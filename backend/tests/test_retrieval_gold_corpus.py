@@ -11,7 +11,7 @@ Four families, mirroring the draft-room gold-corpus contract shape:
 * ``RetrievalGoldLoaderTests`` - typed loader contract plus the
   ``test_tamper_*`` tamper-sensitivity proofs (selectable via ``-k tamper``).
 * ``RetrievalDiscriminationTests`` - runs the repo's real retrieval path
-  (real LanceDB ``VectorStore`` with dense + BM25 FTS hybrid search, real
+  (real LanceDB ``VectorStore`` with dense + native BM25 FTS hybrid search, real
   ``rrf_fuse``, real ``DocumentRetrievalService.filter_relevant``) over the
   corpus with a deterministic token-hash embedding injected at the
   ``embedding_service`` seam (selectable via ``-k discrimination``).
@@ -406,6 +406,107 @@ class RetrievalGoldLoaderTests(unittest.TestCase):
         with self.assertRaises(RetrievalGoldCorpusError):
             load_corpus(corpus_dir)
 
+    def test_tamper_malformed_manifest_json_fails_load(self):
+        corpus_dir = self._scratch_copy()
+        (corpus_dir / "manifest.json").write_text("{not json", encoding="utf-8")
+        with self.assertRaises(RetrievalGoldCorpusError):
+            load_corpus(corpus_dir)
+
+    def test_tamper_malformed_cases_json_fails_load(self):
+        corpus_dir = self._scratch_copy()
+        (corpus_dir / "cases.json").write_text("[broken", encoding="utf-8")
+        with self.assertRaises(RetrievalGoldCorpusError):
+            load_corpus(corpus_dir)
+
+    def test_tamper_manifest_schema_version_fails_load(self):
+        corpus_dir = self._scratch_copy()
+        self._rewrite_manifest(
+            corpus_dir, lambda m: m.update(schema_version="9.9.9")
+        )
+        with self.assertRaises(RetrievalGoldCorpusError):
+            load_corpus(corpus_dir)
+
+    def test_tamper_cases_schema_version_fails_load(self):
+        corpus_dir = self._scratch_copy()
+        self._rewrite_cases(corpus_dir, lambda c: c.update(schema_version="9.9.9"))
+        with self.assertRaises(RetrievalGoldCorpusError):
+            load_corpus(corpus_dir)
+
+    def test_tamper_cases_corpus_id_mismatch_fails_load(self):
+        corpus_dir = self._scratch_copy()
+        self._rewrite_cases(corpus_dir, lambda c: c.update(corpus_id="other_corpus"))
+        with self.assertRaises(RetrievalGoldCorpusError):
+            load_corpus(corpus_dir)
+
+    def test_tamper_char_length_mismatch_fails_load(self):
+        corpus_dir = self._scratch_copy()
+        self._rewrite_manifest(
+            corpus_dir, lambda m: m["documents"][0].update(char_length=1)
+        )
+        with self.assertRaises(RetrievalGoldCorpusError):
+            load_corpus(corpus_dir)
+
+    def test_tamper_unknown_superseded_by_target_fails_load(self):
+        corpus_dir = self._scratch_copy()
+        self._rewrite_manifest(
+            corpus_dir,
+            lambda m: m["documents"][0].update(superseded_by="doc_does_not_exist"),
+        )
+        with self.assertRaises(RetrievalGoldCorpusError):
+            load_corpus(corpus_dir)
+
+    def test_tamper_duplicate_case_id_fails_load(self):
+        corpus_dir = self._scratch_copy()
+
+        def mutate(cases):
+            duplicated = dict(cases["cases"][1])
+            duplicated["id"] = cases["cases"][0]["id"]
+            cases["cases"].append(duplicated)
+
+        self._rewrite_cases(corpus_dir, mutate)
+        with self.assertRaises(RetrievalGoldCorpusError):
+            load_corpus(corpus_dir)
+
+    def test_tamper_missing_fixture_file_fails_load(self):
+        corpus_dir = self._scratch_copy()
+        (corpus_dir / "programme_timeline.md").unlink()
+        with self.assertRaises(RetrievalGoldCorpusError):
+            load_corpus(corpus_dir)
+
+    def test_tamper_bool_span_offsets_fail_load(self):
+        corpus_dir = self._scratch_copy()
+
+        def mutate(cases):
+            for case in cases["cases"]:
+                if case["id"] == "rg-002":
+                    case["expected_span"]["start"] = True
+
+        self._rewrite_cases(corpus_dir, mutate)
+        with self.assertRaises(RetrievalGoldCorpusError) as cm:
+            load_corpus(corpus_dir)
+        self.assertIn("wrong types", str(cm.exception))
+
+    def test_tamper_pipe_in_document_path_fails_load(self):
+        corpus_dir = self._scratch_copy()
+        self._rewrite_manifest(
+            corpus_dir, lambda m: m["documents"][0].update(path="a|b.md")
+        )
+        with self.assertRaises(RetrievalGoldCorpusError) as cm:
+            load_corpus(corpus_dir)
+        self.assertIn("cannot contain '|'", str(cm.exception))
+
+    @unittest.skipIf(
+        os.name != "nt",
+        "drive-relative paths (C:foo.md) are a Windows path form",
+    )
+    def test_tamper_win32_drive_relative_path_fails_load(self):
+        corpus_dir = self._scratch_copy()
+        self._rewrite_manifest(
+            corpus_dir, lambda m: m["documents"][0].update(path="C:escaped.md")
+        )
+        with self.assertRaises(RetrievalGoldCorpusError):
+            load_corpus(corpus_dir)
+
 
 class RetrievalGoldPurityTests(unittest.TestCase):
     """Test-support purity: the loader never imports production code, and the
@@ -435,23 +536,27 @@ class RetrievalGoldPurityTests(unittest.TestCase):
                 self.assertNotIn("retrieval_gold", fh.read(), py_file)
 
     def test_retrieval_gold_root_seam_redirects_the_default_fixtures_dir(self):
+        """The loader itself honors RETRIEVAL_GOLD_ROOT when no explicit root
+        is passed (the frozen ranking-degradation probe sets this env var for
+        a fresh pytest process)."""
         from tests.retrieval_gold import gold_corpus
 
         scratch = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, scratch, True)
         shutil.copytree(FIXTURES_DIR, scratch / "corpus")
         with patch.dict(os.environ, {"RETRIEVAL_GOLD_ROOT": str(scratch / "corpus")}):
-            root = Path(os.environ["RETRIEVAL_GOLD_ROOT"])
-            corpus = gold_corpus.load_corpus(root)
-            self.assertEqual(len(corpus.documents), 10)
+            redirected = gold_corpus.load_corpus()
+        pristine = gold_corpus.load_corpus(FIXTURES_DIR)
+        self.assertEqual(redirected, pristine)
 
 
 
 class RetrievalDiscriminationTests(unittest.IsolatedAsyncioTestCase):
     """Run the repo's real retrieval path over the corpus.
 
-    Real machinery: LanceDB ``VectorStore`` (dense ANN + tantivy BM25 FTS,
-    hybrid RRF fusion), ``DocumentRetrievalService.filter_relevant`` cutoff
+    Real machinery: LanceDB ``VectorStore`` (dense flat vector scan - the
+    corpus is below the ANN index row threshold - plus native LanceDB BM25
+    FTS, hybrid RRF fusion), ``DocumentRetrievalService.filter_relevant`` cutoff
     and group-aware dedup, and the ``RAGEngine.retrieve_eval_results``
     retrieval-only seam. Substituted/pinned (disclosed in the eval docs):
     the deterministic token-hash embedding at the ``embedding_service``
@@ -548,6 +653,7 @@ class RetrievalDiscriminationTests(unittest.IsolatedAsyncioTestCase):
         engine = self._make_engine(corpus, store, embedder)
 
         saw_nonempty = False
+        traps_compared = 0
         with patch.object(settings, "query_transformation_enabled", False):
             for case in corpus.cases:
                 with self.subTest(case=case.id):
@@ -611,13 +717,20 @@ class RetrievalDiscriminationTests(unittest.IsolatedAsyncioTestCase):
                             else case.expected_span.text
                         )
                         trap_units = self._span_unit_ids(corpus, trap, trap_span_text)
+                        self.assertTrue(
+                            trap_units,
+                            f"{case.id}: trap units for {trap} not found (split policy drift)",
+                        )
                         trap_positions = [
                             index
                             for index, record in enumerate(direct)
                             if record["id"] in trap_units
                         ]
                         if not trap_positions:
+                            # Semantically equivalent to passing: an absent
+                            # trap has position >= limit > any baseline <= limit-1.
                             continue
+                        traps_compared += 1
                         self.assertGreater(
                             min(trap_positions),
                             baseline,
@@ -625,8 +738,43 @@ class RetrievalDiscriminationTests(unittest.IsolatedAsyncioTestCase):
                             "above the expected document's span-bearing chunk",
                         )
 
+                    # PRR-008: join the two legs - the EXPECTED DOCUMENT must
+                    # survive the production relevance filter, not only surface
+                    # in a direct search. (Span-chunk-level survival is NOT
+                    # asserted: the per-document dedup and the 0.75 cutoff can
+                    # legitimately keep a different chunk of the same document
+                    # - measured for rg-013/rg-015, whose span chunks score
+                    # 0.758-0.888 - so the docs claim document-level retrieval
+                    # through the cutoff, which is what this asserts.)
+                    filtered = await engine.document_retrieval.filter_relevant(
+                        [dict(record) for record in direct],
+                        reranked=False,
+                        indexed_file_ids={document.path for document in corpus.documents},
+                    )
+                    filtered_docs = {source.file_id for source in filtered}
+                    self.assertIn(
+                        case.expected_doc,
+                        filtered_docs,
+                        f"{case.id}: expected document does not survive the production "
+                        "relevance filter",
+                    )
+                    # F-007: the lexical leg must have participated for THIS
+                    # case, not only at the end of the run.
+                    self.assertEqual(
+                        {record.get("_fts_status") for record in direct},
+                        {"ok"},
+                        f"{case.id}: hybrid search degraded to dense-only",
+                    )
+
         self.assertTrue(
             saw_nonempty, "control failed: no case retrieved anything (store empty?)"
+        )
+        self.assertGreaterEqual(
+            traps_compared,
+            7,
+            "too few trap cases reached the ranking comparison "
+            "(measured 7-8 of 15 depending on fixture geometry; the per-case "
+            "trap_units assertion above covers the wholesale empty-set regression)",
         )
         self.assertEqual(
             store.get_fts_exceptions(),
@@ -647,6 +795,72 @@ class RetrievalDiscriminationTests(unittest.IsolatedAsyncioTestCase):
             {"ok"},
             "hybrid search records must carry _fts_status 'ok' (lexical leg ran)",
         )
+
+    async def test_frozen_probe_swap_degrades_ranking(self):
+        """Committed form of the frozen CI probe's sanctioned swap: swapping
+        the probe case's expected_doc with must_not_match[0] (selected via
+        gold_corpus.probe_case()) must keep the corpus loader-valid and
+        invert the ranking so the trap assertion would fail - the AC3
+        degradation proof, enforced in CI rather than run once manually."""
+        corpus = load_corpus(FIXTURES_DIR)
+        scratch = Path(tempfile.mkdtemp(prefix="retrieval-gold-swap-"))
+        self.addCleanup(shutil.rmtree, scratch, True)
+        shutil.copytree(FIXTURES_DIR, scratch / "corpus")
+        cases_path = scratch / "corpus" / "cases.json"
+        with cases_path.open("r", encoding="utf-8") as fh:
+            cases_doc = json.load(fh)
+        target = next(
+            case
+            for case in cases_doc["cases"]
+            if case.get("expected_doc") and case.get("must_not_match")
+        )
+        old_expected = target["expected_doc"]
+        trap_doc = target["must_not_match"][0]
+        target["expected_doc"] = trap_doc
+        target["must_not_match"][0] = old_expected
+        with cases_path.open("w", encoding="utf-8", newline="\n") as fh:
+            json.dump(cases_doc, fh, indent=2)
+
+        swapped = load_corpus(scratch / "corpus")  # loader-clean swap proof
+        swapped_case = swapped.probe_case()
+        embedder = _DeterministicEmbeddingService()
+        store = await self._build_store(swapped, embedder)
+        engine = self._make_engine(swapped, store, embedder)
+
+        direct = await store.search(
+            _embed_text(swapped_case.query),
+            limit=DIRECT_TOP_K,
+            query_text=swapped_case.query,
+            hybrid=True,
+            hybrid_alpha=HYBRID_ALPHA,
+        )
+        expected_units = self._span_unit_ids(
+            swapped, swapped_case.expected_doc, swapped_case.expected_span.text
+        )
+        # After the swap the NOW-TRAP document is old_expected (the original
+        # expected doc); its span chunks carry the same shared-preamble text.
+        trap_units = self._span_unit_ids(
+            swapped, swapped_case.must_not_match[0], swapped_case.expected_span.text
+        )
+        assert expected_units != trap_units or not expected_units, (
+            "swap test setup: unit sets must name different documents"
+        )
+        expected_positions = [
+            index for index, record in enumerate(direct) if record["id"] in expected_units
+        ]
+        trap_positions = [
+            index for index, record in enumerate(direct) if record["id"] in trap_units
+        ]
+        self.assertTrue(expected_positions, "swapped orientation lost the span chunk")
+        self.assertTrue(trap_positions, "swapped orientation lost the trap chunk")
+        self.assertLessEqual(
+            min(trap_positions),
+            min(expected_positions),
+            "the frozen probe swap must DEGRADE the ranking (trap at or above the "
+            "expected passage - a strict inversion or a tie at the top, either of "
+            "which violates the discrimination family's strict trap assertion)",
+        )
+        _ = engine  # engine built on the swapped corpus for parity with the probe
 
     async def test_right_reason_probe_trap_chunk_vector_inverts_ranking(self):
         """In-suite right-reason probe: substituting the TRAP chunk's

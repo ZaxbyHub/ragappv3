@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -227,7 +228,12 @@ def _check_span(span: dict, text: str, where: str, offset_guard: bool = True) ->
     start = _require(span, "start", where)
     end = _require(span, "end", where)
     span_text = _require(span, "text", where)
-    if not isinstance(start, int) or not isinstance(end, int) or not isinstance(span_text, str):
+    if (
+        type(start) is not int
+        or type(end) is not int
+        or not isinstance(span_text, str)
+    ):
+        # exact int types: bool is an int subclass and must not pass
         raise RetrievalGoldCorpusError(f"{where}: span fields have wrong types")
     if not 0 <= start < end <= len(text):
         raise RetrievalGoldCorpusError(
@@ -258,16 +264,34 @@ def _validate_path(path: str, where: str) -> None:
     candidate = Path(path)
     if candidate.is_absolute() or ".." in candidate.parts:
         raise RetrievalGoldCorpusError(f"{where}: path must be relative and contained: {path!r}")
+    if "|" in path:
+        # "|" is the retrieval harness's chunk-id separator
+        # (f"{path}|{scale}|{index}"); a path containing it would corrupt the
+        # round-trip between manifest entries and store chunk ids.
+        raise RetrievalGoldCorpusError(f"{where}: path cannot contain '|': {path!r}")
 
 
 def load_corpus(root: Optional[Path] = None) -> RetrievalGoldCorpus:
-    base = Path(root) if root is not None else DEFAULT_FIXTURES_DIR
+    """Load and validate the corpus.
+
+    Fixture resolution order: the explicit ``root`` argument, then the
+    ``RETRIEVAL_GOLD_ROOT`` environment variable (the seam the frozen
+    ranking-degradation probe sets for a fresh pytest process), then the
+    default fixtures directory.
+    """
+    if root is not None:
+        base = Path(root)
+    else:
+        base = Path(os.environ.get("RETRIEVAL_GOLD_ROOT", DEFAULT_FIXTURES_DIR))
     manifest_path = base / "manifest.json"
     if not manifest_path.is_file():
         raise RetrievalGoldCorpusError(f"manifest not found: {manifest_path}")
 
     with manifest_path.open("r", encoding="utf-8") as fh:
-        manifest = json.load(fh)
+        try:
+            manifest = json.load(fh)
+        except json.JSONDecodeError as exc:
+            raise RetrievalGoldCorpusError(f"manifest: invalid JSON: {exc}") from exc
 
     where = "manifest"
     if _require(manifest, "schema_version", where) != "1.0.0":
@@ -280,6 +304,11 @@ def load_corpus(root: Optional[Path] = None) -> RetrievalGoldCorpus:
             f"{where}: normalization.policy must be 'crlf-to-lf' (recorded {policy!r})"
         )
     roles = tuple(_require(manifest, "roles", where))
+    unknown_roles = [role for role in roles if role not in DOCUMENT_ROLES]
+    if unknown_roles:
+        raise RetrievalGoldCorpusError(
+            f"{where}: roles outside the canonical vocabulary: {unknown_roles!r}"
+        )
     documents_raw = _require(manifest, "documents", where)
     if not documents_raw or not isinstance(documents_raw, list):
         raise RetrievalGoldCorpusError(f"{where}: documents must be a non-empty list")
@@ -302,8 +331,15 @@ def load_corpus(root: Optional[Path] = None) -> RetrievalGoldCorpus:
         if role not in roles:
             raise RetrievalGoldCorpusError(f"{entry_where}: unknown role {role!r}")
         doc_file = base / path
-        if not doc_file.is_file():
-            raise RetrievalGoldCorpusError(f"{entry_where}: fixture file missing: {path}")
+        # Containment is checked on the RESOLVED path: platform quirks (e.g.
+        # Windows drive-relative "C:foo.md" paths, whose is_absolute() is
+        # False) must not let a manifest entry read outside the fixtures root.
+        if not doc_file.is_file() or not doc_file.resolve().is_relative_to(
+            base.resolve()
+        ):
+            raise RetrievalGoldCorpusError(
+                f"{entry_where}: fixture file missing or outside the fixtures root: {path}"
+            )
         text = normalize_text(doc_file.read_bytes())
         digest = normalized_sha256(text)
         recorded = _require(entry, "sha256", entry_where)
@@ -346,10 +382,28 @@ def load_corpus(root: Optional[Path] = None) -> RetrievalGoldCorpus:
     if not cases_path.is_file():
         raise RetrievalGoldCorpusError(f"cases file not found: {cases_path}")
     with cases_path.open("r", encoding="utf-8") as fh:
-        cases_doc = json.load(fh)
-    kinds = tuple(_require(cases_doc, "case_kinds", "cases") or ())
+        try:
+            cases_doc = json.load(fh)
+        except json.JSONDecodeError as exc:
+            raise RetrievalGoldCorpusError(f"cases: invalid JSON: {exc}") from exc
+    cases_where = "cases"
+    if _require(cases_doc, "schema_version", cases_where) != "1.0.0":
+        raise RetrievalGoldCorpusError(
+            f"{cases_where}: unsupported schema_version"
+        )
+    cases_corpus_id = _require(cases_doc, "corpus_id", cases_where)
+    if cases_corpus_id != manifest.get("corpus_id"):
+        raise RetrievalGoldCorpusError(
+            f"{cases_where}: corpus_id {cases_corpus_id!r} does not match the manifest's"
+        )
+    kinds = tuple(_require(cases_doc, "case_kinds", cases_where) or ())
     if not kinds:
         kinds = CASE_KINDS
+    unknown_kinds = [kind for kind in kinds if kind not in CASE_KINDS]
+    if unknown_kinds:
+        raise RetrievalGoldCorpusError(
+            f"{cases_where}: case_kinds outside the canonical vocabulary: {unknown_kinds!r}"
+        )
     cases_raw = _require(cases_doc, "cases", "cases")
 
     seen_case_ids: set = set()

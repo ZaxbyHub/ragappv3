@@ -63,11 +63,12 @@ bytes, so the corpus holds identically on Linux CI and Windows/CRLF
 checkouts.
 
 What the retrieval gold corpus PROVES, deterministically in CI: retrieval
-discrimination on confusable fixtures — every expected span's chunk is
-retrieved in the top-k through the real LanceDB dense + BM25 hybrid search,
-real RRF fusion and the real relevance cutoff; near-trap passages from the
-wrong document never outrank the expected passage; and an out-of-domain
-query returns no confident hit instead of a hallucinated one.
+discrimination on confusable fixtures — every expected passage ranks in the
+top-k of the real LanceDB dense + BM25 hybrid search with real RRF fusion,
+and the expected document survives the real production relevance cutoff
+(per-document dedup may keep a different chunk of that document); near-trap
+passages from the wrong document never outrank the expected passage; and an
+out-of-domain query returns no confident hit instead of a hallucinated one.
 
 What it does NOT prove: answer quality or generation faithfulness (still
 requires the labeled real corpus in section 1 and the human calibration

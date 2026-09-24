@@ -5,7 +5,7 @@ Programme: Gretna Marsh Pilot soil-moisture monitoring. Custodian: site register
 ## Chronology
 
 - 2029-06-10: Aeris-M Field Specification Revision 1 issued by Kellerman Instruments.
-- 2030-05-19: HydraProbe-9 product specification issued by Voss AgriTech; one bench unit acquired.
+- 2030-05-19: Marram TDR-9 product specification issued by Voss AgriTech; one bench unit acquired.
 - 2030-08-14: installation of all 38 Aeris-M probes complete across 6 plots.
 - 2030-10-02: provincial permit WPB-2049-1187 issued.
 - 2031-01-06: firmware 4.2.1 released by Kellerman Instruments.
@@ -26,7 +26,7 @@ The timeline is maintained from the site register. Amendments require the site l
 
 ## Additional programme events
 
-- 2030-09-08: bench comparison sheet opened for the single HydraProbe-9 unit; the sheet records its 10-minute cadence and 60-day factory cycle side by side with Aeris-M figures for reference only.
+- 2030-09-08: bench comparison sheet opened for the single Marram TDR-9 unit; the sheet records its 10-minute cadence and 60-day factory cycle side by side with Aeris-M figures for reference only.
 - 2031-01-12: four probes from plot 3 withdrawn after drift exceeded the Revision 2 threshold; quarantine entries opened the same day.
 - 2031-01-19: replacement probes installed on plot 3; register cross-referenced to the withdrawal entries.
 - 2031-02-10: Cobalt AgriSupply spring service offer declined in writing; the reply cites the controlling specification.

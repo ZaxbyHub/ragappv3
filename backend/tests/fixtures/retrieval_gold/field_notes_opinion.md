@@ -16,7 +16,7 @@ Cobalt AgriSupply's 120-day service interval is reckless, in my opinion, for any
 
 ## On batteries
 
-The HydraProbe-9 will outlast the Aeris-M on paper - ten years against five and a half - and paper is where I leave it, because the two products are not interchangeable and nobody at this site pretends otherwise.
+The Marram TDR-9 will outlast the Aeris-M on paper - ten years against five and a half - and paper is where I leave it, because the two products are not interchangeable and nobody at this site pretends otherwise.
 
 ## On paperwork
 

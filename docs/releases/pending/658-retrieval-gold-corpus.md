@@ -19,7 +19,7 @@
   the purity is enforced by a test.
 - `backend/tests/test_retrieval_gold_corpus.py` — four contract families:
   manifest parity (including a CRLF-rewrite robustness test), case
-  integrity, loader contract with five tamper proofs (`pytest -k tamper`),
+  integrity, loader contract with a 17-proof tamper family (`pytest -k tamper`),
   and a retrieval-discrimination family (`pytest -k discrimination`) that
   runs the repo's REAL retrieval path — LanceDB dense + BM25 FTS hybrid
   search, RRF fusion, the production relevance cutoff and dedup — fully
@@ -30,7 +30,7 @@
   met at HEAD (25 deterministic cases in CI) while the operator-labeled
   real-corpus split remains pending; `docs/eval-operator-workflow.md` §3a
   states what the corpus proves and does not prove;
-  `docs/engineering/testing.md` now documents the enforced 44-item Windows
+  `docs/engineering/testing.md` now documents the observed 44-item Windows
   environmental baseline.
 
 ## Why
@@ -46,8 +46,11 @@ frontier audit identified (E7) for any future retrieval-quality floor.
 No user-facing surface changes. The suite runs automatically in the Backend
 CI job. To iterate on it locally:
 `cd backend && python -m pytest tests/test_retrieval_gold_corpus.py -q`.
-`RETRIEVAL_GOLD_ROOT` redirects fixture resolution (used by the frozen
-ranking-degradation probe).
+`RETRIEVAL_GOLD_ROOT` redirects fixture resolution in the loader (used by the
+frozen ranking-degradation probe). `manifest.json` and `cases.json` are
+generated artifacts: regenerate them byte-stably from the hand-authored
+documents with
+`python backend/tests/retrieval_gold/generate_corpus.py`.
 
 ## Known limitations
 

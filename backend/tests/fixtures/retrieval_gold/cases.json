@@ -80,7 +80,7 @@
       "kind": "vendor_confusion",
       "query": "which sensor specification offers a 10 year battery life",
       "notes": "Vendor confusion: battery vs cell wording across the two product lines.",
-      "expected_doc": "hydraprobe_9_spec.md",
+      "expected_doc": "marram_tdr_9_spec.md",
       "expected_span": {
         "start": 1347,
         "end": 1412,
@@ -102,9 +102,9 @@
     {
       "id": "rg-005",
       "kind": "vendor_confusion",
-      "query": "what is the calibration interval of the HydraProbe-9",
+      "query": "what is the calibration interval of the Marram TDR-9",
       "notes": "Vendor confusion on calibration interval.",
-      "expected_doc": "hydraprobe_9_spec.md",
+      "expected_doc": "marram_tdr_9_spec.md",
       "expected_span": {
         "start": 926,
         "end": 977,
@@ -126,9 +126,9 @@
     {
       "id": "rg-006",
       "kind": "vendor_confusion",
-      "query": "what is the operating temperature range of the HydraProbe-9",
+      "query": "what is the operating temperature range of the Marram TDR-9",
       "notes": "The datasheet mentions the competitor's +70 C ceiling inside an Aeris-M warning - a genuine lexical near-trap.",
-      "expected_doc": "hydraprobe_9_spec.md",
+      "expected_doc": "marram_tdr_9_spec.md",
       "expected_span": {
         "start": 871,
         "end": 903,
@@ -278,9 +278,9 @@
     {
       "id": "rg-013",
       "kind": "vendor_confusion",
-      "query": "how deep can the HydraProbe-9 measure",
+      "query": "how deep can the Marram TDR-9 measure",
       "notes": "Vendor confusion on measurement depth.",
-      "expected_doc": "hydraprobe_9_spec.md",
+      "expected_doc": "marram_tdr_9_spec.md",
       "expected_span": {
         "start": 745,
         "end": 797,
@@ -434,9 +434,9 @@
     {
       "id": "rg-021",
       "kind": "morphological_variant",
-      "query": "compare the default sampling cadence of the Aeris-M and the HydraProbe-9",
-      "notes": "Multi-document morphological variant: 'intervals' (query) vs 'interval'; both product lines' cadence figures must surface, HydraProbe-9 first for this phrasing.",
-      "expected_doc": "hydraprobe_9_spec.md",
+      "query": "compare the default sampling cadence of the Aeris-M revision 2 spec and the Marram TDR-9",
+      "notes": "Multi-document morphological variant: 'intervals' (query) vs 'interval'; both product lines' cadence figures must surface, Marram TDR-9 first for this phrasing.",
+      "expected_doc": "marram_tdr_9_spec.md",
       "expected_span": {
         "start": 611,
         "end": 666,

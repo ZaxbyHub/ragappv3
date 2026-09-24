@@ -20,7 +20,7 @@ For the record, this memo quotes the specification directly: "Calibration interv
 
 ## 4. Vendor separation
 
-We also bench-test one HydraProbe-9 unit from Voss AgriTech. It runs a 10-minute cadence on a 60-day factory cycle and is a completely separate product line. Its figures belong only on the comparison bench sheet, never on Aeris-M deployment forms.
+We also bench-test one Marram TDR-9 unit from Voss AgriTech. It runs a 10-minute cadence on a 60-day factory cycle and is a completely separate product line. Its figures belong only on the comparison bench sheet, never on Aeris-M deployment forms.
 
 ## 5. Housekeeping
 
@@ -28,4 +28,4 @@ Shift leads initial the register at handover. Damaged probes go to quarantine pe
 
 ## 6. Forms and register habits
 
-Deployment forms cite the specification revision in force on the form's date, never the revision in force at probe installation. Register corrections append with a cross-reference; nobody edits a line that an inspector has already initialed. Bench sheets for the HydraProbe-9 stay on the bench clipboard and travel nowhere else, and the DSV-44 return form is collected from the manufacturer portal rather than from the distributor, whose stock note says they do not carry it.
+Deployment forms cite the specification revision in force on the form's date, never the revision in force at probe installation. Register corrections append with a cross-reference; nobody edits a line that an inspector has already initialed. Bench sheets for the Marram TDR-9 stay on the bench clipboard and travel nowhere else, and the DSV-44 return form is collected from the manufacturer portal rather than from the distributor, whose stock note says they do not carry it.

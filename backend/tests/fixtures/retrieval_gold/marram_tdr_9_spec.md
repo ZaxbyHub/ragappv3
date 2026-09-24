@@ -1,10 +1,10 @@
-# HydraProbe-9 Soil Sensor - Product Specification
+# Marram TDR-9 Soil Sensor - Product Specification
 
-Document class: manufacturer specification. Model: HydraProbe-9. Issued by Voss AgriTech, Hardware Division, 2030-05-19. This document is the current controlling specification for the HydraProbe-9 family.
+Document class: manufacturer specification. Model: Marram TDR-9. Issued by Voss AgriTech, Hardware Division, 2030-05-19. This document is the current controlling specification for the Marram TDR-9 family.
 
 ## 1. Product overview
 
-The HydraProbe-9 is a time-domain reflectometry soil sensor intended for continuous unattended deployment. It shares no components, firmware, or calibration standards with the Kellerman Instruments Aeris-M; the two product lines are unrelated and their specifications must never be intermixed.
+The Marram TDR-9 is a time-domain reflectometry soil sensor intended for continuous unattended deployment. It shares no components, firmware, or calibration standards with the Kellerman Instruments Aeris-M; the two product lines are unrelated and their specifications must never be intermixed.
 
 ## 2. Sampling and measurement
 
@@ -35,8 +35,8 @@ The HydraProbe-9 is a time-domain reflectometry soil sensor intended for continu
 
 - Housing: glass-filled nylon, rated for buried service.
 - The sensor head may be cleaned in the field with deionized water.
-- No lithium cell is present anywhere in the HydraProbe-9; disposal follows ordinary electronics recycling.
+- No lithium cell is present anywhere in the Marram TDR-9; disposal follows ordinary electronics recycling.
 
 ## 7. Interchange warning
 
-Distributors occasionally quote HydraProbe-9 figures when asked about Aeris-M deployments because both products use capacitive or reflectometry sensing in agriculture. Correct practice: any question about cadence, accuracy, calibration interval, battery life, or operating range must be answered from the specification of the model actually deployed at the site.
+Distributors occasionally quote Marram TDR-9 figures when asked about Aeris-M deployments because both products use capacitive or reflectometry sensing in agriculture. Correct practice: any question about cadence, accuracy, calibration interval, battery life, or operating range must be answered from the specification of the model actually deployed at the site.
