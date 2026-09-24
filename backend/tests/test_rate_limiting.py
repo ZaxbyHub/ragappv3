@@ -1172,5 +1172,45 @@ class TestRedisUrlRedaction(unittest.TestCase):
         )
 
 
+class TestWhitelistNonAsciiGuard(unittest.TestCase):
+    """PRR-001 (BNK-001): `_should_whitelist` must not 500 on a non-ASCII X-API-Key.
+
+    Starlette decodes raw header bytes as latin-1, so a client that sends
+    `X-API-Key: foo-\\xe9` reaches us as the str `'foo-é'` (U+00E9). Without
+    the guard, `hmac.compare_digest('foo-é', settings.health_check_api_key)`
+    raises `TypeError: comparing strings with non-ASCII characters is not
+    supported`, which propagates uncaught through the limiter wrapper and
+    surfaces as HTTP 500. With the guard, the request is treated as a
+    non-match (falls through to the bucket check / 429).
+    """
+
+    def test_non_ascii_x_api_key_is_not_a_match_and_does_not_raise(self):
+        from starlette.requests import Request
+
+        from app.limiter import _should_whitelist
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers.get.return_value = "foo-\\xe9"  # the only key call
+        mock_request.client.host = "127.0.0.1"
+
+        with patch("app.limiter.settings") as mock_settings:
+            mock_settings.health_check_api_key = "ascii-only-key"
+            # Pre-fix: raises TypeError. Post-fix: returns False without raising.
+            self.assertFalse(_should_whitelist(mock_request))
+
+    def test_ascii_match_still_works(self):
+        from starlette.requests import Request
+
+        from app.limiter import _should_whitelist
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers.get.return_value = "matching-ascii-key"
+        mock_request.client.host = "127.0.0.1"
+
+        with patch("app.limiter.settings") as mock_settings:
+            mock_settings.health_check_api_key = "matching-ascii-key"
+            self.assertTrue(_should_whitelist(mock_request))
+
+
 if __name__ == "__main__":
     unittest.main()
