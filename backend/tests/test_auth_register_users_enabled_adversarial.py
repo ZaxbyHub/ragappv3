@@ -315,6 +315,17 @@ class TestRegisterUsersEnabledGuardAdversarial(unittest.TestCase):
     def test_register_sql_injection_when_users_disabled(self):
         """SQL injection in username with users_enabled=False should still 403."""
         settings.users_enabled = False
+        # The register route now enforces its documented 5/hour limit (#659),
+        # which would answer payloads 6-7 of this 7-payload list with 429
+        # instead of the guard's 403. Bypass rate limiting through the
+        # production health-check whitelist (a valid X-API-Key) so every
+        # payload still reaches the users-disabled guard under test.
+        self._orig_health_key = settings.health_check_api_key
+        settings.health_check_api_key = "adversarial-register-403-test-key"
+        self.addCleanup(
+            setattr, settings, "health_check_api_key", self._orig_health_key
+        )
+        headers = {"X-API-Key": settings.health_check_api_key}
         injection_payloads = [
             "'; DROP TABLE users; --",
             "' OR '1'='1",
@@ -329,6 +340,7 @@ class TestRegisterUsersEnabledGuardAdversarial(unittest.TestCase):
             response = self.client.post(
                 "/api/auth/register",
                 json={"username": payload, "password": "Password123"},
+                headers=headers,
             )
             self.assertEqual(
                 response.status_code,

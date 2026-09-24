@@ -48,7 +48,18 @@ def _should_whitelist(request: Request) -> bool:
     configured health_check_api_key, causing the request to bypass rate limits.
     """
     key = request.headers.get("X-API-Key")
-    if key and hmac.compare_digest(key, settings.health_check_api_key):
+    if not key:
+        return False
+    try:
+        matched = hmac.compare_digest(key, settings.health_check_api_key)
+    except TypeError:
+        # Starlette decodes raw header bytes as latin-1, so a non-ASCII X-API-Key
+        # reaches us as a str with code points >= 0x80. compare_digest rejects
+        # that with TypeError ("comparing strings with non-ASCII characters is
+        # not supported"). Treat as a non-match instead of 500ing — the request
+        # falls through to the bucket check and is rate-limited normally.
+        return False
+    if matched:
         logger.info(
             "Whitelist hit", extra={
                 "client_ip": request.client.host if request.client else None,
@@ -56,8 +67,7 @@ def _should_whitelist(request: Request) -> bool:
                 "reason": "health-check whitelist",
             }
         )
-        return True
-    return False
+    return matched
 
 
 class WhitelistLimiter(Limiter):
