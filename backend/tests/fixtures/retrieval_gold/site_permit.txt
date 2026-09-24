@@ -1,0 +1,37 @@
+PROVINCIAL BOARD OF ALDERBURY - FIELD INSTRUMENTATION PERMIT
+
+Permit number: WPB-2049-1187
+
+Holder: Gretna Marsh Pilot programme, c/o site register office
+
+Issued: 2030-10-02
+
+Expires: 2032-09-30 unless renewed
+
+Summary: instrumentation permit WPB-2049-1187 governs the provincial field deployment at the named site and expires unless renewed before 2032-09-30.
+
+CONDITIONS
+
+1. Authorized instruments. The holder may operate up to 50 soil-moisture probes of the Kellerman Instruments Aeris-M family at the Gretna Marsh Pilot site, Province of Alderbury.
+
+2. Cadence. Instrument cadence shall follow the controlling manufacturer specification revision in force on the date of each deployment form.
+
+3. Calibration records. Every calibration event shall be entered in the site register within 24 hours of the event, citing the specification revision used.
+
+4. Cell safety. No probe housing shall be opened at the site. Recovered units shall be returned to the manufacturer for cell removal. Disposal in general waste is prohibited.
+
+5. Relocation. No probe shall be moved between plots without a same-week entry in the site register; relocation outside the permitted site requires a written variance from the Board.
+
+6. Reporting. Quarterly compliance summaries are due to the Board by the 15th day of the month following the close of each quarter.
+
+7. Superseded documents. Figures quoted from superseded specification revisions are invalid for compliance purposes after 2031-02-01.
+
+8. Bench instruments. A single comparison-bench sensor of another manufacturer may be kept on site provided its figures appear only on bench sheets and never on deployment forms.
+
+9. Records retention. The site register, deployment forms, and specification copies cited by them shall be retained for seven years after permit expiry.
+
+10. Board contact. Variance applications and renewal notices go to the Board's field instrumentation office, quoting this permit number, and are decided within forty working days of a complete application.
+
+Interpretation: headings in this permit are for convenience; conditions are read together. Where a condition defers to a manufacturer specification, the revision in force on the date of the relevant site form is the revision that governs, and no distributor bulletin is a specification for the purposes of this permit.
+
+This permit is rendered as plain text from the Board register; the register copy controls in any dispute.

@@ -1,0 +1,514 @@
+{
+  "schema_version": "1.0.0",
+  "corpus_id": "retrieval_gold_corpus_v1",
+  "case_kinds": [
+    "exact_fact",
+    "revision_marker",
+    "vendor_confusion",
+    "memo_quote",
+    "morphological_variant",
+    "not_in_corpus"
+  ],
+  "cases": [
+    {
+      "id": "rg-001",
+      "kind": "revision_marker",
+      "query": "what sampling cadence does revision 2 of the Aeris-M field specification retain",
+      "notes": "Tier-1 doc-level trap: both revision documents carry the span at identical offsets (shared preamble); the discriminator tail ('Revision 2 retains the 15-minute default cadence.') lives in the same chunk. This is the case the frozen C3 probe selects.",
+      "expected_doc": "aeris_m_spec_rev2.md",
+      "expected_span": {
+        "start": 54,
+        "end": 164,
+        "text": "The Aeris-M capacitive soil-moisture probe operates from -20 C to +60 C at up to 95 percent relative humidity.",
+        "sha256": "9140be6c169d278eaab0be10f91c3d2ff4de6398a48fe95357d14d4e72b52db6"
+      },
+      "must_not_match": [
+        "aeris_m_spec_rev1_superseded.md"
+      ],
+      "also_expected": []
+    },
+    {
+      "id": "rg-002",
+      "kind": "revision_marker",
+      "query": "which calibration interval applies under Aeris-M specification revision 2",
+      "notes": "Superseded revision near-trap: identical sentence shape, different number.",
+      "expected_doc": "aeris_m_spec_rev2.md",
+      "expected_span": {
+        "start": 1278,
+        "end": 1329,
+        "text": "Calibration interval: 90 days under normal service.",
+        "sha256": "4d14dc4a2402e446246fdd178fdb26883bc0a947837c255d812f7214aef5def1"
+      },
+      "must_not_match": [
+        "aeris_m_spec_rev1_superseded.md"
+      ],
+      "also_expected": [],
+      "trap_span": {
+        "document": "aeris_m_spec_rev1_superseded.md",
+        "start": 1105,
+        "end": 1157,
+        "text": "Calibration interval: 180 days under normal service.",
+        "sha256": "b048a6dbbefd58ad1894c852ed6ac6eca936b0a336adc1279c9cb2bb8b34cc2d"
+      }
+    },
+    {
+      "id": "rg-003",
+      "kind": "revision_marker",
+      "query": "what stated accuracy does Aeris-M specification revision 2 give",
+      "notes": "Revision pair accuracy discrimination.",
+      "expected_doc": "aeris_m_spec_rev2.md",
+      "expected_span": {
+        "start": 1012,
+        "end": 1080,
+        "text": "Stated accuracy: plus or minus 1.8 percent volumetric water content.",
+        "sha256": "87d92ee35ad35af9f20ce394ae3d2b9b1cd66a258f5760a769cbb6beeb673130"
+      },
+      "must_not_match": [
+        "aeris_m_spec_rev1_superseded.md"
+      ],
+      "also_expected": [],
+      "trap_span": {
+        "document": "aeris_m_spec_rev1_superseded.md",
+        "start": 943,
+        "end": 1011,
+        "text": "Stated accuracy: plus or minus 2.5 percent volumetric water content.",
+        "sha256": "6668aa87336f2b9edae32e4f0e7f739d601ed3128a1f5880aa8e925965c17585"
+      }
+    },
+    {
+      "id": "rg-004",
+      "kind": "vendor_confusion",
+      "query": "which sensor specification offers a 10 year battery life",
+      "notes": "Vendor confusion: battery vs cell wording across the two product lines.",
+      "expected_doc": "marram_tdr_9_spec.md",
+      "expected_span": {
+        "start": 1347,
+        "end": 1412,
+        "text": "Expected battery life: 10 years at the 10-minute default cadence.",
+        "sha256": "e0b2319334fdf3a298312ccc49139501b2c4aed5bb1a71286ca1db72f73a05bb"
+      },
+      "must_not_match": [
+        "aeris_m_spec_rev2.md"
+      ],
+      "also_expected": [],
+      "trap_span": {
+        "document": "aeris_m_spec_rev2.md",
+        "start": 2087,
+        "end": 2150,
+        "text": "Expected cell life: 5.5 years at the 15-minute default cadence.",
+        "sha256": "e3209fd8cdcc78fe6d3ece206f80e848a7430231aae4e9b88aff7c794297e0e6"
+      }
+    },
+    {
+      "id": "rg-005",
+      "kind": "vendor_confusion",
+      "query": "what is the calibration interval of the Marram TDR-9",
+      "notes": "Vendor confusion on calibration interval.",
+      "expected_doc": "marram_tdr_9_spec.md",
+      "expected_span": {
+        "start": 926,
+        "end": 977,
+        "text": "Calibration interval: 60 days under normal service.",
+        "sha256": "05d53aa8764480937ab0ab23840874f591521c5d7eed5b8f40a28558c18470aa"
+      },
+      "must_not_match": [
+        "aeris_m_spec_rev2.md"
+      ],
+      "also_expected": [],
+      "trap_span": {
+        "document": "aeris_m_spec_rev2.md",
+        "start": 1278,
+        "end": 1329,
+        "text": "Calibration interval: 90 days under normal service.",
+        "sha256": "4d14dc4a2402e446246fdd178fdb26883bc0a947837c255d812f7214aef5def1"
+      }
+    },
+    {
+      "id": "rg-006",
+      "kind": "vendor_confusion",
+      "query": "what is the operating temperature range of the Marram TDR-9",
+      "notes": "The datasheet mentions the competitor's +70 C ceiling inside an Aeris-M warning - a genuine lexical near-trap.",
+      "expected_doc": "marram_tdr_9_spec.md",
+      "expected_span": {
+        "start": 871,
+        "end": 903,
+        "text": "Operating range: -40 C to +70 C.",
+        "sha256": "b64706f8fc73f09fab84109827ca94a09fb206f0774c7288fc28771041bc10ab"
+      },
+      "must_not_match": [
+        "aeris_m_safety_datasheet.md"
+      ],
+      "also_expected": [],
+      "trap_span": {
+        "document": "aeris_m_safety_datasheet.md",
+        "start": 1738,
+        "end": 1915,
+        "text": "The storage ceiling of 60 C is an absolute limit and is lower than the +70 C operating ceiling of some competitor products; do not transfer handling rules between product lines.",
+        "sha256": "0b71c5cdd7a5e0e4a7b4b77a6e6ebdfa09273e802f8ef610fcc20665cdd67099"
+      }
+    },
+    {
+      "id": "rg-007",
+      "kind": "exact_fact",
+      "query": "at what storage temperature may Aeris-M cells vent",
+      "notes": "Straight fact lookup in the safety datasheet.",
+      "expected_doc": "aeris_m_safety_datasheet.md",
+      "expected_span": {
+        "start": 435,
+        "end": 495,
+        "text": "Store below 60 C. Storage above 60 C may cause cell venting.",
+        "sha256": "e168fd36a775647da8e58673f60853031f8e61e40d43bc0d767483c1e3c2d550"
+      },
+      "must_not_match": [],
+      "also_expected": []
+    },
+    {
+      "id": "rg-008",
+      "kind": "memo_quote",
+      "query": "which calibration sentence does the site deployment memo tell crews to quote on forms",
+      "notes": "Tier-2 text-level trap: the memo quotes the specification sentence verbatim inside its own framing, so the expected span (framing + quote) exists only in the memo while the trap span (the bare quoted sentence) is the specification's own wording; the memo's framing vocabulary is the ranking discriminator.",
+      "expected_doc": "site_deployment_memo.md",
+      "expected_span": {
+        "start": 473,
+        "end": 571,
+        "text": "this memo quotes the specification directly: \"Calibration interval: 90 days under normal service.\"",
+        "sha256": "5d3a209b5ea5e6802a2c3318dd2c7779910ecb1b60ddc6cf38dc4b0b329f9d57"
+      },
+      "must_not_match": [
+        "aeris_m_spec_rev2.md"
+      ],
+      "also_expected": [],
+      "trap_span": {
+        "document": "aeris_m_spec_rev2.md",
+        "start": 1278,
+        "end": 1329,
+        "text": "Calibration interval: 90 days under normal service.",
+        "sha256": "4d14dc4a2402e446246fdd178fdb26883bc0a947837c255d812f7214aef5def1"
+      }
+    },
+    {
+      "id": "rg-009",
+      "kind": "morphological_variant",
+      "query": "is the Aeris-M calibration logging window 24 hours or 7 days under revision 2",
+      "notes": "Morphological variant: 'calibrations' (query) vs 'calibration' (document).",
+      "expected_doc": "aeris_m_spec_rev2.md",
+      "expected_span": {
+        "start": 1411,
+        "end": 1500,
+        "text": "Every calibration event must be logged to the site register within 24 hours of the event.",
+        "sha256": "57a487a5f1eeeb0f5bdcfb3451895565ed8a35a235a522b655bfe86d388486a3"
+      },
+      "must_not_match": [
+        "aeris_m_spec_rev1_superseded.md"
+      ],
+      "also_expected": [],
+      "trap_span": {
+        "document": "aeris_m_spec_rev1_superseded.md",
+        "start": 1239,
+        "end": 1326,
+        "text": "Every calibration event must be logged to the site register within 7 days of the event.",
+        "sha256": "89d3dcf3d798654940c5b414c9b757cf9f8122d6c811885633edf285e706b7ad"
+      }
+    },
+    {
+      "id": "rg-010",
+      "kind": "morphological_variant",
+      "query": "explain the 15-min cadence rule for the Aeris-M",
+      "notes": "Morphological variant: '15-min' (query) shares the '15' token with '15 minutes' in the document.",
+      "expected_doc": "aeris_m_spec_rev2.md",
+      "expected_span": {
+        "start": 812,
+        "end": 867,
+        "text": "Default sampling cadence: one reading every 15 minutes.",
+        "sha256": "6542c6bc4b4cc440ac79e283bb3ccbe26e6cee493e967951112ae8ddd87917a1"
+      },
+      "must_not_match": [
+        "aeris_m_spec_rev1_superseded.md"
+      ],
+      "also_expected": [],
+      "trap_span": {
+        "document": "aeris_m_spec_rev1_superseded.md",
+        "start": 743,
+        "end": 798,
+        "text": "Default sampling cadence: one reading every 30 minutes.",
+        "sha256": "535c8615eba66f76130a92e82c642251e660f8d3c63e86e333a54c367b97d53d"
+      }
+    },
+    {
+      "id": "rg-011",
+      "kind": "exact_fact",
+      "query": "when was the provincial permit WPB-2049-1187 issued for the Gretna Marsh Pilot",
+      "notes": "Multi-document question: the timeline also records the issue date and must appear in top-k.",
+      "expected_doc": "site_permit.txt",
+      "expected_span": {
+        "start": 156,
+        "end": 174,
+        "text": "Issued: 2030-10-02",
+        "sha256": "d61f0c394a6ebeb79cc4b3896480ca5283bd27d94b4440e24b98b62203128945"
+      },
+      "must_not_match": [],
+      "also_expected": [
+        "programme_timeline.md"
+      ]
+    },
+    {
+      "id": "rg-012",
+      "kind": "revision_marker",
+      "query": "is 4.2.1 the reference firmware for Aeris-M revision 2",
+      "notes": "Firmware reference discrimination across the revision pair.",
+      "expected_doc": "aeris_m_spec_rev2.md",
+      "expected_span": {
+        "start": 1756,
+        "end": 1805,
+        "text": "Reference firmware for Revision 2: version 4.2.1.",
+        "sha256": "291a1aa5752c17d1bfd557db2073e9bb5fd63a76aba8e265904995556228e106"
+      },
+      "must_not_match": [
+        "aeris_m_spec_rev1_superseded.md"
+      ],
+      "also_expected": [],
+      "trap_span": {
+        "document": "aeris_m_spec_rev1_superseded.md",
+        "start": 1636,
+        "end": 1685,
+        "text": "Reference firmware for Revision 1: version 3.0.7.",
+        "sha256": "1183f569effc0cd1ce48cfb1617e30886131e9efb73bf397b7dae7c7b2896564"
+      }
+    },
+    {
+      "id": "rg-013",
+      "kind": "vendor_confusion",
+      "query": "how deep can the Marram TDR-9 measure",
+      "notes": "Vendor confusion on measurement depth.",
+      "expected_doc": "marram_tdr_9_spec.md",
+      "expected_span": {
+        "start": 745,
+        "end": 797,
+        "text": "Measurement depth: up to 90 cm below ground surface.",
+        "sha256": "c63b65027ca69f30f94ad4c4ef981b4d2231dd2c0ee3d472d53957781afedcd9"
+      },
+      "must_not_match": [
+        "aeris_m_spec_rev2.md"
+      ],
+      "also_expected": [],
+      "trap_span": {
+        "document": "aeris_m_spec_rev2.md",
+        "start": 956,
+        "end": 1009,
+        "text": "Measurement depth: up to 120 cm below ground surface.",
+        "sha256": "5f30fcab41d344238c4751a5dd68daafb2acde1f655925ed20316729385226f7"
+      }
+    },
+    {
+      "id": "rg-014",
+      "kind": "exact_fact",
+      "query": "what form accompanies an Aeris-M return consignment",
+      "notes": "Rare-token fact lookup.",
+      "expected_doc": "aeris_m_safety_datasheet.md",
+      "expected_span": {
+        "start": 1284,
+        "end": 1366,
+        "text": "The return consignment form is DSV-44; damaged units travel under UN3090 labeling.",
+        "sha256": "37956115e6738de053df1200f4d51fbf25b3873bdd7d3dc40e3833efecc20527"
+      },
+      "must_not_match": [],
+      "also_expected": []
+    },
+    {
+      "id": "rg-015",
+      "kind": "exact_fact",
+      "query": "what does the glossary define as a variance",
+      "notes": "Definition lookup in the glossary.",
+      "expected_doc": "programme_glossary.md",
+      "expected_span": {
+        "start": 1008,
+        "end": 1086,
+        "text": "Variance: a written board authorization to operate outside a permit condition.",
+        "sha256": "cbce8d4725cac0743feb3ed6dc04df426ab78843ad3fa84f290f51961e510a24"
+      },
+      "must_not_match": [],
+      "also_expected": []
+    },
+    {
+      "id": "rg-016",
+      "kind": "exact_fact",
+      "query": "who issued the site deployment memo and on what date",
+      "notes": "Attribution fact lookup.",
+      "expected_doc": "site_deployment_memo.md",
+      "expected_span": {
+        "start": 45,
+        "end": 96,
+        "text": "From: Dr. Marta Ovist, site lead. Date: 2031-03-05.",
+        "sha256": "6525296c0ed3557b40742620a8e6b8146e5818d625a634e0b62ecc37df38f5a9"
+      },
+      "must_not_match": [],
+      "also_expected": []
+    },
+    {
+      "id": "rg-017",
+      "kind": "revision_marker",
+      "query": "how does revision 2 change the calibration interval relative to revision 1",
+      "notes": "The revision-notes summary is the only place both numbers appear in one sentence; the superseded document remains the near-trap.",
+      "expected_doc": "aeris_m_spec_rev2.md",
+      "expected_span": {
+        "start": 2698,
+        "end": 2880,
+        "text": "Revision 2 shortens the calibration interval from the 180 days set by Revision 1 to 90 days, tightens the stated accuracy from plus or minus 2.5 percent to plus or minus 1.8 percent,",
+        "sha256": "d0072444b6dc559179cc6f90afc754d3b52e379396980732b93f153d5d130e1a"
+      },
+      "must_not_match": [
+        "aeris_m_spec_rev1_superseded.md"
+      ],
+      "also_expected": [],
+      "trap_span": {
+        "document": "aeris_m_spec_rev1_superseded.md",
+        "start": 1105,
+        "end": 1157,
+        "text": "Calibration interval: 180 days under normal service.",
+        "sha256": "b048a6dbbefd58ad1894c852ed6ac6eca936b0a336adc1279c9cb2bb8b34cc2d"
+      }
+    },
+    {
+      "id": "rg-018",
+      "kind": "exact_fact",
+      "query": "what was logged on plot 3 on 2031-01-09",
+      "notes": "The opinion column states the same date as fact inside opinion prose - a real lexical near-trap with different phrasing; the timeline Notes paragraph carries the load-bearing relative-date wording.",
+      "expected_doc": "programme_timeline.md",
+      "expected_span": {
+        "start": 547,
+        "end": 600,
+        "text": "2031-01-09: first drift observation logged on plot 3.",
+        "sha256": "74bed2d802abe4a4223fe364cee73585669fee105d9178fa2b506405bc5f46f7"
+      },
+      "must_not_match": [
+        "field_notes_opinion.md"
+      ],
+      "also_expected": [],
+      "trap_span": {
+        "document": "field_notes_opinion.md",
+        "start": 610,
+        "end": 721,
+        "text": "The facts: firmware 4.2.1 was released on 2031-01-06, and the first drift observation was logged on 2031-01-09.",
+        "sha256": "c2186c774b0046c754e2e4985fe816cb57a6b35a9036debdc45af1e41ccfadd0"
+      }
+    },
+    {
+      "id": "rg-019",
+      "kind": "exact_fact",
+      "query": "how many maintained units does the distributor 1.2 percent accuracy claim rest on",
+      "notes": "Distributor claim vs controlling figure: the corpus must prefer the bulletin for a bulletin-framed query while the specification's own figure is the near-trap.",
+      "expected_doc": "distributor_bulletin.md",
+      "expected_span": {
+        "start": 540,
+        "end": 681,
+        "text": "Across 214 maintained units we observe the Aeris-M holding plus or minus 1.2 percent volumetric water content across the full operating band,",
+        "sha256": "8fec5b3642728b406d5018466c3841497129bd53a6d2601f3e68caaae722d45b"
+      },
+      "must_not_match": [
+        "aeris_m_spec_rev2.md"
+      ],
+      "also_expected": [],
+      "trap_span": {
+        "document": "aeris_m_spec_rev2.md",
+        "start": 1012,
+        "end": 1080,
+        "text": "Stated accuracy: plus or minus 1.8 percent volumetric water content.",
+        "sha256": "87d92ee35ad35af9f20ce394ae3d2b9b1cd66a258f5760a769cbb6beeb673130"
+      }
+    },
+    {
+      "id": "rg-020",
+      "kind": "exact_fact",
+      "query": "when does provincial permit WPB-2049-1187 expire unless renewed",
+      "notes": "Permit expiry lookup by permit number.",
+      "expected_doc": "site_permit.txt",
+      "expected_span": {
+        "start": 176,
+        "end": 210,
+        "text": "Expires: 2032-09-30 unless renewed",
+        "sha256": "75415053221e198ec955db6930f9e968734549b80d174374634240d4fcb5b83c"
+      },
+      "must_not_match": [],
+      "also_expected": []
+    },
+    {
+      "id": "rg-021",
+      "kind": "morphological_variant",
+      "query": "compare the default sampling cadence of the Aeris-M revision 2 spec and the Marram TDR-9",
+      "notes": "Multi-document morphological variant: 'intervals' (query) vs 'interval'; both product lines' cadence figures must surface, Marram TDR-9 first for this phrasing.",
+      "expected_doc": "marram_tdr_9_spec.md",
+      "expected_span": {
+        "start": 611,
+        "end": 666,
+        "text": "Default sampling cadence: one reading every 10 minutes.",
+        "sha256": "04f92579b657b2c8e6da2891ac1a252138a8b4cc82fd189ee819f839c2ac7269"
+      },
+      "must_not_match": [],
+      "also_expected": [
+        "aeris_m_spec_rev2.md"
+      ]
+    },
+    {
+      "id": "rg-022",
+      "kind": "exact_fact",
+      "query": "what does the publisher say about the field notes column",
+      "notes": "Opinion-document provenance lookup.",
+      "expected_doc": "field_notes_opinion.md",
+      "expected_span": {
+        "start": 143,
+        "end": 271,
+        "text": "The publisher insists this column mixes the writer's opinions with a few checkable facts, and readers should keep the two apart.",
+        "sha256": "548903721bf1487a987584d198a0e7921f26fd1bf19652d841793d1ab72de0da"
+      },
+      "must_not_match": [],
+      "also_expected": []
+    },
+    {
+      "id": "rg-023",
+      "kind": "revision_marker",
+      "query": "what cell life does Aeris-M revision 2 promise at the default cadence",
+      "notes": "Cell-life discrimination across the revision pair; the in-suite trap-chunk-vector probe uses rg-013 (see the test file).",
+      "expected_doc": "aeris_m_spec_rev2.md",
+      "expected_span": {
+        "start": 2087,
+        "end": 2150,
+        "text": "Expected cell life: 5.5 years at the 15-minute default cadence.",
+        "sha256": "e3209fd8cdcc78fe6d3ece206f80e848a7430231aae4e9b88aff7c794297e0e6"
+      },
+      "must_not_match": [
+        "aeris_m_spec_rev1_superseded.md"
+      ],
+      "also_expected": [],
+      "trap_span": {
+        "document": "aeris_m_spec_rev1_superseded.md",
+        "start": 1869,
+        "end": 1932,
+        "text": "Expected cell life: 6.0 years at the 30-minute default cadence.",
+        "sha256": "ec7d0524c1ed92d2aee8cf8dfcee1ff8f09dd6d24fb71c5a8e1770941f07da42"
+      }
+    },
+    {
+      "id": "rg-024",
+      "kind": "not_in_corpus",
+      "query": "what is the maintenance schedule for the submarine ballast pump anodes",
+      "notes": "Honest absence: every query token is out of domain; the expected result is NO confident hit (empty after the relevance cutoff), not a hallucinated match.",
+      "expected_doc": "",
+      "expected_span": null
+    },
+    {
+      "id": "rg-025",
+      "kind": "exact_fact",
+      "query": "how many probes does the permit authorize at the site",
+      "notes": "Permit ceiling lookup; the permit renders one condition per line.",
+      "expected_doc": "site_permit.txt",
+      "expected_span": {
+        "start": 402,
+        "end": 553,
+        "text": "The holder may operate up to 50 soil-moisture probes of the Kellerman Instruments Aeris-M family at the Gretna Marsh Pilot site, Province of Alderbury.",
+        "sha256": "e0fbc900c2dcd71dcac7fd58d2120e9396989ef330f4c523c8c9616f1e7795de"
+      },
+      "must_not_match": [],
+      "also_expected": []
+    }
+  ]
+}

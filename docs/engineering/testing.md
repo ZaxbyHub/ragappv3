@@ -138,19 +138,25 @@ Three more workflows complete the gate lattice: `closure-evidence.yml` (PRs whos
 
 > **Windows host test baseline (pre-existing, not regressions):** a full
 > test-suite run (backend or frontend) on a Windows/CRLF checkout reports a
-> stable set of environmental failures that CI (Linux) never sees. Know them
-> before debugging: (1) `tests/draft_room/test_gold_corpus_contract.py` — the
-> gold-corpus manifest pins sha256 hashes of LF fixture bytes, and a CRLF
-> checkout rewrites them (~41 errors/failures; provable in seconds with
-> `git show HEAD:<fixture> | sha256sum` vs the on-disk hash); (2)
+> stable set of environmental failures that CI (Linux) never sees. The stable
+> backend set is 44 failing ids. Know them before debugging: (1) 41 items in
+> `tests/draft_room/test_gold_corpus_contract.py` — the gold-corpus manifest
+> pins sha256 hashes of LF fixture bytes, and a CRLF checkout rewrites them
+> (provable in seconds with `git show HEAD:<fixture> | sha256sum` vs the
+> on-disk hash; the issue-#658 `retrieval_gold` corpus deliberately hashes
+> CRLF-normalized bytes and is NOT part of this failure class); (2)
+> `test_check_test_collection_scope.py::test_git_command_failure_outside_repo_falls_back`
+> — the degraded-mode fallback shells out to `git`, which the local MSYS
+> environment resolves differently than CI's; (3)
 > `test_draft_input_storage.py::TestPathSafety::test_symlink_escape_rejected`
-> — Windows symlink privilege (WinError 1314); (3)
+> — Windows symlink privilege (WinError 1314); (4)
 > `test_upload_validation_regression.py::TestSecureFilename::test_strips_traversal`
-> — POSIX-only backslash-traversal semantics; (4) occasional timing flakes
+> — POSIX-only backslash-traversal semantics; (5) occasional timing flakes
 > under `-n auto` load (e.g. `test_org_invites` concurrent-accept — passes in
-> isolation). (5) Frontend: under full-suite load on Windows the full-App render specs (`src/App.subpath.test.tsx`, `src/App.draft-room.test.tsx`) can exceed Vitest's default 5000ms timeout —
+> isolation; on a full-suite DRIFT confined to this flake class, re-run the
+> drifted ids in isolation before concluding regression). (6) Frontend: under full-suite load on Windows the full-App render specs (`src/App.subpath.test.tsx`, `src/App.draft-room.test.tsx`) can exceed Vitest's default 5000ms timeout —
 > they carry an explicit per-suite budget and pass in isolation; treat a timeout in only these specs as this known load-sensitive class; anything
-> else is a regression. (6) Backend: a Windows run can exit 1 after all tests pass with `PermissionError [WinError 5]` on
+> else is a regression. (7) Backend: a Windows run can exit 1 after all tests pass with `PermissionError [WinError 5]` on
 > `pytest-of-<user>\pytest-current` during teardown — zero FAILED lines, no summary; re-run with `--basetemp` inside the repo (e.g.
 > `--basetemp=.swarm/pytest-tmp`) to get a clean result. Anything outside this set deserves investigation.
 
