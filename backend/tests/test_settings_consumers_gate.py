@@ -14,7 +14,13 @@ pytest suite. Covers the census contract end to end:
 - T6 textual presence is not consumption (comment / string literal /
   Store-context write do not mint a consumer),
 - T7 the census is wired into the ci.yml quality-contracts job and the
-  justfile quality-contracts recipe.
+  justfile quality-contracts recipe,
+- T8 an unreadable/unparseable config.py exits 2 (documented IO-error code),
+  with a clean diagnostic and no traceback,
+- T9 a config.py without a Settings class exits 2 with a clean diagnostic,
+- T10 a `: Settings`-annotated DI param counts as a consumer,
+- T11 a rebinding through an aliased `get_settings` import counts, while a
+  bare local function merely named `get_settings` does not mint consumers.
 """
 
 import subprocess
@@ -88,6 +94,7 @@ def test_t2_synthetic_dormant_field_fails_census_named(tmp_path):
     result = _run(fixture)
     assert result.returncode == 1, f"expected exit 1, got {result.returncode}"
     assert "synthetic_dormant_field" in result.stdout, result.stdout
+    assert "settings-consumers:" in result.stderr, result.stderr
 
 
 def test_t3_multiline_getattr_counts_as_consumer(tmp_path):
@@ -141,6 +148,10 @@ def test_t5_allowlist_contract(tmp_path):
     allowlist.write_text("not_a_settings_field :: some reason\n", encoding="utf-8")
     result = _run(fixture, "--allowlist", str(allowlist))
     assert result.returncode == 1, "unknown-field allowlist entry must fail"
+    assert "is not a Settings field" in result.stderr, (
+        "the unknown-field rejection must carry its specific diagnostic, "
+        "otherwise this sub-case also passes on unrelated failures"
+    )
 
 
 def test_t6_textual_presence_is_not_consumption(tmp_path):
@@ -194,3 +205,72 @@ def test_t7_census_wired_into_ci_and_justfile():
             found_just_line = True
             break
     assert found_just_line, "justfile quality-contracts recipe must run the census"
+
+
+def test_t8_unparseable_config_exits_2_without_traceback(tmp_path):
+    """T8: an unreadable/unparseable config.py uses the documented IO-error exit code."""
+    fixture = _make_fixture(tmp_path, "")
+    config = fixture / "backend" / "app" / "config.py"
+    config.write_text("this is not python @ syntax error !!!\n", encoding="utf-8")
+    result = _run(fixture)
+    assert result.returncode == 2, f"IO/parse errors must exit 2, got {result.returncode}"
+    assert "cannot read or parse" in result.stderr, result.stderr
+    assert "Traceback" not in result.stderr and "Traceback" not in result.stdout, (
+        "a scanner crash must produce a clean diagnostic, not a traceback"
+    )
+
+
+def test_t9_missing_settings_class_exits_2(tmp_path):
+    """T9: a config.py without a Settings class exits 2 with a clean diagnostic."""
+    fixture = _make_fixture(tmp_path, "")
+    config = fixture / "backend" / "app" / "config.py"
+    config.write_text("OTHER = 1\n", encoding="utf-8")
+    result = _run(fixture)
+    assert result.returncode == 2, f"missing Settings class must exit 2, got {result.returncode}"
+    assert "class Settings not found" in result.stderr, result.stderr
+    assert "Traceback" not in result.stderr and "Traceback" not in result.stdout
+
+
+def test_t10_di_typed_param_counts_as_consumer(tmp_path):
+    """T10: a `: Settings`-annotated DI param is a consumer binding form."""
+    fixture = _make_fixture(tmp_path, "")
+    consumer = fixture / "backend" / "app" / "services" / "consumer.py"
+    consumer.write_text(
+        "from app.config import Settings\n\n\n"
+        "def read_dep(dep: Settings) -> int:\n"
+        "    return dep.consumed_fixture_field\n",
+        encoding="utf-8",
+    )
+    result = _run(fixture)
+    assert result.returncode == 0, f"DI-typed param must count as a consumer: {result.stdout}\n{result.stderr}"
+
+
+def test_t11_aliased_get_settings_rebind_counts_and_bare_names_do_not(tmp_path):
+    """T11: `x = <aliased get_settings>()` counts only when the name traces to an import."""
+    fixture = _make_fixture(tmp_path, "")
+    consumer = fixture / "backend" / "app" / "services" / "consumer.py"
+    consumer.write_text(
+        "from app.config import get_settings as gs\n\n\n"
+        "def read_rebound() -> int:\n"
+        "    conf = gs()\n"
+        "    return conf.consumed_fixture_field\n",
+        encoding="utf-8",
+    )
+    result = _run(fixture)
+    assert result.returncode == 0, f"aliased get_settings rebind must count: {result.stdout}\n{result.stderr}"
+
+    impostor = fixture / "backend" / "app" / "services" / "consumer.py"
+    impostor.write_text(
+        "def get_settings():\n"
+        "    return 1\n\n\n"
+        "def read_shadowed() -> int:\n"
+        "    conf = get_settings()\n"
+        "    return conf.consumed_fixture_field\n",
+        encoding="utf-8",
+    )
+    result = _run(fixture)
+    assert result.returncode == 1, (
+        "a bare local function merely named get_settings must NOT mint a consumer "
+        f"(field must stay dormant): {result.stdout}\n{result.stderr}"
+    )
+    assert "consumed_fixture_field" in result.stdout, result.stdout

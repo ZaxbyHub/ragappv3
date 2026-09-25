@@ -37,10 +37,19 @@ Residual risks (documented in docs/releases/pending/662-*.md):
       counted as a consumer (masks dormancy) — review-time detection only;
   (B) a settings-agnostic file whose object holds a duck-typed Settings via an
       unannotated parameter loses its chain reads (false dormancy) — the
-      allowlist is the remedy and T1 fails loud on any live field caught.
+      allowlist is the remedy and T1 fails loud on any live field caught;
+  (C) alias/typed-param bindings are file-scoped: a same-file name collision
+      with a settings alias or Settings-typed param can mint a false consumer;
+  (D) annotation shapes beyond a bare `Settings` name (`Optional[Settings]`,
+      `Annotated[Settings, ...]`, string forward refs) are not detected as
+      Settings-typed — fail-closed (the gate flags, the allowlist remedies);
+  (E) the scan scope is `backend/app` + repo-root `scripts/` only; dev
+      tooling under `backend/scripts/` deliberately does not count as a
+      production read site.
 
 Exit codes: 0 = green; 1 = dormant fields or allowlist contract violations;
-2 = usage/IO errors.
+2 = usage/IO errors (unreadable or unparseable config/consumer source,
+missing Settings class, unreadable allowlist).
 """
 
 from __future__ import annotations
@@ -58,7 +67,13 @@ SINGLETON_NAMES = {"get_settings", "Settings"}
 
 def enumerate_settings_fields(config_path: Path) -> list[str]:
     """Return Settings field names, mirroring pydantic's model_fields semantics."""
-    tree = ast.parse(config_path.read_text(encoding="utf-8"))
+    try:
+        tree = ast.parse(config_path.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, ValueError, RecursionError) as exc:
+        # A config file we cannot read/parse is an IO/usage failure (exit 2),
+        # never a dormant-field finding (exit 1) — keep the two contracts apart.
+        print(f"settings-consumers: cannot read or parse {config_path.as_posix()}: {exc}", file=sys.stderr)
+        raise SystemExit(2) from None
     for node in tree.body:
         if isinstance(node, ast.ClassDef) and node.name == "Settings":
             fields: list[str] = []
@@ -72,8 +87,12 @@ def enumerate_settings_fields(config_path: Path) -> list[str]:
                 if isinstance(annotation, ast.Subscript) and getattr(annotation.value, "id", "") == "ClassVar":
                     continue
                 fields.append(name)
-            return fields
-    raise SystemExit(f"settings-consumers: class Settings not found in {config_path}")
+            # Duplicate names collapse to one entry (matching pydantic's
+            # last-wins field semantics; duplicate names are identical strings
+            # so first-position retention is unobservable).
+            return list(dict.fromkeys(fields))
+    print(f"settings-consumers: class Settings not found in {config_path.as_posix()}", file=sys.stderr)
+    raise SystemExit(2)
 
 
 class FileCensus:
@@ -82,6 +101,7 @@ class FileCensus:
     def __init__(self) -> None:  # noqa: D107 - simple container
         self.aliases: set[str] = set()  # names bound to the settings singleton
         self.typed: set[str] = set()  # names annotated : Settings
+        self.singleton_callables: set[str] = set()  # imported get_settings/Settings names
         self.settings_touched = False  # file imports/calls anything settings-related
 
 
@@ -113,12 +133,21 @@ def analyze_file(tree: ast.Module, settings_class_names: set[str]) -> FileCensus
                         settings_class_names.add(alias.asname or "Settings")
                         facts.settings_touched = True
             for alias in node.names:
-                if alias.name == "get_settings":
+                if alias.name in SINGLETON_NAMES:
+                    # Track the imported (possibly aliased) name so a rebind
+                    # `x = <singleton>()` only counts when the callable traces
+                    # to a real import — a local function merely named
+                    # get_settings/Settings must not mint consumers.
+                    facts.singleton_callables.add(alias.asname or alias.name)
                     facts.settings_touched = True
         elif isinstance(node, ast.Assign):
             if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
                 value = node.value
-                if isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.func.id in SINGLETON_NAMES:
+                if (
+                    isinstance(value, ast.Call)
+                    and isinstance(value.func, ast.Name)
+                    and value.func.id in facts.singleton_callables
+                ):
                     facts.aliases.add(node.targets[0].id)
                     facts.settings_touched = True
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -164,7 +193,14 @@ def parse_allowlist(path: Path, fields: set[str]) -> tuple[set[str], list[str]]:
     """Return (allowed fields, violations). Entry: `field :: reason [:: owner-hint]`."""
     allowed: set[str] = set()
     violations: list[str] = []
-    for lineno, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+    try:
+        text = path.read_text(encoding="utf-8-sig")  # utf-8-sig: tolerate a BOM from Windows editors
+    except (OSError, ValueError) as exc:
+        # ValueError covers UnicodeDecodeError (non-UTF-8 bytes) — same
+        # usage/IO-error contract as the config/scan-source paths.
+        print(f"settings-consumers: cannot read allowlist {path.as_posix()}: {exc}", file=sys.stderr)
+        raise SystemExit(2) from None
+    for lineno, raw in enumerate(text.splitlines(), start=1):
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
@@ -190,7 +226,7 @@ def main(argv: list[str] | None = None) -> int:
     root = Path(args.root).resolve()
     config_path = root / CONFIG_REL
     if not config_path.is_file():
-        print(f"settings-consumers: {config_path} not found under root {root}", file=sys.stderr)
+        print(f"settings-consumers: {config_path.as_posix()} not found under root {root}", file=sys.stderr)
         return 2
 
     fields = enumerate_settings_fields(config_path)
@@ -218,8 +254,8 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             try:
                 tree = ast.parse(path.read_text(encoding="utf-8"))
-            except SyntaxError as exc:
-                print(f"settings-consumers: cannot parse {path}: {exc}", file=sys.stderr)
+            except (OSError, SyntaxError, ValueError, RecursionError) as exc:
+                print(f"settings-consumers: cannot read or parse {path.as_posix()}: {exc}", file=sys.stderr)
                 return 2
             rel = path.relative_to(root).as_posix()
             facts = analyze_file(tree, {"Settings"})
@@ -232,7 +268,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"DORMANT: {field}")
         print(
             f"settings-consumers: {len(dormant)} field(s) without production consumers "
-            f"(declare a consumer, or add a reasoned entry to {allowlist_path.relative_to(root) if allowlist_path.is_relative_to(root) else allowlist_path})",
+            f"(declare a consumer, or add a reasoned entry to {allowlist_path.relative_to(root).as_posix() if allowlist_path.is_relative_to(root) else allowlist_path.as_posix()})",
             file=sys.stderr,
         )
         return 1

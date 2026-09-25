@@ -93,7 +93,7 @@
 
 ## Known caveats
 
-- Census residuals (both directions bounded, both deliberate):
+- Census residuals (all directions bounded, all deliberate):
   (A) a settings-importing file holding a non-Settings `.settings` object is
   counted as a consumer — this masks dormancy, the allowlist cannot remedy it
   (it suppresses flags, it cannot create them), detection is review-time;
@@ -101,13 +101,31 @@
   an unannotated parameter (`self.settings = settings` from an unimported
   parameter) loses its chain reads — false dormancy, remedied by the
   allowlist, and the wrapper's real-tree test fails loud if a live field is
-  ever caught.
+  ever caught;
+  (C) alias and Settings-typed bindings are collected at file scope, so a
+  same-file name collision with a settings alias or an unrelated local
+  function named `get_settings`/`Settings` could mint a false consumer —
+  rebinds through `get_settings()`/`Settings()` only count when the callable
+  name traces to an import in that file, and any file reusing those common
+  local names deserves a review-time look;
+  (D) annotation shapes beyond a bare `Settings` name (`Optional[Settings]`,
+  `Annotated[Settings, ...]`, string forward refs) are not detected as
+  Settings-typed — fail-closed: the gate flags the field, the reasoned
+  allowlist is the remedy;
+  (E) the scan scope is `backend/app` plus repo-root `scripts/`; dev tooling
+  under `backend/scripts/` deliberately does not count as a production read
+  site (a field consumed only by a benchmark there is dormant by this
+  contract).
+- Unparseable/unreadable config or consumer sources, a missing `Settings`
+  class, and an unreadable allowlist exit with code 2 (usage/IO error) and a
+  clean diagnostic — never a traceback-coded exit 1, so "scanner crashed" is
+  distinguishable from "dormant fields found" in CI logs.
 - Dynamic-name `getattr(settings, var, ...)` access is not resolvable
   statically; the settings-API round-trip path is the known instance and is
   excluded as serialization. A future field consumed only that way needs an
   allowlist entry with a reason.
-- `config.py` line numbers shifted by the removals; no bandit baseline re-anchor
-  was needed (`run_bandit.py` reports no new findings — 131 suppressed, count
-  unchanged; the removals shifted no baselined finding).
+- No bandit baseline re-anchor was needed (`run_bandit.py` reports no new
+  findings — 131 suppressed, count unchanged; the removals shifted no
+  baselined finding).
 - Frontend `VITE_*` env vars are a different surface with different tooling
   and remain out of scope (per the issue).
