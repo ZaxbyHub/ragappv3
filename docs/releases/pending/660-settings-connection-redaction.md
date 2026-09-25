@@ -14,13 +14,15 @@
   - the local-reranker fallback entry keeps its non-identifying
     `"local (sentence-transformers)"` url but drops the `model` field (the
     reranker model name is in `INFRA_REDACTED_FIELDS`);
-  - error values keep their classification prefix verbatim
-    (`SSRF blocked: ` / `transport failure: ` / `embedding inference failed`)
-    but the detail is reduced to the exception type name
-    (`SSRF blocked: URLBlocked`, `transport failure: ConnectError`), which
-    closes every exception-text channel at once: the `host!r` echo in
-    URLBlocked messages, resolved-IP:port tuples embedded by httpx connect
-    errors, and the URLBlocked "URL is malformed: ..." port-fragment echo.
+  - error values on the two except-site branches keep their classification
+    prefix verbatim (`SSRF blocked: ` / `transport failure: `) but the
+    detail is reduced to the exception type name (`SSRF blocked:
+    URLBlocked`, `transport failure: ConnectError`), which closes every
+    exception-text channel at once: the `host!r` echo in URLBlocked
+    messages, resolved-IP:port tuples embedded by httpx connect errors, and
+    the URLBlocked "URL is malformed: ..." port-fragment echo. The
+    embeddings HTTP-failure message `embedding inference failed (HTTP N)`
+    carries no configuration values and is kept verbatim.
   - `ok` and `status` are untouched, so member-facing diagnostics keep
     working (the frontend reads only `v?.ok`).
 - **Admins and superadmins are unchanged**: the post-process block is skipped

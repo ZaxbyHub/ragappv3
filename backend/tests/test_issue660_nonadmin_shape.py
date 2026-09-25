@@ -15,10 +15,10 @@ the frozen check bytes stay identical.
 
 import os
 import queue
+import shutil
 import socket
 import sqlite3
 import tempfile
-import threading
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
@@ -70,7 +70,6 @@ class _SimplePool:
     def __init__(self, db_path):
         self.db_path = db_path
         self._pool = Queue(maxsize=5)
-        self._lock = threading.Lock()
         self._closed = False
 
     def get_connection(self):
@@ -114,9 +113,19 @@ class TestIssue660NonAdminShape(unittest.TestCase):
 
         self.app = app
         self.tmp = tempfile.mkdtemp()
+        # Cleanup contract (review PRR-F2): every module-global mutation gets
+        # its addCleanup registered BEFORE the mutation, so a setUp abort can
+        # never poison the settings singleton / dependency_overrides for the
+        # rest of the worker (repo precedent: TestSettingsInfraRedaction).
+        # addCleanup runs LIFO: overrides clear -> pool close -> globals
+        # restore -> tempdir removal.
+        self.addCleanup(shutil.rmtree, self.tmp, True)
         self._original_data_dir = settings.data_dir
         self._original_jwt = settings.jwt_secret_key
         self._original_users = settings.users_enabled
+        self._original_chat_api_key = settings.chat_api_key
+        self._original_instant_api_key = settings.instant_api_key
+        self.addCleanup(self._restore_globals)
         settings.data_dir = Path(self.tmp)
         settings.users_enabled = True
         settings.jwt_secret_key = "test-secret-key-for-testing-at-least-32-chars-long"
@@ -137,6 +146,7 @@ class TestIssue660NonAdminShape(unittest.TestCase):
             _pool_cache.clear()
         run_migrations(self.db)
         self.pool = _SimplePool(self.db)
+        self.addCleanup(self.pool.close_all)
 
         def override_db():
             conn = self.pool.get_connection()
@@ -147,6 +157,7 @@ class TestIssue660NonAdminShape(unittest.TestCase):
 
         app.dependency_overrides[get_db] = override_db
         app.dependency_overrides[get_db_pool] = lambda: self.pool
+        self.addCleanup(app.dependency_overrides.clear)
 
         conn = self.pool.get_connection()
         try:
@@ -157,32 +168,29 @@ class TestIssue660NonAdminShape(unittest.TestCase):
                 " role, is_active) VALUES (1, 'viewer1', ?, 'V', 'viewer', 1)",
                 (pw,),
             )
+            conn.execute(
+                "INSERT INTO users (id, username, hashed_password, full_name,"
+                " role, is_active) VALUES (2, 'admin1', ?, 'A', 'admin', 1)",
+                (pw,),
+            )
             conn.commit()
         finally:
             self.pool.release_connection(conn)
 
         self.client = TestClient(app)
         self.viewer_token = create_access_token(1, "viewer1", "viewer")
+        self.admin_token = create_access_token(2, "admin1", "admin")
 
-    def tearDown(self):
-        from app.models.database import _pool_cache, _pool_cache_lock
-
-        self.app.dependency_overrides.clear()
-        with _pool_cache_lock:
-            for _, p in list(_pool_cache.items()):
-                p.close_all()
-            _pool_cache.clear()
-        self.pool.close_all()
+    def _restore_globals(self):
         for field, value in self._snapshot.items():
             setattr(settings, field, value)
         settings.data_dir = self._original_data_dir
         settings.jwt_secret_key = self._original_jwt
         settings.users_enabled = self._original_users
+        settings.chat_api_key = self._original_chat_api_key
+        settings.instant_api_key = self._original_instant_api_key
         if self._original_allow_local is not None:
             os.environ["ALLOW_LOCAL_SERVICES"] = self._original_allow_local
-        import shutil
-
-        shutil.rmtree(self.tmp, ignore_errors=True)
 
     # -- scenario helpers ---------------------------------------------------
 
@@ -350,3 +358,50 @@ class TestIssue660NonAdminShape(unittest.TestCase):
         self.assertEqual(chat["error"], "SSRF blocked: URLBlocked")
         self.assertEqual(chat["status"], None)
         self.assertIs(chat["ok"], False)
+
+    def test_viewer_settings_view_redacts_api_key_set_flags(self):
+        # chat_api_key_set / instant_api_key_set are computed response flags
+        # in INFRA_REDACTED_FIELDS but not Settings attributes, so the frozen
+        # structural sweep's hasattr filter cannot seed them (review
+        # PRR-F3) — pin their role redaction here: a viewer must see both
+        # coerced to False even when keys are configured, while an admin
+        # sees the true values.
+        settings.chat_api_key = "i660-secret-chat-key"
+        settings.instant_api_key = "i660-secret-instant-key"
+        viewer = self.client.get(
+            "/api/settings",
+            headers={"Authorization": "Bearer %s" % self.viewer_token},
+        )
+        self.assertEqual(viewer.status_code, 200, viewer.text)
+        self.assertIs(viewer.json()["chat_api_key_set"], False)
+        self.assertIs(viewer.json()["instant_api_key_set"], False)
+        admin = self.client.get(
+            "/api/settings",
+            headers={"Authorization": "Bearer %s" % self.admin_token},
+        )
+        self.assertEqual(admin.status_code, 200, admin.text)
+        self.assertIs(admin.json()["chat_api_key_set"], True)
+        self.assertIs(admin.json()["instant_api_key_set"], True)
+
+    def test_viewer_chat_reranker_http_failure_has_no_error_field(self):
+        # PRR-F6 drift-hazard pin: the chat/reranker GET >=300 branches set
+        # no error today. The redaction rewrite only covers entries recorded
+        # in error_types (the two except sites), so if a future change adds
+        # an error string on these branches it would ship unredacted to
+        # non-admins — this test fails first (see the handler comment).
+        settings.ollama_embedding_url = _SEED_EMBED_URL
+        settings.ollama_chat_url = _SEED_CHAT_URL
+        settings.reranker_url = _SEED_RERANK_URL
+        body = self._probe(
+            dns_map=self._public_dns(
+                _SEED_EMBED_URL, _SEED_CHAT_URL, _SEED_RERANK_URL
+            ),
+            get_result=500,
+        )
+        for name in ("chat", "reranker"):
+            self.assertNotIn("error", body[name])
+            self.assertEqual(body[name]["status"], 500)
+            self.assertIs(body[name]["ok"], False)
+            self.assertEqual(body[name]["url"], name)
+        self.assertEqual(body["embeddings"]["url"], "embeddings")
+        self.assertIs(body["embeddings"]["ok"], True)

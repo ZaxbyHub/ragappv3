@@ -1676,10 +1676,14 @@ async def test_connection(user: dict = Depends(get_current_active_user)):
     POST).
 
     Callers below the admin role (issue #660) receive the target name
-    instead of the configured URL, no local-mode ``model`` entry, and error
-    details reduced to the exception type name after the classification
-    prefix, so no configured host, resolved address, or URL fragment is
-    disclosed. Admin/superadmin responses are unchanged.
+    instead of the configured URL, no local-mode ``model`` entry, and — on
+    the two except-site branches — error details reduced to the exception
+    type name after the classification prefix (``SSRF blocked:
+    URLBlocked``, ``transport failure: ConnectError``), so no configured
+    host, resolved address, or URL fragment is disclosed. The
+    ``embedding inference failed (HTTP N)`` message carries no
+    configuration values and is kept verbatim. Admin/superadmin responses
+    are unchanged.
     """
     targets = {
         "embeddings": settings.ollama_embedding_url,
@@ -1775,7 +1779,11 @@ async def test_connection(user: dict = Depends(get_current_active_user)):
                 # exception type name. Invariant: today every
                 # error_types[name] entry also carries an "error" key (both
                 # except sites set it); the .get() guard keeps this safe if a
-                # future branch records a type without an error.
+                # future branch records a type without an error. Converse
+                # hazard: an error string built OUTSIDE the two except sites
+                # (the chat/reranker GET >=300 branches set no error today)
+                # would bypass this rewrite entirely — route any future error
+                # construction through an except site or extend error_types.
                 entry["error"] = (
                     entry["error"].split(":", 1)[0] + ": " + error_types[name]
                 )
