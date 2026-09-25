@@ -46,20 +46,10 @@ class TestNewConfigFields:
         settings = Settings()
         assert settings.hyde_enabled is False
 
-    def test_sparse_search_max_candidates_default(self):
-        """Test sparse_search_max_candidates defaults to 1000."""
-        settings = Settings()
-        assert settings.sparse_search_max_candidates == 1000
-
     def test_retrieval_recency_weight_default(self):
         """Test retrieval_recency_weight defaults to 0.1."""
         settings = Settings()
         assert settings.retrieval_recency_weight == 0.1
-
-    def test_recency_decay_lambda_default(self):
-        """Test recency_decay_lambda defaults to 0.001."""
-        settings = Settings()
-        assert settings.recency_decay_lambda == 0.001
 
     def test_multi_scale_indexing_enabled_default_true(self):
         """Test multi_scale_indexing_enabled defaults to True."""
@@ -463,18 +453,6 @@ class TestEdgeCasesAndBoundaryValues:
             settings = Settings()
             assert settings.retrieval_recency_weight == 1.0
 
-    def test_recency_decay_lambda_positive_values(self):
-        """Test recency_decay_lambda accepts positive float values."""
-        with patch.dict("os.environ", {"RECENCY_DECAY_LAMBDA": "0.01"}):
-            settings = Settings()
-            assert settings.recency_decay_lambda == 0.01
-
-    def test_sparse_search_max_candidates_positive(self):
-        """Test sparse_search_max_candidates accepts positive integers."""
-        with patch.dict("os.environ", {"SPARSE_SEARCH_MAX_CANDIDATES": "500"}):
-            settings = Settings()
-            assert settings.sparse_search_max_candidates == 500
-
 
 class TestPathHelpersWithVariousVaultIds:
     """Test path helpers with various vault ID values."""
@@ -645,30 +623,6 @@ class TestConfigAdversarial:
             settings = Settings()
             # This is a BUG - it accepts negative values
             assert settings.context_distillation_dedup_threshold == -0.5
-
-    def test_recency_decay_lambda_negative(self):
-        """recency_decay_lambda negative should be REJECTED (no validator currently)."""
-        # BUG: No validator exists - this should fail but currently accepts negative
-        with patch.dict("os.environ", {"RECENCY_DECAY_LAMBDA": "-0.1"}):
-            settings = Settings()
-            # This is a BUG - negative lambda doesn't make mathematical sense
-            assert settings.recency_decay_lambda == -0.1
-
-    def test_sparse_search_max_candidates_zero(self):
-        """sparse_search_max_candidates=0 should be REJECTED (no validator currently)."""
-        # BUG: No validator exists - this should fail but currently accepts 0
-        with patch.dict("os.environ", {"SPARSE_SEARCH_MAX_CANDIDATES": "0"}):
-            settings = Settings()
-            # This is a BUG - zero candidates makes no sense
-            assert settings.sparse_search_max_candidates == 0
-
-    def test_sparse_search_max_candidates_negative(self):
-        """sparse_search_max_candidates negative should be REJECTED (no validator currently)."""
-        # BUG: No validator exists - this should fail but currently accepts negative
-        with patch.dict("os.environ", {"SPARSE_SEARCH_MAX_CANDIDATES": "-100"}):
-            settings = Settings()
-            # This is a BUG
-            assert settings.sparse_search_max_candidates == -100
 
     def test_context_max_tokens_zero(self):
         """context_max_tokens=0 should be REJECTED (no validator currently)."""

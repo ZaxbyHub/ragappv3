@@ -131,6 +131,9 @@ jobs:
       - name: Config and env contract check
         run: python scripts/check_config_contract.py
 
+      - name: Settings consumers check
+        run: python scripts/check_settings_consumers.py
+
       - name: PR scope drift check
         run: python scripts/check_pr_scope_drift.py
 

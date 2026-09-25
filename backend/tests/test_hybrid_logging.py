@@ -137,7 +137,6 @@ class HybridLoggingTests(unittest.IsolatedAsyncioTestCase):
         """BM25 FTS returns results -> INFO log fires."""
         with patch("app.services.vector_store.settings") as mock_settings:
             mock_settings.multi_scale_indexing_enabled = False
-            mock_settings.sparse_search_max_candidates = 1000
             mock_settings.vector_search_concurrency = 4
 
             vs = self._make_vs()
@@ -179,7 +178,6 @@ class HybridLoggingTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("app.services.vector_store.settings") as mock_settings:
             mock_settings.multi_scale_indexing_enabled = False
-            mock_settings.sparse_search_max_candidates = 1000
             mock_settings.vector_search_concurrency = 4
 
             vs = self._make_vs()
@@ -230,7 +228,6 @@ class HybridLoggingTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("app.services.vector_store.settings") as mock_settings:
             mock_settings.multi_scale_indexing_enabled = False
-            mock_settings.sparse_search_max_candidates = 1000
             mock_settings.vector_search_concurrency = 4
 
             vs = self._make_vs()
@@ -270,7 +267,6 @@ class HybridLoggingTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("app.services.vector_store.settings") as mock_settings:
             mock_settings.multi_scale_indexing_enabled = False
-            mock_settings.sparse_search_max_candidates = 1000
             mock_settings.vector_search_concurrency = 4
 
             vs = self._make_vs()
@@ -472,7 +468,6 @@ async def test_bm25_fts_returns_empty_no_success_log_pytest(caplog):
 
     with patch("app.services.vector_store.settings") as mock_settings:
         mock_settings.multi_scale_indexing_enabled = False
-        mock_settings.sparse_search_max_candidates = 1000
         mock_settings.vector_search_concurrency = 4
 
         vs = _standalone_make_vs()

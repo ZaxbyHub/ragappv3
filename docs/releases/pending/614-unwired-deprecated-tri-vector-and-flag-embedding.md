@@ -76,10 +76,17 @@
   prior operators may have moved on.
 - The Phase 4.2 sweep recorded `recency_decay_lambda`, `retrieval_profile`,
   `sparse_embedding_timeout`, and `sparse_search_max_candidates` as
-  internal-only (not exposed in `.env.example`). They are deliberately
-  retained; if an operator-facing need arises they should graduate via
-  the same wire-then-test pattern that #202 / #615 used for
-  `JWT_ALGORITHM`.
+  internal-only (not exposed in `.env.example`). ~~They are deliberately
+  retained; if an operator-facing need arises they should graduate via the
+  same wire-then-test pattern that #202 / #615 used for `JWT_ALGORITHM`.~~
+  **Superseded by #662**: all four were later verified to have no production
+  consumer at all (none wire-able: the sparse pair's code path was removed by
+  the Harrier migration, `recency_decay_lambda`'s exponential formula was
+  never implemented, `retrieval_profile` was superseded by its own wired
+  boolean) and were removed with named-field reintroduction guards. The
+  #662 settings-consumer census (`scripts/check_settings_consumers.py`, wired
+  into CI) now makes the declared-but-unwired class fail the build at
+  authoring time.
 - No bandit or SAST findings involve these two identifiers — the deletions
   are pure deletion, no callsite touched, so `backend/security/bandit-baseline.json`
   is unchanged.

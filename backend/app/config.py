@@ -575,19 +575,9 @@ class Settings(BaseSettings):
     hyde_enabled: bool = False
     """Enable HyDE: generate a hypothetical answer passage and embed it as additional query vector. Default False."""
 
-    # ── Sparse search configuration ──────────────────────────────────
-    sparse_search_max_candidates: int = 1000
-    """Deprecated: Sparse search removed. Field retained for config compatibility."""
-
-    sparse_embedding_timeout: float = 2.0
-    """Deprecated: Sparse embedding removed. Field retained for config compatibility."""
-
     # ── Retrieval recency configuration ──────────────────────────
     retrieval_recency_weight: float = 0.1
     """Weight for recency score blending in RRF fusion (0.0 = disabled, 1.0 = fully recency-based)."""
-
-    recency_decay_lambda: float = 0.001
-    """Exponential decay rate (lambda) for recency scoring. Higher values decay faster."""
 
     # ── Parent-document retrieval configuration (Issue #12) ──────────────────
     parent_retrieval_enabled: bool = True
@@ -821,10 +811,6 @@ class Settings(BaseSettings):
     draft_default_logical_mode: str = "thinking"
     """Default logical model mode ("instant" or "thinking") for Draft Room
     compile stages that do not pin a specific mode."""
-
-    # ── Retrieval profile configuration ──────────────────────────────────
-    retrieval_profile: str = "advanced"
-    """Retrieval profile: 'baseline' (dense + hybrid + rerank), 'advanced' (adds enrichment)."""
 
     # Document processing configuration (legacy - DEPRECATED)
     chunk_size: int | None = None
