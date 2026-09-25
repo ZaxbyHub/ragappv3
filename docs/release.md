@@ -739,7 +739,7 @@ groups:
 #### Settings and Connection API
 
 - `POST /api/settings` and `PUT /api/settings` are documented as admin-only settings write operations.
-- `GET /api/settings/connection` is documented as an authenticated connection probe that checks embedding, thinking-chat, instant-chat, and reranker availability.
+- `GET /api/settings/connection` is documented as an authenticated connection probe that checks embedding, thinking-chat, and reranker availability (no instant-chat probe), and — since issue #660 — returns role-redacted responses: callers below the admin role receive target names instead of configured endpoint URLs, and error details are reduced to the exception type.
 - Release connection-test guidance now covers the instant chat endpoint and reports instant model health alongside embedding and thinking-chat model health.
 
 #### Configuration and Supply Chain

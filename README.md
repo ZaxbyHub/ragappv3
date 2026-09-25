@@ -591,7 +591,7 @@ Feedback is stored as the current user's signal on owned chat sessions. Non-admi
 | GET | `/api/settings` | Get settings |
 | POST | `/api/settings` | Apply settings update |
 | PUT | `/api/settings` | Update settings |
-| GET | `/api/settings/connection` | Test authenticated model service connections |
+| GET | `/api/settings/connection` | Test authenticated model service connections (infra URLs redacted for non-admin callers) |
 
 ### API Documentation
 

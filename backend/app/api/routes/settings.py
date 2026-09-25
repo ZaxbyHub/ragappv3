@@ -1674,6 +1674,16 @@ async def test_connection(user: dict = Depends(get_current_active_user)):
     unreachable; an HTTP status with ``ok=False`` means the request was
     served but the probe failed (e.g. inference error on the embeddings
     POST).
+
+    Callers below the admin role (issue #660) receive the target name
+    instead of the configured URL, no local-mode ``model`` entry, and — on
+    the two except-site branches — error details reduced to the exception
+    type name after the classification prefix (``SSRF blocked:
+    URLBlocked``, ``transport failure: ConnectError``), so no configured
+    host, resolved address, or URL fragment is disclosed. The
+    ``embedding inference failed (HTTP N)`` message carries no
+    configuration values and is kept verbatim. Admin/superadmin responses
+    are unchanged.
     """
     targets = {
         "embeddings": settings.ollama_embedding_url,
@@ -1682,17 +1692,26 @@ async def test_connection(user: dict = Depends(get_current_active_user)):
     if settings.reranker_url:
         targets["reranker"] = settings.reranker_url
 
+    # Role-aware redaction (issue #660): callers below the admin role must not
+    # learn the deployment's inference topology. Applied to the finished
+    # result dict just before returning, mirroring _redact_infra_for_non_admin.
+    from app.api.deps import UserRole
+
+    redact = UserRole.level(user.get("role", "viewer")) < UserRole.level("admin")
+
     async with httpx.AsyncClient(
         timeout=5.0,
         follow_redirects=False,
         transport=SSRFSafeTransport(),
     ) as client:
         results = {}
+        error_types: dict[str, str] = {}
         for name, url in targets.items():
             try:
                 try:
                     assert_url_safe(url)
                 except URLBlocked as exc:
+                    error_types[name] = type(exc).__name__
                     results[name] = {
                         "url": url,
                         "status": None,
@@ -1725,6 +1744,7 @@ async def test_connection(user: dict = Depends(get_current_active_user)):
                         "ok": response.status_code < 300,
                     }
             except Exception as exc:
+                error_types[name] = type(exc).__name__
                 results[name] = {
                     "url": url,
                     "status": None,
@@ -1740,6 +1760,33 @@ async def test_connection(user: dict = Depends(get_current_active_user)):
                 "status": "local",
                 "model": settings.reranker_model,
             }
+
+    if redact:
+        for name, entry in results.items():
+            if name in targets:
+                # Fail-closed: every probed entry carries the configured URL
+                # today; replace unconditionally so future drift cannot dodge
+                # redaction.
+                entry["url"] = name
+            # Loop-level, OUTSIDE the guard: the local-mode entry exists only
+            # when "reranker" is NOT in targets (reranker_url falsy), so a
+            # guarded pop would skip exactly the entry that carries the model
+            # disclosure.
+            entry.pop("model", None)
+            if name in error_types and entry.get("error"):
+                # Type-level error summary for non-admins: keep the
+                # classification prefix verbatim, swap the detail for the
+                # exception type name. Invariant: today every
+                # error_types[name] entry also carries an "error" key (both
+                # except sites set it); the .get() guard keeps this safe if a
+                # future branch records a type without an error. Converse
+                # hazard: an error string built OUTSIDE the two except sites
+                # (the chat/reranker GET >=300 branches set no error today)
+                # would bypass this rewrite entirely — route any future error
+                # construction through an except site or extend error_types.
+                entry["error"] = (
+                    entry["error"].split(":", 1)[0] + ": " + error_types[name]
+                )
     return results
 
 
