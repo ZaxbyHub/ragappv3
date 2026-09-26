@@ -10,6 +10,7 @@ from app.api.deps import (
     get_evaluate_policy,
     require_vault_permission,
 )
+from app.models.database import set_migration_flag
 from app.security import csrf_protect
 
 router = APIRouter(prefix="/vaults/{vault_id}/members", tags=["vault-members"])
@@ -283,6 +284,11 @@ def remove_vault_member(
             "DELETE FROM vault_members WHERE vault_id = ? AND user_id = ?",
             (vault_id, member_user_id),
         )
+        # Durable-removal marker (issue #690 / S03-SK-01): written in the same
+        # transaction as the DELETE so the startup orphan backfill can never
+        # re-grant a membership an admin explicitly removed. User-scoped: any
+        # removed membership blocks the Default-vault backfill for that user.
+        set_migration_flag(conn, f"vault_members.removed.user.{member_user_id}")
         conn.commit()
     except Exception:
         conn.rollback()

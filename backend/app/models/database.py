@@ -23,6 +23,7 @@ from app.models.migration_journal import (
     record_migration_outcome,
     record_schema_version,
 )
+from app.utils.slug import generate_org_slug
 
 logger = logging.getLogger(__name__)
 
@@ -1709,6 +1710,25 @@ def init_db(sqlite_path: str) -> None:
             ):
                 if name not in existing_file_cols:
                     conn.execute(f"ALTER TABLE files ADD COLUMN {name} {ddl}")
+
+        # Legacy-schema pre-guards (issue #690, T1-05-K-01): SCHEMA declares
+        # indexes over columns that older databases may predate (no ALTER
+        # path ever added users.locked_until; memories.vault_id's ALTER lives
+        # in migrate_add_vaults, which runs after init_db). ALTER them in
+        # before executescript so init_db cannot abort before migration #1.
+        if "users" in existing_tables:
+            user_cols = {
+                row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()
+            }
+            if "locked_until" not in user_cols:
+                conn.execute("ALTER TABLE users ADD COLUMN locked_until TIMESTAMP")
+        if "memories" in existing_tables:
+            memory_cols = {
+                row[1] for row in conn.execute("PRAGMA table_info(memories)").fetchall()
+            }
+            if "vault_id" not in memory_cols:
+                conn.execute("ALTER TABLE memories ADD COLUMN vault_id INTEGER")
+
         conn.executescript(SCHEMA)
         conn.commit()
     finally:
@@ -2128,7 +2148,6 @@ def migrate_add_vault_permission_columns(sqlite_path: str) -> None:
 
 def migrate_add_org_slug_column(sqlite_path: str) -> None:
     """Migration: Add slug column to organizations table and add 'owner' to org_members role CHECK."""
-    import re
 
     conn = sqlite3.connect(sqlite_path)
     try:
@@ -2140,16 +2159,66 @@ def migrate_add_org_slug_column(sqlite_path: str) -> None:
 
         if "slug" not in columns:
             conn.execute("ALTER TABLE organizations ADD COLUMN slug TEXT")
-            # Generate slugs for existing orgs
-            cursor = conn.execute("SELECT id, name FROM organizations")
-            for row in cursor.fetchall():
-                slug = row[1].lower().strip()
-                slug = re.sub(r"[^a-z0-9]+", "-", slug)
-                slug = slug.strip("-")
-                slug = re.sub(r"-+", "-", slug)[:50]
+
+        # Repair passes run on EVERY invocation (idempotent), not only when the
+        # column was just added: databases migrated by the old code already have
+        # the column but can hold empty/duplicate slugs, and the fresh schema
+        # enforces slug TEXT UNIQUE (issue #690, T1-05-K-06).
+        cursor = conn.execute("SELECT id, name FROM organizations")
+        for row in cursor.fetchall():
+            slug = generate_org_slug(row[1])
+            conn.execute(
+                "UPDATE organizations SET slug = ? WHERE id = ? AND (slug IS NULL OR slug = '')",
+                (slug, row[0]),
+            )
+
+        # Deduplicate slugs with guaranteed termination: within each duplicate
+        # group the lowest id keeps the slug; every loser gets a rowid-based
+        # suffix (unique per row), extended with a counter if that string is
+        # itself taken.
+        dup_cursor = conn.execute(
+            """SELECT slug FROM organizations
+               WHERE slug IS NOT NULL
+               GROUP BY slug HAVING COUNT(*) > 1"""
+        )
+        for (dup_slug,) in dup_cursor.fetchall():
+            rows = conn.execute(
+                "SELECT id, rowid FROM organizations WHERE slug = ? ORDER BY id",
+                (dup_slug,),
+            ).fetchall()
+            for org_id, row_id in rows[1:]:
+                candidate = f"{dup_slug}-{row_id}"
+                suffix = 1
+                while (
+                    conn.execute(
+                        "SELECT 1 FROM organizations WHERE slug = ?", (candidate,)
+                    ).fetchone()
+                    is not None
+                ):
+                    if suffix > 20:
+                        raise RuntimeError(
+                            "organizations slug dedup failed to converge for"
+                            f" org id {org_id}"
+                        )
+                    suffix += 1
+                    candidate = f"{dup_slug}-{row_id}-{suffix}"
                 conn.execute(
-                    "UPDATE organizations SET slug = ? WHERE id = ?", (slug, row[0])
+                    "UPDATE organizations SET slug = ? WHERE id = ?", (candidate, org_id)
                 )
+                logger.warning(
+                    "Deduplicated organization slug: org %d slug %r -> %r",
+                    org_id,
+                    dup_slug,
+                    candidate,
+                )
+
+        # Enforce the same uniqueness as the fresh schema's slug TEXT UNIQUE:
+        # a partial unique index (multiple NULLs allowed, duplicates rejected)
+        # is the exact semantic equivalent of the column constraint.
+        conn.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_organizations_slug
+               ON organizations(slug) WHERE slug IS NOT NULL"""
+        )
 
         conn.commit()
     finally:
@@ -2159,6 +2228,15 @@ def migrate_add_org_slug_column(sqlite_path: str) -> None:
 def migrate_vault_paths(sqlite_path: str) -> None:
     """
     Migration: Rename vault directories from sanitized_name to numeric ID.
+
+    One-shot per database (milestone-gated) and collision-guarded (issue #690,
+    T1-05-K2-01): a vault whose sanitized name resolves to another vault's
+    id-keyed directory — or to a legacy candidate claimed by more than one
+    vault — is skipped rather than renamed/merged over the other vault's
+    storage. Guards compare lowercased paths so case-insensitive filesystems
+    cannot alias two names onto one directory. The gate is set only after a
+    run with no per-vault failure, so a partially failed run retries on the
+    next boot while a clean run never resolves a path from a name again.
 
     Reads all vaults from the database, and for each vault, checks if:
     - vaults/{sanitized_name}/ exists but vaults/{id}/ does NOT exist → rename
@@ -2173,13 +2251,53 @@ def migrate_vault_paths(sqlite_path: str) -> None:
 
     conn = sqlite3.connect(sqlite_path)
     try:
+        if migration_flag_done(conn, "migration.vault_paths.done"):
+            return
+
         cursor = conn.execute("SELECT id, name FROM vaults")
         vaults = cursor.fetchall()
 
+        def _sanitize(name: str) -> str:
+            return "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
+
+        id_dir_keys = {str(vaults_dir / str(vid)).lower() for vid, _ in vaults}
+        name_claims: dict[str, int] = {}
+        for _, name in vaults:
+            key = str(vaults_dir / _sanitize(name)).lower()
+            name_claims[key] = name_claims.get(key, 0) + 1
+
+        had_failure = False
         for vault_id, name in vaults:
-            safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
+            safe_name = _sanitize(name)
             old_path = vaults_dir / safe_name
             new_path = vaults_dir / str(vault_id)
+            old_key = str(old_path).lower()
+
+            if old_key == str(new_path).lower():
+                logger.warning(
+                    "Vault %d name %r sanitizes to its own id-keyed directory;"
+                    " skipping legacy path migration",
+                    vault_id,
+                    name,
+                )
+                continue
+            if old_key in id_dir_keys:
+                logger.warning(
+                    "Vault %d name %r resolves to another vault's id-keyed"
+                    " directory %s; skipping legacy path migration",
+                    vault_id,
+                    name,
+                    old_path,
+                )
+                continue
+            if name_claims.get(old_key, 0) > 1:
+                logger.warning(
+                    "Vault %d name %r resolves to a legacy directory claimed by"
+                    " multiple vaults; skipping legacy path migration",
+                    vault_id,
+                    name,
+                )
+                continue
 
             try:
                 if not old_path.exists() and not new_path.exists():
@@ -2200,8 +2318,13 @@ def migrate_vault_paths(sqlite_path: str) -> None:
                         f"Merged vault directory contents: {safe_name} → {vault_id}"
                     )
             except (OSError, shutil.Error) as e:
+                had_failure = True
                 logger.warning(f"Failed to migrate vault '{name}' (ID {vault_id}): {e}")
                 # Continue with other vaults, don't raise
+
+        if not had_failure:
+            set_migration_flag(conn, "migration.vault_paths.done")
+            conn.commit()
     finally:
         conn.close()
 
@@ -5614,16 +5737,65 @@ def transaction_context(conn: sqlite3.Connection):
         raise
 
 
+# Migration-milestone marker storage (issue #690). Same DDL as the
+# system_flags table in _BASE_SCHEMA (double-definition pattern, like
+# MIGRATION_JOURNAL_DDL) so marker reads/writes are schema-safe even on a
+# degraded boot or a test schema that never created the table.
+_SYSTEM_FLAGS_DDL = """
+CREATE TABLE IF NOT EXISTS system_flags (
+    name TEXT PRIMARY KEY,
+    value INTEGER NOT NULL DEFAULT 0,
+    version INTEGER NOT NULL DEFAULT 0,
+    reason TEXT,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+
+def migration_flag_done(conn: sqlite3.Connection, name: str) -> bool:
+    """Return True when the named migration milestone marker exists.
+
+    Execute-only contract: never commits, rolls back, or closes — the caller
+    owns the transaction.
+    """
+    conn.execute(_SYSTEM_FLAGS_DDL)
+    row = conn.execute(
+        "SELECT 1 FROM system_flags WHERE name = ?", (name,)
+    ).fetchone()
+    return row is not None
+
+
+def set_migration_flag(conn: sqlite3.Connection, name: str) -> None:
+    """Record the named migration milestone marker (idempotent).
+
+    Execute-only contract: never commits, rolls back, or closes — the caller
+    owns the transaction, so a marker written beside other statements is
+    atomic with them.
+    """
+    conn.execute(_SYSTEM_FLAGS_DDL)
+    conn.execute(
+        "INSERT OR IGNORE INTO system_flags (name, value, reason)"
+        " VALUES (?, 1, 'migration milestone')",
+        (name,),
+    )
+
+
 def migrate_assign_orphan_users_to_default_vault(sqlite_path: str) -> None:
     """
     Migration: Assign existing users without vault access to the Default vault.
 
-    Idempotent — uses INSERT OR IGNORE and a NOT IN subquery to only insert
-    rows for users who have zero vault_members entries.
+    One-time per user (issue #690, S03-SK-01): a user who already holds any
+    vault membership, has access through a group grant or an owning
+    organization, was previously granted by this backfill (handled marker),
+    or was removed from a membership through the app (removal marker) is
+    skipped. The markers make membership removals durable across restarts —
+    the old blanket ``zero rows == orphan`` predicate resurrected every
+    removed membership on each boot.
     """
     conn = sqlite3.connect(sqlite_path)
     try:
         conn.execute("PRAGMA foreign_keys = ON;")
+        conn.execute(_SYSTEM_FLAGS_DDL)
 
         # Find the Default vault ID
         cursor = conn.execute("SELECT id FROM vaults WHERE name = ?", ("Default",))
@@ -5638,15 +5810,44 @@ def migrate_assign_orphan_users_to_default_vault(sqlite_path: str) -> None:
         else:
             default_vault_id = row[0]
 
-        # Assign all users without any vault_members to Default vault
-        conn.execute(
-            """INSERT OR IGNORE INTO vault_members (vault_id, user_id, permission)
-               SELECT ?, id, 'read' FROM users
-               WHERE id NOT IN (SELECT DISTINCT user_id FROM vault_members)""",
-            (default_vault_id,),
-        )
+        # Users with no membership through ANY path and no grant/removal
+        # marker: the only population this one-time backfill may grant.
+        candidate_sql = """
+            SELECT u.id FROM users u
+            WHERE u.id NOT IN (SELECT DISTINCT user_id FROM vault_members)
+              AND u.id NOT IN (
+                  SELECT gm.user_id FROM group_members gm
+                  JOIN vault_group_access vga ON vga.group_id = gm.group_id)
+              AND u.id NOT IN (
+                  SELECT om.user_id FROM org_members om
+                  JOIN vaults ov ON ov.org_id = om.org_id)
+              AND NOT EXISTS (SELECT 1 FROM system_flags f
+                              WHERE f.name =
+                                  'migration.orphan_backfill.handled.' || u.id)
+              AND NOT EXISTS (SELECT 1 FROM system_flags f
+                              WHERE f.name =
+                                  'vault_members.removed.user.' || u.id)
+        """
+        candidate_ids = [r[0] for r in conn.execute(candidate_sql).fetchall()]
+        for user_id in candidate_ids:
+            conn.execute(
+                "INSERT OR IGNORE INTO vault_members (vault_id, user_id, permission)"
+                " VALUES (?, ?, 'read')",
+                (default_vault_id, user_id),
+            )
+            # Handled marker in the same transaction as the grant: a later
+            # removal of the granted row can never be undone by a rerun.
+            conn.execute(
+                "INSERT OR IGNORE INTO system_flags (name, value, reason)"
+                " VALUES (?, 1, 'orphan backfill grant marker')",
+                (f"migration.orphan_backfill.handled.{user_id}",),
+            )
         conn.commit()
-        logger.info("Orphan users assigned to Default vault")
+        if candidate_ids:
+            logger.info(
+                "Orphan users assigned to Default vault (%d users)",
+                len(candidate_ids),
+            )
     except Exception:
         conn.rollback()
         raise

@@ -36,7 +36,7 @@
       "SEVERITY.LOW": 62,
       "SEVERITY.MEDIUM": 60,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 81260,
+      "loc": 81564,
       "nosec": 0,
       "skipped_tests": 56
     },
@@ -75,7 +75,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 135,
+      "loc": 167,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -244,7 +244,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 1,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1184,
+      "loc": 1190,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -309,7 +309,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1581,
+      "loc": 1606,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -348,7 +348,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 428,
+      "loc": 430,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -387,7 +387,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1421,
+      "loc": 1429,
       "nosec": 0,
       "skipped_tests": 1
     },
@@ -413,7 +413,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 142,
+      "loc": 147,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -517,7 +517,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 5448,
+      "loc": 5608,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -920,7 +920,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 3118,
+      "loc": 3119,
       "nosec": 0,
       "skipped_tests": 3
     },
@@ -1245,7 +1245,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 983,
+      "loc": 984,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1271,7 +1271,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 121,
+      "loc": 154,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1886,6 +1886,19 @@
       "nosec": 0,
       "skipped_tests": 0
     },
+    "backend/app/utils/slug.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 31,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
     "backend/app/utils/transaction.py": {
       "CONFIDENCE.HIGH": 0,
       "CONFIDENCE.LOW": 0,
@@ -2032,7 +2045,7 @@
       "test_name": "try_except_pass"
     },
     {
-      "code": "403         \"access_token\": access_token,\n404         \"token_type\": \"bearer\",\n405         \"expires_in\": 900,\n406         \"user\": {\n407             \"id\": user_id,\n408             \"username\": body.username,\n409             \"full_name\": body.full_name or \"\",\n410             \"role\": role,\n411             \"is_active\": True,\n412         },\n413         \"message\": \"Registration successful\",\n414     }\n415 \n416 \n417 @limiter.limit(\"10/minute\")\n",
+      "code": "403         \"access_token\": access_token,\n404         \"token_type\": \"bearer\",\n405         \"expires_in\": 900,\n406         \"user\": {\n407             \"id\": user_id,\n408             \"username\": body.username,\n409             \"full_name\": body.full_name or \"\",\n410             \"role\": role,\n411             \"is_active\": True,\n412         },\n413         \"message\": \"Registration successful\",\n414     }\n415 \n416 \n417 @router.post(\"/login\")\n",
       "col_offset": 8,
       "end_col_offset": 20,
       "filename": "backend/app/api/routes/auth.py",
@@ -2106,7 +2119,7 @@
       "test_name": "try_except_pass"
     },
     {
-      "code": "599         \"access_token\": access_token,\n600         \"token_type\": \"bearer\",\n601         \"expires_in\": 15 * 60,\n602         \"user\": {\n603             \"id\": user_id,\n604             \"username\": db_username,\n605             \"full_name\": full_name,\n606             \"role\": role,\n607             \"is_active\": bool(is_active),\n608             \"must_change_password\": bool(must_change_password),\n609         },\n610     }\n611 \n612 \n613 @limiter.limit(\"30/minute\")\n",
+      "code": "599         \"access_token\": access_token,\n600         \"token_type\": \"bearer\",\n601         \"expires_in\": 15 * 60,\n602         \"user\": {\n603             \"id\": user_id,\n604             \"username\": db_username,\n605             \"full_name\": full_name,\n606             \"role\": role,\n607             \"is_active\": bool(is_active),\n608             \"must_change_password\": bool(must_change_password),\n609         },\n610     }\n611 \n612 \n613 @router.post(\"/refresh\")\n",
       "col_offset": 8,
       "end_col_offset": 20,
       "filename": "backend/app/api/routes/auth.py",
@@ -2907,7 +2920,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "379                 conn.execute,\n380                 f\"UPDATE organizations SET {', '.join(updates)} WHERE id = ?\",\n381                 params,\n",
+      "code": "387                 conn.execute,\n388                 f\"UPDATE organizations SET {', '.join(updates)} WHERE id = ?\",\n389                 params,\n",
       "col_offset": 16,
       "end_col_offset": 77,
       "filename": "backend/app/api/routes/organizations.py",
@@ -2918,9 +2931,9 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 380,
+      "line_number": 388,
       "line_range": [
-        380
+        388
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
