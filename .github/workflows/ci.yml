@@ -134,6 +134,9 @@ jobs:
       - name: Settings consumers check
         run: python scripts/check_settings_consumers.py
 
+      - name: Batch-save mock seq contract check
+        run: python scripts/check_batch_mock_seq.py
+
       - name: PR scope drift check
         run: python scripts/check_pr_scope_drift.py
 

@@ -39,16 +39,18 @@ describe("addChatMessagesBatch (issue #507 / PRR-005)", () => {
   });
 
   it("falls back to sequential single-message saves when the batch POST 404s (old backend during a rolling restart)", async () => {
+    // Rows carry the server-issued seq per the single-message endpoint's
+    // response contract (issue #683) — the fallback feeds the same migrateId.
     postMock
       .mockRejectedValueOnce({ response: { status: 404 } })
-      .mockResolvedValueOnce({ data: { id: 1, role: "user", content: "question" } })
-      .mockResolvedValueOnce({ data: { id: 2, role: "assistant", content: "answer" } });
+      .mockResolvedValueOnce({ data: { id: 1, role: "user", content: "question", seq: 1 } })
+      .mockResolvedValueOnce({ data: { id: 2, role: "assistant", content: "answer", seq: 2 } });
 
     const saved = await addChatMessagesBatch(5, turnPayloads);
 
     expect(saved).toEqual([
-      { id: 1, role: "user", content: "question" },
-      { id: 2, role: "assistant", content: "answer" },
+      { id: 1, role: "user", content: "question", seq: 1 },
+      { id: 2, role: "assistant", content: "answer", seq: 2 },
     ]);
     expect(postMock).toHaveBeenCalledTimes(3);
     // One batch attempt, then one POST per message to the single-message URL.

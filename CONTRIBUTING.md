@@ -108,6 +108,8 @@ npm run build
 ```bash
 python scripts/check_runtime_contract.py   # runtime pins: Docker/CI/engines/docs parity
 python scripts/check_config_contract.py
+python scripts/check_settings_consumers.py   # every Settings field has a production read site
+python scripts/check_batch_mock_seq.py   # send-path batch mocks mirror the save response contract
 python scripts/check_pr_scope_drift.py
 python scripts/check_sast_baseline.py   # SAST baseline/scope/workflow integrity
 python scripts/check_secretscan.py      # .secretscanignore validity

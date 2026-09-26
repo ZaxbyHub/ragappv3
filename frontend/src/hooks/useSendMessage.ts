@@ -235,10 +235,13 @@ export function useSendMessage(
       // may persist the user row by itself. A failed batch
       // commits nothing server-side, so the visible retry below can never
       // duplicate a successful sibling write (UI-002).
+      // Carry the server-issued seq onto the migrated rows: durableKeepSeq
+      // (the Retry/Edit truncate anchor) treats a missing seq as "not
+      // durable", so dropping it deletes earlier saved turns (#683).
       const migrateId = (oldId: string, saveResult: ChatSessionMessage) => {
         const dbId = String(saveResult.id);
         if (dbId === oldId) {
-          updateMessage(oldId, { saveState: "saved" });
+          updateMessage(oldId, { saveState: "saved", seq: saveResult.seq });
           return;
         }
         const feedbackKey = `chat_feedback_${oldId}`;
@@ -247,7 +250,11 @@ export function useSendMessage(
           localStorage.setItem(`chat_feedback_${dbId}`, feedbackValue);
           localStorage.removeItem(feedbackKey);
         }
-        replaceMessageId(oldId, dbId, { created_at: saveResult.created_at, saveState: "saved" });
+        replaceMessageId(oldId, dbId, {
+          created_at: saveResult.created_at,
+          saveState: "saved",
+          seq: saveResult.seq,
+        });
       };
 
       type PersistOptions = {
