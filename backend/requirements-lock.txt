@@ -2748,9 +2748,9 @@ scipy==1.17.1 \
     #   scikit-learn
     #   sentence-transformers
     #   unstructured-inference
-sentence-transformers==5.6.1 \
-    --hash=sha256:16af5d682ef66672b076d58599a23905800e850ec2bfb1865938306bf684ad72 \
-    --hash=sha256:cefbb17b6325a982a4732c8c49fb013375392687049d1de3d435c4b04060680b
+sentence-transformers==6.1.0 \
+    --hash=sha256:299025df51550dc1a38f05be27a9b0bf881c4e5e70542b3b7757d05e00aa3868 \
+    --hash=sha256:eb8122f4d180f552eda26dc3d77e84e8c11dc2b1d456a406b9f24abb70ceeadd
     # via -r backend/requirements.txt
 setuptools==83.0.0 \
     --hash=sha256:025bccbbf0fa05b6192bc64ae1e7b16e001fd6d6d4d5de03c97b1c1ade523bef \
