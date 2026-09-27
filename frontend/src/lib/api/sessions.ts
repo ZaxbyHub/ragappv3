@@ -78,7 +78,15 @@ export async function parseSSEStream(
           const parsed = JSON.parse(data);
           if (parsed.type === 'error') {
             completed = true; // onError is terminal; never fire it twice
-            callbacks.onError?.(new Error(parsed.message || 'Chat stream error'));
+            // Issue #684: carry the server's rejection code (e.g.
+            // ADMISSION_REJECTED vs ADMISSION_REJECTED_PREWRITTEN) so
+            // terminal handlers can distinguish "nothing was written for
+            // this turn" from "the durable user row already exists".
+            const streamError = new Error(parsed.message || 'Chat stream error');
+            if (typeof parsed.code === 'string' && parsed.code) {
+              (streamError as Error & { code?: string }).code = parsed.code;
+            }
+            callbacks.onError?.(streamError);
             return;
           }
           if (parsed.type === 'mode' && (parsed.mode === 'instant' || parsed.mode === 'thinking')) {
@@ -549,11 +557,29 @@ export async function addChatMessagesBatchKeepalive(
  */
 export async function truncateChatSession(
   sessionId: number,
-  keepSeq: number
+  keepSeq: number,
+  expectedTail?: { seq: number; id: number }
 ): Promise<{ remaining_count: number; tail_seq: number | null }> {
+  // Issue #684 (T1-13-S-05): when the client states its observed tail, the
+  // body carries expected_tail_seq and the server refuses stale views (409).
+  // The tail row's server id (expected_tail_id) is the ABA-proof precondition:
+  // per-session seq values are MAX(seq)+1 and are reused after another writer
+  // truncates and resaves the same row count, so the never-reused PRIMARY KEY
+  // is what actually distinguishes the observed tail (#684 review).
+  const body: {
+    keep_seq: number;
+    expected_tail_seq?: number;
+    expected_tail_id?: number;
+  } = { keep_seq: keepSeq };
+  if (expectedTail && typeof expectedTail.seq === "number") {
+    body.expected_tail_seq = expectedTail.seq;
+  }
+  if (expectedTail && Number.isFinite(expectedTail.id) && expectedTail.id > 0) {
+    body.expected_tail_id = expectedTail.id;
+  }
   const response = await apiClient.post<{ remaining_count: number; tail_seq: number | null }>(
     `/chat/sessions/${sessionId}/truncate`,
-    { keep_seq: keepSeq }
+    body
   );
   return response.data;
 }
@@ -584,10 +610,16 @@ export interface ForkSessionResponse extends ChatSessionDetail {
   fork_message_index: number;
 }
 
-export async function forkChatSession(sessionId: number, messageIndex: number): Promise<ForkSessionResponse> {
+export async function forkChatSession(
+  sessionId: number,
+  anchor: { through_seq: number }
+): Promise<ForkSessionResponse> {
+  // Issue #684 (T1-13-K-02): the fork anchors on the durable seq to include
+  // (server copies rows with seq <= through_seq) instead of a client-local
+  // positional index, so an unpersisted earlier turn cannot misalign the copy.
   const response = await apiClient.post<ForkSessionResponse>(
     `/chat/sessions/${sessionId}/fork`,
-    { message_index: messageIndex }
+    { through_seq: anchor.through_seq }
   );
   return response.data;
 }

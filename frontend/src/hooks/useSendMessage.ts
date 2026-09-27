@@ -11,6 +11,7 @@ import {
   type WikiReference,
   type KMSReference,
 } from "@/lib/api";
+import { toast } from "sonner";
 import { useChatStore, type Message } from "@/stores/useChatStore";
 import { useChatModeStore } from "@/stores/useChatModeStore";
 import { useChatShellStore } from "@/stores/useChatShellStore";
@@ -32,8 +33,17 @@ export interface UseSendMessageReturn {
   handleStop: () => void;
   handleKeyDown: (e: React.KeyboardEvent) => void;
   handleInputChange: (e: React.ChangeEvent<HTMLTextAreaElement>) => void;
-  /** Send with explicit content + history — does not read or modify composer input state. */
-  sendDirect: (content: string, historyMessages: Message[]) => Promise<void>;
+  /**
+   * Send with explicit content + history — does not read or modify composer
+   * input state. `opts.restoreRows` (issue #684 / T1-13-S-08) carries the
+   * original turn rows a revision already truncated, restored server-side if
+   * the replacement is admission-rejected before any content.
+   */
+  sendDirect: (
+    content: string,
+    historyMessages: Message[],
+    opts?: { restoreRows?: Message[] }
+  ) => Promise<void>;
   /** Current pipeline stage (Searching/Reading/Drafting) before content streams, or null. */
   currentStage: string | null;
 }
@@ -91,7 +101,12 @@ export function useSendMessage(
    * "send from composer" path and the "retry/sendDirect" path go through here.
    */
   const sendCore = useCallback(
-    async (content: string, historyMessages: Message[], clearInput: boolean) => {
+    async (
+      content: string,
+      historyMessages: Message[],
+      clearInput: boolean,
+      revisionOpts?: { restoreRows?: Message[] }
+    ) => {
       if (sendingRef.current) return;
       sendingRef.current = true;
       setIsStreaming(true);
@@ -325,12 +340,14 @@ export function useSendMessage(
 
         if (options.keepalive) {
           const persistPromise = addChatMessagesBatchKeepalive(sessionId, prepared.messages);
-          const { setPendingTurnPersist } = useChatStore.getState();
+          const { setPendingTurnPersist, registerPendingTurnPersist } = useChatStore.getState();
           setPendingTurnPersist(persistPromise);
+          registerPendingTurnPersist?.(persistPromise);
           void persistPromise.finally(() => {
             if (useChatStore.getState().pendingTurnPersist === persistPromise) {
               useChatStore.getState().setPendingTurnPersist(null);
             }
+            useChatStore.getState().unregisterPendingTurnPersist?.(persistPromise);
           });
           return persistPromise;
         }
@@ -361,15 +378,55 @@ export function useSendMessage(
             updateMessage(userMessage.id, { saveState: "failed" });
           }
         })();
-        // PRR-003: expose the in-flight save so revision operations can await it.
-        const { setPendingTurnPersist } = useChatStore.getState();
+        // PRR-003: expose the in-flight save so revision operations can await
+        // it. Issue #684 (T1-13-S2-06): also register it in the all-in-flight
+        // registry — the single slot is overwritten by a newer save, but a
+        // revision must wait for EVERY unsettled save.
+        const { setPendingTurnPersist, registerPendingTurnPersist } = useChatStore.getState();
         setPendingTurnPersist(persistPromise);
+        registerPendingTurnPersist?.(persistPromise);
         void persistPromise.finally(() => {
           if (useChatStore.getState().pendingTurnPersist === persistPromise) {
             useChatStore.getState().setPendingTurnPersist(null);
           }
+          useChatStore.getState().unregisterPendingTurnPersist?.(persistPromise);
         });
         return persistPromise;
+      };
+
+      // Issue #684 (T1-13-S-08): restore the original turn a revision already
+      // truncated when the replacement was admission-rejected before any
+      // content — the one terminal outcome where the server provably wrote
+      // nothing for the replacement (the stream route returns at the
+      // admission gate, before the durable user pre-write). Re-save the rows
+      // (server-side append), then mirror locally with the new ids/seqs.
+      const restoreRevisedTurn = async (rows: Message[]) => {
+        try {
+          const payload: AddMessageRequest[] = rows.map((m) => ({
+            role: m.role === "assistant" ? "assistant" : "user",
+            content: typeof m.content === "string" ? m.content : "",
+          }));
+          const saved = await addChatMessagesBatch(sessionId, payload);
+          const storeState = useChatStore.getState();
+          const failedIdx = storeState.messageIds.indexOf(userMessage.id);
+          if (failedIdx >= 0) storeState.removeMessagesFrom(failedIdx);
+          for (const row of rows) {
+            useChatStore.getState().addMessage({ ...row, saveState: "saving" });
+          }
+          const tailIds = useChatStore.getState().messageIds.slice(-rows.length);
+          tailIds.forEach((localId, i) => {
+            if (saved[i]) migrateId(localId, saved[i]);
+          });
+          // Mirror the ordinary persist path's sidebar bookkeeping (review
+          // F-004): the restore is a real server write, so the session list
+          // must reflect the new updated_at instead of going stale.
+          await refreshHistory(true);
+          useChatShellStore.getState().requestSessionListRefresh();
+          toast.error("Couldn't regenerate — kept your original answer.");
+        } catch (err) {
+          console.error("Failed to restore the revised turn:", err);
+          toast.error("Couldn't update conversation history");
+        }
       };
 
       const turnPersistence: CurrentTurnPersistence = {
@@ -605,6 +662,25 @@ export function useSendMessage(
             setStreamingMessageId(null);
             sendingRef.current = false;
             if (ownsPersistence) void persistTurn("failed");
+            // Issue #684 (T1-13-S-08): ADMISSION_REJECTED is emitted by the
+            // route-level CHAT gate strictly BEFORE the durable user-row
+            // pre-write, so this code provably means nothing was written for
+            // the replacement — a revision that already truncated the
+            // original turn restores it instead of losing the Q&A. Engine-side
+            // admission rejections arrive AFTER the pre-write and are relabeled
+            // ADMISSION_REJECTED_PREWRITTEN by the route when the pre-write
+            // landed (restoring would
+            // append the original after the pre-written replacement user row
+            // and duplicate the question); other pre-content failures and any
+            // partial-content turn keep today's behavior (the latter is
+            // already durable via the save above).
+            if (
+              revisionOpts?.restoreRows &&
+              !streamedContent.trim() &&
+              (error as { code?: string }).code === "ADMISSION_REJECTED"
+            ) {
+              void restoreRevisedTurn(revisionOpts.restoreRows);
+            }
           },
           onComplete: async () => {
             // A pagehide callback may have already claimed the one-shot save.
@@ -730,10 +806,14 @@ export function useSendMessage(
    * Used for retry / regenerate so it doesn't touch the composer input.
    */
   const sendDirect = useCallback(
-    async (content: string, historyMessages: Message[]) => {
+    async (
+      content: string,
+      historyMessages: Message[],
+      opts?: { restoreRows?: Message[] }
+    ) => {
       const { isStreaming: currentIsStreaming } = useChatStore.getState();
       if (currentIsStreaming || sendingRef.current) return;
-      await sendCore(content, historyMessages, false);
+      await sendCore(content, historyMessages, false, opts);
     },
     [sendCore]
   );

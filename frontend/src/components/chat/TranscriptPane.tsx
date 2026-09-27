@@ -35,7 +35,7 @@ import { useAuthStore } from "@/stores/useAuthStore";
 import { useChatShellStore } from "@/stores/useChatShellStore";
 import { useSendMessage } from "@/hooks/useSendMessage";
 import { useChatHistory } from "@/hooks/useChatHistory";
-import { forkChatSession, truncateChatSession } from "@/lib/api";
+import { forkChatSession, getChatSession, truncateChatSession } from "@/lib/api";
 import { mapSessionMessage } from "@/lib/chatMessageMapper";
 import { toast } from "sonner";
 import type { Message } from "@/stores/useChatStore";
@@ -388,6 +388,11 @@ export function TranscriptPane({ className }: TranscriptPaneProps) {
   const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null);
   const [isForking, setIsForking] = useState(false);
   const isForkingRef = useRef(false);
+  // Issue #684 (T1-13-S-04): synchronous in-flight guard for the revision
+  // handlers (Retry/Edit). Unlike the render-time `isStreaming` check, this ref
+  // is set before the handler's first await, so a second synchronous click
+  // cannot double-fire the server call.
+  const revisionInFlightRef = useRef(false);
 
   // Ref-backed pinned-bottom state — read inside scroll callbacks without
   // creating stale closures over isAtBottom (which is captured by useEffect).
@@ -527,17 +532,21 @@ export function TranscriptPane({ className }: TranscriptPaneProps) {
     setTimeout(() => composerRef.current?.focus(), 0);
   };
 
-  // PRR-003: let a just-interrupted turn's background save settle before any
-  // server-side history revision, so the truncate/fork below observes (or
-  // removes) those rows instead of racing them.
+  // PRR-003 / issue #684 (T1-13-S2-06): let every just-interrupted turn's
+  // background save settle before any server-side history revision, so the
+  // truncate/fork below observes (or removes) those rows instead of racing
+  // them. The single-slot store misses older in-flight saves (the newest save
+  // overwrites the slot), so ALSO drain the all-in-flight registry — the
+  // registry is absent in partial store mocks, where it degrades to none.
   const awaitPendingPersist = useCallback(async () => {
-    const pending = useChatStore.getState().pendingTurnPersist;
-    if (pending) {
-      try {
-        await pending;
-      } catch {
-        // Save failures are already surfaced on the message (UI-002).
-      }
+    const { pendingTurnPersist, pendingTurnPersists } = useChatStore.getState();
+    const inFlight: Array<Promise<void>> = [...(pendingTurnPersists ?? [])];
+    if (pendingTurnPersist) inFlight.push(pendingTurnPersist);
+    if (inFlight.length === 0) return;
+    try {
+      await Promise.allSettled(inFlight);
+    } catch {
+      // Save failures are already surfaced on the message (UI-002).
     }
   }, []);
 
@@ -556,90 +565,171 @@ export function TranscriptPane({ className }: TranscriptPaneProps) {
     return keepSeq;
   };
 
-  // Retry: find last user message, trim persisted history + store, call sendDirect
-  const handleRetry = useCallback(async () => {
-    if (isStreaming) return;
-    await awaitPendingPersist();
-    const { messageIds: ids, messagesById, activeChatId } = useChatStore.getState();
-    let lastUserIdx = -1;
-    for (let i = ids.length - 1; i >= 0; i--) {
-      if (messagesById[ids[i]]?.role === "user") { lastUserIdx = i; break; }
-    }
-    if (lastUserIdx < 0) return;
-
-    // Trim the persisted history first so the server matches the local trim;
-    // on failure bail out before touching the local transcript.
-    if (activeChatId) {
-      try {
-        await truncateChatSession(
-          parseInt(activeChatId),
-          durableKeepSeq(ids.slice(0, lastUserIdx), messagesById)
-        );
-      } catch {
-        toast.error("Couldn't update conversation history");
-        return;
+  // Issue #684 (T1-13-S-05): the highest server-issued seq this tab has
+  // observed for the session — sent as the truncate's expected-tail
+  // precondition so the server can refuse a stale view.
+  // Issue #684 review (ABA): the precondition carries BOTH the observed
+  // tail seq and the tail row's server id — per-session seq values are
+  // MAX(seq)+1 and are reused after another writer truncates and resaves,
+  // so the never-reused PRIMARY KEY is what the server can actually check.
+  // Rows without a seq (never persisted locally) contribute nothing, exactly
+  // like durableKeepSeq.
+  const observedTail = (ids: string[], byId: Record<string, Message>): { seq: number; id: number } => {
+    let tail = 0;
+    let tailId = 0;
+    for (const id of ids) {
+      const row = byId[id];
+      const seq = row?.seq;
+      if (typeof seq === "number" && seq > tail) {
+        tail = seq;
+        const numericId = Number(row.id);
+        tailId = Number.isFinite(numericId) ? numericId : 0;
       }
     }
+    return { seq: tail, id: tailId };
+  };
 
-    const userContent = messagesById[ids[lastUserIdx]].content;
-    const history = ids.slice(0, lastUserIdx).map((id) => messagesById[id]);
-    removeMessagesFrom(lastUserIdx);
-    sendDirect(userContent, history);
-  }, [isStreaming, removeMessagesFrom, sendDirect, awaitPendingPersist]);
+  // Issue #684 (T1-13-S-05): a 409 stale-view refusal converges this tab by
+  // refetching the session (the shell's loaded-session guard never refetches
+  // on its own). The activeChatId re-checks keep a concurrent session switch
+  // from clobbering the new session's transcript; the toast fires only when
+  // the reload actually happened.
+  const reloadAfterStaleRefusal = useCallback(
+    async (sessionId: string) => {
+      if (useChatStore.getState().activeChatId !== sessionId) return;
+      try {
+        const detail = await getChatSession(parseInt(sessionId));
+        if (useChatStore.getState().activeChatId !== sessionId) return;
+        loadChat(sessionId, (detail.messages ?? []).map(mapSessionMessage));
+        toast.info("Conversation changed elsewhere — reloaded the latest history.");
+      } catch {
+        toast.error("Couldn't update conversation history");
+      }
+    },
+    [loadChat]
+  );
+
+  // Retry: find last user message, trim persisted history + store, call sendDirect
+  const handleRetry = useCallback(async () => {
+    // Issue #684 (T1-13-S-04): the in-flight ref is set synchronously, before
+    // the first await, so a second click in the same task cannot double-fire
+    // the truncate; the finally spans every post-set path so no early return
+    // strands the guard.
+    if (isStreaming || revisionInFlightRef.current) return;
+    revisionInFlightRef.current = true;
+    try {
+      await awaitPendingPersist();
+      const { messageIds: ids, messagesById, activeChatId } = useChatStore.getState();
+      let lastUserIdx = -1;
+      for (let i = ids.length - 1; i >= 0; i--) {
+        if (messagesById[ids[i]]?.role === "user") { lastUserIdx = i; break; }
+      }
+      if (lastUserIdx < 0) return;
+
+      // Issue #684 (T1-13-S-08): snapshot the rows this revision removes so
+      // an admission-rejected replacement (which writes nothing server-side)
+      // can restore them instead of losing the original Q&A.
+      const restoreRows = activeChatId
+        ? ids.slice(lastUserIdx).map((id) => messagesById[id])
+        : undefined;
+
+      // Trim the persisted history first so the server matches the local trim;
+      // on failure bail out before touching the local transcript.
+      if (activeChatId) {
+        try {
+          await truncateChatSession(
+            parseInt(activeChatId),
+            durableKeepSeq(ids.slice(0, lastUserIdx), messagesById),
+            observedTail(ids, messagesById)
+          );
+        } catch (err) {
+          // Issue #684 (T1-13-S-05): a stale-view refusal (409) converges this
+          // tab from the server; any other failure keeps today's behavior.
+          if ((err as { response?: { status?: number } })?.response?.status === 409) {
+            await reloadAfterStaleRefusal(activeChatId);
+          } else {
+            toast.error("Couldn't update conversation history");
+          }
+          return;
+        }
+      }
+
+      const userContent = messagesById[ids[lastUserIdx]].content;
+      const history = ids.slice(0, lastUserIdx).map((id) => messagesById[id]);
+      removeMessagesFrom(lastUserIdx);
+      sendDirect(userContent, history, restoreRows ? { restoreRows } : undefined);
+    } finally {
+      revisionInFlightRef.current = false;
+    }
+  }, [isStreaming, removeMessagesFrom, sendDirect, awaitPendingPersist, reloadAfterStaleRefusal]);
 
   // Edit: trim persisted history + store from message index, restore content to composer
   const handleEdit = useCallback(async (messageId: string, content: string) => {
-    if (isStreaming) return;
-    await awaitPendingPersist();
-    const { messageIds: ids, messagesById, activeChatId } = useChatStore.getState();
-    const idx = ids.indexOf(messageId);
-    if (idx < 0) return;
-    if (activeChatId) {
-      try {
-        await truncateChatSession(
-          parseInt(activeChatId),
-          durableKeepSeq(ids.slice(0, idx), messagesById)
-        );
-      } catch {
-        toast.error("Couldn't update conversation history");
-        return;
+    // Issue #684 (T1-13-S-04): synchronous in-flight guard, reset on every
+    // post-set path (full-scope finally).
+    if (isStreaming || revisionInFlightRef.current) return;
+    revisionInFlightRef.current = true;
+    try {
+      await awaitPendingPersist();
+      const { messageIds: ids, messagesById, activeChatId } = useChatStore.getState();
+      const idx = ids.indexOf(messageId);
+      if (idx < 0) return;
+      if (activeChatId) {
+        try {
+          await truncateChatSession(
+            parseInt(activeChatId),
+            durableKeepSeq(ids.slice(0, idx), messagesById),
+            observedTail(ids, messagesById)
+          );
+        } catch (err) {
+          // Issue #684 (T1-13-S-05): a stale-view refusal reloads the session;
+          // other failures keep today's behavior.
+          if ((err as { response?: { status?: number } })?.response?.status === 409) {
+            await reloadAfterStaleRefusal(activeChatId);
+          } else {
+            toast.error("Couldn't update conversation history");
+          }
+          return;
+        }
       }
+      // Issue #573 (AC3): snapshot the pre-edit content keyed by transcript
+      // slot ("<activeChatId>:<index>"). Editing truncates in place and the
+      // re-sent message lands at the same index, so the slot key is stable and
+      // the stepper can offer the pre-edit content as a sibling version — with
+      // zero change to the fork/lineage data model. Re-editing while an older
+      // version is displayed records that displayed text only if it is not
+      // already a navigable snapshot, and always clears the display pointer:
+      // the edit starts a new live lineage, so the re-sent message must render
+      // as the live content, not the stale selected version. Slots at or after
+      // the truncation point become stale (their indices will map to different
+      // messages after the re-send), so they are dropped. Version-state
+      // mutations run only after the server truncate has SUCCEEDED, so a
+      // failed truncate leaves the version maps untouched (PRR-011).
+      const slotKey = activeChatId ? `${activeChatId}:${idx}` : null;
+      const editState = useChatStore.getState();
+      const originalContent = messagesById[messageId]?.content;
+      if (slotKey) {
+        const existingSnapshots = editState.messageEditVersions?.[slotKey] ?? [];
+        const pointerWasSet = editState.activeEditVersion?.[slotKey] !== undefined;
+        if (
+          typeof originalContent === "string" &&
+          originalContent.length > 0 &&
+          !existingSnapshots.includes(originalContent)
+        ) {
+          recordEditVersion?.(slotKey, originalContent);
+        }
+        if (pointerWasSet) {
+          setActiveEditVersion?.(slotKey, null);
+        }
+      }
+      clearEditVersionsFrom?.(idx + 1);
+      removeMessagesFrom(idx);
+      setInput(content);
+      composerRef.current?.focus();
+    } finally {
+      revisionInFlightRef.current = false;
     }
-    // Issue #573 (AC3): snapshot the pre-edit content keyed by transcript
-    // slot ("<activeChatId>:<index>"). Editing truncates in place and the
-    // re-sent message lands at the same index, so the slot key is stable and
-    // the stepper can offer the pre-edit content as a sibling version — with
-    // zero change to the fork/lineage data model. Re-editing while an older
-    // version is displayed records that displayed text only if it is not
-    // already a navigable snapshot, and always clears the display pointer:
-    // the edit starts a new live lineage, so the re-sent message must render
-    // as the live content, not the stale selected version. Slots at or after
-    // the truncation point become stale (their indices will map to different
-    // messages after the re-send), so they are dropped. Version-state
-    // mutations run only after the server truncate has SUCCEEDED, so a
-    // failed truncate leaves the version maps untouched (PRR-011).
-    const slotKey = activeChatId ? `${activeChatId}:${idx}` : null;
-    const editState = useChatStore.getState();
-    const originalContent = messagesById[messageId]?.content;
-    if (slotKey) {
-      const existingSnapshots = editState.messageEditVersions?.[slotKey] ?? [];
-      const pointerWasSet = editState.activeEditVersion?.[slotKey] !== undefined;
-      if (
-        typeof originalContent === "string" &&
-        originalContent.length > 0 &&
-        !existingSnapshots.includes(originalContent)
-      ) {
-        recordEditVersion?.(slotKey, originalContent);
-      }
-      if (pointerWasSet) {
-        setActiveEditVersion?.(slotKey, null);
-      }
-    }
-    clearEditVersionsFrom?.(idx + 1);
-    removeMessagesFrom(idx);
-    setInput(content);
-    composerRef.current?.focus();
-  }, [isStreaming, removeMessagesFrom, setInput, awaitPendingPersist, recordEditVersion, setActiveEditVersion, clearEditVersionsFrom]);
+  }, [isStreaming, removeMessagesFrom, setInput, awaitPendingPersist, recordEditVersion, setActiveEditVersion, clearEditVersionsFrom, reloadAfterStaleRefusal]);
 
   // Issue #573 (AC3): step the displayed sibling version of an edited turn.
   // Invariants (shared with the row-side resolution below):
@@ -751,18 +841,31 @@ export function TranscriptPane({ className }: TranscriptPaneProps) {
 
   // Fork
   const handleFork = useCallback(async (messageId: string) => {
+    // Issue #684 (T1-13-S-04): the guard is set BEFORE the pending-save await
+    // (base set it only after, so a double-click during that await
+    // double-fired the fork); the finally spans every post-set path.
     if (isForkingRef.current) return;
     const { activeChatId } = useChatStore.getState();
     if (!activeChatId) return;
-    await awaitPendingPersist();
-    const { messageIds: ids } = useChatStore.getState();
-    const msgIndex = ids.indexOf(messageId);
-    if (msgIndex < 0) return;
-
     isForkingRef.current = true;
     setIsForking(true);
     try {
-      const forked = await forkChatSession(parseInt(activeChatId), msgIndex);
+      await awaitPendingPersist();
+      const { messageIds: ids, messagesById } = useChatStore.getState();
+      const msgIndex = ids.indexOf(messageId);
+      if (msgIndex < 0) return;
+
+      // Issue #684 (T1-13-K-02): anchor the copy on the highest durable seq up
+      // to and including the clicked message — a local positional index
+      // diverges from the server's rows whenever a turn exists locally but was
+      // never persisted, slicing the wrong rows or 400ing out of bounds.
+      const throughSeq = durableKeepSeq(ids.slice(0, msgIndex + 1), messagesById);
+      if (throughSeq < 1) {
+        // Nothing durable to fork yet — refuse locally, no server call.
+        toast.warning("Fork returned no messages — staying on the current session.");
+        return;
+      }
+      const forked = await forkChatSession(parseInt(activeChatId), { through_seq: throughSeq });
       if (!forked.messages?.length) {
         toast.warning("Fork returned no messages — staying on the current session.");
         return;

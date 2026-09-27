@@ -82,21 +82,26 @@ describe("chat parity invariants (issue #573 AC9 / C9)", () => {
     const source = readFileSync(TRANSCRIPT_PANE, "utf-8");
 
     expect(source).toContain(
-      'forkChatSession, truncateChatSession'
+      'forkChatSession, getChatSession, truncateChatSession'
     );
 
-    // Call shapes: forkChatSession(parseInt(activeChatId), msgIndex) and
-    // truncateChatSession(parseInt(activeChatId), <keep-seq expression>).
-    const forkCalls = source.match(/forkChatSession\(\s*parseInt\(activeChatId\)\s*,\s*msgIndex\s*\)/g) ?? [];
+    // Call shapes (issue #684): forkChatSession(parseInt(activeChatId),
+    // { through_seq }) anchors the copy on the durable seq (not the local
+    // positional index), and truncateChatSession(parseInt(activeChatId),
+    // <keep-seq expression>, <observed-tail expression>) carries the stale-view
+    // precondition. The pane must still call each through parseInt(activeChatId).
+    const forkCalls =
+      source.match(/forkChatSession\(\s*parseInt\(activeChatId\)\s*,\s*\{\s*through_seq:\s*throughSeq\s*\}\s*\)/g) ?? [];
     expect(
       forkCalls.length,
-      "forkChatSession must keep its (sessionId, messageIndex) call shape (issue #573 AC9)"
+      "forkChatSession must keep its (sessionId, { through_seq }) durable-anchor call shape (issue #573 AC9 / #684)"
     ).toBeGreaterThanOrEqual(1);
 
-    const truncateCalls = source.match(/truncateChatSession\(\s*parseInt\(activeChatId\)\s*,/g) ?? [];
+    const truncateCalls =
+      source.match(/truncateChatSession\(\s*parseInt\(activeChatId\)\s*,[\s\S]{0,200}?observedTail\(/g) ?? [];
     expect(
       truncateCalls.length,
-      "truncateChatSession must keep its (sessionId, keepSeq) call shape (issue #573 AC9)"
-    ).toBeGreaterThanOrEqual(1);
+      "truncateChatSession must keep its (sessionId, keepSeq, observedTail) preconditioned call shape at BOTH revision sites (issue #573 AC9 / #684 review F-001 — a >=1 threshold admits a single-site precondition drop)"
+    ).toBeGreaterThanOrEqual(2);
   });
 });

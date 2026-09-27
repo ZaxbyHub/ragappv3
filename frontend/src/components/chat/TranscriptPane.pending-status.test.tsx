@@ -103,6 +103,7 @@ vi.mock("@/hooks/useChatHistory", () => ({
 vi.mock("@/lib/api", () => ({
   truncateChatSession: vi.fn(),
   forkChatSession: vi.fn(),
+  getChatSession: vi.fn(),
 }));
 vi.mock("react-router-dom", () => ({
   useNavigate: () => vi.fn(),
