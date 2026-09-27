@@ -25,7 +25,15 @@ DOCUMENTS = os.path.join(BACKEND, "app", "api", "routes", "documents.py")
 # unreachable (SpreadsheetParser's extension gate matches _is_spreadsheet_file)
 # and a future reachable code may be added here deliberately.
 SHIPPED_INGEST_ERROR_CODES = frozenset(
-    {"PARSER_UNAVAILABLE", "PARSE_FAILED", "FILE_MISSING", "ENRICHMENT_FAILED"}
+    {
+        "PARSER_UNAVAILABLE",
+        "PARSE_FAILED",
+        "FILE_MISSING",
+        "ENRICHMENT_FAILED",
+        # issue #691: dimension-changing single-file ingests are refused with
+        # this stable code (reindex remediation), never a raw message.
+        "DIMENSION_CHANGED",
+    }
 )
 
 _PERSIST_PATTERNS = (

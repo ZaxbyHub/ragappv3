@@ -169,6 +169,18 @@
   `failed_retryable`); they self-heal via the retry/startup-resume
   machinery after the new index commits, but proxies are not refreshed
   into the new index as part of the reindex itself.
+- **Single-file ingests refuse a dimension change (issue #691).** An
+  upload/scan/email ingest whose embeddings have a different dimension than
+  the live index fails closed with an actionable error naming both
+  dimensions; it no longer auto-migrates (the old auto-migration committed a
+  staged rebuild holding only the current file's rows, wiping every other
+  indexed file's vectors). The persisted user-visible error is the stable
+  `DIMENSION_CHANGED` code with the reindex remediation. Run the admin
+  reindex job to migrate the index, then re-ingest the refused file — a
+  full (all-vaults) reindex re-embeds the whole corpus into its staged
+  rebuild before the validated swap. A vault-scoped reindex cannot migrate
+  the dimension (its rebuild would swap the global index while re-embedding
+  only one vault's files) and now fails fast with the same guidance instead.
 - The embedding cache has no TTL — invalidation is exclusively by contract
   key (model/embedder revision/prefix/dim/text) and capacity pruning (LRU
   beyond `embedding_cache_max_entries`).
