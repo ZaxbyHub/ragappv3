@@ -366,11 +366,13 @@ async def update_organization(
         # Build partial update
         updates = []
         params = []
+        slug_param_index = None
         if req.name is not None:
             updates.append("name = ?")
             params.append(req.name)
             # Update slug when name changes
             updates.append("slug = ?")
+            slug_param_index = len(params)
             params.append(_generate_slug(req.name))
         if req.description is not None:
             updates.append("description = ?")
@@ -382,15 +384,30 @@ async def update_organization(
         updates.append("updated_at = CURRENT_TIMESTAMP")
         params.append(org_id)
 
+        # One "-2" slug-suffix retry when the renamed org's slug collides —
+        # the update-route mirror of the create route's collision handling.
+        # A description-only update (no slug rewrite) cannot collide on slug
+        # and gets no retry.
         try:
-            await asyncio.to_thread(
-                conn.execute,
-                f"UPDATE organizations SET {', '.join(updates)} WHERE id = ?",
-                params,
-            )
-            await asyncio.to_thread(conn.commit)
+            max_attempt = 1 if slug_param_index is not None else 0
+            for attempt in range(max_attempt + 1):
+                attempt_params = params
+                if attempt == 1:
+                    attempt_params = list(params)
+                    attempt_params[slug_param_index] += "-2"
+                try:
+                    await asyncio.to_thread(
+                        conn.execute,
+                        f"UPDATE organizations SET {', '.join(updates)} WHERE id = ?",
+                        attempt_params,
+                    )
+                    await asyncio.to_thread(conn.commit)
+                    break
+                except sqlite3.IntegrityError:
+                    await asyncio.to_thread(conn.rollback)
+                    if attempt == max_attempt:
+                        raise
         except sqlite3.IntegrityError:
-            await asyncio.to_thread(conn.rollback)
             raise HTTPException(
                 status_code=409,
                 detail="Conflict — could not update organization. Please choose a different name.",

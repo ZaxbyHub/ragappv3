@@ -36,7 +36,7 @@
       "SEVERITY.LOW": 62,
       "SEVERITY.MEDIUM": 60,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 81564,
+      "loc": 81577,
       "nosec": 0,
       "skipped_tests": 56
     },
@@ -244,7 +244,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 1,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1190,
+      "loc": 1203,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -2920,9 +2920,9 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "387                 conn.execute,\n388                 f\"UPDATE organizations SET {', '.join(updates)} WHERE id = ?\",\n389                 params,\n",
-      "col_offset": 16,
-      "end_col_offset": 77,
+      "code": "400                         conn.execute,\n401                         f\"UPDATE organizations SET {', '.join(updates)} WHERE id = ?\",\n402                         attempt_params,\n",
+      "col_offset": 24,
+      "end_col_offset": 85,
       "filename": "backend/app/api/routes/organizations.py",
       "issue_confidence": "LOW",
       "issue_cwe": {
@@ -2931,9 +2931,9 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 388,
+      "line_number": 401,
       "line_range": [
-        388
+        401
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
