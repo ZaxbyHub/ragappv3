@@ -86,4 +86,21 @@ describe("truncateChatSession (issue #507 / CHAT-006, PRR-020)", () => {
     expect(postMock.mock.calls[0][0]).toBe("/chat/sessions/5/truncate");
     expect(postMock.mock.calls[0][1]).toEqual({ keep_seq: 2 });
   });
+
+  it("POSTs the observed tail precondition: expected_tail_seq AND the ABA-proof expected_tail_id (issue #684 review F2)", async () => {
+    // Both fields are OPTIONAL body members, so tsc/eslint stay silent if a
+    // refactor drops either; this wire pin is the one place a silent drop
+    // fails the suite. The id is the ABA-proof half (per-session seqs are
+    // reused after a truncate+resave; the AUTOINCREMENT PK is not).
+    postMock.mockResolvedValueOnce({ data: { remaining_count: 2, tail_seq: 2 } });
+
+    await truncateChatSession(5, 2, { seq: 4, id: 4 });
+
+    expect(postMock).toHaveBeenCalledTimes(1);
+    expect(postMock.mock.calls[0][1]).toEqual({
+      keep_seq: 2,
+      expected_tail_seq: 4,
+      expected_tail_id: 4,
+    });
+  });
 });

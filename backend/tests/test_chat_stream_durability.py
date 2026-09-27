@@ -578,6 +578,57 @@ async def test_duplicate_prewrite_is_idempotent_and_finalize_upserts(env):
     assert sorted(r[0] for r in rows) == ["assistant", "user"]
 
 
+async def test_engine_admission_rejection_relabelled_after_prewrite(env):
+    """Issue #684: an ADMISSION_REJECTED error chunk forwarded from the engine
+    (embedding gate) arrives AFTER the durable user-row pre-write, unlike the
+    route-level CHAT gate which returns before it. The forwarded frame must
+    carry ADMISSION_REJECTED_PREWRITTEN when the pre-write landed (a client
+    restoring a truncated original on the bare code would append it after the
+    pre-written replacement user row and duplicate the question), and keep the
+    bare ADMISSION_REJECTED when the pre-write failed (nothing was written —
+    restore-safe)."""
+
+    async def rejected_query(*args, **kwargs):
+        yield {
+            "type": "error",
+            "message": "embeddings saturated",
+            "code": "ADMISSION_REJECTED",
+        }
+
+    env.engine.query = rejected_query
+
+    # Positive arm: the pre-write lands, so the forwarded frame is relabelled.
+    response = env.make_stream("relabel-turn")
+    events = []
+    async for chunk in response.body_iterator:
+        text = chunk if isinstance(chunk, str) else chunk.decode("utf-8", "replace")
+        if text.startswith("data:"):
+            events.append(text)
+    error_events = [e for e in events if '"type": "error"' in e]
+    assert error_events, "expected an error frame"
+    assert any("ADMISSION_REJECTED_PREWRITTEN" in e for e in error_events)
+    assert not any('"code": "ADMISSION_REJECTED"' in e for e in events)
+    assert len([r for r in env.rows() if r[0] == "user"]) == 1
+
+    # Negative arm: the pre-write failed (nothing durable), so the bare code
+    # is kept and a client may safely restore the truncated original.
+    with patch.object(
+        chat_routes,
+        "_prewrite_user_turn",
+        return_value={"ok": False, "duplicate": False},
+    ):
+        response = env.make_stream("relabel-turn-nopre")
+        events2 = []
+        async for chunk in response.body_iterator:
+            text = chunk if isinstance(chunk, str) else chunk.decode("utf-8", "replace")
+            if text.startswith("data:"):
+                events2.append(text)
+    error_events2 = [e for e in events2 if '"type": "error"' in e]
+    assert error_events2, "expected an error frame"
+    assert any('"code": "ADMISSION_REJECTED"' in e for e in error_events2)
+    assert not any("ADMISSION_REJECTED_PREWRITTEN" in e for e in events2)
+
+
 async def test_admission_rejection_writes_nothing(env):
     """A request rejected by the admission gate never started a turn, so the
     pre-write must not run (zero rows)."""

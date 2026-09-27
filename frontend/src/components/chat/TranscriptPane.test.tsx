@@ -88,6 +88,8 @@ vi.mock("@/hooks/useSendMessage");
 vi.mock("@/hooks/useChatHistory");
 vi.mock("@/lib/api", () => ({
   forkChatSession: vi.fn(),
+  truncateChatSession: vi.fn(),
+  getChatSession: vi.fn(),
 }));
 vi.mock("react-router-dom", () => ({
   useNavigate: () => mockNavigate,
@@ -109,9 +111,10 @@ vi.mock("./MessageBubble", () => ({
   ),
 }));
 vi.mock("./AssistantMessage", () => ({
-  AssistantMessage: ({ message, onFork }: { message: { id: string; role: string; content: string }; onFork?: () => void }) => (
+  AssistantMessage: ({ message, onRetry, onFork }: { message: { id: string; role: string; content: string }; onRetry?: () => void; onFork?: () => void }) => (
     <div data-testid="message-bubble" data-message-id={message.id}>
       {message.content}
+      {onRetry && <button type="button" aria-label={`Retry ${message.id}`} onClick={onRetry}>Retry</button>}
       {onFork && <button type="button" aria-label={`Fork ${message.id}`} onClick={onFork}>Fork</button>}
     </div>
   ),
@@ -153,7 +156,7 @@ vi.mock("@tanstack/react-virtual", () => ({
 
 import { useSendMessage, MAX_INPUT_LENGTH } from "@/hooks/useSendMessage";
 import { useChatHistory } from "@/hooks/useChatHistory";
-import { forkChatSession } from "@/lib/api";
+import { truncateChatSession, forkChatSession } from "@/lib/api";
 import { toast } from "sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
@@ -176,6 +179,7 @@ describe("TranscriptPane", () => {
   const mockSetInput = vi.fn();
   const mockHandleSend = vi.fn();
   const mockHandleStop = vi.fn();
+  const mockSendDirect = vi.fn();
   const mockRefreshHistory = vi.fn();
   const mockGetActiveVault = vi.fn();
   beforeEach(() => {
@@ -214,6 +218,10 @@ describe("TranscriptPane", () => {
     (useSendMessage as ReturnType<typeof vi.fn>).mockReturnValue({
       handleSend: mockHandleSend,
       handleStop: mockHandleStop,
+      // The retry continuation calls sendDirect after the truncate resolves;
+      // leaving it undefined made the continuation throw post-teardown (CI
+      // Frontend failure on the F-001 pin test).
+      sendDirect: mockSendDirect,
     });
 
     (useChatHistory as ReturnType<typeof vi.fn>).mockReturnValue({
@@ -285,8 +293,8 @@ describe("TranscriptPane", () => {
       mockChatState.activeChatId = "10";
       _mockMessageCount = 2;
       setMockMessages([
-        { id: "m1", role: "user", content: "Question" },
-        { id: "m2", role: "assistant", content: "Answer" },
+        { id: "m1", role: "user", content: "Question", seq: 1 },
+        { id: "m2", role: "assistant", content: "Answer", seq: 2 },
       ]);
 
       render(<TranscriptPane />);
@@ -294,7 +302,9 @@ describe("TranscriptPane", () => {
       await userEvent.dblClick(screen.getByLabelText("Fork m2"));
 
       expect(forkChatSession).toHaveBeenCalledTimes(1);
-      expect(forkChatSession).toHaveBeenCalledWith(10, 1);
+      // Issue #684: the fork anchors on the highest durable seq up to and
+      // including the clicked message, not the local positional index.
+      expect(forkChatSession).toHaveBeenCalledWith(10, { through_seq: 2 });
       await waitFor(() => expect(screen.queryByLabelText("Fork m2")).not.toBeInTheDocument());
 
       resolveFork({
@@ -338,6 +348,40 @@ describe("TranscriptPane", () => {
       expect(mockNavigate).toHaveBeenCalledWith("/chat/20");
     });
 
+    it("retry pins the full truncate precondition triple: keep_seq AND observed tail (issue #684 review F-001)", async () => {
+      // The third argument is the AC1 stale-view precondition's delivery
+      // mechanism: it is an OPTIONAL API parameter, so tsc/eslint stay silent
+      // if a regression drops it, and every other suite pins only the first
+      // two arguments (call-count or slice). This exact 3-arg pin is the one
+      // place a dropped or zeroed observed tail fails the suite. The id is
+      // the ABA-proof half: per-session seqs are reused after a resave, the
+      // tail row's PRIMARY KEY is not.
+      vi.mocked(truncateChatSession).mockResolvedValue({
+        remaining_count: 2,
+        tail_seq: 2,
+      });
+      mockChatState.activeChatId = "10";
+      _mockMessageCount = 4;
+      setMockMessages([
+        { id: "1", role: "user", content: "first question", seq: 1 },
+        { id: "2", role: "assistant", content: "first answer", seq: 2 },
+        { id: "3", role: "user", content: "second question", seq: 3 },
+        { id: "4", role: "assistant", content: "second answer", seq: 4 },
+      ]);
+
+      render(<TranscriptPane />);
+
+      await userEvent.click(screen.getByLabelText("Retry 4"));
+
+      await waitFor(() => expect(truncateChatSession).toHaveBeenCalledTimes(1));
+      // keep_seq = highest durable seq among kept rows (m1/m2) = 2;
+      // expected tail = the client's observed tail row: seq 4, server id 4.
+      expect(truncateChatSession).toHaveBeenCalledWith(10, 2, { seq: 4, id: 4 });
+      // Drain the post-truncate continuation (removeMessagesFrom + sendDirect)
+      // inside the test so it cannot throw after teardown.
+      await waitFor(() => expect(mockSendDirect).toHaveBeenCalledTimes(1));
+    });
+
     it("does not load the transcript when the fork response has no messages (issue #83)", async () => {
       vi.mocked(forkChatSession).mockResolvedValue({
         id: 99,
@@ -352,8 +396,8 @@ describe("TranscriptPane", () => {
       mockChatState.activeChatId = "10";
       _mockMessageCount = 2;
       setMockMessages([
-        { id: "m1", role: "user", content: "Question" },
-        { id: "m2", role: "assistant", content: "Answer" },
+        { id: "m1", role: "user", content: "Question", seq: 1 },
+        { id: "m2", role: "assistant", content: "Answer", seq: 2 },
       ]);
 
       render(<TranscriptPane />);
