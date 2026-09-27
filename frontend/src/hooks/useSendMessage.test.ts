@@ -103,9 +103,11 @@ describe("useSendMessage", () => {
     apiMocks.createChatSession.mockResolvedValue({ id: 42 });
     // Default batch save: user row gets id 100, assistant row id 101 (issue #507
     // realignment — the hook persists a turn via one addChatMessagesBatch call).
+    // Rows carry the server-issued seq per the add_messages_batch contract
+    // (issue #683): migrateId must store it so Retry/Edit anchor the truncate.
     apiMocks.addChatMessagesBatch.mockResolvedValue([
-      { id: 100, created_at: "2026-05-12T00:00:00Z" },
-      { id: 101, created_at: "2026-05-12T00:00:01Z" },
+      { id: 100, created_at: "2026-05-12T00:00:00Z", seq: 1 },
+      { id: 101, created_at: "2026-05-12T00:00:01Z", seq: 2 },
     ]);
     apiMocks.chatStream.mockImplementation((_messages: unknown, handlers: {
       onMessage: (chunk: string) => void;
@@ -138,6 +140,49 @@ describe("useSendMessage", () => {
       expect.objectContaining({ role: "user", content: "What changed?" }),
       expect.objectContaining({ role: "assistant" }),
     ]);
+  });
+
+  it("stores the server-issued seq, not a locally computed position (issue #683)", async () => {
+    // Non-positional server seqs: the server is free to assign any per-session
+    // sequence, so no locally computable value (1/2/3/4) can satisfy the
+    // assertions below. A "fix" that hardcodes the payload position instead
+    // of forwarding saveResult.seq fails here while passing positional
+    // fixtures — the implementation-review mutation probe.
+    const refreshHistory = vi.fn().mockResolvedValue(undefined);
+    apiMocks.addChatMessagesBatch
+      .mockReset()
+      .mockResolvedValueOnce([
+        { id: 100, created_at: "2026-05-12T00:00:00Z", seq: 7 },
+        { id: 101, created_at: "2026-05-12T00:00:01Z", seq: 9 },
+      ])
+      .mockResolvedValueOnce([
+        { id: 102, created_at: "2026-05-12T00:00:02Z", seq: 12 },
+        { id: 103, created_at: "2026-05-12T00:00:03Z", seq: 15 },
+      ]);
+
+    const { result } = renderHook(() => useSendMessage(7, refreshHistory));
+
+    useChatStore.setState({ input: "first question" });
+    await act(async () => {
+      await result.current.handleSend();
+    });
+    await waitFor(() => {
+      expect(refreshHistory).toHaveBeenCalledTimes(1);
+    });
+
+    useChatStore.setState({ input: "second question" });
+    await act(async () => {
+      await result.current.handleSend();
+    });
+    await waitFor(() => {
+      expect(refreshHistory).toHaveBeenCalledTimes(2);
+    });
+
+    const byId = useChatStore.getState().messagesById;
+    expect(byId["100"].seq).toBe(7);
+    expect(byId["101"].seq).toBe(9);
+    expect(byId["102"].seq).toBe(12);
+    expect(byId["103"].seq).toBe(15);
   });
 
   it("persists the FULL streamed assistant content (rAF batching must flush before persist — UI-PERF-2)", async () => {
@@ -622,8 +667,8 @@ describe("useSendMessage", () => {
       apiMocks.addChatMessagesBatch
         .mockReset()
         .mockResolvedValue([
-          { id: 200, created_at: "2026-06-01T00:00:00Z" },
-          { id: 201, created_at: "2026-06-01T00:00:01Z" },
+          { id: 200, created_at: "2026-06-01T00:00:00Z", seq: 1 },
+          { id: 201, created_at: "2026-06-01T00:00:01Z", seq: 2 },
         ]);
 
       const { result } = renderHook(() => useSendMessage(7, refreshHistory));
@@ -1016,8 +1061,8 @@ describe("useSendMessage", () => {
 
       await act(async () => {
         resolveBatch([
-          { id: 200, created_at: "2026-06-01T00:00:00Z" },
-          { id: 201, created_at: "2026-06-01T00:00:01Z" },
+          { id: 200, created_at: "2026-06-01T00:00:00Z", seq: 1 },
+          { id: 201, created_at: "2026-06-01T00:00:01Z", seq: 2 },
         ]);
         await pending;
       });

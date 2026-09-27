@@ -107,11 +107,12 @@ frontend-build-subpath:
 frontend-build-subpath-derived:
     cd frontend && MSYS_NO_PATHCONV=1 VITE_APP_BASENAME=/meridian npm run build
 
-# Quality contracts job (all seven scripts, CI order)
+# Quality contracts job (all eight scripts, CI order)
 quality-contracts:
     python scripts/check_runtime_contract.py
     python scripts/check_config_contract.py
     python scripts/check_settings_consumers.py
+    python scripts/check_batch_mock_seq.py
     python scripts/check_pr_scope_drift.py
     python scripts/check_sast_baseline.py
     python scripts/check_secretscan.py

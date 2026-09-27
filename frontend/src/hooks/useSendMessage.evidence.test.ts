@@ -71,8 +71,8 @@ describe("useSendMessage — evidence candidates", () => {
     useChatShellStore.setState({ sessionListRefreshToken: 0 });
     apiMocks.createChatSession.mockResolvedValue({ id: 42 });
     apiMocks.addChatMessagesBatch.mockResolvedValue([
-      { id: 100, created_at: "2026-09-06T00:00:00Z" },
-      { id: 101, created_at: "2026-09-06T00:00:01Z" },
+      { id: 100, created_at: "2026-09-06T00:00:00Z", seq: 1 },
+      { id: 101, created_at: "2026-09-06T00:00:01Z", seq: 2 },
     ]);
   });
 
