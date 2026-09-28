@@ -117,19 +117,79 @@ def migrate_uploads(dry_run: bool = False) -> MigrationResult:
             shutil.copy2(f, dest_path)
 
             # Verify size match
-            if f.stat().st_size == dest_path.stat().st_size:
-                # Rename source instead of deleting - safe backup
-                backup_path = f.with_suffix(f.suffix + ".migrated")
-                f.rename(backup_path)
-                migrated += 1
-                logger.debug(f"Migrated {f.name} to vault {vault_id}")
-            else:
+            if f.stat().st_size != dest_path.stat().st_size:
                 dest_path.unlink()  # Rollback copy
                 failed.append(f.name)
                 logger.warning(f"Size mismatch for {f.name}, skipping")
+                continue
+
+            # Rename source instead of deleting - safe backup
+            backup_path = f.with_suffix(f.suffix + ".migrated")
+            f.rename(backup_path)
         except Exception as e:
             failed.append(f.name)
             logger.error(f"Failed to migrate {f.name}: {e}")
+            continue
+
+        # The bytes are committed to the new location; move the row with them
+        # in the same logical operation (issue #692 / R2-L3-C01). Keyed by the
+        # exact source path so only the row(s) that named these bytes are
+        # rewritten — never same-name rows in other vaults or rows pointing
+        # at other legitimate roots.
+        try:
+            _set_file_row_path(str(f), str(dest_path))
+        except Exception as e:
+            failed.append(f.name)
+            if backup_path.exists():
+                if f.exists():
+                    # Path.rename replaces silently on POSIX, so an explicit
+                    # guard is the only cross-platform way to detect that the
+                    # source name reappeared (concurrent upload/restore). The
+                    # only surviving copy stays at dest_path — never unlink
+                    # it; the logged paths let an operator repair the row.
+                    logger.error(
+                        "Migration row update failed for %s AND the source "
+                        "name %s reappeared; bytes remain at %s while the "
+                        "row still names the reappeared file — manual row "
+                        "repair needed (update error: %s)",
+                        f.name,
+                        f,
+                        dest_path,
+                        e,
+                    )
+                else:
+                    try:
+                        # Restore the source name FIRST; only then is it safe
+                        # to drop the copy. A failed restore keeps the bytes
+                        # at dest_path for the same never-delete-the-only-copy
+                        # reason.
+                        backup_path.rename(f)
+                        dest_path.unlink()
+                        logger.error(
+                            "Migration row update failed for %s; reverted the "
+                            "bytes to the legacy path the row still names: %s",
+                            f.name,
+                            e,
+                        )
+                    except OSError as restore_exc:
+                        logger.error(
+                            "Migration row update failed for %s AND the "
+                            "source restore failed (%s); bytes remain at %s "
+                            "while the row still names %s — manual row repair "
+                            "needed",
+                            f.name,
+                            restore_exc,
+                            dest_path,
+                            f,
+                        )
+            else:
+                logger.error(
+                    "Migration row update failed for %s: %s", f.name, e
+                )
+            continue
+
+        migrated += 1
+        logger.debug(f"Migrated {f.name} to vault {vault_id}")
 
     logger.info(
         f"Migration complete: {migrated}/{len(old_files)} files migrated, {len(failed)} failed"
@@ -157,6 +217,28 @@ def _lookup_vault_id(filename: str) -> int:
         if row:
             return row[0]
         raise ValueError(f"Could not determine vault_id for file: {filename}")
+    finally:
+        pool.release_connection(conn)
+
+
+def _set_file_row_path(old_path: str, new_path: str) -> None:
+    """Point the files row(s) naming ``old_path`` at ``new_path``.
+
+    The durable bookkeeping half of every on-disk upload move (issue #692 /
+    R2-L3-C01): the two stores must never disagree about where the bytes
+    live. Keyed by the exact stored path so only the row(s) that named the
+    moved bytes are rewritten.
+    """
+    from app.models.database import get_pool
+
+    pool = get_pool(str(settings.sqlite_path), max_size=settings.db_pool_max_size)
+    conn = pool.get_connection()
+    try:
+        conn.execute(
+            "UPDATE files SET file_path = ? WHERE file_path = ?",
+            (new_path, old_path),
+        )
+        conn.commit()
     finally:
         pool.release_connection(conn)
 
@@ -203,9 +285,18 @@ def rollback_migration() -> dict:
 
             try:
                 shutil.move(str(f), str(dest))
-                results["moved"].append(str(f))
             except Exception as e:
                 results["failed"].append(f"{f}: {e}")
+                continue
+            results["moved"].append(str(f))
+            # Row moves with the bytes (issue #692 / R2-L3-C01): rows pointing
+            # at the vault location follow it back to the flat directory —
+            # including collision-renamed destinations, which update to the
+            # actual new name. Best-effort: a failure is recorded, not raised.
+            try:
+                _set_file_row_path(str(f), str(dest))
+            except Exception as e:
+                results["failed"].append(f"{f}: row update failed: {e}")
 
     logger.info(
         f"Rollback complete: {len(results['moved'])} moved, {len(results['skipped'])} skipped, {len(results['failed'])} failed"

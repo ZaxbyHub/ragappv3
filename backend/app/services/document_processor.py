@@ -1598,6 +1598,28 @@ class DocumentProcessor:
             return f"status '{current_status}' is no longer retry-eligible"
         return None
 
+    def _raise_if_file_row_missing(self, file_id: int) -> None:
+        """Abort an in-flight generation when its ``files`` row was deleted.
+
+        A vault delete racing this worker must not end with the vector store
+        holding chunks for a row (and vault) that no longer exists, with no
+        tombstone (issue #692 / T1-21-S2-10). Mirrors the row-gone branch of
+        ``_retry_staleness_reason`` at the last durable write: called right
+        before the vector write, it closes the whole parse/embed span.
+        """
+        conn = self.pool.get_connection()
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM files WHERE id = ?", (file_id,)
+            ).fetchone()
+        finally:
+            self.pool.release_connection(conn)
+        if row is None:
+            raise DocumentProcessingError(
+                "File row removed mid-ingest (vault deleted); "
+                "discarding this generation"
+            )
+
     async def _live_vector_count(self, file_id: int) -> Optional[int]:
         """Live vector count for a file, or None when unavailable (W15).
 
@@ -3464,6 +3486,12 @@ class DocumentProcessor:
                         percent=0.0,
                     )
 
+                    # Last durable-write staleness gate (issue #692 /
+                    # T1-21-S2-10): mirror the process_existing_file guard —
+                    # a vault delete that committed during this worker's
+                    # parse/embed span must not receive chunks for a row that
+                    # no longer exists.
+                    self._raise_if_file_row_missing(file_id)
                     # Initialize vector table with embedding dimension and add chunks
                     embedding_dim = len(embeddings[0])
                     stage_started_at = time.monotonic()
@@ -3972,6 +4000,13 @@ class DocumentProcessor:
 
                     embedding_dim = len(embeddings[0])
                     stage_started_at = time.monotonic()
+                    # Last durable-write staleness gate (issue #692 /
+                    # T1-21-S2-10): a vault delete may have committed while
+                    # this worker parsed/embedded. Discard the generation
+                    # instead of writing chunks for a row that no longer
+                    # exists. Covers bare and vector_target (staged rebuild)
+                    # calls alike, and every parse branch funnels through here.
+                    self._raise_if_file_row_missing(file_id)
                     # [W8/W13 contract] Thread the optional rebuild target into
                     # every vector-store call below as a trailing ``target=``
                     # argument (dimension-migrating reindex); omitted entirely

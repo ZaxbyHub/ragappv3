@@ -2585,6 +2585,17 @@ class BackgroundProcessor:
                 atom_ids=[aid for aid in batch_atom_ids if aid],
             )
         stale_ids = [pid for pid in prior_ids if pid not in new_ids]
+        # Last-write staleness gate (issue #692 / T1-21-S2-10): the embedding
+        # awaits above straddled generations, so a vault/file delete may have
+        # committed meanwhile — proxy vectors must not land for a files row
+        # that no longer exists, with no tombstone to sweep them.
+        try:
+            self.processor._raise_if_file_row_missing(file_id)
+        except DocumentProcessingError:
+            logger.info(
+                "Skipping proxy vector write for deleted file_id=%s", file_id
+            )
+            return
         await vec_store.add_chunks_then_delete_ids(new_records, stale_ids)
         # Record the new proxy vector ids in the derived table. Records are only
         # persisted when the atom's current derived-record fingerprint still

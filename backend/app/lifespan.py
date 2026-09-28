@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import sqlite3
+import time
 from contextlib import asynccontextmanager
 from typing import Union, get_args, get_origin
 
@@ -589,11 +590,23 @@ async def lifespan(app: FastAPI):
         )
 
     # Migrate uploads to per-vault directories (run before accepting requests)
+    # [issue #692 / P03-SK2-06] No asyncio.wait_for here: it cancels only the
+    # awaiting coroutine, never the to_thread worker, so a timeout would let
+    # the migration keep copying/renaming while the server serves requests —
+    # and resolve_any() could hand out a partially-written destination. The
+    # await below genuinely blocks startup until the migration completes,
+    # which is what the comment above promises. A failure still must not
+    # brick boot (try/except below, unchanged).
     try:
         from app.services.upload_path import migrate_uploads
 
         logger.info("Checking for upload migration...")
-        await asyncio.wait_for(asyncio.to_thread(migrate_uploads, False), timeout=15)
+        _migration_started = time.monotonic()
+        await asyncio.to_thread(migrate_uploads, False)
+        logger.info(
+            "Upload migration finished in %.1fs",
+            time.monotonic() - _migration_started,
+        )
     except Exception as e:
         logger.warning(f"Upload migration failed (continuing anyway): {e}")
 
