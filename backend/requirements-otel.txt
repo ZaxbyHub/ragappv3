@@ -10,6 +10,6 @@
 # packages carry (open-telemetry/semantic-conventions-genai) are Development
 # status with no stable release as of 2026-09 — do not describe them as
 # stable, and bump pins consciously.
-opentelemetry-api==1.29.0
-opentelemetry-sdk==1.29.0
-opentelemetry-exporter-otlp-proto-http==1.29.0
+opentelemetry-api==1.44.0
+opentelemetry-sdk==1.44.0
+opentelemetry-exporter-otlp-proto-http==1.44.0
