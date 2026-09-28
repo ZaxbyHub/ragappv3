@@ -53,10 +53,12 @@ Workstream A PR 3 of 7 (audit remediation, frontier audit 2026-09-23).
 
 - Navigating to the New chat surface (`/chat`) while an answer is streaming
   now aborts that stream and clears the transcript, matching the session
-  rail's New chat button; the turn is persisted as interrupted by the same
-  durable path as Stop. This is disclosed deliberately (external review
-  F-001): previously the URL, the shell and the store could keep pointing at
-  different sessions after this navigation.
+  rail's New chat button. Nothing is written client-side for that in-flight
+  turn; the server's detached producer keeps generating after the client
+  abort and later saves the answer as a normal completed turn, so it
+  reappears when the session is reopened (external review F-001). This is
+  disclosed deliberately: previously the URL, the shell and the store could
+  keep pointing at different sessions after this navigation.
 - A failed feedback-mirror migration (storage unavailable) no longer marks a
   saved exchange as failed; the vote may remain under its old key until the
   1000-key prune or a re-vote rewrites it.
