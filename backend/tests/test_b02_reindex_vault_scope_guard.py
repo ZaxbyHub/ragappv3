@@ -19,6 +19,7 @@ rebuild (``begin_attempts == 1``), re-embeds vault 1's file, and completes —
 leaving vault 2 lying indexed.
 """
 
+import shutil
 import sqlite3
 import unittest
 from pathlib import Path
@@ -71,6 +72,9 @@ class _RecordingVectorStore:
 class ReindexVaultScopeGuardTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         tmp = Path(mkdtemp(prefix="b02-vaultscope-"))
+        # Registered FIRST so (LIFO) it runs LAST, after the connection and
+        # pool have been closed and the sqlite/lancedb files are unlockable.
+        self.addCleanup(shutil.rmtree, tmp, True)
         self.db_path = tmp / "app.db"
         run_migrations(str(self.db_path))
         self.conn = _connect(str(self.db_path))

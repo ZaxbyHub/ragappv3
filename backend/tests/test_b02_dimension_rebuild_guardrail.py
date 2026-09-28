@@ -20,6 +20,7 @@ and raises nothing).
 from __future__ import annotations
 
 import sqlite3
+from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -253,8 +254,9 @@ async def test_scan_probe_refuses_before_any_write(tmp_path: Path) -> None:
 
     patches = _scan_harness_patches(processor, tmp_path, "hashgrdscan")
     try:
-        with patches[0], patches[1], patches[2], patches[3], patches[4], \
-                patches[5], patches[6], patches[7], patches[8], patches[9]:
+        with ExitStack() as stack:
+            for cm in patches:
+                stack.enter_context(cm)
             with pytest.raises(EmbeddingDimensionChangedError) as excinfo:
                 await processor.process_file(
                     str(scan_path), vault_id=1, source="scan"
@@ -307,17 +309,15 @@ async def test_upload_refusal_persists_dimension_changed_code(
 
     processor = _processor(pool, store)
     patches = _scan_harness_patches(processor, tmp_path, "hashgrdup2")
-    try:
-        with patches[0], patches[1], patches[2], patches[3], patches[4], \
-                patches[5], patches[6], patches[7], patches[8], patches[9]:
-            with pytest.raises(EmbeddingDimensionChangedError):
-                await processor.process_existing_file(
-                    file_id=file_id,
-                    file_path=str(tmp_path / "up.txt"),
-                    vault_id=1,
-                )
-    finally:
-        pass
+    with ExitStack() as stack:
+        for cm in patches:
+            stack.enter_context(cm)
+        with pytest.raises(EmbeddingDimensionChangedError):
+            await processor.process_existing_file(
+                file_id=file_id,
+                file_path=str(tmp_path / "up.txt"),
+                vault_id=1,
+            )
 
     conn = sqlite3.connect(db_path)
     row = conn.execute(

@@ -92,6 +92,19 @@ async def _table_dim(store) -> int:  # noqa: ANN001
     return int(field.type.list_size)
 
 
+def _cleanup_tmp(*paths) -> None:  # noqa: ANN001
+    """Best-effort rmtree of the part's mkdtemp dirs (issue #691 review).
+
+    Pools/stores may still hold open handles on Windows, so failures to
+    delete are ignored -- this reduces residue, it cannot add failures.
+    """
+    import shutil
+
+    for path in paths:
+        if path is not None:
+            shutil.rmtree(path, ignore_errors=True)
+
+
 async def _reprocess_file(store, pool, db_vault_id: int, file_id: int, upload_path: Path, new_dim: int, vector_target=None):  # noqa: ANN001, ANN202
     """Drive the ingest step for one file.
 
@@ -149,6 +162,9 @@ async def _scenario() -> tuple[str, str, str, str]:
         VectorStore,
     )
 
+    tmp2: Path | None = None
+    tmp3: Path | None = None
+    tmp4: Path | None = None
     tmp = Path(tempfile.mkdtemp(prefix="c9_db_"))
     db_path = str(tmp / "app.db")
     init_db(db_path)
@@ -188,6 +204,7 @@ async def _scenario() -> tuple[str, str, str, str]:
         await store.add_chunks([_record(f"{file_id}_0", file_id, "seed content", OLD_DIM)])
         seeded_count = await store.count_by_file(str(file_id))
         if seeded_count != 1:
+            _cleanup_tmp(tmp)
             return f"harness invalid: seeded index has {seeded_count} rows", "", "", ""
 
         # ---- Part 1: bare-call dimension change must FAIL CLOSED (#691) ----
@@ -277,6 +294,7 @@ async def _scenario() -> tuple[str, str, str, str]:
         await store2.add_chunks([_record(f"{file_id2}_0", file_id2, "seed content two", OLD_DIM)])
         old_count = await store2.count_by_file(str(file_id2))
         if old_count != 1:
+            _cleanup_tmp(tmp, tmp2)
             return (
                 part1_reason,
                 f"harness invalid: second seed has {old_count} rows",
@@ -332,6 +350,7 @@ async def _scenario() -> tuple[str, str, str, str]:
         )
         baseline3 = await store3.count_by_file(str(file_id3))
         if baseline3 != 2:
+            _cleanup_tmp(tmp, tmp2, tmp3)
             return (
                 part1_reason,
                 part2_reason,
@@ -441,6 +460,7 @@ async def _scenario() -> tuple[str, str, str, str]:
         await store4.add_chunks([_record(f"{file_id4}_0", file_id4, "old-gen four", OLD_DIM)])
         baseline4 = await store4.count_by_file(str(file_id4))
         if baseline4 != 1:
+            _cleanup_tmp(tmp, tmp2, tmp3, tmp4)
             return (
                 part1_reason,
                 part2_reason,
@@ -455,6 +475,7 @@ async def _scenario() -> tuple[str, str, str, str]:
         )
         temp_rows4 = await handle4.table.count_rows()
         if temp_rows4 < 1:
+            _cleanup_tmp(tmp, tmp2, tmp3, tmp4)
             return (
                 part1_reason,
                 part2_reason,
@@ -488,6 +509,7 @@ async def _scenario() -> tuple[str, str, str, str]:
                 f"behind (tables: {table_names4})"
             )
 
+    _cleanup_tmp(tmp, tmp2, tmp3, tmp4)
     return part1_reason, part2_reason, part3_reason, part4_reason
 
 
