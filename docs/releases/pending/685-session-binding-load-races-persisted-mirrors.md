@@ -45,8 +45,21 @@ Workstream A PR 3 of 7 (audit remediation, frontier audit 2026-09-23).
   as failed.
 - **Pinned sessions sync across tabs** (T1-13-S2-11). Toggling a pin
   re-reads localStorage first, and a `storage` event from another tab
-  replaces the in-memory list, so one tab's pins are no longer silently
-  overwritten by another tab's stale copy.
+  replaces the in-memory list (including removals and clears of the key), so
+  one tab's pins are no longer silently overwritten by another tab's stale
+  copy.
+
+## Behavior notes
+
+- Navigating to the New chat surface (`/chat`) while an answer is streaming
+  now aborts that stream and clears the transcript, matching the session
+  rail's New chat button; the turn is persisted as interrupted by the same
+  durable path as Stop. This is disclosed deliberately (external review
+  F-001): previously the URL, the shell and the store could keep pointing at
+  different sessions after this navigation.
+- A failed feedback-mirror migration (storage unavailable) no longer marks a
+  saved exchange as failed; the vote may remain under its old key until the
+  1000-key prune or a re-vote rewrites it.
 
 ## Verification
 

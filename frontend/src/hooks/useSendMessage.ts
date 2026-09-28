@@ -17,6 +17,7 @@ import { useChatModeStore } from "@/stores/useChatModeStore";
 import { useChatShellStore } from "@/stores/useChatShellStore";
 import { useLlmHealthStore } from "@/stores/useLlmHealthStore";
 import { useSettingsStore } from "@/stores/useSettingsStore";
+import { readFeedbackVote, writeFeedbackVote } from "@/lib/chatFeedbackStorage";
 import { computeEffectiveChatMode } from "@/lib/chatMode";
 import type { UsedMemory } from "@/lib/api";
 import useCoalescedAppend from "./useCoalescedAppend";
@@ -27,6 +28,15 @@ import useCoalescedAppend from "./useCoalescedAppend";
 // RAG prompts; larger paste-sized input is routed to attachments by the
 // Composer instead (LARGE_PASTE_THRESHOLD).
 export const MAX_INPUT_LENGTH = 100_000;
+
+// Issue #685 (PRR-001): the in-flight turn's persistence handle lives at
+// MODULE scope, not only on the hook instance. The first send from /chat
+// navigates to /chat/:id, and PageShell keys the page content by pathname —
+// ChatShell (and this hook) remount mid-turn, so an instance ref would be
+// null in the remounted handleStop and Stop would silently skip persistStop.
+// The module slot survives the remount; it is single-slot because sendingRef
+// makes turns strictly sequential.
+let activeTurnPersistence: CurrentTurnPersistence | null = null;
 
 export interface UseSendMessageReturn {
   handleSend: () => Promise<void>;
@@ -131,6 +141,11 @@ export function useSendMessage(
 
       const currentState = useChatStore.getState();
       let sessionId: number;
+      // Issue #685 / external review F-004: only a send that actually CREATED
+      // a session may fire the binding callback — follow-up sends on an
+      // existing session must not re-navigate (a session switch racing the
+      // create would otherwise bounce the user back to the created id).
+      let createdSession = false;
 
       if (currentState.activeChatId) {
         sessionId = parseInt(currentState.activeChatId);
@@ -146,6 +161,7 @@ export function useSendMessage(
           const newSession = await createChatSession({ vault_id: activeVaultId });
           sessionId = newSession.id;
           useChatStore.setState({ activeChatId: newSession.id.toString() });
+          createdSession = true;
         } catch (err) {
           console.error("Failed to create chat session:", err);
           const status = (err as { response?: { status?: number } })?.response?.status;
@@ -170,8 +186,10 @@ export function useSendMessage(
       // Issue #685: a newly created session must be bound across ALL identity
       // mirrors (chat store, shell store, URL) before any continuation runs.
       // Invoked after the generation check so a send stopped during session
-      // creation does not navigate.
-      onSessionCreated?.(sessionId.toString());
+      // creation does not navigate, and only for created sessions (F-004).
+      if (createdSession) {
+        onSessionCreated?.(sessionId.toString());
+      }
 
       const turnId =
         typeof crypto !== "undefined" && "randomUUID" in crypto
@@ -271,19 +289,19 @@ export function useSendMessage(
           updateMessage(oldId, { saveState: "saved", seq: saveResult.seq });
           return;
         }
-        // Issue #685 (T1-13-K-07): the feedback mirror is best-effort — a
-        // storage exception while renaming the key must never fail the
-        // durable save that already succeeded server-side.
+        // Issue #685 (external review F-009): route the mirror rename through
+        // the shared guarded helpers so the key format has one source of
+        // truth; a storage exception here must never fail the durable save
+        // that already succeeded server-side (best-effort mirror).
         try {
-          const feedbackKey = `chat_feedback_${oldId}`;
-          const feedbackValue = localStorage.getItem(feedbackKey);
-          if (feedbackValue !== null) {
-            localStorage.setItem(`chat_feedback_${dbId}`, feedbackValue);
-            localStorage.removeItem(feedbackKey);
+          const vote = readFeedbackVote(oldId);
+          if (vote !== null) {
+            writeFeedbackVote(dbId, vote);
+            writeFeedbackVote(oldId, null);
           }
         } catch {
-          // Mirror migration failed (quota/security/unavailable storage) — the
-          // save itself is durable; the vote simply stays under the old key.
+          // Helpers already guard; this is belt-and-braces for any unexpected
+          // storage surface — the vote simply stays under the old key.
         }
         replaceMessageId(oldId, dbId, {
           created_at: saveResult.created_at,
@@ -458,11 +476,13 @@ export function useSendMessage(
             candidateSources: undefined,
           });
           currentTurnPersistenceRef.current = null;
+          if (activeTurnPersistence === turnPersistence) activeTurnPersistence = null;
           void persistTurn("interrupted", { allowEmptyAssistant: true });
         },
         persistPagehide: () => {
           if (!claimTurnPersistence()) return;
           currentTurnPersistenceRef.current = null;
+          if (activeTurnPersistence === turnPersistence) activeTurnPersistence = null;
           void persistTurn("interrupted", {
             allowEmptyAssistant: true,
             keepalive: true,
@@ -470,10 +490,14 @@ export function useSendMessage(
         },
       };
       currentTurnPersistenceRef.current = turnPersistence;
+      activeTurnPersistence = turnPersistence;
 
       const clearTurnPersistence = () => {
         if (currentTurnPersistenceRef.current === turnPersistence) {
           currentTurnPersistenceRef.current = null;
+        }
+        if (activeTurnPersistence === turnPersistence) {
+          activeTurnPersistence = null;
         }
       };
 
@@ -844,7 +868,12 @@ export function useSendMessage(
     // pressed during session creation has no stream to abort, and without
     // this bump the send would start generating once creation resolved.
     sendGenRef.current += 1;
-    currentTurnPersistenceRef.current?.persistStop();
+    // Issue #685 (PRR-001): the mounted instance may be a REMOUNT (PageShell
+    // keys page content by pathname, so the first-send navigate replaces the
+    // hook) whose ref never saw the in-flight turn — the module slot still
+    // holds it, so Stop persists the interrupted turn across the remount.
+    const persistence = currentTurnPersistenceRef.current ?? activeTurnPersistence;
+    persistence?.persistStop();
     useChatStore.getState().stopStreaming();
     sendingRef.current = false;
   }, []);
@@ -885,7 +914,11 @@ export function useSendMessage(
 
   useEffect(() => {
     const handlePagehide = () => {
-      currentTurnPersistenceRef.current?.persistPagehide();
+      // Issue #685 (PRR-001): fall back to the module slot — a PageShell
+      // remount replaces this instance before pagehide, and the surviving
+      // handle (installed by the pre-remount send) must still fire.
+      const persistence = currentTurnPersistenceRef.current ?? activeTurnPersistence;
+      persistence?.persistPagehide();
     };
     window.addEventListener("pagehide", handlePagehide);
     return () => window.removeEventListener("pagehide", handlePagehide);

@@ -8,6 +8,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { BrowserRouter, Routes, Route } from "react-router-dom";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import ChatShell from "./ChatShell";
 import { useChatStore } from "@/stores/useChatStore";
 import { useChatShellStore } from "@/stores/useChatShellStore";
@@ -68,12 +69,19 @@ const TEST_VAULT: Vault = { id: 1, name: "Test Vault", file_count: 5 } as Vault;
 
 function renderChatShellRoutes(): void {
   render(
-    <BrowserRouter>
-      <Routes>
-        <Route path="/chat" element={<ChatShell />} />
-        <Route path="/chat/:sessionId" element={<ChatShell />} />
-      </Routes>
-    </BrowserRouter>
+    // QueryClientProvider: once a turn's rows migrate to numeric server ids,
+    // AssistantMessage's CanvasEntryPoints bridge mounts a react-query hook —
+    // without a client the ErrorBoundary replaces the whole chat area.
+    <QueryClientProvider
+      client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
+    >
+      <BrowserRouter>
+        <Routes>
+          <Route path="/chat" element={<ChatShell />} />
+          <Route path="/chat/:sessionId" element={<ChatShell />} />
+        </Routes>
+      </BrowserRouter>
+    </QueryClientProvider>
   );
 }
 
@@ -290,5 +298,60 @@ describe("ChatShell session load retry behavior (issue #685)", () => {
     const state = useChatStore.getState();
     expect(state.activeChatId).toBeNull();
     expect(state.messageIds).toEqual([]);
+  });
+
+  it("stop during a live stream shows the interrupted banner (PRR-004 DOM path)", async () => {
+    // Review finding PRR-004: no unit test clicked Stop and asserted the
+    // banner. chatStream stays pending (the e2e "SLOW" shape) so the turn is
+    // live when Stop is clicked; persistStop must stamp the assistant row
+    // interrupted and TranscriptPane must render its status banner.
+    addChatMessagesBatchMock.mockResolvedValue([
+      { id: 100, created_at: "2026-05-12T00:00:00Z", seq: 1 },
+      { id: 101, created_at: "2026-05-12T00:00:01Z", seq: 2 },
+    ]);
+    // One chunk then silence: the e2e "SLOW" shape (a content-less assistant
+    // row is never persisted — LIVE-01).
+    chatStreamMock.mockImplementation(
+      (
+        _messages: unknown,
+        handlers: {
+          onMessage: (chunk: string) => void;
+        }
+      ) => {
+        handlers.onMessage("partial answer");
+        return vi.fn();
+      }
+    );
+
+    window.history.pushState({}, "", "/chat");
+    renderChatShellRoutes();
+
+    const composer = screen.getByLabelText("Message input");
+    fireEvent.change(composer, { target: { value: "SLOW: tell me more" } });
+    await act(async () => {
+      fireEvent.keyDown(composer, { key: "Enter" });
+    });
+
+    await waitFor(() => {
+      expect(useChatStore.getState().isStreaming).toBe(true);
+      expect(useChatStore.getState().messageIds.length).toBe(2);
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Stop generating" }));
+    });
+
+    await waitFor(() => {
+      expect(
+        document.querySelector('[data-interrupted-status="interrupted"]')
+      ).not.toBeNull();
+    });
+    // The durable path ran for the interrupted turn.
+    await waitFor(() => {
+      expect(addChatMessagesBatchMock).toHaveBeenCalledWith(
+        8,
+        expect.arrayContaining([expect.objectContaining({ status: "interrupted" })])
+      );
+    });
   });
 });

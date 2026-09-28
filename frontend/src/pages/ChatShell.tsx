@@ -3,7 +3,6 @@ import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { cn } from "@/lib/utils";
 import { getChatSession } from "@/lib/api";
 import { mapSessionMessage } from "@/lib/chatMessageMapper";
-import { AlertTriangle } from "lucide-react";
 import { useChatShellStore } from "@/stores/useChatShellStore";
 import { useChatMessages, useChatStore, type Message } from "@/stores/useChatStore";
 import { useChatModeStore } from "@/stores/useChatModeStore";
@@ -29,7 +28,7 @@ import {
   SheetDescription,
   SheetClose,
 } from "@/components/ui/sheet";
-import { PanelLeft, PanelRight, Download, X } from "lucide-react";
+import { PanelLeft, PanelRight, Download, X, AlertTriangle } from "lucide-react";
 
 function useIsMobile(breakpoint = 768) {
   const [isMobile, setIsMobile] = useState(
@@ -296,10 +295,16 @@ export default function ChatShell() {
     [navigate]
   );
   useEffect(() => {
-    // Issue #685 (T1-13-S-02): invalidate ANY in-flight load on every re-run,
-    // including the early-return branches below — navigating back to a
-    // store-held session (or to New chat) must drop a still-pending fetch
-    // for another session, not just a fetch superseded by a newer fetch.
+    // Issue #685 (external review F-003): the already-loading fast path runs
+    // BEFORE the token bump — a re-run for the exact session whose fetch is
+    // in flight must not discard that fetch (StrictMode's dev double-mount
+    // would otherwise blank the transcript). Every OTHER re-run still bumps,
+    // so a fetch superseded by a newer selection or by New chat is dropped.
+    if (sessionId && sessionId === loadedSessionRef.current) return;
+    // Issue #685 (T1-13-S-02): invalidate ANY in-flight load on every other
+    // re-run — navigating back to a store-held session (or to New chat) must
+    // drop a still-pending fetch for another session, not just a fetch
+    // superseded by a newer fetch.
     const seq = ++loadSeqRef.current;
     setSessionLoadError(null);
     if (!sessionId) {
@@ -315,7 +320,6 @@ export default function ChatShell() {
       newChatAction?.();
       return;
     }
-    if (sessionId === loadedSessionRef.current) return;
     // Don't reload if we already have messages for this session
     const { activeChatId } = useChatStore.getState();
     if (activeChatId === sessionId) {
