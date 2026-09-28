@@ -11,6 +11,7 @@ export interface MemoryResult {
   content: string;
   metadata?: Record<string, unknown>;
   score?: number;
+  updated_at?: string | null;
 }
 
 export interface AddMemoryRequest {
@@ -32,9 +33,10 @@ export interface SearchMemoriesResponse {
 
 export interface UpdateMemoryRequest {
   content?: string;
-  category?: string;
-  tags?: string;
-  source?: string;
+  category?: string | null;
+  tags?: string | null;
+  source?: string | null;
+  expected_updated_at?: string;
 }
 
 export async function searchMemories(

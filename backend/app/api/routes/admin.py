@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import hmac
+import logging
 import sqlite3
 from datetime import datetime, timezone
 
@@ -22,6 +23,8 @@ from app.services.secret_manager import SecretManager
 from app.services.toggle_manager import ToggleManager
 
 router = APIRouter(prefix="/admin", tags=["admin"])
+
+logger = logging.getLogger(__name__)
 
 
 class TogglePayload(BaseModel):
@@ -115,8 +118,9 @@ async def set_toggle(
             auth.get("user_id"),
             request.client.host if request.client else None,
         )
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to compute audit HMAC: {exc}")
+    except Exception:
+        logger.exception("Failed to compute audit HMAC for feature toggle")
+        raise HTTPException(status_code=500, detail="Failed to compute audit HMAC")
     try:
         await asyncio.to_thread(
             _write_toggle_with_audit,
@@ -130,8 +134,9 @@ async def set_toggle(
             hmac_digest,
             timestamp,
         )
-    except sqlite3.Error as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to update toggle: {exc}")
+    except sqlite3.Error:
+        logger.exception("Failed to update feature toggle")
+        raise HTTPException(status_code=500, detail="Failed to update toggle")
     request.app.state.model_validation = await asyncio.to_thread(
         toggle_manager.get_toggle, "model_validation", settings.enable_model_validation
     )
@@ -167,9 +172,10 @@ async def set_maintenance(
             auth.get("user_id"),
             ip,
         )
-    except Exception as exc:
+    except Exception:
+        logger.exception("Failed to compute audit HMAC for maintenance flag")
         raise HTTPException(
-            status_code=500, detail=f"Failed to compute audit HMAC: {exc}"
+            status_code=500, detail="Failed to compute audit HMAC"
         )
     try:
         await asyncio.to_thread(
@@ -184,8 +190,9 @@ async def set_maintenance(
                 timestamp=timestamp,
             ),
         )
-    except sqlite3.Error as exc:
+    except sqlite3.Error:
+        logger.exception("Failed to update maintenance flag")
         raise HTTPException(
-            status_code=500, detail=f"Failed to update maintenance flag: {exc}"
+            status_code=500, detail="Failed to update maintenance flag"
         )
     return await asyncio.to_thread(_maintenance_response, service)

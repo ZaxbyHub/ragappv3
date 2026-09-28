@@ -145,7 +145,7 @@ DOC_PYTHON_RE = re.compile(r"(?i)\bpython\s*[\s:.@]*?(\d+\.\d+)")
 # pin written in package.json style must still be caught.
 DOC_VITEST_RE = re.compile(r"(?i)\bvitest\b[ @()<>=+^~v]*(\d+)(?:\.(\d+|x))?\b")
 DOC_VITE_RE = re.compile(r"(?i)\bvite\b[ @()<>=+^~v]*(\d+)(?:\.(\d+|x))?\b")
-DOC_SCRIPT_RE = re.compile(r"scripts/check_[a-z_]+\.py")
+DOC_SCRIPT_RE = re.compile(r"scripts/check_[a-z0-9_]+\.py")
 
 
 def read(relative_path: str) -> str:
