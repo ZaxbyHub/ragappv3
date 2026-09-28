@@ -55,7 +55,8 @@ interface CurrentTurnPersistence {
 
 export function useSendMessage(
   activeVaultId: number | null,
-  refreshHistory: (force?: boolean) => Promise<void>
+  refreshHistory: (force?: boolean) => Promise<void>,
+  options?: { onSessionCreated?: (sessionId: string) => void }
 ): UseSendMessageReturn {
   // Actions only, resolved once: zustand action references are stable for
   // the store's lifetime, and taking them via getState() avoids subscribing
@@ -94,6 +95,11 @@ export function useSendMessage(
   // Lifecycle persistence is owned by this hook so navigation aborts can
   // continue discarding old-session work through the shared store path.
   const currentTurnPersistenceRef = useRef<CurrentTurnPersistence | null>(null);
+
+  // Issue #685: optional binding callback for a session created by the first
+  // send. Extracted so sendCore depends on the function identity, not the
+  // options object.
+  const onSessionCreated = options?.onSessionCreated;
 
   /**
    * Core send primitive. Accepts content and a history snapshot directly so
@@ -160,6 +166,12 @@ export function useSendMessage(
         // do not append any message (no dangling assistant bubble).
         return;
       }
+
+      // Issue #685: a newly created session must be bound across ALL identity
+      // mirrors (chat store, shell store, URL) before any continuation runs.
+      // Invoked after the generation check so a send stopped during session
+      // creation does not navigate.
+      onSessionCreated?.(sessionId.toString());
 
       const turnId =
         typeof crypto !== "undefined" && "randomUUID" in crypto
@@ -259,11 +271,19 @@ export function useSendMessage(
           updateMessage(oldId, { saveState: "saved", seq: saveResult.seq });
           return;
         }
-        const feedbackKey = `chat_feedback_${oldId}`;
-        const feedbackValue = localStorage.getItem(feedbackKey);
-        if (feedbackValue !== null) {
-          localStorage.setItem(`chat_feedback_${dbId}`, feedbackValue);
-          localStorage.removeItem(feedbackKey);
+        // Issue #685 (T1-13-K-07): the feedback mirror is best-effort — a
+        // storage exception while renaming the key must never fail the
+        // durable save that already succeeded server-side.
+        try {
+          const feedbackKey = `chat_feedback_${oldId}`;
+          const feedbackValue = localStorage.getItem(feedbackKey);
+          if (feedbackValue !== null) {
+            localStorage.setItem(`chat_feedback_${dbId}`, feedbackValue);
+            localStorage.removeItem(feedbackKey);
+          }
+        } catch {
+          // Mirror migration failed (quota/security/unavailable storage) — the
+          // save itself is durable; the vote simply stays under the old key.
         }
         replaceMessageId(oldId, dbId, {
           created_at: saveResult.created_at,
@@ -783,6 +803,7 @@ export function useSendMessage(
       reset,
       activeVaultId,
       refreshHistory,
+      onSessionCreated,
     ]
   );
 

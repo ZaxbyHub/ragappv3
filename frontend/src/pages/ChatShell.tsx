@@ -1,8 +1,9 @@
 import { useEffect, useState, useCallback, useRef } from "react";
-import { useParams, useSearchParams } from "react-router-dom";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { cn } from "@/lib/utils";
 import { getChatSession } from "@/lib/api";
 import { mapSessionMessage } from "@/lib/chatMessageMapper";
+import { AlertTriangle } from "lucide-react";
 import { useChatShellStore } from "@/stores/useChatShellStore";
 import { useChatMessages, useChatStore, type Message } from "@/stores/useChatStore";
 import { useChatModeStore } from "@/stores/useChatModeStore";
@@ -64,6 +65,12 @@ export default function ChatShell() {
   } = useChatShellStore();
 
   const isMobile = useIsMobile();
+  // Issue #685: newChat action subscribed via a selector (stable zustand
+  // reference) instead of useChatStore.getState() in the effect — existing
+  // suites mock the store as a bare selector fn without getState, and the
+  // no-session branch now needs this action on every re-run. Optional-chained
+  // for partial store mocks (repo convention).
+  const newChatAction = useChatStore((s) => s.newChat);
   // Deep link (issue #514 AC-23): DocumentDetailPage routes here with
   // ?document_ids=<id> AND sets the scope through the chat-mode store. The
   // store is the source of truth at send time, so on a HARD refresh (store
@@ -269,13 +276,43 @@ export default function ChatShell() {
   // Monotonic token for in-flight transcript loads so a stale fetch can never
   // overwrite a newer selection's transcript.
   const loadSeqRef = useRef(0);
+  // Issue #685 (T1-13-S-03): a failed session load must be visible and
+  // retryable. loadAttempt bumps to re-run the effect for a retry; the error
+  // is cleared at the top of every effect run so no stale banner survives a
+  // transition (new chat, first-send early return, another selection).
+  const [sessionLoadError, setSessionLoadError] = useState<string | null>(null);
+  const [loadAttempt, setLoadAttempt] = useState(0);
+  // Issue #685 (T1-13-S2-02): bind a session created by the first send across
+  // all three identity mirrors — the chat store write happens in the hook;
+  // this callback adds the shell's activeSessionId and the /chat/:id URL
+  // (replace, so no extra history entry). Stable identity keeps the send
+  // pipeline's memoization intact (#616).
+  const navigate = useNavigate();
+  const handleSessionCreated = useCallback(
+    (id: string) => {
+      useChatShellStore.getState().setActiveSessionId(id);
+      navigate(`/chat/${id}`, { replace: true });
+    },
+    [navigate]
+  );
   useEffect(() => {
+    // Issue #685 (T1-13-S-02): invalidate ANY in-flight load on every re-run,
+    // including the early-return branches below — navigating back to a
+    // store-held session (or to New chat) must drop a still-pending fetch
+    // for another session, not just a fetch superseded by a newer fetch.
+    const seq = ++loadSeqRef.current;
+    setSessionLoadError(null);
     if (!sessionId) {
       // Clear the marker so a delete-then-undo refetch of the same id re-runs
       // coherently instead of being skipped as "already loaded".
       loadedSessionRef.current = null;
       // New chat: evidence selection belongs to the previous session.
       useChatShellStore.getState().resetEvidenceSelection();
+      // Issue #685 invariant: URL, shell id and chat-store id name ONE
+      // session — the new-chat URL holds no session, so neither does the
+      // chat store (sends from /chat create a fresh session instead of
+      // silently appending to the previously active one).
+      newChatAction?.();
       return;
     }
     if (sessionId === loadedSessionRef.current) return;
@@ -290,7 +327,6 @@ export default function ChatShell() {
     // Same-id loads and clearMessages never reach this line.
     useChatShellStore.getState().resetEvidenceSelection();
     loadedSessionRef.current = sessionId;
-    const seq = ++loadSeqRef.current;
     (async () => {
       try {
         if (testMode) {
@@ -302,10 +338,22 @@ export default function ChatShell() {
         const loadedMessages: Message[] = (detail.messages ?? []).map(mapSessionMessage);
         useChatStore.getState().loadChat(sessionId, loadedMessages);
       } catch (err) {
+        // A superseded failure is as stale as a superseded success: it must
+        // not clobber the newer selection's state.
+        if (seq !== loadSeqRef.current) return;
         console.error("Failed to load chat session:", err);
+        // Issue #685 (T1-13-S-03): surface the failure with a retry, and
+        // leave no previously-active session as the silent send target —
+        // the next send creates a fresh session instead of streaming into
+        // the session the URL no longer names.
+        loadedSessionRef.current = null; // allow the Retry to re-fetch
+        setSessionLoadError(
+          "Couldn't load this chat session. It may have been deleted or the server is unreachable."
+        );
+        newChatAction?.();
       }
     })();
-  }, [sessionId, testMode]);
+  }, [sessionId, testMode, loadAttempt, newChatAction]);
 
   // UI-037: the mobile Sheet is only mounted on mobile viewports, so its
   // controlled open state cannot silently re-open the sheet when the viewport
@@ -559,9 +607,33 @@ export default function ChatShell() {
             <PanelRight className="h-5 w-5" aria-hidden="true" />
           </Button>
         </header>
+        {/* Issue #685 (T1-13-S-03): a failed session load is visible and
+            retryable. Kept outside <header> (its element order is
+            source-inspected) and above the transcript so the composer stays
+            mounted and usable. Exactly one Retry control on the page. */}
+        {sessionLoadError && (
+          <div
+            role="alert"
+            className="flex items-start gap-2 border-b border-destructive/40 bg-destructive/10 px-4 py-2"
+            data-session-load-error
+          >
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-destructive" aria-hidden />
+            <div className="min-w-0 flex-1">
+              <p className="text-xs font-medium text-destructive">{sessionLoadError}</p>
+              <Button
+                variant="link"
+                size="sm"
+                className="h-auto p-0 text-destructive text-xs underline"
+                onClick={() => setLoadAttempt((attempt) => attempt + 1)}
+              >
+                Retry
+              </Button>
+            </div>
+          </div>
+        )}
         <div className="flex-1 overflow-hidden">
           <ErrorBoundary fallback={transcriptFallback}>
-            <TranscriptPane />
+            <TranscriptPane onSessionCreated={handleSessionCreated} />
           </ErrorBoundary>
         </div>
         {/* MOBILE: Safe area padding for iOS */}

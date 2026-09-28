@@ -114,11 +114,14 @@ export const useChatShellStore = create<ChatShellState>((set, get) => ({
   closeRightPane: () => set({ rightPaneOpen: false }),
   setSessionSearchQuery: (query) => set({ sessionSearchQuery: query }),
   togglePinSession: (sessionId) => {
-    const { pinnedSessionIds } = get();
-    const isPinned = pinnedSessionIds.includes(sessionId);
+    // Issue #685 (T1-13-S2-11): re-read storage instead of trusting the
+    // in-memory list — another tab may have pinned/unpinned sessions since
+    // this tab loaded, and rewriting from memory would silently drop them.
+    const current = loadPinnedSessions();
+    const isPinned = current.includes(sessionId);
     const newIds = isPinned
-      ? pinnedSessionIds.filter((id) => id !== sessionId)
-      : [...pinnedSessionIds, sessionId];
+      ? current.filter((id) => id !== sessionId)
+      : [...current, sessionId];
     persistPinnedSessions(newIds);
     set({ pinnedSessionIds: newIds });
   },
@@ -137,3 +140,26 @@ export const useChatShellStore = create<ChatShellState>((set, get) => ({
     }),
   setActiveRightTab: (tab) => set({ activeRightTab: tab }),
 }));
+
+// Issue #685 (T1-13-S2-11): keep this tab's pinned list coherent with edits
+// from other tabs. The storage event fires only for cross-document changes,
+// and the persisted value is authoritative — REPLACE from it (a union would
+// resurrect pins another tab just removed). key === null (a cross-tab clear)
+// is left to the next toggle's fresh read.
+if (typeof window !== "undefined") {
+  window.addEventListener("storage", (event) => {
+    if (event.key !== PINNED_SESSIONS_KEY) return;
+    if (event.newValue === null) return;
+    let next: number[] = [];
+    try {
+      const parsed = JSON.parse(event.newValue);
+      if (Array.isArray(parsed)) {
+        next = parsed.filter((id): id is number => typeof id === "number");
+      }
+    } catch {
+      // Unparseable external write: fall back to empty rather than keeping a
+      // list that no longer matches storage.
+    }
+    useChatShellStore.setState({ pinnedSessionIds: next });
+  });
+}

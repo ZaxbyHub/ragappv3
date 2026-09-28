@@ -46,6 +46,13 @@ import type { Message } from "@/stores/useChatStore";
 
 interface TranscriptPaneProps {
   className?: string;
+  /**
+   * Issue #685 (T1-13-S2-02): called synchronously when a send creates a new
+   * session, so the owning page can bind the shell's activeSessionId and the
+   * /chat/:id URL to it. Optional — harnesses that render the pane (or the
+   * underlying hook) without a router pass nothing and the binding is skipped.
+   */
+  onSessionCreated?: (sessionId: string) => void;
 }
 
 interface EmptyTranscriptProps {
@@ -200,18 +207,34 @@ const MessageRow = memo(function MessageRow({
   const isAssistantStreaming = isStreaming && isLast && safeMessage.role === "assistant" && streamingMessageId === messageId;
   const isHighlighted = highlightedId === messageId;
 
-  // Issue #573 (AC3): sibling versions for this row's transcript slot.
+  // Issue #573 (AC3) / #685: sibling versions for this row's transcript slot.
   // Resolution rule (shared with handleSelectEditVersion): while a pointer is
   // set the snapshots list is complete and authoritative; otherwise the live
   // content is the implicit newest version (deduped against the last
   // snapshot). Computed inside the row so the parent never subscribes to
   // message bodies (#616).
+  const slotKey =
+    safeMessage.role === "user" && activeChatId ? `${activeChatId}:${editSlotIndex}` : null;
+  const slotSnapshots = slotKey ? editVersionsMap[slotKey] ?? [] : [];
+  const slotPointer = slotKey ? activeEditVersionsMap[slotKey] : undefined;
+  // Issue #685 (TQ-sibling-batch-03-06): the displayed content resolves from
+  // the version pointer AT RENDER TIME — outside the streaming gate so an
+  // older version stays displayed while a follow-up send streams. The store's
+  // `content` always holds the LIVE text the send paths serialize as LLM
+  // history; this override is display-only (it also seeds the edit composer
+  // through onEdit, so editing from an old version keeps the pre-#685
+  // lineage semantics).
+  let displayedContent = safeMessage.content;
+  if (slotPointer !== undefined && slotSnapshots.length > 0) {
+    const clampedPointer =
+      slotPointer >= slotSnapshots.length ? Math.max(slotSnapshots.length - 1, 0) : slotPointer;
+    displayedContent = slotSnapshots[clampedPointer];
+  }
   let rowEditVersions: Array<{ label: string; content: string }> = [];
   let rowEditActiveIndex = 0;
-  if (!isStreaming && safeMessage.role === "user" && activeChatId) {
-    const slotKey = `${activeChatId}:${editSlotIndex}`;
-    const snapshots = editVersionsMap[slotKey] ?? [];
-    const activeStored = activeEditVersionsMap[slotKey];
+  if (!isStreaming && safeMessage.role === "user" && slotKey) {
+    const snapshots = slotSnapshots;
+    const activeStored = slotPointer;
     let contents: string[];
     let activeIndex: number;
     if (activeStored !== undefined) {
@@ -321,7 +344,7 @@ const MessageRow = memo(function MessageRow({
       ) : (
         <>
           <MessageBubble
-            message={safeMessage}
+            message={{ ...safeMessage, content: displayedContent }}
             isStreaming={isAssistantStreaming}
             isEditDisabled={isStreaming}
             onFork={onFork ? () => onFork(messageId) : undefined}
@@ -347,7 +370,7 @@ const MessageRow = memo(function MessageRow({
 // TranscriptPane
 // =============================================================================
 
-export function TranscriptPane({ className }: TranscriptPaneProps) {
+export function TranscriptPane({ className, onSessionCreated }: TranscriptPaneProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const navigate = useNavigate();
@@ -377,7 +400,9 @@ export function TranscriptPane({ className }: TranscriptPaneProps) {
   const activeSessionId = useChatShellStore((s) => s.activeSessionId);
 
   const { refreshHistory } = useChatHistory(vaultId);
-  const { handleSend, handleStop, sendDirect, currentStage } = useSendMessage(vaultId, refreshHistory);
+  const { handleSend, handleStop, sendDirect, currentStage } = useSendMessage(vaultId, refreshHistory, {
+    onSessionCreated,
+  });
 
   const [showScrollButton, setShowScrollButton] = useState(false);
   // setIsAtBottom is retained for legacy components that read isAtBottom via
@@ -707,7 +732,10 @@ export function TranscriptPane({ className }: TranscriptPaneProps) {
       // failed truncate leaves the version maps untouched (PRR-011).
       const slotKey = activeChatId ? `${activeChatId}:${idx}` : null;
       const editState = useChatStore.getState();
-      const originalContent = messagesById[messageId]?.content;
+      // Issue #685: `content` is the DISPLAYED text (the row renders the
+      // pointer-resolved snapshot), so this is the pre-#685 snapshotted value
+      // whether or not a version pointer is set.
+      const originalContent = content;
       if (slotKey) {
         const existingSnapshots = editState.messageEditVersions?.[slotKey] ?? [];
         const pointerWasSet = editState.activeEditVersion?.[slotKey] !== undefined;
@@ -731,17 +759,19 @@ export function TranscriptPane({ className }: TranscriptPaneProps) {
     }
   }, [isStreaming, removeMessagesFrom, setInput, awaitPendingPersist, recordEditVersion, setActiveEditVersion, clearEditVersionsFrom, reloadAfterStaleRefusal]);
 
-  // Issue #573 (AC3): step the displayed sibling version of an edited turn.
-  // Invariants (shared with the row-side resolution below):
+  // Issue #573 (AC3) / #685 (TQ-sibling-batch-03-06): step the displayed
+  // sibling version of an edited turn. DISPLAY-ONLY: stepping moves the
+  // activeEditVersion pointer and NEVER writes the message's `content` — the
+  // live content is what the send/retry/continue/suggestion paths serialize
+  // as LLM history, and the row resolves the displayed snapshot at render
+  // time from the pointer (see MessageRow). Invariants (shared with the
+  // row-side resolution):
   //   * the snapshots list is COMPLETE once a pointer is set — stepping away
   //     from the live content freezes it as the latest snapshot exactly once;
   //   * while no pointer is set, the displayed list is snapshots plus the live
   //     content (deduped), and the live content IS the newest version;
-  //   * stepping to the newest version clears the pointer and restores that
-  //     snapshot's content as the live content.
-  // This prevents the duplicate-sibling bug where displaying an older version
-  // (which overwrites live content) would re-append that older text as a new
-  // version on the next render.
+  //   * stepping to the newest version clears the pointer so the row renders
+  //     the live content again.
   const handleSelectEditVersion = useCallback(
     (messageId: string, index: number, liveContent: string) => {
       const state = useChatStore.getState();
@@ -762,23 +792,20 @@ export function TranscriptPane({ className }: TranscriptPaneProps) {
           recordEditVersion?.(slotKey, liveContent); // freeze the edited text
         }
         setActiveEditVersion?.(slotKey, clamped);
-        const target = liveIsSnapshot ? snapshots[clamped] : [...snapshots, liveContent][clamped];
-        updateMessage(messageId, { content: target });
         return;
       }
 
       // Pointer already set: the snapshots list is complete and authoritative.
       if (clamped === snapshots.length - 1) {
-        // Returning to the newest version clears the pointer; its content
-        // becomes the live content again.
+        // Returning to the newest version clears the pointer; the row renders
+        // the live content again (the live content IS the newest snapshot —
+        // it was frozen when the pointer was first set).
         setActiveEditVersion?.(slotKey, null);
-        updateMessage(messageId, { content: snapshots[snapshots.length - 1] });
         return;
       }
       setActiveEditVersion?.(slotKey, clamped);
-      updateMessage(messageId, { content: snapshots[clamped] });
     },
-    [recordEditVersion, setActiveEditVersion, updateMessage]
+    [recordEditVersion, setActiveEditVersion]
   );
 
   // Issue #573 (AC2): continue a length-truncated response. The truncated
