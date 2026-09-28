@@ -217,6 +217,41 @@ def _reset_db_pool():
 
 
 @pytest.fixture(autouse=True)
+def _b03_data_dir_isolation(request):
+    """Snapshot/restore DATA_DIR env + settings.data_dir for b03 modules.
+
+    The issue-#692 (B03) test modules seed a tmp ``DATA_DIR`` and rebind
+    ``settings.data_dir`` per test. Without restoration the LAST b03 test in
+    an xdist worker leaks both: later tests that construct a fresh
+    ``Settings(_env_file=None)`` (e.g. ``test_config_alignment.py``) re-read
+    ``os.environ["DATA_DIR"]`` and fail with a tmp-dir name instead of
+    'data' — observed as a deterministic CI Backend failure under ``-n
+    auto`` (issue #692 PR review follow-up F-001).
+
+    Restoring ONLY the settings singleton is provably insufficient; the env
+    var is the load-bearing half. Scoped by module name so the rest of the
+    suite keeps its exact fixture semantics. Mirrors the autouse env
+    snapshot precedent in ``tests/issue513_checks/conftest.py``.
+    """
+    if not request.module.__name__.startswith("test_b03"):
+        yield
+        return
+
+    import os
+
+    saved_env = os.environ.get("DATA_DIR")
+    from app.config import settings
+
+    saved_data_dir = settings.data_dir
+    yield
+    if saved_env is None:
+        os.environ.pop("DATA_DIR", None)
+    else:
+        os.environ["DATA_DIR"] = saved_env
+    settings.data_dir = saved_data_dir
+
+
+@pytest.fixture(autouse=True)
 def _reset_active_user_cache():
     """Clear the active-user cache before and after every test.
 

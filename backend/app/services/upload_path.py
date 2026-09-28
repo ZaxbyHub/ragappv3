@@ -95,9 +95,12 @@ def migrate_uploads(dry_run: bool = False) -> MigrationResult:
         if not f.is_file():
             continue
 
-        # Lookup vault_id from database
+        # Resolve the destination from the row naming the exact legacy path
+        # (never by file_name: a same-named row in another vault must not
+        # hijack the destination). No matching row = drifted stored string or
+        # orphaned bytes: skip before touching anything.
         try:
-            vault_id = _lookup_vault_id(f.name)
+            vault_id = _lookup_vault_id_for_path(str(f))
         except ValueError as e:
             failed.append(f.name)
             logger.warning(str(e))
@@ -106,6 +109,19 @@ def migrate_uploads(dry_run: bool = False) -> MigrationResult:
         # Determine destination
         dest_dir = provider.get_upload_dir(vault_id)
         dest_path = dest_dir / f.name
+
+        # Never overwrite (and later revert-unlink) bytes this run did not
+        # create: a pre-existing destination means a previous partial run or
+        # an upload already lives there (issue #692 review follow-up F-002).
+        if dest_path.exists():
+            failed.append(f.name)
+            logger.warning(
+                "Destination %s already exists for %s; skipping to avoid "
+                "overwriting existing bytes",
+                dest_path,
+                f.name,
+            )
+            continue
 
         if dry_run:
             logger.info(f"[DRY RUN] Would move {f.name} to vault {vault_id}")
@@ -135,9 +151,15 @@ def migrate_uploads(dry_run: bool = False) -> MigrationResult:
         # in the same logical operation (issue #692 / R2-L3-C01). Keyed by the
         # exact source path so only the row(s) that named these bytes are
         # rewritten — never same-name rows in other vaults or rows pointing
-        # at other legitimate roots.
+        # at other legitimate roots. A zero-row match is a drifted path
+        # string (no row claims these bytes) and is treated as failure so the
+        # revert below restores the pre-migration state instead of silently
+        # counting a mismatched migration as migrated.
         try:
-            _set_file_row_path(str(f), str(dest_path))
+            if _set_file_row_path(str(f), str(dest_path)) == 0:
+                raise RuntimeError(
+                    f"no files row names the legacy path being migrated ({f})"
+                )
         except Exception as e:
             failed.append(f.name)
             if backup_path.exists():
@@ -189,6 +211,8 @@ def migrate_uploads(dry_run: bool = False) -> MigrationResult:
             continue
 
         migrated += 1
+        if migrated % 200 == 0:
+            logger.info("Upload migration progress: %d files migrated", migrated)
         logger.debug(f"Migrated {f.name} to vault {vault_id}")
 
     logger.info(
@@ -221,26 +245,57 @@ def _lookup_vault_id(filename: str) -> int:
         pool.release_connection(conn)
 
 
-def _set_file_row_path(old_path: str, new_path: str) -> None:
-    """Point the files row(s) naming ``old_path`` at ``new_path``.
+def _lookup_vault_id_for_path(path: str) -> int:
+    """Resolve the vault that owns the row naming exactly ``path``.
 
-    The durable bookkeeping half of every on-disk upload move (issue #692 /
-    R2-L3-C01): the two stores must never disagree about where the bytes
-    live. Keyed by the exact stored path so only the row(s) that named the
-    moved bytes are rewritten.
+    Unlike :func:`_lookup_vault_id` (file_name-keyed, first-row-wins), this
+    keys on the exact stored path, so a migrated file is always filed into
+    the vault whose row actually claims those bytes — a same-named row in
+    another vault can never hijack the destination (issue #692 review
+    follow-up F-005/F-006). Raises ValueError when no row names the path
+    (drifted stored strings, orphaned bytes): the caller skips the file
+    instead of copying bytes that no row will ever point at.
     """
     from app.models.database import get_pool
 
     pool = get_pool(str(settings.sqlite_path), max_size=settings.db_pool_max_size)
     conn = pool.get_connection()
     try:
-        conn.execute(
+        row = conn.execute(
+            "SELECT vault_id FROM files WHERE file_path = ?", (path,)
+        ).fetchone()
+        if row:
+            return row[0]
+        raise ValueError(f"Could not determine vault for file: {path}")
+    finally:
+        pool.release_connection(conn)
+
+
+def _set_file_row_path(old_path: str, new_path: str) -> int:
+    """Point the files row(s) naming ``old_path`` at ``new_path``.
+
+    The durable bookkeeping half of every on-disk upload move (issue #692 /
+    R2-L3-C01): the two stores must never disagree about where the bytes
+    live. Keyed by the exact stored path so only the row(s) that named the
+    moved bytes are rewritten. Returns the number of rows updated; callers
+    that require a match treat 0 as a failure (a drifted path string means
+    no row claims these bytes, so the on-disk move must not stand).
+    """
+    from app.models.database import get_pool
+
+    pool = get_pool(str(settings.sqlite_path), max_size=settings.db_pool_max_size)
+    conn = pool.get_connection()
+    try:
+        cursor = conn.execute(
             "UPDATE files SET file_path = ? WHERE file_path = ?",
             (new_path, old_path),
         )
-        conn.commit()
+        updated = int(cursor.rowcount or 0)
+        if updated:
+            conn.commit()
     finally:
         pool.release_connection(conn)
+    return updated
 
 
 def rollback_migration() -> dict:
@@ -293,8 +348,14 @@ def rollback_migration() -> dict:
             # at the vault location follow it back to the flat directory —
             # including collision-renamed destinations, which update to the
             # actual new name. Best-effort: a failure is recorded, not raised.
+            # A zero-row match is legitimate here (leftover bytes no row
+            # references), so it is only logged.
             try:
-                _set_file_row_path(str(f), str(dest))
+                if _set_file_row_path(str(f), str(dest)) == 0:
+                    logger.debug(
+                        "Rollback moved %s back but no files row referenced "
+                        "it; nothing to update", f,
+                    )
             except Exception as e:
                 results["failed"].append(f"{f}: row update failed: {e}")
 

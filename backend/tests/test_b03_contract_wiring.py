@@ -59,11 +59,18 @@ def test_b03_guard_governed_by_runtime_contract_inventory():
         "scripts/check_b03_upload_migration_timeout.py"
     ), "the inventory regex must govern the digit-bearing script name"
 
-    for doc in ("docs/engineering/testing.md", "docs/engineering/conventions.md"):
+    for doc in (
+        "docs/engineering/testing.md",
+        "docs/engineering/conventions.md",
+    ):
         text = (REPO / doc).read_text(encoding="utf-8")
         assert "scripts/check_b03_upload_migration_timeout.py" in text, (
             f"{doc} must name the b03 guard in its contract-script inventory"
         )
+    agents = (REPO / "AGENTS.md").read_text(encoding="utf-8")
+    assert "check_b03_upload_migration_timeout.py" in agents, (
+        "AGENTS.md must name the b03 guard in its contract-script list"
+    )
 
 
 if __name__ == "__main__":

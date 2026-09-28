@@ -2597,6 +2597,28 @@ class BackgroundProcessor:
             )
             return
         await vec_store.add_chunks_then_delete_ids(new_records, stale_ids)
+        # Post-write compensation (issue #692 review follow-up F-004): the
+        # pre-write gate above cannot cover the embedding awaits between it
+        # and this write. If the row vanished meanwhile, discard the just-
+        # written proxy vectors instead of leaving orphans, and skip the
+        # derived-table writes below (those rows cascade away with the files
+        # row anyway).
+        try:
+            self.processor._raise_if_file_row_missing(file_id)
+        except DocumentProcessingError:
+            try:
+                await vec_store.delete_by_file(str(file_id))
+                logger.warning(
+                    "Discarded enrichment proxy vectors written for "
+                    "file_id=%s after its row was removed mid-write",
+                    file_id,
+                )
+            except Exception:  # noqa: BLE001 — compensation is best-effort
+                logger.exception(
+                    "Failed to discard proxy vectors for removed file_id=%s",
+                    file_id,
+                )
+            return
         # Record the new proxy vector ids in the derived table. Records are only
         # persisted when the atom's current derived-record fingerprint still
         # matches (set_proxy_vector_id is fingerprint-guarded and returns 0 on a
