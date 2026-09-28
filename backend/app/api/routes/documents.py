@@ -2685,10 +2685,13 @@ async def reindex_documents(
 
 
 @router.get("/reindex/jobs/{job_id}", response_model=ReindexJobStatusResponse)
+@limiter.limit(settings.admin_rate_limit)
 async def get_reindex_job_status(
+    request: Request,
     job_id: int,
     conn: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(require_admin_role),
+    csrf_token: str = Depends(csrf_protect),
 ) -> ReindexJobStatusResponse:
     """Return the full status of a reindex job by ID."""
 

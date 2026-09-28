@@ -3516,6 +3516,23 @@ class BackgroundProcessor:
                         probe_dim = len(probe_embeddings[0])
                 live_dim = await vector_store.get_live_embedding_dim()
                 if probe_dim is not None and live_dim is not None and probe_dim != live_dim:
+                    if vault_id is not None:
+                        # [issue #691 review] A vault-scoped reindex re-embeds
+                        # only its own vault's files, but the rebuild commit
+                        # swaps the GLOBAL chunks table: every other vault's
+                        # indexed files would lose their vectors while their
+                        # rows still say status='indexed' — the same defect
+                        # class as the bare-call wipe this PR removes. Refuse
+                        # the dimension migration for vault-scoped jobs; a
+                        # full (all-vaults) reindex owns it.
+                        raise VectorStoreError(
+                            f"embedding dimension changed ({live_dim} -> "
+                            f"{probe_dim}): a vault-scoped reindex cannot "
+                            f"migrate the index because the rebuild swaps the "
+                            f"whole vector index while re-embedding only this "
+                            f"vault's files. Run a full reindex (all vaults) "
+                            f"at the new dimension instead."
+                        )
                     rebuild_handle = await vector_store.begin_dimension_rebuild(probe_dim)
                     logger.info(
                         "Reindex job %d: embedding dimension %d != live table "

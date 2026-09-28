@@ -294,6 +294,17 @@ class DocumentProcessingError(Exception):
     pass
 
 
+class EmbeddingDimensionChangedError(DocumentProcessingError):
+    """An ingest was refused because the live index dimension differs.
+
+    Classified to the stable ``DIMENSION_CHANGED`` ingest-error code so the
+    persisted (user-visible) message carries the reindex remediation instead
+    of the generic PARSE_FAILED reason (issue #691).
+    """
+
+    pass
+
+
 class DocumentParseError(Exception):
     """Exception raised when document parsing fails."""
 
@@ -312,6 +323,7 @@ INGEST_ERROR_PARSER_UNAVAILABLE = "PARSER_UNAVAILABLE"
 INGEST_ERROR_PARSE_FAILED = "PARSE_FAILED"
 INGEST_ERROR_FILE_MISSING = "FILE_MISSING"
 INGEST_ERROR_ENRICHMENT_FAILED = "ENRICHMENT_FAILED"
+INGEST_ERROR_DIMENSION_CHANGED = "DIMENSION_CHANGED"
 
 _INGEST_ERROR_REASONS = {
     INGEST_ERROR_PARSER_UNAVAILABLE: "document parser is unavailable",
@@ -319,6 +331,10 @@ _INGEST_ERROR_REASONS = {
     INGEST_ERROR_FILE_MISSING: "uploaded file is missing from storage",
     INGEST_ERROR_ENRICHMENT_FAILED: (
         "content enrichment failed; the indexed document is unaffected"
+    ),
+    INGEST_ERROR_DIMENSION_CHANGED: (
+        "embedding dimension changed; run the admin reindex job to migrate "
+        "the index, then re-ingest this file"
     ),
 }
 
@@ -342,6 +358,8 @@ def classify_ingest_error(exc: BaseException) -> str:
     current: Optional[BaseException] = exc
     depth = 0
     while current is not None and depth <= _INGEST_ERROR_CAUSE_DEPTH:
+        if isinstance(current, EmbeddingDimensionChangedError):
+            return INGEST_ERROR_DIMENSION_CHANGED
         if isinstance(current, ImportError):
             return INGEST_ERROR_PARSER_UNAVAILABLE
         if isinstance(current, (FileNotFoundError, FileExistsError)):
@@ -1043,68 +1061,53 @@ class DocumentProcessor:
                 f"Vector store visibility check failed: file_id={file_id} has zero LanceDB rows"
             )
 
-    async def _maybe_begin_dimension_rebuild(self, embedding_dim: int) -> object | None:
-        """Bare-call dimension auto-migration probe (issue #513 AC9 / INGEST-010).
+    async def _ensure_live_dimension_compatible(self, embedding_dim: int) -> None:
+        """Refuse single-file ingests that would need a dimension migration.
 
-        When this ingest call carries no explicit ``vector_target`` and the
-        live vector table exists at a DIFFERENT embedding dimension, open a
-        dimension-rebuild handle so the caller can route every vector
-        operation into the rebuild temp table: the incompatible live index is
-        replaced by a validated atomic swap only on success and stays fully
-        intact when anything fails. Returns None (previous behavior, byte for
-        byte) when the dimensions match, when the store does not expose the
-        rebuild API (test doubles, alternative backends), or when no live
-        table exists yet.
+        When the live ``chunks`` table exists at a DIFFERENT embedding
+        dimension than this ingest's embeddings, dimension migration is
+        exclusively the admin reindex job's business (``_reindex_embed_all``
+        re-embeds the whole corpus into a staged rebuild table before its
+        validated swap). A single-file ingest must never open that rebuild
+        itself: the staged table would hold only this file's rows, so the
+        swap would destroy every other indexed file's vectors while their
+        rows still claim ``status='indexed'`` (issue #691). Fail closed with
+        an actionable error instead: the raw exception names both dimensions
+        and the reindex remediation (server log), while the persisted
+        user-visible message is the stable ``DIMENSION_CHANGED`` code.
+
+        Best-effort by contract: when the store is absent, does not expose
+        the dimension probe (test doubles, alternative backends), the probe
+        fails, or the probe returns a non-numeric dimension, this returns
+        without raising and the ordinary write path surfaces any real
+        mismatch.
         """
         if self.vector_store is None:
-            return None
+            return
         get_live_dim = getattr(self.vector_store, "get_live_embedding_dim", None)
-        begin_rebuild = getattr(self.vector_store, "begin_dimension_rebuild", None)
-        if get_live_dim is None or begin_rebuild is None:
-            return None
+        if get_live_dim is None:
+            return
         try:
             live_dim = await get_live_dim()
+            if live_dim is None or int(live_dim) == int(embedding_dim):
+                return
         except Exception:  # noqa: BLE001 - probe must never fail the ingest
             logger.warning(
                 "Live embedding-dimension probe failed for dim=%s; proceeding "
-                "without auto-migration",
+                "without the compatibility check",
                 embedding_dim,
                 exc_info=True,
             )
-            return None
-        if live_dim is None or int(live_dim) == int(embedding_dim):
-            return None
-        handle = await begin_rebuild(embedding_dim)
-        logger.info(
-            "Embedding dimension %d != live table dimension %s — routing this "
-            "ingest into dimension-rebuild table '%s' (live index untouched "
-            "until commit; issue #513 AC9)",
-            embedding_dim,
-            live_dim,
-            getattr(handle, "table_name", "?"),
-        )
-        return handle
-
-    async def _abort_dimension_rebuild_quietly(self, handle: object) -> None:
-        """Best-effort abort of an auto-opened dimension rebuild after failure.
-
-        The original ingest error is always the one surfaced to the caller;
-        a failing abort only logs (the temp table — never the live index —
-        may survive and is dropped by the next ``begin_dimension_rebuild``).
-        """
-        abort_rebuild = getattr(self.vector_store, "abort_dimension_rebuild", None)
-        if abort_rebuild is None or handle is None:
             return
-        try:
-            await abort_rebuild(handle)
-        except Exception:  # noqa: BLE001 - cleanup must not mask the real error
-            logger.warning(
-                "Aborting the dimension rebuild after an ingest failure "
-                "failed; the rebuild temp table may remain (the live index "
-                "is untouched and the temp table is dropped by the next "
-                "begin_dimension_rebuild)",
-                exc_info=True,
-            )
+        raise EmbeddingDimensionChangedError(
+            f"Embedding dimension changed: incoming embeddings have dimension "
+            f"{int(embedding_dim)} but the live vector index was built at "
+            f"dimension {int(live_dim)}. Refusing this single-file ingest: a "
+            f"dimension migration rebuilds the whole index and must never be "
+            f"triggered by one file's ingest. Run the admin reindex job "
+            f"(Reindex) to migrate the index, then re-ingest this file "
+            f"(issue #691)."
+        )
 
     @staticmethod
     def _build_chunk_uid(file_id: int, chunk: ProcessedChunk) -> str:
@@ -3464,6 +3467,11 @@ class DocumentProcessor:
                     # Initialize vector table with embedding dimension and add chunks
                     embedding_dim = len(embeddings[0])
                     stage_started_at = time.monotonic()
+                    # [issue #691] Scan/email must refuse a dimension-changing
+                    # ingest exactly like the upload path (same actionable
+                    # error, before any write) instead of failing mid-write
+                    # inside add_chunks against the old-dimension live table.
+                    await self._ensure_live_dimension_compatible(embedding_dim)
                     await self.vector_store.init_table(embedding_dim)
                     _add_elapsed_ms(stage_timings, "vector_write_ms", stage_started_at)
 
@@ -3596,11 +3604,12 @@ class DocumentProcessor:
                 add_chunks, delete_*, visibility count) threads it as a
                 trailing ``target=`` argument so a dimension-migrating reindex
                 writes into the rebuild table instead of the live index.
-                When None, a dimension mismatch against the live table is
-                probed after embedding (C9/INGEST-010): on mismatch this call
-                opens its own rebuild handle (auto-migration), commits the
-                atomic swap only if the whole write phase succeeds, and aborts
-                with the prior index untouched on any failure.
+                When None (bare call), a dimension mismatch against the live
+                table is REFUSED with an actionable error before any write
+                (issue #691): a single-file ingest must never open the staged
+                rebuild itself — that swap would destroy every other indexed
+                file's vectors. Dimension migration is the admin reindex
+                job's business; it passes ``vector_target`` explicitly.
 
         Failure semantics match ``process_file``: status -> 'error',
         phase -> 'error', error_message populated. Wiki ingest job is
@@ -3968,103 +3977,63 @@ class DocumentProcessor:
                     # argument (dimension-migrating reindex); omitted entirely
                     # when None so stores/doubles without the parameter behave
                     # exactly as before.
-                    # [C9/INGEST-010] Bare-call auto-migration: when this call
-                    # carries NO explicit target, probe the live table's
-                    # dimension now that this file's embeddings are known; on
-                    # mismatch open a rebuild handle so every write below lands
-                    # in the rebuild temp table. The live index is replaced by
-                    # the validated atomic swap only after the whole write
-                    # phase succeeds; any failure aborts the rebuild and
-                    # re-raises with the prior index fully intact.
-                    auto_rebuild_handle = (
-                        await self._maybe_begin_dimension_rebuild(embedding_dim)
-                        if vector_target is None
-                        else None
-                    )
-                    active_target = (
-                        vector_target
-                        if vector_target is not None
-                        else auto_rebuild_handle
-                    )
+                    # [issue #691] A bare call (no ``vector_target``) must
+                    # never auto-migrate the index dimension: the staged
+                    # rebuild would hold only this file's rows, so the swap
+                    # would wipe every other indexed file's vectors while
+                    # their rows still claim ``status='indexed'``. Fail
+                    # closed with an actionable error instead; the admin
+                    # reindex job owns dimension migration (it re-embeds the
+                    # whole corpus into its staged rebuild before its own
+                    # validated swap).
+                    if vector_target is None:
+                        await self._ensure_live_dimension_compatible(
+                            embedding_dim
+                        )
                     _target_kwargs = (
-                        {"target": active_target} if active_target is not None else {}
+                        {"target": vector_target}
+                        if vector_target is not None
+                        else {}
                     )
-                    try:
-                        if (
-                            auto_rebuild_handle is not None
-                            and not settings.reupload_safe_order
-                        ):
-                            # The delete-first ordering cannot coexist with an
-                            # auto-opened dimension rebuild: deleting this
-                            # file's live old-dimension rows before the
-                            # rebuild commits would destroy the prior index
-                            # the migration must preserve, and the rebuild
-                            # table starts empty so there is nothing to delete
-                            # there. Fail the ingest rather than silently
-                            # performing something other than the configured
-                            # ordering; the abort below leaves the live index
-                            # untouched.
-                            raise DocumentProcessingError(
-                                "Dimension-changing ingest requires the safe "
-                                "re-upload ordering (reupload_safe_order): the "
-                                "delete-first ordering cannot preserve the "
-                                "prior index during a dimension rebuild "
-                                "(issue #513 AC9)"
-                            )
-                        await self.vector_store.init_table(
-                            embedding_dim, **_target_kwargs
+                    await self.vector_store.init_table(
+                        embedding_dim, **_target_kwargs
+                    )
+                    _add_elapsed_ms(stage_timings, "vector_write_ms", stage_started_at)
+
+                    if settings.reupload_safe_order:
+                        vector_timings = await self.vector_store.add_chunks(
+                            records, **_target_kwargs
+                        )
+                        _merge_vector_timings(stage_timings, vector_timings)
+                        stage_started_at = time.monotonic()
+                        deleted = await self.vector_store.delete_old_generation_by_file(
+                            str(file_id), file_hash[:8], **_target_kwargs
                         )
                         _add_elapsed_ms(stage_timings, "vector_write_ms", stage_started_at)
-
-                        if settings.reupload_safe_order:
-                            vector_timings = await self.vector_store.add_chunks(
-                                records, **_target_kwargs
+                        if deleted > 0:
+                            logger.info(
+                                "Safe re-upload: deleted %d old-generation chunks for file_id=%s",
+                                deleted,
+                                file_id,
                             )
-                            _merge_vector_timings(stage_timings, vector_timings)
-                            stage_started_at = time.monotonic()
-                            deleted = await self.vector_store.delete_old_generation_by_file(
-                                str(file_id), file_hash[:8], **_target_kwargs
-                            )
-                            _add_elapsed_ms(stage_timings, "vector_write_ms", stage_started_at)
-                            if deleted > 0:
-                                logger.info(
-                                    "Safe re-upload: deleted %d old-generation chunks for file_id=%s",
-                                    deleted,
-                                    file_id,
-                                )
-                        else:
-                            stage_started_at = time.monotonic()
-                            await self.vector_store.delete_by_file(
-                                str(file_id), **_target_kwargs
-                            )
-                            _add_elapsed_ms(stage_timings, "vector_write_ms", stage_started_at)
-                            vector_timings = await self.vector_store.add_chunks(
-                                records, **_target_kwargs
-                            )
-                            _merge_vector_timings(stage_timings, vector_timings)
-
-                        await self._verify_vector_rows_visible(file_id, active_target)
-
-                        # Publish the generation's atoms/assets/stage rows after the
-                        # new vectors are durable (issue #460).
-                        self._publish_artifacts(
-                            file_id, vault_id, generation_hash, parsed
+                    else:
+                        stage_started_at = time.monotonic()
+                        await self.vector_store.delete_by_file(
+                            str(file_id), **_target_kwargs
                         )
-                    except Exception:
-                        if auto_rebuild_handle is not None:
-                            await self._abort_dimension_rebuild_quietly(
-                                auto_rebuild_handle
-                            )
-                        raise
-                    if auto_rebuild_handle is not None:
-                        # All writes durable and visible in the rebuild table:
-                        # swap it in as the live index. A commit failure
-                        # propagates to the error handling below (the temp
-                        # table remains recoverable; the old index was already
-                        # dropped only after full validation by the store).
-                        await self.vector_store.commit_dimension_rebuild(
-                            auto_rebuild_handle
+                        _add_elapsed_ms(stage_timings, "vector_write_ms", stage_started_at)
+                        vector_timings = await self.vector_store.add_chunks(
+                            records, **_target_kwargs
                         )
+                        _merge_vector_timings(stage_timings, vector_timings)
+
+                    await self._verify_vector_rows_visible(file_id, vector_target)
+
+                    # Publish the generation's atoms/assets/stage rows after the
+                    # new vectors are durable (issue #460).
+                    self._publish_artifacts(
+                        file_id, vault_id, generation_hash, parsed
+                    )
         except Exception as e:
             # Raw exception stays in the server log; persisted fields are
             # user-facing (issue #562).

@@ -36,7 +36,7 @@
       "SEVERITY.LOW": 62,
       "SEVERITY.MEDIUM": 60,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 81577,
+      "loc": 81562,
       "nosec": 0,
       "skipped_tests": 56
     },
@@ -673,7 +673,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 3207,
+      "loc": 3216,
       "nosec": 0,
       "skipped_tests": 4
     },
@@ -816,7 +816,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 1,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 3393,
+      "loc": 3369,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -3585,7 +3585,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1739                 conn.execute(\n1740                     f\"DELETE FROM failed_chunks WHERE id IN ({placeholders})\",\n1741                     clear_ids,\n",
+      "code": "1742                 conn.execute(\n1743                     f\"DELETE FROM failed_chunks WHERE id IN ({placeholders})\",\n1744                     clear_ids,\n",
       "col_offset": 20,
       "end_col_offset": 77,
       "filename": "backend/app/services/document_processor.py",
@@ -3596,9 +3596,9 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 1740,
+      "line_number": 1743,
       "line_range": [
-        1740
+        1743
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
