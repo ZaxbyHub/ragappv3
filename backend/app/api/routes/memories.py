@@ -558,7 +558,6 @@ async def update_memory(
 
         # Check vault write permission
         memory_vault_id = row[1]
-        stored_content = row[2]
         # Global memories (vault_id IS NULL) are admin-only (issue #404).
         _require_admin_for_global(user, memory_vault_id)
         if memory_vault_id is not None:
@@ -585,32 +584,28 @@ async def update_memory(
                 detail="Memory was modified by another session",
             )
 
-        # No-op save detection (issue #515, AC27): the wiki-claim
-        # invalidation below must only fire when the submitted content
-        # actually differs from the stored content — an identical-content
-        # save cannot have changed any derived claim.
-        content_changed = body.content is not None and body.content != stored_content
-
-        # Build update query dynamically based on provided fields
+        # Build update query dynamically based on provided fields. The
+        # embedding-clearing entries and the no-op-save decision are added
+        # inside the transaction below, against the freshest stored content
+        # re-read under the write lock (a concurrent write between the
+        # request-time read and the lock must not produce a stale baseline).
         update_fields = []
         params = []
 
         if body.content is not None:
             update_fields.append("content = ?")
             params.append(body.content)
-            # Clear the stale embedding only when the content actually
-            # changed (issue #686, T1-02-S-03): an identical-content save
-            # keeps the stored vector. embed_and_store below recomputes
-            # best-effort after commit.
-            if content_changed and memory_store._has_embedding_columns(conn):
-                update_fields.append("embedding = NULL")
-                update_fields.append("embedding_model = NULL")
         # Explicit-null vs omitted (issue #515, AC19, extended to
         # category/source by issue #686, T1-02-K-02): a JSON null CLEARS the
         # column (SET ... = NULL), while an omitted field preserves the
         # stored value. The distinction is made via pydantic v2
         # model_fields_set: the field counts as "provided" when it was
         # explicitly sent, even when its validated value is None.
+        # Documented asymmetry: the tags/expires_at before-validators
+        # normalize "" to None (so an empty-string tags CLEARS), while
+        # category/source have no such validator (an empty string stores
+        # ''). The Memory page always sends null for cleared fields, so the
+        # asymmetry is intentional and unchanged.
         fields_set = body.model_fields_set
         if "category" in fields_set:
             update_fields.append("category = ?")
@@ -671,32 +666,55 @@ async def update_memory(
         # stored content survives an invalidation error.
         try:
             async with _atomic_memory_write(conn):
-                # Authoritative token re-check under the write lock: no other
-                # writer can commit between this read and our UPDATE. String
-                # equality on CURRENT_TIMESTAMP has 1-second resolution, so
-                # same-second races remain possible by design (a monotonic
-                # version column would close them; no schema change here).
-                if body.expected_updated_at is not None:
-                    recheck = await asyncio.to_thread(
-                        conn.execute,
-                        "SELECT updated_at FROM memories WHERE id = ?",
-                        (memory_id,),
+                # Authoritative re-read under the write lock: no other writer
+                # can commit between this read and our UPDATE. The optional
+                # token is compared here (string equality on
+                # CURRENT_TIMESTAMP has 1-second resolution, so same-second
+                # races remain possible by design — a monotonic version
+                # column would close them; no schema change here), and the
+                # no-op-save baseline is refreshed from this same read.
+                recheck = await asyncio.to_thread(
+                    conn.execute,
+                    "SELECT updated_at, content FROM memories WHERE id = ?",
+                    (memory_id,),
+                )
+                fresh = await asyncio.to_thread(recheck.fetchone)
+                if fresh is None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Memory with id {memory_id} not found",
                     )
-                    fresh = await asyncio.to_thread(recheck.fetchone)
-                    if fresh is None:
-                        raise HTTPException(
-                            status_code=404,
-                            detail=f"Memory with id {memory_id} not found",
-                        )
-                    if body.expected_updated_at != fresh[0]:
-                        raise HTTPException(
-                            status_code=409,
-                            detail="Memory was modified by another session",
-                        )
+                if (
+                    body.expected_updated_at is not None
+                    and body.expected_updated_at != fresh[0]
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Memory was modified by another session",
+                    )
+
+                # No-op save detection (issue #515, AC27): the wiki-claim
+                # invalidation below must only fire when the submitted
+                # content actually differs from the stored content — an
+                # identical-content save cannot have changed any derived
+                # claim.
+                content_changed = (
+                    body.content is not None and body.content != fresh[1]
+                )
+
+                sql_fields = list(update_fields)
+                if content_changed and memory_store._has_embedding_columns(conn):
+                    # Clear the stale embedding only when the content
+                    # actually changed (issue #686, T1-02-S-03): an
+                    # identical-content save keeps the stored vector.
+                    # embed_and_store below recomputes best-effort after
+                    # commit.
+                    sql_fields.append("embedding = NULL")
+                    sql_fields.append("embedding_model = NULL")
 
                 sql = f"""
                     UPDATE memories
-                    SET {", ".join(update_fields)}, updated_at = CURRENT_TIMESTAMP
+                    SET {", ".join(sql_fields)}, updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
                 """
                 await asyncio.to_thread(conn.execute, sql, params)

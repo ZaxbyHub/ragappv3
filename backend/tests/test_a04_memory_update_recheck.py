@@ -220,7 +220,7 @@ def test_row_deleted_before_recheck_returns_404(env):
             self._memory_id = memory_id
 
         def execute(self, sql, params=()):
-            if sql.strip().startswith("SELECT updated_at FROM memories"):
+            if sql.strip().startswith("SELECT updated_at"):
                 self._base.execute(
                     "DELETE FROM memories WHERE id = ?", (self._memory_id,)
                 )

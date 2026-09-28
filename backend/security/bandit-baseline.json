@@ -36,7 +36,7 @@
       "SEVERITY.LOW": 62,
       "SEVERITY.MEDIUM": 60,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 81774,
+      "loc": 81778,
       "nosec": 0,
       "skipped_tests": 62
     },
@@ -231,7 +231,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 1,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 739,
+      "loc": 743,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -2896,7 +2896,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "696 \n697                 sql = f\"\"\"\n698                     UPDATE memories\n699                     SET {\", \".join(update_fields)}, updated_at = CURRENT_TIMESTAMP\n700                     WHERE id = ?\n701                 \"\"\"\n702                 await asyncio.to_thread(conn.execute, sql, params)\n",
+      "code": "714 \n715                 sql = f\"\"\"\n716                     UPDATE memories\n717                     SET {\", \".join(sql_fields)}, updated_at = CURRENT_TIMESTAMP\n718                     WHERE id = ?\n719                 \"\"\"\n720                 await asyncio.to_thread(conn.execute, sql, params)\n",
       "col_offset": 22,
       "end_col_offset": 19,
       "filename": "backend/app/api/routes/memories.py",
@@ -2907,13 +2907,13 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 697,
+      "line_number": 715,
       "line_range": [
-        697,
-        698,
-        699,
-        700,
-        701
+        715,
+        716,
+        717,
+        718,
+        719
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
