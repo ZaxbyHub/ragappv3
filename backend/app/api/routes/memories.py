@@ -140,6 +140,7 @@ class MemoryUpdateRequest(BaseModel):
     )
     expected_updated_at: Optional[str] = Field(
         None,
+        max_length=64,
         description=(
             "Optional concurrency token: the updated_at value the caller last "
             "read. When provided and no longer current, the update is "
@@ -617,6 +618,10 @@ async def update_memory(
             update_fields.append("source = ?")
             params.append(body.source)
         if body.importance is not None:
+            # Value-guard (not fields_set) BY DESIGN: importance has no
+            # meaningful cleared state, so explicit null preserves the stored
+            # value — unlike category/tags/source/expires_at, whose
+            # explicit-null clears are documented in the release notes.
             update_fields.append("importance = ?")
             params.append(body.importance)
         if "expires_at" in fields_set:
@@ -839,9 +844,18 @@ async def delete_memory(
                 await asyncio.to_thread(
                     lambda: _WikiStore(conn).mark_claims_stale_by_memory(memory_id, memory_vault_id)
                 )
-            await asyncio.to_thread(
+            cursor = await asyncio.to_thread(
                 conn.execute, "DELETE FROM memories WHERE id = ?", (memory_id,)
             )
+            # In-transaction re-check (mirrors update_memory): if another
+            # request deleted the row between the pre-check and our write
+            # lock, surface 404 instead of a success for a row we did not
+            # delete.
+            if cursor.rowcount == 0:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Memory with id {memory_id} not found",
+                )
     except HTTPException:
         raise
     except Exception:

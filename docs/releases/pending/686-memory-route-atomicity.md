@@ -70,10 +70,13 @@ Workstream A PR 4 of 7 (audit remediation, frontier audit 2026-09-23).
 - The backfill single-flight lock is per-process (per event loop), matching
   the in-request overlap the audit found; multi-worker deployments were
   never serialized by this route.
-- Documented asymmetry (unchanged by design): an empty-string `tags` value
-  clears tags (its validator normalizes `""` to null), while an
+- Documented asymmetries (unchanged by design): an empty-string `tags`
+  value clears tags (its validator normalizes `""` to null), while an
   empty-string `category`/`source` stores the empty string; the Memory page
-  always sends `null` for cleared fields.
+  always sends `null` for cleared fields. Separately, `importance: null` is
+  a no-op (preserves the stored value) rather than a clear — importance has
+  no meaningful cleared state — so it is deliberately a value-guard instead
+  of a `model_fields_set` presence-guard.
 
 ## Verification
 
