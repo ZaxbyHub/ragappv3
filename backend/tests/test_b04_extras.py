@@ -25,6 +25,8 @@ import zipfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "backend"))
 
@@ -87,6 +89,81 @@ async def test_same_hash_legacy_duplicates_converge(tmp_path):
         [_record(f"{prefix}default_0", 7, "dup")], generation_prefix=prefix
     )
     assert await store.count_by_file("7") == 1
+
+
+async def test_complete_readd_updates_vectors_in_place(tmp_path):
+    """F-001 regression (PR #828 review): a COMPLETE same-generation re-add
+    with CHANGED embeddings/text must update the stored rows in place.
+
+    The chunk ids carry no model or parser identity, so a same-dimension
+    re-embed produces the same ids with different vectors — the guard must
+    re-write them (id upsert), not skip the write, or the corpus keeps
+    old-model vectors labelled under the new model. Also pins the count:
+    exactly one row per chunk id after the update.
+    """
+    from app.services.vector_store import VectorStore
+
+    store = VectorStore(db_path=tmp_path / "lancedb")
+    await store.init_table(_DIM)
+    prefix = "8_eeee5555_"
+    old_records = [
+        _record(f"{prefix}default_{i}", 8, f"old text {i}") for i in range(2)
+    ]
+    for r in old_records:
+        r["embedding"] = [0.1] * _DIM
+    await store.add_chunks(old_records, generation_prefix=prefix)
+
+    new_records = [
+        _record(f"{prefix}default_{i}", 8, f"new text {i}") for i in range(2)
+    ]
+    for i, r in enumerate(new_records):
+        r["embedding"] = [0.9 - i * 0.1] * _DIM
+    await store.add_chunks(new_records, generation_prefix=prefix)
+
+    assert await store.count_by_file("8") == 2
+    rows = await store.get_chunks_by_uid([r["id"] for r in new_records])
+    assert {r["id"] for r in rows} == {r["id"] for r in new_records}
+    stored = {r["id"]: r for r in rows}
+    for r in new_records:
+        assert stored[r["id"]]["text"] == r["text"], "text must be updated"
+        # LanceDB stores embeddings as float32 — compare with tolerance.
+        assert stored[r["id"]]["embedding"] == pytest.approx(r["embedding"]), (
+            "same-hash re-embed must land the new vector"
+        )
+
+
+async def test_guard_falls_open_on_transient_count_failure(tmp_path, caplog):
+    """F-003 regression (both reviews): a transient count_rows failure must
+    fall through to the plain append WITH a warning — not skip the write.
+
+    A regression that narrows the except tuple or drops the fallback would
+    turn every guarded add into a silent zero-row ingest; this test fails
+    if the fallback stops appending or stops logging.
+    """
+    import logging
+
+    from app.services.vector_store import VectorStore
+
+    store = VectorStore(db_path=tmp_path / "lancedb")
+    await store.init_table(_DIM)
+    prefix = "14_ffff6666_"
+    records = [_record(f"{prefix}default_{i}", 14, f"g{i}") for i in range(2)]
+
+    async def _boom(*_args, **_kwargs):
+        raise RuntimeError("transient lancedb failure")
+
+    with caplog.at_level(logging.WARNING, logger="app.services.vector_store"):
+        with patch.object(store.table, "count_rows", new=_boom):
+            timings = await store.add_chunks(records, generation_prefix=prefix)
+
+    assert "vector_write_ms" in timings
+    rows = await store.get_chunks_by_uid([r["id"] for r in records])
+    assert {r["id"] for r in rows} == {r["id"] for r in records}, (
+        "fail-open fallback must still append"
+    )
+    assert any(
+        "generation guard failed" in rec.message for rec in caplog.records
+    ), "the fallback must log a warning"
 
 
 async def test_equal_count_different_ids_resets(tmp_path):
@@ -249,7 +326,6 @@ async def test_scan_gate_matrix(tmp_path):
         # image screens once folded).
         (uploads / "BAD.DOCX").write_bytes(_zip_bytes({"junk.txt": "x"}))
         (uploads / "PHOTO.JPG").write_text("<html>not an image", encoding="utf-8")
-        (uploads / "bad.docx").write_bytes(_zip_bytes({"junk.txt": "x"}))
 
         pool = SQLiteConnectionPool(db_path, max_size=2)
         processor = AsyncMock()
@@ -262,6 +338,19 @@ async def test_scan_gate_matrix(tmp_path):
     }
     enqueued_names = {Path(str(p)).name for p in enqueued if p}
     assert enqueued_names == {"good.txt", "page.html", "good.docx"}
+
+
+async def test_scan_gate_sub8byte_txt_passes():
+    """Route parity: a 1-7 byte text file is accepted (only empty rejects)."""
+    from app.services.upload_validation import validate_ingest_candidate
+
+    with tempfile.TemporaryDirectory(prefix="b04x_sub8_") as td:
+        tiny = Path(td) / "tiny.txt"
+        tiny.write_text("hi", encoding="utf-8")
+        assert validate_ingest_candidate(tiny) == (True, None)
+        empty = Path(td) / "empty.txt"
+        empty.write_text("", encoding="utf-8")
+        assert validate_ingest_candidate(empty) == (False, "empty")
 
 
 async def test_widened_unique_index_positive_and_staleness(tmp_path):
@@ -388,3 +477,116 @@ async def test_enqueue_dedupe_across_path_forms():
     finally:
         settings.data_dir = old_dir
         os.chdir(old_cwd)
+
+
+async def test_corrupt_stored_path_does_not_abort_directory_scan(tmp_path, caplog):
+    """F-008 regression: one stored file_path that Path.resolve() rejects
+    (embedded NUL) must not abort discovery for the whole directory — the
+    raw string falls back into the membership set and other new files are
+    still found and enqueued."""
+    import logging
+
+    from app.config import settings
+    from app.models.database import SQLiteConnectionPool, init_db
+    from app.services.file_watcher import FileWatcher
+
+    with patch.object(settings, "data_dir", tmp_path):
+        db_path = str(settings.sqlite_path)
+        init_db(db_path)
+        conn = sqlite3.connect(db_path)
+        conn.execute("INSERT INTO vaults (name) VALUES ('v')")
+        conn.commit()
+        conn.close()
+        vid = _vault_id(db_path)
+        uploads = settings.vault_uploads_dir(vid)
+        (uploads / "healthy.txt").write_text("fine", encoding="utf-8")
+
+        corrupt_path = "corru" + chr(0) + "pt.txt"
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "INSERT INTO files (vault_id, file_path, file_name, file_size, status) "
+            "VALUES (?, ?, 'corrupt', 1, 'indexed')",
+            (vid, corrupt_path),
+        )
+        conn.commit()
+        conn.close()
+
+        pool = SQLiteConnectionPool(db_path, max_size=2)
+        processor = AsyncMock()
+        fw = FileWatcher(processor=processor, pool=pool)
+        with caplog.at_level(logging.ERROR, logger="app.services.file_watcher"):
+            await fw.scan_once()
+
+    enqueued = {
+        Path(
+            str(call.kwargs.get("file_path", call.args[0] if call.args else ""))
+        ).name
+        for call in processor.enqueue.await_args_list
+    }
+    assert enqueued == {"healthy.txt"}, (
+        "a corrupt stored path must not abort the directory scan"
+    )
+
+
+async def test_process_file_same_hash_reingest_after_error_updates_in_place(tmp_path):
+    """F-002 regression (PR #828 external review): the process_file
+    safe-order call site must pass the generation prefix — a same-hash
+    re-ingest (allowed after a row moved to 'error') must update the
+    existing generation in place, not append a duplicate copy.
+    """
+    from app.config import settings
+    from app.models.database import get_pool, init_db
+    from app.services.chunking import ProcessedChunk
+    from app.services.document_artifacts import ParsedDocument
+    from app.services.document_processor import DocumentProcessor
+    from app.services.vector_store import VectorStore
+
+    with patch.object(settings, "data_dir", tmp_path), patch.object(
+        settings, "wiki_enabled", False
+    ), patch.object(settings, "wiki_compile_on_ingest", False):
+        db_path = str(settings.sqlite_path)
+        init_db(db_path)
+        conn = sqlite3.connect(db_path)
+        conn.execute("INSERT INTO vaults (name) VALUES ('v')")
+        conn.commit()
+        conn.close()
+        vid = _vault_id(db_path)
+        src = settings.vault_uploads_dir(vid) / "re.txt"
+        src.write_text("reingest content", encoding="utf-8")
+
+        pool = get_pool(db_path, max_size=3)
+        store = VectorStore(db_path=tmp_path / "lancedb")
+        await store.init_table(_DIM)
+        processor = DocumentProcessor(
+            pool=pool,
+            embedding_service=_FakeEmbeddingService(_DIM),
+            vector_store=store,
+        )
+        chunk = ProcessedChunk(
+            text="reingest content",
+            metadata={"chunk_scale": "default", "raw_text": "reingest content"},
+            chunk_index=0,
+        )
+        with patch.object(
+            processor,
+            "_process_document_file",
+            new=AsyncMock(return_value=([chunk], "reingest content", ParsedDocument(atoms=()))),
+        ), patch("app.services.document_processor.compute_parent_windows"):
+            await processor.process_file(str(src), vault_id=vid)
+            with pool.connection() as conn:
+                file_id = conn.execute(
+                    "SELECT id FROM files WHERE file_path = ?", (str(src),)
+                ).fetchone()["id"]
+            # A later failure moves the row to 'error'; 'error' is exempt
+            # from the duplicate check, so the re-ingest is allowed.
+            conn2 = sqlite3.connect(db_path)
+            conn2.execute(
+                "UPDATE files SET status = 'error' WHERE id = ?", (file_id,)
+            )
+            conn2.commit()
+            conn2.close()
+            await processor.process_file(str(src), vault_id=vid)
+
+        assert await store.count_by_file(str(file_id)) == 1, (
+            "same-hash re-ingest must update in place, not append a duplicate"
+        )

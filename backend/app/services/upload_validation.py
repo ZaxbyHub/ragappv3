@@ -105,9 +105,12 @@ def validate_ingest_candidate(path) -> tuple[bool, str | None]:
 
     Used by ``FileWatcher.scan_once`` (issue #693 / RT-S5-02) so bytes that
     reach ingestion through a scanned directory — a completed upload, an
-    interrupted upload's leftovers, an email attachment — pass the same
-    extension/content screens the upload route enforces before trusting the
-    bytes, regardless of origin.
+    interrupted upload's leftovers, an attachment the scan discovers before
+    its producer enqueues it directly — pass the same extension/content
+    screens the upload route enforces before trusting the bytes, regardless
+    of origin. Producers that enqueue WITHOUT a scan (the email poller and
+    draft promotion) do not pass through this gate; their validation remains
+    their own (issue #693 scoped the gate to ``scan_once``).
 
     Parity with the upload route: the extension is derived exactly as
     ``documents.py`` does (``Path(...).suffix.lower()``) and passed to every
@@ -130,10 +133,12 @@ def validate_ingest_candidate(path) -> tuple[bool, str | None]:
     except OSError:
         return False, "unreadable"
 
-    if len(header) < 8:
-        # The route rejects an empty upload before any screen runs; a
-        # sub-8-byte file cannot match any signature either.
-        return False, "too_short"
+    if len(header) == 0:
+        # Exact route parity (documents.py rejects only the empty upload at
+        # this stage): a 1-7 byte text file is as acceptable here as through
+        # the upload route — the signature screens below handle short headers
+        # (header[:len(magic)] cannot match a longer signature).
+        return False, "empty"
 
     if not _check_magic_bytes(file_suffix, header):
         return False, "magic_mismatch"

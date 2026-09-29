@@ -344,7 +344,14 @@ class FileWatcher:
                     (f"{str(directory)}%", f"{str(directory.resolve())}%"),
                 )
                 for row in cursor.fetchall():
-                    files_in_db.add(str(Path(row["file_path"]).resolve()))
+                    try:
+                        files_in_db.add(str(Path(row["file_path"]).resolve()))
+                    except (OSError, ValueError):
+                        # A corrupt stored path (e.g. an embedded NUL) must
+                        # not abort discovery for the whole directory
+                        # (PR #828 review F-008): fall back to the raw
+                        # stored string so the rest of the scan proceeds.
+                        files_in_db.add(row["file_path"])
             finally:
                 self.pool.release_connection(conn)
         except Exception as e:

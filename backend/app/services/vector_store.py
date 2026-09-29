@@ -873,10 +873,12 @@ class VectorStore:
         When ``generation_prefix`` is set (``{file_id}_{hash8}_``, the same
         string ``delete_old_generation_by_file`` derives), the write is
         idempotent per generation (issue #693): a complete same-generation
-        re-add is a no-op, and any partial/duplicated/stale state under the
-        prefix is reset before the append so the file ends with exactly one
-        row per chunk id. The guard runs against the selected table (live or
-        rebuild target).
+        re-add is re-written IN PLACE via an id-keyed upsert — so changed
+        embeddings/text under the same chunk ids (a same-dimension re-embed)
+        are stored, not silently skipped (PR #828 review F-001) — and any
+        partial/duplicated/stale state under the prefix is reset before the
+        append so the file ends with exactly one row per chunk id. The guard
+        runs against the selected table (live or rebuild target).
         """
         async with self._acquire_write_lock():
             # Kwargs are passed only when set: test doubles commonly replace
@@ -1044,6 +1046,16 @@ class VectorStore:
         # matches nothing. Runs against the SELECTED table (live or rebuild
         # target) so a dimension-rebuild add is guarded on the rebuild temp
         # table and can never be silenced by the live table's state.
+        #
+        # A COMPLETE generation (same ids, same count) is re-written IN PLACE
+        # via an id-keyed upsert rather than skipped: the ids carry no model
+        # or parser identity, so a same-dimension re-embed (or any reparse
+        # preserving the chunk layout) produces the same ids with different
+        # vectors/text — skipping the write would leave stale content served
+        # under the new identity (PR #828 review F-001). The upsert updates
+        # matched ids and inserts unmatched ones, so the file still ends with
+        # exactly one row per chunk id.
+        upserted = False
         if generation_prefix and processed_records:
             file_ids = {str(r["file_id"]) for r in processed_records}
             if len(file_ids) == 1:
@@ -1073,16 +1085,29 @@ class VectorStore:
                     if complete:
                         logger.info(
                             "add_chunks: complete same-generation re-add for "
-                            "file_id=%s (%d rows); skipping duplicate append",
+                            "file_id=%s (%d rows); re-writing rows in place "
+                            "via id upsert so changed embeddings/text are not "
+                            "silently skipped",
                             safe_file_id,
                             len(incoming_ids),
                         )
-                        return timings
-                    if total > 0:
+                        t0 = time.monotonic()
+                        await (
+                            table.merge_insert(on="id")
+                            .when_matched_update_all()
+                            .when_not_matched_insert_all()
+                            .execute(processed_records)
+                        )
+                        timings["vector_write_ms"] += (
+                            time.monotonic() - t0
+                        ) * 1000
+                        upserted = True
+                    elif total > 0:
                         logger.info(
-                            "add_chunks: resetting %d anomalous generation "
-                            "rows for file_id=%s before re-add (partial, "
-                            "duplicated, or stale ids)",
+                            "add_chunks: resetting %d generation rows for "
+                            "file_id=%s whose ids differ from the incoming "
+                            "chunks (chunk layout changed under the same "
+                            "hash) before re-add",
                             total,
                             safe_file_id,
                         )
@@ -1095,9 +1120,10 @@ class VectorStore:
                     # failure falls back to the plain-append semantics.
                     logger.warning("add_chunks generation guard failed: %s", e)
 
-        t0 = time.monotonic()
-        await table.add(processed_records)
-        timings["vector_write_ms"] += (time.monotonic() - t0) * 1000
+        if not upserted:
+            t0 = time.monotonic()
+            await table.add(processed_records)
+            timings["vector_write_ms"] += (time.monotonic() - t0) * 1000
 
         if target is not None:
             # Rebuild temp-table writes: no live index bookkeeping and no
