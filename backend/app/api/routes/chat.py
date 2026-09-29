@@ -14,6 +14,7 @@ import sqlite3
 import time
 import uuid
 from contextlib import AsyncExitStack
+from contextlib import suppress as contextlib_suppress
 from html import escape as _xml_escape
 from typing import Any, Callable, Dict, List, Literal, Optional, Set, Tuple
 
@@ -1263,9 +1264,16 @@ def stream_chat_response(
                 # E3 admission (issue #518): the CHAT gate now spans the
                 # producer's lifetime (the real generation), not a single
                 # connection's. Rejection logs the protocol error+done pair.
+                _admission_controller = get_admission_controller()
+                # Queue depth this arrival joins, sampled before parking
+                # (issue #687, P01-SK2-06) so the queue-wait metric records
+                # the observed depth instead of a constant 0.
+                _queue_depth = await _admission_controller.queue_depth(
+                    AdmissionClass.CHAT
+                )
                 try:
                     await admission_stack.enter_async_context(
-                        get_admission_controller().admit(AdmissionClass.CHAT)
+                        _admission_controller.admit(AdmissionClass.CHAT)
                     )
                 except AdmissionRejected as exc:
                     logger.warning("Chat stream admission rejected: %s", exc)
@@ -1278,7 +1286,9 @@ def stream_chat_response(
                 gate_token = mark_chat_gate()
                 admission_stack.callback(lambda: reset_chat_gate(gate_token))
                 get_telemetry().record_queue_wait(
-                    "chat", time.monotonic() - _queue_wait_started
+                    "chat",
+                    time.monotonic() - _queue_wait_started,
+                    depth=_queue_depth,
                 )
 
                 # Issue #553: write the durable user row (status 'pending')
@@ -1500,28 +1510,65 @@ def stream_chat_response(
         # stream. The engine's generation-phase gate is skipped under this
         # lease (chat_gate_held marker), so route+engine never double-count.
         # Rejection yields the protocol error+done pair (ENH-016: every
-        # terminal path emits done).
-        async with AsyncExitStack() as admission_stack:
-            try:
-                await admission_stack.enter_async_context(
-                    get_admission_controller().admit(AdmissionClass.CHAT)
+        # terminal path emits done). The admission enter runs on a child task
+        # so the connection keeps receiving CHAT-002 heartbeat comments while
+        # the request waits in the admission queue — previously the first
+        # byte could only arrive after admission (#687, TQ-budget-all-05).
+        admission_stack = AsyncExitStack()
+        enter_task: Optional[asyncio.Task] = None
+        sampled_depth = 0
+        try:
+
+            async def _enter_admission() -> None:
+                nonlocal sampled_depth
+                controller = get_admission_controller()
+                # Sample the queue depth this arrival joins (issue #687,
+                # P01-SK2-06) — inside the entering task, so earlier queued
+                # arrivals have already parked their waiters.
+                sampled_depth = await controller.queue_depth(
+                    AdmissionClass.CHAT
                 )
-            except AdmissionRejected as exc:
-                logger.warning("Chat stream admission rejected: %s", exc)
-                yield f"data: {json.dumps({'type': 'error', 'message': 'Chat capacity is saturated; retry shortly', 'code': 'ADMISSION_REJECTED'})}\n\n"
-                yield f"data: {json.dumps({'type': 'done', 'sources': [], 'memories_used': [], 'wiki_used': [], 'kms_used': [], 'score_type': 'distance', 'turn_id': current_turn_id()})}\n\n"
-                return
+                await admission_stack.enter_async_context(
+                    controller.admit(AdmissionClass.CHAT)
+                )
+
+            enter_task = asyncio.create_task(_enter_admission())
+            while not enter_task.done():
+                done, _ = await asyncio.wait(
+                    {enter_task}, timeout=CHAT_HEARTBEAT_INTERVAL
+                )
+                if enter_task in done:
+                    break
+                yield _sse_heartbeat()
+            await enter_task
+
             # Mark this request as already chat-gated so the engine's
             # generation-phase gate skips its own acquire (no same-key
             # nesting; see app/services/admission.py).
             gate_token = mark_chat_gate()
             admission_stack.callback(lambda: reset_chat_gate(gate_token))
             get_telemetry().record_queue_wait(
-                "chat", time.monotonic() - _queue_wait_started
+                "chat",
+                time.monotonic() - _queue_wait_started,
+                depth=sampled_depth,
             )
 
             async for event in _event_generator_inner():
                 yield event
+        except AdmissionRejected as exc:
+            logger.warning("Chat stream admission rejected: %s", exc)
+            yield f"data: {json.dumps({'type': 'error', 'message': 'Chat capacity is saturated; retry shortly', 'code': 'ADMISSION_REJECTED'})}\n\n"
+            yield f"data: {json.dumps({'type': 'done', 'sources': [], 'memories_used': [], 'wiki_used': [], 'kms_used': [], 'score_type': 'distance', 'turn_id': current_turn_id()})}\n\n"
+            return
+        finally:
+            if enter_task is not None and not enter_task.done():
+                # Client disconnected while still queued: cancel the enter —
+                # the cancelled acquire unregisters its waiter (admission
+                # #687) — and consume the task so nothing is orphaned.
+                enter_task.cancel()
+                with contextlib_suppress(asyncio.CancelledError, Exception):
+                    await enter_task
+            await admission_stack.aclose()
 
     if durable_active:
         key = (durable_session_id, durable_turn_id)
@@ -1806,40 +1853,44 @@ async def chat(
     _turn_id = request_id_var.get() or f"turn-{uuid.uuid4().hex}"
     set_current_turn(_turn_id)
     get_telemetry().record_chat_turn(_turn_id)
+    # E3 admission (issue #518): route-level CHAT gate for the non-stream
+    # path. mark_chat_gate() makes the engine's generation-phase gate
+    # skip its own acquire (explicit no-nesting contract — see
+    # app/services/admission.py); without it, budget-sized concurrent
+    # non-stream requests deadlock (swarm review F-002). Saturation is a
+    # bounded overload response, never an unbounded queue.
     try:
-        # E3 admission (issue #518): route-level CHAT gate for the non-stream
-        # path. mark_chat_gate() makes the engine's generation-phase gate
-        # skip its own acquire (explicit no-nesting contract — see
-        # app/services/admission.py); without it, budget-sized concurrent
-        # non-stream requests deadlock (swarm review F-002). Saturation is a
-        # bounded overload response, never an unbounded queue.
-        try:
-            async with get_admission_controller().admit(AdmissionClass.CHAT):
-                gate_token = mark_chat_gate()
-                try:
-                    return await non_stream_chat_response(
-                        body.message,
-                        history,
-                        rag_engine,
-                        vault_id=body.vault_id,
-                        mode=effective_mode,
-                        require_vault=require_vault,
-                        user_id=user.get("id"),
-                        include_global=include_global,
-                        can_write_memory=can_write_memory,
-                        temperature=body.temperature,
-                        retrieval_mode=body.retrieval_mode,
-                        citation_mode=body.citation_mode,
-                        metadata_filter=body.metadata_filter,
-                        vision_context=vision_context,
-                        document_ids=body.document_ids,
-                    )
-                finally:
-                    reset_chat_gate(gate_token)
-        except AdmissionRejected as exc:
-            raise HTTPException(
-                status_code=503, detail="chat admission rejected"
-            ) from exc
+        async with get_admission_controller().admit(AdmissionClass.CHAT):
+            gate_token = mark_chat_gate()
+            try:
+                return await non_stream_chat_response(
+                    body.message,
+                    history,
+                    rag_engine,
+                    vault_id=body.vault_id,
+                    mode=effective_mode,
+                    require_vault=require_vault,
+                    user_id=user.get("id"),
+                    include_global=include_global,
+                    can_write_memory=can_write_memory,
+                    temperature=body.temperature,
+                    retrieval_mode=body.retrieval_mode,
+                    citation_mode=body.citation_mode,
+                    metadata_filter=body.metadata_filter,
+                    vision_context=vision_context,
+                    document_ids=body.document_ids,
+                )
+            finally:
+                reset_chat_gate(gate_token)
+    except AdmissionRejected as exc:
+        raise HTTPException(
+            status_code=503, detail="chat admission rejected"
+        ) from exc
+    except HTTPException:
+        # Expected protocol-level rejections (the 503 above) must reach
+        # FastAPI unlogged — they are bounded overload responses, not
+        # unhandled failures (#687, T1-28-K-07).
+        raise
     except Exception:
         logger.exception("[chat] UNHANDLED EXCEPTION during chat processing")
         raise

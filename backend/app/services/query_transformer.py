@@ -168,7 +168,16 @@ class QueryTransformer:
         if settings.redis_url:
             try:
                 import redis
-                self._redis_client = redis.from_url(settings.redis_url)
+                # Socket timeouts derived from the same setting that bounds
+                # redis_call, so a stalled call's worker thread frees itself
+                # at the wrapper's deadline instead of blocking forever
+                # (#687, T1-02-S2-02).
+                _timeout = float(getattr(settings, "redis_io_timeout_seconds", 1.0))
+                self._redis_client = redis.from_url(
+                    settings.redis_url,
+                    socket_timeout=_timeout,
+                    socket_connect_timeout=_timeout,
+                )
             except Exception as e:
                 logger.warning("Redis connection failed, using LRU fallback: %s", e)
         # LRU cache for transform results — OrderedDict preserves insertion order,
@@ -549,7 +558,14 @@ class QueryPlanner:
         if settings.redis_url:
             try:
                 import redis
-                self._redis_client = redis.from_url(settings.redis_url)
+                # Same socket-timeout rationale as QueryTransformer above
+                # (#687, T1-02-S2-02).
+                _timeout = float(getattr(settings, "redis_io_timeout_seconds", 1.0))
+                self._redis_client = redis.from_url(
+                    settings.redis_url,
+                    socket_timeout=_timeout,
+                    socket_connect_timeout=_timeout,
+                )
             except Exception as e:
                 logger.warning(
                     "QueryPlanner Redis connection failed, using LRU fallback: %s", e

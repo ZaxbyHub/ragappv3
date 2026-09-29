@@ -258,7 +258,16 @@ class EmbeddingService:
         self._redis_misses = 0
         if settings.redis_url and redis is not None:
             try:
-                self._redis_client = redis.from_url(settings.redis_url)
+                # Socket timeouts derived from redis_io_timeout_seconds so a
+                # stalled cache call's redis_io worker thread frees itself at
+                # the wrapper's deadline instead of blocking forever
+                # (#687, T1-02-S2-02).
+                _timeout = float(getattr(settings, "redis_io_timeout_seconds", 1.0))
+                self._redis_client = redis.from_url(
+                    settings.redis_url,
+                    socket_timeout=_timeout,
+                    socket_connect_timeout=_timeout,
+                )
                 # Verify connectivity with a quiet ping
                 self._redis_client.ping()
                 self._redis_available = True

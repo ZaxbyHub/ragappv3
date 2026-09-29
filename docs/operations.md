@@ -46,31 +46,51 @@ roles, not capacity claims.
   caps, on by default (`ADMISSION_ENABLED=true`); a deployment that
   previously ran more than 8 concurrent chat streams (or 4 instant) will
   start queueing at those numbers with zero `.env` changes.
-- With the shipped settings mapping each class has its OWN budget key
-  (one measured endpoint role per class: thinking LLM, instant LLM, TEI
-  :8080, TEI :8081, vision, background). Foreground-preference eviction
-  between chat and background holders only engages when classes SHARE a
-  budget key — with the shipped mapping they do not, so admission never
-  evicts across classes in a default deployment (the capability exists for
-  custom controllers that map several classes onto one device budget).
-- Foreground preference (shared-key deployments): when interactive work is
-  blocked and only background holders occupy a budget, one local
-  (same-process) background holder is logically evicted (its task keeps
-  running; its later release is a no-op). Background work never preempts
-  interactive work and is never starved — queued background items all
-  complete once interactive pressure subsides.
-- Overload is bounded: queues hold at most `ADMISSION_QUEUE_MAX_SIZE`
-  in-flight + queued requests per class; beyond that the request is
-  rejected immediately (SSE `ADMISSION_REJECTED` error + done on the stream
-  path, HTTP 503 on the non-stream path). A queued request whose deadline
-  (`ADMISSION_DEADLINE_SECONDS`) expires is rejected, never executed.
+- Device mapping (#687): CHAT and BACKGROUND share ONE LLM-device budget
+  key sized `max(ADMISSION_CHAT_BUDGET, ADMISSION_BACKGROUND_BUDGET)`
+  (defaults: `max(8, 2) = 8`), because both contend for the same thinking
+  LLM. Either setting's cap can therefore be exceeded up to the larger of
+  the two (background alone can hold up to 8 slots, still bounded
+  underneath by the per-process ingestion semaphore). Instant, embedding,
+  reranking and vision keep their own measured-endpoint keys.
+- Foreground preference (now effective in default deployments, #687): when
+  interactive chat work is blocked and only background holders occupy the
+  llm budget, one local (same-process) background holder is logically
+  evicted (its task keeps running; its later release is a no-op). Work is
+  never cancelled and background is never starved — queued background
+  items all complete once interactive pressure subsides. Under sustained
+  full chat load, background admits QUEUE (with
+  `ADMISSION_DEADLINE_SECONDS=None` that queueing is unbounded in time).
+- Overload is bounded: the enforced bound is `ADMISSION_QUEUE_MAX_SIZE`
+  counted as in-flight holders for the budget key PLUS queued waiters for
+  the class; at or over the bound the request is rejected immediately (SSE
+  `ADMISSION_REJECTED` error + done on the stream path, HTTP 503 on the
+  non-stream path). Because chat and background share one key (#687), full
+  chat occupancy tightens the background queue bound from 64 to
+  `ADMISSION_QUEUE_MAX_SIZE − chat holders` (with 8 chat holders, the 57th
+  concurrent background request is `queue_full`-rejected where the
+  pre-#687 dedicated key accepted through #64). A queued request whose
+  deadline (`ADMISSION_DEADLINE_SECONDS`) expires is rejected, never
+  executed.
 - Leases: a live holder renews (heartbeats every ttl/3), so a long
   thinking-mode generation NEVER loses its slot to the 30 s TTL; the TTL
   exists solely to reap holders whose process died without releasing, and
-  runs on the next acquire. On graceful shutdown the controller releases
+  runs on the next acquire. With a shared store, expiry authority is the
+  REDIS server clock (TIME-based Lua; Redis >= 5 required for the
+  effect-replicated scripts) — host clock skew cannot reap a live holder,
+  and during a rolling upgrade mixed-version replicas may stamp epochs
+  from different clocks, so upgrade all replicas within one TTL window.
+  On graceful shutdown the controller releases
   all in-flight slots, cancels renewal heartbeats, closes a Redis store's
   connection pool and rejects new admits (wired in `app/lifespan.py`
   AFTER background workers drain).
+- Optional Redis cache isolation (#687): the embedding/query-transform
+  caches' sync Redis calls run on a small dedicated bounded thread pool
+  (`app/services/redis_io.py`, 8 workers) with socket timeouts derived
+  from `REDIS_IO_TIMEOUT_SECONDS`, so a hung Redis can never consume the
+  shared default executor that unrelated request work uses. Migrating
+  those caches to redis-py asyncio (no threads at all) is future
+  hardening, not part of #687.
 - Degradation: if the shared store (Redis) is unreachable, admission fails
   OPEN — requests proceed — and the controller exposes `.degraded`; the
   operator-visible signal is the absence of admission metrics progression
