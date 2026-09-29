@@ -121,7 +121,7 @@ def main() -> int:
             async def get_chunks_by_uid(self, uids):
                 return [{"id": u} for u in uids if u in self._existing]
 
-            async def add_chunks(self, records):
+            async def add_chunks(self, records, generation_prefix=None):
                 self.added.extend(records)
                 for r in records:
                     self._existing.add(r["id"])

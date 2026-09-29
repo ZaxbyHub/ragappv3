@@ -8,6 +8,7 @@ the exact same validation logic.
 
 import os
 import re
+from pathlib import Path
 
 # Magic byte signatures for file types where extension spoofing is high-risk.
 # Text-based formats (txt, md, csv, json, yaml, etc.) have no fixed binary header
@@ -97,6 +98,58 @@ def _validate_ooxml_member(path, required_member: str) -> bool:
     if len(names) > 10000:
         return False
     return any(name == required_member for name in names)
+
+
+def validate_ingest_candidate(path) -> tuple[bool, str | None]:
+    """Screen one on-disk file with the upload route's structural checks.
+
+    Used by ``FileWatcher.scan_once`` (issue #693 / RT-S5-02) so bytes that
+    reach ingestion through a scanned directory — a completed upload, an
+    interrupted upload's leftovers, an email attachment — pass the same
+    extension/content screens the upload route enforces before trusting the
+    bytes, regardless of origin.
+
+    Parity with the upload route: the extension is derived exactly as
+    ``documents.py`` does (``Path(...).suffix.lower()``) and passed to every
+    lookup; the screens are the 8-byte magic-byte check, the image polyglot
+    header screens (only for extensions in ``_IMAGE_MAGIC_BYTES``), and the
+    full-file OOXML member check. The route's PIL-based raster decode is
+    intentionally NOT mirrored here: a per-scan image decode is a hot-path
+    cost the scan contract does not require, and the upload route remains
+    the authoritative decode path.
+
+    Returns ``(True, None)`` when the file may be enqueued, or
+    ``(False, reason)`` with a stable reason string. Fail-closed on IO
+    errors: unreadable bytes are not enqueued.
+    """
+    file_suffix = Path(str(path)).suffix.lower()
+
+    try:
+        with open(str(path), "rb") as fh:
+            header = fh.read(32)
+    except OSError:
+        return False, "unreadable"
+
+    if len(header) < 8:
+        # The route rejects an empty upload before any screen runs; a
+        # sub-8-byte file cannot match any signature either.
+        return False, "too_short"
+
+    if not _check_magic_bytes(file_suffix, header):
+        return False, "magic_mismatch"
+
+    if file_suffix in _IMAGE_MAGIC_BYTES:
+        if _detect_image_reject_header(header):
+            return False, "image_header_rejected"
+        if not _check_image_magic(file_suffix, header):
+            return False, "image_magic_mismatch"
+
+    required_member = _OOXML_REQUIRED_MEMBERS.get(file_suffix)
+    if required_member is not None:
+        if not _validate_ooxml_member(path, required_member):
+            return False, "ooxml_member_missing"
+
+    return True, None
 
 
 def _check_image_magic(extension: str, header: bytes) -> bool:
