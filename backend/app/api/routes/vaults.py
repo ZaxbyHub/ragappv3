@@ -786,7 +786,7 @@ async def delete_vault(
                     type(restore_exc).__name__,
                 )
         raise
-    except (sqlite3.Error, OSError, RuntimeError) as e:
+    except (sqlite3.Error, OSError, RuntimeError):
         await asyncio.to_thread(lambda: conn.rollback())
         if draft_purge_plan is not None:
             try:
@@ -798,7 +798,7 @@ async def delete_vault(
                     type(restore_exc).__name__,
                 )
         logger.exception("Error deleting vault %d", vault_id)
-        raise HTTPException(status_code=500, detail=f"Delete failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to delete vault")
 
     # -- Post-commit vector reconciliation (W21 / C19). -------------------
     # The relational delete is durable now; destroy the vault's vectors. On

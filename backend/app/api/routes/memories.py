@@ -5,9 +5,12 @@ Provides endpoints for listing, creating, updating, deleting, and searching memo
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import sqlite3
+import threading
+import weakref
 from datetime import datetime, timezone
 from typing import Callable, List, Optional, Union
 
@@ -135,6 +138,15 @@ class MemoryUpdateRequest(BaseModel):
     expires_at: Optional[str] = Field(
         None, description="Optional ISO timestamp after which the memory expires"
     )
+    expected_updated_at: Optional[str] = Field(
+        None,
+        max_length=64,
+        description=(
+            "Optional concurrency token: the updated_at value the caller last "
+            "read. When provided and no longer current, the update is "
+            "rejected with 409 (issue #686, T1-02-S-05)."
+        ),
+    )
 
     @field_validator("tags", mode="before")
     @classmethod
@@ -206,7 +218,11 @@ def _parse_tags_to_list(tags: Optional[str]) -> Optional[List[str]]:
     try:
         parsed = json.loads(tags)
         if isinstance(parsed, list):
-            return parsed
+            # Keep only string members so legacy pre-#515 rows with
+            # non-string elements cannot 500 the typed List[str] response
+            # (issue #686, T1-02-S-06). The write path already rejects
+            # non-string arrays (#515 AC18); this guards rows written before.
+            return [tag for tag in parsed if isinstance(tag, str)]
         # If JSON parsed but is not a list, fallback to string split
         return [t.strip() for t in str(parsed).split(",") if t.strip()]
     except json.JSONDecodeError:
@@ -262,6 +278,57 @@ def _is_admin(user: dict) -> bool:
     return user.get("role") in ("superadmin", "admin")
 
 
+@contextlib.asynccontextmanager
+async def _atomic_memory_write(conn: sqlite3.Connection):
+    """Run memory content plus its derived-state writes in one transaction.
+
+    Pool connections keep Python's default isolation level, where an
+    outermost SAVEPOINT RELEASE commits immediately (issue #686, T1-02-S-01),
+    so the route — the transaction owner since #253 — must open the
+    transaction itself. Any leftover transaction on a reused pooled
+    connection is rolled back first (the admin routes use the same pattern):
+    the production pool rolls back on release, but defensive reset keeps a
+    stale write from joining this transaction.
+    """
+    if conn.in_transaction:
+        await asyncio.to_thread(conn.rollback)
+    await asyncio.to_thread(conn.execute, "BEGIN IMMEDIATE")
+    try:
+        yield
+    except BaseException:
+        try:
+            await asyncio.to_thread(conn.rollback)
+        except sqlite3.Error:
+            logger.exception("Rollback failed after memory write error")
+        raise
+    else:
+        await asyncio.to_thread(conn.commit)
+
+
+_backfill_locks_guard = threading.Lock()
+_backfill_locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _get_backfill_lock() -> asyncio.Lock:
+    """Per-event-loop single-flight lock for the superadmin backfill.
+
+    A module-level ``asyncio.Lock`` binds to the first loop that acquires it
+    and raises on later loops (starlette's TestClient spins a fresh loop per
+    request), so locks are keyed by the running loop; dead loops drop out of
+    the weakref map. Scope is per-process, matching the in-request overlap
+    the audit found (issue #686, T1-02-S2-07).
+    """
+    loop = asyncio.get_running_loop()
+    with _backfill_locks_guard:
+        lock = _backfill_locks.get(loop)
+        if lock is None:
+            lock = asyncio.Lock()
+            _backfill_locks[loop] = lock
+        return lock
+
+
 async def _perform_memory_search(
     memory_store: MemoryStore,
     query: str,
@@ -290,15 +357,22 @@ async def _perform_memory_search(
 @router.get("/memories", response_model=MemoryListResponse)
 async def list_memories(
     vault_id: Optional[int] = Query(None, description="Filter by vault ID"),
+    limit: int = Query(
+        200, ge=1, le=500, description="Maximum number of memories to return"
+    ),
+    offset: int = Query(0, ge=0, description="Number of memories to skip"),
     conn: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
     evaluate: Callable = Depends(get_evaluate_policy),
 ):
     """
-    List all memories.
+    List memories.
 
-    Returns a list of all memories with their id, content, category, tags, source,
-    created_at, and updated_at fields.
+    Returns memories with their id, content, category, tags, source,
+    created_at, and updated_at fields, newest first, bounded by ``limit``
+    (default 200, max 500) with ``offset`` paging (issue #686, T1-02-S2-09 —
+    the read must stay bounded; the default still covers what the Memory
+    page shows today).
 
     Authorization:
     - vault_id=N: requires read access to vault N. Admin/superadmin callers
@@ -325,6 +399,7 @@ async def list_memories(
             WHERE (vault_id = ? OR vault_id IS NULL)
               AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))
             ORDER BY created_at DESC
+            LIMIT ? OFFSET ?
             """
         else:
             sql = """
@@ -333,8 +408,9 @@ async def list_memories(
             WHERE vault_id = ?
               AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))
             ORDER BY created_at DESC
+            LIMIT ? OFFSET ?
             """
-        cursor = await asyncio.to_thread(conn.execute, sql, (vault_id,))
+        cursor = await asyncio.to_thread(conn.execute, sql, (vault_id, limit, offset))
     else:
         # Listing across all vaults — restrict to admin/superadmin to prevent
         # cross-vault leakage. Non-admin users must specify a vault_id.
@@ -350,7 +426,9 @@ async def list_memories(
             FROM memories
             WHERE expires_at IS NULL OR datetime(expires_at) > datetime('now')
             ORDER BY created_at DESC
+            LIMIT ? OFFSET ?
             """,
+            (limit, offset),
         )
     rows = await asyncio.to_thread(cursor.fetchall)
 
@@ -370,7 +448,10 @@ async def list_memories(
                 id=str(row[0]),
                 content=row[1],
                 metadata=metadata,
-                importance=float(row[5] or 0.5),
+                # None-guard (not truthiness) so importance 0.0 round-trips
+                # instead of being coerced to the 0.5 default (issue #686,
+                # T1-02-K-03; same guard the store read paths already apply).
+                importance=float(row[5]) if row[5] is not None else 0.5,
                 expires_at=row[6],
                 created_at=row[7],
                 updated_at=row[8],
@@ -428,17 +509,17 @@ async def create_memory(
             len(body.content),
         )
         raise HTTPException(status_code=400, detail=str(e))
-    except sqlite3.Error as e:
+    except sqlite3.Error:
         logger.exception(
             "Database error in create_memory (content length: %d)", len(body.content)
         )
-        raise HTTPException(status_code=500, detail=f"Database error: {e}")
-    except (ValueError, TypeError, RuntimeError) as e:
+        raise HTTPException(status_code=500, detail="Database error")
+    except (ValueError, TypeError, RuntimeError):
         logger.exception(
             "Unexpected error in create_memory (content length: %d)",
             len(body.content),
         )
-        raise HTTPException(status_code=500, detail=f"Server error: {e}")
+        raise HTTPException(status_code=500, detail="Server error")
 
     return _memory_record_to_response(record)
 
@@ -462,11 +543,12 @@ async def update_memory(
     Returns 404 if the memory is not found.
     """
     try:
-        # Check if memory exists and get vault_id + current content (the
-        # content is the no-op-save baseline for the claim invalidation below)
+        # Check if memory exists and get vault_id + current content and the
+        # concurrency-token baseline (the content is the no-op-save baseline
+        # for the claim invalidation below).
         cursor = await asyncio.to_thread(
             conn.execute,
-            "SELECT id, vault_id, content FROM memories WHERE id = ?",
+            "SELECT id, vault_id, content, updated_at FROM memories WHERE id = ?",
             (memory_id,),
         )
         row = await asyncio.to_thread(cursor.fetchone)
@@ -477,7 +559,6 @@ async def update_memory(
 
         # Check vault write permission
         memory_vault_id = row[1]
-        stored_content = row[2]
         # Global memories (vault_id IS NULL) are admin-only (issue #404).
         _require_admin_for_global(user, memory_vault_id)
         if memory_vault_id is not None:
@@ -491,42 +572,56 @@ async def update_memory(
         if body.content is not None and not body.content.strip():
             raise HTTPException(status_code=422, detail="Content cannot be empty")
 
-        # No-op save detection (issue #515, AC27): the wiki-claim
-        # invalidation below must only fire when the submitted content
-        # actually differs from the stored content — an identical-content
-        # save cannot have changed any derived claim.
-        content_changed = body.content is not None and body.content != stored_content
+        # Optional optimistic-concurrency token (issue #686, T1-02-S-05): a
+        # caller that echoes the updated_at it read gets a 409 when another
+        # writer committed first; omitting the token keeps the update
+        # unconditional (all pre-existing callers).
+        if (
+            body.expected_updated_at is not None
+            and body.expected_updated_at != row[3]
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Memory was modified by another session",
+            )
 
-        # Build update query dynamically based on provided fields
+        # Build update query dynamically based on provided fields. The
+        # embedding-clearing entries and the no-op-save decision are added
+        # inside the transaction below, against the freshest stored content
+        # re-read under the write lock (a concurrent write between the
+        # request-time read and the lock must not produce a stale baseline).
         update_fields = []
         params = []
 
         if body.content is not None:
             update_fields.append("content = ?")
             params.append(body.content)
-            # Clear stale embedding atomically with the content change so
-            # semantic search never returns results based on the old content.
-            # embed_and_store below recomputes best-effort after commit.
-            if memory_store._has_embedding_columns(conn):
-                update_fields.append("embedding = NULL")
-                update_fields.append("embedding_model = NULL")
-        if body.category is not None:
+        # Explicit-null vs omitted (issue #515, AC19, extended to
+        # category/source by issue #686, T1-02-K-02): a JSON null CLEARS the
+        # column (SET ... = NULL), while an omitted field preserves the
+        # stored value. The distinction is made via pydantic v2
+        # model_fields_set: the field counts as "provided" when it was
+        # explicitly sent, even when its validated value is None.
+        # Documented asymmetry: the tags/expires_at before-validators
+        # normalize "" to None (so an empty-string tags CLEARS), while
+        # category/source have no such validator (an empty string stores
+        # ''). The Memory page always sends null for cleared fields, so the
+        # asymmetry is intentional and unchanged.
+        fields_set = body.model_fields_set
+        if "category" in fields_set:
             update_fields.append("category = ?")
             params.append(body.category)
-        # Explicit-null vs omitted (issue #515, AC19): a JSON null for
-        # tags/expires_at CLEARS the column (SET ... = NULL), while an
-        # omitted field preserves the stored value. The before-validators
-        # normalize null/"" to None, so the distinction is made here via
-        # pydantic v2 model_fields_set: the field counts as "provided" when
-        # it was explicitly sent, even when its validated value is None.
-        fields_set = body.model_fields_set
         if "tags" in fields_set:
             update_fields.append("tags = ?")
             params.append(body.tags)
-        if body.source is not None:
+        if "source" in fields_set:
             update_fields.append("source = ?")
             params.append(body.source)
         if body.importance is not None:
+            # Value-guard (not fields_set) BY DESIGN: importance has no
+            # meaningful cleared state, so explicit null preserves the stored
+            # value — unlike category/tags/source/expires_at, whose
+            # explicit-null clears are documented in the release notes.
             update_fields.append("importance = ?")
             params.append(body.importance)
         if "expires_at" in fields_set:
@@ -561,7 +656,7 @@ async def update_memory(
                 id=str(row[0]),
                 content=row[1],
                 metadata=metadata,
-                importance=float(row[5] or 0.5),
+                importance=float(row[5]) if row[5] is not None else 0.5,
                 expires_at=row[6],
                 created_at=row[7],
                 updated_at=row[8],
@@ -570,20 +665,87 @@ async def update_memory(
         # Add memory_id to params
         params.append(memory_id)
 
-        # Execute update
-        sql = f"""
-            UPDATE memories
-            SET {", ".join(update_fields)}, updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-        """
-        await asyncio.to_thread(conn.execute, sql, params)
-        await asyncio.to_thread(conn.commit)
+        # One transaction covers the content UPDATE and the claim
+        # invalidation (issue #686, T1-02-S-02): the helper opens BEGIN
+        # IMMEDIATE and rolls both back on any failure, so the previously
+        # stored content survives an invalidation error.
+        try:
+            async with _atomic_memory_write(conn):
+                # Authoritative re-read under the write lock: no other writer
+                # can commit between this read and our UPDATE. The optional
+                # token is compared here (string equality on
+                # CURRENT_TIMESTAMP has 1-second resolution, so same-second
+                # races remain possible by design — a monotonic version
+                # column would close them; no schema change here), and the
+                # no-op-save baseline is refreshed from this same read.
+                recheck = await asyncio.to_thread(
+                    conn.execute,
+                    "SELECT updated_at, content FROM memories WHERE id = ?",
+                    (memory_id,),
+                )
+                fresh = await asyncio.to_thread(recheck.fetchone)
+                if fresh is None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Memory with id {memory_id} not found",
+                    )
+                if (
+                    body.expected_updated_at is not None
+                    and body.expected_updated_at != fresh[0]
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Memory was modified by another session",
+                    )
+
+                # No-op save detection (issue #515, AC27): the wiki-claim
+                # invalidation below must only fire when the submitted
+                # content actually differs from the stored content — an
+                # identical-content save cannot have changed any derived
+                # claim.
+                content_changed = (
+                    body.content is not None and body.content != fresh[1]
+                )
+
+                sql_fields = list(update_fields)
+                if content_changed and memory_store._has_embedding_columns(conn):
+                    # Clear the stale embedding only when the content
+                    # actually changed (issue #686, T1-02-S-03): an
+                    # identical-content save keeps the stored vector.
+                    # embed_and_store below recomputes best-effort after
+                    # commit.
+                    sql_fields.append("embedding = NULL")
+                    sql_fields.append("embedding_model = NULL")
+
+                sql = f"""
+                    UPDATE memories
+                    SET {", ".join(sql_fields)}, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                """
+                await asyncio.to_thread(conn.execute, sql, params)
+
+                # Mark wiki claims stale since the source memory content
+                # changed. No-op guard (issue #515, AC27): identical-content
+                # saves keep sole-source claims active. The helper no longer
+                # commits (DD-C009 / #108); our transaction commits it with
+                # the content change or rolls both back.
+                if content_changed and memory_vault_id is not None:
+                    from app.services.wiki_store import WikiStore as _WikiStore
+
+                    await asyncio.to_thread(
+                        lambda: _WikiStore(conn).mark_claims_stale_by_memory(memory_id, memory_vault_id)
+                    )
+        except HTTPException:
+            raise
+        except Exception:
+            logger.exception("Failed to update memory %d", memory_id)
+            raise HTTPException(status_code=500, detail="Failed to update memory")
 
         # If content changed, recompute embedding so semantic search stays fresh.
         # embed_and_store is best-effort: if the embedding service is down, FTS
         # fallback remains intact and the old embedding (now stale) is NULLed first
         # inside the method so searches won't use misleading vectors.
-        if body.content is not None:
+        if content_changed and body.content is not None:
             try:
                 await memory_store.embed_and_store(memory_id, body.content)
             except Exception:
@@ -591,25 +753,6 @@ async def update_memory(
                     "Could not recompute embedding for memory %d after content update",
                     memory_id,
                 )
-            # Mark wiki claims stale since the source memory content changed.
-            # No-op guard (issue #515, AC27): identical-content saves keep
-            # sole-source claims active — only real content changes
-            # supersede derived claims.
-            if content_changed and memory_vault_id is not None:
-                try:
-                    from app.services.wiki_store import WikiStore as _WikiStore
-
-                    await asyncio.to_thread(
-                        lambda: _WikiStore(conn).mark_claims_stale_by_memory(memory_id, memory_vault_id)
-                    )
-                    # The mark_claims_stale_by_memory helper no longer commits
-                    # (DD-C009 / #108) so the caller controls the transaction
-                    # boundary. Commit here so the stale markings persist on
-                    # update. Only commit when the helper succeeds to avoid
-                    # persisting partial stale state on mid-loop exceptions.
-                    await asyncio.to_thread(conn.commit)
-                except Exception as _wiki_exc:
-                    logger.warning("mark_claims_stale_by_memory(%d) failed: %s", memory_id, _wiki_exc)
 
         # Fetch updated record
         cursor = await asyncio.to_thread(
@@ -641,15 +784,16 @@ async def update_memory(
             id=str(row[0]),
             content=row[1],
             metadata=metadata,
-            importance=float(row[5] or 0.5),
+            importance=float(row[5]) if row[5] is not None else 0.5,
             expires_at=row[6],
             created_at=row[7],
             updated_at=row[8],
         )
-    except (sqlite3.Error, OSError) as e:
-        logger.error(f"Database error during memory update: {e}")
-        await asyncio.to_thread(lambda: conn.rollback())
-        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+    except HTTPException:
+        raise
+    except (sqlite3.Error, OSError):
+        logger.exception("Database error during memory update")
+        raise HTTPException(status_code=500, detail="Failed to update memory")
 
 
 @router.delete("/memories/{memory_id}")
@@ -686,27 +830,37 @@ async def delete_memory(
         if not await evaluate(user, "vault", memory_vault_id, "admin"):
             raise HTTPException(status_code=403, detail="No admin access to this vault")
 
-    # Mark wiki claims stale before removing the memory record.
-    # Use a savepoint so any partial stale state from a mid-loop exception
-    # is rolled back before the DELETE commits — preventing orphan
-    # lint findings on rows that still exist (DD-C009 / #108).
-    if memory_vault_id is not None:
-        await asyncio.to_thread(conn.execute, "SAVEPOINT stale_marking")
-        try:
-            from app.services.wiki_store import WikiStore as _WikiStore
-            await asyncio.to_thread(
-                lambda: _WikiStore(conn).mark_claims_stale_by_memory(memory_id, memory_vault_id)
-            )
-            await asyncio.to_thread(conn.execute, "RELEASE SAVEPOINT stale_marking")
-        except Exception as _wiki_exc:
-            await asyncio.to_thread(conn.execute, "ROLLBACK TO SAVEPOINT stale_marking")
-            logger.warning("mark_claims_stale_by_memory(%d) failed: %s", memory_id, _wiki_exc)
+    # Mark wiki claims stale and delete the memory in ONE transaction
+    # (issue #686, T1-02-S-01 / T1-02-K-09): the helper opens BEGIN
+    # IMMEDIATE and rolls everything back on any failure — an outermost
+    # SAVEPOINT RELEASE on these connections would commit the marking before
+    # the DELETE runs, and a marking failure must abort the delete rather
+    # than fall through to it (DD-C009 / #108 contract, now actually held).
+    try:
+        async with _atomic_memory_write(conn):
+            if memory_vault_id is not None:
+                from app.services.wiki_store import WikiStore as _WikiStore
 
-    # Delete the memory
-    await asyncio.to_thread(
-        conn.execute, "DELETE FROM memories WHERE id = ?", (memory_id,)
-    )
-    await asyncio.to_thread(conn.commit)
+                await asyncio.to_thread(
+                    lambda: _WikiStore(conn).mark_claims_stale_by_memory(memory_id, memory_vault_id)
+                )
+            cursor = await asyncio.to_thread(
+                conn.execute, "DELETE FROM memories WHERE id = ?", (memory_id,)
+            )
+            # In-transaction re-check (mirrors update_memory): if another
+            # request deleted the row between the pre-check and our write
+            # lock, surface 404 instead of a success for a row we did not
+            # delete.
+            if cursor.rowcount == 0:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Memory with id {memory_id} not found",
+                )
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to delete memory %d", memory_id)
+        raise HTTPException(status_code=500, detail="Failed to delete memory")
 
     return {"message": f"Memory {memory_id} deleted successfully", "forgotten": True}
 
@@ -799,8 +953,11 @@ async def backfill_memory_embeddings(
     """Trigger embedding backfill for memories missing embeddings or with stale models.
 
     Superadmin only. Runs synchronously and returns a progress summary.
+    Single-flight (issue #686, T1-02-S2-07): concurrent requests serialize
+    on a per-loop lock so at most one backfill runs at a time per process.
     """
     if user.get("role") != "superadmin":
         raise HTTPException(status_code=403, detail="Superadmin access required")
-    summary = await memory_store.backfill_missing_embeddings()
+    async with _get_backfill_lock():
+        summary = await memory_store.backfill_missing_embeddings()
     return {"status": "complete", "summary": summary}

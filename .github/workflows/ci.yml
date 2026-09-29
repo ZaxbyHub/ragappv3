@@ -149,6 +149,9 @@ jobs:
       - name: Test collection scope check
         run: python scripts/check_test_collection_scope.py
 
+      - name: HTTP 500 detail hygiene check
+        run: python scripts/check_a04_http500_detail_hygiene.py
+
       - name: Upload migration timeout contract check
         run: python scripts/check_b03_upload_migration_timeout.py
 

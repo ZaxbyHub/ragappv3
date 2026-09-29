@@ -36,7 +36,7 @@
       "SEVERITY.LOW": 62,
       "SEVERITY.MEDIUM": 60,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 81910,
+      "loc": 82022,
       "nosec": 0,
       "skipped_tests": 62
     },
@@ -75,7 +75,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 167,
+      "loc": 173,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -231,7 +231,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 1,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 643,
+      "loc": 749,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -2896,9 +2896,9 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "573         # Execute update\n574         sql = f\"\"\"\n575             UPDATE memories\n576             SET {\", \".join(update_fields)}, updated_at = CURRENT_TIMESTAMP\n577             WHERE id = ?\n578         \"\"\"\n579         await asyncio.to_thread(conn.execute, sql, params)\n",
-      "col_offset": 14,
-      "end_col_offset": 11,
+      "code": "719 \n720                 sql = f\"\"\"\n721                     UPDATE memories\n722                     SET {\", \".join(sql_fields)}, updated_at = CURRENT_TIMESTAMP\n723                     WHERE id = ?\n724                 \"\"\"\n725                 await asyncio.to_thread(conn.execute, sql, params)\n",
+      "col_offset": 22,
+      "end_col_offset": 19,
       "filename": "backend/app/api/routes/memories.py",
       "issue_confidence": "LOW",
       "issue_cwe": {
@@ -2907,13 +2907,13 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 574,
+      "line_number": 720,
       "line_range": [
-        574,
-        575,
-        576,
-        577,
-        578
+        720,
+        721,
+        722,
+        723,
+        724
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
