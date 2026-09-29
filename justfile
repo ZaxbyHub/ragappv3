@@ -118,6 +118,7 @@ quality-contracts:
     python scripts/check_secretscan.py
     python scripts/check_test_collection_scope.py
     python scripts/check_a04_http500_detail_hygiene.py
+    python scripts/check_b03_upload_migration_timeout.py
 
 # SAST job (CI installs backend/requirements-dev.txt first)
 sast:

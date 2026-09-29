@@ -145,6 +145,9 @@ DOC_PYTHON_RE = re.compile(r"(?i)\bpython\s*[\s:.@]*?(\d+\.\d+)")
 # pin written in package.json style must still be caught.
 DOC_VITEST_RE = re.compile(r"(?i)\bvitest\b[ @()<>=+^~v]*(\d+)(?:\.(\d+|x))?\b")
 DOC_VITE_RE = re.compile(r"(?i)\bvite\b[ @()<>=+^~v]*(\d+)(?:\.(\d+|x))?\b")
+# Digit-bearing script names (e.g. check_b03_upload_migration_timeout.py,
+# issue #692) are contract scripts too: the class must accept [0-9] or the
+# ci.yml→docs inventory enforcement silently ignores them.
 DOC_SCRIPT_RE = re.compile(r"scripts/check_[a-z0-9_]+\.py")
 
 
