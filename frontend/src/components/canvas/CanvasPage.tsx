@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Download, FileJson, Loader2, RefreshCw, ShieldAlert, TriangleAlert, Wand2 } from "lucide-react";
@@ -210,16 +210,41 @@ export default function CanvasPage() {
   // (artifact switch / save / restore / reload) so a pending write can never
   // resurrect a draft after it was cleared.
   const draftTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Pending debounced draft (Composer.tsx pattern): the (uid, text) pair the
+  // timer has not yet written. Flushed on unmount and artifact switch; cleared
+  // wherever the draft is discarded. lastWrittenDraftRef backs the
+  // differs-from-last-write skip so a flush after an already-written value is
+  // a no-op.
+  const pendingDraftRef = useRef<{ uid: string; text: string } | null>(null);
+  const lastWrittenDraftRef = useRef<{ uid: string; text: string } | null>(null);
   const cancelDraftTimer = () => {
     if (draftTimerRef.current != null) {
       clearTimeout(draftTimerRef.current);
       draftTimerRef.current = null;
     }
+    pendingDraftRef.current = null;
+    lastWrittenDraftRef.current = null;
   };
+  const flushPendingDraft = useCallback(() => {
+    if (draftTimerRef.current != null) {
+      clearTimeout(draftTimerRef.current);
+      draftTimerRef.current = null;
+    }
+    const pending = pendingDraftRef.current;
+    pendingDraftRef.current = null;
+    const last = lastWrittenDraftRef.current;
+    if (pending && (last?.uid !== pending.uid || last?.text !== pending.text)) {
+      writeCanvasDraft(pending.uid, pending.text);
+      lastWrittenDraftRef.current = pending;
+    }
+  }, []);
 
   // Reset all per-artifact state on navigation to a different artifact.
   useEffect(() => {
-    cancelDraftTimer();
+    // Flush the previous artifact's pending edit first — it was never
+    // scheduled to write under the new uid, and dropping it would lose the
+    // tail of the user's last keystrokes (issue #688).
+    flushPendingDraft();
     setEditorText(null);
     setEditorBaseVersionNo(null);
     setSelectedVersionNo(null);
@@ -234,7 +259,7 @@ export default function CanvasPage() {
     setEditRangeInstruction("");
     setEditRangeTarget(null);
     setSelection({ start: 0, end: 0 });
-  }, [artifactUid]);
+  }, [artifactUid, flushPendingDraft]);
 
   // Initialize (or re-initialize, when the server moved ahead) the editor
   // from the current version, rehydrating any persisted draft.
@@ -262,18 +287,33 @@ export default function CanvasPage() {
 
   // Debounced best-effort persistence of the unsaved draft.
   useEffect(() => {
-    if (editorText == null || currentContent == null) return;
+    if (editorText == null || currentContent == null) {
+      // A switch to a cached artifact re-runs this effect with the NEW uid
+      // before setEditorText(null) lands; a pending pair recorded now would
+      // pair the new uid with the old text. Nothing is schedulable without
+      // both values, so drop any stale pending.
+      pendingDraftRef.current = null;
+      return;
+    }
     if (editorText === currentContent) {
+      // Discard: cancel the timer and any pending write so a later flush
+      // cannot resurrect the draft being cleared here (issue #688).
+      cancelDraftTimer();
       clearCanvasDraft(artifactUid);
       return;
     }
-    const timer = setTimeout(() => writeCanvasDraft(artifactUid, editorText), DRAFT_PERSIST_DEBOUNCE_MS);
+    pendingDraftRef.current = { uid: artifactUid, text: editorText };
+    const timer = setTimeout(flushPendingDraft, DRAFT_PERSIST_DEBOUNCE_MS);
     draftTimerRef.current = timer;
     return () => {
       clearTimeout(timer);
       if (draftTimerRef.current === timer) draftTimerRef.current = null;
     };
-  }, [artifactUid, editorText, currentContent]);
+  }, [artifactUid, editorText, currentContent, flushPendingDraft]);
+
+  // Unmount: never lose the tail of an edit that had not hit the debounce
+  // edge yet (Composer.tsx pattern).
+  useEffect(() => () => { flushPendingDraft(); }, [flushPendingDraft]);
 
   // Browser-level guard: refresh, tab close, or navigating away from the app
   // (DraftRoomDetailPage pattern).

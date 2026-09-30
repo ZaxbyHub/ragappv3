@@ -1079,9 +1079,26 @@ class RAGEngine:
                     }
                     yield {"type": "done"}
                     return
+                # Issue #688 idempotency: the directive persists at most one
+                # memory per (content, source, vault) key. A turn cancelled
+                # after the INSERT committed but before the confirmation was
+                # consumed leaves the memory stored-but-unconfirmed; re-sending
+                # the same directive must confirm the existing row, not insert
+                # a duplicate. (A unique index would be stronger but joins the
+                # epic's deferred schema lane.)
                 memory = await asyncio.to_thread(
-                    self.memory_store.add_memory, memory_content, source="chat", vault_id=vault_id
+                    self.memory_store.find_memory_by_content,
+                    memory_content,
+                    "chat",
+                    vault_id,
                 )
+                if memory is None:
+                    memory = await asyncio.to_thread(
+                        self.memory_store.add_memory,
+                        memory_content,
+                        source="chat",
+                        vault_id=vault_id,
+                    )
                 yield {
                     "type": "content",
                     "content": f"Memory stored: {memory.content}",
