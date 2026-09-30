@@ -8,7 +8,8 @@ module ``app/services/admission.py`` exposing exactly this contract:
 * ``AdmissionRejected(Exception)`` with attribute ``reason`` — "queue_full",
   "deadline_exceeded", or "shutdown".
 * ``AdmissionStore`` — async store ABC: ``try_acquire(key, holder,
-  ttl_seconds) -> bool``, ``release(key, holder)``, ``occupancy(key) -> int``,
+  ttl_seconds, budget) -> bool`` (one atomic budget-bounded acquire;
+  #687), ``release(key, holder)``, ``occupancy(key) -> int``,
   ``sweep_expired(key) -> int``. The cross-process seam: controllers sharing
   one store object share budgets (the production Redis store implements the
   same ABC).
@@ -56,15 +57,26 @@ from app.services.admission import (  # noqa: F401
 
 
 class CountingStore(AdmissionStore):
-    """Delegating store that counts try_acquire calls (retry-storm guard)."""
+    """Delegating store that counts try_acquire calls (retry-storm guard).
+
+    Dual-shape forward (#687): the fixed ``try_acquire`` seam carries the
+    budget; the pre-#687 seam is 3-arg. Both shapes reach the inner store's
+    real acquire path — a 3-arg-only double would TypeError into
+    ``_admit_waiter``'s fail-open branch and let assertions pass through a
+    broken seam.
+    """
 
     def __init__(self, inner: AdmissionStore):
         self.inner = inner
         self.acquire_attempts = 0
 
-    async def try_acquire(self, key, holder, ttl_seconds):
+    async def try_acquire(self, key, holder, ttl_seconds, budget=None):
         self.acquire_attempts += 1
-        return await self.inner.try_acquire(key, holder, ttl_seconds)
+        try:
+            return await self.inner.try_acquire(key, holder, ttl_seconds, budget)
+        except TypeError:
+            # Pre-#687 inner store (3-arg seam).
+            return await self.inner.try_acquire(key, holder, ttl_seconds)
 
     async def release(self, key, holder):
         await self.inner.release(key, holder)
@@ -413,7 +425,11 @@ def test_from_settings_reads_admission_config_keys():
         admission_queue_max_size=11,
     )
     ctrl = AdmissionController.from_settings(s)
-    assert ctrl.budget_for(AdmissionClass.CHAT) == 3
+    # #687 (T1-28-S-04): CHAT and BACKGROUND share one LLM-device budget key
+    # sized max(chat, background) so foreground preemption between them
+    # engages in default deployments — both classes now see the same (max)
+    # budget instead of per-class keys.
+    assert ctrl.budget_for(AdmissionClass.CHAT) == 7
     assert ctrl.budget_for(AdmissionClass.BACKGROUND) == 7
     for cls in AdmissionClass:
         assert ctrl.budget_for(cls) >= 1
@@ -438,6 +454,11 @@ class _RecController:
     async def admit(self, admission_class, **kwargs):
         self.calls.append((admission_class, kwargs))
         yield SimpleNamespace(admission_class=admission_class, holder="rec")
+
+    async def queue_depth(self, admission_class):
+        # #687 (P01-SK2-06): the stream route also samples the observed
+        # queue depth before parking on admission.
+        return 0
 
 
 async def test_engine_stream_path_consults_admission():
