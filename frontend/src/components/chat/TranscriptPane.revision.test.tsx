@@ -264,7 +264,7 @@ describe("TranscriptPane revision flows (persisted session, issue #507)", () => 
     // Server-side trim FIRST, anchored at the highest durable seq among the
     // kept rows (m1 seq 1, m2 seq 2 → keepSeq 2).
     expect(truncateChatSession).toHaveBeenCalledTimes(1);
-    expect(truncateChatSession).toHaveBeenCalledWith(77, 2);
+    expect(truncateChatSession.mock.calls[0].slice(0, 2)).toEqual([77, 2]);
 
     // The local transcript is untouched while the truncate is in flight.
     expect(mockChatState.messageIds).toHaveLength(4);
@@ -313,8 +313,8 @@ describe("TranscriptPane revision flows (persisted session, issue #507)", () => 
     // The anchor is the max durable seq among the KEPT rows (m1/m2 have none)
     // → 0. A positional keep_count of 2 would keep turn 2's rows server-side
     // and duplicate the Q&A pair after the retry lands.
-    expect(truncateChatSession).toHaveBeenCalledWith(77, 0);
-    expect(truncateChatSession).not.toHaveBeenCalledWith(77, 2);
+    expect(truncateChatSession.mock.calls[0].slice(0, 2)).toEqual([77, 0]);
+    expect(truncateChatSession).not.toHaveBeenCalledWith(77, 2, expect.anything());
 
     resolveTruncate({ remaining_count: 0, tail_seq: null });
     await waitFor(() => expect(mockSendDirect).toHaveBeenCalledTimes(1));
@@ -348,7 +348,7 @@ describe("TranscriptPane revision flows (persisted session, issue #507)", () => 
 
     resolvePersist();
     await waitFor(() => expect(truncateChatSession).toHaveBeenCalledTimes(1));
-    expect(truncateChatSession).toHaveBeenCalledWith(77, 2);
+    expect(truncateChatSession.mock.calls[0].slice(0, 2)).toEqual([77, 2]);
   });
 
   it("edit truncates the persisted history at the edited message's own index before trimming the store", async () => {
@@ -373,7 +373,7 @@ describe("TranscriptPane revision flows (persisted session, issue #507)", () => 
     // Nothing is kept before the edited message → keepSeq 0 (no durable seq
     // among zero kept rows), NOT the stale positional index math (PRR-020).
     expect(truncateChatSession).toHaveBeenCalledTimes(1);
-    expect(truncateChatSession).toHaveBeenCalledWith(77, 0);
+    expect(truncateChatSession.mock.calls[0].slice(0, 2)).toEqual([77, 0]);
 
     // Store untouched until the truncate resolves.
     expect(mockChatState.messageIds).toEqual(["m1", "m2"]);
@@ -415,8 +415,8 @@ describe("TranscriptPane revision flows (persisted session, issue #507)", () => 
   it("fork maps the response through mapSessionMessage so kmsRefs and mode reach the store (UI-039)", async () => {
     mockChatState.activeChatId = "77";
     setMockMessages([
-      { id: "m1", role: "user", content: "Question" },
-      { id: "m2", role: "assistant", content: "Answer" },
+      { id: "m1", role: "user", content: "Question", seq: 1 },
+      { id: "m2", role: "assistant", content: "Answer", seq: 2 },
     ]);
 
     vi.mocked(forkChatSession).mockResolvedValue({

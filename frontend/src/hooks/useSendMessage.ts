@@ -11,11 +11,13 @@ import {
   type WikiReference,
   type KMSReference,
 } from "@/lib/api";
+import { toast } from "sonner";
 import { useChatStore, type Message } from "@/stores/useChatStore";
 import { useChatModeStore } from "@/stores/useChatModeStore";
 import { useChatShellStore } from "@/stores/useChatShellStore";
 import { useLlmHealthStore } from "@/stores/useLlmHealthStore";
 import { useSettingsStore } from "@/stores/useSettingsStore";
+import { readFeedbackVote, writeFeedbackVote } from "@/lib/chatFeedbackStorage";
 import { computeEffectiveChatMode } from "@/lib/chatMode";
 import type { UsedMemory } from "@/lib/api";
 import useCoalescedAppend from "./useCoalescedAppend";
@@ -27,13 +29,31 @@ import useCoalescedAppend from "./useCoalescedAppend";
 // Composer instead (LARGE_PASTE_THRESHOLD).
 export const MAX_INPUT_LENGTH = 100_000;
 
+// Issue #685 (PRR-001): the in-flight turn's persistence handle lives at
+// MODULE scope, not only on the hook instance. The first send from /chat
+// navigates to /chat/:id, and PageShell keys the page content by pathname —
+// ChatShell (and this hook) remount mid-turn, so an instance ref would be
+// null in the remounted handleStop and Stop would silently skip persistStop.
+// The module slot survives the remount; it is single-slot because sendingRef
+// makes turns strictly sequential.
+let activeTurnPersistence: CurrentTurnPersistence | null = null;
+
 export interface UseSendMessageReturn {
   handleSend: () => Promise<void>;
   handleStop: () => void;
   handleKeyDown: (e: React.KeyboardEvent) => void;
   handleInputChange: (e: React.ChangeEvent<HTMLTextAreaElement>) => void;
-  /** Send with explicit content + history — does not read or modify composer input state. */
-  sendDirect: (content: string, historyMessages: Message[]) => Promise<void>;
+  /**
+   * Send with explicit content + history — does not read or modify composer
+   * input state. `opts.restoreRows` (issue #684 / T1-13-S-08) carries the
+   * original turn rows a revision already truncated, restored server-side if
+   * the replacement is admission-rejected before any content.
+   */
+  sendDirect: (
+    content: string,
+    historyMessages: Message[],
+    opts?: { restoreRows?: Message[] }
+  ) => Promise<void>;
   /** Current pipeline stage (Searching/Reading/Drafting) before content streams, or null. */
   currentStage: string | null;
 }
@@ -45,7 +65,8 @@ interface CurrentTurnPersistence {
 
 export function useSendMessage(
   activeVaultId: number | null,
-  refreshHistory: (force?: boolean) => Promise<void>
+  refreshHistory: (force?: boolean) => Promise<void>,
+  options?: { onSessionCreated?: (sessionId: string) => void }
 ): UseSendMessageReturn {
   // Actions only, resolved once: zustand action references are stable for
   // the store's lifetime, and taking them via getState() avoids subscribing
@@ -85,13 +106,23 @@ export function useSendMessage(
   // continue discarding old-session work through the shared store path.
   const currentTurnPersistenceRef = useRef<CurrentTurnPersistence | null>(null);
 
+  // Issue #685: optional binding callback for a session created by the first
+  // send. Extracted so sendCore depends on the function identity, not the
+  // options object.
+  const onSessionCreated = options?.onSessionCreated;
+
   /**
    * Core send primitive. Accepts content and a history snapshot directly so
    * it doesn't depend on the Zustand input field at all. Both the normal
    * "send from composer" path and the "retry/sendDirect" path go through here.
    */
   const sendCore = useCallback(
-    async (content: string, historyMessages: Message[], clearInput: boolean) => {
+    async (
+      content: string,
+      historyMessages: Message[],
+      clearInput: boolean,
+      revisionOpts?: { restoreRows?: Message[] }
+    ) => {
       if (sendingRef.current) return;
       sendingRef.current = true;
       setIsStreaming(true);
@@ -110,6 +141,11 @@ export function useSendMessage(
 
       const currentState = useChatStore.getState();
       let sessionId: number;
+      // Issue #685 / external review F-004: only a send that actually CREATED
+      // a session may fire the binding callback — follow-up sends on an
+      // existing session must not re-navigate (a session switch racing the
+      // create would otherwise bounce the user back to the created id).
+      let createdSession = false;
 
       if (currentState.activeChatId) {
         sessionId = parseInt(currentState.activeChatId);
@@ -125,6 +161,7 @@ export function useSendMessage(
           const newSession = await createChatSession({ vault_id: activeVaultId });
           sessionId = newSession.id;
           useChatStore.setState({ activeChatId: newSession.id.toString() });
+          createdSession = true;
         } catch (err) {
           console.error("Failed to create chat session:", err);
           const status = (err as { response?: { status?: number } })?.response?.status;
@@ -144,6 +181,14 @@ export function useSendMessage(
         // Cancelled while the session was being created — do not stream,
         // do not append any message (no dangling assistant bubble).
         return;
+      }
+
+      // Issue #685: a newly created session must be bound across ALL identity
+      // mirrors (chat store, shell store, URL) before any continuation runs.
+      // Invoked after the generation check so a send stopped during session
+      // creation does not navigate, and only for created sessions (F-004).
+      if (createdSession) {
+        onSessionCreated?.(sessionId.toString());
       }
 
       const turnId =
@@ -235,19 +280,34 @@ export function useSendMessage(
       // may persist the user row by itself. A failed batch
       // commits nothing server-side, so the visible retry below can never
       // duplicate a successful sibling write (UI-002).
+      // Carry the server-issued seq onto the migrated rows: durableKeepSeq
+      // (the Retry/Edit truncate anchor) treats a missing seq as "not
+      // durable", so dropping it deletes earlier saved turns (#683).
       const migrateId = (oldId: string, saveResult: ChatSessionMessage) => {
         const dbId = String(saveResult.id);
         if (dbId === oldId) {
-          updateMessage(oldId, { saveState: "saved" });
+          updateMessage(oldId, { saveState: "saved", seq: saveResult.seq });
           return;
         }
-        const feedbackKey = `chat_feedback_${oldId}`;
-        const feedbackValue = localStorage.getItem(feedbackKey);
-        if (feedbackValue !== null) {
-          localStorage.setItem(`chat_feedback_${dbId}`, feedbackValue);
-          localStorage.removeItem(feedbackKey);
+        // Issue #685 (external review F-009): route the mirror rename through
+        // the shared guarded helpers so the key format has one source of
+        // truth; a storage exception here must never fail the durable save
+        // that already succeeded server-side (best-effort mirror).
+        try {
+          const vote = readFeedbackVote(oldId);
+          if (vote !== null) {
+            writeFeedbackVote(dbId, vote);
+            writeFeedbackVote(oldId, null);
+          }
+        } catch {
+          // Helpers already guard; this is belt-and-braces for any unexpected
+          // storage surface — the vote simply stays under the old key.
         }
-        replaceMessageId(oldId, dbId, { created_at: saveResult.created_at, saveState: "saved" });
+        replaceMessageId(oldId, dbId, {
+          created_at: saveResult.created_at,
+          saveState: "saved",
+          seq: saveResult.seq,
+        });
       };
 
       type PersistOptions = {
@@ -318,12 +378,14 @@ export function useSendMessage(
 
         if (options.keepalive) {
           const persistPromise = addChatMessagesBatchKeepalive(sessionId, prepared.messages);
-          const { setPendingTurnPersist } = useChatStore.getState();
+          const { setPendingTurnPersist, registerPendingTurnPersist } = useChatStore.getState();
           setPendingTurnPersist(persistPromise);
+          registerPendingTurnPersist?.(persistPromise);
           void persistPromise.finally(() => {
             if (useChatStore.getState().pendingTurnPersist === persistPromise) {
               useChatStore.getState().setPendingTurnPersist(null);
             }
+            useChatStore.getState().unregisterPendingTurnPersist?.(persistPromise);
           });
           return persistPromise;
         }
@@ -354,15 +416,55 @@ export function useSendMessage(
             updateMessage(userMessage.id, { saveState: "failed" });
           }
         })();
-        // PRR-003: expose the in-flight save so revision operations can await it.
-        const { setPendingTurnPersist } = useChatStore.getState();
+        // PRR-003: expose the in-flight save so revision operations can await
+        // it. Issue #684 (T1-13-S2-06): also register it in the all-in-flight
+        // registry — the single slot is overwritten by a newer save, but a
+        // revision must wait for EVERY unsettled save.
+        const { setPendingTurnPersist, registerPendingTurnPersist } = useChatStore.getState();
         setPendingTurnPersist(persistPromise);
+        registerPendingTurnPersist?.(persistPromise);
         void persistPromise.finally(() => {
           if (useChatStore.getState().pendingTurnPersist === persistPromise) {
             useChatStore.getState().setPendingTurnPersist(null);
           }
+          useChatStore.getState().unregisterPendingTurnPersist?.(persistPromise);
         });
         return persistPromise;
+      };
+
+      // Issue #684 (T1-13-S-08): restore the original turn a revision already
+      // truncated when the replacement was admission-rejected before any
+      // content — the one terminal outcome where the server provably wrote
+      // nothing for the replacement (the stream route returns at the
+      // admission gate, before the durable user pre-write). Re-save the rows
+      // (server-side append), then mirror locally with the new ids/seqs.
+      const restoreRevisedTurn = async (rows: Message[]) => {
+        try {
+          const payload: AddMessageRequest[] = rows.map((m) => ({
+            role: m.role === "assistant" ? "assistant" : "user",
+            content: typeof m.content === "string" ? m.content : "",
+          }));
+          const saved = await addChatMessagesBatch(sessionId, payload);
+          const storeState = useChatStore.getState();
+          const failedIdx = storeState.messageIds.indexOf(userMessage.id);
+          if (failedIdx >= 0) storeState.removeMessagesFrom(failedIdx);
+          for (const row of rows) {
+            useChatStore.getState().addMessage({ ...row, saveState: "saving" });
+          }
+          const tailIds = useChatStore.getState().messageIds.slice(-rows.length);
+          tailIds.forEach((localId, i) => {
+            if (saved[i]) migrateId(localId, saved[i]);
+          });
+          // Mirror the ordinary persist path's sidebar bookkeeping (review
+          // F-004): the restore is a real server write, so the session list
+          // must reflect the new updated_at instead of going stale.
+          await refreshHistory(true);
+          useChatShellStore.getState().requestSessionListRefresh();
+          toast.error("Couldn't regenerate — kept your original answer.");
+        } catch (err) {
+          console.error("Failed to restore the revised turn:", err);
+          toast.error("Couldn't update conversation history");
+        }
       };
 
       const turnPersistence: CurrentTurnPersistence = {
@@ -374,11 +476,13 @@ export function useSendMessage(
             candidateSources: undefined,
           });
           currentTurnPersistenceRef.current = null;
+          if (activeTurnPersistence === turnPersistence) activeTurnPersistence = null;
           void persistTurn("interrupted", { allowEmptyAssistant: true });
         },
         persistPagehide: () => {
           if (!claimTurnPersistence()) return;
           currentTurnPersistenceRef.current = null;
+          if (activeTurnPersistence === turnPersistence) activeTurnPersistence = null;
           void persistTurn("interrupted", {
             allowEmptyAssistant: true,
             keepalive: true,
@@ -386,10 +490,14 @@ export function useSendMessage(
         },
       };
       currentTurnPersistenceRef.current = turnPersistence;
+      activeTurnPersistence = turnPersistence;
 
       const clearTurnPersistence = () => {
         if (currentTurnPersistenceRef.current === turnPersistence) {
           currentTurnPersistenceRef.current = null;
+        }
+        if (activeTurnPersistence === turnPersistence) {
+          activeTurnPersistence = null;
         }
       };
 
@@ -598,6 +706,25 @@ export function useSendMessage(
             setStreamingMessageId(null);
             sendingRef.current = false;
             if (ownsPersistence) void persistTurn("failed");
+            // Issue #684 (T1-13-S-08): ADMISSION_REJECTED is emitted by the
+            // route-level CHAT gate strictly BEFORE the durable user-row
+            // pre-write, so this code provably means nothing was written for
+            // the replacement — a revision that already truncated the
+            // original turn restores it instead of losing the Q&A. Engine-side
+            // admission rejections arrive AFTER the pre-write and are relabeled
+            // ADMISSION_REJECTED_PREWRITTEN by the route when the pre-write
+            // landed (restoring would
+            // append the original after the pre-written replacement user row
+            // and duplicate the question); other pre-content failures and any
+            // partial-content turn keep today's behavior (the latter is
+            // already durable via the save above).
+            if (
+              revisionOpts?.restoreRows &&
+              !streamedContent.trim() &&
+              (error as { code?: string }).code === "ADMISSION_REJECTED"
+            ) {
+              void restoreRevisedTurn(revisionOpts.restoreRows);
+            }
           },
           onComplete: async () => {
             // A pagehide callback may have already claimed the one-shot save.
@@ -700,6 +827,7 @@ export function useSendMessage(
       reset,
       activeVaultId,
       refreshHistory,
+      onSessionCreated,
     ]
   );
 
@@ -723,10 +851,14 @@ export function useSendMessage(
    * Used for retry / regenerate so it doesn't touch the composer input.
    */
   const sendDirect = useCallback(
-    async (content: string, historyMessages: Message[]) => {
+    async (
+      content: string,
+      historyMessages: Message[],
+      opts?: { restoreRows?: Message[] }
+    ) => {
       const { isStreaming: currentIsStreaming } = useChatStore.getState();
       if (currentIsStreaming || sendingRef.current) return;
-      await sendCore(content, historyMessages, false);
+      await sendCore(content, historyMessages, false, opts);
     },
     [sendCore]
   );
@@ -736,7 +868,12 @@ export function useSendMessage(
     // pressed during session creation has no stream to abort, and without
     // this bump the send would start generating once creation resolved.
     sendGenRef.current += 1;
-    currentTurnPersistenceRef.current?.persistStop();
+    // Issue #685 (PRR-001): the mounted instance may be a REMOUNT (PageShell
+    // keys page content by pathname, so the first-send navigate replaces the
+    // hook) whose ref never saw the in-flight turn — the module slot still
+    // holds it, so Stop persists the interrupted turn across the remount.
+    const persistence = currentTurnPersistenceRef.current ?? activeTurnPersistence;
+    persistence?.persistStop();
     useChatStore.getState().stopStreaming();
     sendingRef.current = false;
   }, []);
@@ -777,7 +914,11 @@ export function useSendMessage(
 
   useEffect(() => {
     const handlePagehide = () => {
-      currentTurnPersistenceRef.current?.persistPagehide();
+      // Issue #685 (PRR-001): fall back to the module slot — a PageShell
+      // remount replaces this instance before pagehide, and the surviving
+      // handle (installed by the pre-remount send) must still fire.
+      const persistence = currentTurnPersistenceRef.current ?? activeTurnPersistence;
+      persistence?.persistPagehide();
     };
     window.addEventListener("pagehide", handlePagehide);
     return () => window.removeEventListener("pagehide", handlePagehide);

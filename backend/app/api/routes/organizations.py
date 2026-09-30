@@ -15,6 +15,7 @@ from app.api.deps import UserRole, require_role
 from app.config import settings
 from app.models.database import get_pool
 from app.security import csrf_protect
+from app.utils.slug import generate_org_slug
 
 router = APIRouter(prefix="/organizations", tags=["organizations"])
 
@@ -102,11 +103,7 @@ def _generate_invite_token() -> tuple[str, str]:
 
 
 def _generate_slug(name: str) -> str:
-    slug = name.lower().strip()
-    slug = re.sub(r"[^a-z0-9]+", "-", slug)
-    slug = slug.strip("-")
-    slug = re.sub(r"-+", "-", slug)
-    return slug[:50]
+    return generate_org_slug(name)
 
 
 def _is_org_admin_or_owner(conn: sqlite3.Connection, org_id: int, user_id: int) -> bool:
@@ -188,25 +185,36 @@ async def create_organization(
     try:
         slug = _generate_slug(req.name)
         try:
-            # Insert organization
-            cursor = await asyncio.to_thread(
-                conn.execute,
-                """INSERT INTO organizations (name, description, slug, created_by)
-                   VALUES (?, ?, ?, ?)""",
-                (req.name, req.description or "", slug, user["id"]),
-            )
-            org_id = cursor.lastrowid
+            # Insert organization. A slug collision between two distinct
+            # non-ASCII names (org-<hash> fallback, 48-bit coincidence) is
+            # retried once with a suffix before surfacing as a conflict.
+            for attempt in (0, 1):
+                candidate_slug = slug if attempt == 0 else f"{slug}-2"
+                try:
+                    cursor = await asyncio.to_thread(
+                        conn.execute,
+                        """INSERT INTO organizations (name, description, slug, created_by)
+                           VALUES (?, ?, ?, ?)""",
+                        (req.name, req.description or "", candidate_slug, user["id"]),
+                    )
+                    org_id = cursor.lastrowid
 
-            # Add creator as owner
-            await asyncio.to_thread(
-                conn.execute,
-                "INSERT INTO org_members (org_id, user_id, role) VALUES (?, ?, 'owner')",
-                (org_id, user["id"]),
-            )
+                    # Add creator as owner (same transaction as the org row)
+                    await asyncio.to_thread(
+                        conn.execute,
+                        "INSERT INTO org_members (org_id, user_id, role)"
+                        " VALUES (?, ?, 'owner')",
+                        (org_id, user["id"]),
+                    )
 
-            await asyncio.to_thread(conn.commit)
+                    await asyncio.to_thread(conn.commit)
+                    slug = candidate_slug
+                    break
+                except sqlite3.IntegrityError:
+                    await asyncio.to_thread(conn.rollback)
+                    if attempt == 1:
+                        raise
         except sqlite3.IntegrityError:
-            await asyncio.to_thread(conn.rollback)
             raise HTTPException(
                 status_code=409,
                 detail="Conflict — could not create organization. Please choose a different name.",
@@ -358,11 +366,13 @@ async def update_organization(
         # Build partial update
         updates = []
         params = []
+        slug_param_index = None
         if req.name is not None:
             updates.append("name = ?")
             params.append(req.name)
             # Update slug when name changes
             updates.append("slug = ?")
+            slug_param_index = len(params)
             params.append(_generate_slug(req.name))
         if req.description is not None:
             updates.append("description = ?")
@@ -374,15 +384,30 @@ async def update_organization(
         updates.append("updated_at = CURRENT_TIMESTAMP")
         params.append(org_id)
 
+        # One "-2" slug-suffix retry when the renamed org's slug collides —
+        # the update-route mirror of the create route's collision handling.
+        # A description-only update (no slug rewrite) cannot collide on slug
+        # and gets no retry.
         try:
-            await asyncio.to_thread(
-                conn.execute,
-                f"UPDATE organizations SET {', '.join(updates)} WHERE id = ?",
-                params,
-            )
-            await asyncio.to_thread(conn.commit)
+            max_attempt = 1 if slug_param_index is not None else 0
+            for attempt in range(max_attempt + 1):
+                attempt_params = params
+                if attempt == 1:
+                    attempt_params = list(params)
+                    attempt_params[slug_param_index] += "-2"
+                try:
+                    await asyncio.to_thread(
+                        conn.execute,
+                        f"UPDATE organizations SET {', '.join(updates)} WHERE id = ?",
+                        attempt_params,
+                    )
+                    await asyncio.to_thread(conn.commit)
+                    break
+                except sqlite3.IntegrityError:
+                    await asyncio.to_thread(conn.rollback)
+                    if attempt == max_attempt:
+                        raise
         except sqlite3.IntegrityError:
-            await asyncio.to_thread(conn.rollback)
             raise HTTPException(
                 status_code=409,
                 detail="Conflict — could not update organization. Please choose a different name.",

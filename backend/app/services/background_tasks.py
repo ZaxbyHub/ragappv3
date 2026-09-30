@@ -2585,7 +2585,40 @@ class BackgroundProcessor:
                 atom_ids=[aid for aid in batch_atom_ids if aid],
             )
         stale_ids = [pid for pid in prior_ids if pid not in new_ids]
+        # Last-write staleness gate (issue #692 / T1-21-S2-10): the embedding
+        # awaits above straddled generations, so a vault/file delete may have
+        # committed meanwhile — proxy vectors must not land for a files row
+        # that no longer exists, with no tombstone to sweep them.
+        try:
+            self.processor._raise_if_file_row_missing(file_id)
+        except DocumentProcessingError:
+            logger.info(
+                "Skipping proxy vector write for deleted file_id=%s", file_id
+            )
+            return
         await vec_store.add_chunks_then_delete_ids(new_records, stale_ids)
+        # Post-write compensation (issue #692 review follow-up F-004): the
+        # pre-write gate above cannot cover the embedding awaits between it
+        # and this write. If the row vanished meanwhile, discard the just-
+        # written proxy vectors instead of leaving orphans, and skip the
+        # derived-table writes below (those rows cascade away with the files
+        # row anyway).
+        try:
+            self.processor._raise_if_file_row_missing(file_id)
+        except DocumentProcessingError:
+            try:
+                await vec_store.delete_by_file(str(file_id))
+                logger.warning(
+                    "Discarded enrichment proxy vectors written for "
+                    "file_id=%s after its row was removed mid-write",
+                    file_id,
+                )
+            except Exception:  # noqa: BLE001 — compensation is best-effort
+                logger.exception(
+                    "Failed to discard proxy vectors for removed file_id=%s",
+                    file_id,
+                )
+            return
         # Record the new proxy vector ids in the derived table. Records are only
         # persisted when the atom's current derived-record fingerprint still
         # matches (set_proxy_vector_id is fingerprint-guarded and returns 0 on a
@@ -3516,6 +3549,23 @@ class BackgroundProcessor:
                         probe_dim = len(probe_embeddings[0])
                 live_dim = await vector_store.get_live_embedding_dim()
                 if probe_dim is not None and live_dim is not None and probe_dim != live_dim:
+                    if vault_id is not None:
+                        # [issue #691 review] A vault-scoped reindex re-embeds
+                        # only its own vault's files, but the rebuild commit
+                        # swaps the GLOBAL chunks table: every other vault's
+                        # indexed files would lose their vectors while their
+                        # rows still say status='indexed' — the same defect
+                        # class as the bare-call wipe this PR removes. Refuse
+                        # the dimension migration for vault-scoped jobs; a
+                        # full (all-vaults) reindex owns it.
+                        raise VectorStoreError(
+                            f"embedding dimension changed ({live_dim} -> "
+                            f"{probe_dim}): a vault-scoped reindex cannot "
+                            f"migrate the index because the rebuild swaps the "
+                            f"whole vector index while re-embedding only this "
+                            f"vault's files. Run a full reindex (all vaults) "
+                            f"at the new dimension instead."
+                        )
                     rebuild_handle = await vector_store.begin_dimension_rebuild(probe_dim)
                     logger.info(
                         "Reindex job %d: embedding dimension %d != live table "

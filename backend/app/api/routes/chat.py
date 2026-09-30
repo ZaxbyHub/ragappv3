@@ -274,6 +274,17 @@ class TruncateSessionRequest(BaseModel):
 
     keep_count: Optional[int] = Field(default=None, ge=0)
     keep_seq: Optional[int] = Field(default=None, ge=0)
+    # Issue #684 (T1-13-S-05): the client's observed session tail. When present,
+    # the truncate is refused with 409 unless the server's current MAX(seq)
+    # equals it — a stale second tab never deletes rows it never saw. Absent
+    # (legacy clients) the request keeps its historical semantics.
+    expected_tail_seq: Optional[int] = Field(default=None, ge=0)
+    # Issue #684 review (ABA): seq values are per-session MAX(seq)+1 and are
+    # REUSED after another writer truncates and resaves the same row count, so
+    # a seq-only precondition can pass on a coincidental equal tail. The tail
+    # row's PRIMARY KEY (AUTOINCREMENT, never reused) is the authoritative
+    # precondition; the shipped client always sends it.
+    expected_tail_id: Optional[int] = Field(default=None, ge=0)
 
 
 def _safe_json_loads(raw: Optional[str]) -> Any:
@@ -293,9 +304,22 @@ class UpdateSessionRequest(BaseModel):
 
 
 class ForkSessionRequest(BaseModel):
-    """Request model for forking a chat session from a specific message index."""
+    """Request model for forking a chat session.
 
-    message_index: int = Field(..., ge=0, description="Index of the last message to include in the fork (0-based)")
+    Exactly one anchor is required (issue #684, T1-13-K-02): the legacy
+    positional ``message_index`` (0-based index of the last message to include,
+    kept for older clients) or the durable ``through_seq`` (the highest server
+    seq to include, copied as ``seq <= through_seq``). The durable anchor keeps
+    the copy correct whenever the local transcript diverges from the server's
+    rows (unpersisted turn, failed save, stale tab).
+    """
+
+    message_index: Optional[int] = Field(
+        default=None, ge=0, description="Index of the last message to include in the fork (0-based, legacy)"
+    )
+    through_seq: Optional[int] = Field(
+        default=None, ge=1, description="Highest durable seq to include in the fork (seq <= through_seq)"
+    )
 
 
 class FeedbackRequest(BaseModel):
@@ -984,7 +1008,19 @@ def stream_chat_response(
                     elif chunk_type == "error":
                         logger.warning("Streaming error chunk received from RAG engine: %s", chunk.get('message', 'unknown'))
                         turn_state["status"] = _TURN_STATUS_FAILED
-                        yield f"data: {json.dumps({'type': 'error', 'message': 'Chat stream failed', 'code': chunk.get('code', 'UNKNOWN_ERROR')})}\n\n"
+                        error_code = chunk.get('code', 'UNKNOWN_ERROR')
+                        # Issue #684: an admission rejection forwarded from the
+                        # engine (embedding gate) happens AFTER the durable
+                        # user-row pre-write, unlike the route-level CHAT gate
+                        # which returns before it. Relabel it so clients can
+                        # tell "nothing was written" (ADMISSION_REJECTED, safe
+                        # to restore a truncated original) from "the
+                        # replacement user row already exists"
+                        # (ADMISSION_REJECTED_PREWRITTEN, restoring would
+                        # duplicate the question).
+                        if error_code == "ADMISSION_REJECTED" and turn_state.get("prewrite_ok"):
+                            error_code = "ADMISSION_REJECTED_PREWRITTEN"
+                        yield f"data: {json.dumps({'type': 'error', 'message': 'Chat stream failed', 'code': error_code})}\n\n"
                         yield f"data: {json.dumps({'type': 'done', 'sources': [], 'memories_used': [], 'wiki_used': [], 'kms_used': [], 'score_type': score_type, 'turn_id': current_turn_id()})}\n\n"
                         return
                     elif chunk_type == "fallback":
@@ -2312,10 +2348,13 @@ async def fork_session(
     _csrf_token: str = Depends(csrf_protect),
 ):
     """
-    Fork a chat session from a specific message index.
+    Fork a chat session from an anchor (issue #684).
 
-    Creates a new session containing messages 0..message_index (inclusive)
-    from the original session, preserving vault context.
+    Exactly one anchor is required: the legacy positional ``message_index``
+    (copies messages 0..message_index inclusive; out of range is a 400) or the
+    durable ``through_seq`` (copies exactly the rows with ``seq <= through_seq``
+    with all positional side fields aligned; an anchor selecting zero rows is a
+    400). The new session preserves vault context and renumbers its rows 1..n.
     """
     # Fetch original session
     session_result = await asyncio.to_thread(
@@ -2330,6 +2369,19 @@ async def fork_session(
     vault_id = session_row[1]
     if not await evaluate(user, "vault", vault_id, "write"):
         raise HTTPException(status_code=403, detail="No write access to this vault")
+
+    # Issue #684 (T1-13-K-02): exactly one anchor — the legacy positional
+    # message_index or the durable through_seq.
+    if (body.message_index is None) == (body.through_seq is None):
+        raise HTTPException(
+            status_code=422,
+            detail="Fork requires exactly one of message_index or through_seq",
+        )
+
+    # Durable anchor (issue #684): apply the cutoff in SQL so the main rows and
+    # every positional side-fetch below stay aligned for BOTH anchor forms.
+    anchor_filter = " AND seq <= ?" if body.through_seq is not None else ""
+    anchor_params = (session_id, body.through_seq) if body.through_seq is not None else (session_id,)
 
     # Detect optional columns on chat_messages.
     table_info_cursor = await asyncio.to_thread(
@@ -2346,36 +2398,48 @@ async def fork_session(
         and "citation_enforcement" in fork_col_names
     )
 
-    # Fetch messages up to message_index, including all available columns.
+    # Fetch messages up to the anchor, including all available columns.
     if has_memories_col and has_wiki_refs_col:
         messages_result = await asyncio.to_thread(
             conn.execute,
-            "SELECT role, content, sources, memories, wiki_refs, created_at FROM chat_messages "
-            "WHERE session_id = ? ORDER BY seq ASC, id ASC",
-            (session_id,),
+            f"SELECT role, content, sources, memories, wiki_refs, created_at FROM chat_messages "
+            f"WHERE session_id = ?{anchor_filter} ORDER BY seq ASC, id ASC",  # nosec B608 - anchor_filter is the in-file constant "" or " AND seq <= ?"; all values bind as parameters (#684)
+            anchor_params,
         )
     elif has_memories_col:
         messages_result = await asyncio.to_thread(
             conn.execute,
-            "SELECT role, content, sources, memories, created_at FROM chat_messages "
-            "WHERE session_id = ? ORDER BY seq ASC, id ASC",
-            (session_id,),
+            f"SELECT role, content, sources, memories, created_at FROM chat_messages "
+            f"WHERE session_id = ?{anchor_filter} ORDER BY seq ASC, id ASC",  # nosec B608 - anchor_filter is the in-file constant "" or " AND seq <= ?"; all values bind as parameters (#684)
+            anchor_params,
         )
     else:
         messages_result = await asyncio.to_thread(
             conn.execute,
-            "SELECT role, content, sources, created_at FROM chat_messages "
-            "WHERE session_id = ? ORDER BY seq ASC, id ASC",
-            (session_id,),
+            f"SELECT role, content, sources, created_at FROM chat_messages "
+            f"WHERE session_id = ?{anchor_filter} ORDER BY seq ASC, id ASC",  # nosec B608 - anchor_filter is the in-file constant "" or " AND seq <= ?"; all values bind as parameters (#684)
+            anchor_params,
         )
     all_rows = await asyncio.to_thread(messages_result.fetchall)
 
-    if body.message_index >= len(all_rows):
-        raise HTTPException(
-            status_code=400,
-            detail=f"message_index {body.message_index} is out of bounds for session with {len(all_rows)} messages",
-        )
-    forked_rows = all_rows[: body.message_index + 1]
+    if body.through_seq is not None:
+        # Durable anchor: all_rows is already seq-filtered by the SQL cutoff.
+        forked_rows = all_rows
+        if not forked_rows:
+            raise HTTPException(
+                status_code=400,
+                detail=f"nothing to fork at through_seq {body.through_seq}",
+            )
+    else:
+        if body.message_index >= len(all_rows):
+            raise HTTPException(
+                status_code=400,
+                detail=f"message_index {body.message_index} is out of bounds for session with {len(all_rows)} messages",
+            )
+        forked_rows = all_rows[: body.message_index + 1]
+    # Effective positional cutoff of the copy (equals message_index for legacy
+    # forks; recorded on the fork row for lineage, #684).
+    fork_cutoff = len(forked_rows) - 1
 
     # Side-fetch the original session's mode values in the same row order
     # so they can be re-applied to the copied rows without bifurcating the
@@ -2384,11 +2448,11 @@ async def fork_session(
     if has_mode_col:
         source_mode_result = await asyncio.to_thread(
             conn.execute,
-            "SELECT mode FROM chat_messages WHERE session_id = ? ORDER BY seq ASC, id ASC",
-            (session_id,),
+            f"SELECT mode FROM chat_messages WHERE session_id = ?{anchor_filter} ORDER BY seq ASC, id ASC",  # nosec B608 - anchor_filter is the in-file constant "" or " AND seq <= ?"; all values bind as parameters (#684)
+            anchor_params,
         )
         source_mode_rows = await asyncio.to_thread(source_mode_result.fetchall)
-        source_modes = [r[0] for r in source_mode_rows[: body.message_index + 1]]
+        source_modes = [r[0] for r in source_mode_rows[: len(forked_rows)]]
 
     # Side-fetch source kms_refs in row order so they can be re-applied to the
     # copied rows without bifurcating the INSERT branches below.
@@ -2396,11 +2460,11 @@ async def fork_session(
     if has_kms_refs_col:
         source_kms_result = await asyncio.to_thread(
             conn.execute,
-            "SELECT kms_refs FROM chat_messages WHERE session_id = ? ORDER BY seq ASC, id ASC",
-            (session_id,),
+            f"SELECT kms_refs FROM chat_messages WHERE session_id = ?{anchor_filter} ORDER BY seq ASC, id ASC",  # nosec B608 - anchor_filter is the in-file constant "" or " AND seq <= ?"; all values bind as parameters (#684)
+            anchor_params,
         )
         source_kms_rows = await asyncio.to_thread(source_kms_result.fetchall)
-        source_kms_refs = [r[0] for r in source_kms_rows[: body.message_index + 1]]
+        source_kms_refs = [r[0] for r in source_kms_rows[: len(forked_rows)]]
 
     # Side-fetch durable turn-lifecycle fields (issue #507, extended by
     # issue #510 AC-17/UI-004) in row order so the fork preserves turn
@@ -2408,13 +2472,13 @@ async def fork_session(
     source_turn_rows: List[tuple] = []
     turn_source_result = await asyncio.to_thread(
         conn.execute,
-        "SELECT turn_id, status, citation_confidence, unverifiable_claims, "
-        "currency_warnings, citation_enforcement "
-        "FROM chat_messages WHERE session_id = ? ORDER BY seq ASC, id ASC",
-        (session_id,),
+        f"SELECT turn_id, status, citation_confidence, unverifiable_claims, "
+        f"currency_warnings, citation_enforcement "
+        f"FROM chat_messages WHERE session_id = ?{anchor_filter} ORDER BY seq ASC, id ASC",  # nosec B608 - anchor_filter is the in-file constant "" or " AND seq <= ?"; all values bind as parameters (#684)
+        anchor_params,
     )
     source_turn_all = await asyncio.to_thread(turn_source_result.fetchall)
-    source_turn_rows = source_turn_all[: body.message_index + 1]
+    source_turn_rows = source_turn_all[: len(forked_rows)]
 
     # Create new forked session and copy messages atomically.
     fork_title = f"Branch of {session_row[2] or 'conversation'}"
@@ -2423,7 +2487,7 @@ async def fork_session(
         cursor = await asyncio.to_thread(
             conn.execute,
             "INSERT INTO chat_sessions (vault_id, user_id, title, forked_from_session_id, fork_message_index, created_at, updated_at) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
-            (vault_id, user["id"], fork_title, session_id, body.message_index),
+            (vault_id, user["id"], fork_title, session_id, fork_cutoff),
         )
         new_session_id = cursor.lastrowid
 
@@ -2676,7 +2740,7 @@ async def fork_session(
         "vault_id": vault_id,
         "title": fork_title,
         "forked_from_session_id": session_id,
-        "fork_message_index": body.message_index,
+        "fork_message_index": fork_cutoff,
         "messages": messages,
     }
 
@@ -3323,6 +3387,20 @@ async def truncate_session_messages(
     ``keep_count``: a local array index diverges from server seq whenever a
     turn exists locally but was never persisted. ``boundary`` >= the current
     max seq is a no-op success; ``boundary = 0`` clears all messages.
+
+    Issue #684 (stale-view protection): when the client also sends
+    ``expected_tail_seq``, the request is refused with 409 unless the
+    session's current ``MAX(seq)`` equals it, the DELETE additionally guards
+    itself on that equality inside the same statement, and a zero rowcount on
+    the ``boundary < expected`` arm (rows provably existed above the boundary
+    at the pre-check) rolls back with the same 409 — a concurrent writer
+    landing between the pre-check and the delete is refused, never silently
+    applied. When the client sends ``expected_tail_id`` — the PRIMARY KEY of
+    its observed tail row — the same refusal compares that PK instead: seq
+    values are per-session ``MAX(seq)+1`` and are reused after another
+    writer truncates and resaves, so the never-reused PK is the
+    ABA-proof precondition (issue #684 review). Requests without either
+    field keep the exact legacy semantics described above.
     """
     if body.keep_seq is None and body.keep_count is None:
         raise HTTPException(
@@ -3339,16 +3417,90 @@ async def truncate_session_messages(
     if not await evaluate(user, "vault", session_row[1], "write"):
         raise HTTPException(status_code=403, detail="No write access to this vault")
 
+    # Issue #684 (T1-13-S-05): when the client states its observed tail, refuse
+    # the truncate unless the server's current tail equals it — any mismatch
+    # (stale tab that missed rows, or a client-ahead view after another writer
+    # truncated) means this request may not delete rows on the client's behalf.
+    if body.expected_tail_seq is not None:
+        tail_probe = await asyncio.to_thread(
+            conn.execute,
+            "SELECT COALESCE(MAX(seq), 0) FROM chat_messages WHERE session_id = ?",
+            (session_id,),
+        )
+        current_tail = (await asyncio.to_thread(tail_probe.fetchone))[0]
+        if body.expected_tail_seq != current_tail:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"stale view: session tail is {current_tail}, "
+                    f"client observed {body.expected_tail_seq} - refetch and retry"
+                ),
+            )
+    if body.expected_tail_id is not None:
+        # ABA-proof arm: the tail row's PRIMARY KEY is never reused, so an
+        # equal seq on a resaved session cannot masquerade as the observed
+        # tail (issue #684 review).
+        tail_id_probe = await asyncio.to_thread(
+            conn.execute,
+            "SELECT id FROM chat_messages WHERE session_id = ? "
+            "ORDER BY seq DESC, id DESC LIMIT 1",
+            (session_id,),
+        )
+        tail_id_row = await asyncio.to_thread(tail_id_probe.fetchone)
+        current_tail_id = tail_id_row[0] if tail_id_row else 0
+        if body.expected_tail_id != current_tail_id:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"stale view: session tail row is {current_tail_id}, "
+                    f"client observed {body.expected_tail_id} - refetch and retry"
+                ),
+            )
+
     try:
         # Implicit-transaction model (see add_messages_batch): the DELETE opens
         # the transaction, the commit closes it, and a failure rolls the trim
-        # back entirely.
-        delete_result = await asyncio.to_thread(
-            conn.execute,
-            "DELETE FROM chat_messages WHERE session_id = ? AND seq > ?",
-            (session_id, boundary),
-        )
+        # back entirely. With an expected tail, the DELETE additionally guards
+        # itself on the CURRENT tail inside the same statement (SQLite's single
+        # writer makes the subquery stable for the statement), so a row landing
+        # between the pre-check above and this delete cannot be silently
+        # removed by a stale request (#684).
+        if body.expected_tail_id is not None:
+            delete_result = await asyncio.to_thread(
+                conn.execute,
+                "DELETE FROM chat_messages WHERE session_id = ? AND seq > ? "
+                "AND ? = (SELECT id FROM chat_messages WHERE session_id = ? "
+                "ORDER BY seq DESC, id DESC LIMIT 1)",
+                (session_id, boundary, body.expected_tail_id, session_id),
+            )
+        elif body.expected_tail_seq is not None:
+            delete_result = await asyncio.to_thread(
+                conn.execute,
+                "DELETE FROM chat_messages WHERE session_id = ? AND seq > ? "
+                "AND ? = (SELECT COALESCE(MAX(seq), 0) FROM chat_messages WHERE session_id = ?)",
+                (session_id, boundary, body.expected_tail_seq, session_id),
+            )
+        else:
+            delete_result = await asyncio.to_thread(
+                conn.execute,
+                "DELETE FROM chat_messages WHERE session_id = ? AND seq > ?",
+                (session_id, boundary),
+            )
         deleted = await asyncio.to_thread(lambda: delete_result.rowcount)
+        if (
+            body.expected_tail_seq is not None
+            and deleted == 0
+            and boundary < body.expected_tail_seq
+        ):
+            # The pre-check passed (tail == expected) and boundary < tail
+            # implies at least one row above the boundary existed, so a
+            # zero rowcount here can only mean the tail moved between the
+            # check and the guarded delete: refuse, never silently apply.
+            await asyncio.to_thread(conn.rollback)
+            raise HTTPException(
+                status_code=409,
+                detail="stale view: the session changed during the truncate - refetch and retry",
+            )
         tail_result = await asyncio.to_thread(
             conn.execute,
             "SELECT COALESCE(MAX(seq), 0) FROM chat_messages WHERE session_id = ?",

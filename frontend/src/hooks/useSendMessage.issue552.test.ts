@@ -36,10 +36,13 @@ function installAbortableStream(): void {
   );
 }
 
-function savedRows(messages: unknown[]): Array<{ id: number; created_at: string }> {
+function savedRows(
+  messages: unknown[],
+): Array<{ id: number; created_at: string; seq: number }> {
   return messages.map((_, index) => ({
     id: 100 + index,
     created_at: `2026-09-12T00:00:0${index}Z`,
+    seq: index + 1,
   }));
 }
 

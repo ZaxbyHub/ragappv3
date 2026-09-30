@@ -300,7 +300,22 @@ class TestReindexInterruptedMappedAway(_ProcessorHarness):
 
         route_conn = _connect(self.db_path)
         self.addCleanup(route_conn.close)
+        # The route is rate-limited (slowapi wrapper requires a starlette
+        # Request in the call args), so the direct call passes a minimal one.
+        from starlette.requests import Request
+
+        request = Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": f"/api/documents/reindex/jobs/{job_id}",
+                "headers": [],
+                "query_string": b"",
+                "client": ("testclient", 50000),
+            }
+        )
         response = await get_reindex_job_status(
+            request,
             job_id=job_id,
             conn=route_conn,
             user={"id": 1, "username": "checker", "role": "superadmin"},

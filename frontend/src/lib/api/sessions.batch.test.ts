@@ -39,16 +39,18 @@ describe("addChatMessagesBatch (issue #507 / PRR-005)", () => {
   });
 
   it("falls back to sequential single-message saves when the batch POST 404s (old backend during a rolling restart)", async () => {
+    // Rows carry the server-issued seq per the single-message endpoint's
+    // response contract (issue #683) — the fallback feeds the same migrateId.
     postMock
       .mockRejectedValueOnce({ response: { status: 404 } })
-      .mockResolvedValueOnce({ data: { id: 1, role: "user", content: "question" } })
-      .mockResolvedValueOnce({ data: { id: 2, role: "assistant", content: "answer" } });
+      .mockResolvedValueOnce({ data: { id: 1, role: "user", content: "question", seq: 1 } })
+      .mockResolvedValueOnce({ data: { id: 2, role: "assistant", content: "answer", seq: 2 } });
 
     const saved = await addChatMessagesBatch(5, turnPayloads);
 
     expect(saved).toEqual([
-      { id: 1, role: "user", content: "question" },
-      { id: 2, role: "assistant", content: "answer" },
+      { id: 1, role: "user", content: "question", seq: 1 },
+      { id: 2, role: "assistant", content: "answer", seq: 2 },
     ]);
     expect(postMock).toHaveBeenCalledTimes(3);
     // One batch attempt, then one POST per message to the single-message URL.
@@ -83,5 +85,22 @@ describe("truncateChatSession (issue #507 / CHAT-006, PRR-020)", () => {
     expect(postMock).toHaveBeenCalledTimes(1);
     expect(postMock.mock.calls[0][0]).toBe("/chat/sessions/5/truncate");
     expect(postMock.mock.calls[0][1]).toEqual({ keep_seq: 2 });
+  });
+
+  it("POSTs the observed tail precondition: expected_tail_seq AND the ABA-proof expected_tail_id (issue #684 review F2)", async () => {
+    // Both fields are OPTIONAL body members, so tsc/eslint stay silent if a
+    // refactor drops either; this wire pin is the one place a silent drop
+    // fails the suite. The id is the ABA-proof half (per-session seqs are
+    // reused after a truncate+resave; the AUTOINCREMENT PK is not).
+    postMock.mockResolvedValueOnce({ data: { remaining_count: 2, tail_seq: 2 } });
+
+    await truncateChatSession(5, 2, { seq: 4, id: 4 });
+
+    expect(postMock).toHaveBeenCalledTimes(1);
+    expect(postMock.mock.calls[0][1]).toEqual({
+      keep_seq: 2,
+      expected_tail_seq: 4,
+      expected_tail_id: 4,
+    });
   });
 });

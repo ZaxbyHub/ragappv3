@@ -77,6 +77,7 @@ describe("useSendMessage issue #553 server-side durable turn wiring", () => {
         messages.map((_, index) => ({
           id: 100 + index,
           created_at: `2026-09-13T00:00:0${index}Z`,
+          seq: index + 1,
         })),
     );
   });

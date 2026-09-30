@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
+import { readFeedbackVote, writeFeedbackVote } from "@/lib/chatFeedbackStorage";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { updateMessageFeedback } from "@/lib/api";
@@ -138,9 +139,8 @@ function FeedbackActions({
     if (serverFeedback !== undefined) {
       setInternalFeedback(serverFeedback);
       if (serverFeedback === null && messageId) {
-        try {
-          localStorage.removeItem(`chat_feedback_${messageId}`);
-        } catch { /* ignore */ }
+        // Server knows the vote is cleared; drop the local mirror (best-effort).
+        writeFeedbackVote(messageId, null);
       }
       return;
     }
@@ -148,11 +148,9 @@ function FeedbackActions({
       setInternalFeedback(null);
       return;
     }
-    try {
-      const stored = localStorage.getItem(`chat_feedback_${messageId}`);
-      if (stored === "up" || stored === "down") setInternalFeedback(stored);
-      else setInternalFeedback(null);
-    } catch { /* ignore */ }
+    const stored = readFeedbackVote(messageId);
+    if (stored) setInternalFeedback(stored);
+    else setInternalFeedback(null);
   }, [messageId, serverFeedback]);
 
   const current = externalFeedback !== undefined ? externalFeedback : internalFeedback;
@@ -164,15 +162,9 @@ function FeedbackActions({
 
       if (externalFeedback === undefined) setInternalFeedback(next);
 
-      try {
-        if (messageId) {
-          if (next === null) {
-            localStorage.removeItem(`chat_feedback_${messageId}`);
-          } else {
-            localStorage.setItem(`chat_feedback_${messageId}`, next);
-          }
-        }
-      } catch { /* ignore */ }
+      if (messageId) {
+        writeFeedbackVote(messageId, next);
+      }
 
       onFeedback?.(next);
 
@@ -184,12 +176,9 @@ function FeedbackActions({
         updateMessageFeedback(Number(sessionId), Number(messageId), next).catch(() => {
           if (feedbackSeqByMessage.get(String(messageId)) !== mySeq) return; // a newer vote superseded this one
           if (externalFeedback === undefined) setInternalFeedback(prev);
-          try {
-            if (messageId) {
-              if (prev === null) localStorage.removeItem(`chat_feedback_${messageId}`);
-              else localStorage.setItem(`chat_feedback_${messageId}`, prev);
-            }
-          } catch { /* ignore */ }
+          if (messageId) {
+            writeFeedbackVote(messageId, prev);
+          }
           onFeedback?.(prev);
           toast.error("Couldn't save feedback");
         });

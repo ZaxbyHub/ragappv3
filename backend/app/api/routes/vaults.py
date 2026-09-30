@@ -589,6 +589,20 @@ async def update_vault(
     return vault
 
 
+def _log_vault_dir_rmtree_error(func, path, exc_info):  # noqa: ANN001
+    """Log, never raise, per-child failures of deleted-vault directory removal.
+
+    Passing this as ``shutil.rmtree(onerror=...)`` keeps the cleanup
+    best-effort (one locked file must not abort the sweep) while making every
+    leftover visible in the log instead of silently swallowed.
+    """
+    logger.warning(
+        "Failed to remove %s during deleted-vault directory cleanup: %s",
+        path,
+        exc_info[1],
+    )
+
+
 @router.delete("/vaults/{vault_id}")
 async def delete_vault(
     vault_id: int,
@@ -657,8 +671,13 @@ async def delete_vault(
 
     # W21 (C19 / RC-17): the vault's file ids, collected inside the
     # transaction below so a post-commit vector-store failure can record
-    # per-file `vector_delete_pending` tombstones for the sweep.
+    # per-file `vector_delete_pending` tombstones for the sweep. The stored
+    # paths are collected alongside them for the post-commit disk GC (issue
+    # #692 / T1-21-S-04): after `DELETE FROM files` the paths are
+    # unrecoverable, and the uploaded bytes they name must not outlive the
+    # vault the way single-document delete already prevents.
     vault_file_ids: List[int] = []
+    vault_file_paths: List[str] = []
 
     try:
         # Start transaction. BEGIN IMMEDIATE acquires the write lock up front
@@ -666,15 +685,16 @@ async def delete_vault(
         # between our reads and writes (avoids SQLITE_BUSY mid-cascade).
         await asyncio.to_thread(conn.execute, "BEGIN IMMEDIATE")
 
-        # Collect the vault's file ids BEFORE deleting their rows: they are
-        # needed for the post-commit vector reconciliation below, and after
-        # `DELETE FROM files` they are unrecoverable.
+        # Collect the vault's file ids and stored paths BEFORE deleting their
+        # rows: they are needed for the post-commit vector reconciliation and
+        # disk GC below, and after `DELETE FROM files` they are unrecoverable.
         file_id_rows = await asyncio.to_thread(
             lambda: conn.execute(
-                "SELECT id FROM files WHERE vault_id = ?", (vault_id,)
+                "SELECT id, file_path FROM files WHERE vault_id = ?", (vault_id,)
             ).fetchall()
         )
         vault_file_ids = [int(row[0]) for row in file_id_rows]
+        vault_file_paths = [str(row[1]) for row in file_id_rows if row[1]]
 
         # W21 (C19): vector chunks are NOT deleted here. The relational
         # deletion is committed first (durable intent) and the vector store
@@ -766,7 +786,7 @@ async def delete_vault(
                     type(restore_exc).__name__,
                 )
         raise
-    except (sqlite3.Error, OSError, RuntimeError) as e:
+    except (sqlite3.Error, OSError, RuntimeError):
         await asyncio.to_thread(lambda: conn.rollback())
         if draft_purge_plan is not None:
             try:
@@ -778,7 +798,7 @@ async def delete_vault(
                     type(restore_exc).__name__,
                 )
         logger.exception("Error deleting vault %d", vault_id)
-        raise HTTPException(status_code=500, detail=f"Delete failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to delete vault")
 
     # -- Post-commit vector reconciliation (W21 / C19). -------------------
     # The relational delete is durable now; destroy the vault's vectors. On
@@ -837,6 +857,32 @@ async def delete_vault(
                 vault_id,
                 type(e).__name__,
             )
+
+    # -- Post-commit disk GC (issue #692 / T1-21-S-04). ---------------------
+    # Parity with single-document delete: the rows are durably gone, so the
+    # uploaded originals they named are unreachable orphans now. Unlink each
+    # one through the same root-containment helper the document-delete path
+    # uses, THEN remove the vault's whole storage directory. Order matters:
+    # _unlink_document_file resolves the vault's upload/document roots, whose
+    # accessors recreate missing directories, so running the rmtree first
+    # would let the unlinks rebuild data/vaults/{id}/ after its removal.
+    try:
+        from app.api.routes.documents import _unlink_document_file
+
+        for stored_path in vault_file_paths:
+            await asyncio.to_thread(_unlink_document_file, stored_path, vault_id)
+
+        vault_dir = settings.data_dir / "vaults" / str(vault_id)
+        if vault_dir.is_dir():
+            await asyncio.to_thread(
+                shutil.rmtree, vault_dir, False, _log_vault_dir_rmtree_error
+            )
+    except Exception as e:  # noqa: BLE001 — GC must not fail the response
+        logger.warning(
+            "Post-commit disk cleanup for deleted vault %s incomplete: %s",
+            vault_id,
+            e,
+        )
 
     return {
         "message": f"Vault '{vault_name}' (id: {vault_id}) deleted successfully"

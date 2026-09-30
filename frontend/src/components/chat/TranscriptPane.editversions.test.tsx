@@ -26,6 +26,7 @@ const truncateMock = vi.hoisted(() => vi.fn(async () => ({})));
 vi.mock("@/lib/api", () => ({
   forkChatSession: vi.fn(async () => ({ id: 99, messages: [] })),
   truncateChatSession: truncateMock,
+  getChatSession: vi.fn(),
 }));
 vi.mock("@/hooks/useChatHistory", () => ({
   useChatHistory: () => ({ refreshHistory: refreshHistoryMock }),

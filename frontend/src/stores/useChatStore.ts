@@ -81,6 +81,14 @@ export interface ChatState {
   pendingTurnPersist: Promise<void> | null;
 
   /**
+   * Every in-flight durable turn save (issue #684 / T1-13-S2-06). The single
+   * slot above is overwritten by each new save, so revision operations ALSO
+   * drain this registry to wait for older still-unsettled saves before any
+   * server-side history change. Entries self-remove when their save settles.
+   */
+  pendingTurnPersists: Set<Promise<void>>;
+
+  /**
    * Client-side edit-version snapshots (issue #573 AC3), keyed by transcript
    * slot `"<activeChatId>:<index>"`. Editing truncates the session in place
    * and re-sends, so the pre-edit content is snapshotted here to make sibling
@@ -115,6 +123,9 @@ export interface ChatState {
   setAbortFn: (abortFn: (() => void) | null) => void;
   setInputError: (error: string | null) => void;
   setPendingTurnPersist: (p: Promise<void> | null) => void;
+  /** Issue #684: register/unregister an in-flight turn save (self-removing). */
+  registerPendingTurnPersist: (p: Promise<void>) => void;
+  unregisterPendingTurnPersist: (p: Promise<void>) => void;
   toggleSource: (sourceId: string) => void;
   clearExpandedSources: () => void;
   stopStreaming: () => void;
@@ -146,6 +157,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   expandedSources: new Set(),
   activeChatId: null,
   pendingTurnPersist: null,
+  pendingTurnPersists: new Set(),
   messageEditVersions: {},
   activeEditVersion: {},
 
@@ -236,6 +248,19 @@ export const useChatStore = create<ChatState>((set, get) => ({
   setAbortFn: (abortFn) => set({ abortFn }),
   setInputError: (inputError) => set({ inputError }),
   setPendingTurnPersist: (p) => set({ pendingTurnPersist: p }),
+  registerPendingTurnPersist: (p) =>
+    set((state) => {
+      const next = new Set(state.pendingTurnPersists ?? []);
+      next.add(p);
+      return { pendingTurnPersists: next };
+    }),
+  unregisterPendingTurnPersist: (p) =>
+    set((state) => {
+      if (!state.pendingTurnPersists?.has(p)) return {};
+      const next = new Set(state.pendingTurnPersists);
+      next.delete(p);
+      return { pendingTurnPersists: next };
+    }),
 
   toggleSource: (sourceId) => {
     set((state) => {
