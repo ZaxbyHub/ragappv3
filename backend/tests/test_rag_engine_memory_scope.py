@@ -85,6 +85,9 @@ def _make_engine():
     eng.memory_store = MagicMock()
     eng.memory_store.search_memories = MagicMock(return_value=[])
     eng.memory_store.detect_memory_intent = MagicMock(return_value=None)
+    # Issue #688 dedupe lookup: None means "not stored yet" (the auto-attr
+    # MagicMock would be truthy and skip the insert).
+    eng.memory_store.find_memory_by_content = MagicMock(return_value=None)
     eng.memory_store.add_memory = MagicMock(return_value=None)
     return eng
 
