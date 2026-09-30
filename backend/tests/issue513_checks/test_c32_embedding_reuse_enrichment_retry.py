@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import sqlite3
 import sys
 import tempfile
 from pathlib import Path
@@ -41,6 +42,26 @@ def _hermetic_env() -> None:
     os.environ["JWT_SECRET_KEY"] = "test-jwt-secret-key-for-testing-only"
     os.environ["REDIS_URL"] = ""
     os.environ["DATA_DIR"] = _TMPDIR
+
+
+def _reset_embedding_cache_connection() -> None:
+    """Drop the module-global cache connection around this isolated scenario.
+
+    ``embedding_cache`` keeps one SQLite connection at module scope. pytest-xdist
+    workers can therefore inherit a connection opened by an earlier test under a
+    different ``settings.data_dir``; a closed inherited connection makes the
+    cache's best-effort lookup/store paths silently miss and masks this check's
+    isolated cache directory. This acceptance scenario owns its cache lifecycle
+    so its ``DATA_DIR`` patch is actually exercised.
+    """
+    from app.services import embedding_cache
+
+    if embedding_cache._conn is not None:
+        try:
+            embedding_cache._conn.close()
+        except sqlite3.Error:
+            pass
+    embedding_cache._conn = None
 
 
 class _CountingEmbedding:
@@ -193,7 +214,11 @@ async def _scenario() -> str:
 def main() -> int:
     _hermetic_env()
     logging.disable(logging.CRITICAL)
-    reason = asyncio.run(_scenario())
+    _reset_embedding_cache_connection()
+    try:
+        reason = asyncio.run(_scenario())
+    finally:
+        _reset_embedding_cache_connection()
     if reason:
         print(f"C32 CHECK: FAIL: {reason}")
         return 1
@@ -203,6 +228,29 @@ def main() -> int:
 
 def test_c32_embedding_reuse_enrichment_retry() -> None:
     assert main() == 0
+
+
+def test_c32_resets_inherited_closed_embedding_cache_connection() -> None:
+    """C32 remains valid when a prior xdist test left the cache connection closed.
+
+    Before C32 resets module state, ``lookup`` and ``store`` swallow the closed
+    SQLite connection errors as cache misses, so its retry embeds both unchanged
+    chunks. The normal C32 assertions in ``main`` make this a behavioral
+    regression test rather than a private-state-only check.
+    """
+    _hermetic_env()
+    from app.services import embedding_cache
+
+    _reset_embedding_cache_connection()
+    try:
+        # Inject the inherited state directly. Calling ``lookup`` here would
+        # open a disk cache using whichever settings object pytest had already
+        # imported, which would make this regression setup itself non-hermetic.
+        embedding_cache._conn = sqlite3.connect(":memory:")
+        embedding_cache._conn.close()
+        assert main() == 0
+    finally:
+        _reset_embedding_cache_connection()
 
 
 if __name__ == "__main__":

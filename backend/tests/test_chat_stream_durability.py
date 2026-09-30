@@ -250,9 +250,22 @@ async def _consume_until(response, predicate):
             pass
 
     task = asyncio.create_task(consumer())
-    await asyncio.wait_for(saw.wait(), timeout=10)
-    await asyncio.sleep(0)
-    task.cancel()
+    try:
+        await asyncio.wait_for(saw.wait(), timeout=10)
+        await asyncio.sleep(0)
+    finally:
+        # ``saw.wait()`` can time out or a later assertion can fail while the
+        # reader is parked on the next frame.  The response reader is a task
+        # owned by this helper, so always retire it before exposing either
+        # outcome to the caller.  Otherwise pytest-asyncio has to cancel it
+        # during loop shutdown and obscures the real failure.
+        await _cancel_and_await(task)
+
+
+async def _cancel_and_await(task):
+    """Retire a task this test owns, including on an assertion path."""
+    if not task.done():
+        task.cancel()
     try:
         await task
     except asyncio.CancelledError:
@@ -367,24 +380,80 @@ async def test_shutdown_cancellation_persists_interrupted_turn(env):
 
     env.engine.query = gated_query
     response = env.make_stream(turn_id)
-    await _consume_until(response, _is_content_event)
-    # The producer keeps running past the disconnect; cancel it directly.
+    # stream_chat_response creates and registers the producer synchronously.
+    # Keep that owned task rather than re-looking it up after the reader has
+    # unwound: a failed assertion must still retire the gated producer.
     entry = chat_routes._turn_registry().get((env.session_id, turn_id))
     assert entry is not None and entry.task is not None
-    entry.task.cancel()
+    producer = entry.task
     try:
-        await entry.task
-    except asyncio.CancelledError:
-        pass
-    assert _wait_for(
-        lambda: len([r for r in env.rows() if r[0] == "assistant"]) == 1
-    )
+        await _consume_until(response, _is_content_event)
+        # The gate proves the producer is still generating after disconnect.
+        assert not producer.done()
+        await _cancel_and_await(producer)
+        assert _wait_for(
+            lambda: len([r for r in env.rows() if r[0] == "assistant"]) == 1
+        )
 
-    rows = env.rows()
-    assistant_rows = [r for r in rows if r[0] == "assistant"]
-    assert len(assistant_rows) == 1
-    assert assistant_rows[0][1] == "interrupted"
-    assert "The plan begins" in assistant_rows[0][4]
+        rows = env.rows()
+        assistant_rows = [r for r in rows if r[0] == "assistant"]
+        assert len(assistant_rows) == 1
+        assert assistant_rows[0][1] == "interrupted"
+        assert "The plan begins" in assistant_rows[0][4]
+    finally:
+        await _cancel_and_await(producer)
+
+
+async def test_consume_until_timeout_cancels_owned_reader_task():
+    """A failed wait must not leave the direct-generator reader for loop
+    shutdown, where it can hide the test's actual assertion/timeout."""
+    reader_cancelled = asyncio.Event()
+
+    async def blocked_reader():
+        try:
+            await asyncio.Event().wait()
+            yield "unreachable"
+        finally:
+            reader_cancelled.set()
+
+    class _Response:
+        body_iterator = blocked_reader()
+
+    async def _timeout_after_reader_starts(awaitable, timeout):
+        # Let the consumer start and park, then emulate the helper's bounded
+        # wait expiring without spending ten seconds in a regression test.
+        await asyncio.sleep(0)
+        awaitable.close()
+        raise asyncio.TimeoutError
+
+    with patch.object(asyncio, "wait_for", _timeout_after_reader_starts):
+        with pytest.raises(asyncio.TimeoutError):
+            await _consume_until(_Response(), lambda _text: False)
+
+    assert reader_cancelled.is_set()
+
+
+async def test_failed_shutdown_check_retires_gated_producer():
+    """The shutdown test's failure cleanup owns its blocked producer instead
+    of leaving pytest-asyncio to discover it during loop shutdown."""
+    producer_cancelled = asyncio.Event()
+
+    async def blocked_producer():
+        try:
+            await asyncio.Event().wait()
+        finally:
+            producer_cancelled.set()
+
+    producer = asyncio.create_task(blocked_producer())
+    await asyncio.sleep(0)
+    with pytest.raises(AssertionError, match="forced shutdown check"):
+        try:
+            raise AssertionError("forced shutdown check")
+        finally:
+            await _cancel_and_await(producer)
+
+    assert producer.done()
+    assert producer_cancelled.is_set()
 
 
 # ---------------------------------------------------------------------------
