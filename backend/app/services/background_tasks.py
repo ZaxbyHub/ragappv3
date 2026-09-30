@@ -2892,8 +2892,10 @@ class BackgroundProcessor:
             and processed when start() is called.
 
         Returns:
-            ``True`` when a new queue item was added, or ``False`` when the
-            file is already owned by the recovery path.
+            ``True`` when the file is queued — including when a path-level
+            dedupe suppressed a duplicate insert because an equivalent
+            non-terminal job already holds the slot (issue #693) — or
+            ``False`` when the file is already owned by the recovery path.
         """
         reservation_added = False
         if file_id is not None:
@@ -2939,6 +2941,7 @@ class BackgroundProcessor:
                     await self._release_recovery_file(file_id)
                 raise DocumentProcessingError("Maintenance mode prevents enqueueing")
         job_id: Optional[int] = None
+        job_insert_suppressed = False
         if getattr(self, "_ingest_lease_enabled", False):
             # Durable claim row first (issue #559): the jobs row is the
             # authoritative queue entry; the asyncio.Queue below is only the
@@ -2953,10 +2956,23 @@ class BackgroundProcessor:
                 "file_id": file_id,
                 "file_hash": file_hash,
             }
+            if file_id is None:
+                # Path-based item (scan / email attachment): carry a
+                # normalized dedupe key (issue #693 / T1-27-S-05). The
+                # enqueue-side window is the only layer that sees every
+                # producer — the watcher's files-row check cannot help
+                # before a worker creates the row — and the normalized key
+                # keeps the dedupe independent of the path form (relative
+                # vs resolved) each producer used.
+                payload["path_key"] = os.path.normcase(os.path.abspath(file_path))
 
-            def _insert_job() -> int:
+            def _insert_job() -> Optional[int]:
                 with self.processor.pool.connection() as conn:
                     lease = self._make_ingest_lease(conn)
+                    if file_id is None:
+                        return lease.enqueue_deduped(
+                            INGESTION_QUEUE, payload, path_key=payload["path_key"]
+                        )
                     return lease.enqueue(INGESTION_QUEUE, payload)
 
             try:
@@ -2968,6 +2984,9 @@ class BackgroundProcessor:
                     exc_info=True,
                 )
                 job_id = None
+            else:
+                if job_id is None:
+                    job_insert_suppressed = True
         task = TaskItem(
             file_path=file_path,
             attempt=1,
@@ -2980,6 +2999,15 @@ class BackgroundProcessor:
             recovery_claim=_recovery_claim,
             job_id=job_id,
         )
+        if job_insert_suppressed:
+            # An equivalent non-terminal job already holds this path's
+            # ingestion slot (issue #693 / T1-27-S-05): the file IS queued,
+            # just not twice. No in-memory put — that would double-process
+            # the row the lease already owns.
+            logger.debug(
+                "Path already holds a queued ingestion job: %s", file_path
+            )
+            return True
         if job_id is not None:
             # Lease mode: the DB row is the queue entry; workers poll-claim it.
             # No in-memory put — a put here would double-process the row.

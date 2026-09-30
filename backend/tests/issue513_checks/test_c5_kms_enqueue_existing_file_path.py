@@ -72,7 +72,7 @@ class _FakeVectorStore:
     async def init_table(self, embedding_dim: int) -> None:  # noqa: ANN001
         return None
 
-    async def add_chunks(self, records):  # noqa: ANN001, ANN202
+    async def add_chunks(self, records, generation_prefix=None):  # noqa: ANN001, ANN202
         for rec in records:
             self.rows[rec["id"]] = rec
         return {"vector_write_ms": 0.0, "optimize_ms": 0.0}

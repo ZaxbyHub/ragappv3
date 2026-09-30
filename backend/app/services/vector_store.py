@@ -861,6 +861,7 @@ class VectorStore:
         self,
         records: List[Dict[str, Any]],
         target: Optional[DimensionRebuildHandle] = None,
+        generation_prefix: Optional[str] = None,
     ) -> Dict[str, float]:
         """Serialize chunk writes and related LanceDB maintenance.
 
@@ -868,11 +869,28 @@ class VectorStore:
         into the rebuild temp table (expected dim taken from the handle) and
         the live table's index bookkeeping is left untouched; the validated
         swap happens only at ``commit_dimension_rebuild``.
+
+        When ``generation_prefix`` is set (``{file_id}_{hash8}_``, the same
+        string ``delete_old_generation_by_file`` derives), the write is
+        idempotent per generation (issue #693): a complete same-generation
+        re-add is re-written IN PLACE via an id-keyed upsert — so changed
+        embeddings/text under the same chunk ids (a same-dimension re-embed)
+        are stored, not silently skipped (PR #828 review F-001) — and any
+        partial/duplicated/stale state under the prefix is reset before the
+        append so the file ends with exactly one row per chunk id. The guard
+        runs against the selected table (live or rebuild target).
         """
         async with self._acquire_write_lock():
+            # Kwargs are passed only when set: test doubles commonly replace
+            # ``_add_chunks_unlocked`` with a bare ``*args`` coroutine, and
+            # an unconditional keyword would raise on those (and the guarded
+            # wrappers in issue513 checks assert call shapes).
+            kwargs: Dict[str, Any] = {}
             if target is not None:
-                return await self._add_chunks_unlocked(records, target=target)
-            return await self._add_chunks_unlocked(records)
+                kwargs["target"] = target
+            if generation_prefix is not None:
+                kwargs["generation_prefix"] = generation_prefix
+            return await self._add_chunks_unlocked(records, **kwargs)
 
     async def add_chunks_then_delete_ids(
         self, records: List[Dict[str, Any]], old_ids: List[str]
@@ -922,15 +940,19 @@ class VectorStore:
         self,
         records: List[Dict[str, Any]],
         target: Optional[DimensionRebuildHandle] = None,
+        generation_prefix: Optional[str] = None,
     ) -> Dict[str, float]:
         """
         Add chunk records to the vector store.
 
         Args:
             records: List of records with keys: id, text, file_id, chunk_index,
-                     metadata, embedding, vault_id (required, caller must provide).
+                     embedding, vault_id (required, caller must provide).
             target: Optional dimension-rebuild handle; writes go to the rebuild
-                temp table instead of the live table.
+                    temp table instead of the live table.
+            generation_prefix: Optional ``{file_id}_{hash8}_`` prefix enabling
+                    the same-generation idempotency guard (issue #693). Must
+                    only be supplied when every record belongs to one file.
 
         Raises:
             RuntimeError: If table is not initialized.
@@ -1017,9 +1039,91 @@ class VectorStore:
                     )
             processed_records.append(processed_record)
 
-        t0 = time.monotonic()
-        await table.add(processed_records)
-        timings["vector_write_ms"] += (time.monotonic() - t0) * 1000
+        # Same-generation idempotency guard (issue #693): LanceDB appends are
+        # not upserts, so a same-hash reprocess would duplicate every row —
+        # the deterministic ids share the {file_id}_{hash8}_ prefix, so the
+        # post-insert delete-by-prefix in delete_old_generation_by_file
+        # matches nothing. Runs against the SELECTED table (live or rebuild
+        # target) so a dimension-rebuild add is guarded on the rebuild temp
+        # table and can never be silenced by the live table's state.
+        #
+        # A COMPLETE generation (same ids, same count) is re-written IN PLACE
+        # via an id-keyed upsert rather than skipped: the ids carry no model
+        # or parser identity, so a same-dimension re-embed (or any reparse
+        # preserving the chunk layout) produces the same ids with different
+        # vectors/text — skipping the write would leave stale content served
+        # under the new identity (PR #828 review F-001). The upsert updates
+        # matched ids and inserts unmatched ones, so the file still ends with
+        # exactly one row per chunk id.
+        upserted = False
+        if generation_prefix and processed_records:
+            file_ids = {str(r["file_id"]) for r in processed_records}
+            if len(file_ids) == 1:
+                incoming_ids = [str(r["id"]) for r in processed_records]
+                if len(set(incoming_ids)) != len(incoming_ids):
+                    raise VectorStoreValidationError(
+                        "add_chunks: duplicate record ids within one generation"
+                    )
+                safe_file_id = _lance_escape(file_ids.pop())
+                safe_prefix = _lance_escape(generation_prefix)
+                guard_pred = (
+                    f"file_id = '{safe_file_id}' AND id LIKE '{safe_prefix}%'"
+                )
+                try:
+                    total = await table.count_rows(guard_pred)
+                    complete = False
+                    if total == len(incoming_ids):
+                        rows = (
+                            await table.query()
+                            .where(guard_pred)
+                            .select(["id"])
+                            .limit(len(incoming_ids) + 1)
+                            .to_list()
+                        )
+                        existing_ids = {str(row["id"]) for row in rows}
+                        complete = existing_ids == set(incoming_ids)
+                    if complete:
+                        logger.info(
+                            "add_chunks: complete same-generation re-add for "
+                            "file_id=%s (%d rows); re-writing rows in place "
+                            "via id upsert so changed embeddings/text are not "
+                            "silently skipped",
+                            safe_file_id,
+                            len(incoming_ids),
+                        )
+                        t0 = time.monotonic()
+                        await (
+                            table.merge_insert(on="id")
+                            .when_matched_update_all()
+                            .when_not_matched_insert_all()
+                            .execute(processed_records)
+                        )
+                        timings["vector_write_ms"] += (
+                            time.monotonic() - t0
+                        ) * 1000
+                        upserted = True
+                    elif total > 0:
+                        logger.info(
+                            "add_chunks: resetting %d generation rows for "
+                            "file_id=%s whose ids differ from the incoming "
+                            "chunks (chunk layout changed under the same "
+                            "hash) before re-add",
+                            total,
+                            safe_file_id,
+                        )
+                        await table.delete(guard_pred)
+                        if target is None:
+                            self._index_mutation_generation += 1
+                except (OSError, RuntimeError, ValueError) as e:
+                    # The guard is a safety net layered over the append, not a
+                    # gate the append depends on: a transient count/query
+                    # failure falls back to the plain-append semantics.
+                    logger.warning("add_chunks generation guard failed: %s", e)
+
+        if not upserted:
+            t0 = time.monotonic()
+            await table.add(processed_records)
+            timings["vector_write_ms"] += (time.monotonic() - t0) * 1000
 
         if target is not None:
             # Rebuild temp-table writes: no live index bookkeeping and no

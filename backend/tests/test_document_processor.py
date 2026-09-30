@@ -310,7 +310,7 @@ CREATE TABLE posts (
             async def init_table(self, embedding_dim):
                 self.embedding_dim = embedding_dim
 
-            async def add_chunks(self, records):
+            async def add_chunks(self, records, generation_prefix=None):
                 self.records.extend(records)
 
             async def delete_old_generation_by_file(self, file_id, new_hash_short):
@@ -373,7 +373,7 @@ CREATE TABLE posts (
             async def init_table(self, embedding_dim):
                 self.embedding_dim = embedding_dim
 
-            async def add_chunks(self, records):
+            async def add_chunks(self, records, generation_prefix=None):
                 self.records.extend(records)
 
             async def delete_old_generation_by_file(self, file_id, new_hash_short):
@@ -447,7 +447,7 @@ CREATE TABLE posts (
             async def init_table(self, embedding_dim):
                 self.embedding_dim = embedding_dim
 
-            async def add_chunks(self, records):
+            async def add_chunks(self, records, generation_prefix=None):
                 self.records.extend(records)
 
             async def delete_old_generation_by_file(self, file_id, new_hash_short):
