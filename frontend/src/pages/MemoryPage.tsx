@@ -118,9 +118,16 @@ function MemoryPageContent({ activeVaultId }: { activeVaultId: number }) {
     try {
       await updateMemory(editTarget.id, {
         content: editContent.trim(),
-        category: editCategory.trim() || undefined,
-        tags: editTags.trim() || undefined,
-        source: editSource.trim() || undefined,
+        // Cleared fields are sent as explicit null so the backend clears
+        // them (issue #686, T1-02-K-02) — `undefined` would drop the key
+        // and silently keep the old value.
+        category: editCategory.trim() || null,
+        tags: editTags.trim() || null,
+        source: editSource.trim() || null,
+        // Optimistic-concurrency token from the loaded row: a 409 toast
+        // instead of silently overwriting another session's edit (issue
+        // #686, T1-02-S-05).
+        expected_updated_at: editTarget.updated_at ?? undefined,
       });
       toast.success("Memory updated");
       closeEdit();

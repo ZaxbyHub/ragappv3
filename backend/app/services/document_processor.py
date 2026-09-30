@@ -1598,6 +1598,76 @@ class DocumentProcessor:
             return f"status '{current_status}' is no longer retry-eligible"
         return None
 
+    def _raise_if_file_row_missing(self, file_id: int) -> None:
+        """Abort an in-flight generation when its ``files`` row was deleted.
+
+        A vault delete racing this worker must not end with the vector store
+        holding chunks for a row (and vault) that no longer exists, with no
+        tombstone (issue #692 / T1-21-S2-10). Mirrors the row-gone branch of
+        ``_retry_staleness_reason`` at the last durable write: called right
+        before the vector write, it closes the whole parse/embed span. The
+        narrower guard-to-``add_chunks`` window it cannot close is covered by
+        the post-write compensating discard in
+        :meth:`_discard_vectors_if_row_gone`.
+        """
+        conn = self.pool.get_connection()
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM files WHERE id = ?", (file_id,)
+            ).fetchone()
+        finally:
+            self.pool.release_connection(conn)
+        if row is None:
+            raise DocumentProcessingError(
+                "File row removed mid-ingest (vault deleted); "
+                "discarding this generation"
+            )
+
+    async def _discard_vectors_if_row_gone(
+        self, file_id: int, *, target_kwargs: Optional[dict] = None
+    ) -> None:
+        """Post-write compensation for the residual staleness window.
+
+        The pre-write gate above cannot cover the awaits between itself and
+        ``add_chunks`` (dimension check, ``init_table``). Re-reading the row
+        after the write and deleting the just-written chunks when the row is
+        gone closes that window mechanically instead of relying on the
+        disclosed bound (issue #692 review follow-up F-004). Raises the same
+        staleness error so the caller's failure path runs; the raised error
+        is a no-op on the already-deleted row.
+        """
+        # get_connection_async: the async checkout surface used across this
+        # module (#645 AC2 — no sync pooled checkouts inside async defs).
+        conn = await self.pool.get_connection_async()
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM files WHERE id = ?", (file_id,)
+            ).fetchone()
+        finally:
+            self.pool.release_connection(conn)
+        if row is not None:
+            return
+        try:
+            deleted = await self.vector_store.delete_by_file(
+                str(file_id), **(target_kwargs or {})
+            )
+            logger.warning(
+                "Discarded %d vector chunk(s) written for file_id=%s after "
+                "its row was removed mid-ingest",
+                deleted,
+                file_id,
+            )
+        except Exception:  # noqa: BLE001 — compensation must not mask the gate
+            logger.exception(
+                "Failed to discard vectors written for removed file_id=%s; "
+                "the next vault/vector reconciliation should sweep them",
+                file_id,
+            )
+        raise DocumentProcessingError(
+            "File row removed mid-ingest (vault deleted); wrote and "
+            "discarded this generation"
+        )
+
     async def _live_vector_count(self, file_id: int) -> Optional[int]:
         """Live vector count for a file, or None when unavailable (W15).
 
@@ -3464,6 +3534,12 @@ class DocumentProcessor:
                         percent=0.0,
                     )
 
+                    # Last durable-write staleness gate (issue #692 /
+                    # T1-21-S2-10): mirror the process_existing_file guard —
+                    # a vault delete that committed during this worker's
+                    # parse/embed span must not receive chunks for a row that
+                    # no longer exists.
+                    self._raise_if_file_row_missing(file_id)
                     # Initialize vector table with embedding dimension and add chunks
                     embedding_dim = len(embeddings[0])
                     stage_started_at = time.monotonic()
@@ -3502,6 +3578,7 @@ class DocumentProcessor:
                         _merge_vector_timings(stage_timings, vector_timings)
 
                     await self._verify_vector_rows_visible(file_id)
+                    await self._discard_vectors_if_row_gone(file_id)
 
                     # Publish the generation's atoms/assets/stage rows after the
                     # new vectors are durable, so old-generation atoms/assets are
@@ -3972,6 +4049,13 @@ class DocumentProcessor:
 
                     embedding_dim = len(embeddings[0])
                     stage_started_at = time.monotonic()
+                    # Last durable-write staleness gate (issue #692 /
+                    # T1-21-S2-10): a vault delete may have committed while
+                    # this worker parsed/embedded. Discard the generation
+                    # instead of writing chunks for a row that no longer
+                    # exists. Covers bare and vector_target (staged rebuild)
+                    # calls alike, and every parse branch funnels through here.
+                    self._raise_if_file_row_missing(file_id)
                     # [W8/W13 contract] Thread the optional rebuild target into
                     # every vector-store call below as a trailing ``target=``
                     # argument (dimension-migrating reindex); omitted entirely
@@ -4028,6 +4112,9 @@ class DocumentProcessor:
                         _merge_vector_timings(stage_timings, vector_timings)
 
                     await self._verify_vector_rows_visible(file_id, vector_target)
+                    await self._discard_vectors_if_row_gone(
+                        file_id, target_kwargs=_target_kwargs
+                    )
 
                     # Publish the generation's atoms/assets/stage rows after the
                     # new vectors are durable (issue #460).

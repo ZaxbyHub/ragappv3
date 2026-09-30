@@ -75,13 +75,16 @@ const loadPinnedSessions = (): number[] => {
   return [];
 };
 
-// Persist pinned sessions to localStorage
-const persistPinnedSessions = (ids: number[]) => {
-  if (typeof window === "undefined") return;
+// Persist pinned sessions to localStorage. Returns whether the write landed —
+// callers keep the in-memory list coherent with storage on failure (F-005).
+const persistPinnedSessions = (ids: number[]): boolean => {
+  if (typeof window === "undefined") return false;
   try {
     localStorage.setItem(PINNED_SESSIONS_KEY, JSON.stringify(ids));
+    return true;
   } catch {
-    // Silently fail on localStorage errors (quota exceeded, etc.)
+    // Quota/security failure: report so state can revert to storage truth.
+    return false;
   }
 };
 
@@ -114,13 +117,22 @@ export const useChatShellStore = create<ChatShellState>((set, get) => ({
   closeRightPane: () => set({ rightPaneOpen: false }),
   setSessionSearchQuery: (query) => set({ sessionSearchQuery: query }),
   togglePinSession: (sessionId) => {
-    const { pinnedSessionIds } = get();
-    const isPinned = pinnedSessionIds.includes(sessionId);
+    // Issue #685 (T1-13-S2-11): re-read storage instead of trusting the
+    // in-memory list — another tab may have pinned/unpinned sessions since
+    // this tab loaded, and rewriting from memory would silently drop them.
+    const current = loadPinnedSessions();
+    const isPinned = current.includes(sessionId);
     const newIds = isPinned
-      ? pinnedSessionIds.filter((id) => id !== sessionId)
-      : [...pinnedSessionIds, sessionId];
-    persistPinnedSessions(newIds);
-    set({ pinnedSessionIds: newIds });
+      ? current.filter((id) => id !== sessionId)
+      : [...current, sessionId];
+    // F-005: if the write fails (quota exhausted), keep memory equal to
+    // storage — a phantom in-memory pin could otherwise never be unpinned,
+    // because the next toggle would re-read storage and compute "pin" again.
+    if (persistPinnedSessions(newIds)) {
+      set({ pinnedSessionIds: newIds });
+    } else {
+      set({ pinnedSessionIds: current });
+    }
   },
   isSessionPinned: (sessionId) => {
     return get().pinnedSessionIds.includes(sessionId);
@@ -137,3 +149,31 @@ export const useChatShellStore = create<ChatShellState>((set, get) => ({
     }),
   setActiveRightTab: (tab) => set({ activeRightTab: tab }),
 }));
+
+// Issue #685 (external review F-007 / review PRR-007): keep this tab's pinned
+// list coherent with edits from other tabs. The storage event fires only for
+// cross-document changes, and the persisted value is authoritative — REPLACE
+// from it (a union would resurrect pins another tab just removed). A removal
+// or clear of the key (newValue === null, or a cross-tab clear() surfacing as
+// key === null) means the pins are gone: mirror that instead of leaving stale
+// in-memory pins that a later toggle would resurrect.
+if (typeof window !== "undefined") {
+  window.addEventListener("storage", (event) => {
+    if (event.key !== null && event.key !== PINNED_SESSIONS_KEY) return;
+    if (event.newValue === null) {
+      useChatShellStore.setState({ pinnedSessionIds: [] });
+      return;
+    }
+    let next: number[] = [];
+    try {
+      const parsed = JSON.parse(event.newValue);
+      if (Array.isArray(parsed)) {
+        next = parsed.filter((id): id is number => typeof id === "number");
+      }
+    } catch {
+      // Unparseable external write: fall back to empty rather than keeping a
+      // list that no longer matches storage.
+    }
+    useChatShellStore.setState({ pinnedSessionIds: next });
+  });
+}

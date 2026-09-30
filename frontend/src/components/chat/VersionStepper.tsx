@@ -3,8 +3,10 @@
 // snapshots for an edited turn. Editing truncates the session in place and
 // re-sends; the pre-edit content is snapshotted in useChatStore
 // (messageEditVersions), so sibling versions are navigable without any change
-// to the fork/lineage data model. The parent owns which version is displayed
-// (stepping swaps it via updateMessage — display-only).
+// to the fork/lineage data model. The parent owns which version is displayed:
+// stepping moves the activeEditVersion pointer only — the row resolves the
+// displayed snapshot at render time and the store's live content is never
+// rewritten (issue #685).
 
 interface VersionStepperProps {
   versions: Array<{ label: string; content: string }>;
