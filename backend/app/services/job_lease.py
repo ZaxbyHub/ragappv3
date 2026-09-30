@@ -283,6 +283,56 @@ class JobLease:
             del owned
         return job_id
 
+    def enqueue_deduped(
+        self,
+        queue: str,
+        payload: dict[str, Any],
+        *,
+        path_key: str,
+    ) -> Optional[int]:
+        """Insert one pending job unless an equivalent one is already queued.
+
+        Path-level dedupe window (issue #693 / T1-27-S-05): a path-based
+        ingestion item (an email attachment or a scanned file, no ``file_id``
+        yet) may be enqueued twice — e.g. an email poller queues an
+        attachment and a periodic scan finds the same on-disk file before
+        any worker created its ``files`` row. The single INSERT..SELECT..
+        WHERE NOT EXISTS statement is atomic, so concurrent enqueues cannot
+        both insert. Non-terminal set is exactly ``('pending','running')``
+        per the jobs CHECK constraint; terminal rows never hold the slot.
+
+        ``path_key`` must be a normalized form (``os.path.normcase(
+        os.path.abspath(...))``) — the payload carries it under
+        ``$.path_key`` so producers using different path spellings (relative
+        vs resolved) still dedupe.
+
+        Returns the new job id, or ``None`` when an equivalent non-terminal
+        job already exists (suppressed — not an error).
+        """
+        if not self._shape.supports_enqueue:
+            raise ValueError(
+                f"JobLease.enqueue_deduped: table {self._table!r} has no "
+                "payload_json column; rows there are enqueued by their "
+                "own typed store"
+            )
+        with self._write_txn() as owned:
+            cur = self._conn.execute(
+                """
+                INSERT INTO jobs (queue, payload_json)
+                SELECT ?, ?
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM jobs
+                    WHERE queue = ?
+                      AND status IN ('pending', 'running')
+                      AND json_extract(payload_json, '$.path_key') = ?
+                )
+                """,
+                (queue, json.dumps(payload), queue, path_key),
+            )
+            job_id = int(cur.lastrowid) if cur.rowcount > 0 else None
+            del owned
+        return job_id
+
     def claim(self, queue: str, worker_id: str) -> Optional[sqlite3.Row]:
         """Atomically claim the oldest claimable pending row of ``queue``.
 

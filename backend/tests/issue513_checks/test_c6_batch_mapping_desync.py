@@ -91,7 +91,7 @@ def main() -> int:
             async def init_table(self, dim):
                 return None
 
-            async def add_chunks(self, records):
+            async def add_chunks(self, records, generation_prefix=None):
                 self.added.extend(records)
                 return None
 
