@@ -2833,7 +2833,9 @@ tokenizers==0.22.2 \
     --hash=sha256:df6c4265b289083bf710dff49bc51ef252f9d5be33a45ee2bed151114a56207b \
     --hash=sha256:e10bf9113d209be7cd046d40fbabbaf3278ff6d18eb4da4c500443185dc1896c \
     --hash=sha256:f01a9c019878532f98927d2bacb79bbb404b43d3437455522a00a30718cdedb5
-    # via transformers
+    # via
+    #   sentence-transformers
+    #   transformers
 torch==2.13.0 \
     --hash=sha256:024c6cc0c1b085f2f91f20a3dc27b0471d021c31ce84b81be3afdc39f791fd9d \
     --hash=sha256:092790c696a760c729fd5722835f50b9d81fd7c8f141571f3f3cf4081a8f664c \
