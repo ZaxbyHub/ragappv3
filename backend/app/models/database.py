@@ -1735,6 +1735,59 @@ def init_db(sqlite_path: str) -> None:
         conn.close()
 
 
+def _widen_files_hash_vault_unique_index(conn: sqlite3.Connection) -> None:
+    """Create/upgrade ``idx_files_hash_vault_indexed`` to the widened WHERE.
+
+    Issue #693 / T1-05-K2-09: the partial unique index over
+    ``(file_hash, vault_id)`` covers ``status IN ('indexed', 'partial')`` so a
+    truthfully-partial document owns its content slot exactly like an indexed
+    one. Idempotent and cheap on re-runs: a ``sqlite_master`` staleness check
+    skips the swap when the index already carries the widened predicate, so
+    boots do not rebuild the index. The DROP+CREATE run inside an explicit
+    ``BEGIN IMMEDIATE`` because Python 3.11 sqlite3 autocommits DDL outside a
+    transaction — a bare DROP followed by a failing CREATE would leave the
+    database with no uniqueness at all. On IntegrityError (legacy databases
+    holding a partial+indexed pair for one hash+vault) the rollback restores
+    the previous index, whose presence is verified afterwards.
+    """
+    index_name = "idx_files_hash_vault_indexed"
+    widened_sql = (
+        f"CREATE UNIQUE INDEX {index_name} ON files(file_hash, vault_id) "
+        "WHERE file_hash IS NOT NULL AND status IN ('indexed','partial')"
+    )
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+        (index_name,),
+    ).fetchone()
+    current_sql = None
+    if row is not None:
+        current_sql = row["sql"] if isinstance(row, sqlite3.Row) else row[0]
+    if current_sql is not None and "partial" in current_sql:
+        return
+
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(f"DROP INDEX IF EXISTS {index_name}")
+        conn.execute(widened_sql)
+        conn.commit()
+    except sqlite3.IntegrityError as e:
+        conn.rollback()
+        surviving = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name=?",
+            (index_name,),
+        ).fetchone()
+        logger.warning(
+            "Could not widen unique file-hash index to include partial rows "
+            "(duplicate hash+vault rows across indexed/partial exist): %s. "
+            "%s",
+            e,
+            "The previous narrow index was preserved."
+            if surviving is not None
+            else "No index survived; it will be retried on the next boot "
+            "after duplicates are removed.",
+        )
+
+
 def run_migrations(sqlite_path: str) -> None:
     """
     Run database migrations to initialize the schema.
@@ -1891,24 +1944,18 @@ def run_migrations(sqlite_path: str) -> None:
     # SSE chat streams. Registered last: purely additive table, no rebuilds.
     migrate_add_chat_stream_events(sqlite_path)
 
-    # Add partial unique index for duplicate hash detection (HIGH-10)
-    # Wrapped in IntegrityError handler: existing databases may have duplicate
-    # (file_hash, vault_id) pairs that prevent index creation.
+    # Partial unique index for duplicate hash detection (HIGH-10), widened to
+    # treat a `partial` row the same as an `indexed` one (issue #693 /
+    # T1-05-K2-09): a truthfully-partial document owns its (file_hash,
+    # vault_id) content slot exactly like an indexed one. Wrapped in an
+    # explicit transaction because Python 3.11 sqlite3 autocommits DDL outside
+    # one — a bare DROP followed by a failing CREATE would leave the database
+    # with NO uniqueness. On IntegrityError (legacy databases already holding
+    # a partial+indexed pair for one hash+vault) the rollback restores the
+    # previous narrow index and we log the same tolerant warning as before.
     conn = sqlite3.connect(sqlite_path)
     try:
-        conn.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_files_hash_vault_indexed
-            ON files(file_hash, vault_id)
-            WHERE file_hash IS NOT NULL AND status = 'indexed'
-        """)
-        conn.commit()
-    except sqlite3.IntegrityError as e:
-        logger.warning(
-            "Could not create unique file-hash index (duplicate indexed records exist): %s. "
-            "The index will not be created until duplicates are removed.",
-            e,
-        )
-        conn.rollback()
+        _widen_files_hash_vault_unique_index(conn)
     finally:
         conn.close()
 
@@ -4303,10 +4350,11 @@ def migrate_widen_files_status(sqlite_path: str) -> None:
     tables referencing it via FKs. The swap therefore also drops and recreates
     the FTS triggers, rebuilds both FTS projections from the new table, and
     recreates every files index except ``idx_files_hash_vault_indexed`` — that
-    partial unique index is intentionally recreated by the block in
-    ``run_migrations`` that runs right after this migration, matching its
-    IntegrityError-tolerant semantics (existing duplicate rows must not fail
-    the migration).
+    partial unique index is intentionally recreated by the
+    ``_widen_files_hash_vault_unique_index`` block in ``run_migrations`` that
+    runs right after this migration, matching its IntegrityError-tolerant
+    semantics (existing duplicate rows must not fail the migration) and its
+    issue-#693 widened ``status IN ('indexed','partial')`` predicate.
 
     Must run AFTER every migration that adds a files column and after the two
     files FTS migrations (registered at the end of ``run_migrations`` for

@@ -15,8 +15,19 @@ from ..config import settings
 from ..models.database import SQLiteConnectionPool
 from .background_tasks import BackgroundProcessor
 from .upload_path import UploadPathProvider
+from .upload_validation import validate_ingest_candidate
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_scan_candidate(file_path: Path) -> tuple[bool, Optional[str]]:
+    """Thread-context wrapper around the shared structural screen.
+
+    ``validate_ingest_candidate`` performs blocking IO (header + zip central
+    directory reads); ``scan_once`` calls this through ``asyncio.to_thread``
+    so none of it lands on the event loop.
+    """
+    return validate_ingest_candidate(file_path)
 
 
 class FileWatcher:
@@ -50,6 +61,14 @@ class FileWatcher:
         self.pool = pool
         self._watching_task: Optional[asyncio.Task] = None
         self._running = False
+        # Lifecycle handshake (issue #693 / T1-27-S-06): ``_stopping`` marks an
+        # in-progress stop() drain and ``_pending_start`` records a restart
+        # requested while a drain was already under way. Both are read and
+        # written ONLY on the event loop that owns the watch task (stop(),
+        # start(), and _ensure_running all execute there, each in synchronous
+        # stretches), so no cross-thread interleaving can drop a restart.
+        self._stopping = False
+        self._pending_start = False
         self._shutdown_event = asyncio.Event()
         # Wake signal for prompt reconciliation (issue #494 CONFIG-001): a
         # saved auto_scan_interval_minutes change sets this so the watch loop
@@ -89,31 +108,71 @@ class FileWatcher:
         """
         Stop the file watcher gracefully.
 
-        Signals the watcher to shut down and waits for it to complete.
+        Signals the watcher to shut down and waits for it to complete. A
+        restart requested while the drain was under way (``reconcile``
+        during stop, issue #693 / T1-27-S-06) is honored after the drain:
+        the watcher ends RUNNING rather than stopping while
+        ``auto_scan_enabled`` is True.
         """
         if not self._running:
             logger.warning("File watcher is not running")
             return
+        if self._stopping:
+            # A second stop racing an in-progress drain must not observe the
+            # drained task and clobber ``_running`` after a pending restart.
+            logger.debug("File watcher stop already in progress")
+            return
 
         logger.info("Stopping file watcher...")
-        self._shutdown_event.set()
-        # Interrupt an in-flight interval wait so shutdown is prompt (the
-        # watch loop waits on wake OR shutdown, whichever fires first).
-        self._wake_event.set()
+        self._stopping = True
+        try:
+            self._shutdown_event.set()
+            # Interrupt an in-flight interval wait so shutdown is prompt (the
+            # watch loop waits on wake OR shutdown, whichever fires first).
+            self._wake_event.set()
 
-        if self._watching_task:
-            try:
-                await asyncio.wait_for(self._watching_task, timeout=5.0)
-            except asyncio.TimeoutError:
-                logger.warning("Watch task did not stop gracefully, cancelling...")
-                self._watching_task.cancel()
+            if self._watching_task:
                 try:
-                    await self._watching_task
-                except asyncio.CancelledError:
-                    pass
+                    await asyncio.wait_for(self._watching_task, timeout=5.0)
+                except asyncio.TimeoutError:
+                    logger.warning("Watch task did not stop gracefully, cancelling...")
+                    self._watching_task.cancel()
+                    try:
+                        await self._watching_task
+                    except asyncio.CancelledError:
+                        pass
 
-        self._running = False
-        logger.info("File watcher stopped")
+            self._running = False
+            logger.info("File watcher stopped")
+
+            if self._pending_start:
+                # reconcile(enabled=True) arrived while this drain was under
+                # way: honor it now instead of leaving the watcher stopped
+                # with auto_scan_enabled True (issue #693 / T1-27-S-06).
+                self._pending_start = False
+                logger.info("File watcher restart requested during stop; restarting")
+                await self.start()
+        finally:
+            self._stopping = False
+
+    async def _ensure_running(self) -> None:
+        """Loop-owned restart decision for ``reconcile(enabled=True)``.
+
+        Runs ON the event loop that owns the watch task (scheduled via
+        ``run_coroutine_threadsafe``) so the whole read-decide-write below is
+        a synchronous stretch relative to stop()/start(): if a stop() drain
+        is under way, record the pending start so stop() restarts when the
+        drain completes; if the watcher is stopped, start it; otherwise only
+        wake the loop so a changed cadence applies on the next cycle.
+        """
+        if self._stopping:
+            self._pending_start = True
+            self._wake_event.set()
+            return
+        if not self._running:
+            await self.start()
+            return
+        self._wake_event.set()
 
     def reconcile(self, settings_source=None) -> None:
         """Reconcile the watcher lifecycle with the current auto-scan settings.
@@ -123,8 +182,9 @@ class FileWatcher:
         effect WITHOUT an app restart (issue #494 CONFIG-001):
 
           - ``auto_scan_enabled`` False -> stop a running watcher;
-          - ``auto_scan_enabled`` True  -> start a stopped watcher;
-          - enabled and already running -> wake the watch loop so a changed
+          - ``auto_scan_enabled`` True  -> ensure the watcher is running
+            (including a restart requested while a stop() drain is still in
+            progress, issue #693), and wake a running watcher so a changed
             interval applies on its next cycle (the loop re-reads
             ``settings.auto_scan_interval_minutes`` on every iteration).
 
@@ -156,13 +216,14 @@ class FileWatcher:
                 logger.error("FileWatcher lifecycle transition failed: %s", exc)
 
         if enabled:
-            if self._running:
-                # Cadence may have changed: wake the loop so the next cycle
-                # picks up the new interval.
-                loop.call_soon_threadsafe(self._wake_event.set)
-            else:
-                fut = asyncio.run_coroutine_threadsafe(self.start(), loop)
-                fut.add_done_callback(_log_lifecycle_failure)
+            # The enabled path never reads lifecycle flags from the calling
+            # thread (issue #693 / R9): the branch decision (pending-start
+            # during a drain / start a stopped watcher / wake for a cadence
+            # change) is owned by _ensure_running ON the watch loop, so a
+            # back-to-back save racing a draining stop cannot silently drop
+            # the restart.
+            fut = asyncio.run_coroutine_threadsafe(self._ensure_running(), loop)
+            fut.add_done_callback(_log_lifecycle_failure)
         elif self._running:
             fut = asyncio.run_coroutine_threadsafe(self.stop(), loop)
             fut.add_done_callback(_log_lifecycle_failure)
@@ -215,9 +276,23 @@ class FileWatcher:
             try:
                 # #650 review: _find_new_files does a blocking pooled
                 # checkout (issue #645 flagged this helper explicitly) —
-                # keep it off the event loop.
+                # keep it off the event loop. The structural validation
+                # screen (issue #693 / RT-S5-02) is the same class of
+                # blocking IO (zip central-directory reads), so it runs in
+                # the same thread context.
                 new_files = await asyncio.to_thread(self._find_new_files, directory)
                 for file_path in new_files:
+                    ok, reason = await asyncio.to_thread(
+                        _validate_scan_candidate, file_path
+                    )
+                    if not ok:
+                        logger.warning(
+                            "Scan rejected file failing structural validation "
+                            "(%s); not enqueued: %s",
+                            reason,
+                            file_path,
+                        )
+                        continue
                     await self.processor.enqueue(str(file_path), vault_id=vault_id)
                     enqueued_count += 1
                     logger.info(f"Enqueued new file for processing: {file_path}")
@@ -248,7 +323,14 @@ class FileWatcher:
                 if file_path.is_file():
                     files_on_disk.add(file_path.resolve())
 
-        # Get files from database
+        # Get files from database. The stored ``file_path`` form depends on
+        # how the row was written (absolute for route uploads, either form
+        # for older rows) while the on-disk scan collects RESOLVED absolute
+        # paths, so both sides are normalized (issue #693 / T1-27-KR-05):
+        # the LIKE prefix matches BOTH spellings of the scan directory, and
+        # membership compares resolved forms. Without this, a relative
+        # ``data_dir`` makes one stored form miss the LIKE arm and the other
+        # fail membership, re-enqueuing files that are already in the DB.
         files_in_db: Set[str] = set()
         try:
             if self.pool is None:
@@ -257,11 +339,19 @@ class FileWatcher:
             conn = self.pool.get_connection()
             try:
                 cursor = conn.execute(
-                    "SELECT file_path FROM files WHERE file_path LIKE ?",
-                    (f"{str(directory)}%",)
+                    "SELECT file_path FROM files "
+                    "WHERE file_path LIKE ? OR file_path LIKE ?",
+                    (f"{str(directory)}%", f"{str(directory.resolve())}%"),
                 )
                 for row in cursor.fetchall():
-                    files_in_db.add(row["file_path"])
+                    try:
+                        files_in_db.add(str(Path(row["file_path"]).resolve()))
+                    except (OSError, ValueError):
+                        # A corrupt stored path (e.g. an embedded NUL) must
+                        # not abort discovery for the whole directory
+                        # (PR #828 review F-008): fall back to the raw
+                        # stored string so the rest of the scan proceeds.
+                        files_in_db.add(row["file_path"])
             finally:
                 self.pool.release_connection(conn)
         except Exception as e:
@@ -272,7 +362,8 @@ class FileWatcher:
             logger.error(f"Error querying database: {e}")
             raise
 
-        # Find new files (on disk but not in DB)
+        # Find new files (on disk but not in DB) — resolved form vs resolved
+        # form.
         new_files: Set[Path] = set()
         for file_path in files_on_disk:
             if str(file_path) not in files_in_db:

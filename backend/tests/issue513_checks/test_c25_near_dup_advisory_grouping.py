@@ -156,7 +156,7 @@ async def _ingest_near_duplicate(db_path: str, tmp: Path) -> str | None:
         async def init_table(self, dim):  # noqa: ANN001, ANN202
             return None
 
-        async def add_chunks(self, records):  # noqa: ANN001, ANN202
+        async def add_chunks(self, records, generation_prefix=None):  # noqa: ANN001, ANN202
             return {}
 
         async def delete_old_generation_by_file(self, fid, gen):  # noqa: ANN001, ANN202

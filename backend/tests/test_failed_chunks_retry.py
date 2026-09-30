@@ -93,7 +93,7 @@ class _FakeVectorStore:
         self.added_records = []
         self._existing_ids = set()
 
-    async def add_chunks(self, records):
+    async def add_chunks(self, records, generation_prefix=None):
         for r in records:
             self.added_records.append(r)
             self._existing_ids.add(r["id"])
