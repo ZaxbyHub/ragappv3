@@ -3,11 +3,12 @@ reachable from the shipped settings mapping (T1-28-S-04).
 
 The module docstring of app/services/admission.py guarantees that "when a
 foreground request is blocked and only background holders occupy the budget,
-one local background holder is logically evicted". ``from_settings`` however
-maps every AdmissionClass to its OWN budget key (admission.py L556-L563), and
-``_maybe_preempt`` skips holders on a different key (``if active_key != key:
-continue``, L744-L748) — so a CHAT admit contending with a local BACKGROUND
-lease for the saturated device capacity never evicts it.
+one local background holder is logically evicted". The #687 fix maps CHAT and
+BACKGROUND onto the SHARED "llm" budget key (``from_settings``, sized
+``max(chat, background)``), so a CHAT admit contending with a local
+BACKGROUND lease for the saturated device capacity now evicts it — this
+check pins exactly that (docstring corrected by #827 review PRR-007; the
+pre-#687 per-class mapping described here previously made the check RED).
 """
 
 import asyncio

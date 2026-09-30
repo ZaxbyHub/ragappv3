@@ -495,7 +495,14 @@ class _Lease:
             try:
                 await self._renewer
             except asyncio.CancelledError:
-                pass
+                # The renewer's own cancellation surfaces here, but so does a
+                # cancellation delivered to the CALLING task while it was
+                # awaiting (the preemption path sits inside _acquire's
+                # cancel-scoped try). Swallowing that would defeat the
+                # cancellation coverage (#827 review F-004): re-raise when
+                # the current task is itself being cancelled.
+                if asyncio.current_task().cancelling():
+                    raise
             self._renewer = None
 
     async def release(self) -> None:
@@ -746,6 +753,14 @@ class AdmissionController:
         except AdmissionRejected:
             self._unregister(admission_class, waiter)
             raise
+        except BaseException:
+            # Defense-in-depth (#827 review PRR-011): an unforeseen exception
+            # from the pre-park awaits must not orphan the lane-registered
+            # waiter — clean up exactly like the CancelledError leg, then
+            # re-raise so the caller still sees the real failure.
+            self._unregister(admission_class, waiter)
+            await self._release_orphan_lease(admission_class, waiter)
+            raise
         return lease
 
     async def _release_orphan_lease(
@@ -844,9 +859,11 @@ class AdmissionController:
                 self._mark_degraded()
             # Stop the evicted lease's renewal AFTER the store release: the
             # synchronous ``revoked`` flag above already keeps any in-flight
-            # renewer quiet (see _renew_loop), and this ordering means a
-            # cancellation landing mid-eviction cannot skip the holder's
-            # deletion (#687, T1-28-K-08).
+            # renewer quiet (see _renew_loop). A cancellation landing on the
+            # store-release await itself can still skip the holder's deletion
+            # (pre-existing shape; the holder is then reaped by TTL), and
+            # _stop_renewal re-raises a cancellation delivered to THIS task
+            # so the queued admit's cancel-scope stays honest (#827 F-004).
             await lease._stop_renewal()  # noqa: SLF001 — same-module lifecycle
             return
 

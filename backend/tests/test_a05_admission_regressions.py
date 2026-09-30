@@ -19,8 +19,13 @@ import inspect
 import re
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+from fastapi import HTTPException
 
 from app.api.routes import chat as chat_module
+from app.api.routes.chat import ChatRequest
 from app.services import admission as admission_module
 from app.services.admission import (
     AdmissionClass,
@@ -77,11 +82,50 @@ async def test_pump_re_latch_settles_without_runaway_pumps():
     assert ctrl.hub.pump_dirty is False
 
 
+class _ParkAcquireStore(MemoryAdmissionStore):
+    """One-shot store whose NEXT ``try_acquire`` captures the live budget
+    decision, parks on a gate, and returns the STALE pre-park decision —
+    modeling a store round trip suspended while a concurrent release lands
+    (the head-only analogue of the frozen C2 dual-shape gate)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.gate: asyncio.Event | None = None
+        self.parked = asyncio.Event()
+        self._armed = False
+
+    def arm(self) -> None:
+        self.gate = asyncio.Event()
+        self.parked = asyncio.Event()
+        self._armed = True
+
+    async def try_acquire(self, key, holder, ttl_seconds, budget=None):
+        try:
+            decision = await super().try_acquire(key, holder, ttl_seconds, budget)
+        except TypeError:  # pragma: no cover — head tree always takes 4-arg
+            decision = await super().try_acquire(key, holder, ttl_seconds)
+        if not self._armed:
+            return decision
+        self._armed = False  # one-shot: park only the armed call
+        self.parked.set()
+        assert self.gate is not None
+        await self.gate.wait()
+        return decision  # stale: the pre-park decision
+
+
 async def test_release_during_pump_re_pumps_and_admits():
-    """A release landing while a pump is between its store round trips must
-    still admit the queued waiter via the dirty re-latch (AC2's behavior,
-    pinned here without the parked-store harness)."""
-    store = MemoryAdmissionStore()
+    """A release landing while a pump is SUSPENDED on its store round trip
+    must still admit the queued waiter via the dirty re-latch.
+
+    Discriminating by construction (#827 review PRR-004): the pump's armed
+    ``try_acquire`` captures the pre-release full-budget decision (False) and
+    parks; ``L1.release()`` lands mid-park (its ``schedule_pump`` only marks
+    the hub dirty); on gate-open the pump resumes with the stale False and
+    breaks — WITHOUT the dirty re-latch nothing re-pumps and the waiter stays
+    parked (mutation-probed: reverting the latch fails this test). With the
+    latch, the teardown re-pump re-reads the freed budget and admits.
+    """
+    store = _ParkAcquireStore()
     ctrl = AdmissionController(
         budgets={"chat": 1},
         class_budgets={CHAT: "chat"},
@@ -98,15 +142,16 @@ async def test_release_during_pump_re_pumps_and_admits():
     await _settle(25)  # W queued; its pump saw occupancy 1 and broke out
     assert entered == []
 
-    # A fresh pump is mid-flight (parked on the store seam's await boundary)
-    # when the release lands: schedule it, yield once so it starts, release.
+    store.arm()  # park the NEXT try_acquire (the fresh pump's round trip)
     ctrl.hub.schedule_pump()
-    await asyncio.sleep(0)
-    await l1.release()  # lands while the pump holds pump_scheduled
+    await store.parked.wait()  # pump suspended with the stale full decision
+    await l1.release()  # lands mid-park: schedule_pump can only mark dirty
+    store.gate.set()  # pump resumes, breaks on the stale False
     await _settle(50)
 
     try:
         assert entered == [True]  # dirty re-latch admitted W with no further event
+        assert await store.occupancy("chat") == 0
     finally:
         if not w.done():
             w.cancel()
@@ -268,6 +313,10 @@ async def test_disconnect_while_queued_frees_waiter(monkeypatch):
         except asyncio.TimeoutError:
             continue
         if chunk.startswith(":"):
+            # TST-004 (#827 review): a queued heartbeat is a bare SSE comment
+            # — it must never carry an id: line that could advance any
+            # client's last-event-id.
+            assert "id:" not in chunk
             saw_heartbeat = True
             break
     assert saw_heartbeat, "harness: queued stream never heartbeated"
@@ -388,3 +437,82 @@ def _method_source(source: str, name: str) -> str:
         re.DOTALL,
     )
     return match.group(0) if match else ""
+
+
+# ---------------------------------------------------------------------------
+# #827 feedback pins — F-006 (the HTTPException passthrough is load-bearing)
+# and PRR-011 (unforeseen pre-park exceptions still clean up the waiter)
+# ---------------------------------------------------------------------------
+
+
+class _AdmittingController:
+    """Admits immediately; stands in for get_admission_controller()."""
+
+    from contextlib import asynccontextmanager as _acm
+
+    @_acm
+    async def admit(self, admission_class, **kwargs):
+        yield SimpleNamespace(admission_class=admission_class, holder="pin")
+
+
+async def test_nonstream_httpexception_body_failures_stay_unlogged(monkeypatch, caplog):
+    """F-006 (#827 review): the ``except HTTPException: raise`` clause ahead
+    of the broad handler is load-bearing for failures raised INSIDE the try
+    body — an HTTPException from ``non_stream_chat_response`` (e.g. the
+    rag_engine-missing 503) must reach FastAPI without the
+    "[chat] UNHANDLED EXCEPTION" traceback. Mutation: deleting the clause
+    routes the 503 through ``except Exception`` and this test fails on the
+    caplog count."""
+    import logging as _logging
+
+    caplog.set_level(_logging.INFO)
+    monkeypatch.setattr(
+        chat_module, "get_admission_controller", lambda: _AdmittingController()
+    )
+
+    async def allow_evaluate(*args, **kwargs):
+        return True
+
+    with pytest.raises(HTTPException) as exc_info:
+        await chat_module.chat.__wrapped__(
+            request=MagicMock(),
+            body=ChatRequest(message="hello"),
+            rag_engine=None,  # non_stream_chat_response raises 503 (unavailable)
+            user={"id": 1, "username": "u", "role": "superadmin"},
+            evaluate=allow_evaluate,
+            _csrf_token="test-csrf",
+            _=True,
+        )
+
+    assert exc_info.value.status_code == 503
+    unhandled = [
+        record
+        for record in caplog.records
+        if "UNHANDLED EXCEPTION" in record.getMessage()
+    ]
+    assert len(unhandled) == 0
+
+
+async def test_unexpected_preempt_exception_still_unregisters_waiter(monkeypatch):
+    """PRR-011 (#827 review): an unforeseen exception from the pre-park awaits
+    must not orphan the lane-registered waiter — the cancellation-scoped try
+    cleans up (unregister + orphan-lease release) and re-raises, so the
+    caller sees the real failure and the queue is empty afterwards."""
+    store = MemoryAdmissionStore()
+    ctrl = AdmissionController(
+        budgets={"chat": 1},
+        class_budgets={CHAT: "chat"},
+        store=store,
+    )
+
+    async def explode(self, key):
+        raise RuntimeError("injected pre-park failure")
+
+    monkeypatch.setattr(AdmissionController, "_maybe_preempt", explode)
+
+    with pytest.raises(RuntimeError, match="injected pre-park failure"):
+        await ctrl._acquire(CHAT, None, True)  # noqa: SLF001
+
+    await _settle(25)
+    assert await ctrl.queue_depth(CHAT) == 0  # waiter unregistered
+    assert await store.occupancy("chat") == 0  # no orphan lease

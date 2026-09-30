@@ -64,6 +64,10 @@ async def redis_call(func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
     clients are not cancellable mid-socket-read; the abandoned result is
     simply discarded, and the client's socket timeout eventually frees the
     thread).
+
+    Note for future wrappers: ``loop.run_in_executor`` does NOT propagate
+    the caller's ``contextvars`` (unlike ``asyncio.to_thread``) — every
+    callable passed here must take explicit arguments (#827 review PRR-014).
     """
     timeout = getattr(settings, "redis_io_timeout_seconds", 1.0)
     loop = asyncio.get_running_loop()
@@ -73,3 +77,16 @@ async def redis_call(func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
         ),
         timeout=timeout,
     )
+
+
+def shutdown_executor() -> None:
+    """Release the dedicated cache-I/O pool (lifespan shutdown hygiene).
+
+    Abandoned threads from timed-out calls cannot be joined here (they are
+    bounded by the clients' socket timeouts instead); ``wait=False`` just
+    stops the pool from accepting new work.
+    """
+    global _executor
+    if _executor is not None:
+        _executor.shutdown(wait=False)
+        _executor = None

@@ -8,6 +8,7 @@ import logging
 import sqlite3
 import time
 from contextlib import asynccontextmanager
+from contextlib import suppress as contextlib_suppress
 from typing import Union, get_args, get_origin
 
 from fastapi import FastAPI
@@ -1087,3 +1088,6 @@ async def lifespan(app: FastAPI):
         _auth_executor.shutdown(wait=False)
     except Exception:
         pass
+    with contextlib_suppress(Exception):
+        from app.services import redis_io
+        redis_io.shutdown_executor()

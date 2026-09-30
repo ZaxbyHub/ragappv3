@@ -14,7 +14,6 @@ import sqlite3
 import time
 import uuid
 from contextlib import AsyncExitStack
-from contextlib import suppress as contextlib_suppress
 from html import escape as _xml_escape
 from typing import Any, Callable, Dict, List, Literal, Optional, Set, Tuple
 
@@ -1564,10 +1563,22 @@ def stream_chat_response(
             if enter_task is not None and not enter_task.done():
                 # Client disconnected while still queued: cancel the enter —
                 # the cancelled acquire unregisters its waiter (admission
-                # #687) — and consume the task so nothing is orphaned.
+                # #687) — and consume the task so nothing is orphaned. The
+                # Exception leg is load-bearing: AdmissionRejected can win a
+                # race with the cancel, and letting it escape a generator
+                # teardown would replace the GeneratorExit mid-close.
                 enter_task.cancel()
-                with contextlib_suppress(asyncio.CancelledError, Exception):
+                try:
                     await enter_task
+                except (asyncio.CancelledError, Exception) as exc:  # noqa: BLE001
+                    if not isinstance(exc, asyncio.CancelledError):
+                        # PR-review PRR-009: unforeseen teardown bugs are
+                        # logged (debug), never silently swallowed.
+                        logger.debug(
+                            "[chat] admission enter task failed during "
+                            "disconnect teardown: %r",
+                            exc,
+                        )
             await admission_stack.aclose()
 
     if durable_active:

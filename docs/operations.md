@@ -38,21 +38,31 @@ roles, not capacity claims.
   at or above the per-process semaphores they complement — so enabling
   admission does not change current throughput; tighten only after baseline
   observation via `GET /metrics`.
-- Budget semantics, honestly stated (swarm review F-010/F-011): embedding,
-  vision and background budgets are set EQUAL to the per-process
-  semaphores that still bind underneath — raising only the
-  `ADMISSION_*_BUDGET` does NOT raise those ceilings; raise both together.
-  Chat and instant had NO prior bound: their admission budgets are NEW
-  caps, on by default (`ADMISSION_ENABLED=true`); a deployment that
-  previously ran more than 8 concurrent chat streams (or 4 instant) will
-  start queueing at those numbers with zero `.env` changes.
+- Budget semantics, honestly stated (swarm review F-010/F-011, #827 review
+  F-003): embedding and vision budgets are set EQUAL to the per-process
+  semaphores that still bind underneath — raising only those
+  `ADMISSION_*_BUDGET` values does NOT raise those ceilings;
+  raise both together. BACKGROUND no longer has its own budget key (see the device
+  mapping below), and `ingestion_worker_count` bounds only the ingestion
+  worker loop — no worker-count setting bounds the enrichment, draft, KMS
+  and wiki-compile background work (each runs as a single serial consumer,
+  so the shared llm budget is the only cross-category cap on it). Chat and
+  instant had NO prior bound: their admission budgets are NEW caps, on by default
+  (`ADMISSION_ENABLED=true`); a deployment that previously ran more than 8
+  concurrent chat streams (or 4 instant) will start queueing at those
+  numbers with zero `.env` changes.
 - Device mapping (#687): CHAT and BACKGROUND share ONE LLM-device budget
   key sized `max(ADMISSION_CHAT_BUDGET, ADMISSION_BACKGROUND_BUDGET)`
   (defaults: `max(8, 2) = 8`), because both contend for the same thinking
-  LLM. Either setting's cap can therefore be exceeded up to the larger of
-  the two (background alone can hold up to 8 slots, still bounded
-  underneath by the per-process ingestion semaphore). Instant, embedding,
-  reranking and vision keep their own measured-endpoint keys.
+  LLM. `ADMISSION_BACKGROUND_BUDGET` is therefore NOT an independent cap:
+  any value up to the chat budget has no effect on the shared budget, and a
+  value above it raises the chat cap with it. Instant, embedding,
+  reranking and vision keep their own measured-endpoint keys. Two counting
+  caveats: evicted-but-running background holders are uncounted by design,
+  so REAL thinking-LLM concurrency can briefly reach chat budget + evicted
+  background (at defaults 8 + up to 8 = 16, vs 10 before #687); and chat's
+  queue bound is reduced by background holders on the shared key (see the
+  overload paragraph).
 - Foreground preference (now effective in default deployments, #687): when
   interactive chat work is blocked and only background holders occupy the
   llm budget, one local (same-process) background holder is logically
@@ -73,13 +83,28 @@ roles, not capacity claims.
   deadline (`ADMISSION_DEADLINE_SECONDS`) expires is rejected, never
   executed.
 - Leases: a live holder renews (heartbeats every ttl/3), so a long
-  thinking-mode generation NEVER loses its slot to the 30 s TTL; the TTL
-  exists solely to reap holders whose process died without releasing, and
-  runs on the next acquire. With a shared store, expiry authority is the
-  REDIS server clock (TIME-based Lua; Redis >= 5 required for the
-  effect-replicated scripts) — host clock skew cannot reap a live holder,
-  and during a rolling upgrade mixed-version replicas may stamp epochs
-  from different clocks, so upgrade all replicas within one TTL window.
+  thinking-mode generation NEVER loses its slot to the lease TTL (a FIXED
+  30 s — not operator-configurable); the TTL exists solely to reap holders
+  whose process died without releasing, and runs on the next acquire. With
+  a shared store, expiry authority is the REDIS server clock (TIME-based
+  Lua; Redis >= 6 required in practice — effects replication is the
+  default since Redis 5, but the pinned redis-py speaks RESP3/`HELLO`,
+  which Redis 5 rejects, so a Redis 5 store ends up `degraded`) — host
+  clock skew cannot reap a live holder. ROLLING UPGRADES (#827 review
+  F-002): pre-#687 replicas enforce `admission:chat`/`admission:background`
+  while post-#687 replicas enforce `admission:llm` — mixed versions admit
+  on DISJOINT keys, so the budget is unshared (defaults worst case ~18
+  concurrent holders across old and new replicas, versus the 10 the
+  pre-split configuration intended: 8 chat + 2 background) until the last
+  old replica restarts; the
+  TTL window does NOT bound that window, because live holders renew for as
+  long as their requests run. Upgrade all replicas, then optionally
+  `DEL admission:chat admission:background` (the orphaned old hashes are
+  inert). Clock skew is a separate, narrower residual: the unchanged
+  instant/embedding/reranking/vision keys are written by BOTH versions, and
+  a mixed pair stamping epochs from different clocks can mis-sweep those
+  keys under skew — the same upgrade-within-one-TTL-window guidance applies
+  to them.
   On graceful shutdown the controller releases
   all in-flight slots, cancels renewal heartbeats, closes a Redis store's
   connection pool and rejects new admits (wired in `app/lifespan.py`

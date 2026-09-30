@@ -27,7 +27,9 @@ Workstream A PR 5 of 7 (audit remediation, frontier audit 2026-09-23).
   (T1-28-S2-10, T1-28-S-12). `AdmissionStore.try_acquire` is now ONE
   atomic budget-bounded acquire; the Redis store implements it (plus
   occupancy, sweep and refresh) as Lua scripts stamped with the Redis
-  server clock (`TIME`, Redis >= 5). Two replicas can no longer both
+  server clock (`TIME`; Redis >= 6 in practice — the pinned redis-py
+  speaks RESP3/`HELLO`, which Redis 5 rejects, so a Redis 5 store ends up
+  `degraded`). Two replicas can no longer both
   acquire against the same budget slot, and a replica whose host clock
   runs fast can no longer sweep another replica's live holder.
 - **Foreground preemption now fires in default deployments**
@@ -76,5 +78,8 @@ Workstream A PR 5 of 7 (audit remediation, frontier audit 2026-09-23).
   (`max(ADMISSION_CHAT_BUDGET, ADMISSION_BACKGROUND_BUDGET)`); instant,
   embedding, reranking and vision keys are unchanged. See
   docs/operations.md for the tightened background queue bound under chat
-  saturation and the mixed-epoch rolling-upgrade caveat (Redis >= 5
-  required for the TIME-based scripts).
+  saturation and the rolling-upgrade notes (Redis >= 6 in practice for
+  the TIME-based scripts; mixed-version replicas admit on disjoint key
+  sets until old replicas drain — `DEL admission:chat
+  admission:background` afterwards if you want the orphaned hashes
+  gone).

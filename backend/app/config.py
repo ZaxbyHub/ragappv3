@@ -348,11 +348,12 @@ class Settings(BaseSettings):
     admission_vision_budget: int = 2
     """Concurrent vision/multimodal admits (mirrors multimodal_concurrency)."""
     admission_background_budget: int = 2
-    """Concurrent background-work admits (mirrors ingestion_worker_count). Shares the
-    LLM-device budget key with chat (budget = max(chat, background), #687): background
-    rides the same thinking-LLM capacity and is preemptable by foreground chat; under
-    full chat load background admits queue (see docs/operations.md for the queue-bound
-    arithmetic)."""
+    """Concurrent background-work admits. Shares the LLM-device budget key with chat
+    (budget = max(chat, background), #687), so at the default chat budget of 8 this
+    setting does NOT cap background work — any value up to the chat budget has no
+    effect, and a value ABOVE the chat budget raises the chat cap with it. Background
+    is preemptable by foreground chat and queues when chat saturates the key (see
+    docs/operations.md for the queue-bound arithmetic)."""
     admission_queue_max_size: int = 64
     """Per-class bound on in-flight holders for the budget key plus queued waiters
     for the class; at or over the bound requests are rejected immediately (queue_full)."""

@@ -1,12 +1,14 @@
 """Issue #687 acceptance check AC10 (frozen) — stalled optional-Redis cache
 calls must not starve the shared default executor (T1-02-S2-02).
 
-``redis_call`` (redis_io.py L29-L41) wraps ``asyncio.to_thread(...)`` in
-``asyncio.wait_for(..., settings.redis_io_timeout_seconds)``. On timeout the
-await is abandoned but the thread keeps blocking in its socket read (the
-sync Redis clients are built without socket timeouts), and
-``asyncio.to_thread`` runs on the loop's single default executor — so
-enough abandoned Redis threads starve UNRELATED to_thread work.
+Pre-#687, ``redis_call`` wrapped ``asyncio.to_thread(...)`` (the loop's
+single default executor) in ``asyncio.wait_for(...)`` and the sync Redis
+clients had no socket timeouts — abandoned threads starved unrelated
+to_thread work. The #687 fix (docstring corrected by #827 review PRR-014)
+runs ``redis_call`` on a dedicated bounded ``redis-io`` pool via
+``loop.run_in_executor`` with socket-timeout'd clients, so this check
+discriminates: the default executor (capped at 2 workers here) stays
+responsive while cache calls stall.
 """
 
 import asyncio
