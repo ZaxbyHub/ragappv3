@@ -74,6 +74,10 @@ MANUAL_RENAME_FUNCTIONS = {"update_session"}
 
 _TITLE_UPDATE_RE = re.compile(r"UPDATE\s+chat_sessions\s+SET\s+title", re.IGNORECASE)
 _ENCLOSING_DEF_RE = re.compile(r"(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)")
+# Guard predicates are matched against the statement's WHERE clause ONLY —
+# never the SET clause (`SET title = ?` would self-satisfy a naive
+# substring check over the whole statement, which is how this census was
+# first written and caught by the implementation review as tautological).
 _GUARD_PREDICATES = (
     "title IS NULL",
     "title = ?",
@@ -81,7 +85,7 @@ _GUARD_PREDICATES = (
 
 
 def _iter_title_updates():
-    """Yield (file, enclosing_function, sql_snippet) for every title UPDATE."""
+    """Yield (file, enclosing_function, where_clause) for every title UPDATE."""
     for path in sorted(BACKEND_APP.rglob("*.py")):
         source = path.read_text(encoding="utf-8")
         for match in _TITLE_UPDATE_RE.finditer(source):
@@ -89,8 +93,10 @@ def _iter_title_updates():
             for fn in _ENCLOSING_DEF_RE.finditer(source, 0, match.start()):
                 fn_match = fn
             fn_name = fn_match.group(1) if fn_match else "<module>"
-            snippet = source[match.start() : match.start() + 400]
-            yield path, fn_name, snippet
+            statement = source[match.start() : match.start() + 400]
+            where_at = statement.upper().find("WHERE")
+            where_clause = statement[where_at:] if where_at >= 0 else ""
+            yield path, fn_name, where_clause
 
 
 class TestTitleGuardCensus:
@@ -99,22 +105,47 @@ class TestTitleGuardCensus:
     def test_every_auto_title_update_carries_a_title_guard(self):
         guarded = 0
         unguarded = []
-        for path, fn_name, snippet in _iter_title_updates():
+        for path, fn_name, where_clause in _iter_title_updates():
             if fn_name in MANUAL_RENAME_FUNCTIONS:
                 continue
-            if any(pred in snippet for pred in _GUARD_PREDICATES):
+            if where_clause and any(
+                pred in where_clause for pred in _GUARD_PREDICATES
+            ):
                 guarded += 1
             else:
                 unguarded.append(f"{path.relative_to(REPO_ROOT)}::{fn_name}")
         assert not unguarded, (
-            "Auto-title UPDATE(s) without a title-guard predicate (a manual "
-            "rename committed between read and write would be overwritten): "
-            f"{unguarded}"
+            "Auto-title UPDATE(s) without a title-guard predicate in the WHERE "
+            "clause (a manual rename committed between read and write would be "
+            f"overwritten): {unguarded}"
         )
         assert guarded >= 5, (
             "Expected at least five guarded auto-title writes after issue #688; "
             f"found {guarded}. If a write was removed, update this census."
         )
+
+    def test_census_detects_the_base_defect(self):
+        """The census must fail on the pre-fix shape: an unguarded
+        `UPDATE chat_sessions SET title = ? ... WHERE id = ?` (issue #688's
+        original defect) must classify as unguarded even though its SET
+        clause contains `title = ?`."""
+        # The WHERE-sliced predicate check must reject a bare `WHERE id = ?`.
+        statement = (
+            "UPDATE chat_sessions SET title = ?, updated_at = CURRENT_TIMESTAMP "
+            "WHERE id = ?"
+        )
+        where_at = statement.upper().find("WHERE")
+        synthetic_where = statement[where_at:]
+        assert not any(p in synthetic_where for p in _GUARD_PREDICATES), (
+            "the census must not accept `WHERE id = ?` as a title guard"
+        )
+        # And the fixed shape must be accepted.
+        fixed = (
+            "UPDATE chat_sessions SET title = ?, updated_at = CURRENT_TIMESTAMP "
+            "WHERE id = ? AND (title IS NULL OR title = '')"
+        )
+        where_at = fixed.upper().find("WHERE")
+        assert "title IS NULL" in fixed[where_at:]
 
 
 class _RecController:
