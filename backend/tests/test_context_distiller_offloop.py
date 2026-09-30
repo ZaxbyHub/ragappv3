@@ -3,8 +3,8 @@
 
 Contract:
 - the O(K^2) greedy cosine dedup loop runs OFF the event loop (worker
-  thread via asyncio.to_thread), so a concurrent watchdog task keeps
-  ticking while distill() runs (generous margin per the frozen check C13)
+  thread via asyncio.to_thread), so the loop can make progress while
+  distill() holds the helper (frozen check C13)
 - total sentences are capped at ``context_distiller_max_sentences`` BEFORE
   dedup (earliest sources' sentences kept first, one INFO with counts);
   embed_batch receives at most the capped set
@@ -15,15 +15,13 @@ import asyncio
 import logging
 import math
 import random
-import time
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from app.services.context_distiller import ContextDistiller, DistillResult
 from app.services.rag_engine import RAGSource
-
-GAP_THRESHOLD_MS = 150.0  # generous: pre-fix blocks ~500-850ms; post-fix ~15-31ms
 
 
 def make_vector(i: int, dim: int = 8):
@@ -45,29 +43,6 @@ class FakeEmbeddingService:
     async def embed_batch(self, texts):
         self.calls.append(list(texts))
         return [make_vector(i, self.dim) for i in range(len(texts))]
-
-
-class Watchdog:
-    """Loop-responsiveness probe: max gap between 5ms-sleep wakeups."""
-
-    def __init__(self):
-        self.max_gap = 0.0
-        self.iterations = 0
-        self._last = None
-        self._stop = asyncio.Event()
-
-    async def run(self):
-        self._last = time.monotonic()
-        while not self._stop.is_set():
-            await asyncio.sleep(0.005)
-            now = time.monotonic()
-            if now - self._last > self.max_gap:
-                self.max_gap = now - self._last
-            self.iterations += 1
-            self._last = now
-
-    def stop(self):
-        self._stop.set()
 
 
 class TestGreedyDedupHelper:
@@ -107,6 +82,8 @@ class TestDedupOffEventLoop:
 
     @pytest.mark.asyncio
     async def test_watchdog_keeps_ticking_during_distill(self):
+        from app.services.context_distiller import _greedy_dedup
+
         with patch("app.config.settings") as mock_settings:
             mock_settings.context_distillation_dedup_threshold = 0.92
             mock_settings.context_distillation_synthesis_enabled = False
@@ -132,25 +109,66 @@ class TestDedupOffEventLoop:
                     )
                 )
 
-            wd = Watchdog()
-            wd_task = asyncio.create_task(wd.run())
-            await asyncio.sleep(0.05)  # let the watchdog start ticking
+            loop_thread_id = threading.get_ident()
+            helper_started = threading.Event()
+            release_helper = threading.Event()
+            worker_thread_ids = []
+            progress_before_release = threading.Event()
+            loop_progress = asyncio.Event()
 
-            result = await distiller.distill(
-                "observatory signals", sources, eval_result="CONFIDENT"
-            )
+            def mark_loop_progress():
+                # This callback can run before the worker is released only when
+                # the event loop remains schedulable while the helper is held.
+                if not release_helper.is_set():
+                    progress_before_release.set()
+                loop_progress.set()
 
-            await asyncio.sleep(0.05)  # observe the tail
-            wd.stop()
-            await wd_task
+            def gated_greedy_dedup(embeddings, sentence_map, threshold):
+                worker_thread_id = threading.get_ident()
+                worker_thread_ids.append(worker_thread_id)
+                helper_started.set()
+                assert worker_thread_id != loop_thread_id, (
+                    "sentence dedup helper ran on the event-loop thread"
+                )
+                loop.call_soon_threadsafe(mark_loop_progress)
+                # Safety timeout prevents a broken worker handoff from
+                # deadlocking the test; it is never a latency threshold.
+                release_helper.wait(timeout=10.0)
+                return _greedy_dedup(embeddings, sentence_map, threshold)
+
+            async def release_after_loop_progress():
+                try:
+                    await asyncio.wait_for(loop_progress.wait(), timeout=10.0)
+                finally:
+                    release_helper.set()
+
+            loop = asyncio.get_running_loop()
+            with patch(
+                "app.services.context_distiller._greedy_dedup",
+                side_effect=gated_greedy_dedup,
+            ):
+                release_task = asyncio.create_task(release_after_loop_progress())
+                distill_task = asyncio.create_task(
+                    distiller.distill(
+                        "observatory signals", sources, eval_result="CONFIDENT"
+                    )
+                )
+                try:
+                    result = await asyncio.wait_for(distill_task, timeout=10.0)
+                finally:
+                    release_helper.set()
+                    if not release_task.done():
+                        release_task.cancel()
+                    await asyncio.gather(release_task, return_exceptions=True)
 
         assert isinstance(result, DistillResult)
         assert result.sources, "distill returned no sources"
-        gap_ms = wd.max_gap * 1000
-        assert gap_ms < GAP_THRESHOLD_MS, (
-            f"sentence dedup blocked the event loop: max watchdog gap "
-            f"{gap_ms:.0f} ms >= {GAP_THRESHOLD_MS:.0f} ms threshold "
-            f"({wd.iterations} iterations)"
+        assert helper_started.is_set(), "dedup helper was never invoked"
+        assert worker_thread_ids and worker_thread_ids[0] != loop_thread_id, (
+            "sentence dedup helper ran on the event-loop thread"
+        )
+        assert progress_before_release.is_set(), (
+            "event loop made no progress while dedup helper was held"
         )
 
 
