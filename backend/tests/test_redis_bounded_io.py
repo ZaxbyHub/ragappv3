@@ -173,7 +173,7 @@ class TestQueryPlannerBoundedRedis:
         monkeypatch.setattr(settings, "query_transform_cache_ttl_sec", 3600)
         slow = SlowFakeRedis()
 
-        with patch("redis.from_url", lambda url: slow), caplog.at_level(
+        with patch("redis.from_url", lambda url, **kwargs: slow), caplog.at_level(
             logging.WARNING, logger="app.services.query_transformer"
         ):
             planner = QueryPlanner(_mock_llm())
@@ -203,7 +203,7 @@ class TestQueryPlannerBoundedRedis:
         monkeypatch.setattr(settings, "redis_url", "redis://localhost:6379/0")
         monkeypatch.setattr(settings, "query_transform_cache_ttl_sec", 3600)
 
-        with patch("redis.from_url", lambda url: FailingFakeRedis()):
+        with patch("redis.from_url", lambda url, **kwargs: FailingFakeRedis()):
             planner = QueryPlanner(_mock_llm())
             plan = await planner.plan(self.QUERY)
 
@@ -216,7 +216,7 @@ class TestQueryPlannerBoundedRedis:
         fake = FastFakeRedis()
         llm = _mock_llm()
 
-        with patch("redis.from_url", lambda url: fake):
+        with patch("redis.from_url", lambda url, **kwargs: fake):
             planner = QueryPlanner(llm)
             first = await planner.plan(self.QUERY)
             assert llm.chat_completion.call_count == 1

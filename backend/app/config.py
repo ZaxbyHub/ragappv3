@@ -336,7 +336,9 @@ class Settings(BaseSettings):
     admission_enabled: bool = True
     """Enable shared inference admission. False = zero-overhead pass-through."""
     admission_chat_budget: int = 8
-    """Concurrent chat (thinking-mode) generation admits. Generous by design (no bound exists today)."""
+    """Concurrent chat (thinking-mode) generation admits. Generous by design (no bound exists today).
+    Chat and background share one LLM-device budget key sized max(chat, background)
+    (#687), so foreground chat preempts local background holders when the device saturates."""
     admission_instant_budget: int = 4
     """Concurrent instant-mode generation admits."""
     admission_embedding_budget: int = 4
@@ -346,9 +348,15 @@ class Settings(BaseSettings):
     admission_vision_budget: int = 2
     """Concurrent vision/multimodal admits (mirrors multimodal_concurrency)."""
     admission_background_budget: int = 2
-    """Concurrent background-work admits (mirrors ingestion_worker_count)."""
+    """Concurrent background-work admits. Shares the LLM-device budget key with chat
+    (budget = max(chat, background), #687), so at the default chat budget of 8 this
+    setting does NOT cap background work — any value up to the chat budget has no
+    effect, and a value ABOVE the chat budget raises the chat cap with it. Background
+    is preemptable by foreground chat and queues when chat saturates the key (see
+    docs/operations.md for the queue-bound arithmetic)."""
     admission_queue_max_size: int = 64
-    """Per-class bound on queued waiters; beyond it requests are rejected immediately (queue_full)."""
+    """Per-class bound on in-flight holders for the budget key plus queued waiters
+    for the class; at or over the bound requests are rejected immediately (queue_full)."""
     admission_deadline_seconds: Optional[float] = None
     """Default queue deadline per admit in seconds. None = no deadline (conservative default)."""
     admission_store_url: str = ""

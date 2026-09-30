@@ -14,7 +14,9 @@ Guarantees implemented here:
 * foreground preference over background work, WITHOUT starving background —
   when a foreground request is blocked and only background holders occupy the
   budget, one local background holder is *logically evicted* (its task keeps
-  running; its later release is a no-op). Work is never cancelled;
+  running; its later release is a no-op). Work is never cancelled. With the
+  shipped ``from_settings`` mapping, chat and background share one LLM-device
+  budget key, so this guarantee fires in default deployments (#687);
 * deadline propagation — a queued request whose deadline expires is rejected,
   never executed;
 * cancellation — a disconnected waiter frees its queue slot (and any slot
@@ -80,14 +82,20 @@ class AdmissionStore:
     """Async store seam shared by coordinators (the cross-process boundary).
 
     ``try_acquire`` registers ``holder`` against ``key`` for ``ttl_seconds``
-    and returns True (False when the holder is already registered);
-    ``occupancy`` counts live holders (stale ones are swept); ``release``
-    removes a holder; ``sweep_expired`` drops holders past their TTL and
-    returns how many were removed.
+    in ONE atomic operation that also enforces ``budget``: stale holders are
+    swept first, and the acquire only lands when fewer than ``budget`` live
+    holders exist (``budget <= 0`` disables the bound for callers that
+    manage their own). It returns True when registered (False when the
+    budget is full or the holder is already registered); ``occupancy`` counts
+    live holders (stale ones are swept); ``release`` removes a holder;
+    ``sweep_expired`` drops holders past their TTL and returns how many were
+    removed.
     """
 
     @abstractmethod
-    async def try_acquire(self, key: str, holder: str, ttl_seconds: float) -> bool:
+    async def try_acquire(
+        self, key: str, holder: str, ttl_seconds: float, budget: int
+    ) -> bool:
         ...
 
     @abstractmethod
@@ -132,9 +140,13 @@ class MemoryAdmissionStore(AdmissionStore):
             self._holders.pop(key, None)
         return entry
 
-    async def try_acquire(self, key: str, holder: str, ttl_seconds: float) -> bool:
+    async def try_acquire(
+        self, key: str, holder: str, ttl_seconds: float, budget: int
+    ) -> bool:
         now = self._clock()
         entry = self._live(key, now)
+        if budget > 0 and len(entry) >= budget:
+            return False
         if holder in entry:
             return False
         entry[holder] = now + max(ttl_seconds, 0.0)
@@ -175,17 +187,76 @@ class MemoryAdmissionStore(AdmissionStore):
 class RedisAdmissionStore(AdmissionStore):
     """Cross-process store backed by Redis hashes (one hash per budget key).
 
-    Holder field values are absolute expiry epochs (synchronized-clock best
-    effort). Operations are single-key atomic commands.
+    Holder field values are absolute expiry epochs stamped with the REDIS
+    server clock (``redis.call('TIME')`` inside the scripts below), never a
+    caller's host clock — a replica whose wall clock runs ahead cannot sweep
+    another replica's live holder (#687, T1-28-S-12). Budget enforcement,
+    expiry sweeping and the acquire itself happen in ONE script call per
+    operation, so two replicas can never both acquire against the same
+    budget slot (#687, T1-28-S2-10). The scripts use effect-replicated
+    semantics (writes after the nondeterministic ``TIME`` command), which
+    requires Redis >= 5.
     """
 
-    # KEYS[1] = admission hash field key, ARGV[1] = holder, ARGV[2] = new
-    # absolute expiry epoch. Extends the expiry ONLY if the holder is still
+    # KEYS[1] = admission hash, ARGV[1] = budget, ARGV[2] = holder,
+    # ARGV[3] = ttl seconds. Sweeps expired holders, then acquires only if
+    # the budget has room. Returns 1 when the holder was registered.
+    _ACQUIRE_LUA = """
+local t = redis.call('TIME')
+local now = tonumber(t[1]) + tonumber(t[2]) / 1000000.0
+local entry = redis.call('HGETALL', KEYS[1])
+local live = 0
+for i = 1, #entry, 2 do
+  if tonumber(entry[i + 1]) <= now then
+    redis.call('HDEL', KEYS[1], entry[i])
+  else
+    live = live + 1
+  end
+end
+local budget = tonumber(ARGV[1])
+if budget > 0 and live >= budget then
+  return 0
+end
+return redis.call('HSETNX', KEYS[1], ARGV[2], tostring(now + tonumber(ARGV[3])))
+"""
+    # KEYS[1] = admission hash. Sweeps expired holders; returns live count.
+    _OCCUPANCY_LUA = """
+local t = redis.call('TIME')
+local now = tonumber(t[1]) + tonumber(t[2]) / 1000000.0
+local entry = redis.call('HGETALL', KEYS[1])
+local live = 0
+for i = 1, #entry, 2 do
+  if tonumber(entry[i + 1]) <= now then
+    redis.call('HDEL', KEYS[1], entry[i])
+  else
+    live = live + 1
+  end
+end
+return live
+"""
+    # KEYS[1] = admission hash. Sweeps expired holders; returns removed count.
+    _SWEEP_LUA = """
+local t = redis.call('TIME')
+local now = tonumber(t[1]) + tonumber(t[2]) / 1000000.0
+local entry = redis.call('HGETALL', KEYS[1])
+local removed = 0
+for i = 1, #entry, 2 do
+  if tonumber(entry[i + 1]) <= now then
+    redis.call('HDEL', KEYS[1], entry[i])
+    removed = removed + 1
+  end
+end
+return removed
+"""
+    # KEYS[1] = admission hash field key, ARGV[1] = holder, ARGV[2] = ttl
+    # seconds. Extends the expiry (server clock) ONLY if the holder is still
     # registered, so a swept/dead holder can never be resurrected by a late
     # renewal.
     _REFRESH_LUA = """
+local t = redis.call('TIME')
+local now = tonumber(t[1]) + tonumber(t[2]) / 1000000.0
 if redis.call('HEXISTS', KEYS[1], ARGV[1]) == 1 then
-  redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
+  redis.call('HSET', KEYS[1], ARGV[1], tostring(now + tonumber(ARGV[2])))
   return 1
 end
 return 0
@@ -200,39 +271,40 @@ return 0
     def _field(key: str) -> str:
         return f"admission:{key}"
 
-    async def try_acquire(self, key: str, holder: str, ttl_seconds: float) -> bool:
-        now = time.time()
-        field = self._field(key)
-        await self._sweep(field, now)
-        added = await self._redis.hsetnx(field, holder, now + max(ttl_seconds, 0.0))
-        return bool(added)
+    async def try_acquire(
+        self, key: str, holder: str, ttl_seconds: float, budget: int
+    ) -> bool:
+        acquired = await self._redis.eval(
+            self._ACQUIRE_LUA,
+            1,
+            self._field(key),
+            int(budget),
+            holder,
+            max(ttl_seconds, 0.0),
+        )
+        return bool(acquired)
 
     async def release(self, key: str, holder: str) -> None:
         await self._redis.hdel(self._field(key), holder)
 
     async def occupancy(self, key: str) -> int:
-        await self._sweep(self._field(key), time.time())
-        return int(await self._redis.hlen(self._field(key)))
+        return int(
+            await self._redis.eval(self._OCCUPANCY_LUA, 1, self._field(key))
+        )
 
     async def sweep_expired(self, key: str) -> int:
-        return await self._sweep(self._field(key), time.time())
+        return int(await self._redis.eval(self._SWEEP_LUA, 1, self._field(key)))
 
     async def refresh(self, key: str, holder: str, ttl_seconds: float) -> bool:
-        # Atomic check-and-set: only a holder still registered gets its
-        # expiry extended — a swept holder is never resurrected.
+        # Atomic check-and-set on the server clock: only a holder still
+        # registered gets its expiry extended — a swept holder is never
+        # resurrected.
         return bool(
             await self._redis.eval(
                 self._REFRESH_LUA, 1, self._field(key), holder,
-                time.time() + max(ttl_seconds, 0.0),
+                max(ttl_seconds, 0.0),
             )
         )
-
-    async def _sweep(self, field: str, now: float) -> int:
-        entry = await self._redis.hgetall(field)
-        stale = [h for h, exp in entry.items() if float(exp) <= now]
-        if stale:
-            await self._redis.hdel(field, *stale)
-        return len(stale)
 
     async def close(self) -> None:
         await self._redis.aclose()
@@ -287,6 +359,10 @@ class _Hub:
         }
         self.lock: Optional[asyncio.Lock] = None
         self.pump_scheduled = False
+        # A release that lands while a pump is mid-await must not be a lost
+        # wakeup: mark the hub dirty and re-pump when the running pump ends
+        # (its store reads may have observed the pre-release state).
+        self.pump_dirty = False
 
     def lane(self, admission_class: AdmissionClass, foreground: bool):
         return (
@@ -298,6 +374,7 @@ class _Hub:
 
     def schedule_pump(self) -> None:
         if self.pump_scheduled:
+            self.pump_dirty = True
             return
         self.pump_scheduled = True
         loop = asyncio.get_event_loop()
@@ -325,6 +402,9 @@ class _Hub:
                                 break
         finally:
             self.pump_scheduled = False
+            if self.pump_dirty:
+                self.pump_dirty = False
+                self.schedule_pump()
 
 
 _HUBS: "weakref.WeakKeyDictionary[AdmissionStore, _Hub]" = weakref.WeakKeyDictionary()
@@ -391,6 +471,11 @@ class _Lease:
             if alive:
                 controller._clear_degraded_if_set()
             if not alive:
+                if self.revoked:
+                    # Deliberately evicted (foreground preemption): the
+                    # refresh miss is expected, not a store anomaly — stay
+                    # quiet and stop renewing (#687, T1-28-K-08).
+                    return
                 # Slot was swept while we were still running (store-side
                 # race). Do not resurrect it: mark revoked so release()
                 # skips the store release, and surface the anomaly.
@@ -410,7 +495,14 @@ class _Lease:
             try:
                 await self._renewer
             except asyncio.CancelledError:
-                pass
+                # The renewer's own cancellation surfaces here, but so does a
+                # cancellation delivered to the CALLING task while it was
+                # awaiting (the preemption path sits inside _acquire's
+                # cancel-scoped try). Swallowing that would defeat the
+                # cancellation coverage (#827 review F-004): re-raise when
+                # the current task is itself being cancelled.
+                if asyncio.current_task().cancelling():
+                    raise
             self._renewer = None
 
     async def release(self) -> None:
@@ -539,8 +631,19 @@ class AdmissionController:
 
     @classmethod
     def from_settings(cls, settings: Any) -> "AdmissionController":
+        chat_budget = max(1, int(getattr(settings, "admission_chat_budget", 8)))
+        background_budget = max(
+            1, int(getattr(settings, "admission_background_budget", 2))
+        )
+        # CHAT and BACKGROUND contend for one physical device — the thinking
+        # LLM that serves chat streams and background generation jobs — so
+        # they share ONE budget key (#687, T1-28-S-04). The shared budget is
+        # the max of the two settings: neither class loses the capacity its
+        # setting promises, and foreground preemption (above) protects chat
+        # when background holders saturate the device. The other classes map
+        # to their own measured endpoints.
         budgets = {
-            "chat": max(1, int(getattr(settings, "admission_chat_budget", 8))),
+            "llm": max(chat_budget, background_budget),
             "instant": max(1, int(getattr(settings, "admission_instant_budget", 4))),
             "embedding": max(
                 1, int(getattr(settings, "admission_embedding_budget", 4))
@@ -549,17 +652,14 @@ class AdmissionController:
                 1, int(getattr(settings, "admission_reranking_budget", 4))
             ),
             "vision": max(1, int(getattr(settings, "admission_vision_budget", 2))),
-            "background": max(
-                1, int(getattr(settings, "admission_background_budget", 2))
-            ),
         }
         class_budgets = {
-            AdmissionClass.CHAT: "chat",
+            AdmissionClass.CHAT: "llm",
             AdmissionClass.INSTANT: "instant",
             AdmissionClass.EMBEDDING: "embedding",
             AdmissionClass.RERANKING: "reranking",
             AdmissionClass.VISION: "vision",
-            AdmissionClass.BACKGROUND: "background",
+            AdmissionClass.BACKGROUND: "llm",
         }
         store_url = str(getattr(settings, "admission_store_url", "") or "")
         store: Optional[AdmissionStore] = None
@@ -618,19 +718,26 @@ class AdmissionController:
             self._seq,
             asyncio.current_task(),
         )
-        self.hub.lane(admission_class, foreground).append(waiter)
-
-        # Foreground preference: interactive classes (chat/instant/embedding/
-        # reranking/vision) may evict a local background holder when blocked;
-        # background work never preempts anything — that is the fairness half
-        # of "foreground preference without starvation".
-        if foreground and admission_class is not AdmissionClass.BACKGROUND:
-            await self._maybe_preempt(key)
-        self.hub.schedule_pump()
-        # Give the scheduled pump a chance to run before parking on the future.
-        await asyncio.sleep(0)
-
+        # The waiter is registered on the lane BEFORE the preemption read and
+        # the yield below, so a cancellation at ANY of those awaits must
+        # unregister it — otherwise the pump later admits an orphan into a
+        # lease nobody releases (a slot leaked forever, #687 T1-28-S-01).
+        # Everything from the append through the park lives inside this try.
         try:
+            self.hub.lane(admission_class, foreground).append(waiter)
+
+            # Foreground preference: interactive classes (chat/instant/
+            # embedding/reranking/vision) may evict a local background holder
+            # when blocked; background work never preempts anything — that
+            # is the fairness half of "foreground preference without
+            # starvation".
+            if foreground and admission_class is not AdmissionClass.BACKGROUND:
+                await self._maybe_preempt(key)
+            self.hub.schedule_pump()
+            # Give the scheduled pump a chance to run before parking on the
+            # future.
+            await asyncio.sleep(0)
+
             if effective_deadline is None:
                 lease = await future
             else:
@@ -645,6 +752,14 @@ class AdmissionController:
             raise
         except AdmissionRejected:
             self._unregister(admission_class, waiter)
+            raise
+        except BaseException:
+            # Defense-in-depth (#827 review PRR-011): an unforeseen exception
+            # from the pre-park awaits must not orphan the lane-registered
+            # waiter — clean up exactly like the CancelledError leg, then
+            # re-raise so the caller still sees the real failure.
+            self._unregister(admission_class, waiter)
+            await self._release_orphan_lease(admission_class, waiter)
             raise
         return lease
 
@@ -674,29 +789,19 @@ class AdmissionController:
         key = self.class_budgets[admission_class]
         degraded_store = False
         try:
-            occupancy = await self.store.occupancy(key)
+            acquired = await self.store.try_acquire(
+                key, waiter.holder, self.ttl_seconds, self.budgets.get(key, 1)
+            )
         except Exception:  # noqa: BLE001 — degraded store: fail open
             self._mark_degraded()
             degraded_store = True
-            occupancy = -1
+            acquired = True
         if not degraded_store:
-            # The occupancy read succeeded — the store is healthy again
+            # The acquire round trip succeeded — the store is healthy again
             # (issue #518 'backend unavailable/recovered').
             self._clear_degraded_if_set()
-        budget = self.budgets.get(key, 1)
-        if occupancy >= budget > 0:
+        if not acquired:
             return False
-        if not degraded_store:
-            try:
-                acquired = await self.store.try_acquire(
-                    key, waiter.holder, self.ttl_seconds
-                )
-            except Exception:  # noqa: BLE001 — degraded store: fail open
-                self._mark_degraded()
-                degraded_store = True
-                acquired = True
-            if not acquired:
-                return False
         try:
             lane.remove(waiter)
         except ValueError:
@@ -752,6 +857,14 @@ class AdmissionController:
                 await self.store.release(active_key, holder)
             except Exception:  # noqa: BLE001 — best-effort eviction
                 self._mark_degraded()
+            # Stop the evicted lease's renewal AFTER the store release: the
+            # synchronous ``revoked`` flag above already keeps any in-flight
+            # renewer quiet (see _renew_loop). A cancellation landing on the
+            # store-release await itself can still skip the holder's deletion
+            # (pre-existing shape; the holder is then reaped by TTL), and
+            # _stop_renewal re-raises a cancellation delivered to THIS task
+            # so the queued admit's cancel-scope stays honest (#827 F-004).
+            await lease._stop_renewal()  # noqa: SLF001 — same-module lifecycle
             return
 
     def _forget_lease(self, lease: _Lease) -> None:

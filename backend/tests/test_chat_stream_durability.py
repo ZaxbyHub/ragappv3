@@ -640,6 +640,11 @@ async def test_admission_rejection_writes_nothing(env):
                 raise AdmissionRejected("queue_full")
             raise AssertionError("unexpected admission class")
 
+        async def queue_depth(self, cls):
+            # #687 (P01-SK2-06): the stream route samples queue depth on the
+            # same controller before parking on admission.
+            return 0
+
     with patch(
         "app.api.routes.chat.get_admission_controller", return_value=_Saturated()
     ):

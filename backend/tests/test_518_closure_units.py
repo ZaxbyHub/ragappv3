@@ -218,9 +218,14 @@ class FlakyMemoryStore(MemoryAdmissionStore):
         await self._maybe_fail()
         return await super().occupancy(key)
 
-    async def try_acquire(self, key, holder, ttl_seconds):
+    async def try_acquire(self, key, holder, ttl_seconds, budget=None):
         await self._maybe_fail()
-        return await super().try_acquire(key, holder, ttl_seconds)
+        # Dual-shape forward (#687): fixed seam carries the budget; the
+        # pre-#687 seam is 3-arg.
+        try:
+            return await super().try_acquire(key, holder, ttl_seconds, budget)
+        except TypeError:
+            return await super().try_acquire(key, holder, ttl_seconds)
 
     async def release(self, key, holder):
         await self._maybe_fail()
