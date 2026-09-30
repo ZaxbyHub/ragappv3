@@ -170,7 +170,7 @@ class FakeVectorStore:
     ) -> List[Dict]:
         return self.search_results[:limit]
 
-    def add_chunks(self, records: List[Dict]):
+    def add_chunks(self, records: List[Dict], generation_prefix=None):
         self.stored_chunks.extend(records)
 
     def delete_by_file(self, file_id: str) -> int:

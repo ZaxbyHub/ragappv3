@@ -1264,7 +1264,12 @@ class DocumentProcessor:
             logger.warning("Failed to mark stale enrichment for file_id=%s: %s", file_id, e)
 
     def _is_enrichment_job_current(self, file_id: int, file_hash: str) -> bool:
-        """Return True only if this queued enrichment still matches the live file row."""
+        """Return True only if this queued enrichment still matches the live file row.
+
+        A truthfully-``partial`` file row is current (issue #693 /
+        T1-25-KR-03, dedup half): its enrichment must not be declared stale
+        merely because the ingest reported partial success.
+        """
         if self.pool is None:
             return False
         try:
@@ -1282,7 +1287,7 @@ class DocumentProcessor:
             return False
         current_hash = row["file_hash"] if isinstance(row, sqlite3.Row) else row[0]
         current_status = row["status"] if isinstance(row, sqlite3.Row) else row[1]
-        if current_hash != file_hash or current_status != "indexed":
+        if current_hash != file_hash or current_status not in ("indexed", "partial"):
             logger.info(
                 "Skipping stale enrichment for file_id=%s: current status/hash no longer match queued job",
                 file_id,
@@ -2100,7 +2105,12 @@ class DocumentProcessor:
         self, file_hash: str, conn: sqlite3.Connection, vault_id: int
     ) -> Optional[sqlite3.Row]:
         """
-        Check if a file with the given hash already exists and is indexed.
+        Check if a file with the given hash already exists and is live.
+
+        A ``partial`` row owns its content slot exactly like an ``indexed``
+        one (issue #693 / T1-05-K2-09): until it reaches a terminal state,
+        re-ingesting the same content must be reported as a duplicate rather
+        than creating a second document.
 
         Args:
             file_hash: The hash of the file to check
@@ -2108,10 +2118,12 @@ class DocumentProcessor:
             vault_id: The vault ID to check for duplicates in (defaults to 1)
 
         Returns:
-            The existing file row if found and indexed, None otherwise
+            The existing file row if found and live (indexed or partial),
+            None otherwise
         """
         cursor = conn.execute(
-            "SELECT * FROM files WHERE file_hash = ? AND vault_id = ? AND status = 'indexed'",
+            "SELECT * FROM files WHERE file_hash = ? AND vault_id = ? "
+            "AND status IN ('indexed', 'partial')",
             (file_hash, vault_id),
         )
         return cursor.fetchone()
@@ -2137,16 +2149,18 @@ class DocumentProcessor:
             vault_id: Vault to scope the check to.
 
         Returns:
-            The existing row when one of {pending, processing, indexed} matches,
-            else None. Rows in 'error' state are intentionally NOT matched —
-            re-uploading a previously-failed file should be allowed.
+            The existing row when one of {pending, processing, indexed,
+            partial} matches, else None. Rows in 'error' state are
+            intentionally NOT matched — re-uploading a previously-failed
+            file should be allowed. A ``partial`` row owns its content slot
+            until it reaches a terminal state (issue #693 / T1-05-K2-09).
         """
         cursor = conn.execute(
             """
             SELECT * FROM files
             WHERE file_hash = ?
               AND vault_id = ?
-              AND status IN ('pending', 'processing', 'indexed')
+              AND status IN ('pending', 'processing', 'indexed', 'partial')
             ORDER BY id DESC
             LIMIT 1
             """,
@@ -3553,8 +3567,13 @@ class DocumentProcessor:
 
                     if settings.reupload_safe_order:
                         # Safe re-upload: insert new generation first, then delete old (Issue #13)
-                        # Step 1+2: Insert new-generation chunks (hash-prefixed IDs)
-                        vector_timings = await self.vector_store.add_chunks(records)
+                        # Step 1+2: Insert new-generation chunks (hash-prefixed IDs);
+                        # the generation prefix makes a same-hash reprocess a
+                        # no-op instead of a duplicate append (issue #693).
+                        vector_timings = await self.vector_store.add_chunks(
+                            records,
+                            generation_prefix=f"{file_id}_{file_hash[:8]}_",
+                        )
                         _merge_vector_timings(stage_timings, vector_timings)
                         # Step 3: Delete old-generation chunks for this file
                         # (chunks whose IDs don't start with the new hash prefix)
@@ -4085,8 +4104,15 @@ class DocumentProcessor:
                     _add_elapsed_ms(stage_timings, "vector_write_ms", stage_started_at)
 
                     if settings.reupload_safe_order:
+                        # The generation prefix makes a same-hash reprocess a
+                        # no-op instead of a duplicate append (issue #693);
+                        # with a rebuild target the guard runs against the
+                        # rebuild temp table (threaded through _target_kwargs'
+                        # target), never the live table.
                         vector_timings = await self.vector_store.add_chunks(
-                            records, **_target_kwargs
+                            records,
+                            generation_prefix=f"{file_id}_{file_hash[:8]}_",
+                            **_target_kwargs,
                         )
                         _merge_vector_timings(stage_timings, vector_timings)
                         stage_started_at = time.monotonic()
