@@ -420,19 +420,33 @@ includes `"stale_embeddings": true` in the `vector_store` section.
 cp -r /your/data/dir/lancedb /your/data/dir/lancedb.bak
 cp /your/data/dir/app.db /your/data/dir/app.db.bak
 
-# 2. Run the migration script to clear stale embeddings
+# 2. Stop the application — the script refuses to run while another
+#    process holds the database
+docker compose stop knowledgevault
+
+# 3. Run the migration script to clear stale embeddings
 #    (dry-run first to see what will change)
 python scripts/migrate_embeddings.py --dry-run
 
-# 3. Run the actual migration — this wipes LanceDB and resets file statuses to pending
+# 4. Run the actual migration — this resets file statuses to pending,
+#    then wipes the LanceDB index (the reset runs first so a crash or a
+#    locked database leaves the old vectors intact instead of stranding
+#    'indexed' rows over an empty index)
 python scripts/migrate_embeddings.py
 
-# 4. Restart the application — the background processor will re-index all files
-docker compose restart knowledgevault
+# 5. Start the application — the background processor will re-index all files
+docker compose start knowledgevault
 ```
 
 The background processor automatically re-embeds all files with `status='pending'`.
 Depending on the number of documents and your hardware, this may take several minutes.
+
+If a migration run is interrupted (crash, Ctrl-C, lock error), re-run the
+script **before** restarting the application: after the status reset, an app
+boot against the still-old-dimension index would fail every re-embed and
+leave files in `error`/retry states that no recovery sweep picks up. If that
+re-run itself refuses with exit code 3, the index deletion is incomplete
+(the interruption landed mid-wipe) — re-run with `--force` to finish it.
 
 **Health check after migration:**
 
@@ -448,7 +462,16 @@ curl -H "X-API-Key: ${HEALTH_CHECK_API_KEY:?set HEALTH_CHECK_API_KEY}" \
 ```
 
 > **Note:** `scripts/migrate_embeddings.py` is safe to run multiple times. On a clean
-> deployment (no existing LanceDB data), it is a no-op.
+> deployment (no existing LanceDB data and no indexed files), it is a no-op, and a re-run
+> after an interrupted migration detects the leftover state (empty index with files still
+> marked `indexed`/`partial`) and repairs it by re-queuing those files for re-indexing.
+> The script refuses (instead of destroying data) with these exit codes:
+> **3** — the stored dimension cannot be read on a non-empty index; **4** — the
+> configured `EMBEDDING_DIM` cannot be loaded; **5** — another process holds the
+> database, or the database is unreadable/corrupt at the writer probe; **6** — the
+> database is unreadable/corrupt during repair detection (restore `app.db` from your
+> backup). Pass `--force` to override exits 3 and 4 only; the lock/corruption refusals
+> (5 and 6) always stop the run.
 
 ---
 
