@@ -1510,6 +1510,42 @@ def _apply_validated_settings(values: dict[str, object]) -> SettingsResponse:
     return SettingsResponse.model_validate(_build_settings_dict())
 
 
+def _effective_embedding_identity() -> tuple[str, str, str]:
+    """(model, doc_prefix, query_prefix) as the vector store validates them.
+
+    Prefixes use the same falsy-to-empty-string normalization as
+    ``VectorStore._compute_embedding_prefix_hash`` so ``None`` and ``""``
+    compare equal — a None<->"" write is not an identity change.
+    """
+    return (
+        settings.embedding_model,
+        str(settings.embedding_doc_prefix or ""),
+        str(settings.embedding_query_prefix or ""),
+    )
+
+
+def _invalidate_vector_store_readiness(app) -> None:
+    """Mark the live vector store not-ready after an embedding-identity change.
+
+    Issue #695: a runtime ``embedding_model`` / prefix change silently
+    mismatches new-model query vectors against document vectors embedded by
+    the old model until the next restart (``validate_schema``). Mirror the
+    restart-time mismatch handling here so ``require_model_ready`` returns
+    503 until an admin reindex that begins after the change completes.
+    """
+    store = getattr(app.state, "vector_store", None)
+    if store is None or not hasattr(store, "_ready"):
+        return
+    # Same transition VectorStore.mark_ready(False) performs (vector_store.py);
+    # executed synchronously because these route handlers run off the event
+    # loop and mark_ready is a coroutine.
+    store._ready = False
+    logger.warning(
+        "Embedding identity changed via settings API; vector store marked "
+        "not ready (admin reindex required)"
+    )
+
+
 def _apply_settings_update(update: SettingsUpdate) -> SettingsResponse:
     """Validate, apply, and return updated settings.
 
@@ -1578,8 +1614,14 @@ def post_settings(
     """Apply settings update and persist to database."""
     _enforce_curator_required_when_enabled(update)
     values = _validate_settings_update(update)
+    prior_embedding_identity = _effective_embedding_identity()
     _persist_settings(conn, update)
     _apply_validated_settings(values)
+    if _effective_embedding_identity() != prior_embedding_identity:
+        # Before _hot_rebind_llm_clients on purpose: persist has already
+        # committed and that hook is not exception-tolerant, so a rebind
+        # failure must not leave the silent-mismatch window open (issue #695).
+        _invalidate_vector_store_readiness(request.app)
     _hot_rebind_llm_clients(request.app, update)
     if (
         update.auto_scan_enabled is not None
@@ -1606,8 +1648,14 @@ def put_settings(
     """Update settings (upserts into settings_kv)."""
     _enforce_curator_required_when_enabled(update)
     values = _validate_settings_update(update)
+    prior_embedding_identity = _effective_embedding_identity()
     _persist_settings(conn, update)
     _apply_validated_settings(values)
+    if _effective_embedding_identity() != prior_embedding_identity:
+        # Before _hot_rebind_llm_clients on purpose: persist has already
+        # committed and that hook is not exception-tolerant, so a rebind
+        # failure must not leave the silent-mismatch window open (issue #695).
+        _invalidate_vector_store_readiness(request.app)
     _hot_rebind_llm_clients(request.app, update)
     if (
         update.auto_scan_enabled is not None
