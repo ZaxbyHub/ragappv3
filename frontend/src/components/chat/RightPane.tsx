@@ -95,6 +95,12 @@ function extractStructuredOutputs(messages: Message[]): StructuredOutput[] {
     const content = message.content;
     if (!content) continue;
 
+    // Structural ids (issue #689 / T1-13-K-09): ids derive from message
+    // identity + the push ordinal (`outputs.length`), never from content —
+    // two blocks sharing their first 20 non-whitespace characters must not
+    // collide as React keys, and a message's terminated table plus trailing
+    // unterminated table must not either (implementation-review Finding 1).
+
     // Extract code blocks (```...```)
     const codeBlockRegex = /```(?:(\w+)?\n)?([\s\S]*?)```/g;
     let codeMatch;
@@ -109,8 +115,7 @@ function extractStructuredOutputs(messages: Message[]): StructuredOutput[] {
           ? firstLine.slice(0, 30) + "..."
           : firstLine;
 
-      // Generate a simple hash-based ID
-      const id = `code-${codeContent.slice(0, 50).replace(/\s/g, "").slice(0, 20)}`;
+      const id = `code-${message.id}-${outputs.length}`;
 
       outputs.push({
         id,
@@ -150,7 +155,7 @@ function extractStructuredOutputs(messages: Message[]): StructuredOutput[] {
           cells.slice(0, 2).join(" | ").slice(0, 40) || "Table";
 
         // Generate a simple hash-based ID
-        const id = `table-${tableContent.slice(0, 50).replace(/\s/g, "").slice(0, 20)}`;
+        const id = `table-${message.id}-${outputs.length}`;
 
         outputs.push({
           id,
@@ -179,7 +184,10 @@ function extractStructuredOutputs(messages: Message[]): StructuredOutput[] {
       const title =
         cells.slice(0, 2).join(" | ").slice(0, 40) || "Table";
 
-      const id = `table-${tableContent.slice(0, 50).replace(/\s/g, "").slice(0, 20)}`;
+      // Final unterminated table: `outputs.length` is distinct from every
+      // id minted above (each push consumes one length), so a terminated
+      // table earlier in the message cannot collide with this one.
+      const id = `table-${message.id}-${outputs.length}`;
 
       outputs.push({
         id,
@@ -386,6 +394,10 @@ function SourcePreview({ source, query, onJumpToAnswer }: SourcePreviewProps) {
 
     setChunkContext(null);
     setContextError(null);
+    // Issue #689 (T1-13-S2-07): every selection change — including the ones
+    // that skip the fetch below — must clear a spinner left over from the
+    // previously selected source's pending context fetch.
+    setIsLoadingContext(false);
     if (!source.id) return;
     // Synthesized sources have no real chunk row — skip the context fetch.
     if (isSynthesized) return;
@@ -684,7 +696,10 @@ export function RightPane() {
   // stable, so this never re-renders the pane on token growth.
   const candidateSources = useStreamingCandidateSources();
   const { selectedEvidenceSource, setSelectedEvidenceSource, activeRightTab, setActiveRightTab, selectedEvidenceMessageId } = useChatShellStore();
-  const sourcesForSelected = useSourcesForSourceId(selectedEvidenceSource?.id);
+  const sourcesForSelected = useSourcesForSourceId(
+    selectedEvidenceSource?.id,
+    selectedEvidenceMessageId
+  );
   const [selectedSource, setSelectedSource] = useState<Source | null>(null);
   const [activeTab, setActiveTab] = useState<string>("sources");
 

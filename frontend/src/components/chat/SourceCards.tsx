@@ -62,7 +62,14 @@ function SourceCard({ source, fallbackIndex, validCitationLabels, onClick }: Sou
       onClick={onClick}
       role="button"
       tabIndex={0}
-      onKeyDown={(e) => e.key === "Enter" && onClick()}
+      onKeyDown={(e) => {
+        // role="button" owes the full native button keyboard contract: Space
+        // activates exactly like Enter (and must not scroll the page).
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onClick();
+        }
+      }}
       aria-label={`Source ${badgeLabel}: ${source.filename}`}
     >
       <div className="flex items-start justify-between gap-2">

@@ -235,8 +235,8 @@ describe("ChatShell Mobile Layout", () => {
     });
   });
 
-  describe("test_right_pane_sheet_renders_75vh", () => {
-    it("right pane Sheet renders at 75vh on below-lg viewports when rightPaneOpen and activeRightTab !== workspace", () => {
+  describe("test_right_pane_sheet_renders_45vh", () => {
+    it("right pane Sheet renders at 45vh on below-lg viewports when rightPaneOpen and activeRightTab !== workspace", () => {
       mockStoreState.rightPaneOpen = true;
       mockStoreState.activeRightTab = "evidence";
       // Simulate below-lg viewport (tablet/mobile)
@@ -248,11 +248,14 @@ describe("ChatShell Mobile Layout", () => {
         </BrowserRouter>
       );
 
-      // Find the Sheet content with side="bottom" and 75vh height
+      // Find the Sheet content with side="bottom" and 45vh height (issue #689
+      // / UI-R4-14: 75vh covered the composer; the chat column is padded by
+      // the same height while the sheet is open so the composer stays above
+      // the non-modal sheet).
       const sheetContents = document.querySelectorAll('[data-testid="sheet-content"]');
       const bottomSheets = Array.from(sheetContents).filter((el) => el.getAttribute("data-side") === "bottom");
-      const has75vh = bottomSheets.some((el) => el.className.includes("h-[75vh]"));
-      expect(has75vh).toBe(true);
+      const has45vh = bottomSheets.some((el) => el.className.includes("h-[45vh]"));
+      expect(has45vh).toBe(true);
     });
   });
 

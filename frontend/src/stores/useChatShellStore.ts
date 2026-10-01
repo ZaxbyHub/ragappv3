@@ -53,11 +53,6 @@ const MIN_SESSION_RAIL_WIDTH = 240;
 const MAX_SESSION_RAIL_WIDTH = 400;
 const DEFAULT_SESSION_RAIL_WIDTH = 320;
 
-const isMobile = () => {
-  if (typeof window === "undefined") return false;
-  return window.innerWidth < 768;
-};
-
 // Load pinned sessions from localStorage
 const loadPinnedSessions = (): number[] => {
   if (typeof window === "undefined") return [];
@@ -88,8 +83,18 @@ const persistPinnedSessions = (ids: number[]): boolean => {
   }
 };
 
+// The session rail defaults open only at >=lg (1024px). Between md and lg the
+// expanded nav rail (240px) plus a 320px session rail leaves the chat column
+// ~208px (issue #689 / UI-R1-03); below lg the rail starts closed and the
+// user can still open it from its toggle. SSR/jsdom (innerWidth 1024) sees
+// the same open default as before.
+const isDesktopViewport = () => {
+  if (typeof window === "undefined") return true;
+  return window.innerWidth >= 1024;
+};
+
 export const useChatShellStore = create<ChatShellState>((set, get) => ({
-  sessionRailOpen: !isMobile(),
+  sessionRailOpen: isDesktopViewport(),
   rightPaneOpen: false,
   rightPaneWidth: DEFAULT_RIGHT_PANE_WIDTH,
   sessionRailWidth: DEFAULT_SESSION_RAIL_WIDTH,

@@ -143,7 +143,14 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
   const internalRef = useRef<HTMLTextAreaElement>(null);
   const textareaRef = (inputRef ?? internalRef) as React.RefObject<HTMLTextAreaElement>;
 
-  const { input, setInput, inputError, setInputError, activeChatId } = useChatStore();
+  // Scoped selectors (issue #689 / TQ-sibling-batch-05-05): whole-store
+  // destructures re-render the composer on every unrelated chat-store change;
+  // individual selectors keep the #616 render budget.
+  const input = useChatStore((s) => s.input);
+  const setInput = useChatStore((s) => s.setInput);
+  const inputError = useChatStore((s) => s.inputError);
+  const setInputError = useChatStore((s) => s.setInputError);
+  const activeChatId = useChatStore((s) => s.activeChatId);
   const storedChatMode = useChatModeStore((s) => s.chatMode);
   const setStoredChatMode = useChatModeStore((s) => s.setChatMode);
   const temperature = useChatModeStore((s) => s.temperature);
@@ -184,7 +191,7 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
     return () => clearInterval(handle);
   }, [refreshLlmHealth]);
 
-  const { getActiveVault } = useVaultStore();
+  const getActiveVault = useVaultStore((s) => s.getActiveVault);
   const activeVault = getActiveVault();
   const activeVaultId = useVaultStore((s) => s.activeVaultId);
 
@@ -660,8 +667,10 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
             </div>
           )}
 
-          {/* Toolbar */}
-          <div className="flex items-center justify-between border-t border-border px-2 py-2">
+          {/* Toolbar — wraps instead of clipping (issue #689 / UI-R1-02): at
+              common laptop widths the ~900px of controls exceed the composer
+              box, so the trailing Send/Stop must stay in flow, not overflow. */}
+          <div className="flex flex-wrap items-center justify-between gap-x-1 border-t border-border px-2 py-2">
             <div className="flex items-center gap-1">
               {/* Slash command hint */}
               <Tooltip>
@@ -717,8 +726,8 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
             )}
 
             {/* Mode toggle (Instant / Thinking) */}
-            <div className="flex flex-col items-end gap-1">
-              <div className="flex items-center gap-1">
+            <div className="flex min-w-0 flex-1 flex-col items-end gap-1">
+              <div className="flex flex-wrap items-center justify-end gap-1">
                 <div
                   role="radiogroup"
                   aria-label="Chat mode"
@@ -889,7 +898,7 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
                 variant="destructive"
                 size="sm"
                 onClick={onStop}
-                className="gap-1.5 h-8 active:scale-95"
+                className="gap-1.5 h-8 shrink-0 active:scale-95"
                 aria-label="Stop generating"
               >
                 <Square className="h-3 w-3 fill-current" />
@@ -900,7 +909,7 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
                 size="sm"
                 onClick={handleSubmit}
                 disabled={!input.trim() || input.length > MAX_INPUT_LENGTH || hasUploading}
-                className="h-8 w-8 rounded-full p-0 shadow-xs active:scale-95"
+                className="h-8 w-8 shrink-0 rounded-full p-0 shadow-xs active:scale-95"
                 aria-label="Send message"
               >
                 <Send className="h-3.5 w-3.5" />

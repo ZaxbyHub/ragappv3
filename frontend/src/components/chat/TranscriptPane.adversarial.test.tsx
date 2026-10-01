@@ -1219,23 +1219,32 @@ describe("TranscriptPane ADVERSARIAL TESTS", () => {
     });
 
     it("should handle vault becoming active during render", async () => {
-      // First render with no vault
-      (useVaultStore as unknown as ReturnType<typeof vi.fn>).mockReturnValue({
+      // First render with no vault (selector-aware mock: production reads
+      // per-field via selectors, whole-store via no-arg calls)
+      const noVaultState = {
         vaults: [],
         activeVaultId: null,
         getActiveVault: () => undefined,
-      });
+      };
+      (useVaultStore as unknown as ReturnType<typeof vi.fn>).mockImplementation(
+        (selector?: (s: unknown) => unknown) =>
+          typeof selector === "function" ? selector(noVaultState) : noVaultState
+      );
 
       setMockChatState({ messages: [], input: "", isStreaming: false, inputError: null });
 
       render(<TranscriptPane />);
 
       // Update store to have an active vault
-      (useVaultStore as unknown as ReturnType<typeof vi.fn>).mockReturnValue({
+      const activeVaultState = {
         vaults: [{ id: 1, name: "New Vault", file_count: 5 }],
         activeVaultId: 1,
         getActiveVault: () => ({ id: 1, name: "New Vault", file_count: 5 }),
-      });
+      };
+      (useVaultStore as unknown as ReturnType<typeof vi.fn>).mockImplementation(
+        (selector?: (s: unknown) => unknown) =>
+          typeof selector === "function" ? selector(activeVaultState) : activeVaultState
+      );
 
       // Force re-render
       render(<TranscriptPane />);

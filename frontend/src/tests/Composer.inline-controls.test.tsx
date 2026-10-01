@@ -13,12 +13,16 @@ import userEvent from "@testing-library/user-event";
 import React from "react";
 
 vi.mock("@/stores/useChatStore", () => ({
-  useChatStore: vi.fn(() => ({
-    input: "hello world",
-    setInput: vi.fn(),
-    inputError: null,
-    activeChatId: "1",
-  })),
+  useChatStore: vi.fn((selector?: (s: any) => unknown) => {
+    const state = {
+      input: "hello world",
+      setInput: vi.fn(),
+      setInputError: vi.fn(),
+      inputError: null,
+      activeChatId: "1",
+    };
+    return typeof selector === "function" ? selector(state) : state;
+  }),
 }));
 
 const mockChatModeStore = vi.hoisted(() => ({
@@ -60,10 +64,13 @@ vi.mock("@/stores/useSettingsStore", () => ({
 
 vi.mock("@/stores/useVaultStore", () => ({
   useVaultStore: Object.assign(
-    vi.fn(() => ({
-      activeVaultId: 1,
-      getActiveVault: () => ({ id: 1, name: "Test Vault", file_count: 1 }),
-    })),
+    vi.fn((selector?: (s: any) => unknown) => {
+      const state = {
+        activeVaultId: 1,
+        getActiveVault: () => ({ id: 1, name: "Test Vault", file_count: 1 }),
+      };
+      return typeof selector === "function" ? selector(state) : state;
+    }),
     { getState: () => ({ activeVaultId: 1 }) }
   ),
 }));

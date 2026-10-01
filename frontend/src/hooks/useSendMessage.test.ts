@@ -538,9 +538,10 @@ describe("useSendMessage", () => {
 
       await act(async () => {
         // A pre-content server failure: the generic branch stamps status
-        // "failed", but persistTurn's empty-content guard (LIVE-01) keeps the
-        // turn unpersisted and replaces the raw message with the
-        // empty-response error.
+        // "failed" with the real cause, and persistTurn's empty-content guard
+        // (LIVE-01) keeps the turn unpersisted. Issue #689 (T1-13-K-05): the
+        // stamped cause must SURVIVE the guard — only an error-less empty
+        // stream gets the generic empty-response text.
         capture.trigger.error(new Error("upstream LLM returned 500"));
       });
 
@@ -549,7 +550,7 @@ describe("useSendMessage", () => {
       });
       const assistant = useChatStore.getState().messagesById[streamingId!];
       expect(assistant?.status).toBe("failed");
-      expect(assistant?.error).toBe("The model returned an empty response. Try again.");
+      expect(assistant?.error).toBe("upstream LLM returned 500");
       expect(apiMocks.addChatMessagesBatch).not.toHaveBeenCalled();
     });
 
@@ -1022,12 +1023,14 @@ describe("useSendMessage", () => {
         capture.trigger.error(new Error("boom"));
       });
 
-      // An empty answer — even a failed one — is never persisted.
+      // An empty answer — even a failed one — is never persisted. Issue #689
+      // (T1-13-K-05): the stamped cause ("boom") survives the empty-content
+      // guard; the generic empty-response text is only for error-less streams.
       expect(apiMocks.addChatMessagesBatch).not.toHaveBeenCalled();
       expect(refreshHistory).not.toHaveBeenCalled();
 
       const assistant = useChatStore.getState().messagesById[streamingId!];
-      expect(assistant?.error).toBe("The model returned an empty response. Try again.");
+      expect(assistant?.error).toBe("boom");
     });
 
     it("exposes the in-flight turn save on the store and clears it when settled (PRR-003)", async () => {

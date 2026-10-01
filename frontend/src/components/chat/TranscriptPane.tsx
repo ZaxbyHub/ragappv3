@@ -390,7 +390,7 @@ export function TranscriptPane({ className, onSessionCreated }: TranscriptPanePr
   const setActiveEditVersion = useChatStore((s) => s.setActiveEditVersion);
   const clearEditVersionsFrom = useChatStore((s) => s.clearEditVersionsFrom);
 
-  const { getActiveVault } = useVaultStore();
+  const getActiveVault = useVaultStore((s) => s.getActiveVault);
   const activeVault = getActiveVault();
   const vaultId = useVaultStore((s) => s.activeVaultId);
 
@@ -422,6 +422,11 @@ export function TranscriptPane({ className, onSessionCreated }: TranscriptPanePr
   // Ref-backed pinned-bottom state — read inside scroll callbacks without
   // creating stale closures over isAtBottom (which is captured by useEffect).
   const isAtBottomRef = useRef(true);
+
+  // Owner of the jump-to-answer highlight timer (issue #689 / T1-13-S2-10):
+  // a second jump within 1.5s must cancel the first jump's timer instead of
+  // letting it clear the newer highlight early.
+  const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // User intent flag: once the user manually scrolls up, we stop auto-scroll
   // until they click "New messages" or reach the bottom themselves.
   const userScrolledUpRef = useRef(false);
@@ -502,11 +507,23 @@ export function TranscriptPane({ className, onSessionCreated }: TranscriptPanePr
         const el = scrollRef.current?.querySelector(`[data-message-id="${msgId}"]`);
         el?.scrollIntoView({ behavior: "smooth", block: "center" });
         setHighlightedMessageId(msgId);
-        setTimeout(() => setHighlightedMessageId(null), 1500);
+        if (highlightTimerRef.current !== null) {
+          clearTimeout(highlightTimerRef.current);
+        }
+        highlightTimerRef.current = setTimeout(() => {
+          setHighlightedMessageId(null);
+          highlightTimerRef.current = null;
+        }, 1500);
       }
     };
     window.addEventListener("evidence:jump-to-answer", handler);
-    return () => window.removeEventListener("evidence:jump-to-answer", handler);
+    return () => {
+      window.removeEventListener("evidence:jump-to-answer", handler);
+      if (highlightTimerRef.current !== null) {
+        clearTimeout(highlightTimerRef.current);
+        highlightTimerRef.current = null;
+      }
+    };
   }, []);
 
   // Page title — updates whenever active session title changes

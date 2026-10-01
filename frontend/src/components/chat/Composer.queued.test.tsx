@@ -33,12 +33,16 @@ vi.mock("@/lib/api", async () => {
 });
 
 vi.mock("@/stores/useChatStore", () => ({
-  useChatStore: vi.fn(() => ({
-    input: "hello world",
-    setInput: vi.fn(),
-    inputError: null,
-    activeChatId: null,
-  })),
+  useChatStore: vi.fn((selector?: (s: any) => unknown) => {
+    const state = {
+      input: "hello world",
+      setInput: vi.fn(),
+      setInputError: vi.fn(),
+      inputError: null,
+      activeChatId: null,
+    };
+    return typeof selector === "function" ? selector(state) : state;
+  }),
 }));
 
 vi.mock("@/stores/useVaultStore", () => ({

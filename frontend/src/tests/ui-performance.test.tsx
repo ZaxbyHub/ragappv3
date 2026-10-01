@@ -111,11 +111,14 @@ vi.mock("@/stores/useChatStore", () => ({
 }));
 
 vi.mock("@/stores/useVaultStore", () => ({
-  useVaultStore: vi.fn(() => ({
-    activeVaultId: 1,
-    vaults: [{ id: 1, name: "Test Vault", file_count: 5 }],
-    getActiveVault: vi.fn(() => ({ id: 1, name: "Test Vault", file_count: 5 })),
-  })),
+  useVaultStore: vi.fn((selector?: (s: any) => unknown) => {
+    const state = {
+      activeVaultId: 1,
+      vaults: [{ id: 1, name: "Test Vault", file_count: 5 }],
+      getActiveVault: vi.fn(() => ({ id: 1, name: "Test Vault", file_count: 5 })),
+    };
+    return typeof selector === "function" ? selector(state) : state;
+  }),
 }));
 
 vi.mock("@/hooks/useSendMessage", () => ({

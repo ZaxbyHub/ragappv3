@@ -26,16 +26,22 @@ const mockSetSelectedEvidenceMessageId = vi.fn();
 const mockSetEvidenceReturnFocusId = vi.fn();
 const mockSetActiveRightTab = vi.fn();
 
-// Setup default mock return values
+// Setup default mock implementation (selector-aware: production subscribes
+// per-field via selectors)
 beforeEach(() => {
   vi.clearAllMocks();
-  (useChatShellStore as unknown as vi.Mock).mockReturnValue({
-    openRightPane: mockOpenRightPane,
-    setSelectedEvidenceSource: mockSetSelectedEvidenceSource,
-    setSelectedEvidenceMessageId: mockSetSelectedEvidenceMessageId,
-    setEvidenceReturnFocusId: mockSetEvidenceReturnFocusId,
-    setActiveRightTab: mockSetActiveRightTab,
-  });
+  (useChatShellStore as unknown as vi.Mock).mockImplementation(
+    (selector?: (s: unknown) => unknown) => {
+      const state = {
+        openRightPane: mockOpenRightPane,
+        setSelectedEvidenceSource: mockSetSelectedEvidenceSource,
+        setSelectedEvidenceMessageId: mockSetSelectedEvidenceMessageId,
+        setEvidenceReturnFocusId: mockSetEvidenceReturnFocusId,
+        setActiveRightTab: mockSetActiveRightTab,
+      };
+      return typeof selector === "function" ? selector(state) : state;
+    }
+  );
 });
 
 // =============================================================================

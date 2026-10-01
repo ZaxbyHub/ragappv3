@@ -580,7 +580,15 @@ export default function ChatShell() {
       </Sheet>
 
       {/* MAIN TRANSCRIPT AREA */}
-      <main className="flex flex-1 flex-col min-w-0 bg-background">
+      <main
+        className="flex flex-1 flex-col min-w-0 bg-background"
+        /* Issue #689 (UI-R4-14): while the bottom evidence sheet is open on
+           below-lg viewports, pad the chat column by the sheet height so the
+           bottom-docked composer rides ABOVE the non-modal sheet instead of
+           underneath it. Keep the 45vh literals in sync with the SheetContent
+           height class below. */
+        style={{ paddingBottom: isBelowLg && rightPaneOpen ? "45vh" : undefined }}
+      >
         <header className="flex h-14 items-center gap-2 border-b border-border px-4">
           {/* Page-level heading landmark (sr-only) so screen-reader heading
               navigation has an h1 on this route (UI-HIER-1, #291). */}
@@ -676,12 +684,12 @@ export default function ChatShell() {
         </div>
       </aside>
 
-      {/* MOBILE: Right Pane Sheet (slides from bottom, 75vh). Non-modal
+      {/* MOBILE: Right Pane Sheet (slides from bottom, 45vh). Non-modal
           (PRODUCT-ENH-10): no overlay, no focus trap — composer and transcript
           stay interactive while the evidence drawer is open. */}
       {isBelowLg && (
         <Sheet modal={false} open={rightPaneOpen} onOpenChange={(open) => !open && closeRightPane()}>
-          <SheetContent side="bottom" overlay={false} className="h-[75vh] rounded-t-xl p-0 lg:hidden" aria-describedby="evidence-sources-desc">
+          <SheetContent side="bottom" overlay={false} className="h-[45vh] rounded-t-xl p-0 lg:hidden" aria-describedby="evidence-sources-desc">
             <SheetHeader className="px-4 pt-4 pb-2 border-b border-border">
               <SheetTitle id="evidence-sources-title" className="text-base text-left">Evidence</SheetTitle>
               <SheetDescription id="evidence-sources-desc" className="sr-only">

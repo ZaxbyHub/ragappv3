@@ -330,9 +330,15 @@ export function useSendMessage(
         const assistantContent = streamedContent || assistantMsg.content;
         if (!assistantContent.trim() && !allowEmptyAssistant) {
           // LIVE-01/PRR-001: pre-content server failures are never persisted.
-          updateMessage(assistantMessageId, {
-            error: "The model returned an empty response. Try again.",
-          });
+          // Issue #689 (T1-13-K-05): the generic empty-response text is only
+          // for streams that ended with no content AND no error — a real,
+          // already-stamped cause (admission/capacity, network, 5xx, interrupt)
+          // must not be overwritten by the persistence guard.
+          if (!assistantMsg.error) {
+            updateMessage(assistantMessageId, {
+              error: "The model returned an empty response. Try again.",
+            });
+          }
           return null;
         }
 
