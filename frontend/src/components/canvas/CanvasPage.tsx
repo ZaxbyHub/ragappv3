@@ -285,6 +285,14 @@ export default function CanvasPage() {
 
   const isDirty = editorText != null && currentContent != null && editorText !== currentContent;
 
+  // Content just applied by save/restore/edit-range (applyNewVersion). Until
+  // the refetch lands, currentContent is the stale cached version, so the
+  // debounce effect would otherwise treat the applied content as a user edit
+  // and re-arm the pending draft — a flush inside that window would persist
+  // the applied content as a "draft" that can later resurface over newer
+  // server content (PR #832 review, external F-003).
+  const lastAppliedRef = useRef<{ uid: string; text: string } | null>(null);
+
   // Debounced best-effort persistence of the unsaved draft.
   useEffect(() => {
     if (editorText == null || currentContent == null) {
@@ -295,9 +303,15 @@ export default function CanvasPage() {
       pendingDraftRef.current = null;
       return;
     }
-    if (editorText === currentContent) {
+    const applied = lastAppliedRef.current;
+    if (
+      editorText === currentContent ||
+      (applied != null && applied.uid === artifactUid && applied.text === editorText)
+    ) {
       // Discard: cancel the timer and any pending write so a later flush
-      // cannot resurrect the draft being cleared here (issue #688).
+      // cannot resurrect the draft being cleared here (issue #688). The
+      // applied-content arm covers the stale-cache window before the
+      // refetch lands (external F-003).
       cancelDraftTimer();
       clearCanvasDraft(artifactUid);
       return;
@@ -372,6 +386,7 @@ export default function CanvasPage() {
   const applyNewVersion = (version: CanvasVersion) => {
     cancelDraftTimer();
     clearCanvasDraft(artifactUid);
+    lastAppliedRef.current = { uid: artifactUid, text: version.content };
     setEditorText(version.content);
     setEditorBaseVersionNo(version.version_no);
     setSelectedVersionNo(version.version_no);
@@ -497,8 +512,11 @@ export default function CanvasPage() {
         setConflict("reload");
         setEditRangeOpen(false);
       } else {
-        // 422 canvas_invalid_range / 502 canvas_model_unavailable surface the
-        // backend detail verbatim; the dialog stays open for correction.
+        // 422 canvas_invalid_range / canvas_empty_model_reply /
+        // canvas_content_required and 502 canvas_model_unavailable /
+        // canvas_model_truncated surface the backend detail verbatim (same
+        // raw-code parity as the sibling canvas errors); the dialog stays
+        // open for correction.
         setActionError(getCanvasErrorDetail(err));
       }
     } finally {

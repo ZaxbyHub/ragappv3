@@ -73,6 +73,7 @@ BACKEND_APP = REPO_ROOT / "backend" / "app"
 MANUAL_RENAME_FUNCTIONS = {"update_session"}
 
 _TITLE_UPDATE_RE = re.compile(r"UPDATE\s+chat_sessions\s+SET\s+title", re.IGNORECASE)
+_SELECT_RE = re.compile(r"\bSELECT\b", re.IGNORECASE)
 _ENCLOSING_DEF_RE = re.compile(r"(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)")
 # Guard predicates are matched against the statement's WHERE clause ONLY —
 # never the SET clause (`SET title = ?` would self-satisfy a naive
@@ -84,18 +85,46 @@ _GUARD_PREDICATES = (
 )
 
 
+def _classify_title_update(source: str, match: "re.Match[str]"):
+    """Classify one title-UPDATE match: returns (enclosing_fn, where_clause).
+
+    Shared by the live census and the self-check so the self-check exercises
+    the same parsing path the census runs (a self-check that re-implements
+    the slicing inline cannot detect the census itself regressing — PR #832
+    review F-002). The statement is bounded at the first ``;`` after the
+    match so a WHERE-less UPDATE cannot bleed into a LATER statement's WHERE
+    clause, and the guard predicate must appear in the WHERE clause's first
+    OR-segment (``WHERE id = ? OR title IS NULL`` updates on the id alone
+    and is NOT a guard).
+    """
+    fn_match = None
+    for fn in _ENCLOSING_DEF_RE.finditer(source, 0, match.start()):
+        fn_match = fn
+    fn_name = fn_match.group(1) if fn_match else "<module>"
+    statement = source[match.start() :]
+    semi_at = statement.find(";")
+    if semi_at >= 0:
+        statement = statement[:semi_at]
+    # A WHERE-less UPDATE must not inherit a LATER statement's WHERE: bound
+    # at the first SELECT too (no title UPDATE in this repo contains a
+    # subselect; if one ever does, the census fails loudly — a false alarm a
+    # developer resolves — never a silent pass).
+    select_at = _SELECT_RE.search(statement)
+    if select_at:
+        statement = statement[: select_at.start()]
+    statement = statement[:400]
+    where_at = statement.upper().find("WHERE")
+    where_clause = statement[where_at:] if where_at >= 0 else ""
+    first_or_segment = re.split(r"\sOR\s", where_clause, maxsplit=1, flags=re.IGNORECASE)[0]
+    return fn_name, first_or_segment
+
+
 def _iter_title_updates():
     """Yield (file, enclosing_function, where_clause) for every title UPDATE."""
     for path in sorted(BACKEND_APP.rglob("*.py")):
         source = path.read_text(encoding="utf-8")
         for match in _TITLE_UPDATE_RE.finditer(source):
-            fn_match = None
-            for fn in _ENCLOSING_DEF_RE.finditer(source, 0, match.start()):
-                fn_match = fn
-            fn_name = fn_match.group(1) if fn_match else "<module>"
-            statement = source[match.start() : match.start() + 400]
-            where_at = statement.upper().find("WHERE")
-            where_clause = statement[where_at:] if where_at >= 0 else ""
+            fn_name, where_clause = _classify_title_update(source, match)
             yield path, fn_name, where_clause
 
 
@@ -124,28 +153,61 @@ class TestTitleGuardCensus:
             f"found {guarded}. If a write was removed, update this census."
         )
 
-    def test_census_detects_the_base_defect(self):
-        """The census must fail on the pre-fix shape: an unguarded
-        `UPDATE chat_sessions SET title = ? ... WHERE id = ?` (issue #688's
-        original defect) must classify as unguarded even though its SET
-        clause contains `title = ?`."""
-        # The WHERE-sliced predicate check must reject a bare `WHERE id = ?`.
-        statement = (
-            "UPDATE chat_sessions SET title = ?, updated_at = CURRENT_TIMESTAMP "
-            "WHERE id = ?"
+    def test_census_classifies_synthetic_shapes(self):
+        """Self-check driving the REAL census classifier over synthetic
+        sources (PR #832 review F-002): the base defect shape must classify
+        unguarded even though its SET clause contains `title = ?`; the fixed
+        shape must classify guarded; an OR-composed guard must NOT count
+        (it updates on the id alone); and a WHERE-less UPDATE must not bleed
+        into a following statement's WHERE."""
+        base_defect = (
+            "def _auto_name(session_id):\n"
+            "    UPDATE chat_sessions SET title = ?, updated_at = CURRENT_TIMESTAMP "
+            "WHERE id = ?\n"
         )
-        where_at = statement.upper().find("WHERE")
-        synthetic_where = statement[where_at:]
-        assert not any(p in synthetic_where for p in _GUARD_PREDICATES), (
+        _, where_clause = _classify_title_update(
+            base_defect, next(_TITLE_UPDATE_RE.finditer(base_defect))
+        )
+        assert not any(p in where_clause for p in _GUARD_PREDICATES), (
             "the census must not accept `WHERE id = ?` as a title guard"
         )
-        # And the fixed shape must be accepted.
+
         fixed = (
-            "UPDATE chat_sessions SET title = ?, updated_at = CURRENT_TIMESTAMP "
-            "WHERE id = ? AND (title IS NULL OR title = '')"
+            "def _auto_name(session_id):\n"
+            "    UPDATE chat_sessions SET title = ?, updated_at = CURRENT_TIMESTAMP "
+            "WHERE id = ? AND (title IS NULL OR title = '')\n"
         )
-        where_at = fixed.upper().find("WHERE")
-        assert "title IS NULL" in fixed[where_at:]
+        _, where_clause = _classify_title_update(
+            fixed, next(_TITLE_UPDATE_RE.finditer(fixed))
+        )
+        assert any(p in where_clause for p in _GUARD_PREDICATES), (
+            "the census must accept the shipped AND-composed guard"
+        )
+
+        or_guard = (
+            "def _auto_name(session_id):\n"
+            "    UPDATE chat_sessions SET title = ?, updated_at = CURRENT_TIMESTAMP "
+            "WHERE id = ? OR title IS NULL\n"
+        )
+        _, where_clause = _classify_title_update(
+            or_guard, next(_TITLE_UPDATE_RE.finditer(or_guard))
+        )
+        assert not any(p in where_clause for p in _GUARD_PREDICATES), (
+            "the census must not accept an OR-composed predicate as a guard "
+            "(it updates on the id alone)"
+        )
+
+        bleed = (
+            "def _auto_name(session_id):\n"
+            "    UPDATE chat_sessions SET title = ?, updated_at = CURRENT_TIMESTAMP\n"
+            "    other = SELECT title FROM chat_sessions WHERE title IS NULL\n"
+        )
+        _, where_clause = _classify_title_update(
+            bleed, next(_TITLE_UPDATE_RE.finditer(bleed))
+        )
+        assert not any(p in where_clause for p in _GUARD_PREDICATES), (
+            "a WHERE-less UPDATE must not inherit a later statement's WHERE"
+        )
 
 
 class _RecController:
@@ -238,6 +300,30 @@ class TestDonePayloadParity:
         assert model.citation_confidence == {"S1": 0.9}
         assert model.unverifiable_claims == ["u1"]
 
+    @pytest.mark.asyncio
+    async def test_stream_done_supplies_no_unmirrored_contract_keys(self):
+        """The parity guard's reverse direction (PR #832 review F-004): a NEW
+        content-bearing done key that ChatResponse does not mirror is exactly
+        the one-sided drift this class exists to catch — the forward check
+        alone cannot see it."""
+        from app.api.routes.chat import ChatResponse
+
+        protocol_keys = {
+            "type",
+            "turn_id",
+            "sources",
+            "memories_used",
+            "wiki_used",
+            "kms_used",
+            "score_type",
+        }
+        done = await _collect_done(_AllKeysEngine())
+        extras = set(done) - set(ChatResponse.model_fields) - protocol_keys
+        assert not extras, (
+            "Done payload carries contract keys ChatResponse does not mirror "
+            f"(add them to ChatResponse or the protocol set): {sorted(extras)}"
+        )
+
 
 class TestTraceFlagContract:
     """G3(a): `trace` reaches the client iff the flag is on."""
@@ -270,6 +356,19 @@ class TestTraceFlagContract:
         done = await _collect_done(_TracingEngine(), flag_override=True)
         assert done is not None
         assert done.get("trace") == {"stages": ["retrieve"]}
+
+    @pytest.mark.asyncio
+    async def test_trace_not_synthesized_when_engine_does_not_attach(self):
+        """The iff-contract's other direction (PR #832 review F-004): flag on
+        but the engine attached no trace — the route must not emit a
+        `"trace": null` key; weakening the gate to the flag alone must fail
+        here."""
+        done = await _collect_done(_AllKeysEngine(), flag_override=True)
+        assert done is not None
+        assert "trace" not in done, (
+            "trace must stay absent when the engine did not attach one, even "
+            "with rag_trace_in_response on"
+        )
 
 
 class TestRememberDirectiveIdempotencyKey:
@@ -331,6 +430,73 @@ class TestRememberDirectiveIdempotencyKey:
         assert count == 1
 
 
+class TestFindMemoryByContentLookup:
+    """Negative-path pins for the remember dedupe lookup (PR #832 review,
+    external F-001/F-007): only a LIVE, non-expiring, same-vault, same-source
+    row may confirm a re-sent directive."""
+
+    @staticmethod
+    def _make_store(tmp_path):
+        from app.models.database import SQLiteConnectionPool, init_db, run_migrations
+        from app.services.memory_store import MemoryStore
+
+        db_path = tmp_path / "find-lookup.db"
+        init_db(str(db_path))
+        run_migrations(str(db_path))
+        pool = SQLiteConnectionPool(str(db_path), max_size=5)
+        return MemoryStore(pool=pool, embedding_service=None), pool
+
+    def _content(self, store, content, expires_at=None, source="chat", vault_id=1):
+        return store.add_memory(
+            content, source=source, vault_id=vault_id, expires_at=expires_at
+        )
+
+    def test_expired_chat_row_does_not_dedupe(self, tmp_path):
+        store, pool = self._make_store(tmp_path)
+        try:
+            self._content(store, "the pump code is 7", expires_at="2000-01-01T00:00:00")
+            assert store.find_memory_by_content("the pump code is 7", "chat", 1) is None
+            # The insert path therefore runs and stores a LIVE row.
+            record = store.add_memory("the pump code is 7", source="chat", vault_id=1)
+            assert record.id is not None
+            found = store.find_memory_by_content("the pump code is 7", "chat", 1)
+            assert found is not None and found.id == record.id
+        finally:
+            pool.close_all()
+
+    def test_future_expiry_row_does_not_dedupe(self, tmp_path):
+        store, pool = self._make_store(tmp_path)
+        try:
+            self._content(store, "the pump code is 7", expires_at="2099-01-01T00:00:00")
+            assert store.find_memory_by_content("the pump code is 7", "chat", 1) is None, (
+                "an expiring row is invisible to retrieval and swept by eviction; "
+                "confirming it would claim a memory the user can never retrieve"
+            )
+        finally:
+            pool.close_all()
+
+    def test_other_vault_and_null_vault_do_not_cross_dedupe(self, tmp_path):
+        store, pool = self._make_store(tmp_path)
+        try:
+            record = self._content(store, "the pump code is 7", vault_id=1)
+            assert store.find_memory_by_content("the pump code is 7", "chat", 2) is None
+            assert store.find_memory_by_content("the pump code is 7", "chat", None) is None
+            global_record = self._content(store, "the pump code is 7", vault_id=None)
+            found = store.find_memory_by_content("the pump code is 7", "chat", None)
+            assert found is not None and found.id == global_record.id
+            assert store.find_memory_by_content("the pump code is 7", "chat", 1).id == record.id
+        finally:
+            pool.close_all()
+
+    def test_other_source_does_not_dedupe(self, tmp_path):
+        store, pool = self._make_store(tmp_path)
+        try:
+            self._content(store, "the pump code is 7", source="upload")
+            assert store.find_memory_by_content("the pump code is 7", "chat", 1) is None
+        finally:
+            pool.close_all()
+
+
 class TestCanvasEditRangeFailureCodes:
     """G3(b): the exact detail codes for degenerate model replies."""
 
@@ -362,6 +528,11 @@ class TestCanvasEditRangeFailureCodes:
         store.get_version.return_value = {"content": "alpha\nbeta\ngamma"}
         store.append_version.return_value = {"version_no": 2}
         llm = MagicMock()
+        # Pin last_metrics to a real empty dict: a bare MagicMock attribute
+        # would be truthy and `.get("finish_reason")` a Mock, so the
+        # truncation branch would pass "by accident" instead of by contract
+        # (PR #832 review, external F-007).
+        llm.last_metrics = {}
         llm.chat_completion = AsyncMock(return_value="")
         app.state.llm_client = llm
         with patch("app.api.routes.canvas.get_canvas_store", lambda: store):
@@ -377,6 +548,67 @@ class TestCanvasEditRangeFailureCodes:
         assert response.status_code == 422
         assert response.json()["detail"] == "canvas_empty_model_reply"
         store.append_version.assert_not_called()
+
+    def test_whitespace_only_reply_returns_canvas_empty_model_reply(self):
+        """The empty-reply predicate is strip-based: a whitespace-only reply
+        must 422 exactly like an empty one (PR #832 review F-003 — mutating
+        `.strip()` away must fail here)."""
+        app, client = self._minimal_canvas_app()
+        store = MagicMock()
+        store.get_version.return_value = {"content": "alpha\nbeta\ngamma"}
+        store.append_version.return_value = {"version_no": 2}
+        llm = MagicMock()
+        llm.last_metrics = {}
+        llm.chat_completion = AsyncMock(return_value="   \n  ")
+        app.state.llm_client = llm
+        with patch("app.api.routes.canvas.get_canvas_store", lambda: store):
+            response = client.post(
+                "/api/canvas/artifacts/uid/edit-range",
+                json={
+                    "start_line": 2,
+                    "end_line": 2,
+                    "instruction": "rewrite",
+                    "base_version_no": 1,
+                },
+            )
+        assert response.status_code == 422
+        assert response.json()["detail"] == "canvas_empty_model_reply"
+        store.append_version.assert_not_called()
+
+    def test_blank_selection_with_empty_reply_records_noop_version(self):
+        """A whitespace-only selection with an empty reply is at most a
+        whitespace collapse — it keeps the pre-#688 no-op-version behavior
+        instead of 422ing (PR #832 review, external F-002)."""
+        app, client = self._minimal_canvas_app()
+        store = MagicMock()
+        store.get_version.return_value = {"content": "alpha\n\n\ngamma"}
+        store.append_version.return_value = {
+            "id": 55,
+            "version_no": 2,
+            "name": None,
+            "origin": "model_edit",
+            "content": "alpha\n\ngamma",
+            "content_sha256": "sha-blank",
+            "model_edit_json": None,
+            "created_by": 1,
+            "created_at": "2026-01-01T00:00:00Z",
+        }
+        llm = MagicMock()
+        llm.last_metrics = {}
+        llm.chat_completion = AsyncMock(return_value="")
+        app.state.llm_client = llm
+        with patch("app.api.routes.canvas.get_canvas_store", lambda: store):
+            response = client.post(
+                "/api/canvas/artifacts/uid/edit-range",
+                json={
+                    "start_line": 2,
+                    "end_line": 3,
+                    "instruction": "rewrite",
+                    "base_version_no": 1,
+                },
+            )
+        assert response.status_code == 200
+        store.append_version.assert_called_once()
 
     def test_length_truncated_reply_returns_canvas_model_truncated(self):
         import httpx

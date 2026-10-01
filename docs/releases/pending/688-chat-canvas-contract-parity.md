@@ -20,7 +20,10 @@ Workstream A PR 6 of 7 (audit remediation, frontier audit 2026-09-23).
   The engine attaches its `RAGTrace` to the done message when the flag is on;
   the route now forwards it as `trace` on the SSE done event under the same
   flag. With the flag off (the default) `trace` stays absent even if an engine
-  attaches one.
+  attaches one. Operator note: the in-response trace keeps the raw
+  `original_query` (unlike the redacted log path) — the requesting client
+  sees its own prompt; scope the flag to eval/debug deployments (documented
+  contract at `config.py`).
 - **A manual rename always beats an auto-title write** (TQ-sibling-batch-07-04).
   The two remaining unguarded auto-title UPDATEs — the untitled branch of
   `_auto_name_session` and `add_message`'s no-LLM fallback — now carry the
@@ -31,19 +34,22 @@ Workstream A PR 6 of 7 (audit remediation, frontier audit 2026-09-23).
   looks up `MemoryStore.find_memory_by_content(content, source="chat",
   vault_id)` before inserting: a directive re-sent after a cancelled turn (or
   repeated in a later turn) confirms the existing memory instead of storing a
-  duplicate. The idempotency key is content + source + vault — at least as
-  strong as one-per-durable-turn. Two truly concurrent same-directive turns
-  can still race past the check; the stronger unique-index guarantee belongs
-  to the epic's deferred schema lane.
+  duplicate. The idempotency key is content + source + vault against
+  non-expiring rows only — an expired or expiring row is invisible to
+  retrieval (and swept by eviction), so confirming it would claim a memory
+  the user can never retrieve. Two truly concurrent same-directive turns can
+  still race past the check; the stronger unique-index guarantee belongs to
+  the epic's deferred schema lane.
 - **Canvas range edits refuse degenerate model replies** (TQ-instruction-batch-3-01).
   A reply cut off by the output token budget (`finish_reason == "length"`,
   read from the LLM client's `last_metrics`) returns 502
   `canvas_model_truncated` and records no version. An empty (or
-  whitespace-only) reply for a non-empty selection returns 422
+  whitespace-only) reply for a selection that carried content returns 422
   `canvas_empty_model_reply` and records no version — a deliberate
-  "delete these lines" instruction now 422s; users delete by editing. A reply
-  that empties the whole artifact keeps the existing 422
-  `canvas_content_required`.
+  "delete these lines" instruction now 422s; users delete by editing. A
+  whitespace-only selection with an empty reply keeps the pre-#688 no-op
+  version behavior. A reply that empties the whole artifact keeps the
+  existing 422 `canvas_content_required`.
 - **The canvas draft no longer loses its last ≤500 ms** (TQ-sibling-batch-05-04).
   The debounced draft write tracks its pending `(artifact, text)` pair and
   flushes it on unmount and on artifact switch (the Composer's

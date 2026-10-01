@@ -656,12 +656,14 @@ async def edit_canvas_range(
         + replacement.split("\n")
         + lines[body.end_line :]
     )
-    # Issue #688: an empty reply (after fence stripping) for a non-empty
-    # selection is a model failure, not a deletion instruction — recording it
-    # would corrupt the artifact. When the splice emptied the whole artifact,
-    # fall through to _check_content so the fence-only case keeps its
-    # canvas_content_required 422.
-    if not replacement.strip() and new_content.strip():
+    # Issue #688: an empty reply (after fence stripping) for a selection that
+    # carried content is a model failure, not a deletion instruction —
+    # recording it would corrupt the artifact. A whitespace-only selection
+    # with an empty reply is at most a whitespace collapse, so it keeps the
+    # pre-#688 no-op-version behavior. When the splice emptied the whole
+    # artifact, fall through to _check_content so the fence-only case keeps
+    # its canvas_content_required 422.
+    if not replacement.strip() and selected.strip() and new_content.strip():
         raise HTTPException(status_code=422, detail="canvas_empty_model_reply")
     _check_content(new_content)
 

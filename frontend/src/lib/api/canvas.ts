@@ -345,8 +345,9 @@ export async function restoreCanvasVersion(
 }
 
 /** Targeted model edit of a line range. Returns the appended version
- * directly; 422 `canvas_invalid_range` / 502 `canvas_model_unavailable` on
- * failure. */
+ * directly; 422 `canvas_invalid_range` / `canvas_empty_model_reply` /
+ * `canvas_content_required` and 502 `canvas_model_unavailable` /
+ * `canvas_model_truncated` on failure. */
 export async function editCanvasRange(
   artifactUid: string,
   payload: EditCanvasRangeRequest,

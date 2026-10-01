@@ -210,3 +210,46 @@ test("unmount after an equality revert must not resurrect the cleared draft", as
   cleanup();
   expect(localStorage.getItem("canvas-draft:cav_discard")).toBeNull();
 });
+
+test("applied save content is not re-persisted as a draft before the refetch lands", async () => {
+  // External F-003: after applyNewVersion the editor shows the saved content
+  // while currentContent is still the stale cached version. Unmounting
+  // inside that window (refetch never resolves) must NOT flush the applied
+  // content as a "draft" that could later resurface over newer server data.
+  const savedV2 = makeVersion(2, "def hello():\n    print('v2 saved')\n");
+  let serverVersion = makeVersion(1, SAVED_CONTENT);
+  getCanvasArtifactMock.mockImplementation(async () => ({
+    artifact: { ...ARTIFACT_TEST, current_version_no: serverVersion.version_no },
+    version: serverVersion,
+  }));
+  saveCanvasVersionMock.mockImplementation(async () => {
+    serverVersion = savedV2;
+    return savedV2;
+  });
+
+  renderCanvasPage();
+  const editor = await screen.findByLabelText("Canvas content editor");
+  expect(editor).toHaveValue(SAVED_CONTENT);
+
+  vi.useFakeTimers();
+  fireEvent.change(editor, { target: { value: "edited draft" } });
+  act(() => {
+    vi.advanceTimersByTime(100);
+  });
+
+  // Save applies v2, but the artifact refetch is suspended: currentContent
+  // stays at v1 for the whole window.
+  const saveButton = screen.getByRole("button", { name: /save/i });
+  await act(async () => {
+    fireEvent.click(saveButton);
+  });
+  await act(async () => {});
+
+  act(() => {
+    vi.advanceTimersByTime(400);
+  });
+  cleanup();
+
+  // Neither the pre-save draft nor the applied v2 content may be persisted.
+  expect(localStorage.getItem("canvas-draft:cav_discard")).toBeNull();
+});

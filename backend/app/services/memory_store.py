@@ -432,6 +432,7 @@ class MemoryStore:
         )
         return summary
 
+    @with_retry(max_attempts=3, retry_exceptions=(sqlite3.Error,), raise_last_exception=True)
     def find_memory_by_content(
         self,
         content: str,
@@ -443,14 +444,19 @@ class MemoryStore:
         The "remember ..." chat directive persists without an idempotency key;
         re-sending the same directive for the same vault must not duplicate the
         row. The key is (content, source, vault_id) with `IS ?` binds so a NULL
-        vault compares NULL-safe. Read-only; no FTS involved.
+        vault compares NULL-safe. Only non-expiring rows dedupe: the directive
+        itself never sets ``expires_at``, and an expired (or expiring) row is
+        invisible to retrieval and swept by eviction, so confirming it would
+        claim "Memory stored" for a memory the user can never retrieve.
+        Read-only; no FTS involved.
         """
         if not content or not content.strip():
             return None
         sql = (
             "SELECT id, content, category, tags, source, vault_id, importance, "
             "expires_at, created_at, updated_at FROM memories "
-            "WHERE content = ? AND source = ? AND vault_id IS ?"
+            "WHERE content = ? AND source = ? AND vault_id IS ? "
+            "AND expires_at IS NULL"
         )
         conn = self.pool.get_connection()
         try:
