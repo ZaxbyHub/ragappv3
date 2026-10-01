@@ -21,9 +21,20 @@
     runs after the settings row has already been persisted.
   - The hook performs the same transition `VectorStore.mark_ready(False)`
     performs, synchronously, and logs a warning naming the admin-reindex
-    recovery; readiness returns only when an admin reindex that begins after
-    the change completes (the pre-existing `mark_ready(True)` completion
-    path), or at restart via `validate_schema`.
+    recovery. How readiness can return:
+    - An all-vault reindex job that BEGINS after the change and completes
+      (the pre-existing `record_embedding_metadata` + `mark_ready(True)`
+      completion path). A vault-scoped reindex also flips readiness back but
+      leaves a mixed index (every other vault still embedded under the old
+      model) — recovery requires a full reindex.
+    - Restart, ONLY when the configured identity is reverted to the stored
+      sidecar value: after a forward change (A→B) with no reindex, startup
+      replays the persisted B into the singleton and `validate_schema`
+      re-detects the stored-sidecar-A vs configured-B mismatch, so the store
+      stays gated — restarting does not clear the 503.
+    - Recovery is API-only today: `POST /api/documents/reindex` has no
+      frontend caller, and the SettingsPage banner's suggested remediations
+      (per-file reprocess, wiki recompile) never restore readiness.
 - **`backend/tests/test_b06_runtime_model_change_readiness.py`** — frozen
   acceptance checks: PUT/POST `embedding_model` flips, prefix sibling flips,
   and the no-op guard.
@@ -36,7 +47,9 @@
 
 - A reindex already in flight when the identity save lands completes by
   recording the live identity and unconditionally calling `mark_ready(True)`,
-  re-opening the mismatch window until restart. Owned by #696
+  re-opening the mismatch window; because the completion records the live
+  identity, a later restart no longer detects the mismatch either — the
+  mixed index stays queryable until a full re-embed. Owned by #696
   ([Workstream B] PR 7) and #736 (Workstream G PR 4), which this PR
   deliberately does not implement (no dual-embedder serving).
 - Upload/ingest paths are not `require_model_ready`-gated; documents ingested
