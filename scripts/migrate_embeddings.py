@@ -25,7 +25,13 @@ Properties
   when LanceDB is empty and no rows claim vectors). A re-run after an
   interrupted prior run DETECTS the inconsistency (present-but-empty index,
   rows still ``indexed``/``partial``) and repairs it by resetting those rows
-  for re-indexing instead of reporting "Nothing to migrate".
+  for re-indexing instead of reporting "Nothing to migrate". An ABSENT
+  directory is treated as a clean deployment (or a wrong ``--lancedb-path``)
+  and keeps the plain no-op even when rows claim vectors — pass an explicit
+  correct path to repair that state.
+- **Repair mode** (the interrupted-run path above) never wipes data the
+  index no longer has, so it neither loads settings (the exit-4 refusal does
+  not apply) nor consults ``--force`` — it only resets rows.
 - **Dry-run mode**: ``--dry-run`` reports what would change without modifying data.
 - **Irreversible**: deletes the LanceDB directory.  Back up first if you need rollback.
 - **Refuses instead of destroying** when it cannot prove a migration is safe:
@@ -35,6 +41,8 @@ Properties
   (stop the application first) or the database is unreadable/corrupt,
   exit code 6 = the SQLite database is unreadable/corrupt during repair
   detection (restore it from your backup).
+  ``--force`` overrides exits 3 and 4 only; the lock/corruption refusals
+  (5 and 6) always stop the run.
 
 Usage
 -----
@@ -56,7 +64,7 @@ the database)::
 
 After running
 -------------
-Restart the application so the background processor picks up pending files::
+Start the application so the background processor picks up pending files::
 
     docker compose start knowledgevault
 
@@ -64,7 +72,9 @@ If a migration run is interrupted, re-run THIS SCRIPT before restarting the
 application: after the status reset, an app boot against the still-old-dim
 index would fail every re-embed (the vector store rejects mismatched
 dimensions) and leave files in ``error``/retry states no recovery sweep
-re-adopts.
+re-adopts. If the re-run itself refuses with exit code 3 (a partially
+deleted index — e.g. the interruption landed mid-wipe), the deletion is
+incomplete: re-run with ``--force`` to finish it.
 """
 
 import argparse
@@ -260,6 +270,13 @@ def _reset_file_statuses(sqlite_path: Path, dry_run: bool) -> int:
     columns (``phase``, ``partial_embeddings``, ``chunks_failed``,
     ``error_message``) are restored to their queue-entry values only when
     they exist, so ancient schemas without them still reset cleanly.
+
+    Raises ``MigrationRefused`` (→ exit 5 via ``main()``) if a writer acquires
+    the database lock after the writer probe but before this UPDATE (the
+    probe-to-reset window) — the same refusal contract as the probe, instead
+    of a bare traceback. (The read statements above the UPDATE are outside
+    this handler; in live runs the writer probe pre-empts an unreadable
+    database before the reset is reached.)
     """
     if not sqlite_path.exists():
         logger.warning("SQLite database not found at %s — skipping status reset.", sqlite_path)
@@ -312,12 +329,31 @@ def _reset_file_statuses(sqlite_path: Path, dry_run: bool) -> int:
         if "error_message" in columns:
             set_fragments.append("error_message = NULL")
 
-        conn.execute(
-            "UPDATE files SET "
-            + ", ".join(set_fragments)
-            + " WHERE status IN ('indexed', 'partial')"
-        )
-        conn.commit()
+        try:
+            conn.execute(
+                "UPDATE files SET "
+                + ", ".join(set_fragments)
+                + " WHERE status IN ('indexed', 'partial')"
+            )
+            conn.commit()
+        except sqlite3.OperationalError as exc:
+            # The writer probe passed moments ago; a writer that acquired the
+            # lock in the probe-to-reset window surfaces here (PRR-001, PR
+            # #831 review). Same refusal contract as the probe — never a bare
+            # traceback, and the wipe below never runs.
+            raise MigrationRefused(
+                f"Another process acquired a write lock on the SQLite "
+                f"database during the migration ({exc}): {sqlite_path}\n"
+                "Is the application still running? Stop it first, e.g.:\n"
+                "  docker compose stop knowledgevault\n"
+                "Then re-run this migration."
+            ) from exc
+        except sqlite3.DatabaseError as exc:
+            raise MigrationRefused(
+                f"The SQLite database is unreadable or corrupt ({exc}): "
+                f"{sqlite_path}\n"
+                "Repair or restore it (from your backup) before re-running."
+            ) from exc
         logger.info(
             "Reset %d file(s) from 'indexed'/'partial' to 'pending'.",
             resettable_count,

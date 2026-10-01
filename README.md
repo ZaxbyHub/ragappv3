@@ -434,7 +434,7 @@ python scripts/migrate_embeddings.py --dry-run
 #    'indexed' rows over an empty index)
 python scripts/migrate_embeddings.py
 
-# 5. Restart the application — the background processor will re-index all files
+# 5. Start the application — the background processor will re-index all files
 docker compose start knowledgevault
 ```
 
@@ -444,7 +444,9 @@ Depending on the number of documents and your hardware, this may take several mi
 If a migration run is interrupted (crash, Ctrl-C, lock error), re-run the
 script **before** restarting the application: after the status reset, an app
 boot against the still-old-dimension index would fail every re-embed and
-leave files in `error`/retry states that no recovery sweep picks up.
+leave files in `error`/retry states that no recovery sweep picks up. If that
+re-run itself refuses with exit code 3, the index deletion is incomplete
+(the interruption landed mid-wipe) — re-run with `--force` to finish it.
 
 **Health check after migration:**
 
@@ -463,10 +465,13 @@ curl -H "X-API-Key: ${HEALTH_CHECK_API_KEY:?set HEALTH_CHECK_API_KEY}" \
 > deployment (no existing LanceDB data and no indexed files), it is a no-op, and a re-run
 > after an interrupted migration detects the leftover state (empty index with files still
 > marked `indexed`/`partial`) and repairs it by re-queuing those files for re-indexing.
-> The script refuses (instead of destroying data) when the stored dimension cannot be
-> read on a non-empty index, when the configured `EMBEDDING_DIM` cannot be loaded, or
-> while another process holds the database — pass `--force` only for the first two. An
-> unreadable or corrupt `app.db` is also refused (with a restore-from-backup hint).
+> The script refuses (instead of destroying data) with these exit codes:
+> **3** — the stored dimension cannot be read on a non-empty index; **4** — the
+> configured `EMBEDDING_DIM` cannot be loaded; **5** — another process holds the
+> database, or the database is unreadable/corrupt at the writer probe; **6** — the
+> database is unreadable/corrupt during repair detection (restore `app.db` from your
+> backup). Pass `--force` to override exits 3 and 4 only; the lock/corruption refusals
+> (5 and 6) always stop the run.
 
 ---
 

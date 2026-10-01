@@ -43,8 +43,10 @@
 - **`README.md`** — the Harrier-migration operator sequence now stops the
   application before running the script, describes the reset-then-wipe
   order, documents the interrupted-run recovery order (re-run the script
-  BEFORE restarting the app) and the refusal exit codes, and the
-  "safe to run multiple times" note explains the repair behavior.
+  BEFORE restarting the app; a follow-up exit-3 refusal means the deletion
+  was incomplete — finish it with `--force`), and lists the refusal exit
+  codes (3/4/5/6) with the `--force` scope in the "safe to run multiple
+  times" note, which also explains the repair behavior.
 
 ### Tests
 
@@ -52,9 +54,14 @@
   issue-tracer acceptance checks C1-C7): reset-failure consistency, re-run
   repair, partial-row reset, settings-failure no-wipe, concurrent-writer
   no-wipe, legacy-sweep predicate match, and cp1252 `--help`.
-- **`backend/tests/test_migrate_embeddings_cli_refusals.py`** (new):
-  main()-level pins for exit codes 4 and 5 (index intact in both) and the
-  repair-mode dry run.
+- **`backend/tests/test_migrate_embeddings_cli_refusals.py`** (new): the
+  settings-refusal exit-4 and writer-lock exit-5 pins at the `main()` level
+  (index intact in both), the repair-mode dry run, corrupt-database
+  refusals (exit 6 during repair detection; the unreadable/corrupt message
+  — not stop-the-app advice — at the writer probe), a post-probe lock
+  surfacing as exit 5 from the status reset, `--force` overriding the
+  settings refusal, dry-run never refusing on a live writer, and the
+  `main()` exit-1 path when no paths are given and settings cannot load.
 - Existing `backend/tests/test_migrate_embeddings_dim.py` checks (matching
   dimension no-op, unknown-dimension refusal — issue #512 VECTOR-006) stay
   green unchanged.
@@ -65,8 +72,16 @@
   `scripts/migrate_memories.py` carry the same defect classes and are owned
   by issue #705 ([Workstream B] PR 16).
 - Exit codes: 3 = stored dimension undetectable on a non-empty index;
-  4 = configured dimension unreadable; 5 = concurrent writer holds the
-  database, or the database is unreadable/corrupt at the writer probe;
+  4 = configured dimension unreadable; 5 = a concurrent writer holds the
+  database (at the writer probe or acquired between the probe and the
+  status reset — the latter surfacing as exit 5 through ``main()``'s
+  ``MigrationRefused`` mapping), or the database is unreadable/corrupt
+  at the writer probe;
   6 = the SQLite database is unreadable/corrupt during repair detection.
-  Each refusal names its cause and the `--force` / restore-the-backup
-  remedy.
+  Each refusal names its cause: exits 3 and 4 name `--force` as the
+  override; exits 5 and 6 name stop-the-application /
+  restore-from-backup remedies and always stop the run.
+- Repair mode (the interrupted-run path) only resets rows over an
+  already-empty index, so it neither loads settings nor consults
+  `--force`; an absent LanceDB directory keeps the clean no-op even when
+  rows claim vectors (treated as a wrong path or a fresh deployment).
