@@ -101,6 +101,10 @@ class FakeMemoryStore:
     def detect_memory_intent(self, text: str):
         return self.intent
 
+    def find_memory_by_content(self, content: str, source, vault_id):
+        # Issue #688 idempotency lookup: None means "not stored yet".
+        return None
+
     def add_memory(self, content: str, category=None, tags=None, source=None, vault_id=None):
         self.added.append(content)
         return MemoryRecord(id=1, content=content, category=category, tags=tags, source=source, created_at=None, updated_at=None)

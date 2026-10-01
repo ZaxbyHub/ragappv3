@@ -635,6 +635,17 @@ async def edit_canvas_range(
         logger.warning("canvas: edit-range model call failed uid=%s: %s", artifact_uid, exc)
         raise HTTPException(status_code=502, detail="canvas_model_unavailable") from exc
 
+    # Issue #688: the reply was cut off by the output token budget — splicing
+    # the fragment would record a truncated model_edit version. The chat path
+    # reads the same truncation signal (rag_engine.py FULL-ENH-01).
+    finish_reason = (getattr(client, "last_metrics", None) or {}).get("finish_reason")
+    if finish_reason == "length":
+        logger.info(
+            "canvas: edit-range reply truncated uid=%s finish_reason=length",
+            artifact_uid,
+        )
+        raise HTTPException(status_code=502, detail="canvas_model_truncated")
+
     replacement = _strip_markdown_fences(replacement)
 
     # Pinned splice: split/join on LF only, so untouched lines (including CR
@@ -645,6 +656,15 @@ async def edit_canvas_range(
         + replacement.split("\n")
         + lines[body.end_line :]
     )
+    # Issue #688: an empty reply (after fence stripping) for a selection that
+    # carried content is a model failure, not a deletion instruction —
+    # recording it would corrupt the artifact. A whitespace-only selection
+    # with an empty reply is at most a whitespace collapse, so it keeps the
+    # pre-#688 no-op-version behavior. When the splice emptied the whole
+    # artifact, fall through to _check_content so the fence-only case keeps
+    # its canvas_content_required 422.
+    if not replacement.strip() and selected.strip() and new_content.strip():
+        raise HTTPException(status_code=422, detail="canvas_empty_model_reply")
     _check_content(new_content)
 
     version = await asyncio.to_thread(

@@ -15,7 +15,7 @@ import time
 import uuid
 from contextlib import AsyncExitStack
 from html import escape as _xml_escape
-from typing import Any, Callable, Dict, List, Literal, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Set, Tuple, Union
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
@@ -170,6 +170,12 @@ class ChatResponse(BaseModel):
     # Issue #510 honesty fields (parity with the streaming done payload).
     currency_warnings: Optional[List[str]] = None
     citation_enforcement: Optional[Dict[str, Any]] = None
+    # SC-009 honesty fields, completing the #510 parity comment above (issue
+    # #688): forwarded verbatim from the engine's done chunk, so the typing is
+    # pass-through — the producer's payload shape is the contract (the engine
+    # emits a Dict[str, float]; a scalar must still round-trip untouched).
+    citation_confidence: Optional[Union[Dict[str, Any], float, int]] = None
+    unverifiable_claims: Optional[List[str]] = None
     # Score contract (issue #36, verified against backend producers): chat
     # sources carry "distance" or "rerank" — how the client interprets `score`
     # (polarity + thresholds). The memory/UsedMemory channel has its own
@@ -942,6 +948,10 @@ def stream_chat_response(
         # Issue #510 honesty fields (parity with the nonstream capture)
         currency_warnings: Optional[list] = None
         citation_enforcement: Optional[dict] = None
+        # rag_trace_in_response (issue #688): the engine attaches its RAGTrace
+        # to the done message only when the flag is on; the route forwards it
+        # under the same flag so `trace` stays absent otherwise.
+        trace_payload: Optional[Dict[str, Any]] = None
 
         # Resolve the effective mode the same way RAGEngine does and emit it
         # as the first SSE event so the client can show a per-message badge
@@ -1056,6 +1066,7 @@ def stream_chat_response(
                         unverifiable_claims = chunk.get("unverifiable_claims")
                         currency_warnings = chunk.get("currency_warnings")
                         citation_enforcement = chunk.get("citation_enforcement")
+                        trace_payload = chunk.get("trace")
                         answer_contract = chunk.get("answer_contract")
                         llm_metrics = chunk.get("llm_metrics")
                         # Issue #553 durable turn: capture the done payload's
@@ -1206,6 +1217,13 @@ def stream_chat_response(
             done_payload["currency_warnings"] = currency_warnings
         if citation_enforcement is not None:
             done_payload["citation_enforcement"] = citation_enforcement
+        # Issue #688: forward the engine's opted-in trace. The flag gate is
+        # defense in depth — the engine already attaches `trace` only when
+        # rag_trace_in_response is on, and the constraint is that `trace`
+        # stays absent unless the flag is (even for an engine that always
+        # attaches one).
+        if settings.rag_trace_in_response and trace_payload is not None:
+            done_payload["trace"] = trace_payload
         yield f"data: {json.dumps(done_payload)}\n\n"
 
         # Enqueue post-answer wiki compile job (non-blocking).
@@ -1678,6 +1696,10 @@ async def non_stream_chat_response(
     llm_metrics = None
     currency_warnings = None
     citation_enforcement = None
+    # SC-009 honesty fields (issue #688): same done-chunk keys the streaming
+    # consumer reads, so both response shapes carry identical metadata.
+    citation_confidence = None
+    unverifiable_claims = None
 
     try:
         async for chunk in rag_engine.query(
@@ -1708,6 +1730,8 @@ async def non_stream_chat_response(
                 prompt_version = chunk.get("prompt_version")
                 currency_warnings = chunk.get("currency_warnings")
                 citation_enforcement = chunk.get("citation_enforcement")
+                citation_confidence = chunk.get("citation_confidence")
+                unverifiable_claims = chunk.get("unverifiable_claims")
                 answer_contract = chunk.get("answer_contract")
                 llm_metrics = chunk.get("llm_metrics")
     except RAGEngineError as exc:
@@ -1779,6 +1803,8 @@ async def non_stream_chat_response(
         llm_metrics=llm_metrics,
         currency_warnings=currency_warnings,
         citation_enforcement=citation_enforcement,
+        citation_confidence=citation_confidence,
+        unverifiable_claims=unverifiable_claims,
     )
 
 
@@ -2896,10 +2922,14 @@ async def _auto_name_session(
                             session_id,
                         )
             else:
-                # Title is NULL/empty (untitled session) — update unconditionally
+                # Title is NULL/empty (untitled session) — update with the same
+                # PRR-004 title guard as the sibling writes (issue #688): a
+                # manual rename committed between the SELECT above and this
+                # UPDATE must survive, so only write while the title is still
+                # NULL-or-empty (the branch's own coverage).
                 update_query = """
                     UPDATE chat_sessions SET title = ?, updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ?
+                    WHERE id = ? AND (title IS NULL OR title = '')
                 """
                 cursor = await asyncio.to_thread(
                     conn.execute, update_query, (title, session_id)
@@ -2981,7 +3011,13 @@ async def add_message(
             task.add_done_callback(_background_tasks.discard)
         else:
             auto_title = "New conversation"
-            update_title_query = "UPDATE chat_sessions SET title = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
+            # Same PRR-004 title guard as _auto_name_session's writes (issue
+            # #688): the fallback read session_row earlier, and a manual rename
+            # committed in between must not be overwritten by the default.
+            update_title_query = (
+                "UPDATE chat_sessions SET title = ?, updated_at = CURRENT_TIMESTAMP "
+                "WHERE id = ? AND (title IS NULL OR title = '')"
+            )
             await asyncio.to_thread(
                 conn.execute, update_title_query, (auto_title, session_id)
             )

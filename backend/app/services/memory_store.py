@@ -432,6 +432,52 @@ class MemoryStore:
         )
         return summary
 
+    @with_retry(max_attempts=3, retry_exceptions=(sqlite3.Error,), raise_last_exception=True)
+    def find_memory_by_content(
+        self,
+        content: str,
+        source: str,
+        vault_id: Optional[int],
+    ) -> Optional[MemoryRecord]:
+        """Exact-match lookup for an already-stored memory (issue #688).
+
+        The "remember ..." chat directive persists without an idempotency key;
+        re-sending the same directive for the same vault must not duplicate the
+        row. The key is (content, source, vault_id) with `IS ?` binds so a NULL
+        vault compares NULL-safe. Only non-expiring rows dedupe: the directive
+        itself never sets ``expires_at``, and an expired (or expiring) row is
+        invisible to retrieval and swept by eviction, so confirming it would
+        claim "Memory stored" for a memory the user can never retrieve.
+        Read-only; no FTS involved.
+        """
+        if not content or not content.strip():
+            return None
+        sql = (
+            "SELECT id, content, category, tags, source, vault_id, importance, "
+            "expires_at, created_at, updated_at FROM memories "
+            "WHERE content = ? AND source = ? AND vault_id IS ? "
+            "AND expires_at IS NULL"
+        )
+        conn = self.pool.get_connection()
+        try:
+            row = conn.execute(sql, (content, source, vault_id)).fetchone()
+        finally:
+            self.pool.release_connection(conn)
+        if row is None:
+            return None
+        return MemoryRecord(
+            id=row[0],
+            content=row[1],
+            category=row[2],
+            tags=row[3],
+            source=row[4],
+            vault_id=row[5],
+            importance=float(0.5 if row[6] is None else row[6]),
+            expires_at=row[7],
+            created_at=row[8],
+            updated_at=row[9],
+        )
+
     def add_memory(
         self,
         content: str,
