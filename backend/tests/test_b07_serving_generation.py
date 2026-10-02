@@ -219,8 +219,14 @@ def test_second_begin_refused_while_rebuild_open(tmp_path, monkeypatch):
 def _healthz_body(store):
     from app.main import app
 
-    saved = {k: getattr(app.state, k, None) for k in
-             ("vector_store", "db_pool", "embedding_service", "migrations_ok")}
+    keys = ("vector_store", "db_pool", "embedding_service", "migrations_ok")
+    # Record ABSENCE distinctly from a None value: restoring a previously
+    # absent attribute as None would make it merely present-but-None, which
+    # defeats opt-in fixtures that install state only when the attribute is
+    # missing (conftest.ready_vector_store installs its ready mock only when
+    # app.state lacks vector_store — a None left behind turns later co-worker
+    # chat requests into 503 "Vector store is not initialized").
+    saved = {k: (hasattr(app.state, k), getattr(app.state, k, None)) for k in keys}
     app.state.vector_store = store
     app.state.db_pool = object()
     app.state.embedding_service = object()
@@ -230,8 +236,11 @@ def _healthz_body(store):
         resp = client.get("/api/healthz")
         return resp.status_code, resp.json()
     finally:
-        for key, value in saved.items():
-            setattr(app.state, key, value)
+        for key, (was_present, value) in saved.items():
+            if was_present:
+                setattr(app.state, key, value)
+            elif hasattr(app.state, key):
+                delattr(app.state, key)
 
 
 def test_healthz_warns_instead_of_degrading_during_rebuild():
