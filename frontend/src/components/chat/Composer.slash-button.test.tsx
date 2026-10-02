@@ -55,6 +55,7 @@ vi.mock("@/stores/useVaultStore", () => ({
     vi.fn((selector?: (s: any) => unknown) => {
       const state = {
         activeVaultId: 1,
+        vaults: [{ id: 1, name: "Test Vault", file_count: 1 }],
         getActiveVault: () => ({ id: 1, name: "Test Vault", file_count: 1 }),
       };
       return typeof selector === "function" ? selector(state) : state;

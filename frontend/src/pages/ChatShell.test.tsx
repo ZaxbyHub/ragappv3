@@ -259,6 +259,39 @@ describe("ChatShell Mobile Layout", () => {
     });
   });
 
+  describe("test_chat_column_padded_while_sheet_open", () => {
+    it("chat <main> carries paddingBottom 45vh while the sheet is open below-lg, and none when closed (fb F-4)", () => {
+      // The composer stays above the non-modal sheet only while <main>'s
+      // padding matches the sheet height; pin both states so the two 45vh
+      // literals cannot drift apart silently.
+      mockStoreState.rightPaneOpen = true;
+      mockStoreState.activeRightTab = "evidence";
+      matchMediaMatches = true; // below-lg
+
+      const { unmount } = render(
+        <BrowserRouter>
+          <ChatShell />
+        </BrowserRouter>
+      );
+
+      const chatMain = document.querySelector("main.bg-background");
+      expect(chatMain).not.toBeNull();
+      expect((chatMain as HTMLElement).style.paddingBottom).toBe("45vh");
+      unmount();
+
+      mockStoreState.rightPaneOpen = false;
+      render(
+        <BrowserRouter>
+          <ChatShell />
+        </BrowserRouter>
+      );
+      const closedMain = document.querySelector("main.bg-background");
+      expect(closedMain).not.toBeNull();
+      const pad = (closedMain as HTMLElement).style.paddingBottom;
+      expect(pad === "" || pad === "0px").toBe(true);
+    });
+  });
+
   describe("test_right_pane_sheet_not_mounted_on_desktop", () => {
     it("right pane Sheet (side=bottom) is NOT mounted on desktop (lg+) so the Radix SheetPortal overlay does not dim the viewport", () => {
       mockStoreState.rightPaneOpen = true;

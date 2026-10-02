@@ -390,8 +390,12 @@ export function TranscriptPane({ className, onSessionCreated }: TranscriptPanePr
   const setActiveEditVersion = useChatStore((s) => s.setActiveEditVersion);
   const clearEditVersionsFrom = useChatStore((s) => s.clearEditVersionsFrom);
 
-  const getActiveVault = useVaultStore((s) => s.getActiveVault);
-  const activeVault = getActiveVault();
+  // Reactive active-vault selector (F-2): see the same change in Composer —
+  // selecting getActiveVault never re-renders when `vaults` arrives.
+  // Optional chain per the repo's render-path mock-tolerance convention.
+  const activeVault = useVaultStore((s) =>
+    s.vaults?.find((v) => v.id === s.activeVaultId)
+  );
   const vaultId = useVaultStore((s) => s.activeVaultId);
 
   const authUser = useAuthStore((s) => s.user);
@@ -459,6 +463,25 @@ export function TranscriptPane({ className, onSessionCreated }: TranscriptPanePr
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [messageIds.length]);
 
+  // Viewport-resize re-pin (issue #689 review PRR-003): opening/closing the
+  // below-lg evidence sheet pads <main> by 45vh, which shrinks or grows this
+  // scroll container WITHOUT a scroll event — a bottom-pinned user would
+  // silently end up half a viewport above the newest content. Re-pin on
+  // container size changes when the user is still pinned. (Guarded: jsdom
+  // has no ResizeObserver.)
+  useEffect(() => {
+    if (typeof ResizeObserver === "undefined") return;
+    const el = scrollRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => {
+      if (messageIds.length === 0) return;
+      if (!isAtBottomRef.current || userScrolledUpRef.current) return;
+      el.scrollTo({ top: el.scrollHeight, behavior: "auto" });
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [messageIds.length]);
+
   // Token-growth auto-scroll: triggered when the active streaming message's
   // content length grows. ``messageIds.length`` does not change during
   // streaming, so the previous count-based effect missed every chunk.
@@ -495,7 +518,8 @@ export function TranscriptPane({ className, onSessionCreated }: TranscriptPanePr
         messagesById[id]?.sources?.some((s) => s.id === sourceId) ?? false;
       // Prefer the message the evidence selection came from when it still
       // exists and actually cites the source; otherwise fall back to the
-      // first message citing it (persisted/forked selections have no anchor).
+      // first message citing it (selections whose anchoring message has
+      // left the store have no anchor).
       let msgId: string | null = null;
       if (messageId && messagesById[messageId] && citesSource(messageId)) {
         msgId = messageId;

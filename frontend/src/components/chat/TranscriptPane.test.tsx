@@ -565,14 +565,29 @@ describe("TranscriptPane", () => {
 
   describe("6. Composer hides VaultContextPill when no vault", () => {
     it("does not render vault badge when no active vault", () => {
-      mockGetActiveVault.mockReturnValue(undefined);
+      // F-2: production derives the active vault from vaults+activeVaultId;
+      // model "no active vault" the way the store now represents it.
+      (useVaultStore as unknown as ReturnType<typeof vi.fn>).mockImplementation((selector) => {
+        const state = {
+          vaults: [{ id: 1, name: "Test Vault", file_count: 5 }],
+          activeVaultId: null,
+        };
+        return selector ? selector(state) : state;
+      });
 
       renderComposerWithProviders({ onSend: mockHandleSend, onStop: mockHandleStop, isStreaming: false });
       expect(screen.queryByLabelText(/Active vault:/i)).not.toBeInTheDocument();
     });
 
-    it("does not show vault name in badge when getActiveVault returns undefined", () => {
-      mockGetActiveVault.mockReturnValue(undefined);
+    it("does not show vault name in badge when no vault is active", () => {
+      // F-2: same derivation — no active vault means no badge text.
+      (useVaultStore as unknown as ReturnType<typeof vi.fn>).mockImplementation((selector) => {
+        const state = {
+          vaults: [{ id: 1, name: "Test Vault", file_count: 5 }],
+          activeVaultId: null,
+        };
+        return selector ? selector(state) : state;
+      });
 
       renderComposerWithProviders({ onSend: mockHandleSend, onStop: mockHandleStop, isStreaming: false });
       expect(screen.queryByText("Test Vault")).not.toBeInTheDocument();
@@ -1088,10 +1103,14 @@ describe("TranscriptPane", () => {
     });
 
     it("TranscriptPane renders with empty vault CTA", () => {
-      mockGetActiveVault.mockReturnValue({
-        id: 1,
-        name: "Empty Vault",
-        file_count: 0,
+      // F-2: an active vault with zero indexed docs drives the CTA via the
+      // vaults+activeVaultId derivation now.
+      (useVaultStore as unknown as ReturnType<typeof vi.fn>).mockImplementation((selector) => {
+        const state = {
+          vaults: [{ id: 1, name: "Empty Vault", file_count: 0 }],
+          activeVaultId: 1,
+        };
+        return selector ? selector(state) : state;
       });
 
       render(<TranscriptPane />);

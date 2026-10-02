@@ -1015,3 +1015,7 @@ export function RightPane() {
 }
 
 export default RightPane;
+
+// Test seam (MermaidDiagramTestInternals precedent): lets the feedback-round
+// id tests pin the exact structural-id derivation without rendering the pane.
+export const RightPaneTestInternals = { extractStructuredOutputs };

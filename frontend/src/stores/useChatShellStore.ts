@@ -83,11 +83,13 @@ const persistPinnedSessions = (ids: number[]): boolean => {
   }
 };
 
-// The session rail defaults open only at >=lg (1024px). Between md and lg the
-// expanded nav rail (240px) plus a 320px session rail leaves the chat column
-// ~208px (issue #689 / UI-R1-03); below lg the rail starts closed and the
-// user can still open it from its toggle. SSR/jsdom (innerWidth 1024) sees
-// the same open default as before.
+// The session rail defaults open only at >=lg (1024px) — the same breakpoint
+// ChatShell's useIsMobile(1024) uses for the below-lg evidence sheet. Between
+// md and lg the expanded nav rail (240px) plus a 320px session rail leaves
+// the chat column ~208px (issue #689 / UI-R1-03), so below lg the rail
+// starts CLOSED by default; the user can still open it from its toggle at
+// any width (reopening it at 768px narrows the column again — user choice).
+// SSR/jsdom (innerWidth 1024) sees the same open default as before.
 const isDesktopViewport = () => {
   if (typeof window === "undefined") return true;
   return window.innerWidth >= 1024;

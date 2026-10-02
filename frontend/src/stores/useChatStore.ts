@@ -513,8 +513,9 @@ export const useSourcesForSourceId = (
           return clicked.sources;
         }
       }
-      // Fallback for persisted/forked selections without a live anchor: the
-      // first message citing the chunk.
+      // Fallback for selections whose anchoring message is no longer in the
+      // store (removed by truncate/fork/edit), which leave the source
+      // selected with no live anchor message id.
       for (let i = 0; i < s.messageIds.length; i++) {
         const msg = s.messagesById[s.messageIds[i]];
         const found = msg?.sources?.some((src) => src.id === sourceId);

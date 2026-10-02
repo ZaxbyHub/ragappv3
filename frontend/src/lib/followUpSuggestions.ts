@@ -23,7 +23,10 @@ const LEADING_IMPERATIVES = new Set([
 ]);
 
 /** Cap the topic at `max` chars on a word boundary — no trailing ellipsis,
- * which read as mid-phrase truncation inside the chip text (UI-R1-04). */
+ * which read as mid-phrase truncation inside the chip text (UI-R1-04). A
+ * single word longer than `max` has no internal boundary, so it is kept
+ * whole rather than hard-cut mid-word; the 80-char candidate filter in
+ * deriveFollowUps still bounds every shipped suggestion. */
 function capAtWordBoundary(text: string, max: number): string {
   if (text.length <= max) return text;
   const words = text.split(" ");
@@ -33,7 +36,7 @@ function capAtWordBoundary(text: string, max: number): string {
     if (candidate.length > max) break;
     out = candidate;
   }
-  return out || text.slice(0, max).trimEnd();
+  return out || text;
 }
 
 /** Trim to a short topic phrase suitable for embedding in a question. */
@@ -46,13 +49,23 @@ function topicFrom(userContent: string): string {
     .trim();
   if (!cleaned) return "";
   let words = cleaned.split(" ");
-  // Strip ONE leading imperative verb before the filler loop so
-  // "Explain what X does" still loses its interrogative tail words.
-  if (words.length > 1 && LEADING_IMPERATIVES.has(words[0].toLowerCase())) {
+  // Strip ONE leading imperative verb — even when it is the only word, so a
+  // bare "Explain." cannot resurface as "risks around Explain" (PRR-002).
+  // After an imperative, skip the leading-filler loop: the following words
+  // are the sentence's OBJECT, not interrogative scaffolding, and eating
+  // them garbles the chip ("Compare A and B" must keep its "A" — F-5).
+  let strippedImperative = false;
+  if (
+    words.length > 0 &&
+    LEADING_IMPERATIVES.has(words[0].toLowerCase())
+  ) {
     words = words.slice(1);
+    strippedImperative = true;
   }
-  while (words.length > 1 && LEADING_FILLERS.has(words[0].toLowerCase())) {
-    words = words.slice(1);
+  if (!strippedImperative) {
+    while (words.length > 1 && LEADING_FILLERS.has(words[0].toLowerCase())) {
+      words = words.slice(1);
+    }
   }
   if (words.length <= 8) {
     // Char-cap the topic too: an 8-word topic can still exceed the 80-char

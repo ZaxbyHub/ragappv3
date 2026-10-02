@@ -191,8 +191,14 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
     return () => clearInterval(handle);
   }, [refreshLlmHealth]);
 
-  const getActiveVault = useVaultStore((s) => s.getActiveVault);
-  const activeVault = getActiveVault();
+  // Reactive active-vault selector (F-2): selecting the store's stable
+  // getActiveVault function never re-renders when `vaults` arrives or
+  // changes; deriving the vault here keeps the badge/empty-state in sync.
+  // Optional chain is the repo's render-path convention for partial store
+  // mocks (some suites' mock states predate the vaults field).
+  const activeVault = useVaultStore((s) =>
+    s.vaults?.find((v) => v.id === s.activeVaultId)
+  );
   const activeVaultId = useVaultStore((s) => s.activeVaultId);
 
   // Slash command menu
