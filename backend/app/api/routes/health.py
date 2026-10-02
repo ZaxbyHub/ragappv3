@@ -354,9 +354,23 @@ async def healthz(request: Request):
     elif not getattr(vector_store, "table", None):
         issues.append("vector_store not connected")
     elif not getattr(vector_store, "_ready", True):
-        issues.append(
-            "vector_store not ready (embedding model mismatch - reindex required)"
-        )
+        if getattr(vector_store, "rebuild_in_progress", False) is True:
+            # Serving the previous generation while a staged rebuild builds
+            # the next one (issue #696) — the readiness gate admits queries,
+            # so healthz must not report degraded for the same state. The
+            # strict singleton-bool probe matches require_model_ready's.
+            warnings.append(
+                "serving previous embedding generation during staged rebuild"
+            )
+            if not getattr(vector_store, "_draining_embedding_config", None):
+                warnings.append(
+                    "query embedding identity unpinned - degraded dense "
+                    "retrieval until cutover"
+                )
+        else:
+            issues.append(
+                "vector_store not ready (embedding model mismatch - reindex required)"
+            )
     if not getattr(state, "embedding_service", None):
         issues.append("embedding_service not initialized")
     pool = getattr(state, "db_pool", None)
