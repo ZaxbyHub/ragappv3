@@ -687,13 +687,17 @@ def _resolve_page_enrichment(
     """
     from app.config import settings
 
-    needed_vaults = {
-        row["vault_id"]
-        for row in rows
-        if row["vault_id"] is not None
-        and (row["enrichment_enabled"] if "enrichment_enabled" in row.keys() else None)
-        is None
-    }
+    def _needs_resolution(row: sqlite3.Row) -> bool:
+        keys = row.keys()
+        if "vault_id" not in keys or "id" not in keys:
+            return False
+        if row["vault_id"] is None:
+            return False
+        return (
+            row["enrichment_enabled"] if "enrichment_enabled" in keys else None
+        ) is None
+
+    needed_vaults = {row["vault_id"] for row in rows if _needs_resolution(row)}
     if not needed_vaults:
         return {}
     vault_overrides: dict = {vid: settings.chunk_enrichment_enabled for vid in needed_vaults}
@@ -707,16 +711,20 @@ def _resolve_page_enrichment(
         vault_overrides.update({int(r[0]): bool(r[1]) for r in override_rows})
     except sqlite3.Error:
         # Vault lookup failed for the batch: the pre-seeded global defaults
-        # stand for every vault id, matching the helpers' DB-error fallback
-        # (which additionally logs at WARNING there).
-        pass
+        # stand for every vault id, matching the helpers' DB-error fallback —
+        # logged, never silent, because an explicit vault opt-out may be
+        # overridden here (issue #697 / T1-25-KR-17).
+        logger.warning(
+            "Batched vault enrichment override lookup failed for %d vault(s) "
+            "(vault_ids=%s); falling back to the global "
+            "chunk_enrichment_enabled setting",
+            len(needed_vaults),
+            sorted(needed_vaults),
+            exc_info=True,
+        )
     result: dict = {}
     for row in rows:
-        if (
-            row["vault_id"] is not None
-            and (row["enrichment_enabled"] if "enrichment_enabled" in row.keys() else None)
-            is None
-        ):
+        if _needs_resolution(row):
             result[row["id"]] = vault_overrides[row["vault_id"]]
     return result
 

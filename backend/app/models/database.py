@@ -772,18 +772,19 @@ CREATE INDEX IF NOT EXISTS idx_failed_chunks_file_id ON failed_chunks(file_id);
 -- model-independent) and pre-column legacy rows (stamped by the migration).
 -- `group_id` is shared across near-duplicate files in the same vault (cosine
 -- of centroids >= settings.near_dup_threshold); `similarity` stores the cosine
--- against the matched row. Also created for existing databases by
--- migrate_add_document_near_dups.
+-- against the matched row. `embedding_model` is declared LAST so fresh CREATEs
+-- and the migration's appends-at-end ALTER TABLE place it at the same ordinal.
+-- Also created for existing databases by migrate_add_document_near_dups.
 CREATE TABLE IF NOT EXISTS document_near_dups (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     vault_id INTEGER NOT NULL,
     file_id INTEGER NOT NULL UNIQUE,
     centroid BLOB NOT NULL,
     dim INTEGER NOT NULL,
-    embedding_model TEXT,
     group_id TEXT,
     similarity REAL,
-    computed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    computed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    embedding_model TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_near_dups_vault ON document_near_dups(vault_id);
 
@@ -4909,10 +4910,10 @@ def migrate_add_document_near_dups(sqlite_path: str) -> None:
                 file_id INTEGER NOT NULL UNIQUE,
                 centroid BLOB NOT NULL,
                 dim INTEGER NOT NULL,
-                embedding_model TEXT,
                 group_id TEXT,
                 similarity REAL,
-                computed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                computed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                embedding_model TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_near_dups_vault ON document_near_dups(vault_id);

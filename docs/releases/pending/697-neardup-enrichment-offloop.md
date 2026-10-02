@@ -72,11 +72,15 @@
 
 - **One-time marking wave.** On the first ingests after deploying this change,
   each vault's unmatched files (no row, or a stale row) are fingerprinted once
-  — up to `MAX_COMPARE = 500` tokenizations per ingest, on a worker thread
-  under the shared write permit — until they carry marker rows. Per-ingest
-  work then converges to ONE fingerprint (the ingested file's own text) plus
-  bounded numpy comparisons. The same one-time wave recurs per vault after any
-  future embedding-model change.
+  — up to `MAX_COMPARE = 500` full-text reads + tokenizations per ingest, on a
+  worker thread under the shared write permit — until they carry marker rows.
+  After marking converges, a later ingest transfers only each candidate's
+  small stored fingerprint blob (~1 KB, bounded by MAX_COMPARE), never the
+  marked files' full `parsed_text` (the candidate SELECT returns NULL text for
+  stored-fingerprint rows); full texts are read only for first-time compute
+  candidates, and per-ingest work is ONE fingerprint (the ingested file's own
+  text) plus bounded numpy comparisons. The same one-time wave recurs per
+  vault after any future embedding-model change.
 - **Backfill stamp is migration-time, not provenance.** Legacy non-fingerprint
   rows are stamped with the currently-configured model at migration time. A
   deployment that switched embedding models before upgrading keeps that cohort

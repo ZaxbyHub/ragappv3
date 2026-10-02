@@ -210,9 +210,16 @@ def record_file_centroid(
             fingerprint = _text_fingerprint(document_text)
             if fingerprint is not None:
                 try:
+                    # Scan-marked files (stored fingerprints) must not pay the
+                    # full-text transfer again on every later ingest (issue
+                    # #697): for those rows parsed_text is selected as NULL so
+                    # the blob is the only payload materialized; first-time
+                    # compute candidates still need their full text.
                     candidates = conn.execute(
-                        "SELECT files.id, files.parsed_text, nd.centroid, "
-                        "nd.group_id, nd.embedding_model, nd.dim "
+                        "SELECT files.id, "
+                        "CASE WHEN nd.dim = ? AND nd.embedding_model IS NULL "
+                        "THEN NULL ELSE files.parsed_text END, "
+                        "nd.centroid, nd.group_id, nd.embedding_model, nd.dim "
                         "FROM files LEFT JOIN document_near_dups nd "
                         "ON nd.file_id = files.id "
                         "WHERE files.vault_id = ? AND files.parsed_text IS NOT NULL "
@@ -221,7 +228,14 @@ def record_file_centroid(
                         "WHERE c.file_id = files.id AND c.embedding_model = ? "
                         "AND c.dim = ?) "
                         "ORDER BY files.id DESC LIMIT ?",
-                        (vault_id, file_id, model, dim, MAX_COMPARE),
+                        (
+                            FINGERPRINT_DIM,
+                            vault_id,
+                            file_id,
+                            model,
+                            dim,
+                            MAX_COMPARE,
+                        ),
                     ).fetchall()
                 except sqlite3.Error:
                     # Pre-parsed_text schema shape: the fallback is advisory,
@@ -240,6 +254,12 @@ def record_file_centroid(
                             other_fingerprint = stored
                     needs_mark = other_fingerprint is None
                     if other_fingerprint is None:
+                        if parsed_text is None:
+                            # A stored-fingerprint row whose blob failed the
+                            # shape check: no text was fetched for it, and a
+                            # corrupt fingerprint is not worth re-deriving —
+                            # leave it for a future re-scan wave.
+                            continue
                         other_fingerprint = _text_fingerprint(str(parsed_text))
                     if other_fingerprint is None:
                         continue
@@ -266,11 +286,18 @@ def record_file_centroid(
             similarity_to_store: float | None = best_similarity
         elif text_backfill:
             # No live-centroid match, but similar documents were found by
-            # text: reuse the best match's existing group when it has one,
-            # else mint the shared group and give each of them a fingerprint
-            # row so the advisory link is queryable both ways.
+            # text: reuse the best match's existing group when it has one
+            # (highest cosine first, so the pair's group follows its closest
+            # member), else mint the shared group and give each of them a
+            # fingerprint row so the advisory link is queryable both ways.
             group_id = next(
-                (g for _oid, _fp, _sim, g in text_backfill if g is not None),
+                (
+                    g
+                    for _oid, _fp, _sim, g in sorted(
+                        text_backfill, key=lambda entry: entry[2], reverse=True
+                    )
+                    if g is not None
+                ),
                 uuid4().hex,
             )
             similarity_to_store = max(sim for _oid, _fp, sim, _g in text_backfill)
