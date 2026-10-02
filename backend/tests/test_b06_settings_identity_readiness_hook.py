@@ -10,7 +10,11 @@ cannot be edited post-freeze, so the plan critic's remaining gaps live here:
 * POST + ``embedding_doc_prefix`` (the frozen prefix check covers PUT only);
 * ``embedding_query_prefix``-only PUT (the third identity field);
 * missing-store tolerance — with no ``app.state.vector_store`` the save still
-  succeeds and the hook no-ops.
+  succeeds and the hook no-ops;
+* no-op and boundary guards — POST same-value save, same-prefix save,
+  whitespace-padded model (validator strips to the current value), a
+  ``null``-filtered prefix field, an unrelated field, a store lacking the
+  ``_ready`` attribute, and ``embedding_dim`` not being settings-updatable.
 """
 
 import os
@@ -208,7 +212,7 @@ def test_query_prefix_only_change_flips_readiness(ready_store_client):
     assert _gate_status() == 503
 
 
-def test_identity_save_without_vector_store_still_succeeds(monkeypatch):
+def test_identity_save_without_vector_store_still_succeeds():
     """With no app.state.vector_store installed, an identity-changing save
     must still succeed (200) and the hook must no-op — nothing else in the
     handler needs the store (issue #695)."""
@@ -259,3 +263,104 @@ def test_identity_save_without_vector_store_still_succeeds(monkeypatch):
             conn.commit()
         finally:
             test_pool.release_connection(conn)
+
+
+def test_post_same_embedding_model_keeps_readiness(ready_store_client):
+    """A redundant POST of the same embedding_model must keep the store ready
+    — the POST handler's no-op guard is a separate code copy from the PUT
+    one, so it is pinned on its own (issue #695)."""
+    client, store = ready_store_client
+    resp = client.post(
+        "/api/settings", json={"embedding_model": settings.embedding_model}
+    )
+    assert resp.status_code == 200, resp.text
+    assert store._ready is True
+    assert _gate_status() == 200
+
+
+def test_put_same_doc_prefix_keeps_readiness(ready_store_client):
+    """Re-saving the current embedding_doc_prefix must not flip readiness —
+    the no-op guard covers every identity field, not just the model
+    (issue #695)."""
+    client, store = ready_store_client
+    resp = client.put(
+        "/api/settings",
+        json={"embedding_doc_prefix": settings.embedding_doc_prefix or ""},
+    )
+    assert resp.status_code == 200, resp.text
+    assert store._ready is True
+    assert _gate_status() == 200
+
+
+def test_put_whitespace_padded_model_keeps_readiness(ready_store_client):
+    """A whitespace-padded model name strips to the current value before it
+    is applied, so the effective identity is unchanged and the store must
+    stay ready (issue #695)."""
+    client, store = ready_store_client
+    resp = client.put(
+        "/api/settings",
+        json={"embedding_model": f"  {settings.embedding_model}  "},
+    )
+    assert resp.status_code == 200, resp.text
+    assert store._ready is True
+    assert _gate_status() == 200
+
+
+def test_unrelated_field_save_keeps_readiness(ready_store_client):
+    """Saving a field outside the embedding identity must never flip the
+    store (canary against an over-eager identity comparison, issue #695)."""
+    client, store = ready_store_client
+    resp = client.put("/api/settings", json={"auto_scan_enabled": True})
+    assert resp.status_code == 200, resp.text
+    assert store._ready is True
+    assert _gate_status() == 200
+
+
+def test_identity_save_with_store_lacking_ready_attr(ready_store_client):
+    """A store object without a ``_ready`` attribute must be left untouched:
+    the hook's guard no-ops silently instead of raising or pinning a new
+    attribute onto it (issue #695)."""
+    client, _real_store = ready_store_client
+
+    class _BareStore:
+        pass
+
+    bare = _BareStore()
+    app.state.vector_store = bare
+    resp = client.put(
+        "/api/settings", json={"embedding_model": settings.embedding_model + "-x"}
+    )
+    assert resp.status_code == 200, resp.text
+    assert not hasattr(bare, "_ready")
+
+
+def test_null_prefix_field_does_not_flip_readiness(ready_store_client):
+    """A ``null`` prefix field is filtered out before the apply (only
+    non-None values are validated/applied), so a payload of null + the
+    unchanged model must not flip the store. The current prefix is made
+    non-empty first so the assertion is discriminating: if the None filter
+    were ever removed, ``None`` would coerce to ``""`` (via the identity
+    tuple's ``str(x or "")``), differ from the configured prefix, and flip
+    the store — failing this test (issue #695)."""
+    client, store = ready_store_client
+    settings.embedding_doc_prefix = "review-pfx"
+    resp = client.put(
+        "/api/settings",
+        json={"embedding_doc_prefix": None, "embedding_model": settings.embedding_model},
+    )
+    assert resp.status_code == 200, resp.text
+    assert store._ready is True
+    assert _gate_status() == 200
+
+
+def test_embedding_dim_is_not_settings_updatable():
+    """Structural pin for the identity tuple: ``embedding_dim`` is compared
+    by ``validate_schema`` but deliberately absent from
+    ``_effective_embedding_identity`` — safe only while it cannot be changed
+    through the settings API. If this pin ever fails, the identity tuple in
+    ``_effective_embedding_identity`` must grow the dimension (issue #695
+    review follow-up)."""
+    from app.api.routes.settings import ALLOWED_FIELDS, SettingsUpdate
+
+    assert "embedding_dim" not in ALLOWED_FIELDS
+    assert "embedding_dim" not in SettingsUpdate.model_fields

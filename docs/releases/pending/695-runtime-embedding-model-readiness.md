@@ -41,7 +41,26 @@
 - **`backend/tests/test_b06_settings_identity_readiness_hook.py`** — hook
   coverage beyond the frozen module: the flip survives a failing
   `_hot_rebind_llm_clients` (ordering pin), POST + `embedding_doc_prefix`,
-  `embedding_query_prefix`-only change, and missing-store tolerance.
+  `embedding_query_prefix`-only change, missing-store tolerance, and the
+  no-op/boundary guards (same-value saves incl. whitespace-stripped and
+  `null`-filtered fields, an unrelated field, a store without a `_ready`
+  attribute, `embedding_dim` not being settings-updatable).
+
+### Operator caveats
+
+- **Multi-worker deployments:** the readiness flip (like every runtime
+  settings change) is per-process. Under `uvicorn --workers N` or multiple
+  replicas, only the worker that served the save gates with 503; siblings
+  keep serving until they are restarted or re-save the change themselves.
+  This is incomplete protection, not a regression — before this change every
+  worker served the mismatch silently. Single-process is the default
+  topology.
+- **`/api/healthz` reports 503 while the store is not-ready** (same state as
+  the restart-time mismatch). Do not wire a liveness probe, autoheal, or a
+  self-healing container policy to `healthz` across an identity change — a
+  restart cannot clear the 503 (see recovery semantics above) and a
+  restart-loop would kill the remediation reindex. Readiness/track that
+  signal with `startupProbe`-style semantics or alert on it instead.
 
 ### Known out-of-scope races (owned by the zero-downtime switchover work)
 
@@ -49,9 +68,13 @@
   recording the live identity and unconditionally calling `mark_ready(True)`,
   re-opening the mismatch window; because the completion records the live
   identity, a later restart no longer detects the mismatch either — the
-  mixed index stays queryable until a full re-embed. Owned by #696
-  ([Workstream B] PR 7) and #736 (Workstream G PR 4), which this PR
-  deliberately does not implement (no dual-embedder serving).
+  mixed index stays queryable until a full re-embed. A vault-scoped reindex
+  that begins after the change has the same effect (it also restores
+  readiness over a mixed index). Both races are recorded on #696
+  ([Workstream B] PR 7, see the tracking comment on that issue); #736
+  (Workstream G PR 4) additionally covers the ungated-ingestion residual.
+  This PR deliberately does not implement the switchover or a
+  completion-time guard (no dual-embedder serving).
 - Upload/ingest paths are not `require_model_ready`-gated; documents ingested
   during the not-ready window still embed under the new model into the old
   index (pre-existing behavior, outside this issue's query-vector invariant).

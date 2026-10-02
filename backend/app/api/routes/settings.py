@@ -1515,7 +1515,11 @@ def _effective_embedding_identity() -> tuple[str, str, str]:
 
     Prefixes use the same falsy-to-empty-string normalization as
     ``VectorStore._compute_embedding_prefix_hash`` so ``None`` and ``""``
-    compare equal — a None<->"" write is not an identity change.
+    compare equal — a None<->"" write is not an identity change. This tuple
+    must stay in lockstep with ``validate_schema``'s compared identity
+    (model id, dim, prefix hash): ``embedding_dim`` is deliberately absent
+    only because it is not a settings-updatable field (not in
+    ALLOWED_FIELDS) — if that ever changes, this tuple must grow too.
     """
     return (
         settings.embedding_model,
@@ -1531,7 +1535,8 @@ def _invalidate_vector_store_readiness(app) -> None:
     mismatches new-model query vectors against document vectors embedded by
     the old model until the next restart (``validate_schema``). Mirror the
     restart-time mismatch handling here so ``require_model_ready`` returns
-    503 until an admin reindex that begins after the change completes.
+    503 until an all-vault reindex that begins after the change completes
+    (a vault-scoped reindex also lifts the gate, over a mixed index).
     """
     store = getattr(app.state, "vector_store", None)
     if store is None or not hasattr(store, "_ready"):
