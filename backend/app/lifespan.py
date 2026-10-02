@@ -639,6 +639,15 @@ async def lifespan(app: FastAPI):
         await _validate_tei_embedding_model(app.state.embedding_service)
 
     app.state.vector_store = VectorStore()
+    # Zero-downtime switchover wiring (issue #696): while a staged rebuild is
+    # open on the store, the embedding service pins embed_single/embed_passage
+    # to the SERVING generation's identity (the draining snapshot captured at
+    # the identity-changing settings save) so queries keep landing in the old
+    # generation's embedding space until cutover. embed_batch (which builds
+    # the new generation) is deliberately unpinned.
+    app.state.embedding_service.set_serving_identity_provider(
+        app.state.vector_store.serving_embedding_identity
+    )
     # Critical: fail fast if the vector store cannot connect or initialize its table.
     # Without these two, no search or ingestion is possible.
     await asyncio.wait_for(app.state.vector_store.connect(), timeout=15)

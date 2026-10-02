@@ -268,6 +268,45 @@ class AtomEnrichmentTaskItem:
     attempt: int = 0
 
 
+async def _embedding_identity_changed(vector_store: object) -> bool:
+    """True when the live table's recorded embedding identity differs from
+    the configured one — the #695/#834 readiness-flip condition (issue #696).
+
+    Shape-probed so every existing harness takes a defined branch: a store
+    without ``get_embedding_metadata`` (test_issue229 / test_b02 stubs) or
+    whose call fails or returns a non-dict (MagicMock auto-attributes) reads
+    as NOT changed — the legacy dimension-only routing. A real store whose
+    recorded model id or prefix hash differs from live settings reads as
+    changed, which routes same-dimension model changes through the staged
+    rebuild instead of rewriting the live table in place.
+    """
+    get_meta = getattr(vector_store, "get_embedding_metadata", None)
+    if get_meta is None:
+        return False
+    try:
+        meta = await get_meta()
+    except Exception:  # noqa: BLE001 - probe must never fail the job
+        return False
+    if not isinstance(meta, dict):
+        return False
+    stored_model = meta.get("embedding_model_id")
+    if not isinstance(stored_model, str) or not stored_model:
+        # No recorded identity: validate_schema's no_stored_identifier branch
+        # owns that readiness state; routing stays dimension-only.
+        return False
+    if stored_model != str(settings.embedding_model or ""):
+        return True
+    stored_hash = meta.get("embedding_prefix_hash")
+    hash_fn = getattr(vector_store, "_compute_embedding_prefix_hash", None)
+    if isinstance(stored_hash, str) and stored_hash and callable(hash_fn):
+        try:
+            if stored_hash != str(hash_fn()):
+                return True
+        except Exception:  # noqa: BLE001 - probe must never fail the job
+            return False
+    return False
+
+
 class BackgroundProcessor:
     """
     Background task processor using asyncio.Queue for document ingestion.
@@ -3531,7 +3570,24 @@ class BackgroundProcessor:
         rebuild (issue #513 W13) commits only when ALL files succeed and is
         aborted otherwise; stored model identity is updated (and its failure
         fails the job) before ``completed`` is reported.
+
+        Issue #696 extends the staged path to same-dimension MODEL-identity
+        changes (the live table is never rewritten in place under a new
+        embedder) and guards the job against mid-run identity moves: the
+        identity is snapshotted at job start, re-checked before commit (a
+        changed identity aborts the staged rebuild — never commit a
+        mixed-generation table) and at completion (skip the metadata write +
+        readiness lift so the mismatch stays detectable).
         """
+        def _job_identity() -> tuple[str, str, str]:
+            # R1 snapshot basis: the raw identity triple as the settings-side
+            # readiness hook compares it (#695) — model + prefixes.
+            return (
+                str(settings.embedding_model or ""),
+                str(settings.embedding_doc_prefix or ""),
+                str(settings.embedding_query_prefix or ""),
+            )
+
         try:
             # Select files to reindex
             async with self.processor.pool.connection_async() as conn:
@@ -3559,9 +3615,14 @@ class BackgroundProcessor:
             # routed into a rebuild temp table and the live index is replaced
             # by a validated atomic swap only after ALL files succeed. On any
             # failure the temp table is dropped and the old index is preserved.
+            # Issue #696: a same-dimension embedding-IDENTITY change (the
+            # live table was recorded under a different model/prefix set —
+            # the #695/#834 readiness-flip case) routes through the same
+            # staged path instead of rewriting the live table in place.
             vector_store = self.processor.vector_store
             rebuild_handle = None
             probe_dim: Optional[int] = None
+            job_start_identity = _job_identity()
             if vector_store is not None and vaults_files:
                 emb_service = self.processor.embedding_service
                 if emb_service is not None:
@@ -3576,32 +3637,58 @@ class BackgroundProcessor:
                     if probe_embeddings and probe_embeddings[0] is not None:
                         probe_dim = len(probe_embeddings[0])
                 live_dim = await vector_store.get_live_embedding_dim()
-                if probe_dim is not None and live_dim is not None and probe_dim != live_dim:
+                identity_changed = await _embedding_identity_changed(vector_store)
+                dim_changed = (
+                    probe_dim is not None and live_dim is not None and probe_dim != live_dim
+                )
+                if dim_changed or identity_changed:
                     if vault_id is not None:
-                        # [issue #691 review] A vault-scoped reindex re-embeds
-                        # only its own vault's files, but the rebuild commit
-                        # swaps the GLOBAL chunks table: every other vault's
-                        # indexed files would lose their vectors while their
-                        # rows still say status='indexed' — the same defect
-                        # class as the bare-call wipe this PR removes. Refuse
-                        # the dimension migration for vault-scoped jobs; a
-                        # full (all-vaults) reindex owns it.
+                        # [issue #691 review, extended to identity changes by
+                        # #696] A vault-scoped reindex re-embeds only its own
+                        # vault's files, but the rebuild commit swaps the
+                        # GLOBAL chunks table: every other vault's indexed
+                        # files would lose their vectors while their rows
+                        # still say status='indexed' — the same defect class
+                        # as the bare-call wipe this PR removes. Refuse the
+                        # migration for vault-scoped jobs; a full (all-vaults)
+                        # reindex owns it. This also closes tracked race R2
+                        # (#696 comment 5946440228): a vault-scoped reindex
+                        # after an identity change can no longer lift the
+                        # readiness gate over a mixed index.
+                        if dim_changed:
+                            reason = (
+                                f"embedding dimension changed ({live_dim} -> "
+                                f"{probe_dim})"
+                            )
+                        else:
+                            reason = "embedding model identity changed"
                         raise VectorStoreError(
-                            f"embedding dimension changed ({live_dim} -> "
-                            f"{probe_dim}): a vault-scoped reindex cannot "
-                            f"migrate the index because the rebuild swaps the "
-                            f"whole vector index while re-embedding only this "
+                            f"{reason}: a vault-scoped reindex cannot migrate "
+                            f"the index because the rebuild swaps the whole "
+                            f"vector index while re-embedding only this "
                             f"vault's files. Run a full reindex (all vaults) "
-                            f"at the new dimension instead."
+                            f"instead."
+                        )
+                    if probe_dim is None:
+                        # Identity changed but no probe ran (embedding service
+                        # unavailable): staging needs the target dimension and
+                        # an in-place rewrite is exactly what #696 removes.
+                        raise VectorStoreError(
+                            "embedding identity changed but the embedding "
+                            "service is unavailable; re-run the reindex when "
+                            "the embedding service is reachable"
                         )
                     rebuild_handle = await vector_store.begin_dimension_rebuild(probe_dim)
                     logger.info(
-                        "Reindex job %d: embedding dimension %d != live table "
-                        "dimension %d — rebuilding into temp table '%s' "
+                        "Reindex job %d: %s — rebuilding into temp table '%s' "
                         "(live index untouched until commit)",
                         job_id,
-                        probe_dim,
-                        live_dim,
+                        (
+                            f"embedding dimension {probe_dim} != live table "
+                            f"dimension {live_dim}"
+                            if dim_changed
+                            else "embedding model identity changed at equal dimension"
+                        ),
                         getattr(rebuild_handle, "table_name", "?"),
                     )
 
@@ -3610,6 +3697,7 @@ class BackgroundProcessor:
             processed_files = 0
             failed_files = 0
             failed_details: list[str] = []
+            commit_attempted = False
 
             try:
                 for vault_id_sorted in sorted(vaults_files.keys()):
@@ -3644,21 +3732,54 @@ class BackgroundProcessor:
                             failed_details.append(f"file_id={file_id}: {exc}")
                             continue
 
-                # Same-dimension reindex: nothing to swap; unchanged behavior.
+                # A staged rebuild (dimension OR same-dimension identity
+                # change, issue #696) swaps only on full success.
                 if rebuild_handle is not None:
                     if failed_files > 0:
                         raise VectorStoreError(
                             f"dimension rebuild aborted: {failed_files}/{total_files} "
                             f"file(s) failed to re-embed at dimension {probe_dim}"
                         )
+                    if _job_identity() != job_start_identity:
+                        # R1 guard (#696 comment 5946440228): the live
+                        # identity moved underneath this job (an admin saved a
+                        # new embedding model mid-run). Rows already staged
+                        # were embedded under the old identity and later ones
+                        # under the new — committing would build a
+                        # mixed-generation table. Abort so the previous
+                        # generation stays fully intact and intact-detectable.
+                        raise VectorStoreError(
+                            "embedding identity changed during reindex; the "
+                            "staged rebuild was aborted so no mixed-generation "
+                            "table is committed. Re-run the reindex job."
+                        )
+                    commit_attempted = True
                     await vector_store.commit_dimension_rebuild(rebuild_handle)
                     rebuild_handle = None
-            except Exception:
+            except BaseException:
                 # Old index preserved: drop the temp table, then let the outer
-                # handler fail the job.
+                # handler fail the job. EXCEPT when the failure came from
+                # commit_dimension_rebuild itself (#696): after the live-table
+                # drop the temp table is the RECOVERY artifact the commit's
+                # CRITICAL log names — dropping it would destroy the only
+                # complete replacement copy. It must be promoted manually
+                # before any re-run (the next begin drops it as stale).
+                # BaseException (not Exception) so cancellation (shutdown)
+                # also aborts an open rebuild instead of leaking the flag and
+                # stranding the staged table until process exit.
                 if rebuild_handle is not None:
-                    await vector_store.abort_dimension_rebuild(rebuild_handle)
-                    rebuild_handle = None
+                    if commit_attempted:
+                        logger.critical(
+                            "Reindex job %d: dimension rebuild commit failed; "
+                            "temp table '%s' is PRESERVED as the recovery "
+                            "artifact (promote it manually before re-running "
+                            "the reindex).",
+                            job_id,
+                            getattr(rebuild_handle, "table_name", "?"),
+                        )
+                    else:
+                        await vector_store.abort_dimension_rebuild(rebuild_handle)
+                        rebuild_handle = None
                 raise
 
             # Determine final job status and result
@@ -3680,14 +3801,88 @@ class BackgroundProcessor:
             # left in a mismatched state on restart (metadata not persisted
             # but job reported as completed). After a committed dimension
             # rebuild (W13) the recorded dim is the probe-observed dim the
-            # new index was actually built at.
+            # new index was actually built at. Issue #696 adds the R1
+            # completion guard: if the live identity moved underneath the
+            # job (in-flight settings save), skip BOTH the metadata write and
+            # the readiness lift — the sidecar stays uncorrupted so the
+            # mismatch remains detectable, and a re-run rebuilds cleanly.
             try:
                 vector_store = self.processor.vector_store
                 if vector_store is not None:
+                    if _job_identity() != job_start_identity:
+                        # Identity moved between job start and completion. On
+                        # the staged path the (old-identity) drain snapshot is
+                        # now stale relative to the COMMITTED table — clear it
+                        # so an automatic retry cannot pin the OLD model
+                        # against the NEW table (PRR-009's chain, sibling of
+                        # the 3852 branch). On the in-place path there is no
+                        # snapshot; the table may hold a mixed in-place
+                        # rewrite, which the surfaced 503 state already gates.
+                        if commit_attempted:
+                            try:
+                                clear_moved = getattr(
+                                    vector_store,
+                                    "clear_draining_embedding_config",
+                                    None,
+                                )
+                                if callable(clear_moved):
+                                    await clear_moved()
+                            except Exception:  # noqa: BLE001 - best-effort
+                                logger.warning(
+                                    "Reindex job %d: could not clear the "
+                                    "draining snapshot after the mid-run "
+                                    "identity change; manually delete the "
+                                    "'embedding_draining_config' settings_kv "
+                                    "row before re-running.",
+                                    job_id,
+                                    exc_info=True,
+                                )
+                            logger.error(
+                                "Reindex job %d: embedding identity changed "
+                                "during the run; stored model identity left "
+                                "unchanged and readiness NOT lifted (re-run "
+                                "the reindex job). The staged generation was "
+                                "already committed and is live; the recorded "
+                                "identity/readiness are stale until a reindex "
+                                "completes, and the draining snapshot was "
+                                "just cleared (delete the "
+                                "'embedding_draining_config' settings_kv row "
+                                "manually if that clear failed).",
+                                job_id,
+                            )
+                        else:
+                            logger.error(
+                                "Reindex job %d: embedding identity changed "
+                                "during the run; stored model identity left "
+                                "unchanged and readiness NOT lifted (re-run "
+                                "the reindex job). The in-place re-embed may "
+                                "have written a mixed table; the recorded "
+                                "identity/readiness are stale until a reindex "
+                                "completes.",
+                                job_id,
+                            )
+                        return "failed", {"processed": processed_files, "failed": 0}, None
                     await vector_store.record_embedding_metadata(
                         probe_dim or settings.embedding_dim, raise_on_error=True
                     )
                     await vector_store.mark_ready(True)
+                    # Cutover complete: the draining snapshot that pinned
+                    # query embedding to the old generation is obsolete (#696).
+                    clear_drain = getattr(
+                        vector_store, "clear_draining_embedding_config", None
+                    )
+                    if callable(clear_drain):
+                        try:
+                            await clear_drain()
+                        except Exception:  # noqa: BLE001 - cutover already committed
+                            logger.warning(
+                                "Reindex job %d: failed to clear the draining "
+                                "embedding config after cutover (a later "
+                                "rebuild cross-checks it against the sidecar "
+                                "and refuses to pin on mismatch).",
+                                job_id,
+                                exc_info=True,
+                            )
                     logger.info(
                         "Vector store model identity updated and marked ready after reindex job %d.",
                         job_id,
@@ -3696,6 +3891,39 @@ class BackgroundProcessor:
                     logger.warning("Vector store unavailable; cannot update model identity after reindex job %d.", job_id)
             except Exception as exc:
                 logger.exception("Failed to update vector store model identity after reindex job %d", job_id)
+                if commit_attempted:
+                    # The staged generation was already COMMITTED: the drain
+                    # snapshot no longer describes the live table. Clear it so
+                    # an automatic retry's serving pin cannot resolve to the
+                    # OLD model against the NEW table (silently wrong dense
+                    # retrieval for the whole retry — issue #696 feedback
+                    # round). The surfaced unpinned path takes over instead.
+                    try:
+                        clear_stale = getattr(
+                            self.processor.vector_store,
+                            "clear_draining_embedding_config",
+                            None,
+                        )
+                        if callable(clear_stale):
+                            await clear_stale()
+                            logger.warning(
+                                "Reindex job %d: cleared the draining snapshot "
+                                "after the post-commit identity write failed; a "
+                                "retry will serve WITHOUT a pin (degraded "
+                                "dense retrieval) until it completes.",
+                                job_id,
+                            )
+                    except Exception:  # noqa: BLE001 - best-effort cleanup
+                        logger.error(
+                            "Reindex job %d: could not clear the draining "
+                            "snapshot after the post-commit identity write "
+                            "failed; a retry may pin the OLD model against "
+                            "the committed NEW table. Manually delete the "
+                            "'embedding_draining_config' settings_kv row "
+                            "before re-running.",
+                            job_id,
+                            exc_info=True,
+                        )
                 return "failed", {}, str(exc)
 
             result = {"processed": processed_files, "failed": 0}

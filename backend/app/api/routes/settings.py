@@ -1528,7 +1528,33 @@ def _effective_embedding_identity() -> tuple[str, str, str]:
     )
 
 
-def _invalidate_vector_store_readiness(app) -> None:
+def _prior_embedding_config() -> dict:
+    """Full embedding config BEFORE a save overwrites it (issue #696).
+
+    Captured next to ``_effective_embedding_identity`` (i.e. before
+    ``_apply_validated_settings``) so the draining snapshot describes the
+    configuration the live vector index was actually built under. Prefixes
+    are the RESOLVED effective values (Qwen auto-prefix rule keyed on the
+    CURRENT model name) and the embedding endpoint URL is included — the
+    sidecar identity records neither, and both are required to keep querying
+    the old generation with its own embedder while a staged rebuild runs.
+    """
+    from app.services.embeddings import resolve_effective_prefixes
+
+    doc_prefix, query_prefix = resolve_effective_prefixes(
+        settings.embedding_model,
+        settings.embedding_doc_prefix,
+        settings.embedding_query_prefix,
+    )
+    return {
+        "model": str(settings.embedding_model or ""),
+        "url": str(settings.ollama_embedding_url or ""),
+        "doc_prefix": doc_prefix,
+        "query_prefix": query_prefix,
+    }
+
+
+def _invalidate_vector_store_readiness(app, prior_config: dict) -> None:
     """Mark the live vector store not-ready after an embedding-identity change.
 
     Issue #695: a runtime ``embedding_model`` / prefix change silently
@@ -1537,6 +1563,15 @@ def _invalidate_vector_store_readiness(app) -> None:
     restart-time mismatch handling here so ``require_model_ready`` returns
     503 until an all-vault reindex that begins after the change completes
     (a vault-scoped reindex also lifts the gate, over a mixed index).
+
+    Issue #696: additionally persist the PRIOR embedding config
+    (``prior_config``, captured before the save applied) as the draining
+    snapshot, write-if-absent — the first identity-changing flip wins because
+    the snapshot must describe the config the live table was built under; it
+    is cleared only at staged cutover (reindex completion). The snapshot is
+    what lets a same-dimension staged rebuild keep serving the previous
+    generation with its own query embedder instead of 503ing. Best-effort:
+    a snapshot failure must never block the save.
     """
     store = getattr(app.state, "vector_store", None)
     if store is None or not hasattr(store, "_ready"):
@@ -1545,6 +1580,18 @@ def _invalidate_vector_store_readiness(app) -> None:
     # executed synchronously because these route handlers run off the event
     # loop and mark_ready is a coroutine.
     store._ready = False
+    register = getattr(store, "register_draining_embedding_config", None)
+    if callable(register):
+        try:
+            register(prior_config)
+        except Exception:  # noqa: BLE001 - snapshot write is best-effort
+            logger.warning(
+                "Failed to persist the draining embedding config after an "
+                "identity change: during the next staged rebuild, queries "
+                "will be admitted with UNPINNED embedding identity (new "
+                "model vs old index) until cutover",
+                exc_info=True,
+            )
     logger.warning(
         "Embedding identity changed via settings API; vector store marked "
         "not ready (admin reindex required)"
@@ -1620,13 +1667,14 @@ def post_settings(
     _enforce_curator_required_when_enabled(update)
     values = _validate_settings_update(update)
     prior_embedding_identity = _effective_embedding_identity()
+    prior_embedding_config = _prior_embedding_config()
     _persist_settings(conn, update)
     _apply_validated_settings(values)
     if _effective_embedding_identity() != prior_embedding_identity:
         # Before _hot_rebind_llm_clients on purpose: persist has already
         # committed and that hook is not exception-tolerant, so a rebind
         # failure must not leave the silent-mismatch window open (issue #695).
-        _invalidate_vector_store_readiness(request.app)
+        _invalidate_vector_store_readiness(request.app, prior_embedding_config)
     _hot_rebind_llm_clients(request.app, update)
     if (
         update.auto_scan_enabled is not None
@@ -1654,13 +1702,14 @@ def put_settings(
     _enforce_curator_required_when_enabled(update)
     values = _validate_settings_update(update)
     prior_embedding_identity = _effective_embedding_identity()
+    prior_embedding_config = _prior_embedding_config()
     _persist_settings(conn, update)
     _apply_validated_settings(values)
     if _effective_embedding_identity() != prior_embedding_identity:
         # Before _hot_rebind_llm_clients on purpose: persist has already
         # committed and that hook is not exception-tolerant, so a rebind
         # failure must not leave the silent-mismatch window open (issue #695).
-        _invalidate_vector_store_readiness(request.app)
+        _invalidate_vector_store_readiness(request.app, prior_embedding_config)
     _hot_rebind_llm_clients(request.app, update)
     if (
         update.auto_scan_enabled is not None

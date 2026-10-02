@@ -190,7 +190,13 @@ def require_model_ready(vector_store: VectorStore = Depends(get_vector_store)) -
     """Return the vector store only if it is initialized and ready.
 
     Raises HTTPException 503 if the vector store is None (not initialized) or
-    if its _ready flag is False (embedding model mismatch — reindex required).
+    if its _ready flag is False (embedding model mismatch — reindex required)
+    UNLESS a staged rebuild is open (issue #696): while ``rebuild_in_progress``
+    is True the live table is still the previous, internally consistent
+    generation, so queries are admitted against it (the query-embedding path
+    pins to that generation's identity via the serving-override funnel). The
+    flag probe is a STRICT singleton-bool check so ``getattr`` defaults are
+    not defeated by MagicMock auto-attributes in existing 503 suites.
     """
     if vector_store is None:
         raise HTTPException(
@@ -198,6 +204,10 @@ def require_model_ready(vector_store: VectorStore = Depends(get_vector_store)) -
             detail="Vector store is not initialized.",
         )
     if getattr(vector_store, '_ready', True) is False:
+        if getattr(vector_store, 'rebuild_in_progress', False) is True:
+            # Serving the previous generation while a staged rebuild builds
+            # the next one (issue #696) — not an outage.
+            return vector_store
         raise HTTPException(
             status_code=503,
             detail="Embedding model mismatch — admin reindex required",

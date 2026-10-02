@@ -482,7 +482,7 @@ curl -H "X-API-Key: ${HEALTH_CHECK_API_KEY:?set HEALTH_CHECK_API_KEY}" \
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/health` | Service health status |
-| GET | `/api/healthz` | Lightweight readiness probe — returns 503 if critical services (db, vector store, embedding) are not initialised, if the startup database migration failed, if the vector store is not ready (embedding-model mismatch), or if the DB pool recently saturated; reports an enabled maintenance flag as a non-blocking warning; suitable for Kubernetes readiness probes |
+| GET | `/api/healthz` | Lightweight readiness probe — returns 503 if critical services (db, vector store, embedding) are not initialised, if the startup database migration failed, if the vector store is not ready (embedding-model mismatch) unless a staged rebuild is serving the previous generation (then 200 with warnings), or if the DB pool recently saturated; reports an enabled maintenance flag as a non-blocking warning; suitable for Kubernetes readiness probes |
 
 ### Authentication
 
