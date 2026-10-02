@@ -43,7 +43,7 @@ vi.mock("@/hooks/useSendMessage", () => ({
 vi.mock("@/stores/useVaultStore", () => ({
   useVaultStore: vi.fn((selector?: (s: unknown) => unknown) =>
     typeof selector === "function"
-      ? selector({ activeVaultId: null, vaults: [] })
+      ? selector({ getActiveVault: () => null, activeVaultId: null, vaults: [] })
       : { getActiveVault: () => null, activeVaultId: null, vaults: [] }
   ),
 }));

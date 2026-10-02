@@ -390,8 +390,12 @@ export function TranscriptPane({ className, onSessionCreated }: TranscriptPanePr
   const setActiveEditVersion = useChatStore((s) => s.setActiveEditVersion);
   const clearEditVersionsFrom = useChatStore((s) => s.clearEditVersionsFrom);
 
-  const { getActiveVault } = useVaultStore();
-  const activeVault = getActiveVault();
+  // Reactive active-vault selector (F-2): see the same change in Composer —
+  // selecting getActiveVault never re-renders when `vaults` arrives.
+  // Optional chain per the repo's render-path mock-tolerance convention.
+  const activeVault = useVaultStore((s) =>
+    s.vaults?.find((v) => v.id === s.activeVaultId)
+  );
   const vaultId = useVaultStore((s) => s.activeVaultId);
 
   const authUser = useAuthStore((s) => s.user);
@@ -422,6 +426,11 @@ export function TranscriptPane({ className, onSessionCreated }: TranscriptPanePr
   // Ref-backed pinned-bottom state — read inside scroll callbacks without
   // creating stale closures over isAtBottom (which is captured by useEffect).
   const isAtBottomRef = useRef(true);
+
+  // Owner of the jump-to-answer highlight timer (issue #689 / T1-13-S2-10):
+  // a second jump within 1.5s must cancel the first jump's timer instead of
+  // letting it clear the newer highlight early.
+  const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // User intent flag: once the user manually scrolls up, we stop auto-scroll
   // until they click "New messages" or reach the bottom themselves.
   const userScrolledUpRef = useRef(false);
@@ -452,6 +461,25 @@ export function TranscriptPane({ className, onSessionCreated }: TranscriptPanePr
     if (!isAtBottomRef.current || userScrolledUpRef.current) return;
     scrollToBottomNow("auto");
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [messageIds.length]);
+
+  // Viewport-resize re-pin (issue #689 review PRR-003): opening/closing the
+  // below-lg evidence sheet pads <main> by 45vh, which shrinks or grows this
+  // scroll container WITHOUT a scroll event — a bottom-pinned user would
+  // silently end up half a viewport above the newest content. Re-pin on
+  // container size changes when the user is still pinned. (Guarded: jsdom
+  // has no ResizeObserver.)
+  useEffect(() => {
+    if (typeof ResizeObserver === "undefined") return;
+    const el = scrollRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => {
+      if (messageIds.length === 0) return;
+      if (!isAtBottomRef.current || userScrolledUpRef.current) return;
+      el.scrollTo({ top: el.scrollHeight, behavior: "auto" });
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
   }, [messageIds.length]);
 
   // Token-growth auto-scroll: triggered when the active streaming message's
@@ -490,7 +518,8 @@ export function TranscriptPane({ className, onSessionCreated }: TranscriptPanePr
         messagesById[id]?.sources?.some((s) => s.id === sourceId) ?? false;
       // Prefer the message the evidence selection came from when it still
       // exists and actually cites the source; otherwise fall back to the
-      // first message citing it (persisted/forked selections have no anchor).
+      // first message citing it (selections whose anchoring message has
+      // left the store have no anchor).
       let msgId: string | null = null;
       if (messageId && messagesById[messageId] && citesSource(messageId)) {
         msgId = messageId;
@@ -502,11 +531,23 @@ export function TranscriptPane({ className, onSessionCreated }: TranscriptPanePr
         const el = scrollRef.current?.querySelector(`[data-message-id="${msgId}"]`);
         el?.scrollIntoView({ behavior: "smooth", block: "center" });
         setHighlightedMessageId(msgId);
-        setTimeout(() => setHighlightedMessageId(null), 1500);
+        if (highlightTimerRef.current !== null) {
+          clearTimeout(highlightTimerRef.current);
+        }
+        highlightTimerRef.current = setTimeout(() => {
+          setHighlightedMessageId(null);
+          highlightTimerRef.current = null;
+        }, 1500);
       }
     };
     window.addEventListener("evidence:jump-to-answer", handler);
-    return () => window.removeEventListener("evidence:jump-to-answer", handler);
+    return () => {
+      window.removeEventListener("evidence:jump-to-answer", handler);
+      if (highlightTimerRef.current !== null) {
+        clearTimeout(highlightTimerRef.current);
+        highlightTimerRef.current = null;
+      }
+    };
   }, []);
 
   // Page title — updates whenever active session title changes

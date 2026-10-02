@@ -497,10 +497,25 @@ export const useLastUserContent = (): string =>
  * clicked: the displayed source list should be the parent message's
  * sources, not the latest message's.
  */
-export const useSourcesForSourceId = (sourceId?: string): Source[] | undefined =>
+export const useSourcesForSourceId = (
+  sourceId?: string,
+  clickedMessageId?: string | null
+): Source[] | undefined =>
   useChatStore(
     useShallow((s) => {
       if (!sourceId) return undefined;
+      // Issue #689 (T1-13-K-04): when the evidence selection is anchored to a
+      // message (AssistantMessage stores the clicked message id), prefer THAT
+      // message's sources even if an earlier message cites the same chunk.
+      if (clickedMessageId) {
+        const clicked = s.messagesById[clickedMessageId];
+        if (clicked?.sources?.some((src) => src.id === sourceId)) {
+          return clicked.sources;
+        }
+      }
+      // Fallback for selections whose anchoring message is no longer in the
+      // store (removed by truncate/fork/edit), which leave the source
+      // selected with no live anchor message id.
       for (let i = 0; i < s.messageIds.length; i++) {
         const msg = s.messagesById[s.messageIds[i]];
         const found = msg?.sources?.some((src) => src.id === sourceId);

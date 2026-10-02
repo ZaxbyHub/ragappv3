@@ -62,6 +62,16 @@ const MermaidDiagram = memo(function MermaidDiagram({ chart }: MermaidDiagramPro
           setError(message);
           setSvg(null);
         });
+    })
+    .catch((err: unknown) => {
+      if (cancelled) return;
+      // The dynamic import itself can reject (chunk load failure) — without
+      // this handler the spinner would stay up forever (issue #689 /
+      // TQ-sibling-batch-01-06). Same fallback shape as a render failure.
+      const message =
+        err instanceof Error ? err.message : typeof err === "string" ? err : "Failed to load diagram renderer";
+      setError(message);
+      setSvg(null);
     });
 
     return () => {

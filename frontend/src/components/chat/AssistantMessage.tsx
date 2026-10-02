@@ -225,13 +225,15 @@ export function AssistantMessage({
   messageFeedback,
 }: AssistantMessageProps) {
   const [isDebugActive, setIsDebugActive] = useState(false);
-  const {
-    openRightPane,
-    setSelectedEvidenceSource,
-    setSelectedEvidenceMessageId,
-    setEvidenceReturnFocusId,
-    setActiveRightTab,
-  } = useChatShellStore();
+  // Scoped selectors (issue #689 / TQ-sibling-batch-05-05): this component
+  // renders once per assistant message, so a whole-store destructure here
+  // re-rendered every message on any unrelated shell-store change; individual
+  // selector subscriptions keep the #616 render budget (actions are stable).
+  const openRightPane = useChatShellStore((s) => s.openRightPane);
+  const setSelectedEvidenceSource = useChatShellStore((s) => s.setSelectedEvidenceSource);
+  const setSelectedEvidenceMessageId = useChatShellStore((s) => s.setSelectedEvidenceMessageId);
+  const setEvidenceReturnFocusId = useChatShellStore((s) => s.setEvidenceReturnFocusId);
+  const setActiveRightTab = useChatShellStore((s) => s.setActiveRightTab);
   const prefersReducedMotion = useReducedMotion();
 
   // Canvas entry points (issue #509). The capability query and navigation

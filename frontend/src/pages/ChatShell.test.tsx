@@ -235,8 +235,8 @@ describe("ChatShell Mobile Layout", () => {
     });
   });
 
-  describe("test_right_pane_sheet_renders_75vh", () => {
-    it("right pane Sheet renders at 75vh on below-lg viewports when rightPaneOpen and activeRightTab !== workspace", () => {
+  describe("test_right_pane_sheet_renders_45vh", () => {
+    it("right pane Sheet renders at 45vh on below-lg viewports when rightPaneOpen and activeRightTab !== workspace", () => {
       mockStoreState.rightPaneOpen = true;
       mockStoreState.activeRightTab = "evidence";
       // Simulate below-lg viewport (tablet/mobile)
@@ -248,11 +248,47 @@ describe("ChatShell Mobile Layout", () => {
         </BrowserRouter>
       );
 
-      // Find the Sheet content with side="bottom" and 75vh height
+      // Find the Sheet content with side="bottom" and 45vh height (issue #689
+      // / UI-R4-14: 75vh covered the composer; the chat column is padded by
+      // the same height while the sheet is open so the composer stays above
+      // the non-modal sheet).
       const sheetContents = document.querySelectorAll('[data-testid="sheet-content"]');
       const bottomSheets = Array.from(sheetContents).filter((el) => el.getAttribute("data-side") === "bottom");
-      const has75vh = bottomSheets.some((el) => el.className.includes("h-[75vh]"));
-      expect(has75vh).toBe(true);
+      const has45vh = bottomSheets.some((el) => el.className.includes("h-[45vh]"));
+      expect(has45vh).toBe(true);
+    });
+  });
+
+  describe("test_chat_column_padded_while_sheet_open", () => {
+    it("chat <main> carries paddingBottom 45vh while the sheet is open below-lg, and none when closed (fb F-4)", () => {
+      // The composer stays above the non-modal sheet only while <main>'s
+      // padding matches the sheet height; pin both states so the two 45vh
+      // literals cannot drift apart silently.
+      mockStoreState.rightPaneOpen = true;
+      mockStoreState.activeRightTab = "evidence";
+      matchMediaMatches = true; // below-lg
+
+      const { unmount } = render(
+        <BrowserRouter>
+          <ChatShell />
+        </BrowserRouter>
+      );
+
+      const chatMain = document.querySelector("main.bg-background");
+      expect(chatMain).not.toBeNull();
+      expect((chatMain as HTMLElement).style.paddingBottom).toBe("45vh");
+      unmount();
+
+      mockStoreState.rightPaneOpen = false;
+      render(
+        <BrowserRouter>
+          <ChatShell />
+        </BrowserRouter>
+      );
+      const closedMain = document.querySelector("main.bg-background");
+      expect(closedMain).not.toBeNull();
+      const pad = (closedMain as HTMLElement).style.paddingBottom;
+      expect(pad === "" || pad === "0px").toBe(true);
     });
   });
 

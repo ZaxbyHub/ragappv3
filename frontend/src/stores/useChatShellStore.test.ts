@@ -32,6 +32,15 @@ describe("useChatShellStore", () => {
       expect(state.rightPaneWidth).toBe(400);
       expect(state.activeSessionId).toBe(null);
     });
+
+    it("defaults sessionRailOpen=false in the md-lg band (768-1023, issue #689 UI-R1-03)", async () => {
+      // The nav rail (240px expanded) plus a 320px session rail would leave
+      // only ~208px of chat column at 768px, so below lg the rail defaults
+      // closed. Pin a mid-band width, not just the 768 edge.
+      mockWindowInnerWidth(900);
+      const { useChatShellStore } = await import("./useChatShellStore");
+      expect(useChatShellStore.getState().sessionRailOpen).toBe(false);
+    });
   });
 
   describe("test_toggle_session_rail", () => {

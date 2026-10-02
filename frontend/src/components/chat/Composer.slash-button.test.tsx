@@ -15,7 +15,9 @@ const mockChatState = vi.hoisted(() => ({
 }));
 
 vi.mock("@/stores/useChatStore", () => ({
-  useChatStore: vi.fn(() => mockChatState),
+  useChatStore: vi.fn((selector?: (s: any) => unknown) =>
+    typeof selector === "function" ? selector(mockChatState) : mockChatState
+  ),
 }));
 
 vi.mock("@/stores/useChatModeStore", () => ({
@@ -53,6 +55,7 @@ vi.mock("@/stores/useVaultStore", () => ({
     vi.fn((selector?: (s: any) => unknown) => {
       const state = {
         activeVaultId: 1,
+        vaults: [{ id: 1, name: "Test Vault", file_count: 1 }],
         getActiveVault: () => ({ id: 1, name: "Test Vault", file_count: 1 }),
       };
       return typeof selector === "function" ? selector(state) : state;
