@@ -92,6 +92,10 @@
   bare ingest during a same-dimension rebuild writes new-model vectors into
   the live table and the commit swap drops them; #736 AC2 owns gating
   uploads.
+- An A→B→A identity flip-back WITHIN one reindex job run defeats the R1
+  start-vs-end comparison (rows embedded under B in between can commit);
+  requires two admin saves inside one job's duration — disclosed blind spot,
+  per-row identity binding would be the full fix.
 - The sidecar identity does not record the embedding endpoint URL, so a
   same-model swap to a different endpoint is not detected as an identity
   change (pre-existing, shared with restart-time validation; follow-up

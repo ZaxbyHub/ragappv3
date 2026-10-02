@@ -1587,8 +1587,9 @@ def _invalidate_vector_store_readiness(app, prior_config: dict) -> None:
         except Exception:  # noqa: BLE001 - snapshot write is best-effort
             logger.warning(
                 "Failed to persist the draining embedding config after an "
-                "identity change (zero-downtime serving degraded to 503 "
-                "until cutover for this transition)",
+                "identity change: during the next staged rebuild, queries "
+                "will be admitted with UNPINNED embedding identity (new "
+                "model vs old index) until cutover",
                 exc_info=True,
             )
     logger.warning(

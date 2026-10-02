@@ -365,7 +365,7 @@ async def healthz(request: Request):
             if not getattr(vector_store, "_draining_embedding_config", None):
                 warnings.append(
                     "query embedding identity unpinned - degraded dense "
-                    "retrieval until cutover"
+                    "retrieval until cutover (per-process view)"
                 )
         else:
             issues.append(
