@@ -513,6 +513,52 @@ class EmbeddingService:
             )
             return None
 
+    async def effective_embedding_model(self) -> str:
+        """The model id whose space the NEXT single-text embed lands in.
+
+        Mirrors the serving-identity funnel exactly (issue #696): while a
+        staged rebuild is open and a verified pin exists, single-text
+        embeds run under the PINNED model — so anything labelling stored
+        vectors (e.g. memory embeddings) must label them with this id, not
+        live settings, or the label contradicts the vector space. Live
+        settings otherwise.
+
+        Prefer :meth:`embed_passage_with_label` when the label and the
+        embed must observe the SAME pin value (one read feeds both).
+        """
+        identity = await self._serving_identity_or_none()
+        if identity is not None and identity.model:
+            return identity.model
+        return str(settings.embedding_model or "")
+
+    async def embed_passage_with_label(self, text: str) -> "tuple[List[float], str]":
+        """Embed a passage and report the model whose space it occupies.
+
+        The serving pin is read ONCE and feeds both the embed and the
+        returned label, so a cutover landing between the two reads cannot
+        produce an old-space vector labelled with the new model (issue #696
+        feedback round, M-UNC-001). Falls back to live settings when no pin
+        is served; never raises on the pin path (see
+        :meth:`_serving_identity_or_none`).
+        """
+        identity = await self._serving_identity_or_none()
+        if identity is not None:
+            vector = await self._embed_with_prefix(
+                text,
+                identity.doc_prefix,
+                config=self._request_config_for_identity(identity),
+            )
+            return vector, identity.model
+        # No-pin path: freeze the config FIRST and label from the SAME
+        # snapshot the embed uses, so a settings save landing during the
+        # provider round-trip cannot mislabel the row (issue #696 feedback
+        # round 2, F3).
+        config = self._request_config()
+        vector = await self._embed_with_prefix(
+            text, config.doc_prefix, config=config
+        )
+        return vector, config.model
+
     def _detect_provider_mode(self, base_url: str) -> tuple:
         """
         Detect which embedding provider mode to use based on URL path.
@@ -943,14 +989,9 @@ class EmbeddingService:
         Raises:
             EmbeddingError: If the API request fails or returns non-200 status.
         """
-        identity = await self._serving_identity_or_none()
-        if identity is not None:
-            return await self._embed_with_prefix(
-                text,
-                identity.doc_prefix,
-                config=self._request_config_for_identity(identity),
-            )
-        return await self._embed_with_prefix(text, self.embedding_doc_prefix)
+        # Delegate to the labelled variant so the funnel logic lives in ONE
+        # place (embed_passage_with_label); the label is discarded here.
+        return (await self.embed_passage_with_label(text))[0]
 
     async def embed_probe(self, timeout: float) -> None:
         """Issue a cache-bypassing ping embedding for deep-health checks.

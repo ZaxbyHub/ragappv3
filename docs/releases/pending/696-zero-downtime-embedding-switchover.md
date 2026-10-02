@@ -1,9 +1,6 @@
 # Workstream B PR 7: zero-downtime embedding switchover (Issue #696)
-
 ## What changed
-
 ### Backend
-
 - **`backend/app/services/background_tasks.py`** — the reindex job
   (`_reindex_embed_all`) now routes a same-dimension embedding-MODEL change
   through the staged rebuild table instead of rewriting the live table in
@@ -31,7 +28,17 @@
     recovery artifact the commit's CRITICAL log names. Recovery procedure:
     manually promote `chunks_dim_rebuild` to `chunks` BEFORE re-running the
     reindex; the next `begin_dimension_rebuild` drops the preserved temp
-    table as stale.
+    table as stale. Promotion (LanceDB has no rename): from Python,
+    `import lancedb; db = lancedb.connect("<lancedb_path>"); df =
+    db.open_table("chunks_dim_rebuild").to_pandas();
+    db.create_table("chunks", data=df, mode="overwrite")` — do NOT
+    `drop_table("chunks")` first: after a post-drop commit failure the live
+    table may already be gone and dropping a missing table raises. Note the
+    sidecar identity metadata is NOT updated by a manual promotion, so
+    `validate_schema` will still report a mismatch (healthz/503 "reindex
+    required") until a reindex completes or the `embedding_model_id` /
+    `embedding_dim` / `embedding_prefix_hash` rows in `settings_kv` are
+    corrected manually.
   - When the identity changed but the embedding service is unavailable
     (no dimension probe), the job fails with actionable guidance instead of
     staging (`begin_dimension_rebuild(None)`) or rewriting in place.
@@ -72,9 +79,7 @@
   fires when no draining snapshot exists.
 - **`backend/app/lifespan.py`** — wires the embedding service's
   serving-identity provider to the vector store.
-
 ## Operator notes and caveats
-
 - Zero-downtime switchovers are fully served when the model change is made
   through the settings API (the draining snapshot pins query embedding to
   the old generation until cutover). When the identity changed via env file
@@ -83,15 +88,28 @@
   model against the OLD index (degraded dense rankings; hybrid FTS intact)
   until cutover — surfaced as the healthz warning above and a loud
   begin-time log.
-- Cutover has a brief deny-window: admission clears when the commit starts,
-  so the table swap itself is momentarily 503 (never a mixed generation).
+- Cutover admit/deny semantics: NEW requests are 503'd for the duration of
+  the table swap (flag clears when the commit starts; the window spans the
+  staged-table load, drop/create, and index builds — seconds on small
+  corpora, longer on large ones). Requests already in flight when the
+  commit started are neither queued nor drained: each completes against
+  whichever generation its search lands on, so at most a query's worth of
+  mixed-generation results (or a transient error) can occur per cutover.
+  One sub-window is worse than a wrong ranking: while the live table is
+  dropped and not yet recreated, both hybrid arms fail against the missing
+  table and the fused result is a SUCCESSFUL EMPTY response (200, no
+  sources) rather than an error. Every such query self-heals on retry.
 - Multi-worker/lease-mode deployments: `rebuild_in_progress` and the
   readiness flip are per-process (`uvicorn --workers`); the same scope
   caveat as #695 applies.
-- Known interaction owned by #736 (uploads during not-ready windows): a
-  bare ingest during a same-dimension rebuild writes new-model vectors into
-  the live table and the commit swap drops them; #736 AC2 owns gating
-  uploads.
+- Known interaction, scoped to #736 (explicit scope decision, recorded in
+  the PR body): uploads AND deletes made while a staged rebuild is open hit
+  the live table and are lost to the swap (an uploaded file's chunks
+  vanish while its row stays `indexed`; a mid-window delete is reverted at
+  the swap — re-apply it after cutover). Re-running the reindex after
+  cutover recovers dropped uploads. Gating the ingest/delete surfaces
+  during a rebuild is #736 AC2's surface (its AC2 covers upload gating);
+  this PR records the deferral rather than silently expanding scope.
 - An A→B→A identity flip-back WITHIN one reindex job run defeats the R1
   start-vs-end comparison (rows embedded under B in between can commit);
   requires two admin saves inside one job's duration — disclosed blind spot,
@@ -100,24 +118,23 @@
   same-model swap to a different endpoint is not detected as an identity
   change (pre-existing, shared with restart-time validation; follow-up
   candidate: extend the identity tuple with the URL).
-- The memories vector corpus is only migrated by the offline memories
-  migration; during a rebuild the funnel pins memory query/write EMBEDDINGS
-  to the serving generation, but the corpus itself is version-skewed until
-  that migration runs (unchanged behavior, now documented).
-
+- Memories during a rebuild: memory embeddings written while a rebuild is
+  open are embedded under the SERVING (old) generation and labelled with
+  that generation's model id (labels follow the vector space). After
+  cutover, run the memories backfill (`POST /api/memories/backfill-embeddings`)
+  once: it selects rows whose label differs from the current model and
+  re-embeds them into the new space. The memories corpus is otherwise only
+  migrated by the offline memories migration.
 ## AC5 operator verification procedure (non-CI)
-
 On a deployment with two live embedding endpoints (old and new model):
 trigger a same-dimension model change through the settings API, then start
-the admin reindex while driving concurrent `POST /chat` queries. Confirm
+the admin reindex while driving concurrent `POST /api/chat` queries. Confirm
 every response is 200, retrieved sources come from a single consistent
 generation, the old-generation query embedder is used until commit (check
 the old endpoint's request logs), a mid-rebuild failure keeps the prior
 generation fully queryable, and GPU memory headroom holds with both
 embedder servers loaded.
-
 ## Tests
-
 - Frozen acceptance checks (issue #696):
   `backend/tests/test_b07_same_dim_staged_rebuild.py` (C1-C4, RED at base
   51cf9409 → GREEN on this PR) plus the three preserving suites (C6-C8).

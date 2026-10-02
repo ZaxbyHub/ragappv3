@@ -249,10 +249,13 @@ class VectorStore:
         # query embedding pins to the serving identity. Single-process flag —
         # the same per-process scope as the #695 readiness flip.
         self.rebuild_in_progress: bool = False
-        # In-memory cache of the draining embedding config (issue #696):
-        # the full config the live table was built under, persisted in
-        # settings_kv at the identity-changing settings save. Lazily loaded.
-        self._draining_embedding_config: Optional[dict] = None
+        # Serving pin, resolved ONCE at rebuild open (issue #696 review
+        # round: gate/healthz/pin must agree from the first query, and the
+        # begin-time warning must fire even for an idle rebuild — a lazy
+        # per-query resolution was wrong in both directions for healthz and
+        # logged nothing until the first query arrived).
+        self._serving_pin = None
+        self._serving_pin_resolved: bool = False
         # Track the row count at last IVF_PQ build to detect post-delete churn (Issue #13)
         self._last_index_build_row_count: int = 0
         self._index_mutation_generation: int = 0
@@ -418,7 +421,6 @@ class VectorStore:
             )
             existing = cursor.fetchone()
             if existing is not None:
-                self._draining_embedding_config = json.loads(existing[0])
                 return False
             payload = json.dumps(config)
             cursor.execute(
@@ -427,13 +429,14 @@ class VectorStore:
                 (self.DRAINING_CONFIG_KEY, payload),
             )
             conn.commit()
-            self._draining_embedding_config = dict(config)
+            from app.utils.secrets import redact_url
+
             logger.info(
                 "Draining embedding config captured (model=%s url=%s); the "
                 "previous generation stays queryable with its own embedder "
                 "during the next staged rebuild",
                 config.get("model"),
-                config.get("url"),
+                redact_url(str(config.get("url") or "")),
             )
             return True
         finally:
@@ -442,11 +445,14 @@ class VectorStore:
     async def clear_draining_embedding_config(self) -> None:
         """Drop the draining config (cutover complete, issue #696).
 
-        Best-effort: a failure is logged loudly (a stale snapshot would pin
-        the wrong generation on a later rebuild — serving_embedding_identity
-        cross-checks against the sidecar as a second line of defense).
+        Best-effort: a failure is logged loudly. A stale snapshot that
+        survives this clear is refused by the begin-time pin resolution ONLY
+        when the sidecar still records a DIFFERENT model than the snapshot;
+        when the identity write itself failed at cutover (sidecar stale and
+        equal to the snapshot), the cross-check passes and the row MUST be
+        deleted manually before the next rebuild — see the reindex job's
+        error log for that remediation.
         """
-        self._draining_embedding_config = None
 
         def _delete() -> None:
             conn = sqlite3.connect(str(settings.sqlite_path))
@@ -492,29 +498,29 @@ class VectorStore:
             return None
         return parsed if isinstance(parsed, dict) else None
 
-    async def serving_embedding_identity(self):
-        """The serving generation's embedding identity, or None (issue #696).
+    async def _resolve_serving_pin(self):
+        """Resolve the serving pin ONCE at rebuild open (issue #696).
 
-        Non-None only while a staged rebuild is open on this store AND a
-        draining snapshot exists AND its model still matches the sidecar
-        identity recorded for the live table (a mismatch means the snapshot
-        is stale — e.g. a failed cutover clear — and pinning it would embed
-        queries in the wrong space, so the surfaced unpinned path is used
-        instead). Returns :class:`EmbeddingIdentity` with RESOLVED prefixes.
+        Loads the persisted draining snapshot, cross-checks its model
+        against the sidecar identity of the live table, and returns the
+        :class:`EmbeddingIdentity` to pin query embedding to — or ``None``
+        when no verified pin exists (no snapshot, unparsable snapshot, or
+        stale model vs sidecar). Every unresolved outcome logs HERE, at
+        rebuild open, so an idle rebuild still surfaces the degraded mode
+        (the lazy per-query resolution this replaces logged nothing until a
+        query arrived and made healthz's view wrong in both directions).
         """
-        if self.rebuild_in_progress is not True:
+        try:
+            config = await asyncio.to_thread(self._load_draining_config_sync)
+        except sqlite3.Error as exc:
+            logger.warning(
+                "Failed to load the draining embedding config at rebuild "
+                "open (%s); serving WITHOUT a pin — query embeddings run "
+                "under the NEW model against the OLD index (degraded dense "
+                "retrieval until cutover).",
+                exc,
+            )
             return None
-        if self._draining_embedding_config is None:
-            try:
-                self._draining_embedding_config = await asyncio.to_thread(
-                    self._load_draining_config_sync
-                )
-            except sqlite3.Error as exc:
-                logger.warning(
-                    "Failed to load the draining embedding config: %s", exc
-                )
-                return None
-        config = self._draining_embedding_config
         if not config:
             logger.warning(
                 "Serving previous generation during rebuild without a "
@@ -529,7 +535,8 @@ class VectorStore:
             logger.warning(
                 "Draining snapshot model (%s) does not match the sidecar "
                 "identity of the live table (%s); refusing to pin query "
-                "embedding to the stale snapshot.",
+                "embedding to the stale snapshot — query embeddings run "
+                "under the NEW model against the OLD index until cutover.",
                 config.get("model"),
                 sidecar_model,
             )
@@ -542,6 +549,26 @@ class VectorStore:
             doc_prefix=str(config.get("doc_prefix") or ""),
             query_prefix=str(config.get("query_prefix") or ""),
         )
+
+    async def serving_embedding_identity(self):
+        """The serving generation's embedding identity, or None (issue #696).
+
+        Resolved ONCE at ``begin_dimension_rebuild`` (see
+        :meth:`_resolve_serving_pin`) and stored on the instance, so the
+        gate, healthz, and every query seam read one consistent value with
+        no per-query sqlite reads. ``None`` while no rebuild is open, or
+        when no verified draining snapshot existed at rebuild open (the
+        begin-time warning names the degraded mode).
+        """
+        if self.rebuild_in_progress is not True:
+            return None
+        if not self._serving_pin_resolved:
+            # Defensive: a store opened before this field existed, or a
+            # begin that somehow skipped resolution. Resolve lazily rather
+            # than serving an unverified default.
+            self._serving_pin = await self._resolve_serving_pin()
+            self._serving_pin_resolved = True
+        return self._serving_pin
 
     @asynccontextmanager
     async def _acquire_write_lock(self):
@@ -2503,6 +2530,40 @@ class VectorStore:
             # From here the live table is the previous, fully consistent
             # generation being served while the staged one builds (#696).
             self.rebuild_in_progress = True
+            # Resolve the serving pin ONCE, at open: gate, healthz, and the
+            # query funnel all read this single value, and an unresolved pin
+            # is logged here (not lazily at first query). Two failure legs:
+            # an Exception (sqlite lock, read failure) is SOFT — the rebuild
+            # opens unpinned and loudly logged; a BaseException beyond that
+            # (cancellation at shutdown) rolls the flag back and drops the
+            # just-created staged table (we still hold the write lock, so
+            # abort_dimension_rebuild cannot be used here) instead of leaking
+            # both until process exit.
+            try:
+                self._serving_pin = await self._resolve_serving_pin()
+            except Exception:  # noqa: BLE001 - pin must never fail the begin
+                self._serving_pin = None
+                self._serving_pin_resolved = True
+                logger.warning(
+                    "Serving-pin resolution failed at rebuild open; serving "
+                    "WITHOUT a pin (degraded dense retrieval until cutover).",
+                    exc_info=True,
+                )
+            except BaseException:
+                self._serving_pin = None
+                self._serving_pin_resolved = False
+                self.rebuild_in_progress = False
+                try:
+                    await self.db.drop_table(DIMENSION_REBUILD_TABLE)
+                except Exception:  # noqa: BLE001 - best-effort rollback
+                    logger.warning(
+                        "Failed to drop the staged table '%s' after "
+                        "cancellation at rebuild open (the next begin's "
+                        "stale-reclaim will reclaim it).",
+                        DIMENSION_REBUILD_TABLE,
+                    )
+                raise
+            self._serving_pin_resolved = True
             logger.info(
                 "Opened dimension rebuild into '%s' at dim=%d (live 'chunks' untouched)",
                 DIMENSION_REBUILD_TABLE,
@@ -2525,9 +2586,13 @@ class VectorStore:
         Serving admission (``rebuild_in_progress``) is cleared at ENTRY
         (issue #696): once the swap begins, the gate must stop admitting over
         a table being swapped, and a raised failure must not leave the flag
-        admitting over a half-swapped table.
+        admitting over a half-swapped table. The resolved serving pin is
+        reset with it (the swapped table is a NEW generation; the old pin no
+        longer describes it).
         """
         self.rebuild_in_progress = False
+        self._serving_pin = None
+        self._serving_pin_resolved = False
         async with self._acquire_write_lock():
             if self.db is None:
                 raise VectorStoreConnectionError(
@@ -2613,9 +2678,12 @@ class VectorStore:
         ``commit_dimension_rebuild`` after the live-table drop must NOT be
         followed by this abort — the temp table is the RECOVERY artifact the
         commit's CRITICAL log names (it must be manually promoted before any
-        re-run, because the next ``begin`` drops it as stale).
+        re-run, because the next ``begin`` drops it as stale). The resolved
+        serving pin is reset with the flag.
         """
         self.rebuild_in_progress = False
+        self._serving_pin = None
+        self._serving_pin_resolved = False
         if handle is None:
             return
         async with self._acquire_write_lock():

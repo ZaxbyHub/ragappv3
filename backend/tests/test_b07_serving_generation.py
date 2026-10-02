@@ -248,13 +248,14 @@ def test_healthz_warns_instead_of_degrading_during_rebuild():
         table=object(),
         _ready=False,
         rebuild_in_progress=True,
-        _draining_embedding_config=None,
+        _serving_pin=None,
     )
     status, body = _healthz_body(store)
     assert status == 200
-    assert "serving previous embedding generation during staged rebuild" in body.get(
-        "warnings", []
-    )
+    warnings = body.get("warnings", [])
+    assert "serving previous embedding generation during staged rebuild" in warnings
+    # Both warnings fire for the unpinned state (issue #696 feedback round).
+    assert "query embedding identity unpinned" in " ".join(warnings)
 
 
 def test_healthz_still_degrades_when_not_ready_without_rebuild():
@@ -315,8 +316,13 @@ def test_funnel_pins_single_and_passage_not_batch(embed_service, monkeypatch):
     assert "_serving_identity" not in batch_src
     assert "_serving_identity" not in probe_src
     single_src = inspect.getsource(EmbeddingService.embed_single)
+    label_src = inspect.getsource(EmbeddingService.embed_passage_with_label)
     passage_src = inspect.getsource(EmbeddingService.embed_passage)
-    assert "_serving_identity" in single_src and "_serving_identity" in passage_src
+    assert "_serving_identity" in single_src
+    # embed_passage delegates to embed_passage_with_label, where the pin
+    # consult now lives (single funnel — issue #696 feedback round 2).
+    assert "embed_passage_with_label" in passage_src
+    assert "_serving_identity" in label_src
 
 
 def test_funnel_falls_back_to_live_settings_on_none_or_failure(embed_service, monkeypatch):
@@ -494,6 +500,8 @@ async def test_r1_completion_guard_on_in_place_path(tmp_path):
         assert error is None  # guard outcome is log-guided, not a raw exception
         assert store.record_embedding_metadata.await_count == 0
         assert store.mark_ready.await_count == 0
+        # In-place path: nothing to clear (no staged snapshot exists).
+        assert store.clear_draining_embedding_config.await_count == 0
     finally:
         settings.embedding_model = orig
         pool.close_all()
@@ -773,3 +781,420 @@ class _FakeDB:
         table = _FakeTable(name, schema)
         self._tables[name] = table
         return table
+
+
+# ---------------------------------------------------------------------------
+# Feedback round (issue #696 review comments 5956786689 + 5956819555)
+# ---------------------------------------------------------------------------
+
+
+class _HashingStore(_SidecarStore):
+    """Sidecar store that also exposes the prefix-hash computation, enabling
+    the _embedding_identity_changed hash leg (previously untested)."""
+
+    def _compute_embedding_prefix_hash(self):
+        return "deadbeefdeadbeef"
+
+
+def test_prefix_hash_mismatch_routes_staged():
+    """The hash leg of _embedding_identity_changed: recorded model matches
+    live settings but the recorded prefix hash differs -> identity changed
+    (routes the same-dim reindex through the staged rebuild)."""
+    orig = settings.embedding_model
+    settings.embedding_model = NEW_MODEL
+    try:
+        store = _HashingStore(sidecar_model=NEW_MODEL)
+        # _SidecarStore.get_embedding_metadata returns OLD_PREFIX_HASH; the
+        # store's own hash computes "deadbeef..." -> mismatch -> True.
+        assert asyncio.run(_embedding_identity_changed(store)) is True
+        # Matching hash -> False (no identity change).
+
+        async def _matching_meta():
+            return {
+                "embedding_model_id": NEW_MODEL,
+                "embedding_dim": 4,
+                "embedding_prefix_hash": "deadbeefdeadbeef",
+            }
+
+        store2 = _HashingStore(sidecar_model=NEW_MODEL)
+        store2.get_embedding_metadata = _matching_meta
+        assert asyncio.run(_embedding_identity_changed(store2)) is False
+    finally:
+        settings.embedding_model = orig
+
+
+def test_pin_resolved_at_begin_from_persisted_row(tmp_path, monkeypatch):
+    """The serving pin is resolved ONCE at begin (from the persisted row),
+    not lazily per query: the resolved flag is set inside begin, and the
+    pin survives abort-reset only while the rebuild is open."""
+    monkeypatch.setattr(settings, "data_dir", tmp_path)
+    run_migrations(str(tmp_path / "app.db"))
+    vs = VectorStore(db_path=tmp_path / "lancedb")
+    vs.db = _FakeDB()
+
+    async def _run():
+        vs.register_draining_embedding_config(
+            {"model": OLD_MODEL, "url": "http://old:8080/embed",
+             "doc_prefix": "doc:", "query_prefix": "query:"}
+        )
+        await vs.init_table(8)
+        await vs.mark_ready(False)
+        await asyncio.to_thread(_force_sidecar_model, OLD_MODEL)
+        handle = await vs.begin_dimension_rebuild(8)
+        try:
+            assert vs.rebuild_in_progress is True
+            # Prove resolution happened at BEGIN, not lazily: the pin and
+            # its resolved flag are already set before any query.
+            assert vs._serving_pin_resolved is True
+            identity = await vs.serving_embedding_identity()
+            assert identity is not None and identity.model == OLD_MODEL
+            assert identity.query_prefix == "query:"
+        finally:
+            await vs.abort_dimension_rebuild(handle)
+        # Abort resets the pin with the flag.
+        assert vs._serving_pin is None and vs._serving_pin_resolved is False
+
+    asyncio.run(_run())
+
+
+def test_begin_pin_resolution_failure_is_soft(tmp_path, monkeypatch):
+    """A sqlite failure during begin-time pin resolution must not fail the
+    begin: the rebuild opens unpinned with the begin-time warning."""
+    monkeypatch.setattr(settings, "data_dir", tmp_path)
+    run_migrations(str(tmp_path / "app.db"))
+    vs = VectorStore(db_path=tmp_path / "lancedb")
+    vs.db = _FakeDB()
+
+    async def _run():
+        await vs.init_table(8)
+        await vs.mark_ready(False)
+        vs.register_draining_embedding_config(
+            {"model": OLD_MODEL, "url": "http://old:8080/embed",
+             "doc_prefix": "", "query_prefix": ""}
+        )
+
+        def _boom():
+            raise sqlite3.OperationalError("disk I/O error")
+
+        monkeypatch.setattr(vs, "_load_draining_config_sync", _boom)
+        handle = await vs.begin_dimension_rebuild(8)
+        try:
+            assert vs.rebuild_in_progress is True
+            assert await vs.serving_embedding_identity() is None
+        finally:
+            await vs.abort_dimension_rebuild(handle)
+
+    asyncio.run(_run())
+
+
+async def test_clear_drain_raise_post_commit_job_completes(job_harness):
+    """A clear_draining failure at cutover must not fail the job (cutover
+    already committed; the failure only leaves a stale row that the sidecar
+    cross-check refuses)."""
+    harness = job_harness
+    harness.store._sidecar_model = NEW_MODEL  # dim-triggered staging
+    harness.emb.dim = 6
+    harness.store.clear_draining_embedding_config = AsyncMock(
+        side_effect=RuntimeError("sqlite locked")
+    )
+    harness.processor.processor.process_existing_file = _Recorder()
+    status, _, error = await harness.processor._reindex_embed_all(  # noqa: SLF001
+        1, vault_id=None
+    )
+    assert status == "completed"
+    assert error is None
+    assert harness.store.mark_ready.await_count == 1
+    assert harness.store.clear_draining_embedding_config.await_count == 1
+
+
+async def test_identity_flip_during_commit_clears_drain(job_harness):
+    """The identity-changed completion guard on the STAGED path (commit
+    already done, settings flipped inside the commit window) must clear the
+    draining snapshot - kills the gate-open and clear-neutralized mutants
+    (review round 2, F1)."""
+    harness = job_harness
+    harness.store._sidecar_model = NEW_MODEL
+    harness.emb.dim = 6
+
+    real_commit = harness.store.commit_dimension_rebuild
+
+    async def _commit_flipping_identity(handle):
+        await real_commit(handle)
+        # The commit has swapped the table; NOW the admin flips identity.
+        settings.embedding_model = THIRD_MODEL
+
+    harness.store.commit_dimension_rebuild = AsyncMock(
+        side_effect=_commit_flipping_identity
+    )
+    harness.processor.processor.process_existing_file = _Recorder()
+    status, _, error = await harness.processor._reindex_embed_all(  # noqa: SLF001
+        1, vault_id=None
+    )
+    assert status == "failed"
+    assert harness.store.commit_dimension_rebuild.await_count == 1
+    assert harness.store.clear_draining_embedding_config.await_count == 1
+    assert harness.store.mark_ready.await_count == 0
+    assert harness.store.record_embedding_metadata.await_count == 0
+    assert error is None  # guard outcome is log-guided, not a raw exception
+
+
+async def test_post_commit_metadata_failure_clears_drain(job_harness):
+    """PRR-009 / external M-UNC chain: when the identity write fails AFTER
+    the staged commit, the drain snapshot (which still describes the OLD
+    generation) must be cleared - otherwise the auto-retry's cross-check
+    passes and pins the OLD model against the committed NEW table."""
+    harness = job_harness
+    harness.store._sidecar_model = NEW_MODEL
+    harness.emb.dim = 6
+    harness.store.record_embedding_metadata = AsyncMock(
+        side_effect=RuntimeError("Simulated metadata write failure")
+    )
+    harness.processor.processor.process_existing_file = _Recorder()
+    status, _, _ = await harness.processor._reindex_embed_all(  # noqa: SLF001
+        1, vault_id=None
+    )
+    assert status == "failed"
+    assert harness.store.commit_dimension_rebuild.await_count == 1
+    assert harness.store.mark_ready.await_count == 0
+    assert harness.store.clear_draining_embedding_config.await_count == 1
+
+
+def test_healthz_unpinned_absent_with_verified_pin():
+    """With a resolved pin, healthz reports only the rebuild warning - no
+    false 'unpinned' (the lazy-cache version was wrong in both directions)."""
+    store = SimpleNamespace(
+        table=object(),
+        _ready=False,
+        rebuild_in_progress=True,
+        _serving_pin=object(),
+    )
+    status, body = _healthz_body(store)
+    assert status == 200
+    warnings = body.get("warnings", [])
+    assert "serving previous embedding generation during staged rebuild" in warnings
+    assert not any("unpinned" in w for w in warnings)
+
+
+def test_truthy_nonbool_flag_serves_none():
+    """serving_embedding_identity keeps the strict singleton-bool gate."""
+    store = SimpleNamespace(
+        rebuild_in_progress="yes", _serving_pin=None, _serving_pin_resolved=False
+    )
+    assert asyncio.run(VectorStore.serving_embedding_identity(store)) is None
+
+
+def test_lifespan_wiring_source_pin():
+    """The lifespan MUST wire the embedding service's serving-identity
+    provider to the vector store (deleting the call survived the full suite
+    - source-text guard per the repo's wiring-test convention)."""
+    src = (
+        (Path(__file__).resolve().parents[1] / "app" / "lifespan.py")
+        .read_text(encoding="utf-8")
+    )
+    assert "set_serving_identity_provider(" in src
+    assert "app.state.vector_store.serving_embedding_identity" in src
+
+
+def test_settings_capture_precedes_apply_both_handlers():
+    """The prior-config capture must run BEFORE settings are applied in
+    both save handlers, or the snapshot describes the NEW config (the
+    moved-capture mutant survived the full suite)."""
+    src = (
+        (Path(__file__).resolve().parents[1] / "app" / "api" / "routes" / "settings.py")
+        .read_text(encoding="utf-8")
+    )
+    for handler in ("def post_settings(", "def put_settings("):
+        start = src.index(handler)
+        next_at = src.find("\n@", start)
+        end = next_at if next_at != -1 else len(src)
+        body = src[start:end]
+        capture = body.index("prior_embedding_config = _prior_embedding_config()")
+        apply_at = body.index("_apply_validated_settings(values)")
+        invalidate = body.index("_invalidate_vector_store_readiness(")
+        assert capture < apply_at < invalidate, handler
+
+
+def test_settings_hook_persists_old_config_row(tmp_path, monkeypatch):
+    """The readiness hook must persist the PRIOR (OLD-generation) config -
+    model, endpoint URL, and RESOLVED prefixes - as the draining row
+    (register(prior_config)->pass survived the full suite)."""
+    from app.api.routes.settings import _invalidate_vector_store_readiness
+    from app.services.embeddings import resolve_effective_prefixes
+
+    monkeypatch.setattr(settings, "data_dir", tmp_path)
+    run_migrations(str(tmp_path / "app.db"))
+    vs = VectorStore(db_path=tmp_path / "lancedb")
+    vs.db = _FakeDB()
+
+    async def _run():
+        monkeypatch.setattr(settings, "embedding_model", "qwen-old-model")
+        monkeypatch.setattr(settings, "embedding_doc_prefix", "")
+        monkeypatch.setattr(settings, "embedding_query_prefix", "")
+        monkeypatch.setattr(
+            settings, "ollama_embedding_url", "http://old-host:8080/embed"
+        )
+        prior = {
+            "model": "qwen-old-model",
+            "url": "http://old-host:8080/embed",
+            "doc_prefix": resolve_effective_prefixes("qwen-old-model", "", "")[0],
+            "query_prefix": resolve_effective_prefixes("qwen-old-model", "", "")[1],
+        }
+        app_like = SimpleNamespace(state=SimpleNamespace(vector_store=vs))
+        _invalidate_vector_store_readiness(app_like, prior)
+        assert vs._ready is False
+        row = await asyncio.to_thread(vs._load_draining_config_sync)
+        assert row == prior
+        assert row["model"] == "qwen-old-model"
+        assert row["doc_prefix"].startswith("Instruct: Represent")
+        assert row["query_prefix"].startswith("Instruct: Retrieve")
+
+    asyncio.run(_run())
+
+
+def test_effective_embedding_model_follows_pin(embed_service):
+    """The label helper mirrors the funnel: pinned model while a verified
+    identity is served, live settings otherwise."""
+    identity = EmbeddingIdentity(
+        model=OLD_MODEL, url=_LOOPBACK, doc_prefix="", query_prefix=""
+    )
+
+    async def _provider():
+        return identity
+
+    embed_service.set_serving_identity_provider(_provider)
+    assert asyncio.run(embed_service.effective_embedding_model()) == OLD_MODEL
+
+    async def _none():
+        return None
+
+    embed_service.set_serving_identity_provider(_none)
+    assert asyncio.run(embed_service.effective_embedding_model()) == NEW_MODEL
+
+
+# ---------------------------------------------------------------------------
+# Feedback round 2 (reviewer NEEDS_REVISION items, run 837-fb1)
+# ---------------------------------------------------------------------------
+
+
+class _OneConnPool:
+    """Minimal pool over one real sqlite connection (for _store_embedding)."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def get_connection(self):
+        return self._conn
+
+    def release_connection(self, conn):
+        pass
+
+
+def test_store_embedding_label_uses_model_used():
+    """The sqlite label must be model_used (the space the vector occupies) -
+    the exact line M-UNC-001 flagged; reverting it to settings must fail
+    this test (kills the label mutant for real)."""
+    from app.services.memory_store import MemoryStore
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE memories (id INTEGER PRIMARY KEY, content TEXT,"
+        " embedding TEXT, embedding_model TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO memories (id, content) VALUES (1, 'remember this')"
+    )
+    conn.commit()
+    store = MemoryStore.__new__(MemoryStore)
+    store.pool = _OneConnPool(conn)
+    assert (
+        store._store_embedding(1, [0.0, 1.0], model_used=OLD_MODEL) is True
+    )
+    row = conn.execute(
+        "SELECT embedding_model FROM memories WHERE id = 1"
+    ).fetchone()
+    assert row[0] == OLD_MODEL
+
+
+def test_memory_label_bound_via_embed_passage_with_label(embed_service):
+    """_embed_text_with_outcome prefers embed_passage_with_label: ONE pin
+    read feeds both the embed and the label (no straddle)."""
+    from app.services.memory_store import MemoryStore
+
+    identity = EmbeddingIdentity(
+        model=OLD_MODEL, url=_LOOPBACK, doc_prefix="doc:", query_prefix=""
+    )
+    seen_configs = []
+
+    async def _provider():
+        return identity
+
+    async def _record_prefix(text, prefix, config=None):
+        seen_configs.append((config.model, prefix))
+        return [0.0, 1.0]
+
+    embed_service.set_serving_identity_provider(_provider)
+    embed_service._embed_with_prefix = _record_prefix  # type: ignore[attr-defined]
+    store = MemoryStore.__new__(MemoryStore)
+    store.embedding_service = embed_service
+    embedding, outcome, model_used = asyncio.run(
+        store._embed_text_with_outcome("remember this")
+    )
+    assert outcome == "ok" and embedding == [0.0, 1.0]
+    assert model_used == OLD_MODEL
+    # The embed ran under the SAME pinned identity the label reports.
+    assert seen_configs == [(OLD_MODEL, "doc:")]
+
+
+def test_begin_time_warning_fires_for_unpinned_rebuild(tmp_path, monkeypatch, caplog):
+    """The begin-time warning (CS-003: 'no begin-time warning log') fires at
+    rebuild open when no draining snapshot exists - even for an idle
+    rebuild with zero queries."""
+    import logging
+
+    monkeypatch.setattr(settings, "data_dir", tmp_path)
+    run_migrations(str(tmp_path / "app.db"))
+    vs = VectorStore(db_path=tmp_path / "lancedb")
+    vs.db = _FakeDB()
+
+    async def _run():
+        await vs.init_table(8)
+        await vs.mark_ready(False)
+        handle = await vs.begin_dimension_rebuild(8)
+        await vs.abort_dimension_rebuild(handle)
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(_run())
+    assert any(
+        "without a" in r.message and "draining snapshot" in r.message
+        for r in caplog.records
+    ), [r.message for r in caplog.records]
+
+
+def test_begin_cancellation_rolls_back_flag_and_staged_table(
+    tmp_path, monkeypatch
+):
+    """Cancellation landing in begin's pin-resolution await must roll the
+    flag back and drop the staged table (BaseException leg)."""
+    from app.services.vector_store import DIMENSION_REBUILD_TABLE
+
+    monkeypatch.setattr(settings, "data_dir", tmp_path)
+    run_migrations(str(tmp_path / "app.db"))
+    vs = VectorStore(db_path=tmp_path / "lancedb")
+    vs.db = _FakeDB()
+
+    async def _run():
+        await vs.init_table(8)
+        await vs.mark_ready(False)
+
+        async def _cancelled():
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(vs, "_resolve_serving_pin", _cancelled)
+        with pytest.raises(asyncio.CancelledError):
+            await vs.begin_dimension_rebuild(8)
+        assert vs.rebuild_in_progress is False
+        assert vs._serving_pin is None
+        assert vs._serving_pin_resolved is False
+        assert DIMENSION_REBUILD_TABLE not in await vs.db.table_names()
+
+    asyncio.run(_run())

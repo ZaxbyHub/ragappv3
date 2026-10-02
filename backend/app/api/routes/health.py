@@ -362,7 +362,12 @@ async def healthz(request: Request):
             warnings.append(
                 "serving previous embedding generation during staged rebuild"
             )
-            if not getattr(vector_store, "_draining_embedding_config", None):
+            if not getattr(vector_store, "_serving_pin", None):
+                # Accurate in BOTH directions now: the pin is resolved once
+                # at rebuild open (vector_store.begin_dimension_rebuild), so
+                # a persisted-but-valid snapshot never reads as "unpinned"
+                # before the first query, and a stale/mismatched snapshot
+                # that the pin refused DOES read as unpinned here.
                 warnings.append(
                     "query embedding identity unpinned - degraded dense "
                     "retrieval until cutover (per-process view)"

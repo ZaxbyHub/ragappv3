@@ -3756,7 +3756,7 @@ class BackgroundProcessor:
                     commit_attempted = True
                     await vector_store.commit_dimension_rebuild(rebuild_handle)
                     rebuild_handle = None
-            except Exception:
+            except BaseException:
                 # Old index preserved: drop the temp table, then let the outer
                 # handler fail the job. EXCEPT when the failure came from
                 # commit_dimension_rebuild itself (#696): after the live-table
@@ -3764,6 +3764,9 @@ class BackgroundProcessor:
                 # CRITICAL log names — dropping it would destroy the only
                 # complete replacement copy. It must be promoted manually
                 # before any re-run (the next begin drops it as stale).
+                # BaseException (not Exception) so cancellation (shutdown)
+                # also aborts an open rebuild instead of leaking the flag and
+                # stranding the staged table until process exit.
                 if rebuild_handle is not None:
                     if commit_attempted:
                         logger.critical(
@@ -3807,12 +3810,57 @@ class BackgroundProcessor:
                 vector_store = self.processor.vector_store
                 if vector_store is not None:
                     if _job_identity() != job_start_identity:
-                        logger.error(
-                            "Reindex job %d: embedding identity changed during "
-                            "the run; stored model identity left unchanged and "
-                            "readiness NOT lifted (re-run the reindex job).",
-                            job_id,
-                        )
+                        # Identity moved between job start and completion. On
+                        # the staged path the (old-identity) drain snapshot is
+                        # now stale relative to the COMMITTED table — clear it
+                        # so an automatic retry cannot pin the OLD model
+                        # against the NEW table (PRR-009's chain, sibling of
+                        # the 3852 branch). On the in-place path there is no
+                        # snapshot; the table may hold a mixed in-place
+                        # rewrite, which the surfaced 503 state already gates.
+                        if commit_attempted:
+                            try:
+                                clear_moved = getattr(
+                                    vector_store,
+                                    "clear_draining_embedding_config",
+                                    None,
+                                )
+                                if callable(clear_moved):
+                                    await clear_moved()
+                            except Exception:  # noqa: BLE001 - best-effort
+                                logger.warning(
+                                    "Reindex job %d: could not clear the "
+                                    "draining snapshot after the mid-run "
+                                    "identity change; manually delete the "
+                                    "'embedding_draining_config' settings_kv "
+                                    "row before re-running.",
+                                    job_id,
+                                    exc_info=True,
+                                )
+                            logger.error(
+                                "Reindex job %d: embedding identity changed "
+                                "during the run; stored model identity left "
+                                "unchanged and readiness NOT lifted (re-run "
+                                "the reindex job). The staged generation was "
+                                "already committed and is live; the recorded "
+                                "identity/readiness are stale until a reindex "
+                                "completes, and the draining snapshot was "
+                                "just cleared (delete the "
+                                "'embedding_draining_config' settings_kv row "
+                                "manually if that clear failed).",
+                                job_id,
+                            )
+                        else:
+                            logger.error(
+                                "Reindex job %d: embedding identity changed "
+                                "during the run; stored model identity left "
+                                "unchanged and readiness NOT lifted (re-run "
+                                "the reindex job). The in-place re-embed may "
+                                "have written a mixed table; the recorded "
+                                "identity/readiness are stale until a reindex "
+                                "completes.",
+                                job_id,
+                            )
                         return "failed", {"processed": processed_files, "failed": 0}, None
                     await vector_store.record_embedding_metadata(
                         probe_dim or settings.embedding_dim, raise_on_error=True
@@ -3843,6 +3891,39 @@ class BackgroundProcessor:
                     logger.warning("Vector store unavailable; cannot update model identity after reindex job %d.", job_id)
             except Exception as exc:
                 logger.exception("Failed to update vector store model identity after reindex job %d", job_id)
+                if commit_attempted:
+                    # The staged generation was already COMMITTED: the drain
+                    # snapshot no longer describes the live table. Clear it so
+                    # an automatic retry's serving pin cannot resolve to the
+                    # OLD model against the NEW table (silently wrong dense
+                    # retrieval for the whole retry — issue #696 feedback
+                    # round). The surfaced unpinned path takes over instead.
+                    try:
+                        clear_stale = getattr(
+                            self.processor.vector_store,
+                            "clear_draining_embedding_config",
+                            None,
+                        )
+                        if callable(clear_stale):
+                            await clear_stale()
+                            logger.warning(
+                                "Reindex job %d: cleared the draining snapshot "
+                                "after the post-commit identity write failed; a "
+                                "retry will serve WITHOUT a pin (degraded "
+                                "dense retrieval) until it completes.",
+                                job_id,
+                            )
+                    except Exception:  # noqa: BLE001 - best-effort cleanup
+                        logger.error(
+                            "Reindex job %d: could not clear the draining "
+                            "snapshot after the post-commit identity write "
+                            "failed; a retry may pin the OLD model against "
+                            "the committed NEW table. Manually delete the "
+                            "'embedding_draining_config' settings_kv row "
+                            "before re-running.",
+                            job_id,
+                            exc_info=True,
+                        )
                 return "failed", {}, str(exc)
 
             result = {"processed": processed_files, "failed": 0}
