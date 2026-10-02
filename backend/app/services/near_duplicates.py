@@ -212,9 +212,10 @@ def record_file_centroid(
                 try:
                     # Scan-marked files (stored fingerprints) must not pay the
                     # full-text transfer again on every later ingest (issue
-                    # #697): for those rows parsed_text is selected as NULL so
-                    # the blob is the only payload materialized; first-time
-                    # compute candidates still need their full text.
+                    # #697): both the select list and the != '' predicate
+                    # route stored-fingerprint rows through a constant so
+                    # SQLite never materializes their parsed_text; first-time
+                    # compute candidates still get their full text.
                     candidates = conn.execute(
                         "SELECT files.id, "
                         "CASE WHEN nd.dim = ? AND nd.embedding_model IS NULL "
@@ -222,8 +223,10 @@ def record_file_centroid(
                         "nd.centroid, nd.group_id, nd.embedding_model, nd.dim "
                         "FROM files LEFT JOIN document_near_dups nd "
                         "ON nd.file_id = files.id "
-                        "WHERE files.vault_id = ? AND files.parsed_text IS NOT NULL "
-                        "AND files.parsed_text != '' AND files.id != ? "
+                        "WHERE files.vault_id = ? "
+                        "AND (CASE WHEN nd.dim = ? AND nd.embedding_model IS NULL "
+                        "THEN 'marked' ELSE files.parsed_text END) != '' "
+                        "AND files.id != ? "
                         "AND NOT EXISTS (SELECT 1 FROM document_near_dups c "
                         "WHERE c.file_id = files.id AND c.embedding_model = ? "
                         "AND c.dim = ?) "
@@ -231,6 +234,7 @@ def record_file_centroid(
                         (
                             FINGERPRINT_DIM,
                             vault_id,
+                            FINGERPRINT_DIM,
                             file_id,
                             model,
                             dim,
