@@ -17,13 +17,20 @@ Design:
   centroids in the same vault are scanned. Cosine of two L2-normalized
   vectors is their dot product (computed via the general cosine form anyway
   so abnormally-scaled blobs cannot skew results).
-- Text-space fallback (issue #513 C25): files that pre-date centroid
-  recording (migrated or directly seeded rows) have no centroid to compare
-  against. When the ingested file's full text is available, each such file's
-  advisory similarity is estimated from a DETERMINISTIC offline fingerprint
-  of its ``parsed_text`` (L2-normalized token-count feature hashing — no
-  model, no network), and above-threshold matches gain a centroid row in the
-  same shared group. Purely additive and advisory.
+- Centroids carry the ``embedding_model`` they were computed under (issue
+  #697): only rows recorded under the same model at the same dimension are
+  compared in embedding space. A same-dimension model switch therefore
+  invalidates old rows instead of silently comparing across spaces.
+- Text-space fallback (issue #513 C25, routing fixed by #697): vault files
+  that are not embedding-comparable for a record — no row (pre-dating
+  centroid recording), or a row under a different (model, dim) — are compared
+  via a DETERMINISTIC offline fingerprint of their ``parsed_text``
+  (L2-normalized token-count feature hashing — no model, no network).
+  Stored fingerprints (dim=256, model NULL rows) are reused without
+  re-tokenization, and every scanned candidate's row is written in
+  fingerprint form, marking it scanned so no later ingest repeats the work;
+  above-threshold matches gain a fingerprint row in the shared group.
+  Purely additive and advisory.
 - On a match at/above the threshold, the new row reuses the matched row's
   ``group_id`` when it has one (backfilling it if empty); otherwise a fresh
   ``uuid4().hex`` group is created. The best (highest-cosine) match wins.
@@ -121,11 +128,14 @@ def record_file_centroid(
     """Record (or replace) a file's centroid and assign an advisory group_id.
 
     Compares the file's pooled centroid against up to ``MAX_COMPARE`` the most
-    recent other centroids in the same vault; on cosine >= threshold the file
-    joins the matched row's group (reusing its group_id, backfilling it if
-    empty, else minting a new ``uuid4().hex`` group) and stores the similarity
-    against the best match. ADVISORY ONLY: never raises — any failure is
-    logged as a warning and the ingest continues unaffected.
+    recent other centroids **recorded under the same embedding model at the
+    same dimension** (issue #697: model identity is persisted per row, so a
+    same-dimension model switch or a stale legacy row is never silently
+    compared across incomparable spaces). On cosine >= threshold the file joins
+    the matched row's group (reusing its group_id, backfilling it if empty,
+    else minting a new ``uuid4().hex`` group) and stores the similarity against
+    the best match. ADVISORY ONLY: never raises — any failure is logged as a
+    warning and the ingest continues unaffected.
 
     Args:
         conn: Application sqlite connection (the caller's transaction/commit
@@ -136,18 +146,28 @@ def record_file_centroid(
         embeddings: The file's current-generation chunk embeddings.
         threshold: Cosine threshold; defaults to ``settings.near_dup_threshold``.
         document_text: The file's full parsed text. When provided, vault files
-            that pre-date centroid recording (no ``document_near_dups`` row)
-            are additionally compared via deterministic offline text
-            fingerprints of their ``parsed_text``; above-threshold matches
-            gain a centroid row in this file's group (issue #513 C25 —
-            seeded/migrated documents must still join advisory groups).
-            Omitted (None) by legacy callers: behavior identical to before.
+            that are NOT embedding-comparable for this record — no
+            ``document_near_dups`` row at all, or a row recorded under a
+            different (model, dim) — are compared via deterministic offline
+            text fingerprints of their ``parsed_text`` (issue #513 C25; issue
+            #697 turns the old dimension-skip into this explicit
+            re-fingerprint route so no file is unreachable by both scan
+            paths). Stored fingerprints (dim=256, model NULL rows) are reused
+            without re-tokenization; every other scanned candidate is
+            fingerprinted at most ONCE and its row is written/rewritten in
+            fingerprint form (``embedding_model`` NULL, dim 256), which marks
+            it scanned so no later ingest re-fingerprints it. Above-threshold
+            matches join the shared group (a matched candidate's existing
+            group_id is reused when non-NULL, else a fresh group is minted and
+            backfilled onto both rows). Omitted (None) by legacy callers:
+            behavior identical to before, plus the model-identity filter.
     """
     try:
         centroid = _centroid_from_embeddings(embeddings)
         if centroid is None:
             return
         dim = int(centroid.shape[0])
+        model = str(settings.embedding_model)
         effective_threshold = (
             float(settings.near_dup_threshold) if threshold is None else float(threshold)
         )
@@ -155,8 +175,9 @@ def record_file_centroid(
         rows = conn.execute(
             "SELECT file_id, centroid, group_id FROM document_near_dups "
             "WHERE vault_id = ? AND file_id != ? "
+            "AND embedding_model = ? AND dim = ? "
             "ORDER BY computed_at DESC, id DESC LIMIT ?",
-            (vault_id, file_id, MAX_COMPARE),
+            (vault_id, file_id, model, dim, MAX_COMPARE),
         ).fetchall()
 
         matched_file_id: int | None = None
@@ -167,6 +188,8 @@ def record_file_centroid(
                 continue
             other = np.frombuffer(blob, dtype=np.float32)
             if other.shape[0] != dim:
+                # Defensive only: the SQL filter already pins model+dim, so a
+                # mismatch here means a corrupted blob, not a legacy row.
                 continue
             similarity = _cosine(centroid, other)
             if similarity >= effective_threshold and similarity > best_similarity:
@@ -174,37 +197,62 @@ def record_file_centroid(
                 matched_file_id = int(other_file_id)
                 matched_group_id = other_group_id
 
-        # Text-space fallback (issue #513 C25): estimate similarity for vault
-        # files that pre-date centroid recording — they have no row to compare
-        # embeddings against, so compare deterministic offline fingerprints of
-        # their parsed_text against this file's. Bounded and advisory: each
-        # above-threshold match gains one centroid row in the shared group.
-        text_backfill: list[tuple[int, np.ndarray, float]] = []
+        # Text-space fallback (issue #513 C25, routing fixed by #697): compare
+        # deterministic offline fingerprints for vault files that are NOT
+        # embedding-comparable for this record — no row, or a row recorded
+        # under a different (model, dim). Stored fingerprints (dim=256, model
+        # NULL) are reused as-is; anything else is fingerprinted once and its
+        # row written in fingerprint form, which marks the file scanned so no
+        # later ingest repeats the tokenization.
+        text_backfill: list[tuple[int, np.ndarray, float, str | None]] = []
+        scan_marks: list[tuple[int, np.ndarray, str | None]] = []
         if document_text:
             fingerprint = _text_fingerprint(document_text)
             if fingerprint is not None:
                 try:
                     candidates = conn.execute(
-                        "SELECT id, parsed_text FROM files "
-                        "WHERE vault_id = ? AND parsed_text IS NOT NULL "
-                        "AND parsed_text != '' AND id != ? "
-                        "AND id NOT IN (SELECT file_id FROM document_near_dups) "
-                        "ORDER BY id DESC LIMIT ?",
-                        (vault_id, file_id, MAX_COMPARE),
+                        "SELECT files.id, files.parsed_text, nd.centroid, "
+                        "nd.group_id, nd.embedding_model, nd.dim "
+                        "FROM files LEFT JOIN document_near_dups nd "
+                        "ON nd.file_id = files.id "
+                        "WHERE files.vault_id = ? AND files.parsed_text IS NOT NULL "
+                        "AND files.parsed_text != '' AND files.id != ? "
+                        "AND NOT EXISTS (SELECT 1 FROM document_near_dups c "
+                        "WHERE c.file_id = files.id AND c.embedding_model = ? "
+                        "AND c.dim = ?) "
+                        "ORDER BY files.id DESC LIMIT ?",
+                        (vault_id, file_id, model, dim, MAX_COMPARE),
                     ).fetchall()
                 except sqlite3.Error:
                     # Pre-parsed_text schema shape: the fallback is advisory,
                     # skip it without disturbing the embedding-space path.
                     candidates = []
-                for other_id, parsed_text in candidates:
-                    other_fingerprint = _text_fingerprint(str(parsed_text))
+                for other_id, parsed_text, blob, other_group, other_model, other_dim in candidates:
+                    other_fingerprint: np.ndarray | None = None
+                    if (
+                        blob is not None
+                        and other_model is None
+                        and other_dim == FINGERPRINT_DIM
+                        and isinstance(blob, (bytes, bytearray))
+                    ):
+                        stored = np.frombuffer(blob, dtype=np.float32)
+                        if stored.shape[0] == FINGERPRINT_DIM:
+                            other_fingerprint = stored
+                    needs_mark = other_fingerprint is None
+                    if other_fingerprint is None:
+                        other_fingerprint = _text_fingerprint(str(parsed_text))
                     if other_fingerprint is None:
                         continue
                     similarity = _cosine(fingerprint, other_fingerprint)
                     if similarity >= effective_threshold:
                         text_backfill.append(
-                            (int(other_id), other_fingerprint, float(similarity))
+                            (int(other_id), other_fingerprint, float(similarity), other_group)
                         )
+                    elif needs_mark:
+                        # Scanned once with no match: mark the file so no
+                        # later ingest re-tokenizes it (rewrite preserves any
+                        # existing advisory group membership).
+                        scan_marks.append((int(other_id), other_fingerprint, other_group))
 
         if matched_file_id is not None:
             group_id = matched_group_id or uuid4().hex
@@ -217,35 +265,56 @@ def record_file_centroid(
                 )
             similarity_to_store: float | None = best_similarity
         elif text_backfill:
-            # No live-centroid match, but similar pre-existing documents were
-            # found by text: mint the shared group and give each of them a
-            # centroid row so the advisory link is queryable both ways.
-            group_id = uuid4().hex
-            similarity_to_store = max(sim for _oid, _fp, sim in text_backfill)
+            # No live-centroid match, but similar documents were found by
+            # text: reuse the best match's existing group when it has one,
+            # else mint the shared group and give each of them a fingerprint
+            # row so the advisory link is queryable both ways.
+            group_id = next(
+                (g for _oid, _fp, _sim, g in text_backfill if g is not None),
+                uuid4().hex,
+            )
+            similarity_to_store = max(sim for _oid, _fp, sim, _g in text_backfill)
         else:
             group_id = uuid4().hex
             similarity_to_store = None
 
-        for other_id, other_fingerprint, similarity in text_backfill:
+        for other_id, other_fingerprint, _similarity, _existing_group in text_backfill:
             conn.execute(
                 "INSERT OR REPLACE INTO document_near_dups "
-                "(vault_id, file_id, centroid, dim, group_id, similarity, computed_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                "(vault_id, file_id, centroid, dim, embedding_model, group_id, "
+                "similarity, computed_at) "
+                "VALUES (?, ?, ?, ?, NULL, ?, ?, CURRENT_TIMESTAMP)",
                 (
                     vault_id,
                     other_id,
                     other_fingerprint.tobytes(),
                     int(other_fingerprint.shape[0]),
                     group_id,
-                    similarity,
+                    _similarity,
+                ),
+            )
+
+        for other_id, other_fingerprint, existing_group in scan_marks:
+            conn.execute(
+                "INSERT OR REPLACE INTO document_near_dups "
+                "(vault_id, file_id, centroid, dim, embedding_model, group_id, "
+                "similarity, computed_at) "
+                "VALUES (?, ?, ?, ?, NULL, ?, NULL, CURRENT_TIMESTAMP)",
+                (
+                    vault_id,
+                    other_id,
+                    other_fingerprint.tobytes(),
+                    int(other_fingerprint.shape[0]),
+                    existing_group,
                 ),
             )
 
         conn.execute(
             "INSERT OR REPLACE INTO document_near_dups "
-            "(vault_id, file_id, centroid, dim, group_id, similarity, computed_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
-            (vault_id, file_id, centroid.tobytes(), dim, group_id, similarity_to_store),
+            "(vault_id, file_id, centroid, dim, embedding_model, group_id, "
+            "similarity, computed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+            (vault_id, file_id, centroid.tobytes(), dim, model, group_id, similarity_to_store),
         )
         conn.commit()
     except Exception:

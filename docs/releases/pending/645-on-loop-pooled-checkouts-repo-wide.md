@@ -105,3 +105,25 @@ the guard repo-wide so a new on-loop checkout fails CI.
     `api/deps.py`): a sync helper invoked with a connection already held
     from an off-loop checkout; a few trivial INSERT/SELECT statements on
     that held connection — no checkout, no queue wait.
+- Update (issue #697, Workstream B PR 8): the enrichment-resolution sites this
+  document previously failed to enumerate are now converted. The
+  `_row_to_document_response` enrichment branch — reachable from
+  `list_documents` (per row, up to `per_page=1000`), `get_document`, and
+  `toggle_file_enrichment` in `api/routes/documents.py` — no longer performs
+  the per-row synchronous `is_enrichment_enabled_for_file` pooled checkout on
+  the event loop: routes resolve the page's effective enrichment in one
+  batched off-loop query (`_resolve_page_enrichment`, the same shape as the
+  batched near-dup-group lookup), and the sync per-file helper remains only as
+  a standalone fallback inside the builder (unreachable from async frames;
+  pinned by the scoped AST census in `backend/tests/test_b08_guardrail_sync_census.py`
+  — the repo-wide structural guard remains owned by #803). The advisory
+  near-duplicate scan `near_duplicates.record_file_centroid` (also on-loop,
+  and re-fingerprinting unmatched legacy texts per ingest) is dispatched to a
+  worker thread and scan-marked by the same issue. REMAINING debt, unchanged
+  and owned by the Workstream B ingest-pipeline PRs (slots 9/14/15): the
+  `is_enrichment_enabled_for_file`/`is_enrichment_enabled_for_vault` calls
+  inside `should_enqueue_enrichment` (reached from the async
+  background-tasks loop) and `_get_chunk_enrichment_service` (reached from
+  async `run_enrichment_job`) still run synchronously on the loop — single
+  bounded checkouts, logged on DB-error fallback since #697, but not yet
+  dispatched.

@@ -15,7 +15,7 @@ import os
 import sqlite3
 from dataclasses import asdict
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, List, Mapping, Optional, Sequence
 
 import aiofiles
 from fastapi import (
@@ -670,8 +670,71 @@ def _vault_relative_file_path(raw_file_path: str) -> str:
     return normalized.rsplit("/", 1)[-1]
 
 
-def _row_to_document_response(row: sqlite3.Row) -> DocumentResponse:
-    """Convert a database row to a DocumentResponse."""
+def _resolve_page_enrichment(
+    conn: sqlite3.Connection, rows: Sequence[sqlite3.Row]
+) -> dict:
+    """Effective enrichment for a page of rows in ONE query (issue #697).
+
+    Batched companion of ``is_enrichment_enabled_for_file`` so page/list
+    projections never pay a synchronous pooled checkout per row on the event
+    loop (the same shape as ``_near_duplicate_groups_for``). Only rows that
+    have a vault and NO file-level override need resolution; for those, the
+    precedence is vault override else global — identical to the helpers'
+    semantics. The map is pre-seeded with every distinct vault_id in scope
+    (defaulting to the global setting, which also covers orphaned vault ids),
+    then overlaid with the vaults query, so callers can resolve every row from
+    the map without falling back to the per-file helper.
+    """
+    from app.config import settings
+
+    needed_vaults = {
+        row["vault_id"]
+        for row in rows
+        if row["vault_id"] is not None
+        and (row["enrichment_enabled"] if "enrichment_enabled" in row.keys() else None)
+        is None
+    }
+    if not needed_vaults:
+        return {}
+    vault_overrides: dict = {vid: settings.chunk_enrichment_enabled for vid in needed_vaults}
+    try:
+        placeholders = ",".join("?" * len(needed_vaults))
+        override_rows = conn.execute(
+            "SELECT id, enrichment_enabled FROM vaults "
+            f"WHERE id IN ({placeholders}) AND enrichment_enabled IS NOT NULL",  # nosec B608 — placeholders is a fixed '?,?..' literal, ids are bound
+            tuple(sorted(needed_vaults)),
+        ).fetchall()
+        vault_overrides.update({int(r[0]): bool(r[1]) for r in override_rows})
+    except sqlite3.Error:
+        # Vault lookup failed for the batch: the pre-seeded global defaults
+        # stand for every vault id, matching the helpers' DB-error fallback
+        # (which additionally logs at WARNING there).
+        pass
+    result: dict = {}
+    for row in rows:
+        if (
+            row["vault_id"] is not None
+            and (row["enrichment_enabled"] if "enrichment_enabled" in row.keys() else None)
+            is None
+        ):
+            result[row["id"]] = vault_overrides[row["vault_id"]]
+    return result
+
+
+def _row_to_document_response(
+    row: sqlite3.Row,
+    *,
+    enrichment_map: Optional[Mapping[int, bool]] = None,
+) -> DocumentResponse:
+    """Convert a database row to a DocumentResponse.
+
+    ``enrichment_map`` (issue #697): precomputed effective-enrichment values
+    keyed by file id, produced off the event loop by
+    ``_resolve_page_enrichment``. Route handlers pass it so no per-row
+    synchronous pooled checkout happens on the loop; the per-file helper
+    fallback below remains only for standalone/direct use outside route
+    handlers (it is unreachable from async frames in this module).
+    """
     keys = row.keys()
     file_name = row["file_name"]
     chunk_count = row["chunk_count"] or 0
@@ -737,11 +800,13 @@ def _row_to_document_response(row: sqlite3.Row) -> DocumentResponse:
     vault_id = row["vault_id"] if "vault_id" in keys else None
     effective_enrichment = False
     if vault_id is not None:
-        from app.services.document_processor import is_enrichment_enabled_for_file
-
         if file_enrichment_override is not None:
             effective_enrichment = file_enrichment_override
+        elif enrichment_map is not None and file_id in enrichment_map:
+            effective_enrichment = bool(enrichment_map[file_id])
         else:
+            from app.services.document_processor import is_enrichment_enabled_for_file
+
             effective_enrichment = is_enrichment_enabled_for_file(file_id, vault_id)
 
     return DocumentResponse(
@@ -1017,7 +1082,13 @@ async def list_documents(
             )
     rows = await asyncio.to_thread(cursor.fetchall)
 
-    documents = [_row_to_document_response(row) for row in rows]
+    # Effective enrichment for the page in ONE off-loop query (issue #697) —
+    # the builder consumes the map instead of doing a synchronous pooled
+    # checkout per row on the event loop.
+    page_enrichment = await asyncio.to_thread(_resolve_page_enrichment, conn, rows)
+    documents = [
+        _row_to_document_response(row, enrichment_map=page_enrichment) for row in rows
+    ]
 
     # Advisory near-duplicate groups for the page, in one batched query
     # (issue #513 W26 exposure — no per-row lookup).
@@ -1996,7 +2067,8 @@ async def get_document(
     if not await evaluate(user, "vault", row["vault_id"], "read"):
         raise HTTPException(status_code=403, detail="Access denied to vault")
 
-    document = _row_to_document_response(row)
+    row_enrichment = await asyncio.to_thread(_resolve_page_enrichment, conn, [row])
+    document = _row_to_document_response(row, enrichment_map=row_enrichment)
     # Advisory near-duplicate group (issue #513 W26 exposure).
     document.near_duplicate_group = await asyncio.to_thread(
         _near_duplicate_group_for, conn, file_id
@@ -2071,7 +2143,12 @@ async def toggle_file_enrichment(
         (file_id,),
     )
     updated_row = await asyncio.to_thread(cursor.fetchone)
-    document = _row_to_document_response(updated_row)
+    updated_enrichment = await asyncio.to_thread(
+        _resolve_page_enrichment, conn, [updated_row]
+    )
+    document = _row_to_document_response(
+        updated_row, enrichment_map=updated_enrichment
+    )
     document.near_duplicate_group = await asyncio.to_thread(
         _near_duplicate_group_for, conn, file_id
     )

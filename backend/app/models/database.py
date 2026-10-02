@@ -766,6 +766,10 @@ CREATE INDEX IF NOT EXISTS idx_failed_chunks_file_id ON failed_chunks(file_id);
 -- revisions are always retained. One row per file (file_id UNIQUE); re-ingest
 -- replaces the row (idempotent). `centroid` is the L2-normalized mean of the
 -- file's current-generation chunk embeddings (float32 BLOB, `dim` dims).
+-- `embedding_model` is the settings.embedding_model the centroid was computed
+-- under (issue #697): rows are only compared in embedding space with centroids
+-- recorded under the same model. NULL marks text-fingerprint rows (dim=256,
+-- model-independent) and pre-column legacy rows (stamped by the migration).
 -- `group_id` is shared across near-duplicate files in the same vault (cosine
 -- of centroids >= settings.near_dup_threshold); `similarity` stores the cosine
 -- against the matched row. Also created for existing databases by
@@ -776,6 +780,7 @@ CREATE TABLE IF NOT EXISTS document_near_dups (
     file_id INTEGER NOT NULL UNIQUE,
     centroid BLOB NOT NULL,
     dim INTEGER NOT NULL,
+    embedding_model TEXT,
     group_id TEXT,
     similarity REAL,
     computed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -4874,12 +4879,26 @@ def migrate_add_document_near_dups(sqlite_path: str) -> None:
     centroid in the same vault. The table is also part of _BASE_SCHEMA (fresh
     databases get it from init_db); this migration covers existing installs.
 
+    Issue #697: rows now carry the `embedding_model` the centroid was computed
+    under, so centroids are only compared in embedding space with rows recorded
+    under the same model. For databases that pre-date the column, this
+    migration (a) adds it via a PRAGMA-guarded ALTER TABLE and (b) stamps
+    legacy non-fingerprint rows (dim != 256) with the currently-configured
+    settings.embedding_model — behavior-preserving vs pre-#697 code, which
+    compared those rows regardless of provenance. The stamp is the
+    migration-time model, not true provenance: a deployment that switched
+    embedding models before upgrading keeps that cohort cross-model comparable
+    (identical to before) until the next model change. dim=256 rows stay NULL —
+    they are text fingerprints, which are model-independent.
+
     Rows are advisory metadata only — nothing in ingestion blocks, deletes, or
     rejects documents based on them.
 
     Idempotent — safe to run multiple times. Table and index use IF NOT EXISTS
-    guards.
+    guards; the ALTER and backfill are guarded on the column's presence/values.
     """
+    from app.config import settings as _settings
+
     conn = sqlite3.connect(sqlite_path)
     try:
         conn.execute("PRAGMA foreign_keys = ON;")
@@ -4890,6 +4909,7 @@ def migrate_add_document_near_dups(sqlite_path: str) -> None:
                 file_id INTEGER NOT NULL UNIQUE,
                 centroid BLOB NOT NULL,
                 dim INTEGER NOT NULL,
+                embedding_model TEXT,
                 group_id TEXT,
                 similarity REAL,
                 computed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -4897,6 +4917,21 @@ def migrate_add_document_near_dups(sqlite_path: str) -> None:
 
             CREATE INDEX IF NOT EXISTS idx_near_dups_vault ON document_near_dups(vault_id);
         """)
+        existing_cols = {
+            row[1] for row in conn.execute("PRAGMA table_info(document_near_dups)").fetchall()
+        }
+        if "embedding_model" not in existing_cols:
+            # Table pre-dates the #697 column: fresh CREATEs above are no-ops
+            # for it, so add the column explicitly (nullable, no default —
+            # legacy rows keep NULL until the backfill below stamps them).
+            conn.execute(
+                "ALTER TABLE document_near_dups ADD COLUMN embedding_model TEXT"
+            )
+        conn.execute(
+            "UPDATE document_near_dups SET embedding_model = ? "
+            "WHERE embedding_model IS NULL AND dim != ?",
+            (_settings.embedding_model, 256),
+        )
         conn.commit()
     finally:
         conn.close()
