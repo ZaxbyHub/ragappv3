@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import type { JSX } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Loader2, FolderOpen, Search, Shield } from "lucide-react";
@@ -34,6 +34,7 @@ import {
 interface ManageVaultsSheetProps {
   group: Group | null;
   open: boolean;
+  editorToken?: number;
   onOpenChange: (open: boolean) => void;
   onSave: (vaultAccess: VaultAccessItem[]) => Promise<void>;
 }
@@ -47,6 +48,7 @@ const PERMISSIONS = [
 export function ManageVaultsSheet({
   group,
   open,
+  editorToken,
   onOpenChange,
   onSave,
 }: ManageVaultsSheetProps): JSX.Element {
@@ -54,8 +56,20 @@ export function ManageVaultsSheet({
   const [accessMap, setAccessMap] = useState<Map<number, string>>(new Map());
   const [searchQuery, setSearchQuery] = useState("");
   const [isSaving, setIsSaving] = useState(false);
+  const [activeOpeningKey, setActiveOpeningKey] = useState<string | null>(null);
+  const [initializedOpeningKey, setInitializedOpeningKey] = useState<string | null>(null);
+  const openingKey = open && group ? `${group.id}:${editorToken ?? 0}` : null;
+  const currentOpeningKeyRef = useRef<string | null>(openingKey);
+  currentOpeningKeyRef.current = openingKey;
 
-  const { data: allVaults = [], isLoading: isLoadingVaults } = useQuery<Vault[]>({
+  const {
+    data: allVaults,
+    isLoading: isLoadingVaults,
+    fetchStatus: vaultCatalogFetchStatus,
+    status: vaultCatalogStatus,
+    isSuccess: isVaultCatalogReadSuccessful,
+    isError: isVaultCatalogReadError,
+  } = useQuery<Vault[]>({
     queryKey: ["vaults"],
     queryFn: async () => {
       const resp = await listVaults();
@@ -64,22 +78,69 @@ export function ManageVaultsSheet({
     enabled: open,
   });
 
-  const { data: groupVaults = [], isLoading: isLoadingAccess } = useQuery({
+  const {
+    data: groupVaults,
+    isLoading: isLoadingAccess,
+    fetchStatus: groupAccessFetchStatus,
+    status: groupAccessStatus,
+    isSuccess: isGroupAccessReadSuccessful,
+    isError: isGroupAccessReadError,
+  } = useQuery({
     queryKey: ["groups", group?.id, "vaults"],
     queryFn: () => getGroupVaults(group!.id),
     enabled: open && !!group,
   });
 
-  // Initialise access map from current group vault permissions
+  const hasSuccessfulReads =
+    vaultCatalogStatus === "success" &&
+    groupAccessStatus === "success" &&
+    vaultCatalogFetchStatus === "idle" &&
+    groupAccessFetchStatus === "idle" &&
+    isVaultCatalogReadSuccessful &&
+    isGroupAccessReadSuccessful &&
+    !isVaultCatalogReadError &&
+    !isGroupAccessReadError;
+
+  // Reset all editor state whenever a new group/opening becomes active. The
+  // opening token also changes when the same group is reopened.
   useEffect(() => {
-    if (open && groupVaults.length > 0) {
-      const map = new Map<number, string>();
-      for (const gv of groupVaults) {
-        map.set(gv.id, gv.permission ?? "read");
-      }
-      setAccessMap(map);
+    if (activeOpeningKey === openingKey) {
+      return;
     }
-  }, [open, groupVaults]);
+    setActiveOpeningKey(openingKey);
+    setInitializedOpeningKey(null);
+    setAccessMap(new Map());
+    setIsSaving(false);
+  }, [activeOpeningKey, openingKey]);
+
+  // Initialize exactly once from successful reads for this opening. A
+  // background refetch must not overwrite local edits, and a successful empty
+  // response is still a valid empty snapshot.
+  useEffect(() => {
+    if (
+      !openingKey ||
+      activeOpeningKey !== openingKey ||
+      initializedOpeningKey === openingKey ||
+      !hasSuccessfulReads ||
+      !allVaults ||
+      !groupVaults
+    ) {
+      return;
+    }
+    const map = new Map<number, string>();
+    for (const gv of groupVaults) {
+      map.set(gv.id, gv.permission ?? "read");
+    }
+    setAccessMap(map);
+    setInitializedOpeningKey(openingKey);
+  }, [
+    activeOpeningKey,
+    allVaults,
+    groupVaults,
+    hasSuccessfulReads,
+    initializedOpeningKey,
+    openingKey,
+  ]);
 
   useEffect(() => {
     if (!open) setSearchQuery("");
@@ -105,19 +166,36 @@ export function ManageVaultsSheet({
     });
   }, []);
 
+  const isLoading = isLoadingVaults || isLoadingAccess;
+  const hasReadError = isVaultCatalogReadError || isGroupAccessReadError;
+  const hasInitializedOpening =
+    openingKey !== null &&
+    activeOpeningKey === openingKey &&
+    initializedOpeningKey === openingKey;
+  const canSave = hasSuccessfulReads && hasInitializedOpening && !isSaving;
+
   const handleSave = useCallback(async () => {
+    const submittedOpeningKey = openingKey;
+    if (!canSave || !submittedOpeningKey) {
+      return;
+    }
     setIsSaving(true);
     try {
       const vaultAccess: VaultAccessItem[] = Array.from(accessMap.entries()).map(
         ([vault_id, permission]) => ({ vault_id, permission })
       );
       await onSave(vaultAccess);
+    } catch {
+      // The owning mutation reports the failure. Do not leak a rejected
+      // promise from this React event handler.
     } finally {
-      setIsSaving(false);
+      if (currentOpeningKeyRef.current === submittedOpeningKey) {
+        setIsSaving(false);
+      }
     }
-  }, [accessMap, onSave]);
+  }, [accessMap, canSave, onSave, openingKey]);
 
-  const filteredVaults = allVaults.filter((vault) => {
+  const filteredVaults = (allVaults ?? []).filter((vault) => {
     // Only show vaults belonging to the same org as the group (or global vaults)
     if (group?.org_id != null && vault.org_id != null && vault.org_id !== group.org_id) {
       return false;
@@ -130,7 +208,6 @@ export function ManageVaultsSheet({
   });
 
   const selectedCount = accessMap.size;
-  const isLoading = isLoadingVaults || isLoadingAccess;
 
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
@@ -177,6 +254,14 @@ export function ManageVaultsSheet({
                   </div>
                 ))}
               </div>
+            ) : hasReadError ? (
+              <div
+                className="text-center py-8 text-muted-foreground"
+                role="status"
+                aria-live="polite"
+              >
+                Unable to load vault access. Please try again.
+              </div>
             ) : filteredVaults.length === 0 ? (
               <div
                 className="text-center py-8 text-muted-foreground"
@@ -205,7 +290,7 @@ export function ManageVaultsSheet({
                         checked={hasAccess}
                         onCheckedChange={() => toggleVault(vault.id)}
                         aria-label={`Grant access to ${vault.name}`}
-                        disabled={isSaving}
+                        disabled={isSaving || !hasInitializedOpening}
                         className="mt-0.5"
                       />
                       <div className="flex-1 min-w-0">
@@ -235,7 +320,7 @@ export function ManageVaultsSheet({
                           <Select
                             value={permission}
                             onValueChange={(v) => setPermission(vault.id, v)}
-                            disabled={!hasAccess || isSaving}
+                            disabled={!hasAccess || isSaving || !hasInitializedOpening}
                           >
                             <SelectTrigger
                               className="h-7 w-28 text-xs"
@@ -277,7 +362,7 @@ export function ManageVaultsSheet({
           </Button>
           <Button
             onClick={handleSave}
-            disabled={isSaving || isLoading}
+            disabled={!canSave}
             className="w-full sm:w-auto"
             aria-label="Save vault access changes"
           >
