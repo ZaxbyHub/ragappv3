@@ -5,6 +5,8 @@ import { useChatStore } from "@/stores/useChatStore";
 import { useChatModeStore } from "@/stores/useChatModeStore";
 import { useChatShellStore } from "@/stores/useChatShellStore";
 import { useLlmHealthStore } from "@/stores/useLlmHealthStore";
+import { useVaultStore } from "@/stores/useVaultStore";
+import type { Vault } from "@/lib/api";
 
 const apiMocks = vi.hoisted(() => ({
   createChatSession: vi.fn(),
@@ -267,6 +269,14 @@ describe("useSendMessage", () => {
   });
 
   describe("vault null guard", () => {
+    // Issue #781 (UI-R1-05): the guard stays for zero-or-many accessible
+    // vaults, but its copy must name the constraint and the control instead
+    // of contradicting the composer's own "All Vaults" affordance. These
+    // pins run against the real useVaultStore, whose default vaults list is
+    // empty (the zero-vault leg).
+    const CONSTRAINT_MESSAGE =
+      "Pick a vault to chat in — choose one from the vault selector, or create a vault.";
+
     it("shows error and returns early when activeVaultId is null with no activeChatId", async () => {
       const refreshHistory = vi.fn().mockResolvedValue(undefined);
       useChatStore.setState({ input: "Hello" });
@@ -278,9 +288,7 @@ describe("useSendMessage", () => {
       });
 
       await waitFor(() => {
-        expect(useChatStore.getState().inputError).toBe(
-          "Please select a vault before starting a chat."
-        );
+        expect(useChatStore.getState().inputError).toBe(CONSTRAINT_MESSAGE);
       });
       expect(apiMocks.createChatSession).not.toHaveBeenCalled();
       expect(refreshHistory).not.toHaveBeenCalled();
@@ -303,7 +311,111 @@ describe("useSendMessage", () => {
     });
   });
 
+  describe("first-send vault resolution (issue #781)", () => {
+    // Full Vault shape (same as useVaultStore.selection-guardrails.test.ts)
+    // — the store is real here, so the seed must satisfy the Vault type.
+    function makeVault(id: number, name: string): Vault {
+      return {
+        id,
+        name,
+        description: "",
+        created_at: "2026-09-01T00:00:00Z",
+        updated_at: "2026-09-01T00:00:00Z",
+        file_count: 0,
+        memory_count: 0,
+        session_count: 0,
+        org_id: null,
+        effective_enrichment_enabled: true,
+        effective_multimodal_enabled: true,
+      };
+    }
+
+    function seedVaults(vaults: Vault[]) {
+      localStorage.removeItem("kv_active_vault_id");
+      useVaultStore.setState({
+        vaults,
+        activeVaultId: null,
+        loading: false,
+        error: null,
+      });
+    }
+
+    it("auto-picks the sole accessible vault for session AND stream, without persisting the selection", async () => {
+      seedVaults([makeVault(7, "Only Vault")]);
+      const refreshHistory = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ input: "First question" });
+
+      const { result } = renderHook(() => useSendMessage(null, refreshHistory));
+
+      await act(async () => {
+        await result.current.handleSend();
+      });
+
+      // The send proceeds in the sole vault: the created session and the
+      // streamed turn are BOTH scoped to it (the stream's vault argument is
+      // chatStream's third parameter).
+      await waitFor(() => {
+        expect(apiMocks.createChatSession).toHaveBeenCalledWith({ vault_id: 7 });
+      });
+      expect(apiMocks.chatStream).toHaveBeenCalled();
+      expect(apiMocks.chatStream.mock.calls[0][2]).toBe(7);
+      expect(useChatStore.getState().inputError).toBeNull();
+
+      // The persisted "All Vaults" choice used by Documents/Search scoping
+      // must survive the auto-pick untouched (issue #781 Constraints).
+      expect(useVaultStore.getState().activeVaultId).toBeNull();
+      expect(localStorage.getItem("kv_active_vault_id")).toBeNull();
+    });
+
+    it("scopes a FOLLOW-UP send in the auto-created session to the sole vault (Copilot review follow-up)", async () => {
+      // First send auto-picked the sole vault and created the session, but
+      // the selection stays null by design. The follow-up must still reach
+      // /chat/stream scoped to that vault: the backend 403s a null vault_id
+      // for non-admins ("Searching all vaults requires admin access").
+      seedVaults([makeVault(7, "Only Vault")]);
+      const refreshHistory = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ activeChatId: "42", input: "Follow up" });
+
+      const { result } = renderHook(() => useSendMessage(null, refreshHistory));
+
+      await act(async () => {
+        await result.current.handleSend();
+      });
+
+      await waitFor(() => {
+        expect(apiMocks.chatStream).toHaveBeenCalled();
+      });
+      expect(apiMocks.createChatSession).not.toHaveBeenCalled();
+      expect(apiMocks.chatStream.mock.calls[0][2]).toBe(7);
+      expect(useChatStore.getState().inputError).toBeNull();
+      // Still no persisted-selection overwrite.
+      expect(useVaultStore.getState().activeVaultId).toBeNull();
+      expect(localStorage.getItem("kv_active_vault_id")).toBeNull();
+    });
+
+    it("keeps the constraint message when multiple vaults are accessible", async () => {
+      seedVaults([makeVault(1, "Alpha"), makeVault(2, "Beta")]);
+      const refreshHistory = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ input: "Hello" });
+
+      const { result } = renderHook(() => useSendMessage(null, refreshHistory));
+
+      await act(async () => {
+        await result.current.handleSend();
+      });
+
+      await waitFor(() => {
+        expect(useChatStore.getState().inputError).toBe(
+          "Pick a vault to chat in — choose one from the vault selector, or create a vault."
+        );
+      });
+      expect(apiMocks.createChatSession).not.toHaveBeenCalled();
+      expect(apiMocks.chatStream).not.toHaveBeenCalled();
+    });
+  });
+
   describe("vault_id defaulting — regression (F#)", () => {
+    // Same zero-vault leg as above, pinned from the session-call side.
     it("createChatSession not called and error shown when activeVaultId is null with no activeChatId", async () => {
       const refreshHistory = vi.fn().mockResolvedValue(undefined);
       useChatStore.setState({ input: "Hello" });
@@ -317,7 +429,7 @@ describe("useSendMessage", () => {
       await waitFor(() => {
         expect(apiMocks.createChatSession).not.toHaveBeenCalled();
         expect(useChatStore.getState().inputError).toBe(
-          "Please select a vault before starting a chat."
+          "Pick a vault to chat in — choose one from the vault selector, or create a vault."
         );
       });
     });

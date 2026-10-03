@@ -13,6 +13,7 @@ import {
 } from "@/lib/api";
 import { toast } from "sonner";
 import { useChatStore, type Message } from "@/stores/useChatStore";
+import { useVaultStore } from "@/stores/useVaultStore";
 import { useChatModeStore } from "@/stores/useChatModeStore";
 import { useChatShellStore } from "@/stores/useChatShellStore";
 import { useLlmHealthStore } from "@/stores/useLlmHealthStore";
@@ -146,19 +147,45 @@ export function useSendMessage(
       // existing session must not re-navigate (a session switch racing the
       // create would otherwise bounce the user back to the created id).
       let createdSession = false;
+      // Issue #781 (UI-R1-05): resolve the vault for THIS send at the point
+      // of use. With exactly one accessible vault there is nothing to choose
+      // between, so the send proceeds in that vault — without overwriting
+      // the persisted "All Vaults" selection that Documents/Search scoping
+      // rely on (no setActiveVault, no localStorage write). The resolved id
+      // scopes both the created session and the streamed turn; zero or
+      // multiple accessible vaults keep the gate, but with a message that
+      // names the constraint and the control instead of contradicting the
+      // composer's own "All Vaults" affordance.
+      //
+      // PR #845 review follow-up (Copilot): the resolution must run for
+      // EVERY send, not only session creation — a follow-up in the
+      // auto-created session re-enters with activeChatId set, and an
+      // unresolved null vault_id makes /chat/stream 403 for non-admins
+      // ("Searching all vaults requires admin access"). With exactly one
+      // accessible vault that is the only vault the session could belong
+      // to, so scoping follow-ups to it is safe.
+      let sendVaultId = activeVaultId;
+      if (!sendVaultId) {
+        const { vaults } = useVaultStore.getState();
+        if (vaults.length === 1) {
+          sendVaultId = vaults[0].id;
+        }
+      }
 
       if (currentState.activeChatId) {
         sessionId = parseInt(currentState.activeChatId);
       } else {
-        if (!activeVaultId) {
-          setInputError("Please select a vault before starting a chat.");
+        if (!sendVaultId) {
+          setInputError(
+            "Pick a vault to chat in — choose one from the vault selector, or create a vault."
+          );
           setIsStreaming(false);
           setAbortFn(null);
           sendingRef.current = false;
           return;
         }
         try {
-          const newSession = await createChatSession({ vault_id: activeVaultId });
+          const newSession = await createChatSession({ vault_id: sendVaultId });
           sessionId = newSession.id;
           useChatStore.setState({ activeChatId: newSession.id.toString() });
           createdSession = true;
@@ -784,7 +811,7 @@ export function useSendMessage(
             if (ownsPersistence) await persistTurn("complete");
           },
         },
-        activeVaultId ?? undefined,
+        sendVaultId ?? undefined,
         effectiveMode,
         useChatModeStore.getState().temperature,
         useChatModeStore.getState().retrievalMode,
