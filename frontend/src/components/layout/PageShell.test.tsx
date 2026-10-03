@@ -13,6 +13,20 @@ vi.mock("@/lib/api", () => ({
   getSettings: mockGetSettings,
 }));
 
+// Issue #782: PageShell now mounts the FirstRunChecklist; keep its
+// fetch deterministic here (server says hidden).
+vi.mock("@/lib/api/onboarding", () => ({
+  getOnboardingMilestones: vi.fn().mockResolvedValue({
+    vault_created: true,
+    upload_indexed: true,
+    first_question_asked: true,
+    first_citation_opened: true,
+    show_checklist: false,
+  }),
+  markCitationOpened: vi.fn(),
+  dismissChecklist: vi.fn(),
+}));
+
 vi.mock("./Navigation", () => ({
   Navigation: () => <nav aria-label="Primary navigation" />,
 }));

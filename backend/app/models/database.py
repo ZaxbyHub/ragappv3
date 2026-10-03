@@ -1644,6 +1644,19 @@ CREATE TABLE IF NOT EXISTS chat_stream_events (
 );
 """
 
+# First-run onboarding milestone state (issue #782, UI-ENH-07 stage 2).
+# vault_created / upload_indexed / first_question_asked are DERIVED at read
+# time from vaults/files/chat rows; this table persists only the two facts no
+# other table records — the first citation open and the checklist dismissal.
+_USER_ONBOARDING_STATE_DDL = """
+CREATE TABLE IF NOT EXISTS user_onboarding_state (
+    user_id INTEGER PRIMARY KEY,
+    citation_opened_at TEXT,
+    checklist_dismissed_at TEXT,
+    updated_at TEXT
+);
+"""
+
 SCHEMA = (
     _BASE_SCHEMA
     + _DRAFT_ROOM_CORE_DDL
@@ -1655,6 +1668,7 @@ SCHEMA = (
     + _ENRICHMENT_DERIVED_DDL
     + _CANVAS_DDL
     + _CHAT_STREAM_EVENTS_DDL
+    + _USER_ONBOARDING_STATE_DDL
     # Recovery journal (issue #512): records migration phase/outcome, schema
     # version and authoritative index generation. Defined in
     # app.models.migration_journal and also created by
@@ -1949,6 +1963,8 @@ def run_migrations(sqlite_path: str) -> None:
     # Per-turn stream event log (issue #555) — the replay source for resumable
     # SSE chat streams. Registered last: purely additive table, no rebuilds.
     migrate_add_chat_stream_events(sqlite_path)
+    # Per-user onboarding milestone state (issue #782) — purely additive.
+    migrate_add_user_onboarding_state(sqlite_path)
 
     # Partial unique index for duplicate hash detection (HIGH-10), widened to
     # treat a `partial` row the same as an `indexed` one (issue #693 /
@@ -6884,6 +6900,45 @@ def migrate_add_chat_stream_events(sqlite_path: str) -> None:
     try:
         conn.executescript(_CHAT_STREAM_EVENTS_DDL)
         conn.commit()
+    finally:
+        conn.close()
+
+
+def migrate_add_user_onboarding_state(sqlite_path: str) -> None:
+    """Migration: add per-user onboarding milestone state (issue #782).
+
+    Creates ``user_onboarding_state`` — one row per user holding the two
+    first-run facts no other table records (first citation open, checklist
+    dismissal). The other three milestones are derived at read time from
+    vaults/files/chat rows, so no backfill exists or is needed.
+
+    Executes ``_USER_ONBOARDING_STATE_DDL`` — the exact same constant appended
+    to ``SCHEMA`` — so a database created by ``init_db`` and a legacy database
+    upgraded by this migration converge on an identical schema
+    (double-definition convention). Purely additive: ``CREATE TABLE IF NOT
+    EXISTS``, no existing data touched; rollback is a plain revert.
+
+    Attempts journal to migration_journal start/succeeded/failed, matching the
+    migrate_add_document_near_dups peer shape; the journal never raises, and a
+    failed migration re-raises after journaling.
+    """
+    conn = sqlite3.connect(sqlite_path)
+    conn.isolation_level = None
+    _journal = "migrate_add_user_onboarding_state"
+    try:
+        record_migration_outcome(
+            conn, migration_name=_journal, phase="start", outcome="ok"
+        )
+        conn.execute("PRAGMA foreign_keys = ON;")
+        conn.executescript(_USER_ONBOARDING_STATE_DDL)
+        record_migration_outcome(
+            conn, migration_name=_journal, phase="succeeded", outcome="ok"
+        )
+    except Exception:
+        record_migration_outcome(
+            conn, migration_name=_journal, phase="failed", outcome="error"
+        )
+        raise
     finally:
         conn.close()
 

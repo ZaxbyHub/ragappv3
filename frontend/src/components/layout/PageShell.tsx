@@ -4,6 +4,7 @@ import { motion, AnimatePresence, useReducedMotion } from "framer-motion";
 import { Navigation } from "./Navigation";
 import { UploadIndicator } from "@/components/shared/UploadIndicator";
 import UnconfiguredChatBanner from "@/components/UnconfiguredChatBanner";
+import FirstRunChecklist from "@/components/onboarding/FirstRunChecklist";
 import { getSettings } from "@/lib/api";
 import type { HealthStatus } from "@/types/health";
 import type { NavItemId } from "./navigationTypes";
@@ -91,6 +92,10 @@ export function PageShell({ children, activeItem, onItemSelect, healthStatus }: 
         {chatConfigured === false && (
           <UnconfiguredChatBanner chatConfigured={false} />
         )}
+        {/* Issue #782: server-driven first-run checklist — visible wherever
+            the user lands after Setup finishes, self-hiding when complete or
+            dismissed. Renders null while pending/failed (fail-open). */}
+        <FirstRunChecklist />
         <div className={isChat ? "flex-1 min-h-0 overflow-hidden" : "flex-1 min-h-0 p-6 lg:p-8 overflow-auto pb-20 md:pb-6 mx-auto w-full"}>
           <AnimatePresence mode="wait">
             <motion.div

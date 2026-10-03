@@ -19,6 +19,7 @@ import {
 } from "@/stores/useChatStore";
 import { useChatShellStore } from "@/stores/useChatShellStore";
 import { getChunkContext, getDocumentRawBlob, getArtifactRawBlob, type ChunkContextResponse, type Source } from "@/lib/api";
+import { reportCitationOpened } from "@/lib/api/onboarding";
 import { buildEvidenceView, type EvidenceLocation } from "@/lib/evidence";
 import { WikiCards } from "./WikiCards";
 import { KMSCards } from "./KMSCards";
@@ -789,6 +790,10 @@ export function RightPane() {
     setSelectedEvidenceSource(source);
     setActiveTab("preview");
     setActiveRightTab("preview");
+    // Issue #782: first-run milestone — the user opened a citation (the
+    // evidence-pane list is a second entry point beside AssistantMessage's
+    // funnel; the client-side once-guard keeps this to one POST).
+    void reportCitationOpened();
   }, [setSelectedEvidenceSource, setActiveRightTab]);
 
   const handleJumpToAnswer = useCallback(() => {

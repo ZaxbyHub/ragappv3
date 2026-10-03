@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { useVaultStore } from "@/stores/useVaultStore";
 import { VaultSelector } from "@/components/vault/VaultSelector";
+import { VaultGate } from "@/components/vault/VaultGate";
 import { WikiPageList, PAGE_TYPES } from "./WikiPageList";
 import { WikiPageDetail } from "./WikiPageDetail";
 import { WikiEditDialog } from "./WikiEditDialog";
@@ -319,6 +320,7 @@ export default function WikiPage() {
             <EmptyState
               title="Select a vault"
               description="Choose a vault to view its wiki pages."
+              action={<VaultGate />}
             />
           ) : (
             <WikiPageList
