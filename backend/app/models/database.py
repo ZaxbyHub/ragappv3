@@ -766,10 +766,15 @@ CREATE INDEX IF NOT EXISTS idx_failed_chunks_file_id ON failed_chunks(file_id);
 -- revisions are always retained. One row per file (file_id UNIQUE); re-ingest
 -- replaces the row (idempotent). `centroid` is the L2-normalized mean of the
 -- file's current-generation chunk embeddings (float32 BLOB, `dim` dims).
+-- `embedding_model` is the settings.embedding_model the centroid was computed
+-- under (issue #697): rows are only compared in embedding space with centroids
+-- recorded under the same model. NULL marks text-fingerprint rows (dim=256,
+-- model-independent) and pre-column legacy rows (stamped by the migration).
 -- `group_id` is shared across near-duplicate files in the same vault (cosine
 -- of centroids >= settings.near_dup_threshold); `similarity` stores the cosine
--- against the matched row. Also created for existing databases by
--- migrate_add_document_near_dups.
+-- against the matched row. `embedding_model` is declared LAST so fresh CREATEs
+-- and the migration's appends-at-end ALTER TABLE place it at the same ordinal.
+-- Also created for existing databases by migrate_add_document_near_dups.
 CREATE TABLE IF NOT EXISTS document_near_dups (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     vault_id INTEGER NOT NULL,
@@ -778,7 +783,8 @@ CREATE TABLE IF NOT EXISTS document_near_dups (
     dim INTEGER NOT NULL,
     group_id TEXT,
     similarity REAL,
-    computed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    computed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    embedding_model TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_near_dups_vault ON document_near_dups(vault_id);
 
@@ -4874,16 +4880,49 @@ def migrate_add_document_near_dups(sqlite_path: str) -> None:
     centroid in the same vault. The table is also part of _BASE_SCHEMA (fresh
     databases get it from init_db); this migration covers existing installs.
 
+    Issue #697: rows now carry the `embedding_model` the centroid was computed
+    under, so centroids are only compared in embedding space with rows recorded
+    under the same model. For databases that pre-date the column, this
+    migration (a) adds it via a PRAGMA-guarded ALTER TABLE and (b) stamps
+    legacy non-fingerprint rows (dim != 256) with the currently-configured
+    settings.embedding_model — behavior-preserving vs pre-#697 code, which
+    compared those rows regardless of provenance. The stamp is the
+    migration-time model, not true provenance: a deployment that switched
+    embedding models before upgrading keeps that cohort cross-model comparable
+    (identical to before) until the next model change. dim=256 rows stay NULL —
+    they are text fingerprints, which are model-independent.
+
+    The ALTER and the backfill run inside ONE explicit BEGIN IMMEDIATE
+    transaction (issue #697 review PRR-005): a failure rolls back both, so the
+    database never rests in the column-added/rows-unstamped window where the
+    reader's `embedding_model = ?` filter would silently exclude legacy rows.
+    Attempts journal to migration_journal start/succeeded/failed (PRR-004),
+    matching the migrate_widen_* / wiki-claims peer shape; the journal never
+    raises, and a failed migration re-raises after journaling so
+    run_migrations' existing degraded-startup surface is unchanged.
+
     Rows are advisory metadata only — nothing in ingestion blocks, deletes, or
     rejects documents based on them.
 
     Idempotent — safe to run multiple times. Table and index use IF NOT EXISTS
-    guards.
+    guards (autocommitted outside the swap transaction, like the peer
+    migrations' executescript shape); the ALTER and backfill are guarded on
+    the column's presence/values and converge on re-run.
     """
+    from app.config import settings as _settings
+
     conn = sqlite3.connect(sqlite_path)
+    conn.isolation_level = None
+    _journal = "migrate_add_document_near_dups"
     try:
+        record_migration_outcome(
+            conn, migration_name=_journal, phase="start", outcome="ok"
+        )
         conn.execute("PRAGMA foreign_keys = ON;")
-        conn.executescript("""
+        # DDL is idempotent and autocommitted OUTSIDE the explicit transaction
+        # (executescript would implicitly commit one); only the ALTER + the
+        # backfill stamp need atomicity.
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS document_near_dups (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 vault_id INTEGER NOT NULL,
@@ -4892,12 +4931,46 @@ def migrate_add_document_near_dups(sqlite_path: str) -> None:
                 dim INTEGER NOT NULL,
                 group_id TEXT,
                 similarity REAL,
-                computed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_near_dups_vault ON document_near_dups(vault_id);
+                computed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                embedding_model TEXT
+            )
         """)
-        conn.commit()
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_near_dups_vault "
+            "ON document_near_dups(vault_id)"
+        )
+        existing_cols = {
+            row[1] for row in conn.execute("PRAGMA table_info(document_near_dups)").fetchall()
+        }
+        stamped = 0
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if "embedding_model" not in existing_cols:
+                # Table pre-dates the #697 column: fresh CREATEs above are
+                # no-ops for it, so add the column explicitly (nullable, no
+                # default — legacy rows keep NULL until the backfill below
+                # stamps them).
+                conn.execute(
+                    "ALTER TABLE document_near_dups ADD COLUMN embedding_model TEXT"
+                )
+            cursor = conn.execute(
+                "UPDATE document_near_dups SET embedding_model = ? "
+                "WHERE embedding_model IS NULL AND dim != ?",
+                (_settings.embedding_model, 256),
+            )
+            stamped = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+            conn.commit()
+        except Exception as exc:
+            conn.rollback()
+            record_migration_outcome(
+                conn, migration_name=_journal, phase="failed", outcome="error",
+                detail=f"{type(exc).__name__}: {exc}",
+            )
+            raise
+        record_migration_outcome(
+            conn, migration_name=_journal, phase="succeeded", outcome="ok",
+            detail=f"rows stamped={stamped}",
+        )
     finally:
         conn.close()
 

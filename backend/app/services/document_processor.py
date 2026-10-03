@@ -198,7 +198,16 @@ def is_enrichment_enabled_for_vault(vault_id: Optional[int]) -> bool:
             return settings.chunk_enrichment_enabled
         return bool(override)
     except Exception:
-        # DB error — conservatively fall back to global
+        # DB error — conservatively fall back to global, but never silently:
+        # an operator's explicit vault opt-out is being overridden here, so
+        # the fallback is logged (issue #697 / T1-25-KR-17).
+        logger.warning(
+            "Vault enrichment override lookup failed for vault_id=%s; "
+            "falling back to the global chunk_enrichment_enabled=%s setting",
+            vault_id,
+            settings.chunk_enrichment_enabled,
+            exc_info=True,
+        )
         return settings.chunk_enrichment_enabled
 
 
@@ -247,7 +256,17 @@ def is_enrichment_enabled_for_file(file_id: int, vault_id: int) -> bool:
             return settings.chunk_enrichment_enabled
         return bool(vault_override)
     except Exception:
-        # DB error — conservatively fall back to vault resolution
+        # DB error — conservatively fall back to vault resolution, but never
+        # silently: an operator's explicit file-level opt-out may be
+        # overridden here, so the fallback is logged (issue #697 /
+        # T1-25-KR-17).
+        logger.warning(
+            "File enrichment override lookup failed for file_id=%s (vault_id=%s); "
+            "falling back to vault/global enrichment resolution",
+            file_id,
+            vault_id,
+            exc_info=True,
+        )
         return is_enrichment_enabled_for_vault(vault_id)
 
 
@@ -3132,7 +3151,13 @@ class DocumentProcessor:
         if embeddings:
             try:
                 async with self._write_session() as conn:
-                    near_duplicates.record_file_centroid(
+                    # Off-loop (issue #697): the advisory scan re-tokenizes
+                    # candidate texts and runs SQLite I/O — bounded, but far
+                    # too slow for the event loop on large vaults. Pool
+                    # connections are check_same_thread=False, so the pooled
+                    # conn hands off to the worker thread safely.
+                    await asyncio.to_thread(
+                        near_duplicates.record_file_centroid,
                         conn,
                         vault_id,
                         file_id,
