@@ -14,7 +14,7 @@ from typing import Union, get_args, get_origin
 from fastapi import FastAPI
 
 from app.api.routes.settings import PERSISTED_FUNCTIONAL_FIELDS
-from app.config import Settings, settings
+from app.config import Settings, canonicalize_vector_metric, settings
 from app.middleware.logging import SensitiveFieldFilter
 from app.models.database import SQLiteConnectionPool, get_pool, run_migrations
 from app.security import CSRFManager
@@ -168,8 +168,10 @@ def _validate_setting_value(key: str, value) -> bool:
         current[key] = value
         type(settings).model_validate(current)
         return True
-    except Exception as e:
-        logger.warning("Persisted setting %s=%r failed validation: %s", key, value, e)
+    except Exception:
+        # Persisted values may contain credentials or other sensitive settings.
+        # Log the field name only; callers retain the validation boundary.
+        logger.warning("Persisted setting %s failed validation", key)
         return False
 
 
@@ -188,12 +190,8 @@ def _batch_validate_persisted(converted_pairs: dict) -> bool:
         candidate.update(converted_pairs)
         type(settings).model_validate(candidate)
         return True
-    except Exception as e:
-        logger.warning(
-            "Persisted settings rejected as a set (%s); falling back to "
-            "per-key replay",
-            e,
-        )
+    except Exception:
+        logger.warning("Persisted settings rejected as a set; falling back to per-key replay")
         return False
 
 
@@ -228,8 +226,8 @@ def _load_persisted_settings(sqlite_path: str) -> None:
                         converted = persisted[key]
                     if _validate_setting_value(key, converted):
                         setattr(settings, key, converted)
-                except Exception as e:
-                    logger.warning(f"Failed to restore persisted setting {key}: {e}")
+                except Exception:
+                    logger.warning("Failed to restore persisted setting %s", key)
 
         # Every remaining persisted functional field replays through the typed
         # converter map (issue #494 CONFIG-003).
@@ -399,9 +397,11 @@ def _load_persisted_settings(sqlite_path: str) -> None:
                             converted = json.loads(raw)
                         except (json.JSONDecodeError, ValueError):
                             converted = raw
+                if key == "vector_metric":
+                    converted = canonicalize_vector_metric(converted)
                 converted_pairs[key] = converted
-            except Exception as e:
-                logger.warning(f"Failed to restore persisted setting {key}: {e}")
+            except Exception:
+                logger.warning("Failed to restore persisted setting %s", key)
         if converted_pairs and _batch_validate_persisted(converted_pairs):
             for key, converted in converted_pairs.items():
                 setattr(settings, key, converted)
@@ -413,8 +413,8 @@ def _load_persisted_settings(sqlite_path: str) -> None:
                 try:
                     if _validate_setting_value(key, converted):
                         setattr(settings, key, converted)
-                except Exception as e:
-                    logger.warning(f"Failed to restore persisted setting {key}: {e}")
+                except Exception:
+                    logger.warning("Failed to restore persisted setting %s", key)
     except sqlite3.OperationalError:
         logger.debug(
             "Settings table not yet created; skipping persisted settings load (expected on first startup)"

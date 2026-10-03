@@ -4,6 +4,7 @@ import { getJwtAccessToken, refreshAccessToken } from "@/lib/api";
 import {
   draftRoomKeys,
   getDraftEventsUrl,
+  getDraftRoomPollIntervalMs,
   type DraftDetail,
   type DraftRoomCapabilities,
 } from "@/lib/api/draftRoom";
@@ -74,7 +75,6 @@ const STREAM_HEALTHY_MS = 20000;
 const STREAM_INACTIVITY_TIMEOUT_MS = 45000;
 const MAX_BUFFER_BYTES = 64 * 1024;
 const MAX_CONSECUTIVE_FAILURES = 3;
-const DEFAULT_POLL_INTERVAL_SECONDS = 2;
 const STAGE_PROGRESS_COALESCE_MS = 1000;
 
 const KNOWN_EVENT_TYPES: ReadonlySet<string> = new Set([
@@ -188,9 +188,7 @@ export function useDraftRoomEvents(
       setPollingFallback(true);
       const capabilities = queryClient.getQueryData<DraftRoomCapabilities>(draftRoomKeys.capabilities());
       const configuredSeconds = capabilities?.limits?.poll_interval_seconds;
-      const pollSeconds =
-        typeof configuredSeconds === "number" ? configuredSeconds : DEFAULT_POLL_INTERVAL_SECONDS;
-      const intervalMs = Math.max(500, pollSeconds * 1000);
+      const intervalMs = getDraftRoomPollIntervalMs(configuredSeconds);
       pollTimer = setInterval(() => {
         const detail = queryClient.getQueryData<DraftDetail>(draftRoomKeys.detail(id));
         // Stop only when there is no active work anywhere — no compile job

@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""Check Draft Room capability fixture keys against the backend contract."""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import sys
+from pathlib import Path
+
+from check_l02_typescript_ast import run_typescript_facts
+
+
+def emitted_limit_keys(root: Path) -> set[str]:
+    backend = root / "backend" / "app" / "api" / "routes" / "draft_room.py"
+    tree = ast.parse(backend.read_text(encoding="utf-8"))
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or node.name != "get_capabilities":
+            continue
+        for call in ast.walk(node):
+            if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name) or call.func.id != "DraftRoomCapabilities":
+                continue
+            limits = next((kw.value for kw in call.keywords if kw.arg == "limits"), None)
+            if isinstance(limits, ast.Dict):
+                return {key.value for key in limits.keys if isinstance(key, ast.Constant) and isinstance(key.value, str)}
+    raise RuntimeError("could not locate get_capabilities limits literal")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
+    args = parser.parse_args(argv)
+    root = args.root.resolve()
+    try:
+        emitted = emitted_limit_keys(root)
+        directory = root / "frontend" / "src" / "components" / "draft-room"
+        files = sorted((*directory.glob("*.test.ts"), *directory.glob("*.test.tsx")))
+        facts = run_typescript_facts(root, files)
+        errors: list[str] = []
+        for item in facts["files"]:
+            relative = Path(item["file"]).relative_to(root).as_posix()
+            if item["fixtureUnsupported"]:
+                errors.append(f"UNSUPPORTED fixture syntax: {relative}")
+            for fact in item["fixtureKeys"]:
+                if fact["key"] not in emitted:
+                    errors.append(f"FIXTURE-DRIFT {fact['key']}: {relative}:{fact['line']}")
+    except (OSError, SyntaxError, RuntimeError, ValueError) as exc:
+        print(f"capability-fixtures: {exc}", file=sys.stderr)
+        return 2
+    for error in errors:
+        print(error)
+    return 1 if errors else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
