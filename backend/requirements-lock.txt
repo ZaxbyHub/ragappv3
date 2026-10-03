@@ -993,9 +993,9 @@ httpx==0.28.1 \
     #   -r backend/requirements.txt
     #   huggingface-hub
     #   unstructured-client
-huggingface-hub==1.26.0 \
-    --hash=sha256:c8cd4e2df1ba9402f77fce9b509ec1d52debb502551789473f34016acc14e361 \
-    --hash=sha256:e8cca670caa5d8dfa7e45bf45e86b466698198cd8150c021bcdb4a86b9252364
+huggingface-hub==2.0.0 \
+    --hash=sha256:375e5ad35cb3505efbf19c0cdd7e3fbf1e2304b12cd0e6b7fc8d75c6f5484619 \
+    --hash=sha256:b3eecb60540c17e8ef94c187104f4a5c0c451afcb9510ba8e17739bedcc2d6dd
     # via
     #   accelerate
     #   sentence-transformers
