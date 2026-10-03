@@ -453,6 +453,8 @@ services:
 ```bash
 # Document chunking (affects memory and vector store size)
 CHUNK_SIZE_CHARS=1000      # Smaller chunks = more embeddings, better granularity
+# NOTE: CHUNK_SIZE_CHARS / CHUNK_OVERLAP_CHARS apply only when MULTI_SCALE_INDEXING_ENABLED=false;
+# multi-scale indexing (the default) uses MULTI_SCALE_CHUNK_SIZES instead
 CHUNK_OVERLAP_CHARS=100    # Faster processing (less accurate)
 CHUNK_OVERLAP_CHARS=400    # Slower processing (more accurate)
 MULTI_SCALE_INDEXING_ENABLED=true
@@ -496,7 +498,7 @@ Wide spreadsheets (100+ columns) are automatically split into column groups to e
 - **Pre-embedding validation:** Check logs for warnings about oversized chunks
 - **Column-group metadata:** Each chunk is tagged with `col_group` index for identification
 
-If you process many wide spreadsheets, monitor logs for chunk size warnings and consider adjusting `CHUNK_SIZE_CHARS` if needed.
+If you process many wide spreadsheets, monitor logs for chunk size warnings and consider adjusting `CHUNK_SIZE_CHARS` if needed (only effective with multi-scale indexing disabled — see the note under Optimization Settings).
 
 #### Shared Embedding Cache (Redis L2)
 

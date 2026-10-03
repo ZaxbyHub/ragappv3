@@ -82,6 +82,15 @@ def apply_legacy_settings_conversion(data: Mapping[str, object]) -> dict:
     return converted
 
 
+# Hard per-text embedding input cap (issue #698): chunk-size-family
+# configuration is bounded by what the embedder can actually accept, so an
+# out-of-bounds value fails at configuration time instead of mid-ingest.
+# EmbeddingService.MAX_TEXT_LENGTH (app/services/embeddings.py) mirrors this
+# value; config cannot import the service (circular import), so the equality
+# is pinned by a guardrail test instead of by an import.
+EMBEDDING_MAX_TEXT_CHARS = 8192
+
+
 class Settings(BaseSettings):
     """Application settings with environment variable support."""
 
@@ -1154,6 +1163,46 @@ class Settings(BaseSettings):
             return legacy_chunk_size * 4
         return 2000  # ~500 tokens with llama.cpp -ub 8192 batch size
 
+    @field_validator("chunk_size_chars", mode="after")
+    @classmethod
+    def validate_chunk_size_chars_bounds(cls, v: int | None) -> int | None:
+        """Bound chunk_size_chars to the embedder's per-text cap (issue #698).
+
+        Runs after the legacy `mode="before"` migrator, so direct values and
+        legacy chunk_size x4 conversions are both checked. An out-of-bounds
+        chunk size can only fail per-chunk mid-ingest otherwise — the exact
+        settings-to-runtime contract drift this closes.
+        """
+        if v is not None and (v <= 0 or v > EMBEDDING_MAX_TEXT_CHARS):
+            raise ValueError(
+                f"chunk_size_chars must be between 1 and "
+                f"{EMBEDDING_MAX_TEXT_CHARS} (the embedder's per-text cap; "
+                f"see EMBEDDING_MAX_TEXT_CHARS)"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def validate_chunk_overlap_below_size(self) -> "Settings":
+        """chunk_overlap_chars must stay strictly below chunk_size_chars.
+
+        The chunker (unstructured, pinned 0.18.32) rejects overlap >= size
+        with ``'overlap' argument must be less than max_characters`` — a
+        config that passes validation here would otherwise fail EVERY
+        document ingest at chunk time (issue #698 review: the same
+        knowable-but-unenforced bound class as the per-text cap). Runs after
+        both legacy migrators, so direct and chunk_size/chunk_overlap x4
+        derived values are both checked.
+        """
+        overlap = self.chunk_overlap_chars
+        size = self.chunk_size_chars
+        if overlap is not None and size is not None and overlap >= size:
+            raise ValueError(
+                f"chunk_overlap_chars ({overlap}) must be strictly less than "
+                f"chunk_size_chars ({size}) — the chunker rejects overlap >= "
+                f"chunk size at ingest time (issue #698)"
+            )
+        return self
+
     @field_validator("chunk_overlap_chars", mode="before")
     @classmethod
     def migrate_chunk_overlap_chars(cls, v: int | None, values) -> int:
@@ -1433,13 +1482,33 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "multi_scale_chunk_sizes must contain only positive integers"
                 )
+            if size > EMBEDDING_MAX_TEXT_CHARS:
+                raise ValueError(
+                    f"multi_scale_chunk_sizes entries must not exceed "
+                    f"{EMBEDDING_MAX_TEXT_CHARS} (the embedder's per-text cap) — "
+                    f"an oversized scale would silently drop every chunk it "
+                    f"produces at ingest (issue #698)"
+                )
         return ",".join(str(x) for x in unique_sizes)
 
     @field_validator("multi_scale_overlap_ratio", mode="after")
     @classmethod
     def validate_multi_scale_overlap_ratio(cls, v: float) -> float:
-        """Validate multi_scale_overlap_ratio is in range 0.0-1.0."""
-        return cls._validate_float_range(v, 0.0, 1.0, "multi_scale_overlap_ratio")
+        """Validate multi_scale_overlap_ratio is in range [0.0, 1.0).
+
+        Strictly less than 1.0 (issue #698 review): at exactly 1.0 the
+        per-scale overlap becomes ``int(scale * 1.0) == scale`` and the
+        underlying chunker rejects every ingest with
+        "'overlap' argument must be less than max_characters" — so the
+        degenerate ratio fails at configuration time instead.
+        """
+        if v < 0.0 or v >= 1.0:
+            raise ValueError(
+                "multi_scale_overlap_ratio must be in [0.0, 1.0) — at 1.0 the "
+                "per-scale chunk overlap equals the scale size and every "
+                "ingest fails in the chunker (issue #698)"
+            )
+        return v
 
     @field_validator("index_rebuild_delta", mode="after")
     @classmethod
