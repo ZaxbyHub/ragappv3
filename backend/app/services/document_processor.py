@@ -1027,7 +1027,9 @@ class DocumentProcessor:
         if oversized:
             logger.warning(
                 "Document '%s' has %d chunk(s) exceeding effective embedding length (%d chars after prefix): %s. "
-                "With fail_fast=False these chunks are skipped and reported as failed; fail_fast=True raises.",
+                "With fail_fast=False embed_batch returns None placeholders at these positions "
+                "(dropped from the embedded set; the enrichment path treats any None as a chunk-level failure); "
+                "fail_fast=True raises.",
                 source_filename,
                 len(oversized),
                 effective_max,

@@ -84,17 +84,95 @@ async def test_chunk_view_clamped_to_half_when_between_half_and_remaining(
 
     monkeypatch.setattr(settings, "model_context_tokens", 4096)
     llm = _RecordingLLM()
+    chunker = ContextualChunker(llm)
     chunk = ProcessedChunk(text="y" * 12_000, metadata={}, chunk_index=0)
-    await ContextualChunker(llm).contextualize_chunks("z" * 60_000, [chunk], "f.txt")
+    await chunker.contextualize_chunks("z" * 60_000, [chunk], "f.txt")
 
     payload = llm.payloads[0]
-    y_count = payload.count("y")
     budget = 4 * 4096
+    # Measure the exact fixed scaffolding the way the production budget does
+    # (PRR-010: the clamp is half of REMAINING, not half of the budget — the
+    # budget//2 bound is ~340 chars looser than the real invariant), and
+    # subtract the scaffolding's own share of the counted character so the
+    # assertion measures the chunk view alone.
+    fixed_prompt = chunker._build_prompt(
+        document_text="",
+        chunk_text="",
+        chunk_index=0,
+        total_chunks=1,
+        source_filename="f.txt",
+    )
+    fixed = sum(len(m["content"]) for m in fixed_prompt)
+    baseline_y = sum(m["content"].count("y") for m in fixed_prompt)
+    remaining = budget - fixed
+    y_count = payload.count("y") - baseline_y
     # The chunk view is clamped well below the raw 12,000 chars (half of
-    # remaining ≈ 7.7k) while the document absorbs the rest of the budget.
+    # remaining ≈ 7.8k) while the document absorbs the rest of the budget.
     assert y_count < 12_000
-    assert y_count <= budget // 2
+    assert y_count <= remaining // 2
     assert max(llm.lengths) <= budget
+
+
+async def test_truncation_warning_fires_once_per_call(monkeypatch, caplog):
+    """One WARNING for the first per-chunk truncation; repeats log DEBUG.
+
+    Copilot review on PR #848 (contextual_chunking.py:144/215): the bounded
+    view is rebuilt per chunk, so an over-budget document emitted one
+    identical WARNING per chunk — log spam for routine behavior.
+    """
+    import logging
+
+    from app.config import settings
+    from app.services.chunking import ProcessedChunk
+    from app.services.contextual_chunking import ContextualChunker
+
+    monkeypatch.setattr(settings, "model_context_tokens", 4096)
+    llm = _RecordingLLM()
+    chunks = [
+        ProcessedChunk(text=f"y{i}", metadata={}, chunk_index=i) for i in range(4)
+    ]
+    with caplog.at_level(
+        logging.DEBUG, logger="app.services.contextual_chunking"
+    ):
+        await ContextualChunker(llm).contextualize_chunks(
+            "z" * 60_000, chunks, "f.txt"
+        )
+    truncation_warnings = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "Document view truncated" in r.message
+    ]
+    truncation_debugs = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.DEBUG and "Document view truncated" in r.message
+    ]
+    assert len(truncation_warnings) == 1
+    assert len(truncation_debugs) >= 1
+
+
+async def test_escape_once_path_matches_direct_escape(monkeypatch):
+    """The per-call pre-escaped document yields the same prompt as raw+escape.
+
+    Pins the escape-once refactor (N-5): contextualize_chunks passes the
+    once-escaped document through, and _build_prompt must not re-escape it.
+    """
+    from html import escape as _xml_escape
+
+    from app.config import settings
+    from app.services.chunking import ProcessedChunk
+    from app.services.contextual_chunking import ContextualChunker
+
+    monkeypatch.setattr(settings, "model_context_tokens", 4096)
+    doc = "a&b<c " * 500
+    llm = _RecordingLLM()
+    chunk = ProcessedChunk(text="y" * 100, metadata={}, chunk_index=0)
+    await ContextualChunker(llm).contextualize_chunks(doc, [chunk], "f.txt")
+    # The escaped form of the document head appears verbatim (escaped once,
+    # not double-escaped: "&amp;" would become "&amp;amp;" under re-escape).
+    assert "&amp;" in llm.payloads[0]
+    assert "&amp;amp;" not in llm.payloads[0]
+    assert _xml_escape("a&b<c") in llm.payloads[0]
 
 
 async def test_two_chunks_of_different_lengths_use_per_chunk_budget(monkeypatch):

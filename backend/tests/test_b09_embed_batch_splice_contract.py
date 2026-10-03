@@ -153,7 +153,67 @@ async def test_provider_failure_reports_batch_and_none_placeholders(service):
     assert len(embeddings) == len(texts)
     assert embeddings[0] is None
     assert embeddings[1] == [0.1] * 768
-    assert failed != []
+    # Exact index (PR #848 review PRR-003): failed_batch_indices indexes the
+    # valid-subsequence batches — "boom-trigger" is batch 0 even though its
+    # TEXT position is 0 here; a wrong-index implementation must not pass.
+    assert failed == [0]
+
+
+async def test_adjacent_invalid_and_provider_failure_keeps_positions(service):
+    """Invalid text + provider-failed batch side by side: positions stay exact.
+
+    Review probe (PR #848 PRR-003): with per-text char-bounded batching, the
+    oversized text (position 0) and the provider-failed text (position 1)
+    both land None while the valid text (position 2) still gets its vector —
+    and failed_batch_indices indexes the valid-subsequence batch (0), not
+    the original text position (1).
+    """
+    import app.services.embeddings as emb_module
+
+    emb_module.settings.embedding_batch_max_chars = 20
+    client = MagicMock()
+
+    async def mock_post(url, json=None, **kwargs):
+        inputs = (json or {}).get("input", [])
+        if any(t.startswith("boom") for t in inputs):
+            raise RuntimeError("provider down")
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {"embeddings": [[0.1] * 768] * len(inputs)}
+        return response
+
+    client.post = mock_post
+    service._client = client
+
+    texts = ["x" * 9000, "boom-trigger", "fine text"]
+    embeddings, failed = await service.embed_batch(texts, fail_fast=False)
+
+    assert len(embeddings) == len(texts)
+    assert embeddings[0] is None  # oversized (never sent)
+    assert embeddings[1] is None  # provider-failed batch
+    assert embeddings[2] == [0.1] * 768
+    assert failed == [0]
+
+
+def test_put_size_lowering_below_current_overlap_422(monkeypatch):
+    """PUT that LOWERS size below the CURRENT overlap 422s (effective pair).
+
+    PR #848 review PRR-005: the cross-field check runs on the effective
+    pair (updated value when provided, current singleton value otherwise),
+    so a single-sided size PUT is compared against the persisted overlap.
+    """
+    from fastapi import HTTPException
+
+    from app.api.routes.settings import SettingsUpdate, _validate_settings_update
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "chunk_size_chars", 2000)
+    monkeypatch.setattr(settings, "chunk_overlap_chars", 200)
+    with pytest.raises(HTTPException) as exc_info:
+        _validate_settings_update(SettingsUpdate(chunk_size_chars=100))
+    assert exc_info.value.status_code == 422
+    assert "200" in str(exc_info.value.detail)
+    assert "100" in str(exc_info.value.detail)
 
 
 async def test_fail_fast_true_still_raises_on_first_invalid(service):

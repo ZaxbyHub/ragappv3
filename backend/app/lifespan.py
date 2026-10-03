@@ -173,6 +173,30 @@ def _validate_setting_value(key: str, value) -> bool:
         return False
 
 
+def _batch_validate_persisted(converted_pairs: dict) -> bool:
+    """Validate ALL persisted values as one merged candidate state.
+
+    Cross-field model validators (chunk overlap vs size, jobs-lease
+    coherence) reject a persisted pair when each key is validated alone
+    against the not-yet-updated singleton, silently reverting one field of
+    an operator-saved pair on restart (issue #698 feedback). Validating the
+    merged candidate once makes a jointly-valid pair replay as a unit;
+    callers fall back to per-key replay when this returns False.
+    """
+    try:
+        candidate = settings.model_dump()
+        candidate.update(converted_pairs)
+        type(settings).model_validate(candidate)
+        return True
+    except Exception as e:
+        logger.warning(
+            "Persisted settings rejected as a set (%s); falling back to "
+            "per-key replay",
+            e,
+        )
+        return False
+
+
 def _load_persisted_settings(sqlite_path: str) -> None:
     """Load user-configurable settings from DB if they were previously saved."""
     conn = sqlite3.connect(sqlite_path)
@@ -337,32 +361,56 @@ def _load_persisted_settings(sqlite_path: str) -> None:
         # Iterate the exported single source of truth; the guard above
         # guarantees the literal mirror (plus the legacy-loop keys above)
         # covers exactly this set.
+        #
+        # Two-pass replay (issue #698 feedback): convert every persisted key
+        # first, then batch-validate the merged candidate state ONCE before
+        # applying. Per-key validation alone rejects a jointly-valid pair
+        # (e.g. chunk_size_chars=150 + chunk_overlap_chars=100 replayed over
+        # boot defaults {2000,200}) because the first key is checked against
+        # the not-yet-updated sibling — silently reverting one field of an
+        # operator-saved pair on restart. When the merged set is rejected,
+        # fall back to the historical per-key behavior (warn + skip each
+        # offender individually).
+        converted_pairs: dict = {}
         for key in PERSISTED_FUNCTIONAL_FIELDS:
-            if key in persisted:
-                try:
-                    if not hasattr(settings, key):
-                        logger.warning(f"Unknown persisted setting {key}, skipping")
-                        continue
-                    decoder = _PERSISTED_FIELD_DECODERS.get(key)
-                    if decoder is not None:
-                        converted = decoder(persisted[key])
+            if key not in persisted:
+                continue
+            try:
+                if not hasattr(settings, key):
+                    logger.warning(f"Unknown persisted setting {key}, skipping")
+                    continue
+                decoder = _PERSISTED_FIELD_DECODERS.get(key)
+                if decoder is not None:
+                    converted = decoder(persisted[key])
+                else:
+                    # Fallback: infer from the current value's runtime type.
+                    expected_type = type(getattr(settings, key))
+                    raw = persisted[key]
+                    if expected_type is type(None):  # NoneType - just set as string
+                        converted = raw
+                    elif expected_type is bool:
+                        converted = str(raw).lower() in ("true", "1", "yes", "on")
+                    elif expected_type is int:
+                        converted = int(raw)
+                    elif expected_type is float:
+                        converted = float(raw)
                     else:
-                        # Fallback: infer from the current value's runtime type.
-                        expected_type = type(getattr(settings, key))
-                        raw = persisted[key]
-                        if expected_type is type(None):  # NoneType - just set as string
+                        try:
+                            converted = json.loads(raw)
+                        except (json.JSONDecodeError, ValueError):
                             converted = raw
-                        elif expected_type is bool:
-                            converted = str(raw).lower() in ("true", "1", "yes", "on")
-                        elif expected_type is int:
-                            converted = int(raw)
-                        elif expected_type is float:
-                            converted = float(raw)
-                        else:
-                            try:
-                                converted = json.loads(raw)
-                            except (json.JSONDecodeError, ValueError):
-                                converted = raw
+                converted_pairs[key] = converted
+            except Exception as e:
+                logger.warning(f"Failed to restore persisted setting {key}: {e}")
+        if converted_pairs and _batch_validate_persisted(converted_pairs):
+            for key, converted in converted_pairs.items():
+                setattr(settings, key, converted)
+        else:
+            for key in PERSISTED_FUNCTIONAL_FIELDS:
+                if key not in converted_pairs:
+                    continue
+                converted = converted_pairs[key]
+                try:
                     if _validate_setting_value(key, converted):
                         setattr(settings, key, converted)
                 except Exception as e:

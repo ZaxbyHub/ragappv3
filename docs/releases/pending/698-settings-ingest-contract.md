@@ -54,7 +54,9 @@
     failure, cancels still-pending siblings before re-raising — a surviving
     sibling can no longer keep mutating `chunk.text` after the ingest caller
     has caught the raise (embedded and stored text can no longer diverge).
-    Outer `CancelledError` passes through unchanged.
+    Outer `CancelledError` passes through unchanged. The document is
+    XML-escaped once per call (not once per chunk) and prompt-budget
+    truncation logs one WARNING per document with repeats at DEBUG.
 - **`backend/app/services/document_processor.py`** — the persistent
   embedding-cache identity includes the serving endpoint
   (`model_revision` now carries `settings.ollama_embedding_url`), so
@@ -68,6 +70,16 @@
 - **`backend/app/services/embedding_cache.py`** — connection init creates
   `idx_embedding_cache_created_at`, so the prune's `ORDER BY created_at`
   stops full-scanning the table at the entry cap.
+
+- **`backend/app/lifespan.py`** — persisted-settings replay validates the
+  merged candidate state once (batch) before applying, falling back to the
+  historical per-key warn-and-skip only when the set as a whole is
+  rejected. Per-key replay order could silently revert one field of a
+  jointly-valid persisted pair on restart (e.g. a PUT-legal
+  `chunk_size_chars=150` + `chunk_overlap_chars=100` pair replayed over
+  boot defaults `{2000, 200}` landed as `{2000, 100}`); the same fix
+  covers the pre-existing jobs-lease heartbeat/reclaim instance of that
+  class (issue #559).
 
 ### Operations
 
@@ -108,10 +120,25 @@
   `MULTI_SCALE_CHUNK_SIZES` entry. `CHUNK_OVERLAP_CHARS >= CHUNK_SIZE_CHARS`
   (direct or legacy-derived) and `MULTI_SCALE_OVERLAP_RATIO = 1.0` are
   likewise rejected at configuration time — both previously failed every
-  ingest in the chunker. These startup failures apply to environment
-  variables and fresh construction; a value already persisted in
-  `settings_kv` that fails validation at startup is logged as a warning and
-  replaced by the default (the existing lifespan replay behavior).
+  ingest in the chunker. The PUT `/settings` API enforces the same rules
+  and answers 422 — including the cross-field overlap rule for a
+  single-sided size update that would land at or below the currently
+  persisted overlap (such PUTs were accepted before this change). One
+  precision on "at configuration time": the embedder's EFFECTIVE per-text
+  budget also subtracts the document prefix (82 chars for the auto-applied
+  Qwen prefix), so a `chunk_size_chars` within the prefix distance of the
+  8192 cap can still produce chunks that are skipped per-chunk at embed
+  time rather than rejected at startup. These startup failures apply to
+  environment variables and fresh construction; a value already persisted
+  in `settings_kv` that fails validation at startup is logged as a warning
+  and replaced by the default (the existing lifespan replay behavior) —
+  and jointly-valid persisted pairs now replay as a unit (batch-validated)
+  instead of being split by per-key replay order.
+- The Windows launcher applies the new `--max-client-batch-size 128` only
+  when it CREATES the TEI container: if `harrier-embed` is already running
+  from before the upgrade, remove it first (`docker rm -f harrier-embed`)
+  and re-run `start-services.ps1`, or it keeps TEI's default 32-text client
+  batch cap (docker-compose deployments are unaffected).
 - The embedding-cache identity change intentionally invalidates every
   pre-existing cache row (one-time cold cache on first deploy; the table is
   a rebuildable cache, not user data).

@@ -104,7 +104,9 @@ class ContextualChunker:
             f"ContextualChunker initialized with concurrency limit: {concurrency}"
         )
 
-    def _bounded_document_view(self, escaped_doc: str, doc_budget: int) -> str:
+    def _bounded_document_view(
+        self, escaped_doc: str, doc_budget: int, warn_state: dict | None = None
+    ) -> str:
         """Fit the (already XML-escaped) document into ``doc_budget`` chars.
 
         Budget arithmetic (issue #698): when the escaped document exceeds the
@@ -119,6 +121,13 @@ class ContextualChunker:
                 already applied — the budget is measured on the escaped
                 form).
             doc_budget: Maximum characters the view may occupy.
+            warn_state: Optional per-``contextualize_chunks``-call dict.
+                Prompt-budget truncation is routine for large documents and
+                the view is rebuilt per chunk, so with a warn_state the
+                FIRST truncation logs a WARNING and later ones log DEBUG
+                (Copilot review on PR #848: one identical WARNING per chunk
+                floods the log). Direct callers without a warn_state keep
+                the always-WARNING behavior.
 
         Returns:
             The whole document when it fits, else a head+marker+tail view
@@ -138,10 +147,17 @@ class ContextualChunker:
             escaped_doc[:head] + marker + escaped_doc[len(escaped_doc) - tail :]
         )
         if len(escaped_doc) > len(view):
-            logger.warning(
+            message = (
                 f"Document view truncated from {len(escaped_doc)} to "
                 f"{len(view)} escaped characters for contextualization"
             )
+            if warn_state is None:
+                logger.warning(message)
+            elif warn_state.get("truncation_warned"):
+                logger.debug(message)
+            else:
+                warn_state["truncation_warned"] = True
+                logger.warning(message)
         return view
 
     def _build_prompt(
@@ -151,6 +167,8 @@ class ContextualChunker:
         chunk_index: int,
         total_chunks: int,
         source_filename: str,
+        escaped_document: str | None = None,
+        warn_state: dict | None = None,
     ) -> List[dict]:
         """
         Build the prompt for generating chunk context.
@@ -163,8 +181,10 @@ class ContextualChunker:
         view, and filename view — is bounded by
         ``4 * settings.model_context_tokens`` characters (the repo's own
         chars-per-token conversion), measured on the POST-ESCAPE views so XML
-        escaping inflation cannot break the bound (escaping happens exactly
-        once, here). The chunk view gets at most half the remaining budget;
+        escaping inflation cannot break the bound (the document is escaped
+        exactly once — here when called directly, or once per
+        ``contextualize_chunks`` call via ``escaped_document``). The chunk
+        view gets at most half the remaining budget;
         the document view gets the rest (marker-inside-budget head/tail
         split). When the fixed scaffolding alone exceeds the budget, both
         views are empty and the prompt degrades to that fixed floor. The
@@ -177,6 +197,13 @@ class ContextualChunker:
             chunk_index: The index of the chunk in the document.
             total_chunks: Total number of chunks in the document.
             source_filename: The name of the source file.
+            escaped_document: Pre-escaped document text. The escape is
+                chunk-independent, so ``contextualize_chunks`` escapes once
+                per call and passes it here — escaping the whole document
+                per chunk made total escape work O(chunks x document) (PR
+                #848 review N-5). When None, ``document_text`` is escaped.
+            warn_state: Optional per-call dict forwarding the
+                truncate-once-warn contract to ``_bounded_document_view``.
 
         Returns:
             List of message dicts for LLM chat completion.
@@ -214,8 +241,13 @@ class ContextualChunker:
         else:
             chunk_view = _xml_escape(chunk_text)[: remaining // 2]
             doc_budget = remaining - len(chunk_view)
+            escaped_doc = (
+                escaped_document
+                if escaped_document is not None
+                else _xml_escape(document_text)
+            )
             doc_view = self._bounded_document_view(
-                _xml_escape(document_text), doc_budget
+                escaped_doc, doc_budget, warn_state=warn_state
             )
             user_content = _user_content(doc_view, chunk_view)
 
@@ -254,7 +286,13 @@ class ContextualChunker:
         # Prompt budgeting happens per chunk inside _build_prompt (issue
         # #698) — the budget depends on the chunk's own escaped size, so a
         # single once-per-call truncation sized for one chunk could overrun
-        # for a larger one.
+        # for a larger one. The document ESCAPE is chunk-independent, so it
+        # happens exactly once here (per-chunk whole-document escapes made
+        # total escape work O(chunks x document) — PR #848 review N-5), and
+        # truncation warnings are once-per-call via the shared warn_state
+        # (Copilot review on PR #848: one identical WARNING per chunk).
+        escaped_doc = _xml_escape(document_text)
+        warn_state: dict = {}
 
         # Process all chunks concurrently with semaphore limiting.
         tasks = [
@@ -265,6 +303,8 @@ class ContextualChunker:
                     chunk_index=idx,
                     total_chunks=total_chunks,
                     source_filename=safe_filename,
+                    escaped_document=escaped_doc,
+                    warn_state=warn_state,
                 )
             )
             for idx, chunk in enumerate(chunks)
@@ -297,6 +337,8 @@ class ContextualChunker:
         chunk_index: int,
         total_chunks: int,
         source_filename: str,
+        escaped_document: str | None = None,
+        warn_state: dict | None = None,
     ) -> None:
         """
         Generate and add context to a single chunk.
@@ -310,6 +352,11 @@ class ContextualChunker:
             chunk_index: The index of this chunk.
             total_chunks: Total number of chunks.
             source_filename: Source filename for the prompt.
+            escaped_document: Pre-escaped document text (escape-once per
+                ``contextualize_chunks`` call — PR #848 review N-5). When
+                None, ``_build_prompt`` escapes ``document_text`` itself.
+            warn_state: Optional per-call dict for the truncate-once-warn
+                contract.
         """
         async with self._semaphore:
             try:
@@ -319,6 +366,8 @@ class ContextualChunker:
                     chunk_index=chunk_index,
                     total_chunks=total_chunks,
                     source_filename=source_filename,
+                    escaped_document=escaped_document,
+                    warn_state=warn_state,
                 )
 
                 # Retry loop with exponential backoff for transient LLM failures
