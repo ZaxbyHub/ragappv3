@@ -50,7 +50,7 @@ def _is_executor_call(node: ast.AST) -> bool:
     return False
 
 
-def _centroid_dispatch_violations(path: Path) -> list[str]:
+def _centroid_dispatch_violations(path: Path) -> tuple[list[str], int]:
     """References to record_file_centroid NOT dispatched via an executor.
 
     A reference is clean when its innermost enclosing call is an executor
@@ -66,12 +66,14 @@ def _centroid_dispatch_violations(path: Path) -> list[str]:
             parent_of[id(child)] = parent
 
     violations: list[str] = []
+    refs_seen = 0
     for node in ast.walk(tree):
         is_ref = (
             isinstance(node, ast.Attribute) and node.attr == _CENTROID_REF
         ) or (isinstance(node, ast.Name) and node.id == _CENTROID_REF)
         if not is_ref:
             continue
+        refs_seen += 1
         # Walk up to the innermost enclosing Call and classify.
         cursor: ast.AST = node
         chain: list[ast.AST] = [node]
@@ -99,14 +101,20 @@ def _centroid_dispatch_violations(path: Path) -> list[str]:
                 f"line {getattr(node, 'lineno', '?')}: bare reference to "
                 f"{_CENTROID_REF} outside any call"
             )
-    return violations
+    return violations, refs_seen
 
 
-def _async_frame_builder_violations(path: Path) -> list[str]:
+def _async_frame_builder_violations(path: Path) -> tuple[list[str], int]:
     """_row_to_document_response calls from async bodies lacking the map kwarg,
-    plus direct is_enrichment_enabled_for_file calls from async bodies."""
+    plus direct is_enrichment_enabled_for_file calls from async bodies.
+
+    Returns ``(violations, names_seen)`` where ``names_seen`` counts every
+    tracked call name the walker examined, so a future edit that blinds the
+    walker (wrong identifier, missed tree shape) fails the walker-bite
+    assertion instead of passing vacuously (PRR-006)."""
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     violations: list[str] = []
+    names_seen = 0
     for node in ast.walk(tree):
         if not isinstance(node, ast.AsyncFunctionDef):
             continue
@@ -115,6 +123,9 @@ def _async_frame_builder_violations(path: Path) -> list[str]:
                 continue
             func = sub.func
             name = getattr(func, "attr", None) or getattr(func, "id", None)
+            if name not in ("_row_to_document_response", "is_enrichment_enabled_for_file"):
+                continue
+            names_seen += 1
             if name == "_row_to_document_response":
                 kw = next(
                     (k for k in sub.keywords if k.arg == "enrichment_map"), None
@@ -126,19 +137,26 @@ def _async_frame_builder_violations(path: Path) -> list[str]:
                         f"line {sub.lineno}: async-frame "
                         f"_row_to_document_response call without enrichment_map"
                     )
-            if name == "is_enrichment_enabled_for_file":
+            else:
                 violations.append(
                     f"line {sub.lineno}: async-frame direct call of "
                     f"is_enrichment_enabled_for_file"
                 )
-    return violations
+    return violations, names_seen
 
 
 def test_record_file_centroid_dispatched_off_loop_census() -> None:
-    violations = _centroid_dispatch_violations(_DP)
+    violations, refs_seen = _centroid_dispatch_violations(_DP)
+    # Walker-bite guard (PRR-006): the census must actually have observed the
+    # production reference(s); a blind walker (identifier drift, tree-shape
+    # change) must fail here rather than pass vacuously with [].
+    assert refs_seen >= 1, "census walker saw no record_file_centroid reference"
     assert violations == []
 
 
 def test_row_builder_calls_from_async_pass_enrichment_map_census() -> None:
-    violations = _async_frame_builder_violations(_DOCS)
+    violations, names_seen = _async_frame_builder_violations(_DOCS)
+    # Walker-bite guard (PRR-006): the three async-frame call sites
+    # (list/get/toggle) must be observed for a clean pass to mean anything.
+    assert names_seen >= 3, "census walker saw no tracked builder/helper calls"
     assert violations == []

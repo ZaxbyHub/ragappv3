@@ -9,7 +9,13 @@
   `_BASE_SCHEMA`; `migrate_add_document_near_dups` adds it to pre-existing
   tables via a PRAGMA-guarded `ALTER TABLE` and stamps legacy non-fingerprint
   rows (`dim != 256`, `embedding_model IS NULL`) with the currently-configured
-  `settings.embedding_model`). Centroids are only compared in embedding space
+  `settings.embedding_model`). The ALTER and the backfill stamp run inside
+  ONE explicit `BEGIN IMMEDIATE` transaction and the migration journals
+  start/succeeded/failed to `migration_journal` (feedback-round hardening:
+  the pre-feedback shape could rest in a column-added/rows-unstamped window
+  after a backfill failure), so a failure rolls back both and is visible to
+  the migration journal; a failed migration still re-raises into the existing
+  degraded-startup surface. Centroids are only compared in embedding space
   with rows recorded under the same model at the same dimension, so a
   same-dimension embedding-model switch invalidates old rows instead of
   silently comparing across spaces.
@@ -74,14 +80,18 @@
   each vault's unmatched files (no row, or a stale row) are fingerprinted once
   — up to `MAX_COMPARE = 500` full-text reads + tokenizations per ingest, on a
   worker thread under the shared write permit — until they carry marker rows.
-  After marking converges, a later ingest neither reads nor transfers a marked
-  file's full `parsed_text` at all: the candidate SELECT routes
-  stored-fingerprint rows through a constant in BOTH the select list and the
-  `!= ''` predicate, so only each candidate's small stored fingerprint blob
-  (~1 KB, bounded by MAX_COMPARE) is touched; full texts are read only for
-  first-time compute candidates, and per-ingest work is ONE fingerprint (the
-  ingested file's own text) plus bounded numpy comparisons. The same one-time
-  wave recurs per vault after any future embedding-model change.
+  The wave's candidate batch is fetched in one round-trip, so peak memory
+  during it scales with the combined texts of the UNMARKED candidates in the
+  batch; after marking converges, a later ingest neither reads nor transfers a
+  marked file's full `parsed_text` at all — the query still enumerates marked
+  rows each ingest BY DESIGN (their stored ~1 KB fingerprint blobs, bounded by
+  MAX_COMPARE, are what later ingests compare against; committed coverage for
+  the elision lives in `test_b08_no_refetch_elision.py`), only their full text
+  is elided via CASE routing in BOTH the select list and the `!= ''`
+  predicate. Full texts are read only for first-time compute candidates, and
+  per-ingest work is ONE fingerprint (the ingested file's own text) plus
+  bounded numpy comparisons. The same one-time wave recurs per vault after
+  any future embedding-model change.
 - **Backfill stamp is migration-time, not provenance.** Legacy non-fingerprint
   rows are stamped with the currently-configured model at migration time. A
   deployment that switched embedding models before upgrading keeps that cohort
