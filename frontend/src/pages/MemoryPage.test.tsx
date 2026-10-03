@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, waitFor, act } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import MemoryPage from '@/pages/MemoryPage';
+import { MemoryRouter } from 'react-router-dom';
 
 // Hoisted mock functions
 const mockFetchVaults = vi.hoisted(() => vi.fn());
@@ -113,13 +114,34 @@ vi.mock('@/components/ui/label', () => ({
   Label: ({ children, ...props }: React.LabelHTMLAttributes<HTMLLabelElement>) => <label {...props}>{children}</label>,
 }));
 
+// Action-aware EmptyState mock (issue #781): the real component accepts
+// `action?: ReactNode | EmptyStateAction` and renders ReactNode actions
+// as-is — the null-vault branch now passes <VaultGate /> through it.
 vi.mock('@/components/EmptyState', () => ({
-  EmptyState: ({ title, description }: { title: string; description?: string }) => (
-    <div data-testid="empty-state" role="status">
-      <p data-testid="empty-state-title">{title}</p>
-      {description && <p data-testid="empty-state-description">{description}</p>}
-    </div>
-  ),
+  EmptyState: ({
+    title,
+    description,
+    action,
+  }: {
+    title: string;
+    description?: string;
+    action?: { label: string; onClick: () => void } | React.ReactNode;
+  }) => {
+    const isActionObject = (a: unknown): a is { label: string; onClick: () => void } =>
+      typeof a === 'object' && a !== null && 'label' in a && 'onClick' in a;
+    return (
+      <div data-testid="empty-state" role="status">
+        <p data-testid="empty-state-title">{title}</p>
+        {description && <p data-testid="empty-state-description">{description}</p>}
+        {action &&
+          (isActionObject(action) ? (
+            <button onClick={action.onClick}>{action.label}</button>
+          ) : (
+            action
+          ))}
+      </div>
+    );
+  },
 }));
 
 vi.mock('@/components/vault/VaultSelector', () => ({
@@ -200,7 +222,11 @@ describe('MemoryPage', () => {
       });
 
       await act(async () => {
-        render(<MemoryPage />);
+        render(
+        <MemoryRouter>
+          <MemoryPage />
+        </MemoryRouter>
+      );
       });
 
       await waitFor(() => {
@@ -227,7 +253,11 @@ describe('MemoryPage', () => {
       });
 
       await act(async () => {
-        render(<MemoryPage />);
+        render(
+        <MemoryRouter>
+          <MemoryPage />
+        </MemoryRouter>
+      );
       });
 
       await waitFor(() => {
@@ -255,11 +285,17 @@ describe('MemoryPage', () => {
       });
 
       await act(async () => {
-        render(<MemoryPage />);
+        render(
+        <MemoryRouter>
+          <MemoryPage />
+        </MemoryRouter>
+      );
       });
 
-      // VaultSelector and "Add Memory" button are part of MemoryPageContent, not the guard
-      expect(screen.queryByTestId('vault-selector')).not.toBeInTheDocument();
+      // Issue #781: the null branch renders the vault-gate selector its copy
+      // names (via VaultGate) — but MemoryPageContent itself still must not
+      // mount, so its affordances stay absent.
+      expect(screen.getByTestId('vault-selector')).toBeInTheDocument();
       expect(screen.queryByText('Add Memory')).not.toBeInTheDocument();
     });
 
@@ -283,7 +319,11 @@ describe('MemoryPage', () => {
       mockUseMemorySearch.mockClear();
 
       await act(async () => {
-        render(<MemoryPage />);
+        render(
+        <MemoryRouter>
+          <MemoryPage />
+        </MemoryRouter>
+      );
       });
 
       // useMemorySearch should never be called because MemoryPageContent is not rendered
@@ -310,7 +350,11 @@ describe('MemoryPage', () => {
       mockUseMemoryCrud.mockClear();
 
       await act(async () => {
-        render(<MemoryPage />);
+        render(
+        <MemoryRouter>
+          <MemoryPage />
+        </MemoryRouter>
+      );
       });
 
       // useMemoryCrud should never be called because MemoryPageContent is not rendered
@@ -338,7 +382,11 @@ describe('MemoryPage', () => {
       });
 
       await act(async () => {
-        render(<MemoryPage />);
+        render(
+        <MemoryRouter>
+          <MemoryPage />
+        </MemoryRouter>
+      );
       });
 
       await waitFor(() => {
@@ -365,7 +413,11 @@ describe('MemoryPage', () => {
       });
 
       await act(async () => {
-        render(<MemoryPage />);
+        render(
+        <MemoryRouter>
+          <MemoryPage />
+        </MemoryRouter>
+      );
       });
 
       await waitFor(() => {
@@ -399,7 +451,11 @@ describe('MemoryPage', () => {
       });
 
       await act(async () => {
-        render(<MemoryPage />);
+        render(
+        <MemoryRouter>
+          <MemoryPage />
+        </MemoryRouter>
+      );
       });
 
       await waitFor(() => {
@@ -433,7 +489,11 @@ describe('MemoryPage', () => {
       });
 
       await act(async () => {
-        render(<MemoryPage />);
+        render(
+        <MemoryRouter>
+          <MemoryPage />
+        </MemoryRouter>
+      );
       });
 
       await waitFor(() => {
@@ -469,7 +529,11 @@ describe('MemoryPage', () => {
       });
 
       await act(async () => {
-        render(<MemoryPage />);
+        render(
+        <MemoryRouter>
+          <MemoryPage />
+        </MemoryRouter>
+      );
       });
 
       await waitFor(() => {
@@ -508,7 +572,11 @@ describe('MemoryPage', () => {
       });
 
       await act(async () => {
-        render(<MemoryPage />);
+        render(
+        <MemoryRouter>
+          <MemoryPage />
+        </MemoryRouter>
+      );
       });
 
       await waitFor(() => {

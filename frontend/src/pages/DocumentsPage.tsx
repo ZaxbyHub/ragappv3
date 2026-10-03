@@ -37,6 +37,7 @@ import { useVaultStore } from "@/stores/useVaultStore";
 import { useSettingsStore } from "@/stores/useSettingsStore";
 import { useUploadStore } from "@/stores/useUploadStore";
 import { VaultSelector } from "@/components/vault/VaultSelector";
+import { VaultGate } from "@/components/vault/VaultGate";
 import { EmptyState } from "@/components/EmptyState";
 import { ErrorState } from "@/components/shared/ErrorState";
 import {
@@ -713,6 +714,11 @@ export default function DocumentsPage() {
         ? {
             title: "Select a vault to view documents",
             description: "Documents are scoped to the active vault.",
+            // Issue #781 (UI-R2-03): the no-selection state points at
+            // vault scoping without offering a control from where the user
+            // stands — VaultGate renders the selector (and the create/open
+            // action) inline, unlike the copy-only branch it replaces.
+            action: <VaultGate />,
           }
         : hasActiveSearch && totalVaultDocuments > 0
           ? {

@@ -19,6 +19,7 @@ import { EmptyState } from "@/components/EmptyState";
 import { toast } from "sonner";
 import { useVaultStore } from "@/stores/useVaultStore";
 import { VaultSelector } from "@/components/vault/VaultSelector";
+import { VaultGate } from "@/components/vault/VaultGate";
 import { PageTitleHeader } from "@/components/layout/PageTitleHeader";
 import { useMemorySearch } from "@/hooks/useMemorySearch";
 import { useMemoryCrud, getCategoryFromMetadata, getTagsFromMetadata, getSourceFromMetadata, MAX_MEMORY_CONTENT_LENGTH } from "@/hooks/useMemoryCrud";
@@ -28,14 +29,24 @@ export default function MemoryPage() {
   const { activeVaultId } = useVaultStore();
 
   if (activeVaultId === null) {
+    // Issue #781 (UI-R2-03 + UI-R4-08): this branch told the user to pick
+    // from "the vault selector" without rendering one, under a title that
+    // differed from the populated branch. The gate now renders the selector
+    // itself via VaultGate, under the same "Memory" title as the
+    // vault-selected branch. MemoryPageContent (and its memory queries)
+    // still never mounts here — no vault-less search is issued.
     return (
       <>
-        <PageTitleHeader title="Memories" />
+        <PageTitleHeader
+          title="Memory"
+          description="View and manage AI memory and context"
+        />
         <div className="p-8">
           <EmptyState
             icon={Brain}
             title="Select a vault"
             description="Choose a vault from the vault selector to view its memories."
+            action={<VaultGate reason="Memories are scoped to a single vault." />}
           />
         </div>
       </>

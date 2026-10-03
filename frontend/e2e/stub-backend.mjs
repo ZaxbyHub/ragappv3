@@ -49,7 +49,11 @@
 
 import http from "node:http";
 
-const PORT = 9090;
+// E2E_STUB_PORT (issue #781): local runs can move the stub off the default
+// :9090 (e.g. when a foreign service squats it) — playwright.config.ts and
+// the vite preview proxy read the same variable, so the whole e2e tier moves
+// together. CI never sets it, so the default keeps CI byte-identical.
+const PORT = Number(process.env.E2E_STUB_PORT || 9090);
 
 const nowIso = () => new Date().toISOString();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -101,6 +105,16 @@ const SOURCE = {
 const sessions = new Map(); // id -> { session, messages: [] }
 let nextSessionId = 1;
 let nextMessageId = 1;
+
+// Mutable vault list (issue #781): the first-run walkthrough creates a vault
+// through the real /vaults UI, so GET must reflect POSTs.
+const vaults = [VAULT];
+let nextVaultId = 2;
+
+// Uploaded documents (issue #781): the walkthrough uploads one file through
+// the real UploadDropzone; the list and stats reflect it.
+const documents = [];
+let nextDocumentId = 1;
 
 function createSession(vaultId = 1) {
   const id = nextSessionId++;
@@ -288,7 +302,75 @@ const server = http.createServer(async (req, res) => {
 
     // ---- vaults ----
     if (method === "GET" && (path === "/api/vaults/accessible" || path === "/api/vaults")) {
-      return sendJson(req, res, 200, { vaults: [VAULT] });
+      return sendJson(req, res, 200, { vaults });
+    }
+    if (method === "POST" && path === "/api/vaults") {
+      // Issue #781 walkthrough: create a vault via the real VaultsPage
+      // dialog. Accept { name, description? } and append to the list so the
+      // selector (and the chat recovery leg) can pick it up.
+      const body = await readBody(req);
+      const name = String(body.name || "E2E Vault").slice(0, 100);
+      const vault = {
+        ...VAULT,
+        id: nextVaultId++,
+        name,
+        description: String(body.description || ""),
+        created_at: nowIso(),
+        updated_at: nowIso(),
+        file_count: 0,
+      };
+      vaults.push(vault);
+      return sendJson(req, res, 200, vault);
+    }
+
+    // ---- documents (issue #781 walkthrough) ----
+    if (method === "GET" && path === "/api/documents") {
+      const vaultId = Number(url.searchParams.get("vault_id") || 0);
+      const scoped = vaultId ? documents.filter((d) => d.vault_id === vaultId) : documents;
+      return sendJson(req, res, 200, { documents: scoped, total: scoped.length });
+    }
+    if (method === "GET" && path === "/api/documents/stats") {
+      return sendJson(req, res, 200, {
+        total_documents: documents.length,
+        total_chunks: documents.length,
+        total_size_bytes: documents.reduce((sum, d) => sum + (d.size ?? 0), 0),
+        documents_by_status: documents.length ? { processed: documents.length } : {},
+      });
+    }
+    if (method === "POST" && path === "/api/documents") {
+      // Multipart upload — read the raw body and lift the filename from the
+      // content-disposition part header; the stub never parses the payload.
+      const raw = await new Promise((resolve) => {
+        const chunks = [];
+        let size = 0;
+        req.on("data", (c) => {
+          size += c.length;
+          if (size > MAX_BODY_BYTES) {
+            resolve("");
+            req.destroy();
+            return;
+          }
+          chunks.push(c);
+        });
+        req.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
+        req.on("error", () => resolve(""));
+      });
+      const disposition = raw.match(/filename="([^"]+)"/);
+      const filename = disposition ? disposition[1] : `e2e-upload-${nextDocumentId}.txt`;
+      const vaultId = Number(url.searchParams.get("vault_id") || 0) || vaults[0]?.id || 1;
+      const doc = {
+        id: String(nextDocumentId++),
+        filename,
+        vault_id: vaultId,
+        content_type: "text/plain",
+        size: raw.length,
+        created_at: nowIso(),
+        processed_at: nowIso(),
+        error_message: null,
+        metadata: { status: "processed", chunk_count: 1 },
+      };
+      documents.push(doc);
+      return sendJson(req, res, 200, { id: doc.id, filename, status: "processed" });
     }
 
     // ---- chat sessions ----
