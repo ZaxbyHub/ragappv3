@@ -36,7 +36,7 @@
       "SEVERITY.LOW": 62,
       "SEVERITY.MEDIUM": 60,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 83424,
+      "loc": 83599,
       "nosec": 0,
       "skipped_tests": 63
     },
@@ -309,7 +309,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1688,
+      "loc": 1709,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -387,7 +387,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1437,
+      "loc": 1461,
       "nosec": 0,
       "skipped_tests": 1
     },
@@ -517,7 +517,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 5677,
+      "loc": 5710,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -764,7 +764,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 256,
+      "loc": 311,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -816,7 +816,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 1,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 3471,
+      "loc": 3481,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1024,7 +1024,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 162,
+      "loc": 166,
       "nosec": 0,
       "skipped_tests": 1
     },
@@ -1037,7 +1037,7 @@
       "SEVERITY.LOW": 1,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1432,
+      "loc": 1460,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -3705,7 +3705,7 @@
       "test_name": "hashlib"
     },
     {
-      "code": "1360                 )\n1361         except Exception:\n1362             pass  # Silently ignore any errors accessing internal pool state\n1363 \n",
+      "code": "1405                 )\n1406         except Exception:\n1407             pass  # Silently ignore any errors accessing internal pool state\n1408 \n",
       "col_offset": 8,
       "end_col_offset": 16,
       "filename": "backend/app/services/embeddings.py",
@@ -3716,10 +3716,10 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1361,
+      "line_number": 1406,
       "line_range": [
-        1361,
-        1362
+        1406,
+        1407
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",

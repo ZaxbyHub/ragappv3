@@ -82,6 +82,15 @@ def apply_legacy_settings_conversion(data: Mapping[str, object]) -> dict:
     return converted
 
 
+# Hard per-text embedding input cap (issue #698): chunk-size-family
+# configuration is bounded by what the embedder can actually accept, so an
+# out-of-bounds value fails at configuration time instead of mid-ingest.
+# EmbeddingService.MAX_TEXT_LENGTH (app/services/embeddings.py) mirrors this
+# value; config cannot import the service (circular import), so the equality
+# is pinned by a guardrail test instead of by an import.
+EMBEDDING_MAX_TEXT_CHARS = 8192
+
+
 class Settings(BaseSettings):
     """Application settings with environment variable support."""
 
@@ -1154,6 +1163,24 @@ class Settings(BaseSettings):
             return legacy_chunk_size * 4
         return 2000  # ~500 tokens with llama.cpp -ub 8192 batch size
 
+    @field_validator("chunk_size_chars", mode="after")
+    @classmethod
+    def validate_chunk_size_chars_bounds(cls, v: int | None) -> int | None:
+        """Bound chunk_size_chars to the embedder's per-text cap (issue #698).
+
+        Runs after the legacy `mode="before"` migrator, so direct values and
+        legacy chunk_size x4 conversions are both checked. An out-of-bounds
+        chunk size can only fail per-chunk mid-ingest otherwise — the exact
+        settings-to-runtime contract drift this closes.
+        """
+        if v is not None and (v <= 0 or v > EMBEDDING_MAX_TEXT_CHARS):
+            raise ValueError(
+                f"chunk_size_chars must be between 1 and "
+                f"{EMBEDDING_MAX_TEXT_CHARS} (the embedder's per-text cap; "
+                f"see EMBEDDING_MAX_TEXT_CHARS)"
+            )
+        return v
+
     @field_validator("chunk_overlap_chars", mode="before")
     @classmethod
     def migrate_chunk_overlap_chars(cls, v: int | None, values) -> int:
@@ -1432,6 +1459,13 @@ class Settings(BaseSettings):
             if size <= 0:
                 raise ValueError(
                     "multi_scale_chunk_sizes must contain only positive integers"
+                )
+            if size > EMBEDDING_MAX_TEXT_CHARS:
+                raise ValueError(
+                    f"multi_scale_chunk_sizes entries must not exceed "
+                    f"{EMBEDDING_MAX_TEXT_CHARS} (the embedder's per-text cap) — "
+                    f"an oversized scale would silently drop every chunk it "
+                    f"produces at ingest (issue #698)"
                 )
         return ",".join(str(x) for x in unique_sizes)
 

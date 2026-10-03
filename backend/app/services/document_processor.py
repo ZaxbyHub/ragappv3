@@ -1027,7 +1027,7 @@ class DocumentProcessor:
         if oversized:
             logger.warning(
                 "Document '%s' has %d chunk(s) exceeding effective embedding length (%d chars after prefix): %s. "
-                "embed_batch() will raise EmbeddingError for these chunks.",
+                "With fail_fast=False these chunks are skipped and reported as failed; fail_fast=True raises.",
                 source_filename,
                 len(oversized),
                 effective_max,
@@ -1948,7 +1948,17 @@ class DocumentProcessor:
             provider_mode = str(getattr(service, "provider_mode", "") or "")
         except Exception:  # noqa: BLE001 - identity must never fail the embed path
             provider_mode = ""
-        model_revision = f"{type(service).__name__}:{provider_mode}"
+        # The serving endpoint is part of the identity (issue #698): two
+        # endpoints serving the same model id can hold different weights
+        # (re-served/re-quantized), so without the URL the persistent cache
+        # silently reuses stale vectors across an endpoint change. Note:
+        # changing this format intentionally invalidates every pre-existing
+        # cache row (a one-time cold cache — the table is a rebuildable
+        # cache, not user data).
+        model_revision = (
+            f"{type(service).__name__}:{provider_mode}"
+            f":{settings.ollama_embedding_url}"
+        )
         prefix_obj = getattr(service, "embedding_doc_prefix", None)
         doc_prefix = (
             str(prefix_obj)
@@ -1991,8 +2001,13 @@ class DocumentProcessor:
             )
             miss_embeddings, failed_batch_indices = embeddings_result
             if failed_batch_indices:
+                failed_positions = [
+                    i for i, emb in enumerate(miss_embeddings) if emb is None
+                ]
                 raise DocumentProcessingError(
-                    f"Embedding failed for enriched chunks: batches {failed_batch_indices}"
+                    f"Embedding failed for enriched chunks: batches "
+                    f"{failed_batch_indices}, failed text positions "
+                    f"{failed_positions}"
                 )
             if len(miss_embeddings) != len(miss_texts):
                 raise DocumentProcessingError(
@@ -2004,11 +2019,17 @@ class DocumentProcessor:
                     continue
                 embeddings[i] = emb
                 stored.append((keys[i], emb))
-            embedding_cache_store(stored)
-        missing = sum(1 for emb in embeddings if emb is None)
-        if missing:
+            # Off the event loop (issue #698): store() executes the SQLite
+            # INSERT plus the entry-cap prune (an unindexed ORDER BY scan at
+            # the default 50k cap measured 400-600 ms) — every comparable
+            # sync seam in this file is offloaded via asyncio.to_thread.
+            await asyncio.to_thread(embedding_cache_store, stored)
+        missing_positions = [i for i, emb in enumerate(embeddings) if emb is None]
+        if missing_positions:
             raise DocumentProcessingError(
-                f"Enriched embedding count mismatch: expected {len(texts)}, got {len(texts) - missing}"
+                f"Enriched embedding failed for text positions {missing_positions} "
+                f"(invalid or unembeddable texts: expected {len(texts)}, got "
+                f"{len(texts) - len(missing_positions)})"
             )
         return embeddings  # type: ignore[return-value]  # no None members past the guard
 

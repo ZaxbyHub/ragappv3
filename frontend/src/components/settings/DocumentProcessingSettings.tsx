@@ -38,7 +38,7 @@ export function DocumentProcessingSettings({
             <p role="alert" className="text-xs text-destructive">{errors.chunk_size_chars}</p>
           )}
           <p className="text-xs text-muted-foreground">
-            Number of characters per document chunk
+            Number of characters per document chunk. Applies only when multi-scale indexing is disabled — multi-scale indexing is enabled by default and uses its own chunk scales (MULTI_SCALE_CHUNK_SIZES), so this field has no effect on the shipped default configuration.
           </p>
           <ReindexFieldWarning />
         </div>
@@ -58,7 +58,7 @@ export function DocumentProcessingSettings({
             <p role="alert" className="text-xs text-destructive">{errors.chunk_overlap_chars}</p>
           )}
           <p className="text-xs text-muted-foreground">
-            Number of overlapping characters between chunks (must be less than chunk size)
+            Number of overlapping characters between chunks (must be less than chunk size). Like chunk size, applies only when multi-scale indexing is disabled.
           </p>
           <ReindexFieldWarning />
         </div>

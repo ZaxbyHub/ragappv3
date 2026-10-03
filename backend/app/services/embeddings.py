@@ -228,7 +228,7 @@ class EmbeddingService:
     # Hard caps for input validation
     MAX_BATCH_SIZE = 512  # Maximum number of texts per batch call
     MAX_TEXT_LENGTH = (
-        8192  # Maximum characters per text (derived from chunk_size_chars=8192)
+        8192  # Hard per-text cap for embedder input; unrelated to chunk_size_chars (default 2000)
     )
     MIN_SPLIT_CHARS = 200  # Minimum text length to attempt single-text splitting
 
@@ -1123,16 +1123,19 @@ class EmbeddingService:
         Args:
             texts: List of texts to embed.
             batch_size: Maximum number of texts per API request (default: 512).
-            fail_fast: If True (default), raise on any batch failure.
-                       If False, return (embeddings, failed_batch_indices) with None
-                       placeholders for failed batches.
+            fail_fast: If True (default), raise on the first invalid text
+                       (None/whitespace/oversized) and on any batch failure.
+                       If False, return (embeddings, failed_batch_indices)
+                       with None placeholders at invalid-text positions and
+                       at failed-batch positions (issue #698: a single
+                       oversized text degrades per-item instead of raising).
 
         Returns:
             When fail_fast=True: List of embedding vectors.
-            When fail_fast=False: Tuple of (embeddings, failed_batch_indices) where failed batch positions contain None.
+            When fail_fast=False: Tuple of (embeddings, failed_batch_indices) where invalid texts and failed batch positions contain None; len(embeddings) == len(texts) always.
 
         Raises:
-            EmbeddingError: If any batch fails and fail_fast=True.
+            EmbeddingError: If any text is invalid or any batch fails and fail_fast=True.
         """
         if not texts:
             return [] if fail_fast else ([], [])
@@ -1142,19 +1145,46 @@ class EmbeddingService:
         # the configuration that issued the call.
         config = self._request_config()
 
-        # Input validation guards
+        # Input validation guards (issue #698): classify invalid texts up
+        # front. fail_fast=True raises on the first one (existing contract,
+        # message shapes unchanged); fail_fast=False degrades per-text — an
+        # invalid text never reaches the provider, receives a None
+        # placeholder at its ORIGINAL position, and is reported in one
+        # WARNING. Downstream ingest callers already skip per-text failures
+        # via the None placeholders ([W10] contract), so a single oversized
+        # chunk no longer fails the whole document.
         prefix_len = len(config.doc_prefix) if config.doc_prefix else 0
         effective_max = self.MAX_TEXT_LENGTH - prefix_len
 
+        invalid_reasons: dict[int, str] = {}
         for idx, text in enumerate(texts):
             if text is None:
-                raise EmbeddingError(f"Text at index {idx} is None")
-            if not text.strip():
-                raise EmbeddingError(f"Text at index {idx} is empty or whitespace only")
-            if len(text) > effective_max:
-                raise EmbeddingError(
-                    f"Text at index {idx} exceeds maximum length ({effective_max} characters after prefix accounting)"
+                invalid_reasons[idx] = f"Text at index {idx} is None"
+            elif not text.strip():
+                invalid_reasons[idx] = (
+                    f"Text at index {idx} is empty or whitespace only"
                 )
+            elif len(text) > effective_max:
+                invalid_reasons[idx] = (
+                    f"Text at index {idx} exceeds maximum length "
+                    f"({effective_max} characters after prefix accounting)"
+                )
+
+        if invalid_reasons and fail_fast:
+            first = min(invalid_reasons)
+            raise EmbeddingError(invalid_reasons[first])
+        if invalid_reasons:
+            logger.warning(
+                "embed_batch(fail_fast=False): skipping %d invalid text(s) "
+                "at position(s) %s; reasons: %s",
+                len(invalid_reasons),
+                sorted(invalid_reasons),
+                "; ".join(invalid_reasons[i] for i in sorted(invalid_reasons)),
+            )
+
+        invalid_set = set(invalid_reasons)
+        valid_positions = [i for i in range(len(texts)) if i not in invalid_set]
+        valid_texts = [texts[i] for i in valid_positions]
 
         # Use configured batch size if not specified
         if batch_size is None:
@@ -1163,9 +1193,11 @@ class EmbeddingService:
         # Clamp batch_size to valid range
         batch_size = max(1, min(batch_size, self.MAX_BATCH_SIZE))
 
-        # Apply document prefix to all texts
+        # Apply document prefix to the VALID texts only (invalid ones never
+        # reach the provider — issue #698); with fail_fast=True no invalid
+        # texts can be present here (they raised above).
         texts_to_embed = []
-        for text in texts:
+        for text in valid_texts:
             if config.doc_prefix:
                 texts_to_embed.append(config.doc_prefix + text)
             else:
@@ -1225,7 +1257,7 @@ class EmbeddingService:
             return all_embeddings
         else:
             failed_indices: List[int] = []
-            all_embeddings_with_nones: List[Optional[List[float]]] = []
+            valid_with_nones: List[Optional[List[float]]] = []
             for batch_idx, result in enumerate(batch_results):
                 if isinstance(result, Exception):
                     failed_indices.append(batch_idx)
@@ -1233,11 +1265,24 @@ class EmbeddingService:
                     # (placeholders track the ACTUAL char-bounded batch size —
                     # batches are no longer uniform batch_size slices).
                     for _ in batches[batch_idx][1]:
-                        all_embeddings_with_nones.append(None)
+                        valid_with_nones.append(None)
                     logger.warning(f"Batch {batch_idx} failed (skipping): {result}")
                 else:
-                    all_embeddings_with_nones.extend(result)
-            return all_embeddings_with_nones, failed_indices
+                    valid_with_nones.extend(result)
+            # Splice the valid-subsequence results back to ORIGINAL positions,
+            # placing None at each invalid text's position (issue #698). The
+            # count contract len(embeddings) == len(texts) holds for empty,
+            # all-invalid, and mixed inputs; failed_indices reference the
+            # valid-subsequence batches (provider failures only — invalid
+            # texts are reported through their None placeholders).
+            embeddings_with_nones: List[Optional[List[float]]] = []
+            valid_iter = iter(valid_with_nones)
+            for i in range(len(texts)):
+                if i in invalid_set:
+                    embeddings_with_nones.append(None)
+                else:
+                    embeddings_with_nones.append(next(valid_iter))
+            return embeddings_with_nones, failed_indices
 
     async def _embed_batch_api(
         self, texts: List[str], config: Optional[_EmbeddingRequestConfig] = None
