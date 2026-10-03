@@ -403,13 +403,36 @@ export interface FindingDispositionResponse {
   revision: DraftRevisionSummary | null;
 }
 
+/**
+ * Capability limits emitted by GET /draft-room/capabilities.
+ *
+ * The fields stay optional because the capability endpoint is additive across
+ * deployed server versions and several read-only views intentionally tolerate
+ * an older response while the query is being hydrated. Every field listed here
+ * is an actual server-emitted key; consumers must not invent client-only names.
+ */
+export interface DraftRoomCapabilityLimits {
+  max_inputs?: number;
+  max_total_input_mb?: number;
+  max_total_parsed_chars?: number;
+  parse_timeout_seconds?: number;
+  upload_rate_limit?: string;
+  poll_interval_seconds?: number;
+  compile_rate_limit?: string;
+  max_sections?: number;
+  job_timeout_seconds?: number;
+  job_max_model_calls?: number;
+  max_correction_loops?: number;
+  max_page_size?: number;
+}
+
 export interface DraftRoomCapabilities {
   enabled: boolean;
   modes: DraftMode[];
   tiers: DraftTier[];
   piece_types: string[];
   transformation_strengths: string[];
-  limits: Record<string, unknown>;
+  limits: DraftRoomCapabilityLimits;
   export_formats: string[];
   logical_model_modes: string[];
   default_logical_mode: string;

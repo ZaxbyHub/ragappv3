@@ -353,9 +353,18 @@ function decodeStr(v: string | null | undefined, fallback: string): string {
   return v;
 }
 
+const VECTOR_METRIC_ALIASES: Record<string, "l2" | "cosine" | "dot"> = {
+  euclidean: "l2",
+  dot_product: "dot",
+};
+
+function normalizeVectorMetric(value: string | null | undefined): "l2" | "cosine" | "dot" {
+  const decoded = decodeStr(value, "cosine");
+  if (decoded === "l2" || decoded === "cosine" || decoded === "dot") return decoded;
+  return VECTOR_METRIC_ALIASES[decoded] ?? "cosine";
+}
+
 function fromSettings(settings: SettingsResponse): SettingsFormData {
-  const validMetrics = ["cosine", "euclidean", "dot_product"];
-  const rawMetric = decodeStr(settings.vector_metric, "cosine");
   const validModes = ["draft", "active_if_verified"];
   const curatorMode = settings.wiki_llm_curator_mode ?? "draft";
   return {
@@ -366,7 +375,7 @@ function fromSettings(settings: SettingsResponse): SettingsFormData {
     auto_scan_interval_minutes: settings.auto_scan_interval_minutes ?? 60,
     max_distance_threshold: settings.max_distance_threshold ?? 0.7,
     retrieval_window: settings.retrieval_window ?? 1,
-    vector_metric: validMetrics.includes(rawMetric) ? rawMetric : "cosine",
+    vector_metric: normalizeVectorMetric(settings.vector_metric),
     embedding_doc_prefix: decodeStr(settings.embedding_doc_prefix, ""),
     embedding_query_prefix: decodeStr(settings.embedding_query_prefix, ""),
     embedding_batch_size: settings.embedding_batch_size ?? 64,
@@ -470,17 +479,25 @@ const FIELD_VALIDATORS: Partial<
   Record<keyof SettingsFormData, (data: SettingsFormData) => string | undefined>
 > = {
   chunk_size_chars: (d) =>
+    !Number.isFinite(d.chunk_size_chars) ||
+    !Number.isInteger(d.chunk_size_chars) ||
     d.chunk_size_chars <= 0
       ? "Chunk size must be a positive integer"
       : undefined,
   chunk_overlap_chars: (d) => {
-    if (d.chunk_overlap_chars < 0)
+    if (
+      !Number.isFinite(d.chunk_overlap_chars) ||
+      !Number.isInteger(d.chunk_overlap_chars) ||
+      d.chunk_overlap_chars < 0
+    )
       return "Chunk overlap must be a non-negative integer";
     if (d.chunk_overlap_chars >= d.chunk_size_chars)
       return "Chunk overlap must be less than chunk size";
     return undefined;
   },
   retrieval_top_k: (d) =>
+    !Number.isFinite(d.retrieval_top_k) ||
+    !Number.isInteger(d.retrieval_top_k) ||
     d.retrieval_top_k <= 0
       ? "Retrieval top-k must be a positive integer"
       : undefined,
@@ -489,30 +506,39 @@ const FIELD_VALIDATORS: Partial<
       ? "Scan interval must be a positive integer"
       : undefined,
   embedding_batch_size: (d) =>
-    d.embedding_batch_size < 1 || d.embedding_batch_size > 128
+    !Number.isFinite(d.embedding_batch_size) ||
+    !Number.isInteger(d.embedding_batch_size) ||
+    d.embedding_batch_size < 1 ||
+    d.embedding_batch_size > 128
       ? "Embedding batch size must be between 1 and 128"
       : undefined,
   max_distance_threshold: (d) =>
-    d.max_distance_threshold < 0 || d.max_distance_threshold > 1
-      ? "Distance threshold must be between 0 and 1"
+    !Number.isFinite(d.max_distance_threshold) || d.max_distance_threshold < 0
+      ? "Distance threshold must be non-negative"
       : undefined,
   retrieval_window: (d) =>
-    d.retrieval_window < 0 || d.retrieval_window > 3
-      ? "Retrieval window must be between 0 and 3"
+    !Number.isFinite(d.retrieval_window) ||
+    !Number.isInteger(d.retrieval_window) ||
+    d.retrieval_window < 0
+      ? "Retrieval window must be non-negative"
       : undefined,
   vector_metric: (d) =>
-    ["cosine", "euclidean", "dot_product"].includes(d.vector_metric)
+    ["l2", "cosine", "dot"].includes(d.vector_metric)
       ? undefined
-      : "Vector metric must be cosine, euclidean, or dot_product",
+      : "Vector metric must be l2, cosine, or dot",
   initial_retrieval_top_k: (d) =>
     d.initial_retrieval_top_k !== undefined &&
-    (d.initial_retrieval_top_k < 5 || d.initial_retrieval_top_k > 100)
-      ? "Initial retrieval top-k must be between 5 and 100"
+    (!Number.isFinite(d.initial_retrieval_top_k) ||
+      !Number.isInteger(d.initial_retrieval_top_k) ||
+      d.initial_retrieval_top_k <= 0)
+      ? "Initial retrieval top-k must be positive"
       : undefined,
   reranker_top_n: (d) =>
     d.reranker_top_n !== undefined &&
-    (d.reranker_top_n < 1 || d.reranker_top_n > 20)
-      ? "Reranker top-n must be between 1 and 20"
+    (!Number.isFinite(d.reranker_top_n) ||
+      !Number.isInteger(d.reranker_top_n) ||
+      d.reranker_top_n <= 0)
+      ? "Reranker top-n must be positive"
       : undefined,
   hybrid_alpha: (d) =>
     d.hybrid_alpha !== undefined &&
@@ -665,7 +691,7 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
       if (field === "embedding_model")
         saved = decodeStr(settings.embedding_model, "");
       else if (field === "vector_metric")
-        saved = decodeStr(settings.vector_metric, "cosine");
+        saved = normalizeVectorMetric(settings.vector_metric);
       else if (field === "embedding_doc_prefix")
         saved = decodeStr(settings.embedding_doc_prefix, "");
       else if (field === "embedding_query_prefix")
