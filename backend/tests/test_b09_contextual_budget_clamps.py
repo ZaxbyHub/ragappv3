@@ -66,14 +66,46 @@ async def test_escape_heavy_input_bounded_end_to_end(monkeypatch):
     assert max(llm.lengths) <= 4 * 4096
 
 
+async def test_chunk_view_clamped_to_half_when_between_half_and_remaining(
+    monkeypatch,
+):
+    """The chunk view is capped at half the remaining budget, not `remaining`.
+
+    A 12,000-char chunk at model_context_tokens=4096 fits WITHIN the whole
+    remaining budget (~15.4k) but exceeds HALF of it — so this prompt
+    discriminates the half split specifically: with the half clamp present
+    the payload carries ~7.7k chunk chars; with the clamp loosened to the
+    full remaining budget (or removed) it carries all 12,000 (issue #698
+    review round 2: no other test discriminated the half split).
+    """
+    from app.config import settings
+    from app.services.chunking import ProcessedChunk
+    from app.services.contextual_chunking import ContextualChunker
+
+    monkeypatch.setattr(settings, "model_context_tokens", 4096)
+    llm = _RecordingLLM()
+    chunk = ProcessedChunk(text="y" * 12_000, metadata={}, chunk_index=0)
+    await ContextualChunker(llm).contextualize_chunks("z" * 60_000, [chunk], "f.txt")
+
+    payload = llm.payloads[0]
+    y_count = payload.count("y")
+    budget = 4 * 4096
+    # The chunk view is clamped well below the raw 12,000 chars (half of
+    # remaining ≈ 7.7k) while the document absorbs the rest of the budget.
+    assert y_count < 12_000
+    assert y_count <= budget // 2
+    assert max(llm.lengths) <= budget
+
+
 async def test_two_chunks_of_different_lengths_use_per_chunk_budget(monkeypatch):
     """Per-chunk budgeting: each prompt's DOCUMENT share reflects its own chunk.
 
     Note (review): this test discriminates once-per-call vs per-chunk
-    budgeting via document composition; the chunk-half CLAMP itself is
-    pinned by test_escape_inflation_stays_bounded_end_to_end and
-    TestBoundedPromptBudget (an 8000-char chunk is below `remaining`, so
-    removing the clamp does not move this test).
+    budgeting via document composition; it does NOT pin the chunk-half
+    clamp (both chunks here sit below `remaining`). The clamp is pinned by
+    test_chunk_view_clamped_to_half_when_between_half_and_remaining, and
+    the budget TRUNCATION (any clamping at all) by
+    test_escape_heavy_input_bounded_end_to_end and TestBoundedPromptBudget.
     """
     from app.config import settings
     from app.services.chunking import ProcessedChunk
