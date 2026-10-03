@@ -5,6 +5,8 @@ import { FileText, Library, Plus, RefreshCw, Search } from "lucide-react";
 
 import { useVaultStore } from "@/stores/useVaultStore";
 import { VaultSelector } from "@/components/vault/VaultSelector";
+import { VaultGate } from "@/components/vault/VaultGate";
+import { EmptyState } from "@/components/EmptyState";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -211,9 +213,11 @@ export default function KMSPage() {
       <ScrollArea className="flex-1">
         <div className="p-6">
           {!activeVaultId ? (
-            <p className="text-sm text-muted-foreground text-center py-12">
-              Select a vault to view its knowledge entries.
-            </p>
+            <EmptyState
+              title="Select a vault"
+              description="Select a vault to view its knowledge entries."
+              action={<VaultGate />}
+            />
           ) : error ? (
             <p className="text-sm text-destructive py-8">{error}</p>
           ) : loading && entries.length === 0 ? (

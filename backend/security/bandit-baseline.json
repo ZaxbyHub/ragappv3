@@ -36,7 +36,7 @@
       "SEVERITY.LOW": 62,
       "SEVERITY.MEDIUM": 60,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 83424,
+      "loc": 83666,
       "nosec": 0,
       "skipped_tests": 63
     },
@@ -235,6 +235,19 @@
       "nosec": 0,
       "skipped_tests": 0
     },
+    "backend/app/api/routes/onboarding.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 163,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
     "backend/app/api/routes/organizations.py": {
       "CONFIDENCE.HIGH": 0,
       "CONFIDENCE.LOW": 1,
@@ -426,7 +439,7 @@
       "SEVERITY.LOW": 1,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 196,
+      "loc": 198,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -517,7 +530,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 5677,
+      "loc": 5754,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -3390,7 +3403,7 @@
       "test_name": "try_except_pass"
     },
     {
-      "code": "81     settings.users_enabled\n82     and settings.jwt_secret_key == \"change-me-to-a-random-64-char-string\"\n83 ):\n",
+      "code": "82     settings.users_enabled\n83     and settings.jwt_secret_key == \"change-me-to-a-random-64-char-string\"\n84 ):\n",
       "col_offset": 35,
       "end_col_offset": 73,
       "filename": "backend/app/main.py",
@@ -3401,9 +3414,9 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'change-me-to-a-random-64-char-string'",
-      "line_number": 82,
+      "line_number": 83,
       "line_range": [
-        82
+        83
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
