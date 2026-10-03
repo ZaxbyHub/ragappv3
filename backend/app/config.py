@@ -1181,6 +1181,28 @@ class Settings(BaseSettings):
             )
         return v
 
+    @model_validator(mode="after")
+    def validate_chunk_overlap_below_size(self) -> "Settings":
+        """chunk_overlap_chars must stay strictly below chunk_size_chars.
+
+        The chunker (unstructured, pinned 0.18.32) rejects overlap >= size
+        with ``'overlap' argument must be less than max_characters`` — a
+        config that passes validation here would otherwise fail EVERY
+        document ingest at chunk time (issue #698 review: the same
+        knowable-but-unenforced bound class as the per-text cap). Runs after
+        both legacy migrators, so direct and chunk_size/chunk_overlap x4
+        derived values are both checked.
+        """
+        overlap = self.chunk_overlap_chars
+        size = self.chunk_size_chars
+        if overlap is not None and size is not None and overlap >= size:
+            raise ValueError(
+                f"chunk_overlap_chars ({overlap}) must be strictly less than "
+                f"chunk_size_chars ({size}) — the chunker rejects overlap >= "
+                f"chunk size at ingest time (issue #698)"
+            )
+        return self
+
     @field_validator("chunk_overlap_chars", mode="before")
     @classmethod
     def migrate_chunk_overlap_chars(cls, v: int | None, values) -> int:
@@ -1472,8 +1494,21 @@ class Settings(BaseSettings):
     @field_validator("multi_scale_overlap_ratio", mode="after")
     @classmethod
     def validate_multi_scale_overlap_ratio(cls, v: float) -> float:
-        """Validate multi_scale_overlap_ratio is in range 0.0-1.0."""
-        return cls._validate_float_range(v, 0.0, 1.0, "multi_scale_overlap_ratio")
+        """Validate multi_scale_overlap_ratio is in range [0.0, 1.0).
+
+        Strictly less than 1.0 (issue #698 review): at exactly 1.0 the
+        per-scale overlap becomes ``int(scale * 1.0) == scale`` and the
+        underlying chunker rejects every ingest with
+        "'overlap' argument must be less than max_characters" — so the
+        degenerate ratio fails at configuration time instead.
+        """
+        if v < 0.0 or v >= 1.0:
+            raise ValueError(
+                "multi_scale_overlap_ratio must be in [0.0, 1.0) — at 1.0 the "
+                "per-scale chunk overlap equals the scale size and every "
+                "ingest fails in the chunker (issue #698)"
+            )
+        return v
 
     @field_validator("index_rebuild_delta", mode="after")
     @classmethod

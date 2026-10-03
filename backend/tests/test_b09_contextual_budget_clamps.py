@@ -66,8 +66,15 @@ async def test_escape_heavy_input_bounded_end_to_end(monkeypatch):
     assert max(llm.lengths) <= 4 * 4096
 
 
-async def test_two_chunks_of_different_lengths_each_bounded(monkeypatch):
-    """Per-chunk budgeting: the larger chunk's prompt fits its own budget too."""
+async def test_two_chunks_of_different_lengths_use_per_chunk_budget(monkeypatch):
+    """Per-chunk budgeting: each prompt's DOCUMENT share reflects its own chunk.
+
+    Note (review): this test discriminates once-per-call vs per-chunk
+    budgeting via document composition; the chunk-half CLAMP itself is
+    pinned by test_escape_inflation_stays_bounded_end_to_end and
+    TestBoundedPromptBudget (an 8000-char chunk is below `remaining`, so
+    removing the clamp does not move this test).
+    """
     from app.config import settings
     from app.services.chunking import ProcessedChunk
     from app.services.contextual_chunking import ContextualChunker

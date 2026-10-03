@@ -901,6 +901,28 @@ def _validate_settings_update(update: SettingsUpdate) -> dict[str, object]:
                 f"(legacy chunk_size is converted x4)"
             ),
         )
+    # Issue #698 review: the modern pair has no cross-field rule anywhere,
+    # while the legacy seam enforces chunk_overlap < chunk_size — an overlap
+    # >= the resulting size passes every existing check and then fails EVERY
+    # ingest in the chunker. Check the EFFECTIVE pair (updated value when
+    # provided, current singleton value otherwise).
+    effective_size = converted.get("chunk_size_chars", settings.chunk_size_chars)
+    effective_overlap = converted.get(
+        "chunk_overlap_chars", settings.chunk_overlap_chars
+    )
+    if (
+        effective_size is not None
+        and effective_overlap is not None
+        and effective_overlap >= effective_size
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"chunk_overlap_chars ({effective_overlap}) must be strictly "
+                f"less than chunk_size_chars ({effective_size}) — the chunker "
+                f"rejects overlap >= chunk size at ingest time (issue #698)"
+            ),
+        )
     return converted
 
 

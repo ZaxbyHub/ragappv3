@@ -252,3 +252,61 @@ def test_settings_construction_both_bounds():
         Settings(chunk_size_chars=9000)
     with pytest.raises(ValidationError):
         Settings(chunk_size_chars=0)
+
+
+def test_settings_construction_overlap_must_stay_below_size():
+    """Cross-field: overlap >= size (direct or legacy-derived) is rejected.
+
+    The chunker (unstructured 0.18.32) rejects overlap >= size with
+    "'overlap' argument must be less than max_characters" — without this
+    validator such a config fails EVERY ingest instead of failing at
+    configuration time (issue #698 review finding).
+    """
+    from pydantic import ValidationError
+
+    from app.config import Settings
+
+    with pytest.raises(ValidationError, match="strictly less"):
+        Settings(chunk_size_chars=1000, chunk_overlap_chars=5000)
+    with pytest.raises(ValidationError, match="strictly less"):
+        Settings(chunk_size_chars=1000, chunk_overlap_chars=1000)
+    # Legacy-derived pair: chunk_size=100/chunk_overlap=100 -> 400/400.
+    with pytest.raises(ValidationError, match="strictly less"):
+        Settings(chunk_size=100, chunk_overlap=100)
+    # In-range pair still constructs.
+    assert Settings(chunk_size_chars=1000, chunk_overlap_chars=200) is not None
+
+
+def test_multi_scale_overlap_ratio_one_rejected():
+    """ratio=1.0 makes per-scale overlap == scale and kills every ingest."""
+    from pydantic import ValidationError
+
+    from app.config import Settings
+
+    with pytest.raises(ValidationError, match="multi_scale_overlap_ratio"):
+        Settings(multi_scale_overlap_ratio=1.0)
+    # The rest of the range stays valid.
+    assert Settings(multi_scale_overlap_ratio=0.99) is not None
+    assert Settings(multi_scale_overlap_ratio=0.0) is not None
+
+
+def test_put_cross_field_overlap_above_resulting_size_422():
+    """PUT overlap >= resulting size 422s, including single-sided updates."""
+    from fastapi import HTTPException
+
+    from app.api.routes.settings import SettingsUpdate, _validate_settings_update
+
+    with pytest.raises(HTTPException) as exc_info:
+        _validate_settings_update(
+            SettingsUpdate(chunk_size_chars=1000, chunk_overlap_chars=5000)
+        )
+    assert exc_info.value.status_code == 422
+    # Single-sided: only overlap provided, compared against the current size.
+    with pytest.raises(HTTPException) as exc_info:
+        _validate_settings_update(SettingsUpdate(chunk_overlap_chars=1_000_000))
+    assert exc_info.value.status_code == 422
+    # In-range pair still converts cleanly.
+    converted = _validate_settings_update(
+        SettingsUpdate(chunk_size_chars=1000, chunk_overlap_chars=200)
+    )
+    assert converted["chunk_size_chars"] == 1000

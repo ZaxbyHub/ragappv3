@@ -12,7 +12,12 @@
   legacy-derived values are checked at construction). `multi_scale_chunk_sizes`
   rejects entries above the cap — under the shipped default
   (multi-scale on), an oversized scale would otherwise silently drop every
-  chunk it produces at ingest.
+  chunk it produces at ingest. A cross-field model validator rejects
+  `chunk_overlap_chars >= chunk_size_chars`, and
+  `multi_scale_overlap_ratio` is now strictly `< 1.0` (implementation-review
+  findings: both configurations previously passed every validation check and
+  then failed EVERY ingest in the chunker with "'overlap' argument must be
+  less than max_characters").
 - **`backend/app/api/routes/settings.py`** — the PUT path enforces the same
   both-bounds rule at two seams: the `SettingsUpdate` field validator, and a
   post-`apply_legacy_settings_conversion` re-check inside
@@ -100,7 +105,13 @@
 - Configurations with `CHUNK_SIZE_CHARS > 8192` (or legacy `CHUNK_SIZE >=
   2049`) now fail at startup with a named validation error instead of
   failing per-chunk mid-ingest. The same bound applies to each
-  `MULTI_SCALE_CHUNK_SIZES` entry.
+  `MULTI_SCALE_CHUNK_SIZES` entry. `CHUNK_OVERLAP_CHARS >= CHUNK_SIZE_CHARS`
+  (direct or legacy-derived) and `MULTI_SCALE_OVERLAP_RATIO = 1.0` are
+  likewise rejected at configuration time — both previously failed every
+  ingest in the chunker. These startup failures apply to environment
+  variables and fresh construction; a value already persisted in
+  `settings_kv` that fails validation at startup is logged as a warning and
+  replaced by the default (the existing lifespan replay behavior).
 - The embedding-cache identity change intentionally invalidates every
   pre-existing cache row (one-time cold cache on first deploy; the table is
   a rebuildable cache, not user data).
