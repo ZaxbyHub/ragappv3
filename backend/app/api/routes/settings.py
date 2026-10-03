@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, field_validator, model_validator
+from pydantic_settings import DotEnvSettingsSource, EnvSettingsSource
 
 from app.api.deps import get_csrf_manager, get_current_active_user, get_db, require_role
 from app.config import apply_legacy_settings_conversion, settings
@@ -1284,8 +1285,8 @@ def _compute_effective_sources(conn: Optional[sqlite3.Connection]) -> dict[str, 
     ``setattr(settings, key, value)`` overwrites env-derived values, so
     persistence wins after the first save. Values:
       - "kv":      a row exists in ``settings_kv`` for this field.
-      - "env":     no kv row, and an env variable with the same name
-                   (uppercased) is set.
+      - "env":     no kv row, and Pydantic resolved the field from its
+                   environment or configured dotenv source.
       - "default": neither.
 
     The Models tab uses this to label inputs honestly without disabling
@@ -1298,21 +1299,33 @@ def _compute_effective_sources(conn: Optional[sqlite3.Connection]) -> dict[str, 
             kv_keys = {row[0] for row in cursor.fetchall()}
         except sqlite3.Error:
             kv_keys = set()
+    settings_cls = type(settings)
+    env_values = EnvSettingsSource(settings_cls)()
+    dotenv_values = DotEnvSettingsSource(
+        settings_cls,
+        env_file=getattr(
+            settings, "_configured_env_file", settings_cls.model_config.get("env_file")
+        ),
+    )()
+
+    def source_badge(field: str) -> str:
+        # EnvSettingsSource has higher precedence than DotEnvSettingsSource.
+        # Keep the existing UI convention that an explicit empty source value
+        # receives the default badge, even though selected settings use empty
+        # strings as meaningful runtime values.
+        if field in env_values:
+            return "env" if env_values[field] != "" else "default"
+        if field in dotenv_values:
+            return "env" if dotenv_values[field] != "" else "default"
+        return "default"
+
     out: dict[str, str] = {}
-    import os as _os
 
     for field in ALLOWED_FIELDS:
         if field in kv_keys:
             out[field] = "kv"
         else:
-            # Treat ``X=""`` as "not set". Pydantic typically falls back
-            # to its default for empty strings, so labelling the source
-            # as "env" would mislead the Models tab badges.
-            env_val = _os.environ.get(field.upper(), "")
-            if env_val != "":
-                out[field] = "env"
-            else:
-                out[field] = "default"
+            out[field] = source_badge(field)
     return out
 
 

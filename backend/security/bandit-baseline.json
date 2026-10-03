@@ -36,7 +36,7 @@
       "SEVERITY.LOW": 62,
       "SEVERITY.MEDIUM": 60,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 83424,
+      "loc": 83491,
       "nosec": 0,
       "skipped_tests": 63
     },
@@ -140,7 +140,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 3679,
+      "loc": 3680,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -309,7 +309,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1688,
+      "loc": 1698,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -387,7 +387,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1437,
+      "loc": 1458,
       "nosec": 0,
       "skipped_tests": 1
     },
@@ -400,7 +400,7 @@
       "SEVERITY.LOW": 7,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 830,
+      "loc": 832,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -517,7 +517,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 5677,
+      "loc": 5710,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -3243,28 +3243,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1072         await app.state.thinking_llm_client.close()\n1073     except Exception:\n1074         pass\n1075     try:\n",
-      "col_offset": 4,
-      "end_col_offset": 12,
-      "filename": "backend/app/lifespan.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 703,
-        "link": "https://cwe.mitre.org/data/definitions/703.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1073,
-      "line_range": [
-        1073,
-        1074
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
-      "test_id": "B110",
-      "test_name": "try_except_pass"
-    },
-    {
-      "code": "1076         await app.state.instant_llm_client.close()\n1077     except Exception:\n1078         pass\n1079     try:\n",
+      "code": "1076         await app.state.thinking_llm_client.close()\n1077     except Exception:\n1078         pass\n1079     try:\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3285,7 +3264,7 @@
       "test_name": "try_except_pass"
     },
     {
-      "code": "1080         await app.state.embedding_service.close()\n1081     except Exception:\n1082         pass\n1083     try:\n",
+      "code": "1080         await app.state.instant_llm_client.close()\n1081     except Exception:\n1082         pass\n1083     try:\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3306,7 +3285,7 @@
       "test_name": "try_except_pass"
     },
     {
-      "code": "1084         await app.state.reranking_service.close()\n1085     except Exception:\n1086         pass\n1087     try:\n",
+      "code": "1084         await app.state.embedding_service.close()\n1085     except Exception:\n1086         pass\n1087     try:\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3327,7 +3306,7 @@
       "test_name": "try_except_pass"
     },
     {
-      "code": "1088         app.state.vector_store.close()\n1089     except Exception:\n1090         pass\n1091     try:\n",
+      "code": "1088         await app.state.reranking_service.close()\n1089     except Exception:\n1090         pass\n1091     try:\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3348,7 +3327,7 @@
       "test_name": "try_except_pass"
     },
     {
-      "code": "1092         app.state.db_pool.close_all()\n1093     except Exception:\n1094         pass\n1095     try:\n",
+      "code": "1092         app.state.vector_store.close()\n1093     except Exception:\n1094         pass\n1095     try:\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3369,7 +3348,7 @@
       "test_name": "try_except_pass"
     },
     {
-      "code": "1097         _auth_executor.shutdown(wait=False)\n1098     except Exception:\n1099         pass\n1100     with contextlib_suppress(Exception):\n",
+      "code": "1096         app.state.db_pool.close_all()\n1097     except Exception:\n1098         pass\n1099     try:\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3380,10 +3359,31 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1098,
+      "line_number": 1097,
       "line_range": [
-        1098,
-        1099
+        1097,
+        1098
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
+      "test_id": "B110",
+      "test_name": "try_except_pass"
+    },
+    {
+      "code": "1101         _auth_executor.shutdown(wait=False)\n1102     except Exception:\n1103         pass\n1104     with contextlib_suppress(Exception):\n",
+      "col_offset": 4,
+      "end_col_offset": 12,
+      "filename": "backend/app/lifespan.py",
+      "issue_confidence": "HIGH",
+      "issue_cwe": {
+        "id": 703,
+        "link": "https://cwe.mitre.org/data/definitions/703.html"
+      },
+      "issue_severity": "LOW",
+      "issue_text": "Try, Except, Pass detected.",
+      "line_number": 1102,
+      "line_range": [
+        1102,
+        1103
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
