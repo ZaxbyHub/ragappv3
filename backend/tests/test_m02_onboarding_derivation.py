@@ -288,3 +288,42 @@ class TestDerivationCensus:
         flags = _flags(client)
         assert flags["upload_indexed"] is False
         assert flags["show_checklist"] is True
+
+    def test_show_checklist_true_for_eligible_incomplete_user(
+        self, seeded_db, monkeypatch
+    ) -> None:
+        """Positive direction of the show_checklist formula (Phase 4.5 R1):
+
+        an eligible user (not dismissed, not all-four-complete) MUST see the
+        checklist. The frozen suite only asserts the False directions; an
+        implementation with show_checklist hardcoded False passes every
+        frozen check — this pin closes that hole.
+        """
+        import pathlib
+
+        monkeypatch.setattr(
+            "app.config.settings.data_dir", pathlib.Path(seeded_db).parent
+        )
+        monkeypatch.setattr(
+            "app.config.settings.jwt_secret_key",
+            "test-secret-key-for-testing-only-min-32-chars!!",
+        )
+        monkeypatch.setattr("app.config.settings.users_enabled", True)
+        # Eligible: one milestone done (vault created), three pending, and
+        # the user has never dismissed anything.
+        _sql(
+            seeded_db,
+            "INSERT INTO vaults (id, name, owner_id) VALUES (1, 'V', 1)",
+        )
+        flags = _flags(client=_client())
+        assert flags["show_checklist"] is True
+        assert flags["vault_created"] is True
+        assert flags["upload_indexed"] is False
+
+        # And dismissing the eligible user hides it (the False direction the
+        # frozen suite covers, re-asserted here against the same seed).
+        dismiss = _client().post(
+            "/api/onboarding/milestones/dismiss", headers=_headers()
+        )
+        assert dismiss.status_code == 200, dismiss.text
+        assert _flags(client=_client())["show_checklist"] is False
