@@ -9,7 +9,7 @@ import logging
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 from urllib.parse import urlparse
 
 import httpx
@@ -169,6 +169,59 @@ class _EmbeddingRequestConfig:
     query_prefix: str
 
 
+# Qwen3 auto-prefixes applied when the model includes "qwen" and the user
+# hasn't supplied explicit prefixes in settings (single source for the
+# EmbeddingService properties and serving-identity capture, issue #696).
+_QWEN_DOC_PREFIX = (
+    "Instruct: Represent this technical documentation passage for retrieval.\n"
+    "Document: "
+)
+_QWEN_QUERY_PREFIX = (
+    "Instruct: Retrieve relevant technical documentation passages.\n"
+    "Query: "
+)
+
+
+def resolve_effective_prefixes(
+    model: str, doc_prefix: Optional[str], query_prefix: Optional[str]
+) -> tuple[str, str]:
+    """Resolve the effective (doc, query) prefixes for an embedding model.
+
+    Applies the same Qwen3 auto-prefix rule as
+    :attr:`EmbeddingService.embedding_doc_prefix` /
+    :attr:`EmbeddingService.embedding_query_prefix`, keyed on ``model``
+    rather than live settings so a config captured under an older model
+    resolves exactly as that generation embedded (issue #696). Falsy values
+    normalize to empty strings.
+    """
+    model_name = str(model or "")
+    doc = str(doc_prefix or "")
+    query = str(query_prefix or "")
+    if "qwen" in model_name.lower():
+        if not doc:
+            doc = _QWEN_DOC_PREFIX
+        if not query:
+            query = _QWEN_QUERY_PREFIX
+    return doc, query
+
+
+@dataclass(frozen=True)
+class EmbeddingIdentity:
+    """Full embedding configuration of one index generation (issue #696).
+
+    Captured when an embedding identity changes so the app can keep
+    embedding queries against the generation it is still serving while a
+    staged rebuild builds the next one. Prefixes are the RESOLVED effective
+    values (Qwen auto-prefix rule applied against ``model``), not raw
+    settings.
+    """
+
+    model: str
+    url: str
+    doc_prefix: str
+    query_prefix: str
+
+
 class EmbeddingService:
     """Service for generating text embeddings via Ollama or OpenAI-compatible APIs."""
 
@@ -179,16 +232,9 @@ class EmbeddingService:
     )
     MIN_SPLIT_CHARS = 200  # Minimum text length to attempt single-text splitting
 
-    # Qwen3 auto-prefixes applied when the configured model includes "qwen"
-    # and the user hasn't supplied explicit prefixes in settings.
-    _QWEN_DOC_PREFIX = (
-        "Instruct: Represent this technical documentation passage for retrieval.\n"
-        "Document: "
-    )
-    _QWEN_QUERY_PREFIX = (
-        "Instruct: Retrieve relevant technical documentation passages.\n"
-        "Query: "
-    )
+    # Qwen3 auto-prefix resolution lives in ``resolve_effective_prefixes``
+    # (module level) so the EmbeddingService properties and serving-identity
+    # capture share one implementation (issue #696).
     _global_batch_semaphore: asyncio.Semaphore | None = None
     _global_batch_semaphore_limit: int | None = None
     _global_batch_semaphore_loop: asyncio.AbstractEventLoop | None = None
@@ -244,6 +290,16 @@ class EmbeddingService:
         # LRU cache. Cache keys include the live model/url/prefix fingerprints,
         # so a settings change naturally invalidates cached entries.
         self._embed_cache = LRUCache(maxsize=1000)
+
+        # Serving-generation override provider (issue #696): an async callable
+        # returning the EmbeddingIdentity of the generation the vector store is
+        # still serving while a staged rebuild builds the next one, or None
+        # when live settings are authoritative. Consulted by embed_single /
+        # embed_passage only — embed_batch builds the NEW generation and must
+        # never be pinned. Wired in lifespan to VectorStore.serving_embedding_identity.
+        self._serving_identity_provider: Optional[
+            Callable[[], "Awaitable[Optional[EmbeddingIdentity]]"]
+        ] = None
 
         # Last embedding-API call metrics (analogous to LLMClient.last_metrics).
         # Populated on every provider-path call (success or failure); None until
@@ -312,18 +368,16 @@ class EmbeddingService:
     @property
     def embedding_doc_prefix(self) -> str:
         """Live read of the document prefix; auto-applies Qwen3 default when unset."""
-        prefix = settings.embedding_doc_prefix
-        if not prefix and "qwen" in settings.embedding_model.lower():
-            return self._QWEN_DOC_PREFIX
-        return prefix
+        return resolve_effective_prefixes(
+            settings.embedding_model, settings.embedding_doc_prefix, None
+        )[0]
 
     @property
     def embedding_query_prefix(self) -> str:
         """Live read of the query prefix; auto-applies Qwen3 default when unset."""
-        prefix = settings.embedding_query_prefix
-        if not prefix and "qwen" in settings.embedding_model.lower():
-            return self._QWEN_QUERY_PREFIX
-        return prefix
+        return resolve_effective_prefixes(
+            settings.embedding_model, None, settings.embedding_query_prefix
+        )[1]
 
     @property
     def provider_mode(self) -> str:
@@ -335,13 +389,17 @@ class EmbeddingService:
         """Live read of the resolved embeddings endpoint URL."""
         return self._resolved_url_and_mode()[1]
 
-    def _resolved_url_and_mode(self) -> tuple:
-        """Resolve provider mode and embeddings URL from the current settings.
+    def _resolved_url_and_mode(self, base_url: Optional[str] = None) -> tuple:
+        """Resolve provider mode and embeddings URL from the settings.
 
         Reads ``settings.ollama_embedding_url`` at call time so endpoint
-        changes take effect without re-instantiating the service.
+        changes take effect without re-instantiating the service. When
+        ``base_url`` is provided (a serving-identity override, issue #696),
+        that URL is resolved instead — the mode cache is keyed by URL, so
+        live and overridden URLs never poison each other's resolution.
         """
-        base_url = settings.ollama_embedding_url
+        if base_url is None:
+            base_url = settings.ollama_embedding_url
         if not base_url:
             raise EmbeddingError("Embedding service is not configured")
         if not base_url.startswith(("http://", "https://")):
@@ -401,6 +459,105 @@ class EmbeddingService:
             doc_prefix=self.embedding_doc_prefix,
             query_prefix=self.embedding_query_prefix,
         )
+
+    def _request_config_for_identity(
+        self, identity: EmbeddingIdentity
+    ) -> _EmbeddingRequestConfig:
+        """Frozen request configuration for a serving-generation identity.
+
+        Mirrors :meth:`_request_config` but sources model/URL/prefixes from
+        the captured ``EmbeddingIdentity`` (issue #696) so queries embedded
+        while a staged rebuild is open land in the OLD generation's embedding
+        space — same provider-resolution machinery, same cache-key
+        fingerprinting, different identity.
+        """
+        mode, url = self._resolved_url_and_mode(identity.url)
+        return _EmbeddingRequestConfig(
+            url=url,
+            mode=mode,
+            ollama_style=self._ollama_endpoint_style(url) if mode == "ollama" else None,
+            model=identity.model,
+            doc_prefix=identity.doc_prefix,
+            query_prefix=identity.query_prefix,
+        )
+
+    def set_serving_identity_provider(
+        self,
+        provider: Optional[Callable[[], Awaitable[Optional[EmbeddingIdentity]]]],
+    ) -> None:
+        """Install (or clear, with ``None``) the serving-identity provider.
+
+        The provider is consulted by :meth:`embed_single` and
+        :meth:`embed_passage` only; ``embed_batch`` (which builds the new
+        generation during a rebuild) and :meth:`embed_probe` (which probes
+        the CURRENT endpoint) are deliberately unpinned (issue #696).
+        """
+        self._serving_identity_provider = provider
+
+    async def _serving_identity_or_none(self) -> Optional[EmbeddingIdentity]:
+        """Current serving identity, or None — never raises.
+
+        An unset provider, a None return (no rebuild open / no draining
+        snapshot), or any provider failure falls back to live settings
+        rather than failing the query.
+        """
+        provider = self._serving_identity_provider
+        if provider is None:
+            return None
+        try:
+            return await provider()
+        except Exception as exc:  # noqa: BLE001 - the pin must never fail a query
+            logger.warning(
+                "Serving-identity provider failed; embedding under live settings: %s",
+                exc,
+            )
+            return None
+
+    async def effective_embedding_model(self) -> str:
+        """The model id whose space the NEXT single-text embed lands in.
+
+        Mirrors the serving-identity funnel exactly (issue #696): while a
+        staged rebuild is open and a verified pin exists, single-text
+        embeds run under the PINNED model — so anything labelling stored
+        vectors (e.g. memory embeddings) must label them with this id, not
+        live settings, or the label contradicts the vector space. Live
+        settings otherwise.
+
+        Prefer :meth:`embed_passage_with_label` when the label and the
+        embed must observe the SAME pin value (one read feeds both).
+        """
+        identity = await self._serving_identity_or_none()
+        if identity is not None and identity.model:
+            return identity.model
+        return str(settings.embedding_model or "")
+
+    async def embed_passage_with_label(self, text: str) -> "tuple[List[float], str]":
+        """Embed a passage and report the model whose space it occupies.
+
+        The serving pin is read ONCE and feeds both the embed and the
+        returned label, so a cutover landing between the two reads cannot
+        produce an old-space vector labelled with the new model (issue #696
+        feedback round, M-UNC-001). Falls back to live settings when no pin
+        is served; never raises on the pin path (see
+        :meth:`_serving_identity_or_none`).
+        """
+        identity = await self._serving_identity_or_none()
+        if identity is not None:
+            vector = await self._embed_with_prefix(
+                text,
+                identity.doc_prefix,
+                config=self._request_config_for_identity(identity),
+            )
+            return vector, identity.model
+        # No-pin path: freeze the config FIRST and label from the SAME
+        # snapshot the embed uses, so a settings save landing during the
+        # provider round-trip cannot mislabel the row (issue #696 feedback
+        # round 2, F3).
+        config = self._request_config()
+        vector = await self._embed_with_prefix(
+            text, config.doc_prefix, config=config
+        )
+        return vector, config.model
 
     def _detect_provider_mode(self, base_url: str) -> tuple:
         """
@@ -798,6 +955,16 @@ class EmbeddingService:
         Raises:
             EmbeddingError: If the API request fails or returns non-200 status.
         """
+        identity = await self._serving_identity_or_none()
+        if identity is not None:
+            # Serving the previous generation while a staged rebuild builds
+            # the next one (issue #696): embed under the captured identity so
+            # the query lands in the old generation's embedding space.
+            return await self._embed_with_prefix(
+                text,
+                identity.query_prefix,
+                config=self._request_config_for_identity(identity),
+            )
         return await self._embed_with_prefix(text, self.embedding_query_prefix)
 
     async def embed_passage(self, text: str) -> List[float]:
@@ -807,6 +974,9 @@ class EmbeddingService:
         Applies the document prefix (if configured) to the input text before embedding.
         The document prefix is used for indexing documents and must remain constant for
         a given index to ensure consistent embedding space.
+
+        While a staged rebuild is open, the serving-identity provider pins this
+        call to the OLD generation's configuration (issue #696).
 
         Results are cached using an LRU cache to avoid redundant API calls.
 
@@ -819,7 +989,9 @@ class EmbeddingService:
         Raises:
             EmbeddingError: If the API request fails or returns non-200 status.
         """
-        return await self._embed_with_prefix(text, self.embedding_doc_prefix)
+        # Delegate to the labelled variant so the funnel logic lives in ONE
+        # place (embed_passage_with_label); the label is discarded here.
+        return (await self.embed_passage_with_label(text))[0]
 
     async def embed_probe(self, timeout: float) -> None:
         """Issue a cache-bypassing ping embedding for deep-health checks.

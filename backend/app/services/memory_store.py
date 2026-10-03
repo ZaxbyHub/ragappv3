@@ -211,32 +211,66 @@ class MemoryStore:
 
     async def _embed_text_with_outcome(
         self, text: str
-    ) -> "tuple[Optional[List[float]], str]":
+    ) -> "tuple[Optional[List[float]], str, str]":
         """Best-effort embed; never raises.
 
-        Returns ``(embedding, outcome)`` where outcome is (issue #515, OBS-004):
+        Returns ``(embedding, outcome, model_used)`` where outcome is
+        (issue #515, OBS-004):
 
           * ``"ok"``      — the provider returned a vector;
           * ``"skipped"`` — no embedding service is wired in or text is empty;
           * ``"failed"``  — the provider raised or returned None.
+
+        ``model_used`` is the model id whose space the vector actually
+        lands in — the serving generation's pinned model while a staged
+        rebuild is open, live settings otherwise (issue #696). Callers must
+        label the stored row with THIS id, not live settings, or the label
+        contradicts the vector space and the cutover backfill can neither
+        find nor repair the row.
         """
         if not self.embedding_service or not text:
-            return None, "skipped"
+            return None, "skipped", ""
+        # Preferred path: ONE pin read feeds both the embed and the label
+        # (embed and label cannot straddle a cutover — issue #696 feedback
+        # round). Test doubles and older service shapes without the bound
+        # method fall back to embed_passage + a separate label read.
+        with_label = getattr(self.embedding_service, "embed_passage_with_label", None)
+        if callable(with_label):
+            try:
+                embedding, model_used = await with_label(text)
+            except Exception as exc:  # noqa: BLE001 — defensive, optional path
+                logger.debug("Memory embedding failed (continuing FTS-only): %s", exc)
+                return None, "failed", ""
+            if embedding is None:
+                return None, "failed", ""
+            return embedding, "ok", model_used
         try:
             embedding = await self.embedding_service.embed_passage(text)
         except Exception as exc:  # noqa: BLE001 — defensive, optional path
             logger.debug("Memory embedding failed (continuing FTS-only): %s", exc)
-            return None, "failed"
+            return None, "failed", ""
         if embedding is None:
-            return None, "failed"
-        return embedding, "ok"
+            return None, "failed", ""
+        try:
+            model_used = await self.embedding_service.effective_embedding_model()
+        except Exception:  # noqa: BLE001 - stub/alternative embedders
+            model_used = getattr(settings, "embedding_model", None) or ""
+        return embedding, "ok", model_used
 
     async def _embed_text(self, text: str) -> Optional[List[float]]:
         """Best-effort embed; never raises. Returns None on failure or when
         no embedding service is wired in.
         """
-        embedding, _outcome = await self._embed_text_with_outcome(text)
+        embedding, _outcome, _model = await self._embed_text_with_outcome(text)
         return embedding
+
+    async def _embed_text_with_model(
+        self, text: str
+    ) -> "tuple[Optional[List[float]], str]":
+        """Best-effort embed returning the model id whose space the vector
+        occupies (serving pin during a staged rebuild — issue #696)."""
+        embedding, _outcome, model_used = await self._embed_text_with_outcome(text)
+        return embedding, model_used
 
     def _run_coro_sync(self, coro):
         """asyncio.run bridge that does not leak the coroutine when called
@@ -257,6 +291,7 @@ class MemoryStore:
         memory_id: int,
         embedding: Optional[List[float]],
         expected_content: Optional[str] = None,
+        model_used: Optional[str] = None,
     ) -> bool:
         """Persist the embedding JSON for a single memory row.
 
@@ -275,7 +310,13 @@ class MemoryStore:
             return False
         try:
             payload = json.dumps(embedding)
-            model = getattr(settings, "embedding_model", None) or ""
+            # Label with the model whose space the vector actually occupies
+            # (the serving pin during a staged rebuild — issue #696), NOT
+            # live settings: a mismatched label makes the cutover backfill
+            # (which selects embedding_model != current) unable to find or
+            # repair the row. Callers that predate the pin pass None and
+            # keep the live-settings label.
+            model = model_used or getattr(settings, "embedding_model", None) or ""
             conn = self.pool.get_connection()
             try:
                 if not self._has_embedding_columns(conn):
@@ -324,11 +365,11 @@ class MemoryStore:
           * ``"skipped"`` — no embedding service is wired in or content is
             empty.
         """
-        embedding, outcome = await self._embed_text_with_outcome(content)
+        embedding, outcome, model_used = await self._embed_text_with_outcome(content)
         if embedding is None:
             return outcome
         written = await asyncio.to_thread(
-            self._store_embedding, memory_id, embedding, content
+            self._store_embedding, memory_id, embedding, content, model_used
         )
         return "stored" if written else "failed"
 
@@ -533,9 +574,13 @@ class MemoryStore:
         # because lexical search continues to work without the embedding.
         if self.embedding_service is not None:
             try:
-                embedding = self._run_coro_sync(self._embed_text(content))
+                embedding, model_used = self._run_coro_sync(
+                    self._embed_text_with_model(content)
+                )
                 if embedding is not None:
-                    self._store_embedding(memory_id, embedding, content)
+                    self._store_embedding(
+                        memory_id, embedding, content, model_used
+                    )
             except Exception as exc:  # noqa: BLE001
                 logger.debug(
                     "Memory embedding skipped on add (id=%s): %s", memory_id, exc
@@ -582,9 +627,13 @@ class MemoryStore:
 
         if self.embedding_service is not None:
             try:
-                embedding = self._run_coro_sync(self._embed_text(new_content))
+                embedding, model_used = self._run_coro_sync(
+                    self._embed_text_with_model(new_content)
+                )
                 if embedding is not None:
-                    self._store_embedding(memory_id, embedding, new_content)
+                    self._store_embedding(
+                        memory_id, embedding, new_content, model_used
+                    )
             except Exception as exc:  # noqa: BLE001
                 logger.debug(
                     "Memory embedding refresh skipped (id=%s): %s", memory_id, exc
