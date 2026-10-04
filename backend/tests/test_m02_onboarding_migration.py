@@ -134,9 +134,12 @@ def test_migration_is_idempotent_on_rerun(tmp_path: Path) -> None:
     finally:
         conn.close()
     assert rows == [("2026-10-03T00:00:00+00:00",)]
-    # The journal records a second complete attempt (start + succeeded), never
-    # a failure — the double-definition convention converges.
-    assert _journal_rows(db_path, _JOURNAL_NAME)[-1] == ("succeeded", "ok")
+    # Issue #699: a no-op rerun is journal-SILENT (nothing attempted, nothing
+    # recorded) — the last row stays the first run's terminal outcome.
+    assert _journal_rows(db_path, _JOURNAL_NAME) == [
+        ("start", "ok"),
+        ("succeeded", "ok"),
+    ]
 
 
 def test_migration_pins_load_bearing_constraints(tmp_path: Path) -> None:

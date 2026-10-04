@@ -1837,6 +1837,7 @@ def run_migrations(sqlite_path: str) -> None:
         _jobs_conn.close()
 
     # Migrate refresh token index from non-unique to unique
+    _us_journal = "run_migrations_user_sessions_refresh_hash_unique"
     conn = sqlite3.connect(sqlite_path)
     try:
         # Check if a unique index already exists (from prior migration run)
@@ -1855,8 +1856,24 @@ def run_migrations(sqlite_path: str) -> None:
             # Create unique index directly (with or without dedup)
             conn.execute("DROP INDEX IF EXISTS idx_user_sessions_refresh_hash")
             if needs_migration:
+                # Destructive-dedup record (issue #699 AC5 class): count +
+                # log + journal row inside the delete's transaction.
+                _doomed = conn.execute(
+                    "SELECT COUNT(*) FROM user_sessions WHERE id NOT IN ("
+                    "SELECT MAX(id) FROM user_sessions GROUP BY refresh_token_hash)"
+                ).fetchone()[0]
+                logger.info(
+                    "run_migrations: deleting %d duplicate user_sessions row(s) "
+                    "(unrecoverable; keeping highest id per refresh_token_hash)",
+                    _doomed,
+                )
                 conn.execute(
                     "DELETE FROM user_sessions WHERE id NOT IN (SELECT MAX(id) FROM user_sessions GROUP BY refresh_token_hash)"
+                )
+                record_migration_outcome(
+                    conn, migration_name=_us_journal, phase="succeeded",
+                    outcome="ok",
+                    detail=f"deduplicated user_sessions rows deleted: {_doomed}",
                 )
             conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_user_sessions_refresh_hash ON user_sessions(refresh_token_hash)"
@@ -1864,15 +1881,39 @@ def run_migrations(sqlite_path: str) -> None:
         elif row[0] and "UNIQUE" not in row[0].upper():
             # Non-unique index exists — migrate to unique
             conn.execute("DROP INDEX IF EXISTS idx_user_sessions_refresh_hash")
+            _doomed = conn.execute(
+                "SELECT COUNT(*) FROM user_sessions WHERE id NOT IN ("
+                "SELECT MAX(id) FROM user_sessions GROUP BY refresh_token_hash)"
+            ).fetchone()[0]
+            if _doomed:
+                logger.info(
+                    "run_migrations: deleting %d duplicate user_sessions row(s) "
+                    "(unrecoverable; keeping highest id per refresh_token_hash)",
+                    _doomed,
+                )
             conn.execute(
                 "DELETE FROM user_sessions WHERE id NOT IN (SELECT MAX(id) FROM user_sessions GROUP BY refresh_token_hash)"
+            )
+            record_migration_outcome(
+                conn, migration_name=_us_journal, phase="succeeded", outcome="ok",
+                detail=f"deduplicated user_sessions rows deleted: {_doomed}",
             )
             conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_user_sessions_refresh_hash ON user_sessions(refresh_token_hash)"
             )
         conn.commit()
-    except Exception:
+    except Exception as exc:
         conn.rollback()
+        # Issue #699 review (PRR-001): the dedup attempt must end in a
+        # terminal journal outcome even when it fails; the rollback discarded
+        # any in-transaction count row, so record the failure on its own
+        # committed transaction.
+        record_migration_outcome(
+            conn, migration_name=_us_journal,
+            phase="failed", outcome="error",
+            detail=f"{type(exc).__name__}: {exc}",
+        )
+        conn.commit()
         raise
     finally:
         conn.close()
@@ -2922,6 +2963,39 @@ def migrate_add_chat_turn_columns(sqlite_path: str) -> None:
             for idx_row in conn.execute("PRAGMA index_list(chat_messages)").fetchall()
         )
         if not turn_role_index_exists:
+            # Destructive-dedup record (issue #699 AC5): the deleted-row count
+            # is logged and journaled inside the delete's own transaction
+            # (committed with this function's single conn.commit() below), so
+            # the record exists iff the delete committed. One-time by
+            # construction — later connects skip this block via the index
+            # probe above and journal nothing.
+            _doomed = conn.execute(
+                """
+                SELECT COUNT(*) FROM chat_messages
+                WHERE turn_id IS NOT NULL
+                  AND id NOT IN (
+                    SELECT id FROM (
+                      SELECT id, ROW_NUMBER() OVER (
+                        PARTITION BY session_id, turn_id, role
+                        ORDER BY (CASE status WHEN 'complete' THEN 3
+                                              WHEN 'interrupted' THEN 2
+                                              WHEN 'failed' THEN 2
+                                              ELSE 1 END) DESC,
+                                 LENGTH(COALESCE(content, '')) DESC,
+                                 id DESC
+                      ) AS rn
+                      FROM chat_messages WHERE turn_id IS NOT NULL
+                    ) ranked WHERE ranked.rn = 1
+                  )
+                """
+            ).fetchone()[0]
+            if _doomed:
+                logger.info(
+                    "migrate_add_chat_turn_columns: deleting %d duplicate "
+                    "chat_messages row(s) (unrecoverable; keeping the most "
+                    "informative row per session/turn/role)",
+                    _doomed,
+                )
             conn.execute(
                 """
                 DELETE FROM chat_messages
@@ -2942,6 +3016,11 @@ def migrate_add_chat_turn_columns(sqlite_path: str) -> None:
                   )
                 """
             )
+            record_migration_outcome(
+                conn, migration_name="migrate_add_chat_turn_columns",
+                phase="succeeded", outcome="ok",
+                detail=f"deduplicated chat_messages rows deleted: {_doomed}",
+            )
             conn.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_messages_session_turn_role
@@ -2950,6 +3029,20 @@ def migrate_add_chat_turn_columns(sqlite_path: str) -> None:
                 """
             )
         conn.commit()
+    except Exception as exc:
+        # Issue #699 review (PRR-001): a failed attempt (lock error at the
+        # BEGIN above, a failing backfill or index creation) must leave a
+        # terminal journal outcome. The rollback discards the in-transaction
+        # dedup count row together with the DML, so the failure row is
+        # recorded on its own committed transaction.
+        conn.rollback()
+        record_migration_outcome(
+            conn, migration_name="migrate_add_chat_turn_columns",
+            phase="failed", outcome="error",
+            detail=f"{type(exc).__name__}: {exc}",
+        )
+        conn.commit()
+        raise
     finally:
         conn.close()
 
@@ -3320,9 +3413,6 @@ def migrate_add_curator_claim_support(sqlite_path: str) -> None:
     _journal = "migrate_add_curator_claim_support"
     recovered = False
     try:
-        record_migration_outcome(
-            conn, migration_name=_journal, phase="start", outcome="ok"
-        )
         # Recovery: if a previous run crashed mid-migration, the old
         # table may still be present alongside (or instead of) the new
         # one. Restore the canonical name before doing anything else.
@@ -3350,12 +3440,9 @@ def migrate_add_curator_claim_support(sqlite_path: str) -> None:
 
         # Skip if wiki_claims doesn't exist yet (fresh install path will
         # create it via migrate_add_wiki_tables, which already includes
-        # the new schema after this function lands).
+        # the new schema after this function lands). Journal-silent
+        # (issue #699 AC2): nothing was attempted.
         if not new_present:
-            record_migration_outcome(
-                conn, migration_name=_journal, phase="succeeded", outcome="noop",
-                detail="wiki_claims table absent",
-            )
             return
 
         existing_cols = {
@@ -3379,11 +3466,8 @@ def migrate_add_curator_claim_support(sqlite_path: str) -> None:
                 ).fetchone()[0]
                 if dest_count >= backup_count and missing_ids == 0:
                     conn.execute("DROP TABLE IF EXISTS wiki_claims_old")
-                    record_migration_outcome(
-                        conn, migration_name=_journal, phase="succeeded",
-                        outcome="noop",
-                        detail="created_by_kind already present; stale backup dropped",
-                    )
+                    # Journal-silent (issue #699 AC2): a stale backup beside a
+                    # complete table is routine disposition, not an attempt.
                     return
                 logger.warning(
                     "migrate_add_curator_claim_support: backup holds rows the "
@@ -3400,10 +3484,8 @@ def migrate_add_curator_claim_support(sqlite_path: str) -> None:
                 # main swap path below must re-run on it.
                 old_present = None
             else:
-                record_migration_outcome(
-                    conn, migration_name=_journal, phase="succeeded",
-                    outcome="noop", detail="created_by_kind already present",
-                )
+                # Journal-silent (issue #699 AC2): migration already applied,
+                # nothing attempted.
                 return
 
         # Third recovery branch: both tables exist and wiki_claims is the OLD
@@ -3438,6 +3520,11 @@ def migrate_add_curator_claim_support(sqlite_path: str) -> None:
                 conn.execute("PRAGMA legacy_alter_table = OFF")
                 recovered = True
 
+        # Real work remains (old-shaped table): journal the attempt start only
+        # now (issue #699 AC2) — every no-op path above is journal-silent.
+        record_migration_outcome(
+            conn, migration_name=_journal, phase="start", outcome="ok"
+        )
         # Snapshot row count for parity check.
         before_count = conn.execute("SELECT COUNT(*) FROM wiki_claims").fetchone()[0]
 
@@ -3453,8 +3540,10 @@ def migrate_add_curator_claim_support(sqlite_path: str) -> None:
         # that the retry then destroyed. The whole swap now runs inside ONE
         # explicit BEGIN IMMEDIATE transaction using execute() only, so any
         # failure rolls back to the pre-swap state (backup table included).
-        conn.execute("BEGIN IMMEDIATE")
+        # BEGIN sits INSIDE the try (issue #699 AC1) so a lock error at the
+        # transaction open is journaled as a terminal failed outcome.
         try:
+            conn.execute("BEGIN IMMEDIATE")
             # Drop FTS triggers — they reference wiki_claims by name.
             for trig in (
                 "wiki_claims_fts_insert",
@@ -3580,19 +3669,35 @@ def migrate_add_curator_claim_support(sqlite_path: str) -> None:
             conn.execute("PRAGMA legacy_alter_table = OFF")
             conn.execute("PRAGMA foreign_keys = ON")
 
-        # Validate FK integrity post-swap. Any violation here means we
-        # produced a broken DB; fail loudly so an operator notices.
-        violations = conn.execute("PRAGMA foreign_key_check").fetchall()
-        if violations:
-            record_migration_outcome(
-                conn, migration_name=_journal, phase="failed", outcome="error",
-                detail=f"foreign_key_check violations: {len(violations)}",
-            )
-            raise RuntimeError(
-                f"migrate_add_curator_claim_support: foreign_key_check "
-                f"reported {len(violations)} violation(s) post-swap: "
-                f"{violations[:5]}"
-            )
+        # Validate FK integrity post-swap (issue #699 AC4 class, scoped): the
+        # swap rebuilt the wiki_claims parent table, so the rows at risk are in
+        # its child tables — wiki_claim_sources.claim_id and
+        # wiki_relations.claim_id both reference wiki_claims(id). PRAGMA
+        # foreign_key_check(T) reports only FKs declared BY T, so each child is
+        # checked in table-arg form (behind an existence guard for pre-schema
+        # databases); an unrelated pre-existing orphan elsewhere cannot block
+        # this migration. Any violation here means we produced a broken DB;
+        # fail loudly so an operator notices.
+        for child in ("wiki_claims", "wiki_claim_sources", "wiki_relations"):
+            child_present = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                (child,),
+            ).fetchone()
+            if not child_present:
+                continue
+            violations = conn.execute(
+                f"PRAGMA foreign_key_check({child})"  # fixed literal names
+            ).fetchall()
+            if violations:
+                record_migration_outcome(
+                    conn, migration_name=_journal, phase="failed", outcome="error",
+                    detail=f"foreign_key_check({child}) violations: {len(violations)}",
+                )
+                raise RuntimeError(
+                    f"migrate_add_curator_claim_support: "
+                    f"foreign_key_check({child}) reported {len(violations)} "
+                    f"violation(s) post-swap: {violations[:5]}"
+                )
 
         # The swap rebuilt the claims table and its FTS projection — record
         # the derived-data invalidation and the final outcome.
@@ -4052,6 +4157,30 @@ def migrate_add_files_search_fts(sqlite_path: str) -> None:
         conn.close()
 
 
+def _files_content_fts_complete(conn: sqlite3.Connection) -> bool:
+    """True when the ``files_content_fts`` virtual table and all three sync
+    triggers exist — the issue #699 AC3 completeness gate. Because #512 made
+    creation, triggers, and the backfill ONE transaction, completeness implies
+    the backfill finished for any database migrated by that implementation or
+    later; a failed attempt rolls the table away so the gate cannot skip a
+    half-built index it created. (A pre-#512 database whose creation
+    committed but whose backfill never did is NOT detected — see the release
+    notes' known-scope section.)
+    """
+    names = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table', 'trigger')"
+        ).fetchall()
+    }
+    return {
+        "files_content_fts",
+        "files_content_fts_insert",
+        "files_content_fts_delete",
+        "files_content_fts_update",
+    } <= names
+
+
 def migrate_add_files_content_fts(sqlite_path: str) -> None:
     """Migration: add ``files_content_fts`` FTS5 index over ``files.parsed_text``.
 
@@ -4069,10 +4198,24 @@ def migrate_add_files_content_fts(sqlite_path: str) -> None:
     runs (i.e. when ``files_content_fts`` does not yet exist), it executes
     ``INSERT INTO files_content_fts(...) VALUES('rebuild')`` which re-indexes
     all existing ``parsed_text`` values in the files table. For databases with
-    many large documents this can take several seconds to a few minutes. The
-    migration is gated on table existence, so subsequent startups are a no-op.
-    If you need to avoid startup latency on first deploy, run the migration
-    manually before bringing up the service:
+    many large documents this can take several seconds to a few minutes.
+    Subsequent startups are a journal-silent no-op: once the virtual table AND
+    all three sync triggers exist (see ``_files_content_fts_complete``), the
+    whole creation+backfill sequence is known to have completed for any
+    database migrated by the #512-or-later one-transaction implementation, so
+    a failure rolls the table away and a retry re-runs everything. (A
+    pre-#512 database whose creation committed but whose backfill never did
+    is not detected by this gate — see the release notes' known-scope
+    section.) The transaction is still OPENED on every call
+    (and rolled back on the no-op path) so a lock error at ``BEGIN
+    IMMEDIATE`` is journaled as a terminal ``failed`` row (issue #699 AC1).
+    Force-reindex remedy (review round): if the index is ever stale while
+    complete-shaped (the one drift the gate cannot self-heal), drop the
+    virtual table and its three triggers — ``DROP TABLE files_content_fts``
+    plus ``DROP TRIGGER`` on ``files_content_fts_insert``/``_delete``/
+    ``_update`` — and restart; the gate then re-runs the whole
+    creation+backfill sequence. To avoid first-deploy startup latency, run
+    the migration manually before bringing up the service:
 
         python -c "from app.models.database import migrate_add_files_content_fts; \
 migrate_add_files_content_fts('/path/to/app.db')"
@@ -4086,15 +4229,17 @@ migrate_add_files_content_fts('/path/to/app.db')"
     conn.isolation_level = None
     _journal = "migrate_add_files_content_fts"
     try:
-        record_migration_outcome(
-            conn, migration_name=_journal, phase="start", outcome="ok"
-        )
-        existing_cols = [
-            row[1] for row in conn.execute("PRAGMA table_info(files)").fetchall()
-        ]
-        if "parsed_text" not in existing_cols:
-            # Defensive: normally added by migrate_add_files_parsed_text first.
-            conn.execute("ALTER TABLE files ADD COLUMN parsed_text TEXT")
+        complete = _files_content_fts_complete(conn)
+        if not complete:
+            record_migration_outcome(
+                conn, migration_name=_journal, phase="start", outcome="ok"
+            )
+            existing_cols = [
+                row[1] for row in conn.execute("PRAGMA table_info(files)").fetchall()
+            ]
+            if "parsed_text" not in existing_cols:
+                # Defensive: normally added by migrate_add_files_parsed_text first.
+                conn.execute("ALTER TABLE files ADD COLUMN parsed_text TEXT")
 
         # Non-destructive retry semantics (issue #512 SEARCH-005): creation and
         # backfill run inside ONE explicit transaction using individual
@@ -4102,9 +4247,18 @@ migrate_add_files_content_fts('/path/to/app.db')"
         # transaction first and split the operation). A failure anywhere
         # rolls back the virtual table, the triggers AND the backfill, so a
         # retry re-runs the whole sequence instead of silently skipping the
-        # backfill because the table now exists.
-        conn.execute("BEGIN IMMEDIATE")
+        # backfill because the table now exists. BEGIN sits INSIDE this try
+        # (issue #699 AC1) so a lock error at the transaction open itself is
+        # journaled as a terminal failed outcome rather than stranding a
+        # bare start row.
         try:
+            conn.execute("BEGIN IMMEDIATE")
+            if complete:
+                # Nothing to do (issue #699 AC3): completeness implies the
+                # backfill finished. Roll the just-opened transaction back
+                # and leave zero journal rows on this boot.
+                conn.rollback()
+                return
             conn.execute(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS files_content_fts USING fts5("
                 "parsed_text, content='files', content_rowid='id')"
@@ -4127,9 +4281,10 @@ migrate_add_files_content_fts('/path/to/app.db')"
                 " INSERT INTO files_content_fts(rowid, parsed_text)"
                 " VALUES (new.id, new.parsed_text); END"
             )
-            # Backfill on every run: idempotent full rebuild of the external
-            # content table, so a first-run failure leaves nothing behind and
-            # a retry restores completeness.
+            # Idempotent full rebuild of the external content table, so a
+            # first-run failure leaves nothing behind and a retry restores
+            # completeness. Runs only when the completeness gate above found
+            # the index missing/incomplete (issue #699 AC3).
             conn.execute(
                 "INSERT INTO files_content_fts(files_content_fts) VALUES('rebuild')"
             )
@@ -4171,9 +4326,6 @@ def migrate_widen_wiki_claim_sources_source_kind(sqlite_path: str) -> None:
     conn.isolation_level = None
     _journal = "migrate_widen_wiki_claim_sources_source_kind"
     try:
-        record_migration_outcome(
-            conn, migration_name=_journal, phase="start", outcome="ok"
-        )
         # Recovery first (issue #512 DB-002): probe the backup BEFORE the
         # canonical-table early return, or a crash-after-rename state can
         # never be restored. Renamed-only → restore the canonical name.
@@ -4223,11 +4375,10 @@ def migrate_widen_wiki_claim_sources_source_kind(sqlite_path: str) -> None:
             else:
                 conn.execute("DROP TABLE wiki_claim_sources_old")
 
+        # Journal-silent no-op probes (issue #699 AC2): nothing to attempt when
+        # the table is absent — the recovery block above runs FIRST so a
+        # crash-after-rename state is always dispositioned (issue #512 DB-002).
         if not tbl and not old_present:
-            record_migration_outcome(
-                conn, migration_name=_journal, phase="succeeded", outcome="noop",
-                detail="wiki_claim_sources table absent",
-            )
             return
 
         if recovered:
@@ -4246,12 +4397,11 @@ def migrate_widen_wiki_claim_sources_source_kind(sqlite_path: str) -> None:
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='wiki_claim_sources'"
         ).fetchone()
         if create_sql and "'wiki'" in create_sql[0]:
-            record_migration_outcome(
-                conn, migration_name=_journal, phase="succeeded", outcome="noop",
-                detail="source_kind CHECK already widened",
-            )
             return
 
+        record_migration_outcome(
+            conn, migration_name=_journal, phase="start", outcome="ok"
+        )
         before_count = conn.execute("SELECT COUNT(*) FROM wiki_claim_sources").fetchone()[0]
 
         conn.execute("PRAGMA foreign_keys = OFF")
@@ -4259,9 +4409,11 @@ def migrate_widen_wiki_claim_sources_source_kind(sqlite_path: str) -> None:
         # Atomicity (issue #512 DB-002): the swap runs inside ONE explicit
         # BEGIN IMMEDIATE transaction using execute() only, so a crash or
         # copy failure rolls back to the pre-swap state (backup included)
-        # instead of leaving a committed empty destination.
-        conn.execute("BEGIN IMMEDIATE")
+        # instead of leaving a committed empty destination. BEGIN sits INSIDE
+        # the try (issue #699 AC1) so a lock error at the transaction open is
+        # journaled as a terminal failed outcome.
         try:
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute("ALTER TABLE wiki_claim_sources RENAME TO wiki_claim_sources_old")
 
             conn.execute(
@@ -4395,9 +4547,6 @@ def migrate_widen_files_status(sqlite_path: str) -> None:
     conn.isolation_level = None
     _journal = "migrate_widen_files_status"
     try:
-        record_migration_outcome(
-            conn, migration_name=_journal, phase="start", outcome="ok"
-        )
         tbl = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='files'"
         ).fetchone()
@@ -4437,11 +4586,10 @@ def migrate_widen_files_status(sqlite_path: str) -> None:
             else:
                 conn.execute("DROP TABLE IF EXISTS files_old")
 
+        # Journal-silent no-op probes (issue #699 AC2): nothing to attempt when
+        # the table is absent — but the recovery block above runs FIRST so a
+        # crash-after-rename state is always dispositioned (issue #512 DB-002).
         if not tbl and not old_present:
-            record_migration_outcome(
-                conn, migration_name=_journal, phase="succeeded", outcome="noop",
-                detail="files table absent",
-            )
             return
 
         if recovered:
@@ -4462,12 +4610,11 @@ def migrate_widen_files_status(sqlite_path: str) -> None:
         if create_sql and "'partial'" in create_sql[0] and (
             "partial_embeddings" in create_sql[0]
         ):
-            record_migration_outcome(
-                conn, migration_name=_journal, phase="succeeded", outcome="noop",
-                detail="status CHECK widened and partial_embeddings column present",
-            )
             return
 
+        record_migration_outcome(
+            conn, migration_name=_journal, phase="start", outcome="ok"
+        )
         before_count = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
 
         conn.execute("PRAGMA foreign_keys = OFF")
@@ -4476,9 +4623,11 @@ def migrate_widen_files_status(sqlite_path: str) -> None:
         # BEGIN IMMEDIATE transaction using execute() only (executescript would
         # implicitly commit), so a crash or copy failure rolls back to the
         # pre-swap state (files_old included) instead of leaving a committed
-        # empty destination.
-        conn.execute("BEGIN IMMEDIATE")
+        # empty destination. BEGIN sits INSIDE the try (issue #699 AC1) so a
+        # lock error at the transaction open is journaled as a terminal failed
+        # outcome.
         try:
+            conn.execute("BEGIN IMMEDIATE")
             # Drop the FTS triggers first — they reference files by name and
             # would fire on the copy below.
             for trig in (
@@ -4673,16 +4822,42 @@ def migrate_widen_files_status(sqlite_path: str) -> None:
             conn.execute("PRAGMA legacy_alter_table = OFF")
             conn.execute("PRAGMA foreign_keys = ON")
 
-        violations = conn.execute("PRAGMA foreign_key_check").fetchall()
-        if violations:
-            record_migration_outcome(
-                conn, migration_name=_journal, phase="failed", outcome="error",
-                detail=f"foreign_key_check violations: {len(violations)}",
-            )
-            raise RuntimeError(
-                f"migrate_widen_files_status: foreign_key_check reported "
-                f"{len(violations)} violation(s) post-swap: {violations[:5]}"
-            )
+        # Scoped integrity check (issue #699 AC4 class): the swap rebuilt the
+        # files parent table, so the rows at risk are in the child tables
+        # referencing files(id) — PRAGMA foreign_key_check(T) reports only FKs
+        # declared BY T, so each child is checked in table-arg form (behind an
+        # existence guard for pre-schema databases). An unrelated pre-existing
+        # orphan anywhere else cannot block this migration.
+        for child in (
+            "files",
+            "document_atoms",
+            "document_assets",
+            "ingestion_stage_states",
+            "document_atom_enrichments",
+            "failed_chunks",
+            "wiki_page_files",
+            "kms_entries",
+            "document_tags",
+        ):
+            child_present = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                (child,),
+            ).fetchone()
+            if not child_present:
+                continue
+            violations = conn.execute(
+                f"PRAGMA foreign_key_check({child})"  # fixed literal names
+            ).fetchall()
+            if violations:
+                record_migration_outcome(
+                    conn, migration_name=_journal, phase="failed", outcome="error",
+                    detail=f"foreign_key_check({child}) violations: {len(violations)}",
+                )
+                raise RuntimeError(
+                    f"migrate_widen_files_status: foreign_key_check({child}) "
+                    f"reported {len(violations)} violation(s) post-swap: "
+                    f"{violations[:5]}"
+                )
 
         invalidate_derived_data(
             conn,
@@ -4711,9 +4886,6 @@ def migrate_widen_document_reindex_jobs_status(sqlite_path: str) -> None:
     conn.isolation_level = None
     _journal = "migrate_widen_document_reindex_jobs_status"
     try:
-        record_migration_outcome(
-            conn, migration_name=_journal, phase="start", outcome="ok"
-        )
         tbl = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='document_reindex_jobs'"
         ).fetchone()
@@ -4761,11 +4933,10 @@ def migrate_widen_document_reindex_jobs_status(sqlite_path: str) -> None:
             else:
                 conn.execute("DROP TABLE IF EXISTS document_reindex_jobs_old")
 
+        # Journal-silent no-op probes (issue #699 AC2): nothing to attempt when
+        # the table is absent — the recovery block above runs FIRST (issue
+        # #512 DB-002 ordering).
         if not tbl and not old_present:
-            record_migration_outcome(
-                conn, migration_name=_journal, phase="succeeded", outcome="noop",
-                detail="document_reindex_jobs table absent",
-            )
             return
 
         if recovered:
@@ -4785,20 +4956,21 @@ def migrate_widen_document_reindex_jobs_status(sqlite_path: str) -> None:
             " AND name='document_reindex_jobs'"
         ).fetchone()
         if create_sql and "'interrupted'" in create_sql[0]:
-            record_migration_outcome(
-                conn, migration_name=_journal, phase="succeeded", outcome="noop",
-                detail="status CHECK already widened",
-            )
             return
 
+        record_migration_outcome(
+            conn, migration_name=_journal, phase="start", outcome="ok"
+        )
         before_count = conn.execute(
             "SELECT COUNT(*) FROM document_reindex_jobs"
         ).fetchone()[0]
 
         conn.execute("PRAGMA foreign_keys = OFF")
         conn.execute("PRAGMA legacy_alter_table = ON")
-        conn.execute("BEGIN IMMEDIATE")
+        # BEGIN sits INSIDE the try (issue #699 AC1) so a lock error at the
+        # transaction open is journaled as a terminal failed outcome.
         try:
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 "ALTER TABLE document_reindex_jobs RENAME TO document_reindex_jobs_old"
             )
@@ -4931,9 +5103,6 @@ def migrate_add_document_near_dups(sqlite_path: str) -> None:
     conn.isolation_level = None
     _journal = "migrate_add_document_near_dups"
     try:
-        record_migration_outcome(
-            conn, migration_name=_journal, phase="start", outcome="ok"
-        )
         conn.execute("PRAGMA foreign_keys = ON;")
         # DDL is idempotent and autocommitted OUTSIDE the explicit transaction
         # (executescript would implicitly commit one); only the ALTER + the
@@ -4958,9 +5127,24 @@ def migrate_add_document_near_dups(sqlite_path: str) -> None:
         existing_cols = {
             row[1] for row in conn.execute("PRAGMA table_info(document_near_dups)").fetchall()
         }
+        # Journal-silent no-op probe (issue #699 AC2): the column already
+        # exists and no legacy fingerprint rows remain to stamp — nothing to
+        # attempt, so no start row is written either.
+        if "embedding_model" in existing_cols:
+            needs_stamp = conn.execute(
+                "SELECT EXISTS(SELECT 1 FROM document_near_dups"
+                " WHERE embedding_model IS NULL AND dim != 256)"
+            ).fetchone()[0] == 1
+            if not needs_stamp:
+                return
+        record_migration_outcome(
+            conn, migration_name=_journal, phase="start", outcome="ok"
+        )
         stamped = 0
-        conn.execute("BEGIN IMMEDIATE")
+        # BEGIN sits INSIDE the try (issue #699 AC1) so a lock error at the
+        # transaction open is journaled as a terminal failed outcome.
         try:
+            conn.execute("BEGIN IMMEDIATE")
             if "embedding_model" not in existing_cols:
                 # Table pre-dates the #697 column: fresh CREATEs above are
                 # no-ops for it, so add the column explicitly (nullable, no
@@ -4995,9 +5179,13 @@ def migrate_add_wiki_relations_unique(sqlite_path: str) -> None:
     """Migration: add UNIQUE constraint on wiki_relations(subject_entity_id, predicate, object_entity_id).
 
     Deduplicates existing rows first (keeps highest id per triple), then
-    creates a unique index. Idempotent.
+    creates a unique index. Idempotent — already-migrated databases return
+    before any journaling (issue #699 AC2). The one-time dedup attempt
+    journals its deleted-row count on success and a terminal ``failed`` row
+    on failure (issue #699 review PRR-001).
     """
     conn = sqlite3.connect(sqlite_path)
+    _journal = "migrate_add_wiki_relations_unique"
     try:
         tbl = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='wiki_relations'"
@@ -5011,17 +5199,50 @@ def migrate_add_wiki_relations_unique(sqlite_path: str) -> None:
         if idx:
             return
 
+        # Destructive-dedup record (issue #699 AC5 class): the deleted-row
+        # count is logged and journaled inside the delete's own transaction,
+        # so the record exists iff the delete committed. One-time by
+        # construction (gated on index absence above).
+        doomed_count = conn.execute(
+            "SELECT COUNT(*) FROM wiki_relations WHERE id NOT IN ("
+            "SELECT MAX(id) FROM wiki_relations"
+            " GROUP BY subject_entity_id, predicate, object_entity_id)"
+        ).fetchone()[0]
+        if doomed_count:
+            logger.info(
+                "migrate_add_wiki_relations_unique: deleting %d duplicate "
+                "wiki_relations row(s) (unrecoverable; keeping highest id per triple)",
+                doomed_count,
+            )
         conn.execute(
             """DELETE FROM wiki_relations WHERE id NOT IN (
                 SELECT MAX(id) FROM wiki_relations
                 GROUP BY subject_entity_id, predicate, object_entity_id
             )"""
         )
+        record_migration_outcome(
+            conn, migration_name=_journal, phase="succeeded", outcome="ok",
+            detail=f"deduplicated wiki_relations rows deleted: {doomed_count}",
+        )
         conn.execute(
             "CREATE UNIQUE INDEX idx_wiki_relations_unique_triple "
             "ON wiki_relations(subject_entity_id, predicate, object_entity_id)"
         )
         conn.commit()
+    except Exception as exc:
+        # Issue #699 review (PRR-001): a failed attempt (failing dedup DELETE
+        # or index creation) must leave a terminal journal outcome. The
+        # rollback discards the in-transaction count row together with the
+        # DML, so the failure row is recorded on its own committed
+        # transaction.
+        conn.rollback()
+        record_migration_outcome(
+            conn, migration_name=_journal,
+            phase="failed", outcome="error",
+            detail=f"{type(exc).__name__}: {exc}",
+        )
+        conn.commit()
+        raise
     finally:
         conn.close()
 
@@ -5036,49 +5257,53 @@ def migrate_add_wiki_claims_unique_claim_text(sqlite_path: str) -> None:
     conn.isolation_level = None
     _journal = "migrate_add_wiki_claims_unique_claim_text"
     try:
-        record_migration_outcome(
-            conn, migration_name=_journal, phase="start", outcome="ok"
-        )
+        # Journal-silent no-op probes (issue #699 AC2): when the table is
+        # absent or the unique index already exists there is nothing to
+        # attempt, so no start row is written either and a clean boot adds
+        # zero journal rows.
         tbl = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='wiki_claims'"
         ).fetchone()
         if not tbl:
-            record_migration_outcome(
-                conn, migration_name=_journal, phase="succeeded", outcome="noop",
-                detail="wiki_claims table absent",
-            )
             return
 
         idx = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_wiki_claims_unique_vault_claim'"
         ).fetchone()
         if idx:
-            record_migration_outcome(
-                conn, migration_name=_journal, phase="succeeded", outcome="noop",
-                detail="unique index already present",
-            )
             return
 
+        record_migration_outcome(
+            conn, migration_name=_journal, phase="start", outcome="ok"
+        )
         # Enable FK enforcement BEFORE the transaction (a PRAGMA issued
         # inside one is a no-op) so the DELETE below runs under the real
         # constraint after the remap, per the sibling precedent in
         # migrate_add_curator_claim_support.
         conn.execute("PRAGMA foreign_keys = ON")
-        # wiki_claim_sources is the only table referencing wiki_claims(id)
-        # (schema grep, issue #512 DB-003) — but guard its existence so a
-        # database predating the wiki tables can still be deduplicated.
+        # TWO tables reference wiki_claims(id) (schema grep, issues #512
+        # DB-003 and #699): wiki_claim_sources.claim_id and
+        # wiki_relations.claim_id (ON DELETE CASCADE). Guard each existence so
+        # a database predating the wiki tables can still be deduplicated.
         sources_present = conn.execute(
             "SELECT name FROM sqlite_master"
             " WHERE type='table' AND name='wiki_claim_sources'"
         ).fetchone()
-        # Remap dependent evidence before deleting duplicates (issue #512
-        # DB-003): every wiki_claim_sources row pointing at a doomed twin is
-        # re-pointed at the surviving MAX(id) twin first, so no evidence is
-        # orphaned (or silently cascade-deleted) by the dedup. The remap +
-        # delete + index run inside ONE explicit transaction; a failure
-        # (including the foreign_key_check below) rolls everything back.
-        conn.execute("BEGIN IMMEDIATE")
+        relations_present = conn.execute(
+            "SELECT name FROM sqlite_master"
+            " WHERE type='table' AND name='wiki_relations'"
+        ).fetchone()
+        # Remap dependent rows before deleting duplicates (issue #512 DB-003,
+        # extended to wiki_relations by #699): every child row pointing at a
+        # doomed twin is re-pointed at the surviving MAX(id) twin first, so no
+        # evidence or relation is orphaned (or silently cascade-deleted) by
+        # the dedup. The remaps + delete + index run inside ONE explicit
+        # transaction; a failure (including the scoped foreign_key_check
+        # below) rolls everything back. BEGIN sits INSIDE the try (issue #699
+        # AC1) so a lock error at the transaction open is journaled as a
+        # terminal failed outcome.
         try:
+            conn.execute("BEGIN IMMEDIATE")
             if sources_present:
                 conn.execute(
                     """UPDATE wiki_claim_sources
@@ -5098,23 +5323,70 @@ def migrate_add_wiki_claims_unique_claim_text(sqlite_path: str) -> None:
                         GROUP BY vault_id, claim_text
                     )"""
                 )
+            if relations_present:
+                conn.execute(
+                    """UPDATE wiki_relations
+                    SET claim_id = (
+                        SELECT MAX(keep.id) FROM wiki_claims AS keep
+                        WHERE keep.vault_id = (
+                            SELECT doomed.vault_id FROM wiki_claims AS doomed
+                            WHERE doomed.id = wiki_relations.claim_id
+                        )
+                        AND keep.claim_text = (
+                            SELECT doomed.claim_text FROM wiki_claims AS doomed
+                            WHERE doomed.id = wiki_relations.claim_id
+                        )
+                    )
+                    WHERE claim_id NOT IN (
+                        SELECT MAX(id) FROM wiki_claims
+                        GROUP BY vault_id, claim_text
+                    )"""
+                )
             # Remove duplicate rows (keep the latest / highest-id per vault+claim pair)
+            doomed_count = conn.execute(
+                "SELECT COUNT(*) FROM wiki_claims WHERE id NOT IN ("
+                "SELECT MAX(id) FROM wiki_claims GROUP BY vault_id, claim_text)"
+            ).fetchone()[0]
             conn.execute(
                 """DELETE FROM wiki_claims WHERE id NOT IN (
                     SELECT MAX(id) FROM wiki_claims
                     GROUP BY vault_id, claim_text
                 )"""
             )
+            # Destructive-delete record (issue #699 AC5 class): the count row
+            # rides the delete's own transaction, so the record exists iff the
+            # delete committed.
+            record_migration_outcome(
+                conn, migration_name=_journal, phase="succeeded", outcome="ok",
+                detail=f"deduplicated wiki_claims rows deleted: {doomed_count}",
+            )
             conn.execute(
                 "CREATE UNIQUE INDEX idx_wiki_claims_unique_vault_claim "
                 "ON wiki_claims(vault_id, claim_text)"
             )
-            violations = conn.execute("PRAGMA foreign_key_check").fetchall()
-            if violations:
-                raise RuntimeError(
-                    f"migrate_add_wiki_claims_unique_claim_text: foreign_key_check "
-                    f"reported {len(violations)} violation(s) after dedup: {violations[:5]}"
+            # Scoped integrity checks (issue #699 AC4): only the child tables
+            # whose rows this migration remapped can be orphaned by it —
+            # PRAGMA foreign_key_check(T) reports only FKs declared BY T, so
+            # an unrelated pre-existing orphan anywhere else in the database
+            # cannot block this migration.
+            fk_children = ["wiki_claims"] + [
+                child
+                for child, present in (
+                    ("wiki_claim_sources", sources_present),
+                    ("wiki_relations", relations_present),
                 )
+                if present
+            ]
+            for child in fk_children:
+                violations = conn.execute(
+                    f"PRAGMA foreign_key_check({child})"  # fixed literal names
+                ).fetchall()
+                if violations:
+                    raise RuntimeError(
+                        f"migrate_add_wiki_claims_unique_claim_text: "
+                        f"foreign_key_check({child}) reported {len(violations)} "
+                        f"violation(s) after dedup: {violations[:5]}"
+                    )
             conn.commit()
         except Exception as exc:
             conn.rollback()
@@ -6022,9 +6294,6 @@ def migrate_add_wiki_lint_findings_json_check(sqlite_path: str) -> None:
     _journal = "migrate_add_wiki_lint_findings_json_check"
     try:
         conn.execute("PRAGMA foreign_keys = ON;")
-        record_migration_outcome(
-            conn, migration_name=_journal, phase="start", outcome="ok"
-        )
         recovered = False
 
         # Recovery prologue: if a prior run crashed after RENAME but before
@@ -6103,20 +6372,17 @@ def migrate_add_wiki_lint_findings_json_check(sqlite_path: str) -> None:
             "SELECT sql FROM sqlite_master "
             "WHERE type='table' AND name='wiki_lint_findings'"
         ).fetchone()
+        # Journal-silent no-op probes (issue #699 AC2): nothing to attempt —
+        # the recovery prologue above has already dispositioned any backup
+        # state (issue #512 DB-001 ordering).
         if not row:
-            record_migration_outcome(
-                conn, migration_name=_journal, phase="succeeded", outcome="noop",
-                detail="wiki_lint_findings table absent",
-            )
             return
         if "json_type(related_page_ids_json)" in row[0]:
-            # CHECK constraints already present — nothing to do.
-            record_migration_outcome(
-                conn, migration_name=_journal, phase="succeeded", outcome="noop",
-                detail="CHECK constraints already present",
-            )
             return
 
+        record_migration_outcome(
+            conn, migration_name=_journal, phase="start", outcome="ok"
+        )
         # Snapshot row count for the parity check.
         before_count = conn.execute(
             "SELECT COUNT(*) FROM wiki_lint_findings"
@@ -6125,9 +6391,11 @@ def migrate_add_wiki_lint_findings_json_check(sqlite_path: str) -> None:
         # Wrap the entire RENAME → CREATE → INSERT → DROP sequence in one
         # explicit BEGIN IMMEDIATE transaction using execute() only
         # (executescript would implicitly commit any pending transaction),
-        # matching the issue #512 DB-001 pattern.
-        conn.execute("BEGIN IMMEDIATE")
+        # matching the issue #512 DB-001 pattern. BEGIN sits INSIDE the try
+        # (issue #699 AC1) so a lock error at the transaction open is
+        # journaled as a terminal failed outcome.
         try:
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 "ALTER TABLE wiki_lint_findings RENAME TO _wiki_lint_findings_old"
             )
@@ -6201,18 +6469,23 @@ def migrate_add_wiki_lint_findings_json_check(sqlite_path: str) -> None:
             raise
         logger.info("Added CHECK constraints to wiki_lint_findings JSON columns")
 
-        # Validate FK integrity post-swap. Any violation means we produced a
-        # broken DB; fail loudly so an operator notices.
-        violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+        # Scoped integrity check (issue #699 AC4 class): wiki_lint_findings
+        # declares no FKs and nothing references it, so the table-arg form is
+        # vacuous BY CONSTRUCTION — kept (rather than dropped) for shape
+        # parity with the sibling migrations and so an unrelated pre-existing
+        # orphan elsewhere in the database can never block this migration.
+        violations = conn.execute(
+            "PRAGMA foreign_key_check(wiki_lint_findings)"
+        ).fetchall()
         if violations:
             record_migration_outcome(
                 conn, migration_name=_journal, phase="failed", outcome="error",
-                detail=f"foreign_key_check violations: {len(violations)}",
+                detail=f"foreign_key_check(wiki_lint_findings) violations: {len(violations)}",
             )
             raise RuntimeError(
-                f"migrate_add_wiki_lint_findings_json_check: foreign_key_check "
-                f"reported {len(violations)} violation(s) post-swap: "
-                f"{violations[:5]}"
+                f"migrate_add_wiki_lint_findings_json_check: "
+                f"foreign_key_check(wiki_lint_findings) reported "
+                f"{len(violations)} violation(s) post-swap: {violations[:5]}"
             )
 
         invalidate_derived_data(
@@ -6490,9 +6763,6 @@ def migrate_relax_draft_claims_span_not_null(sqlite_path: str) -> None:
     conn.isolation_level = None
     _journal = "migrate_relax_draft_claims_span_not_null"
     try:
-        record_migration_outcome(
-            conn, migration_name=_journal, phase="start", outcome="ok"
-        )
         # Recovery: if a previous run crashed after the rename but before the
         # CREATE, only the backup exists. Restore the canonical name first.
         old_present = conn.execute(
@@ -6514,11 +6784,8 @@ def migrate_relax_draft_claims_span_not_null(sqlite_path: str) -> None:
             # probe so the branches below cannot reference it.
             old_present = None
 
+        # Journal-silent no-op probe (issue #699 AC2): nothing to attempt.
         if not new_present:
-            record_migration_outcome(
-                conn, migration_name=_journal, phase="succeeded", outcome="noop",
-                detail="draft_claims table absent",
-            )
             return
 
         def _relaxed() -> bool:
@@ -6549,11 +6816,8 @@ def migrate_relax_draft_claims_span_not_null(sqlite_path: str) -> None:
                 ).fetchone()[0]
                 if dest_count >= backup_count and missing_ids == 0:
                     conn.execute("DROP TABLE IF EXISTS draft_claims_old")
-                    record_migration_outcome(
-                        conn, migration_name=_journal, phase="succeeded",
-                        outcome="noop",
-                        detail="span columns already nullable; stale backup dropped",
-                    )
+                    # Journal-silent (issue #699 AC2): stale backup beside a
+                    # complete table is routine disposition, not an attempt.
                     return
                 logger.warning(
                     "migrate_relax_draft_claims_span_not_null: backup holds "
@@ -6565,10 +6829,8 @@ def migrate_relax_draft_claims_span_not_null(sqlite_path: str) -> None:
                 conn.execute("ALTER TABLE draft_claims_old RENAME TO draft_claims")
                 conn.execute("PRAGMA legacy_alter_table = OFF")
             else:
-                record_migration_outcome(
-                    conn, migration_name=_journal, phase="succeeded",
-                    outcome="noop", detail="span columns already nullable",
-                )
+                # Journal-silent (issue #699 AC2): migration already applied,
+                # nothing attempted.
                 return
         elif old_present:
             # Both tables exist and the canonical one still has the old
@@ -6602,6 +6864,11 @@ def migrate_relax_draft_claims_span_not_null(sqlite_path: str) -> None:
                 conn.execute("ALTER TABLE draft_claims_old RENAME TO draft_claims")
                 conn.execute("PRAGMA legacy_alter_table = OFF")
 
+        # Real work remains (old-shaped table): journal the attempt start only
+        # now (issue #699 AC2) — every no-op path above is journal-silent.
+        record_migration_outcome(
+            conn, migration_name=_journal, phase="start", outcome="ok"
+        )
         before_count = conn.execute(
             "SELECT COUNT(*) FROM draft_claims"
         ).fetchone()[0]
@@ -6611,8 +6878,10 @@ def migrate_relax_draft_claims_span_not_null(sqlite_path: str) -> None:
         # textually pointing at the canonical table name.
         conn.execute("PRAGMA foreign_keys = OFF")
         conn.execute("PRAGMA legacy_alter_table = ON")
-        conn.execute("BEGIN IMMEDIATE")
+        # BEGIN sits INSIDE the try (issue #699 AC1) so a lock error at the
+        # transaction open is journaled as a terminal failed outcome.
         try:
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute("ALTER TABLE draft_claims RENAME TO draft_claims_old")
 
             # Same shape as _DRAFT_ROOM_FACTUALITY_DDL's draft_claims — the
@@ -6687,18 +6956,39 @@ def migrate_relax_draft_claims_span_not_null(sqlite_path: str) -> None:
             conn.execute("PRAGMA legacy_alter_table = OFF")
             conn.execute("PRAGMA foreign_keys = ON")
 
-        # Any violation here means the swap produced a broken DB; fail loudly.
-        violations = conn.execute("PRAGMA foreign_key_check").fetchall()
-        if violations:
-            record_migration_outcome(
-                conn, migration_name=_journal, phase="failed", outcome="error",
-                detail=f"foreign_key_check violations: {len(violations)}",
-            )
-            raise RuntimeError(
-                "migrate_relax_draft_claims_span_not_null: "
-                f"foreign_key_check reported {len(violations)} violation(s) "
-                f"post-swap: {violations[:5]}"
-            )
+        # Scoped integrity check (issue #699 AC4 class): the swap rebuilt the
+        # draft_claims parent table, so the rows at risk are in its child
+        # draft_claim_sources (claim_id REFERENCES draft_claims(id)). PRAGMA
+        # foreign_key_check(T) reports only FKs declared BY T, so the child is
+        # checked in table-arg form (behind an existence guard); an unrelated
+        # pre-existing orphan elsewhere cannot block this migration. Any
+        # violation here means the swap produced a broken DB; fail loudly.
+        sources_present = conn.execute(
+            "SELECT name FROM sqlite_master"
+            " WHERE type='table' AND name='draft_claim_sources'"
+        ).fetchone()
+        for child in ("draft_claims", "draft_claim_sources"):
+            # Issue #699 review (PRR-002): draft_claims re-declares outbound
+            # FKs (revision_id, resolved_by) that base's whole-DB check used
+            # to cover; the rebuilt table itself stays in the scoped set.
+            if child == "draft_claim_sources" and not sources_present:
+                continue
+            violations = conn.execute(
+                f"PRAGMA foreign_key_check({child})"  # fixed literal names
+            ).fetchall()
+            if violations:
+                record_migration_outcome(
+                    conn, migration_name=_journal, phase="failed", outcome="error",
+                    detail=(
+                        f"foreign_key_check({child}) violations: "
+                        f"{len(violations)}"
+                    ),
+                )
+                raise RuntimeError(
+                    "migrate_relax_draft_claims_span_not_null: "
+                    f"foreign_key_check({child}) reported "
+                    f"{len(violations)} violation(s) post-swap: {violations[:5]}"
+                )
 
         record_migration_outcome(
             conn, migration_name=_journal, phase="succeeded", outcome="ok"
@@ -6926,6 +7216,15 @@ def migrate_add_user_onboarding_state(sqlite_path: str) -> None:
     conn.isolation_level = None
     _journal = "migrate_add_user_onboarding_state"
     try:
+        # Journal-silent no-op probe (issue #699 AC2): purely additive DDL —
+        # when the table already exists there is nothing to attempt, so a
+        # clean boot writes no journal rows.
+        tbl = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+            " AND name='user_onboarding_state'"
+        ).fetchone()
+        if tbl:
+            return
         record_migration_outcome(
             conn, migration_name=_journal, phase="start", outcome="ok"
         )

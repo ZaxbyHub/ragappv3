@@ -592,10 +592,17 @@ async def lifespan(app: FastAPI):
     # Operator visibility (issue #512 recovery journal): one summary line
     # with the latest migration/recovery outcomes so a prior failed or
     # recovered migration is visible without querying the journal table.
+    # Issue #699: clean boots no longer write routine journal rows, and an
+    # UNRESOLVED failure/recovery (no later succeeded row for the same
+    # migration — on upgraded databases it is typically buried under
+    # pre-existing noise rows) is surfaced as one extra signal line; resolved
+    # failures are never re-warned.
     try:
-        from app.models.migration_journal import latest_outcomes
+        from app.models.migration_journal import latest_outcomes_with_signal
 
-        _recent = latest_outcomes(str(settings.sqlite_path), limit=3)
+        _recent, _signal = latest_outcomes_with_signal(
+            str(settings.sqlite_path), limit=3
+        )
         if _recent:
             logger.info(
                 "Migration journal (latest %d): %s",
@@ -604,6 +611,17 @@ async def lifespan(app: FastAPI):
                     f"{row['migration_name']}[{row['phase']}:{row['outcome']}]"
                     for row in _recent
                 ),
+            )
+        if _signal is not None:
+            logger.warning(
+                "Migration journal (unresolved failure/recovery, %s, outside "
+                "latest %d): %s[%s:%s] %s",
+                _signal.get("created_at") or "unknown time",
+                len(_recent),
+                _signal["migration_name"],
+                _signal["phase"],
+                _signal["outcome"],
+                _signal.get("detail") or "",
             )
     except Exception as e:  # pragma: no cover - journal is best-effort
         logger.debug("Could not read migration journal at startup: %s", e)
