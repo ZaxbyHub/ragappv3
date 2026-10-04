@@ -271,6 +271,9 @@ class TestBackgroundEnrichmentQueue(unittest.TestCase):
                 def set_enrichment_status(self, file_id, status, error_message=None):
                     events.append(f"enrichment:{status}")
 
+                def clear_cancel(self, file_id):
+                    pass  # issue #783: enqueue clears stale cancel requests
+
                 async def run_enrichment_job(self, **kwargs):
                     events.append("enrichment:ran")
 

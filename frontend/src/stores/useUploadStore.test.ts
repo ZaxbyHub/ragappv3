@@ -607,3 +607,33 @@ describe("useUploadStore — snapshot-ordering map eviction (issue #514)", () =>
     expect(after.statusSeen).toBe(true);
   });
 });
+
+describe("applyStatusSnapshot cancelled mapping (issue #783 PRR-006)", () => {
+  it("maps a server-cancelled ingest to the terminal store 'cancelled'", () => {
+    const store = useUploadStore.getState();
+    store.uploads.forEach((u) => store.removeUpload(u.id));
+    useUploadStore.setState({
+      uploads: [
+        {
+          id: "u-cancel-1",
+          file: new File(["x"], "cancel-me.txt", { type: "text/plain" }),
+          name: "cancel-me.txt",
+          size: 1,
+          status: "processing",
+          progress: 40,
+          vaultId: 1,
+          seq: 1,
+        } as never,
+      ],
+    });
+    store.applyStatusSnapshot("u-cancel-1", {
+      status: "cancelled",
+      phase: "cancelled",
+      phase_message: "Cancelled by user",
+      chunk_count: 0,
+    } as never, 2);
+    const upload = useUploadStore.getState().uploads.find((u) => u.id === "u-cancel-1");
+    expect(upload?.status).toBe("cancelled");
+    expect(upload?.status).not.toBe("processing");
+  });
+});

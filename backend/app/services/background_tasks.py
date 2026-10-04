@@ -26,6 +26,7 @@ from ..models.database import SQLiteConnectionPool
 from .document_processor import (
     DocumentProcessingError,
     DocumentProcessor,
+    IngestCancelledError,
     redact_ingest_error,
 )
 from .embeddings import EmbeddingService
@@ -1227,6 +1228,11 @@ class BackgroundProcessor:
                 lease = self._make_ingest_lease(conn)
                 if outcome == "complete":
                     return bool(lease.complete(job_id, worker_id))
+                if outcome == "cancel":
+                    # issue #783: terminal cancellation — never requeued.
+                    return bool(
+                        lease.cancel(job_id, worker_id, (error or "cancelled")[:500])
+                    )
                 if outcome == "fail":
                     return bool(
                         lease.fail(job_id, worker_id, (error or "failed")[:500])
@@ -1326,6 +1332,27 @@ class BackgroundProcessor:
                     await self._run_task_processing(task)
             except AdmissionRejected as exc:
                 outcome_error = f"admission rejected: {exc.reason}"
+            except IngestCancelledError as exc:
+                # issue #783: terminal cancellation — unwind the generation,
+                # settle the durable row as cancelled, never requeue. The
+                # exception carries the scan-path row id (task.file_id is
+                # None there).
+                cancel_file_id = task.file_id
+                if cancel_file_id is None:
+                    cancel_file_id = exc.file_id
+                if cancel_file_id is not None:
+                    await self.processor.rollback_cancelled_ingest(cancel_file_id)
+                settled = await self._settle_ingest_job(job_id, worker_id, "cancel")
+                if not settled and cancel_file_id is not None:
+                    # Fenced off (janitor reclaimed the row mid-unwind): the
+                    # pending row is re-claimable, so re-arm the registry —
+                    # the reclaimed attempt hits gate A / the guarded
+                    # 'processing' flip and re-cancels instead of silently
+                    # resurrecting a 200-cancelled ingest (PRR-017).
+                    self.processor.request_cancel(cancel_file_id)
+                outcome_error = None
+                outcome_exc = None
+                return
             except Exception as exc:  # noqa: BLE001 — outcome drives settle
                 outcome_error = str(exc)
                 # Retained so the terminal branch hands the exception object
@@ -2938,6 +2965,10 @@ class BackgroundProcessor:
         """
         reservation_added = False
         if file_id is not None:
+            # issue #783: a fresh enqueue (retry-after-cancel, re-upload)
+            # must not inherit a stale cancel request — the registry entry
+            # belongs to the cancelled generation only.
+            self.processor.clear_cancel(file_id)
             async with self._active_file_ids_lock:
                 if _recovery_claim:
                     if file_id not in self._recovery_file_ids:
@@ -3066,6 +3097,58 @@ class BackgroundProcessor:
             raise
         logger.debug(f"Enqueued file: {file_path} (file_id={file_id})")
         return True
+
+    def request_ingest_cancel(self, file_id: int) -> None:
+        """Request cancellation of an in-flight document ingest (issue #783).
+
+        Synchronous BY CONTRACT — the cancel route calls this without
+        ``await``. Marks the DocumentProcessor's cancel registry (observed by
+        the between-steps gates inside both ingest paths) and cancels any
+        still-QUEUED items for the file via the existing #516 machinery
+        (in-memory TaskItems + pending ``jobs`` rows in lease mode); an item
+        a worker already claimed is cancelled at its next gate seam.
+        """
+        self.processor.request_cancel(file_id)
+        self.cancel_pending_jobs(file_id=file_id)
+
+    def clear_ingest_cancel(self, file_id: int) -> None:
+        """Inverse of :meth:`request_ingest_cancel` for refused/failed route
+        flips (issue #783 review re-gate Critical): discards the registry
+        mark so a refused request leaves no cancel state behind.
+
+        Queued-intent restore is intentionally NOT attempted here: on the
+        refused path the files row has already settled (indexed/partial/
+        error), which means its queued item was claimed and completed — no
+        pending rows remain to restore. The duplicate-queued-item edge is
+        covered by the #516 worker-skip contract plus the fresh-enqueue
+        clear in :meth:`enqueue`.
+        """
+        self.processor.clear_cancel(file_id)
+
+    async def _handle_cancellation(
+        self, task: TaskItem, exc: Optional[IngestCancelledError] = None
+    ) -> None:
+        """Unwind a cancelled ingest (issue #783) — no retry, no 'error'.
+
+        The registry flip already happened route-side; the processor's
+        rollback (guarded status UPDATE + vector/atom cleanup + terminal
+        phase) is idempotent, so this runs it for the worker-side decision
+        points (gate A/B, finalize guard, failure-raced-cancel) alike. The
+        scan/sync path's TaskItem carries ``file_id=None`` (the processor
+        assigns the row mid-run), so the exception's own ``file_id`` is the
+        authoritative anchor there — without it the terminal phase would
+        never land on that path.
+        """
+        logger.info(
+            "Cancelling ingestion task for %s (file_id=%s)",
+            task.file_path,
+            task.file_id,
+        )
+        file_id = task.file_id
+        if file_id is None and exc is not None:
+            file_id = exc.file_id
+        if file_id is not None:
+            await self.processor.rollback_cancelled_ingest(file_id)
 
     def cancel_pending_jobs(self, **match: object) -> int:
         """Best-effort cancellation of queued, not-yet-started ingestion tasks
@@ -3696,6 +3779,7 @@ class BackgroundProcessor:
             total_files = 0
             processed_files = 0
             failed_files = 0
+            cancelled_files = 0
             failed_details: list[str] = []
             commit_attempted = False
 
@@ -3705,6 +3789,31 @@ class BackgroundProcessor:
                     for file_id, file_path, vault_id_file in file_list:
                         total_files += 1
                         logger.info("Re-embedding file_id=%d in vault_id=%d", file_id, vault_id_file)
+                        # Snapshot the pre-reindex status: a cancel during a
+                        # staged rebuild must not destroy the document's
+                        # previously indexed live content (issue #783 review
+                        # F-001) — the file is skipped and its prior serving
+                        # state restored instead.
+                        def _read_prior_status():
+                            with self.processor.pool.connection() as _conn:
+                                return _conn.execute(
+                                    "SELECT status FROM files WHERE id = ?",
+                                    (file_id,),
+                                ).fetchone()
+
+                        prior_status_row = await asyncio.to_thread(
+                            _read_prior_status
+                        )
+                        prior_status = (
+                            prior_status_row["status"]
+                            if prior_status_row is not None
+                            else None
+                        )
+                        # A stale document-cancel registered before this
+                        # rebuild must not trip the gates for this file
+                        # (issue #783 review F-006): the rebuild owns the row
+                        # until it finishes.
+                        self.processor.clear_cancel(file_id)
                         reprocess_kwargs = (
                             {"vector_target": rebuild_handle}
                             if rebuild_handle is not None
@@ -3715,6 +3824,44 @@ class BackgroundProcessor:
                                 file_id, file_path, vault_id_file, **reprocess_kwargs
                             )
                             processed_files += 1
+                        except IngestCancelledError:
+                            # issue #783 review PRR-011/F-001: a user
+                            # cancellation during a staged rebuild skips the
+                            # file WITHOUT destroying its previously indexed
+                            # live content — the prior serving state is
+                            # restored so the file is neither stranded in
+                            # 'processing' nor silently unindexed.
+                            logger.info(
+                                "Re-embed skipped for file_id=%d in vault_id=%d: "
+                                "ingest cancelled by user; restoring prior "
+                                "status %r",
+                                file_id,
+                                vault_id_file,
+                                prior_status,
+                            )
+                            try:
+                                if prior_status in ("indexed", "partial", "error"):
+
+                                    def _restore_prior_status():
+                                        with self.processor.pool.connection() as _conn:
+                                            return _conn.execute(
+                                                "UPDATE files SET status = ? "
+                                                "WHERE id = ? "
+                                                "AND status = 'processing'",
+                                                (prior_status, file_id),
+                                            ).rowcount
+
+                                    await asyncio.to_thread(_restore_prior_status)
+                                self.processor.clear_cancel(file_id)
+                            except Exception:  # noqa: BLE001 — never mask the skip
+                                logger.warning(
+                                    "reindex cancel state restore failed for "
+                                    "file_id=%d",
+                                    file_id,
+                                    exc_info=True,
+                                )
+                            cancelled_files += 1
+                            continue
                         except (
                             DocumentProcessingError,
                             FileNotFoundError,
@@ -4059,6 +4206,10 @@ class BackgroundProcessor:
 
         try:
             await self._run_task_processing(task)
+        except IngestCancelledError as exc:
+            # issue #783: user cancellation — unwind, never retry, never
+            # land status='error'.
+            await self._handle_cancellation(task, exc)
         except DocumentProcessingError as e:
             logger.error(f"Processing error for {task.file_path}: {e}")
             await self._handle_failure(task, e)

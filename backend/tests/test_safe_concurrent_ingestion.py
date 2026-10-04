@@ -339,6 +339,10 @@ async def test_process_file_emits_one_stage_timing_log(tmp_path, caplog):
     # #645: process_file checks out via the pool's async surface; mirror it
     # with an AsyncMock so the await resolves to the same fake connection.
     pool.get_connection_async = AsyncMock(return_value=conn)
+    # issue #783: finalize's success write is rowcount-guarded (a cancel the
+    # route accepted must not be buried); the mocked driver reports a landed
+    # write.
+    conn.execute.return_value.rowcount = 1
 
     embedding_service = MagicMock()
     embedding_service.embed_batch = AsyncMock(return_value=([[0.1, 0.2]], []))
