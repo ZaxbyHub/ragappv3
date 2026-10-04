@@ -115,16 +115,41 @@ def test_latest_outcomes_with_signal_signal_in_window_returns_none(tmp_path):
     assert signal is None
 
 
-def test_latest_outcomes_with_signal_surfaces_buried_failure(tmp_path):
+def test_latest_outcomes_with_signal_ignores_resolved_failure(tmp_path):
+    """Out-of-band review F-A: a failed row superseded by a later succeeded
+    row of the SAME migration is resolved — no boot may re-warn about it."""
     db = _journal_db(
         tmp_path,
-        [("failed", "error")]
-        + [("succeeded", "ok")] * 4,  # bury the failure past the window
+        [("failed", "error")] + [("succeeded", "ok")] * 4,
     )
+    recent, signal = latest_outcomes_with_signal(db, limit=3)
+    assert [r["phase"] for r in recent] == ["succeeded", "succeeded", "succeeded"]
+    assert signal is None
+
+
+def test_latest_outcomes_with_signal_surfaces_buried_failure(tmp_path):
+    """The failure is buried past the window AND unresolved (no later
+    succeeded row for its own migration — the other rows belong to a
+    different migration) — it must surface."""
+    db = str(tmp_path / "b.db")
+    conn = sqlite3.connect(db)
+    from app.models.migration_journal import MIGRATION_JOURNAL_DDL
+
+    conn.execute(MIGRATION_JOURNAL_DDL)
+    record_migration_outcome(
+        conn, migration_name="m_dead", phase="failed", outcome="error"
+    )
+    for _ in range(4):
+        record_migration_outcome(
+            conn, migration_name="m_other", phase="succeeded", outcome="ok"
+        )
+    conn.commit()
+    conn.close()
     recent, signal = latest_outcomes_with_signal(db, limit=3)
     assert [r["phase"] for r in recent] == ["succeeded", "succeeded", "succeeded"]
     assert signal is not None
     assert signal["phase"] == "failed"
+    assert signal["migration_name"] == "m_dead"
 
 
 def test_latest_outcomes_with_signal_empty_journal(tmp_path):
@@ -246,6 +271,17 @@ def test_claims_dedup_remaps_wiki_relations_and_ignores_unrelated_orphan(tmp_pat
         assert claims == [(2,)]
     finally:
         conn.close()
+    conn = sqlite3.connect(db)
+    try:
+        detail = conn.execute(
+            "SELECT detail FROM migration_journal"
+            " WHERE migration_name = 'migrate_add_wiki_claims_unique_claim_text'"
+            " AND detail LIKE 'deduplicated%' ORDER BY id"
+        ).fetchall()[-1][0]
+    finally:
+        conn.close()
+    # F-E: the journaled count must equal the rows actually deleted (1 of 2).
+    assert detail == "deduplicated wiki_claims rows deleted: 1"
     phases = _journal_rows(
         db, "migration_name = 'migrate_add_wiki_claims_unique_claim_text'"
         " AND phase != 'start'"
@@ -444,6 +480,187 @@ def test_claim_sources_stale_backup_beside_complete_table_is_silent(tmp_path):
     assert _journal_rows(
         db, "migration_name = 'migrate_widen_wiki_claim_sources_source_kind'"
     ) == []
+
+
+# ---------------------------------------------------------------------------
+# (vii) F-C: BEGIN IMMEDIATE in a journaled migration must sit inside a try
+# whose except journals an outcome — the frozen C1 pins one site; this pins
+# the class.
+# ---------------------------------------------------------------------------
+
+
+def test_begin_immediate_in_journaled_migrations_is_inside_journaling_try():
+    """Out-of-band review F-C: every ``BEGIN IMMEDIATE`` executed inside a
+    journal-writing migration must be enclosed by a try whose except calls
+    ``record_migration_outcome`` (so a lock error at the transaction open
+    cannot strand an unjournaled or start-only attempt). The two
+    non-journaled BEGIN sites (_widen_files_hash_vault_unique_index,
+    migrate_add_draft_room_promotions) are out of scope by definition."""
+    import ast
+    import pathlib
+
+    db_path = (
+        pathlib.Path(__file__).resolve().parents[1] / "app" / "models" / "database.py"
+    )
+    tree = ast.parse(db_path.read_text(encoding="utf-8"))
+    offenders = []
+    for fn in (n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)):
+        fn_nodes = list(ast.walk(fn))
+        if not any(
+            isinstance(c.func, ast.Name) and c.func.id == "record_migration_outcome"
+            for c in fn_nodes
+            if isinstance(c, ast.Call)
+        ):
+            continue
+        begins = [
+            c
+            for c in fn_nodes
+            if isinstance(c, ast.Call)
+            and isinstance(c.func, ast.Attribute)
+            and c.func.attr == "execute"
+            and c.args
+            and isinstance(c.args[0], ast.Constant)
+            and isinstance(c.args[0].value, str)
+            and c.args[0].value.strip() == "BEGIN IMMEDIATE"
+        ]
+        for begin in begins:
+            guarded = False
+            for try_node in fn_nodes:
+                if not (isinstance(try_node, ast.Try) and try_node.handlers):
+                    continue
+                if not any(sub is begin for sub in ast.walk(try_node)):
+                    continue
+                journals = any(
+                    isinstance(c.func, ast.Name)
+                    and c.func.id == "record_migration_outcome"
+                    for handler in try_node.handlers
+                    for c in ast.walk(handler)
+                    if isinstance(c, ast.Call)
+                )
+                if journals:
+                    guarded = True
+                    break
+            if not guarded:
+                offenders.append(f"{fn.name}:{begin.lineno}")
+    assert offenders == []
+
+
+# ---------------------------------------------------------------------------
+# (viii) F-E/PRR-007: exact-count + rolled-back-delete coverage for the
+# previously unpinned destructive-dedup writers.
+# ---------------------------------------------------------------------------
+
+
+def test_wiki_relations_unique_dedup_journals_exact_count(tmp_path):
+    from app.models.database import migrate_add_wiki_relations_unique
+
+    db = str(tmp_path / "wr.db")
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE wiki_relations ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " claim_id INTEGER, subject_entity_id INTEGER, predicate TEXT,"
+        " object_entity_id INTEGER)"
+    )
+    for _ in range(3):
+        conn.execute(
+            "INSERT INTO wiki_relations (claim_id, subject_entity_id,"
+            " predicate, object_entity_id) VALUES (1, 5, 'p', 6)"
+        )
+    conn.execute(
+        "INSERT INTO wiki_relations (claim_id, subject_entity_id,"
+        " predicate, object_entity_id) VALUES (1, 7, 'q', 8)"
+    )
+    conn.commit()
+    conn.close()
+
+    migrate_add_wiki_relations_unique(db)
+
+    conn = sqlite3.connect(db)
+    try:
+        remaining = conn.execute("SELECT COUNT(*) FROM wiki_relations").fetchone()[0]
+        detail = conn.execute(
+            "SELECT detail FROM migration_journal"
+            " WHERE migration_name = 'migrate_add_wiki_relations_unique'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert remaining == 2
+    # F-E: the journaled count must equal the rows actually deleted (3 -> 2).
+    assert detail == "deduplicated wiki_relations rows deleted: 2"
+
+
+def test_wiki_relations_unique_failed_delete_journals_failed_and_rolls_back(tmp_path):
+    """PRR-001 regression pin: a failing destructive attempt journals exactly
+    one terminal failed row and persists no journal record of the delete."""
+    from app.models.database import migrate_add_wiki_relations_unique
+
+    db = str(tmp_path / "wrf.db")
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE wiki_relations ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " claim_id INTEGER, subject_entity_id INTEGER, predicate TEXT,"
+        " object_entity_id INTEGER)"
+    )
+    for _ in range(2):
+        conn.execute(
+            "INSERT INTO wiki_relations (claim_id, subject_entity_id,"
+            " predicate, object_entity_id) VALUES (1, 5, 'p', 6)"
+        )
+    conn.execute(
+        "CREATE TRIGGER wr_block_delete BEFORE DELETE ON wiki_relations"
+        " BEGIN SELECT RAISE(ABORT, 'injected dedup failure'); END"
+    )
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected dedup failure"):
+        migrate_add_wiki_relations_unique(db)
+
+    rows = _journal_rows(db, "migration_name = 'migrate_add_wiki_relations_unique'")
+    assert rows == [("failed", "error")]
+    assert _count(db, "wiki_relations") == 2  # delete rolled back
+
+
+def test_user_sessions_branch_b_dedup_journals_exact_count(tmp_path):
+    """PRR-007: the non-unique-index branch (shipped by _BASE_SCHEMA) with
+    real duplicates — previously untested — journals the exact deleted
+    count and collapses the duplicates."""
+    from app.models.database import init_db
+
+    db = str(tmp_path / "usb.db")
+    init_db(db)  # ships NON-unique idx_user_sessions_refresh_hash
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "INSERT INTO user_sessions (user_id, refresh_token_hash, expires_at)"
+        " VALUES (1, 'branch-b-hash', '2030-01-01 00:00:00')"
+    )
+    conn.execute(
+        "INSERT INTO user_sessions (user_id, refresh_token_hash, expires_at)"
+        " VALUES (2, 'branch-b-hash', '2030-01-01 00:00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+    run_migrations(db)
+
+    conn = sqlite3.connect(db)
+    try:
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM user_sessions WHERE refresh_token_hash ="
+            " 'branch-b-hash'"
+        ).fetchone()[0]
+        details = conn.execute(
+            "SELECT detail FROM migration_journal"
+            " WHERE migration_name = 'run_migrations_user_sessions_refresh_hash_unique'"
+            " ORDER BY id"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert remaining == 1
+    # F-E exact count on branch B (the elif path, never exercised before).
+    assert details[-1][0] == "deduplicated user_sessions rows deleted: 1"
 
 
 # ---------------------------------------------------------------------------

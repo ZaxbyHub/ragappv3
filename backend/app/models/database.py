@@ -1902,8 +1902,18 @@ def run_migrations(sqlite_path: str) -> None:
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_user_sessions_refresh_hash ON user_sessions(refresh_token_hash)"
             )
         conn.commit()
-    except Exception:
+    except Exception as exc:
         conn.rollback()
+        # Issue #699 review (PRR-001): the dedup attempt must end in a
+        # terminal journal outcome even when it fails; the rollback discarded
+        # any in-transaction count row, so record the failure on its own
+        # committed transaction.
+        record_migration_outcome(
+            conn, migration_name=_us_journal,
+            phase="failed", outcome="error",
+            detail=f"{type(exc).__name__}: {exc}",
+        )
+        conn.commit()
         raise
     finally:
         conn.close()
@@ -3019,6 +3029,20 @@ def migrate_add_chat_turn_columns(sqlite_path: str) -> None:
                 """
             )
         conn.commit()
+    except Exception as exc:
+        # Issue #699 review (PRR-001): a failed attempt (lock error at the
+        # BEGIN above, a failing backfill or index creation) must leave a
+        # terminal journal outcome. The rollback discards the in-transaction
+        # dedup count row together with the DML, so the failure row is
+        # recorded on its own committed transaction.
+        conn.rollback()
+        record_migration_outcome(
+            conn, migration_name="migrate_add_chat_turn_columns",
+            phase="failed", outcome="error",
+            detail=f"{type(exc).__name__}: {exc}",
+        )
+        conn.commit()
+        raise
     finally:
         conn.close()
 
@@ -3654,7 +3678,7 @@ def migrate_add_curator_claim_support(sqlite_path: str) -> None:
         # databases); an unrelated pre-existing orphan elsewhere cannot block
         # this migration. Any violation here means we produced a broken DB;
         # fail loudly so an operator notices.
-        for child in ("wiki_claim_sources", "wiki_relations"):
+        for child in ("wiki_claims", "wiki_claim_sources", "wiki_relations"):
             child_present = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
                 (child,),
@@ -4174,9 +4198,12 @@ def migrate_add_files_content_fts(sqlite_path: str) -> None:
     many large documents this can take several seconds to a few minutes.
     Subsequent startups are a journal-silent no-op: once the virtual table AND
     all three sync triggers exist (see ``_files_content_fts_complete``), the
-    whole creation+backfill sequence is known to have completed — it runs in
-    ONE transaction (#512 SEARCH-005), so a failure rolls the table away and a
-    retry re-runs everything. The transaction is still OPENED on every call
+    whole creation+backfill sequence is known to have completed for any
+    database migrated by the #512-or-later one-transaction implementation, so
+    a failure rolls the table away and a retry re-runs everything. (A
+    pre-#512 database whose creation committed but whose backfill never did
+    is not detected by this gate — see the release notes' known-scope
+    section.) The transaction is still OPENED on every call
     (and rolled back on the no-op path) so a lock error at ``BEGIN
     IMMEDIATE`` is journaled as a terminal ``failed`` row (issue #699 AC1).
     If you need to avoid startup latency on first deploy, run the migration
@@ -4246,9 +4273,10 @@ migrate_add_files_content_fts('/path/to/app.db')"
                 " INSERT INTO files_content_fts(rowid, parsed_text)"
                 " VALUES (new.id, new.parsed_text); END"
             )
-            # Backfill on every run: idempotent full rebuild of the external
-            # content table, so a first-run failure leaves nothing behind and
-            # a retry restores completeness.
+            # Idempotent full rebuild of the external content table, so a
+            # first-run failure leaves nothing behind and a retry restores
+            # completeness. Runs only when the completeness gate above found
+            # the index missing/incomplete (issue #699 AC3).
             conn.execute(
                 "INSERT INTO files_content_fts(files_content_fts) VALUES('rebuild')"
             )
@@ -4793,6 +4821,7 @@ def migrate_widen_files_status(sqlite_path: str) -> None:
         # existence guard for pre-schema databases). An unrelated pre-existing
         # orphan anywhere else cannot block this migration.
         for child in (
+            "files",
             "document_atoms",
             "document_assets",
             "ingestion_stage_states",
@@ -5189,6 +5218,20 @@ def migrate_add_wiki_relations_unique(sqlite_path: str) -> None:
             "ON wiki_relations(subject_entity_id, predicate, object_entity_id)"
         )
         conn.commit()
+    except Exception as exc:
+        # Issue #699 review (PRR-001): a failed attempt (failing dedup DELETE
+        # or index creation) must leave a terminal journal outcome. The
+        # rollback discards the in-transaction count row together with the
+        # DML, so the failure row is recorded on its own committed
+        # transaction.
+        conn.rollback()
+        record_migration_outcome(
+            conn, migration_name=_journal,
+            phase="failed", outcome="error",
+            detail=f"{type(exc).__name__}: {exc}",
+        )
+        conn.commit()
+        raise
     finally:
         conn.close()
 
@@ -5315,7 +5358,7 @@ def migrate_add_wiki_claims_unique_claim_text(sqlite_path: str) -> None:
             # PRAGMA foreign_key_check(T) reports only FKs declared BY T, so
             # an unrelated pre-existing orphan anywhere else in the database
             # cannot block this migration.
-            fk_children = [
+            fk_children = ["wiki_claims"] + [
                 child
                 for child, present in (
                     ("wiki_claim_sources", sources_present),
@@ -6913,21 +6956,26 @@ def migrate_relax_draft_claims_span_not_null(sqlite_path: str) -> None:
             "SELECT name FROM sqlite_master"
             " WHERE type='table' AND name='draft_claim_sources'"
         ).fetchone()
-        if sources_present:
+        for child in ("draft_claims", "draft_claim_sources"):
+            # Issue #699 review (PRR-002): draft_claims re-declares outbound
+            # FKs (revision_id, resolved_by) that base's whole-DB check used
+            # to cover; the rebuilt table itself stays in the scoped set.
+            if child == "draft_claim_sources" and not sources_present:
+                continue
             violations = conn.execute(
-                "PRAGMA foreign_key_check(draft_claim_sources)"
+                f"PRAGMA foreign_key_check({child})"  # fixed literal names
             ).fetchall()
             if violations:
                 record_migration_outcome(
                     conn, migration_name=_journal, phase="failed", outcome="error",
                     detail=(
-                        "foreign_key_check(draft_claim_sources) violations: "
+                        f"foreign_key_check({child}) violations: "
                         f"{len(violations)}"
                     ),
                 )
                 raise RuntimeError(
                     "migrate_relax_draft_claims_span_not_null: "
-                    "foreign_key_check(draft_claim_sources) reported "
+                    f"foreign_key_check({child}) reported "
                     f"{len(violations)} violation(s) post-swap: {violations[:5]}"
                 )
 

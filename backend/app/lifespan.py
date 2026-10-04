@@ -592,9 +592,11 @@ async def lifespan(app: FastAPI):
     # Operator visibility (issue #512 recovery journal): one summary line
     # with the latest migration/recovery outcomes so a prior failed or
     # recovered migration is visible without querying the journal table.
-    # Issue #699: clean boots no longer write routine journal rows, and a
-    # failure/recovery buried under PRE-EXISTING noise rows (databases
-    # upgraded from before that) is surfaced as one extra signal line.
+    # Issue #699: clean boots no longer write routine journal rows, and an
+    # UNRESOLVED failure/recovery (no later succeeded row for the same
+    # migration — on upgraded databases it is typically buried under
+    # pre-existing noise rows) is surfaced as one extra signal line; resolved
+    # failures are never re-warned.
     try:
         from app.models.migration_journal import latest_outcomes_with_signal
 
@@ -612,8 +614,9 @@ async def lifespan(app: FastAPI):
             )
         if _signal is not None:
             logger.warning(
-                "Migration journal (latest failure/recovery outside latest %d): "
-                "%s[%s:%s] %s",
+                "Migration journal (unresolved failure/recovery, %s, outside "
+                "latest %d): %s[%s:%s] %s",
+                _signal.get("created_at") or "unknown time",
                 len(_recent),
                 _signal["migration_name"],
                 _signal["phase"],

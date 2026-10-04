@@ -171,7 +171,7 @@ def test_backfill_failure_rolls_back_column_and_journals_failed(tmp_path) -> Non
         conn.close()
 
 
-def test_fresh_db_migration_is_a_journaled_noop(tmp_path) -> None:
+def test_fresh_db_migration_is_journal_silent(tmp_path) -> None:
     from app.models.database import init_db, migrate_add_document_near_dups
 
     db_path = str(tmp_path / "fresh.db")
