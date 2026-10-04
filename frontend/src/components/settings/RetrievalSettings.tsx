@@ -85,8 +85,7 @@ export function RetrievalSettings({
             <Input
               id="initial-retrieval-top-k"
               type="number"
-              min={5}
-              max={100}
+              min={1}
               value={formData.initial_retrieval_top_k ?? 20}
               onChange={(e) => onChange("initial_retrieval_top_k", e.target.value)}
               className={errors.initial_retrieval_top_k ? "border-destructive" : ""}
@@ -95,7 +94,7 @@ export function RetrievalSettings({
               <p role="alert" className="text-xs text-destructive">{errors.initial_retrieval_top_k}</p>
             )}
             <p className="text-xs text-muted-foreground">
-              Number of initial documents to retrieve before reranking (5-100)
+              Number of initial documents to retrieve before reranking (positive integer)
             </p>
           </div>
 
@@ -106,7 +105,6 @@ export function RetrievalSettings({
               id="reranker-top-n"
               type="number"
               min={1}
-              max={20}
               value={formData.reranker_top_n ?? 5}
               onChange={(e) => onChange("reranker_top_n", e.target.value)}
               className={errors.reranker_top_n ? "border-destructive" : ""}
@@ -115,7 +113,7 @@ export function RetrievalSettings({
               <p role="alert" className="text-xs text-destructive">{errors.reranker_top_n}</p>
             )}
             <p className="text-xs text-muted-foreground">
-              Number of top documents to keep after reranking (1-20)
+              Number of top documents to keep after reranking (positive integer)
             </p>
           </div>
         </CardContent>

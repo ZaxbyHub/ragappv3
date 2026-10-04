@@ -164,10 +164,10 @@ describe("SettingsPage issue #494 acceptance checks", () => {
     // Wait for the initial load to complete (tab bar renders post-load).
     await screen.findByRole("tab", { name: /overview/i });
 
-    // One invalid field (retrieval_window must be 0..3) plus one unrelated
+    // One invalid field (retrieval_window must be non-negative) plus one unrelated
     // VALID dirty edit (snapshot value is mockSettings.retrieval_top_k = 8).
     act(() => {
-      useSettingsStore.getState().updateFormField("retrieval_window", 9);
+      useSettingsStore.getState().updateFormField("retrieval_window", -1);
       useSettingsStore.getState().updateFormField("retrieval_top_k", 7);
     });
 
@@ -188,7 +188,7 @@ describe("SettingsPage issue #494 acceptance checks", () => {
     // Correct the invalid field. updateFormField must clear/recompute the
     // stale validation errors so Save becomes enabled again...
     act(() => {
-      useSettingsStore.getState().updateFormField("retrieval_window", 2);
+      useSettingsStore.getState().updateFormField("retrieval_window", 0);
     });
 
     expect(screen.getByRole("button", { name: "Save Changes" })).toBeEnabled();
