@@ -1,13 +1,14 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 // Use vi.hoisted to make mock functions available at mock time
-const { mockPostFn, mockGetFn, mockPatchFn, mockResetCsrfToken, mockEnsureCsrfToken, mockResetSubpathRefreshDiagnostic } = vi.hoisted(() => ({
+const { mockPostFn, mockGetFn, mockPatchFn, mockResetCsrfToken, mockEnsureCsrfToken, mockResetSubpathRefreshDiagnostic, mockResetCitationReport } = vi.hoisted(() => ({
   mockPostFn: vi.fn(),
   mockGetFn: vi.fn(),
   mockPatchFn: vi.fn(),
   mockResetCsrfToken: vi.fn(),
   mockEnsureCsrfToken: vi.fn().mockResolvedValue("mock-csrf-token"),
   mockResetSubpathRefreshDiagnostic: vi.fn(),
+  mockResetCitationReport: vi.fn(),
 }));
 
 // Mock axios before importing the store
@@ -46,6 +47,15 @@ vi.mock("@/lib/api", () => ({
       response: { use: vi.fn() },
     },
   },
+}));
+
+// Issue #849 EXT-001: useAuthStore.logout resets the citation-report
+// once-guard so a same-tab user switch records the next user's milestone.
+vi.mock("@/lib/api/onboarding", () => ({
+  resetCitationReport: mockResetCitationReport,
+  getOnboardingMilestones: vi.fn(),
+  markCitationOpened: vi.fn(),
+  dismissChecklist: vi.fn(),
 }));
 
 // Mock @/stores/useVaultStore
@@ -417,6 +427,37 @@ describe("useAuthStore", () => {
       await logout();
 
       expect(mockResetSubpathRefreshDiagnostic).toHaveBeenCalled();
+    });
+
+    it("resets the citation-report once-guard during logout cleanup, even when the server logout fails (issue #849 EXT-001)", async () => {
+      useAuthStore.setState({
+        user: mockUser,
+        accessToken: "jwt123",
+        isAuthenticated: true,
+        authMode: "jwt",
+      });
+
+      const { logout } = useAuthStore.getState();
+      mockPost?.mockRejectedValueOnce(new Error("Network error"));
+
+      await logout();
+
+      expect(mockResetCitationReport).toHaveBeenCalled();
+    });
+
+    it("resets the citation-report once-guard on a successful logout (issue #849 EXT-001)", async () => {
+      useAuthStore.setState({
+        user: mockUser,
+        accessToken: "jwt123",
+        isAuthenticated: true,
+        authMode: "jwt",
+      });
+
+      const { logout } = useAuthStore.getState();
+
+      await logout();
+
+      expect(mockResetCitationReport).toHaveBeenCalled();
     });
   });
 

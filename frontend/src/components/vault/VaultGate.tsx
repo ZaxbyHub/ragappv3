@@ -18,8 +18,22 @@ interface VaultGateProps {
   reason?: string;
 }
 
+// Issue #782: tolerate router-less mounts (bare unit-test renders — Wiki's
+// null-branch acceptance check renders the page with no Router). react-router
+// throws only AFTER its internal useContext, so catching inside a named hook
+// keeps hook order stable across renders (same shape as WikiPage's
+// useOptionalSearchParams, #515 AC39). Outside a Router the Open Vaults click
+// is inert; production always renders the gate inside the app Router.
+function useOptionalNavigate(): ((to: string) => void) | null {
+  try {
+    return useNavigate() as unknown as (to: string) => void;
+  } catch {
+    return null;
+  }
+}
+
 export function VaultGate({ reason }: VaultGateProps) {
-  const navigate = useNavigate();
+  const navigate = useOptionalNavigate();
 
   return (
     <div className="flex flex-col items-center gap-3" data-testid="vault-gate">
@@ -28,7 +42,14 @@ export function VaultGate({ reason }: VaultGateProps) {
       )}
       <div className="flex flex-wrap items-center justify-center gap-2">
         <VaultSelector />
-        <Button variant="outline" onClick={() => navigate("/vaults")}>
+        <Button
+          variant="outline"
+          onClick={() => {
+            if (navigate) {
+              navigate("/vaults");
+            }
+          }}
+        >
           Open Vaults
         </Button>
       </div>

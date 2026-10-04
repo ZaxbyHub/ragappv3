@@ -10,7 +10,7 @@
 // Mock conventions mirror the frozen m01 fixtures (DocumentsPage.m01 /
 // MemoryPage.m01 superset) plus a useNavigate spy for the mount assertion.
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render as rtlRender, act, waitFor, screen, within } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { MemoryRouter } from 'react-router-dom';
@@ -43,6 +43,15 @@ vi.mock('@tanstack/react-virtual', () => ({
 }));
 
 vi.mock('@/lib/api', () => ({
+  // Issue #782 additions: KMS + Wiki page surfaces (the two new gate sites).
+  listKMSEntries: vi.fn().mockResolvedValue({ entries: [], total: 0, page: 1, per_page: 200 }),
+  recompileVaultKMS: vi.fn().mockResolvedValue({ job_id: 1, status: 'pending' }),
+  listWikiPages: vi.fn().mockResolvedValue({ pages: [], page: 1, per_page: 50 }),
+  listWikiLintFindings: vi.fn().mockResolvedValue({ findings: [] }),
+  getWikiActivityFeed: vi.fn().mockResolvedValue([]),
+  API_BASE_URL: '/api',
+  getJwtAccessToken: vi.fn(() => null),
+  refreshAccessToken: vi.fn(),
   listDocuments: vi.fn().mockResolvedValue({ documents: [], total: 0 }),
   getDocumentStats: vi.fn().mockResolvedValue({
     total_documents: 0,
@@ -218,6 +227,22 @@ vi.mock('@/components/documents/RejectedFilesBanner', () => ({
   RejectedFilesBanner: () => null,
 }));
 
+// Issue #782: Wiki child components mocked so the parent's null branch is
+// isolated (same isolation shape as WikiPage.test.tsx).
+vi.mock('@/pages/WikiPageList', () => ({
+  WikiPageList: () => <div data-testid="wiki-page-list">Page List</div>,
+  PAGE_TYPES: [{ value: '', label: 'All' }],
+}));
+vi.mock('@/pages/WikiPageDetail', () => ({
+  WikiPageDetail: () => <div data-testid="wiki-page-detail" />,
+}));
+vi.mock('@/pages/WikiEditDialog', () => ({
+  WikiEditDialog: () => null,
+}));
+vi.mock('@/pages/WikiLintPanel', () => ({
+  WikiLintPanel: () => <div data-testid="wiki-lint-panel" />,
+}));
+
 vi.mock('@/components/layout/PageTitleHeader', () => ({
   PageTitleHeader: ({ title }: { title: string }) => <div data-testid="page-title">{title}</div>,
 }));
@@ -225,6 +250,8 @@ vi.mock('@/components/layout/PageTitleHeader', () => ({
 
 import MemoryPage from '@/pages/MemoryPage';
 import DocumentsPage from '@/pages/DocumentsPage';
+import KMSPage from '@/pages/KMSPage';
+import WikiPage from '@/pages/WikiPage';
 import { useVaultStore } from '@/stores/useVaultStore';
 import { listDocuments, getDocumentStats } from '@/lib/api';
 
@@ -236,6 +263,24 @@ describe('vault-gate sites guardrail (issue #781, class C17)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockNavigate.mockClear();
+    // WikiPage mounts useWikiEventStream: stub fetch with an open
+    // (never-resolving) stream so no real request is made (WikiPage.test
+    // beforeEach pattern).
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() =>
+        Promise.resolve({
+          ok: true,
+          status: 200,
+          body: {
+            getReader: () => ({
+              read: () => new Promise(() => {}),
+              cancel: vi.fn(),
+            }),
+          },
+        } as unknown as Response)
+      )
+    );
     vi.mocked(listDocuments).mockResolvedValue({ documents: [], total: 0 });
     vi.mocked(getDocumentStats).mockResolvedValue({
       total_documents: 0,
@@ -263,6 +308,10 @@ describe('vault-gate sites guardrail (issue #781, class C17)', () => {
       handleKeyDown: vi.fn(),
       handleDeleteMemory: vi.fn(),
     });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
   });
 
   it('Memory null branch renders the shared VaultGate (selector + action, click-only navigation)', async () => {
@@ -311,5 +360,42 @@ describe('vault-gate sites guardrail (issue #781, class C17)', () => {
       .closest('div[data-testid="empty-state"]');
     expect(emptyState).not.toBeNull();
     expect(within(emptyState as HTMLElement).queryAllByTestId('vault-selector').length).toBe(1);
+  });
+
+  // Issue #782 (class C17 continuation): the two PR-2 gate sites. Assertions
+  // run against THIS file's own mocks (mocked useNavigate never throws;
+  // mocked EmptyState exposes data-testid="empty-state") — the bare-render
+  // router-crash class is pinned by VaultGate.m02.test.tsx with the real
+  // router, and the frozen C1/C2 checks pin the real DOM scoping.
+  it('KMS no-selection state offers the gate selector inline and does not navigate on mount', async () => {
+    seedVaultSelection(null, [{ id: 7, name: 'Team Vault' }]);
+
+    await act(async () => {
+      render(<KMSPage />);
+    });
+
+    const emptyState = screen
+      .getByText('Select a vault to view its knowledge entries.')
+      .closest('div[data-testid="empty-state"]');
+    expect(emptyState).not.toBeNull();
+    expect(within(emptyState as HTMLElement).queryAllByTestId('vault-selector').length).toBe(1);
+    expect(within(emptyState as HTMLElement).getByText('Open Vaults')).toBeInTheDocument();
+    expect(mockNavigate).not.toHaveBeenCalled();
+  });
+
+  it('Wiki no-selection empty state offers the gate selector inline and does not navigate on mount', async () => {
+    seedVaultSelection(null, [{ id: 7, name: 'Team Vault' }]);
+
+    await act(async () => {
+      render(<WikiPage />);
+    });
+
+    const emptyState = screen
+      .getByText('Select a vault')
+      .closest('div[data-testid="empty-state"]');
+    expect(emptyState).not.toBeNull();
+    expect(within(emptyState as HTMLElement).queryAllByTestId('vault-selector').length).toBe(1);
+    expect(within(emptyState as HTMLElement).getByText('Open Vaults')).toBeInTheDocument();
+    expect(mockNavigate).not.toHaveBeenCalled();
   });
 });
