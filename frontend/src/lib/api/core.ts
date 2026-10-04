@@ -552,8 +552,10 @@ export interface UploadDocumentResponse {
 /**
  * Phase-aware status payload returned by GET /documents/{id}/status.
  *
- * `status` stays in the canonical 4-value enum
- * ("pending" | "processing" | "indexed" | "error"). Async lifecycle detail
+ * `status` stays in the canonical files.status enum
+ * ("pending" | "processing" | "indexed" | "partial" | "error" | "cancelled"
+ * — "partial" = completed with failed chunks, issue #513; "cancelled" =
+ * user-cancelled ingest, issue #783). Async lifecycle detail
  * (queued / parsing / extracting_text / chunking / embedding / writing_index)
  * lives in `phase`. `wiki_status` is derived server-side from the latest
  * wiki_compile_jobs row for this file (or "pending" when the processor has

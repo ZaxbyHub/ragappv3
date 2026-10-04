@@ -706,7 +706,10 @@ CREATE TABLE IF NOT EXISTS files (
     -- (process_existing_file) additionally lands in status 'partial'
     -- (frozen C27 requires a status-level distinction there).
     partial_embeddings INTEGER NOT NULL DEFAULT 0,
-    status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'indexed', 'partial', 'error')),
+    -- 'cancelled' is the terminal status of a user-cancelled ingest (issue
+    -- #783): the cancel route flips a pending/processing row to it and the
+    -- worker's between-steps gate lands here on unwind.
+    status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'indexed', 'partial', 'error', 'cancelled')),
     error_message TEXT,
     source TEXT DEFAULT 'upload',
     email_subject TEXT,
@@ -1960,6 +1963,15 @@ def run_migrations(sqlite_path: str) -> None:
     # dropped by the rebuild on pre-widen databases. After the rebuild (or its
     # early noop return) the ALTER is durable.
     migrate_add_files_extraction_diagnostics(sqlite_path)
+    # Issue #783 (ingest cancel). Registered AFTER
+    # migrate_add_files_extraction_diagnostics for the same reason as #514
+    # above: this rebuild enumerates the full canonical files column set
+    # INCLUDING extraction_diagnostics, and BEFORE the
+    # _widen_files_hash_vault_unique_index block below, which recreates the
+    # partial unique idx_files_hash_vault_indexed dropped with files_old (the
+    # rebuild itself does not recreate that index — matching
+    # migrate_widen_files_status's deferral semantics).
+    migrate_add_files_status_cancelled(sqlite_path)
     # Per-turn stream event log (issue #555) — the replay source for resumable
     # SSE chat streams. Registered last: purely additive table, no rebuilds.
     migrate_add_chat_stream_events(sqlite_path)
@@ -4687,6 +4699,325 @@ def migrate_widen_files_status(sqlite_path: str) -> None:
         invalidate_derived_data(
             conn,
             reason="files rebuilt with widened status CHECK (partial)",
+            migration_name=_journal,
+        )
+        record_migration_outcome(
+            conn, migration_name=_journal, phase="succeeded", outcome="ok",
+            detail=f"rows={before_count}",
+        )
+    finally:
+        conn.close()
+
+
+def migrate_add_files_status_cancelled(sqlite_path: str) -> None:
+    """Migration: add 'cancelled' to the files.status CHECK (issue #783).
+
+    ``cancelled`` is the terminal status of a user-cancelled document ingest:
+    ``POST /documents/{file_id}/cancel`` flips a pending/processing row to it
+    and the ingestion worker's between-steps gate lands here on unwind.
+
+    SQLite cannot ALTER a CHECK constraint, so this mirrors
+    ``migrate_widen_files_status``'s rename-recreate-copy rebuild (journal
+    outcomes, crash-recovery probe, row-count parity, FTS trigger/projection
+    rebuild, index recreation) with two deliberate deltas over a naive
+    mirror:
+
+    1. The rebuilt table enumerates the CURRENT canonical files column set —
+       including ``extraction_diagnostics`` (whose own migration is
+       registered before this one precisely because
+       ``migrate_widen_files_status``'s hard-coded list predates it), plus
+       ``folder_id`` and ``parsed_text``.
+    2. The partial unique ``idx_files_hash_vault_indexed`` is NOT recreated
+       here: like ``migrate_widen_files_status``, it is recreated by the
+       ``_widen_files_hash_vault_unique_index`` block in ``run_migrations``
+       that runs immediately after this migration (IntegrityError-tolerant
+       semantics preserved).
+
+    Idempotent — safe to run multiple times.
+    """
+    conn = sqlite3.connect(sqlite_path)
+    conn.isolation_level = None
+    _journal = "migrate_add_files_status_cancelled"
+    try:
+        record_migration_outcome(
+            conn, migration_name=_journal, phase="start", outcome="ok"
+        )
+        tbl = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='files'"
+        ).fetchone()
+        old_present = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='files_old'"
+        ).fetchone()
+        recovered = False
+        if old_present and not tbl:
+            conn.execute("PRAGMA legacy_alter_table = ON")
+            conn.execute("ALTER TABLE files_old RENAME TO files")
+            conn.execute("PRAGMA legacy_alter_table = OFF")
+            recovered = True
+        elif old_present:
+            dest_sql_row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='files'"
+            ).fetchone()
+            dest_sql_text = dest_sql_row[0] if dest_sql_row else ""
+            dest_new_shape = "'cancelled'" in dest_sql_text
+            dest_count = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+            backup_count = conn.execute("SELECT COUNT(*) FROM files_old").fetchone()[0]
+            missing_ids = conn.execute(
+                "SELECT COUNT(*) FROM (SELECT id FROM files_old"
+                " EXCEPT SELECT id FROM files)"
+            ).fetchone()[0]
+            dest_complete = (
+                dest_new_shape and dest_count >= backup_count and missing_ids == 0
+            )
+            if not dest_complete:
+                conn.execute("DROP TABLE files")
+                conn.execute("PRAGMA legacy_alter_table = ON")
+                conn.execute("ALTER TABLE files_old RENAME TO files")
+                conn.execute("PRAGMA legacy_alter_table = OFF")
+                recovered = True
+            else:
+                conn.execute("DROP TABLE IF EXISTS files_old")
+
+        if not tbl and not old_present:
+            record_migration_outcome(
+                conn, migration_name=_journal, phase="succeeded", outcome="noop",
+                detail="files table absent",
+            )
+            return
+
+        if recovered:
+            record_migration_outcome(
+                conn, migration_name=_journal, phase="recovered",
+                outcome="recovered_from_backup",
+                detail="files restored from files_old",
+            )
+            invalidate_derived_data(
+                conn,
+                reason="files restored from files_old (status cancelled recovery)",
+                migration_name=_journal,
+            )
+
+        create_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='files'"
+        ).fetchone()
+        if create_sql and "'cancelled'" in create_sql[0]:
+            record_migration_outcome(
+                conn, migration_name=_journal, phase="succeeded", outcome="noop",
+                detail="status CHECK already admits 'cancelled'",
+            )
+            return
+
+        before_count = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute("PRAGMA legacy_alter_table = ON")
+        # Atomicity (issue #512 semantics, same as migrate_widen_files_status):
+        # the swap runs inside ONE explicit BEGIN IMMEDIATE transaction using
+        # execute() only, so a crash or copy failure rolls back to the
+        # pre-swap state (files_old included).
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for trig in (
+                "files_search_fts_insert",
+                "files_search_fts_delete",
+                "files_search_fts_update",
+                "files_content_fts_insert",
+                "files_content_fts_delete",
+                "files_content_fts_update",
+            ):
+                conn.execute(f"DROP TRIGGER IF EXISTS {trig}")
+
+            conn.execute("ALTER TABLE files RENAME TO files_old")
+
+            conn.execute(
+                """
+                CREATE TABLE files (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    vault_id INTEGER NOT NULL,
+                    file_path TEXT NOT NULL,
+                    file_name TEXT NOT NULL,
+                    file_hash TEXT,
+                    file_size INTEGER NOT NULL,
+                    file_type TEXT,
+                    chunk_count INTEGER DEFAULT 0,
+                    chunks_failed INTEGER NOT NULL DEFAULT 0,
+                    partial_embeddings INTEGER NOT NULL DEFAULT 0,
+                    status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'indexed', 'partial', 'error', 'cancelled')),
+                    error_message TEXT,
+                    source TEXT DEFAULT 'upload',
+                    email_subject TEXT,
+                    email_sender TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    processed_at TIMESTAMP,
+                    modified_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    document_date TEXT,
+                    supersedes_file_id INTEGER,
+                    ingestion_version INTEGER DEFAULT 1,
+                    active_generation_hash TEXT,
+                    phase TEXT,
+                    phase_message TEXT,
+                    progress_percent REAL,
+                    processed_units INTEGER,
+                    total_units INTEGER,
+                    unit_label TEXT,
+                    phase_started_at TIMESTAMP,
+                    processing_started_at TIMESTAMP,
+                    wiki_pending INTEGER NOT NULL DEFAULT 0,
+                    enrichment_status TEXT,
+                    enrichment_error TEXT,
+                    enrichment_updated_at TIMESTAMP,
+                    enrichment_enabled INTEGER,
+                    extraction_diagnostics TEXT,
+                    folder_id INTEGER REFERENCES folders(id) ON DELETE SET NULL,
+                    parsed_text TEXT,
+                    FOREIGN KEY (vault_id) REFERENCES vaults(id)
+                )
+                """
+            )
+
+            conn.execute(
+                """
+                INSERT INTO files (
+                    id, vault_id, file_path, file_name, file_hash, file_size,
+                    file_type, chunk_count, chunks_failed, partial_embeddings,
+                    status, error_message,
+                    source, email_subject, email_sender, created_at, processed_at,
+                    modified_at, document_date, supersedes_file_id,
+                    ingestion_version, active_generation_hash, phase,
+                    phase_message, progress_percent, processed_units,
+                    total_units, unit_label, phase_started_at,
+                    processing_started_at, wiki_pending, enrichment_status,
+                    enrichment_error, enrichment_updated_at, enrichment_enabled,
+                    extraction_diagnostics, folder_id, parsed_text
+                )
+                SELECT
+                    id, vault_id, file_path, file_name, file_hash, file_size,
+                    file_type, chunk_count, chunks_failed, partial_embeddings,
+                    status, error_message,
+                    source, email_subject, email_sender, created_at, processed_at,
+                    modified_at, document_date, supersedes_file_id,
+                    ingestion_version, active_generation_hash, phase,
+                    phase_message, progress_percent, processed_units,
+                    total_units, unit_label, phase_started_at,
+                    processing_started_at, wiki_pending, enrichment_status,
+                    enrichment_error, enrichment_updated_at, enrichment_enabled,
+                    extraction_diagnostics, folder_id, parsed_text
+                FROM files_old
+                """
+            )
+
+            after_count = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+            if after_count != before_count:
+                raise RuntimeError(
+                    f"migrate_add_files_status_cancelled: row-count parity "
+                    f"failed ({before_count} -> {after_count}). files_old has "
+                    f"been preserved."
+                )
+
+            conn.execute("DROP TABLE files_old")
+            for index_ddl in (
+                "CREATE INDEX IF NOT EXISTS idx_files_status ON files(status)",
+                "CREATE INDEX IF NOT EXISTS idx_files_hash_vault_status "
+                "ON files(file_hash, vault_id, status)",
+                "CREATE INDEX IF NOT EXISTS idx_files_vault_id ON files(vault_id)",
+                "CREATE INDEX IF NOT EXISTS idx_files_source ON files(source)",
+                "CREATE INDEX IF NOT EXISTS idx_files_folder_id ON files(folder_id)",
+            ):
+                conn.execute(index_ddl)
+
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS files_search_fts_insert
+                AFTER INSERT ON files BEGIN
+                    INSERT INTO files_search_fts(rowid, file_name, file_type, status, source, email_subject, email_sender, document_date)
+                    VALUES (new.id, new.file_name, new.file_type, new.status, new.source, new.email_subject, new.email_sender, new.document_date);
+                END
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS files_search_fts_delete
+                AFTER DELETE ON files BEGIN
+                    INSERT INTO files_search_fts(files_search_fts, rowid, file_name, file_type, status, source, email_subject, email_sender, document_date)
+                    VALUES ('delete', old.id, old.file_name, old.file_type, old.status, old.source, old.email_subject, old.email_sender, old.document_date);
+                END
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS files_search_fts_update
+                AFTER UPDATE ON files BEGIN
+                    INSERT INTO files_search_fts(files_search_fts, rowid, file_name, file_type, status, source, email_subject, email_sender, document_date)
+                    VALUES ('delete', old.id, old.file_name, old.file_type, old.status, old.source, old.email_subject, old.email_sender, old.document_date);
+                    INSERT INTO files_search_fts(rowid, file_name, file_type, status, source, email_subject, email_sender, document_date)
+                    VALUES (new.id, new.file_name, new.file_type, new.status, new.source, new.email_subject, new.email_sender, new.document_date);
+                END
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS files_content_fts_insert
+                AFTER INSERT ON files BEGIN
+                    INSERT INTO files_content_fts(rowid, parsed_text)
+                    VALUES (new.id, new.parsed_text);
+                END
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS files_content_fts_delete
+                AFTER DELETE ON files BEGIN
+                    INSERT INTO files_content_fts(files_content_fts, rowid, parsed_text)
+                    VALUES ('delete', old.id, old.parsed_text);
+                END
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS files_content_fts_update
+                AFTER UPDATE ON files
+                WHEN new.parsed_text IS NOT old.parsed_text BEGIN
+                    INSERT INTO files_content_fts(files_content_fts, rowid, parsed_text)
+                    VALUES ('delete', old.id, old.parsed_text);
+                    INSERT INTO files_content_fts(rowid, parsed_text)
+                    VALUES (new.id, new.parsed_text);
+                END
+                """
+            )
+
+            conn.execute(
+                "INSERT INTO files_search_fts(files_search_fts) VALUES('rebuild')"
+            )
+            conn.execute(
+                "INSERT INTO files_content_fts(files_content_fts) VALUES('rebuild')"
+            )
+            conn.commit()
+        except Exception as exc:
+            conn.rollback()
+            record_migration_outcome(
+                conn, migration_name=_journal, phase="failed", outcome="error",
+                detail=f"{type(exc).__name__}: {exc}",
+            )
+            raise
+        finally:
+            conn.execute("PRAGMA legacy_alter_table = OFF")
+            conn.execute("PRAGMA foreign_keys = ON")
+
+        violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            record_migration_outcome(
+                conn, migration_name=_journal, phase="failed", outcome="error",
+                detail=f"foreign_key_check violations: {len(violations)}",
+            )
+            raise RuntimeError(
+                f"migrate_add_files_status_cancelled: foreign_key_check "
+                f"reported {len(violations)} violation(s) post-swap: "
+                f"{violations[:5]}"
+            )
+
+        invalidate_derived_data(
+            conn,
+            reason="files rebuilt with widened status CHECK (cancelled)",
             migration_name=_journal,
         )
         record_migration_outcome(

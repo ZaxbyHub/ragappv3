@@ -47,6 +47,7 @@ from .document_artifacts import (
     project_text,
 )
 from .document_progress import (
+    PHASE_CANCELLED,
     PHASE_CHUNKING,
     PHASE_EMBEDDING,
     PHASE_EXTRACTING_TEXT,
@@ -797,6 +798,23 @@ class SpreadsheetParser:
         return chunks
 
 
+class IngestCancelledError(Exception):
+    """An in-flight ingest was cancelled by the user (issue #783).
+
+    Not a failure: it must never land ``files.status='error'`` (both ingest
+    paths re-raise it before their generic handlers) and must never be
+    retried — both worker transports route it to the cancellation unwind
+    (cleanup + terminal ``cancelled`` status) instead of the failure path.
+    Carries the ``file_id`` so the unwind can land the terminal phase even
+    on the scan/sync path, where the task item itself has ``file_id=None``
+    (the processor assigns the row id mid-run).
+    """
+
+    def __init__(self, message: str, file_id: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.file_id = file_id
+
+
 class DocumentProcessor:
     """
     Orchestrates document processing with status tracking and deduplication.
@@ -863,6 +881,11 @@ class DocumentProcessor:
         self._contextual_chunker = contextual_chunker
         self._write_semaphore = write_semaphore
         self._chunk_enrichment_service: Optional[ChunkEnrichmentService] = None
+        # In-flight cancel requests (issue #783): file ids the cancel route
+        # marked. Checked between ingest steps; cleared on unwind, on the
+        # 409 refusal path, and on every re-enqueue so a cancelled ingest
+        # never poisons a later ingest of the same row.
+        self._cancel_requested: set = set()
 
     def set_llm_client(self, llm_client: Optional[LLMClient]) -> None:
         """Rebind optional ingestion LLM work to a different live client."""
@@ -1623,6 +1646,84 @@ class DocumentProcessor:
         if current_status not in ("indexed", "partial"):
             return f"status '{current_status}' is no longer retry-eligible"
         return None
+
+    def request_cancel(self, file_id: int) -> None:
+        """Mark an in-flight ingest as cancel-requested (issue #783).
+
+        Idempotent; the between-steps gates observe the request at their next
+        seam and convert the ingest into an :class:`IngestCancelledError`.
+        """
+        self._cancel_requested.add(file_id)
+
+    def clear_cancel(self, file_id: int) -> None:
+        """Drop a stale cancel request (re-enqueue / unwind / 409 refusal)."""
+        self._cancel_requested.discard(file_id)
+
+    def is_cancel_requested(self, file_id: int) -> bool:
+        return file_id in self._cancel_requested
+
+    def _raise_if_cancelled(self, file_id: Optional[int]) -> None:
+        """Between-steps cancellation gate (issue #783).
+
+        Called at the two seams of BOTH ingest paths — after parse/chunking
+        (before the expensive embedding) and immediately before the vector
+        write (next to ``_raise_if_file_row_missing``, the issue-#692
+        staleness gate) — so a cancelled ingest writes no vectors and
+        publishes no atoms.
+        """
+        if file_id is not None and file_id in self._cancel_requested:
+            raise IngestCancelledError(
+                f"Ingest cancelled by user (file_id={file_id})",
+                file_id=file_id,
+            )
+
+    async def rollback_cancelled_ingest(self, file_id: int) -> None:
+        """Idempotent unwind of a cancelled ingest generation (issue #783).
+
+        Deletes any vectors and atom rows this generation wrote (safe no-ops
+        when the cancel landed before any write), lands the terminal
+        ``cancelled`` status via a guarded UPDATE (never overwrites
+        ``indexed``/``partial``), and clears the terminal phase with the
+        transient progress counters in one write. Never raises: a cleanup
+        failure is logged and the status guard still stands.
+        """
+        try:
+            if self.vector_store is not None:
+                await self.vector_store.delete_by_file(str(file_id))
+        except Exception:  # noqa: BLE001 — cleanup must never raise
+            logger.warning(
+                "cancel cleanup: vector delete failed for file_id=%s",
+                file_id,
+                exc_info=True,
+            )
+        try:
+            conn = await self.pool.get_connection_async()
+            try:
+                conn.execute(
+                    "DELETE FROM document_atoms WHERE file_id = ?", (file_id,)
+                )
+                conn.execute(
+                    "UPDATE files SET status = 'cancelled', "
+                    "processed_at = CURRENT_TIMESTAMP "
+                    "WHERE id = ? AND status IN ('pending', 'processing')",
+                    (file_id,),
+                )
+                conn.commit()
+            finally:
+                self.pool.release_connection(conn)
+        except Exception:  # noqa: BLE001 — cleanup must never raise
+            logger.warning(
+                "cancel cleanup: sqlite cleanup failed for file_id=%s",
+                file_id,
+                exc_info=True,
+            )
+        await clear_progress(
+            self.pool,
+            file_id,
+            phase=PHASE_CANCELLED,
+            phase_message="Cancelled by user",
+        )
+        self.clear_cancel(file_id)
 
     def _raise_if_file_row_missing(self, file_id: int) -> None:
         """Abort an in-flight generation when its ``files`` row was deleted.
@@ -3088,19 +3189,56 @@ class DocumentProcessor:
         from full success by status alone. Full success is ``'indexed'`` on
         both paths (frozen C26 convergence).
         """
+        # Finalize guard (issue #783): a cancel landing AFTER the pre-write
+        # gate spans this whole vector-write + publish span. Detecting it
+        # here must not merely skip this finalize — the already-written
+        # vectors and atoms would orphan on a 'cancelled' row — so unwind the
+        # generation with the same rollback and surface the cancellation to
+        # the transport (raised outside the ingest paths' try blocks, so it
+        # reaches the cancellation handlers directly).
+        if self.is_cancel_requested(file_id):
+            await self.rollback_cancelled_ingest(file_id)
+            raise IngestCancelledError(
+                f"Ingest cancelled after vector write (file_id={file_id})",
+                file_id=file_id,
+            )
         final_status = (
             partial_final_status if chunks_failed_count > 0 else "indexed"
         )
         async with self._write_session() as conn:
-            self._update_status(
-                file_id,
-                final_status,
-                conn,
-                chunk_count=len(chunks),
-                chunks_failed=chunks_failed_count,
-                partial_embeddings=1 if chunks_failed_count > 0 else 0,
+            # Reviewer finding (Phase 4.5, Important): the route can accept a
+            # cancel (guarded UPDATE rowcount 1, 200 returned) in the window
+            # between the registry check above and this commit — an
+            # unconditional success write would then bury the accepted
+            # 'cancelled' under 'indexed'. The write is therefore conditioned
+            # on the row still being pre-terminal, exactly like the route's
+            # own flip; rowcount 0 means the cancel won the race and the
+            # generation must unwind so the 200 survives.
+            landed = conn.execute(
+                "UPDATE files SET status = ?, chunk_count = ?, chunks_failed = ?, "
+                "partial_embeddings = ?, error_message = NULL, "
+                "processed_at = ?, modified_at = ? "
+                "WHERE id = ? AND status IN ('pending', 'processing')",
+                (
+                    final_status,
+                    len(chunks),
+                    chunks_failed_count,
+                    1 if chunks_failed_count > 0 else 0,
+                    datetime.now(UTC).isoformat(),
+                    datetime.now(UTC).isoformat(),
+                    file_id,
+                ),
+            ).rowcount > 0
+            if landed:
+                conn.commit()
+            else:
+                conn.rollback()
+        if not landed:
+            await self.rollback_cancelled_ingest(file_id)
+            raise IngestCancelledError(
+                f"Ingest cancelled before finalize committed (file_id={file_id})",
+                file_id=file_id,
             )
-            conn.commit()
 
         # Save full parsed text and enqueue wiki compile job (fire-and-forget;
         # non-blocking). parsed_text is stored on the files row so manual
@@ -3407,6 +3545,10 @@ class DocumentProcessor:
             # finalization helper's advisory centroid computation (W26).
             chunk_embeddings: List[List[float]] = []
 
+            # Cancel gate A (issue #783): a cancel that landed during
+            # parse/chunking skips the expensive embedding entirely.
+            self._raise_if_cancelled(file_id)
+
             # Generate embeddings and store in vector store
             if self.embedding_service is not None and self.vector_store is not None:
                 # Skip embedding/indexing if no chunks (status indexed with 0 chunks is acceptable)
@@ -3601,6 +3743,10 @@ class DocumentProcessor:
                     # a vault delete that committed during this worker's
                     # parse/embed span must not receive chunks for a row that
                     # no longer exists.
+                    # Cancel gate B (issue #783): same seam — a cancel that
+                    # landed during embedding writes no vectors and publishes
+                    # no atoms.
+                    self._raise_if_cancelled(file_id)
                     self._raise_if_file_row_missing(file_id)
                     # Initialize vector table with embedding dimension and add chunks
                     embedding_dim = len(embeddings[0])
@@ -3653,11 +3799,24 @@ class DocumentProcessor:
                     self._publish_artifacts(
                         file_id, vault_id, generation_hash, parsed
                     )
+        except IngestCancelledError:
+            # issue #783: a user cancellation is not a failure — never write
+            # status='error' over the terminal 'cancelled'; the transport's
+            # cancellation handler unwinds the generation.
+            raise
         except Exception as e:
             # The raw exception (server path + underlying parser error) stays
-            # in the server log only; the persisted fields are user-facing
+            # in the server log only; persisted fields are user-facing
             # (issue #562).
             logger.exception("Ingestion failed for file_id=%s", file_id)
+            if self.is_cancel_requested(file_id):
+                # issue #783: the failure raced a user cancel; the terminal
+                # 'cancelled' must not be clobbered with 'error'.
+                await self.rollback_cancelled_ingest(file_id)
+                raise IngestCancelledError(
+                    f"Ingest failed after cancel was requested (file_id={file_id})",
+                    file_id=file_id,
+                ) from e
             safe_error = redact_ingest_error(e)
             # Phase 3: Update status to error on failure
             # Get connection again to update error status
@@ -3942,6 +4101,10 @@ class DocumentProcessor:
             # advisory centroid computation (W26).
             chunk_embeddings: List[List[float]] = []
 
+            # Cancel gate A (issue #783): a cancel that landed during
+            # parse/chunking skips the expensive embedding entirely.
+            self._raise_if_cancelled(file_id)
+
             if self.embedding_service is not None and self.vector_store is not None:
                 if chunks:
                     chunks = [c for c in chunks if c.text and c.text.strip()]
@@ -4122,6 +4285,10 @@ class DocumentProcessor:
                     # instead of writing chunks for a row that no longer
                     # exists. Covers bare and vector_target (staged rebuild)
                     # calls alike, and every parse branch funnels through here.
+                    # Cancel gate B (issue #783): same seam — a cancel that
+                    # landed during embedding writes no vectors and publishes
+                    # no atoms.
+                    self._raise_if_cancelled(file_id)
                     self._raise_if_file_row_missing(file_id)
                     # [W8/W13 contract] Thread the optional rebuild target into
                     # every vector-store call below as a trailing ``target=``
@@ -4195,10 +4362,23 @@ class DocumentProcessor:
                     self._publish_artifacts(
                         file_id, vault_id, generation_hash, parsed
                     )
+        except IngestCancelledError:
+            # issue #783: a user cancellation is not a failure — never write
+            # status='error' over the terminal 'cancelled'; the transport's
+            # cancellation handler unwinds the generation.
+            raise
         except Exception as e:
             # Raw exception stays in the server log; persisted fields are
             # user-facing (issue #562).
             logger.exception("Existing-file ingestion failed for file_id=%s", file_id)
+            if self.is_cancel_requested(file_id):
+                # issue #783: the failure raced a user cancel; the terminal
+                # 'cancelled' must not be clobbered with 'error'.
+                await self.rollback_cancelled_ingest(file_id)
+                raise IngestCancelledError(
+                    f"Ingest failed after cancel was requested (file_id={file_id})",
+                    file_id=file_id,
+                ) from e
             safe_error = redact_ingest_error(e)
             async with self._write_session() as conn:
                 self._update_status(file_id, "error", conn, error_message=safe_error)

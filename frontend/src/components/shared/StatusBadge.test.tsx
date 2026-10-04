@@ -37,8 +37,7 @@ describe("StatusBadge", () => {
       expect(screen.getByText("Error")).toBeInTheDocument();
       // AlertCircle icon should be rendered for error status
       const badge = screen.getByText("Error").closest("span");
-      expect(badge?.querySelector("svg")).toBeInTheDocument();
-    });
+      expect(badge?.querySelector("svg")).toBeInTheDocument();    });
 
     it("test_partial_shows_partial_badge_not_unknown", () => {
       // LIVE-03: "partial" is a known terminal status — never "Unknown".
@@ -151,6 +150,15 @@ describe("StatusBadge", () => {
       render(<StatusBadge status="error" />);
       const badge = screen.getByText("Error").closest("span");
       expect(badge).toHaveClass("bg-destructive");
+    });
+
+    it("cancelled badge renders the truthful terminal label (issue #783)", () => {
+      render(<StatusBadge status="cancelled" />);
+      expect(screen.getByText("Cancelled")).toBeInTheDocument();
+      expect(FILE_STATUS_LABELS.cancelled).toBe("Cancelled");
+      expect(FILE_STATUS_COLORS.cancelled).toBeDefined();
+      // Never the pre-fix fallback for an unmapped status.
+      expect(screen.queryByText("Unknown")).not.toBeInTheDocument();
     });
   });
 });

@@ -280,6 +280,105 @@ async def retry_document(
         raise HTTPException(status_code=500, detail="Retry failed")
 
 
+@router.post("/{file_id}/cancel")
+@limiter.limit(settings.admin_rate_limit)
+async def cancel_document_ingest(
+    file_id: int,
+    request: Request,
+    conn: sqlite3.Connection = Depends(get_db),
+    user: dict = Depends(get_current_active_user),
+    evaluate: Callable = Depends(get_evaluate_policy),
+    _csrf_token: str = Depends(csrf_protect),
+    background_processor: BackgroundProcessor = Depends(get_background_processor),
+) -> dict:
+    """Cancel a pending/processing document ingest (issue #783).
+
+    Auth mirrors the delete route's per-file gate (vault admin on the file's
+    vault). ``indexed``/``partial``/``error`` rows are terminal — 409 with
+    data untouched (the retry route owns error recovery). A live cancel
+    marks the worker's between-steps gates and cancels still-queued items
+    (synchronous call — no await), then lands the new terminal status
+    ``cancelled`` under a guarded UPDATE so a worker completing in the race
+    window can never be overwritten; rowcount 0 re-reads and answers
+    idempotently (200 when now cancelled — concurrent double-cancel) or
+    refuses (409). The worker unwinds with no orphan atoms or vectors.
+    """
+    cursor = await asyncio.to_thread(
+        conn.execute,
+        "SELECT status, vault_id FROM files WHERE id = ?",
+        (file_id,),
+    )
+    row = await asyncio.to_thread(cursor.fetchone)
+    if row is None:
+        raise HTTPException(
+            status_code=404, detail=f"Document with id {file_id} not found"
+        )
+
+    file_vault_id = row["vault_id"]
+    if not await evaluate(user, "vault", file_vault_id, "admin"):
+        raise HTTPException(status_code=403, detail="Insufficient vault permissions")
+
+    current_status = row["status"]
+    if current_status in ("indexed", "partial", "error"):
+        await _safe_record_action(
+            file_id,
+            "cancel",
+            "refused-terminal",
+            user,
+            getattr(request.app.state, "secret_manager", None),
+            conn,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail="Ingest already finished; nothing to cancel",
+        )
+    if current_status == "cancelled":
+        return {"file_id": file_id, "status": "cancelled"}
+
+    # pending / processing: registry + queued-item cancellation first
+    # (synchronous by contract — see request_ingest_cancel), then the
+    # guarded status flip.
+    background_processor.request_ingest_cancel(file_id)
+    update_cursor = await asyncio.to_thread(
+        conn.execute,
+        "UPDATE files SET status = 'cancelled', processed_at = CURRENT_TIMESTAMP "
+        "WHERE id = ? AND status IN ('pending', 'processing')",
+        (file_id,),
+    )
+    if update_cursor.rowcount == 0:
+        # Raced: the worker settled between the read and the flip. Decide
+        # idempotently from the row's actual terminal state.
+        recheck = await asyncio.to_thread(
+            conn.execute, "SELECT status FROM files WHERE id = ?", (file_id,)
+        )
+        reread = await asyncio.to_thread(recheck.fetchone)
+        if reread is not None and reread["status"] == "cancelled":
+            return {"file_id": file_id, "status": "cancelled"}
+        await _safe_record_action(
+            file_id,
+            "cancel",
+            "refused-completed",
+            user,
+            getattr(request.app.state, "secret_manager", None),
+            conn,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail="Ingest already finished; nothing to cancel",
+        )
+    await asyncio.to_thread(conn.commit)
+    await _safe_record_action(
+        file_id,
+        "cancel",
+        "success",
+        user,
+        getattr(request.app.state, "secret_manager", None),
+        conn,
+    )
+    await asyncio.to_thread(conn.commit)
+    return {"file_id": file_id, "status": "cancelled"}
+
+
 @router.post("/{file_id}/retry-chunks")
 @limiter.limit(settings.admin_rate_limit)
 async def retry_failed_chunks(

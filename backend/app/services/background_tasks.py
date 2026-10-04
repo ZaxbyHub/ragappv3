@@ -26,6 +26,7 @@ from ..models.database import SQLiteConnectionPool
 from .document_processor import (
     DocumentProcessingError,
     DocumentProcessor,
+    IngestCancelledError,
     redact_ingest_error,
 )
 from .embeddings import EmbeddingService
@@ -1227,6 +1228,11 @@ class BackgroundProcessor:
                 lease = self._make_ingest_lease(conn)
                 if outcome == "complete":
                     return bool(lease.complete(job_id, worker_id))
+                if outcome == "cancel":
+                    # issue #783: terminal cancellation — never requeued.
+                    return bool(
+                        lease.cancel(job_id, worker_id, (error or "cancelled")[:500])
+                    )
                 if outcome == "fail":
                     return bool(
                         lease.fail(job_id, worker_id, (error or "failed")[:500])
@@ -1326,6 +1332,20 @@ class BackgroundProcessor:
                     await self._run_task_processing(task)
             except AdmissionRejected as exc:
                 outcome_error = f"admission rejected: {exc.reason}"
+            except IngestCancelledError as exc:
+                # issue #783: terminal cancellation — unwind the generation,
+                # settle the durable row as cancelled, never requeue. The
+                # exception carries the scan-path row id (task.file_id is
+                # None there).
+                cancel_file_id = task.file_id
+                if cancel_file_id is None:
+                    cancel_file_id = exc.file_id
+                if cancel_file_id is not None:
+                    await self.processor.rollback_cancelled_ingest(cancel_file_id)
+                await self._settle_ingest_job(job_id, worker_id, "cancel")
+                outcome_error = None
+                outcome_exc = None
+                return
             except Exception as exc:  # noqa: BLE001 — outcome drives settle
                 outcome_error = str(exc)
                 # Retained so the terminal branch hands the exception object
@@ -2938,6 +2958,10 @@ class BackgroundProcessor:
         """
         reservation_added = False
         if file_id is not None:
+            # issue #783: a fresh enqueue (retry-after-cancel, re-upload)
+            # must not inherit a stale cancel request — the registry entry
+            # belongs to the cancelled generation only.
+            self.processor.clear_cancel(file_id)
             async with self._active_file_ids_lock:
                 if _recovery_claim:
                     if file_id not in self._recovery_file_ids:
@@ -3066,6 +3090,44 @@ class BackgroundProcessor:
             raise
         logger.debug(f"Enqueued file: {file_path} (file_id={file_id})")
         return True
+
+    def request_ingest_cancel(self, file_id: int) -> None:
+        """Request cancellation of an in-flight document ingest (issue #783).
+
+        Synchronous BY CONTRACT — the cancel route calls this without
+        ``await``. Marks the DocumentProcessor's cancel registry (observed by
+        the between-steps gates inside both ingest paths) and cancels any
+        still-QUEUED items for the file via the existing #516 machinery
+        (in-memory TaskItems + pending ``jobs`` rows in lease mode); an item
+        a worker already claimed is cancelled at its next gate seam.
+        """
+        self.processor.request_cancel(file_id)
+        self.cancel_pending_jobs(file_id=file_id)
+
+    async def _handle_cancellation(
+        self, task: TaskItem, exc: Optional[IngestCancelledError] = None
+    ) -> None:
+        """Unwind a cancelled ingest (issue #783) — no retry, no 'error'.
+
+        The registry flip already happened route-side; the processor's
+        rollback (guarded status UPDATE + vector/atom cleanup + terminal
+        phase) is idempotent, so this runs it for the worker-side decision
+        points (gate A/B, finalize guard, failure-raced-cancel) alike. The
+        scan/sync path's TaskItem carries ``file_id=None`` (the processor
+        assigns the row mid-run), so the exception's own ``file_id`` is the
+        authoritative anchor there — without it the terminal phase would
+        never land on that path.
+        """
+        logger.info(
+            "Cancelling ingestion task for %s (file_id=%s)",
+            task.file_path,
+            task.file_id,
+        )
+        file_id = task.file_id
+        if file_id is None and exc is not None:
+            file_id = exc.file_id
+        if file_id is not None:
+            await self.processor.rollback_cancelled_ingest(file_id)
 
     def cancel_pending_jobs(self, **match: object) -> int:
         """Best-effort cancellation of queued, not-yet-started ingestion tasks
@@ -4059,6 +4121,10 @@ class BackgroundProcessor:
 
         try:
             await self._run_task_processing(task)
+        except IngestCancelledError as exc:
+            # issue #783: user cancellation — unwind, never retry, never
+            # land status='error'.
+            await self._handle_cancellation(task, exc)
         except DocumentProcessingError as e:
             logger.error(f"Processing error for {task.file_path}: {e}")
             await self._handle_failure(task, e)
