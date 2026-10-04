@@ -4730,8 +4730,8 @@ def migrate_add_files_status_cancelled(sqlite_path: str) -> None:
     2. The partial unique ``idx_files_hash_vault_indexed`` is NOT recreated
        here: like ``migrate_widen_files_status``, it is recreated by the
        ``_widen_files_hash_vault_unique_index`` block in ``run_migrations``
-       that runs immediately after this migration (IntegrityError-tolerant
-       semantics preserved).
+       (registered a few migrations later, before which no other migration
+       touches ``files``; IntegrityError-tolerant semantics preserved).
 
     Idempotent — safe to run multiple times.
     """

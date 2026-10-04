@@ -1342,7 +1342,14 @@ class BackgroundProcessor:
                     cancel_file_id = exc.file_id
                 if cancel_file_id is not None:
                     await self.processor.rollback_cancelled_ingest(cancel_file_id)
-                await self._settle_ingest_job(job_id, worker_id, "cancel")
+                settled = await self._settle_ingest_job(job_id, worker_id, "cancel")
+                if not settled and cancel_file_id is not None:
+                    # Fenced off (janitor reclaimed the row mid-unwind): the
+                    # pending row is re-claimable, so re-arm the registry —
+                    # the reclaimed attempt hits gate A / the guarded
+                    # 'processing' flip and re-cancels instead of silently
+                    # resurrecting a 200-cancelled ingest (PRR-017).
+                    self.processor.request_cancel(cancel_file_id)
                 outcome_error = None
                 outcome_exc = None
                 return
@@ -3758,6 +3765,7 @@ class BackgroundProcessor:
             total_files = 0
             processed_files = 0
             failed_files = 0
+            cancelled_files = 0
             failed_details: list[str] = []
             commit_attempted = False
 
@@ -3767,6 +3775,31 @@ class BackgroundProcessor:
                     for file_id, file_path, vault_id_file in file_list:
                         total_files += 1
                         logger.info("Re-embedding file_id=%d in vault_id=%d", file_id, vault_id_file)
+                        # Snapshot the pre-reindex status: a cancel during a
+                        # staged rebuild must not destroy the document's
+                        # previously indexed live content (issue #783 review
+                        # F-001) — the file is skipped and its prior serving
+                        # state restored instead.
+                        def _read_prior_status():
+                            with self.processor.pool.connection() as _conn:
+                                return _conn.execute(
+                                    "SELECT status FROM files WHERE id = ?",
+                                    (file_id,),
+                                ).fetchone()
+
+                        prior_status_row = await asyncio.to_thread(
+                            _read_prior_status
+                        )
+                        prior_status = (
+                            prior_status_row["status"]
+                            if prior_status_row is not None
+                            else None
+                        )
+                        # A stale document-cancel registered before this
+                        # rebuild must not trip the gates for this file
+                        # (issue #783 review F-006): the rebuild owns the row
+                        # until it finishes.
+                        self.processor.clear_cancel(file_id)
                         reprocess_kwargs = (
                             {"vector_target": rebuild_handle}
                             if rebuild_handle is not None
@@ -3777,6 +3810,44 @@ class BackgroundProcessor:
                                 file_id, file_path, vault_id_file, **reprocess_kwargs
                             )
                             processed_files += 1
+                        except IngestCancelledError:
+                            # issue #783 review PRR-011/F-001: a user
+                            # cancellation during a staged rebuild skips the
+                            # file WITHOUT destroying its previously indexed
+                            # live content — the prior serving state is
+                            # restored so the file is neither stranded in
+                            # 'processing' nor silently unindexed.
+                            logger.info(
+                                "Re-embed skipped for file_id=%d in vault_id=%d: "
+                                "ingest cancelled by user; restoring prior "
+                                "status %r",
+                                file_id,
+                                vault_id_file,
+                                prior_status,
+                            )
+                            try:
+                                if prior_status in ("indexed", "partial", "error"):
+
+                                    def _restore_prior_status():
+                                        with self.processor.pool.connection() as _conn:
+                                            return _conn.execute(
+                                                "UPDATE files SET status = ? "
+                                                "WHERE id = ? "
+                                                "AND status = 'processing'",
+                                                (prior_status, file_id),
+                                            ).rowcount
+
+                                    await asyncio.to_thread(_restore_prior_status)
+                                self.processor.clear_cancel(file_id)
+                            except Exception:  # noqa: BLE001 — never mask the skip
+                                logger.warning(
+                                    "reindex cancel state restore failed for "
+                                    "file_id=%d",
+                                    file_id,
+                                    exc_info=True,
+                                )
+                            cancelled_files += 1
+                            continue
                         except (
                             DocumentProcessingError,
                             FileNotFoundError,

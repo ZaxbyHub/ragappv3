@@ -1,7 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
-import { FileText, Library, Plus, RefreshCw, Search } from "lucide-react";
+import {
+  FileText,
+  Library,
+  Loader2,
+  Plus,
+  RefreshCw,
+  Search,
+} from "lucide-react";
 
 import { useVaultStore } from "@/stores/useVaultStore";
 import { VaultSelector } from "@/components/vault/VaultSelector";
@@ -176,8 +183,11 @@ export default function KMSPage() {
     }
   }
 
+  const recompilePostInFlightRef = useRef(false);
   async function handleRecompile() {
     if (!activeVaultId || recompilePoll.active) return;
+    if (recompilePostInFlightRef.current) return; // double-click guard (PRR-020)
+    recompilePostInFlightRef.current = true;
     try {
       const handle = await recompileVaultKMS(activeVaultId);
       if (isTerminalJobStatus(handle.status)) {
@@ -196,6 +206,8 @@ export default function KMSPage() {
       recompilePoll.start();
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "Failed to queue recompile");
+    } finally {
+      recompilePostInFlightRef.current = false;
     }
   }
 
@@ -214,9 +226,18 @@ export default function KMSPage() {
             size="sm"
             onClick={handleRecompile}
             disabled={!activeVaultId || recompilePoll.active}
-            title="Recompile document entries for this vault"
+            aria-busy={recompilePoll.active}
+            title={
+              recompilePoll.active
+                ? "Recompile in progress…"
+                : "Recompile document entries for this vault"
+            }
           >
-            <RefreshCw className="w-4 h-4 mr-1" />
+            {recompilePoll.active ? (
+              <Loader2 className="w-4 h-4 mr-1 animate-spin" />
+            ) : (
+              <RefreshCw className="w-4 h-4 mr-1" />
+            )}
             Recompile
           </Button>
           <Button

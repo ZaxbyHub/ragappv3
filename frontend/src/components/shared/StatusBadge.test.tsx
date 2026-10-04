@@ -37,7 +37,8 @@ describe("StatusBadge", () => {
       expect(screen.getByText("Error")).toBeInTheDocument();
       // AlertCircle icon should be rendered for error status
       const badge = screen.getByText("Error").closest("span");
-      expect(badge?.querySelector("svg")).toBeInTheDocument();    });
+      expect(badge?.querySelector("svg")).toBeInTheDocument();
+    });
 
     it("test_partial_shows_partial_badge_not_unknown", () => {
       // LIVE-03: "partial" is a known terminal status — never "Unknown".

@@ -47,7 +47,7 @@
 
 - **`frontend/src/hooks/useJobStatus.ts` (new)** — the shared job-family
   contract: `JOB_FAMILIES` (ingest, wiki, draft-room, kms, reindex),
-  `TERMINAL_JOB_STATUSES`, per-family poll defaults, and a bounded,
+  per-family poll defaults, and a bounded,
   ref-tracked, unmount-safe polling hook parameterized by family. PR 4's
   Activity tray (#784) consumes the same module.
 - **`frontend/src/pages/KMSPage.tsx`** — Recompile keeps the
@@ -66,6 +66,33 @@
   function export needs a non-test importer or a dated allowlist entry
   (`compileDocumentKMS`, `searchKMS`), and a wired allowlist entry fails
   the test so the list cannot rot.
+
+## Feedback round (post-review hardening)
+
+An independent review round and in-repo review surface drove these
+additions, all covered by the companion suites:
+
+- Refused/raced cancels leave no cancel state behind: the route clears the
+  registry and queued-item intent on every 409, and errors around the
+  guarded flip answer 500 after compensating (previously the refusal leaked
+  a registry entry whose later reindex trip deleted live index content).
+- Cancel during a staged embedding rebuild skips the file and restores its
+  prior serving state — the live index is never touched through a rebuild
+  target, and one cancelled file no longer aborts the whole rebuild.
+- A fenced cancel settle (lease lost mid-unwind) re-arms the registry so a
+  reclaimed job re-cancels instead of resurrecting.
+- The rollback purges `failed_chunks` rows, tombstones failed vector
+  deletes onto the `vector_delete_pending` sweep, and gates its destructive
+  deletes on the row being or becoming `cancelled` (a survivor row keeps
+  its content).
+- Both ingest paths refuse to flip a cancelled row back to `processing`.
+- The cancel route writes the truthful terminal phase for queued cancels
+  (previously only the worker unwind did) and audits idempotent repeats.
+- Frontend: server-cancelled ingests land the store's terminal
+  `cancelled` (previously reclassified as `processing` and polled for up
+  to 4 hours); the Recompile button shows a spinner and `aria-busy` while
+  polling; a double-click can no longer orphan the first recompile job;
+  the cancelled chip is visually distinct from pending.
 
 ## Why
 

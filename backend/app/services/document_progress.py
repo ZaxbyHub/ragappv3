@@ -1,7 +1,8 @@
 """Phase-aware processing-progress helpers for the `files` table.
 
-Status (`files.status`) stays in the canonical 4-value enum
-('pending','processing','indexed','error'). All async lifecycle detail
+Status (`files.status`) stays in the canonical 6-value enum
+('pending','processing','indexed','partial','error','cancelled'). All
+async lifecycle detail
 (queued / parsing / chunking / embedding / writing-index / wiki) lives in
 the new `phase` column and friends. Frontend polls
 `GET /documents/{file_id}/status` and uses these fields to render

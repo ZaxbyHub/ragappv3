@@ -94,6 +94,43 @@ describe("useJobStatus (issue-trace 783)", () => {
     expect(result.current.active).toBe(false);
   });
 
+  it("treats a 'cancelled' job as terminal (issue #783 PRR-026)", async () => {
+    const fetchJob = vi.fn().mockResolvedValue({ status: "cancelled" } as JobStatus);
+    const onTerminal = vi.fn();
+
+    const hook = renderHook(() =>
+      useJobStatus("kms", { fetchJob, onTerminal })
+    );
+    act(() => hook.result.current.start());
+    await advance(JOB_FAMILY_POLL_DEFAULTS.kms.intervalMs * 2);
+
+    expect(onTerminal).toHaveBeenCalledTimes(1);
+    expect(onTerminal).toHaveBeenCalledWith({ status: "cancelled" });
+    expect(hook.result.current.active).toBe(false);
+  });
+
+  it("consumer-invoked stop() ends the loop and blocks restart of the tick", async () => {
+    const fetchJob = vi.fn().mockResolvedValue({ status: "running" } as JobStatus);
+    const onTerminal = vi.fn();
+
+    const hook = renderHook(() =>
+      useJobStatus("kms", { fetchJob, onTerminal })
+    );
+    act(() => hook.result.current.start());
+    await advance(JOB_FAMILY_POLL_DEFAULTS.kms.intervalMs);
+    act(() => hook.result.current.stop());
+
+    const callsAtStop = fetchJob.mock.calls.length;
+    await advance(JOB_FAMILY_POLL_DEFAULTS.kms.intervalMs * 3);
+    expect(fetchJob.mock.calls.length).toBe(callsAtStop);
+    expect(onTerminal).not.toHaveBeenCalled();
+    // restart after stop is allowed and works
+    act(() => hook.result.current.start());
+    await advance(JOB_FAMILY_POLL_DEFAULTS.kms.intervalMs);
+    expect(fetchJob.mock.calls.length).toBeGreaterThan(callsAtStop);
+    hook.unmount();
+  });
+
   it("keeps polling past a transiently absent or throwing fetch", async () => {
     const fetchJob = vi
       .fn()

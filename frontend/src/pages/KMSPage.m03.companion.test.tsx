@@ -90,4 +90,56 @@ describe("KMSPage m03 companions (issue-trace 783)", () => {
       "Recompile queued — document entries will refresh shortly"
     );
   });
+
+  it("an already-terminal handle skips polling and toasts immediately (PRR-026)", async () => {
+    vi.useFakeTimers();
+    vi.mocked(recompileVaultKMS).mockResolvedValue({
+      job_id: 11,
+      status: "completed",
+    });
+    vi.mocked(listKMSJobs).mockResolvedValue({ jobs: [] });
+
+    render(<KMSPage />);
+    await act(async () => {
+      vi.advanceTimersByTime(0);
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Recompile" }));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+
+    // The handle was already terminal: no poll, immediate toast + refetch.
+    expect(listKMSJobs).not.toHaveBeenCalled();
+    expect(toast.success).toHaveBeenCalledWith(
+      "Recompile complete — entries refreshed"
+    );
+    expect(listKMSEntries.mock.calls.length).toBeGreaterThan(1);
+  });
+
+  it("a 'cancelled' terminal job toasts info, not an error (PRR-026)", async () => {
+    vi.useFakeTimers();
+    vi.mocked(recompileVaultKMS).mockResolvedValue({
+      job_id: 12,
+      status: "pending",
+    });
+    vi.mocked(listKMSJobs).mockResolvedValue({
+      jobs: [{ ...COMPLETED_JOB, id: 12, status: "cancelled" }],
+    });
+
+    render(<KMSPage />);
+    await act(async () => {
+      vi.advanceTimersByTime(0);
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Recompile" }));
+    for (let i = 0; i < 10; i++) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000);
+      });
+    }
+
+    expect(toast.info).toHaveBeenCalledWith("Recompile cancelled");
+    expect(listKMSEntries.mock.calls.length).toBeGreaterThan(1);
+  });
 });

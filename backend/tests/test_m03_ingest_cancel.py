@@ -229,6 +229,11 @@ def route_env(tmp_path):
     app.dependency_overrides[get_db_pool] = lambda: pool
     app.dependency_overrides[get_background_processor] = lambda: mock_bp
     app.dependency_overrides[get_secret_manager] = lambda: mock_sm
+    # The cancel route reads the audit key from app.state (lifespan-installed,
+    # issue #783 review PRR-029): install the mock so the HMAC audit path
+    # actually exercises in tests instead of silently no-oping.
+    _prior_secret_manager = getattr(app.state, "secret_manager", None)
+    app.state.secret_manager = mock_sm
 
     conn = pool.get_connection()
     try:
@@ -258,6 +263,10 @@ def route_env(tmp_path):
     app.dependency_overrides.pop(get_db_pool, None)
     app.dependency_overrides.pop(get_background_processor, None)
     app.dependency_overrides.pop(get_secret_manager, None)
+    if _prior_secret_manager is None:
+        app.state.__dict__.pop("secret_manager", None)
+    else:
+        app.state.secret_manager = _prior_secret_manager
 
     with _pool_cache_lock:
         for cached_pool in list(_pool_cache.values()):

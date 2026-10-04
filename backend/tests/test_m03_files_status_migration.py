@@ -198,3 +198,123 @@ class TestFilesStatusCancelledMigration(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class TestFilesStatusCancelledCrashRecovery(unittest.TestCase):
+    """PRR-024: the files_old crash-recovery probe (three states), verified
+    against the real migrate_add_files_status_cancelled."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="m03_recovery_")
+        self.db = os.path.join(self.tmp, "app.db")
+        init_db(self.db)
+        run_migrations(self.db)
+
+    def tearDown(self):
+        try:
+            os.remove(self.db)
+        except OSError:
+            pass
+        try:
+            os.rmdir(self.tmp)
+        except OSError:
+            pass
+
+    def _drop_triggers_and_regress(self):
+        conn = sqlite3.connect(self.db)
+        conn.isolation_level = None
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            for trig in (
+                "files_search_fts_insert", "files_search_fts_delete",
+                "files_search_fts_update", "files_content_fts_insert",
+                "files_content_fts_delete", "files_content_fts_update",
+            ):
+                conn.execute(f"DROP TRIGGER IF EXISTS {trig}")
+            conn.execute("DROP TABLE files")
+            conn.execute(_old_shape_files_ddl())
+            conn.execute(
+                "INSERT INTO files (vault_id, file_path, file_name, file_size, "
+                "status) VALUES (1, 'a', 'a', 1, 'processing')"
+            )
+            conn.execute("COMMIT")
+        finally:
+            conn.close()
+
+    def _rename_files_to_old(self):
+        conn = sqlite3.connect(self.db)
+        conn.isolation_level = None
+        try:
+            conn.execute("PRAGMA legacy_alter_table = ON")
+            conn.execute("ALTER TABLE files RENAME TO files_old")
+            conn.execute("PRAGMA legacy_alter_table = OFF")
+        finally:
+            conn.close()
+
+    def test_recovery_state_a_files_old_only(self):
+        # Crash after the rename, before the new table: files_old only.
+        self._drop_triggers_and_regress()
+        self._rename_files_to_old()
+        migrate_add_files_status_cancelled(self.db)
+        conn = sqlite3.connect(self.db)
+        try:
+            n = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+            old = conn.execute(
+                "SELECT name FROM sqlite_master WHERE name='files_old'"
+            ).fetchone()
+            self.assertEqual(n, 1)
+            self.assertIsNone(old)
+        finally:
+            conn.close()
+
+    def test_recovery_state_b_dest_complete_backup_dropped(self):
+        # Both present, destination complete: backup discarded, noop.
+        self._drop_triggers_and_regress()
+        migrate_add_files_status_cancelled(self.db)  # produces new-shape files
+        self._rename_files_to_old()  # leaves files_old beside a new files
+        migrate_add_files_status_cancelled(self.db)
+        conn = sqlite3.connect(self.db)
+        try:
+            self.assertIsNone(conn.execute(
+                "SELECT name FROM sqlite_master WHERE name='files_old'"
+            ).fetchone())
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM files").fetchone()[0], 1
+            )
+        finally:
+            conn.close()
+
+    def test_recovery_state_c_dest_incomplete_restored(self):
+        # Both present, destination missing the backup's ids: dest dropped,
+        # backup restored, rebuild re-run.
+        self._drop_triggers_and_regress()
+        self._rename_files_to_old()
+        # A partial/empty new-shape files table beside the full backup.
+        conn = sqlite3.connect(self.db)
+        conn.isolation_level = None
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            for trig in (
+                "files_search_fts_insert", "files_search_fts_delete",
+                "files_search_fts_update", "files_content_fts_insert",
+                "files_content_fts_delete", "files_content_fts_update",
+            ):
+                conn.execute(f"DROP TRIGGER IF EXISTS {trig}")
+            row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' "
+                "AND name='files_old'"
+            ).fetchone()
+            conn.execute(row[0].replace("files_old", "files", 1))
+            conn.execute("COMMIT")
+        finally:
+            conn.close()
+        migrate_add_files_status_cancelled(self.db)
+        conn = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM files").fetchone()[0], 1
+            )
+            self.assertIsNone(conn.execute(
+                "SELECT name FROM sqlite_master WHERE name='files_old'"
+            ).fetchone())
+        finally:
+            conn.close()

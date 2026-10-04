@@ -160,6 +160,7 @@ const PHASE_LABELS: Record<string, string> = {
   writing_index: "Writing index",
   indexed: "Indexed",
   error: "Error",
+  cancelled: "Cancelled",
 };
 
 export function phaseLabelFor(phase?: string | null): string | null {
@@ -248,14 +249,19 @@ function snapshotToPatch(
   }
 
   // Status mapping: keep coarse for downstream eq-checks. The backend's
-  // canonical 4-value `status` enum maps directly here. Phase string
-  // independently drives the detailed UI.
+  // canonical files.status enum maps directly here (issue #783: a
+  // server-cancelled ingest must land the store's terminal 'cancelled',
+  // not keep polling as 'processing'). Phase string independently drives
+  // the detailed UI.
   switch (snapshot.status) {
     case "indexed":
       patch.status = "indexed";
       break;
     case "error":
       patch.status = "error";
+      break;
+    case "cancelled":
+      patch.status = "cancelled";
       break;
     case "processing":
     case "pending":

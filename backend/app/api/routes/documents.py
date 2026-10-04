@@ -290,7 +290,12 @@ async def cancel_document_ingest(
     evaluate: Callable = Depends(get_evaluate_policy),
     _csrf_token: str = Depends(csrf_protect),
     background_processor: BackgroundProcessor = Depends(get_background_processor),
+    db_pool: SQLiteConnectionPool = Depends(get_db_pool),
 ) -> dict:
+    from app.services.document_progress import (
+        PHASE_CANCELLED,
+        clear_progress,
+    )
     """Cancel a pending/processing document ingest (issue #783).
 
     Auth mirrors the delete route's per-file gate (vault admin on the file's
@@ -333,27 +338,51 @@ async def cancel_document_ingest(
             detail="Ingest already finished; nothing to cancel",
         )
     if current_status == "cancelled":
+        await _safe_record_action(
+            file_id,
+            "cancel",
+            "already-cancelled",
+            user,
+            getattr(request.app.state, "secret_manager", None),
+            conn,
+        )
+        await asyncio.to_thread(conn.commit)
         return {"file_id": file_id, "status": "cancelled"}
 
     # pending / processing: registry + queued-item cancellation first
     # (synchronous by contract — see request_ingest_cancel), then the
     # guarded status flip.
     background_processor.request_ingest_cancel(file_id)
-    update_cursor = await asyncio.to_thread(
-        conn.execute,
-        "UPDATE files SET status = 'cancelled', processed_at = CURRENT_TIMESTAMP "
-        "WHERE id = ? AND status IN ('pending', 'processing')",
-        (file_id,),
-    )
-    if update_cursor.rowcount == 0:
-        # Raced: the worker settled between the read and the flip. Decide
-        # idempotently from the row's actual terminal state.
-        recheck = await asyncio.to_thread(
-            conn.execute, "SELECT status FROM files WHERE id = ?", (file_id,)
+    landed = False
+    reread_status = None
+    try:
+        update_cursor = await asyncio.to_thread(
+            conn.execute,
+            "UPDATE files SET status = 'cancelled', processed_at = CURRENT_TIMESTAMP "
+            "WHERE id = ? AND status IN ('pending', 'processing')",
+            (file_id,),
         )
-        reread = await asyncio.to_thread(recheck.fetchone)
-        if reread is not None and reread["status"] == "cancelled":
+        landed = update_cursor.rowcount > 0
+        if not landed:
+            # Raced: the worker settled between the read and the flip. Decide
+            # idempotently from the row's actual terminal state.
+            recheck = await asyncio.to_thread(
+                conn.execute, "SELECT status FROM files WHERE id = ?", (file_id,)
+            )
+            reread_row = await asyncio.to_thread(recheck.fetchone)
+            reread_status = None if reread_row is None else reread_row["status"]
+    except sqlite3.Error:
+        # The registry/queued-item mutation already happened; a refused or
+        # failed flip must not leave it behind (issue #783 review PRR-016).
+        background_processor.clear_ingest_cancel(file_id)
+        raise
+    if not landed:
+        if reread_status == "cancelled":
             return {"file_id": file_id, "status": "cancelled"}
+        # Refused: undo the registry mark and the queued-item cancellation
+        # intent so a refused request leaves no cancel state behind
+        # (issue #783 review PRR-001-residue / Copilot EXT-001).
+        background_processor.clear_ingest_cancel(file_id)
         await _safe_record_action(
             file_id,
             "cancel",
@@ -367,6 +396,15 @@ async def cancel_document_ingest(
             detail="Ingest already finished; nothing to cancel",
         )
     await asyncio.to_thread(conn.commit)
+    # Land the truthful terminal phase with the counters cleared in the same
+    # style as the worker unwind — a queued cancel never reaches the worker,
+    # so the route owns this row's phase (issue #783 review PRR-005).
+    await clear_progress(
+        db_pool,
+        file_id,
+        phase=PHASE_CANCELLED,
+        phase_message="Cancelled by user",
+    )
     await _safe_record_action(
         file_id,
         "cancel",
@@ -1223,9 +1261,10 @@ async def list_documents(
 class DocumentStatusResponse(BaseModel):
     """Phase-aware status response used by the upload UI to poll indexing.
 
-    `status` stays in the canonical 4-value enum
-    ('pending','processing','indexed','error'); upload/queued/parsing/
-    chunking/embedding/writing-index detail lives in `phase` and friends.
+    `status` stays in the canonical files.status enum
+    ('pending','processing','indexed','partial','error','cancelled');
+    upload/queued/parsing/chunking/embedding/writing-index detail lives in
+    `phase` and friends.
     `wiki_status` is derived from the latest `wiki_compile_jobs` row for
     this file, or 'pending' when `files.wiki_pending=1` and no job row
     has appeared yet, or null when no wiki job has been requested.

@@ -10,10 +10,10 @@
 // clients. RED on the pre-fix tree (listKMSJobs was the audit's finding);
 // GREEN once the poll wiring consumes it.
 //
-// A repo-wide census is deliberately NOT this guard: 35 exports across all
-// 18 api modules have no non-test importers at base (trace 08a census) —
-// re-wiring them is not this PR's scope and each module deserves its own
-// decision.
+// A repo-wide census is deliberately NOT this guard: roughly a third of the
+// api modules' function exports have no non-test importers at base (trace
+// 08a census) — re-wiring them is not this PR's scope and each module
+// deserves its own decision.
 
 import { describe, it, expect } from "vitest";
 import { readFileSync, readdirSync, statSync } from "node:fs";

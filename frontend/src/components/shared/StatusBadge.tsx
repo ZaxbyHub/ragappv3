@@ -1,5 +1,5 @@
 import { Badge } from "@/components/ui/badge";
-import { CheckCircle, Loader2, Clock, AlertCircle, AlertTriangle } from "lucide-react";
+import { CheckCircle, Loader2, Clock, AlertCircle, AlertTriangle, Ban } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
 export const FILE_STATUS_LABELS: Record<string, string> = {
@@ -19,7 +19,7 @@ export const FILE_STATUS_COLORS: Record<string, { variant: "default" | "secondar
   indexed: { variant: "default", className: "bg-success", icon: CheckCircle },
   partial: { variant: "default", className: "bg-warning", icon: AlertTriangle },
   error: { variant: "destructive", className: "", icon: AlertCircle },
-  cancelled: { variant: "outline", className: "", icon: Clock },
+  cancelled: { variant: "outline", className: "", icon: Ban },
 };
 
 interface StatusBadgeProps {
