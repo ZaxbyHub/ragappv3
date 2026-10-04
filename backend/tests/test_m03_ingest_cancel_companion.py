@@ -845,25 +845,31 @@ async def test_cancel_during_staged_rebuild_keeps_live_vectors(route_env):  # no
             vector_target=rebuild_handle,
         )
 
-    def cancel_midflight():
-        processor.request_cancel(file_id)
-
-    # Cancel lands after the write phase begins: poll for the staged write.
+    # Cancel lands INSIDE the staged write: the wrapper blocks after the
+    # staged rows are in place and releases only once the cancel request has
+    # been lodged, so the next gate deterministically observes it. A
+    # free-running task can otherwise finish the whole rebuild inside the
+    # scheduler gap before the test thread wakes (the CI-load race that
+    # produced one spurious DID-NOT-RAISE round); a cancel arriving after
+    # completion is a no-op by contract, not an ICE.
     import threading as _th
 
     written = _th.Event()
+    release = _th.Event()
     _base_add = store.add_chunks
 
-    async def add_then_signal(records, generation_prefix=None, target=None):
+    async def add_then_block(records, generation_prefix=None, target=None):
         result = await _base_add(records, generation_prefix=generation_prefix)
         if target is not None:
             written.set()
+            await asyncio.to_thread(release.wait, 30)
         return result
 
-    store.add_chunks = add_then_signal
+    store.add_chunks = add_then_block
     task = asyncio.create_task(reembed())
     await asyncio.to_thread(written.wait, 30)
     processor.request_cancel(file_id)
+    release.set()
     with pytest.raises(IngestCancelledError):
         await asyncio.wait_for(task, timeout=30)
 
