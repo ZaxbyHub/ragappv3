@@ -82,14 +82,17 @@ def _legacy_db(tmp_path: Path) -> tuple[str, sqlite3.Connection]:
 
 
 def _journal_rows(conn: sqlite3.Connection) -> list[tuple[str, str]]:
-    return [
-        (row[0], row[1])
-        for row in conn.execute(
+    try:
+        cursor = conn.execute(
             "SELECT phase, outcome FROM migration_journal"
             " WHERE migration_name = ? ORDER BY id",
             (_JOURNAL_NAME,),
-        ).fetchall()
-    ]
+        )
+    except sqlite3.OperationalError:
+        # Journal table never created: nothing was ever written (issue #699
+        # makes no-op runs journal-silent).
+        return []
+    return [(row[0], row[1]) for row in cursor.fetchall()]
 
 
 def _has_embedding_model(conn: sqlite3.Connection) -> bool:
@@ -117,14 +120,16 @@ def test_backfill_stamps_legacy_rows_and_journals(tmp_path) -> None:
         assert phases[0] == ("start", "ok")
         assert phases[-1] == ("succeeded", "ok")
 
-        # Idempotent rerun: no error, stamping unchanged, journal grows.
+        # Idempotent rerun: no error, stamping unchanged, and — since issue
+        # #699 — a no-op rerun is journal-SILENT (the row count does not grow).
+        rows_before = _journal_rows(conn)
         migrate_add_document_near_dups(db_path)
         assert stamped == dict(
             conn.execute(
                 "SELECT file_id, embedding_model FROM document_near_dups"
             ).fetchall()
         )
-        assert _journal_rows(conn)[-1] == ("succeeded", "ok")
+        assert _journal_rows(conn) == rows_before
     finally:
         conn.close()
 
@@ -175,8 +180,8 @@ def test_fresh_db_migration_is_a_journaled_noop(tmp_path) -> None:
     try:
         migrate_add_document_near_dups(db_path)
         assert _has_embedding_model(conn)
-        phases = _journal_rows(conn)
-        assert phases[0] == ("start", "ok")
-        assert phases[-1] == ("succeeded", "ok")
+        # Issue #699: a no-op run (column present, nothing to stamp) is
+        # journal-silent — routine per-boot rows no longer bury real signal.
+        assert _journal_rows(conn) == []
     finally:
         conn.close()

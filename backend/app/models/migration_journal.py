@@ -115,8 +115,12 @@ def invalidate_derived_data(
     """Explicit schema/claim-source invalidation interface (slots D1/D2).
 
     Marks derived state (FTS rows, claim-source projections, cached schema
-    views) as invalidated after a repair rebuilt authoritative rows, so
-    consumers that derive from the repaired tables know to rebuild.
+    views) as invalidated after a repair rebuilt authoritative rows. The row
+    is a durable, operator-visible audit marker only: no automated consumer
+    currently rebuilds derived state from this signal (issue #699 removed the
+    earlier docstring claim to the contrary), so a reader must treat it as
+    "derived state was rebuilt/invalidated by this migration", not as a
+    trigger.
     """
     record_migration_outcome(
         conn,
@@ -172,3 +176,39 @@ def latest_outcomes(sqlite_path: str, *, limit: int = 20) -> list[dict]:
         ]
     finally:
         conn.close()
+
+
+def latest_outcomes_with_signal(
+    sqlite_path: str, *, limit: int = 3
+) -> tuple[list[dict], Optional[dict]]:
+    """Startup-summary composition (issue #699): the unchanged newest-first
+    ``latest_outcomes`` window, plus — only when that window contains no
+    failed/recovered row — the newest failure-or-recovery row from the whole
+    journal (else ``None``). This keeps a genuine failure visible in the
+    startup summary even on databases that still carry routine per-boot noise
+    rows written before that noise was eliminated, without changing
+    ``latest_outcomes``' ordering contract.
+    """
+    recent = latest_outcomes(sqlite_path, limit=limit)
+    if any(r.get("phase") in ("failed", "recovered") for r in recent):
+        return recent, None
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        _ensure_table(conn)
+        row = conn.execute(
+            "SELECT id, migration_name, phase, outcome, detail, created_at"
+            " FROM migration_journal WHERE phase IN ('failed', 'recovered')"
+            " ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return recent, None
+    return recent, {
+        "id": row[0],
+        "migration_name": row[1],
+        "phase": row[2],
+        "outcome": row[3],
+        "detail": row[4],
+        "created_at": row[5],
+    }
