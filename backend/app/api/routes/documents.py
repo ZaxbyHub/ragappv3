@@ -292,10 +292,6 @@ async def cancel_document_ingest(
     background_processor: BackgroundProcessor = Depends(get_background_processor),
     db_pool: SQLiteConnectionPool = Depends(get_db_pool),
 ) -> dict:
-    from app.services.document_progress import (
-        PHASE_CANCELLED,
-        clear_progress,
-    )
     """Cancel a pending/processing document ingest (issue #783).
 
     Auth mirrors the delete route's per-file gate (vault admin on the file's
@@ -308,6 +304,11 @@ async def cancel_document_ingest(
     idempotently (200 when now cancelled — concurrent double-cancel) or
     refuses (409). The worker unwinds with no orphan atoms or vectors.
     """
+    from app.services.document_progress import (
+        PHASE_CANCELLED,
+        clear_progress,
+    )
+
     cursor = await asyncio.to_thread(
         conn.execute,
         "SELECT status, vault_id FROM files WHERE id = ?",

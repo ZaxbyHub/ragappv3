@@ -3111,6 +3111,20 @@ class BackgroundProcessor:
         self.processor.request_cancel(file_id)
         self.cancel_pending_jobs(file_id=file_id)
 
+    def clear_ingest_cancel(self, file_id: int) -> None:
+        """Inverse of :meth:`request_ingest_cancel` for refused/failed route
+        flips (issue #783 review re-gate Critical): discards the registry
+        mark so a refused request leaves no cancel state behind.
+
+        Queued-intent restore is intentionally NOT attempted here: on the
+        refused path the files row has already settled (indexed/partial/
+        error), which means its queued item was claimed and completed — no
+        pending rows remain to restore. The duplicate-queued-item edge is
+        covered by the #516 worker-skip contract plus the fresh-enqueue
+        clear in :meth:`enqueue`.
+        """
+        self.processor.clear_cancel(file_id)
+
     async def _handle_cancellation(
         self, task: TaskItem, exc: Optional[IngestCancelledError] = None
     ) -> None:

@@ -28,7 +28,23 @@ from app.services.background_tasks import BackgroundProcessor
 def env(request):
     """The frozen module's route_env fixture, resolvable by name so the
     import stays the discovered fixture and no parameter shadows it."""
-    return request.getfixturevalue("route_env")
+    from unittest.mock import MagicMock as _MG
+
+    route_env = request.getfixturevalue("route_env")
+    # PRR-029: the cancel route reads the audit key from app.state
+    # (lifespan-installed). Install a mock here — in the companion, NOT in
+    # the frozen module — so the HMAC audit path exercises in tests.
+    from app.main import app
+
+    audit_sm = _MG()
+    audit_sm.get_hmac_key.return_value = (b"companion-audit-key-32bytes!!", "v1")
+    prior = getattr(app.state, "secret_manager", None)
+    app.state.secret_manager = audit_sm
+    yield route_env
+    if prior is None:
+        app.state.__dict__.pop("secret_manager", None)
+    else:
+        app.state.secret_manager = prior
 
 
 class _FakeVectorStore:
