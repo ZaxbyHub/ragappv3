@@ -3656,8 +3656,8 @@ def migrate_add_curator_claim_support(sqlite_path: str) -> None:
         # fail loudly so an operator notices.
         for child in ("wiki_claim_sources", "wiki_relations"):
             child_present = conn.execute(
-                "SELECT name FROM sqlite_master"
-                f" WHERE type='table' AND name='{child}'"
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                (child,),
             ).fetchone()
             if not child_present:
                 continue
@@ -4803,8 +4803,8 @@ def migrate_widen_files_status(sqlite_path: str) -> None:
             "document_tags",
         ):
             child_present = conn.execute(
-                "SELECT name FROM sqlite_master"
-                f" WHERE type='table' AND name='{child}'"
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                (child,),
             ).fetchone()
             if not child_present:
                 continue
@@ -7157,6 +7157,15 @@ def migrate_add_user_onboarding_state(sqlite_path: str) -> None:
     conn.isolation_level = None
     _journal = "migrate_add_user_onboarding_state"
     try:
+        # Journal-silent no-op probe (issue #699 AC2): purely additive DDL —
+        # when the table already exists there is nothing to attempt, so a
+        # clean boot writes no journal rows.
+        tbl = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+            " AND name='user_onboarding_state'"
+        ).fetchone()
+        if tbl:
+            return
         record_migration_outcome(
             conn, migration_name=_journal, phase="start", outcome="ok"
         )
