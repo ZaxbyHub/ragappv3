@@ -2442,6 +2442,7 @@ async def get_capabilities(
             "max_total_parsed_chars": settings.draft_max_total_parsed_chars,
             "parse_timeout_seconds": settings.draft_parse_timeout_seconds,
             "upload_rate_limit": settings.draft_upload_rate_limit,
+            "poll_interval_seconds": settings.draft_poll_interval_seconds,
             "compile_rate_limit": settings.draft_compile_rate_limit,
             "max_sections": settings.draft_max_sections,
             "job_timeout_seconds": settings.draft_job_timeout_seconds,

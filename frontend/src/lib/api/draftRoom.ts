@@ -403,13 +403,52 @@ export interface FindingDispositionResponse {
   revision: DraftRevisionSummary | null;
 }
 
+/**
+ * Capability limits emitted by GET /draft-room/capabilities.
+ *
+ * The fields stay optional because the capability endpoint is additive across
+ * deployed server versions and several read-only views intentionally tolerate
+ * an older response while the query is being hydrated. Every field listed here
+ * is an actual server-emitted key; consumers must not invent client-only names.
+ */
+export interface DraftRoomCapabilityLimits {
+  max_inputs?: number;
+  max_total_input_mb?: number;
+  max_total_parsed_chars?: number;
+  parse_timeout_seconds?: number;
+  upload_rate_limit?: string;
+  poll_interval_seconds?: number;
+  compile_rate_limit?: string;
+  max_sections?: number;
+  job_timeout_seconds?: number;
+  job_max_model_calls?: number;
+  max_correction_loops?: number;
+  max_page_size?: number;
+}
+
+export const DEFAULT_DRAFT_ROOM_POLL_INTERVAL_MS = 2000;
+
+/**
+ * Convert the server's optional polling interval from seconds to a safe
+ * browser timer interval. Invalid values and millisecond overflow use the
+ * established two-second fallback; finite positive values are never faster
+ * than the 500ms browser minimum.
+ */
+export function getDraftRoomPollIntervalMs(seconds: unknown): number {
+  if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds <= 0) {
+    return DEFAULT_DRAFT_ROOM_POLL_INTERVAL_MS;
+  }
+  const milliseconds = seconds * 1000;
+  return Number.isFinite(milliseconds) ? Math.max(500, milliseconds) : DEFAULT_DRAFT_ROOM_POLL_INTERVAL_MS;
+}
+
 export interface DraftRoomCapabilities {
   enabled: boolean;
   modes: DraftMode[];
   tiers: DraftTier[];
   piece_types: string[];
   transformation_strengths: string[];
-  limits: Record<string, unknown>;
+  limits: DraftRoomCapabilityLimits;
   export_formats: string[];
   logical_model_modes: string[];
   default_logical_mode: string;

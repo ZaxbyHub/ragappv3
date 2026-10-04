@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, field_validator, model_validator
+from pydantic_settings import DotEnvSettingsSource, EnvSettingsSource, SettingsError
 
 from app.api.deps import get_csrf_manager, get_current_active_user, get_db, require_role
 from app.config import (
@@ -1273,6 +1274,17 @@ _REDACT_TO_FALSE_FIELDS: frozenset[str] = frozenset(
     {"chat_api_key_set", "instant_api_key_set"}
 )
 
+# These booleans are redacted for the same deployment-privacy reason as their
+# related infrastructure fields, but must remain separate from the type-aware
+# blanking set above. They are forced to False for non-admin responses.
+_NON_ADMIN_HIDDEN_FEATURE_FLAG_FIELDS: frozenset[str] = frozenset(
+    {
+        "wiki_llm_curator_enabled",
+        "multimodal_enrichment_enabled",
+        "multimodal_query_vision_enabled",
+    }
+)
+
 
 def _redact_infra_for_non_admin(settings_dict: dict, role: str) -> dict:
     """Blank infra-URL/model fields for callers below the admin role.
@@ -1307,22 +1319,31 @@ def _redact_infra_for_non_admin(settings_dict: dict, role: str) -> dict:
                 settings_dict[field] = False
             else:
                 settings_dict[field] = ""
-    # Keep the curator enable flag consistent with the redacted URL/model so
-    # the frontend's required-when-enabled validator does not fire for non-admins.
-    settings_dict["wiki_llm_curator_enabled"] = False
-    # Same for multimodal: redacted URL/model; don't disclose an enabled multimodal
-    # backend to non-admins.
-    settings_dict["multimodal_enrichment_enabled"] = False
-    # The query-time vision flag likewise discloses that a multimodal query-vision
-    # backend is wired; redact it symmetrically for non-admins (F-08).
-    settings_dict["multimodal_query_vision_enabled"] = False
+    # Keep redacted feature flags consistent with their hidden infrastructure
+    # and remove their provenance just as for the infrastructure fields.
+    for field in _NON_ADMIN_HIDDEN_FEATURE_FLAG_FIELDS:
+        settings_dict[field] = False
     # Drop the provenance hints for redacted fields so a non-admin cannot learn
-    # from effective_sources whether an infra URL was set (kv) vs default.
+    # from effective_sources whether an infra URL or feature gate was set (kv).
     effective_sources = settings_dict.get("effective_sources")
     if isinstance(effective_sources, dict):
-        for field in INFRA_REDACTED_FIELDS:
+        for field in (*INFRA_REDACTED_FIELDS, *_NON_ADMIN_HIDDEN_FEATURE_FLAG_FIELDS):
             effective_sources.pop(field, None)
     return settings_dict
+
+
+def _read_effective_source_values(source_kind: str, source_factory) -> dict:
+    """Read a Pydantic settings source without letting inspection break GET."""
+    try:
+        source = source_factory()
+    except (SettingsError, OSError, UnicodeDecodeError):
+        logger.warning("Unable to inspect %s settings source", source_kind)
+        return {}
+    try:
+        return source()
+    except (SettingsError, OSError, UnicodeDecodeError):
+        logger.warning("Unable to inspect %s settings source", source_kind)
+        return {}
 
 
 def _compute_effective_sources(conn: Optional[sqlite3.Connection]) -> dict[str, str]:
@@ -1333,12 +1354,15 @@ def _compute_effective_sources(conn: Optional[sqlite3.Connection]) -> dict[str, 
     ``setattr(settings, key, value)`` overwrites env-derived values, so
     persistence wins after the first save. Values:
       - "kv":      a row exists in ``settings_kv`` for this field.
-      - "env":     no kv row, and an env variable with the same name
-                   (uppercased) is set.
+      - "env":     no kv row, and Pydantic resolved the field from its
+                   environment or configured dotenv source.
       - "default": neither.
 
-    The Models tab uses this to label inputs honestly without disabling
-    them on env presence.
+    Each Pydantic source is inspected best-effort: a SettingsError or OSError
+    produces an empty map for only that source, preserving the other source and
+    any kv badges. Fields unavailable from a non-kv source fall back to the
+    existing ``default`` badge. The Models tab uses this to label inputs honestly
+    without disabling them on env presence.
     """
     kv_keys: set[str] = set()
     if conn is not None:
@@ -1347,21 +1371,38 @@ def _compute_effective_sources(conn: Optional[sqlite3.Connection]) -> dict[str, 
             kv_keys = {row[0] for row in cursor.fetchall()}
         except sqlite3.Error:
             kv_keys = set()
+    settings_cls = type(settings)
+    env_values = _read_effective_source_values(
+        "environment", lambda: EnvSettingsSource(settings_cls)
+    )
+    dotenv_values = _read_effective_source_values(
+        "dotenv",
+        lambda: DotEnvSettingsSource(
+            settings_cls,
+            env_file=getattr(
+                settings, "_configured_env_file", settings_cls.model_config.get("env_file")
+            ),
+        ),
+    )
+
+    def source_badge(field: str) -> str:
+        # EnvSettingsSource has higher precedence than DotEnvSettingsSource.
+        # Keep the existing UI convention that an explicit empty source value
+        # receives the default badge, even though selected settings use empty
+        # strings as meaningful runtime values.
+        if field in env_values:
+            return "env" if env_values[field] != "" else "default"
+        if field in dotenv_values:
+            return "env" if dotenv_values[field] != "" else "default"
+        return "default"
+
     out: dict[str, str] = {}
-    import os as _os
 
     for field in ALLOWED_FIELDS:
         if field in kv_keys:
             out[field] = "kv"
         else:
-            # Treat ``X=""`` as "not set". Pydantic typically falls back
-            # to its default for empty strings, so labelling the source
-            # as "env" would mislead the Models tab badges.
-            env_val = _os.environ.get(field.upper(), "")
-            if env_val != "":
-                out[field] = "env"
-            else:
-                out[field] = "default"
+            out[field] = source_badge(field)
     return out
 
 
