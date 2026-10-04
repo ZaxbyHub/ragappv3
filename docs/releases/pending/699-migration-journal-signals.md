@@ -7,7 +7,8 @@
 - **`backend/app/models/database.py`** — the migration journal now tells the
   truth about what migrations actually did:
   - Every journaled migration opens its `BEGIN IMMEDIATE` INSIDE a try whose
-    except journals the terminal `failed` row (nine sites), so a lock error at
+    except journals the terminal `failed` row (ten sites after this review
+    round), so a lock error at
     the transaction open records exactly one terminal `failed` outcome instead
     of stranding a bare `start` row (`migrate_add_files_content_fts` still
     opens — and rolls back — its transaction on every call, even when the
@@ -86,6 +87,9 @@
   (`ensure_jobs_schema`) fails before any journaled migration runs — that
   first failure is unjournaled on both the old and new code (F-B scope
   note; concurrent-worker hazards are #700's).
+- If the FTS index is ever stale while complete-shaped, the self-heal does
+  not fire; the remedy is dropping `files_content_fts` and its three
+  triggers and restarting (documented in the migration docstring).
 
 ### Tests
 

@@ -4161,8 +4161,11 @@ def _files_content_fts_complete(conn: sqlite3.Connection) -> bool:
     """True when the ``files_content_fts`` virtual table and all three sync
     triggers exist — the issue #699 AC3 completeness gate. Because #512 made
     creation, triggers, and the backfill ONE transaction, completeness implies
-    the backfill finished; a failed attempt rolls the table away so the gate
-    can never skip a half-built index.
+    the backfill finished for any database migrated by that implementation or
+    later; a failed attempt rolls the table away so the gate cannot skip a
+    half-built index it created. (A pre-#512 database whose creation
+    committed but whose backfill never did is NOT detected — see the release
+    notes' known-scope section.)
     """
     names = {
         row[0]
@@ -4206,8 +4209,13 @@ def migrate_add_files_content_fts(sqlite_path: str) -> None:
     section.) The transaction is still OPENED on every call
     (and rolled back on the no-op path) so a lock error at ``BEGIN
     IMMEDIATE`` is journaled as a terminal ``failed`` row (issue #699 AC1).
-    If you need to avoid startup latency on first deploy, run the migration
-    manually before bringing up the service:
+    Force-reindex remedy (review round): if the index is ever stale while
+    complete-shaped (the one drift the gate cannot self-heal), drop the
+    virtual table and its three triggers — ``DROP TABLE files_content_fts``
+    plus ``DROP TRIGGER`` on ``files_content_fts_insert``/``_delete``/
+    ``_update`` — and restart; the gate then re-runs the whole
+    creation+backfill sequence. To avoid first-deploy startup latency, run
+    the migration manually before bringing up the service:
 
         python -c "from app.models.database import migrate_add_files_content_fts; \
 migrate_add_files_content_fts('/path/to/app.db')"
@@ -5171,7 +5179,10 @@ def migrate_add_wiki_relations_unique(sqlite_path: str) -> None:
     """Migration: add UNIQUE constraint on wiki_relations(subject_entity_id, predicate, object_entity_id).
 
     Deduplicates existing rows first (keeps highest id per triple), then
-    creates a unique index. Idempotent.
+    creates a unique index. Idempotent — already-migrated databases return
+    before any journaling (issue #699 AC2). The one-time dedup attempt
+    journals its deleted-row count on success and a terminal ``failed`` row
+    on failure (issue #699 review PRR-001).
     """
     conn = sqlite3.connect(sqlite_path)
     _journal = "migrate_add_wiki_relations_unique"
