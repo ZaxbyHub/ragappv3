@@ -9,7 +9,11 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, field_validator, model_validator
 
 from app.api.deps import get_csrf_manager, get_current_active_user, get_db, require_role
-from app.config import apply_legacy_settings_conversion, settings
+from app.config import (
+    EMBEDDING_MAX_TEXT_CHARS,
+    apply_legacy_settings_conversion,
+    settings,
+)
 from app.limiter import limiter
 from app.security import CSRFManager, csrf_protect, issue_csrf_token
 from app.services.model_provider_policy import ProviderPolicyError, _parse_strict_origin
@@ -253,8 +257,11 @@ class SettingsUpdate(BaseModel):
     @field_validator("chunk_size_chars")
     @classmethod
     def validate_chunk_size_chars(cls, v):
-        if v is not None and v <= 0:
-            raise ValueError("chunk_size_chars must be a positive integer")
+        if v is not None and (v <= 0 or v > EMBEDDING_MAX_TEXT_CHARS):
+            raise ValueError(
+                f"chunk_size_chars must be a positive integer no greater than "
+                f"{EMBEDDING_MAX_TEXT_CHARS} (the embedder's per-text cap)"
+            )
         return v
 
     @field_validator("chunk_overlap_chars")
@@ -874,7 +881,49 @@ def _validate_settings_update(update: SettingsUpdate) -> dict[str, object]:
         raise HTTPException(
             status_code=400, detail="No valid fields provided for update"
         )
-    return apply_legacy_settings_conversion(values)
+    converted = apply_legacy_settings_conversion(values)
+    # Issue #698: the legacy→new converter can DERIVE chunk_size_chars from a
+    # legacy chunk_size PUT (x4) AFTER the SettingsUpdate field validators
+    # have already run, so the derived value bypasses their bound. Re-check
+    # the POST-conversion value here — persistence is a bare setattr on the
+    # singleton, so an out-of-bounds value would otherwise poison live
+    # ingest until restart. Same predicate as the field validators.
+    derived_size = converted.get("chunk_size_chars")
+    if derived_size is not None and (
+        derived_size <= 0 or derived_size > EMBEDDING_MAX_TEXT_CHARS
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"chunk_size_chars must be between 1 and "
+                f"{EMBEDDING_MAX_TEXT_CHARS} (the embedder's per-text cap); "
+                f"the derived value {derived_size!r} is out of range "
+                f"(legacy chunk_size is converted x4)"
+            ),
+        )
+    # Issue #698 review: the modern pair has no cross-field rule anywhere,
+    # while the legacy seam enforces chunk_overlap < chunk_size — an overlap
+    # >= the resulting size passes every existing check and then fails EVERY
+    # ingest in the chunker. Check the EFFECTIVE pair (updated value when
+    # provided, current singleton value otherwise).
+    effective_size = converted.get("chunk_size_chars", settings.chunk_size_chars)
+    effective_overlap = converted.get(
+        "chunk_overlap_chars", settings.chunk_overlap_chars
+    )
+    if (
+        effective_size is not None
+        and effective_overlap is not None
+        and effective_overlap >= effective_size
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"chunk_overlap_chars ({effective_overlap}) must be strictly "
+                f"less than chunk_size_chars ({effective_size}) — the chunker "
+                f"rejects overlap >= chunk size at ingest time (issue #698)"
+            ),
+        )
+    return converted
 
 
 class SettingsResponse(BaseModel):
