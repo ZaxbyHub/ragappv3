@@ -52,3 +52,13 @@ export async function reportCitationOpened(): Promise<void> {
     // never break the citation-opening interaction.
   }
 }
+
+/**
+ * Clear the once-guard so the next citation open reports again. Called on
+ * logout: the guard is module-scoped and the SPA's logout does not reload the
+ * page, so without this a second user on the same tab would inherit the first
+ * user's latched milestone (issue #849 review EXT-001).
+ */
+export function resetCitationReport(): void {
+  citationReportAcknowledged = false;
+}

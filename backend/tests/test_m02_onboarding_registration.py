@@ -33,3 +33,29 @@ def test_onboarding_routes_registered_on_production_app():
         "POST /api/onboarding/milestones/dismiss is not registered on the "
         "production app"
     )
+
+    # PRR-005: pin the methods at the production-app level too (a GET/POST
+    # swap on a write route would otherwise only be caught by the frozen
+    # route tests' local app).
+    method_map = {path: set(methods) for path, methods in app.openapi()["paths"].items()}
+    assert method_map["/api/onboarding/milestones"] == {"get"}
+    assert method_map["/api/onboarding/milestones/citation-opened"] == {"post"}
+    assert method_map["/api/onboarding/milestones/dismiss"] == {"post"}
+
+
+def test_onboarding_routes_reject_unauthenticated_requests():
+    """PRR-005: no other onboarding test asserts the negative — CSRF runs
+    under the naive test policy everywhere, so these pins are the only
+    guard that the auth dependency (and, transitively, the security
+    posture the PR body advertises) stays wired on the production app."""
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    client = TestClient(app)
+    assert client.get("/api/onboarding/milestones").status_code == 401
+    assert (
+        client.post("/api/onboarding/milestones/citation-opened").status_code
+        == 401
+    )
+    assert client.post("/api/onboarding/milestones/dismiss").status_code == 401

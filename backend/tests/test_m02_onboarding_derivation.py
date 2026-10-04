@@ -327,3 +327,142 @@ class TestDerivationCensus:
         )
         assert dismiss.status_code == 200, dismiss.text
         assert _flags(client=_client())["show_checklist"] is False
+
+    def test_same_user_write_sequences_hit_the_conflict_branch(
+        self, seeded_db, monkeypatch
+    ) -> None:
+        """PRR-001: every other backend test's POST is that user's FIRST
+        write (fresh per-test DB), so the ON CONFLICT(user_id) DO UPDATE
+        branches have zero coverage elsewhere. These same-user sequences are
+        the production-reachable flows: citation-open creates the row, then
+        Dismiss updates it (and vice versa); a regression dropping the ON
+        CONFLICT clause would 503 here."""
+        import pathlib
+
+        monkeypatch.setattr(
+            "app.config.settings.data_dir", pathlib.Path(seeded_db).parent
+        )
+        monkeypatch.setattr(
+            "app.config.settings.jwt_secret_key",
+            "test-secret-key-for-testing-only-min-32-chars!!",
+        )
+        monkeypatch.setattr("app.config.settings.users_enabled", True)
+        _sql(
+            seeded_db,
+            "INSERT INTO vaults (id, name, owner_id) VALUES (1, 'V', 1)",
+        )
+        client = _client()
+
+        # Sequence A: citation-open FIRST (INSERT), then dismiss (UPDATE
+        # branch — the most common real flow: open a citation, then hide
+        # the checklist).
+        first = client.post(
+            "/api/onboarding/milestones/citation-opened", headers=_headers()
+        )
+        assert first.status_code == 200, first.text
+        second = client.post(
+            "/api/onboarding/milestones/dismiss", headers=_headers()
+        )
+        assert second.status_code == 200, second.text
+        flags = _flags(client)
+        assert flags["first_citation_opened"] is True
+        assert flags["show_checklist"] is False
+
+        # Sequence B: dismiss FIRST, then citation-open — the dismissal must
+        # survive and the citation flag must still flip.
+        _sql(seeded_db, "DELETE FROM user_onboarding_state")
+        third = client.post(
+            "/api/onboarding/milestones/dismiss", headers=_headers()
+        )
+        assert third.status_code == 200, third.text
+        fourth = client.post(
+            "/api/onboarding/milestones/citation-opened", headers=_headers()
+        )
+        assert fourth.status_code == 200, fourth.text
+        flags = _flags(client)
+        assert flags["first_citation_opened"] is True
+        assert flags["show_checklist"] is False
+
+    def test_first_write_wins_on_repeat_posts(self, seeded_db, monkeypatch) -> None:
+        """PRR-001: the COALESCE arms keep the FIRST citation/dismiss
+        timestamps — pinned deterministically by pre-seeding a known stamp
+        and asserting the POST cannot overwrite it."""
+        import pathlib
+
+        monkeypatch.setattr(
+            "app.config.settings.data_dir", pathlib.Path(seeded_db).parent
+        )
+        monkeypatch.setattr(
+            "app.config.settings.jwt_secret_key",
+            "test-secret-key-for-testing-only-min-32-chars!!",
+        )
+        monkeypatch.setattr("app.config.settings.users_enabled", True)
+        _sql(
+            seeded_db,
+            "INSERT INTO user_onboarding_state "
+            "(user_id, checklist_dismissed_at, updated_at) "
+            "VALUES (1, '2020-01-01T00:00:00+00:00', '2020-01-01T00:00:00+00:00')",
+        )
+        client = _client()
+        resp = client.post(
+            "/api/onboarding/milestones/dismiss", headers=_headers()
+        )
+        assert resp.status_code == 200, resp.text
+
+        conn = sqlite3.connect(seeded_db)
+        try:
+            row = conn.execute(
+                "SELECT checklist_dismissed_at FROM user_onboarding_state "
+                "WHERE user_id = 1"
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row == ("2020-01-01T00:00:00+00:00",)
+
+    def test_dismissed_and_all_complete_stays_hidden(
+        self, seeded_db, monkeypatch
+    ) -> None:
+        """PRR-001: the (dismissed AND all-complete) cell of
+        show_checklist = not dismissed and not all-complete is unpinned
+        elsewhere — a non-monotonic formula (e.g. XOR-shaped) would pass
+        every single-condition case while hiding or showing wrongly here."""
+        import pathlib
+
+        monkeypatch.setattr(
+            "app.config.settings.data_dir", pathlib.Path(seeded_db).parent
+        )
+        monkeypatch.setattr(
+            "app.config.settings.jwt_secret_key",
+            "test-secret-key-for-testing-only-min-32-chars!!",
+        )
+        monkeypatch.setattr("app.config.settings.users_enabled", True)
+        _sql(
+            seeded_db,
+            "INSERT INTO vaults (id, name, owner_id) VALUES (1, 'V', 1)",
+        )
+        _sql(
+            seeded_db,
+            "INSERT INTO files (vault_id, file_path, file_name, status) "
+            "VALUES (1, 'uploads/c.pdf', 'c.pdf', 'indexed')",
+        )
+        _sql(
+            seeded_db,
+            "INSERT INTO chat_sessions (id, vault_id, user_id, title) "
+            "VALUES (1, 1, 1, 's')",
+        )
+        _sql(
+            seeded_db,
+            "INSERT INTO chat_messages (session_id, role, content) "
+            "VALUES (1, 'user', 'q')",
+        )
+        client = _client()
+        assert client.post(
+            "/api/onboarding/milestones/citation-opened", headers=_headers()
+        ).status_code == 200
+        assert client.post(
+            "/api/onboarding/milestones/dismiss", headers=_headers()
+        ).status_code == 200
+        flags = _flags(client)
+        assert flags["show_checklist"] is False
+        assert flags["first_citation_opened"] is True
+

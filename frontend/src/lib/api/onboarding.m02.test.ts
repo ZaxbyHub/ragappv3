@@ -22,6 +22,7 @@ import {
   markCitationOpened,
   dismissChecklist,
   reportCitationOpened,
+  resetCitationReport,
 } from "./onboarding";
 
 const mockedGet = vi.mocked(apiClient.get);
@@ -75,5 +76,22 @@ describe("lib/api/onboarding m02 (issue #782)", () => {
     mockedPost.mockRejectedValue(new Error("503"));
     await reportCitationOpened();
     expect(mockedPost).not.toHaveBeenCalled();
+  });
+
+  it("resetCitationReport clears the latch (logout wiring, EXT-001)", async () => {
+    // The SPA's logout does not reload the page, so a same-tab user switch
+    // relies on useAuthStore.logout calling resetCitationReport — pin the
+    // reset semantics the logout wiring depends on. The guard is
+    // module-scoped and the earlier test latched it; reset to a known state.
+    resetCitationReport();
+    mockedPost.mockResolvedValue({ data: { ok: true } });
+    await reportCitationOpened();
+    expect(mockedPost).toHaveBeenCalledTimes(1);
+    await reportCitationOpened();
+    expect(mockedPost).toHaveBeenCalledTimes(1); // still latched
+
+    resetCitationReport();
+    await reportCitationOpened();
+    expect(mockedPost).toHaveBeenCalledTimes(2); // reports again
   });
 });

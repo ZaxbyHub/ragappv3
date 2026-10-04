@@ -83,6 +83,23 @@ describe("FirstRunChecklist m02b (shell fail-open contract, issue #782)", () => 
     ).toBeNull();
   });
 
+  it("conveys milestone state as text, not visual-only (PRR-003)", async () => {
+    vi.mocked(getOnboardingMilestones).mockResolvedValue(COMPLETE);
+    render(<FirstRunChecklist />);
+    await waitFor(() => {
+      expect(screen.getByTestId("first-run-checklist")).toBeInTheDocument();
+    });
+    // Every milestone carries an sr-only state label so the done/not-done
+    // distinction is programmatically perceivable (WCAG 1.3.1) — the
+    // checklist deliberately has no live region.
+    const stateLabels = screen.getAllByText(/\((not )?completed\)$/);
+    expect(stateLabels.length).toBe(4);
+    expect(
+      document.querySelectorAll('[data-testid="checklist-milestone"] .sr-only')
+        .length,
+    ).toBe(4);
+  });
+
   it("hides on dismiss and records the dismissal server-side", async () => {
     vi.mocked(getOnboardingMilestones).mockResolvedValue(COMPLETE);
     const user = userEvent.setup();
@@ -131,6 +148,45 @@ describe("FirstRunChecklist m02b (shell fail-open contract, issue #782)", () => 
         screen.getAllByTestId("checklist-milestone")[1].getAttribute("data-done"),
       ).toBe("true");
       expect(container.firstChild).not.toBeNull();
+    });
+
+    it("stops polling when show_checklist flips false while mounted (PRR-006)", async () => {
+      // The "poll only while shown" contract: once the server hides the
+      // checklist (all four complete / dismissed), the interval must stop —
+      // an effect-deps regression (milestones !== null instead of visible)
+      // polls forever while every other assertion still passes.
+      vi.mocked(getOnboardingMilestones)
+        .mockResolvedValueOnce(COMPLETE) // mount load
+        .mockResolvedValueOnce(COMPLETE) // visible-flip effect rerun
+        .mockResolvedValue({
+          ...COMPLETE,
+          upload_indexed: true,
+          first_citation_opened: true,
+          show_checklist: false,
+        });
+      const { container } = render(<FirstRunChecklist />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(screen.getByTestId("first-run-checklist")).toBeInTheDocument();
+
+      // The 3s poll returns the hidden state; the component renders null.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3500);
+      });
+      expect(container.firstChild).toBeNull();
+      // The visible→false transition fires one final load (documented);
+      // let it resolve, then the interval must be cleared for good.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      const callsAtHide = vi.mocked(getOnboardingMilestones).mock.calls.length;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10000);
+      });
+      expect(vi.mocked(getOnboardingMilestones).mock.calls.length).toBe(
+        callsAtHide,
+      );
     });
 
     it("stops refetching after unmount (interval cleared)", async () => {

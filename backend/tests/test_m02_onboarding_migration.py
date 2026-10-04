@@ -139,6 +139,31 @@ def test_migration_is_idempotent_on_rerun(tmp_path: Path) -> None:
     assert _journal_rows(db_path, _JOURNAL_NAME)[-1] == ("succeeded", "ok")
 
 
+def test_migration_pins_load_bearing_constraints(tmp_path: Path) -> None:
+    """PRR-004: the route upserts' ``ON CONFLICT(user_id)`` requires
+    ``user_id`` to be the PRIMARY KEY (a name-only check cannot see a
+    regression that drops it — every write would then raise
+    OperationalError → 503), and the two timestamp columns must stay
+    nullable (a state row is created with only one of them set)."""
+    from app.models.database import migrate_add_user_onboarding_state
+
+    db_path = _legacy_db(tmp_path)
+    migrate_add_user_onboarding_state(db_path)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        cols = {
+            row[1]: row
+            for row in conn.execute("PRAGMA table_info(user_onboarding_state)")
+        }
+    finally:
+        conn.close()
+    # PRAGMA table_info row shape: (cid, name, type, notnull, dflt_value, pk)
+    assert cols["user_id"][5] == 1, "user_id must be the PRIMARY KEY (the ON CONFLICT conflict target)"
+    assert cols["citation_opened_at"][3] == 0, "citation_opened_at must stay nullable"
+    assert cols["checklist_dismissed_at"][3] == 0, "checklist_dismissed_at must stay nullable"
+
+
 def test_fresh_db_schema_includes_table() -> None:
     """init_db's SCHEMA concat and the migration must converge (double
     definition): a fresh database reaches the same table shape."""

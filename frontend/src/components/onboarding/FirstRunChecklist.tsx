@@ -53,10 +53,15 @@ export default function FirstRunChecklist() {
 
   useEffect(() => {
     let cancelled = false;
+    // Issue #849 PRR-002: responses can overlap (a poll issued while an
+    // earlier fetch is still in flight); only the newest generation may
+    // commit, so a slow older snapshot can never regress a newer state.
+    let generation = 0;
     const load = async () => {
+      const gen = ++generation;
       try {
         const next = await getOnboardingMilestones();
-        if (!cancelled) {
+        if (!cancelled && gen === generation) {
           setMilestones(next);
         }
       } catch {
@@ -144,6 +149,13 @@ export default function FirstRunChecklist() {
                   }
                 />
                 {milestone.label}
+                {/* Issue #849 PRR-003: done/not-done must be programmatically
+                    perceivable, not visual-only (WCAG 1.3.1); the checklist
+                    deliberately has no live region, so state is readable as
+                    text on re-read. */}
+                <span className="sr-only">
+                  {done ? "(completed)" : "(not completed)"}
+                </span>
               </li>
             );
           })}
