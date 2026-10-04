@@ -1,0 +1,74 @@
+# 700 — connection-pool, store-transaction and shutdown-budget timeouts hold under concurrency
+
+## What changed
+
+- **Migration/startup connections (T1-05-S-05):** every `sqlite3.connect` in
+  the startup/migration path (73 `migrate_*` sites + 2 `run_migrations`
+  internals in `database.py`, both connects in `migration_journal.py`, and
+  `lifespan._load_persisted_settings`) now passes
+  `timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS` (30.0, defined in
+  `migration_journal.py`, imported by `database.py`/`lifespan.py`), matching
+  `init_db`'s 30000 ms busy timeout instead of Python's 5 s default. A
+  standing AST census guardrail
+  (`test_b11_migration_connect_census.py`) pins the class: 0 of 80 census
+  connects may lack a >= 30000 ms busy timeout before any table access.
+- **Async checkout ceiling (T1-06-S-01):** `get_connection` accepts a
+  keyword-only `deadline`; `get_connection_async` mints it at REQUEST time
+  (before `executor.submit`), so time queued in the bounded checkout
+  executor counts against the documented
+  `max_wait_attempts * CHECKOUT_WAIT_SECONDS` ceiling. 80 concurrent
+  waiters now all resolve within their own budget (previously ~ceil(N/16)
+  queue rounds grew wall time unbounded).
+- **Pool observability (T1-06-K-02):** all five "could not obtain a
+  connection" exits route through a new `_fail_checkout` helper that emits
+  the structured `pool_exhausted` event and marks the capacity wait, so the
+  readiness probe reflects every failure mode, not just loop exhaustion.
+- **Event-loop reachability (T1-06-S-04):** connection creation is
+  serialized by a dedicated `_create_lock` instead of the shared `._lock`,
+  which is now held only for O(1) bookkeeping — `recent_capacity_wait()`
+  (readiness probe) and `_checkout_executor_ready()` can no longer block
+  behind mkdir/connect/WAL-PRAGMA I/O. `_created_count` decrements on every
+  post-increment non-success exit (including BaseException, re-raised);
+  the #262 count invariant and #645 turn-taking refusal are preserved (the
+  mechanism-pinning test was rewritten to pin the invariant, per the issue
+  mandate).
+- **release_connection never raises (S03-SK2-05):** after `close_all()` a
+  release now logs `pool_release_after_close`, closes the connection, and
+  returns — never raising — so the ~100 bare-`finally` callers (get_db
+  included) neither mask in-flight handler exceptions nor leak the
+  connection. A pre-existing test pinning the old raise contract was
+  updated to pin the new one.
+- **Store transaction boundaries (T1-02-S2-05, T1-27-S-09):**
+  `TagStore.update_tag` rolls back on the 0-row branch (no more open WAL
+  write lock until pool release); `FolderStore.create_folder` checks the
+  parent inside its `BEGIN IMMEDIATE` (the FOLDER-001 shape); and
+  `move_documents` runs target-check + UPDATE in one transaction,
+  translating the folders-FK `IntegrityError` to `FolderNotFoundError` —
+  concurrent deletes now surface as the documented 404 instead of a 500.
+- **Shutdown budget (T1-04-S2-02):** the `knowledgevault` compose service
+  sets `stop_grace_period: 90s` (own-line comment documents the coupling to
+  `BackgroundProcessor.stop()`'s 60 s default), so Docker no longer
+  SIGKILLs the process ~50 s before its own drain+optimize budget.
+  `stop()` itself is unchanged.
+
+## Why
+
+Audit remediation issue #700 (frontier audit 20260923T174456Z, Workstream B
+PR 11 of 16): eight concurrency findings where a documented bound or
+guarantee was not enforced on every path.
+
+## Migration steps
+
+None. No schema changes; the compose change takes effect on the next
+`docker compose up` (operators should expect `docker compose stop` to wait
+up to 90 s before SIGKILL).
+
+## Known caveats
+
+- Request-time service connects (vector_store, rag_engine,
+  feedback_reranker, security) still use default busy timeouts; they are a
+  different class (not startup/migration) and are dispositioned out of
+  scope in the trace's recurrence sweep.
+- Root moves (`move_documents(..., folder_id=None)`) now run inside the
+  same two-statement `BEGIN IMMEDIATE` as target moves (uniformity; the
+  brief write lock replaces the implicit one the UPDATE took anyway).

@@ -24,6 +24,14 @@ import logging
 import sqlite3
 from typing import Optional
 
+# Startup/migration connections must be no more lock-fragile than
+# init_db's own connection (issue #700, T1-05-S-05): Python's default
+# 5 s busy timeout makes a sibling worker's migration fail with
+# "database is locked" during a slow per-start rebuild. database.py and
+# lifespan.py import this constant (they already import this module; the
+# reverse import would cycle).
+MIGRATION_CONNECT_TIMEOUT_SECONDS = 30.0
+
 logger = logging.getLogger(__name__)
 
 # Bumped whenever the SCHEMA constant in app.models.database changes shape.
@@ -161,7 +169,7 @@ def publish_index_generation(
 
 def latest_outcomes(sqlite_path: str, *, limit: int = 20) -> list[dict]:
     """Operator-visible tail of the journal (newest first)."""
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         _ensure_table(conn)
         rows = conn.execute(
@@ -201,7 +209,7 @@ def latest_outcomes_with_signal(
     recent = latest_outcomes(sqlite_path, limit=limit)
     if any(r.get("phase") in ("failed", "recovered") for r in recent):
         return recent, None
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         _ensure_table(conn)
         row = conn.execute(

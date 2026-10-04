@@ -17,10 +17,11 @@ These tests verify:
    rolled back (no slot leak). The current code already satisfies this
    invariant; we pin it so future refactors don't regress.
 
-2. The ``_create_connection()`` I/O call runs inside the critical section,
-   so concurrent callers cannot observe a transient inflation of
-   ``_created_count`` between the increment and the I/O result. This is
-   the actual fix for the TOCTOU race.
+2. Under concurrent SUCCESSFUL creation, ``_created_count`` never exceeds
+   ``max_size`` and every slot maps to a live distinct connection. This
+   originally pinned the mechanism (creation I/O inside the shared pool
+   lock); issue #700 moved creation behind a dedicated creation mutex, so
+   the test now pins the count invariant instead.
 
 3. Under concurrent failure, the pool does not transiently exceed
    ``max_size`` as observed by other callers (an external-observer
@@ -81,62 +82,69 @@ class TestSQLiteConnectionPoolCreatedCountRace(unittest.TestCase):
         self.assertEqual(pool._created_count, 0)
         pool.close_all()
 
-    def test_create_connection_runs_under_lock(self):
-        """_create_connection() must run while the pool lock is held.
+    def test_concurrent_create_never_inflates_count_beyond_max(self):
+        """Concurrent creations must never push _created_count past max_size.
 
-        The TOCTOU race in issue #262 occurs because the I/O call runs
-        outside the lock that guards _created_count. With the lock held
-        during I/O, no concurrent caller can observe a transiently
-        inflated _created_count.
-
-        We detect this by snapshotting the lock state from inside a
-        mocked _create_connection(): if the lock is held by the caller,
-        any attempt to acquire it from this thread would block.
+        Issue #262's TOCTOU race was a transiently inflated ``_created_count``
+        observable by concurrent callers. This test originally pinned the
+        MECHANISM (asserting ``_create_connection()`` runs while the shared
+        pool lock is held). Issue #700 deliberately moves the creation I/O off
+        the shared lock — behind a dedicated creation mutex — so the shared
+        lock is never held across connection-creation syscalls (event-loop
+        reachability of ``recent_capacity_wait``). Per issue #700's mandate,
+        the mechanism check is replaced here by the #262 COUNT INVARIANT:
+        under concurrent creation, ``_created_count`` never exceeds
+        ``max_size``, every sampled value corresponds to a slot that is
+        actually being created, and after all creators finish the count
+        equals the number of live, distinct connections (no leak). The
+        failure-path twin lives in
+        ``test_concurrent_failed_create_never_inflates_count_beyond_max``.
         """
         from app.models.database import SQLiteConnectionPool
 
-        pool = SQLiteConnectionPool(str(self.db_path), max_size=2)
+        pool = SQLiteConnectionPool(str(self.db_path), max_size=3)
 
-        # Real connection object — we'll create it ourselves and return it
-        # from the mock so the pool can actually use it.
-        real_conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
-        real_conn.row_factory = sqlite3.Row
+        sampled_counts = []
+        real_create = pool._create_connection
 
-        lock_held_during_io = []
-        io_done = threading.Event()
-        observer_can_proceed = threading.Event()
+        def sampling_create():
+            # Runs after the caller incremented _created_count for THIS
+            # slot; record what a concurrent observer could see.
+            sampled_counts.append(pool._created_count)
+            return real_create()
 
-        def fake_create_connection():
-            # Try to acquire the same lock the caller is using.
-            # If the caller is holding it during I/O, this acquire blocks
-            # until we release — proving the lock was held.
-            acquired = pool._lock.acquire(blocking=False)
-            if acquired:
-                # Lock was NOT held during I/O — TOCTOU window exists.
-                lock_held_during_io.append(False)
-                pool._lock.release()
-            else:
-                # Lock WAS held during I/O — fix is in place.
-                lock_held_during_io.append(True)
-            # Return the real connection so the pool stays usable.
-            return real_conn
+        start = threading.Barrier(3)
+        results: list = []
+        results_lock = threading.Lock()
 
-        with mock.patch.object(pool, "_create_connection", side_effect=fake_create_connection):
-            conn = pool.get_connection()
-            try:
-                # If we got here, the lock-was-held observation fired.
-                self.assertTrue(
-                    lock_held_during_io,
-                    "_create_connection() was never invoked",
-                )
-                self.assertTrue(
-                    lock_held_during_io[0],
-                    "_create_connection() ran OUTSIDE the pool lock — "
-                    "TOCTOU race window is open (see issue #262)",
-                )
-            finally:
-                pool.release_connection(conn)
+        def creator():
+            start.wait(timeout=10)
+            conn = pool.get_connection(max_wait_attempts=5)
+            with results_lock:
+                results.append(conn)
 
+        with mock.patch.object(
+            pool, "_create_connection", side_effect=sampling_create
+        ):
+            threads = [threading.Thread(target=creator) for _ in range(3)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=30)
+
+        self.assertEqual(len(results), 3, "a creator failed or hung")
+        self.assertTrue(
+            all(c <= pool.max_size for c in sampled_counts),
+            f"transient inflation observed: {sorted(sampled_counts)}",
+        )
+        self.assertEqual(
+            len({id(conn) for conn in results}),
+            3,
+            "creators must not share one connection",
+        )
+        self.assertEqual(pool._created_count, 3)
+        for conn in results:
+            pool.release_connection(conn)
         pool.close_all()
 
     def test_concurrent_failed_create_never_inflates_count_beyond_max(self):

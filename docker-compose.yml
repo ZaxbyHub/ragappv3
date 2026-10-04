@@ -87,6 +87,11 @@ services:
         VITE_API_URL: ${VITE_API_URL:-}
     container_name: knowledgevault
     restart: unless-stopped
+    # Shutdown budget (issue #700, T1-04-S2-02): BackgroundProcessor.stop()
+    # defaults to a 60 s drain + final-optimize budget; Docker's implicit
+    # 10 s grace would SIGKILL mid-drain (exit 137). Keep this >= stop()'s
+    # default timeout — check both when changing either.
+    stop_grace_period: 90s
     ports:
       - "${PORT:-9090}:9090"
     volumes:

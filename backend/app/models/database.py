@@ -18,6 +18,7 @@ from queue import Empty, Full, Queue
 
 from app.config import settings
 from app.models.migration_journal import (
+    MIGRATION_CONNECT_TIMEOUT_SECONDS,
     MIGRATION_JOURNAL_DDL,
     invalidate_derived_data,
     record_migration_outcome,
@@ -1694,7 +1695,7 @@ def init_db(sqlite_path: str) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Connect and execute schema
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA busy_timeout=30000;")
@@ -1830,7 +1831,7 @@ def run_migrations(sqlite_path: str) -> None:
     # and legacy databases alike.
     from app.services.job_lease import ensure_jobs_schema
 
-    _jobs_conn = sqlite3.connect(sqlite_path)
+    _jobs_conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         ensure_jobs_schema(_jobs_conn)
     finally:
@@ -1838,7 +1839,7 @@ def run_migrations(sqlite_path: str) -> None:
 
     # Migrate refresh token index from non-unique to unique
     _us_journal = "run_migrations_user_sessions_refresh_hash_unique"
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         # Check if a unique index already exists (from prior migration run)
         cursor = conn.execute(
@@ -2016,7 +2017,7 @@ def run_migrations(sqlite_path: str) -> None:
     # with NO uniqueness. On IntegrityError (legacy databases already holding
     # a partial+indexed pair for one hash+vault) the rollback restores the
     # previous narrow index and we log the same tolerant warning as before.
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         _widen_files_hash_vault_unique_index(conn)
     finally:
@@ -2024,7 +2025,7 @@ def run_migrations(sqlite_path: str) -> None:
 
     # Record the schema version the database has been brought to (issue #512
     # recovery journal; see app.models.migration_journal).
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         record_schema_version(conn)
         conn.commit()
@@ -2044,7 +2045,7 @@ def migrate_add_migration_journal(sqlite_path: str) -> None:
 
     Idempotent — CREATE TABLE IF NOT EXISTS.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         conn.execute(MIGRATION_JOURNAL_DDL)
         conn.commit()
@@ -2067,7 +2068,7 @@ def migrate_add_vaults(sqlite_path: str) -> None:
     Args:
         sqlite_path: Path to the SQLite database file.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         conn.execute("PRAGMA foreign_keys = ON;")
 
@@ -2124,7 +2125,7 @@ def migrate_add_email_columns(sqlite_path: str) -> None:
     Args:
         sqlite_path: Path to the SQLite database file.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         conn.execute("PRAGMA foreign_keys = ON;")
 
@@ -2162,7 +2163,7 @@ def migrate_add_file_metadata_columns(sqlite_path: str) -> None:
     Args:
         sqlite_path: Path to the SQLite database file.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         conn.execute("PRAGMA foreign_keys = ON;")
 
@@ -2200,7 +2201,7 @@ def migrate_add_user_org_tables(sqlite_path: str) -> None:
     Args:
         sqlite_path: Path to the SQLite database file.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         conn.execute("PRAGMA foreign_keys = ON")
         conn.executescript(SCHEMA)
@@ -2219,7 +2220,7 @@ def migrate_add_vault_permission_columns(sqlite_path: str) -> None:
     Args:
         sqlite_path: Path to the SQLite database file.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         conn.execute("PRAGMA foreign_keys = ON")
 
@@ -2259,7 +2260,7 @@ def migrate_add_vault_permission_columns(sqlite_path: str) -> None:
 def migrate_add_org_slug_column(sqlite_path: str) -> None:
     """Migration: Add slug column to organizations table and add 'owner' to org_members role CHECK."""
 
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         conn.execute("PRAGMA foreign_keys = ON")
 
@@ -2359,7 +2360,7 @@ def migrate_vault_paths(sqlite_path: str) -> None:
     if not vaults_dir.exists():
         return
 
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         if migration_flag_done(conn, "migration.vault_paths.done"):
             return
@@ -2445,7 +2446,7 @@ def migrate_add_user_id_to_chat_sessions(
 ) -> None:
     """Migration: Add owner user_id to chat_sessions for per-user policy checks."""
     owns_connection = conn is None
-    conn = conn or sqlite3.connect(sqlite_path)
+    conn = conn or sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         table_cursor = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='chat_sessions'"
@@ -2471,7 +2472,7 @@ def migrate_add_user_id_to_chat_sessions(
 
 def migrate_add_fork_columns(sqlite_path: str) -> None:
     """Migration: Add forked_from_session_id and fork_message_index to chat_sessions."""
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         cursor = conn.execute("PRAGMA table_info(chat_sessions)")
         columns = {row[1] for row in cursor.fetchall()}
@@ -2490,7 +2491,7 @@ def migrate_add_fork_columns(sqlite_path: str) -> None:
 
 def migrate_add_feedback_column(sqlite_path: str) -> None:
     """Migration: Add feedback column to chat_messages table."""
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         existing_cols = [row[1] for row in conn.execute("PRAGMA table_info(chat_messages)").fetchall()]
         if "feedback" not in existing_cols:
@@ -2507,7 +2508,7 @@ def migrate_add_chat_memories_column(sqlite_path: str) -> None:
     message. Persisted as a JSON string for symmetry with ``sources``. Legacy
     rows are left with NULL — the chat route handles both shapes.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         existing_cols = [
             row[1]
@@ -2527,7 +2528,7 @@ def migrate_add_chat_mode_column(sqlite_path: str) -> None:
     assistant row so the UI can show a per-message model badge that survives
     reloads. Legacy rows remain NULL.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         existing_cols = [
             row[1]
@@ -2555,7 +2556,7 @@ def migrate_sanitize_existing_chat_messages(sqlite_path: str) -> None:
         cleanup_existing_chat_messages_rows,
     )
 
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         # Check the table exists and has the expected columns first; some
         # very old test fixtures call run_migrations on a partially-bootstrapped
@@ -2595,7 +2596,7 @@ def migrate_add_memory_embedding_column(sqlite_path: str) -> None:
     Both columns are nullable so existing memories still work via FTS5
     fallback when no embedding has been computed yet.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         existing_cols = [
             row[1] for row in conn.execute("PRAGMA table_info(memories)").fetchall()
@@ -2611,7 +2612,7 @@ def migrate_add_memory_embedding_column(sqlite_path: str) -> None:
 
 def migrate_add_memory_retention_columns(sqlite_path: str) -> None:
     """Migration: add memory retention metadata columns."""
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         existing_cols = {
             row[1] for row in conn.execute("PRAGMA table_info(memories)").fetchall()
@@ -2639,7 +2640,7 @@ def migrate_add_wiki_tables(sqlite_path: str) -> None:
     Args:
         sqlite_path: Path to the SQLite database file.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         conn.execute("PRAGMA foreign_keys = ON;")
         conn.executescript("""
@@ -2826,7 +2827,7 @@ def migrate_add_wiki_refs_and_job_input(sqlite_path: str) -> None:
 
     Idempotent — safe to run multiple times.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         existing_msg_cols = [
             row[1] for row in conn.execute("PRAGMA table_info(chat_messages)").fetchall()
@@ -2851,7 +2852,7 @@ def migrate_add_kms_refs(sqlite_path: str) -> None:
     """Migration: add ``kms_refs`` to chat_messages for persisted [K#] citation
     cards (the KMS counterpart to ``wiki_refs``). Idempotent.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         existing_msg_cols = [
             row[1] for row in conn.execute("PRAGMA table_info(chat_messages)").fetchall()
@@ -2885,7 +2886,7 @@ def migrate_add_chat_turn_columns(sqlite_path: str) -> None:
     ``wiki_refs``/``kms_refs``/``feedback`` precedent: ``run_migrations`` runs on
     every connect, so fresh and existing databases both receive them here.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         existing_msg_cols = [
             row[1] for row in conn.execute("PRAGMA table_info(chat_messages)").fetchall()
@@ -3053,7 +3054,7 @@ def migrate_add_quality_reports(sqlite_path: str) -> None:
     Executes the same ``_QUALITY_REPORTS_DDL`` block appended to the SCHEMA
     constant, so fresh and migrated databases converge by construction.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         conn.executescript(_QUALITY_REPORTS_DDL)
         conn.commit()
@@ -3068,7 +3069,7 @@ def migrate_add_quality_eval_cases(sqlite_path: str) -> None:
     constant (the DDL carries both tables; the split mirrors the two-table
     registration convention while keeping a single shared DDL constant).
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         conn.executescript(_QUALITY_REPORTS_DDL)
         conn.commit()
@@ -3078,7 +3079,7 @@ def migrate_add_quality_eval_cases(sqlite_path: str) -> None:
 
 def migrate_add_wiki_jobs_retry_count(sqlite_path: str) -> None:
     """Migration: add retry_count to wiki_compile_jobs. Idempotent."""
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         existing_cols = [
             row[1] for row in conn.execute("PRAGMA table_info(wiki_compile_jobs)").fetchall()
@@ -3102,7 +3103,7 @@ def migrate_add_draft_jobs_lease_columns(sqlite_path: str) -> None:
     ``_DRAFT_ROOM_CORE_DDL`` fresh-DB shape (worker_id TEXT NULL,
     lease_generation 0, attempts 0).
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         existing_cols = [
             row[1] for row in conn.execute("PRAGMA table_info(draft_jobs)").fetchall()
@@ -3136,7 +3137,7 @@ def migrate_add_kms_tables(sqlite_path: str) -> None:
     Args:
         sqlite_path: Path to the SQLite database file.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         conn.execute("PRAGMA foreign_keys = ON;")
         conn.executescript("""
@@ -3213,7 +3214,7 @@ def migrate_add_document_reindex_jobs(sqlite_path: str) -> None:
     Args:
         sqlite_path: Path to the SQLite database file.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         conn.execute("PRAGMA foreign_keys = ON;")
         conn.executescript("""
@@ -3251,7 +3252,7 @@ def migrate_add_tags_tables(sqlite_path: str) -> None:
     Args:
         sqlite_path: Path to the SQLite database file.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         conn.execute("PRAGMA foreign_keys = ON;")
         conn.executescript("""
@@ -3296,7 +3297,7 @@ def migrate_add_folders(sqlite_path: str) -> None:
     Args:
         sqlite_path: Path to the SQLite database file.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         conn.execute("PRAGMA foreign_keys = ON;")
         conn.executescript("""
@@ -3333,7 +3334,7 @@ def migrate_add_folders(sqlite_path: str) -> None:
 
 def migrate_add_files_parsed_text(sqlite_path: str) -> None:
     """Migration: add parsed_text to files table for wiki recompile. Idempotent."""
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         existing_cols = [
             row[1] for row in conn.execute("PRAGMA table_info(files)").fetchall()
@@ -3361,7 +3362,7 @@ def migrate_add_files_extraction_diagnostics(sqlite_path: str) -> None:
 
     Idempotent — safe to run multiple times.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         existing_cols = [
             row[1] for row in conn.execute("PRAGMA table_info(files)").fetchall()
@@ -3405,7 +3406,7 @@ def migrate_add_curator_claim_support(sqlite_path: str) -> None:
 
     Idempotent — safe to run multiple times.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     # Force autocommit so PRAGMA statements take effect outside of an
     # implicit transaction. This matches the behaviour we verified in
     # the SQLite reproduction case at PR-C reviewer time.
@@ -3737,7 +3738,7 @@ def migrate_add_files_processing_progress(sqlite_path: str) -> None:
 
     Idempotent — safe to run multiple times.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         existing_cols = {
             row[1] for row in conn.execute("PRAGMA table_info(files)").fetchall()
@@ -3767,7 +3768,7 @@ def migrate_add_files_processing_progress(sqlite_path: str) -> None:
 
 def migrate_add_files_enrichment_status(sqlite_path: str) -> None:
     """Migration: add independent post-index enrichment status columns."""
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         existing_cols = {
             row[1] for row in conn.execute("PRAGMA table_info(files)").fetchall()
@@ -3792,7 +3793,7 @@ def migrate_add_vaults_enrichment_toggle(sqlite_path: str) -> None:
 
     Idempotent — safe to run multiple times.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         existing_cols = {
             row[1] for row in conn.execute("PRAGMA table_info(vaults)").fetchall()
@@ -3812,7 +3813,7 @@ def migrate_add_files_enrichment_enabled(sqlite_path: str) -> None:
 
     Idempotent — safe to run multiple times.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         existing_cols = {
             row[1] for row in conn.execute("PRAGMA table_info(files)").fetchall()
@@ -3832,7 +3833,7 @@ def migrate_add_vaults_multimodal_provider(sqlite_path: str) -> None:
 
     Idempotent — safe to run multiple times.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         existing_cols = {
             row[1] for row in conn.execute("PRAGMA table_info(vaults)").fetchall()
@@ -3855,7 +3856,7 @@ def migrate_add_chunks_failed_column(sqlite_path: str) -> None:
 
     Idempotent — safe to run multiple times.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         existing_cols = {
             row[1] for row in conn.execute("PRAGMA table_info(files)").fetchall()
@@ -3878,7 +3879,7 @@ def migrate_add_vector_delete_pending(sqlite_path: str) -> None:
 
     Idempotent — safe to run multiple times.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS vector_delete_pending (
@@ -3911,7 +3912,7 @@ def migrate_add_failed_chunks_table(sqlite_path: str) -> None:
 
     Idempotent — safe to run multiple times.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         conn.execute(
             """
@@ -3947,7 +3948,7 @@ def migrate_add_access_token_denylist(sqlite_path: str) -> None:
 
     Idempotent — safe to run multiple times.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS access_token_denylist (
@@ -3974,7 +3975,7 @@ def migrate_add_service_accounts(sqlite_path: str) -> None:
 
     Idempotent — safe to run multiple times.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS service_accounts (
@@ -4006,7 +4007,7 @@ def migrate_add_org_invites(sqlite_path: str) -> None:
 
     Idempotent — safe to run multiple times.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS org_invites (
@@ -4037,7 +4038,7 @@ def migrate_add_org_invites(sqlite_path: str) -> None:
 
 def migrate_add_security_audit_log(sqlite_path: str) -> None:
     """Migration: add append-only security audit event log."""
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS security_audit_log (
@@ -4078,7 +4079,7 @@ def migrate_add_security_audit_log(sqlite_path: str) -> None:
 
 def migrate_add_files_search_fts(sqlite_path: str) -> None:
     """Create and backfill the document-list metadata FTS index."""
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         def _drop_files_search_fts() -> None:
             for trigger in (
@@ -4222,7 +4223,7 @@ migrate_add_files_content_fts('/path/to/app.db')"
 
     Idempotent — safe to run multiple times.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     # Autocommit mode so the journal rows below commit immediately and the
     # explicit BEGIN IMMEDIATE below is never nested inside an implicit
     # transaction (issue #512 SEARCH-005).
@@ -4322,7 +4323,7 @@ def migrate_widen_wiki_claim_sources_source_kind(sqlite_path: str) -> None:
 
     Idempotent — safe to run multiple times.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     conn.isolation_level = None
     _journal = "migrate_widen_wiki_claim_sources_source_kind"
     try:
@@ -4543,7 +4544,7 @@ def migrate_widen_files_status(sqlite_path: str) -> None:
 
     Idempotent — safe to run multiple times.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     conn.isolation_level = None
     _journal = "migrate_widen_files_status"
     try:
@@ -4882,7 +4883,7 @@ def migrate_widen_document_reindex_jobs_status(sqlite_path: str) -> None:
 
     Idempotent — safe to run multiple times.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     conn.isolation_level = None
     _journal = "migrate_widen_document_reindex_jobs_status"
     try:
@@ -5099,7 +5100,7 @@ def migrate_add_document_near_dups(sqlite_path: str) -> None:
     """
     from app.config import settings as _settings
 
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     conn.isolation_level = None
     _journal = "migrate_add_document_near_dups"
     try:
@@ -5184,7 +5185,7 @@ def migrate_add_wiki_relations_unique(sqlite_path: str) -> None:
     journals its deleted-row count on success and a terminal ``failed`` row
     on failure (issue #699 review PRR-001).
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     _journal = "migrate_add_wiki_relations_unique"
     try:
         tbl = conn.execute(
@@ -5253,7 +5254,7 @@ def migrate_add_wiki_claims_unique_claim_text(sqlite_path: str) -> None:
     Deduplicates existing rows first (keeps highest id per vault+claim pair),
     then creates a unique index.  Idempotent.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     conn.isolation_level = None
     _journal = "migrate_add_wiki_claims_unique_claim_text"
     try:
@@ -5409,7 +5410,7 @@ def migrate_add_wiki_claims_unique_claim_text(sqlite_path: str) -> None:
 
 def migrate_add_wiki_page_hierarchy_and_versioning(sqlite_path: str) -> None:
     """Migration: add parent_id and version columns to wiki_pages. Idempotent."""
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         cols = [row[1] for row in conn.execute("PRAGMA table_info(wiki_pages)").fetchall()]
         if "parent_id" not in cols:
@@ -5425,7 +5426,7 @@ def migrate_add_wiki_page_hierarchy_and_versioning(sqlite_path: str) -> None:
 def migrate_add_wiki_supporting_tables(sqlite_path: str) -> None:
     """Migration: add wiki_page_versions, wiki_page_files, wiki_page_links,
     wiki_activity_log tables. Idempotent via IF NOT EXISTS."""
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS wiki_page_versions (
@@ -5497,7 +5498,7 @@ def migrate_add_wiki_claims_normalized_text(sqlite_path: str) -> None:
         normalized = re.sub(r"[^\w\s]", "", (text or "").lower().strip())
         return re.sub(r"\s+", " ", normalized).strip()
 
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         cols = [row[1] for row in conn.execute("PRAGMA table_info(wiki_claims)").fetchall()]
         if "normalized_text" not in cols:
@@ -5528,7 +5529,7 @@ def get_db_connection(sqlite_path: str) -> sqlite3.Connection:
     Returns:
         sqlite3.Connection: Database connection with row factory set.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA busy_timeout=30000;")
     conn.execute("PRAGMA foreign_keys = ON;")
@@ -5595,6 +5596,13 @@ class SQLiteConnectionPool:
         self.max_size = max_size
         self._pool = Queue(maxsize=max_size)
         self._lock = threading.Lock()
+        # Dedicated creation mutex (issue #700, T1-06-S-04): serializes
+        # _create_connection() I/O WITHOUT holding self._lock, so
+        # event-loop-reachable O(1) reads (recent_capacity_wait,
+        # _checkout_executor_ready) never block behind mkdir/connect/PRAGMA.
+        # Lock ordering is one-way: self._lock may be taken while holding
+        # _create_lock, never the reverse.
+        self._create_lock = threading.Lock()
         self._created_count = 0
         self._closed = False
         # Dedicated, bounded executor for request-path async checkouts
@@ -5701,7 +5709,36 @@ class SQLiteConnectionPool:
                     # review finding PRR-D).
                     return False
 
-    def get_connection(self, max_wait_attempts: int = 3) -> sqlite3.Connection:
+    def _fail_checkout(self, max_wait_attempts: int):
+        """Emit the pool_exhausted event, mark the capacity wait, and raise.
+
+        Every "could not obtain a connection" exit routes through here
+        (issue #700, T1-06-K-02), so the readiness probe's capacity-wait
+        signal reflects every checkout failure mode, not just loop
+        exhaustion. Always raises RuntimeError.
+        """
+        # Structured event (observability): a pool_exhausted event means the pool
+        # could not satisfy a checkout within the wait budget. This surfaces the
+        # #301/#302 capacity class of problem at runtime — e.g. a route still
+        # pinning connections across a stream, or db_pool_max_size undersized.
+        logger.warning(
+            "pool_exhausted sqlite_path=%s max_size=%d created=%d wait_attempts=%d",
+            self.sqlite_path,
+            self.max_size,
+            self._created_count,
+            max_wait_attempts,
+        )
+        self._record_capacity_wait()
+        raise RuntimeError(
+            f"Could not obtain a connection from the pool after {max_wait_attempts} attempts"
+        )
+
+    def get_connection(
+        self,
+        max_wait_attempts: int = 3,
+        *,
+        deadline: float | None = None,
+    ) -> sqlite3.Connection:
         """
         Get a connection from the pool.
 
@@ -5711,6 +5748,11 @@ class SQLiteConnectionPool:
 
         Args:
             max_wait_attempts: Maximum number of wait attempts when pool is at capacity.
+            deadline: Pre-minted monotonic deadline for the whole checkout
+                (issue #700, T1-06-S-01). get_connection_async passes the
+                deadline it minted at REQUEST time so time queued in the
+                checkout executor counts against the caller's budget; when
+                None, it is minted here (sync callers, unchanged since #645).
 
         Returns:
             sqlite3.Connection: A database connection.
@@ -5724,7 +5766,8 @@ class SQLiteConnectionPool:
         # Total-wait budget (issue #645): bound the whole checkout — not just
         # each Queue.get — so invalid-connection cycling and validation time
         # cannot stretch a checkout past max_wait_attempts * CHECKOUT_WAIT_SECONDS.
-        deadline = time.monotonic() + max_wait_attempts * CHECKOUT_WAIT_SECONDS
+        if deadline is None:
+            deadline = time.monotonic() + max_wait_attempts * CHECKOUT_WAIT_SECONDS
 
         attempts = 0
         while attempts < max_wait_attempts:
@@ -5754,10 +5797,7 @@ class SQLiteConnectionPool:
                     # without this check N slow-failing validations stretch the
                     # checkout to N x probe-time regardless of the deadline.
                     if time.monotonic() >= deadline:
-                        raise RuntimeError(
-                            f"Could not obtain a connection from the pool after "
-                            f"{max_wait_attempts} attempts"
-                        )
+                        self._fail_checkout(max_wait_attempts)
                     continue
             except Empty:
                 pass
@@ -5768,10 +5808,7 @@ class SQLiteConnectionPool:
             # already started is bounded by its own worst case (the reserve),
             # so the composed checkout ceiling is deadline + reserve.
             if time.monotonic() >= deadline:
-                raise RuntimeError(
-                    f"Could not obtain a connection from the pool after "
-                    f"{max_wait_attempts} attempts"
-                )
+                self._fail_checkout(max_wait_attempts)
             should_create = False
             with self._lock:
                 if self._created_count < self.max_size:
@@ -5779,28 +5816,30 @@ class SQLiteConnectionPool:
                     should_create = True
 
             if should_create:
-                # Hold the lock across the I/O call so that _created_count
-                # bookkeeping (increment + failure rollback) is atomic with
-                # respect to other callers. Without this, a transient
-                # window between the increment and the failure rollback
-                # lets concurrent get_connection() calls observe an
-                # inflated count and unnecessarily skip creation /
-                # block on the queue. See issue #262.
-                with self._lock:
-                    # Re-check under the creation lock: concurrent workers can
-                    # queue behind an earlier creator and only acquire the
-                    # lock after their own deadline has passed — refuse to
-                    # start creation then (issue #645 final critic round 3).
+                # Creation runs under the DEDICATED creation mutex, not
+                # self._lock (issue #700, T1-06-S-04): the shared lock stays
+                # O(1)-bookkeeping-only so event-loop reads never block
+                # behind creation I/O. Serialization under _create_lock is
+                # what keeps the #262 count invariant airtight and preserves
+                # the #645 turn-taking refusal: a creator queued behind an
+                # earlier one re-checks its deadline only once its turn
+                # arrives.
+                with self._create_lock:
                     if time.monotonic() >= deadline:
-                        self._created_count -= 1
-                        raise RuntimeError(
-                            f"Could not obtain a connection from the pool after "
-                            f"{max_wait_attempts} attempts"
-                        )
+                        with self._lock:
+                            self._created_count -= 1
+                        self._fail_checkout(max_wait_attempts)
                     try:
                         return self._create_connection()
-                    except (sqlite3.Error, OSError):
-                        self._created_count -= 1
+                    except BaseException:
+                        # Return this creator's slot on EVERY non-success exit
+                        # — sqlite3.Error/OSError and anything else — so the
+                        # count never leaks, then re-raise the original error
+                        # (issue #262; broader than the old
+                        # except (sqlite3.Error, OSError), which leaked the
+                        # slot on non-sqlite exceptions).
+                        with self._lock:
+                            self._created_count -= 1
                         raise
 
             # If at max capacity, block until a connection is available.
@@ -5829,10 +5868,7 @@ class SQLiteConnectionPool:
                     # (#645 final critic): invalid-connection cycling must not
                     # extend the checkout past the nominal budget.
                     if time.monotonic() >= deadline:
-                        raise RuntimeError(
-                            f"Could not obtain a connection from the pool after "
-                            f"{max_wait_attempts} attempts"
-                        )
+                        self._fail_checkout(max_wait_attempts)
                     continue
             except Empty:
                 # Timeout occurred, increment attempts and retry
@@ -5840,20 +5876,7 @@ class SQLiteConnectionPool:
                 continue
 
         # Max attempts exhausted
-        # Structured event (observability): a pool_exhausted event means the pool
-        # could not satisfy a checkout within the wait budget. This surfaces the
-        # #301/#302 capacity class of problem at runtime — e.g. a route still
-        # pinning connections across a stream, or db_pool_max_size undersized.
-        logger.warning(
-            "pool_exhausted sqlite_path=%s max_size=%d created=%d wait_attempts=%d",
-            self.sqlite_path,
-            self.max_size,
-            self._created_count,
-            max_wait_attempts,
-        )
-        raise RuntimeError(
-            f"Could not obtain a connection from the pool after {max_wait_attempts} attempts"
-        )
+        self._fail_checkout(max_wait_attempts)
 
     def _checkout_executor_ready(self) -> ThreadPoolExecutor:
         """Return the checkout executor, or raise if the pool is closed.
@@ -5898,6 +5921,15 @@ class SQLiteConnectionPool:
         Raises:
             RuntimeError: If the pool has been closed or max wait attempts exhausted.
         """
+        # Mint the caller's deadline at REQUEST time (issue #700,
+        # T1-06-S-01): the checkout runs on a bounded executor
+        # (CHECKOUT_EXECUTOR_MAX_WORKERS); if the worker minted the deadline,
+        # time queued in the executor's work queue would be invisible to it
+        # and N concurrent waiters would queue in ~ceil(N/workers) rounds,
+        # growing per-caller wall time without bound. The pre-minted deadline
+        # is inert against the closed-pool remap below (a closed pool raises
+        # regardless of the deadline).
+        deadline = time.monotonic() + max_wait_attempts * CHECKOUT_WAIT_SECONDS
         executor = self._checkout_executor_ready()
         try:
             # Submit directly (not loop.run_in_executor) so the completion
@@ -5905,7 +5937,9 @@ class SQLiteConnectionPool:
             # awaiting task cancels run_in_executor's asyncio wrapper even
             # while the worker keeps running, which would hide the acquired
             # connection from any cancellation handling (#592 review PRR-003).
-            work = executor.submit(partial(self.get_connection, max_wait_attempts))
+            work = executor.submit(
+                partial(self.get_connection, max_wait_attempts, deadline=deadline)
+            )
         except RuntimeError as exc:
             # A cross-thread close_all() can shut the executor down between
             # _checkout_executor_ready() and the submit (#592 review PRR-005);
@@ -5951,14 +5985,28 @@ class SQLiteConnectionPool:
         _validate_connection silently no-ops inside the stale transaction.
         The warning is the signal that some call site still leaks.
 
-        Args:
+        Returns:
             conn: The connection to release back to the pool.
 
-        Raises:
-            RuntimeError: If the pool has been closed.
+        This method never raises (issue #700, S03-SK2-05): ~100 call sites
+        release from bare ``finally`` blocks, so a raise here would mask the
+        caller's own in-flight exception AND leak the connection.
         """
         if self._closed:
-            raise RuntimeError("Connection pool has been closed")
+            # After close_all() the pool queue is drained and unpublished;
+            # returning the connection would strand it open in a dead pool.
+            # Close it instead, and never raise.
+            logger.warning(
+                "pool_release_after_close sqlite_path=%s", self.sqlite_path
+            )
+            try:
+                conn.close()
+            except sqlite3.Error:
+                logger.warning(
+                    "pool_release_after_close sqlite_path=%s close_failed=1",
+                    self.sqlite_path,
+                )
+            return
 
         # The guard must never raise: a raise here would bypass the
         # pool-full close below and, in get_db's bare finally, mask the
@@ -6201,7 +6249,7 @@ def migrate_assign_orphan_users_to_default_vault(sqlite_path: str) -> None:
     the old blanket ``zero rows == orphan`` predicate resurrected every
     removed membership on each boot.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         conn.execute("PRAGMA foreign_keys = ON;")
         conn.execute(_SYSTEM_FLAGS_DDL)
@@ -6289,7 +6337,7 @@ def migrate_add_wiki_lint_findings_json_check(sqlite_path: str) -> None:
     # half-migrated state if the INSERT later fails.  Matches the pattern
     # used by migrate_add_curator_claim_support and
     # migrate_widen_wiki_claim_sources.
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     conn.isolation_level = None
     _journal = "migrate_add_wiki_lint_findings_json_check"
     try:
@@ -6517,7 +6565,7 @@ def migrate_add_prompt_versions(sqlite_path: str) -> None:
     Args:
         sqlite_path: Path to the SQLite database file.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         conn.execute("PRAGMA foreign_keys = ON;")
         conn.executescript("""
@@ -6549,7 +6597,7 @@ def migrate_add_prompt_org_overrides(sqlite_path: str) -> None:
     Args:
         sqlite_path: Path to the SQLite database file.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         conn.execute("PRAGMA foreign_keys = ON;")
         conn.executescript("""
@@ -6582,7 +6630,7 @@ def migrate_add_prompt_ab_experiments(sqlite_path: str) -> None:
     Args:
         sqlite_path: Path to the SQLite database file.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         conn.execute("PRAGMA foreign_keys = ON;")
         conn.executescript("""
@@ -6633,7 +6681,7 @@ def migrate_add_password_changed_at(sqlite_path: str) -> None:
     Args:
         sqlite_path: Path to the SQLite database file.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         cursor = conn.execute("PRAGMA table_info(users)")
         existing_cols = {row[1] for row in cursor.fetchall()}
@@ -6663,7 +6711,7 @@ def migrate_add_draft_room_core(sqlite_path: str) -> None:
     Args:
         sqlite_path: Path to the SQLite database file.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         conn.execute("PRAGMA foreign_keys = ON;")
         conn.executescript(_DRAFT_ROOM_CORE_DDL)
@@ -6689,7 +6737,7 @@ def migrate_add_draft_room_pipeline(sqlite_path: str) -> None:
     Args:
         sqlite_path: Path to the SQLite database file.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         conn.execute("PRAGMA foreign_keys = ON;")
         conn.executescript(_DRAFT_ROOM_PIPELINE_DDL)
@@ -6715,7 +6763,7 @@ def migrate_add_draft_room_factuality(sqlite_path: str) -> None:
     Args:
         sqlite_path: Path to the SQLite database file.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         conn.execute("PRAGMA foreign_keys = ON;")
         conn.executescript(_DRAFT_ROOM_FACTUALITY_DDL)
@@ -6757,7 +6805,7 @@ def migrate_relax_draft_claims_span_not_null(sqlite_path: str) -> None:
 
     Idempotent — safe to run multiple times.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     # Autocommit so PRAGMAs take effect outside an implicit transaction,
     # matching migrate_add_curator_claim_support.
     conn.isolation_level = None
@@ -7040,7 +7088,7 @@ def migrate_add_draft_room_promotions(sqlite_path: str) -> None:
     Args:
         sqlite_path: Path to the SQLite database file.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         conn.execute("PRAGMA foreign_keys = OFF;")
         table_row = conn.execute(
@@ -7115,7 +7163,7 @@ def migrate_add_516_draft_reconcile_state(sqlite_path: str) -> None:
     Args:
         sqlite_path: Path to the SQLite database file.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         conn.execute("PRAGMA foreign_keys = ON;")
         conn.executescript(_DRAFT_RECONCILE_STATE_DDL)
@@ -7143,7 +7191,7 @@ def migrate_add_multimodal_artifact_tables(sqlite_path: str) -> None:
     Args:
         sqlite_path: Path to the SQLite database file.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         conn.execute("PRAGMA foreign_keys = ON;")
         # Add files.active_generation_hash for databases created before this PR.
@@ -7166,7 +7214,7 @@ def migrate_add_atom_enrichment_table(sqlite_path: str) -> None:
 
     Idempotent (``CREATE ... IF NOT EXISTS``); existing data is preserved.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         conn.execute("PRAGMA foreign_keys = ON;")
         conn.executescript(_ENRICHMENT_DERIVED_DDL)
@@ -7186,7 +7234,7 @@ def migrate_add_chat_stream_events(sqlite_path: str) -> None:
     EXISTS``, no existing data touched; rollback is a plain revert (the table
     is simply unused afterward).
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         conn.executescript(_CHAT_STREAM_EVENTS_DDL)
         conn.commit()
@@ -7212,7 +7260,7 @@ def migrate_add_user_onboarding_state(sqlite_path: str) -> None:
     migrate_add_document_near_dups peer shape; the journal never raises, and a
     failed migration re-raises after journaling.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     conn.isolation_level = None
     _journal = "migrate_add_user_onboarding_state"
     try:
@@ -7254,7 +7302,7 @@ def migrate_add_canvas_tables(sqlite_path: str) -> None:
     Every statement is ``CREATE ... IF NOT EXISTS``, so repeat execution is a
     no-op and existing data is preserved.
     """
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         conn.execute("PRAGMA foreign_keys = ON;")
         conn.executescript(_CANVAS_DDL)
