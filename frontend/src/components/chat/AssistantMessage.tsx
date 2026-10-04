@@ -8,6 +8,7 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import type { Message } from "@/stores/useChatStore";
 import type { Source } from "@/lib/api";
+import { reportCitationOpened } from "@/lib/api/onboarding";
 import { getReasoningPart } from "@/lib/messageParts";
 import {
   createCanvasArtifact,
@@ -277,6 +278,8 @@ export function AssistantMessage({
       setEvidenceReturnFocusId(message.id);
       setActiveRightTab("evidence");
       openRightPane();
+      // Issue #782: first-run milestone — the user opened a citation.
+      void reportCitationOpened();
       onSourceClick?.(source);
     },
     [

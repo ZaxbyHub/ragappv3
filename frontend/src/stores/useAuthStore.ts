@@ -12,6 +12,7 @@ import {
   attachCsrfInterceptor,
 } from "@/lib/api";
 import { useVaultStore } from "@/stores/useVaultStore";
+import { resetCitationReport } from "@/lib/api/onboarding";
 
 interface User {
   id: number;
@@ -281,6 +282,9 @@ export const useAuthStore = create<AuthState>()(
           setJwtAccessToken(null);
           resetCsrfToken();
           resetSubpathRefreshDiagnostic();
+          // Issue #849 EXT-001: the citation-report once-guard is module-scoped;
+          // a same-tab user switch must record the next user's milestone.
+          resetCitationReport();
           get()._setLoading(false);
           // Reset init guard so re-login works after logout
           _initAttempted = false;

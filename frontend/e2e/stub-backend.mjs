@@ -63,6 +63,47 @@ const ACCESS_TOKEN = "stub-access-token";
 // process, so anonymous contexts get 401 and the login form renders.
 let loggedIn = false;
 
+// Issue #782: first-run onboarding milestone state. DEFAULT OFF — the
+// checklist surface and the setup wizard are opt-in via the /_e2e/* control
+// routes so the other shared-stub specs (chat-smoke, chat-width-budget)
+// never observe them, whatever the run order. Module-level defaults re-arm
+// at process start (the PRR-010 loggedIn pattern).
+let setupMode = false;
+const onboarding = {
+  enabled: false,
+  vault_created: false,
+  upload_indexed: false,
+  first_question_asked: false,
+  first_citation_opened: false,
+  dismissed: false,
+};
+
+function onboardingPayload() {
+  const allFour =
+    onboarding.vault_created &&
+    onboarding.upload_indexed &&
+    onboarding.first_question_asked &&
+    onboarding.first_citation_opened;
+  // Mirrors the server formula (GET /onboarding/milestones): hidden once
+  // dismissed or complete — gated additionally on the test-control enable.
+  return {
+    vault_created: onboarding.vault_created,
+    upload_indexed: onboarding.upload_indexed,
+    first_question_asked: onboarding.first_question_asked,
+    first_citation_opened: onboarding.first_citation_opened,
+    show_checklist: onboarding.enabled && !onboarding.dismissed && !allFour,
+  };
+}
+
+function resetOnboarding() {
+  onboarding.enabled = false;
+  onboarding.vault_created = false;
+  onboarding.upload_indexed = false;
+  onboarding.first_question_asked = false;
+  onboarding.first_citation_opened = false;
+  onboarding.dismissed = false;
+}
+
 const USER = {
   id: 1,
   username: "e2e-user",
@@ -245,7 +286,7 @@ const server = http.createServer(async (req, res) => {
     // ---- auth ----
     if (method === "GET" && path === "/api/auth/setup-status") {
       return sendJson(req, res, 200, {
-        needs_setup: false,
+        needs_setup: setupMode,
         auth_mode: "jwt",
         users_enabled: true,
       });
@@ -262,6 +303,26 @@ const server = http.createServer(async (req, res) => {
     if (method === "POST" && path === "/api/auth/login") {
       await readBody(req); // accept any credentials
       loggedIn = true;
+      return sendJson(
+        req,
+        res,
+        200,
+        { access_token: ACCESS_TOKEN, user: USER },
+        {
+          "Set-Cookie": [
+            "ragapp_refresh_token=stub-refresh-token; Path=/; HttpOnly; SameSite=Lax",
+            "X-CSRF-Token=stub-csrf-token; Path=/; SameSite=Lax",
+          ],
+        }
+      );
+    }
+    if (method === "POST" && path === "/api/auth/register") {
+      // Issue #782 setup leg: the wizard's account step registers the first
+      // admin. Mirrors login's session side-effects (PRR-010-critical: the
+      // post-wizard reloads POST /api/auth/refresh) and ends setup mode.
+      await readBody(req); // accept any payload
+      loggedIn = true;
+      setupMode = false;
       return sendJson(
         req,
         res,
@@ -320,6 +381,7 @@ const server = http.createServer(async (req, res) => {
         file_count: 0,
       };
       vaults.push(vault);
+      onboarding.vault_created = true;
       return sendJson(req, res, 200, vault);
     }
 
@@ -370,6 +432,7 @@ const server = http.createServer(async (req, res) => {
         metadata: { status: "processed", chunk_count: 1 },
       };
       documents.push(doc);
+      onboarding.upload_indexed = true;
       return sendJson(req, res, 200, { id: doc.id, filename, status: "processed" });
     }
 
@@ -422,6 +485,7 @@ const server = http.createServer(async (req, res) => {
     if (method === "POST" && path === "/api/chat/stream") {
       const body = await readBody(req);
       const lastUser = (body.messages || []).filter((x) => x.role === "user").pop();
+      if (lastUser) onboarding.first_question_asked = true;
       const userText = String(lastUser?.content ?? "");
       const slow = /SLOW/i.test(userText);
       const finishReason = /LENGTH/i.test(userText) ? "length" : "stop";
@@ -487,6 +551,34 @@ const server = http.createServer(async (req, res) => {
       });
       res.end();
       return;
+    }
+
+    // ---- onboarding milestones (issue #782) ----
+    if (method === "GET" && path === "/api/onboarding/milestones") {
+      return sendJson(req, res, 200, onboardingPayload());
+    }
+    if (method === "POST" && path === "/api/onboarding/milestones/citation-opened") {
+      await readBody(req);
+      onboarding.first_citation_opened = true;
+      return sendJson(req, res, 200, { ok: true });
+    }
+    if (method === "POST" && path === "/api/onboarding/milestones/dismiss") {
+      await readBody(req);
+      onboarding.dismissed = true;
+      return sendJson(req, res, 200, { ok: true });
+    }
+
+    // ---- e2e control routes (issue #782; test-only) ----
+    if (method === "POST" && path === "/_e2e/onboarding") {
+      const body = await readBody(req);
+      resetOnboarding();
+      if (body.enable) onboarding.enabled = true;
+      return sendJson(req, res, 200, onboardingPayload());
+    }
+    if (method === "POST" && path === "/_e2e/setup-mode") {
+      const body = await readBody(req);
+      setupMode = Boolean(body.needs_setup);
+      return sendJson(req, res, 200, { needs_setup: setupMode });
     }
 
     // ---- fallback ----

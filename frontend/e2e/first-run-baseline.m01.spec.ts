@@ -77,6 +77,10 @@ const deadEnds: DeadEnd[] = [];
 const completed: string[] = [];
 let actionCount = 0;
 
+// Issue #782: the four first-run milestone flips, in walkthrough order
+// (vault -> upload -> question -> citation), asserted post-record.
+const milestoneFlips: string[] = [];
+
 // ---- interaction wrappers (the action-count metric) -------------------------
 
 async function doClick(locator: Locator, options?: { timeout?: number }): Promise<void> {
@@ -160,24 +164,76 @@ test.describe("first-run baseline (trace 781-vaultgate-first-run-baseline / C1)"
       });
     }
 
-    // ---- 2. Setup gate, as far as the stub allows --------------------------
-    // The stub reports needs_setup:false, so the app should not gate on setup;
-    // if a future stub flips it, complete the wizard form best-effort.
+    // ---- 1b. Issue #782: opt the stub into setup mode + the checklist ------
+    // Both surfaces are stub-default-OFF so the other shared-stub specs never
+    // observe them. Enabled here, reset in afterAll (order independence).
+    if (stubReachable) {
+      await page.request.post(`${STUB_ORIGIN}/_e2e/setup-mode`, {
+        data: { needs_setup: true },
+      });
+      await page.request.post(`${STUB_ORIGIN}/_e2e/onboarding`, {
+        data: { enable: true },
+      });
+      // The app already booted (step 1) against needs_setup:false — reload
+      // so the wizard gate is actually exercised.
+      await page.goto("/", { waitUntil: "domcontentloaded" });
+      await page.waitForLoadState("networkidle").catch(() => {});
+    }
+
+    // ---- 2. Setup wizard: the REAL two-step flow (issue #782) --------------
     const setupUser = page.locator("#setup-username");
-    if (await visibleWithin(setupUser, 5_000)) {
+    if (await visibleWithin(setupUser, 15_000)) {
       await doFill(page.locator("#setup-username"), "e2e-admin");
       await doFill(page.locator("#setup-password"), "e2e-password-123");
       await doFill(page.locator("#setup-confirm-password"), "e2e-password-123");
-      const submit = page.getByRole("button", { name: /create|start|finish|submit|complete/i }).first();
+      const submit = page
+        .getByRole("button", { name: /create superadmin account/i })
+        .first();
       await doClick(submit);
-      // The stub has no register route unless extended — degrade gracefully.
-      if (await visibleWithin(page.locator("#login-username"), 10_000)) {
-        completed.push("setup-completed");
+      // Step 2 of the wizard: finish without configuring endpoints (the
+      // settings-write path is not this walkthrough's concern).
+      const skipSetup = page.getByRole("button", { name: /skip setup/i }).first();
+      if (await visibleWithin(skipSetup, 20_000)) {
+        await doClick(skipSetup);
+        completed.push("setup-completed-via-ui");
       } else {
-        completed.push("setup-attempted (stub did not accept the wizard)");
+        deadEnds.push({
+          site: "setup-wizard",
+          gate: "models-step-unreachable",
+          detail:
+            "the account step completed but the model-endpoint step (Skip setup) never rendered",
+        });
+        completed.push("setup-models-step-missing (dead end)");
       }
+    } else if (stubReachable) {
+      deadEnds.push({
+        site: "setup-wizard",
+        gate: "wizard-missing-in-setup-mode",
+        detail:
+          "the stub reports needs_setup:true but the setup wizard never rendered",
+      });
+      completed.push("setup-wizard-missing (dead end)");
     } else {
-      completed.push("setup-skipped (stub reports needs_setup:false)");
+      completed.push("setup-skipped (stub unreachable)");
+    }
+
+    // Issue #782 / AC7: after Setup finishes, the user lands where the
+    // first-run checklist is visible — navigate("/") redirects to
+    // /documents, and the shell renders the checklist with all four
+    // milestones incomplete.
+    const checklist = page.getByTestId("first-run-checklist");
+    if (await visibleWithin(checklist, 20_000)) {
+      completed.push("checklist-visible-after-setup");
+      const incomplete = await page.locator('[data-testid="checklist-milestone"][data-done="false"]').count();
+      completed.push(`checklist-initial (incomplete milestones: ${incomplete})`);
+    } else {
+      deadEnds.push({
+        site: "onboarding-checklist",
+        gate: "checklist-missing-after-setup",
+        detail:
+          "setup finished (or was skipped only due to an unreachable stub) but the first-run checklist never rendered on the landing surface",
+      });
+      completed.push("checklist-missing-after-setup (dead end)");
     }
 
     // ---- 3. Login (stub superadmin) ----------------------------------------
@@ -191,11 +247,16 @@ test.describe("first-run baseline (trace 781-vaultgate-first-run-baseline / C1)"
     // Fail-closed: the authenticated shell must actually appear. A fresh-
     // install walkthrough that cannot even authenticate IS a dead end — a
     // degraded continuation must not yield a vacuously green record.
-    const shell = page
-      .getByRole("button", { name: /new vault|scan directory/i })
-      .first()
-      .or(page.locator("nav").first());
-    const shellVisible = await visibleWithin(shell, 20_000);
+    // Probe candidates SEQUENTIALLY, each a single-element locator: the old
+    // `.or()` union matched BOTH the documents toolbar button and the nav on
+    // the post-setup /documents landing (2 elements -> strict-mode violation
+    // -> false negative), which the base flow's post-login landing masked.
+    const shellVisible =
+      (await visibleWithin(
+        page.getByRole("button", { name: /new vault|scan directory/i }).first(),
+        10_000
+      )) ||
+      (await visibleWithin(page.locator("nav").first(), 10_000));
     if (shellVisible) {
       completed.push("login");
     } else {
@@ -304,10 +365,37 @@ test.describe("first-run baseline (trace 781-vaultgate-first-run-baseline / C1)"
       completed.push("vaults-page-unavailable (recorded-and-continued)");
     }
 
-    // ---- 6. Upload a document (stub) ----------------------------------------
-    await page.goto("/documents", { waitUntil: "domcontentloaded" });
+    // Issue #782 milestone #1: "Create a vault" flips on the checklist.
+    // Navigate to any shell page so the checklist is mounted for the poll.
+    if (createdVaultName) {
+      await page.goto("/documents", { waitUntil: "domcontentloaded" });
+      await expect
+        .poll(
+          async () =>
+            (await page
+              .locator('[data-testid="checklist-milestone"]')
+              .nth(0)
+              .getAttribute("data-done")) ?? "missing",
+          { timeout: 10_000 }
+        )
+        .toBe("true");
+      milestoneFlips.push("vault_created");
+      completed.push("milestone-vault-created-flipped");
+    }
+
+    // ---- 6. Upload a document (stub) — FB-003 fix (issue #782) --------------
+    // The react-dropzone file input is intentionally visually hidden, so a
+    // VISIBILITY gate can never pass (the #781 degradation). Select a
+    // writable vault first (the dropzone is disabled under "All Vaults"),
+    // then target the input by attachment — setInputFiles works on hidden
+    // file inputs; the dropzone card's presence is the reachability probe.
+    const uploadVault = createdVaultName
+      ? new RegExp(createdVaultName, "i")
+      : /e2e vault/i;
+    const pickedForUpload = await pickVault(page, uploadVault);
     const uploadInput = page.locator('input[aria-label="Upload files"]');
-    if (await visibleWithin(uploadInput, 20_000)) {
+    if (pickedForUpload && (await uploadInput.count()) > 0) {
+      await uploadInput.waitFor({ state: "attached", timeout: 20_000 });
       await doSetInputFiles(uploadInput, {
         name: "walkthrough.txt",
         mimeType: "text/plain",
@@ -325,7 +413,25 @@ test.describe("first-run baseline (trace 781-vaultgate-first-run-baseline / C1)"
           : "document-upload-attempted (stub lacks POST /api/documents? recorded-and-continued)"
       );
     } else {
-      completed.push("documents-page-unavailable (recorded-and-continued)");
+      completed.push(
+        "documents-page-unavailable (vault selection or dropzone missing; recorded-and-continued)"
+      );
+    }
+
+    // Issue #782 milestone #2: "Index a document" flips after the upload.
+    if (completed.includes("document-uploaded")) {
+      await expect
+        .poll(
+          async () =>
+            (await page
+              .locator('[data-testid="checklist-milestone"]')
+              .nth(1)
+              .getAttribute("data-done")) ?? "missing",
+          { timeout: 10_000 }
+        )
+        .toBe("true");
+      milestoneFlips.push("upload_indexed");
+      completed.push("milestone-upload-indexed-flipped");
     }
 
     // ---- 7. /chat: first send from the "All Vaults" composer ---------------
@@ -423,6 +529,24 @@ test.describe("first-run baseline (trace 781-vaultgate-first-run-baseline / C1)"
       );
       if (answerVisible) completed.push("assistant-answer-streamed");
 
+      // Issue #782 milestone #3: "Ask a question" flips once a user turn
+      // actually reached the stream (the All-Vaults first send above was
+      // client-side gated — two accessible vaults — and never streamed).
+      if (answerVisible) {
+        await expect
+          .poll(
+            async () =>
+              (await page
+                .locator('[data-testid="checklist-milestone"]')
+                .nth(2)
+                .getAttribute("data-done")) ?? "missing",
+            { timeout: 10_000 }
+          )
+          .toBe("true");
+        milestoneFlips.push("first_question_asked");
+        completed.push("milestone-first-question-flipped");
+      }
+
       const chip = page
         .getByRole("button", { name: /Source S1: handbook\.pdf/i })
         .first();
@@ -442,6 +566,28 @@ test.describe("first-run baseline (trace 781-vaultgate-first-run-baseline / C1)"
         completed.push(
           `citation-opened (source dialog=${sourceDialog}, details pane=${detailsPane})`
         );
+
+        // Issue #782 milestone #4: "Open a citation". The DOM cannot show
+        // this flip — the same GET that reveals first_citation_opened also
+        // returns show_checklist:false (all four complete hides the card),
+        // so the 4th data-done never renders. Poll the stub state directly,
+        // then assert the checklist HIDES on the DOM.
+        await expect
+          .poll(
+            async () =>
+              (
+                await page.request.get(`${STUB_ORIGIN}/api/onboarding/milestones`)
+              )
+                .json()
+                .then((payload: { first_citation_opened?: boolean }) => Boolean(payload.first_citation_opened))
+                .catch(() => false),
+            { timeout: 10_000 }
+          )
+          .toBe(true);
+        milestoneFlips.push("first_citation_opened");
+        completed.push("milestone-first-citation-flipped (stub state)");
+        await expect(checklist).toHaveCount(0, { timeout: 10_000 });
+        completed.push("checklist-hidden-after-all-four-complete");
       } else if (answerVisible) {
         completed.push("citation-missing (answer streamed but no Source S1 chip)");
       }
@@ -451,15 +597,48 @@ test.describe("first-run baseline (trace 781-vaultgate-first-run-baseline / C1)"
       );
     }
 
-    // ---- 9. Emit the record FIRST, then the pass/fail assertion ------------
+    // ---- 9. Emit the record FIRST, then the pass/fail assertions ----------
+    // Action-count accounting (issue #782): base record 15 actions. This
+    // record adds the real setup leg (~+5: 3 fills + submit + Skip setup),
+    // drops the login leg (-3: register authenticated the user, so the login
+    // block never fills), and makes the upload leg real (+3: selector
+    // trigger + vault item + setInputFiles — the base leg recorded a
+    // degradation marker and counted ZERO upload actions). Per-step counts
+    // of the shared journey are unchanged; the deltas are the functionality
+    // the issue's Verification clause requires.
     const record = {
       action_count: actionCount,
       dead_ends: deadEnds,
       completed,
+      milestone_flips: milestoneFlips,
+      action_count_note:
+        "base 15; setup leg +5, login leg -3 (setup-authenticated), upload leg +3 (newly real)",
     };
     fs.mkdirSync(RECORD_DIR, { recursive: true });
     fs.writeFileSync(RECORD_PATH, JSON.stringify(record, null, 2) + "\n");
 
     expect(record.dead_ends, JSON.stringify(record.dead_ends, null, 2)).toEqual([]);
+    expect(record.milestone_flips, JSON.stringify(record.milestone_flips, null, 2)).toEqual([
+      "vault_created",
+      "upload_indexed",
+      "first_question_asked",
+      "first_citation_opened",
+    ]);
+  });
+
+  // Shared-stub state hygiene (issue #782): restore the defaults the other
+  // e2e specs (chat-smoke, chat-width-budget) expect, whatever the run order
+  // and however often the server is reused.
+  test.afterAll(async ({ request }) => {
+    try {
+      await request.post(`${STUB_ORIGIN}/_e2e/setup-mode`, {
+        data: { needs_setup: false },
+      });
+      await request.post(`${STUB_ORIGIN}/_e2e/onboarding`, {
+        data: { enable: false },
+      });
+    } catch {
+      // The stub server may already be gone (last spec in the run).
+    }
   });
 });
