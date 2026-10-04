@@ -4914,9 +4914,6 @@ def migrate_add_files_status_cancelled(sqlite_path: str) -> None:
     conn.isolation_level = None
     _journal = "migrate_add_files_status_cancelled"
     try:
-        record_migration_outcome(
-            conn, migration_name=_journal, phase="start", outcome="ok"
-        )
         tbl = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='files'"
         ).fetchone()
@@ -4953,11 +4950,11 @@ def migrate_add_files_status_cancelled(sqlite_path: str) -> None:
             else:
                 conn.execute("DROP TABLE IF EXISTS files_old")
 
+        # Journal-silent no-op probes (issue #699 AC2, mirroring
+        # migrate_widen_files_status): nothing to attempt when the table is
+        # absent — but the recovery block above runs FIRST so a
+        # crash-after-rename state is always dispositioned (issue #512 DB-002).
         if not tbl and not old_present:
-            record_migration_outcome(
-                conn, migration_name=_journal, phase="succeeded", outcome="noop",
-                detail="files table absent",
-            )
             return
 
         if recovered:
@@ -4976,12 +4973,11 @@ def migrate_add_files_status_cancelled(sqlite_path: str) -> None:
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='files'"
         ).fetchone()
         if create_sql and "'cancelled'" in create_sql[0]:
-            record_migration_outcome(
-                conn, migration_name=_journal, phase="succeeded", outcome="noop",
-                detail="status CHECK already admits 'cancelled'",
-            )
             return
 
+        record_migration_outcome(
+            conn, migration_name=_journal, phase="start", outcome="ok"
+        )
         before_count = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
 
         conn.execute("PRAGMA foreign_keys = OFF")
@@ -4989,9 +4985,11 @@ def migrate_add_files_status_cancelled(sqlite_path: str) -> None:
         # Atomicity (issue #512 semantics, same as migrate_widen_files_status):
         # the swap runs inside ONE explicit BEGIN IMMEDIATE transaction using
         # execute() only, so a crash or copy failure rolls back to the
-        # pre-swap state (files_old included).
-        conn.execute("BEGIN IMMEDIATE")
+        # pre-swap state (files_old included). BEGIN sits INSIDE the try
+        # (issue #699 AC1) so a lock error at the transaction open is
+        # journaled as a terminal failed outcome.
         try:
+            conn.execute("BEGIN IMMEDIATE")
             for trig in (
                 "files_search_fts_insert",
                 "files_search_fts_delete",
@@ -5178,17 +5176,43 @@ def migrate_add_files_status_cancelled(sqlite_path: str) -> None:
             conn.execute("PRAGMA legacy_alter_table = OFF")
             conn.execute("PRAGMA foreign_keys = ON")
 
-        violations = conn.execute("PRAGMA foreign_key_check").fetchall()
-        if violations:
-            record_migration_outcome(
-                conn, migration_name=_journal, phase="failed", outcome="error",
-                detail=f"foreign_key_check violations: {len(violations)}",
-            )
-            raise RuntimeError(
-                f"migrate_add_files_status_cancelled: foreign_key_check "
-                f"reported {len(violations)} violation(s) post-swap: "
-                f"{violations[:5]}"
-            )
+        # Scoped integrity check (issue #699 AC4 class, same shape as
+        # migrate_widen_files_status): the swap rebuilt the files parent
+        # table, so the rows at risk are in the child tables referencing
+        # files(id) — PRAGMA foreign_key_check(T) reports only FKs declared
+        # BY T, so each is checked in table-arg form (behind an existence
+        # guard for pre-schema databases). An unrelated pre-existing orphan
+        # anywhere else cannot block this migration.
+        for child in (
+            "files",
+            "document_atoms",
+            "document_assets",
+            "ingestion_stage_states",
+            "document_atom_enrichments",
+            "failed_chunks",
+            "wiki_page_files",
+            "kms_entries",
+            "document_tags",
+        ):
+            child_present = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                (child,),
+            ).fetchone()
+            if not child_present:
+                continue
+            violations = conn.execute(
+                f"PRAGMA foreign_key_check({child})"  # fixed literal names
+            ).fetchall()
+            if violations:
+                record_migration_outcome(
+                    conn, migration_name=_journal, phase="failed", outcome="error",
+                    detail=f"foreign_key_check({child}) violations: {len(violations)}",
+                )
+                raise RuntimeError(
+                    f"migrate_add_files_status_cancelled: foreign_key_check({child}) "
+                    f"reported {len(violations)} violation(s) post-swap: "
+                    f"{violations[:5]}"
+                )
 
         invalidate_derived_data(
             conn,
