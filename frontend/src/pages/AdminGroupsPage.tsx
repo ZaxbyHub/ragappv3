@@ -1,6 +1,6 @@
 // frontend/src/pages/AdminGroupsPage.tsx
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useRef } from "react";
 import type { JSX } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
@@ -30,6 +30,34 @@ import {
 } from "@/lib/api";
 import { PageTitleHeader } from "@/components/layout/PageTitleHeader";
 
+interface EditorIdentity {
+  groupId: number;
+  openingToken: number;
+}
+
+interface GroupEditMutationVariables {
+  groupId: number;
+  openingToken: number;
+  data: GroupFormData;
+}
+
+interface GroupDeleteMutationVariables {
+  groupId: number;
+  openingToken: number;
+}
+
+interface MembersMutationVariables {
+  groupId: number;
+  openingToken: number;
+  userIds: number[];
+}
+
+interface VaultsMutationVariables {
+  groupId: number;
+  openingToken: number;
+  vaultAccess: VaultAccessItem[];
+}
+
 // ============================================================================
 // Main Page Component
 // ============================================================================
@@ -43,9 +71,20 @@ function AdminGroupsPageContent(): JSX.Element {
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [membersSheetOpen, setMembersSheetOpen] = useState(false);
   const [vaultsSheetOpen, setVaultsSheetOpen] = useState(false);
+  const [membersEditorToken, setMembersEditorToken] = useState(0);
+  const [vaultsEditorToken, setVaultsEditorToken] = useState(0);
+  const [editEditorToken, setEditEditorToken] = useState(0);
+  const [deleteEditorToken, setDeleteEditorToken] = useState(0);
 
   // Selected group for actions
   const [selectedGroup, setSelectedGroup] = useState<Group | null>(null);
+  const selectedGroupRef = useRef<Group | null>(selectedGroup);
+  selectedGroupRef.current = selectedGroup;
+  const editorTokenRef = useRef(0);
+  const membersEditorRef = useRef<EditorIdentity | null>(null);
+  const vaultsEditorRef = useRef<EditorIdentity | null>(null);
+  const editEditorRef = useRef<EditorIdentity | null>(null);
+  const deleteEditorRef = useRef<EditorIdentity | null>(null);
 
   // Invalidate all groups queries (list + any sub-queries)
   const invalidateGroups = useCallback(() => {
@@ -69,13 +108,19 @@ function AdminGroupsPageContent(): JSX.Element {
   });
 
   const updateMutation = useMutation({
-    mutationFn: (data: GroupFormData) => {
-      if (!selectedGroup) throw new Error("No group selected");
-      return updateGroup(selectedGroup.id, data.name, data.description ?? null);
+    mutationFn: ({ groupId, data }: GroupEditMutationVariables) => {
+      return updateGroup(groupId, data.name, data.description ?? null);
     },
-    onSuccess: () => {
+    onSuccess: (_group, variables) => {
       toast.success("Group updated successfully");
-      setEditDialogOpen(false);
+      const currentEditor = editEditorRef.current;
+      if (
+        currentEditor?.groupId === variables.groupId &&
+        currentEditor.openingToken === variables.openingToken &&
+        selectedGroupRef.current?.id === variables.groupId
+      ) {
+        setEditDialogOpen(false);
+      }
       invalidateGroups();
     },
     onError: () => {
@@ -84,13 +129,19 @@ function AdminGroupsPageContent(): JSX.Element {
   });
 
   const deleteMutation = useMutation({
-    mutationFn: () => {
-      if (!selectedGroup) throw new Error("No group selected");
-      return deleteGroup(selectedGroup.id);
+    mutationFn: ({ groupId }: GroupDeleteMutationVariables) => {
+      return deleteGroup(groupId);
     },
-    onSuccess: () => {
+    onSuccess: (_result, variables) => {
       toast.success("Group deleted successfully");
-      setDeleteDialogOpen(false);
+      const currentEditor = deleteEditorRef.current;
+      if (
+        currentEditor?.groupId === variables.groupId &&
+        currentEditor.openingToken === variables.openingToken &&
+        selectedGroupRef.current?.id === variables.groupId
+      ) {
+        setDeleteDialogOpen(false);
+      }
       invalidateGroups();
     },
     onError: () => {
@@ -99,14 +150,20 @@ function AdminGroupsPageContent(): JSX.Element {
   });
 
   const membersMutation = useMutation({
-    mutationFn: (userIds: number[]) => {
-      if (!selectedGroup) throw new Error("No group selected");
-      return updateGroupMembers(selectedGroup.id, userIds);
+    mutationFn: ({ groupId, userIds }: MembersMutationVariables) => {
+      return updateGroupMembers(groupId, userIds);
     },
-    onSuccess: () => {
+    onSuccess: (_result, variables) => {
       toast.success("Group members updated");
-      setMembersSheetOpen(false);
-      queryClient.invalidateQueries({ queryKey: ["groups", selectedGroup?.id, "members"] });
+      const currentEditor = membersEditorRef.current;
+      if (
+        currentEditor?.groupId === variables.groupId &&
+        currentEditor.openingToken === variables.openingToken &&
+        selectedGroupRef.current?.id === variables.groupId
+      ) {
+        setMembersSheetOpen(false);
+      }
+      queryClient.invalidateQueries({ queryKey: ["groups", variables.groupId, "members"] });
     },
     onError: (error: Error) => {
       toast.error(error.message || "Failed to update group members");
@@ -114,14 +171,20 @@ function AdminGroupsPageContent(): JSX.Element {
   });
 
   const vaultsMutation = useMutation({
-    mutationFn: (vaultAccess: VaultAccessItem[]) => {
-      if (!selectedGroup) throw new Error("No group selected");
-      return updateGroupVaults(selectedGroup.id, vaultAccess);
+    mutationFn: ({ groupId, vaultAccess }: VaultsMutationVariables) => {
+      return updateGroupVaults(groupId, vaultAccess);
     },
-    onSuccess: () => {
+    onSuccess: (_result, variables) => {
       toast.success("Vault access updated");
-      setVaultsSheetOpen(false);
-      queryClient.invalidateQueries({ queryKey: ["groups", selectedGroup?.id, "vaults"] });
+      const currentEditor = vaultsEditorRef.current;
+      if (
+        currentEditor?.groupId === variables.groupId &&
+        currentEditor.openingToken === variables.openingToken &&
+        selectedGroupRef.current?.id === variables.groupId
+      ) {
+        setVaultsSheetOpen(false);
+      }
+      queryClient.invalidateQueries({ queryKey: ["groups", variables.groupId, "vaults"] });
     },
     onError: (error: Error) => {
       toast.error(error.message || "Failed to update vault access");
@@ -137,21 +200,37 @@ function AdminGroupsPageContent(): JSX.Element {
   }, []);
 
   const handleEditClick = useCallback((group: Group) => {
+    const openingToken = ++editorTokenRef.current;
+    selectedGroupRef.current = group;
+    editEditorRef.current = { groupId: group.id, openingToken };
+    setEditEditorToken(openingToken);
     setSelectedGroup(group);
     setEditDialogOpen(true);
   }, []);
 
   const handleDeleteClick = useCallback((group: Group) => {
+    const openingToken = ++editorTokenRef.current;
+    selectedGroupRef.current = group;
+    deleteEditorRef.current = { groupId: group.id, openingToken };
+    setDeleteEditorToken(openingToken);
     setSelectedGroup(group);
     setDeleteDialogOpen(true);
   }, []);
 
   const handleManageMembersClick = useCallback((group: Group) => {
+    const openingToken = ++editorTokenRef.current;
+    selectedGroupRef.current = group;
+    membersEditorRef.current = { groupId: group.id, openingToken };
+    setMembersEditorToken(openingToken);
     setSelectedGroup(group);
     setMembersSheetOpen(true);
   }, []);
 
   const handleManageVaultsClick = useCallback((group: Group) => {
+    const openingToken = ++editorTokenRef.current;
+    selectedGroupRef.current = group;
+    vaultsEditorRef.current = { groupId: group.id, openingToken };
+    setVaultsEditorToken(openingToken);
     setSelectedGroup(group);
     setVaultsSheetOpen(true);
   }, []);
@@ -161,20 +240,39 @@ function AdminGroupsPageContent(): JSX.Element {
   }, [createMutation]);
 
   const handleEditSubmit = useCallback(async (data: GroupFormData) => {
-    await updateMutation.mutateAsync(data);
-  }, [updateMutation]);
+    if (!selectedGroup) throw new Error("No group selected");
+    await updateMutation.mutateAsync({
+      groupId: selectedGroup.id,
+      openingToken: editEditorToken,
+      data,
+    });
+  }, [editEditorToken, selectedGroup, updateMutation]);
 
   const handleDeleteConfirm = useCallback(async () => {
-    await deleteMutation.mutateAsync();
-  }, [deleteMutation]);
+    if (!selectedGroup) throw new Error("No group selected");
+    await deleteMutation.mutateAsync({
+      groupId: selectedGroup.id,
+      openingToken: deleteEditorToken,
+    });
+  }, [deleteEditorToken, deleteMutation, selectedGroup]);
 
   const handleMembersSave = useCallback(async (userIds: number[]) => {
-    await membersMutation.mutateAsync(userIds);
-  }, [membersMutation]);
+    if (!selectedGroup) throw new Error("No group selected");
+    await membersMutation.mutateAsync({
+      groupId: selectedGroup.id,
+      openingToken: membersEditorToken,
+      userIds,
+    });
+  }, [membersEditorToken, membersMutation, selectedGroup]);
 
   const handleVaultsSave = useCallback(async (vaultAccess: VaultAccessItem[]) => {
-    await vaultsMutation.mutateAsync(vaultAccess);
-  }, [vaultsMutation]);
+    if (!selectedGroup) throw new Error("No group selected");
+    await vaultsMutation.mutateAsync({
+      groupId: selectedGroup.id,
+      openingToken: vaultsEditorToken,
+      vaultAccess,
+    });
+  }, [selectedGroup, vaultsEditorToken, vaultsMutation]);
 
   // ============================================================================
   // Render
@@ -225,6 +323,7 @@ function AdminGroupsPageContent(): JSX.Element {
       <ManageMembersSheet
         group={selectedGroup}
         open={membersSheetOpen}
+        editorToken={membersEditorToken}
         onOpenChange={setMembersSheetOpen}
         onSave={handleMembersSave}
       />
@@ -233,6 +332,7 @@ function AdminGroupsPageContent(): JSX.Element {
       <ManageVaultsSheet
         group={selectedGroup}
         open={vaultsSheetOpen}
+        editorToken={vaultsEditorToken}
         onOpenChange={setVaultsSheetOpen}
         onSave={handleVaultsSave}
       />
