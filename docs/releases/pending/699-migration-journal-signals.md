@@ -16,9 +16,12 @@
     probe-first prologues (already-done probes return silently, with no start
     row), eliminating the ~19 routine rows per restart that buried the
     operator's "latest 3 outcomes" startup summary within one or two boots.
-    Recovery probes keep their #512 DB-001/DB-002 first-position ordering:
-    backup-table states are still restored/dropped before any silent return,
-    and genuine recoveries still journal `recovered` signal rows.
+    The `migrate_add_user_onboarding_state` writer that master gained from
+    #782 mid-flight received the same gate in this PR's merge follow-up (ten
+    gated writers total). Recovery probes keep their #512 DB-001/DB-002
+    first-position ordering: backup-table states are still restored/dropped
+    before any silent return, and genuine recoveries still journal
+    `recovered` signal rows.
   - `migrate_add_files_content_fts` regained an already-run gate: when the
     virtual table AND all three sync triggers exist, the boot writes no
     journal rows and skips the per-boot full FTS rebuild + `rebuilt`
@@ -68,7 +71,9 @@
   backend/app to name a table).
 - `backend/tests/test_b08_near_dups_migration.py` — the no-op near-dups run
   now asserts journal silence (declared forced change; it previously pinned
-  the per-boot noise this PR removes).
+  the per-boot noise this PR removes). The #782 onboarding migration's rerun
+  test (`backend/tests/test_m02_onboarding_migration.py`) asserts the same
+  silence for the tenth writer (same declared forced-change shape).
 
 ## Known scope (explicitly not covered here)
 
