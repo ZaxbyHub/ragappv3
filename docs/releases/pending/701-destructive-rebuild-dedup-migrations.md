@@ -25,15 +25,16 @@
   between the two used to leave an all-NULL column a re-run never repaired
   (the `chat_messages.seq` recovery pattern; issue #701, T1-05-S-03).
 - `migrate_add_file_metadata_columns` backfills `files.modified_at` from
-  `created_at` on every invocation. The old column-absence gate was dead
+  `created_at` whenever rows still hold NULL (probe-first, so a converged
+  boot performs no schema writes). The old column-absence gate was dead
   code under `run_migrations` (`init_db` adds the column first) and left
   every legacy row `NULL` forever; the ungated pass also repairs the
-  already-damaged population and any crash window. The `files_search_fts`
-  update trigger is dropped for the one-statement backfill and recreated
-  from the identical DDL: `modified_at` is not an indexed column, so
-  skipping the sync is a semantic no-op, while firing it on rows that
-  predate the FTS index raises FTS5's "database disk image is malformed"
-  (issue #701, T1-05-S-09).
+  already-damaged population and any crash window. When a backfill runs,
+  the `files_search_fts` update trigger is dropped for the one-statement
+  backfill and recreated from the identical DDL: `modified_at` is not an
+  indexed column, so skipping the sync is a semantic no-op, while firing it
+  on rows that predate the FTS index raises FTS5's "database disk image is
+  malformed" (issue #701, T1-05-S-09).
 - Three findings in the issue were already fixed on master before this PR
   and are pinned PRESERVING rather than re-fixed here: the
   `migrate_relax_draft_claims_span_not_null` legacy-path coverage now exists
@@ -59,9 +60,10 @@
 - `backend/tests/test_b12_rebuild_highwater_guardrail.py` — positional AST
   census: every qualifying backup-table `DROP` in `database.py` (backup
   suffix `_old`/`_legacy_fk` + renamed-to-backup in the same function) must
-  have a preceding `_preserve_autoincrement_high_water(conn, <backup>, ...)`
-  call, RED on the pre-fix tree, mutation-probed (call removal and
-  misplacement after the DROP both go RED).
+  have its own `_preserve_autoincrement_high_water(conn, <backup>, ...)`
+  call in the interval between the previous qualifying drop of that name
+  and the drop itself, RED on the pre-fix tree, mutation-probed (removing
+  or misplacing ANY of the 17 call sites goes RED).
 
 ## Notes
 
@@ -77,5 +79,6 @@
   claims dedup counts inside `BEGIN IMMEDIATE`), so a concurrent writer
   could in principle make the journaled count diverge from the actual
   delete; migration boots are single-writer in practice.
-- Bandit baseline regenerated for `database.py` line shifts (content-flat
-  regen, no new findings).
+- `database.py` carries no bandit findings, so the SAST gates
+  (`run_bandit.py`, `check_sast_baseline.py`) pass with no baseline
+  regeneration (verified pre-push).

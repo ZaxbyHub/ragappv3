@@ -2233,29 +2233,36 @@ def migrate_add_file_metadata_columns(sqlite_path: str) -> None:
         # leaves NULLs a column-absence gate never repairs (issue #701,
         # T1-05-S-09; chat_messages.seq precedent). created_at is the
         # documented modified_at proxy; rows without created_at stay NULL.
-        # The files_search_fts sync trigger is dropped for this UPDATE:
-        # modified_at is not an indexed column, so skipping the sync is a
-        # semantic no-op, while firing it on rows that predate the FTS index
-        # (exactly the legacy-upgrade shape this backfill repairs) raises
-        # FTS5's 'database disk image is malformed'. The index is rebuilt
-        # from scratch by migrate_add_files_search_fts later in
-        # run_migrations; the trigger is recreated from the identical DDL so
-        # direct calls leave a fully-synced schema.
-        conn.execute("DROP TRIGGER IF EXISTS files_search_fts_update")
-        conn.execute(
-            "UPDATE files SET modified_at = created_at"
-            " WHERE modified_at IS NULL AND created_at IS NOT NULL"
-        )
-        conn.execute(
-            """
-            CREATE TRIGGER IF NOT EXISTS files_search_fts_update AFTER UPDATE ON files BEGIN
-                INSERT INTO files_search_fts(files_search_fts, rowid, file_name, file_type, status, source, email_subject, email_sender, document_date)
-                VALUES ('delete', old.id, old.file_name, old.file_type, old.status, old.source, old.email_subject, old.email_sender, old.document_date);
-                INSERT INTO files_search_fts(rowid, file_name, file_type, status, source, email_subject, email_sender, document_date)
-                VALUES (new.id, new.file_name, new.file_type, new.status, new.source, new.email_subject, new.email_sender, new.document_date);
-            END
-            """
-        )
+        # The probe-first shape keeps a converged boot schema-write-free
+        # (implementation-review round 1): the files_search_fts sync trigger
+        # is dropped only when a backfill actually runs. modified_at is not
+        # an indexed column, so skipping the sync is a semantic no-op, while
+        # firing it on rows that predate the FTS index (exactly the
+        # legacy-upgrade shape this backfill repairs) raises FTS5's
+        # 'database disk image is malformed'. The index is rebuilt from
+        # scratch by migrate_add_files_search_fts later in run_migrations;
+        # the trigger is recreated from the identical DDL so direct calls
+        # leave a fully-synced schema.
+        needs_backfill = conn.execute(
+            "SELECT 1 FROM files WHERE modified_at IS NULL AND created_at IS"
+            " NOT NULL LIMIT 1"
+        ).fetchone()
+        if needs_backfill:
+            conn.execute("DROP TRIGGER IF EXISTS files_search_fts_update")
+            conn.execute(
+                "UPDATE files SET modified_at = created_at"
+                " WHERE modified_at IS NULL AND created_at IS NOT NULL"
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS files_search_fts_update AFTER UPDATE ON files BEGIN
+                    INSERT INTO files_search_fts(files_search_fts, rowid, file_name, file_type, status, source, email_subject, email_sender, document_date)
+                    VALUES ('delete', old.id, old.file_name, old.file_type, old.status, old.source, old.email_subject, old.email_sender, old.document_date);
+                    INSERT INTO files_search_fts(rowid, file_name, file_type, status, source, email_subject, email_sender, document_date)
+                    VALUES (new.id, new.file_name, new.file_type, new.status, new.source, new.email_subject, new.email_sender, new.document_date);
+                END
+                """
+            )
 
         conn.commit()
     finally:

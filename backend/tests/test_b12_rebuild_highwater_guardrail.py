@@ -10,8 +10,9 @@ repo's backup naming conventions end in ``_old`` or ``_legacy_fk``) inside a
 function that also renames a table TO that same backup name, a
 ``_preserve_autoincrement_high_water(conn, <backup>, ...)`` call whose
 ``backup_table`` argument (second positional) is the string literal backup
-name must appear BEFORE that DROP in AST (line) order within the same
-function body.
+name must appear in the interval between the PREVIOUS qualifying drop of
+that same backup name (function start for the first) and this DROP — so
+every drop site carries its own dedicated preceding call.
 
 This closes the vacuity modes a function-level census would allow:
 misplacement (a call after the DROP cannot preserve anything — the backup's
@@ -87,6 +88,7 @@ def test_every_backup_drop_preserves_autoincrement_high_water():
             for match in _RENAME_RE.finditer(sql)
         }
         helpers = list(_helper_calls(func))
+        qualifying_drops = []
         for lineno, sql in executes:
             match = _DROP_RE.search(sql)
             if not match:
@@ -98,15 +100,31 @@ def test_every_backup_drop_preserves_autoincrement_high_water():
                 # A backup-named table dropped without a rename-to-backup in
                 # the same function is not a rename-rebuild disposal site.
                 continue
+            qualifying_drops.append((lineno, dropped))
+
+        # ast.walk is breadth-first, not source order — sort before pairing.
+        qualifying_drops.sort()
+
+        # Pair each drop with its OWN preceding helper call: the call must
+        # sit in the interval between the PREVIOUS qualifying drop of the
+        # same backup name and this one (function start for the first). An
+        # "any earlier call" rule would let one call satisfy every later
+        # drop of the same name, so removing or misplacing a non-first call
+        # would silently stay GREEN.
+        previous_drop_line = {}
+        for lineno, dropped in qualifying_drops:
+            lower_bound = previous_drop_line.get(dropped, 0)
             if not any(
-                helper_lineno < lineno and backup == dropped
+                lower_bound < helper_lineno < lineno and backup == dropped
                 for helper_lineno, backup in helpers
             ):
                 problems.append(
                     f"{func.name}: DROP TABLE {dropped} (line {lineno}) has "
-                    f"no preceding {HELPER}(\"{dropped}\", ...) call in the "
-                    "same function"
+                    f"no {HELPER}(conn, \"{dropped}\", ...) call between its "
+                    f"predecessor (line {lower_bound or 'function start'}) "
+                    "and the drop"
                 )
+            previous_drop_line[dropped] = lineno
 
     assert not problems, (
         "rename-rebuild backup drops without high-water preservation:\n"
