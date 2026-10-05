@@ -81,10 +81,11 @@ class FolderUpdateRequest(BaseModel):
 
 class FolderMoveRequest(BaseModel):
     vault_id: int
-    # Bounded well under SQLite's host-parameter limit so a huge batch
-    # cannot hold the global write lock for an arbitrary IN-scan inside
-    # move_documents' transaction (issue #700 review, PRR-007).
-    file_ids: list[int] = Field(..., min_length=1, max_length=999)
+    # Bounded (aligned with the documents per-page ceiling of 1000 the UI
+    # selects against, and far under SQLite's host-parameter limit) so a
+    # huge batch cannot hold the global write lock for an arbitrary IN-scan
+    # inside move_documents' transaction (issue #700 review, PRR-007).
+    file_ids: list[int] = Field(..., min_length=1, max_length=1000)
     # null => move the documents to the root (unfiled).
     folder_id: Optional[int] = None
 

@@ -25,8 +25,10 @@
   queue rounds grew wall time unbounded).
 - **Pool observability (T1-06-K-02):** all five "could not obtain a
   connection" exits route through a new `_fail_checkout` helper that emits
-  the structured `pool_exhausted` event and marks the capacity wait, so the
-  readiness probe reflects every failure mode, not just loop exhaustion.
+  the structured `pool_exhausted` event, so the log stream reflects every
+  failure mode, not just loop exhaustion. The readiness probe's
+  capacity-wait signal is deliberately unchanged: it still means a caller
+  was forced to wait for capacity, not that any checkout failed.
 - **Event-loop reachability (T1-06-S-04):** connection creation is
   serialized by a dedicated `_create_lock` instead of the shared `._lock`,
   which is now held only for O(1) bookkeeping — `recent_capacity_wait()`
@@ -58,8 +60,10 @@
   `BackgroundProcessor.stop()`'s 60 s per-phase budget), so the common
   single-phase drain is no longer SIGKILLed at Docker's implicit 10 s.
   `stop()` applies its timeout per drain phase, so a busy multi-phase
-  shutdown can still hit the grace period — tracked in #854. `stop()`
-  itself is unchanged.
+  shutdown can still hit the grace period — tracked in #854. Note the
+  grace period only matters once the container actually receives SIGTERM:
+  until #748 ships (`CMD` runs uvicorn under `sh -c` without `exec`), the
+  shell may not forward it. `stop()` itself is unchanged.
 
 ## Why
 
