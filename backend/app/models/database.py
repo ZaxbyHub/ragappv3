@@ -1820,12 +1820,19 @@ def _preserve_autoincrement_high_water(
     ``DROP TABLE`` destroys the dropped table's ``sqlite_sequence`` row, and
     a freshly recreated AUTOINCREMENT table starts its counter at
     ``max(copied id)`` — ids of rows deleted before the rebuild would be
-    reissued afterward. Call this inside the rebuild transaction, after the
-    copy's parity check and immediately before the backup DROP: it raises
-    the canonical table's counter to at least the backup's recorded
-    high-water mark. ``sqlite_sequence`` is documented as writable by
-    ordinary DML (https://sqlite.org/autoinc.html). No-ops when the backup
-    has no sequence row (never inserted) or no AUTOINCREMENT table exists.
+    reissued afterward. Call this immediately before the backup DROP —
+    inside the rebuild transaction at the main-swap sites, or in the
+    autocommit recovery prologue at the stale-backup sites (each statement
+    there self-commits, and the preserve-before-drop ordering plus this
+    helper's idempotence make crash-resume converge). It raises the
+    canonical table's counter to at least the backup's recorded high-water
+    mark. ``sqlite_sequence`` is documented as writable by ordinary DML
+    (https://sqlite.org/autoinc.html). No-ops when the backup has no
+    sequence row (never inserted), no AUTOINCREMENT table exists, the
+    stored value is not a usable integer, or the value is outside the
+    plausible AUTOINCREMENT range — a corrupt ``seq`` is skipped (the
+    pre-#701 behavior) rather than aborting the migration or copying an
+    id-exhausting counter onto the canonical table.
     """
     try:
         row = conn.execute(
@@ -1835,7 +1842,14 @@ def _preserve_autoincrement_high_water(
         return
     if row is None or row[0] is None:
         return
-    high_water = int(row[0])
+    try:
+        high_water = int(row[0])
+    except (TypeError, ValueError, OverflowError):
+        # Corrupted/unrepresentable seq: skip preservation instead of
+        # failing the migration or copying garbage (issue #701 review).
+        return
+    if not 0 < high_water < 2 ** 62:
+        return
     conn.execute(
         "UPDATE sqlite_sequence SET seq = ? WHERE name = ? AND seq < ?",
         (high_water, canonical_table, high_water),
@@ -2233,36 +2247,64 @@ def migrate_add_file_metadata_columns(sqlite_path: str) -> None:
         # leaves NULLs a column-absence gate never repairs (issue #701,
         # T1-05-S-09; chat_messages.seq precedent). created_at is the
         # documented modified_at proxy; rows without created_at stay NULL.
-        # The probe-first shape keeps a converged boot schema-write-free
-        # (implementation-review round 1): the files_search_fts sync trigger
-        # is dropped only when a backfill actually runs. modified_at is not
-        # an indexed column, so skipping the sync is a semantic no-op, while
-        # firing it on rows that predate the FTS index (exactly the
-        # legacy-upgrade shape this backfill repairs) raises FTS5's
-        # 'database disk image is malformed'. The index is rebuilt from
-        # scratch by migrate_add_files_search_fts later in run_migrations;
-        # the trigger is recreated from the identical DDL so direct calls
-        # leave a fully-synced schema.
+        # The probe-first shape keeps a converged boot free of schema
+        # writes; the read cost is one unindexed probe per boot, the same
+        # shape as the chat_messages.seq precedent. When a backfill runs,
+        # the files_search_fts sync trigger is dropped for the UPDATE and
+        # recreated from the identical DDL: modified_at is not an indexed
+        # column, so skipping the sync is a semantic no-op, while firing it
+        # on rows that predate the FTS index raises FTS5's "database disk
+        # image is malformed". The recreate is gated on the FTS table (and
+        # its indexed columns) actually existing, so a direct call on a
+        # minimal database leaves no dangling trigger behind; run_migrations
+        # rebuilds the index later in the boot either way. The whole block
+        # runs inside one explicit transaction, so the trigger is never
+        # durably absent and a concurrent writer cannot slip into the gap.
         needs_backfill = conn.execute(
             "SELECT 1 FROM files WHERE modified_at IS NULL AND created_at IS"
             " NOT NULL LIMIT 1"
         ).fetchone()
         if needs_backfill:
-            conn.execute("DROP TRIGGER IF EXISTS files_search_fts_update")
-            conn.execute(
-                "UPDATE files SET modified_at = created_at"
-                " WHERE modified_at IS NULL AND created_at IS NOT NULL"
-            )
-            conn.execute(
-                """
-                CREATE TRIGGER IF NOT EXISTS files_search_fts_update AFTER UPDATE ON files BEGIN
-                    INSERT INTO files_search_fts(files_search_fts, rowid, file_name, file_type, status, source, email_subject, email_sender, document_date)
-                    VALUES ('delete', old.id, old.file_name, old.file_type, old.status, old.source, old.email_subject, old.email_sender, old.document_date);
-                    INSERT INTO files_search_fts(rowid, file_name, file_type, status, source, email_subject, email_sender, document_date)
-                    VALUES (new.id, new.file_name, new.file_type, new.status, new.source, new.email_subject, new.email_sender, new.document_date);
-                END
-                """
-            )
+            fts_ready = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name"
+                " = 'files_search_fts'"
+            ).fetchone() is not None
+            existing_cols = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(files)").fetchall()
+            }
+            trigger_recreatable = fts_ready and {
+                "file_name",
+                "file_type",
+                "status",
+                "source",
+                "email_subject",
+                "email_sender",
+                "document_date",
+            }.issubset(existing_cols)
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                if trigger_recreatable:
+                    conn.execute("DROP TRIGGER IF EXISTS files_search_fts_update")
+                conn.execute(
+                    "UPDATE files SET modified_at = created_at"
+                    " WHERE modified_at IS NULL AND created_at IS NOT NULL"
+                )
+                if trigger_recreatable:
+                    conn.execute(
+                        """
+                        CREATE TRIGGER IF NOT EXISTS files_search_fts_update AFTER UPDATE ON files BEGIN
+                            INSERT INTO files_search_fts(files_search_fts, rowid, file_name, file_type, status, source, email_subject, email_sender, document_date)
+                            VALUES ('delete', old.id, old.file_name, old.file_type, old.status, old.source, old.email_subject, old.email_sender, old.document_date);
+                            INSERT INTO files_search_fts(rowid, file_name, file_type, status, source, email_subject, email_sender, document_date)
+                            VALUES (new.id, new.file_name, new.file_type, new.status, new.source, new.email_subject, new.email_sender, new.document_date);
+                        END
+                        """
+                    )
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
 
         conn.commit()
     finally:
@@ -5611,7 +5653,9 @@ def migrate_add_document_near_dups(sqlite_path: str) -> None:
 def migrate_add_wiki_relations_unique(sqlite_path: str) -> None:
     """Migration: add UNIQUE constraint on wiki_relations(subject_entity_id, predicate, object_entity_id).
 
-    Deduplicates existing rows first (keeps highest id per triple), then
+    Deduplicates existing rows first (keeps highest id per triple among rows
+    whose key columns are all non-NULL — NULL-keyed rows are exempt, since
+    the UNIQUE index treats NULLs as distinct and would accept them), then
     creates a unique index. Idempotent — already-migrated databases return
     before any journaling (issue #699 AC2). The one-time dedup attempt
     journals its deleted-row count on success and a terminal ``failed`` row
@@ -5940,7 +5984,12 @@ def migrate_add_wiki_claims_normalized_text(sqlite_path: str) -> None:
     existing rows. Idempotent. Mirrors normalize_claim_text in wiki_store."""
     import re
 
-    def _normalize(text: str) -> str:
+    def _normalize(text) -> str:
+        if isinstance(text, bytes):
+            # Hostile/corrupt row: decode instead of wedging every boot.
+            text = text.decode("utf-8", "replace")
+        elif not isinstance(text, str):
+            text = "" if text is None else str(text)
         normalized = re.sub(r"[^\w\s]", "", (text or "").lower().strip())
         return re.sub(r"\s+", " ", normalized).strip()
 
@@ -5950,18 +5999,57 @@ def migrate_add_wiki_claims_normalized_text(sqlite_path: str) -> None:
         if "normalized_text" not in cols:
             conn.execute("ALTER TABLE wiki_claims ADD COLUMN normalized_text TEXT")
         # Backfill whenever rows still lack a value: column absence alone is
-        # not a sufficient guard, because ALTER TABLE ADD COLUMN auto-commits
-        # outside this transaction — a process killed between the ALTER and
-        # the backfill would otherwise leave NULL rows a re-run never
+        # not a sufficient guard — init_db adds this column ahead of this
+        # migration on the boot path, and a crash between any ALTER and its
+        # backfill would otherwise leave NULL rows a re-run never
         # repopulates (chat_messages.seq precedent; issue #701, T1-05-S-03).
         rows = conn.execute(
             "SELECT id, claim_text FROM wiki_claims WHERE normalized_text IS NULL"
         ).fetchall()
-        for claim_id, claim_text in rows:
-            conn.execute(
-                "UPDATE wiki_claims SET normalized_text = ? WHERE id = ?",
-                (_normalize(claim_text), claim_id),
-            )
+        if rows:
+            # Bracket the bulk UPDATE with the wiki_claims_fts sync trigger,
+            # mirroring the files_search_fts_update guard in
+            # migrate_add_file_metadata_columns: claim_text IS an indexed
+            # column, and firing the external-content 'delete' command for a
+            # rowid missing from the index raises FTS5's "database disk
+            # image is malformed" (the exact drift shape this backfill
+            # repairs). The recreate is gated on the FTS table existing, so
+            # a direct call on a minimal database leaves no dangling trigger
+            # behind. One explicit transaction: the trigger is never
+            # durably absent and the backfill is atomic.
+            fts_ready = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name"
+                " = 'wiki_claims_fts'"
+            ).fetchone() is not None
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                if fts_ready:
+                    conn.execute("DROP TRIGGER IF EXISTS wiki_claims_fts_update")
+                for claim_id, claim_text in rows:
+                    conn.execute(
+                        "UPDATE wiki_claims SET normalized_text = ? WHERE id = ?",
+                        (_normalize(claim_text), claim_id),
+                    )
+                if fts_ready:
+                    conn.execute(
+                        """
+                        CREATE TRIGGER IF NOT EXISTS wiki_claims_fts_update AFTER UPDATE ON wiki_claims BEGIN
+                            INSERT INTO wiki_claims_fts(wiki_claims_fts, rowid, claim_text, subject, predicate, object) VALUES ('delete', old.id, old.claim_text, old.subject, old.predicate, old.object);
+                            INSERT INTO wiki_claims_fts(rowid, claim_text, subject, predicate, object) VALUES (new.id, new.claim_text, new.subject, new.predicate, new.object);
+                        END
+                        """
+                    )
+                    # Heal any pre-existing index drift while the sync
+                    # trigger is under our control: unlike the files side,
+                    # no later run_migrations step rebuilds this index.
+                    conn.execute(
+                        "INSERT INTO wiki_claims_fts(wiki_claims_fts)"
+                        " VALUES('rebuild')"
+                    )
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_wiki_claims_vault_normalized "
             "ON wiki_claims(vault_id, normalized_text)"
