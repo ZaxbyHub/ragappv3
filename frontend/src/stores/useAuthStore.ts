@@ -137,14 +137,24 @@ export const useAuthStore = create<AuthState>()(
               await useVaultStore.getState().fetchVaults();
               return;
             }
-          } catch {
-            // Token invalid and refresh failed — clear all auth state
-            set({
-              accessToken: null,
-              user: null,
-              isAuthenticated: false,
-            });
-            setJwtAccessToken(null);
+          } catch (error) {
+            // Auth-shaped failure (fetchMe rejected with 401/403): the server
+            // refused the session — clear it. Anything else is transport-class
+            // (#774): a fetchMe/refresh that never reached the backend keeps
+            // the persisted session so the app recovers when the backend does.
+            const status =
+              (error as { response?: { status?: number } } | null)?.response?.status ??
+              (error as { status?: number } | null)?.status;
+            if (status === 401 || status === 403) {
+              set({
+                accessToken: null,
+                user: null,
+                isAuthenticated: false,
+              });
+              setJwtAccessToken(null);
+            } else {
+              console.warn("Auth init unavailable (transport failure):", error);
+            }
           }
 
           try {
@@ -256,9 +266,12 @@ export const useAuthStore = create<AuthState>()(
           // New authenticated session: start a fresh diagnostic burst.
           resetSubpathRefreshDiagnostic();
 
-          // Reset and re-fetch CSRF token for new session
+          // Reset and re-fetch CSRF token for new session. Best-effort like
+          // login's post-login re-fetch: the account is already created, so
+          // a failed post-signup token fetch (incl. the #774 deadline) must
+          // not surface as a register failure.
           resetCsrfToken();
-          await ensureCsrfToken();
+          await ensureCsrfToken().catch(() => undefined);
         } finally {
           get()._setLoading(false);
         }
@@ -314,14 +327,13 @@ export const useAuthStore = create<AuthState>()(
           setJwtAccessToken(null);
           return null;
         } catch (error) {
-          console.error("Token refresh failed:", error);
-          // Clear auth state on refresh failure
-          set({
-            user: null,
-            accessToken: null,
-            isAuthenticated: false,
-          });
-          setJwtAccessToken(null);
+          // Transport-class failure (network error, refresh timeout, or 5xx —
+          // issue #774 / UI-R4-09): refreshAccessToken rejects ONLY for
+          // transport failures; an auth-shaped rejection resolves null and
+          // the branch above clears the session. A backend outage must not
+          // log an authenticated user out — keep the session so it survives
+          // the outage and a later refresh can succeed.
+          console.warn("Token refresh unavailable (transport failure):", error);
           return null;
         }
       },

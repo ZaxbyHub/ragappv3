@@ -44,6 +44,10 @@ export function MaintenanceSettings({ vaultId }: MaintenanceSettingsProps) {
     null | "recompile" | "lint" | "connections" | "jobs"
   >(null);
   const [recentJobs, setRecentJobs] = useState<WikiCompileJob[]>([]);
+  // True when the LAST jobs fetch failed (issue #774 / TQ-sibling-batch-08-04):
+  // a failed load must not render "No recent jobs." — that is a verdict about
+  // the job history, not about a failed request.
+  const [jobsError, setJobsError] = useState(false);
 
   const refreshJobs = async () => {
     if (!vaultId) {
@@ -52,13 +56,16 @@ export function MaintenanceSettings({ vaultId }: MaintenanceSettingsProps) {
     }
     setBusy("jobs");
     try {
-      const out = await listWikiJobs({ vault_id: vaultId });
+      const out = await listWikiJobs({ vault_id: vaultId, limit: 10 });
       // Latest 10 by id desc — backend may already sort, but we don't rely.
       const jobs = (out.jobs ?? []).slice(0, 10);
       setRecentJobs(jobs);
+      setJobsError(false);
     } catch (e) {
-      // Non-fatal: wiki tables may not exist on a fresh install.
+      // Request-level failure: keep the failure distinguishable from a
+      // genuinely empty job history.
       setRecentJobs([]);
+      setJobsError(true);
       void e;
     } finally {
       setBusy(null);
@@ -202,7 +209,11 @@ export function MaintenanceSettings({ vaultId }: MaintenanceSettingsProps) {
           </Button>
         </CardHeader>
         <CardContent>
-          {recentJobs.length === 0 ? (
+          {jobsError ? (
+            <p className="text-xs text-destructive" role="alert">
+              No recent jobs — couldn't load
+            </p>
+          ) : recentJobs.length === 0 ? (
             <p className="text-xs text-muted-foreground">No recent jobs.</p>
           ) : (
             <div className="space-y-1 text-xs">

@@ -18,6 +18,7 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { RoleGuard } from "@/components/auth/RoleGuard";
 import { Building2, Plus, Trash2, Users, Vault, ChevronDown, ChevronUp, Loader2, UserPlus, UserX, Search } from "lucide-react";
 import { EmptyState } from "@/components/EmptyState";
+import { ErrorState } from "@/components/shared/ErrorState";
 import { NATIVE_SELECT_CLASS_NAME } from "@/lib/utils";
 import { LoadingSpinner } from "@/components/LoadingSpinner";
 import { useTestMode } from "@/fixtures/TestModeContext";
@@ -81,6 +82,11 @@ function OrgsPageContent() {
   const testMode = useTestMode();
   const [orgs, setOrgs] = useState<Organization[]>(testMode ? MOCK_ORGS : []);
   const [loading, setLoading] = useState(!testMode);
+  // True when the LAST organizations fetch failed (issue #774 / UI-R4-10): a
+  // failed load must not render the same "No organizations found" empty
+  // state a genuinely empty account would (mirrors useDocumentPolling's
+  // listError from #258).
+  const [orgsError, setOrgsError] = useState(false);
   const [expandedOrgId, setExpandedOrgId] = useState<number | null>(null);
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
@@ -95,6 +101,9 @@ function OrgsPageContent() {
   const [userSearchResults, setUserSearchResults] = useState<UserResult[]>([]);
   const [showUserDropdown, setShowUserDropdown] = useState(false);
   const [searchingUsers, setSearchingUsers] = useState(false);
+  // True when the last user search failed (issue #774): "No users found" is
+  // a verdict about the directory, not about a failed request.
+  const [userSearchError, setUserSearchError] = useState(false);
   const userSearchRef = useRef<HTMLDivElement>(null);
   const [newMemberRole, setNewMemberRole] = useState<OrgRole>("member");
   const [updatingMemberId, setUpdatingMemberId] = useState<number | null>(null);
@@ -131,9 +140,14 @@ function OrgsPageContent() {
     try {
       const response = await apiClient.get<{ users: UserResult[] }>("/users/", { params: { q: query, limit: 10 } });
       setUserSearchResults(response.data.users.filter((u) => u.is_active));
+      setUserSearchError(false);
       setShowUserDropdown(true);
     } catch {
       setUserSearchResults([]);
+      setUserSearchError(true);
+      // Open the dropdown on failure too (#774): otherwise a first-attempt
+      // failure stays invisible and the leg's failure line never renders.
+      setShowUserDropdown(true);
     } finally {
       setSearchingUsers(false);
     }
@@ -165,8 +179,10 @@ function OrgsPageContent() {
     try {
       const response = await apiClient.get<{ organizations: Organization[]; total: number }>("/organizations/");
       setOrgs(Array.isArray(response.data) ? response.data : response.data.organizations ?? []);
+      setOrgsError(false);
     } catch (err: any) {
       console.error("Failed to fetch organizations:", err);
+      setOrgsError(true);
       toast.error((err as any)?.originalError?.response?.data?.detail || (err as any)?.response?.data?.detail || "Failed to load organizations");
     } finally {
       setLoading(false);
@@ -329,6 +345,13 @@ function OrgsPageContent() {
 
       {loading ? (
         <LoadingSpinner label="Loading organizations…" />
+      ) : orgsError ? (
+        <ErrorState
+          title="No organizations found — couldn't load"
+          description="The organizations request failed. Check your connection, then retry."
+          action={{ label: "Retry", onClick: () => void fetchOrgs() }}
+          size="sm"
+        />
       ) : orgs.length === 0 ? (
         <EmptyState
           icon={Building2}
@@ -418,8 +441,13 @@ function OrgsPageContent() {
                         </div>
                       )}
                       {showUserDropdown && userSearchQuery.trim() && !searchingUsers && userSearchResults.length === 0 && (
-                        <div className="absolute z-50 top-full left-0 right-0 mt-1 bg-popover border rounded-sm shadow-md px-3 py-2 text-sm text-muted-foreground">
-                          No users found
+                        <div
+                          role={userSearchError ? "alert" : undefined}
+                          className={`absolute z-50 top-full left-0 right-0 mt-1 bg-popover border rounded-sm shadow-md px-3 py-2 text-sm ${userSearchError ? "text-destructive" : "text-muted-foreground"}`}
+                        >
+                          {userSearchError
+                            ? "User search failed — check your connection and try again."
+                            : "No users found"}
                         </div>
                       )}
                     </div>

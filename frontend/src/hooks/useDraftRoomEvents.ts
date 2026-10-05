@@ -346,7 +346,15 @@ export function useDraftRoomEvents(
             return "stop"; // fatal — refreshing won't help; stop looping.
           }
           if (detail.includes("token_expired")) {
-            const newToken = await refreshAccessToken();
+            // refreshAccessToken rejects on transport failures (#774) — treat
+            // that exactly like a null refresh (fatal for this connection)
+            // rather than letting it escape as an unhandled rejection.
+            let newToken: string | null;
+            try {
+              newToken = await refreshAccessToken();
+            } catch {
+              newToken = null;
+            }
             return newToken && !controller.signal.aborted ? "error" : "stop";
           }
         }
@@ -418,7 +426,20 @@ export function useDraftRoomEvents(
             startPolling();
           }
         }
-        await new Promise((resolve) => setTimeout(resolve, backoff));
+        // Abort-aware backoff (#774 / TQ-sibling-batch-06-04): unmount aborts
+        // wake the sleep early so the loop (and this closure) exit promptly
+        // instead of lingering until the timer fires.
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, backoff);
+          controller.signal.addEventListener(
+            "abort",
+            () => {
+              clearTimeout(timer);
+              resolve();
+            },
+            { once: true }
+          );
+        });
         backoff = Math.min(backoff * 2, RECONNECT_MAX_MS);
       }
     })();

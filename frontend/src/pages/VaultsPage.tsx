@@ -56,7 +56,13 @@ export default function VaultsPage() {
       setOrgs(data);
       // Auto-select if user has exactly one org
       if (data.length === 1) setOrgId(data[0].id);
-    }).catch(() => {});
+    }).catch((err: unknown) => {
+      // Surfaced, not swallowed (issue #774 / T1-20-K-07): a silent failure
+      // makes the Organization selector disappear and the create-vault POST
+      // 400 later with no explanation.
+      console.error("Failed to load organizations:", err);
+      toast.error("Failed to load organizations");
+    });
   }, [fetchVaults, testMode]);
 
   function openCreateDialog() {

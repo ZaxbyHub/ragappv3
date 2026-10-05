@@ -102,7 +102,15 @@ export function useWikiEventStream(
             return "stop"; // fatal — refreshing won't help; stop looping.
           }
           if (detail.includes("token_expired")) {
-            const newToken = await refreshAccessToken();
+            // refreshAccessToken rejects on transport failures (#774) — treat
+            // that exactly like a null refresh (fatal for this connection)
+            // rather than letting it escape as an unhandled rejection.
+            let newToken: string | null;
+            try {
+              newToken = await refreshAccessToken();
+            } catch {
+              newToken = null;
+            }
             return newToken && !controller.signal.aborted ? "error" : "stop";
           }
         }
@@ -137,7 +145,20 @@ export function useWikiEventStream(
         // Reset backoff on a clean server-side close so the next reconnect is
         // fast (≈1 s) rather than inheriting the last error-backoff value.
         if (result === "clean") backoff = RECONNECT_BASE_MS;
-        await new Promise((resolve) => setTimeout(resolve, backoff));
+        // Abort-aware backoff (#774 / TQ-sibling-batch-06-04): unmount aborts
+        // wake the sleep early so the loop (and this closure) exit promptly
+        // instead of lingering until the timer fires.
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, backoff);
+          controller.signal.addEventListener(
+            "abort",
+            () => {
+              clearTimeout(timer);
+              resolve();
+            },
+            { once: true }
+          );
+        });
         backoff = Math.min(backoff * 2, RECONNECT_MAX_MS);
       }
     })();
