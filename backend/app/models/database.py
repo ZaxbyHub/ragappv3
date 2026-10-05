@@ -1812,6 +1812,54 @@ def _widen_files_hash_vault_unique_index(conn: sqlite3.Connection) -> None:
         )
 
 
+def _preserve_autoincrement_high_water(
+    conn: sqlite3.Connection, backup_table: str, canonical_table: str
+) -> None:
+    """Keep a rename-rebuild from reissuing AUTOINCREMENT ids (issue #701).
+
+    ``DROP TABLE`` destroys the dropped table's ``sqlite_sequence`` row, and
+    a freshly recreated AUTOINCREMENT table starts its counter at
+    ``max(copied id)`` — ids of rows deleted before the rebuild would be
+    reissued afterward. Call this immediately before the backup DROP —
+    inside the rebuild transaction at the main-swap sites, or in the
+    autocommit recovery prologue at the stale-backup sites (each statement
+    there self-commits, and the preserve-before-drop ordering plus this
+    helper's idempotence make crash-resume converge). It raises the
+    canonical table's counter to at least the backup's recorded high-water
+    mark. ``sqlite_sequence`` is documented as writable by ordinary DML
+    (https://sqlite.org/autoinc.html). No-ops when the backup has no
+    sequence row (never inserted), no AUTOINCREMENT table exists, the
+    stored value is not a usable integer, or the value is outside the
+    plausible AUTOINCREMENT range — a corrupt ``seq`` is skipped (the
+    pre-#701 behavior) rather than aborting the migration or copying an
+    id-exhausting counter onto the canonical table.
+    """
+    try:
+        row = conn.execute(
+            "SELECT seq FROM sqlite_sequence WHERE name = ?", (backup_table,)
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return
+    if row is None or row[0] is None:
+        return
+    try:
+        high_water = int(row[0])
+    except (TypeError, ValueError, OverflowError):
+        # Corrupted/unrepresentable seq: skip preservation instead of
+        # failing the migration or copying garbage (issue #701 review).
+        return
+    if not 0 < high_water < 2 ** 62:
+        return
+    conn.execute(
+        "UPDATE sqlite_sequence SET seq = ? WHERE name = ? AND seq < ?",
+        (high_water, canonical_table, high_water),
+    )
+    conn.execute(
+        "INSERT INTO sqlite_sequence (name, seq) SELECT ?, ?"
+        " WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = ?)",
+        (canonical_table, high_water, canonical_table),
+    )
+
 def run_migrations(sqlite_path: str) -> None:
     """
     Run database migrations to initialize the schema.
@@ -2193,10 +2241,70 @@ def migrate_add_file_metadata_columns(sqlite_path: str) -> None:
             conn.execute(
                 "ALTER TABLE files ADD COLUMN modified_at TIMESTAMP DEFAULT NULL"
             )
-            # Backfill existing rows: use created_at as a reasonable modified_at proxy
-            conn.execute(
-                "UPDATE files SET modified_at = created_at WHERE modified_at IS NULL"
-            )
+        # Backfill whenever rows still lack a value. init_db adds this column
+        # ahead of this migration, so the gate above is already closed under
+        # run_migrations — and a crash between any ALTER and its backfill
+        # leaves NULLs a column-absence gate never repairs (issue #701,
+        # T1-05-S-09; chat_messages.seq precedent). created_at is the
+        # documented modified_at proxy; rows without created_at stay NULL.
+        # The probe-first shape keeps a converged boot free of schema
+        # writes; the read cost is one unindexed probe per boot, the same
+        # shape as the chat_messages.seq precedent. When a backfill runs,
+        # the files_search_fts sync trigger is dropped for the UPDATE and
+        # recreated from the identical DDL: modified_at is not an indexed
+        # column, so skipping the sync is a semantic no-op, while firing it
+        # on rows that predate the FTS index raises FTS5's "database disk
+        # image is malformed". The recreate is gated on the FTS table (and
+        # its indexed columns) actually existing, so a direct call on a
+        # minimal database leaves no dangling trigger behind; run_migrations
+        # rebuilds the index later in the boot either way. The whole block
+        # runs inside one explicit transaction, so the trigger is never
+        # durably absent and a concurrent writer cannot slip into the gap.
+        needs_backfill = conn.execute(
+            "SELECT 1 FROM files WHERE modified_at IS NULL AND created_at IS"
+            " NOT NULL LIMIT 1"
+        ).fetchone()
+        if needs_backfill:
+            fts_ready = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name"
+                " = 'files_search_fts'"
+            ).fetchone() is not None
+            existing_cols = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(files)").fetchall()
+            }
+            trigger_recreatable = fts_ready and {
+                "file_name",
+                "file_type",
+                "status",
+                "source",
+                "email_subject",
+                "email_sender",
+                "document_date",
+            }.issubset(existing_cols)
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                if trigger_recreatable:
+                    conn.execute("DROP TRIGGER IF EXISTS files_search_fts_update")
+                conn.execute(
+                    "UPDATE files SET modified_at = created_at"
+                    " WHERE modified_at IS NULL AND created_at IS NOT NULL"
+                )
+                if trigger_recreatable:
+                    conn.execute(
+                        """
+                        CREATE TRIGGER IF NOT EXISTS files_search_fts_update AFTER UPDATE ON files BEGIN
+                            INSERT INTO files_search_fts(files_search_fts, rowid, file_name, file_type, status, source, email_subject, email_sender, document_date)
+                            VALUES ('delete', old.id, old.file_name, old.file_type, old.status, old.source, old.email_subject, old.email_sender, old.document_date);
+                            INSERT INTO files_search_fts(rowid, file_name, file_type, status, source, email_subject, email_sender, document_date)
+                            VALUES (new.id, new.file_name, new.file_type, new.status, new.source, new.email_subject, new.email_sender, new.document_date);
+                        END
+                        """
+                    )
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
 
         conn.commit()
     finally:
@@ -3478,6 +3586,7 @@ def migrate_add_curator_claim_support(sqlite_path: str) -> None:
                     " EXCEPT SELECT id FROM wiki_claims)"
                 ).fetchone()[0]
                 if dest_count >= backup_count and missing_ids == 0:
+                    _preserve_autoincrement_high_water(conn, "wiki_claims_old", "wiki_claims")
                     conn.execute("DROP TABLE IF EXISTS wiki_claims_old")
                     # Journal-silent (issue #699 AC2): a stale backup beside a
                     # complete table is routine disposition, not an attempt.
@@ -3521,6 +3630,7 @@ def migrate_add_curator_claim_support(sqlite_path: str) -> None:
                     "wiki_claims_old alongside pre-PR-C wiki_claims; "
                     "dropping the stale table before re-running migration."
                 )
+                _preserve_autoincrement_high_water(conn, "wiki_claims_old", "wiki_claims")
                 conn.execute("DROP TABLE IF EXISTS wiki_claims_old")
             else:
                 logger.warning(
@@ -3621,6 +3731,7 @@ def migrate_add_curator_claim_support(sqlite_path: str) -> None:
                     f"wiki_claims_old has been preserved."
                 )
 
+            _preserve_autoincrement_high_water(conn, "wiki_claims_old", "wiki_claims")
             conn.execute("DROP TABLE wiki_claims_old")
 
             # Recreate the FTS triggers exactly as in the original schema
@@ -4386,6 +4497,7 @@ def migrate_widen_wiki_claim_sources_source_kind(sqlite_path: str) -> None:
                 conn.execute("PRAGMA legacy_alter_table = OFF")
                 recovered = True
             else:
+                _preserve_autoincrement_high_water(conn, "wiki_claim_sources_old", "wiki_claim_sources")
                 conn.execute("DROP TABLE wiki_claim_sources_old")
 
         # Journal-silent no-op probes (issue #699 AC2): nothing to attempt when
@@ -4473,6 +4585,7 @@ def migrate_widen_wiki_claim_sources_source_kind(sqlite_path: str) -> None:
                     f"wiki_claim_sources_old has been preserved."
                 )
 
+            _preserve_autoincrement_high_water(conn, "wiki_claim_sources_old", "wiki_claim_sources")
             conn.execute("DROP TABLE wiki_claim_sources_old")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_wiki_claim_sources_claim_id "
@@ -4597,6 +4710,7 @@ def migrate_widen_files_status(sqlite_path: str) -> None:
                 conn.execute("PRAGMA legacy_alter_table = OFF")
                 recovered = True
             else:
+                _preserve_autoincrement_high_water(conn, "files_old", "files")
                 conn.execute("DROP TABLE IF EXISTS files_old")
 
         # Journal-silent no-op probes (issue #699 AC2): nothing to attempt when
@@ -4743,6 +4857,7 @@ def migrate_widen_files_status(sqlite_path: str) -> None:
             # Dropping files_old frees the index names attached to it so the
             # CREATE INDEX IF NOT EXISTS calls below (and the partial unique
             # index block in run_migrations) take effect on the new table.
+            _preserve_autoincrement_high_water(conn, "files_old", "files")
             conn.execute("DROP TABLE files_old")
             for index_ddl in (
                 "CREATE INDEX IF NOT EXISTS idx_files_status ON files(status)",
@@ -4949,6 +5064,7 @@ def migrate_add_files_status_cancelled(sqlite_path: str) -> None:
                 conn.execute("PRAGMA legacy_alter_table = OFF")
                 recovered = True
             else:
+                _preserve_autoincrement_high_water(conn, "files_old", "files")
                 conn.execute("DROP TABLE IF EXISTS files_old")
 
         # Journal-silent no-op probes (issue #699 AC2, mirroring
@@ -5088,6 +5204,7 @@ def migrate_add_files_status_cancelled(sqlite_path: str) -> None:
                     f"been preserved."
                 )
 
+            _preserve_autoincrement_high_water(conn, "files_old", "files")
             conn.execute("DROP TABLE files_old")
             for index_ddl in (
                 "CREATE INDEX IF NOT EXISTS idx_files_status ON files(status)",
@@ -5287,6 +5404,7 @@ def migrate_widen_document_reindex_jobs_status(sqlite_path: str) -> None:
                 conn.execute("PRAGMA legacy_alter_table = OFF")
                 recovered = True
             else:
+                _preserve_autoincrement_high_water(conn, "document_reindex_jobs_old", "document_reindex_jobs")
                 conn.execute("DROP TABLE IF EXISTS document_reindex_jobs_old")
 
         # Journal-silent no-op probes (issue #699 AC2): nothing to attempt when
@@ -5371,6 +5489,7 @@ def migrate_widen_document_reindex_jobs_status(sqlite_path: str) -> None:
                     f"parity failed ({before_count} -> {after_count}). "
                     f"document_reindex_jobs_old has been preserved."
                 )
+            _preserve_autoincrement_high_water(conn, "document_reindex_jobs_old", "document_reindex_jobs")
             conn.execute("DROP TABLE document_reindex_jobs_old")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_document_reindex_jobs_vault_status "
@@ -5534,7 +5653,9 @@ def migrate_add_document_near_dups(sqlite_path: str) -> None:
 def migrate_add_wiki_relations_unique(sqlite_path: str) -> None:
     """Migration: add UNIQUE constraint on wiki_relations(subject_entity_id, predicate, object_entity_id).
 
-    Deduplicates existing rows first (keeps highest id per triple), then
+    Deduplicates existing rows first (keeps highest id per triple among rows
+    whose key columns are all non-NULL — NULL-keyed rows are exempt, since
+    the UNIQUE index treats NULLs as distinct and would accept them), then
     creates a unique index. Idempotent — already-migrated databases return
     before any journaling (issue #699 AC2). The one-time dedup attempt
     journals its deleted-row count on success and a terminal ``failed`` row
@@ -5559,9 +5680,18 @@ def migrate_add_wiki_relations_unique(sqlite_path: str) -> None:
         # count is logged and journaled inside the delete's own transaction,
         # so the record exists iff the delete committed. One-time by
         # construction (gated on index absence above).
+        # A row is a duplicate only when EVERY key column is non-NULL: the
+        # UNIQUE index created below never rejects a row carrying a NULL in
+        # any key column (NULLs are distinct under UNIQUE), so NULL-keyed
+        # rows are exempt from the dedup entirely (issue #701, T1-05-K2-03).
         doomed_count = conn.execute(
-            "SELECT COUNT(*) FROM wiki_relations WHERE id NOT IN ("
+            "SELECT COUNT(*) FROM wiki_relations"
+            " WHERE subject_entity_id IS NOT NULL AND predicate IS NOT NULL"
+            " AND object_entity_id IS NOT NULL"
+            " AND id NOT IN ("
             "SELECT MAX(id) FROM wiki_relations"
+            " WHERE subject_entity_id IS NOT NULL AND predicate IS NOT NULL"
+            " AND object_entity_id IS NOT NULL"
             " GROUP BY subject_entity_id, predicate, object_entity_id)"
         ).fetchone()[0]
         if doomed_count:
@@ -5571,8 +5701,13 @@ def migrate_add_wiki_relations_unique(sqlite_path: str) -> None:
                 doomed_count,
             )
         conn.execute(
-            """DELETE FROM wiki_relations WHERE id NOT IN (
+            """DELETE FROM wiki_relations
+               WHERE subject_entity_id IS NOT NULL AND predicate IS NOT NULL
+               AND object_entity_id IS NOT NULL
+               AND id NOT IN (
                 SELECT MAX(id) FROM wiki_relations
+                WHERE subject_entity_id IS NOT NULL AND predicate IS NOT NULL
+                AND object_entity_id IS NOT NULL
                 GROUP BY subject_entity_id, predicate, object_entity_id
             )"""
         )
@@ -5849,7 +5984,12 @@ def migrate_add_wiki_claims_normalized_text(sqlite_path: str) -> None:
     existing rows. Idempotent. Mirrors normalize_claim_text in wiki_store."""
     import re
 
-    def _normalize(text: str) -> str:
+    def _normalize(text) -> str:
+        if isinstance(text, bytes):
+            # Hostile/corrupt row: decode instead of wedging every boot.
+            text = text.decode("utf-8", "replace")
+        elif not isinstance(text, str):
+            text = "" if text is None else str(text)
         normalized = re.sub(r"[^\w\s]", "", (text or "").lower().strip())
         return re.sub(r"\s+", " ", normalized).strip()
 
@@ -5858,13 +5998,58 @@ def migrate_add_wiki_claims_normalized_text(sqlite_path: str) -> None:
         cols = [row[1] for row in conn.execute("PRAGMA table_info(wiki_claims)").fetchall()]
         if "normalized_text" not in cols:
             conn.execute("ALTER TABLE wiki_claims ADD COLUMN normalized_text TEXT")
-            # Backfill existing rows (SQLite has no regex, so normalize in Python).
-            rows = conn.execute("SELECT id, claim_text FROM wiki_claims").fetchall()
-            for claim_id, claim_text in rows:
-                conn.execute(
-                    "UPDATE wiki_claims SET normalized_text = ? WHERE id = ?",
-                    (_normalize(claim_text), claim_id),
-                )
+        # Backfill whenever rows still lack a value: column absence alone is
+        # not a sufficient guard — init_db adds this column ahead of this
+        # migration on the boot path, and a crash between any ALTER and its
+        # backfill would otherwise leave NULL rows a re-run never
+        # repopulates (chat_messages.seq precedent; issue #701, T1-05-S-03).
+        rows = conn.execute(
+            "SELECT id, claim_text FROM wiki_claims WHERE normalized_text IS NULL"
+        ).fetchall()
+        if rows:
+            # Bracket the bulk UPDATE with the wiki_claims_fts sync trigger,
+            # mirroring the files_search_fts_update guard in
+            # migrate_add_file_metadata_columns: claim_text IS an indexed
+            # column, and firing the external-content 'delete' command for a
+            # rowid missing from the index raises FTS5's "database disk
+            # image is malformed" (the exact drift shape this backfill
+            # repairs). The recreate is gated on the FTS table existing, so
+            # a direct call on a minimal database leaves no dangling trigger
+            # behind. One explicit transaction: the trigger is never
+            # durably absent and the backfill is atomic.
+            fts_ready = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name"
+                " = 'wiki_claims_fts'"
+            ).fetchone() is not None
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                if fts_ready:
+                    conn.execute("DROP TRIGGER IF EXISTS wiki_claims_fts_update")
+                for claim_id, claim_text in rows:
+                    conn.execute(
+                        "UPDATE wiki_claims SET normalized_text = ? WHERE id = ?",
+                        (_normalize(claim_text), claim_id),
+                    )
+                if fts_ready:
+                    conn.execute(
+                        """
+                        CREATE TRIGGER IF NOT EXISTS wiki_claims_fts_update AFTER UPDATE ON wiki_claims BEGIN
+                            INSERT INTO wiki_claims_fts(wiki_claims_fts, rowid, claim_text, subject, predicate, object) VALUES ('delete', old.id, old.claim_text, old.subject, old.predicate, old.object);
+                            INSERT INTO wiki_claims_fts(rowid, claim_text, subject, predicate, object) VALUES (new.id, new.claim_text, new.subject, new.predicate, new.object);
+                        END
+                        """
+                    )
+                    # Heal any pre-existing index drift while the sync
+                    # trigger is under our control: unlike the files side,
+                    # no later run_migrations step rebuilds this index.
+                    conn.execute(
+                        "INSERT INTO wiki_claims_fts(wiki_claims_fts)"
+                        " VALUES('rebuild')"
+                    )
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_wiki_claims_vault_normalized "
             "ON wiki_claims(vault_id, normalized_text)"
@@ -6782,6 +6967,7 @@ def migrate_add_wiki_lint_findings_json_check(sqlite_path: str) -> None:
                     "_wiki_lint_findings_old alongside complete wiki_lint_findings; "
                     "dropping stale table."
                 )
+                _preserve_autoincrement_high_water(conn, "_wiki_lint_findings_old", "wiki_lint_findings")
                 conn.execute("DROP TABLE _wiki_lint_findings_old")
             else:
                 logger.warning(
@@ -6886,6 +7072,7 @@ def migrate_add_wiki_lint_findings_json_check(sqlite_path: str) -> None:
                     f"failed ({before_count} -> {after_count}). "
                     f"_wiki_lint_findings_old has been preserved."
                 )
+            _preserve_autoincrement_high_water(conn, "_wiki_lint_findings_old", "wiki_lint_findings")
             conn.execute("DROP TABLE _wiki_lint_findings_old")
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_wiki_lint_findings_vault_status_severity
@@ -7247,6 +7434,7 @@ def migrate_relax_draft_claims_span_not_null(sqlite_path: str) -> None:
                     " EXCEPT SELECT id FROM draft_claims)"
                 ).fetchone()[0]
                 if dest_count >= backup_count and missing_ids == 0:
+                    _preserve_autoincrement_high_water(conn, "draft_claims_old", "draft_claims")
                     conn.execute("DROP TABLE IF EXISTS draft_claims_old")
                     # Journal-silent (issue #699 AC2): stale backup beside a
                     # complete table is routine disposition, not an attempt.
@@ -7284,6 +7472,7 @@ def migrate_relax_draft_claims_span_not_null(sqlite_path: str) -> None:
                     "draft_claims_old alongside pre-migration draft_claims; "
                     "dropping the stale table before re-running migration."
                 )
+                _preserve_autoincrement_high_water(conn, "draft_claims_old", "draft_claims")
                 conn.execute("DROP TABLE IF EXISTS draft_claims_old")
             else:
                 logger.warning(
@@ -7373,6 +7562,7 @@ def migrate_relax_draft_claims_span_not_null(sqlite_path: str) -> None:
                     "draft_claims_old has been preserved."
                 )
 
+            _preserve_autoincrement_high_water(conn, "draft_claims_old", "draft_claims")
             conn.execute("DROP TABLE draft_claims_old")
             conn.commit()
         except Exception as exc:
@@ -7511,6 +7701,7 @@ def migrate_add_draft_room_promotions(sqlite_path: str) -> None:
                     "vault_id, file_id, filename, promoted_by, created_at "
                     "FROM draft_promotions_legacy_fk"
                 )
+                _preserve_autoincrement_high_water(conn, "draft_promotions_legacy_fk", "draft_promotions")
                 conn.execute("DROP TABLE draft_promotions_legacy_fk")
                 conn.commit()
             except BaseException:
