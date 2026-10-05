@@ -447,3 +447,27 @@ def test_release_connection_rollback_failure_logged_not_raised(tmp_path, caplog)
     finally:
         p.release_connection(again)
     p.close_all()
+
+
+def test_release_connection_after_close_all_never_raises_and_closes(tmp_path, caplog):
+    """Issue #700 (S03-SK2-05), close half: releasing a HEALTHY connection
+    after ``close_all()`` must never raise (get_db and ~100 sibling call
+    sites release from bare ``finally`` blocks; a raise would mask the
+    handler's own in-flight exception) AND must CLOSE the connection — after
+    close_all() the pool queue is drained and unpublished, so queueing it
+    back would strand it open in a dead pool (the r2-s03-probe3 leak).
+    Emits the structured ``pool_release_after_close`` event."""
+    import logging
+
+    p = SQLiteConnectionPool(sqlite_path=_tmp_db_path(tmp_path), max_size=2)
+    conn = p.get_connection()
+    p.close_all()
+
+    with caplog.at_level(logging.WARNING, logger="app.models.database"):
+        # Pre-#700 this raised RuntimeError("Connection pool has been
+        # closed") as the first statement and leaked the connection.
+        p.release_connection(conn)
+
+    assert any("pool_release_after_close" in r.message for r in caplog.records)
+    with pytest.raises(sqlite3.ProgrammingError):
+        conn.execute("SELECT 1")  # closed, not leaked open

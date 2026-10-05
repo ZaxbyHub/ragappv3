@@ -147,12 +147,16 @@ class FolderStore:
         name = name.strip()
         if not name:
             raise ValueError("Folder name must not be empty")
-        if parent_folder_id is not None:
-            self._require_folder_in_vault(vault_id, parent_folder_id)
-        # BEGIN IMMEDIATE: name-uniqueness check + INSERT must be atomic so two
-        # concurrent creates cannot both pass the check before either commits.
+        # BEGIN IMMEDIATE before ANY read (issue #700, T1-27-S-09): the
+        # parent-existence check must run INSIDE the write transaction,
+        # mirroring update_folder's FOLDER-001 fix (#514). With the check
+        # outside, a concurrent delete of the parent commits between the
+        # check and the INSERT and the FK violation surfaces as an unhandled
+        # sqlite3.IntegrityError (500) instead of FolderNotFoundError (404).
         self._db.execute("BEGIN IMMEDIATE")
         try:
+            if parent_folder_id is not None:
+                self._require_folder_in_vault(vault_id, parent_folder_id)
             if self._name_exists(vault_id, parent_folder_id, name):
                 raise FolderDuplicateError(
                     f"Folder {name!r} already exists in this location"
@@ -165,6 +169,29 @@ class FolderStore:
                 (vault_id, parent_folder_id, name, description, now, now),
             )
             self._db.commit()
+        except sqlite3.IntegrityError as e:
+            self._db.rollback()
+            # A concurrent delete of the parent (or of the whole vault,
+            # which cascades folders) between the route's authz and the
+            # INSERT violates a folders FK — surface the documented 404,
+            # but only when the referenced row is REALLY gone; never mask
+            # an unrelated constraint failure (issue #700 review, PRR-027).
+            gone = False
+            if parent_folder_id is not None:
+                try:
+                    self._require_folder_in_vault(vault_id, parent_folder_id)
+                except FolderNotFoundError:
+                    gone = True
+            if not gone:
+                gone = (
+                    self._db.execute(
+                        "SELECT 1 FROM vaults WHERE id = ?", (vault_id,)
+                    ).fetchone()
+                    is None
+                )
+            if gone:
+                raise FolderNotFoundError("Folder not found in this vault") from e
+            raise
         except Exception:
             self._db.rollback()
             raise
@@ -295,17 +322,51 @@ class FolderStore:
         moved. Raises FolderNotFoundError when the target folder isn't in the
         vault.
         """
-        if folder_id is not None:
-            self._require_folder_in_vault(vault_id, folder_id)
-        valid_files = self._vault_file_ids(vault_id, file_ids)
-        if not valid_files:
-            return 0
-        placeholders = ",".join("?" * len(valid_files))
-        cur = self._db.execute(
-            f"UPDATE files SET folder_id = ? WHERE id IN ({placeholders})",
-            (folder_id, *valid_files),
-        )
-        self._db.commit()
+        # The target check + UPDATE share ONE transaction (issue #700,
+        # T1-27-S-09): with no encompassing transaction a concurrent delete
+        # of the target commits between the check and the UPDATE, and the
+        # FK violation surfaces as an unhandled sqlite3.IntegrityError (500)
+        # instead of FolderNotFoundError (404). Root moves (folder_id None)
+        # take the same BEGIN/commit envelope for uniformity. The check runs
+        # BEFORE the empty-valid_files early return so a missing target
+        # still raises even when no files are being moved.
+        if self._db.in_transaction:
+            # Defense in depth (mirrors routes/auth.py): a prior DML on this
+            # shared connection can leave an implicit transaction open, and
+            # BEGIN IMMEDIATE inside it fails with "cannot start a
+            # transaction within a transaction" (issue #700 review, PRR-006).
+            self._db.rollback()
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            if folder_id is not None:
+                self._require_folder_in_vault(vault_id, folder_id)
+            valid_files = self._vault_file_ids(vault_id, file_ids)
+            if not valid_files:
+                self._db.rollback()
+                return 0
+            placeholders = ",".join("?" * len(valid_files))
+            cur = self._db.execute(
+                f"UPDATE files SET folder_id = ? WHERE id IN ({placeholders})",
+                (folder_id, *valid_files),
+            )
+            self._db.commit()
+        except sqlite3.IntegrityError as e:
+            self._db.rollback()
+            if folder_id is not None:
+                # Translate ONLY when the target is really gone: re-check
+                # after the rollback so an unrelated IntegrityError (a
+                # future constraint or trigger) surfaces as itself instead
+                # of a misleading 404 (issue #700 review, PRR-003).
+                try:
+                    self._require_folder_in_vault(vault_id, folder_id)
+                except FolderNotFoundError:
+                    raise FolderNotFoundError(
+                        "Folder not found in this vault"
+                    ) from e
+            raise
+        except Exception:
+            self._db.rollback()
+            raise
         return cur.rowcount
 
 
