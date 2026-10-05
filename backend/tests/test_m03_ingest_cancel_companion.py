@@ -71,6 +71,15 @@ class _FakeVectorStore:
         self.records = keep
         return removed
 
+    async def count_by_file(self, file_id, target=None):
+        # Production's _verify_vector_rows_visible calls this after the
+        # embed; without it the verification step crashes with
+        # AttributeError and the file lands 'error' instead of reaching
+        # the cancel unwind — an order/timing-dependent failure observed
+        # on PR #852's CI (the _StagedVectorStore subclass already modeled
+        # this method; the base fake was missing it).
+        return len(self._rows_for(file_id))
+
     def row_count(self, file_id):
         return len(self._rows_for(file_id))
 
@@ -531,17 +540,24 @@ def test_cancel_route_reread_idempotent_200_when_worker_cancelled(route_env):  #
     assert route_env.file_status(file_id) == "cancelled"
 
 
-def test_cancel_route_audit_rows_recorded(route_env):  # noqa: F811 - fixture reuse
+def test_cancel_route_audit_rows_recorded(env):
     """PRR-029: the HMAC audit path records cancel decisions now that the
-    fixture installs app.state.secret_manager."""
+    fixture installs app.state.secret_manager.
+
+    Requests the companion's ``env`` fixture (which installs the mock
+    secret_manager and yields route_env), NOT bare ``route_env``: the audit
+    path no-ops without app.state.secret_manager, so depending on ambient
+    cross-test state made this pass or fail with the xdist distribution
+    (observed as a deterministic Backend CI failure on PR #852's worker
+    split after #700 added test files)."""
     import sqlite3 as _sqlite3
 
-    file_id = route_env.seed_file("processing")
-    route_env.client.post(
+    file_id = env.seed_file("processing")
+    env.client.post(
         f"/api/documents/{file_id}/cancel",
-        headers=route_env.superadmin_headers(),
+        headers=env.superadmin_headers(),
     )
-    conn = _sqlite3.connect(route_env.db_path)
+    conn = _sqlite3.connect(env.db_path)
     try:
         n = conn.execute(
             "SELECT COUNT(*) FROM document_actions WHERE file_id = ? "
