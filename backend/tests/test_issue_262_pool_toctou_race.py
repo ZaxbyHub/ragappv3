@@ -93,10 +93,13 @@ class TestSQLiteConnectionPoolCreatedCountRace(unittest.TestCase):
         lock is never held across connection-creation syscalls (event-loop
         reachability of ``recent_capacity_wait``). Per issue #700's mandate,
         the mechanism check is replaced here by the #262 COUNT INVARIANT:
-        under concurrent creation, ``_created_count`` never exceeds
-        ``max_size``, every sampled value corresponds to a slot that is
-        actually being created, and after all creators finish the count
-        equals the number of live, distinct connections (no leak). The
+        under concurrent creation no caller can acquire more than
+        ``max_size`` slots and after all creators finish the count equals
+        the number of live, distinct connections (no leak). The headline
+        bound is enforced structurally by the capacity-checked increment
+        (this test cannot discriminate it — the discriminating power for
+        #262 lives in the failure-path twin below and issue #700's
+        lock-scope checks). The
         failure-path twin lives in
         ``test_concurrent_failed_create_never_inflates_count_beyond_max``.
         """
@@ -167,9 +170,10 @@ class TestSQLiteConnectionPoolCreatedCountRace(unittest.TestCase):
         def fake_create_connection():
             # While I/O runs, observe the current _created_count.
             with peak_lock:
-                # pool._lock is held during I/O after the fix; here we
-                # read under peak_lock only — no contention with pool lock
-                # because we know the pool lock state from the other test.
+                # Since issue #700 the creation I/O runs under the dedicated
+                # _create_lock (NOT the shared pool._lock); this observer
+                # reads under peak_lock only, so it never contends with
+                # either pool lock.
                 observed = pool._created_count
                 if observed > peak_count_during_io["value"]:
                     peak_count_during_io["value"] = observed
@@ -217,11 +221,10 @@ class TestSQLiteConnectionPoolCreatedCountRace(unittest.TestCase):
                 except Exception:
                     pass
 
-        # Successful creates plus one slot for the in-flight ones should
-        # never have exceeded max_size from any observer's perspective.
-        # With the fix (lock held during I/O), the peak is bounded by
-        # max_size. Without the fix, the peak can transiently exceed
-        # max_size during overlapping failed creates.
+        # Successful creates plus the in-flight ones must never push the
+        # observed count past max_size from any observer's perspective.
+        # The capacity-checked increment bounds it by construction; the
+        # peak probe exists to catch any future unguarded increment path.
         self.assertLessEqual(
             peak_count_during_io["value"],
             pool.max_size,

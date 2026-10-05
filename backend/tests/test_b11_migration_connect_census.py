@@ -2,8 +2,10 @@
 the STARTUP/MIGRATION connect class must set a busy timeout >= 30000 ms
 before any table access.
 
-Scope: backend/app/models/database.py (outside SQLiteConnectionPool),
-backend/app/models/migration_journal.py, backend/app/lifespan.py. A connect
+Scope: an EXPLICIT target list (backend/app/models/database.py outside
+SQLiteConnectionPool, backend/app/models/migration_journal.py,
+backend/app/lifespan.py) — a new startup-time module in this class must be
+added to TARGETS to be guarded. A connect
 is compliant when it passes ``timeout=<n>`` with n >= 30.0 (resolving
 module constants, incl. MIGRATION_CONNECT_TIMEOUT_SECONDS imported from
 app.models.migration_journal) or when a ``busy_timeout`` >= 30000 statement
@@ -103,6 +105,8 @@ def _census() -> tuple[list[str], int]:
                 min((node.end_lineno or node.lineno) + 5, len(lines)),
             ):
                 line = lines[ln]
+                if line.lstrip().startswith("#"):
+                    continue  # comment text is not an executed PRAGMA
                 m = BUSY_OK.search(line)
                 if m and int(m.group(1)) >= 30000:
                     ok = True
@@ -118,6 +122,15 @@ def _census() -> tuple[list[str], int]:
 
 def test_startup_migration_connects_carry_30s_busy_timeout():
     bad, total = _census()
+    # Floor the population: the census scans an explicit TARGETS list, so a
+    # refactor that routes connects through an alias/helper (or the list
+    # drifting out of the class) would otherwise green the guardrail on an
+    # empty scan (issue #700 review, PRR-010).
+    assert total >= 80, (
+        f"census population collapsed to {total} (expected >= 80 startup/"
+        "migration sqlite3.connect sites) — the guardrail is no longer "
+        "scanning the class; check TARGETS and the call-shape filter"
+    )
     assert not bad, (
         f"{len(bad)} of {total} startup/migration sqlite3.connect calls lack a "
         f">=30000 ms busy timeout before table access (issue #700 class C12): "

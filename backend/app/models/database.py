@@ -5710,12 +5710,18 @@ class SQLiteConnectionPool:
                     return False
 
     def _fail_checkout(self, max_wait_attempts: int):
-        """Emit the pool_exhausted event, mark the capacity wait, and raise.
+        """Emit the pool_exhausted event and raise.
 
         Every "could not obtain a connection" exit routes through here
-        (issue #700, T1-06-K-02), so the readiness probe's capacity-wait
-        signal reflects every checkout failure mode, not just loop
-        exhaustion. Always raises RuntimeError.
+        (issue #700, T1-06-K-02) so the structured event fires on every
+        checkout failure mode. This deliberately does NOT touch the
+        capacity-wait signal: recent_capacity_wait means a caller was
+        FORCED TO WAIT FOR CAPACITY (issue #550), and several of the exits
+        routed here (invalid-idle cycling, entry-gate refusal) happen with
+        free slots — stamping them would flip /healthz to a false
+        "saturated" 503 (issue #700 review, PRR-004). Capacity stamping
+        stays at the single pre-blocking-get site below. Always raises
+        RuntimeError.
         """
         # Structured event (observability): a pool_exhausted event means the pool
         # could not satisfy a checkout within the wait budget. This surfaces the
@@ -5728,7 +5734,6 @@ class SQLiteConnectionPool:
             self._created_count,
             max_wait_attempts,
         )
-        self._record_capacity_wait()
         raise RuntimeError(
             f"Could not obtain a connection from the pool after {max_wait_attempts} attempts"
         )
@@ -5763,9 +5768,12 @@ class SQLiteConnectionPool:
         if self._closed:
             raise RuntimeError("Connection pool has been closed")
 
-        # Total-wait budget (issue #645): bound the whole checkout — not just
-        # each Queue.get — so invalid-connection cycling and validation time
-        # cannot stretch a checkout past max_wait_attempts * CHECKOUT_WAIT_SECONDS.
+        # Total-wait budget (issue #645): bound the whole WAIT LOOP — not
+        # just each Queue.get — so invalid-connection cycling and validation
+        # time cannot stretch the wait past max_wait_attempts *
+        # CHECKOUT_WAIT_SECONDS. The budget bounds waiting, not validation:
+        # a checkout that finds a free connection can still run one final
+        # validation probe past the deadline before returning.
         if deadline is None:
             deadline = time.monotonic() + max_wait_attempts * CHECKOUT_WAIT_SECONDS
 
@@ -5830,7 +5838,7 @@ class SQLiteConnectionPool:
                             self._created_count -= 1
                         self._fail_checkout(max_wait_attempts)
                     try:
-                        return self._create_connection()
+                        conn = self._create_connection()
                     except BaseException:
                         # Return this creator's slot on EVERY non-success exit
                         # — sqlite3.Error/OSError and anything else — so the
@@ -5841,6 +5849,20 @@ class SQLiteConnectionPool:
                         with self._lock:
                             self._created_count -= 1
                         raise
+                # A creation can complete after another thread's close_all():
+                # the creation mutex is not shared with the pool lock, so
+                # close_all no longer serializes behind in-flight creation
+                # (issue #700 review, PRR-005). A connection minted by an
+                # already-closed pool must never reach the caller.
+                if self._closed:
+                    try:
+                        conn.close()
+                    except sqlite3.Error:
+                        pass
+                    with self._lock:
+                        self._created_count -= 1
+                    raise RuntimeError("Connection pool has been closed")
+                return conn
 
             # If at max capacity, block until a connection is available.
             # Reaching this line means every connection is checked out and
@@ -5985,7 +6007,7 @@ class SQLiteConnectionPool:
         _validate_connection silently no-ops inside the stale transaction.
         The warning is the signal that some call site still leaks.
 
-        Returns:
+        Args:
             conn: The connection to release back to the pool.
 
         This method never raises (issue #700, S03-SK2-05): ~100 call sites
@@ -6033,8 +6055,14 @@ class SQLiteConnectionPool:
         try:
             self._pool.put_nowait(conn)
         except Full:
-            # Pool is full, close the connection
-            conn.close()
+            # Pool is full, close the connection. close() is wrapped so the
+            # never-raise contract is strict (issue #700 review, PRR-005).
+            try:
+                conn.close()
+            except sqlite3.Error:
+                logger.warning(
+                    "pool_release_close_failed sqlite_path=%s", self.sqlite_path
+                )
 
     def close_all(self) -> None:
         """
@@ -6058,7 +6086,8 @@ class SQLiteConnectionPool:
             executor = self._checkout_executor
             self._checkout_executor = None
         # wait=False: an in-flight checkout finishes on its own; get_connection
-        # re-checks _closed on every wait-loop iteration (see the loop guard
+        # re-checks _closed on every wait-loop iteration AND after connection
+        # creation completes (see the loop guard and the post-create guard
         # above) and re-raises RuntimeError("Connection pool has been closed")
         # to its awaiter instead of returning a connection from a closed pool.
         if executor is not None:

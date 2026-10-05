@@ -109,3 +109,52 @@ def test_deadline_refused_creation_returns_its_slot(tmp_path):
         for conn in held:
             pool.release_connection(conn)
         pool.close_all()
+
+
+def test_move_documents_fk_translation_branch_fires(tmp_path, monkeypatch):
+    """The IntegrityError->FolderNotFoundError translation must actually
+    fire when the UPDATE hits a dangling folders FK (review spr2 F-2: the
+    concurrency race can no longer produce one under BEGIN IMMEDIATE, so
+    pin the branch directly — skip the pre-UPDATE check, leave the target
+    deleted, and let the UPDATE violate the FK; the post-rollback re-check
+    then proves the target is gone and translates)."""
+    db_path = tmp_path / "translate.db"
+    run_migrations(str(db_path))
+    conn = _fresh_conn(db_path)
+    try:
+        vault_id = _seed_vault(conn)
+        store = FolderStore(conn)
+        target = conn.execute(
+            "INSERT INTO folders (vault_id, name) VALUES (?, 'gone')", (vault_id,)
+        )
+        target_id = int(target.lastrowid)
+        f = conn.execute(
+            "INSERT INTO files (vault_id, file_path, file_name, file_size) "
+            "VALUES (?, 'p1', 'n1', 10)",
+            (vault_id,),
+        )
+        file_id = int(f.lastrowid)
+        conn.commit()
+        conn.execute("DELETE FROM folders WHERE id = ?", (target_id,))
+        conn.commit()
+
+        real = store._require_folder_in_vault
+        calls = {"n": 0}
+
+        def skip_first_check(v_id: int, f_id: int) -> None:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return  # skip the pre-UPDATE check so the UPDATE runs
+            real(v_id, f_id)
+
+        monkeypatch.setattr(store, "_require_folder_in_vault", skip_first_check)
+        try:
+            store.move_documents(vault_id, [file_id], target_id)
+            raised = "none"
+        except FolderNotFoundError:
+            raised = "FolderNotFoundError"
+        assert calls["n"] >= 2, "post-rollback re-check never ran"
+        assert raised == "FolderNotFoundError"
+        assert not conn.in_transaction
+    finally:
+        conn.close()

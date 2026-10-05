@@ -11,7 +11,7 @@ import sqlite3
 from dataclasses import asdict
 from typing import Callable, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from app.api.deps import (
@@ -19,6 +19,8 @@ from app.api.deps import (
     get_db,
     get_evaluate_policy,
 )
+from app.config import settings
+from app.limiter import limiter
 from app.security import csrf_protect
 from app.services.folder_store import (
     _UNSET,
@@ -79,7 +81,10 @@ class FolderUpdateRequest(BaseModel):
 
 class FolderMoveRequest(BaseModel):
     vault_id: int
-    file_ids: list[int] = Field(..., min_length=1)
+    # Bounded well under SQLite's host-parameter limit so a huge batch
+    # cannot hold the global write lock for an arbitrary IN-scan inside
+    # move_documents' transaction (issue #700 review, PRR-007).
+    file_ids: list[int] = Field(..., min_length=1, max_length=999)
     # null => move the documents to the root (unfiled).
     folder_id: Optional[int] = None
 
@@ -187,8 +192,10 @@ async def delete_folder(
 
 
 @router.post("/move")
+@limiter.limit(settings.admin_rate_limit)
 async def move_documents(
-    request: FolderMoveRequest,
+    request: Request,
+    payload: FolderMoveRequest,
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
     evaluate: Callable = Depends(get_evaluate_policy),
@@ -196,11 +203,11 @@ async def move_documents(
 ):
     """Move one or more documents into a folder (or to root when folder_id is
     null). Both the target folder and the files are scoped to the vault."""
-    await _require_vault_write(evaluate, user, request.vault_id)
+    await _require_vault_write(evaluate, user, payload.vault_id)
     store = FolderStore(db)
     try:
         moved = store.move_documents(
-            request.vault_id, request.file_ids, request.folder_id
+            payload.vault_id, payload.file_ids, payload.folder_id
         )
     except FolderNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
