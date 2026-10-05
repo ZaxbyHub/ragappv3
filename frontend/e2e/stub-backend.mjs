@@ -157,6 +157,76 @@ let nextVaultId = 2;
 const documents = [];
 let nextDocumentId = 1;
 
+// Activity tray job seeds (issue #784): created through POST /_e2e/jobs.
+// Every family's seed materializes in the REAL route shape the tray's
+// useActivityJobs adapters poll (wiki/kms/reindex job rows, a draft + its
+// job for draft-room, and a processing document row for ingest — seed
+// status "running" is not a document status, so it lands as "processing").
+// The action routes below mutate these same seed records, which is what
+// GET /_e2e/jobs?family= reads back.
+const E2E_JOB_FAMILIES = ["ingest", "wiki", "kms", "draft-room", "reindex"];
+const e2eSeeds = Object.fromEntries(E2E_JOB_FAMILIES.map((f) => [f, []]));
+let nextE2eJobId = 1;
+let nextE2eDraftId = 1;
+
+const E2E_TERMINAL_JOB_STATUSES = ["completed", "failed", "cancelled"];
+
+function resetE2eJobs() {
+  for (const family of E2E_JOB_FAMILIES) {
+    e2eSeeds[family] = [];
+  }
+  // Ingest seeds materialize document rows; drop only the rows the seeder
+  // created (flagged at seed time), never walkthrough-uploaded documents.
+  for (let i = documents.length - 1; i >= 0; i -= 1) {
+    if (documents[i].e2eSeed) documents.splice(i, 1);
+  }
+}
+
+function e2eJobShape(family, seed) {
+  const base = {
+    id: seed.id,
+    status: seed.status,
+    // A failed seed's title rides the error field - the same place the
+    // real backend puts a failed job's reason, and the field the tray
+    // surfaces as a failed row's title.
+    error: seed.status === "failed" ? seed.title ?? `job ${seed.id} failed` : null,
+    result_json: "{}",
+    created_at: seed.created_at,
+    started_at: seed.created_at,
+    completed_at: null,
+    retry_count: 0,
+  };
+  if (family === "wiki") {
+    return { ...base, vault_id: 1, trigger_type: "manual", trigger_id: null };
+  }
+  if (family === "kms") {
+    return { ...base, vault_id: 1, trigger_type: "manual", trigger_id: null, input_json: "{}" };
+  }
+  if (family === "reindex") {
+    return { ...base, vault_id: 1, trigger_type: "api", trigger_id: "1", input_json: "{}" };
+  }
+  // draft-room
+  return {
+    ...base,
+    draft_id: seed.draftId,
+    job_type: "compile",
+    start_stage: null,
+    active_stage: seed.status === "running" ? "compiling" : null,
+    progress_percent: 0,
+    model_call_count: 0,
+    max_model_calls: 0,
+    parent_job_id: null,
+    attempt_no: 1,
+    compile_input_sha256: null,
+    prompt_bundle_version: null,
+    timeout_seconds: 1800,
+    cancel_requested_at: null,
+    heartbeat_at: null,
+    error_code: null,
+    error_message: null,
+  };
+}
+
 function createSession(vaultId = 1) {
   const id = nextSessionId++;
   const session = {
@@ -385,10 +455,15 @@ const server = http.createServer(async (req, res) => {
       return sendJson(req, res, 200, vault);
     }
 
-    // ---- documents (issue #781 walkthrough) ----
+    // ---- documents (issue #781 walkthrough; #784 adds the status filter
+    // the Activity tray's ingest adapter polls) ----
     if (method === "GET" && path === "/api/documents") {
       const vaultId = Number(url.searchParams.get("vault_id") || 0);
-      const scoped = vaultId ? documents.filter((d) => d.vault_id === vaultId) : documents;
+      const status = url.searchParams.get("status");
+      let scoped = vaultId ? documents.filter((d) => d.vault_id === vaultId) : documents;
+      if (status) {
+        scoped = scoped.filter((d) => (d.metadata?.status ?? "") === status);
+      }
       return sendJson(req, res, 200, { documents: scoped, total: scoped.length });
     }
     if (method === "GET" && path === "/api/documents/stats") {
@@ -434,6 +509,108 @@ const server = http.createServer(async (req, res) => {
       documents.push(doc);
       onboarding.upload_indexed = true;
       return sendJson(req, res, 200, { id: doc.id, filename, status: "processed" });
+    }
+
+    // ---- Activity tray job routes (issue #784) ----
+    // List routes mirror the real backend shapes the tray's adapters poll.
+    // (Dedicated matcher: the chat section's `let m` is declared further
+    // down — using it here would hit its temporal dead zone.)
+    let trayMatch;
+    // Wiki/KMS lists honor the vault_id query the real adapters send, so a
+    // multi-vault stub state cannot duplicate rows per vault the way the
+    // real per-vault backend never would (review F-003/M-PLAT-01).
+    const trayVaultId = Number(url.searchParams.get("vault_id") || 0);
+    const inTrayVault = (seed) => !trayVaultId || (seed.vaultId ?? 1) === trayVaultId;
+    if (method === "GET" && path === "/api/wiki/jobs") {
+      return sendJson(req, res, 200, {
+        jobs: e2eSeeds.wiki.filter(inTrayVault).map((s) => e2eJobShape("wiki", s)),
+      });
+    }
+    if (method === "GET" && path === "/api/kms/jobs") {
+      return sendJson(req, res, 200, {
+        jobs: e2eSeeds.kms.filter(inTrayVault).map((s) => e2eJobShape("kms", s)),
+      });
+    }
+    if (method === "GET" && path === "/api/documents/reindex/jobs") {
+      return sendJson(req, res, 200, {
+        jobs: e2eSeeds.reindex.map((s) => e2eJobShape("reindex", s)),
+      });
+    }
+    if (method === "GET" && path === "/api/draft-room/drafts") {
+      const items = e2eSeeds["draft-room"].map((s) => ({
+        id: s.draftId,
+        vault_id: 1,
+        title: s.title ?? `Draft ${s.draftId}`,
+        status: "ready",
+        active_job_id: s.status === "running" ? s.id : null,
+      }));
+      return sendJson(req, res, 200, { items, total: items.length, page: 1, per_page: 50 });
+    }
+    if ((trayMatch = path.match(/^\/api\/draft-room\/drafts\/(\d+)\/jobs$/)) && method === "GET") {
+      const draftId = Number(trayMatch[1]);
+      const items = e2eSeeds["draft-room"]
+        .filter((s) => s.draftId === draftId)
+        .map((s) => e2eJobShape("draft-room", s));
+      return sendJson(req, res, 200, { items, total: items.length, page: 1, per_page: 50 });
+    }
+    // Action routes: mutate the SAME seed records the list routes and
+    // GET /_e2e/jobs read, with the production terminal-state gates — a
+    // cancel on a terminal job 404s (wiki_store refuses non-pending/
+    // non-running), a retry only from failed, an ingest cancel on a
+    // finished document 409s (documents.py) — so the e2e cannot pass with
+    // an affordance the real server would refuse (review F-003/M-PLAT-01,
+    // PRR-026).
+    if ((trayMatch = path.match(/^\/api\/wiki\/jobs\/(\d+)\/(cancel|retry)$/)) && method === "POST") {
+      const seed = e2eSeeds.wiki.find((s) => s.id === Number(trayMatch[1]));
+      if (!seed) return sendJson(req, res, 404, { detail: "Job not found or not cancellable" });
+      if (trayMatch[2] === "cancel") {
+        if (E2E_TERMINAL_JOB_STATUSES.includes(seed.status)) {
+          return sendJson(req, res, 404, { detail: "Job not found or not cancellable" });
+        }
+        seed.status = "cancelled";
+      } else {
+        if (seed.status !== "failed") {
+          return sendJson(req, res, 404, { detail: "Job is not in 'failed' state" });
+        }
+        seed.status = "pending";
+      }
+      return sendJson(req, res, 200, { job_id: seed.id, status: seed.status });
+    }
+    if (
+      (trayMatch = path.match(/^\/api\/draft-room\/drafts\/(\d+)\/jobs\/(\d+)\/(cancel|retry)$/)) &&
+      method === "POST"
+    ) {
+      const seed = e2eSeeds["draft-room"].find(
+        (s) => s.draftId === Number(trayMatch[1]) && s.id === Number(trayMatch[2])
+      );
+      if (!seed) return sendJson(req, res, 404, { detail: "job not found" });
+      if (trayMatch[3] === "cancel") {
+        if (E2E_TERMINAL_JOB_STATUSES.includes(seed.status)) {
+          return sendJson(req, res, 404, { detail: "job not cancellable" });
+        }
+        seed.status = "cancelled";
+      } else {
+        if (seed.status !== "failed") {
+          return sendJson(req, res, 404, { detail: "job not in 'failed' state" });
+        }
+        seed.status = "pending";
+      }
+      return sendJson(req, res, 200, e2eJobShape("draft-room", seed));
+    }
+    if ((trayMatch = path.match(/^\/api\/documents\/(\d+)\/cancel$/)) && method === "POST") {
+      const doc = documents.find((d) => String(d.id) === trayMatch[1]);
+      if (!doc) return sendJson(req, res, 404, { detail: "file not found" });
+      const current = doc.metadata?.status ?? "";
+      if (current === "cancelled") {
+        return sendJson(req, res, 200, { file_id: doc.id, status: "cancelled" });
+      }
+      if (["indexed", "partial", "error"].includes(current)) {
+        return sendJson(req, res, 409, { detail: "Ingest already finished; nothing to cancel" });
+      }
+      doc.metadata = { ...(doc.metadata ?? {}), status: "cancelled" };
+      const seed = e2eSeeds.ingest.find((s) => String(s.docId) === trayMatch[1]);
+      if (seed) seed.status = "cancelled";
+      return sendJson(req, res, 200, { file_id: doc.id, status: "cancelled" });
     }
 
     // ---- chat sessions ----
@@ -569,6 +746,61 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ---- e2e control routes (issue #782; test-only) ----
+    // Activity tray seeding (issue #784): POST /_e2e/jobs body
+    // { family, status?, title? } seeds one job; default status "running".
+    // Ingest seeds materialize as a PROCESSING document row (the adapter
+    // polls GET /api/documents?status=...); draft-room seeds as a draft +
+    // its job; wiki/kms/reindex land in vault 1.
+    if (method === "POST" && path === "/_e2e/jobs") {
+      const body = await readBody(req);
+      const family = String(body.family || "");
+      if (!E2E_JOB_FAMILIES.includes(family)) {
+        return sendJson(req, res, 400, { detail: `unknown family ${family}` });
+      }
+      const status = String(body.status || "running");
+      const title = body.title ? String(body.title) : null;
+      const id = nextE2eJobId++;
+      const seed = { id, family, status, title, created_at: nowIso(), vaultId: 1 };
+      if (family === "ingest") {
+        const docId = nextDocumentId++;
+        seed.docId = String(docId);
+        documents.push({
+          id: String(docId),
+          filename: title ?? `activity-tray-ingest-${docId}.txt`,
+          vault_id: 1,
+          size: 128,
+          content_type: "text/plain",
+          created_at: seed.created_at,
+          // Seeded phase text so the tray's documentProgress-derived phase
+          // is assertable end-to-end.
+          metadata: {
+            status: status === "pending" ? "pending" : "processing",
+            phase: "parsing",
+            chunk_count: 0,
+          },
+          e2eSeed: true,
+        });
+      } else if (family === "draft-room") {
+        seed.draftId = nextE2eDraftId++;
+      }
+      e2eSeeds[family].push(seed);
+      return sendJson(req, res, 200, { id: seed.id, family: seed.family, status: seed.status });
+    }
+    if (method === "GET" && path === "/_e2e/jobs") {
+      const family = url.searchParams.get("family") || "";
+      if (!E2E_JOB_FAMILIES.includes(family)) {
+        return sendJson(req, res, 400, { detail: `unknown family ${family}` });
+      }
+      return sendJson(req, res, 200, { jobs: e2eSeeds[family] });
+    }
+    // Reset the tray's seed state between tests: exact-count and id-scoped
+    // assertions must not depend on seeds leaked from an earlier spec or a
+    // reused stub server (PRR-003 / review F-004).
+    if (method === "POST" && path === "/_e2e/reset-jobs") {
+      await readBody(req);
+      resetE2eJobs();
+      return sendJson(req, res, 200, { ok: true });
+    }
     if (method === "POST" && path === "/_e2e/onboarding") {
       const body = await readBody(req);
       resetOnboarding();

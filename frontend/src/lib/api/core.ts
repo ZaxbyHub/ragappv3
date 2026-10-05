@@ -930,6 +930,48 @@ export async function getDocument(fileId: string | number): Promise<Document> {
   return response.data;
 }
 
+/**
+ * Cancel a running or queued document ingest (issue #783's endpoint,
+ * `POST /documents/{file_id}/cancel`). The server returns 200 with the
+ * terminal status; 409 when the ingest already finished (nothing to cancel).
+ */
+export async function cancelDocumentIngest(
+  fileId: string | number
+): Promise<{ file_id: number; status: string }> {
+  const response = await apiClient.post<{ file_id: number; status: string }>(
+    `/documents/${encodeURIComponent(fileId)}/cancel`,
+    null
+  );
+  return response.data;
+}
+
+/** One embedding-reindex job row from `GET /documents/reindex/jobs` (issue #784). */
+export interface ReindexJobSummary {
+  id: number;
+  vault_id?: number | null;
+  trigger_type?: string | null;
+  trigger_id?: string | null;
+  status: string;
+  error?: string | null;
+  result_json?: string | null;
+  input_json?: string | null;
+  retry_count?: number;
+  created_at?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+}
+
+/**
+ * List recent embedding-reindex jobs (admin route; non-admin callers get 403
+ * and callers treat that as "family hidden", per the Activity tray contract).
+ */
+export async function listReindexJobs(): Promise<{ jobs: ReindexJobSummary[] }> {
+  const response = await apiClient.get<{ jobs: ReindexJobSummary[] }>(
+    "/documents/reindex/jobs"
+  );
+  return response.data;
+}
+
 export async function uploadDocument(
   file: File,
   onProgress?: (progress: number) => void,

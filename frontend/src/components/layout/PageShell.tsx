@@ -2,6 +2,7 @@ import { ReactNode, useEffect, useState } from "react";
 import { useLocation } from "react-router-dom";
 import { motion, AnimatePresence, useReducedMotion } from "framer-motion";
 import { Navigation } from "./Navigation";
+import { ActivityTray } from "./ActivityTray";
 import { UploadIndicator } from "@/components/shared/UploadIndicator";
 import UnconfiguredChatBanner from "@/components/UnconfiguredChatBanner";
 import FirstRunChecklist from "@/components/onboarding/FirstRunChecklist";
@@ -115,6 +116,12 @@ export function PageShell({ children, activeItem, onItemSelect, healthStatus }: 
 
       {/* Global Upload Indicator - Shows on all pages */}
       <UploadIndicator />
+
+      {/* Issue #784: shell-level Activity tray — every family's server-side
+          background jobs, visible from any route. Additive alongside the
+          upload indicator (which tracks this tab's in-flight HTTP uploads,
+          a different concern from server-side job state). */}
+      <ActivityTray />
     </div>
   );
 }

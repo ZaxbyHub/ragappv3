@@ -655,6 +655,12 @@ class ReindexJobStatusResponse(BaseModel):
     completed_at: Optional[str] = None
 
 
+class ReindexJobListResponse(BaseModel):
+    """Recent reindex jobs for the Activity tray's reindex family (#784)."""
+
+    jobs: List[ReindexJobStatusResponse]
+
+
 class FileEnrichmentToggleRequest(BaseModel):
     """Request model for toggling per-file enrichment override.
 
@@ -2960,6 +2966,71 @@ async def get_reindex_job_status(
 
     row_dict = dict(row)
     return ReindexJobStatusResponse(**row_dict)
+
+
+@router.get("/reindex/jobs", response_model=ReindexJobListResponse)
+async def list_reindex_jobs(
+    conn: sqlite3.Connection = Depends(get_db),
+    user: dict = Depends(require_admin_role),
+) -> ReindexJobListResponse:
+    """List recent reindex jobs, newest first (Activity tray, issue #784).
+
+    Deliberate deviations from the per-job sibling route above:
+    - no ``csrf_protect``: the SPA's CSRF interceptor only arms on mutating
+      methods, and the guard has no safe-method exemption, so a CSRF-gated
+      GET is uncallable from the frontend;
+    - no rate-limit decorator: the tray polls this route (~every 8s), which
+      the admin rate limit ("10/minute", IP-keyed) cannot sustain — read
+      routes like ``GET /documents`` set this repo's unlimited-read
+      precedent.
+    The legacy terminal ``interrupted`` status maps to ``failed`` in BOTH
+    store branches (the sibling maps it only on the unified path).
+    """
+
+    lease_on = bool(getattr(settings, "reindex_job_lease_enabled", False))
+
+    def _fetch_jobs():
+        if lease_on:
+            rows = conn.execute(
+                """
+                SELECT id,
+                       json_extract(payload_json, '$.vault_id') AS vault_id,
+                       COALESCE(json_extract(payload_json, '$.trigger_type'), 'api') AS trigger_type,
+                       json_extract(payload_json, '$.trigger_id') AS trigger_id,
+                       CASE WHEN status = 'interrupted' THEN 'failed' ELSE status END AS status,
+                       error, result_json,
+                       json_extract(payload_json, '$.input_json') AS input_json,
+                       attempts AS retry_count,
+                       created_at, started_at, completed_at
+                FROM jobs WHERE queue = 'reindex'
+                ORDER BY created_at DESC, id DESC
+                LIMIT 20
+                """
+            ).fetchall()
+            out = []
+            for row in rows:
+                row_dict = dict(row)
+                row_dict["input_json"] = row_dict.get("input_json") or "{}"
+                out.append(row_dict)
+            return out
+        rows = conn.execute(
+            """
+            SELECT id, vault_id, trigger_type, trigger_id,
+                   CASE WHEN status = 'interrupted' THEN 'failed' ELSE status END AS status,
+                   error, result_json, input_json,
+                   COALESCE(retry_count, 0) AS retry_count,
+                   created_at, started_at, completed_at
+            FROM document_reindex_jobs
+            ORDER BY created_at DESC, id DESC
+            LIMIT 20
+            """
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    jobs = await asyncio.to_thread(_fetch_jobs)
+    return ReindexJobListResponse(
+        jobs=[ReindexJobStatusResponse(**job) for job in jobs]
+    )
 
 
 def _unlink_document_file(stored_path: str, vault_id: int) -> None:

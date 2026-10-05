@@ -1,4 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { Document } from "@/lib/api/core";
+import { listDocuments, listReindexJobs } from "@/lib/api/core";
+import { listWikiJobs } from "@/lib/api/wiki";
+import { listKMSJobs } from "@/lib/api/kms";
+import { listDrafts, listDraftJobs } from "@/lib/api/draftRoom";
+import { documentProgress } from "@/components/documents/documentProgress";
+import { useVaultStore } from "@/stores/useVaultStore";
 
 /**
  * Shared job-family contract for background-job polling (issue #783).
@@ -157,4 +164,325 @@ export function useJobStatus(family: JobFamily, opts: UseJobStatusOptions) {
   }, []);
 
   return { active, start, stop };
+}
+
+// ---------------------------------------------------------------------------
+// Activity tray aggregation (issue #784, [Workstream M] PR 4 of 4)
+//
+// The tray's data source: one poll loop over the five family adapters, each
+// reusing the family's existing server list client (never the client upload
+// store). Mirrors the single-job hook's discipline above: setTimeout chain,
+// never setInterval; API clients are imported (dynamic) and dereferenced
+// ONLY at poll time; every family failure degrades to zero rows for one
+// tick instead of throwing (a 403 for feature/admin-gated families is an
+// ordinary "not visible to this user", not an error).
+// ---------------------------------------------------------------------------
+
+/** One normalized job row the Activity tray renders, whatever the family. */
+export interface ActivityJobRow {
+  family: JobFamily;
+  /** Stable React key (never rendered as text). */
+  key: string;
+  title: string;
+  /** Display text derived from the family's own phase vocabulary. */
+  phase: string;
+  status: string;
+  terminal: boolean;
+  /** Cancel is offered for wiki / draft-room / ingest while non-terminal. */
+  cancellable: boolean;
+  /** Retry is offered for failed wiki / draft-room jobs. */
+  retryable: boolean;
+  jobId?: number;
+  vaultId?: number;
+  draftId?: number;
+  fileId?: string;
+}
+
+const ACTIVITY_TRAY_INTERVAL_MS = 8000;
+
+/**
+ * Floor for caller-supplied intervals: a 0/negative intervalMs must not
+ * become a setTimeout(fn, 0) self-rescheduling hot loop.
+ */
+const ACTIVITY_MIN_INTERVAL_MS = 1000;
+
+/** Page budget for the ingest family's bounded pagination. */
+const ACTIVITY_INGEST_PAGES = 3;
+const ACTIVITY_INGEST_PAGE_SIZE = 200;
+
+/** Bounded retention: all live rows plus the N most recent terminal rows. */
+const ACTIVITY_TERMINAL_RETENTION = 3;
+
+function retainRows(rows: ActivityJobRow[]): ActivityJobRow[] {
+  const live = rows.filter((r) => !r.terminal);
+  // Terminal rows arrive concatenated per parent (vault/draft), each parent
+  // newest-first — slicing positionally would spend the whole budget on the
+  // first parent's backlog and hide a just-failed job from every later
+  // vault/draft. Family job ids are globally autoincrement, so descending id
+  // is global recency.
+  const terminal = rows
+    .filter((r) => r.terminal)
+    .sort((a, b) => (b.jobId ?? 0) - (a.jobId ?? 0))
+    .slice(0, ACTIVITY_TERMINAL_RETENTION);
+  return [...live, ...terminal];
+}
+
+async function accessibleVaultIds(): Promise<number[]> {
+  const store = useVaultStore.getState();
+  // The tray's first tick can race the shell's vault fetch; an empty store
+  // must not silently stay empty — kick a load so a later tick sees the
+  // vaults (the kick is a no-op while the store is already loading).
+  if (store.vaults.length === 0 && !store.loading) {
+    void Promise.resolve(store.fetchVaults()).catch(() => {});
+  }
+  return store.vaults.map((v: { id: number }) => v.id);
+}
+
+async function fetchIngestRows(): Promise<ActivityJobRow[]> {
+  // The route filters by a single status value; union both live statuses and
+  // dedupe by file id (a list source that ignores the filter must not
+  // double-count a document). Pagination is bounded: a pathological backlog
+  // must not fan out unbounded requests — documents beyond the page budget
+  // are not surfaced (disclosed in the release note).
+  const fetchStatusDocs = async (status: string): Promise<Document[]> => {
+    const docs: Document[] = [];
+    for (let page = 1; page <= ACTIVITY_INGEST_PAGES; page += 1) {
+      const res = await listDocuments({ status, perPage: ACTIVITY_INGEST_PAGE_SIZE, page });
+      docs.push(...res.documents);
+      if (docs.length >= res.total) break;
+    }
+    return docs;
+  };
+  const [pending, processing] = await Promise.all([
+    fetchStatusDocs("pending"),
+    fetchStatusDocs("processing"),
+  ]);
+  const byId = new Map<string, Document>();
+  for (const doc of [...pending, ...processing]) {
+    byId.set(doc.id, doc);
+  }
+  return [...byId.values()].map((doc) => ({
+    family: "ingest" as const,
+    key: `ingest-${doc.id}`,
+    title: doc.filename || `Document ${doc.id}`,
+    phase: documentProgress(doc).label,
+    status: (doc.metadata?.status as string | undefined) ?? "",
+    terminal: false,
+    cancellable: true,
+    retryable: false,
+    fileId: doc.id,
+  }));
+}
+
+async function fetchWikiRows(): Promise<ActivityJobRow[]> {
+  const vaultIds = await accessibleVaultIds();
+  const lists = await Promise.allSettled(
+    vaultIds.map((vaultId) => listWikiJobs({ vault_id: vaultId }))
+  );
+  const jobs = lists.flatMap((r) => (r.status === "fulfilled" ? r.value.jobs : []));
+  return retainRows(
+    jobs.map((job) => ({
+      family: "wiki" as const,
+      key: `wiki-${job.id}`,
+      // A failed compile's own error text is the most useful title the
+      // family's job shape carries (WikiCompileJob has no title field).
+      title:
+        job.status === "failed" && job.error ? job.error : "Wiki compile",
+      phase: job.status,
+      status: job.status,
+      terminal: isTerminalJobStatus(job.status),
+      cancellable: !isTerminalJobStatus(job.status),
+      retryable: job.status === "failed",
+      jobId: job.id,
+      vaultId: job.vault_id,
+    }))
+  );
+}
+
+async function fetchKmsRows(): Promise<ActivityJobRow[]> {
+  const vaultIds = await accessibleVaultIds();
+  // require_kms_enabled / per-vault read denials (403) are the family's
+  // ordinary hidden state, not errors.
+  const lists = await Promise.allSettled(
+    vaultIds.map((vaultId) => listKMSJobs(vaultId))
+  );
+  const jobs = lists.flatMap((r) => (r.status === "fulfilled" ? r.value.jobs : []));
+  return retainRows(
+    jobs.map((job) => ({
+      family: "kms" as const,
+      key: `kms-${job.id}`,
+      title: "KMS recompile",
+      phase: job.status,
+      status: job.status,
+      terminal: isTerminalJobStatus(job.status),
+      cancellable: false,
+      retryable: false,
+      jobId: job.id,
+      vaultId: job.vault_id,
+    }))
+  );
+}
+
+async function fetchDraftRoomRows(): Promise<ActivityJobRow[]> {
+  const drafts = await listDrafts({ page: 1, per_page: 10 });
+  const lists = await Promise.allSettled(
+    drafts.items.map((draft) => listDraftJobs(draft.id, { page: 1, per_page: 20 }))
+  );
+  const jobsByDraft = drafts.items.map((draft, i) => ({
+    draft,
+    jobs: lists[i].status === "fulfilled" ? lists[i].value.items : [],
+  }));
+  return retainRows(
+    jobsByDraft.flatMap(({ draft, jobs }) =>
+      jobs.map((job) => ({
+        family: "draft-room" as const,
+        key: `draft-${draft.id}-job-${job.id}`,
+        title: draft.title || `Draft ${draft.id}`,
+        phase: job.active_stage ?? job.status,
+        status: job.status,
+        terminal: isTerminalJobStatus(job.status),
+        cancellable: !isTerminalJobStatus(job.status),
+        retryable: job.status === "failed",
+        draftId: draft.id,
+        jobId: job.id,
+      }))
+    )
+  );
+}
+
+async function fetchReindexRows(): Promise<ActivityJobRow[]> {
+  const { jobs } = await listReindexJobs();
+  return retainRows(
+    jobs.map((job) => ({
+      family: "reindex" as const,
+      key: `reindex-${job.id}`,
+      title:
+        job.vault_id != null
+          ? `Embedding reindex (vault ${job.vault_id})`
+          : "Embedding reindex",
+      phase: job.status,
+      status: job.status,
+      terminal: isTerminalJobStatus(job.status),
+      cancellable: false,
+      retryable: false,
+      jobId: job.id,
+    }))
+  );
+}
+
+async function fetchAllActivityRows(): Promise<ActivityJobRow[]> {
+  const results = await Promise.allSettled([
+    fetchIngestRows(),
+    fetchWikiRows(),
+    fetchKmsRows(),
+    fetchDraftRoomRows(),
+    fetchReindexRows(),
+  ]);
+  return results.flatMap((r) => (r.status === "fulfilled" ? r.value : []));
+}
+
+export interface UseActivityJobsOptions {
+  intervalMs?: number;
+}
+
+/**
+ * Server-sourced, shell-level job list for the Activity tray: polls the five
+ * family adapters on one bounded setTimeout chain (never the client upload
+ * store — a reload or another tab loses nothing). `refresh()` forces an
+ * immediate extra tick (used after tray Cancel/Retry actions).
+ */
+export function useActivityJobs(options: UseActivityJobsOptions = {}) {
+  const [rows, setRows] = useState<ActivityJobRow[]>([]);
+  const [loading, setLoading] = useState(false);
+  const optionsRef = useRef(options);
+  optionsRef.current = options;
+  const mountedRef = useRef(false);
+  const inFlightRef = useRef(false);
+  // A refresh() landing while a tick is in flight must not be dropped: it
+  // sets this flag and the in-flight chain runs one more pass when it settles
+  // (PRR-004 / review F-005b).
+  const pendingRef = useRef(false);
+  // Loading is a first-load signal, not a per-poll spinner (PRR-032).
+  const hasLoadedRef = useRef(false);
+  // Generation-scoped scheduling: only the newest effect generation may keep
+  // the timer chain alive, so a StrictMode remount's stale in-flight fetch
+  // settles without arming a second chain (PRR-007 / review F-005a).
+  const generationRef = useRef(0);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Stable indirection so the loop can schedule its own next tick without a
+  // self-referencing useCallback (same pattern as useJobStatus above).
+  const tickRef = useRef<() => void>(() => {});
+
+  const runFetch = useCallback(async () => {
+    if (inFlightRef.current) {
+      pendingRef.current = true;
+      return;
+    }
+    inFlightRef.current = true;
+    if (mountedRef.current && !hasLoadedRef.current) setLoading(true);
+    try {
+      do {
+        pendingRef.current = false;
+        const next = await fetchAllActivityRows();
+        if (mountedRef.current) {
+          setRows(next);
+          hasLoadedRef.current = true;
+        }
+      } while (pendingRef.current && mountedRef.current);
+    } finally {
+      inFlightRef.current = false;
+      if (mountedRef.current) setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    const generation = ++generationRef.current;
+    const schedule = (): void => {
+      timerRef.current = setTimeout(
+        () => tickRef.current(),
+        Math.max(
+          optionsRef.current.intervalMs ?? ACTIVITY_TRAY_INTERVAL_MS,
+          ACTIVITY_MIN_INTERVAL_MS
+        )
+      );
+    };
+    const tick = (): void => {
+      // Backgrounded tab: skip the fetch but keep the chain alive at the same
+      // cadence — the next visible tick catches up (PRR-008).
+      if (typeof document !== "undefined" && document.hidden) {
+        schedule();
+        return;
+      }
+      void runFetch()
+        .catch(() => {
+          // fetchAllActivityRows never rejects (allSettled); this guard only
+          // covers the setState bookkeeping above.
+        })
+        .finally(() => {
+          if (!mountedRef.current || generationRef.current !== generation) return;
+          schedule();
+        });
+    };
+    tickRef.current = tick;
+    tick();
+    return () => {
+      // Live-value read is the point of a generation guard: the cleanup must
+      // see whether a NEWER effect generation has taken ownership.
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+      if (generationRef.current === generation) {
+        mountedRef.current = false;
+      }
+      if (timerRef.current !== null) {
+        clearTimeout(timerRef.current);
+        timerRef.current = null;
+      }
+    };
+  }, [runFetch]);
+
+  const refresh = useCallback(() => {
+    void runFetch().catch(() => {});
+  }, [runFetch]);
+
+  return { rows, loading, refresh };
 }

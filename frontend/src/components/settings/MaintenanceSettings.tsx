@@ -2,8 +2,10 @@
  * Settings → Maintenance tab.
  *
  * Action buttons that hit existing backend endpoints only (per the
- * approved plan, the unwired "Reindex current vault" button is dropped
- * — we'll add it once a real /documents/reindex endpoint ships).
+ * approved plan, the unwired "Reindex current vault" button is dropped —
+ * POST /documents/reindex has since shipped (admin-gated; the Activity
+ * tray's reindex family reads its job list); wiring a maintenance-tab
+ * button for it is tracked separately).
  *
  * Buttons:
  *   - Recompile wiki current vault   → POST /wiki/recompile
