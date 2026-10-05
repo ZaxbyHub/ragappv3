@@ -440,6 +440,31 @@ describe("useActivityJobs adapters (issue #784)", () => {
     });
   });
 
+  it("keeps other families alive when the reindex and ingest adapters reject", async () => {
+    // PRR-014 residual legs: per-adapter rejection tolerance for the two
+    // "@/lib/api/core" consumers (reindex = admin-gated; ingest = network).
+    mockListReindexJobs.mockRejectedValue(new Error("403 admin only"));
+    mockListDocuments.mockRejectedValue(new Error("network down"));
+    mockVaultState.mockReturnValue({
+      vaults: [{ id: 1 }],
+      loading: false,
+      fetchVaults: vi.fn().mockResolvedValue(undefined),
+    });
+    const wikiMock = vi.mocked(listWikiJobs);
+    wikiMock.mockResolvedValue({ jobs: [wikiJob(31, "running")] });
+
+    const { result } = renderHook(() => useActivityJobs());
+
+    await waitFor(
+      () => {
+        expect(result.current.rows.map((r) => r.family)).toEqual(["wiki"]);
+      },
+      { timeout: 8_000 }
+    );
+    expect(result.current.rows[0]?.key).toBe("wiki-31");
+    expect(mockListDocuments).toHaveBeenCalled();
+  });
+
   it("floors caller-supplied intervals at 1s (no setTimeout(0) hot loop)", async () => {
     vi.useFakeTimers();
     const { result } = renderHook(() => useActivityJobs({ intervalMs: 0 }));

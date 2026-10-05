@@ -48,10 +48,14 @@ export function ActivityTray() {
   // until its request settles, so a double-click cannot double-POST
   // (PRR-006 / review F-005c).
   const [pendingKey, setPendingKey] = useState<string | null>(null);
-  // Rows whose Cancel the server refused with 403 (the route requires
-  // per-file vault admin): stop offering an affordance that can only ever
-  // fail for this user (PRR-005 / review F-009).
+  // Rows whose Cancel/Retry the server refused with 403 (cancel requires
+  // per-file vault admin; wiki/draft retry requires vault write): stop
+  // offering affordances that can only ever fail for this user (PRR-005 /
+  // review F-009).
   const deniedCancelKeysRef = useRef<Set<string>>(new Set());
+  const sectionRef = useRef<HTMLElement | null>(null);
+  const focusedKeyRef = useRef<string | null>(null);
+  const prevRowKeysRef = useRef<Set<string>>(new Set());
 
   async function runAction(
     row: ActivityJobRow,
@@ -63,6 +67,8 @@ export function ActivityTray() {
       await action();
     } catch (e) {
       if (errorStatus(e) === 403) {
+        // A 403 means this user lacks the server-side gate for that action
+        // on that row: stop offering an affordance that can only ever fail.
         deniedCancelKeysRef.current.add(row.key);
       }
       // 403 (vault-admin gate) and 409 (already finished) surface as the
@@ -99,6 +105,25 @@ export function ActivityTray() {
     return Promise.resolve();
   }
 
+  // Focus guard (PRR-029): a poll tick can unmount the focused row (a
+  // successful cancel removes it; the terminal cap ages it out) — restore
+  // focus to the tray header instead of dropping it to <body>.
+  const prevKeys = prevRowKeysRef.current;
+  const currentKeys = new Set(rows.map((r) => r.key));
+  if (
+    focusedKeyRef.current &&
+    !currentKeys.has(focusedKeyRef.current) &&
+    prevKeys.has(focusedKeyRef.current) &&
+    typeof document !== "undefined" &&
+    document.activeElement instanceof HTMLElement &&
+    document.activeElement.closest('[aria-label="Activity"]')
+  ) {
+    sectionRef.current
+      ?.querySelector<HTMLButtonElement>("button[aria-expanded]")
+      ?.focus();
+  }
+  prevRowKeysRef.current = currentKeys;
+
   return (
     // Stacked ABOVE the upload indicator on both breakpoints: the indicator
     // is `bottom-20 right-4 z-50` on mobile and `md:bottom-4` on desktop, so
@@ -109,6 +134,7 @@ export function ActivityTray() {
     // AC1's `getByRole("region", { name: /activity/i })` resolves against
     // the implicit role (jsx-a11y forbids the explicit attribute).
     <section
+      ref={sectionRef}
       aria-label="Activity"
       className="fixed bottom-40 right-4 z-40 w-80 max-w-[calc(100vw-2rem)] md:bottom-24"
     >
@@ -157,11 +183,16 @@ export function ActivityTray() {
         {!collapsed && rows.length > 0 && (
           <ul className="max-h-72 overflow-auto px-3 py-2">
             {rows.map((row) => {
-              const cancellable = row.cancellable && !deniedCancelKeysRef.current.has(row.key);
+              const denied = deniedCancelKeysRef.current.has(row.key);
+              const cancellable = row.cancellable && !denied;
+              const retryable = row.retryable && !denied;
               const pending = pendingKey === row.key;
               return (
                 <li
                   key={row.key}
+                  onFocusCapture={() => {
+                    focusedKeyRef.current = row.key;
+                  }}
                   className="flex flex-col gap-1 border-b py-2 last:border-b-0"
                 >
                   <div className="flex items-center justify-between gap-2">
@@ -190,7 +221,7 @@ export function ActivityTray() {
                           Cancel
                         </Button>
                       )}
-                      {row.retryable && (
+                      {retryable && (
                         <Button
                           type="button"
                           variant="ghost"

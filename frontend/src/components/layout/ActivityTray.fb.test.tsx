@@ -22,10 +22,12 @@ import path from "node:path";
 const {
   mockUseActivityJobs,
   mockCancelWikiJob,
+  mockRetryWikiJob,
   mockToastError,
 } = vi.hoisted(() => ({
   mockUseActivityJobs: vi.fn(),
   mockCancelWikiJob: vi.fn(),
+  mockRetryWikiJob: vi.fn(),
   mockToastError: vi.fn(),
 }));
 
@@ -35,7 +37,7 @@ vi.mock("@/hooks/useJobStatus", () => ({
 
 vi.mock("@/lib/api/wiki", () => ({
   cancelWikiJob: mockCancelWikiJob,
-  retryWikiJob: vi.fn(),
+  retryWikiJob: mockRetryWikiJob,
 }));
 
 vi.mock("@/lib/api/draftRoom", () => ({
@@ -110,6 +112,7 @@ beforeEach(() => {
     refresh: vi.fn(),
   }));
   mockCancelWikiJob.mockReset();
+  mockRetryWikiJob.mockReset();
   mockToastError.mockReset();
 });
 
@@ -230,6 +233,35 @@ describe("ActivityTray feedback-round assertions (853-20261005)", () => {
     });
   });
 
+  it("stops offering Retry on a row the server refused with 403 (learned affordance covers retry)", async () => {
+    const user = userEvent.setup();
+    mockRetryWikiJob.mockRejectedValue(
+      Object.assign(new Error("Insufficient vault permissions"), {
+        response: { status: 403 },
+      })
+    );
+    hookRows = [
+      makeRow({
+        family: "wiki",
+        key: "wiki-7",
+        title: "Wiki compile",
+        phase: "failed",
+        status: "failed",
+        terminal: true,
+        retryable: true,
+        jobId: 7,
+        vaultId: 3,
+      }),
+    ];
+    render(<ActivityTray />);
+
+    await user.click(within(rowByFamily("wiki")).getByRole("button", { name: /retry/i }));
+
+    await waitFor(() => {
+      expect(within(rowByFamily("wiki")).queryByRole("button", { name: /retry/i })).toBeNull();
+    });
+  });
+
   it("surfaces a non-403 action failure as an error toast", async () => {
     const user = userEvent.setup();
     mockCancelWikiJob.mockRejectedValue(new Error("network down"));
@@ -252,6 +284,33 @@ describe("ActivityTray feedback-round assertions (853-20261005)", () => {
     });
     // A non-403 failure does NOT remove the affordance.
     expect(within(rowByFamily("wiki")).queryByRole("button", { name: /cancel/i })).not.toBeNull();
+  });
+
+  it("triggers the hook refresh after an action settles (finally-refresh is asserted, not decorative)", async () => {
+    const user = userEvent.setup();
+    const mockRefresh = vi.fn();
+    mockUseActivityJobs.mockImplementation(() => ({
+      rows: [
+        makeRow({
+          family: "wiki",
+          key: "wiki-7",
+          title: "Wiki compile",
+          cancellable: true,
+          jobId: 7,
+          vaultId: 3,
+        }),
+      ],
+      loading: false,
+      refresh: mockRefresh,
+    }));
+    mockCancelWikiJob.mockResolvedValue({ job_id: 7, status: "cancelled" });
+    render(<ActivityTray />);
+
+    await user.click(within(rowByFamily("wiki")).getByRole("button", { name: /cancel/i }));
+
+    await waitFor(() => {
+      expect(mockRefresh).toHaveBeenCalledTimes(1);
+    });
   });
 
   it("never imports the client upload store (server-sourced constraint tripwire)", () => {
