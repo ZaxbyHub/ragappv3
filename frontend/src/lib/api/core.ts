@@ -937,9 +937,9 @@ export async function getDocument(fileId: string | number): Promise<Document> {
  */
 export async function cancelDocumentIngest(
   fileId: string | number
-): Promise<{ file_id: string; status: string }> {
-  const response = await apiClient.post<{ file_id: string; status: string }>(
-    `/documents/${fileId}/cancel`,
+): Promise<{ file_id: number; status: string }> {
+  const response = await apiClient.post<{ file_id: number; status: string }>(
+    `/documents/${encodeURIComponent(fileId)}/cancel`,
     null
   );
   return response.data;

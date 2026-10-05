@@ -3003,7 +3003,7 @@ async def list_reindex_jobs(
                        attempts AS retry_count,
                        created_at, started_at, completed_at
                 FROM jobs WHERE queue = 'reindex'
-                ORDER BY created_at DESC
+                ORDER BY created_at DESC, id DESC
                 LIMIT 20
                 """
             ).fetchall()
@@ -3017,10 +3017,11 @@ async def list_reindex_jobs(
             """
             SELECT id, vault_id, trigger_type, trigger_id,
                    CASE WHEN status = 'interrupted' THEN 'failed' ELSE status END AS status,
-                   error, result_json, input_json, retry_count,
+                   error, result_json, input_json,
+                   COALESCE(retry_count, 0) AS retry_count,
                    created_at, started_at, completed_at
             FROM document_reindex_jobs
-            ORDER BY created_at DESC
+            ORDER BY created_at DESC, id DESC
             LIMIT 20
             """
         ).fetchall()

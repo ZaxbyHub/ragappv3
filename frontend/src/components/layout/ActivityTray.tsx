@@ -17,7 +17,7 @@
 // rendered); row keys never appear as DOM text; buttons are named plain
 // "Cancel" / "Retry".
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { useActivityJobs } from "@/hooks/useJobStatus";
@@ -34,52 +34,83 @@ function rowPhaseTone(row: ActivityJobRow): string {
   return "text-muted-foreground";
 }
 
+/** HTTP status of an action failure, when the error carries one. */
+function errorStatus(e: unknown): number | undefined {
+  const response = (e as { response?: { status?: number } } | null)?.response;
+  return response?.status;
+}
+
 export function ActivityTray() {
   const { rows, loading, refresh } = useActivityJobs();
   const [collapsed, setCollapsed] = useState(false);
   const activeCount = rows.filter((r) => !r.terminal).length;
+  // Row-keyed in-flight marker: the clicked action's button is disabled
+  // until its request settles, so a double-click cannot double-POST
+  // (PRR-006 / review F-005c).
+  const [pendingKey, setPendingKey] = useState<string | null>(null);
+  // Rows whose Cancel the server refused with 403 (the route requires
+  // per-file vault admin): stop offering an affordance that can only ever
+  // fail for this user (PRR-005 / review F-009).
+  const deniedCancelKeysRef = useRef<Set<string>>(new Set());
 
-  async function handleCancel(row: ActivityJobRow) {
+  async function runAction(
+    row: ActivityJobRow,
+    action: () => Promise<unknown>,
+    failureLabel: string
+  ) {
+    setPendingKey(row.key);
     try {
-      if (row.family === "wiki" && row.jobId != null && row.vaultId != null) {
-        await cancelWikiJob(row.jobId, row.vaultId);
-      } else if (row.family === "draft-room" && row.draftId != null && row.jobId != null) {
-        await cancelDraftJob(row.draftId, row.jobId);
-      } else if (row.family === "ingest" && row.fileId != null) {
-        await cancelDocumentIngest(row.fileId);
-      }
+      await action();
     } catch (e) {
+      if (errorStatus(e) === 403) {
+        deniedCancelKeysRef.current.add(row.key);
+      }
       // 403 (vault-admin gate) and 409 (already finished) surface as the
       // server's message; the next poll reconciles the row either way.
-      toast.error(e instanceof Error ? e.message : "Cancel failed");
+      toast.error(e instanceof Error ? e.message : failureLabel);
     } finally {
+      setPendingKey(null);
       // Optional-chained because the hook's test doubles return only
       // { rows, loading } (frozen mock contract).
       refresh?.();
     }
   }
 
-  async function handleRetry(row: ActivityJobRow) {
-    try {
-      if (row.family === "wiki" && row.jobId != null && row.vaultId != null) {
-        await retryWikiJob(row.jobId, row.vaultId);
-      } else if (row.family === "draft-room" && row.draftId != null && row.jobId != null) {
-        await retryDraftJob(row.draftId, row.jobId);
-      }
-    } catch (e) {
-      toast.error(e instanceof Error ? e.message : "Retry failed");
-    } finally {
-      refresh?.();
+  function handleCancel(row: ActivityJobRow) {
+    if (row.family === "wiki" && row.jobId != null && row.vaultId != null) {
+      return runAction(row, () => cancelWikiJob(row.jobId as number, row.vaultId as number), "Cancel failed");
     }
+    if (row.family === "draft-room" && row.draftId != null && row.jobId != null) {
+      return runAction(row, () => cancelDraftJob(row.draftId as number, row.jobId as number), "Cancel failed");
+    }
+    if (row.family === "ingest" && row.fileId != null) {
+      return runAction(row, () => cancelDocumentIngest(row.fileId as string), "Cancel failed");
+    }
+    return Promise.resolve();
+  }
+
+  function handleRetry(row: ActivityJobRow) {
+    if (row.family === "wiki" && row.jobId != null && row.vaultId != null) {
+      return runAction(row, () => retryWikiJob(row.jobId as number, row.vaultId as number), "Retry failed");
+    }
+    if (row.family === "draft-room" && row.draftId != null && row.jobId != null) {
+      return runAction(row, () => retryDraftJob(row.draftId as number, row.jobId as number), "Retry failed");
+    }
+    return Promise.resolve();
   }
 
   return (
+    // Stacked ABOVE the upload indicator on both breakpoints: the indicator
+    // is `bottom-20 right-4 z-50` on mobile and `md:bottom-4` on desktop, so
+    // the tray's previous `bottom-20` anchor sat exactly under it and the
+    // upload card painted over the tray's only affordance (PRR-027 /
+    // review F-002, execution-proven at 375x812).
     // A labelled <section> carries the region landmark role implicitly —
     // AC1's `getByRole("region", { name: /activity/i })` resolves against
     // the implicit role (jsx-a11y forbids the explicit attribute).
     <section
       aria-label="Activity"
-      className="fixed bottom-20 right-4 z-40 w-80 max-w-[calc(100vw-2rem)]"
+      className="fixed bottom-40 right-4 z-40 w-80 max-w-[calc(100vw-2rem)] md:bottom-24"
     >
       <div className="rounded-lg border bg-background/95 shadow-lg backdrop-blur">
         <button
@@ -103,69 +134,83 @@ export function ActivityTray() {
           )}
           Activity{activeCount > 0 ? ` (${activeCount})` : ""}
         </button>
+        {/* Screen-reader status channel for poll-driven job churn (the
+            count itself changes as jobs start/finish; row-level text would
+            be too chatty to announce) — PRR-028 / review F-007. */}
+        <span className="sr-only" aria-live="polite">
+          {activeCount === 0
+            ? "No active background jobs"
+            : `${activeCount} active background job${activeCount === 1 ? "" : "s"}`}
+        </span>
+        {!collapsed && (
+          <div className="flex items-center justify-end border-t px-3 py-1">
+            <button
+              type="button"
+              onClick={() => setCollapsed(true)}
+              className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+            >
+              <ChevronDown className="h-3 w-3" aria-hidden="true" />
+              Hide
+            </button>
+          </div>
+        )}
         {!collapsed && rows.length > 0 && (
-          <>
-            <div className="flex items-center justify-end border-t px-3 py-1">
-              <button
-                type="button"
-                onClick={() => setCollapsed(true)}
-                className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
-              >
-                <ChevronDown className="h-3 w-3" aria-hidden="true" />
-                Hide
-              </button>
-            </div>
-            <ul className="max-h-72 overflow-auto px-3 py-2">
-            {rows.map((row) => (
-              <li
-                key={row.key}
-                className="flex flex-col gap-1 border-b py-2 last:border-b-0"
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-xs font-medium uppercase tracking-wide text-foreground">
-                    {row.family}
-                  </span>
-                  <span className={`text-xs ${rowPhaseTone(row)}`}>{row.phase}</span>
-                </div>
-                <div className="flex items-center justify-between gap-2">
-                  <span className="truncate text-xs text-foreground" title={row.title}>
-                    {row.title}
-                  </span>
-                  <span className="flex shrink-0 items-center gap-1">
-                    {row.cancellable && (
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="sm"
-                        className="h-7 px-2 text-xs"
-                        onClick={() => {
-                          void handleCancel(row);
-                        }}
-                      >
-                        <XCircle className="mr-1 h-3 w-3" aria-hidden="true" />
-                        Cancel
-                      </Button>
-                    )}
-                    {row.retryable && (
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="sm"
-                        className="h-7 px-2 text-xs"
-                        onClick={() => {
-                          void handleRetry(row);
-                        }}
-                      >
-                        <RotateCcw className="mr-1 h-3 w-3" aria-hidden="true" />
-                        Retry
-                      </Button>
-                    )}
-                  </span>
-                </div>
-              </li>
-            ))}
-            </ul>
-          </>
+          <ul className="max-h-72 overflow-auto px-3 py-2">
+            {rows.map((row) => {
+              const cancellable = row.cancellable && !deniedCancelKeysRef.current.has(row.key);
+              const pending = pendingKey === row.key;
+              return (
+                <li
+                  key={row.key}
+                  className="flex flex-col gap-1 border-b py-2 last:border-b-0"
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-medium uppercase tracking-wide text-foreground">
+                      {row.family}
+                    </span>
+                    <span className={`text-xs ${rowPhaseTone(row)}`}>{row.phase}</span>
+                  </div>
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="truncate text-xs text-foreground" title={row.title}>
+                      {row.title}
+                    </span>
+                    <span className="flex shrink-0 items-center gap-1">
+                      {cancellable && (
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="sm"
+                          className="h-7 px-2 text-xs"
+                          disabled={pending}
+                          onClick={() => {
+                            void handleCancel(row);
+                          }}
+                        >
+                          <XCircle className="mr-1 h-3 w-3" aria-hidden="true" />
+                          Cancel
+                        </Button>
+                      )}
+                      {row.retryable && (
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="sm"
+                          className="h-7 px-2 text-xs"
+                          disabled={pending}
+                          onClick={() => {
+                            void handleRetry(row);
+                          }}
+                        >
+                          <RotateCcw className="mr-1 h-3 w-3" aria-hidden="true" />
+                          Retry
+                        </Button>
+                      )}
+                    </span>
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
         )}
       </div>
     </section>

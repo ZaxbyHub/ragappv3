@@ -169,6 +169,19 @@ const e2eSeeds = Object.fromEntries(E2E_JOB_FAMILIES.map((f) => [f, []]));
 let nextE2eJobId = 1;
 let nextE2eDraftId = 1;
 
+const E2E_TERMINAL_JOB_STATUSES = ["completed", "failed", "cancelled"];
+
+function resetE2eJobs() {
+  for (const family of E2E_JOB_FAMILIES) {
+    e2eSeeds[family] = [];
+  }
+  // Ingest seeds materialize document rows; drop only the rows the seeder
+  // created (flagged at seed time), never walkthrough-uploaded documents.
+  for (let i = documents.length - 1; i >= 0; i -= 1) {
+    if (documents[i].e2eSeed) documents.splice(i, 1);
+  }
+}
+
 function e2eJobShape(family, seed) {
   const base = {
     id: seed.id,
@@ -503,11 +516,20 @@ const server = http.createServer(async (req, res) => {
     // (Dedicated matcher: the chat section's `let m` is declared further
     // down — using it here would hit its temporal dead zone.)
     let trayMatch;
+    // Wiki/KMS lists honor the vault_id query the real adapters send, so a
+    // multi-vault stub state cannot duplicate rows per vault the way the
+    // real per-vault backend never would (review F-003/M-PLAT-01).
+    const trayVaultId = Number(url.searchParams.get("vault_id") || 0);
+    const inTrayVault = (seed) => !trayVaultId || (seed.vaultId ?? 1) === trayVaultId;
     if (method === "GET" && path === "/api/wiki/jobs") {
-      return sendJson(req, res, 200, { jobs: e2eSeeds.wiki.map((s) => e2eJobShape("wiki", s)) });
+      return sendJson(req, res, 200, {
+        jobs: e2eSeeds.wiki.filter(inTrayVault).map((s) => e2eJobShape("wiki", s)),
+      });
     }
     if (method === "GET" && path === "/api/kms/jobs") {
-      return sendJson(req, res, 200, { jobs: e2eSeeds.kms.map((s) => e2eJobShape("kms", s)) });
+      return sendJson(req, res, 200, {
+        jobs: e2eSeeds.kms.filter(inTrayVault).map((s) => e2eJobShape("kms", s)),
+      });
     }
     if (method === "GET" && path === "/api/documents/reindex/jobs") {
       return sendJson(req, res, 200, {
@@ -532,11 +554,26 @@ const server = http.createServer(async (req, res) => {
       return sendJson(req, res, 200, { items, total: items.length, page: 1, per_page: 50 });
     }
     // Action routes: mutate the SAME seed records the list routes and
-    // GET /_e2e/jobs read (cancel → cancelled, retry → pending).
+    // GET /_e2e/jobs read, with the production terminal-state gates — a
+    // cancel on a terminal job 404s (wiki_store refuses non-pending/
+    // non-running), a retry only from failed, an ingest cancel on a
+    // finished document 409s (documents.py) — so the e2e cannot pass with
+    // an affordance the real server would refuse (review F-003/M-PLAT-01,
+    // PRR-026).
     if ((trayMatch = path.match(/^\/api\/wiki\/jobs\/(\d+)\/(cancel|retry)$/)) && method === "POST") {
       const seed = e2eSeeds.wiki.find((s) => s.id === Number(trayMatch[1]));
-      if (!seed) return sendJson(req, res, 404, { detail: "job not found" });
-      seed.status = trayMatch[2] === "cancel" ? "cancelled" : "pending";
+      if (!seed) return sendJson(req, res, 404, { detail: "Job not found or not cancellable" });
+      if (trayMatch[2] === "cancel") {
+        if (E2E_TERMINAL_JOB_STATUSES.includes(seed.status)) {
+          return sendJson(req, res, 404, { detail: "Job not found or not cancellable" });
+        }
+        seed.status = "cancelled";
+      } else {
+        if (seed.status !== "failed") {
+          return sendJson(req, res, 404, { detail: "Job is not in 'failed' state" });
+        }
+        seed.status = "pending";
+      }
       return sendJson(req, res, 200, { job_id: seed.id, status: seed.status });
     }
     if (
@@ -547,12 +584,29 @@ const server = http.createServer(async (req, res) => {
         (s) => s.draftId === Number(trayMatch[1]) && s.id === Number(trayMatch[2])
       );
       if (!seed) return sendJson(req, res, 404, { detail: "job not found" });
-      seed.status = trayMatch[3] === "cancel" ? "cancelled" : "pending";
+      if (trayMatch[3] === "cancel") {
+        if (E2E_TERMINAL_JOB_STATUSES.includes(seed.status)) {
+          return sendJson(req, res, 404, { detail: "job not cancellable" });
+        }
+        seed.status = "cancelled";
+      } else {
+        if (seed.status !== "failed") {
+          return sendJson(req, res, 404, { detail: "job not in 'failed' state" });
+        }
+        seed.status = "pending";
+      }
       return sendJson(req, res, 200, e2eJobShape("draft-room", seed));
     }
     if ((trayMatch = path.match(/^\/api\/documents\/(\d+)\/cancel$/)) && method === "POST") {
       const doc = documents.find((d) => String(d.id) === trayMatch[1]);
       if (!doc) return sendJson(req, res, 404, { detail: "file not found" });
+      const current = doc.metadata?.status ?? "";
+      if (current === "cancelled") {
+        return sendJson(req, res, 200, { file_id: doc.id, status: "cancelled" });
+      }
+      if (["indexed", "partial", "error"].includes(current)) {
+        return sendJson(req, res, 409, { detail: "Ingest already finished; nothing to cancel" });
+      }
       doc.metadata = { ...(doc.metadata ?? {}), status: "cancelled" };
       const seed = e2eSeeds.ingest.find((s) => String(s.docId) === trayMatch[1]);
       if (seed) seed.status = "cancelled";
@@ -706,7 +760,7 @@ const server = http.createServer(async (req, res) => {
       const status = String(body.status || "running");
       const title = body.title ? String(body.title) : null;
       const id = nextE2eJobId++;
-      const seed = { id, family, status, title, created_at: nowIso() };
+      const seed = { id, family, status, title, created_at: nowIso(), vaultId: 1 };
       if (family === "ingest") {
         const docId = nextDocumentId++;
         seed.docId = String(docId);
@@ -717,7 +771,14 @@ const server = http.createServer(async (req, res) => {
           size: 128,
           content_type: "text/plain",
           created_at: seed.created_at,
-          metadata: { status: status === "pending" ? "pending" : "processing", chunk_count: 0 },
+          // Seeded phase text so the tray's documentProgress-derived phase
+          // is assertable end-to-end.
+          metadata: {
+            status: status === "pending" ? "pending" : "processing",
+            phase: "parsing",
+            chunk_count: 0,
+          },
+          e2eSeed: true,
         });
       } else if (family === "draft-room") {
         seed.draftId = nextE2eDraftId++;
@@ -731,6 +792,14 @@ const server = http.createServer(async (req, res) => {
         return sendJson(req, res, 400, { detail: `unknown family ${family}` });
       }
       return sendJson(req, res, 200, { jobs: e2eSeeds[family] });
+    }
+    // Reset the tray's seed state between tests: exact-count and id-scoped
+    // assertions must not depend on seeds leaked from an earlier spec or a
+    // reused stub server (PRR-003 / review F-004).
+    if (method === "POST" && path === "/_e2e/reset-jobs") {
+      await readBody(req);
+      resetE2eJobs();
+      return sendJson(req, res, 200, { ok: true });
     }
     if (method === "POST" && path === "/_e2e/onboarding") {
       const body = await readBody(req);

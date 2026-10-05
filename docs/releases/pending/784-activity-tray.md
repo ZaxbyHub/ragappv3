@@ -14,12 +14,18 @@ Issue: #784 ([Workstream M] PR 4 of 4; proposal UI-ENH-11 stage 2 of 2).
 - **Server-sourced, reload-safe**: the tray's data comes from the new
   `useActivityJobs` aggregation export in `@/hooks/useJobStatus` (the #783
   contract module). It polls the five family adapters on one bounded
-  setTimeout chain (~8s, never setInterval); every family failure —
-  including the legitimate 403s for feature/admin-gated families — degrades
-  to zero rows for that tick. The ingest family reads the document list
-  (`pending` + `processing`, deduplicated by file id) through the
-  `documentProgress` phase vocabulary; it never reads the client upload
-  store, so a reload or another tab loses nothing.
+  setTimeout chain (~8s, never setInterval, paused while the tab is
+  hidden); every family failure — including the legitimate 403s for
+  feature/admin-gated families — degrades to zero rows for that tick. The
+  ingest family reads the document list (`pending` + `processing`,
+  deduplicated by file id, bounded to 3 pages of 200 per status) through
+  the `documentProgress` phase vocabulary; it never reads the client
+  upload store, so a reload or another tab loses nothing. Known windows
+  (by design, not bugs): the draft-room family polls the 10 most recently
+  updated drafts with up to 20 jobs each, so jobs on older drafts are not
+  surfaced; ingest documents beyond the 3-page budget are not surfaced;
+  and a non-admin user sees at most 4 of the 5 families (the reindex list
+  route is admin-gated).
 - **Actions**: Cancel on wiki / draft-room / ingest rows calls
   `cancelWikiJob` / `cancelDraftJob` / the new `cancelDocumentIngest`
   client (issue #783's `POST /documents/{file_id}/cancel` endpoint finally

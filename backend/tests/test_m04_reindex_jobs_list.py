@@ -173,6 +173,28 @@ class _RouteEnv:
         finally:
             self.pool.release_connection(conn)
 
+    def seed_raw_legacy_job(self, sql: str, params: tuple) -> int:
+        """Insert a legacy row with raw column control (NULL columns etc.)."""
+        conn = self.pool.get_connection()
+        try:
+            cur = conn.execute(sql, params)
+            conn.commit()
+            return int(cur.lastrowid)
+        finally:
+            self.pool.release_connection(conn)
+
+    def seed_raw_unified_job(self, sql: str, params: tuple) -> int:
+        from app.services.job_lease import ensure_jobs_schema
+
+        conn = self.pool.get_connection()
+        try:
+            ensure_jobs_schema(conn)
+            cur = conn.execute(sql, params)
+            conn.commit()
+            return int(cur.lastrowid)
+        finally:
+            self.pool.release_connection(conn)
+
 
 @pytest.fixture()
 def route_env(tmp_path, monkeypatch):
@@ -383,3 +405,110 @@ def test_rapid_polling_burst_does_not_rate_limit(route_env):
     ]
 
     assert statuses == [200] * 25
+
+
+# ---------------------------------------------------------------------------
+# Feedback round 853-20261005 — coverage the review flagged (PRR-022/023/040
+# + the COALESCE fix for PRR-010)
+# ---------------------------------------------------------------------------
+
+
+def test_empty_table_returns_empty_jobs_list(route_env):
+    """A fresh install has zero reindex jobs: the route must return 200 with
+    an empty list (the frontend destructures `jobs` — a 500 or a missing key
+    would blank the family for every new deployment)."""
+    resp = route_env.client.get(
+        "/api/documents/reindex/jobs", headers=route_env.superadmin_headers()
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"jobs": []}
+
+
+def test_unified_list_caps_at_twenty(route_env, monkeypatch):
+    """The unified (lease-on) branch enforces its own LIMIT 20."""
+    monkeypatch.setattr(settings, "reindex_job_lease_enabled", True, raising=False)
+    for i in range(25):
+        route_env.seed_unified_job("pending", f"2026-03-01 00:00:{i:02d}")
+
+    resp = route_env.client.get(
+        "/api/documents/reindex/jobs", headers=route_env.superadmin_headers()
+    )
+
+    assert resp.status_code == 200
+    assert len(resp.json()["jobs"]) == 20
+
+
+def test_unified_null_input_json_falls_back_to_empty_object(route_env, monkeypatch):
+    """payload_json without an input_json member (legacy unified rows) must
+    reach the response as '{}', not null (the route's COALESCE on the
+    json_extract projection)."""
+    monkeypatch.setattr(settings, "reindex_job_lease_enabled", True, raising=False)
+    job_id = route_env.seed_raw_unified_job(
+        "INSERT INTO jobs (queue, payload_json, status, attempts, created_at) "
+        "VALUES ('reindex', ?, 'running', 0, ?)",
+        (json.dumps({"vault_id": VAULT_ID, "trigger_type": "api"}), "2026-03-02 00:00:00"),
+    )
+
+    resp = route_env.client.get(
+        "/api/documents/reindex/jobs", headers=route_env.superadmin_headers()
+    )
+
+    assert resp.status_code == 200
+    jobs = resp.json()["jobs"]
+    assert len(jobs) == 1
+    assert jobs[0]["id"] == job_id
+    assert jobs[0]["input_json"] == "{}"
+
+
+def test_legacy_null_retry_count_coalesces_to_zero(route_env):
+    """PRR-010: one legacy row with an explicitly NULL retry_count must not
+    ValidationError the whole 20-row response — the route COALESCEs it to 0."""
+    job_id = route_env.seed_raw_legacy_job(
+        "INSERT INTO document_reindex_jobs "
+        "(vault_id, trigger_type, trigger_id, status, retry_count, created_at) "
+        "VALUES (?, 'api', '1', 'running', NULL, ?)",
+        (VAULT_ID, "2026-03-03 00:00:00"),
+    )
+    route_env.seed_legacy_job("running", "2026-03-01 00:00:00")
+
+    resp = route_env.client.get(
+        "/api/documents/reindex/jobs", headers=route_env.superadmin_headers()
+    )
+
+    assert resp.status_code == 200
+    by_id = {job["id"]: job for job in resp.json()["jobs"]}
+    assert by_id[job_id]["retry_count"] == 0
+
+
+def test_legacy_rows_pin_trigger_and_retry_fields(route_env):
+    """PRR-040: the legacy branch's trigger_type/trigger_id/retry_count
+    projections are pinned (dropping a column from the SELECT would 500 or
+    silently default)."""
+    route_env.seed_legacy_job("running", "2026-03-01 00:00:00")
+
+    resp = route_env.client.get(
+        "/api/documents/reindex/jobs", headers=route_env.superadmin_headers()
+    )
+
+    assert resp.status_code == 200
+    jobs = resp.json()["jobs"]
+    assert len(jobs) == 1
+    assert jobs[0]["trigger_type"] == "api"
+    assert jobs[0]["trigger_id"] == "1"
+    assert jobs[0]["retry_count"] == 0
+    assert jobs[0]["input_json"] == "{}"
+
+
+def test_same_second_created_at_ties_order_by_id_desc(route_env):
+    """The id DESC tiebreak keeps the 20-row window stable for rows created
+    in the same second (PRR-011 residue / review F-008)."""
+    first = route_env.seed_legacy_job("completed", "2026-03-04 00:00:00")
+    second = route_env.seed_legacy_job("running", "2026-03-04 00:00:00")
+
+    resp = route_env.client.get(
+        "/api/documents/reindex/jobs", headers=route_env.superadmin_headers()
+    )
+
+    assert resp.status_code == 200
+    assert [job["id"] for job in resp.json()["jobs"]] == [second, first]
