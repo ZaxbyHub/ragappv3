@@ -313,6 +313,54 @@ describe("ActivityTray feedback-round assertions (853-20261005)", () => {
     });
   });
 
+  it("restores focus to the tray header when the focused row is removed by a poll tick", async () => {
+    const user = userEvent.setup();
+    hookRows = [
+      makeRow({
+        family: "wiki",
+        key: "wiki-7",
+        title: "Wiki compile",
+        cancellable: true,
+        jobId: 7,
+        vaultId: 3,
+      }),
+      makeRow({ family: "kms", key: "kms-11", title: "KMS recompile" }),
+    ];
+    const { rerender } = render(<ActivityTray />);
+
+    // Focus a control inside the focused row (negative fixture first: focus
+    // OUTSIDE the tray must never be stolen by the guard).
+    await user.click(within(rowByFamily("wiki")).getByRole("button", { name: /cancel/i }));
+    // Resolve the click's async continuation so the button is re-enabled
+    // (mockCancelWikiJob resolves in beforeEach) and focus sits on it.
+    await waitFor(() => {
+      expect(
+        document.activeElement?.closest('[aria-label="Activity"]')
+      ).not.toBeNull();
+    });
+
+    // Poll tick: the focused row vanishes (cancelled rows drop from the
+    // pending/processing windows the adapters poll).
+    hookRows = [makeRow({ family: "kms", key: "kms-11", title: "KMS recompile" })];
+    rerender(<ActivityTray />);
+
+    const header = screen.getByRole("button", { name: /activity/i });
+    await waitFor(() => {
+      expect(document.activeElement).toBe(header);
+    });
+
+    // Negative case: focus outside the tray is NOT stolen by the guard.
+    const outside = screen.getByRole("button", { name: /activity/i });
+    outside.blur();
+    const bodyTarget = document.createElement("button");
+    document.body.appendChild(bodyTarget);
+    bodyTarget.focus();
+    hookRows = [];
+    rerender(<ActivityTray />);
+    expect(document.activeElement).toBe(bodyTarget);
+    bodyTarget.remove();
+  });
+
   it("never imports the client upload store (server-sourced constraint tripwire)", () => {
     const traySource = readFileSync(
       path.join(path.dirname(fileURLToPath(import.meta.url)), "ActivityTray.tsx"),
