@@ -53,7 +53,7 @@
   `IntegrityError` to `FolderNotFoundError` only after a post-rollback
   re-check proves the target is really gone (unrelated constraint failures
   keep surfacing) — concurrent deletes now surface as the documented 404
-  instead of a 500. Batch moves are capped at 999 ids and rate-limited so
+  instead of a 500. Batch moves are capped at 1000 ids and rate-limited so
   the transaction's write-lock hold stays bounded.
 - **Shutdown budget (T1-04-S2-02):** the `knowledgevault` compose service
   sets `stop_grace_period: 90s` (own-line comment documents the coupling to
