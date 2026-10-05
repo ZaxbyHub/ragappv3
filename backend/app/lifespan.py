@@ -17,6 +17,7 @@ from app.api.routes.settings import PERSISTED_FUNCTIONAL_FIELDS
 from app.config import Settings, canonicalize_vector_metric, settings
 from app.middleware.logging import SensitiveFieldFilter
 from app.models.database import SQLiteConnectionPool, get_pool, run_migrations
+from app.models.migration_journal import MIGRATION_CONNECT_TIMEOUT_SECONDS
 from app.security import CSRFManager
 from app.services.background_tasks import get_background_processor
 from app.services.document_extraction import DocumentExtractionService
@@ -197,7 +198,7 @@ def _batch_validate_persisted(converted_pairs: dict) -> bool:
 
 def _load_persisted_settings(sqlite_path: str) -> None:
     """Load user-configurable settings from DB if they were previously saved."""
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     conn.row_factory = sqlite3.Row
     try:
         cursor = conn.execute("SELECT key, value FROM settings_kv")

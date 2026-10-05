@@ -36,7 +36,7 @@
       "SEVERITY.LOW": 62,
       "SEVERITY.MEDIUM": 60,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 85126,
+      "loc": 85214,
       "nosec": 0,
       "skipped_tests": 64
     },
@@ -179,7 +179,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 154,
+      "loc": 158,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -413,7 +413,7 @@
       "SEVERITY.LOW": 7,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 876,
+      "loc": 877,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -530,7 +530,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 6242,
+      "loc": 6287,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -543,7 +543,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 198,
+      "loc": 199,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1154,7 +1154,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 3,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 247,
+      "loc": 283,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1583,7 +1583,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 3,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 232,
+      "loc": 233,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -3256,7 +3256,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1138         await app.state.thinking_llm_client.close()\n1139     except Exception:\n1140         pass\n1141     try:\n",
+      "code": "1139         await app.state.thinking_llm_client.close()\n1140     except Exception:\n1141         pass\n1142     try:\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3267,17 +3267,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1139,
+      "line_number": 1140,
       "line_range": [
-        1139,
-        1140
+        1140,
+        1141
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "1142         await app.state.instant_llm_client.close()\n1143     except Exception:\n1144         pass\n1145     try:\n",
+      "code": "1143         await app.state.instant_llm_client.close()\n1144     except Exception:\n1145         pass\n1146     try:\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3288,17 +3288,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1143,
+      "line_number": 1144,
       "line_range": [
-        1143,
-        1144
+        1144,
+        1145
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "1146         await app.state.embedding_service.close()\n1147     except Exception:\n1148         pass\n1149     try:\n",
+      "code": "1147         await app.state.embedding_service.close()\n1148     except Exception:\n1149         pass\n1150     try:\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3309,17 +3309,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1147,
+      "line_number": 1148,
       "line_range": [
-        1147,
-        1148
+        1148,
+        1149
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "1150         await app.state.reranking_service.close()\n1151     except Exception:\n1152         pass\n1153     try:\n",
+      "code": "1151         await app.state.reranking_service.close()\n1152     except Exception:\n1153         pass\n1154     try:\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3330,17 +3330,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1151,
+      "line_number": 1152,
       "line_range": [
-        1151,
-        1152
+        1152,
+        1153
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "1154         app.state.vector_store.close()\n1155     except Exception:\n1156         pass\n1157     try:\n",
+      "code": "1155         app.state.vector_store.close()\n1156     except Exception:\n1157         pass\n1158     try:\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3351,17 +3351,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1155,
+      "line_number": 1156,
       "line_range": [
-        1155,
-        1156
+        1156,
+        1157
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "1158         app.state.db_pool.close_all()\n1159     except Exception:\n1160         pass\n1161     try:\n",
+      "code": "1159         app.state.db_pool.close_all()\n1160     except Exception:\n1161         pass\n1162     try:\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3372,17 +3372,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1159,
+      "line_number": 1160,
       "line_range": [
-        1159,
-        1160
+        1160,
+        1161
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "1163         _auth_executor.shutdown(wait=False)\n1164     except Exception:\n1165         pass\n1166     with contextlib_suppress(Exception):\n",
+      "code": "1164         _auth_executor.shutdown(wait=False)\n1165     except Exception:\n1166         pass\n1167     with contextlib_suppress(Exception):\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3393,10 +3393,10 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1164,
+      "line_number": 1165,
       "line_range": [
-        1164,
-        1165
+        1165,
+        1166
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
@@ -3832,7 +3832,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "264             self._db.execute(\n265                 f\"UPDATE folders SET {set_clause} WHERE id = ? AND vault_id = ?\",\n266                 values,\n",
+      "code": "291             self._db.execute(\n292                 f\"UPDATE folders SET {set_clause} WHERE id = ? AND vault_id = ?\",\n293                 values,\n",
       "col_offset": 16,
       "end_col_offset": 80,
       "filename": "backend/app/services/folder_store.py",
@@ -3843,18 +3843,18 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 265,
+      "line_number": 292,
       "line_range": [
-        265
+        292
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "304         cur = self._db.execute(\n305             f\"UPDATE files SET folder_id = ? WHERE id IN ({placeholders})\",\n306             (folder_id, *valid_files),\n",
-      "col_offset": 12,
-      "end_col_offset": 74,
+      "code": "348             cur = self._db.execute(\n349                 f\"UPDATE files SET folder_id = ? WHERE id IN ({placeholders})\",\n350                 (folder_id, *valid_files),\n",
+      "col_offset": 16,
+      "end_col_offset": 78,
       "filename": "backend/app/services/folder_store.py",
       "issue_confidence": "MEDIUM",
       "issue_cwe": {
@@ -3863,9 +3863,9 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 305,
+      "line_number": 349,
       "line_range": [
-        305
+        349
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
@@ -4509,7 +4509,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "149         rows = self._db.execute(\n150             f\"SELECT id FROM tags WHERE vault_id = ? AND id IN ({placeholders})\",\n151             (vault_id, *tag_ids),\n",
+      "code": "155         rows = self._db.execute(\n156             f\"SELECT id FROM tags WHERE vault_id = ? AND id IN ({placeholders})\",\n157             (vault_id, *tag_ids),\n",
       "col_offset": 12,
       "end_col_offset": 80,
       "filename": "backend/app/services/tag_store.py",
@@ -4520,16 +4520,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 150,
+      "line_number": 156,
       "line_range": [
-        150
+        156
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "247         rows = self._db.execute(\n248             f\"\"\"SELECT dt.file_id AS _fid, t.*, 0 AS document_count\n249                 FROM tags t\n250                 JOIN document_tags dt ON dt.tag_id = t.id\n251                 JOIN files f ON f.id = dt.file_id\n252                 WHERE dt.file_id IN ({placeholders}) AND t.vault_id = f.vault_id\n253                 ORDER BY t.name COLLATE NOCASE ASC\"\"\",\n254             tuple(file_ids),\n",
+      "code": "253         rows = self._db.execute(\n254             f\"\"\"SELECT dt.file_id AS _fid, t.*, 0 AS document_count\n255                 FROM tags t\n256                 JOIN document_tags dt ON dt.tag_id = t.id\n257                 JOIN files f ON f.id = dt.file_id\n258                 WHERE dt.file_id IN ({placeholders}) AND t.vault_id = f.vault_id\n259                 ORDER BY t.name COLLATE NOCASE ASC\"\"\",\n260             tuple(file_ids),\n",
       "col_offset": 12,
       "end_col_offset": 53,
       "filename": "backend/app/services/tag_store.py",
@@ -4540,14 +4540,14 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 248,
+      "line_number": 254,
       "line_range": [
-        248,
-        249,
-        250,
-        251,
-        252,
-        253
+        254,
+        255,
+        256,
+        257,
+        258,
+        259
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",

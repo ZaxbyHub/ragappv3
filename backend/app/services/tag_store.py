@@ -125,6 +125,12 @@ class TagStore:
                 f"Tag {updates.get('name')!r} already exists in this vault"
             ) from e
         if cur.rowcount == 0:
+            # A 0-row UPDATE still opened a write transaction (implicit
+            # BEGIN on DML); leaving it open holds the WAL write lock until
+            # the pooled connection's eventual release rollback (issue #700,
+            # T1-02-S2-05). End it explicitly so the connection returns with
+            # no open transaction on every path.
+            self._db.rollback()
             return None
         self._db.commit()
         return self.get_tag(tag_id, vault_id)
