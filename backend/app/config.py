@@ -7,7 +7,7 @@ import warnings
 from pathlib import Path
 from typing import Annotated, Mapping, Optional
 
-from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic import Field, PrivateAttr, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from app.services.document_artifacts import RASTER_IMAGE_EXTENSIONS
@@ -33,6 +33,24 @@ LEGACY_SETTINGS_CONVERSIONS: tuple[tuple[str, str, int], ...] = (
     ("chunk_overlap", "chunk_overlap_chars", 4),
     ("vector_top_k", "retrieval_top_k", 1),
 )
+
+
+VECTOR_METRIC_ALIASES: Mapping[str, str] = {
+    "euclidean": "l2",
+    "dot_product": "dot",
+}
+
+
+def canonicalize_vector_metric(value: object) -> object:
+    """Map the two supported legacy vector metric aliases to LanceDB names.
+
+    Unknown values deliberately pass through unchanged for existing
+    API, environment, and persisted-setting compatibility. No separate
+    validation rejects values outside this narrow backward-compatibility mapping.
+    """
+    if isinstance(value, str):
+        return VECTOR_METRIC_ALIASES.get(value, value)
+    return value
 
 
 def apply_legacy_settings_conversion(data: Mapping[str, object]) -> dict:
@@ -79,6 +97,10 @@ def apply_legacy_settings_conversion(data: Mapping[str, object]) -> dict:
                 new_field,
                 legacy_value * factor,
             )
+    if "vector_metric" in converted:
+        converted["vector_metric"] = canonicalize_vector_metric(
+            converted["vector_metric"]
+        )
     return converted
 
 
@@ -94,6 +116,12 @@ EMBEDDING_MAX_TEXT_CHARS = 8192
 class Settings(BaseSettings):
     """Application settings with environment variable support."""
 
+    # Pydantic Settings applies ``_env_file`` during construction but does not
+    # retain that per-instance choice.  The settings API needs that resolved
+    # source configuration to report provenance faithfully, including callers
+    # that intentionally use an alternate dotenv file in tests or tooling.
+    _configured_env_file: object = PrivateAttr(default=None)
+
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", extra="ignore"
     )
@@ -103,6 +131,11 @@ class Settings(BaseSettings):
     # file therefore forwards documented keys in short form (`- KEY`), which
     # OMITS unset keys entirely instead of injecting "" — do not add
     # env_ignore_empty=True, it would silently break those contracts.
+
+    def __init__(self, **values: object) -> None:
+        configured_env_file = values.get("_env_file", self.model_config.get("env_file"))
+        super().__init__(**values)
+        self._configured_env_file = configured_env_file
 
     # Server configuration
     port: int = 9090

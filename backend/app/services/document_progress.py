@@ -1,7 +1,8 @@
 """Phase-aware processing-progress helpers for the `files` table.
 
-Status (`files.status`) stays in the canonical 4-value enum
-('pending','processing','indexed','error'). All async lifecycle detail
+Status (`files.status`) stays in the canonical 6-value enum
+('pending','processing','indexed','partial','error','cancelled'). All
+async lifecycle detail
 (queued / parsing / chunking / embedding / writing-index / wiki) lives in
 the new `phase` column and friends. Frontend polls
 `GET /documents/{file_id}/status` and uses these fields to render
@@ -31,6 +32,10 @@ PHASE_EMBEDDING = "embedding"
 PHASE_WRITING_INDEX = "writing_index"
 PHASE_INDEXED = "indexed"
 PHASE_ERROR = "error"
+# Terminal phase of a user-cancelled ingest (issue #783): the cancel route
+# flips files.status to 'cancelled' and the worker's unwind clears transient
+# counters while landing this phase.
+PHASE_CANCELLED = "cancelled"
 
 ALL_PHASES = frozenset(
     {
@@ -42,6 +47,7 @@ ALL_PHASES = frozenset(
         PHASE_WRITING_INDEX,
         PHASE_INDEXED,
         PHASE_ERROR,
+        PHASE_CANCELLED,
     }
 )
 
@@ -135,7 +141,13 @@ async def set_phase(
         logger.warning("set_phase failed for file_id=%s: %s", file_id, e)
 
 
-async def clear_progress(pool: SQLiteConnectionPool, file_id: int) -> None:
+async def clear_progress(
+    pool: SQLiteConnectionPool,
+    file_id: int,
+    *,
+    phase: str = PHASE_INDEXED,
+    phase_message: Optional[str] = None,
+) -> None:
     """Reset transient progress fields on terminal success.
 
     Called after a successful indexing run so the next poll snapshot shows
@@ -143,6 +155,11 @@ async def clear_progress(pool: SQLiteConnectionPool, file_id: int) -> None:
     `phase` is left at ``indexed`` so the frontend can distinguish "ready"
     from "still mid-pipeline". The checkout runs off the event loop via the
     pool's dedicated checkout executor (#645).
+
+    Issue #783 adds the keyword-only ``phase``/``phase_message`` overrides so
+    a cancelled ingest can land its terminal phase (``PHASE_CANCELLED``) and
+    a user-facing note in the same single write; the defaults preserve the
+    historical behavior byte-for-byte (indexed + message cleared).
     """
     try:
         conn = await pool.get_connection_async()
@@ -151,7 +168,7 @@ async def clear_progress(pool: SQLiteConnectionPool, file_id: int) -> None:
                 """
                 UPDATE files
                 SET phase = ?,
-                    phase_message = NULL,
+                    phase_message = ?,
                     progress_percent = NULL,
                     processed_units = NULL,
                     total_units = NULL,
@@ -159,7 +176,7 @@ async def clear_progress(pool: SQLiteConnectionPool, file_id: int) -> None:
                     phase_started_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
-                (PHASE_INDEXED, file_id),
+                (phase, phase_message, file_id),
             )
             conn.commit()
         finally:

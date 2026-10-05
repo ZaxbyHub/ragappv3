@@ -247,6 +247,36 @@ class TestSetPhase(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(row["total_units"])
         self.assertIsNone(row["unit_label"])
 
+    async def test_clear_progress_terminal_overrides(self):
+        """Issue #783: keyword-only phase/message overrides land the terminal
+        phase in the same single write; the 2-arg default behavior above is
+        the pinned compatibility contract."""
+        from app.services.document_progress import PHASE_CANCELLED
+
+        await set_phase(
+            self.pool,
+            self.file_id,
+            phase=PHASE_CHUNKING,
+            message="x",
+            total=5,
+            processed=5,
+            unit="chunks",
+            percent=100.0,
+        )
+        await clear_progress(
+            self.pool,
+            self.file_id,
+            phase=PHASE_CANCELLED,
+            phase_message="Cancelled by user",
+        )
+        row = self._row()
+        self.assertEqual(row["phase"], PHASE_CANCELLED)
+        self.assertEqual(row["phase_message"], "Cancelled by user")
+        self.assertIsNone(row["progress_percent"])
+        self.assertIsNone(row["processed_units"])
+        self.assertIsNone(row["total_units"])
+        self.assertIsNone(row["unit_label"])
+
     async def test_set_wiki_pending(self):
         await set_wiki_pending(self.pool, self.file_id, True)
         self.assertEqual(self._row()["wiki_pending"], 1)

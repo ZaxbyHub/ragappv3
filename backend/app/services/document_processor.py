@@ -47,6 +47,7 @@ from .document_artifacts import (
     project_text,
 )
 from .document_progress import (
+    PHASE_CANCELLED,
     PHASE_CHUNKING,
     PHASE_EMBEDDING,
     PHASE_EXTRACTING_TEXT,
@@ -797,6 +798,23 @@ class SpreadsheetParser:
         return chunks
 
 
+class IngestCancelledError(Exception):
+    """An in-flight ingest was cancelled by the user (issue #783).
+
+    Not a failure: it must never land ``files.status='error'`` (both ingest
+    paths re-raise it before their generic handlers) and must never be
+    retried — both worker transports route it to the cancellation unwind
+    (cleanup + terminal ``cancelled`` status) instead of the failure path.
+    Carries the ``file_id`` so the unwind can land the terminal phase even
+    on the scan/sync path, where the task item itself has ``file_id=None``
+    (the processor assigns the row id mid-run).
+    """
+
+    def __init__(self, message: str, file_id: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.file_id = file_id
+
+
 class DocumentProcessor:
     """
     Orchestrates document processing with status tracking and deduplication.
@@ -863,6 +881,11 @@ class DocumentProcessor:
         self._contextual_chunker = contextual_chunker
         self._write_semaphore = write_semaphore
         self._chunk_enrichment_service: Optional[ChunkEnrichmentService] = None
+        # In-flight cancel requests (issue #783): file ids the cancel route
+        # marked. Checked between ingest steps; cleared on unwind, on the
+        # 409 refusal path, and on every re-enqueue so a cancelled ingest
+        # never poisons a later ingest of the same row.
+        self._cancel_requested: set = set()
 
     def set_llm_client(self, llm_client: Optional[LLMClient]) -> None:
         """Rebind optional ingestion LLM work to a different live client."""
@@ -1623,6 +1646,165 @@ class DocumentProcessor:
         if current_status not in ("indexed", "partial"):
             return f"status '{current_status}' is no longer retry-eligible"
         return None
+
+    def request_cancel(self, file_id: int) -> None:
+        """Mark an in-flight ingest as cancel-requested (issue #783).
+
+        Idempotent; the between-steps gates observe the request at their next
+        seam and convert the ingest into an :class:`IngestCancelledError`.
+        """
+        self._cancel_requested.add(file_id)
+
+    def clear_cancel(self, file_id: int) -> None:
+        """Drop a stale cancel request (re-enqueue / unwind / 409 refusal)."""
+        self._cancel_requested.discard(file_id)
+
+    def is_cancel_requested(self, file_id: int) -> bool:
+        return file_id in self._cancel_requested
+
+    def _raise_if_cancelled(self, file_id: Optional[int]) -> None:
+        """Between-steps cancellation gate (issue #783).
+
+        Called at the two seams of BOTH ingest paths — after parse/chunking
+        (before the expensive embedding) and immediately before the vector
+        write (next to ``_raise_if_file_row_missing``, the issue-#692
+        staleness gate) — so a cancelled ingest writes no vectors and
+        publishes no atoms.
+        """
+        if file_id is not None and file_id in self._cancel_requested:
+            raise IngestCancelledError(
+                f"Ingest cancelled by user (file_id={file_id})",
+                file_id=file_id,
+            )
+
+    async def rollback_cancelled_ingest(
+        self, file_id: int, *, run_deletes: bool = True
+    ) -> None:
+        """Idempotent unwind of a cancelled ingest generation (issue #783).
+
+        Deletes any vectors and atom rows this generation wrote (safe no-ops
+        when the cancel landed before any write), lands the terminal
+        ``cancelled`` status via a guarded UPDATE (never overwrites
+        ``indexed``/``partial``), sets the terminal phase and clears the
+        transient progress counters in one write, and purges the per-chunk
+        ``failed_chunks`` rows written during embedding (a cancelled row can
+        never reach the chunk-retry endpoint, which requires indexed/partial
+        — issue #783 review PRR-032). Never raises: a cleanup failure is
+        logged, the failed vector delete is queued on the
+        ``vector_delete_pending`` sweep (the same tombstone the delete route
+        uses, issue #783 review PRR-002), and the status guard still stands.
+        ``run_deletes=False`` (issue #783 review F-001): the caller is a
+        staged-rebuild re-embed — the cancel skips the file but must NOT
+        destroy the document's previously indexed live vectors/atoms, which
+        the rebuild neither owns nor re-creates.
+        """
+        if not run_deletes:
+            self.clear_cancel(file_id)
+            await clear_progress(
+                self.pool,
+                file_id,
+                phase=PHASE_CANCELLED,
+                phase_message="Cancelled by user",
+            )
+            return
+        # Status-aware (PRR-004 review): deletes run when the row is or
+        # becomes 'cancelled' — an already-cancelled row (the route raced
+        # ahead of this unwind) is exactly the orphan-cleanup case — and
+        # skip for every other survivor (indexed/partial/error/missing).
+        deletes_run = False
+        try:
+            conn = await self.pool.get_connection_async()
+            try:
+                row = conn.execute(
+                    "SELECT status FROM files WHERE id = ?", (file_id,)
+                ).fetchone()
+                cur_status = None if row is None else row["status"]
+                # Survivor-explicit gate: only a definitively-terminal
+                # survivor (or a deleted row) skips the deletes; anything
+                # else — pending/processing/cancelled/unknown — is treated
+                # as cancellable so an unreadable status can never strand
+                # orphan artifacts (issue #783 review PRR-004).
+                if cur_status in ("indexed", "partial", "error"):
+                    deletes_run = False  # survivor keeps its content
+                elif cur_status is None:
+                    deletes_run = False  # row gone: #692 discard owns cleanup
+                elif cur_status == "cancelled":
+                    # The route (or a sibling unwind) already accepted the
+                    # cancel: this generation's artifacts are orphans.
+                    deletes_run = True
+                else:
+                    cur = conn.execute(
+                        "UPDATE files SET status = 'cancelled', "
+                        "processed_at = CURRENT_TIMESTAMP "
+                        "WHERE id = ? AND status IN ('pending', 'processing')",
+                        (file_id,),
+                    )
+                    deletes_run = cur.rowcount > 0
+                if deletes_run:
+                    conn.execute(
+                        "DELETE FROM document_atoms WHERE file_id = ?", (file_id,)
+                    )
+                    conn.execute(
+                        "DELETE FROM failed_chunks WHERE file_id = ?", (file_id,)
+                    )
+                conn.commit()
+            finally:
+                self.pool.release_connection(conn)
+        except Exception:  # noqa: BLE001 — cleanup must never raise
+            logger.warning(
+                "cancel cleanup: sqlite cleanup failed for file_id=%s",
+                file_id,
+                exc_info=True,
+            )
+        if not deletes_run:
+            # Survivor row (indexed/partial/error) or deleted row: keep the
+            # terminal phase truthful without touching another writer's
+            # artifacts.
+            await clear_progress(
+                self.pool,
+                file_id,
+                phase=PHASE_CANCELLED,
+                phase_message="Cancelled by user",
+            )
+            self.clear_cancel(file_id)
+            return
+        try:
+            if self.vector_store is not None:
+                await self.vector_store.delete_by_file(str(file_id))
+        except Exception:  # noqa: BLE001 — cleanup must never raise
+            logger.warning(
+                "cancel cleanup: vector delete failed for file_id=%s; "
+                "queueing on vector_delete_pending sweep",
+                file_id,
+                exc_info=True,
+            )
+            try:
+                conn = await self.pool.get_connection_async()
+                try:
+                    # INSERT .. SELECT: a no-op when the row itself is gone.
+                    conn.execute(
+                        "INSERT OR IGNORE INTO vector_delete_pending "
+                        "(file_id, vault_id) "
+                        "SELECT id, vault_id FROM files WHERE id = ?",
+                        (file_id,),
+                    )
+                    conn.commit()
+                finally:
+                    self.pool.release_connection(conn)
+            except Exception:  # noqa: BLE001 — cleanup must never raise
+                logger.warning(
+                    "cancel cleanup: vector_delete_pending insert failed for "
+                    "file_id=%s",
+                    file_id,
+                    exc_info=True,
+                )
+        await clear_progress(
+            self.pool,
+            file_id,
+            phase=PHASE_CANCELLED,
+            phase_message="Cancelled by user",
+        )
+        self.clear_cancel(file_id)
 
     def _raise_if_file_row_missing(self, file_id: int) -> None:
         """Abort an in-flight generation when its ``files`` row was deleted.
@@ -3065,8 +3247,13 @@ class DocumentProcessor:
         chunks_failed_count: int,
         embeddings: Optional[List[List[float]]] = None,
         partial_final_status: str = "indexed",
-    ) -> None:
+        vector_target: object | None = None,
+    ) -> bool:
         """Shared success finalization for BOTH ingest entry points (W9).
+
+        Returns False when the generation was voided by a concurrent settle
+        (issue #783 review PRR-003) — the caller must return None so the
+        transport treats the attempt as record-only instead of success.
 
         ``process_file`` and ``process_existing_file`` converge here with
         identical semantics (issue #513 C26): the final status write, the
@@ -3088,19 +3275,91 @@ class DocumentProcessor:
         from full success by status alone. Full success is ``'indexed'`` on
         both paths (frozen C26 convergence).
         """
+        # Finalize guard (issue #783): a cancel landing AFTER the pre-write
+        # gate spans this whole vector-write + publish span. Detecting it
+        # here must not merely skip this finalize — the already-written
+        # vectors and atoms would orphan on a 'cancelled' row — so unwind the
+        # generation with the same rollback and surface the cancellation to
+        # the transport (raised outside the ingest paths' try blocks, so it
+        # reaches the cancellation handlers directly).
+        if self.is_cancel_requested(file_id):
+            await self.rollback_cancelled_ingest(
+                file_id, run_deletes=vector_target is None
+            )
+            raise IngestCancelledError(
+                f"Ingest cancelled after vector write (file_id={file_id})",
+                file_id=file_id,
+            )
         final_status = (
             partial_final_status if chunks_failed_count > 0 else "indexed"
         )
         async with self._write_session() as conn:
-            self._update_status(
+            # Reviewer finding (Phase 4.5, Important): the route can accept a
+            # cancel (guarded UPDATE rowcount 1, 200 returned) in the window
+            # between the registry check above and this commit — an
+            # unconditional success write would then bury the accepted
+            # 'cancelled' under 'indexed'. The write is therefore conditioned
+            # on the row still being pre-terminal, exactly like the route's
+            # own flip; rowcount 0 means the cancel won the race and the
+            # generation must unwind so the 200 survives.
+            landed = conn.execute(
+                "UPDATE files SET status = ?, chunk_count = ?, chunks_failed = ?, "
+                "partial_embeddings = ?, error_message = NULL, "
+                "processed_at = ?, modified_at = ? "
+                "WHERE id = ? AND status IN ('pending', 'processing')",
+                (
+                    final_status,
+                    len(chunks),
+                    chunks_failed_count,
+                    1 if chunks_failed_count > 0 else 0,
+                    datetime.now(UTC).isoformat(),
+                    datetime.now(UTC).isoformat(),
+                    file_id,
+                ),
+            ).rowcount > 0
+            if landed:
+                conn.commit()
+            else:
+                conn.rollback()
+        if not landed:
+            # Reviewer PRR-003: rowcount-0 also covers a concurrently-settled
+            # or deleted row, not just a cancel. Only a row that is actually
+            # 'cancelled' runs the destructive rollback; any other loser
+            # (indexed/partial winner, vault delete) discards this generation
+            # WITHOUT deleting the survivor's vectors/atoms.
+            reread = None
+            try:
+                conn = await self.pool.get_connection_async()
+                try:
+                    row = conn.execute(
+                        "SELECT status FROM files WHERE id = ?", (file_id,)
+                    ).fetchone()
+                    reread = None if row is None else row["status"]
+                finally:
+                    self.pool.release_connection(conn)
+            except sqlite3.Error:
+                reread = None
+            if reread == "cancelled":
+                await self.rollback_cancelled_ingest(
+                    file_id, run_deletes=vector_target is None
+                )
+                raise IngestCancelledError(
+                    f"Ingest cancelled before finalize committed (file_id={file_id})",
+                    file_id=file_id,
+                )
+            logger.warning(
+                "Finalize skipped for file_id=%d: row settled concurrently "
+                "(status=%r); discarding generation without deletes",
                 file_id,
-                final_status,
-                conn,
-                chunk_count=len(chunks),
-                chunks_failed=chunks_failed_count,
-                partial_embeddings=1 if chunks_failed_count > 0 else 0,
+                reread,
             )
-            conn.commit()
+            self.clear_cancel(file_id)
+            # Void, not raise (PRR-003): a raised failure would retry toward
+            # _mark_task_permanently_failed's unconditional 'error' write,
+            # clobbering the concurrent winner. The callers translate the
+            # False return into a quiet None result (the existing
+            # record-only contract).
+            return False
 
         # Save full parsed text and enqueue wiki compile job (fire-and-forget;
         # non-blocking). parsed_text is stored on the files row so manual
@@ -3198,6 +3457,7 @@ class DocumentProcessor:
         # Clear transient progress fields and pin phase=indexed so polls show
         # a clean "ready" snapshot rather than stale embedding counters.
         await clear_progress(self.pool, file_id)
+        return True
 
     async def process_file(
         self,
@@ -3257,8 +3517,19 @@ class DocumentProcessor:
                 email_sender,
             )
 
-            # Update status to processing
-            self._update_status(file_id, "processing", conn)
+            # Update status to processing. Guarded (issue #783 review
+            # PRR-013): same cancel-reversion guard as the upload path.
+            flipped = conn.execute(
+                "UPDATE files SET status = 'processing', modified_at = ? "
+                "WHERE id = ? AND status != 'cancelled'",
+                (datetime.now(UTC).isoformat(), file_id),
+            ).rowcount > 0
+            if not flipped:
+                raise IngestCancelledError(
+                    f"Ingest cancelled before processing started "
+                    f"(file_id={file_id})",
+                    file_id=file_id,
+                )
             # Clear stale failed-chunk records from a prior partial-failure ingest
             # (Issue #396). Idempotent re-ingest must not accumulate stale rows.
             conn.execute("DELETE FROM failed_chunks WHERE file_id = ?", (file_id,))
@@ -3406,6 +3677,10 @@ class DocumentProcessor:
             # This generation's chunk embeddings, kept in scope for the
             # finalization helper's advisory centroid computation (W26).
             chunk_embeddings: List[List[float]] = []
+
+            # Cancel gate A (issue #783): a cancel that landed during
+            # parse/chunking skips the expensive embedding entirely.
+            self._raise_if_cancelled(file_id)
 
             # Generate embeddings and store in vector store
             if self.embedding_service is not None and self.vector_store is not None:
@@ -3601,6 +3876,10 @@ class DocumentProcessor:
                     # a vault delete that committed during this worker's
                     # parse/embed span must not receive chunks for a row that
                     # no longer exists.
+                    # Cancel gate B (issue #783): same seam — a cancel that
+                    # landed during embedding writes no vectors and publishes
+                    # no atoms.
+                    self._raise_if_cancelled(file_id)
                     self._raise_if_file_row_missing(file_id)
                     # Initialize vector table with embedding dimension and add chunks
                     embedding_dim = len(embeddings[0])
@@ -3653,11 +3932,24 @@ class DocumentProcessor:
                     self._publish_artifacts(
                         file_id, vault_id, generation_hash, parsed
                     )
+        except IngestCancelledError:
+            # issue #783: a user cancellation is not a failure — never write
+            # status='error' over the terminal 'cancelled'; the transport's
+            # cancellation handler unwinds the generation.
+            raise
         except Exception as e:
             # The raw exception (server path + underlying parser error) stays
-            # in the server log only; the persisted fields are user-facing
+            # in the server log only; persisted fields are user-facing
             # (issue #562).
             logger.exception("Ingestion failed for file_id=%s", file_id)
+            if self.is_cancel_requested(file_id):
+                # issue #783: the failure raced a user cancel; the terminal
+                # 'cancelled' must not be clobbered with 'error'.
+                await self.rollback_cancelled_ingest(file_id)
+                raise IngestCancelledError(
+                    f"Ingest failed after cancel was requested (file_id={file_id})",
+                    file_id=file_id,
+                ) from e
             safe_error = redact_ingest_error(e)
             # Phase 3: Update status to error on failure
             # Get connection again to update error status
@@ -3681,7 +3973,7 @@ class DocumentProcessor:
         # enqueue, near-dup centroid, progress cleanup). Both ingest entry
         # points converge here with identical semantics (issue #513 W9/C26).
         stage_started_at = time.monotonic()
-        await self._finalize_indexed_success(
+        finalized = await self._finalize_indexed_success(
             file_id=file_id,
             vault_id=vault_id,
             chunks=chunks,
@@ -3689,6 +3981,13 @@ class DocumentProcessor:
             chunks_failed_count=chunks_failed_count,
             embeddings=chunk_embeddings,
         )
+        if not finalized:
+            logger.info(
+                "Ingest generation voided for file_id=%d: row settled "
+                "concurrently during finalize",
+                file_id,
+            )
+            return None
         _add_elapsed_ms(stage_timings, "sqlite_finalize_ms", stage_started_at)
 
         logger.info(
@@ -3810,8 +4109,20 @@ class DocumentProcessor:
 
         # Transition status: pending -> processing. Duplicate check intentionally
         # skipped — the route already ran it before inserting the row.
+        # Guarded (issue #783 review PRR-013): a route-accepted cancel must
+        # not be silently reverted to 'processing' for the whole parse span.
         async with self._write_session() as conn:
-            self._update_status(file_id, "processing", conn)
+            flipped = conn.execute(
+                "UPDATE files SET status = 'processing', modified_at = ? "
+                "WHERE id = ? AND status != 'cancelled'",
+                (datetime.now(UTC).isoformat(), file_id),
+            ).rowcount > 0
+            if not flipped:
+                raise IngestCancelledError(
+                    f"Ingest cancelled before processing started "
+                    f"(file_id={file_id})",
+                    file_id=file_id,
+                )
             # Clear stale failed-chunk records from a prior partial-failure ingest
             # (Issue #396). Idempotent re-ingest must not accumulate stale rows.
             conn.execute("DELETE FROM failed_chunks WHERE file_id = ?", (file_id,))
@@ -3941,6 +4252,10 @@ class DocumentProcessor:
             # This generation's chunk embeddings for the finalization helper's
             # advisory centroid computation (W26).
             chunk_embeddings: List[List[float]] = []
+
+            # Cancel gate A (issue #783): a cancel that landed during
+            # parse/chunking skips the expensive embedding entirely.
+            self._raise_if_cancelled(file_id)
 
             if self.embedding_service is not None and self.vector_store is not None:
                 if chunks:
@@ -4122,6 +4437,10 @@ class DocumentProcessor:
                     # instead of writing chunks for a row that no longer
                     # exists. Covers bare and vector_target (staged rebuild)
                     # calls alike, and every parse branch funnels through here.
+                    # Cancel gate B (issue #783): same seam — a cancel that
+                    # landed during embedding writes no vectors and publishes
+                    # no atoms.
+                    self._raise_if_cancelled(file_id)
                     self._raise_if_file_row_missing(file_id)
                     # [W8/W13 contract] Thread the optional rebuild target into
                     # every vector-store call below as a trailing ``target=``
@@ -4195,10 +4514,25 @@ class DocumentProcessor:
                     self._publish_artifacts(
                         file_id, vault_id, generation_hash, parsed
                     )
+        except IngestCancelledError:
+            # issue #783: a user cancellation is not a failure — never write
+            # status='error' over the terminal 'cancelled'; the transport's
+            # cancellation handler unwinds the generation.
+            raise
         except Exception as e:
             # Raw exception stays in the server log; persisted fields are
             # user-facing (issue #562).
             logger.exception("Existing-file ingestion failed for file_id=%s", file_id)
+            if self.is_cancel_requested(file_id):
+                # issue #783: the failure raced a user cancel; the terminal
+                # 'cancelled' must not be clobbered with 'error'.
+                await self.rollback_cancelled_ingest(
+                    file_id, run_deletes=vector_target is None
+                )
+                raise IngestCancelledError(
+                    f"Ingest failed after cancel was requested (file_id={file_id})",
+                    file_id=file_id,
+                ) from e
             safe_error = redact_ingest_error(e)
             async with self._write_session() as conn:
                 self._update_status(file_id, "error", conn, error_message=safe_error)
@@ -4218,7 +4552,7 @@ class DocumentProcessor:
         # (issue #513 W9/C26): status write, parsed_text + gated wiki
         # enqueue, gated KMS enqueue, near-dup centroid, progress cleanup.
         stage_started_at = time.monotonic()
-        await self._finalize_indexed_success(
+        finalized = await self._finalize_indexed_success(
             file_id=file_id,
             vault_id=vault_id,
             chunks=chunks,
@@ -4226,7 +4560,15 @@ class DocumentProcessor:
             chunks_failed_count=chunks_failed_count,
             embeddings=chunk_embeddings,
             partial_final_status="partial",
+            vector_target=vector_target,
         )
+        if not finalized:
+            logger.info(
+                "Ingest generation voided for file_id=%d: row settled "
+                "concurrently during finalize",
+                file_id,
+            )
+            return None
         _add_elapsed_ms(stage_timings, "sqlite_finalize_ms", stage_started_at)
 
         logger.info(

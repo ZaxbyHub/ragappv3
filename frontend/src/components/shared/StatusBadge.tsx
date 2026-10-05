@@ -1,5 +1,5 @@
 import { Badge } from "@/components/ui/badge";
-import { CheckCircle, Loader2, Clock, AlertCircle, AlertTriangle } from "lucide-react";
+import { CheckCircle, Loader2, Clock, AlertCircle, AlertTriangle, Ban } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
 export const FILE_STATUS_LABELS: Record<string, string> = {
@@ -9,6 +9,8 @@ export const FILE_STATUS_LABELS: Record<string, string> = {
   /** Pipeline finished with embedding failures (LIVE-03) — completed-with-failures, never pending. */
   partial: "Partial",
   error: "Error",
+  /** Terminal status of a user-cancelled ingest (issue #783). */
+  cancelled: "Cancelled",
 };
 
 export const FILE_STATUS_COLORS: Record<string, { variant: "default" | "secondary" | "outline" | "destructive"; className: string; icon: LucideIcon }> = {
@@ -17,6 +19,7 @@ export const FILE_STATUS_COLORS: Record<string, { variant: "default" | "secondar
   indexed: { variant: "default", className: "bg-success", icon: CheckCircle },
   partial: { variant: "default", className: "bg-warning", icon: AlertTriangle },
   error: { variant: "destructive", className: "", icon: AlertCircle },
+  cancelled: { variant: "outline", className: "", icon: Ban },
 };
 
 interface StatusBadgeProps {

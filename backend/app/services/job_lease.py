@@ -420,6 +420,21 @@ class JobLease:
             done = cur.rowcount > 0
         return done
 
+    def cancel(self, job_id: int, worker_id: str, reason: str = "cancelled") -> bool:
+        """Fenced terminal cancellation (issue #783); ``False`` (and no
+        mutation) when the lease was lost or already settled. Mirrors
+        ``fail`` but lands ``status='cancelled'`` — a cancelled ingest must
+        never be requeued by the retry scheduler."""
+        with self._write_txn():
+            cur = self._conn.execute(
+                f"UPDATE {self._table} SET status = 'cancelled', {self._shape.error_set} "  # nosec B608 - allowlist fragments only
+                "completed_at = CURRENT_TIMESTAMP, heartbeat_at = CURRENT_TIMESTAMP "
+                "WHERE id = ? AND worker_id = ? AND status = 'running'",
+                (reason, job_id, worker_id),
+            )
+            done = cur.rowcount > 0
+        return done
+
     def requeue(
         self,
         job_id: int,

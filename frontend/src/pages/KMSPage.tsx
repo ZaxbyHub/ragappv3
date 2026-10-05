@@ -1,7 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
-import { FileText, Library, Plus, RefreshCw, Search } from "lucide-react";
+import {
+  FileText,
+  Library,
+  Loader2,
+  Plus,
+  RefreshCw,
+  Search,
+} from "lucide-react";
 
 import { useVaultStore } from "@/stores/useVaultStore";
 import { VaultSelector } from "@/components/vault/VaultSelector";
@@ -30,9 +37,11 @@ import {
 import {
   createKMSEntry,
   listKMSEntries,
+  listKMSJobs,
   recompileVaultKMS,
   type KMSEntry,
 } from "@/lib/api";
+import { isTerminalJobStatus, useJobStatus } from "@/hooks/useJobStatus";
 
 const STATUS_OPTIONS = ["all", "draft", "published", "archived"] as const;
 
@@ -106,6 +115,38 @@ export default function KMSPage() {
     return () => clearTimeout(t);
   }, [activeVaultId, search, statusFilter, fetchEntries]);
 
+  // Recompile job polling (issue #783): the POST /kms/recompile handle is
+  // kept and polled through listKMSJobs until a terminal status, then the
+  // entries refetch and the toast reports the real outcome. The listKMSJobs
+  // call lives ONLY inside the poll-time fetcher (lazy-closure constraint)
+  // so suites mocking @/lib/api with partial factories never dereference it
+  // outside a poll.
+  const recompileJobIdRef = useRef<number | null>(null);
+  const recompilePoll = useJobStatus("kms", {
+    fetchJob: async () => {
+      const vaultId = activeVaultId;
+      const jobId = recompileJobIdRef.current;
+      if (vaultId == null || jobId == null) return null;
+      const { jobs } = await listKMSJobs(vaultId);
+      return jobs.find((j) => j.id === jobId) ?? null;
+    },
+    onTerminal: (job) => {
+      if (job.status === "failed") {
+        toast.error(
+          job.error ? `Recompile failed: ${job.error}` : "Recompile failed"
+        );
+      } else if (job.status === "cancelled") {
+        toast.info("Recompile cancelled");
+      } else {
+        toast.success("Recompile complete — entries refreshed");
+      }
+      void fetchEntries(1, false);
+    },
+    onTimeout: () => {
+      toast.error("Recompile did not finish in time");
+    },
+  });
+
   // C37: past the fixed per_page=200 window the remaining entries are fetched
   // on demand; the page-2 request retains the current search/vault filters.
   // PRR-007 (#531): no-op while a fetch is already in flight so a load-more
@@ -142,13 +183,31 @@ export default function KMSPage() {
     }
   }
 
+  const recompilePostInFlightRef = useRef(false);
   async function handleRecompile() {
-    if (!activeVaultId) return;
+    if (!activeVaultId || recompilePoll.active) return;
+    if (recompilePostInFlightRef.current) return; // double-click guard (PRR-020)
+    recompilePostInFlightRef.current = true;
     try {
-      await recompileVaultKMS(activeVaultId);
-      toast.info("Recompile queued — document entries will refresh shortly");
+      const handle = await recompileVaultKMS(activeVaultId);
+      if (isTerminalJobStatus(handle.status)) {
+        // Already terminal (e.g. a synchronous compile result): no polling.
+        if (handle.status === "failed") {
+          toast.error("Recompile failed");
+        } else if (handle.status === "cancelled") {
+          toast.info("Recompile cancelled");
+        } else {
+          toast.success("Recompile complete — entries refreshed");
+        }
+        void fetchEntries(1, false);
+        return;
+      }
+      recompileJobIdRef.current = handle.job_id;
+      recompilePoll.start();
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "Failed to queue recompile");
+    } finally {
+      recompilePostInFlightRef.current = false;
     }
   }
 
@@ -166,10 +225,19 @@ export default function KMSPage() {
             variant="outline"
             size="sm"
             onClick={handleRecompile}
-            disabled={!activeVaultId}
-            title="Recompile document entries for this vault"
+            disabled={!activeVaultId || recompilePoll.active}
+            aria-busy={recompilePoll.active}
+            title={
+              recompilePoll.active
+                ? "Recompile in progress…"
+                : "Recompile document entries for this vault"
+            }
           >
-            <RefreshCw className="w-4 h-4 mr-1" />
+            {recompilePoll.active ? (
+              <Loader2 className="w-4 h-4 mr-1 animate-spin" />
+            ) : (
+              <RefreshCw className="w-4 h-4 mr-1" />
+            )}
             Recompile
           </Button>
           <Button

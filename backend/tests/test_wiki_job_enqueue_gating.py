@@ -111,6 +111,10 @@ class TestWikiJobEnqueueGating(unittest.IsolatedAsyncioTestCase):
         # #645: process_file checks out via the pool's async surface; mirror
         # it with an AsyncMock so the await resolves to the fake connection.
         pool.get_connection_async = AsyncMock(return_value=conn)
+        # issue #783: finalize's success write is rowcount-guarded (a cancel
+        # the route accepted must not be buried); the mocked driver reports
+        # a landed write.
+        conn.execute.return_value.rowcount = 1
 
         embedding_service = MagicMock()
         embedding_service.embed_batch = AsyncMock(return_value=([[0.1, 0.2]], []))
@@ -314,6 +318,10 @@ class TestWikiJobEnqueueGatingProcessExistingFile(unittest.IsolatedAsyncioTestCa
         pool.get_connection.return_value = conn
         # #645: process_existing_file checks out via the pool's async surface.
         pool.get_connection_async = AsyncMock(return_value=conn)
+        # issue #783: finalize's success write is rowcount-guarded (a cancel
+        # the route accepted must not be buried); the mocked driver reports
+        # a landed write.
+        conn.execute.return_value.rowcount = 1
 
         embedding_service = MagicMock()
         embedding_service.embed_batch = AsyncMock(return_value=([[0.1, 0.2]], []))
