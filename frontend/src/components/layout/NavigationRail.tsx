@@ -44,7 +44,10 @@ interface NavConfigItem {
   capabilityGated?: boolean;
 }
 
-const navItems: NavConfigItem[] = [
+// Canonical destination list for every nav surface (issue #775: the command
+// palette consumes this export instead of hand-copying a subset — one source
+// for destinations, labels and gating).
+export const navItems: NavConfigItem[] = [
   { id: "chat", label: "Chat", icon: MessageMultiple01Icon, to: "/chat", section: "workspace" },
   { id: "documents", label: "Documents", icon: Files01Icon, to: "/documents", section: "workspace" },
   { id: "memory", label: "Memory", icon: AiBrain01Icon, to: "/memory", section: "workspace" },
@@ -58,6 +61,22 @@ const navItems: NavConfigItem[] = [
   { id: "settings", label: "Settings", icon: Setting07Icon, to: "/settings", section: "account" },
   { id: "profile", label: "Profile", icon: UserCircleIcon, to: "/profile", section: "account" },
 ];
+
+/** Role predicate for nav visibility (issue #775 single definition — the
+ *  command palette applies the same rule the rail does). */
+export function isAdminRole(role: string | undefined): boolean {
+  return role === "admin" || role === "superadmin";
+}
+
+/** Nav visibility rule (issue #775 single definition): admin-only items need
+ *  an admin role; capability-gated items need their capability advertised. */
+export function isNavItemVisible(
+  item: Pick<NavConfigItem, "adminOnly" | "capabilityGated">,
+  isAdmin: boolean,
+  capabilityVisible: boolean
+): boolean {
+  return (!item.adminOnly || isAdmin) && (!item.capabilityGated || capabilityVisible);
+}
 
 const sectionLabels: Record<NavSection, string> = {
   workspace: "Workspace",
@@ -103,7 +122,8 @@ const DEFAULT_GLOBAL_SEARCH_TYPES: Record<GlobalSearchTypeId, boolean> = {
 // HugeiconsIcon, which spreads its icon prop (`[...icon]`) and crashes with
 // "currentIcon is not iterable". Array.isArray is the correct discriminator,
 // and as a user-defined type guard it also narrows the component branch.
-function isHugeicon(icon: NavConfigItem["icon"]): icon is IconSvgElement {
+// Exported (issue #775) so the command palette renders the same icon kinds.
+export function isHugeicon(icon: NavConfigItem["icon"]): icon is IconSvgElement {
   return Array.isArray(icon);
 }
 
@@ -146,7 +166,7 @@ export function NavigationRail({ healthStatus }: NavigationRailProps) {
   const { theme, setTheme } = useThemeStore();
   const userRole = useAuthStore((state) => state.user?.role);
   const logout = useAuthStore((state) => state.logout);
-  const isAdmin = userRole === "admin" || userRole === "superadmin";
+  const isAdmin = isAdminRole(userRole);
   const draftRoomVisible = useDraftRoomVisible();
 
   // Global search state (issue #515 / PRODUCT-ENH-11) — submitting routes to
@@ -219,7 +239,7 @@ export function NavigationRail({ healthStatus }: NavigationRailProps) {
   const activeItem = getActiveItem();
 
   const visibleItems = navItems.filter(
-    (item) => (!item.adminOnly || isAdmin) && (!item.capabilityGated || draftRoomVisible)
+    (item) => isNavItemVisible(item, isAdmin, draftRoomVisible)
   );
 
   const workspaceItems = visibleItems.filter((i) => i.section === "workspace");

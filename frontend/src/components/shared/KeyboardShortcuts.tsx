@@ -11,6 +11,8 @@ import { Keyboard, RotateCw } from "lucide-react";
 import {
   comboFromEvent,
   effectiveBinding,
+  isEditableTarget,
+  PALETTE_TOGGLE_COMBOS,
   saveShortcutBinding,
   clearShortcutBinding,
   clearShortcutBindings,
@@ -58,16 +60,22 @@ export function useKeyboardShortcuts() {
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      // Issue #775: one owner per combo — if an earlier listener already
+      // claimed this event (e.g. focusSearch on /chat), never double-fire.
+      if (e.defaultPrevented) return;
+      // IME composition is not a shortcut gesture (repo discipline, cf.
+      // useEscapeToStop).
+      if (e.isComposing) return;
       // Show shortcuts on the bound combo (default "?"). Bindings are read at
-      // event time so a fresh mount honors whatever is persisted. Shift is
-      // physically required to type "?" on US layouts, so printable-char
-      // combos carry their shift inside the key itself; modifier combos
-      // normalize to "Ctrl+<key>". Never trigger while typing in inputs.
-      if (e.ctrlKey || e.metaKey) return;
+      // event time so a fresh mount honors whatever is persisted. Modifier
+      // chords normalize to "Ctrl+<key>" in comboFromEvent, so a combo only
+      // matches when the persisted binding literally holds that chord — a
+      // rebind to Ctrl+J therefore fires (issue #775: capture and firing
+      // rules must agree). Never trigger while typing in inputs.
       const combo = comboFromEvent(e);
       if (combo === null || combo !== bindingFor("showShortcuts")) return;
-      const target = e.target as HTMLElement;
-      if (target.tagName !== "INPUT" && target.tagName !== "TEXTAREA" && !target.isContentEditable) {
+      const target = e.target;
+      if (!isEditableTarget(target)) {
         e.preventDefault();
         setOpen(true);
       }
@@ -103,12 +111,38 @@ export function KeyboardShortcutsDialog({ open, onOpenChange }: { open: boolean;
     const handleCapture = (e: KeyboardEvent) => {
       e.preventDefault();
       e.stopPropagation();
+      if (e.isComposing) return;
       const combo = comboFromEvent(e);
       // null = bare modifier press or Escape (cancel) — keep waiting on
       // modifiers, cancel on Escape.
       if (combo === null) {
         if (e.key === "Escape") setCapturing(null);
         return;
+      }
+      // Issue #775 shadow refusal — runs BEFORE the conflict-clearing loop so
+      // a refused capture leaves persisted state untouched. A combo that
+      // could never fire must not be persisted: computing focusSearch's
+      // post-clear effective binding is a pure read — if focusSearch's
+      // current effective binding equals the captured combo, the resolver
+      // below would clear it and focusSearch reverts to its default;
+      // otherwise its current effective binding stands. A combo equal to
+      // that post-clear binding is claimed on /chat by focusSearch's
+      // document listener (document bubble beats every window listener), and
+      // a combo in PALETTE_TOGGLE_COMBOS is claimed everywhere else by the
+      // palette's app-wide window listener. With today's defaults both
+      // clauses collapse to the single reserved "Ctrl+K"; the general
+      // computation keeps the refusal correct if either default ever
+      // changes, while a steal of a *persisted* focusSearch combo (e.g.
+      // "F7") stays allowed (the holder reverts to its default, which fires).
+      if (capturing === "showShortcuts") {
+        const focusDefault = CANONICAL_DEFAULT.focusSearch ?? "Ctrl+K";
+        const current = loadShortcutBindings();
+        const focusEffective = current.focusSearch ?? focusDefault;
+        const focusPostClear = focusEffective === combo ? focusDefault : focusEffective;
+        if (focusPostClear === combo || PALETTE_TOGGLE_COMBOS.has(combo)) {
+          // Swallowed like a bare modifier press: capture stays armed.
+          return;
+        }
       }
       // Conflict handling (PRR-003): if another rebindable shortcut already
       // holds this combo, clear that binding so the combo drives exactly one

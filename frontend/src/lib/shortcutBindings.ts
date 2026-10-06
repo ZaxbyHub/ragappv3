@@ -20,9 +20,20 @@ export function loadShortcutBindings(): ShortcutBindings {
     }
     const bindings: ShortcutBindings = {};
     for (const [id, combo] of Object.entries(parsed as Record<string, unknown>)) {
-      if (typeof combo === "string" && combo.length > 0) {
-        bindings[id] = combo;
+      if (typeof combo !== "string" || combo.length === 0) {
+        continue;
       }
+      // Issue #775: a showShortcuts combo in the palette's reserved set is
+      // dead state — focusSearch's default claims it on /chat and the palette
+      // claims it everywhere else — so a value persisted by a pre-#775 build
+      // is ignored here rather than stranding the shortcut (the dialog and
+      // its Reset control would otherwise be unreachable). Read-only guard:
+      // the dead entry stays in storage until an explicit Reset; every
+      // consumer simply falls back to the default.
+      if (id === "showShortcuts" && PALETTE_TOGGLE_COMBOS.has(combo)) {
+        continue;
+      }
+      bindings[id] = combo;
     }
     return bindings;
   } catch {
@@ -95,4 +106,44 @@ export function comboFromEvent(e: { key: string; ctrlKey: boolean; metaKey: bool
     return `Ctrl+${key}`;
   }
   return key;
+}
+
+/**
+ * Issue #775: the command palette's toggle combos, in comboFromEvent's
+ * normalized form (Ctrl stands in for Cmd). Single definition shared by the
+ * palette's own keydown handler, the rebind-capture shadow refusal, and the
+ * read-time guard in loadShortcutBindings — exactly one owner per combo.
+ */
+export const PALETTE_TOGGLE_COMBOS: ReadonlySet<string> = new Set(["Ctrl+K"]);
+
+/**
+ * True when an event target is a text-entry surface (issue #775). Tolerates
+ * non-Element targets (window/document) — they are never editable.
+ */
+export function isEditableTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  // isContentEditable is explicitly compared (not just returned) so the
+  // function always yields a real boolean even where a DOM implementation
+  // reports the property as undefined (jsdom does).
+  return (
+    target.tagName === "INPUT" ||
+    target.tagName === "TEXTAREA" ||
+    target.isContentEditable === true
+  );
+}
+
+/**
+ * Issue #775: build a KeyboardEventInit whose comboFromEvent normalization
+ * round-trips back to `combo` — used by the palette's "Show keyboard
+ * shortcuts" action to drive the single existing shortcut dispatcher instead
+ * of opening the dialog through a second channel.
+ */
+export function comboToKeyboardEventInit(combo: string): KeyboardEventInit {
+  // cancelable so the receiving listener's preventDefault() is effective
+  // (jsdom and browsers default KeyboardEvent to non-cancelable).
+  if (combo.startsWith("Ctrl+")) {
+    const key = combo.slice("Ctrl+".length);
+    return { key, ctrlKey: true, cancelable: true };
+  }
+  return { key: combo, cancelable: true };
 }
