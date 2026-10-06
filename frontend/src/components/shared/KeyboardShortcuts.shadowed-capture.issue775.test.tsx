@@ -152,4 +152,27 @@ describe("issue #775 — rebind capture safety nets", () => {
     expect(isOpen(rebound.result)).toBe(true);
     rebound.unmount();
   });
+
+  it("an ordinary Ctrl-chord rebind for showShortcuts persists AND fires (chosen semantics, not capture refusal)", () => {
+    // Pins the OTHER half of the C2 contract that the frozen check leaves
+    // open (a capture-refusal fix also passes the frozen assertion): this
+    // implementation's choice is that unshadowed chords are persisted and
+    // the consumer fires them.
+    render(<KeyboardShortcutsDialog open={true} onOpenChange={noop} />);
+    fireEvent.click(
+      screen.getByRole("button", { name: /rebind shortcut: show keyboard shortcuts/i })
+    );
+    act(() => {
+      fireEvent.keyDown(window, { key: "j", ctrlKey: true });
+    });
+    expect(loadShortcutBindings()).toEqual({ showShortcuts: "Ctrl+J" });
+    cleanup();
+
+    const rebound = renderHook(() => useKeyboardShortcuts());
+    act(() => {
+      fireEvent.keyDown(window, { key: "j", ctrlKey: true });
+    });
+    expect(isOpen(rebound.result)).toBe(true);
+    rebound.unmount();
+  });
 });

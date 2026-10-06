@@ -27,6 +27,7 @@ import {
   useKeyboardShortcuts,
 } from "@/components/shared/KeyboardShortcuts";
 import { useThemeStore } from "@/stores/useThemeStore";
+import { useNavigationGuardStore } from "@/stores/useNavigationGuardStore";
 import { unifiedSearch } from "@/lib/api/search";
 
 const authState = vi.hoisted(() => ({
@@ -96,8 +97,11 @@ describe("issue #775 — palette action wiring", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     // The theme store is module-level zustand state shared across tests —
-    // reset it to the shipped default before each case.
+    // reset it to the shipped default before each case. Same for the
+    // navigation guard (implementation-review round 1: palette navigation
+    // must consult it).
     useThemeStore.getState().setTheme("system");
+    useNavigationGuardStore.getState().setConfirmLeave(null);
   });
 
   afterEach(() => {
@@ -156,6 +160,25 @@ describe("issue #775 — palette action wiring", () => {
 
     await waitFor(() => expect(path()).toBe("/documents/5"));
     await waitFor(() => expect(screen.queryByLabelText("Search commands")).toBeNull());
+  });
+
+  it("a declined unsaved-changes guard blocks palette navigation (route unchanged)", () => {
+    const { path } = mountShell();
+    const palette = openPalette();
+
+    // The dirty page's confirmLeave declines: navigation must not fire —
+    // the same contract App.tsx's handleItemSelect follows for the mobile
+    // bottom nav (implementation-review round 1 finding).
+    useNavigationGuardStore.getState().setConfirmLeave(() => false);
+    fireEvent.click(within(palette).getByRole("button", { name: "Go to Documents" }));
+    expect(path()).toBe("/start");
+
+    // And the guard is actually consulted (a dirty page that confirms still
+    // navigates) — fireEvent is act-wrapped, so the route is final here.
+    useNavigationGuardStore.getState().setConfirmLeave(() => true);
+    const palette2 = openPalette();
+    fireEvent.click(within(palette2).getByRole("button", { name: "Go to Documents" }));
+    expect(path()).toBe("/documents");
   });
 
   it("destinations render before every action in DOM order", () => {

@@ -18,6 +18,7 @@ import {
 import { useAuthStore } from "@/stores/useAuthStore";
 import { useDraftRoomVisible } from "@/hooks/useDraftRoomCapabilities";
 import { useThemeStore } from "@/stores/useThemeStore";
+import { useNavigationGuardStore } from "@/stores/useNavigationGuardStore";
 import { bindingFor } from "@/components/shared/KeyboardShortcuts";
 import {
   comboFromEvent,
@@ -225,9 +226,19 @@ export function CommandPalette() {
     [actionCommands, q]
   );
 
+  // Button-triggered programmatic navigation must consult the shared
+  // unsaved-changes guard before navigate() — the same contract App.tsx's
+  // handleItemSelect follows for the mobile bottom nav (a declined
+  // confirmation leaves the current route, and any dirty page, intact).
+  const guardedNavigate = (to: string) => {
+    const confirmLeave = useNavigationGuardStore.getState().confirmLeave;
+    if (confirmLeave && !confirmLeave()) return;
+    navigate(to);
+  };
+
   const executeNav = (command: NavCommand) => {
     closePalette();
-    navigate(command.to);
+    guardedNavigate(command.to);
   };
 
   return (
@@ -296,7 +307,7 @@ export function CommandPalette() {
                     type="button"
                     onClick={() => {
                       closePalette();
-                      navigate(hit.url_hint);
+                      guardedNavigate(hit.url_hint);
                     }}
                     className="flex w-full items-center gap-3 rounded-sm px-3 py-2 text-left text-sm hover:bg-muted/50 focus-visible:bg-muted/50 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                   >
