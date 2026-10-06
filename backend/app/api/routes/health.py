@@ -260,10 +260,15 @@ async def health_check(
     # Expose the ingestion/enrichment backlog depth so operators can observe a
     # stuck BackgroundProcessor without tailing logs (the queue_size property
     # was previously defined but never consumed by any application code).
+    # Off the event loop (issue #702 review): in lease mode the property
+    # reads the durable jobs table through a pooled SQLite connection, and a
+    # saturated pool blocks the checkout — never the request loop.
     bg_processor = getattr(request.app.state, "background_processor", None)
     if bg_processor is not None:
         try:
-            result["ingestion_queue_size"] = bg_processor.queue_size
+            result["ingestion_queue_size"] = await asyncio.to_thread(
+                lambda: bg_processor.queue_size
+            )
         except Exception as exc:
             logger.debug("ingestion queue_size probe failed: %s", exc)
 

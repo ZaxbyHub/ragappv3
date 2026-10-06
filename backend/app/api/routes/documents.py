@@ -238,8 +238,15 @@ async def retry_document(
         # Ensure processor is running
         if not background_processor.is_running:
             await background_processor.start()
+        # Issue #702 / P02-SK2-14: file-scoped dedupe — in lease mode the
+        # durable row IS the queue entry, so a second retry call must see the
+        # first call's non-terminal job and answer "already_in_progress"
+        # instead of inserting a second jobs row for the same file.
         enqueued = await background_processor.enqueue(
-            row["file_path"], vault_id=row["vault_id"], file_id=file_id
+            row["file_path"],
+            vault_id=row["vault_id"],
+            file_id=file_id,
+            _dedupe_existing_job=True,
         )
         retry_status = "scheduled" if enqueued else "already_in_progress"
         user_id = (

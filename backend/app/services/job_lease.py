@@ -244,10 +244,12 @@ class JobLease:
     def _write_txn(self) -> Iterator[bool]:
         """``BEGIN IMMEDIATE`` when we hold the connection's transaction.
 
-        Production pool connections run autocommit and test connections run
-        default isolation; a caller that already has a transaction open keeps
-        ownership (the single-statement writes below are atomic regardless).
-        Yields whether WE own the transaction (and therefore commit it).
+        Pooled production connections use sqlite3's default deferred
+        isolation (a write opens an implicit transaction), and test
+        connections may already sit in a caller-owned transaction; a caller
+        that has a transaction open keeps ownership (the single-statement
+        writes below are atomic regardless). Yields whether WE own the
+        transaction (and therefore commit it).
         """
         if self._conn.in_transaction:
             yield False
@@ -481,11 +483,18 @@ class JobLease:
 
     def release(self, job_id: int, worker_id: str) -> bool:
         """Fenced graceful-shutdown release: give the job up immediately
-        (back to ``pending``) instead of waiting out the reclaim timeout."""
+        (back to ``pending``) instead of waiting out the reclaim timeout.
+
+        The attempt this claim burned is refunded (issue #702 / P02-SK2-11):
+        a graceful handback is not a failure, so it must not consume durable
+        retry budget. Genuine failures settle through ``requeue``/``fail``,
+        which keep ``attempts`` by design.
+        """
         with self._write_txn():
             cur = self._conn.execute(
                 f"UPDATE {self._table} SET status = 'pending', worker_id = NULL, "  # nosec B608 - table is an allowlist value
-                "lease_generation = lease_generation + 1, heartbeat_at = NULL "
+                "lease_generation = lease_generation + 1, "
+                "attempts = MAX(attempts - 1, 0), heartbeat_at = NULL "
                 "WHERE id = ? AND worker_id = ? AND status = 'running'",
                 (job_id, worker_id),
             )
