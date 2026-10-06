@@ -148,16 +148,17 @@ export function useWikiEventStream(
         // Abort-aware backoff (#774 / TQ-sibling-batch-06-04): unmount aborts
         // wake the sleep early so the loop (and this closure) exit promptly
         // instead of lingering until the timer fires.
+        // Listener detached on BOTH settle paths: with {once:true} it would
+        // leak one closure per reconnect for the mount's lifetime whenever
+        // the timer (the normal path) wins the race (PRR-003 / Copilot).
         await new Promise<void>((resolve) => {
-          const timer = setTimeout(resolve, backoff);
-          controller.signal.addEventListener(
-            "abort",
-            () => {
-              clearTimeout(timer);
-              resolve();
-            },
-            { once: true }
-          );
+          const onAbort = () => {
+            controller.signal.removeEventListener("abort", onAbort);
+            clearTimeout(timer);
+            resolve();
+          };
+          const timer = setTimeout(onAbort, backoff);
+          controller.signal.addEventListener("abort", onAbort);
         });
         backoff = Math.min(backoff * 2, RECONNECT_MAX_MS);
       }

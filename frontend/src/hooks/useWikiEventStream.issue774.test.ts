@@ -75,18 +75,23 @@ describe("useWikiEventStream issue 774 hardening", () => {
   it("contains a transport-class refresh rejection on the token_expired path (no unhandled rejection, stream stops)", async () => {
     const unhandled = vi.fn();
     process.on("unhandledRejection", unhandled);
-    // 401 token_expired, then the refresh rejects with a network error.
-    fetchMock.mockResolvedValueOnce(errorResponse(401, "token_expired"));
-    refreshAccessTokenMock.mockRejectedValueOnce(new TypeError("Failed to fetch"));
+    try {
+      // 401 token_expired, then the refresh rejects with a network error.
+      fetchMock.mockResolvedValueOnce(errorResponse(401, "token_expired"));
+      refreshAccessTokenMock.mockRejectedValueOnce(new TypeError("Failed to fetch"));
 
-    renderHook(() => useWikiEventStream(42, vi.fn()));
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
-    await vi.waitFor(() => expect(refreshAccessTokenMock).toHaveBeenCalledTimes(1));
-    // Give any unhandled rejection a chance to surface.
-    await new Promise((r) => setTimeout(r, 25));
+      renderHook(() => useWikiEventStream(42, vi.fn()));
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+      await vi.waitFor(() => expect(refreshAccessTokenMock).toHaveBeenCalledTimes(1));
+      // Give any unhandled rejection a chance to surface.
+      await new Promise((r) => setTimeout(r, 25));
 
-    expect(unhandled).not.toHaveBeenCalled();
-    process.off("unhandledRejection", unhandled);
+      expect(unhandled).not.toHaveBeenCalled();
+    } finally {
+      // The probe listener must not leak when the assertion it guards fails
+      // (PRR-021).
+      process.off("unhandledRejection", unhandled);
+    }
   });
 
   it("does not fetch again after dispose during the reconnect backoff", async () => {

@@ -142,18 +142,29 @@ function VersionHistorySection({ pageId, vaultId }: { pageId: number; vaultId: n
 
   useEffect(() => {
     if (!open) return;
+    // Same cancellation discipline as BacklinksSection: a superseded fetch
+    // (page/vault change or close-during-flight) must not stamp its outcome
+    // over the current section (PRR-006).
+    let cancelled = false;
     setLoading(true);
     getWikiPageVersions(pageId, vaultId)
       .then((data) => {
+        if (cancelled) return;
         setVersions(Array.isArray(data) ? data : data.versions ?? []);
         setVersionsError(false);
       })
       .catch(() => {
         // A failed load must not read as "no history" (#774).
+        if (cancelled) return;
         setVersions([]);
         setVersionsError(true);
       })
-      .finally(() => setLoading(false));
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [open, pageId, vaultId]);
 
   return (
@@ -207,18 +218,27 @@ function AttachmentsSection({ pageId, vaultId }: { pageId: number; vaultId: numb
 
   useEffect(() => {
     if (!open) return;
+    // Same cancellation discipline as BacklinksSection (PRR-006).
+    let cancelled = false;
     setLoading(true);
     getWikiPageFiles(pageId, vaultId)
       .then((data) => {
+        if (cancelled) return;
         setFiles(Array.isArray(data) ? data : data.files ?? []);
         setFilesError(false);
       })
       .catch(() => {
         // A failed load must not read as "no attachments" (#774).
+        if (cancelled) return;
         setFiles([]);
         setFilesError(true);
       })
-      .finally(() => setLoading(false));
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [open, pageId, vaultId]);
 
   return (

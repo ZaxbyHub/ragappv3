@@ -113,10 +113,10 @@ describe("issue 774 OrgsPage member-search failure", () => {
 
     // Expand the org to reveal the member-add form (current user is not a
     // member of the freshly loaded org).
-    const expand = await screen.findByRole("button", { name: /expand/i });
+    const expand = await screen.findByRole("button", { name: /expand/i }, { timeout: 3000 });
     fireEvent.click(expand);
 
-    const search = await screen.findByPlaceholderText(/Search by name or username/i);
+    const search = await screen.findByPlaceholderText(/Search by name or username/i, undefined, { timeout: 3000 });
     fireEvent.change(search, { target: { value: "alice" } });
 
     // The query is debounced 300 ms (real timers), then the request rejects.
@@ -143,9 +143,9 @@ describe("issue 774 OrgsPage member-search failure", () => {
     await act(async () => {
       render(<OrgsPage />);
     });
-    fireEvent.click(await screen.findByRole("button", { name: /expand/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /expand/i }, { timeout: 3000 }));
 
-    const search = await screen.findByPlaceholderText(/Search by name or username/i);
+    const search = await screen.findByPlaceholderText(/Search by name or username/i, undefined, { timeout: 3000 });
     fireEvent.change(search, { target: { value: "alice" } });
 
     expect(

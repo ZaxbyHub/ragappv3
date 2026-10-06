@@ -415,16 +415,15 @@ export function chatStream(
             // during the window resolves the sleep early, and the aborted
             // check below keeps a disposed stream from firing a real
             // refreshAccessToken() after the consumer is gone.
+            // Listener detached on both settle paths (PRR-003).
             await new Promise<void>((resolve) => {
-              const timer = setTimeout(resolve, 1000);
-              abortController.signal.addEventListener(
-                "abort",
-                () => {
-                  clearTimeout(timer);
-                  resolve();
-                },
-                { once: true }
-              );
+              const onAbort = () => {
+                abortController.signal.removeEventListener("abort", onAbort);
+                clearTimeout(timer);
+                resolve();
+              };
+              const timer = setTimeout(onAbort, 1000);
+              abortController.signal.addEventListener("abort", onAbort);
             });
             if (abortController.signal.aborted) {
               return;
@@ -476,16 +475,15 @@ export function chatStream(
       // the next fetch throws AbortError, ending the loop. The remaining
       // silent window while still subscribed is bounded (<= 1.5s) and
       // accepted: the turn is still making progress.
+      // Listener detached on both settle paths (PRR-003).
       await new Promise<void>((resolve) => {
-        const timer = setTimeout(resolve, RESUME_BACKOFF_MS * (attempt + 1));
-        abortController.signal.addEventListener(
-          "abort",
-          () => {
-            clearTimeout(timer);
-            resolve();
-          },
-          { once: true }
-        );
+        const onAbort = () => {
+          abortController.signal.removeEventListener("abort", onAbort);
+          clearTimeout(timer);
+          resolve();
+        };
+        const timer = setTimeout(onAbort, RESUME_BACKOFF_MS * (attempt + 1));
+        abortController.signal.addEventListener("abort", onAbort);
       });
     }
   };

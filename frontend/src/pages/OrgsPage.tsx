@@ -133,6 +133,10 @@ function OrgsPageContent() {
   const searchUsers = useCallback(async (query: string) => {
     if (!query.trim()) {
       setUserSearchResults([]);
+      // A cleared query is not a failed search: drop any stale error so the
+      // destructive line cannot bleed into the next query's debounce window
+      // (PRR-005).
+      setUserSearchError(false);
       setShowUserDropdown(false);
       return;
     }
@@ -223,6 +227,10 @@ function OrgsPageContent() {
         description: newOrgDescription.trim() || "",
       });
       setOrgs((prev) => [...prev, response.data]);
+      // The list is demonstrably live again: a successful create must clear
+      // a stale load-failure flag or the ErrorState would hide the new org
+      // (OOB review F-008).
+      setOrgsError(false);
       toast.success("Organization created successfully");
       setCreateDialogOpen(false);
       setNewOrgName("");

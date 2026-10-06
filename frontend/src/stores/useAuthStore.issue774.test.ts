@@ -98,7 +98,32 @@ describe("issue 774 session retention on transport failures", () => {
     expect(useAuthStore.getState().isAuthenticated).toBe(true);
   });
 
-  it("init keeps the session when fetchMe fails with a network error", async () => {
+  it("cold reload during an outage keeps the persisted user but cannot restore isAuthenticated (lands at login, unchanged from base)", async () => {
+    // OOB review F-003: a real reload produces accessToken=null +
+    // isAuthenticated=false (only `user` is persisted). The keep-session
+    // change preserves the persisted `user` on a transport failure, but the
+    // user still lands at login — this test pins that honest semantics so
+    // the PR text cannot overclaim.
+    useAuthStore.setState({
+      user: mockUser,
+      accessToken: null,
+      isAuthenticated: false,
+      isLoading: false,
+      isInitialized: false,
+    });
+    // Refresh cookie path fails on transport; setup-status too.
+    mockRefreshAccessToken.mockRejectedValueOnce(new TypeError("Failed to fetch"));
+    mockGetFn.mockRejectedValueOnce(new TypeError("Failed to fetch"));
+
+    await useAuthStore.getState().init();
+
+    const state = useAuthStore.getState();
+    expect(state.isAuthenticated).toBe(false);
+    expect(state.user).toEqual(mockUser); // persisted identity retained
+    expect(state.isInitialized).toBe(true);
+  });
+
+  it("init keeps the session when fetchMe fails with a network error (in-memory-token path: remount/hot-reload only)", async () => {
     // init path: in-memory accessToken -> fetchMe -> network failure.
     mockGetFn.mockRejectedValueOnce(new TypeError("Failed to fetch"));
     // checkSetupStatus also fails (same outage) — the finally path must cope.

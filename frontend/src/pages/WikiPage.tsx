@@ -163,18 +163,28 @@ export default function WikiPage() {
   // Fetch activity feed when panel opens
   useEffect(() => {
     if (!activityPanelOpen || !activeVaultId) return;
+    // A superseded fetch (vault switch / panel re-open) must not stamp its
+    // outcome over the current feed (PRR-006).
+    let cancelled = false;
     setActivityLoading(true);
     getWikiActivityFeed(activeVaultId, 50)
       .then((data) => {
+        if (cancelled) return;
         setActivityEntries(Array.isArray(data) ? data : data.entries ?? []);
         setActivityError(false);
       })
       .catch(() => {
         // A failed load must not read as "no activity" (#774).
+        if (cancelled) return;
         setActivityEntries([]);
         setActivityError(true);
       })
-      .finally(() => setActivityLoading(false));
+      .finally(() => {
+        if (!cancelled) setActivityLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [activityPanelOpen, activeVaultId]);
 
   function handleCreateClick() {

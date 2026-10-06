@@ -11,17 +11,23 @@ TQ-sweep-B09-01, TQ-sweep-B05-02, TQ-sweep-B05-03, TQ-sibling-batch-06-04).
   "checking" label and dot instead of "down" — the same "UNKNOWN is not DOWN"
   rule the reconnect banner already follows (PR #606). Only a real poll result
   renders ok/down.
-- **An outage no longer logs you out.** `refreshAccessToken` now distinguishes
-  transport-class failures from session verdicts: a network error, a 5xx, or a
-  refresh that exceeds its new 10 s deadline REJECTS (the store keeps the
-  session and a later refresh can succeed), while a genuine 401/CSRF-403 still
-  resolves `null` and clears auth exactly as before. `useAuthStore.init`
-  likewise keeps the session when `fetchMe` cannot reach the backend and only
-  clears on an auth-shaped 401/403. The 401 interceptor no longer redirects to
-  login when the refresh itself fails on transport — it re-surfaces the
-  original request error. Timeout errors are deliberately never named or
-  worded "AbortError"/"abort" so user-cancel sentinels (chatStream,
-  useSendMessage) cannot swallow them.
+- **A mid-session outage no longer logs you out.** `refreshAccessToken` now
+  distinguishes transport-class failures from session verdicts: a network
+  error, a 5xx, or a refresh that exceeds its new 10 s deadline REJECTS
+  (transport-class), while a genuine 401/CSRF-403 still resolves `null` and
+  clears auth exactly as before. The delivered legs are the apiClient 401
+  interceptor (a transport refresh failure no longer redirects to login; the
+  request re-rejects in the shared normalized error shape with the session
+  intact) and the in-memory-token init path (remount/hot-reload). Scope note:
+  a cold page reload during an outage still lands on the login screen
+  (unchanged from before — the refresh cookie path cannot restore
+  `isAuthenticated` without a reachable backend); only the persisted `user`
+  identity is retained. Timeout errors are deliberately never named or worded
+  "AbortError"/"abort" so user-cancel sentinels (chatStream, useSendMessage)
+  cannot swallow them. A rate-limited refresh (HTTP 429 — the refresh endpoint
+  enforces 30/minute, see the 659 release note) still resolves `null` and
+  clears the session, exactly as before; only network errors and 5xx changed
+  behavior.
 - **The CSRF and refresh fetches are bounded.** Both `/csrf-token`
   (`ensureCsrfToken`) and `/auth/refresh` (`_doRefresh`) carry an
   AbortController + 10 s setTimeout deadline (fake-timer-friendly; no
@@ -62,10 +68,15 @@ TQ-sweep-B09-01, TQ-sweep-B05-02, TQ-sweep-B05-03, TQ-sibling-batch-06-04).
 
 - `refreshAccessToken`'s failure contract changed: rejection ⇔ transport-class
   (network / timeout / 5xx); `null` ⇔ auth-shaped rejection or non-5xx 4xx.
-  All awaiters were hardened in the same change (interceptor, sessions'
-  pre-stream check and token_expired retry, both event-stream hooks' 401
-  refresh paths — the hooks treat a transport rejection exactly like the old
-  null, i.e. "stop", which was already their behavior on a failed refresh).
+  Awaiter disposition: the 401 interceptor, the auth store, and both
+  event-stream hooks handle the new rejection explicitly (the hooks treat a
+  transport rejection exactly like the old `null`, i.e. "stop", which was
+  already their behavior on a failed refresh). The two `chatStream` refresh
+  awaits (pre-stream near-expiry check and the token_expired retry) rely on
+  the stream's outer catch, so a transport failure surfaces the underlying
+  error to the chat UI (e.g. "auth refresh timed out" or a connection-error
+  message) instead of the old "Session expired. Please log in again." — the
+  stream's own retry/abort semantics are unchanged.
 - Two test files pinned the old contracts and were updated with in-file
   rationale: `core.subpath-refresh-diagnostic.test.ts` (its 503 and
   network-error cases now expect rejection; suppression assertions unchanged;
@@ -83,3 +94,8 @@ TQ-sweep-B09-01, TQ-sweep-B05-02, TQ-sweep-B05-03, TQ-sibling-batch-06-04).
   `ProfilePage`'s allSettled-keeps-empty pattern are same-class survivors
   dispositioned in the trace's recurrence census rather than silently
   dropped or quietly widened into this PR.
+- The Overview tab's "checking" state covers the first poll and the cold-cache
+  re-poll window only: after the health hook's re-poll budget is exhausted, or
+  on a failed first check, never-probed services still render "down" until the
+  next poll succeeds (pre-existing `useHealthCheck` behavior, unchanged
+  here).

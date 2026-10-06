@@ -52,6 +52,9 @@ export function MaintenanceSettings({ vaultId }: MaintenanceSettingsProps) {
   const refreshJobs = async () => {
     if (!vaultId) {
       setRecentJobs([]);
+      // Clearing the vault is not a failed load: drop any stale error so the
+      // destructive banner cannot outlive the surface it described (PRR-004).
+      setJobsError(false);
       return;
     }
     setBusy("jobs");

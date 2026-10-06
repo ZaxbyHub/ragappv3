@@ -440,6 +440,14 @@ apiClient.interceptors.response.use(
       const isTokenInvalid = typeof detail === "string" && (
         detail.includes("token_invalid") || detail.includes("user_inactive")
       );
+      // True when the refresh failed for transport reasons (#774): the
+      // session is kept, no logout/redirect, and the error skips the logout
+      // below so control reaches the shared normalizer tail — callers get
+      // the standard .message/.status/.originalError shape instead of a raw
+      // AxiosError (PRR-011 / OOB F-006). No retry loop is possible: 401 is
+      // not a transient status and non-idempotent methods never
+      // transient-retry.
+      let refreshTransportFailure = false;
 
       if (_jwtAccessToken && !isTokenInvalid) {
         // Token may be refreshable — retry with exponential backoff
@@ -461,18 +469,18 @@ apiClient.interceptors.response.use(
             }
           } catch {
             // Refresh transport failure (#774): refreshAccessToken only
-            // rejects for transport-class failures (an auth-shaped rejection
-            // resolves null and falls through to the logout below). An
-            // outage is not a session verdict — surface the original 401
-            // error instead of bouncing the user to the login page.
-            return Promise.reject(error);
+            // rejects for transport-class failures; an auth-shaped rejection
+            // resolves null and takes the logout below.
+            refreshTransportFailure = true;
           }
         }
       }
 
-      // Clear auth state and redirect to login
-      _jwtAccessToken = null;
-      redirectToLogin();
+      if (!refreshTransportFailure) {
+        // Clear auth state and redirect to login
+        _jwtAccessToken = null;
+        redirectToLogin();
+      }
     }
 
     const retryConfig = error.config;
