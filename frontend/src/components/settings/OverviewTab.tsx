@@ -26,11 +26,14 @@ export interface OverviewTabProps {
   wikiEnabled: boolean;
 }
 
-function StatusDot({ ok }: { ok: boolean }) {
+function StatusDot({ ok, checking }: { ok: boolean; checking?: boolean }) {
+  // While the first poll is in flight the service is UNKNOWN, not down —
+  // a muted dot never reads as the destructive "down" verdict (issue #774,
+  // UI-R3-01; the same "UNKNOWN is not DOWN" rule useHealthCheck applies).
   return (
     <span
       className={`inline-block h-2 w-2 rounded-full ${
-        ok ? "bg-emerald-500" : "bg-destructive"
+        checking ? "bg-muted-foreground/40" : ok ? "bg-emerald-500" : "bg-destructive"
       }`}
       aria-hidden
     />
@@ -70,29 +73,29 @@ export function OverviewTab({
         <CardContent className="space-y-2">
           <div className="flex items-center justify-between text-sm">
             <span className="flex items-center gap-2">
-              <StatusDot ok={health.backend} />
+              <StatusDot ok={health.backend} checking={health.loading} />
               Backend
             </span>
             <span className="text-muted-foreground capitalize">
-              {health.backend ? "ok" : "down"}
+              {health.loading ? "checking" : health.backend ? "ok" : "down"}
             </span>
           </div>
           <div className="flex items-center justify-between text-sm">
             <span className="flex items-center gap-2">
-              <StatusDot ok={health.embeddings} />
+              <StatusDot ok={health.embeddings} checking={health.loading} />
               Embedding service
             </span>
             <span className="text-muted-foreground capitalize">
-              {health.embeddings ? "ok" : "down"}
+              {health.loading ? "checking" : health.embeddings ? "ok" : "down"}
             </span>
           </div>
           <div className="flex items-center justify-between text-sm">
             <span className="flex items-center gap-2">
-              <StatusDot ok={health.chat} />
+              <StatusDot ok={health.chat} checking={health.loading} />
               Chat service
             </span>
             <span className="text-muted-foreground capitalize">
-              {health.chat ? "ok" : "down"}
+              {health.loading ? "checking" : health.chat ? "ok" : "down"}
             </span>
           </div>
           {connectionResult && (

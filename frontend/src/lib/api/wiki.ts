@@ -287,6 +287,9 @@ export async function promoteMemoryToWiki(request: PromoteMemoryRequest): Promis
 export async function listWikiJobs(params: {
   vault_id: number;
   status?: string;
+  /** Server-side row bound (#774 / TQ-sweep-B09-01): caps the query and the
+   *  payload instead of shipping the whole job history for a client slice. */
+  limit?: number;
 }): Promise<{ jobs: WikiCompileJob[] }> {
   const response = await apiClient.get<{ jobs: WikiCompileJob[] }>("/wiki/jobs", { params });
   return response.data;

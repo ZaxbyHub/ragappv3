@@ -14,6 +14,11 @@ export interface SSEResumeState {
   lastEventId: string | null;
 }
 
+// Ten backend heartbeats (CHAT_HEARTBEAT_INTERVAL = 15 s, chat.py): a healthy
+// stream always yields at least a comment within this window, so it can never
+// false-positive on a legitimate long-running generation (#774).
+const CHAT_STREAM_INACTIVITY_TIMEOUT_MS = 150_000;
+
 export async function parseSSEStream(
   reader: ReadableStreamDefaultReader<Uint8Array>,
   callbacks: ChatStreamCallbacks,
@@ -38,7 +43,53 @@ export async function parseSSEStream(
   ]);
 
   while (true) {
-    const { done, value } = await reader.read();
+    // Inactivity guard (#774 / TQ-sweep-B05-03): the backend emits an SSE
+    // heartbeat comment every CHAT_HEARTBEAT_INTERVAL (15 s) even during long
+    // generation gaps, so a stream that yields no bytes for ten intervals is
+    // dead, not slow. The race (not reader.read() itself) is what lets this
+    // loop notice and tear the connection down. Same shape as
+    // useDraftRoomEvents' readWithInactivityTimeout; kept local because lib
+    // must not import from hooks.
+    let readResult: ReadableStreamReadResult<Uint8Array>;
+    try {
+      readResult = await new Promise<ReadableStreamReadResult<Uint8Array>>((resolve, reject) => {
+        const inactivity = new Error("chat_stream_inactivity");
+        inactivity.name = "ChatStreamInactivityError";
+        const timer = setTimeout(() => reject(inactivity), CHAT_STREAM_INACTIVITY_TIMEOUT_MS);
+        reader.read().then(
+          (result) => {
+            clearTimeout(timer);
+            resolve(result);
+          },
+          (err) => {
+            clearTimeout(timer);
+            reject(err);
+          }
+        );
+      });
+    } catch (err) {
+      if (!(err instanceof Error) || err.name !== "ChatStreamInactivityError") {
+        // A genuine read failure keeps its original propagation (the outer
+        // catch forwards it); only the deadline takes the stalled path.
+        throw err;
+      }
+      // Stalled stream: tear down the reader so a hung-but-open connection is
+      // actually cancelled rather than abandoned, then take the same path as
+      // an EOF without the completion marker (CHAT-004): interrupted,
+      // retryable via the resume machinery. Never fire onComplete here — a
+      // stall is not a completion.
+      await Promise.resolve(reader.cancel()).catch(() => {});
+      if (!completed) {
+        completed = true;
+        const stalled = new Error(
+          "The response stream stalled before the answer finished."
+        );
+        stalled.name = "ChatInterruptedError";
+        callbacks.onError?.(stalled);
+      }
+      break;
+    }
+    const { done, value } = readResult;
     if (done) {
       // CHAT-004: transport EOF without the protocol completion marker is an
       // interrupted stream, not a successful completion. Surface it once so
@@ -360,8 +411,23 @@ export function chatStream(
           );
 
           if (isTokenExpired && !isTokenInvalid) {
-            // Backoff delay before retry (1 second, matching interceptor pattern)
-            await new Promise((resolve) => setTimeout(resolve, 1000));
+            // Abort-aware wait (#774 / TQ-sibling-batch-06-04): dispose()
+            // during the window resolves the sleep early, and the aborted
+            // check below keeps a disposed stream from firing a real
+            // refreshAccessToken() after the consumer is gone.
+            // Listener detached on both settle paths (PRR-003).
+            await new Promise<void>((resolve) => {
+              const onAbort = () => {
+                abortController.signal.removeEventListener("abort", onAbort);
+                clearTimeout(timer);
+                resolve();
+              };
+              const timer = setTimeout(onAbort, 1000);
+              abortController.signal.addEventListener("abort", onAbort);
+            });
+            if (abortController.signal.aborted) {
+              return;
+            }
 
             const newToken = await refreshAccessToken();
             if (newToken) {
@@ -409,16 +475,15 @@ export function chatStream(
       // the next fetch throws AbortError, ending the loop. The remaining
       // silent window while still subscribed is bounded (<= 1.5s) and
       // accepted: the turn is still making progress.
+      // Listener detached on both settle paths (PRR-003).
       await new Promise<void>((resolve) => {
-        const timer = setTimeout(resolve, RESUME_BACKOFF_MS * (attempt + 1));
-        abortController.signal.addEventListener(
-          "abort",
-          () => {
-            clearTimeout(timer);
-            resolve();
-          },
-          { once: true }
-        );
+        const onAbort = () => {
+          abortController.signal.removeEventListener("abort", onAbort);
+          clearTimeout(timer);
+          resolve();
+        };
+        const timer = setTimeout(onAbort, RESUME_BACKOFF_MS * (attempt + 1));
+        abortController.signal.addEventListener("abort", onAbort);
       });
     }
   };

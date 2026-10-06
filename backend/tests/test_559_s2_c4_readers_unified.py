@@ -410,6 +410,7 @@ class TestC3WikiJobEndpoints(unittest.IsolatedAsyncioTestCase):
         resp = await self._list_wiki_jobs(
             vault_id=1,
             status=None,
+            limit=None,
             db=self.conn,
             user=_USER,
             evaluate=_allow_all,
@@ -714,6 +715,7 @@ class TestC3MigratedHistoryVisibility(unittest.IsolatedAsyncioTestCase):
         wiki_resp = await self._list_wiki_jobs(
             vault_id=1,
             status=None,
+            limit=None,
             db=self.conn,
             user=_USER,
             evaluate=_allow_all,

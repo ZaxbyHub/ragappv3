@@ -86,6 +86,14 @@ export function purgeStaleCsrfCookies(): void {
 let _csrfToken: string | null = null;
 let _csrfFetchPromise: Promise<string> | null = null;
 
+// Bounded CSRF fetch (issue #774, TQ-sweep-B05-02): every mutating request
+// awaits the singleton below, so a hung /csrf-token wedges all writes. The
+// deadline rejects with a plain Error — never an "AbortError" and never
+// abort-worded — because AbortError is the user-cancel sentinel (chatStream's
+// catch) and an abort-worded message matches the /aborted|abort/i user-cancel
+// check in useSendMessage.
+const CSRF_FETCH_TIMEOUT_MS = 10_000;
+
 export function resetCsrfToken(): void {
   _csrfToken = null;
   _csrfFetchPromise = null;
@@ -120,7 +128,12 @@ export async function ensureCsrfToken(force: boolean = false): Promise<string> {
   }
 
   if (!_csrfFetchPromise) {
-    const newPromise: Promise<string> = fetch(`${API_BASE_URL}/csrf-token`, { credentials: "include" })
+    const controller = new AbortController();
+    const deadline = setTimeout(() => controller.abort(), CSRF_FETCH_TIMEOUT_MS);
+    const newPromise: Promise<string> = fetch(`${API_BASE_URL}/csrf-token`, {
+        credentials: "include",
+        signal: controller.signal,
+      })
       .then(async (resp) => {
         if (!resp.ok) throw new Error("Failed to fetch CSRF token");
         const data = await resp.json();
@@ -130,7 +143,19 @@ export async function ensureCsrfToken(force: boolean = false): Promise<string> {
         const token: string = data.csrf_token;
         _csrfToken = token;
         return token;
-      });
+      })
+      .catch((err: unknown) => {
+        if (controller.signal.aborted) {
+          // Our own deadline fired (not a caller cancel — this fetch has no
+          // external signal): surface the timeout, which settles the promise
+          // and lets the singleton clear below so a retry issues a new fetch.
+          const timeout = new Error("csrf token fetch timed out");
+          (timeout as Error & { cause?: unknown }).cause = err;
+          throw timeout;
+        }
+        throw err;
+      })
+      .finally(() => clearTimeout(deadline));
     _csrfFetchPromise = newPromise;
     newPromise
       .catch(() => {
@@ -197,7 +222,14 @@ export function attachCsrfInterceptor(instance: ReturnType<typeof axios.create>)
         resetCsrfToken(); // force refresh on next request
         purgeStaleCsrfCookies(); // drop shadow cookies before refetch
         config._csrfRetry = true;
-        const newToken = await ensureCsrfToken(true);
+        let newToken: string;
+        try {
+          newToken = await ensureCsrfToken(true);
+        } catch {
+          // Token fetch failed (incl. the #774 deadline) — keep the caller's
+          // original CSRF error instead of surfacing the fetch failure.
+          return Promise.reject(error);
+        }
         if (!config.headers) {
           config.headers = {};
         }
@@ -256,6 +288,15 @@ export function resetSubpathRefreshDiagnostic(): void {
 }
 
 // Standalone refresh function to avoid circular dependencies
+/**
+ * Silent token refresh (singleton — concurrent callers share one in-flight
+ * attempt). Failure contract (#774): REJECTS for transport-class failures
+ * (network error, the internal deadline, HTTP 5xx) and RESOLVES `null` when
+ * the server rejected the session (401, CSRF-marked 403, or any other 4xx);
+ * a 2xx body that does not parse also resolves `null` (pre-#774 parity).
+ * Callers: treat a rejection as "backend unavailable — keep the session and
+ * surface the error"; treat `null` as "session rejected — clear auth".
+ */
 export async function refreshAccessToken(): Promise<string | null> {
   if (_refreshInFlight) {
     return _refreshInFlight;
@@ -266,46 +307,92 @@ export async function refreshAccessToken(): Promise<string | null> {
   return _refreshInFlight;
 }
 
+// Bounded refresh fetch (issue #774, TQ-sweep-B05-02): a hung /auth/refresh
+// wedges all 401 recovery behind the singleton above. Same error-shape rules
+// as the CSRF deadline: the timeout is a plain Error, never an AbortError and
+// never abort-worded (user-cancel sentinels).
+const AUTH_REFRESH_TIMEOUT_MS = 10_000;
+
 async function _doRefresh(): Promise<string | null> {
+  // The /auth/refresh endpoint requires the CSRF token.
+  // Read it from the non-httpOnly cookie; if missing, fetch a fresh one.
+  // Force a server-issued token: the jar's cookie may have expired in step
+  // with its Redis TTL (both 900s) while the access token outlived it, which
+  // is exactly when a silent refresh fires.
+  let csrfToken: string | null = null;
   try {
-    // The /auth/refresh endpoint requires the CSRF token.
-    // Read it from the non-httpOnly cookie; if missing, fetch a fresh one.
-    // Force a server-issued token: the jar's cookie may have expired in step
-    // with its Redis TTL (both 900s) while the access token outlived it, which
-    // is exactly when a silent refresh fires.
-    let csrfToken: string | null = null;
-    try {
-      csrfToken = await ensureCsrfToken(true);
-    } catch {
-      // proceed without CSRF — server will reject if required
-    }
+    csrfToken = await ensureCsrfToken(true);
+  } catch {
+    // proceed without CSRF — server will reject if required
+  }
 
-    const headers: Record<string, string> = {};
-    if (csrfToken) {
-      headers["X-CSRF-Token"] = csrfToken;
-    }
+  const headers: Record<string, string> = {};
+  if (csrfToken) {
+    headers["X-CSRF-Token"] = csrfToken;
+  }
 
-    const response = await fetch(`${API_BASE_URL}/auth/refresh`, {
+  const controller = new AbortController();
+  const deadline = setTimeout(() => controller.abort(), AUTH_REFRESH_TIMEOUT_MS);
+  const stopDeadline = () => clearTimeout(deadline);
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE_URL}/auth/refresh`, {
       method: "POST",
       credentials: "include", // Send httpOnly cookie with refresh token
       headers,
+      signal: controller.signal,
     });
-    if (!response.ok) {
-      if (isAuthShapedRefreshRejection(response)) {
-        diagnoseSubpathRefreshFailure();
-      }
+  } catch (err) {
+    stopDeadline();
+    if (controller.signal.aborted) {
+      const timeout = new Error("auth refresh timed out");
+      (timeout as Error & { cause?: unknown }).cause = err;
+      throw timeout;
+    }
+    // Network failure — transport-class by contract (#774): rethrow so the
+    // auth store keeps the session instead of treating an outage as a
+    // session rejection. Callers that cannot throw already catch this.
+    throw err;
+  }
+  if (!response.ok) {
+    stopDeadline();
+    if (isAuthShapedRefreshRejection(response)) {
+      diagnoseSubpathRefreshFailure();
       return null;
     }
-    // /auth/refresh rotates the CSRF cookie (issue_csrf_token in the handler).
-    // Drop the cached token so the next mutating request re-reads the cookie
-    // instead of sending the stale pre-refresh token (403 CSRF mismatch).
-    resetCsrfToken();
-    const data = await response.json();
-    _jwtAccessToken = data.access_token;
-    _refreshMismatchDiagnosed = false;
-    return data.access_token;
-  } catch {
+    if (response.status >= 500) {
+      // A 5xx is an outage, not a session verdict (#774) — transport-class.
+      throw new Error(`auth refresh failed with status ${response.status}`);
+    }
     return null;
+  }
+  // /auth/refresh rotates the CSRF cookie (issue_csrf_token in the handler).
+  // Drop the cached token so the next mutating request re-reads the cookie
+  // instead of sending the stale pre-refresh token (403 CSRF mismatch).
+  resetCsrfToken();
+  try {
+    // The deadline covers the body read too (#774, reviewer question): a
+    // server that sends headers and then stalls the body would otherwise
+    // wedge the _refreshInFlight singleton exactly like a hung fetch.
+    const data = await response.json();
+    stopDeadline();
+    _jwtAccessToken = data.access_token ?? null;
+    _refreshMismatchDiagnosed = false;
+    return data.access_token ?? null;
+  } catch (err) {
+    stopDeadline();
+    if (controller.signal.aborted) {
+      const timeout = new Error("auth refresh timed out");
+      (timeout as Error & { cause?: unknown }).cause = err;
+      throw timeout;
+    }
+    if (err instanceof SyntaxError) {
+      // A 2xx whose body does not parse (e.g. a proxy's 200 + HTML) keeps
+      // today's behavior: a failed refresh, not a transport error (#774).
+      return null;
+    }
+    // Any other body-read failure is transport-class.
+    throw err;
   }
 }
 
@@ -362,6 +449,14 @@ apiClient.interceptors.response.use(
       const isTokenInvalid = typeof detail === "string" && (
         detail.includes("token_invalid") || detail.includes("user_inactive")
       );
+      // True when the refresh failed for transport reasons (#774): the
+      // session is kept, no logout/redirect, and the error skips the logout
+      // below so control reaches the shared normalizer tail — callers get
+      // the standard .message/.status/.originalError shape instead of a raw
+      // AxiosError (PRR-011 / OOB F-006). No retry loop is possible: 401 is
+      // not a transient status and non-idempotent methods never
+      // transient-retry.
+      let refreshTransportFailure = false;
 
       if (_jwtAccessToken && !isTokenInvalid) {
         // Token may be refreshable — retry with exponential backoff
@@ -382,14 +477,19 @@ apiClient.interceptors.response.use(
               return apiClient(error.config);
             }
           } catch {
-            // Refresh failed — fall through to logout
+            // Refresh transport failure (#774): refreshAccessToken only
+            // rejects for transport-class failures; an auth-shaped rejection
+            // resolves null and takes the logout below.
+            refreshTransportFailure = true;
           }
         }
       }
 
-      // Clear auth state and redirect to login
-      _jwtAccessToken = null;
-      redirectToLogin();
+      if (!refreshTransportFailure) {
+        // Clear auth state and redirect to login
+        _jwtAccessToken = null;
+        redirectToLogin();
+      }
     }
 
     const retryConfig = error.config;

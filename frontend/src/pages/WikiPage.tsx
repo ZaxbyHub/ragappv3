@@ -46,6 +46,9 @@ export default function WikiPage() {
   const [lintPanelOpen, setLintPanelOpen] = useState(false);
   const [jobsPanelOpen, setJobsPanelOpen] = useState(false);
   const [activityPanelOpen, setActivityPanelOpen] = useState(false);
+  // True when the last activity fetch failed (issue #774): a failed load
+  // must not read as "No recent activity."
+  const [activityError, setActivityError] = useState(false);
   const [activityEntries, setActivityEntries] = useState<
     Array<{ id: number; action: string; page_title?: string; user?: string; created_at: string }>
   >([]);
@@ -160,11 +163,28 @@ export default function WikiPage() {
   // Fetch activity feed when panel opens
   useEffect(() => {
     if (!activityPanelOpen || !activeVaultId) return;
+    // A superseded fetch (vault switch / panel re-open) must not stamp its
+    // outcome over the current feed (PRR-006).
+    let cancelled = false;
     setActivityLoading(true);
     getWikiActivityFeed(activeVaultId, 50)
-      .then((data) => setActivityEntries(Array.isArray(data) ? data : data.entries ?? []))
-      .catch(() => setActivityEntries([]))
-      .finally(() => setActivityLoading(false));
+      .then((data) => {
+        if (cancelled) return;
+        setActivityEntries(Array.isArray(data) ? data : data.entries ?? []);
+        setActivityError(false);
+      })
+      .catch(() => {
+        // A failed load must not read as "no activity" (#774).
+        if (cancelled) return;
+        setActivityEntries([]);
+        setActivityError(true);
+      })
+      .finally(() => {
+        if (!cancelled) setActivityLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [activityPanelOpen, activeVaultId]);
 
   function handleCreateClick() {
@@ -378,7 +398,12 @@ export default function WikiPage() {
               <h3 className="text-sm font-semibold">Activity Feed</h3>
             </div>
             {activityLoading && <p className="text-xs text-muted-foreground">Loading...</p>}
-            {!activityLoading && activityEntries.length === 0 && (
+            {!activityLoading && activityError && (
+              <p className="text-xs text-destructive" role="alert">
+                Failed to load activity.
+              </p>
+            )}
+            {!activityLoading && !activityError && activityEntries.length === 0 && (
               <p className="text-xs text-muted-foreground">No recent activity.</p>
             )}
             {!activityLoading && activityEntries.length > 0 && (

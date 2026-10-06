@@ -137,15 +137,34 @@ function LintFindingRow({ finding }: { finding: WikiLintFinding }) {
 function VersionHistorySection({ pageId, vaultId }: { pageId: number; vaultId: number }) {
   const [open, setOpen] = useState(false);
   const [versions, setVersions] = useState<WikiPageVersion[]>([]);
+  const [versionsError, setVersionsError] = useState(false);
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
     if (!open) return;
+    // Same cancellation discipline as BacklinksSection: a superseded fetch
+    // (page/vault change or close-during-flight) must not stamp its outcome
+    // over the current section (PRR-006).
+    let cancelled = false;
     setLoading(true);
     getWikiPageVersions(pageId, vaultId)
-      .then((data) => setVersions(Array.isArray(data) ? data : data.versions ?? []))
-      .catch(() => setVersions([]))
-      .finally(() => setLoading(false));
+      .then((data) => {
+        if (cancelled) return;
+        setVersions(Array.isArray(data) ? data : data.versions ?? []);
+        setVersionsError(false);
+      })
+      .catch(() => {
+        // A failed load must not read as "no history" (#774).
+        if (cancelled) return;
+        setVersions([]);
+        setVersionsError(true);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [open, pageId, vaultId]);
 
   return (
@@ -163,7 +182,12 @@ function VersionHistorySection({ pageId, vaultId }: { pageId: number; vaultId: n
       {open && (
         <CardContent className="px-4 pb-3">
           {loading && <p className="text-xs text-muted-foreground">Loading...</p>}
-          {!loading && versions.length === 0 && (
+          {!loading && versionsError && (
+            <p className="text-xs text-destructive" role="alert">
+              Failed to load version history.
+            </p>
+          )}
+          {!loading && !versionsError && versions.length === 0 && (
             <p className="text-xs text-muted-foreground">No version history available.</p>
           )}
           {!loading &&
@@ -189,15 +213,32 @@ function VersionHistorySection({ pageId, vaultId }: { pageId: number; vaultId: n
 function AttachmentsSection({ pageId, vaultId }: { pageId: number; vaultId: number }) {
   const [open, setOpen] = useState(false);
   const [files, setFiles] = useState<WikiPageFile[]>([]);
+  const [filesError, setFilesError] = useState(false);
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
     if (!open) return;
+    // Same cancellation discipline as BacklinksSection (PRR-006).
+    let cancelled = false;
     setLoading(true);
     getWikiPageFiles(pageId, vaultId)
-      .then((data) => setFiles(Array.isArray(data) ? data : data.files ?? []))
-      .catch(() => setFiles([]))
-      .finally(() => setLoading(false));
+      .then((data) => {
+        if (cancelled) return;
+        setFiles(Array.isArray(data) ? data : data.files ?? []);
+        setFilesError(false);
+      })
+      .catch(() => {
+        // A failed load must not read as "no attachments" (#774).
+        if (cancelled) return;
+        setFiles([]);
+        setFilesError(true);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [open, pageId, vaultId]);
 
   return (
@@ -215,7 +256,12 @@ function AttachmentsSection({ pageId, vaultId }: { pageId: number; vaultId: numb
       {open && (
         <CardContent className="px-4 pb-3">
           {loading && <p className="text-xs text-muted-foreground">Loading...</p>}
-          {!loading && files.length === 0 && (
+          {!loading && filesError && (
+            <p className="text-xs text-destructive" role="alert">
+              Failed to load attachments.
+            </p>
+          )}
+          {!loading && !filesError && files.length === 0 && (
             <p className="text-xs text-muted-foreground">No attachments.</p>
           )}
           {!loading &&
@@ -238,6 +284,7 @@ function AttachmentsSection({ pageId, vaultId }: { pageId: number; vaultId: numb
 function BacklinksSection({ pageId, vaultId }: { pageId: number; vaultId: number }) {
   const [open, setOpen] = useState(false);
   const [backlinks, setBacklinks] = useState<WikiPageLink[]>([]);
+  const [backlinksError, setBacklinksError] = useState(false);
   const [resolvedSources, setResolvedSources] = useState<Record<number, { title: string; slug: string } | null>>({});
   const [loading, setLoading] = useState(false);
 
@@ -254,6 +301,7 @@ function BacklinksSection({ pageId, vaultId }: { pageId: number; vaultId: number
         const rows = Array.isArray(data) ? data : data.backlinks ?? [];
         if (cancelled) return;
         setBacklinks(rows);
+        setBacklinksError(false);
         // AC40 (#515): rows normally carry source_title/source_slug from the
         // backend's JOIN onto wiki_pages; resolve legacy rows (null fields)
         // via a page fetch so every backlink still shows its source page.
@@ -276,7 +324,11 @@ function BacklinksSection({ pageId, vaultId }: { pageId: number; vaultId: number
         });
       })
       .catch(() => {
-        if (!cancelled) setBacklinks([]);
+        // A failed load must not read as "nothing links here" (#774).
+        if (!cancelled) {
+          setBacklinks([]);
+          setBacklinksError(true);
+        }
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -301,7 +353,12 @@ function BacklinksSection({ pageId, vaultId }: { pageId: number; vaultId: number
       {open && (
         <CardContent className="px-4 pb-3">
           {loading && <p className="text-xs text-muted-foreground">Loading...</p>}
-          {!loading && backlinks.length === 0 && (
+          {!loading && backlinksError && (
+            <p className="text-xs text-destructive" role="alert">
+              Failed to load backlinks.
+            </p>
+          )}
+          {!loading && !backlinksError && backlinks.length === 0 && (
             <p className="text-xs text-muted-foreground">No pages link to this page.</p>
           )}
           {!loading &&
