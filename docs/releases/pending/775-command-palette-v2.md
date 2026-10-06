@@ -51,6 +51,13 @@ TQ-sibling-batch-03-05).
   (`/search/unified`, #515) with a stale-response guard; entity hits render
   below the commands and navigate to their `url_hint`. Render order is
   pinned: destinations, then actions, then hits.
+- **Palette navigation honors unsaved changes.** Both palette navigation
+  paths — destination commands and entity-hit rows — consult the shared
+  `useNavigationGuardStore.confirmLeave` guard before `navigate()`, the same
+  contract the mobile bottom nav and App.tsx's item-select dispatch follow
+  (implementation-review round 1). A declined confirmation leaves the
+  current route and any dirty page (e.g. an unsaved Draft Room canvas)
+  intact; confirming navigates normally.
 - **The composer's slash/attach buttons are in the Tab order**
   (`tabIndex={-1}` removed; both keep their accessible names and behavior).
 - **Contract evolution (named per plan-critic round 1/3):** the
@@ -65,16 +72,18 @@ TQ-sibling-batch-03-05).
 ## Verification
 
 Frozen checks C1-C10 (issue-tracer trace `.agents/issue-traces/775-command-palette-v2`,
-anchor comment on #775): C1-C8 RED→GREEN, C9/C10 PRESERVING green before and
-after. New suites: `shortcutBindings.roundtrip.issue775.test.ts` (combo
+anchor comments on #775): C1-C8 RED→GREEN, C9/C10 PRESERVING green before and
+after. New suites: `shortcutBindings.roundtrip.issue775.test.ts` (4 — combo
 round-trips, `isEditableTarget`, read-time guard),
-`KeyboardShortcuts.shadowed-capture.issue775.test.tsx` (shadow-refused
-capture, Enter-in-editor, stranded-state fallback, F7-steal pin),
-`command-palette-actions.issue775.test.tsx` (shortcuts action through the
-app-wide hook, theme side effects, entity-hit navigation, DOM order).
+`KeyboardShortcuts.shadowed-capture.issue775.test.tsx` (5 — shadow-refused
+capture, Enter-in-editor, stranded-state fallback, F7-steal pin, Ctrl+J
+persists-and-fires pin), `command-palette-actions.issue775.test.tsx` (5 —
+shortcuts action through the app-wide hook, theme side effects, entity-hit
+navigation, destinations-before-actions DOM order, declined-guard blocks
+palette navigation) — 14/14.
 Sibling suites re-run green: `command-palette.issue258`,
 `KeyboardShortcuts.rebind`/`.test`/`.capture`, `SessionRail.rebind`,
-`Composer.slash-button`, `chat-parity-preserving`, `ChatShell.error-boundary`.
+`Composer.slash-button`, `chat-parity-preserving`, `ChatShell` suites.
 
 ## Known limitations
 
