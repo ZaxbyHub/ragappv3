@@ -27,7 +27,9 @@ TQ-sweep-B09-01, TQ-sweep-B05-02, TQ-sweep-B05-03, TQ-sibling-batch-06-04).
   cannot swallow them. A rate-limited refresh (HTTP 429 — the refresh endpoint
   enforces 30/minute, see the 659 release note) still resolves `null` and
   clears the session, exactly as before; only network errors and 5xx changed
-  behavior.
+  behavior. Known narrow edge (unchanged from before): if the CSRF token
+  fetch itself times out while `/auth/refresh` answers, the refresh proceeds
+  without a CSRF token and a CSRF-marked 403 still clears the session.
 - **The CSRF and refresh fetches are bounded.** Both `/csrf-token`
   (`ensureCsrfToken`) and `/auth/refresh` (`_doRefresh`) carry an
   AbortController + 10 s setTimeout deadline (fake-timer-friendly; no

@@ -52,13 +52,19 @@ describe("useDraftRoomEvents issue 774 hardening (feedback pins)", () => {
     const origRemove = AbortSignal.prototype.removeEventListener;
     vi.spyOn(AbortSignal.prototype, "addEventListener").mockImplementation(
       function (this: AbortSignal, ...args: Parameters<AbortSignal["addEventListener"]>) {
-        if (args[0] === "abort") addCount += 1;
+        // Count only the hook's own listeners: vitest's internals also add
+        // 'abort' listeners on AbortSignals during a test run.
+        if (args[0] === "abort" && (new Error().stack || "").includes("useDraftRoomEvents.ts")) {
+          addCount += 1;
+        }
         return origAdd.apply(this, args);
       }
     );
     vi.spyOn(AbortSignal.prototype, "removeEventListener").mockImplementation(
       function (this: AbortSignal, ...args: Parameters<AbortSignal["removeEventListener"]>) {
-        if (args[0] === "abort") removeCount += 1;
+        if (args[0] === "abort" && (new Error().stack || "").includes("useDraftRoomEvents.ts")) {
+          removeCount += 1;
+        }
         return origRemove.apply(this, args);
       }
     );
@@ -113,30 +119,27 @@ describe("useDraftRoomEvents issue 774 hardening (feedback pins)", () => {
     }
   });
 
-  it("does not fetch again after dispose during the reconnect backoff, and abort-listener bookkeeping balances", async () => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-    // Non-401 failure -> "error" -> reconnect after the 1s base backoff.
-    fetchMock.mockResolvedValue(errorResponse(503, "unavailable"));
+  it("the first backoff cycle's timer-win settle detaches its listener (exact balance), and dispose ends the loop", async () => {
+    // Call 1 fails (-> "error" -> 1s backoff); from call 2 on the fetch hangs
+    // forever, which FREEZES the loop at a deterministic point: fetch(2) is
+    // only invoked after cycle 1's backoff fully settled, so at that instant
+    // addCount === removeCount === 1 exactly. Under the PRR-003 mutation
+    // (timer path does not remove), removeCount stays 0 and this fails.
+    vi.useFakeTimers();
+    fetchMock.mockResolvedValueOnce(errorResponse(503, "unavailable"));
+    fetchMock.mockImplementation(
+      () => new Promise<Response>(() => undefined)
+    );
 
-    const { unmount } = renderEvents();
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
-    // Advance past the first backoff so one full add->timer-settle cycle ran
-    // (the timer-win path must have detached its listener).
+    renderEvents();
+    // Deterministic clock: at +2s the 1s backoff timer has fired (cycle 1
+    // fully settled: add -> timer-win -> remove) and fetch(2) is invoked and
+    // hangs — freezing the loop exactly there.
     await vi.advanceTimersByTimeAsync(2_000);
-    const addsAfterCycle = addCount;
 
-    unmount();
-
-    await vi.advanceTimersByTimeAsync(10_000);
-    // The loop exited on abort: no further fetches after the ones already
-    // in flight when unmount happened.
-    expect(fetchMock.mock.calls.length).toBeLessThan(4);
-    // Leak-class property (PRR-003): the TIMER-WIN settle path detaches its
-    // listener — at least one full backoff cycle ran and removed itself.
-    // (Exact add/remove balance is not asserted: the cycle pending at
-    // unmount settles via abort concurrently with the loop exit under
-    // shouldAdvanceTime, so its removal races this assertion.)
-    expect(addsAfterCycle).toBeGreaterThanOrEqual(1);
-    expect(removeCount).toBeGreaterThanOrEqual(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(addCount).toBe(1);
+    expect(removeCount).toBe(1);
+    expect(removeCount).toBe(addCount);
   });
 });

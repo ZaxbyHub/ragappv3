@@ -94,6 +94,56 @@ describe("useWikiEventStream issue 774 hardening", () => {
     }
   });
 
+  it("the first backoff cycle's timer-win settle detaches its listener (exact balance; F-004 wiki leg)", async () => {
+    vi.useFakeTimers();
+    // Call 1 fails (-> "error" -> 1s backoff); from call 2 on the fetch hangs
+    // forever, freezing the loop at the instant cycle 1 fully settled.
+    fetchMock.mockResolvedValueOnce(errorResponse(503, "unavailable"));
+    fetchMock.mockImplementation(() => new Promise<Response>(() => undefined));
+
+    let addCount = 0;
+    let removeCount = 0;
+    const origAdd = AbortSignal.prototype.addEventListener;
+    const origRemove = AbortSignal.prototype.removeEventListener;
+    const spyAdd = vi
+      .spyOn(AbortSignal.prototype, "addEventListener")
+      .mockImplementation(function (
+        this: AbortSignal,
+        ...args: Parameters<AbortSignal["addEventListener"]>
+      ) {
+        if (args[0] === "abort" && (new Error().stack || "").includes("useWikiEventStream.ts")) {
+          addCount += 1;
+        }
+        return origAdd.apply(this, args);
+      });
+    const spyRemove = vi
+      .spyOn(AbortSignal.prototype, "removeEventListener")
+      .mockImplementation(function (
+        this: AbortSignal,
+        ...args: Parameters<AbortSignal["removeEventListener"]>
+      ) {
+        if (args[0] === "abort" && (new Error().stack || "").includes("useWikiEventStream.ts")) {
+          removeCount += 1;
+        }
+        return origRemove.apply(this, args);
+      });
+
+    try {
+      renderHook(() => useWikiEventStream(42, vi.fn()));
+      await vi.advanceTimersByTimeAsync(2_000);
+
+      // Deterministic exact balance: the timer-win settle path detached.
+      // (Mutation: timer path skipping removeEventListener leaves remove 0
+      // and fails this pin — mirrors the draft-hook pin, PRR-003/F-004.)
+      expect(addCount).toBe(1);
+      expect(removeCount).toBe(1);
+      expect(removeCount).toBe(addCount);
+    } finally {
+      spyAdd.mockRestore();
+      spyRemove.mockRestore();
+    }
+  });
+
   it("does not fetch again after dispose during the reconnect backoff", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     // Non-401 failure -> "error" -> reconnect after RECONNECT_BASE_MS (1s).

@@ -288,6 +288,15 @@ export function resetSubpathRefreshDiagnostic(): void {
 }
 
 // Standalone refresh function to avoid circular dependencies
+/**
+ * Silent token refresh (singleton — concurrent callers share one in-flight
+ * attempt). Failure contract (#774): REJECTS for transport-class failures
+ * (network error, the internal deadline, HTTP 5xx) and RESOLVES `null` when
+ * the server rejected the session (401, CSRF-marked 403, or any other 4xx);
+ * a 2xx body that does not parse also resolves `null` (pre-#774 parity).
+ * Callers: treat a rejection as "backend unavailable — keep the session and
+ * surface the error"; treat `null` as "session rejected — clear auth".
+ */
 export async function refreshAccessToken(): Promise<string | null> {
   if (_refreshInFlight) {
     return _refreshInFlight;
@@ -367,7 +376,7 @@ async function _doRefresh(): Promise<string | null> {
     // wedge the _refreshInFlight singleton exactly like a hung fetch.
     const data = await response.json();
     stopDeadline();
-    _jwtAccessToken = data.access_token;
+    _jwtAccessToken = data.access_token ?? null;
     _refreshMismatchDiagnosed = false;
     return data.access_token ?? null;
   } catch (err) {

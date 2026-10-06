@@ -158,6 +158,11 @@ function OrgsPageContent() {
   }, []);
 
   const handleUserSearchChange = (value: string) => {
+    // The error described the PREVIOUS query: editing the field retires it,
+    // so the destructive line cannot bleed into the new query's debounce
+    // window (PRR-005 re-gate; the blank-query reset in searchUsers covers
+    // the explicit-clear path).
+    setUserSearchError(false);
     setUserSearchQuery(value);
     setSelectedUser(null);
   };
