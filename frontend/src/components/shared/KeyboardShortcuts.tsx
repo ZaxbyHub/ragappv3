@@ -122,14 +122,16 @@ export function KeyboardShortcutsDialog({ open, onOpenChange }: { open: boolean;
       // Issue #775 shadow refusal — runs BEFORE the conflict-clearing loop so
       // a refused capture leaves persisted state untouched. A combo that
       // could never fire must not be persisted: after the resolver runs, the
-      // combo is still claimed when ANY other rebindable shortcut's
-      // post-clear effective binding equals it (a steal of a persisted combo
-      // reverts that holder to its default, so only a combo equal to the
-      // holder's default remains claimed — today that collapses to the
-      // reserved "Ctrl+K"), or when the combo is in PALETTE_TOGGLE_COMBOS
-      // (the palette's app-wide window listener claims it off /chat).
+      // combo is still claimed when ANOTHER rebindable shortcut's post-clear
+      // effective binding equals it (a steal of a persisted combo reverts
+      // that holder to its default, so only a combo equal to the holder's
+      // default remains claimed), or — for showShortcuts — when the combo is
+      // in PALETTE_TOGGLE_COMBOS (the palette's app-wide window listener
+      // claims it off /chat; the reserve is one-directional because
+      // focusSearch capturing its OWN shipped default "Ctrl+K" is an
+      // identity rebind that fires fine and was always allowed).
       const current = loadShortcutBindings();
-      let shadowed = PALETTE_TOGGLE_COMBOS.has(combo);
+      let shadowed = capturing === "showShortcuts" && PALETTE_TOGGLE_COMBOS.has(combo);
       if (!shadowed) {
         for (const other of shortcuts) {
           if (other.id === capturing || !other.rebindable) continue;

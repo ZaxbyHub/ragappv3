@@ -23,10 +23,12 @@ TQ-sibling-batch-03-05).
 - **Rebind capture can no longer persist a combo that cannot fire.** Rebind
   capture refuses any combo that remains shadowed after the conflict
   resolver runs — still claimed by another rebindable shortcut's post-clear
-  effective binding (today that collapses to `Ctrl+K`) or by the palette's
-  reserved combo — leaving the capture armed, exactly like a bare modifier
-  press, in BOTH directions (the reverse steal of `?` for `focusSearch` is
-  refused too). A read-time guard in `loadShortcutBindings` also ignores a
+  effective binding (today that collapses to `Ctrl+K`), and for
+  `showShortcuts` also the palette's reserved combo — leaving the capture
+  armed, exactly like a bare modifier press, in BOTH directions (the reverse
+  steal of `?` for `focusSearch` is refused; re-capturing `focusSearch`'s
+  own shipped default `Ctrl+K` stays allowed — an identity rebind that
+  fires). A read-time guard in `loadShortcutBindings` also ignores a
   pre-existing persisted `showShortcuts: "Ctrl+K"` (writable by pre-#775
   builds) so that state can no longer strand the shortcuts dialog behind a
   dead binding; the guard never writes — the dead entry is dropped from
@@ -88,21 +90,30 @@ TQ-sibling-batch-03-05).
 
 Frozen checks C1-C10 (issue-tracer trace `.agents/issue-traces/775-command-palette-v2`,
 anchor comments on #775): C1-C8 RED→GREEN, C9/C10 PRESERVING green before and
-after. New suites: `shortcutBindings.roundtrip.issue775.test.ts` (4 — combo
-round-trips, `isEditableTarget`, read-time guard),
-`KeyboardShortcuts.shadowed-capture.issue775.test.tsx` (5 — shadow-refused
+after. Issue-775 pin suites (29 tests at the final head):
+`shortcutBindings.roundtrip.issue775.test.ts` (4 — combo round-trips,
+`isEditableTarget`, read-time guard),
+`KeyboardShortcuts.shadowed-capture.issue775.test.tsx` (10 — shadow-refused
 capture, Enter-in-editor, stranded-state fallback, F7-steal pin, Ctrl+J
-persists-and-fires pin), `command-palette-actions.issue775.test.tsx` (5 —
-shortcuts action through the app-wide hook, theme side effects, entity-hit
-navigation, destinations-before-actions DOM order, declined-guard blocks
-palette navigation) — 14/14.
+persists-and-fires pin, reverse-steal refusal, identity-rebind allowed, IME,
+defaultPrevented, Ctrl+K-in-composer carve-out),
+`command-palette-actions.issue775.test.tsx` (11 — shortcuts action through
+the app-wide hook incl. a non-default rebind, theme side effects + resolvedDark
+direction, entity-hit navigation + declined guard on BOTH navigation sites,
+destinations-before-actions DOM order, toggle-close reset + closure,
+copy-link toasts, min-char/empty state),
+`ctrl-k-visible-owner.issue775.test.tsx` (3 — visible-owner rule incl. the
+hidden-only and no-`checkVisibility` fallbacks),
+`command-palette-capability-off.issue775.test.tsx` (1 — capability-OFF
+exclusion), `app-shortcuts-shell.issue775.test.tsx` (1 — "?" through the real
+App shell).
 Sibling suites re-run green: `command-palette.issue258`,
 `KeyboardShortcuts.rebind`/`.test`/`.capture`, `SessionRail.rebind`,
 `Composer.slash-button`, `chat-parity-preserving`, `ChatShell` suites.
-Check-id mapping (the C1-C10 ids above and in the trace/anchor comments on
-#775 map to the shipped files' own headers): ctrl-k-ownership.l04 = C1/AC1;
-KeyboardShortcuts.l04 = C2+C3/AC2+AC3; command-palette.l04 = C4-C7/AC4-AC7;
-Composer.l04 = C8/AC8; issue258 = C9/AC9; rebind = C10/AC10.
+Check-id mapping (trace ids C1-C10 → behaviors; shipped files self-label
+where noted): ctrl-k-ownership.l04 = C1/AC1; KeyboardShortcuts.l04 =
+C2+C3/AC2+AC3; command-palette.l04 = C4-C7/AC4-AC7; Composer.l04 = C8/AC8;
+command-palette.issue258 = C9/AC9; KeyboardShortcuts.rebind = C10/AC10.
 
 ## Known limitations
 
@@ -115,9 +126,9 @@ Composer.l04 = C8/AC8; issue258 = C9/AC9; rebind = C10/AC10.
   fires on that key everywhere OUTSIDE text-entry surfaces (inside editors
   non-modifier combos never fire) — choose rebinds accordingly.
 - The visible-owner rule for `focusSearch` uses `checkVisibility` where the
-  browser provides it; older browsers without that API keep the pre-#775
-  claim behavior (on narrow viewports the palette may open instead of the
-  search focusing).
+  browser provides it. Older browsers without that API keep the pre-#775
+  claim behavior: the hidden instance still claims Ctrl+K and the keypress
+  does nothing visible (the pre-fix symptom persists there).
 - The palette's own toggle combo is reserved and not user-rebindable — the
   shipped contract, now enforced at capture time instead of silently
   shadowed.

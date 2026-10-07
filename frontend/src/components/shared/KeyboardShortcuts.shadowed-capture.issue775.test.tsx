@@ -207,6 +207,25 @@ describe("issue #775 — rebind capture safety nets", () => {
     ).toBeInTheDocument();
   });
 
+  it("focusSearch re-capturing its own default Ctrl+K is an allowed identity rebind (delta review r1)", () => {
+    // The reserved-combo clause is showShortcuts-scoped: focusSearch IS the
+    // /chat claimant of Ctrl+K, so persisting its own default fires fine and
+    // must not be silently refused (delta-review round 1 regression catch).
+    render(<KeyboardShortcutsDialog open={true} onOpenChange={noop} />);
+    fireEvent.click(
+      screen.getByRole("button", { name: /rebind shortcut: focus session search/i })
+    );
+    act(() => {
+      fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    });
+
+    expect(loadShortcutBindings()).toEqual({ focusSearch: "Ctrl+K" });
+    expect(
+      screen.queryByText(/press/i),
+      "the capture completed (not refused)"
+    ).toBeNull();
+  });
+
   it("an IME-composing keydown never opens the dialog (PRR-308a)", () => {
     const hooked = renderHook(() => useKeyboardShortcuts());
     expect(isOpen(hooked.result)).toBe(false);

@@ -238,7 +238,9 @@ describe("issue #775 — palette action wiring", () => {
 
   it("Ctrl+K toggle-close resets query and hits like every other close path", () => {
     // Issue #775 review PRR-103/PRR-306: the keyboard toggle-close is a
-    // third close path — it must leave the same clean state as Escape.
+    // third close path — it must leave the same clean state as Escape. The
+    // closure assertion between close and reopen pins the close DIRECTION
+    // (a can-only-open palette fails here).
     mountShell();
     const palette = openPalette();
     fireEvent.change(within(palette).getByLabelText("Search commands"), {
@@ -246,6 +248,10 @@ describe("issue #775 — palette action wiring", () => {
     });
 
     fireEvent.keyDown(document.body, { key: "k", ctrlKey: true }); // toggle-close
+    expect(
+      screen.queryByRole("dialog"),
+      "Ctrl+K while open must CLOSE the palette"
+    ).toBeNull();
 
     const reopened = openPalette();
     const input = within(reopened).getByLabelText("Search commands") as HTMLInputElement;
@@ -362,12 +368,20 @@ describe("issue #775 — palette action wiring", () => {
   });
 
   it("queries shorter than two characters never hit the search API; dead queries show the empty state", () => {
-    // Issue #775 review PRR-315.
+    // Issue #775 review PRR-315: the min-char guard is pinned PAST the
+    // debounce (a synchronous not-called assertion alone passes with the
+    // guard deleted — the debounced call would land 300ms out).
     mountShell();
     const palette = openPalette();
     const input = within(palette).getByLabelText("Search commands");
     fireEvent.change(input, { target: { value: "z" } });
-    expect(searchMock.unifiedSearch).not.toHaveBeenCalled();
+    vi.useFakeTimers();
+    try {
+      vi.advanceTimersByTime(400); // past the 300ms debounce
+      expect(searchMock.unifiedSearch).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
 
     fireEvent.change(input, { target: { value: "zzzz" } });
     expect(screen.getByText("No matching commands")).toBeTruthy();
