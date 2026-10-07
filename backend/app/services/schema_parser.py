@@ -197,32 +197,38 @@ class SchemaParser:
         # the matched leading verb itself labels the statement.
         return (match.group(1) or match.group(0)).strip().split()[-1].upper()
 
-    @staticmethod
-    def _strip_comments(text: str) -> str:
+    # Quote openers whose spans protect comment markers inside them —
+    # the same three spellings _QUOTED_IDENTIFIER accepts ('...' strings
+    # and "..." / `...` quoted identifiers), each with a doubled-quote
+    # escape so 'a''b' stays one span.
+    _QUOTE_CLOSER = {"'": "'", '"': '"', '`': '`'}
+
+    @classmethod
+    def _strip_comments(cls, text: str) -> str:
         """Remove -- line comments and /* */ block comments, quote-aware.
 
-        Comment markers inside single-quoted string literals are content,
-        not comments, and survive; '' doubled-quote escapes keep the
-        literal open. Comment markers inside comments are consumed with
-        their comment.
+        Comment markers inside ANY quoted span — '...' strings, "..."
+        and `...` quoted identifiers — are content, not comments, and
+        survive verbatim (a doubled quote escapes inside its span).
+        Comment markers inside comments are consumed with their comment.
         """
         out: List[str] = []
         i, n = 0, len(text)
-        in_string = False
+        closer = ''
         while i < n:
             ch = text[i]
-            if in_string:
+            if closer:
                 out.append(ch)
-                if ch == "'":
-                    if i + 1 < n and text[i + 1] == "'":
-                        out.append("'")
+                if ch == closer:
+                    if i + 1 < n and text[i + 1] == closer:
+                        out.append(closer)
                         i += 2
                         continue
-                    in_string = False
+                    closer = ''
                 i += 1
                 continue
-            if ch == "'":
-                in_string = True
+            if ch in cls._QUOTE_CLOSER:
+                closer = ch
                 out.append(ch)
                 i += 1
                 continue
@@ -239,6 +245,45 @@ class SchemaParser:
             i += 1
         return ''.join(out)
 
+    @classmethod
+    def _split_statements(cls, text: str) -> List[str]:
+        """Split SQL text on ';' OUTSIDE quoted spans.
+
+        Same quote model as _strip_comments ('...', "...", `...` with
+        doubled-quote escapes), so a semicolon inside any literal no
+        longer splits a statement's chunk boundary.
+        """
+        statements: List[str] = []
+        current: List[str] = []
+        i, n = 0, len(text)
+        closer = ''
+        while i < n:
+            ch = text[i]
+            if closer:
+                current.append(ch)
+                if ch == closer:
+                    if i + 1 < n and text[i + 1] == closer:
+                        current.append(closer)
+                        i += 2
+                        continue
+                    closer = ''
+                i += 1
+                continue
+            if ch in cls._QUOTE_CLOSER:
+                closer = ch
+                current.append(ch)
+                i += 1
+                continue
+            if ch == ';':
+                statements.append(''.join(current))
+                current = []
+                i += 1
+                continue
+            current.append(ch)
+            i += 1
+        statements.append(''.join(current))
+        return statements
+
     def _extract_chunks(
         self, content: str, source_file: Optional[str] = None
     ) -> List[Dict[str, Any]]:
@@ -254,12 +299,10 @@ class SchemaParser:
         procedures, ... — becomes an ``other_sql`` chunk carrying the
         statement's whitespace-normalized text, so no SQL construct is
         silently dropped (issue #703 / T1-02-K-05). A semicolon inside a
-        comment can neither create a chunk nor merge two statements. A
-        semicolon inside a string literal can still split one long
-        statement's chunk boundary mid-literal, but both halves are
-        indexed — no statement content is lost, only the boundary is
-        approximate. A file whose residual is only comments/whitespace
-        yields zero chunks.
+        comment can neither create a chunk nor merge two statements, and
+        the statement split itself is quote-aware, so a semicolon inside
+        any literal keeps its statement whole. A file whose residual is
+        only comments/whitespace yields zero chunks.
         """
         chunks = []
 
@@ -299,7 +342,7 @@ class SchemaParser:
         residual_parts.append(content[cursor:])
         residual = ''.join(residual_parts)
 
-        for statement in residual.split(';'):
+        for statement in self._split_statements(residual):
             if not statement.strip():
                 continue
             text = ' '.join(statement.split())

@@ -201,9 +201,8 @@ def test_schema_splitter_preserves_semicolons_in_literals(tmp_path):
         "INSERT INTO t (v) VALUES ('a;b');\n", encoding="utf-8"
     )
     chunks = SchemaParser().parse(str(path))
-    joined = " ".join(c["text"] for c in chunks)
-    assert "'a;b'" in joined or ("'a" in joined and "b'" in joined)
-    assert "INSERT" in joined
+    assert len(chunks) == 1
+    assert chunks[0]["text"] == "INSERT INTO t (v) VALUES ('a;b');"
 
 
 def test_schema_comments_produce_no_chunks(tmp_path):
@@ -333,8 +332,8 @@ def test_schema_comment_markers_inside_literals_survive(tmp_path):
         encoding="utf-8",
     )
     chunks = SchemaParser().parse(str(path))
-    joined = " ".join(c["text"] for c in chunks)
-    assert "'a--b;" in joined and "comment */'" in joined  # content preserved
+    assert len(chunks) == 1
+    assert chunks[0]["text"] == "INSERT INTO t (v) VALUES ('a--b; /* not a comment */');"
 
 
 def test_schema_commented_out_create_table_not_extracted(tmp_path):
@@ -371,3 +370,44 @@ def test_schema_commented_table_plus_real_statement(tmp_path):
     assert len(tables) == 1
     assert tables[0]["metadata"]["table_name"] == "real_one"
     assert "phantom" not in " ".join(c["text"] for c in chunks)
+
+
+def test_schema_quoted_identifiers_with_comment_markers_extract(tmp_path):
+    """Comment markers inside "..." and `...` identifiers are content:
+    the table still extracts with its original spelling (table path), and
+    an INSERT into such an identifier stays one whole statement (residual
+    path) — implementation-review round 3."""
+    path = tmp_path / "quoted_markers.sql"
+    path.write_text(
+        'CREATE TABLE "weird--name" (id INT);\n'
+        "CREATE TABLE `weird/*x*/name` (id INT);\n"
+        'INSERT INTO "weird--name" VALUES (1);\n',
+        encoding="utf-8",
+    )
+    chunks = SchemaParser().parse(str(path))
+    tables = [c for c in chunks if c["metadata"]["object_type"] == "table"]
+    inserts = [
+        c
+        for c in chunks
+        if c["metadata"]["object_type"] == "other_sql"
+        and c["metadata"]["statement_type"] == "INSERT"
+    ]
+    assert {t["metadata"]["table_name"] for t in tables} == {
+        "weird--name",
+        "weird/*x*/name",
+    }
+    assert any('CREATE TABLE "weird--name"' in t["text"] for t in tables)
+    assert len(inserts) == 1
+    assert inserts[0]["text"] == 'INSERT INTO "weird--name" VALUES (1);'
+
+
+def test_schema_semicolon_inside_literal_keeps_statement_whole(tmp_path):
+    """A ';' inside a single-quoted literal does not split the statement
+    (quote-aware split; supersedes the earlier boundary-approximation)."""
+    path = tmp_path / "literal_semicolon.sql"
+    path.write_text(
+        "INSERT INTO t VALUES ('a;b');\n", encoding="utf-8"
+    )
+    chunks = SchemaParser().parse(str(path))
+    assert len(chunks) == 1
+    assert chunks[0]["text"] == "INSERT INTO t VALUES ('a;b');"
