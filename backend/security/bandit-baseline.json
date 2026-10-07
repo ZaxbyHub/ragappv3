@@ -36,7 +36,7 @@
       "SEVERITY.LOW": 62,
       "SEVERITY.MEDIUM": 60,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 85790,
+      "loc": 85998,
       "nosec": 0,
       "skipped_tests": 66
     },
@@ -387,7 +387,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1032,
+      "loc": 1033,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -803,7 +803,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 365,
+      "loc": 367,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -829,7 +829,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 1,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 3743,
+      "loc": 3865,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1180,7 +1180,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 167,
+      "loc": 176,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1492,7 +1492,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 122,
+      "loc": 196,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -3598,7 +3598,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "2020                 conn.execute(\n2021                     f\"DELETE FROM failed_chunks WHERE id IN ({placeholders})\",\n2022                     clear_ids,\n",
+      "code": "2178                 conn.execute(\n2179                     f\"DELETE FROM failed_chunks WHERE id IN ({placeholders})\",\n2180                     clear_ids,\n",
       "col_offset": 20,
       "end_col_offset": 77,
       "filename": "backend/app/services/document_processor.py",
@@ -3609,9 +3609,9 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 2021,
+      "line_number": 2179,
       "line_range": [
-        2021
+        2179
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",

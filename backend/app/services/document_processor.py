@@ -7,8 +7,10 @@ while tracking processing status in SQLite and handling file deduplication.
 
 import asyncio
 import hashlib
+import io
 import json
 import logging
+import os
 import sqlite3
 import threading
 import time
@@ -16,7 +18,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, TypeVar
 
 import pandas as pd
 
@@ -655,6 +657,43 @@ class SpreadsheetParser:
             },
         }
 
+    # Byte-order marks that unambiguously identify a CSV's codec before
+    # any fallback guessing runs (issue #703 / T1-25-K-05).
+    _CSV_BOM_CODECS = (
+        (b"\xff\xfe\x00\x00", "utf-32"),
+        (b"\x00\x00\xfe\xff", "utf-32"),
+        (b"\xef\xbb\xbf", "utf-8-sig"),
+        (b"\xff\xfe", "utf-16"),
+        (b"\xfe\xff", "utf-16"),
+    )
+
+    @classmethod
+    def _read_csv_with_encoding_fallback(cls, file_path: str) -> "pd.DataFrame":
+        """Read a CSV through a real-world encoding fallback chain.
+
+        An unambiguous BOM wins; otherwise strict UTF-8 (which also covers
+        plain ASCII and BOM'd UTF-8); on ``UnicodeDecodeError`` a lossy
+        cp1252 leg — the encoding of Excel's default "CSV (Comma
+        delimited)" Windows export — so non-ASCII bytes in that encoding
+        ingest instead of failing the whole file. Every leg keeps the
+        issue-#513 NA-preservation flags (``dtype=str``,
+        ``keep_default_na=False``).
+        """
+        data = Path(file_path).read_bytes()
+        text: Optional[str] = None
+        for bom, codec in cls._CSV_BOM_CODECS:
+            if data.startswith(bom):
+                text = data.decode(codec)
+                break
+        if text is None:
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError:
+                text = data.decode("cp1252", errors="replace")
+        return pd.read_csv(
+            io.StringIO(text), dtype=str, keep_default_na=False
+        ).fillna("")
+
     def parse(self, file_path: str) -> List[dict]:
         """
         Parse a spreadsheet file and return a list of chunk dicts.
@@ -689,8 +728,9 @@ class SpreadsheetParser:
                 # coercion turns literal cell strings like "NA"/"N/A"/"NULL" into
                 # NaN, which ``.fillna("")`` then empties and the non-empty cell
                 # filter drops — destroying literal text. With the flag, empties
-                # stay "" and every literal value round-trips.
-                df = pd.read_csv(file_path, dtype=str, keep_default_na=False).fillna("")
+                # stay "" and every literal value round-trips. The encoding
+                # fallback below keeps the flag on every leg.
+                df = self._read_csv_with_encoding_fallback(file_path)
                 sheets: dict = {"Sheet1": df}
             elif ext in {".xls", ".xlsx"}:
                 xf = pd.ExcelFile(file_path)
@@ -813,6 +853,124 @@ class IngestCancelledError(Exception):
     def __init__(self, message: str, file_id: Optional[int] = None) -> None:
         super().__init__(message)
         self.file_id = file_id
+
+
+# --- Parse deadline + per-file in-flight registry (issue #703) --------------
+#
+# The schema, spreadsheet, image and general document parse paths all run
+# synchronous parser work through asyncio.to_thread under the same
+# settings.document_parse_timeout deadline. Cancelling the await cannot
+# kill the worker thread, so a timed-out parse keeps running; the retry
+# transports requeue after 1s/2s/4s — far below the 300s default timeout —
+# which used to stack concurrent parse attempts of the SAME file on the
+# shared default executor (T1-25-S2-08). The process-wide registry below
+# refuses a new parse of a file whose previous parse has not finished.
+
+_PARSE_IN_FLIGHT_GUARD = threading.Lock()
+_PARSE_IN_FLIGHT: set = set()
+
+_PARSE_T = TypeVar("_PARSE_T")
+
+
+def _parse_registry_key(file_path: str) -> str:
+    """Normalize a parse input path so retries always collide on one key."""
+    return os.path.normcase(os.path.abspath(file_path))
+
+
+def _reserve_parse_slot(file_path: str) -> str:
+    """Atomically reserve the per-file parse slot or refuse the parse.
+
+    Registry key lifetime is the worker's lifetime: the reservation is
+    released only by the worker itself when the parse returns or raises
+    (and by process restart, since the registry is memory-only). A parse
+    whose thread never returns therefore refuses that file's retries
+    until restart — deliberately, because a wall-clock TTL shorter than
+    a legitimate long parse would re-open the overlap this guard exists
+    to prevent.
+    """
+    key = _parse_registry_key(file_path)
+    with _PARSE_IN_FLIGHT_GUARD:
+        if key in _PARSE_IN_FLIGHT:
+            raise DocumentProcessingError(
+                "Another parse of this file is still in flight (a timed-out "
+                f"parse has not finished yet): {file_path}"
+            )
+        _PARSE_IN_FLIGHT.add(key)
+    return key
+
+
+def _release_parse_slot(key: str) -> None:
+    with _PARSE_IN_FLIGHT_GUARD:
+        _PARSE_IN_FLIGHT.discard(key)
+
+
+def _deadline_error(stage: str, file_path: str) -> DocumentProcessingError:
+    return DocumentProcessingError(
+        f"{stage} timed out after {settings.document_parse_timeout}s: {file_path}"
+    )
+
+
+async def _parse_with_deadline(
+    file_path: str,
+    parse_fn: Callable[[], _PARSE_T],
+    *,
+    stage: str,
+    stage_timings: Optional[dict[str, float]] = None,
+    timing_key: Optional[str] = None,
+) -> _PARSE_T:
+    """Run a synchronous parse in a worker thread under the parse deadline.
+
+    Wraps ``asyncio.to_thread`` in ``asyncio.wait_for`` against
+    ``settings.document_parse_timeout`` and refuses to start while
+    another parse of the same file is in flight (see _reserve_parse_slot
+    for the lifetime/semantics). The worker releases the slot in its
+    ``finally``; if the deadline fires first, the abandoned thread keeps
+    the slot until it exits, so retries are refused rather than piled
+    on. The timeout value is read from settings live at every call.
+    """
+    key = _reserve_parse_slot(file_path)
+    started_at = time.monotonic()
+
+    def _tracked() -> _PARSE_T:
+        try:
+            return parse_fn()
+        finally:
+            _release_parse_slot(key)
+
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_tracked),
+            timeout=settings.document_parse_timeout,
+        )
+    except asyncio.TimeoutError:
+        raise _deadline_error(stage, file_path) from None
+    finally:
+        if stage_timings is not None and timing_key is not None:
+            _add_elapsed_ms(stage_timings, timing_key, started_at)
+
+
+async def _await_with_deadline(
+    file_path: str,
+    awaitable,
+    *,
+    stage: str,
+):
+    """Await an already-async parse (e.g. process_image) under the same
+    deadline and per-file in-flight rules as _parse_with_deadline."""
+    key = _reserve_parse_slot(file_path)
+
+    async def _tracked():
+        try:
+            return await awaitable
+        finally:
+            _release_parse_slot(key)
+
+    try:
+        return await asyncio.wait_for(
+            _tracked(), timeout=settings.document_parse_timeout
+        )
+    except asyncio.TimeoutError:
+        raise _deadline_error(stage, file_path) from None
 
 
 class DocumentProcessor:
@@ -2657,8 +2815,10 @@ class DocumentProcessor:
             DocumentProcessingError: If the file parses but produces no chunks
                 (e.g., all sheets are empty).
         """
-        sheet_chunks = await asyncio.to_thread(
-            self.spreadsheet_parser.parse, file_path
+        sheet_chunks = await _parse_with_deadline(
+            file_path,
+            lambda: self.spreadsheet_parser.parse(file_path),
+            stage="Spreadsheet parsing",
         )
 
         if not sheet_chunks:
@@ -2727,7 +2887,11 @@ class DocumentProcessor:
         Returns:
             Tuple of (List of ProcessedChunk objects, joined text, ParsedDocument).
         """
-        schema_chunks = await asyncio.to_thread(self.schema_parser.parse, file_path)
+        schema_chunks = await _parse_with_deadline(
+            file_path,
+            lambda: self.schema_parser.parse(file_path),
+            stage="Schema parsing",
+        )
 
         processed_chunks = []
         atoms: List[DocumentAtom] = []
@@ -2956,7 +3120,9 @@ class DocumentProcessor:
         # to a worker thread internally, so we await it directly here. Wrapping
         # it in asyncio.to_thread would dead-return a coroutine object and crash
         # on `.success` (issue #460 defect 2).
-        image_result: ImageProcessingResult = await process_image(file_path)
+        image_result: ImageProcessingResult = await _await_with_deadline(
+            file_path, process_image(file_path), stage="Image processing"
+        )
 
         filename = Path(file_path).name
         searchable_text = (
@@ -3127,19 +3293,13 @@ class DocumentProcessor:
             Tuple of (List of ProcessedChunk objects, document text as string,
             ParsedDocument of typed atoms).
         """
-        parse_started_at = time.monotonic()
-        try:
-            elements = await asyncio.wait_for(
-                asyncio.to_thread(self.parser.parse, file_path),
-                timeout=settings.document_parse_timeout,
-            )
-        except asyncio.TimeoutError:
-            raise DocumentProcessingError(
-                f"Document parsing timed out after {settings.document_parse_timeout}s: {file_path}"
-            )
-        finally:
-            if stage_timings is not None:
-                _add_elapsed_ms(stage_timings, "parse_ms", parse_started_at)
+        elements = await _parse_with_deadline(
+            file_path,
+            lambda: self.parser.parse(file_path),
+            stage="Document parsing",
+            stage_timings=stage_timings,
+            timing_key="parse_ms",
+        )
         # Parse-quality diagnostics (issue #514 PRODUCT-ENH-06): derived from
         # the elements this parse actually produced and persisted as JSON so
         # the status payload can reveal omissions (low-content pages, dropped

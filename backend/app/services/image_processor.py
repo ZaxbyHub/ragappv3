@@ -130,8 +130,11 @@ async def process_image(file_path: str) -> ImageProcessingResult:
     the event loop responsive while OCR runs.
 
     Extraction order:
-      1. OCR via pytesseract (if available).
-      2. If pytesseract is not available, falls back to returning empty text.
+      1. OCR via pytesseract (if available). An OCR failure (including a
+         missing tesseract binary) flags the result degraded with the
+         stable ``ocr_failed`` error code (issue #703).
+      2. If pytesseract is not available at all, falls back to returning
+         empty text with ``missing_library`` when Pillow is absent too.
 
     Metadata (width, height, format, mode) is always extracted from PIL when
     Pillow is available.
@@ -203,8 +206,19 @@ def _process_image_sync(file_path: str) -> ImageProcessingResult:
                     try:
                         extracted_text = _pytesseract.image_to_string(img)
                     except Exception as exc:  # noqa: BLE001
-                        logger.warning("OCR failed for %s: %s", file_path, exc)
-                        # Non-fatal: we still return the metadata
+                        # OCR could not run (e.g. the tesseract binary is
+                        # missing) or failed on this image: flag the result
+                        # as degraded instead of reporting a clean success
+                        # whose only searchable payload would be filename
+                        # and dimensions (issue #703 / T1-25-K-10). Mirrors
+                        # the no-PIL branch's stable error code.
+                        return ImageProcessingResult(
+                            extracted_text="",
+                            metadata=metadata,
+                            success=False,
+                            error=_bounded_error(f"OCR failed: {exc}"),
+                            error_code=ERROR_OCR_FAILED,
+                        )
         except Exception as exc:  # noqa: BLE001
             return ImageProcessingResult(
                 extracted_text="",

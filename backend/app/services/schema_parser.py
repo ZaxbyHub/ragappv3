@@ -1,8 +1,12 @@
 """
-SQL/DDL schema parser for extracting CREATE TABLE definitions.
-Parses .sql and .ddl files to extract table schemas as chunks.
+SQL/DDL schema parser for extracting searchable SQL statements.
+Parses .sql and .ddl files: CREATE TABLE definitions as structured
+table chunks, plus every other top-level statement (views, indexes,
+inserts, procedures, ...) as verbatim other-SQL chunks so no SQL
+construct is silently dropped (issue #703).
 """
 
+import codecs
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -46,6 +50,36 @@ class SchemaParser:
     # Valid file extensions
     VALID_EXTENSIONS = {'.sql', '.ddl'}
 
+    # Byte-order marks that unambiguously identify UTF-16/UTF-32 text
+    # before any codec guesswork runs (issue #703 / T1-02-K-06).
+    _BOM_CODECS = (
+        (codecs.BOM_UTF32_LE, 'utf-32'),
+        (codecs.BOM_UTF32_BE, 'utf-32'),
+        (codecs.BOM_UTF8, 'utf-8-sig'),
+        (codecs.BOM_UTF16_LE, 'utf-16'),
+        (codecs.BOM_UTF16_BE, 'utf-16'),
+    )
+
+    @classmethod
+    def _decode(cls, data: bytes) -> str:
+        """Decode schema-file bytes with a real-world encoding chain.
+
+        Order: an unambiguous BOM wins; otherwise strict UTF-8 (covering
+        plain ASCII/UTF-8 and BOM'd UTF-8); on failure a lossy cp1252
+        leg — the encoding Windows tools most commonly export — with
+        ``errors='replace'`` as the final fallback so undecodable bytes
+        degrade characters instead of failing the whole file. UTF-16
+        without a BOM is not detected (not distinguishable with
+        confidence) and remains out of scope.
+        """
+        for bom, codec in cls._BOM_CODECS:
+            if data.startswith(bom):
+                return data.decode(codec)
+        try:
+            return data.decode('utf-8')
+        except UnicodeDecodeError:
+            return data.decode('cp1252', errors='replace')
+
     def parse(self, file_path: str) -> List[Dict[str, Any]]:
         """
         Parse a SQL/DDL file and extract CREATE TABLE definitions.
@@ -81,11 +115,10 @@ class SchemaParser:
                 f"of {self.MAX_FILE_SIZE} bytes (100MB)"
             )
 
-        # Read file content with encoding error handling
-        try:
-            content = path.read_text(encoding='utf-8')
-        except UnicodeDecodeError:
-            content = path.read_text(encoding='utf-8', errors='replace')
+        # Read and decode with the BOM-aware fallback chain (issue #703:
+        # a strict-UTF-8-only read made UTF-16 .sql files yield zero
+        # chunks through the lossy replace fallback).
+        content = self._decode(path.read_bytes())
 
         return self._extract_chunks(content, source_file=str(path))
 
@@ -147,19 +180,57 @@ class SchemaParser:
         original += f'{name_quote}{bare_name}{name_quote}'
         return bare_name, original
 
+    # Comments are not statements: they must not become chunks, and a
+    # comments-only file must still report zero extractable content.
+    _LINE_COMMENT = re.compile(r'--[^\n]*')
+    _BLOCK_COMMENT = re.compile(r'/\*.*?\*/', re.DOTALL)
+
+    # Leading keyword(s) used only to label residual statements.
+    _STATEMENT_TYPE = re.compile(
+        r'^\s*(?:CREATE\s+(?:OR\s+REPLACE\s+)?(TABLE|VIEW|INDEX|TRIGGER|PROCEDURE'
+        r'|FUNCTION)|INSERT|UPDATE|DELETE|ALTER|DROP|GRANT|REVOKE|WITH|SET)\b',
+        re.IGNORECASE,
+    )
+
+    @staticmethod
+    def _statement_type(statement: str) -> str:
+        """Best-effort label for a non-CREATE TABLE statement's first keyword."""
+        match = SchemaParser._STATEMENT_TYPE.match(statement)
+        if match is None:
+            return 'OTHER'
+        # Group 1 holds the CREATE object word (VIEW/INDEX/...); otherwise
+        # the matched leading verb itself labels the statement.
+        return (match.group(1) or match.group(0)).strip().split()[-1].upper()
+
+    @staticmethod
+    def _strip_comments(text: str) -> str:
+        """Remove -- line comments and /* */ block comments."""
+        text = SchemaParser._BLOCK_COMMENT.sub(' ', text)
+        return SchemaParser._LINE_COMMENT.sub(' ', text)
+
     def _extract_chunks(
         self, content: str, source_file: Optional[str] = None
     ) -> List[Dict[str, Any]]:
-        """Extract CREATE TABLE chunks from SQL/DDL content.
+        """Extract CREATE TABLE chunks plus every other SQL statement.
 
-        Each emitted chunk's text preserves the ORIGINAL quoted spelling of
-        the table identifier (round-trip safe); metadata carries the bare
-        (unquoted) identifier under ``table_name``.
+        CREATE TABLE blocks keep their structured extraction (original
+        quoted spelling round-trips; metadata carries the bare table
+        name). Every other top-level statement in the residual content —
+        views, inserts, indexes, procedures, ... — becomes a verbatim
+        ``other_sql`` chunk so no SQL construct is silently dropped
+        (issue #703 / T1-02-K-05). Statements are split on ``;``; a
+        semicolon inside a string literal can therefore split one long
+        statement's chunk boundary mid-literal, but both halves are
+        still indexed — no content is lost, only the boundary is
+        approximate. Comments never produce chunks; a file whose
+        residual is only comments/whitespace yields zero chunks.
         """
         chunks = []
 
         # Find all CREATE TABLE blocks
+        table_spans: List[tuple] = []
         for match in self.CREATE_TABLE_PATTERN.finditer(content):
+            table_spans.append((match.start(), match.end()))
             bare_name, original_name = self._identifier_parts(match)
             column_block = match.group(9).strip()
 
@@ -176,5 +247,28 @@ class SchemaParser:
                 }
             }
             chunks.append(chunk)
+
+        # Blank out the matched table blocks, then emit every remaining
+        # top-level statement verbatim (issue #703: nothing is dropped).
+        residual_parts: List[str] = []
+        cursor = 0
+        for start, end in table_spans:
+            residual_parts.append(content[cursor:start])
+            cursor = end
+        residual_parts.append(content[cursor:])
+        residual = ''.join(residual_parts)
+
+        for statement in residual.split(';'):
+            if not self._strip_comments(statement).strip():
+                continue
+            text = ' '.join(statement.split())
+            chunks.append({
+                'text': text + ';',
+                'metadata': {
+                    'statement_type': self._statement_type(statement),
+                    'object_type': 'other_sql',
+                    'source_file': source_file,
+                },
+            })
 
         return chunks

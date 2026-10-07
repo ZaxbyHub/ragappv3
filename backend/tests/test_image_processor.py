@@ -21,6 +21,7 @@ import pytest
 # Ensure the app package is importable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from app.services import image_processor
 from app.services.image_processor import (
     SUPPORTED_IMAGE_TYPES,
     ImageProcessingResult,
@@ -136,10 +137,24 @@ class TestProcessImageReal:
     """Tests using a real in-memory image."""
 
     @pytest.mark.asyncio
-    async def test_process_image_returns_success(self, tmp_image_file: Path | None) -> None:
+    async def test_process_image_returns_success(
+        self, tmp_image_file: Path | None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Processing a valid small image returns success."""
         if tmp_image_file is None:
             pytest.skip("Pillow not available")
+
+        # Deterministic OCR (issue #703): the tesseract BINARY is absent
+        # in CI and on hosts that install only the Python deps, and since
+        # #703 an OCR failure correctly flags the result degraded. These
+        # tests pin the metadata path, so simulate successful (empty) OCR
+        # instead of depending on the host's OCR availability.
+        if image_processor._pytesseract_AVAILABLE:
+            monkeypatch.setattr(
+                image_processor._pytesseract,
+                "image_to_string",
+                lambda *args, **kwargs: "",
+            )
 
         result = await process_image(str(tmp_image_file))
         assert result.success is True
@@ -147,11 +162,23 @@ class TestProcessImageReal:
 
     @pytest.mark.asyncio
     async def test_process_image_metadata_extracted(
-        self, tmp_image_file: Path | None
+        self, tmp_image_file: Path | None, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Metadata (width, height, format, mode) is extracted."""
         if tmp_image_file is None:
             pytest.skip("Pillow not available")
+
+        # Deterministic OCR (issue #703): the tesseract BINARY is absent
+        # in CI and on hosts that install only the Python deps, and since
+        # #703 an OCR failure correctly flags the result degraded. These
+        # tests pin the metadata path, so simulate successful (empty) OCR
+        # instead of depending on the host's OCR availability.
+        if image_processor._pytesseract_AVAILABLE:
+            monkeypatch.setattr(
+                image_processor._pytesseract,
+                "image_to_string",
+                lambda *args, **kwargs: "",
+            )
 
         result = await process_image(str(tmp_image_file))
         assert result.success is True
