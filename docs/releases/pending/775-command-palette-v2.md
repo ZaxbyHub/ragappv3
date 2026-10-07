@@ -90,7 +90,7 @@ TQ-sibling-batch-03-05).
 
 Frozen checks C1-C10 (issue-tracer trace `.agents/issue-traces/775-command-palette-v2`,
 anchor comments on #775): C1-C8 RED→GREEN, C9/C10 PRESERVING green before and
-after. Issue-775 pin suites (29 tests at the final head):
+after. Issue-775 pin suites (30 tests at the final head):
 `shortcutBindings.roundtrip.issue775.test.ts` (4 — combo round-trips,
 `isEditableTarget`, read-time guard),
 `KeyboardShortcuts.shadowed-capture.issue775.test.tsx` (10 — shadow-refused
@@ -122,6 +122,10 @@ command-palette.issue258 = C9/AC9; KeyboardShortcuts.rebind = C10/AC10.
   next time any rebind is saved; until then it remains unread in storage.
 - A refused rebind is silent by design — the capture stays armed exactly as
   if a bare modifier had been pressed; there is no rejection toast.
+- If localStorage writes fail, a completed rebind shows the new combo in the
+  dialog while persistence (and firing) keep the prior binding for the
+  session — the write error is swallowed so the rebind interaction itself
+  never breaks.
 - A shortcut deliberately rebound to a bare editing key (e.g. Tab) still
   fires on that key everywhere OUTSIDE text-entry surfaces (inside editors
   non-modifier combos never fire) — choose rebinds accordingly.

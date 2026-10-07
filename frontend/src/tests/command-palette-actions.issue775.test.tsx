@@ -374,9 +374,12 @@ describe("issue #775 — palette action wiring", () => {
     mountShell();
     const palette = openPalette();
     const input = within(palette).getByLabelText("Search commands");
-    fireEvent.change(input, { target: { value: "z" } });
+    // Fake timers must be installed BEFORE the change — sinon cannot capture
+    // the debounce timer that fireEvent already scheduled on native setTimeout
+    // (delta-review r2: installing after made this pin vacuous).
     vi.useFakeTimers();
     try {
+      fireEvent.change(input, { target: { value: "z" } });
       vi.advanceTimersByTime(400); // past the 300ms debounce
       expect(searchMock.unifiedSearch).not.toHaveBeenCalled();
     } finally {
