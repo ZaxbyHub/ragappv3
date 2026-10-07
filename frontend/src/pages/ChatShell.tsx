@@ -688,7 +688,7 @@ export default function ChatShell() {
           stay interactive while the evidence drawer is open. */}
       {isBelowLg && (
         <Sheet modal={false} open={rightPaneOpen} onOpenChange={(open) => !open && closeRightPane()}>
-          <SheetContent side="bottom" overlay={false} className="h-[45vh] rounded-t-xl p-0 lg:hidden" aria-describedby="evidence-sources-desc">
+          <SheetContent side="bottom" overlay={false} className="h-[45vh] overflow-y-auto rounded-t-xl p-0 lg:hidden" aria-describedby="evidence-sources-desc">
             <SheetHeader className="px-4 pt-4 pb-2 border-b border-border">
               <SheetTitle id="evidence-sources-title" className="text-base text-left">Evidence</SheetTitle>
               <SheetDescription id="evidence-sources-desc" className="sr-only">
