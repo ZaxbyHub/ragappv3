@@ -32,7 +32,7 @@ export function PageTitleHeader({ title, description, actions, before, srOnly, i
     <div className={cn("flex flex-wrap items-center justify-between gap-x-4 gap-y-2", className)}>
       {before}
       <div className="flex min-w-0 max-w-full flex-col items-start justify-start gap-1 py-1.5 px-6 bg-accent/50 rounded-sm">
-        <h1 id={id} className="text-3xl font-semibold tracking-tight [overflow-wrap:anywhere]">
+        <h1 id={id} className="w-full text-3xl font-semibold tracking-tight [overflow-wrap:anywhere]">
           {title}
         </h1>
         {description && <p className="text-muted-foreground mt-1 font-normal">{description}</p>}
