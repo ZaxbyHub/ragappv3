@@ -38,6 +38,20 @@ from .vector_store import VectorStore, VectorStoreError
 
 logger = logging.getLogger(__name__)
 
+
+class ReindexOperatorGuidance(VectorStoreError):
+    """Hand-written operator guidance raised on the reindex path (issue #702).
+
+    The #562 redaction contract (``redact_ingest_error`` maps arbitrary
+    exceptions to stable, content-free codes) would flatten these messages —
+    which are operator constants, not exception payloads — into a generic
+    code and destroy their actionable guidance ("run a full reindex", the
+    rebuild-abort counts). The persist boundary in
+    :meth:`BackgroundProcessor._run_reindex_job_row` persists ``str()`` of
+    this type verbatim and redacts every other ``BaseException``.
+    """
+
+
 # Queue name for the shared jobs-lease table's ingestion rows (issue #559).
 INGESTION_QUEUE = "ingestion"
 
@@ -759,6 +773,12 @@ class BackgroundProcessor:
         orphan by definition once no live jobs row covers it) becomes a
         claimable ``jobs`` row; the processing row is reset to
         ``pending``/``queued`` so file state matches.
+
+        Issue #702 (P02-SK2-08): a file whose only job settled terminally at
+        the attempts cap is NEVER minted a fresh zero-attempt job here (the
+        cap must not be silently bypassed), and its files row is settled to
+        the matching terminal state in the same transaction so it can never
+        linger invisible in ``processing``.
         """
         with self.processor.pool.connection() as conn:
             ensure_jobs_schema(conn)
@@ -788,7 +808,16 @@ class BackgroundProcessor:
                       AND j.status IN ('pending', 'running')
                       AND json_extract(j.payload_json, '$.file_id') IS NOT NULL
                   )
-                """
+                  AND f.id NOT IN (
+                    SELECT CAST(json_extract(j.payload_json, '$.file_id') AS INTEGER)
+                    FROM jobs j
+                    WHERE j.queue = 'ingestion'
+                      AND j.status = 'failed'
+                      AND j.attempts >= ?
+                      AND json_extract(j.payload_json, '$.file_id') IS NOT NULL
+                  )
+                """,
+                (settings.jobs_max_attempts,),
             )
             created = cursor.rowcount
             # Files rows that are still 'processing' but now own a fresh
@@ -806,6 +835,45 @@ class BackgroundProcessor:
                       AND json_extract(j.payload_json, '$.file_id') IS NOT NULL
                   )
                 """
+            )
+            # Cap-excluded files (issue #702 / P02-SK2-08): their retry
+            # budget is terminally exhausted — settle the files row to the
+            # matching terminal state instead of leaving it stranded in
+            # 'processing' with no job and no recovery path. Keyed on
+            # TERMINAL-AT-CAP (status='failed' AND attempts >=
+            # jobs_max_attempts) regardless of error text: the literal
+            # marker is only written when the row's error column was empty
+            # (JobLease's reclaim COALESCE), so an error-keyed predicate
+            # missed the common requeue-then-crash shape (PR #858 feedback
+            # round: PRR-001 / out-of-band F-002, probe-proven). The
+            # attempts predicate also covers worker-driven terminal
+            # failures ('attempt_cap_exceeded: ...', no marker). A file
+            # that a NON-TERMINAL job still covers (an admin retry that
+            # minted fresh work after the cap) is left to that job — only
+            # rows excluded by the cap anti-join settle here.
+            conn.execute(
+                """
+                UPDATE files SET status = 'error', phase = 'error',
+                    error_message = 'lease_attempt_cap_exceeded'
+                WHERE status IN ('pending', 'processing')
+                  AND (phase IS NULL OR phase != 'error')
+                  AND id IN (
+                    SELECT CAST(json_extract(j.payload_json, '$.file_id') AS INTEGER)
+                    FROM jobs j
+                    WHERE j.queue = 'ingestion'
+                      AND j.status = 'failed'
+                      AND j.attempts >= ?
+                      AND json_extract(j.payload_json, '$.file_id') IS NOT NULL
+                  )
+                  AND id NOT IN (
+                    SELECT CAST(json_extract(j.payload_json, '$.file_id') AS INTEGER)
+                    FROM jobs j
+                    WHERE j.queue = 'ingestion'
+                      AND j.status IN ('pending', 'running')
+                      AND json_extract(j.payload_json, '$.file_id') IS NOT NULL
+                  )
+                """,
+                (settings.jobs_max_attempts,),
             )
             if owned:
                 conn.commit()
@@ -892,12 +960,22 @@ class BackgroundProcessor:
         rows that never had a ``legacy_job_id`` (work created under lease
         mode). Legacy rows stuck ``running`` (pre-migration claims) are reset
         to ``pending`` so the legacy claim path can actually serve them.
+
+        Issue #702 (P02-SK2-09): a jobs row left ``running`` by a crash is
+        copied back TOO (as claimable ``pending`` — the old claim is dead by
+        definition at boot), and the INGESTION queue gets its own rollback
+        leg: there is no legacy ingestion table, so the files rows owning
+        non-terminal ingestion jobs are reset to ``pending``/``queued``
+        (pre-collected BEFORE the jobs rows are settled — the reset predicate
+        reads their non-terminal status) and the abandoned jobs rows are
+        settled terminally with ``error='lease_disabled_rollback'`` so they
+        can never be served a second time after a later re-enable.
         """
         reversed_total = 0
         if not any(
             not self._queue_lease_enabled(queue)
             for _, queue in self._COMPILE_JOB_SOURCES
-        ):
+        ) and self._queue_lease_enabled(INGESTION_QUEUE):
             # Every queue's lease switch is on: nothing to reverse-sync and
             # the (possibly mock/test) pool must stay untouched.
             return 0
@@ -918,7 +996,7 @@ class BackgroundProcessor:
                         for row in conn.execute(
                             f"""
                             SELECT j.id FROM jobs j
-                            WHERE j.queue = ? AND j.status = 'pending'
+                            WHERE j.queue = ? AND j.status IN ('pending', 'running')
                               AND json_extract(j.payload_json, '$.reversed_at') IS NULL
                               AND (
                                 json_extract(j.payload_json, '$.legacy_job_id') IS NULL
@@ -956,6 +1034,24 @@ class BackgroundProcessor:
                         "WHERE id = ?",
                         [(i,) for i in source_ids],
                     )
+                    # Settle the copied sources terminally (PR #858 feedback
+                    # round, out-of-band F-005): a row left non-terminal is
+                    # reclaimed and served again after a later lease
+                    # re-enable while the legacy copy ALSO serves it
+                    # (reversed copies carry no legacy_job_id, so the
+                    # re-enable import anti-join never matches them) — the
+                    # job would run twice. Same terminal marker as the
+                    # ingestion rollback leg below.
+                    placeholders_settle = ",".join("?" * len(source_ids))
+                    conn.execute(
+                        f"""
+                        UPDATE jobs SET status = 'failed',
+                            error = 'lease_disabled_rollback',
+                            completed_at = CURRENT_TIMESTAMP
+                        WHERE id IN ({placeholders_settle})
+                        """,  # nosec B608 - placeholders are bound params
+                        source_ids,
+                    )
                     reversed_total += len(source_ids)
                     # A pre-migration claim left a legacy row 'running'; the
                     # rollback boot must make it claimable again.
@@ -963,6 +1059,49 @@ class BackgroundProcessor:
                         f"UPDATE {table} SET status = 'pending', started_at = NULL "  # nosec B608 - table names are module constants
                         "WHERE status = 'running'"
                     )
+                if not self._queue_lease_enabled(INGESTION_QUEUE):
+                    # Ingestion rollback leg (issue #702 / P02-SK2-09): no
+                    # legacy table exists — the files rows ARE the legacy
+                    # queue. ORDER MATTERS: pre-collect the file_ids while
+                    # the jobs rows are still non-terminal, reset those files
+                    # rows to the legacy recovery entry state, THEN settle
+                    # the abandoned jobs rows terminally (a settled row no
+                    # longer matches the collection predicate, and a settled
+                    # row can never be claimed after a re-enable).
+                    ingest_fids = [
+                        int(row[0])
+                        for row in conn.execute(
+                            """
+                            SELECT DISTINCT CAST(json_extract(j.payload_json, '$.file_id') AS INTEGER)
+                            FROM jobs j
+                            WHERE j.queue = ? AND j.status IN ('pending', 'running')
+                              AND json_extract(j.payload_json, '$.file_id') IS NOT NULL
+                            """,
+                            (INGESTION_QUEUE,),
+                        ).fetchall()
+                        if row[0] is not None
+                    ]
+                    if ingest_fids:
+                        conn.executemany(
+                            "UPDATE files SET status = 'pending', phase = 'queued', "
+                            "error_message = NULL WHERE id = ? AND status = 'processing'",
+                            [(fid,) for fid in ingest_fids],
+                        )
+                    settled_ingest = conn.execute(
+                        "UPDATE jobs SET status = 'failed', "
+                        "error = 'lease_disabled_rollback', "
+                        "completed_at = CURRENT_TIMESTAMP "
+                        "WHERE queue = ? AND status IN ('pending', 'running')",
+                        (INGESTION_QUEUE,),
+                    )
+                    if settled_ingest.rowcount:
+                        logger.info(
+                            "Reverse sync: settled %d non-terminal ingestion "
+                            "job(s) at lease rollback (error="
+                            "'lease_disabled_rollback'); their files rows "
+                            "were reset for legacy recovery",
+                            settled_ingest.rowcount,
+                        )
                 if owned:
                     conn.commit()
             except BaseException:
@@ -998,12 +1137,17 @@ class BackgroundProcessor:
     async def _ingest_janitor_loop(self) -> None:
         """Reclaim expired ingestion leases while the process lives (issue #559).
 
-        The first pass runs as soon as the migration barrier opens — at boot,
-        every 'running' lease left by the dead process is expired by
-        definition, so settlement starts immediately instead of waiting out
-        the first interval. A reclaimed job's files row is reset to
+        The first pass runs as soon as the migration barrier opens, but a
+        lease only becomes reclaimable once its heartbeat is older than
+        ``jobs_lease_reclaim_timeout_seconds`` — the timeout is the crash
+        detector, and expiring a boot-fresh heartbeat would fence a lease a
+        live worker may still hold, so a dead process's in-flight row
+        settles after that window by design. The boot sync complements this
+        by never minting a fresh job over a row a non-terminal job already
+        covers. A reclaimed job's files row is reset to
         ``pending``/``queued`` (or failed at the attempts cap) right here,
-        which is what removes the boot-recovery dependence C05 exploited.
+        which is what removes the boot-recovery dependence C05 exploited
+        once the reclaim window elapses.
         """
         await self._jobs_barrier.wait()
         interval = max(5.0, float(settings.jobs_heartbeat_interval_seconds))
@@ -1034,71 +1178,122 @@ class BackgroundProcessor:
         await self._janitor_reclaim_compile_queues()
 
     async def _janitor_sweep_ingestion(self) -> None:
+        """One ingestion janitor pass: reclaim expired leases, then re-sync
+        files rows.
 
-        def run_reclaim() -> int:
-            with self.processor.pool.connection() as conn:
-                lease = self._make_ingest_lease(conn)
-                return lease.reclaim_expired(queue=INGESTION_QUEUE)
+        Stage 2-3 extension (issue #559): the same pass also reclaims the
+        wiki/KMS/reindex queues whose lease switch is on — their rows ARE the
+        ``jobs`` rows, so no secondary resync is needed beyond the ingestion
+        files-row bookkeeping below.
 
-        settled = await asyncio.to_thread(run_reclaim)
-        if not settled:
-            return
-        logger.info(
-            "Ingestion janitor: reclaimed %d expired lease(s)", settled
-        )
+        Issue #702 (P02-SK2-07 + P02-SK2-08): the reclaim and the files-row
+        resync now share ONE ``BEGIN IMMEDIATE`` transaction (``JobLease``'s
+        write wrapper detects the caller-owned transaction and does not
+        commit), so no crash window can separate a terminal cap settlement
+        from its files-row update; and the cap resync acts only on jobs
+        NEWLY capped by this sweep (a job-id diff against the pre-sweep
+        set), never on historical capped jobs sharing a file_id.
+        """
 
-        def resync_files_rows() -> tuple[int, int]:
-            requeued = 0
-            cap_failed = 0
+        def sweep() -> tuple[int, int, int]:
             with self.processor.pool.connection() as conn:
                 ensure_jobs_schema(conn)
-                # Reclaimed-to-pending jobs whose files row is stuck in
-                # 'processing': reset it so the worker's next attempt starts
-                # from the same visible state the route created.
-                reset_cursor = conn.execute(
-                    """
-                    UPDATE files SET status = 'pending', phase = 'queued',
-                        error_message = NULL
-                    WHERE status = 'processing'
-                      AND id IN (
-                        SELECT CAST(json_extract(payload_json, '$.file_id') AS INTEGER)
-                        FROM jobs
-                        WHERE queue = ? AND status = 'pending'
-                          AND json_extract(payload_json, '$.file_id') IS NOT NULL
-                      )
-                    """,
-                    (INGESTION_QUEUE,),
-                )
-                requeued = reset_cursor.rowcount
-                # Jobs the janitor settled terminally at the attempts cap:
-                # fail their files rows too (only cap failures need this —
-                # worker-driven failures already wrote the files row).
-                cap_rows = conn.execute(
-                    """
-                    SELECT CAST(json_extract(payload_json, '$.file_id') AS INTEGER)
-                        AS fid
-                    FROM jobs
-                    WHERE queue = ? AND status = 'failed'
-                      AND error = 'lease_attempt_cap_exceeded'
-                      AND json_extract(payload_json, '$.file_id') IS NOT NULL
-                    """,
-                    (INGESTION_QUEUE,),
-                ).fetchall()
-                cap_ids = [
-                    int(row["fid"]) for row in cap_rows if row["fid"] is not None
-                ]
-                if cap_ids:
-                    cap_cursor = conn.executemany(
-                        "UPDATE files SET status = 'error', phase = 'error', "
-                        "error_message = 'lease_attempt_cap_exceeded' "
-                        "WHERE id = ? AND status IN ('processing', 'pending')",
-                        [(fid,) for fid in cap_ids],
-                    )
-                    cap_failed = cap_cursor.rowcount
-                conn.commit()
-            return requeued, cap_failed
+                owned = not conn.in_transaction
+                if owned:
+                    conn.execute("BEGIN IMMEDIATE")
+                try:
+                    # Terminal-at-cap is keyed on attempts >= jobs_max_attempts
+                    # regardless of error text (PR #858 feedback round:
+                    # PRR-001 / out-of-band F-002 — the literal marker is
+                    # only written when the row's error column was empty,
+                    # so an error-keyed scan missed the common
+                    # requeue-then-crash shape).
+                    pre_capped = {
+                        int(r[0])
+                        for r in conn.execute(
+                            "SELECT id FROM jobs WHERE queue = ? "
+                            "AND status = 'failed' "
+                            "AND attempts >= ?",
+                            (INGESTION_QUEUE, settings.jobs_max_attempts),
+                        ).fetchall()
+                    }
+                    lease = self._make_ingest_lease(conn)
+                    settled = lease.reclaim_expired(queue=INGESTION_QUEUE)
+                    requeued = 0
+                    cap_failed = 0
+                    if settled:
+                        # Reclaimed-to-pending jobs whose files row is stuck
+                        # in 'processing': reset it so the worker's next
+                        # attempt starts from the same visible state the
+                        # route created (idempotent heal, not cap-scoped).
+                        reset_cursor = conn.execute(
+                            """
+                            UPDATE files SET status = 'pending', phase = 'queued',
+                                error_message = NULL
+                            WHERE status = 'processing'
+                              AND id IN (
+                                SELECT CAST(json_extract(payload_json, '$.file_id') AS INTEGER)
+                                FROM jobs
+                                WHERE queue = ? AND status = 'pending'
+                                  AND json_extract(payload_json, '$.file_id') IS NOT NULL
+                                )
+                            """,
+                            (INGESTION_QUEUE,),
+                        )
+                        requeued = reset_cursor.rowcount
+                        post_capped = {
+                            int(r[0])
+                            for r in conn.execute(
+                                "SELECT id FROM jobs WHERE queue = ? "
+                                "AND status = 'failed' "
+                                "AND attempts >= ?",
+                                (INGESTION_QUEUE, settings.jobs_max_attempts),
+                            ).fetchall()
+                        }
+                        newly_capped = [
+                            jid for jid in sorted(post_capped) if jid not in pre_capped
+                        ]
+                        # Jobs the janitor settled terminally at the attempts
+                        # cap IN THIS SWEEP: fail their files rows too (only
+                        # cap failures need this — worker-driven failures
+                        # already wrote the files row).
+                        cap_fids: list[int] = []
+                        if newly_capped:
+                            placeholders = ",".join("?" * len(newly_capped))
+                            cap_rows = conn.execute(
+                                f"""
+                                SELECT CAST(json_extract(payload_json, '$.file_id') AS INTEGER)
+                                    AS fid
+                                FROM jobs
+                                WHERE id IN ({placeholders})
+                                  AND json_extract(payload_json, '$.file_id') IS NOT NULL
+                                """,  # nosec B608 - placeholders are bound params
+                                newly_capped,
+                            ).fetchall()
+                            cap_fids = [
+                                int(row["fid"]) for row in cap_rows if row["fid"] is not None
+                            ]
+                        if cap_fids:
+                            cap_cursor = conn.executemany(
+                                "UPDATE files SET status = 'error', phase = 'error', "
+                                "error_message = 'lease_attempt_cap_exceeded' "
+                                "WHERE id = ? AND status IN ('processing', 'pending')",
+                                [(fid,) for fid in cap_fids],
+                            )
+                            cap_failed = cap_cursor.rowcount
+                    if owned:
+                        conn.commit()
+                except BaseException:
+                    if owned:
+                        conn.rollback()
+                    raise
+                return settled, requeued, cap_failed
 
-        requeued, cap_failed = await asyncio.to_thread(resync_files_rows)
+        settled, requeued, cap_failed = await asyncio.to_thread(sweep)
+        if settled:
+            logger.info(
+                "Ingestion janitor: reclaimed %d expired lease(s)", settled
+            )
         if requeued:
             logger.info(
                 "Ingestion janitor: reset %d processing files row(s) for "
@@ -1368,12 +1563,15 @@ class BackgroundProcessor:
             max_attempts = int(
                 getattr(settings, "jobs_max_attempts", 0) or self.max_retries
             )
-            if self.shutdown_event.is_set():
-                await self._settle_ingest_job(
-                    job_id, worker_id, "release", error=outcome_error
-                )
-            elif task.attempt < max_attempts:
-                delay = self.retry_delay * (2 ** (task.attempt - 1))
+            # Shutdown-window failures settle exactly like any other failure
+            # (PR #858 feedback round, out-of-band F-004): below the cap the
+            # row requeues with its attempt ledger KEPT — the attempt did
+            # real work, so the graceful-release refund must not credit it
+            # back — and at the cap it fails terminally. (The pre-feedback
+            # code settled shutdown failures as `release`, whose refund
+            # handed the consumed attempt back.)
+            delay = self.retry_delay * (2 ** (task.attempt - 1))
+            if task.attempt < max_attempts:
                 await self._settle_ingest_job(
                     job_id,
                     worker_id,
@@ -1424,14 +1622,20 @@ class BackgroundProcessor:
             await asyncio.sleep(0.2)
 
     def _release_all_ingest_leases(self) -> int:
-        """Give back every still-running ingestion lease (shutdown path)."""
+        """Give back every still-running ingestion lease (shutdown path).
+
+        The claim-consumed attempt is refunded (issue #702 / P02-SK2-11): a
+        graceful stop is not a failure and must not burn durable retry
+        budget — mirrors ``JobLease.release``.
+        """
         if self.processor is None or self.processor.pool is None:
             return 0
         with self.processor.pool.connection() as conn:
             ensure_jobs_schema(conn)
             cursor = conn.execute(
                 "UPDATE jobs SET status = 'pending', worker_id = NULL, "
-                "lease_generation = lease_generation + 1, heartbeat_at = NULL "
+                "lease_generation = lease_generation + 1, "
+                "attempts = MAX(attempts - 1, 0), heartbeat_at = NULL "
                 "WHERE queue = ? AND status = 'running'",
                 (INGESTION_QUEUE,),
             )
@@ -1443,6 +1647,8 @@ class BackgroundProcessor:
 
         Mirrors the ingestion release (issue #559 stage 3): a graceful stop
         never leaves a lease waiting out the reclaim timeout on next boot.
+        The claim-consumed attempt is refunded like the ingestion release
+        (issue #702 / P02-SK2-11).
         """
         if self.processor is None or self.processor.pool is None:
             return 0
@@ -1450,7 +1656,8 @@ class BackgroundProcessor:
             ensure_jobs_schema(conn)
             cursor = conn.execute(
                 "UPDATE jobs SET status = 'pending', worker_id = NULL, "
-                "lease_generation = lease_generation + 1, heartbeat_at = NULL "
+                "lease_generation = lease_generation + 1, "
+                "attempts = MAX(attempts - 1, 0), heartbeat_at = NULL "
                 "WHERE queue = 'reindex' AND status = 'running'",
             )
             conn.commit()
@@ -1490,13 +1697,69 @@ class BackgroundProcessor:
         self._ensure_retry_scheduler()
         return True
 
+    def _parked_retry_file_ids(self, ticket: "_RetryTicket") -> list[int]:
+        """File ids an abandoned INGESTION retry ticket must leave recoverable.
+
+        Issue #702 / P02-SK2-12: only ingestion TaskItem tickets carry the
+        files-row status contract; enrichment tickets keep their own
+        enrichment-scoped contract and are left untouched.
+        """
+        item = getattr(ticket, "item", None)
+        if (
+            getattr(ticket, "queue", None) is self.queue
+            and isinstance(item, TaskItem)
+            and item.file_id is not None
+        ):
+            return [item.file_id]
+        return []
+
+    async def _reset_parked_retry_files(self, file_ids: list[int]) -> None:
+        """Reset abandoned-retry files rows to the recoverable state.
+
+        The guarded UPDATE (``WHERE status = 'processing'``) can never
+        clobber a row that already settled through another path; the next
+        startup recovery re-enqueues reset rows.
+        """
+        if not file_ids or self.processor is None or self.processor.pool is None:
+            return
+
+        def _reset() -> None:
+            with self.processor.pool.connection() as conn:
+                conn.executemany(
+                    "UPDATE files SET status = 'pending', phase = 'queued', "
+                    "error_message = NULL WHERE id = ? AND status = 'processing'",
+                    [(fid,) for fid in file_ids],
+                )
+                conn.commit()
+
+        await asyncio.to_thread(_reset)
+
+    async def _reset_parked_retry_ticket(self, ticket: "_RetryTicket") -> int:
+        """Best-effort recoverable-state reset for one abandoned ticket."""
+        file_ids = self._parked_retry_file_ids(ticket)
+        if file_ids:
+            try:
+                await self._reset_parked_retry_files(file_ids)
+            except Exception:  # noqa: BLE001 — abandonment must still proceed
+                logger.warning(
+                    "Could not reset parked-retry file(s) %s; startup "
+                    "recovery remains the backstop",
+                    file_ids,
+                    exc_info=True,
+                )
+        return len(file_ids)
+
     async def _retry_scheduler_loop(self) -> None:
         """Deliver deferred retry tickets into their work queues at due time.
 
         The scheduler is a PRODUCER: ``await queue.put(...)`` may block on a
         full bounded queue without deadlocking, because the worker consumers
         keep draining. On shutdown, pending tickets are discarded (never
-        delivered, never hung on).
+        delivered, never hung on) — and an abandoned INGESTION ticket resets
+        its files row so the work stays recoverable (issue #702 /
+        P02-SK2-12: a parked ticket held in this loop's delay sleep dies
+        with the cancellation, so the reset happens here, not only in
+        ``stop()``'s backlog drain).
         """
         while True:
             if self.shutdown_event.is_set() and self._retry_backlog.empty():
@@ -1512,14 +1775,31 @@ class BackgroundProcessor:
                 if delay > 0:
                     await asyncio.sleep(delay)
                 if self.shutdown_event.is_set():
+                    reset = await self._reset_parked_retry_ticket(ticket)
                     logger.warning(
-                        "Discarding pending retry during shutdown (queue=%s)",
-                        getattr(ticket.queue, "__class__.__name__", "?"),
+                        "Discarding pending retry during shutdown (queue=%s, "
+                        "%d file(s) reset to 'pending')",
+                        type(ticket.queue).__name__,
+                        reset,
                     )
                     continue
                 # Producer-side blocking put is safe here (see docstring).
                 await ticket.queue.put(ticket.item)
             except asyncio.CancelledError:
+                # stop() tears the scheduler down mid-delay with the ticket
+                # already off the backlog (its sleep was cancelled): the
+                # parked work is being abandoned — make it recoverable
+                # before propagating the cancellation. Only during shutdown;
+                # any other canceller keeps the original semantics.
+                if self.shutdown_event.is_set():
+                    try:
+                        await self._reset_parked_retry_ticket(ticket)
+                    except Exception:  # noqa: BLE001 — cancellation proceeds
+                        logger.warning(
+                            "Parked-retry reset failed during scheduler "
+                            "shutdown",
+                            exc_info=True,
+                        )
                 raise
             except Exception:  # noqa: BLE001 — one bad ticket must not kill the loop
                 logger.exception("Retry scheduler failed to deliver a ticket")
@@ -2889,15 +3169,37 @@ class BackgroundProcessor:
         if retry_backlog is not None:
             pending_retries = retry_backlog.qsize()
             if pending_retries:
-                logger.warning(
-                    "Discarding %d pending deferred retry ticket(s) at shutdown",
-                    pending_retries,
-                )
+                # Issue #702 / P02-SK2-12: a discarded ticket's file must not
+                # stay stuck mid-attempt forever. Drain the backlog, collect
+                # the INGESTION tickets (TaskItem doubles carry file_id;
+                # enrichment tickets keep their own status contract) and
+                # reset their files rows to the recoverable state BEFORE the
+                # next startup recovery. NOT gated on any lease switch — the
+                # legacy retry path is exactly the surface that parks
+                # tickets. A ticket the scheduler already took off the
+                # backlog is reset by its cancellation path instead.
+                parked_file_ids: list[int] = []
                 while True:
                     try:
-                        retry_backlog.get_nowait()
+                        ticket = retry_backlog.get_nowait()
                     except asyncio.QueueEmpty:
                         break
+                    parked_file_ids.extend(self._parked_retry_file_ids(ticket))
+                logger.warning(
+                    "Discarding %d pending deferred retry ticket(s) at "
+                    "shutdown; resetting %d parked file(s) to 'pending' for "
+                    "startup recovery",
+                    pending_retries,
+                    len(parked_file_ids),
+                )
+                try:
+                    await self._reset_parked_retry_files(parked_file_ids)
+                except Exception:  # noqa: BLE001 — best-effort recovery hint
+                    logger.warning(
+                        "Could not reset parked-retry files at shutdown; "
+                        "startup recovery remains the backstop",
+                        exc_info=True,
+                    )
 
         # Phase 3: Flush optimize on VectorStore if available
         if hasattr(self.processor, 'vector_store') and self.processor.vector_store is not None:
@@ -2933,6 +3235,7 @@ class BackgroundProcessor:
         *,
         _maintenance_checked: bool = False,
         _recovery_claim: bool = False,
+        _dedupe_existing_job: bool = False,
     ) -> bool:
         """
         Add a file to the processing queue.
@@ -2961,14 +3264,21 @@ class BackgroundProcessor:
             ``True`` when the file is queued — including when a path-level
             dedupe suppressed a duplicate insert because an equivalent
             non-terminal job already holds the slot (issue #693) — or
-            ``False`` when the file is already owned by the recovery path.
+            ``False`` when the file is already owned by the recovery path,
+            or when ``_dedupe_existing_job`` is set and a non-terminal
+            ingestion job already covers this file_id (issue #702 /
+            P02-SK2-14: the admin retry route's "already_in_progress"
+            answer; a second job row would double-queue the file).
         """
         reservation_added = False
         if file_id is not None:
             # issue #783: a fresh enqueue (retry-after-cancel, re-upload)
             # must not inherit a stale cancel request — the registry entry
-            # belongs to the cancelled generation only.
-            self.processor.clear_cancel(file_id)
+            # belongs to the cancelled generation only. The clear itself is
+            # deferred to the accepted-work paths below (lease insert /
+            # legacy put): an enqueue that answers ``already_in_progress``
+            # without inserting anything must leave the cancel mark of the
+            # in-flight generation intact (PR #858 feedback round, OOB F-007).
             async with self._active_file_ids_lock:
                 if _recovery_claim:
                     if file_id not in self._recovery_file_ids:
@@ -3012,6 +3322,7 @@ class BackgroundProcessor:
                 raise DocumentProcessingError("Maintenance mode prevents enqueueing")
         job_id: Optional[int] = None
         job_insert_suppressed = False
+        insert_failed = False
         if getattr(self, "_ingest_lease_enabled", False):
             # Durable claim row first (issue #559): the jobs row is the
             # authoritative queue entry; the asyncio.Queue below is only the
@@ -3036,27 +3347,79 @@ class BackgroundProcessor:
                 # vs resolved) each producer used.
                 payload["path_key"] = os.path.normcase(os.path.abspath(file_path))
 
-            def _insert_job() -> Optional[int]:
+            def _insert_job() -> "int | None | str":
+                # Returns the new job id; None when a path-level dedupe
+                # suppressed the insert (issue #693); or the marker
+                # "in_progress" when the file-scoped dedupe (issue #702 /
+                # P02-SK2-14) found a non-terminal job covering this file.
+                # The dedupe check and the insert share ONE BEGIN IMMEDIATE
+                # so two concurrent duplicate retries cannot both observe
+                # no-open-job and both insert (review round 1 finding 2).
                 with self.processor.pool.connection() as conn:
-                    lease = self._make_ingest_lease(conn)
-                    if file_id is None:
-                        return lease.enqueue_deduped(
-                            INGESTION_QUEUE, payload, path_key=payload["path_key"]
-                        )
-                    return lease.enqueue(INGESTION_QUEUE, payload)
+                    owned = not conn.in_transaction
+                    if owned:
+                        conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        if _dedupe_existing_job and file_id is not None:
+                            row = conn.execute(
+                                "SELECT 1 FROM jobs WHERE queue = ? "
+                                "AND status IN ('pending', 'running') "
+                                "AND CAST(json_extract(payload_json, "
+                                "'$.file_id') AS INTEGER) = ? LIMIT 1",
+                                (INGESTION_QUEUE, file_id),
+                            ).fetchone()
+                            if row is not None:
+                                if owned:
+                                    conn.commit()
+                                return "in_progress"
+                        lease = self._make_ingest_lease(conn)
+                        if file_id is None:
+                            inserted: Optional[int] = lease.enqueue_deduped(
+                                INGESTION_QUEUE,
+                                payload,
+                                path_key=payload["path_key"],
+                            )
+                        else:
+                            inserted = lease.enqueue(INGESTION_QUEUE, payload)
+                        if owned:
+                            conn.commit()
+                        return inserted
+                    except BaseException:
+                        if owned:
+                            conn.rollback()
+                        raise
 
             try:
-                job_id = await asyncio.to_thread(_insert_job)
+                outcome = await asyncio.to_thread(_insert_job)
             except Exception:  # noqa: BLE001 — degrade to legacy transport
                 logger.warning(
                     "Jobs-row insert failed for %s; using in-memory queue only",
                     file_path,
                     exc_info=True,
                 )
-                job_id = None
-            else:
-                if job_id is None:
-                    job_insert_suppressed = True
+                outcome = None
+                # An insert EXCEPTION is not a dedupe suppression: with no
+                # durable row created, the legacy in-memory put below is the
+                # item's only queue entry — fall through to it exactly as
+                # the pre-#702 contract did (round-2 review finding 1:
+                # collapsing the two None causes silently dropped the work
+                # behind a True return).
+                insert_failed = True
+            if outcome == "in_progress":
+                # A non-terminal job already covers this file (issue #702):
+                # the work is queued — report that instead of inserting a
+                # second row.
+                if reservation_added:
+                    await self._release_recovery_file(file_id)
+                logger.debug(
+                    "Non-terminal ingestion job already covers "
+                    "file_id=%s; reporting already-in-progress",
+                    file_id,
+                )
+                return False
+            job_id = outcome
+            if job_id is None and not insert_failed:
+                job_insert_suppressed = True
         task = TaskItem(
             file_path=file_path,
             attempt=1,
@@ -3081,12 +3444,18 @@ class BackgroundProcessor:
         if job_id is not None:
             # Lease mode: the DB row is the queue entry; workers poll-claim it.
             # No in-memory put — a put here would double-process the row.
+            # Work accepted: the stale cancel of a previous generation is
+            # discarded now (deferred from the top of enqueue — see above).
+            if file_id is not None:
+                self.processor.clear_cancel(file_id)
             logger.debug(f"Enqueued file to jobs lease: {file_path} (job_id={job_id})")
             return True
         if file_id is not None:
             async with self._active_file_ids_lock:
                 self._mark_file_queued_locked(file_id)
         try:
+            if file_id is not None:
+                self.processor.clear_cancel(file_id)
             await self.queue.put(task)
         except BaseException:
             if file_id is not None:
@@ -3487,6 +3856,20 @@ class BackgroundProcessor:
             )
             try:
                 await self._run_reindex_job_row(row, worker_id)
+            except asyncio.CancelledError:
+                # shutdown cancellation must reach the loop's exit path
+                raise
+            except Exception:  # noqa: BLE001 — settle failures are janitor food
+                # Issue #702 / P02-SK2-01: one job-level exception must never
+                # end this loop — the ingestion transport's _settle_ingest_job
+                # already wraps every settle the same way. The abandoned lease
+                # (its settle raised) keeps a dead heartbeat and is reclaimed
+                # by the janitor, so no work is lost.
+                logger.exception(
+                    "Reindex lease worker: job %s failed to settle; leaving "
+                    "the lease for janitor reclaim and claiming the next job",
+                    row["id"],
+                )
             finally:
                 heartbeat_task.cancel()
                 await asyncio.gather(heartbeat_task, return_exceptions=True)
@@ -3498,21 +3881,49 @@ class BackgroundProcessor:
         (``run_after``) until ``jobs_max_attempts`` is exhausted, then fails
         it terminally — the durable-retry semantics the legacy queue never
         had (release-noted as the intended improvement).
+
+        Issue #702: the failure detail now travels as an exception OBJECT so
+        the #562 redaction guard at this persist boundary actually fires (the
+        pre-fix code stringified first, defeating the isinstance check);
+        hand-written operator guidance (``ReindexOperatorGuidance``)
+        persists verbatim. A below-cap failure records the failed file ids
+        in the payload (``$.retry_file_ids``) so the next attempt re-embeds
+        only the files that failed, never the whole scope (P02-SK2-04).
         """
         job_id = int(row["id"])
         attempts = int(row["attempts"] or 0)
         payload = json.loads(row["payload_json"] or "{}")
         vault_id = payload.get("vault_id")
+        retry_file_ids = payload.get("retry_file_ids") or []
         logger.info("Starting lease-claimed reindex job %d", job_id)
-        status, result, exc = await self._reindex_embed_all(job_id, vault_id)
+        # Two-argument call unless a retry scope is recorded (issue #702):
+        # the marker-less first attempt needs no narrowing, and test doubles
+        # of this coroutine bind exactly (job_id, vault_id).
+        if retry_file_ids:
+            status, result, exc = await self._reindex_embed_all(
+                job_id, vault_id, retry_file_ids=[int(i) for i in retry_file_ids]
+            )
+        else:
+            status, result, exc = await self._reindex_embed_all(job_id, vault_id)
+        # The retry-scope key is transport metadata, not a persisted result:
+        # pop it before ANY persistence (issue #702 — sibling suites pin the
+        # persisted result shapes by equality).
+        failed_ids = result.pop("failed_ids", None) or []
         # Issue #562 invariant: persisted error fields are user-facing —
         # redact exception payloads at the persist boundary; operator
-        # constants remain verbatim.
-        error_text = (
-            redact_ingest_error(exc)
-            if isinstance(exc, BaseException)
-            else exc
-        )
+        # constants remain verbatim (issue #702 P02-SK2-03/P02-SK2-10: a
+        # literal None must never reach jobs.error either). The verbatim
+        # guidance guarantee is LEASE-PATH-ONLY: the legacy transport's
+        # settlement persists the result-JSON shape instead (feedback
+        # round PRR-008).
+        if isinstance(exc, ReindexOperatorGuidance):
+            error_text = str(exc)
+        elif isinstance(exc, BaseException):
+            error_text = redact_ingest_error(exc)
+        elif exc:
+            error_text = str(exc)
+        else:
+            error_text = "reindex failed (no detail recorded)"
         async with self.processor.pool.connection_async() as conn:
             lease = JobLease(
                 conn,
@@ -3527,13 +3938,29 @@ class BackgroundProcessor:
                         job_id,
                         vault_id,
                     )
+                else:
+                    # Fenced off (janitor reclaimed / shutdown released the
+                    # lease mid-run): the new claimant or janitor owns the
+                    # row — this worker's result is void (PRR-006 parity
+                    # with _settle_ingest_job).
+                    logger.warning(
+                        "Lease reindex job %d completion fenced off — "
+                        "lease lost",
+                        job_id,
+                    )
                 return
             if attempts >= settings.jobs_max_attempts:
-                lease.fail(
+                failed_ok = lease.fail(
                     job_id,
                     worker_id,
                     f"attempt_cap_exceeded: {error_text}"[:500],
                 )
+                if not failed_ok:
+                    logger.warning(
+                        "Lease reindex job %d cap failure fenced off — "
+                        "lease lost",
+                        job_id,
+                    )
                 logger.error(
                     "Lease reindex job %d failed terminally at the attempt "
                     "cap: %s",
@@ -3542,12 +3969,53 @@ class BackgroundProcessor:
                 )
             else:
                 delay = 2.0 ** max(attempts - 1, 0)
-                lease.requeue(
+                # Record the retry scope BEFORE the requeue (issue #702 /
+                # P02-SK2-04): the marker and the requeue commit as ONE
+                # unit — the payload UPDATE opens the transaction, requeue's
+                # write wrapper sees it open and joins it, and the explicit
+                # commit below closes both (a crash between two separate
+                # commits could only ever have degraded to the same narrowed
+                # scope, but one unit is strictly safer). The UPDATE carries
+                # the same worker/status fence as requeue so a
+                # lease-reclaimed worker cannot rewrite a row its successor
+                # now owns.
+                if failed_ids:
+                    conn.execute(
+                        "UPDATE jobs SET payload_json = json_set(payload_json,"
+                        " '$.retry_file_ids', json(?)) "
+                        "WHERE id = ? AND worker_id = ? AND status = 'running'",
+                        (
+                            json.dumps([int(i) for i in failed_ids]),
+                            job_id,
+                            worker_id,
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE jobs SET payload_json = json_remove("
+                        "payload_json, '$.retry_file_ids') "
+                        "WHERE id = ? AND worker_id = ? AND status = 'running'",
+                        (job_id, worker_id),
+                    )
+                requeued_ok = lease.requeue(
                     job_id, worker_id, delay_seconds=delay, error=error_text
                 )
+                conn.commit()
+                if not requeued_ok:
+                    # Fenced off: both the payload UPDATE above and the
+                    # requeue matched zero rows — the successor/janitor owns
+                    # the row, so the "retrying N file(s)" claim below would
+                    # be false evidence (PRR-006).
+                    logger.warning(
+                        "Lease reindex job %d requeue fenced off — lease "
+                        "lost; not retrying from this worker",
+                        job_id,
+                    )
+                    return
                 logger.warning(
-                    "Lease reindex job %d failed; retrying in %.1fs: %s",
+                    "Lease reindex job %d failed; retrying %d file(s) in %.1fs: %s",
                     job_id,
+                    len(failed_ids),
                     delay,
                     error_text,
                 )
@@ -3594,6 +4062,10 @@ class BackgroundProcessor:
                 vault_id = row["vault_id"] if hasattr(row, "keys") else row[0]
 
             status, result, error = await self._reindex_embed_all(job_id, vault_id)
+            # Issue #702: transport metadata never persists — pop before the
+            # settlement writes below (the legacy error/result payloads keep
+            # their exact historical shapes).
+            result.pop("failed_ids", None)
 
             # Legacy settlement on document_reindex_jobs, mapped from the
             # shared body's outcome (writes preserved verbatim per branch).
@@ -3642,8 +4114,11 @@ class BackgroundProcessor:
                 logger.warning("Failed to update reindex job %s status to failed", job_id)
 
     async def _reindex_embed_all(
-        self, job_id: int, vault_id: Optional[int]
-    ) -> tuple[str, dict, Optional[str]]:
+        self,
+        job_id: int,
+        vault_id: Optional[int],
+        retry_file_ids: Optional[list[int]] = None,
+    ) -> tuple[str, dict, Optional[BaseException | str]]:
         """Re-embed all stored documents for one reindex job (shared body).
 
         Returns ``(status, result, error)`` where status is ``completed`` or
@@ -3653,6 +4128,15 @@ class BackgroundProcessor:
         rebuild (issue #513 W13) commits only when ALL files succeed and is
         aborted otherwise; stored model identity is updated (and its failure
         fails the job) before ``completed`` is reported.
+
+        Issue #702: ``error`` carries the failure as an exception OBJECT (a
+        trusted operator-constant string remains a string) so the lease
+        settlement's #562 redaction guard fires at the persist boundary; a
+        per-file failure additionally reports ``result["failed_ids"]`` (and
+        the FIRST failing exception) so the lease caller can narrow the next
+        retry attempt to the failed files via ``retry_file_ids``. The
+        zero-files and exception-path ``result`` shapes are pinned by
+        sibling suites and must not gain keys.
 
         Issue #696 extends the staged path to same-dimension MODEL-identity
         changes (the live table is never rewritten in place under a new
@@ -3672,17 +4156,44 @@ class BackgroundProcessor:
             )
 
         try:
-            # Select files to reindex
+            # Select files to reindex. Issue #702 (P02-SK2-04): a retry
+            # attempt narrows the scope to the files that failed the
+            # previous attempt ($.retry_file_ids); a first attempt (or a
+            # marker-less payload) embeds the full scope. json_each keeps
+            # the id list on ONE host parameter regardless of scope size.
+            retry_scope_json = (
+                json.dumps([int(i) for i in retry_file_ids])
+                if retry_file_ids
+                else None
+            )
             async with self.processor.pool.connection_async() as conn:
-                if vault_id is not None:
-                    rows = conn.execute(
-                        "SELECT id, file_path, vault_id FROM files WHERE vault_id = ? AND status IN ('indexed', 'error')",
-                        (vault_id,),
-                    ).fetchall()
+                if vault_id is not None and retry_scope_json is not None:
+                    sql = (
+                        "SELECT id, file_path, vault_id FROM files "
+                        "WHERE vault_id = ? AND status IN ('indexed', 'error') "
+                        "AND id IN (SELECT value FROM json_each(?))"
+                    )
+                    params: tuple = (vault_id, retry_scope_json)
+                elif vault_id is not None:
+                    sql = (
+                        "SELECT id, file_path, vault_id FROM files "
+                        "WHERE vault_id = ? AND status IN ('indexed', 'error')"
+                    )
+                    params = (vault_id,)
+                elif retry_scope_json is not None:
+                    sql = (
+                        "SELECT id, file_path, vault_id FROM files "
+                        "WHERE status IN ('indexed', 'error') "
+                        "AND id IN (SELECT value FROM json_each(?))"
+                    )
+                    params = (retry_scope_json,)
                 else:
-                    rows = conn.execute(
-                        "SELECT id, file_path, vault_id FROM files WHERE status IN ('indexed', 'error')",
-                    ).fetchall()
+                    sql = (
+                        "SELECT id, file_path, vault_id FROM files "
+                        "WHERE status IN ('indexed', 'error')"
+                    )
+                    params = ()
+                rows = conn.execute(sql, params).fetchall()
 
             # Group by vault_id
             vaults_files: dict[int, list[tuple[int, str, int]]] = {}
@@ -3725,6 +4236,22 @@ class BackgroundProcessor:
                     probe_dim is not None and live_dim is not None and probe_dim != live_dim
                 )
                 if dim_changed or identity_changed:
+                    if retry_scope_json is not None:
+                        # Issue #702 feedback round (PRR-002 / out-of-band
+                        # F-001, probe-proven): a narrowed retry attempt must
+                        # never enter the staged rebuild — the commit swaps
+                        # the GLOBAL chunks table with only the failed files
+                        # staged, silently dropping every other indexed
+                        # file's vectors. Fail with operator guidance; a
+                        # fresh (marker-less) full reindex owns migrations.
+                        raise ReindexOperatorGuidance(
+                            "embedding model/dimension changed while this "
+                            "job holds a file-scoped retry scope: the "
+                            "staged index rebuild would swap the whole "
+                            "vector index with only the previously failed "
+                            "files re-embedded. Run a fresh full reindex "
+                            "(all vaults, no retry scope) instead."
+                        )
                     if vault_id is not None:
                         # [issue #691 review, extended to identity changes by
                         # #696] A vault-scoped reindex re-embeds only its own
@@ -3745,7 +4272,9 @@ class BackgroundProcessor:
                             )
                         else:
                             reason = "embedding model identity changed"
-                        raise VectorStoreError(
+                        # ReindexOperatorGuidance (issue #702): operator
+                        # constant — persists verbatim at the boundary.
+                        raise ReindexOperatorGuidance(
                             f"{reason}: a vault-scoped reindex cannot migrate "
                             f"the index because the rebuild swaps the whole "
                             f"vector index while re-embedding only this "
@@ -3756,7 +4285,7 @@ class BackgroundProcessor:
                         # Identity changed but no probe ran (embedding service
                         # unavailable): staging needs the target dimension and
                         # an in-place rewrite is exactly what #696 removes.
-                        raise VectorStoreError(
+                        raise ReindexOperatorGuidance(
                             "embedding identity changed but the embedding "
                             "service is unavailable; re-run the reindex when "
                             "the embedding service is reachable"
@@ -3781,6 +4310,12 @@ class BackgroundProcessor:
             failed_files = 0
             cancelled_files = 0
             failed_details: list[str] = []
+            # Issue #702 (P02-SK2-04): the structured failure ledger the lease
+            # caller narrows the next retry attempt with, plus the first
+            # failing exception object so the persisted cap error carries a
+            # real (redacted, #562) reason instead of a literal None.
+            failed_ids: list[int] = []
+            first_failure: Optional[BaseException] = None
             commit_attempted = False
 
             try:
@@ -3877,13 +4412,18 @@ class BackgroundProcessor:
                             )
                             failed_files += 1
                             failed_details.append(f"file_id={file_id}: {exc}")
+                            failed_ids.append(file_id)
+                            if first_failure is None:
+                                first_failure = exc
                             continue
 
                 # A staged rebuild (dimension OR same-dimension identity
                 # change, issue #696) swaps only on full success.
                 if rebuild_handle is not None:
                     if failed_files > 0:
-                        raise VectorStoreError(
+                        # ReindexOperatorGuidance (issue #702): operator
+                        # constant — persists verbatim at the boundary.
+                        raise ReindexOperatorGuidance(
                             f"dimension rebuild aborted: {failed_files}/{total_files} "
                             f"file(s) failed to re-embed at dimension {probe_dim}"
                         )
@@ -3895,7 +4435,7 @@ class BackgroundProcessor:
                         # under the new — committing would build a
                         # mixed-generation table. Abort so the previous
                         # generation stays fully intact and intact-detectable.
-                        raise VectorStoreError(
+                        raise ReindexOperatorGuidance(
                             "embedding identity changed during reindex; the "
                             "staged rebuild was aborted so no mixed-generation "
                             "table is committed. Re-run the reindex job."
@@ -3934,14 +4474,21 @@ class BackgroundProcessor:
                 logger.info("Reindex job %d completed (no files to reindex).", job_id)
                 return "completed", {"processed": 0, "failed": 0}, None
             if failed_files > 0:
-                result = {"processed": processed_files, "failed": failed_files, "details": failed_details[:10]}
+                result = {
+                    "processed": processed_files,
+                    "failed": failed_files,
+                    "details": failed_details[:10],
+                    # Transport metadata for the lease caller's retry-scope
+                    # narrowing (issue #702): popped before any persistence.
+                    "failed_ids": failed_ids,
+                }
                 logger.error(
                     "Reindex job %d failed for %d/%d files; stored model identity left unchanged.",
                     job_id,
                     failed_files,
                     total_files,
                 )
-                return "failed", result, None
+                return "failed", result, first_failure
 
             # Update stored model identity and readiness BEFORE reporting
             # completion. If this fails, the job is failed so the app is not
@@ -4008,7 +4555,14 @@ class BackgroundProcessor:
                                 "completes.",
                                 job_id,
                             )
-                        return "failed", {"processed": processed_files, "failed": 0}, None
+                        # Issue #702: carry the operator guidance as the
+                        # failure channel so jobs.error keeps the actionable
+                        # text (verbatim guidance class) instead of None.
+                        return "failed", {"processed": processed_files, "failed": 0}, ReindexOperatorGuidance(
+                            "embedding identity changed during the run; "
+                            "stored model identity left unchanged and "
+                            "readiness NOT lifted (re-run the reindex job)"
+                        )
                     await vector_store.record_embedding_metadata(
                         probe_dim or settings.embedding_dim, raise_on_error=True
                     )
@@ -4071,7 +4625,11 @@ class BackgroundProcessor:
                             job_id,
                             exc_info=True,
                         )
-                return "failed", {}, str(exc)
+                # Issue #702 (P02-SK2-10): hand the exception OBJECT to the
+                # caller so the lease settlement redacts at the persist
+                # boundary instead of receiving an already-stringified path
+                # that bypasses the #562 guard.
+                return "failed", {}, exc
 
             result = {"processed": processed_files, "failed": 0}
             logger.info(
@@ -4083,7 +4641,9 @@ class BackgroundProcessor:
 
         except Exception as exc:
             logger.exception("Error processing reindex job %s", job_id)
-            return "failed", {}, str(exc)
+            # Issue #702 (P02-SK2-10): same contract as the inner return —
+            # the exception object, redacted at the persist boundary.
+            return "failed", {}, exc
 
     async def _process_task_wrapper(self, task: TaskItem) -> None:
         """
@@ -4329,4 +4889,32 @@ class BackgroundProcessor:
 
     @property
     def queue_size(self) -> int:
+        """Backlog size for the ACTIVE transport (issue #702 / P02-SK2-02).
+
+        Lease mode (the shipped default): the durable ``jobs`` rows ARE the
+        queue, and the in-memory ``asyncio.Queue`` stays empty (enqueue
+        returns before any put) — count non-terminal ingestion rows instead,
+        served by ``idx_jobs_claim(queue, status, ...)``; a failed count
+        RAISES rather than degrading to the structurally-empty in-memory
+        reading (a fabricated 0 would mask exactly the distress this metric
+        exists to expose). Legacy mode (or no pool): the in-memory queue's
+        depth, as before.
+        """
+        if getattr(self, "_ingest_lease_enabled", False):
+            if self.processor is None or self.processor.pool is None:
+                return self.queue.qsize()
+            # No degradation-to-qsize in lease mode (PR #858 feedback round,
+            # PRR-012 / out-of-band F-008): the in-memory queue is
+            # structurally empty here, so a failed durable COUNT would
+            # surface an authoritative-looking 0 exactly when the DB is in
+            # distress. Let the failure propagate — /health's probe wrapper
+            # omits the key and logs it, which is the honest reading.
+            with self.processor.pool.connection() as conn:
+                return int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM jobs WHERE queue = ? "
+                        "AND status IN ('pending', 'running')",
+                        (INGESTION_QUEUE,),
+                    ).fetchone()[0]
+                )
         return self.queue.qsize()
