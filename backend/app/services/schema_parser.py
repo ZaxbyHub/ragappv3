@@ -180,11 +180,6 @@ class SchemaParser:
         original += f'{name_quote}{bare_name}{name_quote}'
         return bare_name, original
 
-    # Comments are not statements: they must not become chunks, and a
-    # comments-only file must still report zero extractable content.
-    _LINE_COMMENT = re.compile(r'--[^\n]*')
-    _BLOCK_COMMENT = re.compile(r'/\*.*?\*/', re.DOTALL)
-
     # Leading keyword(s) used only to label residual statements.
     _STATEMENT_TYPE = re.compile(
         r'^\s*(?:CREATE\s+(?:OR\s+REPLACE\s+)?(TABLE|VIEW|INDEX|TRIGGER|PROCEDURE'
@@ -204,9 +199,45 @@ class SchemaParser:
 
     @staticmethod
     def _strip_comments(text: str) -> str:
-        """Remove -- line comments and /* */ block comments."""
-        text = SchemaParser._BLOCK_COMMENT.sub(' ', text)
-        return SchemaParser._LINE_COMMENT.sub(' ', text)
+        """Remove -- line comments and /* */ block comments, quote-aware.
+
+        Comment markers inside single-quoted string literals are content,
+        not comments, and survive; '' doubled-quote escapes keep the
+        literal open. Comment markers inside comments are consumed with
+        their comment.
+        """
+        out: List[str] = []
+        i, n = 0, len(text)
+        in_string = False
+        while i < n:
+            ch = text[i]
+            if in_string:
+                out.append(ch)
+                if ch == "'":
+                    if i + 1 < n and text[i + 1] == "'":
+                        out.append("'")
+                        i += 2
+                        continue
+                    in_string = False
+                i += 1
+                continue
+            if ch == "'":
+                in_string = True
+                out.append(ch)
+                i += 1
+                continue
+            if ch == '-' and i + 1 < n and text[i + 1] == '-':
+                newline = text.find('\n', i)
+                i = n if newline == -1 else newline
+                continue
+            if ch == '/' and i + 1 < n and text[i + 1] == '*':
+                close = text.find('*/', i + 2)
+                i = n if close == -1 else close + 2
+                out.append(' ')
+                continue
+            out.append(ch)
+            i += 1
+        return ''.join(out)
 
     def _extract_chunks(
         self, content: str, source_file: Optional[str] = None
@@ -216,14 +247,17 @@ class SchemaParser:
         CREATE TABLE blocks keep their structured extraction (original
         quoted spelling round-trips; metadata carries the bare table
         name). Every other top-level statement in the residual content —
-        views, inserts, indexes, procedures, ... — becomes a verbatim
-        ``other_sql`` chunk so no SQL construct is silently dropped
-        (issue #703 / T1-02-K-05). Statements are split on ``;``; a
-        semicolon inside a string literal can therefore split one long
+        views, inserts, indexes, procedures, ... — becomes an
+        ``other_sql`` chunk carrying the statement's whitespace-
+        normalized text, so no SQL construct is silently dropped (issue
+        #703 / T1-02-K-05). Comments are stripped (quote-aware) BEFORE
+        the residual is split on ``;``, so a semicolon inside a comment
+        can neither create a chunk nor merge two statements. A
+        semicolon inside a string literal can still split one long
         statement's chunk boundary mid-literal, but both halves are
-        still indexed — no content is lost, only the boundary is
-        approximate. Comments never produce chunks; a file whose
-        residual is only comments/whitespace yields zero chunks.
+        indexed — no statement content is lost, only the boundary is
+        approximate. A file whose residual is only comments/whitespace
+        yields zero chunks.
         """
         chunks = []
 
@@ -248,18 +282,19 @@ class SchemaParser:
             }
             chunks.append(chunk)
 
-        # Blank out the matched table blocks, then emit every remaining
-        # top-level statement verbatim (issue #703: nothing is dropped).
+        # Blank out the matched table blocks, strip comments, then emit
+        # every remaining top-level statement (issue #703: nothing is
+        # dropped, and comments never masquerade as statements).
         residual_parts: List[str] = []
         cursor = 0
         for start, end in table_spans:
             residual_parts.append(content[cursor:start])
             cursor = end
         residual_parts.append(content[cursor:])
-        residual = ''.join(residual_parts)
+        residual = self._strip_comments(''.join(residual_parts))
 
         for statement in residual.split(';'):
-            if not self._strip_comments(statement).strip():
+            if not statement.strip():
                 continue
             text = ' '.join(statement.split())
             chunks.append({

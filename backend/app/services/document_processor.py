@@ -69,7 +69,7 @@ from .embedding_cache import (
     store as embedding_cache_store,
 )
 from .embeddings import EmbeddingService
-from .image_processor import ImageProcessingResult, process_image
+from .image_processor import ImageProcessingResult, _process_image_sync
 from .image_search import build_searchable_text
 from .llm_client import LLMClient
 from .schema_parser import SchemaParser
@@ -947,30 +947,6 @@ async def _parse_with_deadline(
     finally:
         if stage_timings is not None and timing_key is not None:
             _add_elapsed_ms(stage_timings, timing_key, started_at)
-
-
-async def _await_with_deadline(
-    file_path: str,
-    awaitable,
-    *,
-    stage: str,
-):
-    """Await an already-async parse (e.g. process_image) under the same
-    deadline and per-file in-flight rules as _parse_with_deadline."""
-    key = _reserve_parse_slot(file_path)
-
-    async def _tracked():
-        try:
-            return await awaitable
-        finally:
-            _release_parse_slot(key)
-
-    try:
-        return await asyncio.wait_for(
-            _tracked(), timeout=settings.document_parse_timeout
-        )
-    except asyncio.TimeoutError:
-        raise _deadline_error(stage, file_path) from None
 
 
 class DocumentProcessor:
@@ -3120,8 +3096,17 @@ class DocumentProcessor:
         # to a worker thread internally, so we await it directly here. Wrapping
         # it in asyncio.to_thread would dead-return a coroutine object and crash
         # on `.success` (issue #460 defect 2).
-        image_result: ImageProcessingResult = await _await_with_deadline(
-            file_path, process_image(file_path), stage="Image processing"
+        # Route the SYNCHRONOUS image worker through the same deadline
+        # wrapper as the other parsers (issue #703). The async public
+        # entry (process_image) wraps this same sync helper in its own
+        # to_thread; going through the wrapper's thread keeps the
+        # in-flight slot held until the OCR worker thread itself exits —
+        # wrapping the coroutine instead would release the slot at
+        # coroutine cancellation while the abandoned OCR thread ran on.
+        image_result: ImageProcessingResult = await _parse_with_deadline(
+            file_path,
+            lambda: _process_image_sync(file_path),
+            stage="Image processing",
         )
 
         filename = Path(file_path).name

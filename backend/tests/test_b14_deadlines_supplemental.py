@@ -43,13 +43,11 @@ def test_image_ingest_path_enforces_parse_timeout(tmp_path, monkeypatch):
     path = tmp_path / "slow.png"
     path.write_bytes(b"\x89PNG\r\n\x1a\n fake")
 
-    async def _slow_image(file_path: str):
-        await asyncio.to_thread(time.sleep, 1.0)
+    def _slow_image_sync(file_path: str):
+        time.sleep(1.0)
         raise AssertionError("should have been timed out before finishing")
 
-    import app.services.document_processor as dp
-
-    monkeypatch.setattr(dp, "process_image", _slow_image)
+    monkeypatch.setattr(dp, "_process_image_sync", _slow_image_sync)
     _with_timeout(monkeypatch, 0.2)
 
     proc = DocumentProcessor()
@@ -64,6 +62,66 @@ def test_image_ingest_path_enforces_parse_timeout(tmp_path, monkeypatch):
                 str(path), file_id=1, vault_id=1, generation_hash="", parser_fingerprint=""
             )
         )
+
+
+def test_image_parse_timeout_holds_in_flight_slot(tmp_path, monkeypatch):
+    """AC8-shaped image-seam pin: after an image parse times out, a retry
+    while the abandoned OCR worker thread is still alive is REFUSED with
+    the in-flight error, and at most one worker thread ever runs for the
+    file (the slot is released by the worker's own exit, not by the
+    coroutine cancellation — implementation-review R1/R2)."""
+    path = tmp_path / "blocked.png"
+    path.write_bytes(b"\x89PNG\r\n\x1a\n fake")
+    release = threading.Event()
+    ran = threading.Event()
+    lock = threading.Lock()
+    active = {"now": 0, "max": 0}
+
+    def _blocking_image_sync(file_path: str):
+        ran.set()
+        with lock:
+            active["now"] += 1
+            active["max"] = max(active["max"], active["now"])
+        try:
+            release.wait(5.0)
+        finally:
+            with lock:
+                active["now"] -= 1
+
+    monkeypatch.setattr(dp, "_process_image_sync", _blocking_image_sync)
+    _with_timeout(monkeypatch, 0.2)
+
+    proc = DocumentProcessor()
+
+    async def _attempt(expected_message: str) -> None:
+        with pytest.raises(DocumentProcessingError, match=expected_message):
+            await proc._process_image_file(
+                str(path),
+                file_id=1,
+                vault_id=1,
+                generation_hash="",
+                parser_fingerprint="",
+            )
+
+    async def _two_attempts() -> None:
+        await _attempt("timed out")  # attempt 1: deadline fires, thread lives on
+        assert ran.wait(1.0)
+        await _attempt("still in flight")  # attempt 2: REFUSED, no new thread
+
+    # Both attempts share ONE event loop: asyncio.run joins the default
+    # executor at exit, so separate runs would wait out (and release) the
+    # abandoned worker before attempt 2 — the overlap the registry exists
+    # to prevent is only observable on a live loop, which is also the
+    # production shape (one long-lived BackgroundProcessor loop).
+    asyncio.run(_two_attempts())
+    release.set()
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        with _PARSE_IN_FLIGHT_GUARD:
+            if not _PARSE_IN_FLIGHT:
+                break
+        time.sleep(0.05)
+    assert active["max"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -95,11 +153,19 @@ def test_in_flight_registry_refuses_then_readmits(tmp_path, monkeypatch):
         with pytest.raises(DocumentProcessingError):
             await proc._process_document_file(str(path))
 
-    asyncio.run(_attempt())  # attempt 1: times out, thread keeps running
-    assert ran.wait(1.0)
-    asyncio.run(_attempt())  # attempt 2: REFUSED while the thread lives
-    # The refusal above is the behavioral pin; now let the blocked thread
-    # finish and confirm the registry readmits the file afterwards.
+    async def _two_attempts() -> None:
+        # attempt 1: times out, thread keeps running (any DocumentProcessingError)
+        with pytest.raises(DocumentProcessingError):
+            await proc._process_document_file(str(path))
+        assert ran.wait(1.0)
+        # attempt 2: REFUSED while the thread lives (same-loop shape; see
+        # the image-seam pin for the match-asserted refusal variant).
+        with pytest.raises(DocumentProcessingError, match="still in flight"):
+            await proc._process_document_file(str(path))
+
+    asyncio.run(_two_attempts())
+    # Now let the blocked thread finish and confirm the registry readmits
+    # the file afterwards.
     release.set()
     deadline = time.monotonic() + 2.0
     while time.monotonic() < deadline:
@@ -227,9 +293,7 @@ def test_all_parse_paths_route_through_deadline_wrapper():
     for node in ast.walk(tree):
         if isinstance(node, ast.AsyncFunctionDef) and node.name in parse_methods:
             calls = [ast.unparse(n) for n in ast.walk(node) if isinstance(n, ast.Call)]
-            has_wrapper = any(
-                "_parse_with_deadline" in c or "_await_with_deadline" in c for c in calls
-            )
+            has_wrapper = any("_parse_with_deadline" in c for c in calls)
             raw_parse = [
                 c for c in calls if "asyncio.to_thread" in c and ".parse" in c
             ]
@@ -238,3 +302,36 @@ def test_all_parse_paths_route_through_deadline_wrapper():
     for name, (has_wrapper, raw_parse) in found.items():
         assert has_wrapper, f"{name} lost its parse deadline wrapper"
         assert not raw_parse, f"{name} parses via raw asyncio.to_thread: {raw_parse}"
+
+
+def test_schema_comments_with_semicolons_never_become_chunks(tmp_path):
+    """A ';' inside a comment can neither create a chunk nor merge two
+    statements: comments are stripped (quote-aware) BEFORE the residual
+    is split (implementation-review R3)."""
+    path = tmp_path / "comment_semicolons.sql"
+    path.write_text(
+        "-- note; still the same comment\n"
+        "/* block; comment */ INSERT INTO t (v) VALUES (1);\n"
+        "UPDATE t SET v = 2;\n"
+        "-- trailing; tail\n",
+        encoding="utf-8",
+    )
+    chunks = SchemaParser().parse(str(path))
+    others = [c for c in chunks if c["metadata"]["object_type"] == "other_sql"]
+    texts = [c["text"] for c in others]
+    assert len(others) == 2  # the INSERT and the UPDATE only
+    assert any("INSERT INTO t (v) VALUES (1);" == t for t in texts)
+    assert any("UPDATE t SET v = 2;" == t for t in texts)
+    assert not any("note" in t or "comment" in t or "tail" in t for t in texts)
+
+
+def test_schema_comment_markers_inside_literals_survive(tmp_path):
+    """-- and /* */ inside string literals are CONTENT, not comments."""
+    path = tmp_path / "literals2.sql"
+    path.write_text(
+        "INSERT INTO t (v) VALUES ('a--b; /* not a comment */');\n",
+        encoding="utf-8",
+    )
+    chunks = SchemaParser().parse(str(path))
+    joined = " ".join(c["text"] for c in chunks)
+    assert "'a--b;" in joined and "comment */'" in joined  # content preserved

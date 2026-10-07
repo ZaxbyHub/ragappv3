@@ -7,8 +7,8 @@ Workstream B PR 14 of 16 (frontier audit 20260923T174456Z, findings T1-02-K-05/-
 - `.sql`/`.ddl` ingestion no longer silently drops everything that is not a
   `CREATE TABLE`: the schema parser keeps its structured table extraction and
   additionally emits every other top-level SQL statement (views, inserts,
-  indexes, procedures, ...) as verbatim `other_sql` chunks labelled by
-  statement type, so no SQL construct vanishes without a trace and a
+  indexes, procedures, ...) as whitespace-normalized `other_sql` chunks
+  labelled by statement type, so no SQL construct vanishes without a trace and a
   non-table-only file is never mislabeled "empty, encrypted, or unsupported"
   (T1-02-K-05). Statements are split on `;`; a semicolon inside a string
   literal may split a residual chunk boundary, but both halves are indexed —
