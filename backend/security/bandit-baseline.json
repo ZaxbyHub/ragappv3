@@ -36,9 +36,9 @@
       "SEVERITY.LOW": 62,
       "SEVERITY.MEDIUM": 60,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 85754,
+      "loc": 85790,
       "nosec": 0,
-      "skipped_tests": 65
+      "skipped_tests": 66
     },
     "backend/app/__init__.py": {
       "CONFIDENCE.HIGH": 0,
@@ -686,9 +686,9 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 3920,
+      "loc": 3956,
       "nosec": 0,
-      "skipped_tests": 5
+      "skipped_tests": 6
     },
     "backend/app/services/canvas_store.py": {
       "CONFIDENCE.HIGH": 0,

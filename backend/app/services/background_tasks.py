@@ -813,10 +813,11 @@ class BackgroundProcessor:
                     FROM jobs j
                     WHERE j.queue = 'ingestion'
                       AND j.status = 'failed'
-                      AND j.error = 'lease_attempt_cap_exceeded'
+                      AND j.attempts >= ?
                       AND json_extract(j.payload_json, '$.file_id') IS NOT NULL
                   )
-                """
+                """,
+                (settings.jobs_max_attempts,),
             )
             created = cursor.rowcount
             # Files rows that are still 'processing' but now own a fresh
@@ -838,10 +839,16 @@ class BackgroundProcessor:
             # Cap-excluded files (issue #702 / P02-SK2-08): their retry
             # budget is terminally exhausted — settle the files row to the
             # matching terminal state instead of leaving it stranded in
-            # 'processing' with no job and no recovery path. Keyed on the
-            # attempt-cap marker ONLY (other terminal reasons, e.g. the
-            # lease-disabled rollback marker, never suppress minting), and a
-            # file that a NON-TERMINAL job still covers (an admin retry that
+            # 'processing' with no job and no recovery path. Keyed on
+            # TERMINAL-AT-CAP (status='failed' AND attempts >=
+            # jobs_max_attempts) regardless of error text: the literal
+            # marker is only written when the row's error column was empty
+            # (JobLease's reclaim COALESCE), so an error-keyed predicate
+            # missed the common requeue-then-crash shape (PR #858 feedback
+            # round: PRR-001 / out-of-band F-002, probe-proven). The
+            # attempts predicate also covers worker-driven terminal
+            # failures ('attempt_cap_exceeded: ...', no marker). A file
+            # that a NON-TERMINAL job still covers (an admin retry that
             # minted fresh work after the cap) is left to that job — only
             # rows excluded by the cap anti-join settle here.
             conn.execute(
@@ -855,7 +862,7 @@ class BackgroundProcessor:
                     FROM jobs j
                     WHERE j.queue = 'ingestion'
                       AND j.status = 'failed'
-                      AND j.error = 'lease_attempt_cap_exceeded'
+                      AND j.attempts >= ?
                       AND json_extract(j.payload_json, '$.file_id') IS NOT NULL
                   )
                   AND id NOT IN (
@@ -865,7 +872,8 @@ class BackgroundProcessor:
                       AND j.status IN ('pending', 'running')
                       AND json_extract(j.payload_json, '$.file_id') IS NOT NULL
                   )
-                """
+                """,
+                (settings.jobs_max_attempts,),
             )
             if owned:
                 conn.commit()
@@ -1026,6 +1034,24 @@ class BackgroundProcessor:
                         "WHERE id = ?",
                         [(i,) for i in source_ids],
                     )
+                    # Settle the copied sources terminally (PR #858 feedback
+                    # round, out-of-band F-005): a row left non-terminal is
+                    # reclaimed and served again after a later lease
+                    # re-enable while the legacy copy ALSO serves it
+                    # (reversed copies carry no legacy_job_id, so the
+                    # re-enable import anti-join never matches them) — the
+                    # job would run twice. Same terminal marker as the
+                    # ingestion rollback leg below.
+                    placeholders_settle = ",".join("?" * len(source_ids))
+                    conn.execute(
+                        f"""
+                        UPDATE jobs SET status = 'failed',
+                            error = 'lease_disabled_rollback',
+                            completed_at = CURRENT_TIMESTAMP
+                        WHERE id IN ({placeholders_settle})
+                        """,  # nosec B608 - placeholders are bound params
+                        source_ids,
+                    )
                     reversed_total += len(source_ids)
                     # A pre-migration claim left a legacy row 'running'; the
                     # rollback boot must make it claimable again.
@@ -1176,13 +1202,19 @@ class BackgroundProcessor:
                 if owned:
                     conn.execute("BEGIN IMMEDIATE")
                 try:
+                    # Terminal-at-cap is keyed on attempts >= jobs_max_attempts
+                    # regardless of error text (PR #858 feedback round:
+                    # PRR-001 / out-of-band F-002 — the literal marker is
+                    # only written when the row's error column was empty,
+                    # so an error-keyed scan missed the common
+                    # requeue-then-crash shape).
                     pre_capped = {
                         int(r[0])
                         for r in conn.execute(
                             "SELECT id FROM jobs WHERE queue = ? "
                             "AND status = 'failed' "
-                            "AND error = 'lease_attempt_cap_exceeded'",
-                            (INGESTION_QUEUE,),
+                            "AND attempts >= ?",
+                            (INGESTION_QUEUE, settings.jobs_max_attempts),
                         ).fetchall()
                     }
                     lease = self._make_ingest_lease(conn)
@@ -1214,8 +1246,8 @@ class BackgroundProcessor:
                             for r in conn.execute(
                                 "SELECT id FROM jobs WHERE queue = ? "
                                 "AND status = 'failed' "
-                                "AND error = 'lease_attempt_cap_exceeded'",
-                                (INGESTION_QUEUE,),
+                                "AND attempts >= ?",
+                                (INGESTION_QUEUE, settings.jobs_max_attempts),
                             ).fetchall()
                         }
                         newly_capped = [
@@ -1531,12 +1563,15 @@ class BackgroundProcessor:
             max_attempts = int(
                 getattr(settings, "jobs_max_attempts", 0) or self.max_retries
             )
-            if self.shutdown_event.is_set():
-                await self._settle_ingest_job(
-                    job_id, worker_id, "release", error=outcome_error
-                )
-            elif task.attempt < max_attempts:
-                delay = self.retry_delay * (2 ** (task.attempt - 1))
+            # Shutdown-window failures settle exactly like any other failure
+            # (PR #858 feedback round, out-of-band F-004): below the cap the
+            # row requeues with its attempt ledger KEPT — the attempt did
+            # real work, so the graceful-release refund must not credit it
+            # back — and at the cap it fails terminally. (The pre-feedback
+            # code settled shutdown failures as `release`, whose refund
+            # handed the consumed attempt back.)
+            delay = self.retry_delay * (2 ** (task.attempt - 1))
+            if task.attempt < max_attempts:
                 await self._settle_ingest_job(
                     job_id,
                     worker_id,
@@ -1744,7 +1779,7 @@ class BackgroundProcessor:
                     logger.warning(
                         "Discarding pending retry during shutdown (queue=%s, "
                         "%d file(s) reset to 'pending')",
-                        getattr(ticket.queue, "__class__.__name__", "?"),
+                        type(ticket.queue).__name__,
                         reset,
                     )
                     continue
@@ -3239,8 +3274,11 @@ class BackgroundProcessor:
         if file_id is not None:
             # issue #783: a fresh enqueue (retry-after-cancel, re-upload)
             # must not inherit a stale cancel request — the registry entry
-            # belongs to the cancelled generation only.
-            self.processor.clear_cancel(file_id)
+            # belongs to the cancelled generation only. The clear itself is
+            # deferred to the accepted-work paths below (lease insert /
+            # legacy put): an enqueue that answers ``already_in_progress``
+            # without inserting anything must leave the cancel mark of the
+            # in-flight generation intact (PR #858 feedback round, OOB F-007).
             async with self._active_file_ids_lock:
                 if _recovery_claim:
                     if file_id not in self._recovery_file_ids:
@@ -3406,12 +3444,18 @@ class BackgroundProcessor:
         if job_id is not None:
             # Lease mode: the DB row is the queue entry; workers poll-claim it.
             # No in-memory put — a put here would double-process the row.
+            # Work accepted: the stale cancel of a previous generation is
+            # discarded now (deferred from the top of enqueue — see above).
+            if file_id is not None:
+                self.processor.clear_cancel(file_id)
             logger.debug(f"Enqueued file to jobs lease: {file_path} (job_id={job_id})")
             return True
         if file_id is not None:
             async with self._active_file_ids_lock:
                 self._mark_file_queued_locked(file_id)
         try:
+            if file_id is not None:
+                self.processor.clear_cancel(file_id)
             await self.queue.put(task)
         except BaseException:
             if file_id is not None:
@@ -3868,7 +3912,10 @@ class BackgroundProcessor:
         # Issue #562 invariant: persisted error fields are user-facing —
         # redact exception payloads at the persist boundary; operator
         # constants remain verbatim (issue #702 P02-SK2-03/P02-SK2-10: a
-        # literal None must never reach jobs.error either).
+        # literal None must never reach jobs.error either). The verbatim
+        # guidance guarantee is LEASE-PATH-ONLY: the legacy transport's
+        # settlement persists the result-JSON shape instead (feedback
+        # round PRR-008).
         if isinstance(exc, ReindexOperatorGuidance):
             error_text = str(exc)
         elif isinstance(exc, BaseException):
@@ -3891,13 +3938,29 @@ class BackgroundProcessor:
                         job_id,
                         vault_id,
                     )
+                else:
+                    # Fenced off (janitor reclaimed / shutdown released the
+                    # lease mid-run): the new claimant or janitor owns the
+                    # row — this worker's result is void (PRR-006 parity
+                    # with _settle_ingest_job).
+                    logger.warning(
+                        "Lease reindex job %d completion fenced off — "
+                        "lease lost",
+                        job_id,
+                    )
                 return
             if attempts >= settings.jobs_max_attempts:
-                lease.fail(
+                failed_ok = lease.fail(
                     job_id,
                     worker_id,
                     f"attempt_cap_exceeded: {error_text}"[:500],
                 )
+                if not failed_ok:
+                    logger.warning(
+                        "Lease reindex job %d cap failure fenced off — "
+                        "lease lost",
+                        job_id,
+                    )
                 logger.error(
                     "Lease reindex job %d failed terminally at the attempt "
                     "cap: %s",
@@ -3934,10 +3997,21 @@ class BackgroundProcessor:
                         "WHERE id = ? AND worker_id = ? AND status = 'running'",
                         (job_id, worker_id),
                     )
-                lease.requeue(
+                requeued_ok = lease.requeue(
                     job_id, worker_id, delay_seconds=delay, error=error_text
                 )
                 conn.commit()
+                if not requeued_ok:
+                    # Fenced off: both the payload UPDATE above and the
+                    # requeue matched zero rows — the successor/janitor owns
+                    # the row, so the "retrying N file(s)" claim below would
+                    # be false evidence (PRR-006).
+                    logger.warning(
+                        "Lease reindex job %d requeue fenced off — lease "
+                        "lost; not retrying from this worker",
+                        job_id,
+                    )
+                    return
                 logger.warning(
                     "Lease reindex job %d failed; retrying %d file(s) in %.1fs: %s",
                     job_id,
@@ -4162,6 +4236,22 @@ class BackgroundProcessor:
                     probe_dim is not None and live_dim is not None and probe_dim != live_dim
                 )
                 if dim_changed or identity_changed:
+                    if retry_scope_json is not None:
+                        # Issue #702 feedback round (PRR-002 / out-of-band
+                        # F-001, probe-proven): a narrowed retry attempt must
+                        # never enter the staged rebuild — the commit swaps
+                        # the GLOBAL chunks table with only the failed files
+                        # staged, silently dropping every other indexed
+                        # file's vectors. Fail with operator guidance; a
+                        # fresh (marker-less) full reindex owns migrations.
+                        raise ReindexOperatorGuidance(
+                            "embedding model/dimension changed while this "
+                            "job holds a file-scoped retry scope: the "
+                            "staged index rebuild would swap the whole "
+                            "vector index with only the previously failed "
+                            "files re-embedded. Run a fresh full reindex "
+                            "(all vaults, no retry scope) instead."
+                        )
                     if vault_id is not None:
                         # [issue #691 review, extended to identity changes by
                         # #696] A vault-scoped reindex re-embeds only its own
@@ -4804,24 +4894,27 @@ class BackgroundProcessor:
         Lease mode (the shipped default): the durable ``jobs`` rows ARE the
         queue, and the in-memory ``asyncio.Queue`` stays empty (enqueue
         returns before any put) — count non-terminal ingestion rows instead,
-        served by ``idx_jobs_claim(queue, status, ...)``. Legacy mode (or a
-        lease-mode probe against a missing/unusable pool): the in-memory
-        queue's depth, as before.
+        served by ``idx_jobs_claim(queue, status, ...)``; a failed count
+        RAISES rather than degrading to the structurally-empty in-memory
+        reading (a fabricated 0 would mask exactly the distress this metric
+        exists to expose). Legacy mode (or no pool): the in-memory queue's
+        depth, as before.
         """
         if getattr(self, "_ingest_lease_enabled", False):
-            try:
-                with self.processor.pool.connection() as conn:
-                    return int(
-                        conn.execute(
-                            "SELECT COUNT(*) FROM jobs WHERE queue = ? "
-                            "AND status IN ('pending', 'running')",
-                            (INGESTION_QUEUE,),
-                        ).fetchone()[0]
-                    )
-            except Exception:  # noqa: BLE001 — degrade to the legacy reading
-                logger.debug(
-                    "Durable backlog count failed; reporting the in-memory "
-                    "queue depth instead",
-                    exc_info=True,
+            if self.processor is None or self.processor.pool is None:
+                return self.queue.qsize()
+            # No degradation-to-qsize in lease mode (PR #858 feedback round,
+            # PRR-012 / out-of-band F-008): the in-memory queue is
+            # structurally empty here, so a failed durable COUNT would
+            # surface an authoritative-looking 0 exactly when the DB is in
+            # distress. Let the failure propagate — /health's probe wrapper
+            # omits the key and logs it, which is the honest reading.
+            with self.processor.pool.connection() as conn:
+                return int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM jobs WHERE queue = ? "
+                        "AND status IN ('pending', 'running')",
+                        (INGESTION_QUEUE,),
+                    ).fetchone()[0]
                 )
         return self.queue.qsize()

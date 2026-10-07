@@ -270,7 +270,7 @@ async def health_check(
                 lambda: bg_processor.queue_size
             )
         except Exception as exc:
-            logger.debug("ingestion queue_size probe failed: %s", exc)
+            logger.warning("ingestion queue_size probe failed: %s", exc)
 
     if deep:
         deep_state = await _collect_deep_state(request.app.state, llm_checker, model_checker)
