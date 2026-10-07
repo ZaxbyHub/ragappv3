@@ -335,3 +335,39 @@ def test_schema_comment_markers_inside_literals_survive(tmp_path):
     chunks = SchemaParser().parse(str(path))
     joined = " ".join(c["text"] for c in chunks)
     assert "'a--b;" in joined and "comment */'" in joined  # content preserved
+
+
+def test_schema_commented_out_create_table_not_extracted(tmp_path):
+    """A commented-out CREATE TABLE (line style) mints no phantom table
+    chunk: comments are stripped before BOTH extraction passes
+    (implementation-review R2-1)."""
+    path = tmp_path / "commented_table.sql"
+    path.write_text(
+        "-- CREATE TABLE commented_out (id INT);\n", encoding="utf-8"
+    )
+    assert SchemaParser().parse(str(path)) == []
+
+
+def test_schema_block_commented_create_table_not_extracted(tmp_path):
+    """Block-style commented-out CREATE TABLE is likewise not extracted."""
+    path = tmp_path / "block_commented_table.sql"
+    path.write_text(
+        "/* CREATE TABLE block_commented (id INT); */\n", encoding="utf-8"
+    )
+    assert SchemaParser().parse(str(path)) == []
+
+
+def test_schema_commented_table_plus_real_statement(tmp_path):
+    """A commented-out table followed by a real statement extracts ONLY
+    the real content."""
+    path = tmp_path / "mixed_commented.sql"
+    path.write_text(
+        "-- CREATE TABLE phantom (id INT);\n"
+        "CREATE TABLE real_one (id INT);\n",
+        encoding="utf-8",
+    )
+    chunks = SchemaParser().parse(str(path))
+    tables = [c for c in chunks if c["metadata"]["object_type"] == "table"]
+    assert len(tables) == 1
+    assert tables[0]["metadata"]["table_name"] == "real_one"
+    assert "phantom" not in " ".join(c["text"] for c in chunks)

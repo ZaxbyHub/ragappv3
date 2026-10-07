@@ -246,13 +246,15 @@ class SchemaParser:
 
         CREATE TABLE blocks keep their structured extraction (original
         quoted spelling round-trips; metadata carries the bare table
-        name). Every other top-level statement in the residual content —
-        views, inserts, indexes, procedures, ... — becomes an
-        ``other_sql`` chunk carrying the statement's whitespace-
-        normalized text, so no SQL construct is silently dropped (issue
-        #703 / T1-02-K-05). Comments are stripped (quote-aware) BEFORE
-        the residual is split on ``;``, so a semicolon inside a comment
-        can neither create a chunk nor merge two statements. A
+        name). Comments are stripped (quote-aware) once up front, and
+        BOTH the CREATE TABLE match and the residual statement split run
+        on the stripped text — a commented-out CREATE TABLE can no
+        longer mint a phantom table chunk. Every other top-level
+        statement in the residual — views, inserts, indexes,
+        procedures, ... — becomes an ``other_sql`` chunk carrying the
+        statement's whitespace-normalized text, so no SQL construct is
+        silently dropped (issue #703 / T1-02-K-05). A semicolon inside a
+        comment can neither create a chunk nor merge two statements. A
         semicolon inside a string literal can still split one long
         statement's chunk boundary mid-literal, but both halves are
         indexed — no statement content is lost, only the boundary is
@@ -260,6 +262,10 @@ class SchemaParser:
         yields zero chunks.
         """
         chunks = []
+
+        # Strip comments once (quote-aware); every extraction below runs
+        # on the stripped text so commented-out SQL is never extracted.
+        content = self._strip_comments(content)
 
         # Find all CREATE TABLE blocks
         table_spans: List[tuple] = []
@@ -282,16 +288,16 @@ class SchemaParser:
             }
             chunks.append(chunk)
 
-        # Blank out the matched table blocks, strip comments, then emit
-        # every remaining top-level statement (issue #703: nothing is
-        # dropped, and comments never masquerade as statements).
+        # Blank out the matched table blocks, then emit every remaining
+        # top-level statement (issue #703: nothing is dropped, and
+        # comments never masquerade as statements).
         residual_parts: List[str] = []
         cursor = 0
         for start, end in table_spans:
             residual_parts.append(content[cursor:start])
             cursor = end
         residual_parts.append(content[cursor:])
-        residual = self._strip_comments(''.join(residual_parts))
+        residual = ''.join(residual_parts)
 
         for statement in residual.split(';'):
             if not statement.strip():
