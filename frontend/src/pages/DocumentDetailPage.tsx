@@ -273,12 +273,12 @@ export default function DocumentDetailPage() {
         {/* Header */}
         <PageTitleHeader
           before={
-            <>
+            <div className="flex items-center gap-1">
               <Button variant="ghost" size="icon" onClick={() => navigate("/documents")} aria-label="Back">
                 <ArrowLeft className="w-4 h-4" />
               </Button>
               <FileIcon filename={doc.filename} className="w-5 h-5 shrink-0" />
-            </>
+            </div>
           }
           title={<span className="block truncate" title={doc.filename}>{doc.filename}</span>}
           actions={

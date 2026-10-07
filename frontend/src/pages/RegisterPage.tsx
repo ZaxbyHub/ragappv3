@@ -169,7 +169,15 @@ export default function RegisterPage() {
                   onChange={handleChange("password")}
                   disabled={isLoading}
                   aria-required="true"
-                  aria-describedby={errors.password ? "register-password-error register-password-requirements" : "register-password-requirements"}
+                  aria-describedby={
+                    formData.password
+                      ? errors.password
+                        ? "register-password-error register-password-requirements"
+                        : "register-password-requirements"
+                      : errors.password
+                        ? "register-password-error"
+                        : undefined
+                  }
                   aria-invalid={!!errors.password}
                   className="pl-10 pr-10"
                 />
