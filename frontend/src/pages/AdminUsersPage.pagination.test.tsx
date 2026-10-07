@@ -161,7 +161,19 @@ vi.mock('@/components/ui/table', () => ({
 }));
 
 vi.mock('@/components/layout/PageTitleHeader', () => ({
-  PageTitleHeader: ({ title }: any) => <div data-testid="page-title">{title}</div>,
+  PageTitleHeader: ({ title, description, actions, before, srOnly, id }: any) =>
+    srOnly ? (
+      <h1 id={id} className="sr-only">{title}</h1>
+    ) : (
+      <div data-testid="page-title">
+        {before}
+        <div>
+          <h1 id={id}>{title}</h1>
+          {description ?? null}
+        </div>
+        {actions ?? null}
+      </div>
+    ),
 }));
 
 vi.mock('@/components/EmptyState', () => ({

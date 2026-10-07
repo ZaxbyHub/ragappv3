@@ -114,6 +114,10 @@ python scripts/check_pr_scope_drift.py
 python scripts/check_sast_baseline.py   # SAST baseline/scope/workflow integrity
 python scripts/check_secretscan.py      # .secretscanignore validity
 python scripts/check_test_collection_scope.py   # all pytest files live under backend/tests/
+python scripts/check_a04_http500_detail_hygiene.py   # no raw-exception 500 details
+python scripts/check_b03_upload_migration_timeout.py   # upload migration timeout contract
+python scripts/check_l05_raw_palette.py   # raw Tailwind palette classes within budget
+python scripts/check_l05_page_headers.py   # pages use the shared PageTitleHeader
 ```
 
 **Closure evidence gate** (from repo root; standalone workflow

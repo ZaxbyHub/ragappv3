@@ -104,10 +104,10 @@ export function UploadIndicator() {
                 <span
                   className={cn(
                     "shrink-0",
-                    upload.status === "indexed" && "text-emerald-600",
+                    upload.status === "indexed" && "text-success",
                     upload.status === "error" && "text-destructive",
                     upload.status === "cancelled" && "text-muted-foreground",
-                    (upload.status === "indexing" || upload.status === "processing") && "text-blue-600"
+                    (upload.status === "indexing" || upload.status === "processing") && "text-primary"
                   )}
                 >
                   {upload.status === "indexed" && "Done"}

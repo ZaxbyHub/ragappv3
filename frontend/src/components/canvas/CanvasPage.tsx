@@ -22,6 +22,7 @@ import {
 } from "@/components/ui/dialog";
 import { ConfirmDialog, type ConfirmDialogState } from "@/components/documents/ConfirmDialog";
 import { EmptyState } from "@/components/shared/EmptyState";
+import { PageTitleHeader } from "@/components/layout/PageTitleHeader";
 
 import { useNavigationGuardStore } from "@/stores/useNavigationGuardStore";
 import { useCanvasCapabilities } from "@/hooks/useCanvasCapabilities";
@@ -646,24 +647,27 @@ export default function CanvasPage() {
         </Alert>
       )}
 
-      <div>
-        <Link
-          to={`/chat/${sessionId}`}
-          className="text-sm text-muted-foreground hover:underline"
-          aria-label="Back to chat"
-        >
-          &larr; Back to chat
-        </Link>
-        <div className="flex flex-wrap items-center gap-2">
-          <h1 id="canvas-page-heading" className="text-2xl font-semibold tracking-tight">
-            {artifact.name}
-          </h1>
-          <Badge variant="outline">{artifact.kind}</Badge>
-          {artifact.language && (
-            <Badge variant="secondary">{artifact.language}</Badge>
-          )}
-        </div>
-      </div>
+      <PageTitleHeader
+        id="canvas-page-heading"
+        before={
+          <Link
+            to={`/chat/${sessionId}`}
+            className="text-sm text-muted-foreground hover:underline"
+            aria-label="Back to chat"
+          >
+            &larr; Back to chat
+          </Link>
+        }
+        title={artifact.name}
+        actions={
+          <>
+            <Badge variant="outline">{artifact.kind}</Badge>
+            {artifact.language && (
+              <Badge variant="secondary">{artifact.language}</Badge>
+            )}
+          </>
+        }
+      />
 
       {conflict && (
         <Alert variant="destructive" data-testid="canvas-conflict-banner" role="alert">

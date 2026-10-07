@@ -138,13 +138,11 @@ export default function SearchPage() {
 
   return (
     <div className="space-y-6 animate-in fade-in duration-300 pb-12">
-      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-        <PageTitleHeader
-          title="Search"
-          description="Search across documents, wiki, knowledge entries and chats"
-        />
-        <VaultSelector />
-      </div>
+      <PageTitleHeader
+        title="Search"
+        description="Search across documents, wiki, knowledge entries and chats"
+        actions={<VaultSelector />}
+      />
 
       {/* Search form — same contract as the shell's global searchbox */}
       <form

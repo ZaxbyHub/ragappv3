@@ -155,6 +155,12 @@ jobs:
       - name: Upload migration timeout contract check
         run: python scripts/check_b03_upload_migration_timeout.py
 
+      - name: Raw palette budget check
+        run: python scripts/check_l05_raw_palette.py
+
+      - name: Page header ownership check
+        run: python scripts/check_l05_page_headers.py
+
   # BUILD-002: detect whether this run touches the docker build surface, so the
   # docker-smoke job below only spends CI minutes when the image definition
   # actually changed (Dockerfile, frontend/Dockerfile, docker-compose.yml).

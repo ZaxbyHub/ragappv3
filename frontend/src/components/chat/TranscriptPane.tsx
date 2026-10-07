@@ -300,13 +300,13 @@ const MessageRow = memo(function MessageRow({
           </AnimatePresence>
           {showInterruptedStatusBanner && (
             <div
-              className="mt-3 flex items-start gap-2 rounded-sm border border-amber-500/40 bg-amber-500/10 px-3 py-2"
+              className="mt-3 flex items-start gap-2 rounded-sm border border-warning/40 bg-warning/10 px-3 py-2"
               role="status"
               data-interrupted-status={safeMessage.status}
             >
-              <AlertTriangle className="h-4 w-4 shrink-0 text-amber-500 mt-0.5" aria-hidden />
+              <AlertTriangle className="h-4 w-4 shrink-0 text-warning mt-0.5" aria-hidden />
               <div className="min-w-0">
-                <p className="text-xs font-medium text-amber-700 dark:text-amber-300">
+                <p className="text-xs font-medium text-warning">
                   {safeMessage.status === "partial"
                     ? "Response is incomplete — you can retry."
                     : safeMessage.status === "failed"
@@ -319,7 +319,7 @@ const MessageRow = memo(function MessageRow({
                   <Button
                     variant="link"
                     size="sm"
-                    className="h-auto p-0 mt-1 text-amber-700 dark:text-amber-300 text-xs"
+                    className="h-auto p-0 mt-1 text-warning text-xs"
                     onClick={onRetry}
                   >
                     Retry
@@ -467,8 +467,8 @@ export function TranscriptPane({ className, onSessionCreated }: TranscriptPanePr
   // below-lg evidence sheet pads <main> by 45vh, which shrinks or grows this
   // scroll container WITHOUT a scroll event — a bottom-pinned user would
   // silently end up half a viewport above the newest content. Re-pin on
-  // container size changes when the user is still pinned. (Guarded: jsdom
-  // has no ResizeObserver.)
+  // container size changes when the user is still pinned. (ResizeObserver is
+  // stubbed to a no-op in tests, so the callback never fires there.)
   useEffect(() => {
     if (typeof ResizeObserver === "undefined") return;
     const el = scrollRef.current;

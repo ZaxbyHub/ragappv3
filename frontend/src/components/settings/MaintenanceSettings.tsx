@@ -239,7 +239,7 @@ export function MaintenanceSettings({ vaultId }: MaintenanceSettingsProps) {
                   <span
                     className={
                       job.status === "completed"
-                        ? "text-emerald-600"
+                        ? "text-success"
                         : job.status === "failed"
                         ? "text-destructive"
                         : "text-muted-foreground"

@@ -407,16 +407,16 @@ function AdminUsersPageContent() {
 
   return (
     <div className="space-y-6 animate-in fade-in duration-300 pb-12">
-      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-        <PageTitleHeader
-          title="User Management"
-          description="Manage system users and their permissions"
-        />
-        <Button onClick={() => setCreateDialogOpen(true)}>
-          <Plus className="mr-2 h-4 w-4" />
-          Add User
-        </Button>
-      </div>
+      <PageTitleHeader
+        title="User Management"
+        description="Manage system users and their permissions"
+        actions={
+          <Button onClick={() => setCreateDialogOpen(true)}>
+            <Plus className="mr-2 h-4 w-4" />
+            Add User
+          </Button>
+        }
+      />
       <div className="space-y-4">
         {/* Search */}
         <div className="relative">

@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuthStore } from "@/stores/useAuthStore";
 import { Button } from "@/components/ui/button";
+import { PasswordRequirements } from "@/components/shared/PasswordRequirements";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -226,7 +227,7 @@ export default function SetupPage() {
                   onChange={handleChange("password")}
                   disabled={isLoading}
                   aria-required="true"
-                  aria-describedby={errors.password ? "setup-password-error" : undefined}
+                  aria-describedby={errors.password ? "setup-password-error setup-password-requirements" : "setup-password-requirements"}
                   aria-invalid={!!errors.password}
                   className="pl-10 pr-10"
                 />
@@ -241,6 +242,7 @@ export default function SetupPage() {
                   {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
                 </Button>
               </div>
+              <PasswordRequirements id="setup-password-requirements" />
               {errors.password && (
                 <p id="setup-password-error" className="text-sm text-destructive">{errors.password}</p>
               )}

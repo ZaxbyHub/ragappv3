@@ -33,7 +33,33 @@ vi.mock("@/components/ui/button", () => ({
   ),
 }));
 vi.mock("@/components/layout/PageTitleHeader", () => ({
-  PageTitleHeader: ({ title }: { title: string }) => <h1>{title}</h1>,
+  PageTitleHeader: ({
+    title,
+    description,
+    actions,
+    before,
+    srOnly,
+    id,
+  }: {
+    title: ReactNode;
+    description?: ReactNode;
+    actions?: ReactNode;
+    before?: ReactNode;
+    srOnly?: boolean;
+    id?: string;
+  }) =>
+    srOnly ? (
+      <h1 id={id} className="sr-only">{title}</h1>
+    ) : (
+      <div>
+        {before}
+        <div>
+          <h1 id={id}>{title}</h1>
+          {description ?? null}
+        </div>
+        {actions ?? null}
+      </div>
+    ),
 }));
 vi.mock("@/components/ui/dialog", () => ({
   Dialog: ({ children, open }: { children: ReactNode; open: boolean }) => (open ? <div>{children}</div> : null),

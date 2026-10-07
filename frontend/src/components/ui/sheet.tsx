@@ -69,11 +69,15 @@ const SheetContent = React.forwardRef<
       className={cn(sheetVariants({ side }), className)}
       {...props}
     >
-      {children}
-      <SheetPrimitive.Close className="absolute right-4 top-4 flex h-6 w-6 items-center justify-center rounded-sm opacity-70 ring-offset-background transition-opacity hover:opacity-100 focus:outline-hidden focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:pointer-events-none data-[state=open]:bg-secondary">
+      {/* Review PRR-017: the close renders before the sheet children so it is
+          the FIRST tab stop (matching the pre-#776 custom-close position), and
+          after:-inset-2.5 expands its touch target to 44px (repo convention;
+          WCAG 2.5.8 AA floor is 24px) without moving the icon. */}
+      <SheetPrimitive.Close className="absolute right-4 top-4 flex h-6 w-6 items-center justify-center rounded-sm opacity-70 ring-offset-background transition-opacity after:absolute after:-inset-2.5 after:content-[''] hover:opacity-100 focus:outline-hidden focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:pointer-events-none data-[state=open]:bg-secondary">
         <X className="h-4 w-4" />
         <span className="sr-only">Close</span>
       </SheetPrimitive.Close>
+      {children}
     </SheetPrimitive.Content>
   </SheetPortal>
 ))

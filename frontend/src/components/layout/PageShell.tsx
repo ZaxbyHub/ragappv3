@@ -43,8 +43,11 @@ export function PageShell({ children, activeItem, onItemSelect, healthStatus }: 
     };
   }, []);
 
-  // Chat pages get edge-to-edge layout (no padding)
-  const isChat = location.pathname.startsWith("/chat");
+  // Chat pages get edge-to-edge layout (no horizontal padding, no page scroll).
+  // Only /chat and /chat/:sessionId stay full-bleed: the canvas route
+  // (/chat/:sessionId/canvas/:artifactUid) is a regular scrolling page, so the
+  // match is anchored to at most one trailing segment (issue #776/UI-R4-05).
+  const isChat = /^\/chat(\/[^/]+)?\/*$/.test(location.pathname);
 
   // Suppress translate when user prefers reduced motion; keep a brief opacity
   // cross-fade so the page transition still has perceptible feedback.
@@ -97,7 +100,12 @@ export function PageShell({ children, activeItem, onItemSelect, healthStatus }: 
             the user lands after Setup finishes, self-hiding when complete or
             dismissed. Renders null while pending/failed (fail-open). */}
         <FirstRunChecklist />
-        <div className={isChat ? "flex-1 min-h-0 overflow-hidden" : "flex-1 min-h-0 p-6 lg:p-8 overflow-auto pb-20 md:pb-6 mx-auto w-full"}>
+        {/* Issue #776 (UI-R1-01, UI-R3-07): the chat branch clears the fixed
+            mobile bottom nav (measured ~61-65px + safe-area inset; 80px also
+            covers ChatShell's own safe-area spacer) below md; the non-chat
+            branch caps the content measure so `mx-auto` actually centers wide
+            screens. Desktop chat keeps its exact edge-to-edge layout (md:pb-0). */}
+        <div className={isChat ? "flex-1 min-h-0 overflow-hidden pb-20 md:pb-0" : "flex-1 min-h-0 p-6 lg:p-8 overflow-auto pb-20 md:pb-6 max-w-[1536px] mx-auto w-full"}>
           <AnimatePresence mode="wait">
             <motion.div
               key={location.pathname}

@@ -33,7 +33,7 @@ function StatusDot({ ok, checking }: { ok: boolean; checking?: boolean }) {
   return (
     <span
       className={`inline-block h-2 w-2 rounded-full ${
-        checking ? "bg-muted-foreground/40" : ok ? "bg-emerald-500" : "bg-destructive"
+        checking ? "bg-muted-foreground/40" : ok ? "bg-success" : "bg-destructive"
       }`}
       aria-hidden
     />

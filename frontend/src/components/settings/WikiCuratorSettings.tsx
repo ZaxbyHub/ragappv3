@@ -523,7 +523,7 @@ export function WikiCuratorSettings({
               <div
                 className={
                   testResult.ok
-                    ? "flex items-center gap-1 text-xs text-emerald-600"
+                    ? "flex items-center gap-1 text-xs text-success"
                     : "flex items-center gap-1 text-xs text-destructive"
                 }
                 role="status"

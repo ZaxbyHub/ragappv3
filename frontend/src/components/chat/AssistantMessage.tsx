@@ -83,7 +83,7 @@ function ReasoningBlock({
         type="button"
         onClick={() => setExpanded((value) => !value)}
         aria-expanded={expanded}
-        className="inline-flex items-center gap-1.5 px-1.5 py-0.5 rounded-md border border-violet-500/40 bg-violet-500/10 text-violet-700 dark:text-violet-300 text-[10px] font-semibold tracking-wide hover:bg-violet-500/20 transition-colors"
+        className="inline-flex items-center gap-1.5 px-1.5 py-0.5 rounded-md border border-primary/40 bg-primary/10 text-primary text-[10px] font-semibold tracking-wide hover:bg-primary/20 transition-colors"
         title="Show the model's reasoning for this answer"
       >
         <Brain className="h-3 w-3" aria-hidden />
@@ -95,9 +95,9 @@ function ReasoningBlock({
         )}
       </button>
       {expanded && (
-        <div className="mt-1.5 rounded-md border border-violet-500/30 bg-violet-500/5 px-3 py-2">
+        <div className="mt-1.5 rounded-md border border-primary/30 bg-primary/5 px-3 py-2">
           <p className="text-xs whitespace-pre-wrap text-muted-foreground">{text}</p>
-          <p className="mt-1.5 text-[10px] font-medium text-violet-700/80 dark:text-violet-300/80">
+          <p className="mt-1.5 text-[10px] font-medium text-primary/80">
             {`~${tokensEstimate} tokens`}
           </p>
         </div>
@@ -347,7 +347,7 @@ export function AssistantMessage({
           <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Assistant</span>
           {message.mode === "thinking" && (
             <span
-              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md border border-violet-500/40 bg-violet-500/10 text-violet-700 dark:text-violet-300 text-[10px] font-semibold tracking-wide"
+              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md border border-primary/40 bg-primary/10 text-primary text-[10px] font-semibold tracking-wide"
               title="Generated with the Thinking model"
               aria-label="Thinking model"
             >
@@ -357,7 +357,7 @@ export function AssistantMessage({
           )}
           {message.mode === "instant" && (
             <span
-              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md border border-sky-500/40 bg-sky-500/10 text-sky-700 dark:text-sky-300 text-[10px] font-semibold tracking-wide"
+              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md border border-primary/40 bg-primary/10 text-primary text-[10px] font-semibold tracking-wide"
               title="Generated with the Instant model"
               aria-label="Instant model"
             >
@@ -412,16 +412,16 @@ export function AssistantMessage({
             the done payload; mirrors MarkdownMessage's amber alert pattern. */}
         {message.currencyWarnings && message.currencyWarnings.length > 0 && (
           <div
-            className="mt-3 flex items-start gap-2 rounded-sm border border-amber-500/40 bg-amber-500/10 px-3 py-2"
+            className="mt-3 flex items-start gap-2 rounded-sm border border-warning/40 bg-warning/10 px-3 py-2"
             role="alert"
           >
-            <AlertTriangle className="h-4 w-4 shrink-0 text-amber-500 mt-0.5" aria-hidden />
+            <AlertTriangle className="h-4 w-4 shrink-0 text-warning mt-0.5" aria-hidden />
             <div className="flex flex-col gap-1">
-              <p className="text-xs font-semibold text-amber-600 dark:text-amber-400">
+              <p className="text-xs font-semibold text-warning">
                 Currency Warnings
               </p>
               {message.currencyWarnings.map((warning, i) => (
-                <p key={i} className="text-xs text-amber-600/80 dark:text-amber-400/80">
+                <p key={i} className="text-xs text-warning/80">
                   {warning}
                 </p>
               ))}
@@ -434,15 +434,15 @@ export function AssistantMessage({
             "satisfied" stays silent. */}
         {message.citationEnforcement?.status === "missing_citations" && (
           <div
-            className="mt-3 flex items-start gap-2 rounded-sm border border-amber-500/40 bg-amber-500/10 px-3 py-2"
+            className="mt-3 flex items-start gap-2 rounded-sm border border-warning/40 bg-warning/10 px-3 py-2"
             role="alert"
           >
-            <AlertTriangle className="h-4 w-4 shrink-0 text-amber-500 mt-0.5" aria-hidden />
+            <AlertTriangle className="h-4 w-4 shrink-0 text-warning mt-0.5" aria-hidden />
             <div className="flex flex-col gap-1">
-              <p className="text-xs font-semibold text-amber-600 dark:text-amber-400">
+              <p className="text-xs font-semibold text-warning">
                 Citations Required
               </p>
-              <p className="text-xs text-amber-600/80 dark:text-amber-400/80">
+              <p className="text-xs text-warning/80">
                 Citations were required but none were found in this answer
               </p>
             </div>

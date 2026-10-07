@@ -3,6 +3,7 @@ import { useNavigate, Link, Navigate } from "react-router-dom";
 import { useAuthStore } from "@/stores/useAuthStore";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { PasswordRequirements } from "@/components/shared/PasswordRequirements";
 import { Label } from "@/components/ui/label";
 import {
   Card,
@@ -157,19 +158,7 @@ export default function RegisterPage() {
 
             <div className="space-y-2">
               <Label htmlFor="register-password">Password</Label>
-              {formData.password && (
-                <ul className="space-y-0.5 text-xs">
-                  <li className={formData.password.length >= 8 ? "text-green-600 dark:text-green-400" : "text-muted-foreground"}>
-                    {formData.password.length >= 8 ? "✓" : "○"} At least 8 characters
-                  </li>
-                  <li className={/\d/.test(formData.password) ? "text-green-600 dark:text-green-400" : "text-muted-foreground"}>
-                    {/\d/.test(formData.password) ? "✓" : "○"} At least one digit
-                  </li>
-                  <li className={/[A-Z]/.test(formData.password) ? "text-green-600 dark:text-green-400" : "text-muted-foreground"}>
-                    {/[A-Z]/.test(formData.password) ? "✓" : "○"} At least one uppercase letter
-                  </li>
-                </ul>
-              )}
+              {formData.password && <PasswordRequirements id="register-password-requirements" value={formData.password} />}
               <div className="relative">
                 <HugeiconsIcon strokeWidth={1.2} icon={LockPasswordIcon} className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
                 <Input
@@ -180,7 +169,15 @@ export default function RegisterPage() {
                   onChange={handleChange("password")}
                   disabled={isLoading}
                   aria-required="true"
-                  aria-describedby={errors.password ? "register-password-error" : undefined}
+                  aria-describedby={
+                    formData.password
+                      ? errors.password
+                        ? "register-password-error register-password-requirements"
+                        : "register-password-requirements"
+                      : errors.password
+                        ? "register-password-error"
+                        : undefined
+                  }
                   aria-invalid={!!errors.password}
                   className="pl-10 pr-10"
                 />

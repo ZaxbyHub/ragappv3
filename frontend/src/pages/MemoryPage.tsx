@@ -182,19 +182,19 @@ function MemoryPageContent({ activeVaultId }: { activeVaultId: number }) {
 
   return (
     <div className="space-y-6 animate-in fade-in duration-300 pb-12">
-      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-        <PageTitleHeader
-          title="Memory"
-          description="View and manage AI memory and context"
-        />
-        <div className="flex items-center gap-2">
-          <VaultSelector />
-          <Button onClick={() => setIsAddDialogOpen(true)}>
-            <Plus className="w-4 h-4 mr-2" />
-            Add Memory
-          </Button>
-        </div>
-      </div>
+      <PageTitleHeader
+        title="Memory"
+        description="View and manage AI memory and context"
+        actions={
+          <>
+            <VaultSelector />
+            <Button onClick={() => setIsAddDialogOpen(true)}>
+              <Plus className="w-4 h-4 mr-2" />
+              Add Memory
+            </Button>
+          </>
+        }
+      />
 
       <div className="flex items-center gap-2">
         <div className="relative flex-1 max-w-md">
@@ -328,9 +328,9 @@ function MemoryPageContent({ activeVaultId }: { activeVaultId: number }) {
                         const ws = wikiStatusMap[memory.id];
                         if (!ws || ws.wiki_status === "not_promoted") return null;
                         const colorMap: Record<string, string> = {
-                          promoted: "text-green-600",
-                          stale: "text-yellow-600",
-                          promoting: "text-blue-500",
+                          promoted: "text-success",
+                          stale: "text-warning",
+                          promoting: "text-primary",
                         };
                         const labelMap: Record<string, string> = {
                           promoted: `Wiki: ${ws.active_claims}c / ${ws.linked_pages.length}p`,

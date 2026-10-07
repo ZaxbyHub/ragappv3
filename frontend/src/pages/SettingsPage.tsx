@@ -318,16 +318,16 @@ function SettingsPageContent({
   return (
     <>
       {reindexRequired && (
-        <div className="flex items-start gap-3 rounded-sm border border-amber-300 bg-amber-50 dark:bg-amber-950/20 dark:border-amber-800 p-4">
+        <div className="flex items-start gap-3 rounded-sm border border-warning/50 bg-warning/10 p-4">
           <AlertTriangle
-            className="h-5 w-5 text-amber-600 shrink-0 mt-0.5"
+            className="h-5 w-5 text-warning shrink-0 mt-0.5"
             aria-hidden
           />
           <div className="flex-1 min-w-0">
-            <p className="text-sm font-medium text-amber-800 dark:text-amber-200">
+            <p className="text-sm font-medium text-warning">
               Reindex required
             </p>
-            <p className="text-xs text-amber-700 dark:text-amber-300 mt-0.5">
+            <p className="text-xs text-warning/80 mt-0.5">
               Changes to embedding model, chunk size, or vector settings
               invalidate existing document embeddings. Re-process documents
               from the Documents page or run a wiki recompile from the
@@ -336,7 +336,7 @@ function SettingsPageContent({
           </div>
           <button
             onClick={() => setReindexRequired(false)}
-            className="text-amber-600 hover:text-amber-800 text-xs underline shrink-0"
+            className="text-warning hover:text-warning/80 text-xs underline shrink-0"
           >
             Dismiss
           </button>
@@ -476,18 +476,18 @@ function SettingsPageWithStatus({ health }: { health: HealthStatus }) {
 
   return (
     <div className="space-y-6 animate-in fade-in duration-300 pb-12">
-      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-        <PageTitleHeader
-          title="Settings"
-          description="Configure your application preferences"
-        />
-        <div className="flex flex-col items-end gap-1">
-          <ConnectionStatusBadges health={health} />
-          <span className="text-xs text-muted-foreground">
-            {formatLastChecked(health.lastChecked)}
-          </span>
-        </div>
-      </div>
+      <PageTitleHeader
+        title="Settings"
+        description="Configure your application preferences"
+        actions={
+          <div className="flex flex-col items-end gap-1">
+            <ConnectionStatusBadges health={health} />
+            <span className="text-xs text-muted-foreground">
+              {formatLastChecked(health.lastChecked)}
+            </span>
+          </div>
+        }
+      />
       <SettingsPageContent
         health={health}
         connectionResult={connectionResult}

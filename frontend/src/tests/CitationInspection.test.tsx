@@ -162,7 +162,7 @@ describe("SC-009 Citation confidence indicators", () => {
     // At least one green dot should be present
     const dots = screen.getAllByRole("img", { name: "90% textual overlap" });
     expect(dots.length).toBeGreaterThanOrEqual(1);
-    expect(dots[0]).toHaveClass("bg-emerald-500");
+    expect(dots[0]).toHaveClass("bg-success");
   });
 
   it("renders a medium-overlap (amber) dot for score >= 0.4 and < 0.7", () => {
@@ -177,7 +177,7 @@ describe("SC-009 Citation confidence indicators", () => {
     // At least one amber dot should be present
     const dots = screen.getAllByRole("img", { name: "55% textual overlap" });
     expect(dots.length).toBeGreaterThanOrEqual(1);
-    expect(dots[0]).toHaveClass("bg-amber-500");
+    expect(dots[0]).toHaveClass("bg-warning");
   });
 
   it("renders a low-overlap (red) dot for score < 0.4", () => {
@@ -192,7 +192,7 @@ describe("SC-009 Citation confidence indicators", () => {
     // At least one red dot should be present
     const dots = screen.getAllByRole("img", { name: "25% textual overlap" });
     expect(dots.length).toBeGreaterThanOrEqual(1);
-    expect(dots[0]).toHaveClass("bg-red-500");
+    expect(dots[0]).toHaveClass("bg-destructive");
   });
 
   it("shows the overlap indicator in the popover header when present", async () => {
@@ -337,8 +337,8 @@ describe("SC-009 Unverifiable claims list", () => {
 
     const alertEl = screen.getByRole("alert");
     // Check for amber border and background classes
-    expect(alertEl).toHaveClass("border-amber-500/40");
-    expect(alertEl).toHaveClass("bg-amber-500/10");
+    expect(alertEl).toHaveClass("border-warning/40");
+    expect(alertEl).toHaveClass("bg-warning/10");
   });
 });
 

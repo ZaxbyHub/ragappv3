@@ -271,7 +271,10 @@ export function NavigationRail({ healthStatus }: NavigationRailProps) {
       </div>
 
       {/* Scrollable nav content */}
-      <ScrollArea className="flex-1 min-h-0 justify-between">
+      {/* Issue #776 (UI-R3-02): an explicit visible-scrollbar type instead of
+            Radix's default hover-only scrollbar, so the nav list's
+            scrollability is discoverable at short viewport heights. */}
+      <ScrollArea className="flex-1 min-h-0 justify-between" type="auto">
         <div className={cn("pb-2 px-2 overflow-hidden transition-all duration-300 ease-in-out", isExpanded ? "w-full" : "w-14")}>
           {/* Unified discovery search (issue #515 / PRODUCT-ENH-11) */}
           {isExpanded ? (

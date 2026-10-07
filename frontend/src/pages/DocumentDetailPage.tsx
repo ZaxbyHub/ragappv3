@@ -10,6 +10,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { FileIcon } from "@/lib/fileIcon";
 import { StatusBadge } from "@/components/shared/StatusBadge";
+import { PageTitleHeader } from "@/components/layout/PageTitleHeader";
 import { ParseQualityPanel } from "@/components/documents/ParseQualityPanel";
 import { documentField } from "@/components/documents/documentProgress";
 import { formatFileSize, formatDate } from "@/lib/formatters";
@@ -270,37 +271,39 @@ export default function DocumentDetailPage() {
     <ScrollArea className="h-full">
       <div className="flex flex-col gap-4 p-6 max-w-3xl mx-auto">
         {/* Header */}
-        <div className="flex items-start justify-between gap-2">
-          <div className="flex items-center gap-2 min-w-0">
-            <Button variant="ghost" size="icon" onClick={() => navigate("/documents")} aria-label="Back">
-              <ArrowLeft className="w-4 h-4" />
-            </Button>
-            <FileIcon filename={doc.filename} className="w-5 h-5 shrink-0" />
-            <h1 className="text-lg font-semibold truncate" title={doc.filename}>
-              {doc.filename}
-            </h1>
-          </div>
-          <div className="flex items-center gap-2 shrink-0">
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={handleAskAboutDocument}
-              disabled={!isSearchable}
-              title={
-                isSearchable
-                  ? "Ask questions scoped to this document"
-                  : "Waiting until indexed — available once the document is searchable"
-              }
-            >
-              <MessageSquare className="w-4 h-4 mr-1" />
-              Ask about this document
-            </Button>
-            <Button variant="outline" size="sm" onClick={handleDownload}>
-              <Download className="w-4 h-4 mr-1" />
-              Download
-            </Button>
-          </div>
-        </div>
+        <PageTitleHeader
+          before={
+            <div className="flex items-center gap-1">
+              <Button variant="ghost" size="icon" onClick={() => navigate("/documents")} aria-label="Back">
+                <ArrowLeft className="w-4 h-4" />
+              </Button>
+              <FileIcon filename={doc.filename} className="w-5 h-5 shrink-0" />
+            </div>
+          }
+          title={<span className="block truncate" title={doc.filename}>{doc.filename}</span>}
+          actions={
+            <>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleAskAboutDocument}
+                disabled={!isSearchable}
+                title={
+                  isSearchable
+                    ? "Ask questions scoped to this document"
+                    : "Waiting until indexed — available once the document is searchable"
+                }
+              >
+                <MessageSquare className="w-4 h-4 mr-1" />
+                Ask about this document
+              </Button>
+              <Button variant="outline" size="sm" onClick={handleDownload}>
+                <Download className="w-4 h-4 mr-1" />
+                Download
+              </Button>
+            </>
+          }
+        />
 
         {/* Metadata */}
         <Card>

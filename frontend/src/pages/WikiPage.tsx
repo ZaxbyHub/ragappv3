@@ -256,39 +256,41 @@ export default function WikiPage() {
 
   return (
     <div className="space-y-6 animate-in fade-in duration-300 pb-12">
-      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between shrink-0">
-        <div className="flex items-center gap-3">
-          <PageTitleHeader title="Wiki" description="Knowledge base pages" />
-        </div>
-        <div className="flex items-center gap-2">
-          <VaultSelector />
-          <Button
-            variant="outline"
-            onClick={() => { setActivityPanelOpen((v) => !v); setJobsPanelOpen(false); setLintPanelOpen(false); }}
-          >
-            <Activity className="w-4 h-4 mr-1" />
-            Activity
-          </Button>
-          <Button
-            variant="outline"
-            onClick={() => { setJobsPanelOpen((v) => !v); setLintPanelOpen(false); setActivityPanelOpen(false); }}
-          >
-            <Layers className="w-4 h-4 mr-1" />
-            Jobs
-          </Button>
-          <Button
-            variant="outline"
-            onClick={() => { setLintPanelOpen((v) => !v); setJobsPanelOpen(false); setActivityPanelOpen(false); }}
-          >
-            <AlertCircle className="w-4 h-4 mr-1" />
-            Lint {lintFindings.length > 0 && `(${lintFindings.length})`}
-          </Button>
-          <Button onClick={handleCreateClick}>
-            <Plus className="size-4 mr-1" />
-            New Page
-          </Button>
-        </div>
-      </div>
+      <PageTitleHeader
+        className="shrink-0"
+        title="Wiki"
+        description="Knowledge base pages"
+        actions={
+          <>
+            <VaultSelector />
+            <Button
+              variant="outline"
+              onClick={() => { setActivityPanelOpen((v) => !v); setJobsPanelOpen(false); setLintPanelOpen(false); }}
+            >
+              <Activity className="w-4 h-4 mr-1" />
+              Activity
+            </Button>
+            <Button
+              variant="outline"
+              onClick={() => { setJobsPanelOpen((v) => !v); setLintPanelOpen(false); setActivityPanelOpen(false); }}
+            >
+              <Layers className="w-4 h-4 mr-1" />
+              Jobs
+            </Button>
+            <Button
+              variant="outline"
+              onClick={() => { setLintPanelOpen((v) => !v); setJobsPanelOpen(false); setActivityPanelOpen(false); }}
+            >
+              <AlertCircle className="w-4 h-4 mr-1" />
+              Lint {lintFindings.length > 0 && `(${lintFindings.length})`}
+            </Button>
+            <Button onClick={handleCreateClick}>
+              <Plus className="size-4 mr-1" />
+              New Page
+            </Button>
+          </>
+        }
+      />
 
       {/* Toolbar */}
       {activeVaultId && (

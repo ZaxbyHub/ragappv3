@@ -21,6 +21,23 @@ Object.defineProperty(window, 'confirm', {
   writable: true,
 });
 
+// Polyfill ResizeObserver — JSDOM does not implement it, and Radix's
+// ScrollAreaScrollbarAuto (NavigationRail's `type="auto"` scroll area,
+// issue #776/UI-R3-02) instantiates one in a layout effect. Without this
+// shim every suite that renders the real rail crashes at mount.
+class ResizeObserverStub {
+  observe() {}
+  unobserve() {}
+  disconnect() {}
+}
+if (typeof globalThis.ResizeObserver === 'undefined') {
+  Object.defineProperty(globalThis, 'ResizeObserver', {
+    value: ResizeObserverStub,
+    writable: true,
+    configurable: true,
+  });
+}
+
 // Mock Element.prototype.scrollTo — JSDOM does not implement it
 if (!Element.prototype.scrollTo) {
   Element.prototype.scrollTo = vi.fn();

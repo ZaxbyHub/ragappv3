@@ -281,16 +281,16 @@ function AdminGroupsPageContent(): JSX.Element {
   return (
     <div className="space-y-6 animate-in fade-in duration-300 pb-12" role="main" aria-label="Groups Management">
       {/* Header */}
-      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-        <PageTitleHeader
-          title="Groups"
-          description="Manage user groups and their vault access permissions"
-        />
-        <Button onClick={handleCreateClick} aria-label="Create new group">
-          <Plus className="mr-2 h-4 w-4" aria-hidden="true" />
-          Create Group
-        </Button>
-      </div>
+      <PageTitleHeader
+        title="Groups"
+        description="Manage user groups and their vault access permissions"
+        actions={
+          <Button onClick={handleCreateClick} aria-label="Create new group">
+            <Plus className="mr-2 h-4 w-4" aria-hidden="true" />
+            Create Group
+          </Button>
+        }
+      />
 
       {/* Groups Table */}
       <GroupTable

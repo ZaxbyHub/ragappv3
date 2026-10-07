@@ -4,6 +4,7 @@ import { changePassword } from "@/lib/api";
 import { useAuthStore } from "@/stores/useAuthStore";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { PasswordRequirements } from "@/components/shared/PasswordRequirements";
 import { Label } from "@/components/ui/label";
 import {
   Card,
@@ -130,10 +131,9 @@ export default function ChangePasswordRequiredPage() {
                 onChange={(e) => setNewPassword(e.target.value)}
                 disabled={submitting}
                 aria-required="true"
+                aria-describedby="change-password-requirements"
               />
-              <p className="text-xs text-muted-foreground">
-                Must be at least 8 characters, with one digit and one uppercase letter.
-              </p>
+              <PasswordRequirements id="change-password-requirements" />
             </div>
             <div className="space-y-2">
               <Label htmlFor="confirm-password">Confirm New Password</Label>
