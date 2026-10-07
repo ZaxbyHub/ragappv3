@@ -28,8 +28,8 @@ function WikiCard({ wikiRef }: WikiCardProps) {
   return (
     <div
       className={cn(
-        "rounded-sm border border-indigo-500/30 bg-indigo-500/5 p-3 text-sm",
-        "hover:border-indigo-500/50 hover:bg-indigo-500/10 transition-colors duration-150",
+        "rounded-sm border border-primary/30 bg-primary/5 p-3 text-sm",
+        "hover:border-primary/50 hover:bg-primary/10 transition-colors duration-150",
       )}
       role="article"
       aria-label={`Wiki ${wikiRef.wiki_label}: ${wikiRef.title}`}
@@ -37,30 +37,30 @@ function WikiCard({ wikiRef }: WikiCardProps) {
     >
       <div className="flex items-start gap-2">
         <span
-          className="shrink-0 inline-flex items-center justify-center min-w-6 h-5 px-1.5 rounded-full bg-indigo-500/20 text-indigo-700 dark:text-indigo-300 text-[10px] font-bold"
+          className="shrink-0 inline-flex items-center justify-center min-w-6 h-5 px-1.5 rounded-full bg-primary/20 text-primary text-[10px] font-bold"
           aria-label={`Wiki label ${wikiRef.wiki_label}`}
         >
           {wikiRef.wiki_label}
         </span>
         <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-1.5 flex-wrap text-xs text-indigo-700/80 dark:text-indigo-300/80 mb-1">
+          <div className="flex items-center gap-1.5 flex-wrap text-xs text-primary/80 mb-1">
             <BookOpen className="h-3 w-3 shrink-0" aria-hidden />
             <span className="font-semibold truncate">{wikiRef.title}</span>
             {wikiRef.page_type && (
               <>
-                <span aria-hidden className="text-indigo-400">·</span>
+                <span aria-hidden className="text-primary">·</span>
                 <span className="capitalize">{wikiRef.page_type}</span>
               </>
             )}
             {conf && (
               <>
-                <span aria-hidden className="text-indigo-400">·</span>
+                <span aria-hidden className="text-primary">·</span>
                 <span>{conf}</span>
               </>
             )}
             {statusLabel && (
               <>
-                <span aria-hidden className="text-indigo-400">·</span>
+                <span aria-hidden className="text-primary">·</span>
                 <span className="capitalize">{statusLabel}</span>
               </>
             )}
@@ -68,7 +68,7 @@ function WikiCard({ wikiRef }: WikiCardProps) {
               <button
                 type="button"
                 onClick={handleNavigate}
-                className="ml-auto -mr-1.5 inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-sm text-indigo-600 hover:underline focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring dark:text-indigo-400"
+                className="ml-auto -mr-1.5 inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-sm text-primary hover:underline focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
                 aria-label={`Open wiki page ${wikiRef.title}`}
               >
                 <ExternalLink className="h-2.5 w-2.5" aria-hidden />
@@ -82,7 +82,7 @@ function WikiCard({ wikiRef }: WikiCardProps) {
                 <button
                   type="button"
                   onClick={() => setExpanded((v) => !v)}
-                  className="mt-1 text-[10px] text-indigo-600 dark:text-indigo-400 hover:underline flex items-center gap-0.5"
+                  className="mt-1 text-[10px] text-primary hover:underline flex items-center gap-0.5"
                   aria-expanded={expanded}
                 >
                   {expanded ? (
@@ -99,7 +99,7 @@ function WikiCard({ wikiRef }: WikiCardProps) {
             </>
           )}
           {wikiRef.provenance_summary && (
-            <p className="mt-1 text-[10px] text-indigo-500/80 dark:text-indigo-400/60 italic truncate">
+            <p className="mt-1 text-[10px] text-primary/80 italic truncate">
               {wikiRef.provenance_summary}
             </p>
           )}

@@ -22,8 +22,8 @@ function KMSCard({ kmsRef }: KMSCardProps) {
   return (
     <div
       className={cn(
-        "rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-3 text-sm",
-        "hover:border-emerald-500/50 hover:bg-emerald-500/10 transition-colors duration-150",
+        "rounded-lg border border-success/30 bg-success/5 p-3 text-sm",
+        "hover:border-success/50 hover:bg-success/10 transition-colors duration-150",
       )}
       role="article"
       aria-label={`Knowledge ${kmsRef.kms_label}: ${kmsRef.title}`}
@@ -31,31 +31,31 @@ function KMSCard({ kmsRef }: KMSCardProps) {
     >
       <div className="flex items-start gap-2">
         <span
-          className="shrink-0 inline-flex items-center justify-center min-w-6 h-5 px-1.5 rounded-full bg-emerald-500/20 text-emerald-700 dark:text-emerald-300 text-[10px] font-bold"
+          className="shrink-0 inline-flex items-center justify-center min-w-6 h-5 px-1.5 rounded-full bg-success/20 text-success text-[10px] font-bold"
           aria-label={`Knowledge label ${kmsRef.kms_label}`}
         >
           {kmsRef.kms_label}
         </span>
         <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-1.5 flex-wrap text-xs text-emerald-700/80 dark:text-emerald-300/80 mb-1">
+          <div className="flex items-center gap-1.5 flex-wrap text-xs text-success/80 mb-1">
             <Library className="h-3 w-3 shrink-0" aria-hidden />
             <span className="font-semibold truncate">{kmsRef.title}</span>
             {kmsRef.source_type && (
               <>
-                <span aria-hidden className="text-emerald-400">·</span>
+                <span aria-hidden className="text-success">·</span>
                 <span className="capitalize">{kmsRef.source_type}</span>
               </>
             )}
             {statusLabel && (
               <>
-                <span aria-hidden className="text-emerald-400">·</span>
+                <span aria-hidden className="text-success">·</span>
                 <span className="capitalize">{statusLabel}</span>
               </>
             )}
             <button
               type="button"
               onClick={handleNavigate}
-              className="ml-auto -mr-1.5 inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-sm text-emerald-600 hover:underline focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring dark:text-emerald-400"
+              className="ml-auto -mr-1.5 inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-sm text-success hover:underline focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
               aria-label={`Open knowledge entry ${kmsRef.title}`}
             >
               <ExternalLink className="h-2.5 w-2.5" aria-hidden />
@@ -68,7 +68,7 @@ function KMSCard({ kmsRef }: KMSCardProps) {
                 <button
                   type="button"
                   onClick={() => setExpanded((v) => !v)}
-                  className="mt-1 text-[10px] text-emerald-600 dark:text-emerald-400 hover:underline flex items-center gap-0.5"
+                  className="mt-1 text-[10px] text-success hover:underline flex items-center gap-0.5"
                   aria-expanded={expanded}
                 >
                   {expanded ? (
@@ -89,7 +89,7 @@ function KMSCard({ kmsRef }: KMSCardProps) {
               {kmsRef.tags.map((tag) => (
                 <span
                   key={tag}
-                  className="inline-flex items-center px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 text-[10px]"
+                  className="inline-flex items-center px-1.5 py-0.5 rounded bg-success-subdued text-success-subdued-foreground text-[10px]"
                 >
                   {tag}
                 </span>

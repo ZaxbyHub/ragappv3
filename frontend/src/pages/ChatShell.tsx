@@ -13,6 +13,7 @@ import { TranscriptPane } from "@/components/chat/TranscriptPane";
 import { RightPane } from "@/components/chat/RightPane";
 import { ShareAction } from "@/components/chat/ShareAction";
 import { VaultSelector } from "@/components/vault/VaultSelector";
+import { PageTitleHeader } from "@/components/layout/PageTitleHeader";
 import { Button } from "@/components/ui/button";
 // The keyboard-shortcuts surface ("?" listener + dialog) moved to the app
 // shell in MainAppShell (issue #775) — see App.tsx AppShortcutsMount.
@@ -588,8 +589,9 @@ export default function ChatShell() {
       >
         <header className="flex h-14 items-center gap-2 border-b border-border px-4">
           {/* Page-level heading landmark (sr-only) so screen-reader heading
-              navigation has an h1 on this route (UI-HIER-1, #291). */}
-          <h1 className="sr-only">Chat</h1>
+              navigation has an h1 on this route (UI-HIER-1, #291). Rendered
+              via the shared PageTitleHeader srOnly mode. */}
+          <PageTitleHeader title="Chat" srOnly />
           {/* Session rail toggle — visible on all screen sizes */}
           <Button variant="ghost" size="icon" onClick={handleToggleSessionRail}
             aria-label={isMobile ? (mobileSheetOpen ? "Hide sessions" : "Show sessions") : (sessionRailOpen ? "Hide sessions" : "Show sessions")}

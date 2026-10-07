@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { MessageSquare, FileText, Brain, MoreHorizontal, Database, Settings, Users, X, User, Building2, UserCog, BookOpen, Library, LogOut, PenLine } from "lucide-react";
+import { MessageSquare, FileText, Brain, MoreHorizontal, Database, Settings, Users, User, Building2, UserCog, BookOpen, Library, LogOut, PenLine } from "lucide-react";
 import {
   Sheet,
   SheetContent,
@@ -121,18 +121,12 @@ export function MobileBottomNav({ activeItem, onItemSelect }: MobileBottomNavPro
               </span>
             </button>
           </SheetTrigger>
-          <SheetContent side="bottom" className="h-[50vh] rounded-t-2xl" aria-describedby="mobile-more-desc">
+          {/* Issue #776 (UI-R4-03): admin tile lists exceed 50vh, so the sheet
+              content scrolls. Issue #776 (UI-R4-04): SheetContent always renders
+              its own close control — this sheet must not add a second one. */}
+          <SheetContent side="bottom" className="h-[50vh] overflow-y-auto rounded-t-2xl" aria-describedby="mobile-more-desc">
             <SheetHeader className="mb-6">
-              <div className="flex items-center justify-between">
-                <SheetTitle id="mobile-more-title" className="text-xl font-semibold">More</SheetTitle>
-                <button
-                  onClick={() => setMoreOpen(false)}
-                  className="p-2 rounded-sm hover:bg-secondary focus:outline-hidden focus-visible:ring-2 focus-visible:ring-ring min-w-[44px] min-h-[44px]"
-                  aria-label="Close"
-                >
-                  <X className="w-5 h-5" />
-                </button>
-</div>
+              <SheetTitle id="mobile-more-title" className="text-xl font-semibold">More</SheetTitle>
               <SheetDescription id="mobile-more-desc">Access settings, help, and other options</SheetDescription>
             </SheetHeader>
 

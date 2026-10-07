@@ -11,6 +11,7 @@ import {
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { PasswordRequirements } from "@/components/shared/PasswordRequirements";
 import { Label } from "@/components/ui/label";
 import type { User } from "./types";
 
@@ -95,6 +96,7 @@ export function ResetPasswordDialog({
               placeholder="Confirm new password"
             />
           </div>
+          <PasswordRequirements />
           <p className="text-sm text-muted-foreground">
             User will be required to change their password on next login.
           </p>

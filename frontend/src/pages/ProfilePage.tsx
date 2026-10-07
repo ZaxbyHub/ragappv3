@@ -22,6 +22,7 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/com
 import { Badge } from "@/components/ui/badge";
 import { User, Lock, Loader2, Save, Building2, Database, Monitor, LogOut } from "lucide-react";
 import { PageTitleHeader } from "@/components/layout/PageTitleHeader";
+import { PasswordRequirements } from "@/components/shared/PasswordRequirements";
 
 type UserRole = "superadmin" | "admin" | "member" | "viewer";
 
@@ -169,12 +170,10 @@ function ProfilePageContent() {
 
   return (
     <div className="space-y-6 animate-in fade-in duration-300 pb-12">
-      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-        <PageTitleHeader
-          title="Profile"
-          description="Manage your account settings"
-        />
-      </div>
+      <PageTitleHeader
+        title="Profile"
+        description="Manage your account settings"
+      />
 
       <Card>
         <CardHeader>
@@ -232,7 +231,7 @@ function ProfilePageContent() {
             <div className="space-y-2">
               <Label htmlFor="new-password">New Password</Label>
               <Input id="new-password" type="password" placeholder="Enter new password..." value={newPassword} onChange={(e) => setNewPassword(e.target.value)} disabled={changingPassword} aria-label="New password" />
-              <p className="text-xs text-muted-foreground">Must be at least 8 characters</p>
+              <PasswordRequirements />
             </div>
             <div className="space-y-2">
               <Label htmlFor="confirm-password">Confirm New Password</Label>

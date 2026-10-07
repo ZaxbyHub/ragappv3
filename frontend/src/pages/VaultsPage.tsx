@@ -171,15 +171,15 @@ export default function VaultsPage() {
 
   return (
     <div className="space-y-6 animate-in fade-in duration-300 pb-12">
-      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-        <PageTitleHeader
-          title="Vaults"
-          description="Manage your knowledge vaults"
-        />
-        <Button onClick={openCreateDialog}>
-          <Plus className="mr-2 h-4 w-4" /> New Vault
-        </Button>
-      </div>
+      <PageTitleHeader
+        title="Vaults"
+        description="Manage your knowledge vaults"
+        actions={
+          <Button onClick={openCreateDialog}>
+            <Plus className="mr-2 h-4 w-4" /> New Vault
+          </Button>
+        }
+      />
 
       {/* Failed load — distinct from the success+empty state (UI-053): a
           retriable error must never read as "you have no vaults". */}

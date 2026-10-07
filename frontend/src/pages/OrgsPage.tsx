@@ -344,17 +344,17 @@ function OrgsPageContent() {
 
   return (
     <div className="space-y-6 animate-in fade-in duration-300 pb-12">
-      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-        <PageTitleHeader
-          title="Organizations"
-          description="Manage organizations and their members"
-        />
-        {!isMember && (
-          <Button onClick={() => setCreateDialogOpen(true)}>
-            <Plus className="w-4 h-4 mr-2" />Create Organization
-          </Button>
-        )}
-      </div>
+      <PageTitleHeader
+        title="Organizations"
+        description="Manage organizations and their members"
+        actions={
+          !isMember && (
+            <Button onClick={() => setCreateDialogOpen(true)}>
+              <Plus className="w-4 h-4 mr-2" />Create Organization
+            </Button>
+          )
+        }
+      />
 
       {loading ? (
         <LoadingSpinner label="Loading organizations…" />

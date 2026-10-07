@@ -73,7 +73,7 @@ function highlightQueryTerms(text: string, query: string): React.ReactNode[] {
       return (
         <mark
           key={index}
-          className="bg-amber-200/80 dark:bg-amber-500/30 rounded-sm px-0.5"
+          className="bg-warning/20 rounded-sm px-0.5"
           aria-label={`Search match: ${part}`}
         >
           {part}
@@ -274,7 +274,7 @@ function SourceListItem({
               )}
             {source.vision_status && source.vision_status !== "used" && (
               <span
-                className="shrink-0 rounded-sm bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-600"
+                className="shrink-0 rounded-sm bg-warning/15 px-1.5 py-0.5 text-[10px] font-medium text-warning"
                 aria-label={`vision status: ${source.vision_status}`}
               >
                 proxy
@@ -630,7 +630,7 @@ function SourcePreview({ source, query, onJumpToAnswer }: SourcePreviewProps) {
                   {highlightQueryTerms(previewContent.slice(0, supportSpanRange[0]), query)}
                   <mark
                     data-support-span
-                    className="bg-sky-200/70 dark:bg-sky-500/25 rounded-sm px-0.5"
+                    className="bg-primary/20 rounded-sm px-0.5"
                     aria-label="Supporting passage"
                   >
                     {previewContent.slice(supportSpanRange[0], supportSpanRange[1])}

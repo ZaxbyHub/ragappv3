@@ -101,7 +101,7 @@ function SourceCard({ source, fallbackIndex, validCitationLabels, onClick }: Sou
           )}
           {source.vision_status && source.vision_status !== "used" && (
             <span
-              className="shrink-0 rounded-sm bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-600"
+              className="shrink-0 rounded-sm bg-warning/15 px-1.5 py-0.5 text-[10px] font-medium text-warning"
               aria-label={`vision status: ${source.vision_status}`}
             >
               proxy
@@ -121,7 +121,7 @@ function SourceCard({ source, fallbackIndex, validCitationLabels, onClick }: Sou
               className={cn(
                 "text-[10px] px-1.5 py-0",
                 citedState === "cited"
-                  ? "text-emerald-600 border-emerald-500/30 bg-emerald-500/5"
+                  ? "text-success border-success/30 bg-success/5"
                   : "text-muted-foreground"
               )}
               aria-label={

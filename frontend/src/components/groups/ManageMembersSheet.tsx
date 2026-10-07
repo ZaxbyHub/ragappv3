@@ -236,7 +236,7 @@ export function ManageMembersSheet({
         <div className="flex-1 flex flex-col py-4 min-h-0">
           {hasBackgroundReadError && (
             <div
-              className="mb-4 flex items-center justify-between gap-3 rounded-sm border border-amber-500/50 bg-amber-500/10 p-3 text-sm"
+              className="mb-4 flex items-center justify-between gap-3 rounded-sm border border-warning/50 bg-warning/10 p-3 text-sm"
               role="status"
               aria-live="polite"
             >

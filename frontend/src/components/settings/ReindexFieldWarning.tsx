@@ -16,7 +16,7 @@ export function ReindexFieldWarning({
   return (
     <div
       role="note"
-      className="flex items-start gap-1.5 rounded-sm border border-amber-500/40 bg-amber-500/5 px-2.5 py-1.5 text-xs text-amber-800 dark:text-amber-300"
+      className="flex items-start gap-1.5 rounded-sm border border-warning/40 bg-warning/5 px-2.5 py-1.5 text-xs text-warning"
     >
       <AlertTriangle
         className="h-3.5 w-3.5 shrink-0 mt-0.5"

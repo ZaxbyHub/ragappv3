@@ -14,6 +14,7 @@ import type {
   WikiPageLink,
 } from "@/lib/api";
 import { getWikiPage, getWikiPageVersions, getWikiPageFiles, getWikiPageBacklinks } from "@/lib/api";
+import { PageTitleHeader } from "@/components/layout/PageTitleHeader";
 
 interface WikiPageDetailProps {
   page: WikiPage;
@@ -36,7 +37,7 @@ function ClaimRow({ claim }: { claim: WikiClaim }) {
   const isCurator = claim.created_by_kind === "llm_curator";
   const isNeedsReview = claim.status === "needs_review";
   const rowBg = isNeedsReview
-    ? "bg-blue-50/60 dark:bg-blue-950/20 rounded-sm -sm px-2 -mx-2"
+    ? "bg-primary/10 rounded-sm -sm px-2 -mx-2"
     : "";
   return (
     <div
@@ -72,7 +73,7 @@ function ClaimRow({ claim }: { claim: WikiClaim }) {
         {isNeedsReview && (
           <Badge
             variant="outline"
-            className="text-[10px] uppercase border-blue-300 text-blue-700 dark:text-blue-300"
+            className="text-[10px] uppercase border-primary text-primary"
             title="Needs operator review before becoming an active claim."
           >
             Needs review
@@ -386,26 +387,26 @@ export function WikiPageDetail({ page, onBack, onEdit, onDelete }: WikiPageDetai
     <ScrollArea className="h-full">
       <div className="flex flex-col gap-4 p-1">
         {/* Header */}
-        <div className="flex items-start justify-between gap-2">
-          <div className="flex items-center gap-2">
+        <PageTitleHeader
+          before={
             <Button variant="ghost" size="icon" onClick={onBack} aria-label="Back">
               <ArrowLeft className="w-4 h-4" />
             </Button>
-            <div>
-              <h1 className="text-lg font-semibold">{page.title}</h1>
-              <p className="text-xs text-muted-foreground">{page.slug}</p>
-            </div>
-          </div>
-          <div className="flex gap-1">
-            <Button variant="outline" size="sm" onClick={onEdit}>
-              <Edit className="w-4 h-4 mr-1" />
-              Edit
-            </Button>
-            <Button variant="destructive" size="sm" onClick={onDelete}>
-              <Trash2 className="w-4 h-4" />
-            </Button>
-          </div>
-        </div>
+          }
+          title={page.title}
+          description={<span className="text-xs">{page.slug}</span>}
+          actions={
+            <>
+              <Button variant="outline" size="sm" onClick={onEdit}>
+                <Edit className="w-4 h-4 mr-1" />
+                Edit
+              </Button>
+              <Button variant="destructive" size="sm" onClick={onDelete}>
+                <Trash2 className="w-4 h-4" />
+              </Button>
+            </>
+          }
+        />
 
         {/* Meta */}
         <div className="flex gap-2 flex-wrap">

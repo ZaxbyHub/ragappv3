@@ -13,6 +13,7 @@ import {
 import { useVaultStore } from "@/stores/useVaultStore";
 import { VaultSelector } from "@/components/vault/VaultSelector";
 import { VaultGate } from "@/components/vault/VaultGate";
+import { PageTitleHeader } from "@/components/layout/PageTitleHeader";
 import { EmptyState } from "@/components/EmptyState";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -214,41 +215,43 @@ export default function KMSPage() {
   return (
     <div className="flex flex-col h-full">
       {/* Header */}
-      <div className="flex items-center justify-between px-6 py-4 border-b border-border shrink-0">
-        <div className="flex items-center gap-3">
-          <Library className="w-5 h-5 text-muted-foreground" />
-          <h1 className="text-xl font-semibold">Knowledge Management</h1>
-          <VaultSelector />
-        </div>
-        <div className="flex items-center gap-2">
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={handleRecompile}
-            disabled={!activeVaultId || recompilePoll.active}
-            aria-busy={recompilePoll.active}
-            title={
-              recompilePoll.active
-                ? "Recompile in progress…"
-                : "Recompile document entries for this vault"
-            }
-          >
-            {recompilePoll.active ? (
-              <Loader2 className="w-4 h-4 mr-1 animate-spin" />
-            ) : (
-              <RefreshCw className="w-4 h-4 mr-1" />
-            )}
-            Recompile
-          </Button>
-          <Button
-            size="sm"
-            onClick={() => setCreateOpen(true)}
-            disabled={!activeVaultId}
-          >
-            <Plus className="w-4 h-4 mr-1" />
-            New entry
-          </Button>
-        </div>
+      <div className="px-6 py-4 border-b border-border shrink-0">
+        <PageTitleHeader
+          before={<Library className="w-5 h-5 text-muted-foreground" />}
+          title="Knowledge Management"
+          actions={
+            <>
+              <VaultSelector />
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleRecompile}
+                disabled={!activeVaultId || recompilePoll.active}
+                aria-busy={recompilePoll.active}
+                title={
+                  recompilePoll.active
+                    ? "Recompile in progress…"
+                    : "Recompile document entries for this vault"
+                }
+              >
+                {recompilePoll.active ? (
+                  <Loader2 className="w-4 h-4 mr-1 animate-spin" />
+                ) : (
+                  <RefreshCw className="w-4 h-4 mr-1" />
+                )}
+                Recompile
+              </Button>
+              <Button
+                size="sm"
+                onClick={() => setCreateOpen(true)}
+                disabled={!activeVaultId}
+              >
+                <Plus className="w-4 h-4 mr-1" />
+                New entry
+              </Button>
+            </>
+          }
+        />
       </div>
 
       {/* Toolbar */}

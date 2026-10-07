@@ -183,13 +183,16 @@ export default function DraftRoomPage() {
 
   return (
     <div className="animate-in fade-in space-y-6 pb-12 duration-300">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <PageTitleHeader title="Draft Room" description={DRAFT_ROOM_PAGE_DESCRIPTION} />
-        <Button type="button" onClick={() => setCreateOpen(true)} disabled={newDraftDisabled} title={newDraftDisabledReason}>
-          <Plus className="mr-1 h-4 w-4" aria-hidden="true" />
-          {NEW_DRAFT_CTA}
-        </Button>
-      </div>
+      <PageTitleHeader
+        title="Draft Room"
+        description={DRAFT_ROOM_PAGE_DESCRIPTION}
+        actions={
+          <Button type="button" onClick={() => setCreateOpen(true)} disabled={newDraftDisabled} title={newDraftDisabledReason}>
+            <Plus className="mr-1 h-4 w-4" aria-hidden="true" />
+            {NEW_DRAFT_CTA}
+          </Button>
+        }
+      />
 
       {capabilityDisabled && (
         <Alert variant="warning">

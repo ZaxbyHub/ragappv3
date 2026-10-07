@@ -750,40 +750,43 @@ export default function DocumentsPage() {
 
   return (
     <div className="space-y-6 animate-in fade-in duration-300 pb-12">
-      <div className="flex items-center justify-between">
-        <PageTitleHeader title="Documents" description="Manage your knowledge base documents" />
-        <div className="flex items-center gap-2">
-          <VaultSelector />
-          <Button
-            onClick={handleScan}
-            disabled={isScanning || !hasSelectedVault || !canWriteActiveVault}
-            title={
-              !hasSelectedVault
-                ? "Select a vault to scan documents"
-                : !canWriteActiveVault
-                  ? "Write access is required to scan this vault"
-                  : "Scan directory"
-            }
-          >
-            {isScanning ? (
-              <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-            ) : (
-              <ScanLine className="w-4 h-4 mr-2" />
-            )}
-            Scan Directory
-          </Button>
-          {filteredDocuments.length > 0 && canMutateDocuments && (
-            <Button variant="destructive" onClick={handleDeleteAllInVault} disabled={isBulkDeletingAll}>
-              {isBulkDeletingAll ? (
+      <PageTitleHeader
+        title="Documents"
+        description="Manage your knowledge base documents"
+        actions={
+          <>
+            <VaultSelector />
+            <Button
+              onClick={handleScan}
+              disabled={isScanning || !hasSelectedVault || !canWriteActiveVault}
+              title={
+                !hasSelectedVault
+                  ? "Select a vault to scan documents"
+                  : !canWriteActiveVault
+                    ? "Write access is required to scan this vault"
+                    : "Scan directory"
+              }
+            >
+              {isScanning ? (
                 <Loader2 className="w-4 h-4 mr-2 animate-spin" />
               ) : (
-                <Trash className="w-4 h-4 mr-2" />
+                <ScanLine className="w-4 h-4 mr-2" />
               )}
-              Delete All in Vault
+              Scan Directory
             </Button>
-          )}
-        </div>
-      </div>
+            {filteredDocuments.length > 0 && canMutateDocuments && (
+              <Button variant="destructive" onClick={handleDeleteAllInVault} disabled={isBulkDeletingAll}>
+                {isBulkDeletingAll ? (
+                  <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                ) : (
+                  <Trash className="w-4 h-4 mr-2" />
+                )}
+                Delete All in Vault
+              </Button>
+            )}
+          </>
+        }
+      />
 
       {stats && <DocumentStatsCards stats={stats} />}
 

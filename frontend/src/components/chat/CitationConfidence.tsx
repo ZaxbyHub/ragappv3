@@ -22,9 +22,9 @@ const CONFIDENCE_THRESHOLDS = {
 } as const;
 
 const CONFIDENCE_COLORS = {
-  high: "bg-emerald-500",
-  medium: "bg-amber-500",
-  low: "bg-red-500",
+  high: "bg-success",
+  medium: "bg-warning",
+  low: "bg-destructive",
 } as const;
 
 const OVERLAP_DESCRIPTION =

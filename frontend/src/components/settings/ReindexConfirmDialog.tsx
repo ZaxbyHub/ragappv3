@@ -34,7 +34,7 @@ export function ReindexConfirmDialog({
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <AlertTriangle
-              className="h-5 w-5 text-amber-600 dark:text-amber-400"
+              className="h-5 w-5 text-warning"
               aria-hidden="true"
             />
             Re-index required
@@ -74,7 +74,7 @@ export function ReindexConfirmDialog({
           <Button
             onClick={onConfirm}
             disabled={saving}
-            className="bg-amber-600 hover:bg-amber-700 text-white"
+            className="bg-warning hover:bg-warning/90 text-warning-foreground"
           >
             {saving ? "Saving…" : "Save and acknowledge"}
           </Button>

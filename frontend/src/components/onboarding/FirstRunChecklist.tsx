@@ -144,7 +144,7 @@ export default function FirstRunChecklist() {
                   aria-hidden="true"
                   className={
                     done
-                      ? "inline-block h-2 w-2 rounded-full bg-emerald-500"
+                      ? "inline-block h-2 w-2 rounded-full bg-success"
                       : "inline-block h-2 w-2 rounded-full border border-muted-foreground/60"
                   }
                 />

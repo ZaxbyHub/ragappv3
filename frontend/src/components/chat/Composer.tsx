@@ -540,8 +540,8 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
                     "flex items-center gap-2 rounded-sm border px-2 py-1.5 text-xs",
                     status === "error" && "border-destructive/50 bg-destructive/5",
                     status === "indexed" && "border-success/50 bg-success/5",
-                    status === "uploaded" && "border-amber-500/40 bg-amber-500/5",
-                    status === "indexing" && "border-amber-500/40 bg-amber-500/5",
+                    status === "uploaded" && "border-warning/40 bg-warning/5",
+                    status === "indexing" && "border-warning/40 bg-warning/5",
                     status === "uploading" && "border-border bg-muted/50"
                   )}
                   aria-label={`Attachment ${att.file.name}: ${statusText}`}
@@ -563,7 +563,7 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
                       status === "error" && "text-destructive",
                       status === "indexed" && "text-success",
                       (status === "uploaded" || status === "indexing") &&
-                        "text-amber-700 dark:text-amber-300",
+                        "text-warning",
                       status === "uploading" && "text-muted-foreground"
                     )}
                   >
@@ -582,7 +582,7 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
             {hasIndexing && (
               <div
                 role="status"
-                className="text-[11px] text-amber-700 dark:text-amber-300 self-center"
+                className="text-[11px] text-warning self-center"
                 aria-live="polite"
               >
                 Some attachments are still indexing — they may not be searchable yet.
@@ -889,7 +889,7 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
                 <span
                   role="status"
                   aria-live="polite"
-                  className="text-[10px] text-amber-700 dark:text-amber-300"
+                  className="text-[10px] text-warning"
                 >
                   Using {effectiveChatMode} — {desiredChatMode} unavailable
                 </span>
