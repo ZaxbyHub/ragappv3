@@ -12,6 +12,10 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
+
+from app.services.auth_service import password_strength_check
+
 ROOT = Path(__file__).resolve().parents[2]
 COMPONENT = ROOT / "frontend" / "src" / "components" / "shared" / "PasswordRequirements.tsx"
 AUTH_SERVICE = ROOT / "backend" / "app" / "services" / "auth_service.py"
@@ -31,3 +35,24 @@ def test_backend_still_enforces_the_same_three_rules() -> None:
     assert re.search(r"len\(plain_password\) < 8", source)
     assert re.search(r"any\(char\.isdigit\(\) for char in plain_password\)", source)
     assert re.search(r"any\(char\.isupper\(\) for char in plain_password\)", source)
+
+
+# Runtime half (supplemental review): actually exercise the real validator so a
+# behavioral rule change cannot hide behind unchanged source text.
+@pytest.mark.parametrize(
+    ("password", "expected_fragment"),
+    [
+        ("Abcdefg", "at least 8 characters"),
+        ("abcdefgh1", "uppercase"),
+        ("Abcdefgh", "digit"),
+    ],
+)
+def test_password_strength_check_rejects_each_stated_rule(
+    password: str, expected_fragment: str
+) -> None:
+    with pytest.raises(ValueError, match=expected_fragment):
+        password_strength_check(password)
+
+
+def test_password_strength_check_accepts_a_rule_satisfying_password() -> None:
+    assert password_strength_check("Abcdefgh1") is None

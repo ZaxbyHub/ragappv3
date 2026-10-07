@@ -137,6 +137,17 @@ describe("PageShell L05 (issue #776)", () => {
     expect(wrapper.className.split(/\s+/).includes("overflow-hidden")).toBe(false);
   });
 
+  it("session route keeps the full-bleed chat wrapper", () => {
+    // PRR-004: /chat/:sessionId is the app's primary surface; pin the chat
+    // branch there so an over-anchored regex (e.g. /^\/chat\/?$/) cannot
+    // silently move every real conversation into the padded page wrapper.
+    renderShellAt("/chat/session-abc");
+    const wrapper = getLayoutWrapper();
+
+    expect(wrapper.className.split(/\s+/).includes("overflow-hidden")).toBe(true);
+    expect(/(^|\s)pb-(?!0(\s|$))\S+/.test(wrapper.className)).toBe(true);
+  });
+
   it("non-chat content wrapper has a max width", () => {
     renderShellAt("/settings");
 

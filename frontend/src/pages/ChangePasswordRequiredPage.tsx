@@ -131,8 +131,9 @@ export default function ChangePasswordRequiredPage() {
                 onChange={(e) => setNewPassword(e.target.value)}
                 disabled={submitting}
                 aria-required="true"
+                aria-describedby="change-password-requirements"
               />
-              <PasswordRequirements />
+              <PasswordRequirements id="change-password-requirements" />
             </div>
             <div className="space-y-2">
               <Label htmlFor="confirm-password">Confirm New Password</Label>

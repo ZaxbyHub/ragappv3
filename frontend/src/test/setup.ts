@@ -34,6 +34,7 @@ if (typeof globalThis.ResizeObserver === 'undefined') {
   Object.defineProperty(globalThis, 'ResizeObserver', {
     value: ResizeObserverStub,
     writable: true,
+    configurable: true,
   });
 }
 

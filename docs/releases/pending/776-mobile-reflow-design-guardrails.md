@@ -21,19 +21,29 @@ token-contrast-test metric is #777's).
 - **Non-chat content has a measure.** The non-chat wrapper caps at
   `max-w-[1536px]`, so the long-inert `mx-auto` finally centers wide screens
   and Settings/Profile rows stop stretching across 4K monitors.
-- **The mobile "More" sheet scrolls and has one close button.** The fixed
-  `h-[50vh]` sheet gains `overflow-y-auto` (admin tile lists exceed 50vh);
-  the hand-rolled close button is gone — every sheet already renders
-  `SheetContent`'s built-in close control, so the sheet no longer stacks two.
+- **The mobile "More" sheet scrolls and has one close button.** Admin tile
+  lists exceed 50vh, so the tile grid scrolls inside the sheet while the
+  built-in close control stays pinned (the scroll lives on an inner region,
+  so the absolutely positioned close never scrolls away). The hand-rolled
+  close button is gone — every sheet already renders `SheetContent`'s
+  built-in close control, so no sheet stacks two; the mobile chat evidence
+  drawer does the same and drops its duplicate close, and the vendored
+  close's touch target grows to ~40px (repo convention targets >=44px).
 - **Every page header wraps, in one place.** `PageTitleHeader` is now the one
-  page-header component (18 pages): new `actions`/`before` slots render in
-  `flex flex-wrap` rows, so the Wiki/KMS/Documents/detail header actions wrap
-  instead of overflowing at 320-768px, and the wrap rule lives in the shared
-  component instead of per page. Six pages' hand-rolled `<h1>` headers (and
-  canvas's) migrated onto it; KMS's bespoke bordered header bar and the
-  detail pages' private header rows are consolidated. Two disclosed behavior
-  notes: KMS-detail's heading now wraps its edit-mode `<Input>` (the heading
-  landmark survives editing), and pages adopt the shared title-chip look.
+  page-header component (17 pages plus the canvas route): new
+  `actions`/`before` slots render in `flex flex-wrap` rows, so the
+  Wiki/KMS/Documents/detail header actions wrap instead of overflowing at
+  320-768px, and the wrap rule lives in the shared component instead of per
+  page. Six pages' hand-rolled `<h1>` headers (and canvas's) migrated onto
+  it; KMS's bespoke bordered header bar and the detail pages' private header
+  rows are consolidated. Disclosed behavior notes: KMS-detail's heading now
+  wraps its edit-mode `<Input>` (the heading landmark survives editing);
+  every migrated page adopts the shared title-chip look, so detail-page and
+  canvas headings grow from `text-lg`/`text-2xl` to the shared `text-3xl`
+  and long unbroken titles wrap mid-token instead of overflowing; the
+  Draft Room detail "Back" link now sits beside the title rather than above
+  it; long document filenames truncate again (block-level ellipsis with a
+  shrinkable title chip).
 - **The nav rail's scrollbar is discoverable.** `NavigationRail`'s nav
   `ScrollArea` passes `type="auto"` instead of Radix's default
   hover-only scrollbar, so at short viewports (720-768px) the Account
@@ -55,8 +65,15 @@ token-contrast-test metric is #777's).
   empty): an inline ESLint rule `local/no-raw-palette` in
   `frontend/eslint.config.js` (off for `components/ui`, tests, and allowlisted
   files) and `scripts/check_l05_raw_palette.py` (CI Quality contracts; budget
-  ≤10). Visual note: token hues differ slightly from the raw palette they
-  replace; #777 tunes token contrast next.
+  ≤10). Visual notes: token hues differ from the raw palette they replace —
+  on light theme the primary-on-tint chips (citation chips, wiki label pills,
+  thinking/instant badges at 10px) now sit below the 4.5:1 AA text floor
+  (~3.1-4.2:1) where the previous violet/indigo-700 pairings passed; #777
+  exists precisely to bring token contrast to AA and pins it with a test.
+  The thinking and instant mode badges now share one accent (icon + label
+  carry the distinction); chat citation cards shift from indigo/emerald/amber
+  to the primary/success/warning tokens, and search-highlight marks use
+  lighter tints than before.
 - **One page-header ownership guardrail.**
   `scripts/check_l05_page_headers.py` fails CI when any non-test page under
   `frontend/src/pages` renders its own literal `<h1>` instead of the shared

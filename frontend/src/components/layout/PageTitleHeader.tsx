@@ -11,7 +11,9 @@ interface PageTitleHeaderProps {
   /** Leading control rendered before the title (back button, section icon). */
   before?: ReactNode;
   /** Render only the visually-hidden h1 landmark (e.g. chat's toolbar
-   *  header) without the title chip or row chrome. */
+   *  header) without the title chip or row chrome. In this mode
+   *  `description`/`actions`/`before`/`className` are intentionally not
+   *  rendered (the landmark is bare); only `title` and `id` apply. */
   srOnly?: boolean;
   /** Forwarded to the h1 (heading anchors such as canvas-page-heading). */
   id?: string;
@@ -29,8 +31,8 @@ export function PageTitleHeader({ title, description, actions, before, srOnly, i
   return (
     <div className={cn("flex flex-wrap items-center justify-between gap-x-4 gap-y-2", className)}>
       {before}
-      <div className="flex flex-col items-start justify-start gap-1 py-1.5 px-6 bg-accent/50 rounded-sm">
-        <h1 id={id} className="text-3xl font-semibold tracking-tight">
+      <div className="flex min-w-0 flex-col items-start justify-start gap-1 py-1.5 px-6 bg-accent/50 rounded-sm">
+        <h1 id={id} className="text-3xl font-semibold tracking-tight [overflow-wrap:anywhere]">
           {title}
         </h1>
         {description && <p className="text-muted-foreground mt-1 font-normal">{description}</p>}

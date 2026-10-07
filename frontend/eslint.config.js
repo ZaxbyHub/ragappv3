@@ -11,15 +11,32 @@ import { fileURLToPath } from 'node:url';
 // classes (e.g. bg-amber-500) outside the design-system primitives. The app
 // states color through semantic tokens (primary/success/warning/destructive/
 // muted/...). The authoritative census is scripts/check_l05_raw_palette.py;
-// this rule is the authoring-time guardrail. Both read the SAME allowlist
-// file (frontend/raw-palette-allowlist.json, {"lines": [...], "files": [...]}
-// — a missing file means no exemptions) so the two cannot drift apart.
+// this rule is the authoring-time guardrail.
+//
+// Allowlist contract (PRR-001): both consumers read
+// frontend/raw-palette-allowlist.json, but NOT identically — the census
+// honours BOTH keys with repo-root-relative entries ("frontend/src/…") while
+// this rule consumes only whole-file `files` entries, normalized here from
+// the documented repo-root form to flat-config form (flat-config globs
+// resolve relative to frontend/, so a documented "frontend/src/X.tsx" entry
+// would otherwise never match). Line-level `lines` entries are census-only:
+// this rule cannot exempt a single line, so a `lines` exemption still fails
+// lint by design. The census budget (10) is likewise looser than this rule's
+// zero tolerance — both differences are intentional, not drift.
 const RAW_PALETTE_ALLOWLIST_PATH = fileURLToPath(new URL('./raw-palette-allowlist.json', import.meta.url));
 let rawPaletteAllowlistedFiles = [];
 try {
   const parsed = JSON.parse(fs.readFileSync(RAW_PALETTE_ALLOWLIST_PATH, 'utf8'));
-  rawPaletteAllowlistedFiles = Array.isArray(parsed.files) ? parsed.files : [];
-} catch {
+  const entries = Array.isArray(parsed.files) ? parsed.files : [];
+  rawPaletteAllowlistedFiles = entries
+    .map((entry) => String(entry).replace(/^frontend\//, ''))
+    .filter((entry) => entry.startsWith('src/'));
+  const dropped = entries.length - rawPaletteAllowlistedFiles.length;
+  if (dropped > 0) {
+    console.warn(`[local/no-raw-palette] ${dropped} raw-palette-allowlist "files" entr${dropped === 1 ? 'y' : 'ies'} not under frontend/src were ignored (entries must look like "frontend/src/...").`);
+  }
+} catch (error) {
+  console.warn(`[local/no-raw-palette] raw-palette-allowlist.json unreadable (${error instanceof Error ? error.message : error}); running with no exemptions.`);
   rawPaletteAllowlistedFiles = [];
 }
 

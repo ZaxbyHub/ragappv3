@@ -84,6 +84,7 @@ export function ResetPasswordDialog({
               value={newPassword}
               onChange={(e) => setNewPassword(e.target.value)}
               placeholder="Enter new password"
+              aria-describedby="reset-password-requirements"
             />
           </div>
           <div className="space-y-2">
@@ -96,7 +97,7 @@ export function ResetPasswordDialog({
               placeholder="Confirm new password"
             />
           </div>
-          <PasswordRequirements />
+          <PasswordRequirements id="reset-password-requirements" />
           <p className="text-sm text-muted-foreground">
             User will be required to change their password on next login.
           </p>

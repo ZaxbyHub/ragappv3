@@ -158,7 +158,7 @@ export default function RegisterPage() {
 
             <div className="space-y-2">
               <Label htmlFor="register-password">Password</Label>
-              {formData.password && <PasswordRequirements value={formData.password} />}
+              {formData.password && <PasswordRequirements id="register-password-requirements" value={formData.password} />}
               <div className="relative">
                 <HugeiconsIcon strokeWidth={1.2} icon={LockPasswordIcon} className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
                 <Input
@@ -169,7 +169,7 @@ export default function RegisterPage() {
                   onChange={handleChange("password")}
                   disabled={isLoading}
                   aria-required="true"
-                  aria-describedby={errors.password ? "register-password-error" : undefined}
+                  aria-describedby={errors.password ? "register-password-error register-password-requirements" : "register-password-requirements"}
                   aria-invalid={!!errors.password}
                   className="pl-10 pr-10"
                 />

@@ -12,9 +12,17 @@ across frontend/src/**/*.tsx, excluding:
        "files": ["frontend/src/path/File.tsx", ...]}; a missing allowlist
     file is treated as empty).
 
+Allowlist notes: `lines` entries are keyed by line number, so an upstream
+edit that shifts lines silently re-binds (or drops) an exemption — prefer
+whole-file `files` entries when possible. The ESLint rule
+(local/no-raw-palette) consumes only whole-file entries and has zero
+tolerance; this census is the looser, budget-based authority (see the
+contract comment in frontend/eslint.config.js).
+
 More than 10 remaining occurrences exceeds the budget: prints
 "RAW-PALETTE <count> > 10" (followed by per-occurrence detail lines) and
-exits 1. Within budget: prints "RAW-PALETTE <count>" and exits 0.
+exits 1. Within budget: prints "RAW-PALETTE <count>" and exits 0. A missing
+frontend/src tree fails closed with exit 2 (review PRR-013).
 """
 
 from __future__ import annotations
@@ -28,8 +36,6 @@ ROOT = Path(__file__).resolve().parents[1]
 FRONTEND_SRC = ROOT / "frontend" / "src"
 ALLOWLIST_PATH = ROOT / "frontend" / "raw-palette-allowlist.json"
 BUDGET = 10
-
-UI_DIR_PREFIX = "frontend/src/components/ui/"
 
 PALETTE_RE = re.compile(
     r"(?:bg|text|border|ring|from|via|to|fill|stroke|outline|divide|placeholder)"
@@ -49,24 +55,33 @@ def load_allowlist() -> tuple[set[str], set[str]]:
     return lines, files
 
 
+def scan(frontend_src: Path, root: Path, allow_lines: set[str], allow_files: set[str]) -> tuple[list[str], int]:
+    """Count raw-palette occurrences under `frontend_src`; returns (hits, total)."""
+    hits: list[str] = []
+    total = 0
+    for path in sorted(frontend_src.rglob("*.tsx")):
+        if path.name.endswith((".test.tsx", ".spec.tsx")):
+            continue
+        rel = path.relative_to(root).as_posix()
+        if rel.startswith("frontend/src/components/ui/") or rel in allow_files:
+            continue
+        text = path.read_text(encoding="utf-8")
+        for match in PALETTE_RE.finditer(text):
+            line_no = text.count("\n", 0, match.start()) + 1
+            if f"{rel}:{line_no}" in allow_lines:
+                continue
+            hits.append(f"{rel}:{line_no}:{match.group(0)}")
+            total += 1
+    return hits, total
+
+
 def main() -> int:
+    if not FRONTEND_SRC.is_dir():
+        print(f"raw-palette: frontend/src tree not found at {FRONTEND_SRC}", file=sys.stderr)
+        return 2
     try:
         allow_lines, allow_files = load_allowlist()
-        hits: list[str] = []
-        total = 0
-        for path in sorted(FRONTEND_SRC.rglob("*.tsx")):
-            if path.name.endswith((".test.tsx", ".spec.tsx")):
-                continue
-            rel = path.relative_to(ROOT).as_posix()
-            if rel.startswith(UI_DIR_PREFIX) or rel in allow_files:
-                continue
-            text = path.read_text(encoding="utf-8")
-            for match in PALETTE_RE.finditer(text):
-                line_no = text.count("\n", 0, match.start()) + 1
-                if f"{rel}:{line_no}" in allow_lines:
-                    continue
-                hits.append(f"{rel}:{line_no}:{match.group(0)}")
-                total += 1
+        hits, total = scan(FRONTEND_SRC, ROOT, allow_lines, allow_files)
     except (OSError, ValueError) as exc:
         print(f"raw-palette: {exc}", file=sys.stderr)
         return 2

@@ -467,8 +467,8 @@ export function TranscriptPane({ className, onSessionCreated }: TranscriptPanePr
   // below-lg evidence sheet pads <main> by 45vh, which shrinks or grows this
   // scroll container WITHOUT a scroll event — a bottom-pinned user would
   // silently end up half a viewport above the newest content. Re-pin on
-  // container size changes when the user is still pinned. (Guarded: jsdom
-  // has no ResizeObserver.)
+  // container size changes when the user is still pinned. (ResizeObserver is
+  // stubbed to a no-op in tests, so the callback never fires there.)
   useEffect(() => {
     if (typeof ResizeObserver === "undefined") return;
     const el = scrollRef.current;

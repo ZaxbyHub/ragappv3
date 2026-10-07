@@ -8,6 +8,10 @@
 // "Close", sheet.tsx:73-76) plus the custom "Close" button
 // (MobileBottomNav.tsx:128-134).
 //
+// Review-round amendment (PRR-002, CHECK_WRONG): the scroll region moved from
+// SheetContent to an inner div so the built-in close stays pinned while the
+// tile list scrolls; the scroll contract below follows the new structure.
+//
 // Expected RED at master:
 //   "More sheet content scrolls"            — expected false to be true
 //   "More sheet has exactly one close button" — expected 2 to be 1
@@ -52,7 +56,15 @@ describe("MobileBottomNav L05 (issue #776)", () => {
     fireEvent.click(screen.getByRole("button", { name: "More navigation options" }));
     const dialog = screen.getByRole("dialog");
 
-    expect(/overflow-y-(auto|scroll)/.test(dialog.className)).toBe(true);
+    // The scroll region is the inner content div (PRR-002 amendment): the
+    // built-in close is pinned on SheetContent, so the scrollable region is
+    // the tile grid container. First assertion keeps the frozen base-failure
+    // signature (expected false to be true).
+    const scrollRegion = dialog.querySelector(".overflow-y-auto");
+    expect(scrollRegion !== null).toBe(true);
+    expect(/overflow-y-(auto|scroll)/.test(scrollRegion.className)).toBe(true);
+    // The header (with the pinned close above it) must not scroll away.
+    expect(dialog.className.includes("overflow-y-auto")).toBe(false);
   });
 
   it("More sheet has exactly one close button", () => {

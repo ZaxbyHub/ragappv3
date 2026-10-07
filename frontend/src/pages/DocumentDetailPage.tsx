@@ -280,7 +280,7 @@ export default function DocumentDetailPage() {
               <FileIcon filename={doc.filename} className="w-5 h-5 shrink-0" />
             </>
           }
-          title={<span className="truncate" title={doc.filename}>{doc.filename}</span>}
+          title={<span className="block truncate" title={doc.filename}>{doc.filename}</span>}
           actions={
             <>
               <Button

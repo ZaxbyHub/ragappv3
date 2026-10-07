@@ -25,9 +25,8 @@ import {
   SheetHeader,
   SheetTitle,
   SheetDescription,
-  SheetClose,
 } from "@/components/ui/sheet";
-import { PanelLeft, PanelRight, Download, X, AlertTriangle } from "lucide-react";
+import { PanelLeft, PanelRight, Download, AlertTriangle } from "lucide-react";
 
 function useIsMobile(breakpoint = 768) {
   const [isMobile, setIsMobile] = useState(
@@ -688,21 +687,17 @@ export default function ChatShell() {
           stay interactive while the evidence drawer is open. */}
       {isBelowLg && (
         <Sheet modal={false} open={rightPaneOpen} onOpenChange={(open) => !open && closeRightPane()}>
-          <SheetContent side="bottom" overlay={false} className="h-[45vh] overflow-y-auto rounded-t-xl p-0 lg:hidden" aria-describedby="evidence-sources-desc">
-            <SheetHeader className="px-4 pt-4 pb-2 border-b border-border">
+          {/* Review PRR-002: scroll lives on the inner region so SheetContent's
+              built-in close stays pinned; the duplicated custom close was
+              removed (the built-in control remains the single close). */}
+          <SheetContent side="bottom" overlay={false} className="flex h-[45vh] flex-col rounded-t-xl p-0 lg:hidden" aria-describedby="evidence-sources-desc">
+            <SheetHeader className="shrink-0 px-4 pt-4 pb-2 border-b border-border">
               <SheetTitle id="evidence-sources-title" className="text-base text-left">Evidence</SheetTitle>
               <SheetDescription id="evidence-sources-desc" className="sr-only">
                 View retrieved evidence and source documents
               </SheetDescription>
             </SheetHeader>
-            <div className="absolute right-4 top-4 z-10">
-              <SheetClose asChild>
-                <Button variant="ghost" size="icon" className="h-8 w-8" aria-label="Close details panel">
-                  <X className="h-4 w-4" aria-hidden="true" />
-                </Button>
-              </SheetClose>
-            </div>
-            <div className="flex h-full flex-col p-4 pt-2">
+            <div className="flex flex-1 flex-col overflow-y-auto p-4 pt-2">
               <ErrorBoundary fallback={sourcesFallback}>
                 <RightPane />
               </ErrorBoundary>

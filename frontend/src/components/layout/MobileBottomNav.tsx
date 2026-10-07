@@ -122,15 +122,17 @@ export function MobileBottomNav({ activeItem, onItemSelect }: MobileBottomNavPro
             </button>
           </SheetTrigger>
           {/* Issue #776 (UI-R4-03): admin tile lists exceed 50vh, so the sheet
-              content scrolls. Issue #776 (UI-R4-04): SheetContent always renders
-              its own close control — this sheet must not add a second one. */}
-          <SheetContent side="bottom" className="h-[50vh] overflow-y-auto rounded-t-2xl" aria-describedby="mobile-more-desc">
-            <SheetHeader className="mb-6">
+              content scrolls — the scroll lives on an inner region so the
+              built-in close control (absolutely positioned on SheetContent)
+              stays pinned and reachable while scrolled (review PRR-002).
+              Issue #776 (UI-R4-04): this sheet must not add a second close. */}
+          <SheetContent side="bottom" className="flex h-[50vh] flex-col rounded-t-2xl" aria-describedby="mobile-more-desc">
+            <SheetHeader className="shrink-0 pb-2">
               <SheetTitle id="mobile-more-title" className="text-xl font-semibold">More</SheetTitle>
               <SheetDescription id="mobile-more-desc">Access settings, help, and other options</SheetDescription>
             </SheetHeader>
 
-            <div className="grid grid-cols-2 gap-3">
+            <div className="grid flex-1 grid-cols-2 content-start gap-3 overflow-y-auto">
               {moreNavItems
                 .filter((item) => (!item.adminOnly || isAdmin) && (!item.capabilityGated || draftRoomVisible))
                 .map((item) => {
