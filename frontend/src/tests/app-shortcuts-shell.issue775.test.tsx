@@ -71,16 +71,22 @@ describe("issue #775 review PRR-302 — '?' through the real App shell", () => {
     window.history.pushState({}, "", "/vaults");
   });
 
-  it("pressing ? at a shell route opens the keyboard-shortcuts dialog", async () => {
-    const { default: App } = await import("../App");
-    render(<App />);
+  it(
+    "pressing ? at a shell route opens the keyboard-shortcuts dialog",
+    // Full-App render spec: explicit budget per the App.render-timeout-guard
+    // class tripwire (the full lazy-loaded App needs headroom under load).
+    { timeout: 30_000 },
+    async () => {
+      const { default: App } = await import("../App");
+      render(<App />);
 
-    expect(await screen.findByText("Vaults Page")).toBeTruthy();
+      expect(await screen.findByText("Vaults Page")).toBeTruthy();
 
-    fireEvent.keyDown(window, { key: "?", shiftKey: true, ctrlKey: false, metaKey: false });
+      fireEvent.keyDown(window, { key: "?", shiftKey: true, ctrlKey: false, metaKey: false });
 
-    await waitFor(() => {
-      expect(screen.getByText("Keyboard Shortcuts")).toBeTruthy();
-    });
-  });
+      await waitFor(() => {
+        expect(screen.getByText("Keyboard Shortcuts")).toBeTruthy();
+      });
+    }
+  );
 });
