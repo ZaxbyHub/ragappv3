@@ -194,8 +194,8 @@ def test_in_flight_registry_refuses_then_readmits(tmp_path, monkeypatch):
 
 
 def test_schema_splitter_preserves_semicolons_in_literals(tmp_path):
-    """A ';' inside a string literal may split the residual chunk boundary,
-    but no content is lost: every character of the statement is indexed."""
+    """A ';' inside a string literal does not split the statement: the
+    split is quote-aware and the literal's statement stays one chunk."""
     path = tmp_path / "literals.sql"
     path.write_text(
         "INSERT INTO t (v) VALUES ('a;b');\n", encoding="utf-8"

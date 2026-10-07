@@ -2,8 +2,8 @@
 SQL/DDL schema parser for extracting searchable SQL statements.
 Parses .sql and .ddl files: CREATE TABLE definitions as structured
 table chunks, plus every other top-level statement (views, indexes,
-inserts, procedures, ...) as verbatim other-SQL chunks so no SQL
-construct is silently dropped (issue #703).
+inserts, procedures, ...) as whitespace-normalized other-SQL chunks so
+no SQL construct is silently dropped (issue #703).
 """
 
 import codecs

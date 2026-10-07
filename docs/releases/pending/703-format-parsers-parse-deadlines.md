@@ -10,10 +10,11 @@ Workstream B PR 14 of 16 (frontier audit 20260923T174456Z, findings T1-02-K-05/-
   indexes, procedures, ...) as whitespace-normalized `other_sql` chunks
   labelled by statement type, so no SQL construct vanishes without a trace and a
   non-table-only file is never mislabeled "empty, encrypted, or unsupported"
-  (T1-02-K-05). Statements are split on `;`; a semicolon inside a string
-  literal may split a residual chunk boundary, but both halves are indexed —
-  no content is lost. Comments never become chunks; a comments-only schema
-  file still reports zero extractable content.
+  (T1-02-K-05). The statement split is quote-aware, so a semicolon inside a
+  '...', "..." or `...` span keeps its statement whole. Comments are stripped
+  (quote-aware) before extraction and never become chunks; a comments-only
+  schema file — including one whose comments mention a CREATE TABLE — still
+  reports zero extractable content.
 - Schema files decode through a real-world encoding chain: an unambiguous
   BOM wins (UTF-16/UTF-32/UTF-8), otherwise strict UTF-8, with a lossy
   cp1252 last resort — a UTF-16 (BOM) `.sql` now yields its table instead
