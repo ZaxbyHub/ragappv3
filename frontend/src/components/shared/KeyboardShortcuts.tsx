@@ -121,28 +121,31 @@ export function KeyboardShortcutsDialog({ open, onOpenChange }: { open: boolean;
       }
       // Issue #775 shadow refusal — runs BEFORE the conflict-clearing loop so
       // a refused capture leaves persisted state untouched. A combo that
-      // could never fire must not be persisted: computing focusSearch's
-      // post-clear effective binding is a pure read — if focusSearch's
-      // current effective binding equals the captured combo, the resolver
-      // below would clear it and focusSearch reverts to its default;
-      // otherwise its current effective binding stands. A combo equal to
-      // that post-clear binding is claimed on /chat by focusSearch's
-      // document listener (document bubble beats every window listener), and
-      // a combo in PALETTE_TOGGLE_COMBOS is claimed everywhere else by the
-      // palette's app-wide window listener. With today's defaults both
-      // clauses collapse to the single reserved "Ctrl+K"; the general
-      // computation keeps the refusal correct if either default ever
-      // changes, while a steal of a *persisted* focusSearch combo (e.g.
-      // "F7") stays allowed (the holder reverts to its default, which fires).
-      if (capturing === "showShortcuts") {
-        const focusDefault = CANONICAL_DEFAULT.focusSearch ?? "Ctrl+K";
-        const current = loadShortcutBindings();
-        const focusEffective = current.focusSearch ?? focusDefault;
-        const focusPostClear = focusEffective === combo ? focusDefault : focusEffective;
-        if (focusPostClear === combo || PALETTE_TOGGLE_COMBOS.has(combo)) {
-          // Swallowed like a bare modifier press: capture stays armed.
-          return;
+      // could never fire must not be persisted: after the resolver runs, the
+      // combo is still claimed when ANY other rebindable shortcut's
+      // post-clear effective binding equals it (a steal of a persisted combo
+      // reverts that holder to its default, so only a combo equal to the
+      // holder's default remains claimed — today that collapses to the
+      // reserved "Ctrl+K"), or when the combo is in PALETTE_TOGGLE_COMBOS
+      // (the palette's app-wide window listener claims it off /chat).
+      const current = loadShortcutBindings();
+      let shadowed = PALETTE_TOGGLE_COMBOS.has(combo);
+      if (!shadowed) {
+        for (const other of shortcuts) {
+          if (other.id === capturing || !other.rebindable) continue;
+          const otherDefault: string = CANONICAL_DEFAULT[other.id] ?? other.key;
+          const otherEffective: string = current[other.id] ?? otherDefault;
+          const otherPostClear: string =
+            otherEffective === combo ? otherDefault : otherEffective;
+          if (otherPostClear === combo) {
+            shadowed = true;
+            break;
+          }
         }
+      }
+      if (shadowed) {
+        // Swallowed like a bare modifier press: capture stays armed.
+        return;
       }
       // Conflict handling (PRR-003): if another rebindable shortcut already
       // holds this combo, clear that binding so the combo drives exactly one
@@ -150,7 +153,6 @@ export function KeyboardShortcutsDialog({ open, onOpenChange }: { open: boolean;
       // canonical combos — stored bindings are comboFromEvent-normalized, and
       // the rebindable defaults have canonical forms ("Ctrl/Cmd + K" →
       // "Ctrl+K", "?" → "?").
-      const current = loadShortcutBindings();
       for (const other of shortcuts) {
         if (other.id === capturing || !other.rebindable) continue;
         const otherCanonical = CANONICAL_DEFAULT[other.id] ?? other.key;

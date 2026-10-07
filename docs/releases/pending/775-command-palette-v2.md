@@ -13,19 +13,30 @@ TQ-sibling-batch-03-05).
   same. On `/chat` one Ctrl+K now focuses the session search (document-level
   listener wins) and the palette stays closed; everywhere else it opens the
   palette. The second `ChatSearchInput` instance (mobile sheet) also yields
-  to the first. All global keydown consumers additionally skip IME
+  to the first, and a HIDDEN instance never claims the combo at all: the
+  desktop rail stays mounted while hidden (display:none below `md`, or
+  collapsed to w-0/opacity-0), so ownership now resolves to the visible
+  instance — the visible sheet input where one exists, otherwise the
+  palette. Where the browser lacks `checkVisibility` the pre-#775 claim
+  behavior applies. All global keydown consumers additionally skip IME
   composition.
-- **Rebind capture can no longer persist a combo that cannot fire.** The
-  `showShortcuts` capture refuses combos that remain shadowed after the
-  conflict resolver runs — focusSearch's post-clear effective binding or the
-  palette's reserved combo (both collapse to `Ctrl+K` today) — leaving the
-  capture armed, exactly like a bare modifier press. A read-time guard in
-  `loadShortcutBindings` also ignores a pre-existing persisted
-  `showShortcuts: "Ctrl+K"` (writable by pre-#775 builds) so that state can
-  no longer strand the shortcuts dialog behind a dead binding; the guard
-  never writes, and an explicit Reset still clears the stale entry.
-  Stealing a *persisted* focusSearch combo (e.g. F7) still works — the holder
-  reverts to its default, which fires.
+- **Rebind capture can no longer persist a combo that cannot fire.** Rebind
+  capture refuses any combo that remains shadowed after the conflict
+  resolver runs — still claimed by another rebindable shortcut's post-clear
+  effective binding (today that collapses to `Ctrl+K`) or by the palette's
+  reserved combo — leaving the capture armed, exactly like a bare modifier
+  press, in BOTH directions (the reverse steal of `?` for `focusSearch` is
+  refused too). A read-time guard in `loadShortcutBindings` also ignores a
+  pre-existing persisted `showShortcuts: "Ctrl+K"` (writable by pre-#775
+  builds) so that state can no longer strand the shortcuts dialog behind a
+  dead binding; the guard never writes — the dead entry is dropped from
+  storage the next time any rebind is saved. Stealing a *persisted* combo
+  whose holder reverts to a different default (e.g. F7) still works — the
+  old holder's default fires.
+- **Closing the palette with Ctrl/Cmd+K resets it** like every other close
+  path (Escape, outside click, executing a command) — the next open starts
+  with an empty query and no stale entity hits, and no in-flight search
+  lands into a closed palette.
 - **A persisted showShortcuts chord now fires.** The `showShortcuts`
   consumer's blanket Ctrl/Meta early-return is replaced by exact-combo
   matching (chords normalize to `Ctrl+<KEY>` in `comboFromEvent`), so a
@@ -41,12 +52,13 @@ TQ-sibling-batch-03-05).
   `NavigationRail`'s canonical `navItems` export under the rail's own
   visibility rule (`isAdminRole` + `isNavItemVisible`, both exported) — 12
   destinations for an admin with Draft Room enabled, exactly the 9 non-admin
-  destinations for a member, never a `/admin/*` path for non-admins. No
-  hand-copied subset remains.
+  destinations for a member with the capability (8 without it), never a
+  `/admin/*` path for non-admins. No hand-copied subset remains.
 - **The palette runs actions and searches entities.** Five non-navigating
   actions ship: Show keyboard shortcuts (drives the single existing
   dispatcher by dispatching the bound combo), Toggle light/dark theme, Use
-  system theme, Use high contrast theme, and Copy page link. Queries of 2+
+  system theme, Use high contrast theme, and Copy page link (with
+  copied/failed toast feedback on every outcome). Queries of 2+
   characters debounce (300 ms) into the existing unified search API
   (`/search/unified`, #515) with a stale-response guard; entity hits render
   below the commands and navigate to their `url_hint`. Render order is
@@ -57,13 +69,16 @@ TQ-sibling-batch-03-05).
   contract the mobile bottom nav and App.tsx's item-select dispatch follow
   (implementation-review round 1). A declined confirmation leaves the
   current route and any dirty page (e.g. an unsaved Draft Room canvas)
-  intact; confirming navigates normally.
+  intact — the palette itself is dismissed either way, so re-open with
+  Ctrl/Cmd+K to retry; confirming navigates normally.
 - **The composer's slash/attach buttons are in the Tab order**
   (`tabIndex={-1}` removed; both keep their accessible names and behavior).
 - **Contract evolution (named per plan-critic round 1/3):** the
   keyboard-shortcuts surface ("?" listener + dialog) moved from ChatShell to
-  the app shell (`App.tsx` `AppShortcutsMount`), so "?" works on every route
-  and the palette's shortcuts action is wired app-wide. Chat-page behavior is
+  the app shell (`App.tsx` `AppShortcutsMount`), so "?" works on every shell
+  route (the pre-auth setup/login/register and forced-password-change
+  screens render without the shell) and the palette's shortcuts action is
+  wired app-wide. Chat-page behavior is
   unchanged — the same listener and dialog, one level up, mounted exactly
   once. The #573 source-scan guardrail in `chat-parity-preserving.test.ts`
   was retargeted accordingly (asserts the single mount lives in App.tsx and
@@ -84,12 +99,25 @@ palette navigation) — 14/14.
 Sibling suites re-run green: `command-palette.issue258`,
 `KeyboardShortcuts.rebind`/`.test`/`.capture`, `SessionRail.rebind`,
 `Composer.slash-button`, `chat-parity-preserving`, `ChatShell` suites.
+Check-id mapping (the C1-C10 ids above and in the trace/anchor comments on
+#775 map to the shipped files' own headers): ctrl-k-ownership.l04 = C1/AC1;
+KeyboardShortcuts.l04 = C2+C3/AC2+AC3; command-palette.l04 = C4-C7/AC4-AC7;
+Composer.l04 = C8/AC8; issue258 = C9/AC9; rebind = C10/AC10.
 
 ## Known limitations
 
-- A pre-fix stranded `showShortcuts: "Ctrl+K"` stays in localStorage (the
-  read-time guard ignores it without writing) until an explicit Reset
-  shortcuts; the shortcut itself immediately falls back to `?`.
+- A pre-fix stranded `showShortcuts: "Ctrl+K"` is ignored at read time (the
+  shortcut immediately falls back to `?`) and is dropped from storage the
+  next time any rebind is saved; until then it remains unread in storage.
+- A refused rebind is silent by design — the capture stays armed exactly as
+  if a bare modifier had been pressed; there is no rejection toast.
+- A shortcut deliberately rebound to a bare editing key (e.g. Tab) still
+  fires on that key everywhere OUTSIDE text-entry surfaces (inside editors
+  non-modifier combos never fire) — choose rebinds accordingly.
+- The visible-owner rule for `focusSearch` uses `checkVisibility` where the
+  browser provides it; older browsers without that API keep the pre-#775
+  claim behavior (on narrow viewports the palette may open instead of the
+  search focusing).
 - The palette's own toggle combo is reserved and not user-rebindable — the
   shipped contract, now enforced at capture time instead of silently
   shadowed.

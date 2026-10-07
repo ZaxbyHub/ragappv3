@@ -27,9 +27,11 @@ export function loadShortcutBindings(): ShortcutBindings {
       // dead state — focusSearch's default claims it on /chat and the palette
       // claims it everywhere else — so a value persisted by a pre-#775 build
       // is ignored here rather than stranding the shortcut (the dialog and
-      // its Reset control would otherwise be unreachable). Read-only guard:
-      // the dead entry stays in storage until an explicit Reset; every
-      // consumer simply falls back to the default.
+      // its Reset control would otherwise be unreachable). Review PRR-203:
+      // the dead entry is dropped from the NEXT write too — every write path
+      // rebuilds from this filtered view — so it does not survive an
+      // unrelated rebind; until then it stays unread in storage and every
+      // consumer falls back to the default.
       if (id === "showShortcuts" && PALETTE_TOGGLE_COMBOS.has(combo)) {
         continue;
       }

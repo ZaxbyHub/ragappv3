@@ -190,8 +190,25 @@ export function ChatSearchInput({
       // from non-editable focus. Modifier combos (the Ctrl/Cmd+K default and
       // any Ctrl-rebind) keep focusing search from the composer, as shipped.
       if (isEditableTarget(e.target) && !e.ctrlKey && !e.metaKey) return;
+      // Issue #775 review PRR-101: ChatShell keeps the desktop rail MOUNTED
+      // while hidden — display:none below md (`hidden md:flex`) and
+      // w-0/opacity-0 when collapsed — and that hidden instance registers
+      // this document listener FIRST. Claiming from a hidden instance
+      // swallows the combo with no visible action (focus() on an unrendered
+      // element is a no-op), stranding the shortcut from the visible sheet
+      // instance and the palette alike. Own the combo only when this
+      // instance's input is actually rendered; where checkVisibility is
+      // unavailable (older browsers, jsdom) keep the prior claim behavior.
+      const input = inputRef.current;
+      if (
+        input &&
+        typeof input.checkVisibility === "function" &&
+        !input.checkVisibility({ checkOpacity: true })
+      ) {
+        return;
+      }
       e.preventDefault();
-      inputRef.current?.focus();
+      input?.focus();
     };
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);

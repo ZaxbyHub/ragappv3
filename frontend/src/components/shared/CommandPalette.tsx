@@ -9,6 +9,7 @@ import {
 } from "@/components/ui/dialog";
 import { HugeiconsIcon } from "@hugeicons/react";
 import { Keyboard, SunMoon, Monitor, Contrast, Link2, Search } from "lucide-react";
+import { toast } from "sonner";
 import {
   navItems,
   isAdminRole,
@@ -61,6 +62,38 @@ function renderIcon(icon: PaletteIcon, className: string) {
 }
 
 /**
+ * Copy the page URL with user-visible feedback on every outcome (issue #775
+ * review PRR-408): clipboard API when available, execCommand fallback (the
+ * CopyButton pattern) for non-secure-context deployments, and an error toast
+ * when neither path can copy — never a silent no-op.
+ */
+function copyPageLink(url: string): void {
+  const write = navigator.clipboard?.writeText(url);
+  if (write) {
+    void write.then(
+      () => toast.success("Page link copied"),
+      () => toast.error("Couldn't copy — try copying the address bar URL")
+    );
+    return;
+  }
+  try {
+    const textarea = document.createElement("textarea");
+    textarea.value = url;
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
+    document.body.appendChild(textarea);
+    textarea.focus();
+    textarea.select();
+    const copied = document.execCommand("copy");
+    document.body.removeChild(textarea);
+    if (!copied) throw new Error("execCommand failed");
+    toast.success("Page link copied");
+  } catch {
+    toast.error("Couldn't copy — try copying the address bar URL");
+  }
+}
+
+/**
  * Global command palette (issue #258 / legacy-14; v2 per issue #775), mounted
  * once at the app shell. Ctrl/Cmd+K (PALETTE_TOGGLE_COMBOS — the single
  * shared definition) opens a dialog-role palette listing EVERY nav
@@ -80,6 +113,9 @@ export function CommandPalette() {
   const [query, setQuery] = useState("");
   const [hits, setHits] = useState<UnifiedSearchResult[]>([]);
   const hitSeqRef = useRef(0);
+  // Mirrors `open` for the []-dep keydown effect (PRR-103: the keyboard
+  // toggle-close must reset like every other close path).
+  const openRef = useRef(false);
   const navigate = useNavigate();
 
   const userRole = useAuthStore((state) => state.user?.role);
@@ -97,11 +133,24 @@ export function CommandPalette() {
       const combo = comboFromEvent(e);
       if (combo === null || !PALETTE_TOGGLE_COMBOS.has(combo)) return;
       e.preventDefault();
+      // PRR-103: closing via the keyboard toggle must leave the same clean
+      // state as Escape, outside click, or executing a command — no restored
+      // query, no stale hits, no in-flight response landing into a closed
+      // palette.
+      if (openRef.current) {
+        setQuery("");
+        setHits([]);
+        hitSeqRef.current += 1;
+      }
       setOpen((prev) => !prev);
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, []);
+
+  useEffect(() => {
+    openRef.current = open;
+  }, [open]);
 
   // Entity search (issue #775 / #515): queries of 2+ characters hit the
   // existing global search API after a debounce; a request-sequence guard
@@ -207,10 +256,8 @@ export function CommandPalette() {
         label: "Copy page link",
         icon: Link2,
         run: () => {
-          void navigator.clipboard?.writeText(window.location.href)?.catch(() => {
-            // Clipboard access is best-effort; the action is still complete.
-          });
           closePalette();
+          copyPageLink(window.location.href);
         },
       },
     ];

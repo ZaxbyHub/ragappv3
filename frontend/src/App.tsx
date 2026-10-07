@@ -75,7 +75,6 @@ function DocumentsPageFallback() {
   );
 }
 
-// Main app shell wrapper that provides the navigation and page layout
 // App-wide keyboard-shortcuts surface (issue #775): the hook's listener and
 // the dialog live at the shell level so both the "?" shortcut and the
 // palette's "Show keyboard shortcuts" action (which dispatches the bound
@@ -88,6 +87,7 @@ function AppShortcutsMount() {
   );
 }
 
+// Main app shell wrapper that provides the navigation and page layout
 function MainAppShell({ children, testMode = false }: { children: React.ReactNode; testMode?: boolean }) {
   const health = useHealthCheck({ pollInterval: 30000 });
   const navigate = useNavigate();
@@ -167,12 +167,14 @@ function MainAppShell({ children, testMode = false }: { children: React.ReactNod
   return (
     <TestModeProvider testMode={testMode}>
       {/* Global command palette (issue #258 / legacy-14; v2 per issue #775):
-          Ctrl/Cmd+K opens the palette from any shell route. Closed state
-          renders nothing, so it is layout-inert. The keyboard-shortcuts
+          Ctrl/Cmd+K opens the palette from shell routes off /chat (the chat
+          rail owns the combo on /chat by design). Closed state renders
+          nothing, so it is layout-inert. The keyboard-shortcuts
           surface ("?" + the dialog) is mounted HERE at the app shell since
-          issue #775 — one mount on every route instead of ChatShell-only —
-          so the palette's "Show keyboard shortcuts" action and the "?"
-          shortcut work app-wide through the single existing dispatcher. */}
+          issue #775 — one mount on every shell route instead of
+          ChatShell-only — so the palette's "Show keyboard shortcuts" action
+          and the "?" shortcut work app-wide through the single existing
+          dispatcher. */}
       <CommandPalette />
       <AppShortcutsMount />
       <PageShell

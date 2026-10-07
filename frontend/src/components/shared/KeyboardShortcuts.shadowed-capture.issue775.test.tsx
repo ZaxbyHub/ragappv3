@@ -44,6 +44,14 @@ function seedStorage(bindings: Record<string, string>) {
   window.localStorage.setItem(SHORTCUT_BINDINGS_STORAGE_KEY, JSON.stringify(bindings));
 }
 
+function countFocus(el: HTMLElement): () => number {
+  let n = 0;
+  el.addEventListener("focus", () => {
+    n += 1;
+  });
+  return () => n;
+}
+
 describe("issue #775 — rebind capture safety nets", () => {
   const storage = new Map<string, string>();
 
@@ -174,5 +182,86 @@ describe("issue #775 — rebind capture safety nets", () => {
     });
     expect(isOpen(rebound.result)).toBe(true);
     rebound.unmount();
+  });
+
+  it("the reverse steal — capturing '?' for focusSearch — is refused (PRR-401)", () => {
+    // Generalized shadow refusal: "?" is showShortcuts' immovable default,
+    // so persisting it for focusSearch would strand the dialog on /chat.
+    render(<KeyboardShortcutsDialog open={true} onOpenChange={noop} />);
+    fireEvent.click(
+      screen.getByRole("button", { name: /rebind shortcut: focus session search/i })
+    );
+    expect(screen.getByText(/press/i)).toBeInTheDocument();
+
+    act(() => {
+      fireEvent.keyDown(window, { key: "?" });
+    });
+
+    expect(
+      loadShortcutBindings(),
+      "a refused capture must persist nothing"
+    ).toEqual({});
+    expect(
+      screen.getByText(/press/i),
+      "capture stays armed like a bare modifier press"
+    ).toBeInTheDocument();
+  });
+
+  it("an IME-composing keydown never opens the dialog (PRR-308a)", () => {
+    const hooked = renderHook(() => useKeyboardShortcuts());
+    expect(isOpen(hooked.result)).toBe(false);
+
+    act(() => {
+      // isComposing is not constructible via KeyboardEventInit — define it
+      // on the instance exactly as a real IME-driven dispatch reports it.
+      const e = new KeyboardEvent("keydown", {
+        key: "?",
+        shiftKey: true,
+        cancelable: true,
+      });
+      Object.defineProperty(e, "isComposing", { value: true });
+      window.dispatchEvent(e);
+    });
+    expect(isOpen(hooked.result)).toBe(false);
+    hooked.unmount();
+  });
+
+  it("a defaultPrevented keydown never opens the dialog (PRR-308b)", () => {
+    const hooked = renderHook(() => useKeyboardShortcuts());
+    expect(isOpen(hooked.result)).toBe(false);
+
+    act(() => {
+      const e = new KeyboardEvent("keydown", {
+        key: "?",
+        shiftKey: true,
+        cancelable: true,
+      });
+      e.preventDefault();
+      window.dispatchEvent(e);
+    });
+    expect(isOpen(hooked.result), "an earlier claimant must own the combo").toBe(false);
+    hooked.unmount();
+  });
+
+  it("Ctrl+K still focuses search from INSIDE the composer (preserved carve-out, PRR-308c)", () => {
+    render(
+      <div>
+        <ChatSearchInput value="" onChange={() => {}} />
+        <textarea aria-label="composer" />
+      </div>
+    );
+    const textarea = screen.getByLabelText("composer") as HTMLTextAreaElement;
+    const searchInput = screen.getByLabelText("Search chat sessions");
+    const searchFocus = countFocus(searchInput);
+    textarea.focus();
+    expect(document.activeElement).toBe(textarea);
+
+    fireEvent.keyDown(textarea, { key: "k", ctrlKey: true });
+
+    expect(
+      searchFocus(),
+      "modifier combos keep focusing search from the composer (advertised behavior)"
+    ).toBe(1);
+    expect(document.activeElement).toBe(searchInput);
   });
 });
