@@ -22,7 +22,7 @@ import {
   AlertCircle,
 } from "lucide-react";
 import { formatRelativeTime } from "@/lib/formatters";
-import { comboFromEvent, effectiveBinding } from "@/lib/shortcutBindings";
+import { comboFromEvent, effectiveBinding, isEditableTarget } from "@/lib/shortcutBindings";
 import { useChatShellStore } from "@/stores/useChatShellStore";
 import { useChatStore } from "@/stores/useChatStore";
 import { useVaultStore } from "@/stores/useVaultStore";
@@ -175,11 +175,40 @@ export function ChatSearchInput({
   // persisted override applies on every mount).
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      // Issue #775: one owner per combo — an earlier claimant (including the
+      // second ChatSearchInput instance ChatShell mounts for mobile) wins and
+      // this listener yields.
+      if (e.defaultPrevented) return;
+      // IME composition is not a shortcut gesture (repo discipline, cf.
+      // useEscapeToStop).
+      if (e.isComposing) return;
       const combo = comboFromEvent(e);
-      if (combo !== null && combo === effectiveBinding("focusSearch", "Ctrl+K")) {
-        e.preventDefault();
-        inputRef.current?.focus();
+      if (combo === null || combo !== effectiveBinding("focusSearch", "Ctrl+K")) return;
+      // Issue #775: an UNMODIFIED combo bound here would fire on every
+      // keystroke of that key inside any editor (printables, Enter, Tab,
+      // arrows) and steal focus mid-edit — non-modifier combos only fire
+      // from non-editable focus. Modifier combos (the Ctrl/Cmd+K default and
+      // any Ctrl-rebind) keep focusing search from the composer, as shipped.
+      if (isEditableTarget(e.target) && !e.ctrlKey && !e.metaKey) return;
+      // Issue #775 review PRR-101: ChatShell keeps the desktop rail MOUNTED
+      // while hidden — display:none below md (`hidden md:flex`) and
+      // w-0/opacity-0 when collapsed — and that hidden instance registers
+      // this document listener FIRST. Claiming from a hidden instance
+      // swallows the combo with no visible action (focus() on an unrendered
+      // element is a no-op), stranding the shortcut from the visible sheet
+      // instance and the palette alike. Own the combo only when this
+      // instance's input is actually rendered; where checkVisibility is
+      // unavailable (older browsers, jsdom) keep the prior claim behavior.
+      const input = inputRef.current;
+      if (
+        input &&
+        typeof input.checkVisibility === "function" &&
+        !input.checkVisibility({ checkOpacity: true })
+      ) {
+        return;
       }
+      e.preventDefault();
+      input?.focus();
     };
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);

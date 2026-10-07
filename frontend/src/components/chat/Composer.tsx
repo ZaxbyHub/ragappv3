@@ -695,7 +695,6 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
                       textareaRef.current?.focus();
                     }}
                     aria-label="Open slash commands"
-                    tabIndex={-1}
                   >
                     <Slash className="h-4 w-4" />
                   </Button>
@@ -712,7 +711,6 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
                     className="h-8 w-8 text-muted-foreground active:scale-95"
                     onClick={openFilePicker}
                     aria-label="Attach file"
-                    tabIndex={-1}
                     disabled={isStreaming}
                   >
                     <Paperclip className="h-4 w-4" />

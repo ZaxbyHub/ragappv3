@@ -11,6 +11,8 @@ import { Keyboard, RotateCw } from "lucide-react";
 import {
   comboFromEvent,
   effectiveBinding,
+  isEditableTarget,
+  PALETTE_TOGGLE_COMBOS,
   saveShortcutBinding,
   clearShortcutBinding,
   clearShortcutBindings,
@@ -58,16 +60,22 @@ export function useKeyboardShortcuts() {
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      // Issue #775: one owner per combo — if an earlier listener already
+      // claimed this event (e.g. focusSearch on /chat), never double-fire.
+      if (e.defaultPrevented) return;
+      // IME composition is not a shortcut gesture (repo discipline, cf.
+      // useEscapeToStop).
+      if (e.isComposing) return;
       // Show shortcuts on the bound combo (default "?"). Bindings are read at
-      // event time so a fresh mount honors whatever is persisted. Shift is
-      // physically required to type "?" on US layouts, so printable-char
-      // combos carry their shift inside the key itself; modifier combos
-      // normalize to "Ctrl+<key>". Never trigger while typing in inputs.
-      if (e.ctrlKey || e.metaKey) return;
+      // event time so a fresh mount honors whatever is persisted. Modifier
+      // chords normalize to "Ctrl+<key>" in comboFromEvent, so a combo only
+      // matches when the persisted binding literally holds that chord — a
+      // rebind to Ctrl+J therefore fires (issue #775: capture and firing
+      // rules must agree). Never trigger while typing in inputs.
       const combo = comboFromEvent(e);
       if (combo === null || combo !== bindingFor("showShortcuts")) return;
-      const target = e.target as HTMLElement;
-      if (target.tagName !== "INPUT" && target.tagName !== "TEXTAREA" && !target.isContentEditable) {
+      const target = e.target;
+      if (!isEditableTarget(target)) {
         e.preventDefault();
         setOpen(true);
       }
@@ -103,11 +111,42 @@ export function KeyboardShortcutsDialog({ open, onOpenChange }: { open: boolean;
     const handleCapture = (e: KeyboardEvent) => {
       e.preventDefault();
       e.stopPropagation();
+      if (e.isComposing) return;
       const combo = comboFromEvent(e);
       // null = bare modifier press or Escape (cancel) — keep waiting on
       // modifiers, cancel on Escape.
       if (combo === null) {
         if (e.key === "Escape") setCapturing(null);
+        return;
+      }
+      // Issue #775 shadow refusal — runs BEFORE the conflict-clearing loop so
+      // a refused capture leaves persisted state untouched. A combo that
+      // could never fire must not be persisted: after the resolver runs, the
+      // combo is still claimed when ANOTHER rebindable shortcut's post-clear
+      // effective binding equals it (a steal of a persisted combo reverts
+      // that holder to its default, so only a combo equal to the holder's
+      // default remains claimed), or — for showShortcuts — when the combo is
+      // in PALETTE_TOGGLE_COMBOS (the palette's app-wide window listener
+      // claims it off /chat; the reserve is one-directional because
+      // focusSearch capturing its OWN shipped default "Ctrl+K" is an
+      // identity rebind that fires fine and was always allowed).
+      const current = loadShortcutBindings();
+      let shadowed = capturing === "showShortcuts" && PALETTE_TOGGLE_COMBOS.has(combo);
+      if (!shadowed) {
+        for (const other of shortcuts) {
+          if (other.id === capturing || !other.rebindable) continue;
+          const otherDefault: string = CANONICAL_DEFAULT[other.id] ?? other.key;
+          const otherEffective: string = current[other.id] ?? otherDefault;
+          const otherPostClear: string =
+            otherEffective === combo ? otherDefault : otherEffective;
+          if (otherPostClear === combo) {
+            shadowed = true;
+            break;
+          }
+        }
+      }
+      if (shadowed) {
+        // Swallowed like a bare modifier press: capture stays armed.
         return;
       }
       // Conflict handling (PRR-003): if another rebindable shortcut already
@@ -116,7 +155,6 @@ export function KeyboardShortcutsDialog({ open, onOpenChange }: { open: boolean;
       // canonical combos — stored bindings are comboFromEvent-normalized, and
       // the rebindable defaults have canonical forms ("Ctrl/Cmd + K" →
       // "Ctrl+K", "?" → "?").
-      const current = loadShortcutBindings();
       for (const other of shortcuts) {
         if (other.id === capturing || !other.rebindable) continue;
         const otherCanonical = CANONICAL_DEFAULT[other.id] ?? other.key;

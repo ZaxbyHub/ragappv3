@@ -14,10 +14,8 @@ import { RightPane } from "@/components/chat/RightPane";
 import { ShareAction } from "@/components/chat/ShareAction";
 import { VaultSelector } from "@/components/vault/VaultSelector";
 import { Button } from "@/components/ui/button";
-import {
-  useKeyboardShortcuts,
-  KeyboardShortcutsDialog,
-} from "@/components/shared/KeyboardShortcuts";
+// The keyboard-shortcuts surface ("?" listener + dialog) moved to the app
+// shell in MainAppShell (issue #775) — see App.tsx AppShortcutsMount.
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { ErrorState } from "@/components/shared/ErrorState";
 import {
@@ -98,7 +96,6 @@ export default function ChatShell() {
   // chip to return to (issue #508 / PRODUCT-ENH-10).
   const rightPaneToggleRef = useRef<HTMLButtonElement>(null);
   const messages = useChatMessages();
-  const { open: shortcutsOpen, setOpen: setShortcutsOpen } = useKeyboardShortcuts();
   // Mobile Sheet uses its own state, toggled by the same button
   const [mobileSheetOpen, setMobileSheetOpen] = useState(false);
   type ResizeCleanup = (commitPending: boolean) => void;
@@ -711,9 +708,7 @@ export default function ChatShell() {
           </SheetContent>
         </Sheet>
       )}
-
-      {/* Keyboard Shortcuts Dialog */}
-      <KeyboardShortcutsDialog open={shortcutsOpen} onOpenChange={setShortcutsOpen} />
+      {/* Keyboard Shortcuts Dialog — mounted app-wide in App.tsx (issue #775). */}
     </div>
   );
 }

@@ -12,6 +12,10 @@ import { Loader2 } from "lucide-react";
 import { APP_BASENAME } from "@/lib/paths";
 import ReconnectingBanner from "@/components/ReconnectingBanner";
 import { CommandPalette } from "@/components/shared/CommandPalette";
+import {
+  KeyboardShortcutsDialog,
+  useKeyboardShortcuts,
+} from "@/components/shared/KeyboardShortcuts";
 import { DocumentsTableSkeleton } from "@/components/documents/DocumentsTableSkeleton";
 
 // Toggle mock-data mode via: VITE_TEST_MODE=true npm run dev
@@ -68,6 +72,18 @@ function DocumentsPageFallback() {
     >
       <DocumentsTableSkeleton />
     </div>
+  );
+}
+
+// App-wide keyboard-shortcuts surface (issue #775): the hook's listener and
+// the dialog live at the shell level so both the "?" shortcut and the
+// palette's "Show keyboard shortcuts" action (which dispatches the bound
+// combo) reach them on every route. Chat-page behavior is unchanged — the
+// same listener/dialog ChatShell used to mount, one level up.
+function AppShortcutsMount() {
+  const { open: shortcutsOpen, setOpen: setShortcutsOpen } = useKeyboardShortcuts();
+  return (
+    <KeyboardShortcutsDialog open={shortcutsOpen} onOpenChange={setShortcutsOpen} />
   );
 }
 
@@ -150,10 +166,17 @@ function MainAppShell({ children, testMode = false }: { children: React.ReactNod
 
   return (
     <TestModeProvider testMode={testMode}>
-      {/* Global command palette (issue #258 / legacy-14): Ctrl/Cmd+K opens a
-          navigation palette from any shell route. Closed state renders
-          nothing, so it is layout-inert. */}
+      {/* Global command palette (issue #258 / legacy-14; v2 per issue #775):
+          Ctrl/Cmd+K opens the palette from shell routes off /chat (the chat
+          rail owns the combo on /chat by design). Closed state renders
+          nothing, so it is layout-inert. The keyboard-shortcuts
+          surface ("?" + the dialog) is mounted HERE at the app shell since
+          issue #775 — one mount on every shell route instead of
+          ChatShell-only — so the palette's "Show keyboard shortcuts" action
+          and the "?" shortcut work app-wide through the single existing
+          dispatcher. */}
       <CommandPalette />
+      <AppShortcutsMount />
       <PageShell
         activeItem={activeItem}
         onItemSelect={handleItemSelect}
