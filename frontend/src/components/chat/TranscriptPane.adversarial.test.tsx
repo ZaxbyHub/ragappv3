@@ -80,6 +80,7 @@ vi.mock("@/hooks/useChatHistory");
 vi.mock("@/lib/api");
 vi.mock("react-router-dom", () => ({
   useNavigate: () => vi.fn(),
+  useInRouterContext: () => false,
 }));
 vi.mock("./MessageBubble", () => ({
   MessageBubble: ({ message }: { message: { id: string; role: string; content: string } }) => (

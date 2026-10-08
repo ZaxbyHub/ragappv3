@@ -125,13 +125,13 @@ describe("MaintenanceSettings stale jobsError (PRR-004 feedback pin)", () => {
     listWikiJobsMock.mockRejectedValueOnce(new Error("down"));
     const { rerender } = render(<MaintenanceSettings vaultId={1} />);
     await waitFor(() => expect(listWikiJobsMock).toHaveBeenCalledTimes(1));
-    expect(await screen.findByText("No recent jobs — couldn't load")).toBeInTheDocument();
+    expect(await screen.findByText("Couldn't load recent jobs")).toBeInTheDocument();
 
     // Deselect the vault: no request is made, but the banner must go.
     rerender(<MaintenanceSettings vaultId={null} />);
 
     await waitFor(() =>
-      expect(screen.queryByText("No recent jobs — couldn't load")).not.toBeInTheDocument()
+      expect(screen.queryByText("Couldn't load recent jobs")).not.toBeInTheDocument()
     );
     expect(screen.getByText("No recent jobs.")).toBeInTheDocument();
   });

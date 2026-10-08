@@ -1,12 +1,19 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, waitFor, act } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, act } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { VaultGroupAccessPanel } from '@/components/VaultGroupAccessPanel';
 
 // Mock API
+const mockApiClient = vi.hoisted(() => ({
+  get: vi.fn(),
+  post: vi.fn(),
+  patch: vi.fn(),
+  delete: vi.fn(),
+}));
+
 vi.mock('@/lib/api', () => ({
-  default: { get: vi.fn(), post: vi.fn(), patch: vi.fn(), delete: vi.fn() },
-  apiClient: { get: vi.fn(), post: vi.fn(), patch: vi.fn(), delete: vi.fn() },
+  default: mockApiClient,
+  apiClient: mockApiClient,
 }));
 
 // Mock sonner
@@ -32,8 +39,8 @@ vi.mock('@/components/ui/input', () => ({
 }));
 
 vi.mock('@/components/ui/dialog', () => ({
-  Dialog: ({ children, open }: { children: React.ReactNode; open: boolean }) =>
-    open ? <div data-testid="dialog">{children}</div> : null,
+  Dialog: ({ children, open, onOpenChange }: { children: React.ReactNode; open?: boolean; onOpenChange?: (open: boolean) => void }) =>
+    open ? <div data-testid="dialog"><button aria-label="Simulate dialog dismissal" onClick={() => onOpenChange?.(false)} />{children}</div> : null,
   DialogContent: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
   DialogDescription: ({ children }: { children: React.ReactNode }) => <p>{children}</p>,
   DialogFooter: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
@@ -189,5 +196,61 @@ describe('VaultGroupAccessPanel', () => {
     await waitFor(() => {
       expect(screen.getByRole('button', { name: /Grant/i })).toBeInTheDocument();
     });
+  });
+
+  it('keeps the selected group until a pending revoke succeeds, then reconciles and reports success', async () => {
+    const { apiClient } = await import('@/lib/api');
+    const { toast } = await import('sonner');
+    (apiClient.get as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ data: {
+      group_access: [{ group_id: 7, group_name: 'Editors', org_name: 'Example Org', permission: 'read', granted_at: '2024-01-01' }],
+      total: 1,
+    } });
+    let resolveRevoke!: (value: { data: Record<string, never> }) => void;
+    mockApiClient.delete.mockImplementationOnce(
+      () => new Promise((resolve) => { resolveRevoke = resolve; }),
+    );
+    await act(async () => { render(<VaultGroupAccessPanel vaultId={1} />); });
+    await waitFor(() => expect(screen.getByText('Editors')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: 'Revoke access for Editors' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Revoke', exact: true }));
+    await waitFor(() => expect(mockApiClient.delete).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole('button', { name: 'Simulate dialog dismissal' }));
+
+    expect(screen.getByTestId('dialog')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Cancel' })).toBeDisabled();
+    await act(async () => { resolveRevoke({ data: {} }); });
+
+    await waitFor(() => expect(screen.queryByText('Editors')).not.toBeInTheDocument());
+    expect(toast.success).toHaveBeenCalledWith('Group access revoked');
+    expect(screen.queryByTestId('dialog')).not.toBeInTheDocument();
+  });
+
+  it('unlocks group revoke cancellation after the delete fails', async () => {
+    const { apiClient } = await import('@/lib/api');
+    const { toast } = await import('sonner');
+    (apiClient.get as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ data: {
+      group_access: [{ group_id: 7, group_name: 'Editors', org_name: 'Example Org', permission: 'read', granted_at: '2024-01-01' }],
+      total: 1,
+    } });
+    let rejectRevoke!: (error: Error) => void;
+    mockApiClient.delete.mockImplementationOnce(
+      () => new Promise((_, reject) => { rejectRevoke = reject; }),
+    );
+    await act(async () => { render(<VaultGroupAccessPanel vaultId={1} />); });
+    await waitFor(() => expect(screen.getByText('Editors')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: 'Revoke access for Editors' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Revoke', exact: true }));
+    await waitFor(() => expect(mockApiClient.delete).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole('button', { name: 'Simulate dialog dismissal' }));
+    expect(screen.getByTestId('dialog')).toBeInTheDocument();
+
+    await act(async () => { rejectRevoke(new Error('network')); });
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith('Failed to revoke group access'));
+    expect(screen.getByRole('button', { name: 'Cancel' })).toBeEnabled();
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(screen.queryByTestId('dialog')).not.toBeInTheDocument();
+    expect(screen.getByText('Editors')).toBeInTheDocument();
   });
 });

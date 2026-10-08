@@ -1,6 +1,16 @@
-import { useState } from "react";
 import { useNavigate, Link, Navigate } from "react-router-dom";
-import { useAuthStore } from "@/stores/useAuthStore";
+import { useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useAuthOwner } from "@/hooks/useAuthOwner";
+import { captureAuthPrincipalGeneration, subscribeAuthPrincipal } from "@/lib/api/auth-lifecycle";
+import {
+  canNavigateRegisterPublication,
+  canReportRegisterFailure,
+  captureRegisterPublicationScope,
+  isRegisterPublicationAdmissionCurrent,
+  type RegisterPublicationScope,
+  useAuthStore,
+  withRegisterPublicationScope,
+} from "@/stores/useAuthStore";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { PasswordRequirements } from "@/components/shared/PasswordRequirements";
@@ -19,6 +29,7 @@ import { HugeiconsIcon } from "@hugeicons/react";
 import { LockPasswordIcon, User02Icon, UserAdd01Icon, ViewIcon, ViewOffSlashIcon } from "@hugeicons/core-free-icons";
 
 export default function RegisterPage() {
+  type RegisterInvocation = { readonly token: symbol; readonly scope: RegisterPublicationScope };
   const [formData, setFormData] = useState({
     username: "",
     full_name: "",
@@ -31,13 +42,35 @@ export default function RegisterPage() {
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
   const { register, isLoading, isAuthenticated } = useAuthStore();
   const navigate = useNavigate();
+  useAuthOwner();
+  useSyncExternalStore(subscribeAuthPrincipal, captureAuthPrincipalGeneration, captureAuthPrincipalGeneration);
+  const mountedRef = useRef(false);
+  const activeInvocationRef = useRef<RegisterInvocation | null>(null);
+  const latestInvocationRef = useRef<RegisterInvocation | null>(null);
+  useLayoutEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      activeInvocationRef.current = null;
+      latestInvocationRef.current = null;
+    };
+  }, []);
+  // Intentionally render-local: a retained handler keeps A while a fresh render gets B.
+  const renderScope = captureRegisterPublicationScope();
+  const isRetiredInvocation = (scope: RegisterPublicationScope): boolean =>
+    !isRegisterPublicationAdmissionCurrent(scope)
+    && !canReportRegisterFailure(scope)
+    && !canNavigateRegisterPublication(scope);
+  const isLoadingForRegister = isLoading
+    && (activeInvocationRef.current === null
+      || !isRetiredInvocation(activeInvocationRef.current.scope));
 
   // Guard: redirect if already authenticated
   if (isAuthenticated) {
     return <Navigate to="/" replace />;
   }
 
-  const validateForm = (): boolean => {
+  const validateForm = (isCurrent: () => boolean): boolean => {
     const newErrors: Record<string, string> = {};
 
     // Username validation
@@ -63,36 +96,58 @@ export default function RegisterPage() {
       newErrors.confirmPassword = "Passwords do not match";
     }
 
-    setErrors(newErrors);
+    setErrors((previous) => isCurrent() ? newErrors : previous);
     return Object.keys(newErrors).length === 0;
   };
 
   const handleChange = (field: string) => (e: React.ChangeEvent<HTMLInputElement>) => {
-    setFormData((prev) => ({ ...prev, [field]: e.target.value }));
-    // Clear error for this field when user starts typing
+    const value = e.target.value;
+    const isCurrent = () => mountedRef.current && isRegisterPublicationAdmissionCurrent(renderScope);
+    if (!isCurrent()) return;
+    setFormData((prev) => isCurrent() ? { ...prev, [field]: value } : prev);
     if (errors[field]) {
-      setErrors((prev) => ({ ...prev, [field]: "" }));
+      setErrors((prev) => isCurrent() ? { ...prev, [field]: "" } : prev);
     }
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
 
-    if (!validateForm()) {
-      return;
-    }
+    const activeInvocation = activeInvocationRef.current;
+    if (!mountedRef.current || !isRegisterPublicationAdmissionCurrent(renderScope)
+      || (activeInvocation !== null
+        && !(activeInvocation.scope !== renderScope && isRetiredInvocation(activeInvocation.scope)))) return;
+    const invocation: RegisterInvocation = { token: Symbol("register"), scope: renderScope };
+    latestInvocationRef.current = invocation;
+    const isCurrentIntent = () => mountedRef.current && latestInvocationRef.current === invocation;
+    const isCurrentValidation = () => isCurrentIntent() && !isRetiredInvocation(renderScope);
+    if (!validateForm(isCurrentValidation) || !isCurrentIntent()
+      || !isRegisterPublicationAdmissionCurrent(renderScope)) return;
 
+    activeInvocationRef.current = invocation;
     try {
-      await register(
+      await withRegisterPublicationScope(renderScope, () => register(
         formData.username,
         formData.password,
-        formData.full_name || undefined
-      );
-      // Navigate to home page on success
-      navigate("/");
+        formData.full_name || undefined,
+      ));
+      if (isCurrentIntent() && activeInvocationRef.current === invocation
+        && canNavigateRegisterPublication(renderScope)) {
+        navigate("/");
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : "";
-      setError(msg.includes("409") || msg.toLowerCase().includes("already") ? "Username already registered" : (msg || "Registration failed"));
+      const message = msg.includes("409") || msg.toLowerCase().includes("already")
+        ? "Username already registered" : (msg || "Registration failed");
+      if (isCurrentIntent() && activeInvocationRef.current === invocation
+        && canReportRegisterFailure(renderScope)) {
+        setError((previous) => isCurrentIntent() && canReportRegisterFailure(renderScope)
+          ? message : previous);
+      }
+    } finally {
+      if (activeInvocationRef.current === invocation) {
+        activeInvocationRef.current = null;
+      }
     }
   };
 
@@ -125,7 +180,7 @@ export default function RegisterPage() {
                   placeholder="Username (required)"
                   value={formData.username}
                   onChange={handleChange("username")}
-                  disabled={isLoading}
+                  disabled={isLoadingForRegister}
                   // eslint-disable-next-line jsx-a11y-x/no-autofocus -- Intentional first-field focus for account registration.
                   autoFocus
                   aria-required="true"
@@ -149,7 +204,7 @@ export default function RegisterPage() {
                   placeholder="Full name (optional)"
                   value={formData.full_name}
                   onChange={handleChange("full_name")}
-                  disabled={isLoading}
+                  disabled={isLoadingForRegister}
                   aria-required="false"
                   className="pl-10"
                 />
@@ -167,7 +222,7 @@ export default function RegisterPage() {
                   placeholder="Password (min 8 characters)"
                   value={formData.password}
                   onChange={handleChange("password")}
-                  disabled={isLoading}
+                  disabled={isLoadingForRegister}
                   aria-required="true"
                   aria-describedby={
                     formData.password
@@ -207,7 +262,7 @@ export default function RegisterPage() {
                   placeholder="Confirm password"
                   value={formData.confirmPassword}
                   onChange={handleChange("confirmPassword")}
-                  disabled={isLoading}
+                  disabled={isLoadingForRegister}
                   aria-required="true"
                   aria-describedby={errors.confirmPassword ? "register-confirm-password-error" : undefined}
                   aria-invalid={!!errors.confirmPassword}
@@ -240,10 +295,10 @@ export default function RegisterPage() {
                 !formData.username.trim() ||
                 !formData.password ||
                 !formData.confirmPassword ||
-                isLoading
+                isLoadingForRegister
               }
             >
-              {isLoading ? (
+              {isLoadingForRegister ? (
                 <>
                   <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                   Creating Account...

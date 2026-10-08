@@ -4,6 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { BrowserRouter, MemoryRouter } from "react-router-dom";
 import { SessionRail, SessionItem, _sessionCache } from "./SessionRail";
 import * as api from "@/lib/api";
+import { captureAuthOwner, captureAuthPrincipalGeneration } from "@/lib/api/auth-lifecycle";
 import * as useChatShellStoreModule from "@/stores/useChatShellStore";
 
 // Mock useDebounce to return the value immediately (no async delay)
@@ -29,6 +30,8 @@ beforeAll(() => {
 // =============================================================================
 
 vi.mock("@/lib/api", () => ({
+  API_BASE_URL: "/api",
+  attachCsrfInterceptor: vi.fn(),
   listChatSessions: vi.fn(),
   deleteChatSession: vi.fn(),
   updateChatSession: vi.fn(),
@@ -110,6 +113,10 @@ describe("SessionRail ADVERSARIAL TESTS", () => {
 
     // Reset the module-level session cache so each test gets a fresh fetch
     _sessionCache.data = null;
+    delete _sessionCache.vaultId;
+    delete _sessionCache.owner;
+    delete _sessionCache.principalGeneration;
+    delete _sessionCache.readAttempt;
     _sessionCache.ts = 0;
   });
 
@@ -117,6 +124,10 @@ describe("SessionRail ADVERSARIAL TESTS", () => {
     vi.restoreAllMocks();
     // Reset the module-level cache after each test to prevent cross-test pollution
     _sessionCache.data = null;
+    delete _sessionCache.vaultId;
+    delete _sessionCache.owner;
+    delete _sessionCache.principalGeneration;
+    delete _sessionCache.readAttempt;
     _sessionCache.ts = 0;
   });
 
@@ -143,6 +154,8 @@ describe("SessionRail ADVERSARIAL TESTS", () => {
       };
       _sessionCache.data = [cachedSession];
       _sessionCache.vaultId = undefined;
+      _sessionCache.owner = captureAuthOwner();
+      _sessionCache.principalGeneration = captureAuthPrincipalGeneration();
       _sessionCache.ts = Date.now();
       vi.mocked(api.listChatSessions).mockResolvedValue({ sessions: [refreshedSession] });
 
@@ -914,22 +927,36 @@ describe("SessionRail ADVERSARIAL TESTS", () => {
   // BUG DISCOVERED: Malformed API response
   // ===========================================================================
   describe("Malformed API response handling (BUG DISCOVERY)", () => {
-    it("BUG: Should handle API returning {sessions: undefined} instead of array", async () => {
-      // This test documents a real bug: groupSessionsByTime crashes when sessions is undefined.
-      vi.mocked(api.listChatSessions).mockResolvedValue({ sessions: undefined as any });
+    it("fails closed for a malformed response, then recognizes a confirmed empty retry", async () => {
+      vi.mocked(api.listChatSessions)
+        .mockResolvedValueOnce({ sessions: undefined as any })
+        .mockResolvedValueOnce({ sessions: [] });
 
+      let rerender!: ReturnType<typeof render>["rerender"];
       expect(() => {
-        render(
+        ({ rerender } = render(
           <Wrapper>
             <SessionRail />
           </Wrapper>
-        );
+        ));
       }).not.toThrow();
 
-      // Should show empty state
+      expect(await screen.findByText("Session list response was malformed")).toBeInTheDocument();
+      expect(screen.queryByText("No sessions yet")).not.toBeInTheDocument();
+
+      vi.mocked(useChatShellStoreModule.useChatShellStore).mockReturnValue(
+        createMockStore({ sessionListRefreshToken: 1 }),
+      );
+      rerender(
+        <Wrapper>
+          <SessionRail />
+        </Wrapper>
+      );
+
       await waitFor(() => {
         expect(screen.getByText("No sessions yet")).toBeInTheDocument();
       });
+      expect(api.listChatSessions).toHaveBeenCalledTimes(2);
     });
   });
 

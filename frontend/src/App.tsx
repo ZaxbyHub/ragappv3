@@ -4,7 +4,7 @@ import { ProtectedRoute } from "@/components/auth/ProtectedRoute";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { PageShell } from "@/components/layout/PageShell";
 import { useHealthCheck } from "@/hooks/useHealthCheck";
-import { useEffect, lazy, Suspense } from "react";
+import { useCallback, useEffect, useRef, lazy, Suspense } from "react";
 import { useAuthStore } from "@/stores/useAuthStore";
 import { useNavigationGuardStore } from "@/stores/useNavigationGuardStore";
 import type { NavItemId } from "@/components/layout/navigationTypes";
@@ -16,6 +16,8 @@ import {
   KeyboardShortcutsDialog,
   useKeyboardShortcuts,
 } from "@/components/shared/KeyboardShortcuts";
+import { useCommandPaletteAction, type CommandPaletteActionGuard } from "@/lib/commandPaletteActions";
+import { useThemeStore } from "@/stores/useThemeStore";
 import { DocumentsTableSkeleton } from "@/components/documents/DocumentsTableSkeleton";
 
 // Toggle mock-data mode via: VITE_TEST_MODE=true npm run dev
@@ -82,9 +84,68 @@ function DocumentsPageFallback() {
 // same listener/dialog ChatShell used to mount, one level up.
 function AppShortcutsMount() {
   const { open: shortcutsOpen, setOpen: setShortcutsOpen } = useKeyboardShortcuts();
+  const { pathname } = useLocation();
+  const shortcutsActionGuardRef = useRef<CommandPaletteActionGuard | null>(null);
+  const shortcutsOpeningTokenRef = useRef<symbol | null>(null);
+  const shortcutsOpeningGuardRef = useRef<CommandPaletteActionGuard | null>(null);
+  const commandPaletteShortcutsGuard = useCommandPaletteAction({
+    id: "open-keyboard-shortcuts",
+    label: "Open keyboard shortcuts",
+    enabled: pathname === "/chat",
+    execute: (dispatchGuard) => {
+      if (!dispatchGuard.isCurrent()) return;
+      const consumerGuard = shortcutsActionGuardRef.current;
+      if (!consumerGuard?.isCurrent()) return;
+      shortcutsOpeningTokenRef.current = Symbol("keyboard-shortcuts");
+      shortcutsOpeningGuardRef.current = consumerGuard;
+      setShortcutsOpen(true);
+    },
+  });
+  shortcutsActionGuardRef.current = commandPaletteShortcutsGuard;
+  const renderedShortcutsOpeningToken = shortcutsOpeningTokenRef.current;
+  const renderedShortcutsOpeningGuard = shortcutsOpeningGuardRef.current;
+  const handleShortcutsOpenChange = useCallback((nextOpen: boolean) => {
+    if (shortcutsOpeningTokenRef.current !== renderedShortcutsOpeningToken) return;
+    if (renderedShortcutsOpeningGuard && !renderedShortcutsOpeningGuard.isCurrent()) {
+      shortcutsOpeningTokenRef.current = null;
+      shortcutsOpeningGuardRef.current = null;
+      setShortcutsOpen(false);
+      return;
+    }
+    if (nextOpen) {
+      setShortcutsOpen(true);
+      return;
+    }
+    shortcutsOpeningTokenRef.current = null;
+    shortcutsOpeningGuardRef.current = null;
+    setShortcutsOpen(false);
+  }, [renderedShortcutsOpeningGuard, renderedShortcutsOpeningToken, setShortcutsOpen]);
+  useEffect(() => {
+    const openingGuard = shortcutsOpeningGuardRef.current;
+    if (shortcutsOpen && shortcutsOpeningTokenRef.current && openingGuard && !openingGuard.isCurrent()) {
+      shortcutsOpeningTokenRef.current = null;
+      shortcutsOpeningGuardRef.current = null;
+      setShortcutsOpen(false);
+    }
+  }, [commandPaletteShortcutsGuard, setShortcutsOpen, shortcutsOpen]);
   return (
-    <KeyboardShortcutsDialog open={shortcutsOpen} onOpenChange={setShortcutsOpen} />
+    <KeyboardShortcutsDialog open={shortcutsOpen} onOpenChange={handleShortcutsOpenChange} />
   );
+}
+
+function CapabilityCommandPalette() {
+  const { pathname } = useLocation();
+  const { theme, setTheme } = useThemeStore();
+  useCommandPaletteAction({
+    id: "cycle-theme",
+    label: "Cycle theme",
+    enabled: pathname === "/chat",
+    execute: (guard) => {
+      if (!guard.isCurrent()) return;
+      setTheme(theme === "light" ? "dark" : theme === "dark" ? "system" : "light");
+    },
+  });
+  return <CommandPalette />;
 }
 
 // Main app shell wrapper that provides the navigation and page layout
@@ -175,7 +236,7 @@ function MainAppShell({ children, testMode = false }: { children: React.ReactNod
           ChatShell-only — so the palette's "Show keyboard shortcuts" action
           and the "?" shortcut work app-wide through the single existing
           dispatcher. */}
-      <CommandPalette />
+      <CapabilityCommandPalette />
       <AppShortcutsMount />
       <PageShell
         activeItem={activeItem}

@@ -1,160 +1,358 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useReducer, useEffect, useMemo, useRef, useCallback, useSyncExternalStore } from "react";
 import apiClient, { type HealthResponse } from "@/lib/api";
 import { useAuthStore } from "@/stores/useAuthStore";
 import type { HealthStatus } from "@/types/health";
+import { useAuthOwner } from "./useAuthOwner";
+import {
+  captureAuthPrincipalGeneration,
+  isCurrentAuthOwner,
+  subscribeAuthPrincipal,
+  type AuthOwner,
+} from "@/lib/api/auth-lifecycle";
 
 interface UseHealthCheckOptions {
   pollInterval?: number;
 }
 
-/** Deep re-check backstop: at least one real (deep) check this often, so a
- * retained "up" status can never go stale indefinitely. */
 const DEEP_RECHECK_INTERVAL = 90_000;
-
-/** Consecutive fetch failures required before services flip to "down", so a
- * single transient blip doesn't flash the reconnect banner. */
 const FAILURE_THRESHOLD = 2;
 
-/** Polls the backend health endpoint and returns service availability status.
- *
- * A `null`/absent service value from the backend means "not checked this
- * cycle" — the previous value is retained, never coerced to `false`. Only an
- * explicit `false` from the backend, or repeated fetch failures, mark a
- * service as down.
- */
-export function useHealthCheck(options?: UseHealthCheckOptions): HealthStatus {
-  const [health, setHealth] = useState<HealthStatus>({
-    backend: false,
-    embeddings: false,
-    chat: false,
-    loading: true,
-    lastChecked: null,
-  });
+type HealthContext = {
+  owner: AuthOwner;
+  principalGeneration: number;
+  isAuthenticated: boolean;
+  pollInterval?: number;
+};
 
-  const isFirstCheck = useRef(true);
-  const failStreak = useRef(0);
-  const hadSuccess = useRef(false);
-  const lastDeepAt = useRef(0);
-  const hasRealServices = useRef(false);
-  const recheckTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const recheckAttempts = useRef(0);
-  const checkHealthRef = useRef<() => Promise<void>>(() => Promise.resolve());
-  const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
+type HealthLifetime = {
+  context: HealthContext;
+  active: boolean;
+  isFirstCheck: boolean;
+  lastDeepAt: number;
+  hasRealServices: boolean;
+  recheckAttempts: number;
+  nextReadSequence: number;
+  recheckTimer: { handle: ReturnType<typeof setTimeout>; token: symbol } | null;
+  interval: ReturnType<typeof setInterval> | null;
+};
 
-  const clearRecheck = useCallback(() => {
-    if (recheckTimer.current !== null) {
-      clearTimeout(recheckTimer.current);
-      recheckTimer.current = null;
+type HealthRead = {
+  context: HealthContext;
+  lifetime: HealthLifetime;
+  token: symbol;
+  sequence: number;
+};
+
+const initialHealth: HealthStatus = {
+  backend: false,
+  embeddings: false,
+  chat: false,
+  loading: true,
+  lastChecked: null,
+};
+type HealthOutcomeState = {
+  health: HealthStatus;
+  lifetime: HealthLifetime | null;
+  lastPublishedSequence: number;
+  failureStreak: number;
+  hadSuccess: boolean;
+};
+
+type HealthOutcomeAction =
+  | { type: "reset"; lifetime: HealthLifetime; isCurrent: () => boolean }
+  | {
+      type: "failure";
+      lifetime: HealthLifetime;
+      sequence: number;
+      wasLatest: boolean;
+      lastChecked: Date;
+      isCurrent: () => boolean;
     }
+  | {
+      type: "success";
+      lifetime: HealthLifetime;
+      sequence: number;
+      isCurrent: () => boolean;
+      health: Omit<HealthStatus, "embeddings" | "chat"> & {
+        embeddings?: boolean | null;
+        chat?: boolean | null;
+      };
+    };
+
+const initialHealthState: HealthOutcomeState = {
+  health: initialHealth,
+  lifetime: null,
+  lastPublishedSequence: 0,
+  failureStreak: 0,
+  hadSuccess: false,
+};
+
+function healthOutcomeReducer(
+  state: HealthOutcomeState,
+  action: HealthOutcomeAction,
+): HealthOutcomeState {
+  if (action.type === "reset") {
+    if (!action.isCurrent()) return state;
+    return {
+      health: initialHealth,
+      lifetime: action.lifetime,
+      lastPublishedSequence: 0,
+      failureStreak: 0,
+      hadSuccess: false,
+    };
+  }
+  if (!action.isCurrent() || state.lifetime !== action.lifetime || action.sequence < state.lastPublishedSequence) {
+    return state;
+  }
+  if (action.type === "success") {
+    return {
+      health: {
+        ...action.health,
+        embeddings: action.health.embeddings ?? state.health.embeddings,
+        chat: action.health.chat ?? state.health.chat,
+      },
+      lifetime: state.lifetime,
+      lastPublishedSequence: action.sequence,
+      failureStreak: 0,
+      hadSuccess: true,
+    };
+  }
+
+  const failureStreak = state.failureStreak + 1;
+  const shouldPublishDown =
+    (action.wasLatest && !state.hadSuccess) || failureStreak >= FAILURE_THRESHOLD;
+  if (shouldPublishDown) {
+    return {
+      ...state,
+      health: { ...initialHealth, loading: false, lastChecked: action.lastChecked },
+      lastPublishedSequence: action.sequence,
+      failureStreak,
+    };
+  }
+  if (action.wasLatest) {
+    return {
+      ...state,
+      health: state.health.loading ? { ...state.health, loading: false } : state.health,
+      lastPublishedSequence: action.sequence,
+      failureStreak,
+    };
+  }
+  return { ...state, failureStreak };
+}
+
+function useAuthPrincipalGeneration(): number {
+  return useSyncExternalStore(
+    subscribeAuthPrincipal,
+    captureAuthPrincipalGeneration,
+    captureAuthPrincipalGeneration,
+  );
+}
+
+/** Polls backend health while keeping every result in its auth/principal lease. */
+export function useHealthCheck(options?: UseHealthCheckOptions): HealthStatus {
+  const authOwner = useAuthOwner();
+  const principalGeneration = useAuthPrincipalGeneration();
+  const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
+  const pollInterval = options?.pollInterval;
+  const [healthState, dispatchHealth] = useReducer(healthOutcomeReducer, initialHealthState);
+  const latestContextRef = useRef<HealthContext | null>(null);
+  const healthContextRef = useRef<HealthContext | null>(null);
+  const lifetimeRef = useRef<HealthLifetime | null>(null);
+  // latestReadRef is deliberately persistent after a response settles. React
+  // functional reducers may execute after the transport promise continuation.
+  const latestReadRef = useRef<HealthRead | null>(null);
+  const activeReadRef = useRef<HealthRead | null>(null);
+  const checkHealthRef = useRef<() => Promise<void>>(() => Promise.resolve());
+
+  const context = useMemo<HealthContext>(
+    () => ({ owner: authOwner, principalGeneration, isAuthenticated, pollInterval }),
+    [authOwner, isAuthenticated, pollInterval, principalGeneration],
+  );
+  latestContextRef.current = context;
+
+  const isCurrentContext = useCallback((candidate: HealthContext): boolean => {
+    return (
+      latestContextRef.current === candidate &&
+      isCurrentAuthOwner(candidate.owner) &&
+      captureAuthPrincipalGeneration() === candidate.principalGeneration
+    );
   }, []);
 
-  useEffect(() => clearRecheck, [clearRecheck]);
+  const isCurrentLifetime = useCallback(
+    (candidate: HealthContext, lifetime: HealthLifetime): boolean =>
+      isCurrentContext(candidate) &&
+      lifetime.active &&
+      lifetime.context === candidate &&
+      lifetimeRef.current === lifetime,
+    [isCurrentContext],
+  );
 
-  const checkHealth = useCallback(async (): Promise<void> => {
-    // Deep probing now requires credentials on the backend (issue #551): an
-    // unauthenticated deep=true would 401 and flap the reconnect banner for
-    // anonymous visitors (the hook is mounted at the App root, login page
-    // included). Shallow polls still serve the server-side last-known cache
-    // and lazily refresh it, so anonymous users keep getting truthful
-    // service status without triggering provider probes.
-    const deep =
-      isAuthenticated &&
-      (isFirstCheck.current ||
-        Date.now() - lastDeepAt.current >= DEEP_RECHECK_INTERVAL);
-    try {
-      // First check and periodic backstops include deep model probing;
-      // other polls are lightweight (server serves cached last-known status)
+  const isCurrentRead = useCallback(
+    (read: HealthRead): boolean =>
+      isCurrentLifetime(read.context, read.lifetime) && latestReadRef.current === read,
+    [isCurrentLifetime],
+  );
+
+  // A replacement render gets an owned loading view synchronously. The old
+  // state is not returned while its replacement lifetime awaits its first read.
+  const visibleHealth = healthState.lifetime?.context === context ? healthState.health : initialHealth;
+
+  useEffect(() => {
+    const lifetime: HealthLifetime = {
+      context,
+      active: true,
+      isFirstCheck: true,
+
+
+      lastDeepAt: 0,
+      hasRealServices: false,
+      recheckAttempts: 0,
+      nextReadSequence: 1,
+      recheckTimer: null,
+      interval: null,
+    };
+
+    lifetimeRef.current = lifetime;
+    healthContextRef.current = context;
+    if (!isCurrentLifetime(context, lifetime)) return;
+    if (isCurrentLifetime(context, lifetime)) dispatchHealth({ type: "reset", lifetime, isCurrent: () => isCurrentLifetime(context, lifetime) });
+
+    const clearRecheck = (): void => {
+      if (!isCurrentLifetime(context, lifetime)) return;
+      if (lifetime.recheckTimer !== null) {
+        clearTimeout(lifetime.recheckTimer.handle);
+        lifetime.recheckTimer = null;
+      }
+    };
+
+    const checkHealth = async (): Promise<void> => {
+      if (!isCurrentLifetime(context, lifetime)) return;
+      const read: HealthRead = { context, lifetime, token: Symbol("health-read"), sequence: lifetime.nextReadSequence++ };
+      if (!isCurrentLifetime(context, lifetime)) return;
+      latestReadRef.current = read;
+      activeReadRef.current = read;
+
+      const deep =
+        context.isAuthenticated &&
+        (lifetime.isFirstCheck ||
+          Date.now() - lifetime.lastDeepAt >= DEEP_RECHECK_INTERVAL);
+      const deepStartedAt = deep ? Date.now() : null;
+      if (!isCurrentRead(read)) return;
+      const deepWasFirstCheck = lifetime.isFirstCheck;
+      if (deepStartedAt !== null) {
+        if (!isCurrentRead(read)) return;
+        lifetime.lastDeepAt = deepStartedAt;
+        lifetime.isFirstCheck = false;
+      }
       const params = deep ? { deep: true } : {};
-      if (deep) lastDeepAt.current = Date.now();
 
-      const response = await apiClient.get<HealthResponse>("/health", { params });
-      // Success bookkeeping ONLY after the response resolves — resetting the
-      // failure streak before the await would make the catch-side threshold
-      // unreachable (every failure would observe a streak of 0/1).
-      isFirstCheck.current = false;
-      failStreak.current = 0;
-      hadSuccess.current = true;
-      const services = response.data.services;
+      let response: { data: HealthResponse };
+      let services: HealthResponse["services"] | undefined;
+      try {
+        if (!isCurrentRead(read)) return;
+        response = await apiClient.get<HealthResponse>("/health", { params });
+        const payload = response?.data;
+        if (payload === null || typeof payload !== "object") {
+          throw new Error("Malformed health response");
+        }
+        services = payload.services;
+        if (services !== undefined && (services === null || typeof services !== "object")) {
+          throw new Error("Malformed health services");
+        }
+      } catch {
+        if (!isCurrentLifetime(context, lifetime)) return;
+        if (deepStartedAt !== null && isCurrentRead(read) && deepWasFirstCheck) {
+          lifetime.isFirstCheck = true;
+        }
+        dispatchHealth({
+          type: "failure",
+          lifetime,
+          sequence: read.sequence,
+          wasLatest: latestReadRef.current === read,
+          lastChecked: new Date(),
+          isCurrent: () => isCurrentLifetime(context, lifetime),
+        });
+        if (activeReadRef.current === read) activeReadRef.current = null;
+        return;
+      }
 
-      // A shallow poll against a cold server-side cache returns null
-      // services ("not checked this cycle") with a background refresh now in
-      // flight. While we hold no real booleans yet, stay in the `loading`
-      // ("checking") state and re-poll shortly instead of publishing the
-      // initial `false`s — otherwise the banner announces an outage from
-      // unknowns (PR #606 review PRR-002). Bounded: once real booleans
-      // arrive (authoritative true OR false) this never triggers again.
+      if (!isCurrentRead(read)) return;
+      lifetime.isFirstCheck = false;
+
+      if (!isCurrentRead(read)) return;
       const servicesUnknown =
-        !hasRealServices.current &&
+        !lifetime.hasRealServices &&
         services?.embeddings == null &&
         services?.chat == null;
-      if (servicesUnknown && recheckAttempts.current < 5) {
-        recheckAttempts.current += 1;
+      if (servicesUnknown && lifetime.recheckAttempts < 5) {
+        if (!isCurrentRead(read)) return;
+        lifetime.recheckAttempts += 1;
         clearRecheck();
-        // Indirect through the ref so the re-check always runs the latest
-        // closure (auth state may have changed since this one was created).
-        recheckTimer.current = setTimeout(() => {
+        if (!isCurrentRead(read)) return;
+        const timerToken = Symbol("health-recheck");
+        const handle = setTimeout(() => {
+          // The captured read must still be latest before consulting the ref;
+          // otherwise A could accidentally invoke B's current closure.
+          if (!isCurrentRead(read)) return;
+          if (lifetime.recheckTimer?.token !== timerToken) return;
+          lifetime.recheckTimer = null;
           void checkHealthRef.current();
         }, 2000);
+        lifetime.recheckTimer = { handle, token: timerToken };
       } else if (!servicesUnknown) {
-        recheckAttempts.current = 0;
+        if (!isCurrentRead(read)) return;
+        lifetime.recheckAttempts = 0;
       }
+
       if (services?.embeddings != null && services?.chat != null) {
-        hasRealServices.current = true;
+        if (!isCurrentRead(read)) return;
+        lifetime.hasRealServices = true;
       }
 
       const newBackend = services?.backend ?? response.data.status === "ok";
-      // While unknown we hold the checking state; if the re-check budget is
-      // exhausted without real booleans (server sweep genuinely not landing),
-      // fall through to loading=false — the banner then shows its amber
-      // "attempting to reconnect" state, which is accurate, and the regular
-      // heartbeat keeps polling so a recovered server clears it.
       const stillChecking =
-        servicesUnknown && !hasRealServices.current && recheckAttempts.current < 5;
+        servicesUnknown && !lifetime.hasRealServices && lifetime.recheckAttempts < 5;
+      if (!isCurrentRead(read)) return;
+      dispatchHealth({
+        type: "success",
+        lifetime,
+        sequence: read.sequence,
+        isCurrent: () => isCurrentRead(read),
+        health: {
+          backend: newBackend,
+          embeddings: services?.embeddings,
+          chat: services?.chat,
+          loading: stillChecking,
+          lastChecked: new Date(),
+        },
+      });
+      if (activeReadRef.current === read) activeReadRef.current = null;
+    };
 
-      setHealth((prev) => ({
-        backend: newBackend,
-        // null/undefined = "not checked": retain last known value
-        embeddings: services?.embeddings ?? prev.embeddings,
-        chat: services?.chat ?? prev.chat,
-        loading: stillChecking,
-        lastChecked: new Date(),
-      }));
-    } catch {
-      failStreak.current += 1;
-      // Before the first successful check, surface failure immediately (the
-      // initial state is already "down"); afterwards require consecutive
-      // failures so transient blips don't flap the banner.
-      if (hadSuccess.current && failStreak.current < FAILURE_THRESHOLD) {
-        // Threshold grace: keep last-known services but still clear the
-        // initial loading flag — a cold start with the backend down must
-        // not spin forever (the banner renders once loading clears).
-        setHealth((prev) => (prev.loading ? { ...prev, loading: false } : prev));
-        return;
-      }
-      setHealth(() => ({
-        backend: false,
-        embeddings: false,
-        chat: false,
-        loading: false,
-        lastChecked: new Date(),
-      }));
-    }
-    // isAuthenticated is read inside the callback: without it the closure
-    // would pin the mount-time auth state and never send deep after login.
-  }, [isAuthenticated, clearRecheck]);
-
-  useEffect(() => {
     checkHealthRef.current = checkHealth;
-  }, [checkHealth]);
-
-  useEffect(() => {
-    checkHealth();
-
-    if (options?.pollInterval) {
-      const interval = setInterval(checkHealth, options.pollInterval);
-      return () => clearInterval(interval);
+    void checkHealth();
+    if (pollInterval) {
+      lifetime.interval = setInterval(() => {
+        if (!isCurrentLifetime(context, lifetime)) return;
+        void checkHealth();
+      }, pollInterval);
     }
-  }, [checkHealth, options?.pollInterval]);
 
-  return health;
+    return () => {
+      lifetime.active = false;
+      if (lifetime.recheckTimer !== null) {
+        clearTimeout(lifetime.recheckTimer.handle);
+        lifetime.recheckTimer = null;
+      }
+      if (lifetime.interval !== null) {
+        clearInterval(lifetime.interval);
+        lifetime.interval = null;
+      }
+      if (activeReadRef.current?.lifetime === lifetime) activeReadRef.current = null;
+      if (lifetimeRef.current === lifetime) lifetimeRef.current = null;
+      if (healthContextRef.current === context) healthContextRef.current = null;
+    };
+  }, [context, isCurrentLifetime, isCurrentRead, pollInterval]);
+
+  return visibleHealth;
 }

@@ -1,4 +1,5 @@
 import { apiClient } from "./core";
+import { captureAuthOwner, captureAuthPrincipalGeneration, enqueueAuthTransport, type AuthTransportContext } from "./auth-lifecycle";
 
 export interface Session {
   id: string;
@@ -19,12 +20,33 @@ export interface ChangePasswordRequest {
   new_password: string;
 }
 
-export async function changePassword(currentPassword: string, newPassword: string): Promise<void> {
+export interface SessionCredentials {
+  access_token: string;
+  token_type: string;
+  expires_in: number;
+}
+
+/** Preserve the initiating session and principal through dispatch and completion. */
+function runSessionMutation<T>(work: (context: AuthTransportContext) => Promise<T>): Promise<T> {
+  const owner = captureAuthOwner();
+  const principalGeneration = captureAuthPrincipalGeneration();
+  return enqueueAuthTransport(owner, async (context) => {
+    context.assertCurrent();
+    const result = await work(context);
+    context.assertCurrent();
+    return result;
+  }, undefined, () => captureAuthPrincipalGeneration() === principalGeneration);
+}
+
+export function changePassword(currentPassword: string, newPassword: string): Promise<SessionCredentials> {
   const request: ChangePasswordRequest = {
     current_password: currentPassword,
     new_password: newPassword,
   };
-  await apiClient.post("/auth/change-password", request);
+  return runSessionMutation(async (context) => {
+    const response = await apiClient.post<SessionCredentials>("/auth/change-password", request, { signal: context.signal });
+    return response.data;
+  });
 }
 
 export async function listSessions(): Promise<SessionListResponse> {
@@ -32,11 +54,15 @@ export async function listSessions(): Promise<SessionListResponse> {
   return response.data;
 }
 
-export async function revokeSession(sessionId: number): Promise<void> {
-  await apiClient.delete(`/auth/sessions/${sessionId}`);
+export function revokeSession(sessionId: number): Promise<void> {
+  return runSessionMutation(async (context) => {
+    await apiClient.delete(`/auth/sessions/${sessionId}`, { signal: context.signal });
+  });
 }
 
-export async function revokeAllSessions(): Promise<{ access_token: string; token_type: string; expires_in: number }> {
-  const response = await apiClient.delete<{ access_token: string; token_type: string; expires_in: number }>("/auth/sessions");
-  return response.data;
+export function revokeAllSessions(): Promise<SessionCredentials> {
+  return runSessionMutation(async (context) => {
+    const response = await apiClient.delete<SessionCredentials>("/auth/sessions", { signal: context.signal });
+    return response.data;
+  });
 }

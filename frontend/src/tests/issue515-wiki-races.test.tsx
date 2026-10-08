@@ -112,7 +112,7 @@ beforeEach(() => {
         body: {
           getReader: () => ({
             read: () => new Promise<{ value?: Uint8Array; done: boolean }>(() => {}),
-            cancel: vi.fn(),
+            cancel: vi.fn(() => Promise.resolve()),
           }),
         },
       } as unknown as Response)
@@ -331,7 +331,7 @@ describe("issue515 ac33", () => {
             else pending = resolve;
           })
       ),
-      cancel: vi.fn(),
+      cancel: vi.fn(() => Promise.resolve()),
     };
     const emit = (chunk: string) => {
       const item = { value: encoder.encode(chunk), done: false };

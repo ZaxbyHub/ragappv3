@@ -6,12 +6,16 @@
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-const { mockPostFn, mockGetFn, mockRefreshAccessToken, mockSetJwtAccessToken } = vi.hoisted(() => ({
-  mockPostFn: vi.fn(),
-  mockGetFn: vi.fn(),
-  mockRefreshAccessToken: vi.fn(),
-  mockSetJwtAccessToken: vi.fn(),
-}));
+const { mockPostFn, mockGetFn, mockRefreshAccessToken, mockSetJwtAccessToken, mockJwtTokenHolder } = vi.hoisted(() => {
+  const holder = { value: null as string | null };
+  return {
+    mockPostFn: vi.fn(),
+    mockGetFn: vi.fn(),
+    mockRefreshAccessToken: vi.fn(),
+    mockSetJwtAccessToken: vi.fn((token: string | null) => { holder.value = token; }),
+    mockJwtTokenHolder: holder,
+  };
+});
 
 vi.mock("axios", () => ({
   default: {
@@ -39,6 +43,14 @@ vi.mock("@/lib/api", () => ({
   resetSubpathRefreshDiagnostic: vi.fn(),
   attachCsrfInterceptor: vi.fn(),
 }));
+vi.mock("@/lib/api/core", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/api/core")>();
+  return {
+    ...actual,
+    getJwtAccessToken: vi.fn(() => mockJwtTokenHolder.value),
+    onJwtAccessTokenPublished: vi.fn(() => () => undefined),
+  };
+});
 
 vi.mock("@/stores/useVaultStore", () => ({
   useVaultStore: {
@@ -65,6 +77,7 @@ const mockUser = {
 beforeEach(() => {
   vi.clearAllMocks();
   resetInitState();
+  mockJwtTokenHolder.value = "live-jwt";
   useAuthStore.setState({
     user: mockUser,
     accessToken: "live-jwt",
@@ -98,12 +111,11 @@ describe("issue 774 session retention on transport failures", () => {
     expect(useAuthStore.getState().isAuthenticated).toBe(true);
   });
 
-  it("cold reload during an outage keeps the persisted user but cannot restore isAuthenticated (lands at login, unchanged from base)", async () => {
-    // OOB review F-003: a real reload produces accessToken=null +
-    // isAuthenticated=false (only `user` is persisted). The keep-session
-    // change preserves the persisted `user` on a transport failure, but the
-    // user still lands at login — this test pins that honest semantics so
-    // the PR text cannot overclaim.
+  it("cold reload during an outage retains the persisted user while setup status remains unknown and retryable", async () => {
+    // A real reload has accessToken=null and isAuthenticated=false because only
+    // `user` persists. When refresh and setup-status transport both fail, init
+    // retains that identity while exposing an unknown, retryable setup status:
+    // isInitialized=false, initializationFailed=true, needsSetup=null.
     useAuthStore.setState({
       user: mockUser,
       accessToken: null,
@@ -112,6 +124,7 @@ describe("issue 774 session retention on transport failures", () => {
       isInitialized: false,
     });
     // Refresh cookie path fails on transport; setup-status too.
+    mockJwtTokenHolder.value = null;
     mockRefreshAccessToken.mockRejectedValueOnce(new TypeError("Failed to fetch"));
     mockGetFn.mockRejectedValueOnce(new TypeError("Failed to fetch"));
 
@@ -120,7 +133,9 @@ describe("issue 774 session retention on transport failures", () => {
     const state = useAuthStore.getState();
     expect(state.isAuthenticated).toBe(false);
     expect(state.user).toEqual(mockUser); // persisted identity retained
-    expect(state.isInitialized).toBe(true);
+    expect(state.isInitialized).toBe(false);
+    expect(state.initializationFailed).toBe(true);
+    expect(state.needsSetup).toBeNull();
   });
 
   it("init keeps the session when fetchMe fails with a network error (in-memory-token path: remount/hot-reload only)", async () => {
@@ -135,7 +150,9 @@ describe("issue 774 session retention on transport failures", () => {
     expect(state.isAuthenticated).toBe(true);
     expect(state.user).toEqual(mockUser);
     expect(state.accessToken).toBe("live-jwt");
-    expect(state.isInitialized).toBe(true);
+    expect(state.isInitialized).toBe(false);
+    expect(state.initializationFailed).toBe(true);
+    expect(state.needsSetup).toBeNull();
   });
 
   it("init clears the session when fetchMe is rejected with 401", async () => {

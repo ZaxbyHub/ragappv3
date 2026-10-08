@@ -179,37 +179,77 @@ describe("chatStream reconnects with Last-Event-ID after mid-answer EOF (issue #
     dispose();
   }, 5000);
 
-  it("dispose during the resume backoff aborts the resume attempt", async () => {
-    // The mock must honor the abort signal like real fetch: a fetch invoked
-    // with an already-aborted signal rejects instead of streaming.
-    fetchMock.mockImplementation(async (_url: string, init?: RequestInit) => {
-      if (init?.signal?.aborted) {
-        throw Object.assign(new Error("Aborted"), { name: "AbortError" });
-      }
-      return sseResponse(["id: 1\ndata: {\"type\":\"content\",\"content\":\"partial\"}\n\n"]);
-    });
+  it("dispose during the resume backoff stops before a second request", async () => {
+    vi.useFakeTimers();
+    const timeoutSpy = vi.spyOn(globalThis, "setTimeout");
+    const contents: string[] = [];
     const errors: Error[] = [];
-    const dispose = chatStream(
-      [{ role: "user", content: "q" }] as never,
-      { onMessage: () => undefined, onError: (e: Error) => errors.push(e) } as never,
-      1,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      { sessionId: 7, turnId: "turn-abort" },
-    );
-    // Let the EOF register, then dispose INSIDE the 500ms backoff window:
-    // the abort-aware backoff resolves immediately and the resume attempt
-    // carries the aborted signal — no resumed content, no completion.
-    await sleep(120);
-    dispose();
-    await sleep(400);
-    expect(fetchMock.mock.calls.length).toBe(2);
-    const secondInit = fetchMock.mock.calls[1][1] as RequestInit;
-    expect((secondInit?.signal as AbortSignal)?.aborted).toBe(true);
-    expect(errors.some((e) => e.name === "AbortError") || errors.length === 0).toBe(true);
+    let completeCalls = 0;
+    let dispose: (() => void) | undefined;
+
+    try {
+      fetchMock.mockImplementation(async (_url: string, init?: RequestInit) => {
+        if (init?.signal?.aborted) {
+          throw Object.assign(new Error("Aborted"), { name: "AbortError" });
+        }
+        if (fetchMock.mock.calls.length > 1) {
+          throw new Error("unexpected resume fetch after disposal");
+        }
+        return sseResponse(["id: 1\ndata: {\"type\":\"content\",\"content\":\"partial\"}\n\n"]);
+      });
+
+      dispose = chatStream(
+        [{ role: "user", content: "q" }] as never,
+        {
+          onMessage: (content: string) => contents.push(content),
+          onComplete: () => {
+            completeCalls += 1;
+          },
+          onError: (error: Error) => errors.push(error),
+        } as never,
+        1,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { sessionId: 7, turnId: "turn-abort" },
+      );
+
+      for (let flush = 0; flush < 100; flush += 1) {
+        if (
+          fetchMock.mock.calls.length === 1 &&
+          contents.length === 1 &&
+          timeoutSpy.mock.calls.some(([, delay]) => delay === 500)
+        ) {
+          break;
+        }
+        await Promise.resolve();
+      }
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(contents).toEqual(["partial"]);
+      expect(timeoutSpy.mock.calls.filter(([, delay]) => delay === 500)).toHaveLength(1);
+
+      const firstInit = fetchMock.mock.calls[0][1] as RequestInit;
+      const firstSignal = firstInit.signal as AbortSignal;
+      expect(firstSignal.aborted).toBe(false);
+
+      dispose();
+      expect(firstSignal.aborted).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(500);
+      await Promise.resolve();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(contents).toEqual(["partial"]);
+      expect(completeCalls).toBe(0);
+      expect(errors).toEqual([]);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      dispose?.();
+      timeoutSpy.mockRestore();
+      vi.useRealTimers();
+    }
   }, 5000);
 });

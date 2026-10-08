@@ -1,10 +1,20 @@
 // frontend/src/components/chat/SessionRail.tsx
 // SessionRail component with full business logic for chat session management
 
-import { useState, useCallback, useMemo, useEffect, useRef, useLayoutEffect, forwardRef } from "react";
+import {
+  useState,
+  useCallback,
+  useMemo,
+  useEffect,
+  useRef,
+  useLayoutEffect,
+  useSyncExternalStore,
+  forwardRef,
+} from "react";
+import type { MutableRefObject } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useDebounce } from "@/hooks/useDebounce";
-import { useNavigate } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import {
   MessageSquare,
   Search,
@@ -22,7 +32,23 @@ import {
   AlertCircle,
 } from "lucide-react";
 import { formatRelativeTime } from "@/lib/formatters";
-import { comboFromEvent, effectiveBinding, isEditableTarget } from "@/lib/shortcutBindings";
+import { dispatchCommandPaletteOpen } from "@/lib/commandPaletteEvents";
+import {
+  useCommandPaletteAction,
+  type CommandPaletteActionGuard,
+} from "@/lib/commandPaletteActions";
+import { useAuthOwner } from "@/hooks/useAuthOwner";
+import {
+  captureAuthPrincipalGeneration,
+  isCurrentAuthOwner,
+  subscribeAuthPrincipal,
+  type AuthOwner,
+} from "@/lib/api/auth-lifecycle";
+import {
+  comboFromEvent,
+  effectiveBinding,
+  isEditableTarget,
+} from "@/lib/shortcutBindings";
 import { useChatShellStore } from "@/stores/useChatShellStore";
 import { useChatStore } from "@/stores/useChatStore";
 import { useVaultStore } from "@/stores/useVaultStore";
@@ -162,6 +188,23 @@ function groupSessionsByTime(
 // COMPONENT: ChatSearchInput
 // =============================================================================
 
+function canFocusChatSearch(input: HTMLInputElement): boolean {
+  if (!input.isConnected || input.disabled) return false;
+  for (let element: HTMLElement | null = input; element; element = element.parentElement) {
+    if (element.hidden || element.getAttribute("aria-hidden") === "true") return false;
+    const isExplicitlyCollapsedRail =
+      element.style.width === "0px" &&
+      element.classList.contains("md:w-0") &&
+      element.classList.contains("md:overflow-hidden");
+    if (isExplicitlyCollapsedRail) return false;
+    const style = window.getComputedStyle?.(element);
+    if (style?.display === "none" || style?.visibility === "hidden" || style?.opacity === "0") {
+      return false;
+    }
+  }
+  return true;
+}
+
 export function ChatSearchInput({
   value,
   onChange,
@@ -175,43 +218,30 @@ export function ChatSearchInput({
   // persisted override applies on every mount).
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      // Issue #775: one owner per combo — an earlier claimant (including the
-      // second ChatSearchInput instance ChatShell mounts for mobile) wins and
-      // this listener yields.
-      if (e.defaultPrevented) return;
-      // IME composition is not a shortcut gesture (repo discipline, cf.
-      // useEscapeToStop).
-      if (e.isComposing) return;
+      if (e.defaultPrevented || e.repeat || e.isComposing) return;
       const combo = comboFromEvent(e);
       if (combo === null || combo !== effectiveBinding("focusSearch", "Ctrl+K")) return;
-      // Issue #775: an UNMODIFIED combo bound here would fire on every
-      // keystroke of that key inside any editor (printables, Enter, Tab,
-      // arrows) and steal focus mid-edit — non-modifier combos only fire
-      // from non-editable focus. Modifier combos (the Ctrl/Cmd+K default and
-      // any Ctrl-rebind) keep focusing search from the composer, as shipped.
+      // Printable bindings do not run from an editor. Modifier bindings such
+      // as Ctrl+K retain the chat search behavior from editable surfaces.
       if (isEditableTarget(e.target) && !e.ctrlKey && !e.metaKey) return;
-      // Issue #775 review PRR-101: ChatShell keeps the desktop rail MOUNTED
-      // while hidden — display:none below md (`hidden md:flex`) and
-      // w-0/opacity-0 when collapsed — and that hidden instance registers
-      // this document listener FIRST. Claiming from a hidden instance
-      // swallows the combo with no visible action (focus() on an unrendered
-      // element is a no-op), stranding the shortcut from the visible sheet
-      // instance and the palette alike. Own the combo only when this
-      // instance's input is actually rendered; where checkVisibility is
-      // unavailable (older browsers, jsdom) keep the prior claim behavior.
       const input = inputRef.current;
+      if (!input || !canFocusChatSearch(input)) return;
+      // ChatShell keeps the desktop rail mounted while hidden. Do not claim
+      // the event from that hidden instance when the browser exposes the
+      // visibility check; older browsers and jsdom retain the prior behavior.
       if (
-        input &&
         typeof input.checkVisibility === "function" &&
         !input.checkVisibility({ checkOpacity: true })
       ) {
         return;
       }
+      input.focus();
+      if (document.activeElement !== input) return;
       e.preventDefault();
-      input?.focus();
+      e.stopPropagation();
     };
-    document.addEventListener("keydown", handleKeyDown);
-    return () => document.removeEventListener("keydown", handleKeyDown);
+    document.addEventListener("keydown", handleKeyDown, true);
+    return () => document.removeEventListener("keydown", handleKeyDown, true);
   }, []);
 
   const handleClear = useCallback(() => {
@@ -624,11 +654,76 @@ export function SessionGroup({
 // RT-08 fix: Module-level cache to deduplicate session list fetches across
 // multiple SessionRail instances (desktop sidebar + mobile sheet)
 // Exported for test reset between test runs — not part of the public API.
-export const _sessionCache: { data: ChatSession[] | null; vaultId?: number; ts: number } = {
+export const _sessionCache: {
+  data: ChatSession[] | null;
+  vaultId?: number;
+  owner?: AuthOwner;
+  principalGeneration?: number;
+  readAttempt?: number;
+  ts: number;
+} = {
   data: null,
   ts: 0,
 };
 const SESSION_CACHE_TTL = 5000; // 5 seconds
+
+interface SessionContext {
+  // A private lease distinguishes A -> B -> A from the first A.
+  readonly lease: number;
+  readonly owner: AuthOwner;
+  readonly principalGeneration: number;
+  readonly vaultId?: number;
+}
+
+interface PendingDelete {
+  readonly token: number;
+  readonly session: ChatSession;
+  readonly context: SessionContext;
+  readonly wasActive: boolean;
+  readonly wasPinned: boolean;
+  readonly timer: ReturnType<typeof setTimeout>;
+  undone: boolean;
+  finalized: boolean;
+}
+
+function sameSessionContext(left: SessionContext, right: SessionContext): boolean {
+  // Cache equivalence may compare fields; callback liveness must be exact.
+  return left === right;
+}
+
+function isCurrentSessionContext(context: SessionContext, currentVaultId?: number): boolean {
+  return (
+    isCurrentAuthOwner(context.owner) &&
+    captureAuthPrincipalGeneration() === context.principalGeneration &&
+    context.vaultId === currentVaultId
+  );
+}
+
+function isFreshSessionCache(context: SessionContext): boolean {
+  const contextMatches =
+    _sessionCache.owner === context.owner &&
+    _sessionCache.principalGeneration === context.principalGeneration &&
+    _sessionCache.vaultId === context.vaultId;
+  return Boolean(
+    _sessionCache.data &&
+      contextMatches &&
+      Date.now() - _sessionCache.ts < SESSION_CACHE_TTL
+  );
+}
+
+function SessionRailPaletteAction({
+  resetNewChat,
+}: {
+  resetNewChat: (guard?: CommandPaletteActionGuard) => void;
+}) {
+  useCommandPaletteAction({
+    id: "new-chat",
+    label: "New chat",
+    enabled: true,
+    execute: (guard) => resetNewChat(guard),
+  });
+  return null;
+}
 
 interface SessionRailProps {
   vaultId?: number;
@@ -636,8 +731,58 @@ interface SessionRailProps {
 }
 
 export function SessionRail({ vaultId, className }: SessionRailProps) {
+  const authOwner = useAuthOwner();
+  const principalGeneration = useSyncExternalStore(
+    subscribeAuthPrincipal,
+    captureAuthPrincipalGeneration,
+    captureAuthPrincipalGeneration,
+  );
+  const leaseRef = useRef(0);
+  const sessionContext = useMemo<SessionContext>(
+    () => ({ lease: ++leaseRef.current, owner: authOwner, principalGeneration, vaultId }),
+    [authOwner, principalGeneration, vaultId],
+  );
+  const latestSessionContextRef = useRef(sessionContext);
+  const rowTokenRef = useRef<Map<number, number>>(new Map());
+  const pendingDeletesRef = useRef<Map<number, PendingDelete>>(new Map());
+  useLayoutEffect(() => {
+    latestSessionContextRef.current = sessionContext;
+  }, [sessionContext]);
+  return (
+    <SessionRailContent
+      key={sessionContext.lease}
+      vaultId={vaultId}
+      className={className}
+      sessionContext={sessionContext}
+      latestSessionContextRef={latestSessionContextRef}
+      rowTokenRef={rowTokenRef}
+      pendingDeletesRef={pendingDeletesRef}
+    />
+  );
+}
+
+function SessionRailContent({
+  vaultId,
+  className,
+  sessionContext,
+  latestSessionContextRef,
+  rowTokenRef,
+  pendingDeletesRef,
+}: SessionRailProps & {
+  sessionContext: SessionContext;
+  latestSessionContextRef: MutableRefObject<SessionContext>;
+  rowTokenRef: MutableRefObject<Map<number, number>>;
+  pendingDeletesRef: MutableRefObject<Map<number, PendingDelete>>;
+}) {
   const testMode = useTestMode();
   const navigate = useNavigate();
+  const { pathname } = useLocation();
+  const mountedRef = useRef(false);
+  const invocationLeaseRef = useRef<{ active: boolean } | null>(null);
+  const sessionReadAttemptRef = useRef(0);
+  const detailReadAttemptRef = useRef(0);
+  const previousSessionContextRef = useRef<SessionContext | null>(null);
+  const pendingRenameRef = useRef<Map<number, symbol>>(new Map());
   const {
     activeSessionId,
     sessionSearchQuery,
@@ -657,96 +802,179 @@ export function SessionRail({ vaultId, className }: SessionRailProps) {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [focusedSessionIndex, setFocusedSessionIndex] = useState(0);
-  // Tracks pending (delayed) delete timers so Undo can cancel them
-  const pendingDeletesRef = useRef<Map<number, ReturnType<typeof setTimeout>>>(new Map());
+  useEffect(() => {
+    mountedRef.current = true;
+    const invocationLease = { active: true };
+    invocationLeaseRef.current = invocationLease;
+    const pendingDeletes = pendingDeletesRef.current;
+    const rowTokens = rowTokenRef.current;
+    const pendingRename = pendingRenameRef.current;
+    return () => {
+      mountedRef.current = false;
+      invocationLease.active = false;
+      for (const [sessionId] of rowTokens) {
+        if (![...pendingDeletes.values()].some((pending) => pending.session.id === sessionId)) {
+          rowTokens.delete(sessionId);
+        }
+      }
+      pendingRename.clear();
+    };
+  }, [pendingDeletesRef, rowTokenRef]);
 
   // H-7 fix: Debounce search to avoid firing API calls per keystroke
   const [debouncedSearchQuery] = useDebounce(sessionSearchQuery, 300);
+  const detailQueryContext = useMemo(
+    () => ({ raw: sessionSearchQuery, debounced: debouncedSearchQuery }),
+    [sessionSearchQuery, debouncedSearchQuery],
+  );
+  const latestDetailQueryContextRef = useRef(detailQueryContext);
+  latestDetailQueryContextRef.current = detailQueryContext;
+
+  // Session detail markers and content belong to the same private context as
+  // the list. A principal or vault transition retires both before the next
+  // read can publish.
+  const fetchedIdsRef = useRef<Set<number>>(new Set());
+  useEffect(() => {
+    const previous = previousSessionContextRef.current;
+    if (previous && !sameSessionContext(previous, sessionContext)) {
+      fetchedIdsRef.current.clear();
+      setSessions([]);
+      setSessionDetails(new Map());
+    }
+    previousSessionContextRef.current = sessionContext;
+  }, [sessionContext]);
 
   // Fetch sessions on mount and when vaultId changes (with dedup cache)
   const lastRefreshTokenRef = useRef(sessionListRefreshToken);
   useEffect(() => {
     let cancelled = false;
+    const readContext = sessionContext;
+    const invocationLease = invocationLeaseRef.current;
+    if (!mountedRef.current || !isCurrentSessionContext(readContext, vaultId) || !invocationLease?.active) return;
+    const readAttempt = ++sessionReadAttemptRef.current;
     const forceRefresh = sessionListRefreshToken !== lastRefreshTokenRef.current;
     lastRefreshTokenRef.current = sessionListRefreshToken;
+    const canPublish = () =>
+      !cancelled &&
+      mountedRef.current &&
+      invocationLease.active && invocationLeaseRef.current === invocationLease &&
+      readAttempt === sessionReadAttemptRef.current &&
+      sameSessionContext(readContext, latestSessionContextRef.current) &&
+      isCurrentSessionContext(readContext, latestSessionContextRef.current.vaultId);
     const fetchSessions = async () => {
       if (testMode) {
-        setSessions(mockChatSessions);
-        setIsLoading(false);
+        if (canPublish()) {
+          setSessions((previous) => canPublish() ? mockChatSessions : previous);
+          setIsLoading((previous) => canPublish() ? false : previous);
+        }
         return;
       }
       // Use cache if fresh and same vault
-      if (
-        !forceRefresh &&
-        _sessionCache.data &&
-        _sessionCache.vaultId === vaultId &&
-        Date.now() - _sessionCache.ts < SESSION_CACHE_TTL
-      ) {
-        setSessions(_sessionCache.data);
-        setIsLoading(false);
+      if (!forceRefresh && isFreshSessionCache(readContext) && canPublish()) {
+        const cached = _sessionCache.data ?? [];
+        setSessions((previous) => canPublish() ? cached : previous);
+        setIsLoading((previous) => canPublish() ? false : previous);
         return;
       }
 
-      setIsLoading(true);
-      setError(null);
+      if (canPublish()) {
+        setIsLoading((previous) => canPublish() ? true : previous);
+        setError((previous) => canPublish() ? null : previous);
+      }
       try {
+        // Physical reads from separate rail instances share this monotonic
+        // identity so an older response cannot overwrite the newer cache.
+        if (!canPublish()) return;
+        const cacheReadAttempt = (_sessionCache.readAttempt ?? 0) + 1;
+        _sessionCache.readAttempt = cacheReadAttempt;
+        if (!canPublish()) return;
         const data = await listChatSessions(vaultId);
+        if (!data || !Array.isArray(data.sessions)) {
+          throw new Error("Session list response was malformed");
+        }
         const sessionList = Array.isArray(data.sessions) ? data.sessions : [];
-        _sessionCache.data = sessionList;
-        _sessionCache.vaultId = vaultId;
-        _sessionCache.ts = Date.now();
-        if (!cancelled) setSessions(sessionList);
+        if (!canPublish()) return;
+        if (_sessionCache.readAttempt === cacheReadAttempt) {
+          _sessionCache.data = sessionList;
+          _sessionCache.vaultId = vaultId;
+          _sessionCache.owner = readContext.owner;
+          _sessionCache.principalGeneration = readContext.principalGeneration;
+          _sessionCache.ts = Date.now();
+        }
+        setSessions((previous) => (canPublish() ? sessionList : previous));
       } catch (err) {
         const message = err instanceof Error ? err.message : "Failed to load sessions";
-        if (!cancelled) setError(message);
+        if (canPublish()) setError((previous) => canPublish() ? message : previous);
       } finally {
-        if (!cancelled) setIsLoading(false);
+        if (canPublish()) setIsLoading((previous) => canPublish() ? false : previous);
       }
     };
 
     fetchSessions();
     return () => { cancelled = true; };
-  }, [vaultId, sessionListRefreshToken, testMode]);
-
-  // Track which session IDs have been fetched to avoid duplicate fetches
-  const fetchedIdsRef = useRef<Set<number>>(new Set());
+  }, [vaultId, sessionListRefreshToken, testMode, sessionContext, latestSessionContextRef]);
 
   // Fetch session details for first message content when needed for search
   useEffect(() => {
+    let cancelled = false;
+    const readContext = sessionContext;
+    const invocationLease = invocationLeaseRef.current;
+    if (!mountedRef.current || !isCurrentSessionContext(readContext, vaultId) || !invocationLease?.active) return;
+    const readAttempt = ++detailReadAttemptRef.current;
+    const queryContext = detailQueryContext;
+    const query = queryContext.debounced;
+    const canPublish = () =>
+      !cancelled &&
+      mountedRef.current &&
+      invocationLease.active && invocationLeaseRef.current === invocationLease &&
+      readAttempt === detailReadAttemptRef.current &&
+      latestDetailQueryContextRef.current === queryContext &&
+      queryContext.raw === queryContext.debounced &&
+      sameSessionContext(readContext, latestSessionContextRef.current) &&
+      isCurrentSessionContext(readContext, latestSessionContextRef.current.vaultId);
+    const sessionsNeedingDetails = sessions
+      .filter((session) => !fetchedIdsRef.current.has(session.id))
+      .slice(0, 50);
+    if (!query.trim() || queryContext.raw !== queryContext.debounced || sessionsNeedingDetails.length === 0) {
+      return () => { cancelled = true; };
+    }
+
     const fetchSessionDetails = async () => {
-      if (!debouncedSearchQuery.trim()) {
-        // Retain fetched details across an empty query: fetchedIdsRef keeps
-        // its markers, so clearing the map here (while the ref kept markers)
-        // made repeat searches by first-message content find nothing until
-        // remount (UI-043).
-        return;
-      }
-
-      // Only fetch details for sessions we don't already have
-      const sessionsNeedingDetails = sessions.filter((s) => !fetchedIdsRef.current.has(s.id));
-
-      if (sessionsNeedingDetails.length === 0) return;
-
-      const newDetails = new Map(sessionDetails);
-
-      await Promise.all(
-        sessionsNeedingDetails.slice(0, 50).map(async (session) => {
+      const results = await Promise.all(
+        sessionsNeedingDetails.map(async (session) => {
           try {
+            if (!canPublish()) return null;
             const detail = await getChatSession(session.id);
-            newDetails.set(session.id, detail);
-            fetchedIdsRef.current.add(session.id);
+            if (!canPublish()) return null;
+            return [session.id, detail] as const;
           } catch {
-            // Silently fail for individual session fetch errors
+            return null;
           }
-        })
+        }),
       );
-
-      setSessionDetails(newDetails);
+      if (!canPublish()) return;
+      const successful = results.filter(
+        (result): result is readonly [number, ChatSessionDetail] => result !== null,
+      );
+      if (successful.length === 0) return;
+      setSessionDetails((previous) => {
+        if (!canPublish()) return previous;
+        const next = new Map(previous);
+        for (const [id, detail] of successful) next.set(id, detail);
+        return next;
+      });
+      // Fetched markers follow committed details in the layout effect below;
+      // a queued result retired before commit must not poison future reads.
     };
 
     fetchSessionDetails();
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [debouncedSearchQuery, sessions]);
+    return () => { cancelled = true; };
+  }, [debouncedSearchQuery, detailQueryContext, sessions, sessionContext, vaultId, latestSessionContextRef]);
+
+  useLayoutEffect(() => {
+    if (!isCurrentSessionContext(sessionContext, vaultId)) return;
+    fetchedIdsRef.current = new Set(sessionDetails.keys());
+  }, [sessionDetails, sessionContext, vaultId]);
 
   // Filter sessions based on search query (title + first message content)
   const filteredSessions = useMemo(() => {
@@ -778,6 +1006,31 @@ export function SessionRail({ vaultId, className }: SessionRailProps) {
     () => groupSessionsByTime(filteredSessions, pinnedSessionIds),
     [filteredSessions, pinnedSessionIds]
   );
+
+  const nextRowToken = useCallback((sessionId: number) => {
+    const token = (rowTokenRef.current.get(sessionId) ?? 0) + 1;
+    rowTokenRef.current.set(sessionId, token);
+    return token;
+  }, [rowTokenRef]);
+  const isLiveContext = useCallback((context: SessionContext) => {
+    return (
+      mountedRef.current &&
+      sameSessionContext(context, latestSessionContextRef.current) &&
+      isCurrentAuthOwner(context.owner) &&
+      captureAuthPrincipalGeneration() === context.principalGeneration
+    );
+  }, [latestSessionContextRef]);
+  const releaseDeleteRecord = useCallback((pending: PendingDelete) => {
+    if (pendingDeletesRef.current.get(pending.session.id) !== pending) return;
+    pendingDeletesRef.current.delete(pending.session.id);
+    if (
+      !mountedRef.current &&
+      rowTokenRef.current.get(pending.session.id) === pending.token &&
+      !pendingDeletesRef.current.has(pending.session.id)
+    ) {
+      rowTokenRef.current.delete(pending.session.id);
+    }
+  }, [pendingDeletesRef, rowTokenRef]);
 
   // H-1: Virtualizer refs and setup
   const listRef = useRef<HTMLDivElement>(null);
@@ -849,51 +1102,116 @@ export function SessionRail({ vaultId, className }: SessionRailProps) {
   );
 
   // Handle new chat
+  const resetNewChat = useCallback(
+    (guard?: CommandPaletteActionGuard) => {
+      const capturedContext = sessionContext;
+      const isCurrent = () =>
+        (guard?.isCurrent() ?? true) && isLiveContext(capturedContext);
+      if (!isCurrent()) return;
+      useChatStore.getState().newChat();
+      if (!isCurrent()) return;
+      setActiveSessionId(null);
+      if (!isCurrent()) return;
+      setActiveSessionTitle(null);
+      if (!isCurrent()) return;
+      setSessionSearchQuery("");
+      if (!isCurrent()) return;
+      navigate("/chat");
+    },
+    [
+      isLiveContext,
+      navigate,
+      sessionContext,
+      setActiveSessionId,
+      setActiveSessionTitle,
+      setSessionSearchQuery,
+    ]
+  );
+
   const handleNewChat = useCallback(() => {
-    useChatStore.getState().newChat();
-    setActiveSessionId(null);
-    setActiveSessionTitle(null);
-    setSessionSearchQuery("");
-    navigate("/chat");
-  }, [navigate, setActiveSessionId, setActiveSessionTitle, setSessionSearchQuery]);
+    resetNewChat();
+  }, [resetNewChat]);
+
+  // The full palette hook requires an active vault store boundary. Keep it in
+  // a private child that exists only on the real chat route; the child remains
+  // the first fragment sibling across loading, error, empty, and success UI.
+  const paletteAction =
+    pathname === "/chat" ? <SessionRailPaletteAction resetNewChat={resetNewChat} /> : null;
 
   // Handle session click
   const handleSessionClick = useCallback(
     (session: ChatSession) => {
+      const capturedContext = sessionContext;
+      const isCurrent = () => isLiveContext(capturedContext);
+      if (!isCurrent()) return false;
       setActiveSessionId(String(session.id));
+      if (!isCurrent()) return false;
       setActiveSessionTitle(session.title || null);
+      if (!isCurrent()) return false;
       setSessionSearchQuery("");
+      if (!isCurrent()) return false;
       navigate(`/chat/${session.id}`);
+      return isCurrent();
     },
-    [navigate, setActiveSessionId, setActiveSessionTitle, setSessionSearchQuery]
+    [
+      isLiveContext,
+      navigate,
+      sessionContext,
+      setActiveSessionId,
+      setActiveSessionTitle,
+      setSessionSearchQuery,
+    ]
   );
 
   // Handle rename with API call (optimistic update with revert on failure)
   const handleSessionRename = useCallback(
-    async (_session: ChatSession, newTitle: string) => {
-      const originalTitle = _session.title;
-      
+    async (session: ChatSession, newTitle: string) => {
+      const capturedSession = { ...session };
+      const capturedContext = sessionContext;
+      const invocationLease = invocationLeaseRef.current;
+      // A retained A callback must not change B's token before its lease is
+      // proven live.
+      if (!isLiveContext(capturedContext)) return;
+      if (pendingRenameRef.current.has(capturedSession.id)) return;
+      const admission = Symbol("rename");
+      pendingRenameRef.current.set(capturedSession.id, admission);
+      const token = nextRowToken(capturedSession.id);
+      const isCurrent = () =>
+        isLiveContext(capturedContext) &&
+        invocationLease?.active === true &&
+        invocationLeaseRef.current === invocationLease &&
+        rowTokenRef.current.get(capturedSession.id) === token;
+      const originalTitle = capturedSession.title;
+      if (!isCurrent()) return;
+
       // Optimistic update: update local state immediately
       setSessions((prev) =>
-        prev.map((s) =>
-          s.id === _session.id ? { ...s, title: newTitle } : s
-        )
+        isCurrent() ? prev.map((s) =>
+          s.id === capturedSession.id ? { ...s, title: newTitle } : s
+        ) : prev
       );
-      
+      if (!isCurrent()) return;
+
       try {
-        await updateChatSession(_session.id, newTitle);
+        await updateChatSession(capturedSession.id, newTitle);
       } catch (err) {
+        if (!isCurrent()) return;
         setSessions((prev) =>
-          prev.map((s) =>
-            s.id === _session.id ? { ...s, title: originalTitle } : s
-          )
+          isCurrent() ? prev.map((s) =>
+            s.id === capturedSession.id ? { ...s, title: originalTitle } : s
+          ) : prev
         );
+        if (!isCurrent()) return;
         const message = err instanceof Error ? err.message : "Failed to rename session";
         console.warn("Rename failed, reverted:", message);
         toast.error("Failed to rename session. Reverted to original title.");
+      } finally {
+        if (pendingRenameRef.current.get(capturedSession.id) === admission) {
+          pendingRenameRef.current.delete(capturedSession.id);
+        }
       }
     },
-    []
+    [isLiveContext, nextRowToken, rowTokenRef, sessionContext]
   );
 
   // Handle delete with optimistic UI removal + 5-second undo window.
@@ -902,122 +1220,272 @@ export function SessionRail({ vaultId, className }: SessionRailProps) {
   // backend is never called, so there is nothing to restore server-side.
   const handleSessionDelete = useCallback(
     (session: ChatSession) => {
+      const capturedSession = { ...session };
+      const capturedContext = sessionContext;
+      const invocationLease = invocationLeaseRef.current;
+      // A retained A callback must not change B's token before its lease is
+      // proven live.
+      if (!isLiveContext(capturedContext)) return;
+      const priorPending = pendingDeletesRef.current.get(capturedSession.id);
+      if (priorPending) {
+        if (sameSessionContext(priorPending.context, capturedContext)) return;
+        clearTimeout(priorPending.timer);
+        releaseDeleteRecord(priorPending);
+      }
+      const token = nextRowToken(capturedSession.id);
+      const isOperationCurrent = () =>
+        sameSessionContext(capturedContext, latestSessionContextRef.current) &&
+        isCurrentAuthOwner(capturedContext.owner) &&
+        captureAuthPrincipalGeneration() === capturedContext.principalGeneration &&
+        rowTokenRef.current.get(capturedSession.id) === token;
+      const isCurrent = () =>
+        isOperationCurrent() &&
+        isLiveContext(capturedContext) &&
+        invocationLease?.active === true &&
+        invocationLeaseRef.current === invocationLease;
+      if (!isCurrent()) return;
+
       // Optimistic removal
-      setSessions((prev) => prev.filter((s) => s.id !== session.id));
-      const wasActive = String(session.id) === activeSessionId;
+      setSessions((prev) => isCurrent() ? prev.filter((s) => s.id !== capturedSession.id) : prev);
+      if (!isCurrent()) return;
+      const wasActive = String(capturedSession.id) === activeSessionId;
+      const wasPinned = isSessionPinned(capturedSession.id);
       if (wasActive) {
         setActiveSessionId(null);
-        // Stop the chat store from targeting the deleted session (UI-044) —
+        if (!isCurrent()) return;
+        setActiveSessionTitle(null);
+        if (!isCurrent()) return;
+        // Stop the chat store from targeting the deleted session (UI-044) -
         // otherwise the transcript keeps writing into a session slated for
         // deletion until the undo window expires.
         useChatStore.getState().newChat();
+        if (!isCurrent()) return;
         navigate("/chat");
+        if (!isCurrent()) return;
       }
 
       const timer = setTimeout(async () => {
-        pendingDeletesRef.current.delete(session.id);
+        const current = pendingDeletesRef.current.get(capturedSession.id);
+        if (
+          current !== pending ||
+          pending.undone ||
+          pending.finalized ||
+          !isOperationCurrent()
+        ) {
+          if (current === pending) releaseDeleteRecord(pending);
+          return;
+        }
+        pending.finalized = true;
         try {
-          await deleteChatSession(session.id);
-          _sessionCache.ts = 0;
-          if (isSessionPinned(session.id)) togglePinSession(session.id);
+          await deleteChatSession(capturedSession.id);
+          if (!isOperationCurrent()) return;
+          if (
+            _sessionCache.owner === capturedContext.owner &&
+            _sessionCache.principalGeneration === capturedContext.principalGeneration &&
+            _sessionCache.vaultId === capturedContext.vaultId
+          ) {
+            _sessionCache.ts = 0;
+          }
+          if (wasPinned && isSessionPinned(capturedSession.id)) {
+            togglePinSession(capturedSession.id);
+          }
         } catch (err) {
-          // Hard delete failed — restore session in UI and show error
-          setSessions((prev) =>
-            [...prev, session].sort(
-              (a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime()
-            )
-          );
+          const isPendingDeleteCurrent = () =>
+            pendingDeletesRef.current.get(capturedSession.id) === pending &&
+            pending.finalized &&
+            !pending.undone &&
+            rowTokenRef.current.get(capturedSession.id) === pending.token &&
+            sameSessionContext(pending.context, latestSessionContextRef.current) &&
+            isCurrentAuthOwner(pending.context.owner) &&
+            captureAuthPrincipalGeneration() === pending.context.principalGeneration;
+          if (!isPendingDeleteCurrent()) return;
+
+          // The logical delete may outlive this rail, but row restoration stays local.
+          const restoreLocalFailure = () => {
+            if (!isCurrent()) return false;
+            setSessions((prev) => {
+              if (!isCurrent() || prev.some((item) => item.id === capturedSession.id)) return prev;
+              return [...prev, capturedSession].sort(
+                (a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime()
+              );
+            });
+            if (!isCurrent()) return false;
+            if (wasActive && useChatShellStore.getState().activeSessionId === null) {
+              setActiveSessionId(String(capturedSession.id));
+              if (!isCurrent()) return false;
+              setActiveSessionTitle(capturedSession.title || null);
+              if (!isCurrent()) return false;
+              navigate(`/chat/${capturedSession.id}`);
+              if (!isCurrent()) return false;
+            }
+            return isCurrent();
+          };
+          const restoredWhileMounted = restoreLocalFailure();
+          if (!isPendingDeleteCurrent()) return;
           const msg = err instanceof Error ? err.message : "Failed to delete session";
-          toast.error("Could not delete session. It has been restored.", { description: msg });
+          toast.error(
+            restoredWhileMounted
+              ? "Could not delete session. It has been restored."
+              : "Could not delete session.",
+            { description: msg },
+          );
+        } finally {
+          releaseDeleteRecord(pending);
         }
       }, 5000);
 
-      pendingDeletesRef.current.set(session.id, timer);
+      const pending: PendingDelete = {
+        token,
+        session: capturedSession,
+        context: capturedContext,
+        wasActive,
+        wasPinned,
+        timer,
+        undone: false,
+        finalized: false,
+      };
+      pendingDeletesRef.current.set(capturedSession.id, pending);
 
-      toast(`"${session.title || "Untitled"}" deleted`, {
+      toast(`"${capturedSession.title || "Untitled"}" deleted`, {
         action: {
           label: "Undo",
           onClick: () => {
-            const t = pendingDeletesRef.current.get(session.id);
-            if (t !== undefined) {
-              clearTimeout(t);
-              pendingDeletesRef.current.delete(session.id);
-            }
+            const current = pendingDeletesRef.current.get(capturedSession.id);
+            if (current !== pending || pending.undone || pending.finalized || !isOperationCurrent()) return;
+            pending.undone = true;
+            clearTimeout(pending.timer);
+            releaseDeleteRecord(pending);
+            if (!isCurrent()) return;
             // Restore session in UI
-            setSessions((prev) =>
-              [...prev, session].sort(
+            setSessions((prev) => {
+              if (!isCurrent() || prev.some((item) => item.id === capturedSession.id)) return prev;
+              return [...prev, capturedSession].sort(
                 (a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime()
-              )
-            );
-            if (wasActive) {
-              setActiveSessionId(String(session.id));
-              navigate(`/chat/${session.id}`);
+              );
+            });
+            if (!isCurrent()) return;
+            if (wasActive && useChatShellStore.getState().activeSessionId === null) {
+              setActiveSessionId(String(capturedSession.id));
+              if (!isCurrent()) return;
+              setActiveSessionTitle(capturedSession.title || null);
+              if (!isCurrent()) return;
+              navigate(`/chat/${capturedSession.id}`);
             }
           },
         },
         duration: 5000,
       });
     },
-    [activeSessionId, isSessionPinned, navigate, setActiveSessionId, togglePinSession]
+    [
+      activeSessionId,
+      isLiveContext,
+      isSessionPinned,
+      latestSessionContextRef,
+      navigate,
+      nextRowToken,
+      pendingDeletesRef,
+      releaseDeleteRecord,
+      rowTokenRef,
+      sessionContext,
+      setActiveSessionId,
+      setActiveSessionTitle,
+      togglePinSession,
+    ]
   );
 
   // Retry loading sessions
   const handleRetry = useCallback(async () => {
-    _sessionCache.ts = 0; // Invalidate cache for retry
-    setIsLoading(true);
-    setError(null);
+    const readContext = sessionContext;
+    if (!isLiveContext(readContext)) return;
+    const invocationLease = invocationLeaseRef.current;
+    if (!invocationLease?.active) return;
+    const readAttempt = ++sessionReadAttemptRef.current;
+    const isCurrent = () =>
+      isLiveContext(readContext) && invocationLease.active && invocationLeaseRef.current === invocationLease &&
+      readAttempt === sessionReadAttemptRef.current;
+    if (
+      (_sessionCache.owner === readContext.owner &&
+        _sessionCache.principalGeneration === readContext.principalGeneration &&
+        _sessionCache.vaultId === readContext.vaultId)
+    ) {
+      _sessionCache.ts = 0;
+    }
+    if (!isCurrent()) return;
+    setIsLoading((previous) => isCurrent() ? true : previous);
+    setError((previous) => isCurrent() ? null : previous);
     try {
+      if (!isCurrent()) return;
+      const cacheReadAttempt = (_sessionCache.readAttempt ?? 0) + 1;
+      _sessionCache.readAttempt = cacheReadAttempt;
+      if (!isCurrent()) return;
       const data = await listChatSessions(vaultId);
-      setSessions(data.sessions);
+      if (!data || !Array.isArray(data.sessions)) {
+        throw new Error("Session list response was malformed");
+      }
+      if (!isCurrent()) return;
+      if (_sessionCache.readAttempt === cacheReadAttempt) {
+        _sessionCache.data = data.sessions;
+        _sessionCache.vaultId = vaultId;
+        _sessionCache.owner = readContext.owner;
+        _sessionCache.principalGeneration = readContext.principalGeneration;
+        _sessionCache.ts = Date.now();
+      }
+      setSessions((previous) => isCurrent() ? data.sessions : previous);
     } catch (err) {
       const message = err instanceof Error ? err.message : "Failed to load sessions";
-      setError(message);
+      if (isCurrent()) setError((previous) => isCurrent() ? message : previous);
     } finally {
-      setIsLoading(false);
+      if (isCurrent()) setIsLoading((previous) => isCurrent() ? false : previous);
     }
-  }, [vaultId]);
+  }, [isLiveContext, sessionContext, vaultId]);
 
   // Loading skeleton
   if (isLoading) {
     return (
-      <div className={`flex h-full flex-col ${className || ""}`}>
-        <div className="flex items-center justify-between mb-4">
-          <Skeleton className="h-4 w-20" />
-          <Skeleton className="h-8 w-24" />
-        </div>
-        <Skeleton className="h-9 w-full mb-4" />
-        <div className="space-y-4 flex-1">
-          {[...Array(5)].map((_, i) => (
-            <div key={i} className="flex items-center gap-3 px-2 h-16">
-              <Skeleton className="h-4 w-4 shrink-0" />
-              <div className="flex-1 space-y-2">
-                <Skeleton className="h-4 w-[150px]" />
-                <Skeleton className="h-3 w-[100px]" />
+      <>
+        {paletteAction}
+        <div className={`flex h-full flex-col ${className || ""}`}>
+          <div className="flex items-center justify-between mb-4">
+            <Skeleton className="h-4 w-20" />
+            <Skeleton className="h-8 w-24" />
+          </div>
+          <Skeleton className="h-9 w-full mb-4" />
+          <div className="space-y-4 flex-1">
+            {[...Array(5)].map((_, i) => (
+              <div key={i} className="flex items-center gap-3 px-2 h-16">
+                <Skeleton className="h-4 w-4 shrink-0" />
+                <div className="flex-1 space-y-2">
+                  <Skeleton className="h-4 w-[150px]" />
+                  <Skeleton className="h-3 w-[100px]" />
+                </div>
               </div>
-            </div>
-          ))}
+            ))}
+          </div>
         </div>
-      </div>
+      </>
     );
   }
 
   // Error state
   if (error) {
     return (
-      <div className={`flex h-full flex-col ${className || ""}`}>
-        <div className="flex flex-col items-center justify-center py-8 text-center flex-1">
-          <AlertCircle className="w-10 h-10 mb-3 text-destructive" aria-hidden="true" />
-          <p className="text-sm text-muted-foreground">Failed to load sessions</p>
-          <p className="text-xs text-muted-foreground mt-1">{error}</p>
-          <p className="text-xs text-muted-foreground mt-2 max-w-[200px]">
-            Check your network connection, then retry. If this persists, the
-            chat service may be temporarily unavailable.
-          </p>
-          <Button variant="outline" size="sm" onClick={handleRetry} className="mt-3">
-            Retry
-          </Button>
+      <>
+        {paletteAction}
+        <div className={`flex h-full flex-col ${className || ""}`}>
+          <div className="flex flex-col items-center justify-center py-8 text-center flex-1">
+            <AlertCircle className="w-10 h-10 mb-3 text-destructive" aria-hidden="true" />
+            <p className="text-sm text-muted-foreground">Failed to load sessions</p>
+            <p className="text-xs text-muted-foreground mt-1">{error}</p>
+            <p className="text-xs text-muted-foreground mt-2 max-w-[200px]">
+              Check your network connection, then retry. If this persists, the
+              chat service may be temporarily unavailable.
+            </p>
+            <Button variant="outline" size="sm" onClick={handleRetry} className="mt-3">
+              Retry
+            </Button>
+          </div>
         </div>
-      </div>
+      </>
     );
   }
 
@@ -1027,52 +1495,55 @@ export function SessionRail({ vaultId, className }: SessionRailProps) {
   if (sessions.length === 0) {
     const hasIndexedDocs = activeVault ? activeVault.file_count > 0 : false;
     return (
-      <div className={`flex h-full flex-col ${className || ""}`}>
-        <div className="flex items-center justify-between mb-4">
-          <h2 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide">
-            Sessions
-          </h2>
-          <Button size="sm" onClick={handleNewChat}>
-            <Plus className="mr-1.5 h-4 w-4" aria-hidden="true" />
-            New Chat
-          </Button>
+      <>
+        {paletteAction}
+        <div className={`flex h-full flex-col ${className || ""}`}>
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide">
+              Sessions
+            </h2>
+            <Button size="sm" onClick={handleNewChat}>
+              <Plus className="mr-1.5 h-4 w-4" aria-hidden="true" />
+              New Chat
+            </Button>
+          </div>
+          <div className="flex flex-col items-center justify-center py-12 text-center flex-1 px-3">
+            <MessageSquare className="w-12 h-12 text-muted-foreground mb-4" aria-hidden="true" />
+            <p className="text-sm text-muted-foreground">No sessions yet</p>
+            {hasIndexedDocs ? (
+              <>
+                <p className="text-xs text-muted-foreground mt-1">
+                  Start a new chat to begin a conversation
+                </p>
+                <Button variant="outline" className="mt-4" onClick={handleNewChat}>
+                  <Plus className="mr-1.5 h-4 w-4" aria-hidden="true" />
+                  New Chat
+                </Button>
+              </>
+            ) : (
+              <>
+                <p className="text-xs text-muted-foreground mt-1 max-w-[220px]">
+                  Upload documents first so the assistant has something to ground
+                  its answers in.
+                </p>
+                <Button
+                  variant="outline"
+                  className="mt-4"
+                  onClick={() => navigate("/documents")}
+                >
+                  Go to Documents
+                </Button>
+                <button
+                  onClick={handleNewChat}
+                  className="mt-3 text-xs text-muted-foreground underline hover:text-muted-foreground"
+                >
+                  Start a new chat anyway
+                </button>
+              </>
+            )}
+          </div>
         </div>
-        <div className="flex flex-col items-center justify-center py-12 text-center flex-1 px-3">
-          <MessageSquare className="w-12 h-12 text-muted-foreground mb-4" aria-hidden="true" />
-          <p className="text-sm text-muted-foreground">No sessions yet</p>
-          {hasIndexedDocs ? (
-            <>
-              <p className="text-xs text-muted-foreground mt-1">
-                Start a new chat to begin a conversation
-              </p>
-              <Button variant="outline" className="mt-4" onClick={handleNewChat}>
-                <Plus className="mr-1.5 h-4 w-4" aria-hidden="true" />
-                New Chat
-              </Button>
-            </>
-          ) : (
-            <>
-              <p className="text-xs text-muted-foreground mt-1 max-w-[220px]">
-                Upload documents first so the assistant has something to ground
-                its answers in.
-              </p>
-              <Button
-                variant="outline"
-                className="mt-4"
-                onClick={() => navigate("/documents")}
-              >
-                Go to Documents
-              </Button>
-              <button
-                onClick={handleNewChat}
-                className="mt-3 text-xs text-muted-foreground underline hover:text-muted-foreground"
-              >
-                Start a new chat anyway
-              </button>
-            </>
-          )}
-        </div>
-      </div>
+      </>
     );
   }
 
@@ -1082,16 +1553,29 @@ export function SessionRail({ vaultId, className }: SessionRailProps) {
   );
 
   return (
-    <div className={`flex h-full flex-col ${className || ""} p-3 px-6 bg-card/80`}>
+    <>
+      {paletteAction}
+      <div className={`flex h-full flex-col ${className || ""} p-3 px-6 bg-card/80`}>
       {/* Header */}
       <div className="flex items-center justify-between mb-6">
         <h2 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide">
           Sessions
         </h2>
-        <Button size="sm" onClick={handleNewChat} aria-label="Start new chat">
-          <Plus className="mr-1.5 h-4 w-4" aria-hidden="true" />
-          New Chat
-        </Button>
+        <div className="flex items-center gap-1">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => dispatchCommandPaletteOpen()}
+            aria-label="Open command palette"
+          >
+            <Search className="mr-1.5 h-4 w-4" aria-hidden="true" />
+            Commands
+          </Button>
+          <Button size="sm" onClick={handleNewChat} aria-label="Start new chat">
+            <Plus className="mr-1.5 h-4 w-4" aria-hidden="true" />
+            New Chat
+          </Button>
+        </div>
       </div>
 
       {/* Search */}
@@ -1145,8 +1629,9 @@ export function SessionRail({ vaultId, className }: SessionRailProps) {
                       if (e.target !== e.currentTarget) return;
                       if (e.key === "Enter" || e.key === " ") {
                         e.preventDefault();
-                        handleSessionClick(session);
-                        setFocusedSessionIndex(virtualItem.index);
+                        if (handleSessionClick(session)) {
+                          setFocusedSessionIndex(virtualItem.index);
+                        }
                       }
                     }}
                   >
@@ -1155,8 +1640,9 @@ export function SessionRail({ vaultId, className }: SessionRailProps) {
                       isActive={String(session.id) === activeSessionId}
                       isPinned={isSessionPinned(session.id)}
                       onClick={() => {
-                        handleSessionClick(session);
-                        setFocusedSessionIndex(virtualItem.index);
+                        if (handleSessionClick(session)) {
+                          setFocusedSessionIndex(virtualItem.index);
+                        }
                       }}
                       onRename={(newTitle) => handleSessionRename(session, newTitle)}
                       onPinToggle={() => togglePinSession(session.id)}
@@ -1182,8 +1668,9 @@ export function SessionRail({ vaultId, className }: SessionRailProps) {
                     if (e.target !== e.currentTarget) return;
                     if (e.key === "Enter" || e.key === " ") {
                       e.preventDefault();
-                      handleSessionClick(session);
-                      setFocusedSessionIndex(index);
+                      if (handleSessionClick(session)) {
+                        setFocusedSessionIndex(index);
+                      }
                     }
                   }}
                 >
@@ -1192,8 +1679,9 @@ export function SessionRail({ vaultId, className }: SessionRailProps) {
                     isActive={String(session.id) === activeSessionId}
                     isPinned={isSessionPinned(session.id)}
                     onClick={() => {
-                      handleSessionClick(session);
-                      setFocusedSessionIndex(index);
+                      if (handleSessionClick(session)) {
+                        setFocusedSessionIndex(index);
+                      }
                     }}
                     onRename={(newTitle) => handleSessionRename(session, newTitle)}
                     onPinToggle={() => togglePinSession(session.id)}
@@ -1206,7 +1694,8 @@ export function SessionRail({ vaultId, className }: SessionRailProps) {
           );
         })()}
       </div>
-    </div>
+      </div>
+    </>
   );
 }
 

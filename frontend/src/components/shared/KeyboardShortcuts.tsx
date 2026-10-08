@@ -109,9 +109,9 @@ export function KeyboardShortcutsDialog({ open, onOpenChange }: { open: boolean;
   useEffect(() => {
     if (!capturing) return;
     const handleCapture = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || e.repeat || e.isComposing) return;
       e.preventDefault();
       e.stopPropagation();
-      if (e.isComposing) return;
       const combo = comboFromEvent(e);
       // null = bare modifier press or Escape (cancel) — keep waiting on
       // modifiers, cancel on Escape.

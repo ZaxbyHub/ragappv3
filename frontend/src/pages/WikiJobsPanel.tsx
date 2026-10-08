@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import {
@@ -18,6 +18,12 @@ import {
   recompileVaultWiki,
   type WikiCompileJob,
 } from "@/lib/api";
+import { useAuthOwner } from "@/hooks/useAuthOwner";
+import {
+  captureAuthPrincipalGeneration,
+  isCurrentAuthOwner,
+  subscribeAuthPrincipal,
+} from "@/lib/api/auth-lifecycle";
 
 const STATUS_COLORS: Record<WikiCompileJob["status"], string> = {
   pending: "bg-muted text-muted-foreground",
@@ -43,63 +49,207 @@ interface WikiJobsPanelProps {
 }
 
 export function WikiJobsPanel({ vaultId, refreshSignal = 0 }: WikiJobsPanelProps) {
+  const owner = useAuthOwner();
+  const principalGeneration = useSyncExternalStore(
+    subscribeAuthPrincipal,
+    captureAuthPrincipalGeneration,
+    captureAuthPrincipalGeneration,
+  );
+
+  return (
+    <WikiJobsPanelState
+      key={`${vaultId}:${owner.id}:${principalGeneration}`}
+      vaultId={vaultId}
+      refreshSignal={refreshSignal}
+      owner={owner}
+      principalGeneration={principalGeneration}
+    />
+  );
+}
+
+type AuthOwnerLease = ReturnType<typeof useAuthOwner>;
+
+interface WikiJobsPanelStateProps extends WikiJobsPanelProps {
+  owner: AuthOwnerLease;
+  principalGeneration: number;
+}
+
+interface EffectLease { id: number; active: boolean }
+interface QueryContext { vaultId: number; statusFilter: string }
+interface ReadToken { id: number; lease: EffectLease; queryContext: QueryContext }
+interface MutationToken { id: number; lease: EffectLease }
+
+function WikiJobsPanelState({
+  vaultId,
+  refreshSignal = 0,
+  owner,
+  principalGeneration,
+}: WikiJobsPanelStateProps) {
   const [jobs, setJobs] = useState<WikiCompileJob[]>([]);
   const [statusFilter, setStatusFilter] = useState<string>("");
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [jobsPhase, setJobsPhase] = useState<"loading" | "ready" | "error">("loading");
+  const [jobsContext, setJobsContext] = useState<QueryContext | null>(null);
+  const [jobsDataContext, setJobsDataContext] = useState<QueryContext | null>(null);
   const [actionLoading, setActionLoading] = useState<number | null>(null);
+  const effectLeaseRef = useRef<EffectLease | null>(null);
+  const nextLeaseIdRef = useRef(0);
+  const nextReadIdRef = useRef(0);
+  const readTokenRef = useRef<ReadToken | null>(null);
+  const loadingTokenRef = useRef<ReadToken | MutationToken | null>(null);
+  const actionIntentRef = useRef(0);
+  const actionGatesRef = useRef(new Map<number, MutationToken>());
+  const actionLoadingTokenRef = useRef<MutationToken | null>(null);
+  const recompileGateRef = useRef<MutationToken | null>(null);
+  const queryContext = useMemo(() => ({ vaultId, statusFilter }), [vaultId, statusFilter]);
+  const queryContextRef = useRef(queryContext);
+  queryContextRef.current = queryContext;
+  const refreshRef = useRef<() => Promise<void>>(async () => {});
+
+  const mayPublish = useCallback(
+    (lease: EffectLease) =>
+      lease.active &&
+      effectLeaseRef.current === lease &&
+      isCurrentAuthOwner(owner) &&
+      captureAuthPrincipalGeneration() === principalGeneration,
+    [owner, principalGeneration],
+  );
 
   const refresh = useCallback(async () => {
-    setLoading(true);
+    const lease = effectLeaseRef.current;
+    const capturedQuery = queryContext;
+    if (!lease || !mayPublish(lease) || queryContextRef.current !== capturedQuery) return;
+    const token: ReadToken = {
+      id: ++nextReadIdRef.current,
+      lease,
+      queryContext: capturedQuery,
+    };
+    readTokenRef.current = token;
+    loadingTokenRef.current = token;
+    const currentRead = () =>
+      mayPublish(lease) &&
+      readTokenRef.current === token &&
+      queryContextRef.current === token.queryContext;
+    if (!currentRead()) return;
+    setLoading((current) => currentRead() ? true : current);
+    setJobsPhase((current) => currentRead() ? "loading" : current);
+    setJobsContext((current) => currentRead() ? capturedQuery : current);
     try {
       const res = await listWikiJobs({ vault_id: vaultId, status: statusFilter || undefined });
-      setJobs(res.jobs);
+      if (!Array.isArray(res?.jobs)) throw new Error("Jobs response was malformed");
+      if (!currentRead()) return;
+      setJobs((current) => currentRead() ? res.jobs : current);
+      setJobsDataContext((current) => currentRead() ? capturedQuery : current);
+      setJobsPhase((current) => currentRead() ? "ready" : current);
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : "Failed to load jobs");
+      if (currentRead()) {
+        setJobsPhase((current) => currentRead() ? "error" : current);
+        toast.error(e instanceof Error ? e.message : "Failed to load jobs");
+      }
     } finally {
-      setLoading(false);
+      if (currentRead() && loadingTokenRef.current === token) {
+        setLoading((current) => currentRead() && loadingTokenRef.current === token ? false : current);
+      }
     }
-  }, [vaultId, statusFilter]);
+  }, [mayPublish, queryContext, statusFilter, vaultId]);
+  refreshRef.current = refresh;
 
   useEffect(() => {
-    refresh();
-  }, [refresh, refreshSignal]);
+    const lease: EffectLease = { id: ++nextLeaseIdRef.current, active: true };
+    effectLeaseRef.current = lease;
+    return () => {
+      lease.active = false;
+      if (effectLeaseRef.current === lease) effectLeaseRef.current = null;
+      if (readTokenRef.current?.lease === lease) readTokenRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+    return () => {
+      if (readTokenRef.current?.queryContext === queryContext) readTokenRef.current = null;
+    };
+  }, [queryContext, refresh, refreshSignal]);
 
   async function handleRetry(jobId: number) {
-    setActionLoading(jobId);
+    const lease = effectLeaseRef.current;
+    if (!lease || !mayPublish(lease) || actionGatesRef.current.has(jobId)) return;
+    const token: MutationToken = { id: ++actionIntentRef.current, lease };
+    actionGatesRef.current.set(jobId, token);
+    actionLoadingTokenRef.current = token;
+    setActionLoading((current) => mayPublish(lease) && actionLoadingTokenRef.current === token ? jobId : current);
     try {
+      if (!mayPublish(lease) || actionGatesRef.current.get(jobId) !== token) return;
       await retryWikiJob(jobId, vaultId);
-      toast.success("Job queued for retry");
-      await refresh();
+      if (mayPublish(lease)) toast.success("Job queued for retry");
+      if (mayPublish(lease)) await refreshRef.current();
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : "Retry failed");
+      if (mayPublish(lease)) toast.error(e instanceof Error ? e.message : "Retry failed");
     } finally {
-      setActionLoading(null);
+      if (actionGatesRef.current.get(jobId) === token) {
+        actionGatesRef.current.delete(jobId);
+        if (actionLoadingTokenRef.current === token) {
+          setActionLoading((current) =>
+            mayPublish(lease) && actionLoadingTokenRef.current === token && current === jobId
+              ? null
+              : current,
+          );
+        }
+      }
     }
   }
 
   async function handleCancel(jobId: number) {
-    setActionLoading(jobId);
+    const lease = effectLeaseRef.current;
+    if (!lease || !mayPublish(lease) || actionGatesRef.current.has(jobId)) return;
+    const token: MutationToken = { id: ++actionIntentRef.current, lease };
+    actionGatesRef.current.set(jobId, token);
+    actionLoadingTokenRef.current = token;
+    setActionLoading((current) => mayPublish(lease) && actionLoadingTokenRef.current === token ? jobId : current);
     try {
+      if (!mayPublish(lease) || actionGatesRef.current.get(jobId) !== token) return;
       await cancelWikiJob(jobId, vaultId);
-      toast.success("Job cancelled");
-      await refresh();
+      if (mayPublish(lease)) toast.success("Job cancelled");
+      if (mayPublish(lease)) await refreshRef.current();
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : "Cancel failed");
+      if (mayPublish(lease)) toast.error(e instanceof Error ? e.message : "Cancel failed");
     } finally {
-      setActionLoading(null);
+      if (actionGatesRef.current.get(jobId) === token) {
+        actionGatesRef.current.delete(jobId);
+        if (actionLoadingTokenRef.current === token) {
+          setActionLoading((current) =>
+            mayPublish(lease) && actionLoadingTokenRef.current === token && current === jobId
+              ? null
+              : current,
+          );
+        }
+      }
     }
   }
 
   async function handleRecompile() {
-    setLoading(true);
+    const lease = effectLeaseRef.current;
+    if (!lease || !mayPublish(lease) || recompileGateRef.current) return;
+    const token: MutationToken = { id: ++actionIntentRef.current, lease };
+    recompileGateRef.current = token;
+    loadingTokenRef.current = token;
+    setLoading((current) => mayPublish(lease) && loadingTokenRef.current === token ? true : current);
     try {
+      if (!mayPublish(lease) || recompileGateRef.current !== token) return;
       const res = await recompileVaultWiki(vaultId);
-      toast.success(`Recompile job queued (id: ${res.job_id})`);
-      await refresh();
+      if (mayPublish(lease)) toast.success(`Recompile job queued (id: ${res.job_id})`);
+      if (mayPublish(lease)) await refreshRef.current();
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : "Recompile failed");
+      if (mayPublish(lease)) toast.error(e instanceof Error ? e.message : "Recompile failed");
     } finally {
-      setLoading(false);
+      if (recompileGateRef.current === token) {
+        recompileGateRef.current = null;
+        if (loadingTokenRef.current === token) {
+          setLoading((current) =>
+            mayPublish(lease) && loadingTokenRef.current === token && current ? false : current,
+          );
+        }
+      }
     }
   }
 
@@ -121,7 +271,12 @@ export function WikiJobsPanel({ vaultId, refreshSignal = 0 }: WikiJobsPanelProps
         <div className="flex items-center gap-2">
           <Select
             value={statusFilter || "all"}
-            onValueChange={(v) => setStatusFilter(v === "all" ? "" : v)}
+            onValueChange={(v) => {
+              const lease = effectLeaseRef.current;
+              if (!lease || !mayPublish(lease)) return;
+              const next = v === "all" ? "" : v;
+              setStatusFilter((current) => mayPublish(lease) ? next : current);
+            }}
           >
             <SelectTrigger className="text-xs h-8 w-[140px]">
               <SelectValue placeholder="All statuses" />
@@ -135,7 +290,7 @@ export function WikiJobsPanel({ vaultId, refreshSignal = 0 }: WikiJobsPanelProps
               <SelectItem value="cancelled">Cancelled</SelectItem>
             </SelectContent>
           </Select>
-          <Button variant="outline" size="sm" onClick={refresh} disabled={loading}>
+          <Button variant="outline" size="sm" onClick={() => void refreshRef.current()} disabled={loading}>
             {loading ? (
               <Loader2 className="w-3.5 h-3.5 animate-spin" />
             ) : (
@@ -150,7 +305,16 @@ export function WikiJobsPanel({ vaultId, refreshSignal = 0 }: WikiJobsPanelProps
       </div>
 
       {/* Job list */}
-      {jobs.length === 0 && !loading && (
+      {jobsPhase === "error" && jobsContext === queryContext && (
+        <div className="flex items-center justify-between gap-2 rounded border border-destructive/40 p-3 text-sm" role="alert">
+          <span>Couldn&apos;t load wiki jobs.</span>
+          <Button variant="outline" size="sm" onClick={() => void refreshRef.current()} disabled={loading}>
+            Retry
+          </Button>
+        </div>
+      )}
+
+      {jobsPhase === "ready" && jobsContext === queryContext && jobs.length === 0 && (
         <EmptyState
           icon={ClipboardList}
           title="No jobs found"
@@ -158,7 +322,7 @@ export function WikiJobsPanel({ vaultId, refreshSignal = 0 }: WikiJobsPanelProps
         />
       )}
 
-      {jobs.map((job) => (
+      {jobsDataContext === queryContext && jobs.map((job) => (
         <Card key={job.id} className="text-sm">
           <CardContent className="py-2 px-3 flex flex-col gap-1">
             <div className="flex items-center justify-between gap-2">

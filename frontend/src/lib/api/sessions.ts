@@ -1,5 +1,6 @@
 import { apiClient, API_BASE_URL, _jwtAccessToken, getCsrfCookie, getCsrfToken, ChatStreamCallbacks, ChatMessage, Source, UsedMemory, WikiReference, KMSReference, CitationValidationDebug, ChatMetadataFilter, CitationEnforcement, ChatSession, ChatSessionDetail, ChatSessionMessage, CreateSessionRequest, AddMessageRequest, ChatHistoryItem, ensureCsrfToken, refreshAccessToken, isTokenNearExpiry } from "./core";
 import { setChatHistory as storageSetChatHistory, getChatHistory as storageGetChatHistory } from "../storage";
+import { captureAuthOwner, captureAuthPrincipalGeneration, isCurrentAuthOwner, subscribeAuthPrincipal } from "./auth-lifecycle";
 
 // ============================================================================
 // SSE Streaming
@@ -23,6 +24,7 @@ export async function parseSSEStream(
   reader: ReadableStreamDefaultReader<Uint8Array>,
   callbacks: ChatStreamCallbacks,
   resumeState?: SSEResumeState,
+  signal?: AbortSignal,
 ): Promise<void> {
   const decoder = new TextDecoder();
   let buffer = "";
@@ -55,17 +57,23 @@ export async function parseSSEStream(
       readResult = await new Promise<ReadableStreamReadResult<Uint8Array>>((resolve, reject) => {
         const inactivity = new Error("chat_stream_inactivity");
         inactivity.name = "ChatStreamInactivityError";
-        const timer = setTimeout(() => reject(inactivity), CHAT_STREAM_INACTIVITY_TIMEOUT_MS);
-        reader.read().then(
-          (result) => {
-            clearTimeout(timer);
-            resolve(result);
-          },
-          (err) => {
-            clearTimeout(timer);
-            reject(err);
-          }
-        );
+        let settled = false;
+        const detach = () => {
+          clearTimeout(timer);
+          signal?.removeEventListener("abort", onAbort);
+        };
+        const finish = (result?: ReadableStreamReadResult<Uint8Array>, error?: unknown, failed = false) => {
+          if (settled) return;
+          settled = true;
+          detach();
+          if (failed) reject(error);
+          else resolve(result!);
+        };
+        const onAbort = () => finish(undefined, new DOMException("Stream retired", "AbortError"), true);
+        const timer = setTimeout(() => finish(undefined, inactivity, true), CHAT_STREAM_INACTIVITY_TIMEOUT_MS);
+        signal?.addEventListener("abort", onAbort);
+        if (signal?.aborted) { onAbort(); return; }
+        reader.read().then((result) => finish(result), (error) => finish(undefined, error, true));
       });
     } catch (err) {
       if (!(err instanceof Error) || err.name !== "ChatStreamInactivityError") {
@@ -78,7 +86,7 @@ export async function parseSSEStream(
       // an EOF without the completion marker (CHAT-004): interrupted,
       // retryable via the resume machinery. Never fire onComplete here — a
       // stall is not a completion.
-      await Promise.resolve(reader.cancel()).catch(() => {});
+      void Promise.resolve(reader.cancel()).catch(() => {});
       if (!completed) {
         completed = true;
         const stalled = new Error(
@@ -311,6 +319,60 @@ export function chatStream(
   durableTurn?: { sessionId: number; turnId: string },
 ): () => void {
   const abortController = new AbortController();
+  const owner = captureAuthOwner();
+  const principalGeneration = captureAuthPrincipalGeneration();
+  let ownedReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  const isCurrent = () => !abortController.signal.aborted && isCurrentAuthOwner(owner) &&
+    captureAuthPrincipalGeneration() === principalGeneration;
+  const cancelReader = () => {
+    const reader = ownedReader;
+    ownedReader = null;
+    if (!reader) return;
+    try { void Promise.resolve(reader.cancel()).catch(() => {}); } catch { /* local disposal */ }
+  };
+  let retired = false;
+  const retire = () => {
+    if (retired) return;
+    retired = true;
+    abortController.abort();
+    cancelReader();
+    callbacks.onRetired?.();
+  };
+  owner.signal.addEventListener("abort", retire);
+  const unsubscribePrincipal = subscribeAuthPrincipal(() => {
+    if (captureAuthPrincipalGeneration() !== principalGeneration) retire();
+  });
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    owner.signal.removeEventListener("abort", retire);
+    unsubscribePrincipal();
+    cancelReader();
+  };
+  const guardCallback = <Args extends unknown[]>(callback: ((...args: Args) => void) | undefined) =>
+    (...args: Args): void => { if (isCurrent()) callback?.(...args); };
+  const ownedCallbacks: ChatStreamCallbacks = {
+    onMessage: guardCallback(callbacks.onMessage),
+    onSources: guardCallback(callbacks.onSources),
+    onMemories: guardCallback(callbacks.onMemories),
+    onWiki: guardCallback(callbacks.onWiki),
+    onKMS: guardCallback(callbacks.onKMS),
+    onCitationValidation: guardCallback(callbacks.onCitationValidation),
+    onFinalContent: guardCallback(callbacks.onFinalContent),
+    onCitationConfidence: guardCallback(callbacks.onCitationConfidence),
+    onUnverifiableClaims: guardCallback(callbacks.onUnverifiableClaims),
+    onCurrencyWarnings: guardCallback(callbacks.onCurrencyWarnings),
+    onCitationEnforcement: guardCallback(callbacks.onCitationEnforcement),
+    onMode: guardCallback(callbacks.onMode),
+    onStage: guardCallback(callbacks.onStage),
+    onEvidenceCandidates: guardCallback(callbacks.onEvidenceCandidates),
+    onReasoning: guardCallback(callbacks.onReasoning),
+    onReasoningMetrics: guardCallback(callbacks.onReasoningMetrics),
+    onFinishReason: guardCallback(callbacks.onFinishReason),
+    onError: guardCallback(callbacks.onError),
+    onComplete: guardCallback(callbacks.onComplete),
+  };
   // Build the request body once and reuse for both the initial POST and
   // the 401 token-refresh retry path. Keeps payload shape consistent.
   const requestBody = JSON.stringify({
@@ -351,25 +413,27 @@ export function chatStream(
     // flag through a property keeps the reset meaningfully observable.
     const interruptState: { error: Error | null } = { error: null };
     const wrappedCallbacks: ChatStreamCallbacks = {
-      ...callbacks,
+      ...ownedCallbacks,
       onError: (error) => {
+        if (!isCurrent()) return;
         if (error instanceof Error && error.name === "ChatInterruptedError") {
           interruptState.error = error;
           return;
         }
-        callbacks.onError?.(error);
+        ownedCallbacks.onError?.(error);
       },
     };
 
-    for (let attempt = 0; ; attempt++) {
+    for (let attempt = 0; isCurrent(); attempt++) {
       interruptState.error = null;
       try {
         // Pre-stream token refresh check: if JWT is close to expiring, refresh it first
         if (_jwtAccessToken && isTokenNearExpiry(_jwtAccessToken)) {
-          const refreshedToken = await refreshAccessToken();
+          const refreshedToken = await refreshAccessToken(owner);
+          if (!isCurrent()) return;
           if (!refreshedToken) {
             // Refresh failed - abort
-            callbacks.onError?.(new Error("Session expired. Please log in again."));
+            ownedCallbacks.onError?.(new Error("Session expired. Please log in again."));
             return;
           }
         }
@@ -377,9 +441,10 @@ export function chatStream(
         // Get CSRF token for the POST request
         let csrfToken: string;
         try {
-          csrfToken = await ensureCsrfToken();
+          csrfToken = await ensureCsrfToken(false, owner);
+          if (!isCurrent()) return;
         } catch {
-          callbacks.onError?.(new Error("Failed to get CSRF token"));
+          ownedCallbacks.onError?.(new Error("Failed to get CSRF token"));
           return;
         }
 
@@ -394,6 +459,7 @@ export function chatStream(
           headers["Last-Event-ID"] = resumeState.lastEventId;
         }
 
+        if (!isCurrent()) return;
         let response = await fetch(`${API_BASE_URL}/chat/stream`, {
           method: "POST",
           headers,
@@ -401,9 +467,11 @@ export function chatStream(
           signal: abortController.signal,
         });
 
+        if (!isCurrent()) return;
         if (!response.ok && response.status === 401 && _jwtAccessToken) {
           // Check error detail — only retry on token_expired, skip token_invalid/user_inactive
           const errorBody = await response.json().catch(() => null);
+          if (!isCurrent()) return;
           const detail = errorBody?.detail;
           const isTokenExpired = typeof detail === "string" && detail.includes("token_expired");
           const isTokenInvalid = typeof detail === "string" && (
@@ -425,11 +493,12 @@ export function chatStream(
               const timer = setTimeout(onAbort, 1000);
               abortController.signal.addEventListener("abort", onAbort);
             });
-            if (abortController.signal.aborted) {
+            if (!isCurrent()) {
               return;
             }
 
-            const newToken = await refreshAccessToken();
+            const newToken = await refreshAccessToken(owner);
+            if (!isCurrent()) return;
             if (newToken) {
               headers["Authorization"] = `Bearer ${newToken}`;
               response = await fetch(`${API_BASE_URL}/chat/stream`, {
@@ -442,6 +511,7 @@ export function chatStream(
           }
         }
 
+        if (!isCurrent()) return;
         if (!response.ok) {
           throw new Error(`HTTP error! status: ${response.status}`);
         }
@@ -451,16 +521,22 @@ export function chatStream(
           throw new Error("Response body is not readable");
         }
 
-        await parseSSEStream(reader, wrappedCallbacks, resumeState);
+        ownedReader = reader;
+        if (!isCurrent()) { cancelReader(); return; }
+        try {
+          await parseSSEStream(reader, wrappedCallbacks, resumeState, abortController.signal);
+        } finally { cancelReader(); }
+        if (!isCurrent()) return;
         if (interruptState.error == null) {
           // Completed normally, protocol error (forwarded), or user abort.
           return;
         }
       } catch (error) {
+        if (!isCurrent()) return;
         if (error instanceof Error && error.name === "AbortError") {
           return;
         }
-        callbacks.onError?.(
+        ownedCallbacks.onError?.(
           error instanceof Error ? error : new Error(String(error))
         );
         return;
@@ -468,11 +544,11 @@ export function chatStream(
       // Mid-stream interruption: resume only durable turns (the server can
       // only replay frames it persisted for a session/turn pair).
       if (durableTurn == null || attempt >= MAX_RESUME_ATTEMPTS) {
-        callbacks.onError?.(interruptState.error!);
+        ownedCallbacks.onError?.(interruptState.error!);
         return;
       }
-      // Abort-aware backoff: dispose() during the wait resolves early and
-      // the next fetch throws AbortError, ending the loop. The remaining
+      // Abort-aware backoff: dispose() during the wait resolves early; the
+      // isCurrent() loop guard stops before the next request. The remaining
       // silent window while still subscribed is bounded (<= 1.5s) and
       // accepted: the turn is still making progress.
       // Listener detached on both settle paths (PRR-003).
@@ -488,11 +564,10 @@ export function chatStream(
     }
   };
 
-  startStream();
+  if (!isCurrent()) { retire(); release(); }
+  else void startStream().finally(release).catch(() => {});
 
-  return () => {
-    abortController.abort();
-  };
+  return () => { retire(); release(); };
 }
 
 // ============================================================================

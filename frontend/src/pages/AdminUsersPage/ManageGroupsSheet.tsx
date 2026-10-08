@@ -22,6 +22,9 @@ interface ManageGroupsSheetProps {
   allGroups: Group[];
   selectedGroupIds: number[];
   isLoading: boolean;
+  catalogStatus: "unknown" | "pending" | "success" | "error";
+  membershipsStatus: "unknown" | "pending" | "success" | "error";
+  onRetry: () => void;
   isSaving: boolean;
   searchQuery: string;
   onSearchChange: (query: string) => void;
@@ -36,6 +39,9 @@ export function ManageGroupsSheet({
   allGroups,
   selectedGroupIds,
   isLoading,
+  catalogStatus,
+  membershipsStatus,
+  onRetry,
   isSaving,
   searchQuery,
   onSearchChange,
@@ -43,6 +49,8 @@ export function ManageGroupsSheet({
   onSave,
   onClose,
 }: ManageGroupsSheetProps) {
+  const failed = catalogStatus === "error" || membershipsStatus === "error";
+  const ready = catalogStatus === "success" && membershipsStatus === "success";
   const filteredGroups = useMemo(() => {
     const searchLower = searchQuery.toLowerCase();
     return allGroups.filter((group) =>
@@ -82,13 +90,18 @@ export function ManageGroupsSheet({
               onChange={(e) => onSearchChange(e.target.value)}
               className="pl-10"
               aria-label="Search groups"
-              disabled={isLoading}
+              disabled={isLoading || !ready}
             />
           </div>
 
           {/* Groups List */}
           <ScrollArea className="flex-1 -mx-6 px-6">
-            {isLoading ? (
+            {failed ? (
+              <div className="space-y-3">
+                <div role="alert">Failed to load groups or user memberships.</div>
+                <Button variant="outline" onClick={onRetry} disabled={isSaving}>Retry groups</Button>
+              </div>
+            ) : isLoading || !ready ? (
               <div className="space-y-3" role="status" aria-label="Loading groups">
                 {Array.from({ length: 5 }).map((_, i) => (
                   <div key={i} className="flex items-center gap-3 p-3 rounded-sm border">
@@ -120,7 +133,7 @@ export function ManageGroupsSheet({
                       checked={selectedGroupIds.includes(group.id)}
                       onCheckedChange={() => onToggleGroup(group.id)}
                       aria-label={`Select ${group.name}`}
-                      disabled={isSaving}
+                      disabled={isSaving || !ready}
                     />
                     <Label
                       htmlFor={`group-${group.id}`}
@@ -155,7 +168,7 @@ export function ManageGroupsSheet({
           </Button>
           <Button
             onClick={onSave}
-            disabled={isSaving || isLoading || !user}
+            disabled={isSaving || isLoading || !ready || !user}
             className="w-full sm:w-auto"
             aria-label="Save group changes"
           >

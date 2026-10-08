@@ -37,7 +37,12 @@ describe("useDraftRoomEvents issue 774 hardening (feedback pins)", () => {
   let useDraftRoomEvents: typeof import("./useDraftRoomEvents").useDraftRoomEvents;
   let queryClient: QueryClient;
   let addCount: number;
+  let allAddCount: number;
+  let allRemoveCount: number;
   let removeCount: number;
+  let timerAbortListeners: Set<EventListenerOrEventListenerObject>;
+  let activeHookListeners: Set<EventListenerOrEventListenerObject>;
+  let activeHookListenersBySignal: Map<AbortSignal, Set<EventListenerOrEventListenerObject>>;
 
   beforeEach(async () => {
     vi.resetModules();
@@ -47,7 +52,12 @@ describe("useDraftRoomEvents issue 774 hardening (feedback pins)", () => {
     fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
     addCount = 0;
+    allAddCount = 0;
+    allRemoveCount = 0;
     removeCount = 0;
+    timerAbortListeners = new Set();
+    activeHookListeners = new Set();
+    activeHookListenersBySignal = new Map();
     const origAdd = AbortSignal.prototype.addEventListener;
     const origRemove = AbortSignal.prototype.removeEventListener;
     vi.spyOn(AbortSignal.prototype, "addEventListener").mockImplementation(
@@ -55,7 +65,18 @@ describe("useDraftRoomEvents issue 774 hardening (feedback pins)", () => {
         // Count only the hook's own listeners: vitest's internals also add
         // 'abort' listeners on AbortSignals during a test run.
         if (args[0] === "abort" && (new Error().stack || "").includes("useDraftRoomEvents.ts")) {
-          addCount += 1;
+          activeHookListeners.add(args[1]);
+          let listeners = activeHookListenersBySignal.get(this);
+          if (!listeners) {
+            listeners = new Set();
+            activeHookListenersBySignal.set(this, listeners);
+          }
+          listeners.add(args[1]);
+          allAddCount += 1;
+          if (args[2] === undefined) {
+            timerAbortListeners.add(args[1]);
+            addCount += 1;
+          }
         }
         return origAdd.apply(this, args);
       }
@@ -63,7 +84,10 @@ describe("useDraftRoomEvents issue 774 hardening (feedback pins)", () => {
     vi.spyOn(AbortSignal.prototype, "removeEventListener").mockImplementation(
       function (this: AbortSignal, ...args: Parameters<AbortSignal["removeEventListener"]>) {
         if (args[0] === "abort" && (new Error().stack || "").includes("useDraftRoomEvents.ts")) {
-          removeCount += 1;
+          const listeners = activeHookListenersBySignal.get(this);
+          if (listeners?.delete(args[1]) && listeners.size === 0) activeHookListenersBySignal.delete(this);
+          if (activeHookListeners.delete(args[1])) allRemoveCount += 1;
+          if (timerAbortListeners.delete(args[1])) removeCount += 1;
         }
         return origRemove.apply(this, args);
       }
@@ -97,6 +121,30 @@ describe("useDraftRoomEvents issue 774 hardening (feedback pins)", () => {
     });
   }
 
+  it("balances per-read abort listeners across chunks and an unmounted pending read", async () => {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("first"));
+        controller.enqueue(new TextEncoder().encode("second"));
+      },
+    });
+    fetchMock.mockResolvedValueOnce(new Response(body, { status: 200 }));
+
+    const view = renderEvents();
+    const trackedListenerCount = () =>
+      [...activeHookListenersBySignal.values()].reduce((total, listeners) => total + listeners.size, 0);
+    await waitFor(() => {
+      expect(allAddCount).toBe(4); // Owner listener and three per-read listeners.
+      expect(allRemoveCount).toBe(2); // The first two reads settled.
+      expect(trackedListenerCount()).toBe(2); // Owner plus pending third read.
+    });
+
+    view.unmount();
+    await waitFor(() => {
+      expect(allRemoveCount).toBe(4);
+      expect(trackedListenerCount()).toBe(0);
+    });
+  });
   it("contains a transport-class refresh rejection on the token_expired path", async () => {
     const unhandled = vi.fn();
     process.on("unhandledRejection", unhandled);
@@ -131,7 +179,7 @@ describe("useDraftRoomEvents issue 774 hardening (feedback pins)", () => {
       () => new Promise<Response>(() => undefined)
     );
 
-    renderEvents();
+    const { unmount } = renderEvents();
     // Deterministic clock: at +2s the 1s backoff timer has fired (cycle 1
     // fully settled: add -> timer-win -> remove) and fetch(2) is invoked and
     // hangs — freezing the loop exactly there.
@@ -141,5 +189,8 @@ describe("useDraftRoomEvents issue 774 hardening (feedback pins)", () => {
     expect(addCount).toBe(1);
     expect(removeCount).toBe(1);
     expect(removeCount).toBe(addCount);
+    unmount();
+    expect(activeHookListeners.size).toBe(0);
+    expect(allRemoveCount).toBe(allAddCount);
   });
 });

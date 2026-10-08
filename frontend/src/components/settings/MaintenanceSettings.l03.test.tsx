@@ -1,6 +1,6 @@
 /**
  * Issue #774 L03 red checkpoint — the Maintenance tab's "Recent wiki jobs"
- * list treats a failed jobs fetch as an empty list ("No recent jobs."), and
+ * list keeps the failed-jobs error alert visible while preserving its "No recent jobs." empty-state guard, and
  * it fetches the unbounded job list (server-side limit never requested).
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
@@ -40,7 +40,7 @@ describe("issue 774 MaintenanceSettings jobs fetch failure", () => {
     // Wait for the rejection to settle: the current catch resets the list to
     // [] and the empty-state paragraph appears — that is the defect.
     await waitFor(() => {
-      expect(screen.getByText(/No recent jobs/i)).toBeInTheDocument();
+      expect(screen.getByText(/Couldn't load recent jobs/i)).toBeInTheDocument();
     });
 
     expect(screen.queryAllByText("No recent jobs.").length).toBe(0);
