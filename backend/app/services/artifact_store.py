@@ -30,6 +30,7 @@ import hashlib
 import logging
 import os
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -123,9 +124,7 @@ def resolve_confined(rel_path: str, vault_id: int) -> Optional[Path]:
         logger.warning("Could not resolve asset rel_path %r", rel_path)
         return None
     if not _is_within(resolved, root):
-        logger.warning(
-            "Refusing asset rel_path outside vault root: %s", resolved
-        )
+        logger.warning("Refusing asset rel_path outside vault root: %s", resolved)
         return None
     return resolved
 
@@ -323,15 +322,16 @@ def sweep_pending_asset_deletes(conn) -> tuple[int, int]:
     sweep and logged, never silently dropped.
     """
     rows = conn.execute(
-        "SELECT id, file_id, vault_id, rel_path, attempts "
-        "FROM artifact_delete_pending"
+        "SELECT id, file_id, vault_id, rel_path, attempts FROM artifact_delete_pending"
     ).fetchall()
     removed = 0
     remaining = 0
     for row in rows:
         ok = unlink_asset_rel(row["rel_path"], row["vault_id"])
         if ok:
-            conn.execute("DELETE FROM artifact_delete_pending WHERE id = ?", (row["id"],))
+            conn.execute(
+                "DELETE FROM artifact_delete_pending WHERE id = ?", (row["id"],)
+            )
             removed += 1
         else:
             prev_attempts = row["attempts"] or 0
@@ -345,7 +345,10 @@ def sweep_pending_asset_deletes(conn) -> tuple[int, int]:
                 "UPDATE artifact_delete_pending SET attempts = ? WHERE id = ?",
                 (persist, row["id"]),
             )
-            if prev_attempts < _MAX_UNLINK_ATTEMPTS and new_attempts >= _MAX_UNLINK_ATTEMPTS:
+            if (
+                prev_attempts < _MAX_UNLINK_ATTEMPTS
+                and new_attempts >= _MAX_UNLINK_ATTEMPTS
+            ):
                 logger.error(
                     "Asset cleanup failed repeatedly (file_id=%s rel=%s attempts=%s); "
                     "requires operator reconciliation",
@@ -361,6 +364,44 @@ def sweep_pending_asset_deletes(conn) -> tuple[int, int]:
 # ---------------------------------------------------------------------------
 # Generation publication (DB side)
 # ---------------------------------------------------------------------------
+
+
+def record_stage_failure(
+    conn,
+    *,
+    file_id: int,
+    vault_id: int,
+    generation_hash: str,
+    parser_fingerprint: Optional[str],
+    implementation_version: str,
+    stage: str,
+    status: str,
+    error_code: Optional[str] = None,
+) -> None:
+    """Durably record a failed stage row for a generation (issue #704).
+
+    Used by the compensated artifact-publish path: when ``publish_generation``
+    itself fails after the vectors are durable, the rollback discards every
+    row it would have written — including its stage rows — so without this
+    marker nothing in the database says the generation's atoms/assets are
+    stranded. The row uses the schema-admitted ``failed_retryable`` status (a
+    later reprocess/reindex republishes) and carries no raw exception text
+    (the #562 redaction boundary).
+    """
+    _upsert_stage(
+        conn,
+        file_id=file_id,
+        vault_id=vault_id,
+        generation_hash=generation_hash,
+        parser_fingerprint=parser_fingerprint or "",
+        implementation_version=implementation_version,
+        stage=stage,
+        status=status,
+        attempts=1,
+        error_code=error_code,
+        completed_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
+    conn.commit()
 
 
 def publish_generation(

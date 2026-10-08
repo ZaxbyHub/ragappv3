@@ -32,7 +32,10 @@ async def test_background_processor_start_assigns_write_semaphore_before_workers
         mock_settings.reindex_job_lease_enabled = False
         mock_settings.draft_job_lease_enabled = False
         mock_settings.ingestion_worker_count = 2
-        with patch("app.services.background_tasks.asyncio.create_task", side_effect=fake_create_task):
+        with patch(
+            "app.services.background_tasks.asyncio.create_task",
+            side_effect=fake_create_task,
+        ):
             await processor.start()
 
     # The periodic vector-delete reconciliation sweep is spawned in start()
@@ -110,9 +113,13 @@ async def test_start_publication_failure_rolls_back_and_can_retry():
 
     with warnings.catch_warnings(record=True) as publication_warnings:
         warnings.simplefilter("always", RuntimeWarning)
-        with patch.object(bt_mod.asyncio, "create_task", side_effect=fail_at_artifact_sweep):
+        with patch.object(
+            bt_mod.asyncio, "create_task", side_effect=fail_at_artifact_sweep
+        ):
             with patch.object(bt_mod.asyncio, "gather", side_effect=observe_rollback):
-                with pytest.raises(RuntimeError, match="synthetic task publication failure"):
+                with pytest.raises(
+                    RuntimeError, match="synthetic task publication failure"
+                ):
                     await processor.start()
 
         rejected = rejected_coroutines.pop()
@@ -179,7 +186,9 @@ async def test_worker_count_two_vector_store_mutations_are_serialized():
         else:
             await store.delete_by_file("1")
 
-    processor.processor.process_existing_file = AsyncMock(side_effect=process_existing_file)
+    processor.processor.process_existing_file = AsyncMock(
+        side_effect=process_existing_file
+    )
 
     with patch("app.services.background_tasks.settings") as mock_settings:
         mock_settings.ingestion_worker_count = 2
@@ -295,8 +304,10 @@ async def test_embedding_global_semaphore_limits_batches_across_documents():
     EmbeddingService._global_batch_semaphore_limit = None
     EmbeddingService._global_batch_semaphore_loop = None
 
-    with patch("app.services.embeddings.settings") as mock_settings, \
-         patch("app.services.embeddings.assert_url_safe"):
+    with (
+        patch("app.services.embeddings.settings") as mock_settings,
+        patch("app.services.embeddings.assert_url_safe"),
+    ):
         mock_settings.ollama_embedding_url = "http://localhost:8080/v1/embeddings"
         mock_settings.embedding_model = "test-model"
         mock_settings.embedding_doc_prefix = ""
@@ -310,8 +321,12 @@ async def test_embedding_global_semaphore_limits_batches_across_documents():
         service_a = EmbeddingService()
         service_b = EmbeddingService()
         with patch.object(EmbeddingService, "_embed_batch_api", fake_embed_batch_api):
-            task_a = asyncio.create_task(service_a.embed_batch(["a1", "a2"], batch_size=1))
-            task_b = asyncio.create_task(service_b.embed_batch(["b1", "b2"], batch_size=1))
+            task_a = asyncio.create_task(
+                service_a.embed_batch(["a1", "a2"], batch_size=1)
+            )
+            task_b = asyncio.create_task(
+                service_b.embed_batch(["b1", "b2"], batch_size=1)
+            )
             await first_entered.wait()
             await asyncio.sleep(0)
             assert active == 1
@@ -369,23 +384,35 @@ async def test_process_file_emits_one_stage_timing_log(tmp_path, caplog):
         mock_settings.embedding_batch_size = 64
         from app.services.document_artifacts import ParsedDocument
 
-        with patch.object(processor, "_check_duplicate", return_value=None), \
-            patch.object(processor, "_insert_or_get_file_record", return_value=123), \
-            patch.object(processor, "_update_status"), \
-            patch.object(processor, "_validate_chunk_sizes"), \
-            patch.object(processor, "_is_schema_file", return_value=False), \
-            patch.object(processor, "_is_spreadsheet_file", return_value=False), \
+        with (
+            patch.object(processor, "_check_duplicate", return_value=None),
+            patch.object(processor, "_insert_or_get_file_record", return_value=123),
+            patch.object(processor, "_update_status"),
+            patch.object(processor, "_validate_chunk_sizes"),
+            patch.object(processor, "_is_schema_file", return_value=False),
+            patch.object(processor, "_is_spreadsheet_file", return_value=False),
             patch.object(
                 processor,
                 "_process_document_file",
-                new=AsyncMock(return_value=([chunk], "hello world", ParsedDocument(atoms=()))),
-            ), \
-            patch.object(processor, "_get_chunk_enrichment_service", return_value=None), \
-            patch("app.services.document_processor.compute_file_hash", return_value="abc12345"), \
-            patch("app.services.document_processor.set_phase", new_callable=AsyncMock), \
-            patch("app.services.document_processor.clear_progress", new_callable=AsyncMock), \
-            patch("app.services.document_processor.set_wiki_pending", new_callable=AsyncMock), \
-            patch("app.services.wiki_store.WikiStore") as mock_wiki_store:
+                new=AsyncMock(
+                    return_value=([chunk], "hello world", ParsedDocument(atoms=()))
+                ),
+            ),
+            patch.object(processor, "_get_chunk_enrichment_service", return_value=None),
+            patch(
+                "app.services.document_processor.compute_file_hash",
+                return_value="abc12345",
+            ),
+            patch("app.services.document_processor.set_phase", new_callable=AsyncMock),
+            patch(
+                "app.services.document_processor.clear_progress", new_callable=AsyncMock
+            ),
+            patch(
+                "app.services.document_processor.set_wiki_pending",
+                new_callable=AsyncMock,
+            ),
+            patch("app.services.wiki_store.WikiStore") as mock_wiki_store,
+        ):
             mock_wiki_store.return_value.create_job.return_value = None
             caplog.set_level(logging.INFO, logger="app.services.document_processor")
             await processor.process_file(str(file_path), vault_id=1)
@@ -403,12 +430,15 @@ async def test_process_file_emits_one_stage_timing_log(tmp_path, caplog):
             r"(?P<field>[a-z_]+_ms)=(?P<value>\d+(?:\.\d+)?)", message
         )
     }
+    # issue #704 (T1-25-KR-16): enrichment_ms was dropped from the stage
+    # timing fields — it was declared but never recorded (structurally always
+    # 0.0; enrichment runs post-index in the enrichment worker, outside this
+    # entry point's measured span).
     for field in (
         "parse_ms",
         "chunk_ms",
         "contextual_ms",
         "parent_window_ms",
-        "enrichment_ms",
         "embedding_ms",
         "vector_write_ms",
         "optimize_ms",

@@ -107,28 +107,46 @@ def _violations_in_source(source, label):
             and node.func.id in _HELPER_NAMES
         ):
             helper = node.func.id
-            where = f"in {stack[-1][0]} def {stack[-1][1]}" if stack else "at module level"
+            where = (
+                f"in {stack[-1][0]} def {stack[-1][1]}" if stack else "at module level"
+            )
             if not stack:
                 violations.append(
-                    (label, node.lineno, "module-level-call",
-                     f"{helper}(...) called at module level {where}")
+                    (
+                        label,
+                        node.lineno,
+                        "module-level-call",
+                        f"{helper}(...) called at module level {where}",
+                    )
                 )
             elif stack[-1][0] == "sync":
                 sync_def_calls += 1
                 violations.append(
-                    (label, node.lineno, "sync-def-call",
-                     f"{helper}(...) called inside sync def {stack[-1][1]} "
-                     f"(the async helper's coroutine would be dropped)")
+                    (
+                        label,
+                        node.lineno,
+                        "sync-def-call",
+                        f"{helper}(...) called inside sync def {stack[-1][1]} "
+                        f"(the async helper's coroutine would be dropped)",
+                    )
                 )
             elif stack[-1][0] == "lambda":
                 violations.append(
-                    (label, node.lineno, "sync-def-call",
-                     f"{helper}(...) called inside a lambda {where}")
+                    (
+                        label,
+                        node.lineno,
+                        "sync-def-call",
+                        f"{helper}(...) called inside a lambda {where}",
+                    )
                 )
             elif not from_await:
                 violations.append(
-                    (label, node.lineno, "unawaited-call",
-                     f"{helper}(...) is not directly awaited {where}")
+                    (
+                        label,
+                        node.lineno,
+                        "unawaited-call",
+                        f"{helper}(...) is not directly awaited {where}",
+                    )
                 )
             else:
                 legal_awaited_calls += 1
@@ -141,15 +159,23 @@ def _violations_in_source(source, label):
         if isinstance(node, ast.Name) and node.id in _HELPER_NAMES:
             if in_to_thread:
                 violations.append(
-                    (label, node.lineno, "to_thread-dispatch",
-                     f"bare {node.id} passed to asyncio.to_thread/run_in_executor "
-                     f"(the helper is async def — the coroutine is never awaited)")
+                    (
+                        label,
+                        node.lineno,
+                        "to_thread-dispatch",
+                        f"bare {node.id} passed to asyncio.to_thread/run_in_executor "
+                        f"(the helper is async def — the coroutine is never awaited)",
+                    )
                 )
             else:
                 violations.append(
-                    (label, node.lineno, "bare-reference",
-                     f"bare reference to {node.id} used as a value — must be "
-                     f"`await {node.id}(...)` inside an async def")
+                    (
+                        label,
+                        node.lineno,
+                        "bare-reference",
+                        f"bare reference to {node.id} used as a value — must be "
+                        f"`await {node.id}(...)` inside an async def",
+                    )
                 )
             return
 
@@ -199,58 +225,90 @@ class TestIssue645DocumentProgressDispatch(unittest.TestCase):
             and node.name in _HELPER_NAMES
         }
         self.assertEqual(
-            set(functions), set(_HELPER_NAMES),
+            set(functions),
+            set(_HELPER_NAMES),
             f"expected exactly the three helpers in {path}",
+        )
+        # issue #704 (T1-25-KR-09): the checkout/try/finally shape moved into
+        # the shared `write_session` context manager; the helpers acquire it
+        # via `async with write_session(pool)`. Pin BOTH halves.
+        write_session_node = None
+        for candidate in ast.walk(tree):
+            if (
+                isinstance(candidate, ast.AsyncFunctionDef)
+                and candidate.name == "write_session"
+            ):
+                write_session_node = candidate
+        self.assertIsNotNone(
+            write_session_node,
+            "document_progress must define the shared async write_session",
         )
         for name, node in functions.items():
             self.assertIsInstance(
-                node, ast.AsyncFunctionDef,
+                node,
+                ast.AsyncFunctionDef,
                 f"{name} must be `async def` (its pooled checkout runs off "
                 f"the event loop via get_connection_async, issue #645)",
             )
-            # An awaited get_connection_async checkout lexically inside a
-            # try block (the outer best-effort try), plus a finally block
-            # releasing the connection (the inner try/finally).
-            try_nodes = [t for t in ast.walk(node) if isinstance(t, ast.Try)]
-            awaited_checkouts = [
-                inner
-                for inner in ast.walk(node)
-                if isinstance(inner, ast.Await)
-                and isinstance(inner.value, ast.Call)
-                and isinstance(inner.value.func, ast.Attribute)
-                and inner.value.func.attr == "get_connection_async"
-            ]
-            releases_in_finally = [
-                call
-                for t in try_nodes
-                for stmt in t.finalbody
-                for call in ast.walk(stmt)
-                if isinstance(call, ast.Call)
-                and isinstance(call.func, ast.Attribute)
-                and call.func.attr == "release_connection"
-            ]
-            checkout_inside_try = any(
-                isinstance(sub, ast.Await)
-                and isinstance(sub.value, ast.Call)
-                and isinstance(sub.value.func, ast.Attribute)
-                and sub.value.func.attr == "get_connection_async"
-                for t in try_nodes
-                for region in (t.body, t.orelse, t.handlers, t.finalbody)
-                for stmt in region
-                for sub in ast.walk(stmt)
+            uses_write_session = any(
+                isinstance(sub, ast.AsyncWith)
+                and any(
+                    isinstance(item.context_expr, ast.Call)
+                    and isinstance(item.context_expr.func, ast.Name)
+                    and item.context_expr.func.id == "write_session"
+                    for item in sub.items
+                )
+                for sub in ast.walk(node)
             )
             self.assertTrue(
-                awaited_checkouts,
-                f"{name} must await pool.get_connection_async()",
+                uses_write_session,
+                f"{name} must acquire its connection via "
+                f"`async with write_session(pool)` (issue #704)",
             )
-            self.assertTrue(
-                checkout_inside_try,
-                f"{name}'s awaited checkout must sit inside a try block",
-            )
-            self.assertTrue(
-                releases_in_finally,
-                f"{name} must release the connection in a try's finally",
-            )
+        # The awaited get_connection_async checkout lexically inside a
+        # try block (the outer best-effort try), plus a finally block
+        # releasing the connection (the inner try/finally) — on write_session.
+        node = write_session_node
+        try_nodes = [t for t in ast.walk(node) if isinstance(t, ast.Try)]
+        awaited_checkouts = [
+            inner
+            for inner in ast.walk(node)
+            if isinstance(inner, ast.Await)
+            and isinstance(inner.value, ast.Call)
+            and isinstance(inner.value.func, ast.Attribute)
+            and inner.value.func.attr == "get_connection_async"
+        ]
+        releases_in_finally = [
+            call
+            for t in try_nodes
+            for stmt in t.finalbody
+            for call in ast.walk(stmt)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "release_connection"
+        ]
+        checkout_inside_try = any(
+            isinstance(sub, ast.Await)
+            and isinstance(sub.value, ast.Call)
+            and isinstance(sub.value.func, ast.Attribute)
+            and sub.value.func.attr == "get_connection_async"
+            for t in try_nodes
+            for region in (t.body, t.orelse, t.handlers, t.finalbody)
+            for stmt in region
+            for sub in ast.walk(stmt)
+        )
+        self.assertTrue(
+            awaited_checkouts,
+            "write_session must await pool.get_connection_async()",
+        )
+        self.assertTrue(
+            checkout_inside_try,
+            "write_session's awaited checkout must sit inside a try block",
+        )
+        self.assertTrue(
+            releases_in_finally,
+            "write_session must release the connection in a try's finally",
+        )
 
     # -- Requirement 2 + 3: repo-wide dispatch audit. ----------------------
 
@@ -274,7 +332,8 @@ class TestIssue645DocumentProgressDispatch(unittest.TestCase):
         # The audit must be live, not vacuous: the converted tree really has
         # awaited helper calls to find.
         self.assertGreater(
-            legal, 0,
+            legal,
+            0,
             "no awaited helper calls found — the dispatch audit matched "
             "nothing and cannot guard anything",
         )
@@ -287,7 +346,8 @@ class TestIssue645DocumentProgressDispatch(unittest.TestCase):
         files, violations, legal = find_app_dispatch_violations(_APP_DIR)
         sync_defs = [v for v in violations if v[2] == "sync-def-call"]
         self.assertEqual(
-            sync_defs, [],
+            sync_defs,
+            [],
             f"helper call(s) inside sync defs: {sync_defs}",
         )
 
@@ -301,19 +361,19 @@ class TestIssue645DocumentProgressDispatch(unittest.TestCase):
             "from app.services.document_progress import set_phase\n"
             "\n"
             "async def ok_caller(pool, fid):\n"
-            "    await set_phase(pool, fid, phase='queued')\n"      # legal
+            "    await set_phase(pool, fid, phase='queued')\n"  # legal
             "\n"
             "async def to_thread_caller(pool, fid):\n"
-            "    await asyncio.to_thread(set_phase, pool, fid)\n"   # forbidden
+            "    await asyncio.to_thread(set_phase, pool, fid)\n"  # forbidden
             "\n"
             "async def unawaited_caller(pool, fid):\n"
-            "    set_phase(pool, fid, phase='queued')\n"            # forbidden
+            "    set_phase(pool, fid, phase='queued')\n"  # forbidden
             "\n"
             "async def bare_ref_caller(pool, fid):\n"
-            "    task = asyncio.create_task(set_phase)\n"           # forbidden (bare)
+            "    task = asyncio.create_task(set_phase)\n"  # forbidden (bare)
             "\n"
             "def sync_caller(pool, fid):\n"
-            "    set_phase(pool, fid, phase='queued')\n"            # forbidden
+            "    set_phase(pool, fid, phase='queued')\n"  # forbidden
         )
         violations, legal, sync = _violations_in_source(seeded, "<seeded>")
         kinds = sorted(v[2] for v in violations)
@@ -355,7 +415,8 @@ class TestIssue645DocumentProgressDispatch(unittest.TestCase):
         for source, expected_violations in cases:
             violations, _legal, _sync = _violations_in_source(source, "<case>")
             self.assertEqual(
-                len(violations), expected_violations,
+                len(violations),
+                expected_violations,
                 f"unexpected walker result for source:\n{source}\n{violations}",
             )
 

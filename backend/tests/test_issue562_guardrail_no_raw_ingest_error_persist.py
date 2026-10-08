@@ -37,6 +37,11 @@ SHIPPED_INGEST_ERROR_CODES = frozenset(
         # refused while a timed-out parse of the same file is still in
         # flight) persists this stable code, never a raw message.
         "PARSE_TIMEOUT",
+        # issue #704 (T1-25-KR-02): embedding-provider outages and
+        # vector-store rejections classify by failure provenance, distinct
+        # from parse failures.
+        "EMBEDDING_FAILED",
+        "VECTOR_STORE_FAILED",
     }
 )
 

@@ -55,21 +55,15 @@ class TestIngestionLLMRouting(unittest.TestCase):
         original_mode = settings.ingestion_llm_mode
         try:
             settings.ingestion_llm_mode = "disabled"
-            _hot_rebind_llm_clients(
-                app, SettingsUpdate(ingestion_llm_mode="disabled")
-            )
+            _hot_rebind_llm_clients(app, SettingsUpdate(ingestion_llm_mode="disabled"))
             self.assertIsNone(background_processor.bound_client)
 
             settings.ingestion_llm_mode = "thinking"
-            _hot_rebind_llm_clients(
-                app, SettingsUpdate(ingestion_llm_mode="thinking")
-            )
+            _hot_rebind_llm_clients(app, SettingsUpdate(ingestion_llm_mode="thinking"))
             self.assertIs(background_processor.bound_client, thinking)
 
             settings.ingestion_llm_mode = "instant"
-            _hot_rebind_llm_clients(
-                app, SettingsUpdate(ingestion_llm_mode="instant")
-            )
+            _hot_rebind_llm_clients(app, SettingsUpdate(ingestion_llm_mode="instant"))
             self.assertIs(background_processor.bound_client, instant)
         finally:
             settings.ingestion_llm_mode = original_mode
@@ -81,7 +75,9 @@ class TestChunkEnrichmentLimits(unittest.TestCase):
             def __init__(self):
                 self.calls = []
 
-            async def chat_completion(self, messages, max_tokens, temperature, response_format=None):
+            async def chat_completion(
+                self, messages, max_tokens, temperature, response_format=None
+            ):
                 self.calls.append(
                     {
                         "messages": messages,
@@ -123,7 +119,9 @@ class TestChunkEnrichmentInjectionDefense(unittest.TestCase):
             def __init__(self):
                 self.messages = None
 
-            async def chat_completion(self, messages, max_tokens, temperature, response_format=None):
+            async def chat_completion(
+                self, messages, max_tokens, temperature, response_format=None
+            ):
                 self.messages = messages
                 return '{"summary":"short","questions":[],"entities":[],"aliases":[]}'
 
@@ -156,32 +154,51 @@ class TestChunkEnrichmentInjectionDefense(unittest.TestCase):
         self.assertIn("<document>", system_content)
 
         # Exactly one <document> wrapper pair (single text body).
-        self.assertEqual(user_content.count("<document>"), 1,
-                         msg="Exactly one <document> opener")
-        self.assertEqual(user_content.count("</document>"), 1,
-                         msg="Exactly one legitimate </document> closer")
+        self.assertEqual(
+            user_content.count("<document>"), 1, msg="Exactly one <document> opener"
+        )
+        self.assertEqual(
+            user_content.count("</document>"),
+            1,
+            msg="Exactly one legitimate </document> closer",
+        )
 
         # Injected closing tags and instructions are escaped, not raw.
-        self.assertIn("&lt;/document&gt;", user_content,
-                      msg="Injected </document> must be escaped")
-        self.assertIn("&lt;instruction&gt;", user_content,
-                      msg="Injected <instruction> must be escaped")
-        self.assertIn("&lt;user_query&gt;", user_content,
-                      msg="Injected <user_query> must be escaped")
+        self.assertIn(
+            "&lt;/document&gt;",
+            user_content,
+            msg="Injected </document> must be escaped",
+        )
+        self.assertIn(
+            "&lt;instruction&gt;",
+            user_content,
+            msg="Injected <instruction> must be escaped",
+        )
+        self.assertIn(
+            "&lt;user_query&gt;",
+            user_content,
+            msg="Injected <user_query> must be escaped",
+        )
 
         # No literal '<' or '>' may appear inside the <document> body.
         open_pos = user_content.find("<document>")
         close_pos = user_content.find("</document>")
-        body = user_content[open_pos + len("<document>"):close_pos]
+        body = user_content[open_pos + len("<document>") : close_pos]
         self.assertNotIn("<", body, msg="No literal '<' inside the <document> body")
         self.assertNotIn(">", body, msg="No literal '>' inside the <document> body")
 
         # _header_escape collapses the newline in the title, so no forged
         # directive line can be created between header lines.
-        self.assertNotIn("\n[SYSTEM]", user_content,
-                         msg="Title newline must be collapsed by _header_escape")
+        self.assertNotIn(
+            "\n[SYSTEM]",
+            user_content,
+            msg="Title newline must be collapsed by _header_escape",
+        )
         self.assertFalse(
-            any(line.lstrip().startswith("[SYSTEM]") for line in user_content.splitlines()),
+            any(
+                line.lstrip().startswith("[SYSTEM]")
+                for line in user_content.splitlines()
+            ),
             msg="No prompt line may start with the injected [SYSTEM] directive",
         )
 
@@ -200,8 +217,9 @@ class TestChunkEnrichmentInjectionDefense(unittest.TestCase):
         # stays wrapped.
         self.assertIn("Document: doc.txt", user_content)
         self.assertIn("Section: Intro", user_content)
-        self.assertIn("<document>Important evidence for retrieval.</document>",
-                      user_content)
+        self.assertIn(
+            "<document>Important evidence for retrieval.</document>", user_content
+        )
 
 
 class TestBackgroundEnrichmentQueue(unittest.TestCase):
@@ -223,7 +241,7 @@ class TestBackgroundEnrichmentQueue(unittest.TestCase):
             def should_enqueue_enrichment(self, chunks, vault_id=None, file_id=None):
                 return True
 
-            def set_enrichment_status(self, file_id, status, error_message=None):
+            async def set_enrichment_status(self, file_id, status, error_message=None):
                 events.append(f"enrichment:{status}")
 
         async def run_case():
@@ -265,10 +283,14 @@ class TestBackgroundEnrichmentQueue(unittest.TestCase):
                         vault_id=vault_id,
                     )
 
-                def should_enqueue_enrichment(self, chunks, vault_id=None, file_id=None):
+                def should_enqueue_enrichment(
+                    self, chunks, vault_id=None, file_id=None
+                ):
                     return True
 
-                def set_enrichment_status(self, file_id, status, error_message=None):
+                async def set_enrichment_status(
+                    self, file_id, status, error_message=None
+                ):
                     events.append(f"enrichment:{status}")
 
                 def clear_cancel(self, file_id):

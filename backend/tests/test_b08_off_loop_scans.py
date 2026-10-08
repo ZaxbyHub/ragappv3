@@ -70,9 +70,7 @@ class _FakeEmbeddingService:
         self._dim = dim
 
     async def embed_batch(self, texts, fail_fast=False):  # noqa: ANN001, ANN202
-        return [
-            [((i + 1) * 0.25) for i in range(self._dim)] for _ in texts
-        ], []
+        return [[((i + 1) * 0.25) for i in range(self._dim)] for _ in texts], []
 
 
 async def test_record_file_centroid_runs_off_event_loop() -> None:
@@ -88,6 +86,11 @@ async def test_record_file_centroid_runs_off_event_loop() -> None:
     tmp = Path(tempfile.mkdtemp(prefix="b08_ac1_"))
     db_path = str(tmp / "app.db")
     init_db(db_path)
+    # issue #704 (T1-25-S2-10): finalize writes parsed_text in the status
+    # transaction; the column is migration-added.
+    from app.models.database import run_migrations as _run_migrations
+
+    _run_migrations(db_path)
     conn = sqlite3.connect(db_path)
     conn.execute("INSERT INTO vaults (name) VALUES ('v')")
     vault_id = conn.execute("SELECT id FROM vaults LIMIT 1").fetchone()[0]
@@ -125,15 +128,15 @@ async def test_record_file_centroid_runs_off_event_loop() -> None:
     pool = get_pool(db_path, max_size=3)
     store = VectorStore(db_path=tmp / "lancedb")
     try:
-        with patch.object(settings, "data_dir", tmp), patch.object(
-            settings, "wiki_enabled", False
-        ), patch.object(settings, "wiki_compile_on_ingest", False), patch.object(
-            settings, "kms_enabled", False
-        ), patch.object(
-            settings, "multi_scale_indexing_enabled", False
-        ), patch.object(
-            settings, "contextual_chunking_enabled", False
-        ), patch.object(settings, "optimize_mode", "manual"):
+        with (
+            patch.object(settings, "data_dir", tmp),
+            patch.object(settings, "wiki_enabled", False),
+            patch.object(settings, "wiki_compile_on_ingest", False),
+            patch.object(settings, "kms_enabled", False),
+            patch.object(settings, "multi_scale_indexing_enabled", False),
+            patch.object(settings, "contextual_chunking_enabled", False),
+            patch.object(settings, "optimize_mode", "manual"),
+        ):
             await store.init_table(dim)
             await store.add_chunks(
                 [
@@ -153,23 +156,24 @@ async def test_record_file_centroid_runs_off_event_loop() -> None:
                 embedding_service=_FakeEmbeddingService(dim=dim),
                 vector_store=store,
             )
-            with patch.object(
-                processor,
-                "_process_document_file",
-                new=AsyncMock(
-                    return_value=(
-                        [chunk],
-                        "reindexed content",
-                        ParsedDocument(atoms=()),
-                    )
+            with (
+                patch.object(
+                    processor,
+                    "_process_document_file",
+                    new=AsyncMock(
+                        return_value=(
+                            [chunk],
+                            "reindexed content",
+                            ParsedDocument(atoms=()),
+                        )
+                    ),
                 ),
-            ), patch(
-                "app.services.document_processor.compute_file_hash",
-                return_value="hashb08ac1",
-            ), patch(
-                "app.services.document_processor.compute_parent_windows"
-            ), patch.object(
-                near_duplicates, "record_file_centroid", recorder
+                patch(
+                    "app.services.document_processor.compute_file_hash",
+                    return_value="hashb08ac1",
+                ),
+                patch("app.services.document_processor.compute_parent_windows"),
+                patch.object(near_duplicates, "record_file_centroid", recorder),
             ):
                 await processor.process_existing_file(
                     file_id=file_id,
@@ -216,15 +220,27 @@ def test_second_ingest_does_not_rescan_unmatched_legacy_text() -> None:
             "INSERT INTO files "
             "(vault_id, file_path, file_name, file_hash, file_size, status, parsed_text) "
             "VALUES (?, ?, ?, ?, ?, 'indexed', ?)",
-            (vid, "/b08ac2/x.txt", "x.txt", "hash-x", 10,
-             "the quick brown fox jumps over the lazy dog"),
+            (
+                vid,
+                "/b08ac2/x.txt",
+                "x.txt",
+                "hash-x",
+                10,
+                "the quick brown fox jumps over the lazy dog",
+            ),
         )
         conn.execute(
             "INSERT INTO files "
             "(vault_id, file_path, file_name, file_hash, file_size, status, parsed_text) "
             "VALUES (?, ?, ?, ?, ?, 'indexed', ?)",
-            (vid, "/b08ac2/y.txt", "y.txt", "hash-y", 10,
-             "the quick brown fox jumps over the lazy dog again"),
+            (
+                vid,
+                "/b08ac2/y.txt",
+                "y.txt",
+                "hash-y",
+                10,
+                "the quick brown fox jumps over the lazy dog again",
+            ),
         )
         conn.commit()
         ids = {r[1]: r[0] for r in conn.execute("SELECT id, file_name FROM files")}
@@ -233,7 +249,10 @@ def test_second_ingest_does_not_rescan_unmatched_legacy_text() -> None:
         emb = [[1.0] * 8]
 
         near_duplicates.record_file_centroid(
-            conn, vid, x, emb,
+            conn,
+            vid,
+            x,
+            emb,
             document_text="the quick brown fox jumps over the lazy dog",
         )
 
@@ -246,7 +265,10 @@ def test_second_ingest_does_not_rescan_unmatched_legacy_text() -> None:
 
         with patch.object(near_duplicates, "_text_fingerprint", counting_fp):
             near_duplicates.record_file_centroid(
-                conn, vid, y, emb,
+                conn,
+                vid,
+                y,
+                emb,
                 document_text="the quick brown fox jumps over the lazy dog again",
             )
         calls = holder["n"]

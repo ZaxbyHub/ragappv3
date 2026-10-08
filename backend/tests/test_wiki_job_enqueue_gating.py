@@ -17,46 +17,51 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 # Add parent directory to path for imports
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 # Stub missing optional dependencies
 try:
     import lancedb
 except ImportError:
     import types
-    sys.modules['lancedb'] = types.ModuleType('lancedb')
+
+    sys.modules["lancedb"] = types.ModuleType("lancedb")
 
 try:
     import pyarrow
 except ImportError:
     import types
-    sys.modules['pyarrow'] = types.ModuleType('pyarrow')
+
+    sys.modules["pyarrow"] = types.ModuleType("pyarrow")
 
 try:
     from unstructured.partition.auto import partition
 except ImportError:
     import types
-    _unstructured = types.ModuleType('unstructured')
+
+    _unstructured = types.ModuleType("unstructured")
     _unstructured.__path__ = []
-    _unstructured.partition = types.ModuleType('unstructured.partition')
+    _unstructured.partition = types.ModuleType("unstructured.partition")
     _unstructured.partition.__path__ = []
-    _unstructured.partition.auto = types.ModuleType('unstructured.partition.auto')
+    _unstructured.partition.auto = types.ModuleType("unstructured.partition.auto")
     _unstructured.partition.auto.partition = lambda *args, **kwargs: []
-    _unstructured.chunking = types.ModuleType('unstructured.chunking')
+    _unstructured.chunking = types.ModuleType("unstructured.chunking")
     _unstructured.chunking.__path__ = []
-    _unstructured.chunking.title = types.ModuleType('unstructured.chunking.title')
+    _unstructured.chunking.title = types.ModuleType("unstructured.chunking.title")
     _unstructured.chunking.title.chunk_by_title = lambda *args, **kwargs: []
-    _unstructured.documents = types.ModuleType('unstructured.documents')
+    _unstructured.documents = types.ModuleType("unstructured.documents")
     _unstructured.documents.__path__ = []
-    _unstructured.documents.elements = types.ModuleType('unstructured.documents.elements')
-    _unstructured.documents.elements.Element = type('Element', (), {})
-    sys.modules['unstructured'] = _unstructured
-    sys.modules['unstructured.partition'] = _unstructured.partition
-    sys.modules['unstructured.partition.auto'] = _unstructured.partition.auto
-    sys.modules['unstructured.chunking'] = _unstructured.chunking
-    sys.modules['unstructured.chunking.title'] = _unstructured.chunking.title
-    sys.modules['unstructured.documents'] = _unstructured.documents
-    sys.modules['unstructured.documents.elements'] = _unstructured.documents.elements
+    _unstructured.documents.elements = types.ModuleType(
+        "unstructured.documents.elements"
+    )
+    _unstructured.documents.elements.Element = type("Element", (), {})
+    sys.modules["unstructured"] = _unstructured
+    sys.modules["unstructured.partition"] = _unstructured.partition
+    sys.modules["unstructured.partition.auto"] = _unstructured.partition.auto
+    sys.modules["unstructured.chunking"] = _unstructured.chunking
+    sys.modules["unstructured.chunking.title"] = _unstructured.chunking.title
+    sys.modules["unstructured.documents"] = _unstructured.documents
+    sys.modules["unstructured.documents.elements"] = _unstructured.documents.elements
 
 from app.services.document_artifacts import ParsedDocument  # noqa: E402
 
@@ -82,6 +87,18 @@ def _make_mock_settings(wiki_enabled=True, wiki_compile_on_ingest=True):
     return mock
 
 
+def _wiki_pending_writes(conn):
+    """Issue #704 (T1-25-S2-10): the wiki_pending set/clear now run inline on
+    the finalize session's connection (nested set_wiki_pending checkouts would
+    deadlock under the shared write permit), so the lifecycle is pinned on the
+    session connection's UPDATE calls instead of the helper."""
+    return [
+        call
+        for call in conn.execute.call_args_list
+        if "wiki_pending" in str(call.args[0])
+    ]
+
+
 class TestWikiJobEnqueueGating(unittest.IsolatedAsyncioTestCase):
     """Test wiki job creation is gated on wiki_enabled AND wiki_compile_on_ingest."""
 
@@ -89,16 +106,17 @@ class TestWikiJobEnqueueGating(unittest.IsolatedAsyncioTestCase):
         from app.models.database import init_db
 
         self.temp_dir = tempfile.mkdtemp()
-        self.temp_db_path = os.path.join(self.temp_dir, 'test.db')
+        self.temp_db_path = os.path.join(self.temp_dir, "test.db")
         init_db(self.temp_db_path)
 
         # Create a simple text file for processing
-        self.txt_file_path = os.path.join(self.temp_dir, 'test.txt')
-        with open(self.txt_file_path, 'w', encoding='utf-8') as f:
+        self.txt_file_path = os.path.join(self.temp_dir, "test.txt")
+        with open(self.txt_file_path, "w", encoding="utf-8") as f:
             f.write("Justice Sakyi is the AFOMIS Chief.")
 
     async def asyncTearDown(self):
         import shutil
+
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def _make_processor(self):
@@ -136,23 +154,27 @@ class TestWikiJobEnqueueGating(unittest.IsolatedAsyncioTestCase):
     def _make_chunk(self, text="Justice Sakyi is the AFOMIS Chief."):
         """Create a properly-configured ProcessedChunk for testing."""
         from app.services.chunking import ProcessedChunk
+
         return ProcessedChunk(
             text=text,
             metadata={"chunk_scale": "default", "raw_text": text},
             chunk_index=0,
         )
 
-    async def _run_process_file(self, processor, pool, conn, mock_settings, txt_file_path):
+    async def _run_process_file(
+        self, processor, pool, conn, mock_settings, txt_file_path
+    ):
         """Run process_file with common mocks applied."""
         chunk = self._make_chunk()
 
-        with patch("app.services.document_processor.settings", mock_settings), \
-            patch.object(processor, "_check_duplicate", return_value=None), \
-            patch.object(processor, "_insert_or_get_file_record", return_value=123), \
-            patch.object(processor, "_update_status"), \
-            patch.object(processor, "_validate_chunk_sizes"), \
-            patch.object(processor, "_is_schema_file", return_value=False), \
-            patch.object(processor, "_is_spreadsheet_file", return_value=False), \
+        with (
+            patch("app.services.document_processor.settings", mock_settings),
+            patch.object(processor, "_check_duplicate", return_value=None),
+            patch.object(processor, "_insert_or_get_file_record", return_value=123),
+            patch.object(processor, "_update_status"),
+            patch.object(processor, "_validate_chunk_sizes"),
+            patch.object(processor, "_is_schema_file", return_value=False),
+            patch.object(processor, "_is_spreadsheet_file", return_value=False),
             patch.object(
                 processor,
                 "_process_document_file",
@@ -163,14 +185,23 @@ class TestWikiJobEnqueueGating(unittest.IsolatedAsyncioTestCase):
                         ParsedDocument(atoms=()),
                     )
                 ),
-            ), \
-            patch.object(processor, "_get_chunk_enrichment_service", return_value=None), \
-            patch("app.services.document_processor.compute_file_hash", return_value="abc12345"), \
-            patch("app.services.document_processor.set_phase", new_callable=AsyncMock), \
-            patch("app.services.document_processor.clear_progress", new_callable=AsyncMock), \
-            patch("app.services.document_processor.compute_parent_windows"), \
-            patch("app.services.document_processor.set_wiki_pending", new_callable=AsyncMock) as mock_set_wiki_pending, \
-            patch("app.services.wiki_store.WikiStore") as mock_wiki_store_cls:
+            ),
+            patch.object(processor, "_get_chunk_enrichment_service", return_value=None),
+            patch(
+                "app.services.document_processor.compute_file_hash",
+                return_value="abc12345",
+            ),
+            patch("app.services.document_processor.set_phase", new_callable=AsyncMock),
+            patch(
+                "app.services.document_processor.clear_progress", new_callable=AsyncMock
+            ),
+            patch("app.services.document_processor.compute_parent_windows"),
+            patch(
+                "app.services.document_processor.set_wiki_pending",
+                new_callable=AsyncMock,
+            ) as mock_set_wiki_pending,
+            patch("app.services.wiki_store.WikiStore") as mock_wiki_store_cls,
+        ):
             mock_wiki_store = MagicMock()
             mock_wiki_store.create_job.return_value = None
             mock_wiki_store_cls.return_value = mock_wiki_store
@@ -182,7 +213,9 @@ class TestWikiJobEnqueueGating(unittest.IsolatedAsyncioTestCase):
     async def test_wiki_job_not_created_when_wiki_enabled_false(self):
         """When wiki_enabled=False, _WikiStore.create_job must NOT be called."""
         processor, pool, conn, _ = self._make_processor()
-        mock_settings = _make_mock_settings(wiki_enabled=False, wiki_compile_on_ingest=True)
+        mock_settings = _make_mock_settings(
+            wiki_enabled=False, wiki_compile_on_ingest=True
+        )
 
         mock_set_wiki_pending, mock_wiki_store = await self._run_process_file(
             processor, pool, conn, mock_settings, self.txt_file_path
@@ -190,15 +223,19 @@ class TestWikiJobEnqueueGating(unittest.IsolatedAsyncioTestCase):
 
         # create_job should NOT have been called because wiki_enabled=False
         mock_wiki_store.create_job.assert_not_called()
-        # But set_wiki_pending SHOULD have been called twice: True then False
-        self.assertEqual(mock_set_wiki_pending.call_count, 2)
-        mock_set_wiki_pending.assert_any_call(pool, 123, True)
-        mock_set_wiki_pending.assert_any_call(pool, 123, False)
+        # The wiki_pending flag is still set then cleared on the session conn
+        # (issue #704: inline UPDATEs instead of helper calls).
+        wiki_writes = _wiki_pending_writes(conn)
+        self.assertEqual(len(wiki_writes), 2)
+        self.assertIn("wiki_pending = 1", str(wiki_writes[0].args[0]))
+        self.assertIn("wiki_pending = 0", str(wiki_writes[1].args[0]))
 
     async def test_wiki_job_not_created_when_wiki_compile_on_ingest_false(self):
         """When wiki_compile_on_ingest=False, _WikiStore.create_job must NOT be called."""
         processor, pool, conn, _ = self._make_processor()
-        mock_settings = _make_mock_settings(wiki_enabled=True, wiki_compile_on_ingest=False)
+        mock_settings = _make_mock_settings(
+            wiki_enabled=True, wiki_compile_on_ingest=False
+        )
 
         mock_set_wiki_pending, mock_wiki_store = await self._run_process_file(
             processor, pool, conn, mock_settings, self.txt_file_path
@@ -206,13 +243,18 @@ class TestWikiJobEnqueueGating(unittest.IsolatedAsyncioTestCase):
 
         # create_job should NOT have been called because wiki_compile_on_ingest=False
         mock_wiki_store.create_job.assert_not_called()
-        # set_wiki_pending should have been called twice
-        self.assertEqual(mock_set_wiki_pending.call_count, 2)
+        # The wiki_pending flag is still set then cleared on the session conn
+        wiki_writes = _wiki_pending_writes(conn)
+        self.assertEqual(len(wiki_writes), 2)
+        self.assertIn("wiki_pending = 1", str(wiki_writes[0].args[0]))
+        self.assertIn("wiki_pending = 0", str(wiki_writes[1].args[0]))
 
     async def test_wiki_job_created_when_both_flags_true(self):
         """When both wiki_enabled AND wiki_compile_on_ingest are True, create_job MUST be called."""
         processor, pool, conn, _ = self._make_processor()
-        mock_settings = _make_mock_settings(wiki_enabled=True, wiki_compile_on_ingest=True)
+        mock_settings = _make_mock_settings(
+            wiki_enabled=True, wiki_compile_on_ingest=True
+        )
 
         mock_set_wiki_pending, mock_wiki_store = await self._run_process_file(
             processor, pool, conn, mock_settings, self.txt_file_path
@@ -227,25 +269,29 @@ class TestWikiJobEnqueueGating(unittest.IsolatedAsyncioTestCase):
             trigger_id="file:123",
             input_json={"file_id": 123, "vault_id": 1},
         )
-        # set_wiki_pending should have been called twice
-        self.assertEqual(mock_set_wiki_pending.call_count, 2)
-        mock_set_wiki_pending.assert_any_call(pool, 123, True)
-        mock_set_wiki_pending.assert_any_call(pool, 123, False)
+        # The wiki_pending flag is still set then cleared on the session conn
+        wiki_writes = _wiki_pending_writes(conn)
+        self.assertEqual(len(wiki_writes), 2)
+        self.assertIn("wiki_pending = 1", str(wiki_writes[0].args[0]))
+        self.assertIn("wiki_pending = 0", str(wiki_writes[1].args[0]))
 
     async def test_wiki_pending_flag_always_cleared(self):
         """Verify wiki_pending is always cleared after processing, regardless of gating."""
         processor, pool, conn, _ = self._make_processor()
-        mock_settings = _make_mock_settings(wiki_enabled=True, wiki_compile_on_ingest=False)
+        mock_settings = _make_mock_settings(
+            wiki_enabled=True, wiki_compile_on_ingest=False
+        )
 
         chunk = self._make_chunk()
 
-        with patch("app.services.document_processor.settings", mock_settings), \
-            patch.object(processor, "_check_duplicate", return_value=None), \
-            patch.object(processor, "_insert_or_get_file_record", return_value=456), \
-            patch.object(processor, "_update_status"), \
-            patch.object(processor, "_validate_chunk_sizes"), \
-            patch.object(processor, "_is_schema_file", return_value=False), \
-            patch.object(processor, "_is_spreadsheet_file", return_value=False), \
+        with (
+            patch("app.services.document_processor.settings", mock_settings),
+            patch.object(processor, "_check_duplicate", return_value=None),
+            patch.object(processor, "_insert_or_get_file_record", return_value=456),
+            patch.object(processor, "_update_status"),
+            patch.object(processor, "_validate_chunk_sizes"),
+            patch.object(processor, "_is_schema_file", return_value=False),
+            patch.object(processor, "_is_spreadsheet_file", return_value=False),
             patch.object(
                 processor,
                 "_process_document_file",
@@ -256,23 +302,35 @@ class TestWikiJobEnqueueGating(unittest.IsolatedAsyncioTestCase):
                         ParsedDocument(atoms=()),
                     )
                 ),
-            ), \
-            patch.object(processor, "_get_chunk_enrichment_service", return_value=None), \
-            patch("app.services.document_processor.compute_file_hash", return_value="abc12345"), \
-            patch("app.services.document_processor.set_phase", new_callable=AsyncMock), \
-            patch("app.services.document_processor.clear_progress", new_callable=AsyncMock), \
-            patch("app.services.document_processor.compute_parent_windows"), \
-            patch("app.services.document_processor.set_wiki_pending", new_callable=AsyncMock) as mock_set_wiki_pending, \
-            patch("app.services.wiki_store.WikiStore") as mock_wiki_store_cls:
+            ),
+            patch.object(processor, "_get_chunk_enrichment_service", return_value=None),
+            patch(
+                "app.services.document_processor.compute_file_hash",
+                return_value="abc12345",
+            ),
+            patch("app.services.document_processor.set_phase", new_callable=AsyncMock),
+            patch(
+                "app.services.document_processor.clear_progress", new_callable=AsyncMock
+            ),
+            patch("app.services.document_processor.compute_parent_windows"),
+            patch(
+                "app.services.document_processor.set_wiki_pending",
+                new_callable=AsyncMock,
+            ) as mock_set_wiki_pending,
+            patch("app.services.wiki_store.WikiStore") as mock_wiki_store_cls,
+        ):
             mock_wiki_store = MagicMock()
             mock_wiki_store.create_job.return_value = None
             mock_wiki_store_cls.return_value = mock_wiki_store
 
             await processor.process_file(self.txt_file_path, vault_id=1)
 
-            # The final call to set_wiki_pending should be with False (cleared)
-            last_call = mock_set_wiki_pending.call_args_list[-1]
-            self.assertEqual(last_call, unittest.mock.call(pool, 456, False))
+            # The final wiki_pending write should clear the flag (issue #704:
+            # inline UPDATE on the session conn; the file id rides the params).
+            wiki_writes = _wiki_pending_writes(conn)
+            self.assertTrue(wiki_writes)
+            self.assertIn("wiki_pending = 0", str(wiki_writes[-1].args[0]))
+            self.assertIn(456, wiki_writes[-1].args[1])
 
 
 class TestWikiJobEnqueueGatingProcessExistingFile(unittest.IsolatedAsyncioTestCase):
@@ -282,20 +340,22 @@ class TestWikiJobEnqueueGatingProcessExistingFile(unittest.IsolatedAsyncioTestCa
         from app.models.database import init_db
 
         self.temp_dir = tempfile.mkdtemp()
-        self.temp_db_path = os.path.join(self.temp_dir, 'test.db')
+        self.temp_db_path = os.path.join(self.temp_dir, "test.db")
         init_db(self.temp_db_path)
 
-        self.txt_file_path = os.path.join(self.temp_dir, 'test.txt')
-        with open(self.txt_file_path, 'w', encoding='utf-8') as f:
+        self.txt_file_path = os.path.join(self.temp_dir, "test.txt")
+        with open(self.txt_file_path, "w", encoding="utf-8") as f:
             f.write("Justice Sakyi is the AFOMIS Chief.")
 
     async def asyncTearDown(self):
         import shutil
+
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def _make_chunk(self, text="Justice Sakyi is the AFOMIS Chief."):
         """Create a properly-configured ProcessedChunk for testing."""
         from app.services.chunking import ProcessedChunk
+
         return ProcessedChunk(
             text=text,
             metadata={"chunk_scale": "default", "raw_text": text},
@@ -341,11 +401,12 @@ class TestWikiJobEnqueueGatingProcessExistingFile(unittest.IsolatedAsyncioTestCa
 
         chunk = self._make_chunk()
 
-        with patch("app.services.document_processor.settings", mock_settings), \
-            patch.object(processor, "_update_status"), \
-            patch.object(processor, "_validate_chunk_sizes"), \
-            patch.object(processor, "_is_schema_file", return_value=False), \
-            patch.object(processor, "_is_spreadsheet_file", return_value=False), \
+        with (
+            patch("app.services.document_processor.settings", mock_settings),
+            patch.object(processor, "_update_status"),
+            patch.object(processor, "_validate_chunk_sizes"),
+            patch.object(processor, "_is_schema_file", return_value=False),
+            patch.object(processor, "_is_spreadsheet_file", return_value=False),
             patch.object(
                 processor,
                 "_process_document_file",
@@ -356,14 +417,23 @@ class TestWikiJobEnqueueGatingProcessExistingFile(unittest.IsolatedAsyncioTestCa
                         ParsedDocument(atoms=()),
                     )
                 ),
-            ), \
-            patch.object(processor, "_get_chunk_enrichment_service", return_value=None), \
-            patch("app.services.document_processor.compute_file_hash", return_value="abc12345"), \
-            patch("app.services.document_processor.set_phase", new_callable=AsyncMock), \
-            patch("app.services.document_processor.clear_progress", new_callable=AsyncMock), \
-            patch("app.services.document_processor.compute_parent_windows"), \
-            patch("app.services.document_processor.set_wiki_pending", new_callable=AsyncMock) as mock_set_wiki_pending, \
-            patch("app.services.wiki_store.WikiStore") as mock_wiki_store_cls:
+            ),
+            patch.object(processor, "_get_chunk_enrichment_service", return_value=None),
+            patch(
+                "app.services.document_processor.compute_file_hash",
+                return_value="abc12345",
+            ),
+            patch("app.services.document_processor.set_phase", new_callable=AsyncMock),
+            patch(
+                "app.services.document_processor.clear_progress", new_callable=AsyncMock
+            ),
+            patch("app.services.document_processor.compute_parent_windows"),
+            patch(
+                "app.services.document_processor.set_wiki_pending",
+                new_callable=AsyncMock,
+            ) as mock_set_wiki_pending,
+            patch("app.services.wiki_store.WikiStore") as mock_wiki_store_cls,
+        ):
             mock_wiki_store = MagicMock()
             mock_wiki_store.create_job.return_value = None
             mock_wiki_store_cls.return_value = mock_wiki_store
@@ -376,9 +446,13 @@ class TestWikiJobEnqueueGatingProcessExistingFile(unittest.IsolatedAsyncioTestCa
 
     async def test_process_existing_file_respects_gating(self):
         """process_existing_file must NOT create a wiki job when wiki_enabled=False."""
-        mock_settings = _make_mock_settings(wiki_enabled=False, wiki_compile_on_ingest=True)
+        mock_settings = _make_mock_settings(
+            wiki_enabled=False, wiki_compile_on_ingest=True
+        )
 
-        _mock_set_wiki_pending, mock_wiki_store = await self._run_process_existing_file(mock_settings)
+        _mock_set_wiki_pending, mock_wiki_store = await self._run_process_existing_file(
+            mock_settings
+        )
 
         # create_job should NOT have been called because wiki_enabled=False
         mock_wiki_store.create_job.assert_not_called()
@@ -390,9 +464,13 @@ class TestWikiJobEnqueueGatingProcessExistingFile(unittest.IsolatedAsyncioTestCa
         (C3-4): the negative-on-compile-flag case was previously untested for
         ``process_existing_file``.
         """
-        mock_settings = _make_mock_settings(wiki_enabled=True, wiki_compile_on_ingest=False)
+        mock_settings = _make_mock_settings(
+            wiki_enabled=True, wiki_compile_on_ingest=False
+        )
 
-        _mock_set_wiki_pending, mock_wiki_store = await self._run_process_existing_file(mock_settings)
+        _mock_set_wiki_pending, mock_wiki_store = await self._run_process_existing_file(
+            mock_settings
+        )
 
         # create_job should NOT have been called because wiki_compile_on_ingest=False
         mock_wiki_store.create_job.assert_not_called()
@@ -405,9 +483,13 @@ class TestWikiJobEnqueueGatingProcessExistingFile(unittest.IsolatedAsyncioTestCa
         ``process_existing_file``, so a regression that broke only this path's
         enqueue would have shipped green.
         """
-        mock_settings = _make_mock_settings(wiki_enabled=True, wiki_compile_on_ingest=True)
+        mock_settings = _make_mock_settings(
+            wiki_enabled=True, wiki_compile_on_ingest=True
+        )
 
-        _mock_set_wiki_pending, mock_wiki_store = await self._run_process_existing_file(mock_settings)
+        _mock_set_wiki_pending, mock_wiki_store = await self._run_process_existing_file(
+            mock_settings
+        )
 
         # create_job SHOULD have been called once with the file's file_id (789)
         mock_wiki_store.create_job.assert_called_once()
@@ -419,5 +501,5 @@ class TestWikiJobEnqueueGatingProcessExistingFile(unittest.IsolatedAsyncioTestCa
         )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()

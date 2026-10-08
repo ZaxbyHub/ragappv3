@@ -149,7 +149,9 @@ class RecordingVectorStore:
         return sum(1 for r in self.stored_chunks if r.get("file_id") == file_id)
 
     # -- retrieval surface ----------------------------------------------
-    async def search(self, embedding, limit=10, filter_expr=None, vault_id=None, **kwargs):
+    async def search(
+        self, embedding, limit=10, filter_expr=None, vault_id=None, **kwargs
+    ):
         results = []
         for r in self.stored_chunks:
             raw_meta = r.get("metadata")
@@ -307,12 +309,12 @@ class TestRealWorkerEndToEnd(unittest.TestCase):
 
         # AC6 CHECK — the real ingestion worker did not persist the uploaded
         # document to terminal 'indexed' status.
-        print("AC6 CHECK: FAIL — real worker did not persist the uploaded document to 'indexed'")
+        print(
+            "AC6 CHECK: FAIL — real worker did not persist the uploaded document to 'indexed'"
+        )
         self.assertEqual(_files_row_status(db_path, file_id), "indexed")
         self.assertGreater(len(self.store.stored_chunks), 0)
-        stored_text = " ".join(
-            str(r.get("text", "")) for r in self.store.stored_chunks
-        )
+        stored_text = " ".join(str(r.get("text", "")) for r in self.store.stored_chunks)
         self.assertIn(_MARKER_TABLE, stored_text)
 
         # Chat-route retrieval against the actually-stored chunks: a real
@@ -344,7 +346,9 @@ class TestRealWorkerEndToEnd(unittest.TestCase):
 
         # AC6 CHECK — the stored chunk text is not retrievable through the
         # chat route (no sources cite the ingested marker table).
-        print("AC6 CHECK: FAIL — stored chunk text not retrievable through the chat route")
+        print(
+            "AC6 CHECK: FAIL — stored chunk text not retrievable through the chat route"
+        )
         sources = chat_data.get("sources", [])
         self.assertGreater(len(sources), 0)
 
@@ -443,7 +447,9 @@ class TestDeleteRealRowAndVectors(unittest.TestCase):
         first = client.delete(f"/api/documents/{file_id}")
         # AC6 CHECK — the DELETE route did not succeed against a real
         # row/vector fixture (status or body contract broken).
-        print("AC6 CHECK: FAIL — DELETE route did not succeed against the real row/vector fixture")
+        print(
+            "AC6 CHECK: FAIL — DELETE route did not succeed against the real row/vector fixture"
+        )
         self.assertEqual(first.status_code, 200, first.text)
         body = first.json()
         self.assertEqual(body["file_id"], file_id)
@@ -451,7 +457,9 @@ class TestDeleteRealRowAndVectors(unittest.TestCase):
 
         # AC6 CHECK — the files row survived the DELETE (a no-op delete
         # mutant would pass the 200 above but fail here).
-        print("AC6 CHECK: FAIL — the files row survived the DELETE (no-op delete mutant)")
+        print(
+            "AC6 CHECK: FAIL — the files row survived the DELETE (no-op delete mutant)"
+        )
         self.assertIsNone(_files_row_status(db_path, file_id))
 
         # The vector purge ran against the store for THIS file.

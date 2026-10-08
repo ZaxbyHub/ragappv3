@@ -54,11 +54,13 @@ from .document_progress import (
     PHASE_CHUNKING,
     PHASE_EMBEDDING,
     PHASE_EXTRACTING_TEXT,
+    PHASE_INDEXED,
     PHASE_PARSING,
     PHASE_WRITING_INDEX,
     clear_progress,
     set_phase,
     set_wiki_pending,
+    write_session,
 )
 from .embedding_cache import (
     embedding_cache_key,
@@ -69,21 +71,26 @@ from .embedding_cache import (
 from .embedding_cache import (
     store as embedding_cache_store,
 )
-from .embeddings import EmbeddingService
+from .embeddings import EmbeddingError, EmbeddingService
 from .image_processor import ImageProcessingResult, _process_image_sync
 from .image_search import build_searchable_text
 from .llm_client import LLMClient
 from .schema_parser import SchemaParser
-from .vector_store import VectorStore
+from .vector_store import VectorStore, VectorStoreError
 
 logger = logging.getLogger(__name__)
 
 _STAGE_TIMING_FIELDS = (
+    # issue #704 (T1-25-KR-16): enrichment_ms was declared here but never
+    # recorded — enrichment runs post-index in the enrichment worker, outside
+    # every ingest entry point's measured span, so the logged value was
+    # structurally always 0.0. Dropped rather than wired: wiring it inside
+    # the entry points would time "deciding whether to enqueue enrichment",
+    # not enrichment itself.
     "parse_ms",
     "chunk_ms",
     "contextual_ms",
     "parent_window_ms",
-    "enrichment_ms",
     "embedding_ms",
     "vector_write_ms",
     "optimize_ms",
@@ -248,7 +255,9 @@ def is_enrichment_enabled_for_file(file_id: int, vault_id: int) -> bool:
             return is_enrichment_enabled_for_vault(vault_id)
 
         file_override = row["file_override"] if isinstance(row, sqlite3.Row) else row[0]
-        vault_override = row["vault_override"] if isinstance(row, sqlite3.Row) else row[1]
+        vault_override = (
+            row["vault_override"] if isinstance(row, sqlite3.Row) else row[1]
+        )
 
         # File-level override takes precedence
         if file_override is not None:
@@ -351,6 +360,12 @@ INGEST_ERROR_PARSE_TIMEOUT = "PARSE_TIMEOUT"
 INGEST_ERROR_FILE_MISSING = "FILE_MISSING"
 INGEST_ERROR_ENRICHMENT_FAILED = "ENRICHMENT_FAILED"
 INGEST_ERROR_DIMENSION_CHANGED = "DIMENSION_CHANGED"
+# issue #704 (T1-25-KR-02): an embedding-provider outage and a vector-store
+# rejection are not parse failures; persisting them as PARSE_FAILED hid the
+# actual failure provenance from operators (#562 asked for distinguishable
+# codes).
+INGEST_ERROR_EMBEDDING_FAILED = "EMBEDDING_FAILED"
+INGEST_ERROR_VECTOR_STORE_FAILED = "VECTOR_STORE_FAILED"
 
 _INGEST_ERROR_REASONS = {
     INGEST_ERROR_PARSER_UNAVAILABLE: "document parser is unavailable",
@@ -363,6 +378,12 @@ _INGEST_ERROR_REASONS = {
     INGEST_ERROR_DIMENSION_CHANGED: (
         "embedding dimension changed; run the admin reindex job to migrate "
         "the index, then re-ingest this file"
+    ),
+    INGEST_ERROR_EMBEDDING_FAILED: (
+        "the embedding provider failed; the document itself parsed correctly"
+    ),
+    INGEST_ERROR_VECTOR_STORE_FAILED: (
+        "the vector store rejected the write; the document itself parsed correctly"
     ),
 }
 
@@ -394,6 +415,14 @@ def classify_ingest_error(exc: BaseException) -> str:
             return code
         if isinstance(current, EmbeddingDimensionChangedError):
             return INGEST_ERROR_DIMENSION_CHANGED
+        # issue #704 (T1-25-KR-02): failure PROVENANCE must survive
+        # classification — an embedding outage or a vector-store rejection is
+        # not a parse failure, and an operator has to tell them apart from the
+        # persisted code alone. Dimension changes stay first (more specific).
+        if isinstance(current, EmbeddingError):
+            return INGEST_ERROR_EMBEDDING_FAILED
+        if isinstance(current, VectorStoreError):
+            return INGEST_ERROR_VECTOR_STORE_FAILED
         if isinstance(current, ImportError):
             return INGEST_ERROR_PARSER_UNAVAILABLE
         if isinstance(current, (FileNotFoundError, FileExistsError)):
@@ -508,9 +537,7 @@ class SpreadsheetParser:
 
         for _, row in sample_df.iterrows():
             row_parts = [
-                f"{col}: {val}"
-                for col, val in zip(headers, row)
-                if str(val).strip()
+                f"{col}: {val}" for col, val in zip(headers, row) if str(val).strip()
             ]
             if row_parts:
                 row_text = " | ".join(row_parts)
@@ -541,7 +568,12 @@ class SpreadsheetParser:
         return result
 
     def _split_row_by_columns(
-        self, col_val_pairs: List[tuple], sheet_name: str, row_idx: int, total_rows: int, total_col_count: int
+        self,
+        col_val_pairs: List[tuple],
+        sheet_name: str,
+        row_idx: int,
+        total_rows: int,
+        total_col_count: int,
     ) -> List[dict]:
         """
         Split a single wide row into multiple chunks by column groups.
@@ -575,7 +607,7 @@ class SpreadsheetParser:
                     # Single column exceeds limit: truncate this cell's value only
                     header_section = f"Sheet: {sheet_name}\nColumns: {col}\n\n{col}: "
                     available = self.MAX_CHUNK_CHARS - len(header_section)
-                    truncated_val = val[:max(0, available)]
+                    truncated_val = val[: max(0, available)]
                     logger.warning(
                         "Column '%s' value exceeds max chunk size; truncating from %d to %d chars.",
                         col,
@@ -606,12 +638,16 @@ class SpreadsheetParser:
                         )
                     )
                     # Validate that single column fits by itself before starting new group
-                    single_col_text = self._build_column_group_text([(col, val)], sheet_name)
+                    single_col_text = self._build_column_group_text(
+                        [(col, val)], sheet_name
+                    )
                     if len(single_col_text) > self.MAX_CHUNK_CHARS:
                         # Single column exceeds limit; truncate it
-                        header_section = f"Sheet: {sheet_name}\nColumns: {col}\n\n{col}: "
+                        header_section = (
+                            f"Sheet: {sheet_name}\nColumns: {col}\n\n{col}: "
+                        )
                         available = self.MAX_CHUNK_CHARS - len(header_section)
-                        truncated_val = val[:max(0, available)]
+                        truncated_val = val[: max(0, available)]
                         logger.warning(
                             "Column '%s' value exceeds max chunk size; truncating from %d to %d chars.",
                             col,
@@ -640,7 +676,9 @@ class SpreadsheetParser:
 
         return result
 
-    def _build_column_group_text(self, col_val_pairs: List[tuple], sheet_name: str) -> str:
+    def _build_column_group_text(
+        self, col_val_pairs: List[tuple], sheet_name: str
+    ) -> str:
         """Build the text for a column group (helper for _split_row_by_columns)."""
         col_str = " | ".join(col for col, _ in col_val_pairs)
         row_str = " | ".join(f"{col}: {val}" for col, val in col_val_pairs)
@@ -700,7 +738,7 @@ class SpreadsheetParser:
                 try:
                     text = data.decode(codec)
                 except UnicodeDecodeError:
-                    data = data[len(bom):]
+                    data = data[len(bom) :]
                 break
         if text is None:
             try:
@@ -725,18 +763,21 @@ class SpreadsheetParser:
         """
         with open(file_path, "rb") as handle:
             sniff = handle.read(cls._CSV_SNIFF_BYTES)
-        if not any(sniff.startswith(bom) for bom, _ in cls._CSV_BOM_CODECS) and b"\x00" not in sniff:
+        if (
+            not any(sniff.startswith(bom) for bom, _ in cls._CSV_BOM_CODECS)
+            and b"\x00" not in sniff
+        ):
             try:
-                return pd.read_csv(
-                    file_path, dtype=str, keep_default_na=False
-                ).fillna("")
+                return pd.read_csv(file_path, dtype=str, keep_default_na=False).fillna(
+                    ""
+                )
             except UnicodeDecodeError:
                 pass
         data = Path(file_path).read_bytes()
         text = cls._decode_csv_buffer(data)
-        return pd.read_csv(
-            io.StringIO(text), dtype=str, keep_default_na=False
-        ).fillna("")
+        return pd.read_csv(io.StringIO(text), dtype=str, keep_default_na=False).fillna(
+            ""
+        )
 
     def parse(self, file_path: str) -> List[dict]:
         """
@@ -799,9 +840,7 @@ class SpreadsheetParser:
 
         for sheet_name, df in sheets.items():
             if df.empty:
-                logger.debug(
-                    "Skipping empty sheet '%s' in '%s'", sheet_name, file_path
-                )
+                logger.debug("Skipping empty sheet '%s' in '%s'", sheet_name, file_path)
                 continue
 
             headers = list(df.columns)
@@ -810,7 +849,7 @@ class SpreadsheetParser:
 
             # Calculate adaptive row count for this sheet based on column width
             rows_per_chunk = self._calculate_adaptive_rows_per_chunk(
-                df.iloc[0:min(5, total_rows)], headers, sheet_name
+                df.iloc[0 : min(5, total_rows)], headers, sheet_name
             )
 
             start = 0
@@ -838,8 +877,7 @@ class SpreadsheetParser:
 
                 chunk_text = (
                     f"Sheet: {sheet_name}\n"
-                    f"Columns: {header_str}\n\n"
-                    + "\n".join(rows_text_lines)
+                    f"Columns: {header_str}\n\n" + "\n".join(rows_text_lines)
                 )
 
                 # If chunk exceeds max chars, reduce row count or split by columns
@@ -910,6 +948,7 @@ class IngestCancelledError(Exception):
 # shared default executor (T1-25-S2-08). The process-wide registry below
 # refuses a new parse of a file whose previous parse has not finished.
 
+
 class ParseDeadlineError(DocumentProcessingError):
     """A parse exceeded settings.document_parse_timeout (issue #703).
 
@@ -930,9 +969,7 @@ class ParseInFlightError(DocumentProcessingError):
 # Parses run on a dedicated bounded pool rather than the shared default
 # executor, so slow parses queue here instead of delaying the route/DB
 # to_thread work that also shares the default pool (issue #703 review).
-_PARSE_EXECUTOR = ThreadPoolExecutor(
-    max_workers=4, thread_name_prefix="ingest-parse"
-)
+_PARSE_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ingest-parse")
 
 _PARSE_IN_FLIGHT_GUARD = threading.Lock()
 _PARSE_IN_FLIGHT: set = set()
@@ -1154,23 +1191,15 @@ class DocumentProcessor:
         """Yield a pooled connection under the shared SQLite write permit.
 
         Single safe pattern for every status/commit write (issue #513 W1 /
-        RC-3): the permit is acquired FIRST, but the fallible pool checkout
-        happens INSIDE the region protected by the permit's finally, so a
-        ``get_connection`` failure (RuntimeError on exhaustion/closed pool)
-        can never leak the permit. The connection is released in a nested
-        finally before the permit is released in the outer finally.
+        RC-3). Since issue #704 (T1-25-KR-09) this delegates to
+        ``document_progress.write_session`` — the one implementation of the
+        permit-first / checkout-inside / release-order pattern — which the
+        module-level progress helpers (``set_phase`` / ``clear_progress`` /
+        ``set_wiki_pending``) also route through, so every committing writer
+        in this file family serializes on the same permit.
         """
-        if self._write_semaphore:
-            await self._write_semaphore.acquire()
-        try:
-            conn = await self.pool.get_connection_async()
-            try:
-                yield conn
-            finally:
-                self.pool.release_connection(conn)
-        finally:
-            if self._write_semaphore:
-                self._write_semaphore.release()
+        async with write_session(self.pool, self._write_semaphore) as conn:
+            yield conn
 
     def _get_chunker(self) -> "SemanticChunker | EmbeddingSemanticChunker":
         """Return a chunker configured with the live settings values.
@@ -1399,7 +1428,9 @@ class DocumentProcessor:
         )
 
     @staticmethod
-    def _search_text_with_enrichment(chunk: ProcessedChunk, enrichment: Any = None) -> str:
+    def _search_text_with_enrichment(
+        chunk: ProcessedChunk, enrichment: Any = None
+    ) -> str:
         """Build bounded searchable text while preserving raw evidence separately."""
         parts = [chunk.text]
         if not DocumentProcessor._enrichment_has_content(enrichment):
@@ -1433,8 +1464,7 @@ class DocumentProcessor:
 
         selected_chunks = self._select_chunks_for_enrichment(chunks)
         return [
-            (chunk, self._build_chunk_uid(file_id, chunk))
-            for chunk in selected_chunks
+            (chunk, self._build_chunk_uid(file_id, chunk)) for chunk in selected_chunks
         ]
 
     def _select_chunks_for_enrichment(
@@ -1445,14 +1475,19 @@ class DocumentProcessor:
             return []
 
         default_chunks = [
-            chunk for chunk in chunks if chunk.metadata.get("chunk_scale", "default") == "default"
+            chunk
+            for chunk in chunks
+            if chunk.metadata.get("chunk_scale", "default") == "default"
         ]
         source_chunks = default_chunks or chunks
         selected: List[ProcessedChunk] = []
         seen: set[tuple[Any, ...]] = set()
 
         for chunk in source_chunks:
-            if chunk.parent_window_start is not None and chunk.parent_window_end is not None:
+            if (
+                chunk.parent_window_start is not None
+                and chunk.parent_window_end is not None
+            ):
                 key = ("parent", chunk.parent_window_start, chunk.parent_window_end)
             elif default_chunks:
                 key = ("default", chunk.chunk_index)
@@ -1469,15 +1504,19 @@ class DocumentProcessor:
             selected.append(chunk)
         return selected
 
-    def set_enrichment_status(
+    async def set_enrichment_status(
         self, file_id: int, status: str, error_message: Optional[str] = None
     ) -> Optional[str]:
-        """Update enrichment state without changing files.status."""
+        """Update enrichment state without changing files.status.
+
+        Async since issue #704 (T1-25-KR-09): the write routes through the
+        shared write permit like every other committing write.
+        """
         if self.pool is None:
             return None
         updated_at = datetime.now(UTC).isoformat()
         try:
-            with self.pool.connection() as conn:
+            async with write_session(self.pool, self._write_semaphore) as conn:
                 conn.execute(
                     """
                     UPDATE files
@@ -1491,23 +1530,25 @@ class DocumentProcessor:
                 conn.commit()
             return updated_at
         except sqlite3.Error as e:
-            logger.warning("Failed to update enrichment status for file_id=%s: %s", file_id, e)
+            logger.warning(
+                "Failed to update enrichment status for file_id=%s: %s", file_id, e
+            )
             return None
 
-    def _set_enrichment_status(
+    async def _set_enrichment_status(
         self, file_id: int, status: str, error_message: Optional[str] = None
     ) -> Optional[str]:
         """Backward-compatible wrapper for tests and older call sites."""
-        return self.set_enrichment_status(file_id, status, error_message)
+        return await self.set_enrichment_status(file_id, status, error_message)
 
-    def _mark_enrichment_stale_if_current_job(
+    async def _mark_enrichment_stale_if_current_job(
         self, file_id: int, processing_started_at: Optional[str]
     ) -> None:
         """Finish the same enrichment attempt if it becomes stale mid-flight."""
         if self.pool is None or processing_started_at is None:
             return
         try:
-            with self.pool.connection() as conn:
+            async with write_session(self.pool, self._write_semaphore) as conn:
                 conn.execute(
                     """
                     UPDATE files
@@ -1527,7 +1568,9 @@ class DocumentProcessor:
                 )
                 conn.commit()
         except sqlite3.Error as e:
-            logger.warning("Failed to mark stale enrichment for file_id=%s: %s", file_id, e)
+            logger.warning(
+                "Failed to mark stale enrichment for file_id=%s: %s", file_id, e
+            )
 
     def _is_enrichment_job_current(self, file_id: int, file_hash: str) -> bool:
         """Return True only if this queued enrichment still matches the live file row.
@@ -1545,7 +1588,9 @@ class DocumentProcessor:
                     (file_id,),
                 ).fetchone()
         except sqlite3.Error as e:
-            logger.warning("Failed to validate enrichment job for file_id=%s: %s", file_id, e)
+            logger.warning(
+                "Failed to validate enrichment job for file_id=%s: %s", file_id, e
+            )
             return False
 
         if row is None:
@@ -1683,9 +1728,7 @@ class DocumentProcessor:
         re-ingest), then inserts one row per failed chunk. Called inside the
         caller's transaction; does not commit.
         """
-        conn.execute(
-            "DELETE FROM failed_chunks WHERE file_id = ?", (file_id,)
-        )
+        conn.execute("DELETE FROM failed_chunks WHERE file_id = ?", (file_id,))
         for idx in sorted(failed_indices):
             if idx >= len(chunks):
                 continue
@@ -1781,9 +1824,7 @@ class DocumentProcessor:
 
         # Mirror the reupload_safe_order id branch from _build_vector_record. [N4]
         if settings.reupload_safe_order:
-            record_id = (
-                f"{file_id}_{file_hash[:8]}_{chunk_scale}_{chunk.chunk_index}"
-            )
+            record_id = f"{file_id}_{file_hash[:8]}_{chunk_scale}_{chunk.chunk_index}"
         else:
             record_id = chunk_metadata["chunk_uid"]
 
@@ -1935,8 +1976,9 @@ class DocumentProcessor:
         # skip for every other survivor (indexed/partial/error/missing).
         deletes_run = False
         try:
-            conn = await self.pool.get_connection_async()
-            try:
+            # issue #704 (T1-25-KR-09): permit-held session like every other
+            # committing write in this file.
+            async with self._write_session() as conn:
                 row = conn.execute(
                     "SELECT status FROM files WHERE id = ?", (file_id,)
                 ).fetchone()
@@ -1970,8 +2012,6 @@ class DocumentProcessor:
                         "DELETE FROM failed_chunks WHERE file_id = ?", (file_id,)
                     )
                 conn.commit()
-            finally:
-                self.pool.release_connection(conn)
         except Exception:  # noqa: BLE001 — cleanup must never raise
             logger.warning(
                 "cancel cleanup: sqlite cleanup failed for file_id=%s",
@@ -2001,8 +2041,7 @@ class DocumentProcessor:
                 exc_info=True,
             )
             try:
-                conn = await self.pool.get_connection_async()
-                try:
+                async with self._write_session() as conn:
                     # INSERT .. SELECT: a no-op when the row itself is gone.
                     conn.execute(
                         "INSERT OR IGNORE INTO vector_delete_pending "
@@ -2011,8 +2050,6 @@ class DocumentProcessor:
                         (file_id,),
                     )
                     conn.commit()
-                finally:
-                    self.pool.release_connection(conn)
             except Exception:  # noqa: BLE001 — cleanup must never raise
                 logger.warning(
                     "cancel cleanup: vector_delete_pending insert failed for "
@@ -2120,8 +2157,9 @@ class DocumentProcessor:
             return None
 
     async def _retry_failed_chunks_locked(self, file_id: int) -> Dict[str, Any]:
-        conn = await self.pool.get_connection_async()
-        try:
+        # issue #704 (T1-25-KR-09): permit-held session like every other
+        # committing write in this file.
+        async with self._write_session() as conn:
             row = conn.execute(
                 "SELECT id, vault_id, file_hash, status, chunks_failed, "
                 "chunk_count, active_generation_hash FROM files WHERE id = ?",
@@ -2144,8 +2182,6 @@ class DocumentProcessor:
                 "FROM failed_chunks WHERE file_id = ? ORDER BY chunk_index",
                 (file_id,),
             ).fetchall()
-        finally:
-            self.pool.release_connection(conn)
 
         if not stored_rows:
             return {
@@ -2234,62 +2270,66 @@ class DocumentProcessor:
         if records or already_indexed_ids:
             live_count = await self._live_vector_count(file_id)
 
-        conn = await self.pool.get_connection_async()
-        try:
-            clear_ids = already_indexed_ids + succeeded_row_ids
-            if clear_ids:
-                placeholders = ",".join("?" * len(clear_ids))
-                conn.execute(
-                    f"DELETE FROM failed_chunks WHERE id IN ({placeholders})",
-                    clear_ids,
-                )
-            for _chunk_index, reason, row_id in still_failing:
-                conn.execute(
-                    "UPDATE failed_chunks SET attempts = attempts + 1, error_reason = ? "
-                    "WHERE id = ?",
-                    (reason, row_id),
-                )
-            if records or already_indexed_ids:
-                if live_count is None:
-                    # Derived from the ACTUAL rows cleared/written by this
-                    # attempt: cleared rows are (reconciled + written) vectors
-                    # that are now live but were never counted (they had failed
-                    # embedding), so the derived count converges to the same
-                    # value the live count would report.
-                    live_count = (
-                        previous_chunk_count
-                        + len(already_indexed_ids)
-                        + len(records)
+        async with self._write_session() as conn:
+            try:
+                clear_ids = already_indexed_ids + succeeded_row_ids
+                if clear_ids:
+                    placeholders = ",".join("?" * len(clear_ids))
+                    conn.execute(
+                        f"DELETE FROM failed_chunks WHERE id IN ({placeholders})",
+                        clear_ids,
                     )
-                conn.execute(
-                    "UPDATE files SET chunks_failed = "
-                    "(SELECT COUNT(*) FROM failed_chunks WHERE file_id = ?), "
-                    "partial_embeddings = (SELECT CASE WHEN COUNT(*) > 0 "
-                    "THEN 1 ELSE 0 END FROM failed_chunks WHERE file_id = ?), "
-                    "chunk_count = ? "
-                    "WHERE id = ?",
-                    (file_id, file_id, int(live_count), file_id),
+                for _chunk_index, reason, row_id in still_failing:
+                    conn.execute(
+                        "UPDATE failed_chunks SET attempts = attempts + 1, error_reason = ? "
+                        "WHERE id = ?",
+                        (reason, row_id),
+                    )
+                if records or already_indexed_ids:
+                    if live_count is None:
+                        # Derived from the ACTUAL rows cleared/written by this
+                        # attempt: cleared rows are (reconciled + written) vectors
+                        # that are now live but were never counted (they had failed
+                        # embedding), so the derived count converges to the same
+                        # value the live count would report.
+                        live_count = (
+                            previous_chunk_count
+                            + len(already_indexed_ids)
+                            + len(records)
+                        )
+                    # issue #704 (T1-25-K-02): a recovered file must leave the
+                    # 'partial' state — when no failed chunks remain, promote the
+                    # row back to 'indexed' so it rejoins unscoped retrieval and
+                    # KMS. Any still-failing chunk keeps the current status.
+                    conn.execute(
+                        "UPDATE files SET chunks_failed = "
+                        "(SELECT COUNT(*) FROM failed_chunks WHERE file_id = ?), "
+                        "partial_embeddings = (SELECT CASE WHEN COUNT(*) > 0 "
+                        "THEN 1 ELSE 0 END FROM failed_chunks WHERE file_id = ?), "
+                        "chunk_count = ?, "
+                        "status = CASE WHEN (SELECT COUNT(*) FROM failed_chunks "
+                        "WHERE file_id = ?) = 0 THEN 'indexed' ELSE status END "
+                        "WHERE id = ?",
+                        (file_id, file_id, int(live_count), file_id, file_id),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE files SET chunks_failed = "
+                        "(SELECT COUNT(*) FROM failed_chunks WHERE file_id = ?), "
+                        "partial_embeddings = (SELECT CASE WHEN COUNT(*) > 0 "
+                        "THEN 1 ELSE 0 END FROM failed_chunks WHERE file_id = ?) "
+                        "WHERE id = ?",
+                        (file_id, file_id, file_id),
+                    )
+                conn.commit()
+            except sqlite3.Error:
+                conn.rollback()
+                logger.warning(
+                    "SQLite cleanup after retry of file %d failed; LanceDB already "
+                    "updated. Next retry will reconcile.",
+                    file_id,
+                    exc_info=True,
                 )
-            else:
-                conn.execute(
-                    "UPDATE files SET chunks_failed = "
-                    "(SELECT COUNT(*) FROM failed_chunks WHERE file_id = ?), "
-                    "partial_embeddings = (SELECT CASE WHEN COUNT(*) > 0 "
-                    "THEN 1 ELSE 0 END FROM failed_chunks WHERE file_id = ?) "
-                    "WHERE id = ?",
-                    (file_id, file_id, file_id),
-                )
-            conn.commit()
-        except sqlite3.Error:
-            conn.rollback()
-            logger.warning(
-                "SQLite cleanup after retry of file %d failed; LanceDB already "
-                "updated. Next retry will reconcile.",
-                file_id,
-                exc_info=True,
-            )
-        finally:
-            self.pool.release_connection(conn)
 
         return {
             "retried": len(to_embed),
@@ -2316,7 +2356,10 @@ class DocumentProcessor:
                 await delete_by_id(old_id)
 
     def should_enqueue_enrichment(
-        self, chunks: List[ProcessedChunk], vault_id: Optional[int] = None, file_id: Optional[int] = None
+        self,
+        chunks: List[ProcessedChunk],
+        vault_id: Optional[int] = None,
+        file_id: Optional[int] = None,
     ) -> bool:
         """Return True when post-index enrichment is configured and possible.
 
@@ -2362,8 +2405,7 @@ class DocumentProcessor:
         # cache row (a one-time cold cache — the table is a rebuildable
         # cache, not user data).
         model_revision = (
-            f"{type(service).__name__}:{provider_mode}"
-            f":{settings.ollama_embedding_url}"
+            f"{type(service).__name__}:{provider_mode}:{settings.ollama_embedding_url}"
         )
         prefix_obj = getattr(service, "embedding_doc_prefix", None)
         doc_prefix = (
@@ -2372,16 +2414,12 @@ class DocumentProcessor:
             else str(settings.embedding_doc_prefix or "")
         )
         try:
-            dim = int(
-                getattr(service, "embedding_dim", None) or settings.embedding_dim
-            )
+            dim = int(getattr(service, "embedding_dim", None) or settings.embedding_dim)
         except (TypeError, ValueError):
             dim = int(settings.embedding_dim)
         return model_id, model_revision, doc_prefix, dim
 
-    async def _embed_with_cache(
-        self, texts: List[str]
-    ) -> List[List[float]]:
+    async def _embed_with_cache(self, texts: List[str]) -> List[List[float]]:
         """Embed texts through the persistent embedding cache (issue #513 W24).
 
         Cache hits (byte-identical text under the same immutable embedding
@@ -2455,16 +2493,16 @@ class DocumentProcessor:
 
         enrichment_service = self._get_chunk_enrichment_service(vault_id, file_id)
         if enrichment_service is None:
-            self.set_enrichment_status(file_id, "complete")
+            await self.set_enrichment_status(file_id, "complete")
             return
 
         candidates = self._candidate_chunks_for_enrichment(file_id, chunks)
         if not candidates:
-            self.set_enrichment_status(file_id, "complete")
+            await self.set_enrichment_status(file_id, "complete")
             return
 
         source_filename = Path(file_path).name
-        processing_started_at = self.set_enrichment_status(file_id, "processing")
+        processing_started_at = await self.set_enrichment_status(file_id, "processing")
         try:
             chunk_dicts = [
                 {
@@ -2483,7 +2521,7 @@ class DocumentProcessor:
                 if self._enrichment_has_content(enrichment)
             }
             if not enrichment_by_uid:
-                self.set_enrichment_status(file_id, "complete")
+                await self.set_enrichment_status(file_id, "complete")
                 return
 
             enrichment_texts = [
@@ -2522,25 +2560,36 @@ class DocumentProcessor:
             for record in records:
                 record["id"] = f"{record['id']}__enriched"
             if not self._is_enrichment_job_current(file_id, file_hash):
-                self._mark_enrichment_stale_if_current_job(file_id, processing_started_at)
+                await self._mark_enrichment_stale_if_current_job(
+                    file_id, processing_started_at
+                )
                 return
             await self._swap_in_enriched_vector_records(records, old_ids)
             await self._verify_vector_rows_visible(file_id)
-            self.set_enrichment_status(file_id, "complete")
+            await self.set_enrichment_status(file_id, "complete")
         except asyncio.CancelledError:
-            self.set_enrichment_status(
-                file_id,
-                "error",
-                "Enrichment job cancelled before completion",
-            )
+            # Shielded: the status write must survive a pending cancellation
+            # (the sync-era write always completed; issue #704 made it async).
+            try:
+                await asyncio.shield(
+                    self.set_enrichment_status(
+                        file_id,
+                        "error",
+                        "Enrichment job cancelled before completion",
+                    )
+                )
+            except asyncio.CancelledError:
+                pass
             raise
         except Exception as e:
             # Raw exception stays in the server log; enrichment_error is
             # returned to vault readers (issue #562). The document is already
             # parsed and indexed at this point, so a parse-failure code would
             # be contradictory — use the dedicated enrichment code.
-            logger.warning("Post-index enrichment failed for file_id=%s: %s", file_id, e)
-            self.set_enrichment_status(
+            logger.warning(
+                "Post-index enrichment failed for file_id=%s: %s", file_id, e
+            )
+            await self.set_enrichment_status(
                 file_id, "error", format_ingest_error(INGEST_ERROR_ENRICHMENT_FAILED)
             )
 
@@ -2614,9 +2663,6 @@ class DocumentProcessor:
         )
         return cursor.fetchone()
 
-    @with_retry(
-        max_attempts=3, retry_exceptions=(sqlite3.Error,), raise_last_exception=True
-    )
     def _insert_or_get_file_record(
         self,
         file_path: str,
@@ -2629,6 +2675,13 @@ class DocumentProcessor:
     ) -> int:
         """
         Insert a new file record or update existing one, returning the file ID.
+
+        Transient ``sqlite3.Error`` failures (lock contention) are retried by
+        the decorated single-attempt body; only after the retries are exhausted
+        is the surviving error rolled back and re-typed here, so the external
+        contract (``DocumentProcessingError`` after exhaustion) is unchanged
+        (issue #704, T1-25-KR-11 — the retry previously could never fire
+        because the interior except re-typed the error first).
 
         Args:
             file_path: Path to the file
@@ -2645,6 +2698,40 @@ class DocumentProcessor:
         Raises:
             DocumentProcessingError: If database operations fail
         """
+        try:
+            return self._insert_or_get_file_record_once(
+                file_path,
+                file_hash,
+                conn,
+                vault_id,
+                source=source,
+                email_subject=email_subject,
+                email_sender=email_sender,
+            )
+        except sqlite3.Error as e:
+            # Retries already exhausted by the decorator (raise_last_exception
+            # re-raises the last raw sqlite3.Error). Keep the caller-facing
+            # conversion OUTSIDE the retried unit.
+            conn.rollback()
+            raise DocumentProcessingError(
+                f"Database error while inserting/updating file record for "
+                f"'{file_path}': {str(e)}"
+            ) from e
+
+    @with_retry(
+        max_attempts=3, retry_exceptions=(sqlite3.Error,), raise_last_exception=True
+    )
+    def _insert_or_get_file_record_once(
+        self,
+        file_path: str,
+        file_hash: str,
+        conn: sqlite3.Connection,
+        vault_id: int,
+        source: str = "upload",
+        email_subject: Optional[str] = None,
+        email_sender: Optional[str] = None,
+    ) -> int:
+        """Single attempt; sqlite3.Error propagates so @with_retry can retry."""
         path = Path(file_path)
         file_name = path.name
         file_size = path.stat().st_size
@@ -2698,9 +2785,7 @@ class DocumentProcessor:
                 # makes a same-content overwrite a no-op.
                 from app.services.draft_evidence_freshness import on_document_changed
 
-                on_document_changed(
-                    conn, file_id=file_id, new_content_sha256=file_hash
-                )
+                on_document_changed(conn, file_id=file_id, new_content_sha256=file_hash)
             else:
                 # Insert new record
                 cursor = conn.execute(
@@ -2740,12 +2825,11 @@ class DocumentProcessor:
                     "A file with the same content already exists in this vault"
                 ) from e
             raise DocumentProcessingError(f"Database integrity error: {e}") from e
-        except sqlite3.Error as e:
-            # Rollback on error and wrap in DocumentProcessingError
-            conn.rollback()
-            raise DocumentProcessingError(
-                f"Database error while inserting/updating file record for '{path_str}': {str(e)}"
-            ) from e
+        # No `except sqlite3.Error` here by design (issue #704, T1-25-KR-11):
+        # re-typing the transient error inside the retried body hid it from
+        # @with_retry, so "database is locked" failed on the first attempt
+        # forever. Raw sqlite3.Error propagates to the decorator; the public
+        # wrapper re-types whatever survives the retries.
 
     @with_retry(
         max_attempts=3, retry_exceptions=(sqlite3.Error,), raise_last_exception=True
@@ -3009,30 +3093,75 @@ class DocumentProcessor:
         vault_id: int,
         generation_hash: str,
         parsed: ParsedDocument,
+        conn: Optional[sqlite3.Connection] = None,
     ) -> None:
         """Persist a generation's atoms/assets/stage rows (issue #460).
+
+        Production callers pass ``conn`` from a ``_write_session`` so the
+        publish runs under the shared write permit. The ``conn=None`` path
+        (tests and legacy sync callers only) checks out its own pooled
+        connection — a sync function cannot acquire the asyncio permit — and
+        releases it iff it created it; a passed-in connection is never
+        released here (its session owns it).
+
+        See ``_publish_artifacts_on`` for the transaction and failure
+        contract.
+        """
+        own_conn = conn is None
+        if own_conn:
+            conn = self.pool.get_connection()
+        try:
+            self._publish_artifacts_on(conn, file_id, vault_id, generation_hash, parsed)
+        finally:
+            if own_conn:
+                self.pool.release_connection(conn)
+
+    def _publish_artifacts_on(
+        self,
+        conn: sqlite3.Connection,
+        file_id: int,
+        vault_id: int,
+        generation_hash: str,
+        parsed: ParsedDocument,
+    ) -> None:
+        """Publish one generation on the caller's connection (issue #460/#704).
 
         Called only after the new vectors are durable, so old-generation atom and
         asset rows are retired (and their filesystem bytes tombstoned) only once
         the replacement searchable state is in place — never before. The write
-        and the old-generation retirement share one short transaction on a pooled
-        connection (no connection is held during parse/embed/vector work).
+        and the old-generation retirement share one short transaction (no
+        connection is held during parse/embed/vector work).
 
-        A failure here is non-fatal to retrieval: the transaction rolls back (no
-        partial rows), any asset bytes already written for this generation are
-        tombstoned for the sweep, and a later reprocess/reindex republishes.
+        A failure here is non-fatal to retrieval when it happens during the
+        publish transaction itself: the transaction rolls back (no partial
+        rows), any asset bytes already written for this generation are
+        tombstoned for the sweep, and a durable ``stage='publish',
+        status='failed_retryable'`` row in ``ingestion_stage_states`` records
+        the stranded generation — the marker a later reprocess/reindex
+        republish resolves and the one operators/sweeps can query (issue
+        #704, T1-25-KR-14: the old docstring implied a scheduled republish
+        that nothing scheduled). A materialization (disk I/O) failure before
+        any rows were published re-raises so the caller marks the file
+        errored; the marker is recorded on that path too.
         """
         atoms = list(parsed.atoms)
         asset_specs = list(parsed.assets)
         if not atoms and not asset_specs:
             return
         stage_states = [
-            {"stage": "parse", "status": "succeeded", "attempts": 1,
-             "completed_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")},
-            {"stage": "publish", "status": "succeeded", "attempts": 1,
-             "completed_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")},
+            {
+                "stage": "parse",
+                "status": "succeeded",
+                "attempts": 1,
+                "completed_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            },
+            {
+                "stage": "publish",
+                "status": "succeeded",
+                "attempts": 1,
+                "completed_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            },
         ]
-        conn = self.pool.get_connection()
         materialized: List[DocumentAsset] = []
         publish_reached = False
         try:
@@ -3077,8 +3206,15 @@ class DocumentProcessor:
             # so orphaned bytes require operator reconciliation (issue #460,
             # final-critic findings 2/4).
             conn.rollback()
-            self._tombstone_materialized_assets(
-                materialized, file_id, vault_id, generation_hash
+            self._tombstone_materialized_assets_on(
+                conn, materialized, file_id, vault_id, generation_hash
+            )
+            # issue #704 (T1-25-KR-14): the rollback above discarded the publish
+            # stage rows too, so record the durable failure marker now — this
+            # generation's atoms/assets are stranded until a reprocess/reindex
+            # republishes, and nothing else in the DB says so.
+            self._record_publish_failure(
+                conn, file_id, vault_id, generation_hash, parsed
             )
             if not publish_reached:
                 # A materialization (disk I/O) failure occurred before any rows
@@ -3086,7 +3222,45 @@ class DocumentProcessor:
                 # re-raise so the caller marks the file errored.
                 raise
         finally:
-            self.pool.release_connection(conn)
+            # Nothing to release here: the caller's session (or the wrapper's
+            # own_conn finally) owns the connection.
+            pass
+
+    def _record_publish_failure(
+        self,
+        conn: sqlite3.Connection,
+        file_id: int,
+        vault_id: int,
+        generation_hash: str,
+        parsed: ParsedDocument,
+    ) -> None:
+        """Best-effort durable marker for a compensated publish failure.
+
+        Never raises into the caller's compensation path; a marker failure is
+        logged at ERROR so the stranded generation still surfaces to the
+        operator (issue #460 reconciliation + issue #704 T1-25-KR-14).
+        """
+        try:
+            artifact_store.record_stage_failure(
+                conn,
+                file_id=file_id,
+                vault_id=vault_id,
+                generation_hash=generation_hash,
+                parser_fingerprint=parsed.parser_fingerprint,
+                implementation_version=str(ATOM_SCHEMA_VERSION),
+                stage="publish",
+                status="failed_retryable",
+                error_code="PUBLISH_COMPENSATED",
+            )
+        except Exception as marker_exc:  # noqa: BLE001 - advisory marker only
+            logger.error(
+                "Failed to record publish-failure marker for file_id=%s "
+                "gen=%s; the generation's artifacts are stranded and require "
+                "operator reconciliation: %s",
+                file_id,
+                generation_hash,
+                marker_exc,
+            )
 
     def _tombstone_materialized_assets(
         self,
@@ -3094,16 +3268,41 @@ class DocumentProcessor:
         file_id: int,
         vault_id: int,
         generation_hash: str,
+        conn: Optional[sqlite3.Connection] = None,
     ) -> None:
         """Enqueue cleanup of asset bytes written for a failed publish attempt.
 
+        Connection ownership matches ``_publish_artifacts``: production
+        callers pass the session-held conn; ``conn=None`` (tests/legacy)
+        checks out and releases its own.
+        """
+        own_conn = conn is None
+        if own_conn:
+            conn = self.pool.get_connection()
+        try:
+            self._tombstone_materialized_assets_on(
+                conn, materialized, file_id, vault_id, generation_hash
+            )
+        finally:
+            if own_conn:
+                self.pool.release_connection(conn)
+
+    def _tombstone_materialized_assets_on(
+        self,
+        conn: sqlite3.Connection,
+        materialized: List[DocumentAsset],
+        file_id: int,
+        vault_id: int,
+        generation_hash: str,
+    ) -> None:
+        """Tombstone on the caller's connection (issue #460 review, PRR-004/012).
+
         No-op when nothing was materialized. A compensation failure is surfaced
         at ERROR (not silently swallowed) so orphaned bytes require operator
-        reconciliation (issue #460 review, PRR-004/012).
+        reconciliation.
         """
         if not materialized:
             return
-        conn = self.pool.get_connection()
         try:
             artifact_store.enqueue_asset_cleanup(
                 conn,
@@ -3123,8 +3322,6 @@ class DocumentProcessor:
                 generation_hash,
                 exc2,
             )
-        finally:
-            self.pool.release_connection(conn)
 
     def _materialize_asset(
         self,
@@ -3265,13 +3462,18 @@ class DocumentProcessor:
             raise error
 
         if not searchable_text or not searchable_text.strip():
+            # issue #704 (T1-25-KR-06): the caller raises DocumentProcessingError
+            # on the empty chunk list ("No extractable content found"), so the
+            # file ends 'error' — the old wording claimed it was recorded.
             logger.warning(
-                "Image %s produced no searchable text. "
-                "File recorded but not searchable.",
+                "Image %s produced no searchable text; the ingest will fail "
+                "with a no-extractable-content error.",
                 file_path,
             )
-            return [], searchable_text, ParsedDocument(
-                atoms=(), parser_fingerprint=parser_fingerprint
+            return (
+                [],
+                searchable_text,
+                ParsedDocument(atoms=(), parser_fingerprint=parser_fingerprint),
             )
 
         # Plan the raster asset (opaque id + confined path) WITHOUT touching
@@ -3541,9 +3743,13 @@ class DocumentProcessor:
                 f"Ingest cancelled after vector write (file_id={file_id})",
                 file_id=file_id,
             )
-        final_status = (
-            partial_final_status if chunks_failed_count > 0 else "indexed"
-        )
+        final_status = partial_final_status if chunks_failed_count > 0 else "indexed"
+        # issue #704 (T1-25-S2-10): parsed_text commits in the SAME
+        # transaction as the terminal status. Previously it rode a second,
+        # best-effort session whose failure was swallowed — a kill between
+        # the two left an 'indexed' row carrying the previous generation's
+        # parsed_text.
+        _full_text = document_text or ""
         async with self._write_session() as conn:
             # Reviewer finding (Phase 4.5, Important): the route can accept a
             # cancel (guarded UPDATE rowcount 1, 200 returned) in the window
@@ -3553,21 +3759,25 @@ class DocumentProcessor:
             # on the row still being pre-terminal, exactly like the route's
             # own flip; rowcount 0 means the cancel won the race and the
             # generation must unwind so the 200 survives.
-            landed = conn.execute(
-                "UPDATE files SET status = ?, chunk_count = ?, chunks_failed = ?, "
-                "partial_embeddings = ?, error_message = NULL, "
-                "processed_at = ?, modified_at = ? "
-                "WHERE id = ? AND status IN ('pending', 'processing')",
-                (
-                    final_status,
-                    len(chunks),
-                    chunks_failed_count,
-                    1 if chunks_failed_count > 0 else 0,
-                    datetime.now(UTC).isoformat(),
-                    datetime.now(UTC).isoformat(),
-                    file_id,
-                ),
-            ).rowcount > 0
+            landed = (
+                conn.execute(
+                    "UPDATE files SET status = ?, chunk_count = ?, chunks_failed = ?, "
+                    "partial_embeddings = ?, error_message = NULL, parsed_text = ?, "
+                    "processed_at = ?, modified_at = ? "
+                    "WHERE id = ? AND status IN ('pending', 'processing')",
+                    (
+                        final_status,
+                        len(chunks),
+                        chunks_failed_count,
+                        1 if chunks_failed_count > 0 else 0,
+                        _full_text,
+                        datetime.now(UTC).isoformat(),
+                        datetime.now(UTC).isoformat(),
+                        file_id,
+                    ),
+                ).rowcount
+                > 0
+            )
             if landed:
                 conn.commit()
             else:
@@ -3580,14 +3790,14 @@ class DocumentProcessor:
             # WITHOUT deleting the survivor's vectors/atoms.
             reread = None
             try:
-                conn = await self.pool.get_connection_async()
-                try:
+                # issue #704 (T1-25-KR-09): read-only, but still a checkout in
+                # a committing function — route it through the write permit
+                # like every other checkout this file makes.
+                async with self._write_session() as conn:
                     row = conn.execute(
                         "SELECT status FROM files WHERE id = ?", (file_id,)
                     ).fetchone()
                     reread = None if row is None else row["status"]
-                finally:
-                    self.pool.release_connection(conn)
             except sqlite3.Error:
                 reread = None
             if reread == "cancelled":
@@ -3612,24 +3822,24 @@ class DocumentProcessor:
             # record-only contract).
             return False
 
-        # Save full parsed text and enqueue wiki compile job (fire-and-forget;
-        # non-blocking). parsed_text is stored on the files row so manual
+        # Enqueue wiki compile job (fire-and-forget; non-blocking). parsed_text
+        # is stored on the files row (committed with the status above) so manual
         # recompile can use it without re-parsing the original file.
         try:
             from app.services.wiki_store import WikiStore as _WikiStore
 
-            _full_text = document_text or ""
+            # issue #704 (T1-25-S2-10/T1-25-KR-09): everything in this block
+            # runs inline on ONE session-held connection — the wiki_pending
+            # set/clear previously took nested raw checkouts, which would
+            # deadlock once every checkout routes through the shared write
+            # permit.
             async with self._write_session() as conn:
-                if _full_text:
-                    conn.execute(
-                        "UPDATE files SET parsed_text = ? WHERE id = ?",
-                        (_full_text, file_id),
-                    )
-                    conn.commit()
                 # Mark wiki_pending=1 synchronously BEFORE the wiki job is created
                 # so the status route can report wiki_status="pending" during the
                 # brief window before the wiki_compile_jobs row exists.
-                await set_wiki_pending(self.pool, file_id, True)
+                conn.execute(
+                    "UPDATE files SET wiki_pending = 1 WHERE id = ?", (file_id,)
+                )
                 if settings.wiki_enabled and settings.wiki_compile_on_ingest:
                     _WikiStore(conn).create_job(
                         vault_id=vault_id,
@@ -3639,7 +3849,10 @@ class DocumentProcessor:
                     )
                 # Always clear the transient marker after the decision is made,
                 # regardless of whether a job row was created.
-                await set_wiki_pending(self.pool, file_id, False)
+                conn.execute(
+                    "UPDATE files SET wiki_pending = 0 WHERE id = ?", (file_id,)
+                )
+                conn.commit()
         except Exception as _wiki_exc:
             logger.warning(
                 "Failed to enqueue wiki ingest job for file_id=%d: %s",
@@ -3647,6 +3860,8 @@ class DocumentProcessor:
                 _wiki_exc,
             )
             # If wiki enqueue failed, don't leave wiki_pending=1 hanging.
+            # (Outside every session here, so its own permit-held checkout is
+            # safe.)
             await set_wiki_pending(self.pool, file_id, False)
 
         # Enqueue a KMS compile job so the document becomes a user-curatable,
@@ -3749,6 +3964,11 @@ class DocumentProcessor:
         stage_timings = _new_stage_timings()
 
         # Phase 1: Quick DB operations - get connection, do quick ops, release
+        # issue #704 (T1-25-S2-04): remember the row's terminal status before
+        # the insert resets it to 'pending' — a failure that predates any
+        # vector write must restore it instead of demoting to 'error'.
+        pre_ingest_status: Optional[str] = None
+        prior_generation_disturbed = False
         async with self._write_session() as conn:
             # Check for duplicates
             duplicate = self._check_duplicate(file_hash, conn, vault_id)
@@ -3756,6 +3976,12 @@ class DocumentProcessor:
                 raise DuplicateFileError(
                     f"File with hash {file_hash} already indexed as '{duplicate['file_path']}'"
                 )
+
+            prior_row = conn.execute(
+                "SELECT status FROM files WHERE file_path = ?", (str(file_path),)
+            ).fetchone()
+            if prior_row is not None:
+                pre_ingest_status = prior_row["status"]
 
             # Insert or get file record (handles its own commit)
             file_id = self._insert_or_get_file_record(
@@ -3770,15 +3996,17 @@ class DocumentProcessor:
 
             # Update status to processing. Guarded (issue #783 review
             # PRR-013): same cancel-reversion guard as the upload path.
-            flipped = conn.execute(
-                "UPDATE files SET status = 'processing', modified_at = ? "
-                "WHERE id = ? AND status != 'cancelled'",
-                (datetime.now(UTC).isoformat(), file_id),
-            ).rowcount > 0
+            flipped = (
+                conn.execute(
+                    "UPDATE files SET status = 'processing', modified_at = ? "
+                    "WHERE id = ? AND status != 'cancelled'",
+                    (datetime.now(UTC).isoformat(), file_id),
+                ).rowcount
+                > 0
+            )
             if not flipped:
                 raise IngestCancelledError(
-                    f"Ingest cancelled before processing started "
-                    f"(file_id={file_id})",
+                    f"Ingest cancelled before processing started (file_id={file_id})",
                     file_id=file_id,
                 )
             # Clear stale failed-chunk records from a prior partial-failure ingest
@@ -3834,7 +4062,11 @@ class DocumentProcessor:
                 _add_elapsed_ms(stage_timings, "parse_ms", stage_started_at)
             else:
                 chunks, document_text, parsed = await self._process_document_file(
-                    file_path, file_id, stage_timings, generation_hash, parser_fingerprint
+                    file_path,
+                    file_id,
+                    stage_timings,
+                    generation_hash,
+                    parser_fingerprint,
                 )
 
             await set_phase(
@@ -3876,7 +4108,9 @@ class DocumentProcessor:
                             str(e),
                         )
                     finally:
-                        _add_elapsed_ms(stage_timings, "contextual_ms", stage_started_at)
+                        _add_elapsed_ms(
+                            stage_timings, "contextual_ms", stage_started_at
+                        )
                 # else: _get_contextual_chunker already logged a warning if needed
 
             # Compute parent window offsets for small-to-big retrieval (Issue #12)
@@ -3998,7 +4232,9 @@ class DocumentProcessor:
                         logger.warning(
                             "Embedding partial failure: %d/%d chunks failed (%.0f%%). "
                             "Failed batch indices: %s",
-                            len(failed_chunk_indices), len(chunks), failure_pct,
+                            len(failed_chunk_indices),
+                            len(chunks),
+                            failure_pct,
                             failed_batch_indices,
                         )
 
@@ -4006,8 +4242,8 @@ class DocumentProcessor:
                         # (Issue #396) BEFORE dropping them from the kept list.
                         # Uses the ORIGINAL chunks list (indices are into it).
                         try:
-                            _fc_conn = await self.pool.get_connection_async()
-                            try:
+                            # issue #704 (T1-25-KR-09): permit-held session.
+                            async with self._write_session() as _fc_conn:
                                 self._persist_failed_chunks(
                                     file_id,
                                     chunks,
@@ -4016,8 +4252,6 @@ class DocumentProcessor:
                                     _fc_conn,
                                 )
                                 _fc_conn.commit()
-                            finally:
-                                self.pool.release_connection(_fc_conn)
                         except sqlite3.Error:
                             logger.warning(
                                 "Failed to persist failed-chunk identity for file %d "
@@ -4040,15 +4274,13 @@ class DocumentProcessor:
                             # path). Clear them so the only recovery is the
                             # whole-document retry, which re-ingests from scratch.
                             try:
-                                _abort_conn = await self.pool.get_connection_async()
-                                try:
+                                # issue #704 (T1-25-KR-09): permit-held session.
+                                async with self._write_session() as _abort_conn:
                                     _abort_conn.execute(
                                         "DELETE FROM failed_chunks WHERE file_id = ?",
                                         (file_id,),
                                     )
                                     _abort_conn.commit()
-                                finally:
-                                    self.pool.release_connection(_abort_conn)
                             except sqlite3.Error:
                                 logger.warning(
                                     "Could not clear failed_chunks rows before "
@@ -4059,7 +4291,12 @@ class DocumentProcessor:
                                 )
                             raise DocumentProcessingError(
                                 "Too many embedding failures: %d/%d chunks failed (%.0f%%). "
-                                "Aborting document ingest." % (len(failed_chunk_indices), original_chunk_count, failure_pct),
+                                "Aborting document ingest."
+                                % (
+                                    len(failed_chunk_indices),
+                                    original_chunk_count,
+                                    failure_pct,
+                                ),
                             )
                     else:
                         embeddings = batch_embeddings
@@ -4140,6 +4377,10 @@ class DocumentProcessor:
                     # error, before any write) instead of failing mid-write
                     # inside add_chunks against the old-dimension live table.
                     await self._ensure_live_dimension_compatible(embedding_dim)
+                    # issue #704 (T1-25-S2-04): from here on the vector store is
+                    # being mutated — a later failure may legitimately land
+                    # 'error', because the prior generation may be gone.
+                    prior_generation_disturbed = True
                     await self.vector_store.init_table(embedding_dim)
                     _add_elapsed_ms(stage_timings, "vector_write_ms", stage_started_at)
 
@@ -4159,7 +4400,9 @@ class DocumentProcessor:
                         deleted = await self.vector_store.delete_old_generation_by_file(
                             str(file_id), file_hash[:8]
                         )
-                        _add_elapsed_ms(stage_timings, "vector_write_ms", stage_started_at)
+                        _add_elapsed_ms(
+                            stage_timings, "vector_write_ms", stage_started_at
+                        )
                         if deleted > 0:
                             logger.info(
                                 "Safe re-upload: deleted %d old-generation chunks for file_id=%s",
@@ -4170,7 +4413,9 @@ class DocumentProcessor:
                         # Legacy: delete-then-insert (not crash-safe, kept for compat)
                         stage_started_at = time.monotonic()
                         await self.vector_store.delete_by_file(str(file_id))
-                        _add_elapsed_ms(stage_timings, "vector_write_ms", stage_started_at)
+                        _add_elapsed_ms(
+                            stage_timings, "vector_write_ms", stage_started_at
+                        )
                         vector_timings = await self.vector_store.add_chunks(records)
                         _merge_vector_timings(stage_timings, vector_timings)
 
@@ -4180,9 +4425,16 @@ class DocumentProcessor:
                     # Publish the generation's atoms/assets/stage rows after the
                     # new vectors are durable, so old-generation atoms/assets are
                     # retired only once the replacement retrieval state is in place.
-                    self._publish_artifacts(
-                        file_id, vault_id, generation_hash, parsed
-                    )
+                    # issue #704 (T1-25-KR-09): the publish runs under the
+                    # shared write permit like every other committing write.
+                    async with self._write_session() as _pub_conn:
+                        self._publish_artifacts(
+                            file_id,
+                            vault_id,
+                            generation_hash,
+                            parsed,
+                            conn=_pub_conn,
+                        )
         except IngestCancelledError:
             # issue #783: a user cancellation is not a failure — never write
             # status='error' over the terminal 'cancelled'; the transport's
@@ -4202,6 +4454,47 @@ class DocumentProcessor:
                     file_id=file_id,
                 ) from e
             safe_error = redact_ingest_error(e)
+            restored = False
+            if not prior_generation_disturbed and pre_ingest_status in (
+                "indexed",
+                "partial",
+            ):
+                # issue #704 (T1-25-S2-04): the failure predated any write to
+                # the vector store, so the prior generation's vectors are
+                # intact — restore the prior terminal status instead of
+                # demoting the row to 'error'. Guarded so a concurrent
+                # cancel/settle still wins the race.
+                async with self._write_session() as conn:
+                    restored = (
+                        conn.execute(
+                            "UPDATE files SET status = ?, error_message = ?, "
+                            "modified_at = ? WHERE id = ? "
+                            "AND status IN ('pending', 'processing')",
+                            (
+                                pre_ingest_status,
+                                safe_error,
+                                datetime.now(UTC).isoformat(),
+                                file_id,
+                            ),
+                        ).rowcount
+                        > 0
+                    )
+                    conn.commit()
+                if restored:
+                    logger.warning(
+                        "Ingestion failed for file_id=%s before any vector "
+                        "write; restored prior status %r (issue #704)",
+                        file_id,
+                        pre_ingest_status,
+                    )
+                    await set_phase(
+                        self.pool,
+                        file_id,
+                        phase=PHASE_INDEXED,
+                        message="Last ingest attempt failed before replacing "
+                        "the index; the previous version remains searchable",
+                    )
+                    raise
             # Phase 3: Update status to error on failure
             # Get connection again to update error status
             async with self._write_session() as conn:
@@ -4243,7 +4536,7 @@ class DocumentProcessor:
 
         logger.info(
             "Ingestion stage timings file_id=%s file_name=%s parse_ms=%.1f chunk_ms=%.1f "
-            "contextual_ms=%.1f parent_window_ms=%.1f enrichment_ms=%.1f "
+            "contextual_ms=%.1f parent_window_ms=%.1f "
             "embedding_ms=%.1f vector_write_ms=%.1f optimize_ms=%.1f sqlite_finalize_ms=%.1f",
             file_id,
             Path(file_path).name,
@@ -4251,7 +4544,6 @@ class DocumentProcessor:
             stage_timings["chunk_ms"],
             stage_timings["contextual_ms"],
             stage_timings["parent_window_ms"],
-            stage_timings["enrichment_ms"],
             stage_timings["embedding_ms"],
             stage_timings["vector_write_ms"],
             stage_timings["optimize_ms"],
@@ -4362,16 +4654,28 @@ class DocumentProcessor:
         # skipped — the route already ran it before inserting the row.
         # Guarded (issue #783 review PRR-013): a route-accepted cancel must
         # not be silently reverted to 'processing' for the whole parse span.
+        # issue #704 (T1-25-S2-04): capture the row's pre-ingest terminal
+        # status in the SAME session, atomically before the flip — a failure
+        # that predates any vector write restores it instead of demoting.
+        pre_ingest_status: Optional[str] = None
+        prior_generation_disturbed = False
         async with self._write_session() as conn:
-            flipped = conn.execute(
-                "UPDATE files SET status = 'processing', modified_at = ? "
-                "WHERE id = ? AND status != 'cancelled'",
-                (datetime.now(UTC).isoformat(), file_id),
-            ).rowcount > 0
+            status_row = conn.execute(
+                "SELECT status FROM files WHERE id = ?", (file_id,)
+            ).fetchone()
+            if status_row is not None:
+                pre_ingest_status = status_row["status"]
+            flipped = (
+                conn.execute(
+                    "UPDATE files SET status = 'processing', modified_at = ? "
+                    "WHERE id = ? AND status != 'cancelled'",
+                    (datetime.now(UTC).isoformat(), file_id),
+                ).rowcount
+                > 0
+            )
             if not flipped:
                 raise IngestCancelledError(
-                    f"Ingest cancelled before processing started "
-                    f"(file_id={file_id})",
+                    f"Ingest cancelled before processing started (file_id={file_id})",
                     file_id=file_id,
                 )
             # Clear stale failed-chunk records from a prior partial-failure ingest
@@ -4432,7 +4736,11 @@ class DocumentProcessor:
                 _add_elapsed_ms(stage_timings, "parse_ms", stage_started_at)
             else:
                 chunks, document_text, parsed = await self._process_document_file(
-                    file_path, file_id, stage_timings, generation_hash, parser_fingerprint
+                    file_path,
+                    file_id,
+                    stage_timings,
+                    generation_hash,
+                    parser_fingerprint,
                 )
 
             await set_phase(
@@ -4461,7 +4769,9 @@ class DocumentProcessor:
                             str(e),
                         )
                     finally:
-                        _add_elapsed_ms(stage_timings, "contextual_ms", stage_started_at)
+                        _add_elapsed_ms(
+                            stage_timings, "contextual_ms", stage_started_at
+                        )
 
             if document_text and chunks:
                 stage_started_at = time.monotonic()
@@ -4559,7 +4869,9 @@ class DocumentProcessor:
                         logger.warning(
                             "Embedding partial failure: %d/%d chunks failed (%.0f%%). "
                             "Failed batch indices: %s",
-                            len(failed_chunk_indices), len(chunks), failure_pct,
+                            len(failed_chunk_indices),
+                            len(chunks),
+                            failure_pct,
                             failed_batch_indices,
                         )
 
@@ -4567,8 +4879,8 @@ class DocumentProcessor:
                         # (Issue #396) BEFORE dropping them from the kept list.
                         # Uses the ORIGINAL chunks list (indices are into it).
                         try:
-                            _fc_conn = await self.pool.get_connection_async()
-                            try:
+                            # issue #704 (T1-25-KR-09): permit-held session.
+                            async with self._write_session() as _fc_conn:
                                 self._persist_failed_chunks(
                                     file_id,
                                     chunks,
@@ -4577,8 +4889,6 @@ class DocumentProcessor:
                                     _fc_conn,
                                 )
                                 _fc_conn.commit()
-                            finally:
-                                self.pool.release_connection(_fc_conn)
                         except sqlite3.Error:
                             logger.warning(
                                 "Failed to persist failed-chunk identity for file %d "
@@ -4601,15 +4911,13 @@ class DocumentProcessor:
                             # path). Clear them so the only recovery is the
                             # whole-document retry, which re-ingests from scratch.
                             try:
-                                _abort_conn = await self.pool.get_connection_async()
-                                try:
+                                # issue #704 (T1-25-KR-09): permit-held session.
+                                async with self._write_session() as _abort_conn:
                                     _abort_conn.execute(
                                         "DELETE FROM failed_chunks WHERE file_id = ?",
                                         (file_id,),
                                     )
                                     _abort_conn.commit()
-                                finally:
-                                    self.pool.release_connection(_abort_conn)
                             except sqlite3.Error:
                                 logger.warning(
                                     "Could not clear failed_chunks rows before "
@@ -4620,7 +4928,12 @@ class DocumentProcessor:
                                 )
                             raise DocumentProcessingError(
                                 "Too many embedding failures: %d/%d chunks failed (%.0f%%). "
-                                "Aborting document ingest." % (len(failed_chunk_indices), original_chunk_count, failure_pct),
+                                "Aborting document ingest."
+                                % (
+                                    len(failed_chunk_indices),
+                                    original_chunk_count,
+                                    failure_pct,
+                                ),
                             )
                     else:
                         embeddings = batch_embeddings
@@ -4708,17 +5021,15 @@ class DocumentProcessor:
                     # whole corpus into its staged rebuild before its own
                     # validated swap).
                     if vector_target is None:
-                        await self._ensure_live_dimension_compatible(
-                            embedding_dim
-                        )
+                        await self._ensure_live_dimension_compatible(embedding_dim)
                     _target_kwargs = (
-                        {"target": vector_target}
-                        if vector_target is not None
-                        else {}
+                        {"target": vector_target} if vector_target is not None else {}
                     )
-                    await self.vector_store.init_table(
-                        embedding_dim, **_target_kwargs
-                    )
+                    # issue #704 (T1-25-S2-04): the vector store is being
+                    # mutated from here — a later failure may legitimately
+                    # land 'error' because the prior generation may be gone.
+                    prior_generation_disturbed = True
+                    await self.vector_store.init_table(embedding_dim, **_target_kwargs)
                     _add_elapsed_ms(stage_timings, "vector_write_ms", stage_started_at)
 
                     if settings.reupload_safe_order:
@@ -4737,7 +5048,9 @@ class DocumentProcessor:
                         deleted = await self.vector_store.delete_old_generation_by_file(
                             str(file_id), file_hash[:8], **_target_kwargs
                         )
-                        _add_elapsed_ms(stage_timings, "vector_write_ms", stage_started_at)
+                        _add_elapsed_ms(
+                            stage_timings, "vector_write_ms", stage_started_at
+                        )
                         if deleted > 0:
                             logger.info(
                                 "Safe re-upload: deleted %d old-generation chunks for file_id=%s",
@@ -4749,7 +5062,9 @@ class DocumentProcessor:
                         await self.vector_store.delete_by_file(
                             str(file_id), **_target_kwargs
                         )
-                        _add_elapsed_ms(stage_timings, "vector_write_ms", stage_started_at)
+                        _add_elapsed_ms(
+                            stage_timings, "vector_write_ms", stage_started_at
+                        )
                         vector_timings = await self.vector_store.add_chunks(
                             records, **_target_kwargs
                         )
@@ -4762,9 +5077,16 @@ class DocumentProcessor:
 
                     # Publish the generation's atoms/assets/stage rows after the
                     # new vectors are durable (issue #460).
-                    self._publish_artifacts(
-                        file_id, vault_id, generation_hash, parsed
-                    )
+                    # issue #704 (T1-25-KR-09): the publish runs under the
+                    # shared write permit like every other committing write.
+                    async with self._write_session() as _pub_conn:
+                        self._publish_artifacts(
+                            file_id,
+                            vault_id,
+                            generation_hash,
+                            parsed,
+                            conn=_pub_conn,
+                        )
         except IngestCancelledError:
             # issue #783: a user cancellation is not a failure — never write
             # status='error' over the terminal 'cancelled'; the transport's
@@ -4785,6 +5107,49 @@ class DocumentProcessor:
                     file_id=file_id,
                 ) from e
             safe_error = redact_ingest_error(e)
+            restored = False
+            if not prior_generation_disturbed and pre_ingest_status in (
+                "indexed",
+                "partial",
+            ):
+                # issue #704 (T1-25-S2-04): the failure predated any write to
+                # the vector store, so the prior generation's vectors are
+                # intact — restore the prior terminal status instead of
+                # demoting the row to 'error'. Guarded so a concurrent
+                # cancel/settle still wins the race.
+                async with self._write_session() as conn:
+                    restored = (
+                        conn.execute(
+                            "UPDATE files SET status = ?, error_message = ?, "
+                            "modified_at = ? WHERE id = ? "
+                            "AND status IN ('pending', 'processing')",
+                            (
+                                pre_ingest_status,
+                                safe_error,
+                                datetime.now(UTC).isoformat(),
+                                file_id,
+                            ),
+                        ).rowcount
+                        > 0
+                    )
+                    conn.commit()
+                if restored:
+                    logger.warning(
+                        "Existing-file ingestion failed for file_id=%s "
+                        "before any vector write; restored prior status %r "
+                        "(issue #704)",
+                        file_id,
+                        pre_ingest_status,
+                    )
+                    await set_phase(
+                        self.pool,
+                        file_id,
+                        phase=PHASE_INDEXED,
+                        message="Last re-ingest attempt failed before "
+                        "replacing the index; the previous version remains "
+                        "searchable",
+                    )
+                    raise
             async with self._write_session() as conn:
                 self._update_status(file_id, "error", conn, error_message=safe_error)
                 conn.commit()
@@ -4824,7 +5189,7 @@ class DocumentProcessor:
 
         logger.info(
             "Ingestion stage timings file_id=%s file_name=%s parse_ms=%.1f chunk_ms=%.1f "
-            "contextual_ms=%.1f parent_window_ms=%.1f enrichment_ms=%.1f "
+            "contextual_ms=%.1f parent_window_ms=%.1f "
             "embedding_ms=%.1f vector_write_ms=%.1f optimize_ms=%.1f sqlite_finalize_ms=%.1f",
             file_id,
             Path(file_path).name,
@@ -4832,7 +5197,6 @@ class DocumentProcessor:
             stage_timings["chunk_ms"],
             stage_timings["contextual_ms"],
             stage_timings["parent_window_ms"],
-            stage_timings["enrichment_ms"],
             stage_timings["embedding_ms"],
             stage_timings["vector_write_ms"],
             stage_timings["optimize_ms"],
