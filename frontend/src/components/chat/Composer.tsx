@@ -595,7 +595,7 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
         <div
           className={cn(
             "relative rounded-xl border bg-card shadow-xs transition-all duration-150",
-            "focus-within:border-primary/50 focus-within:shadow-md focus-within:shadow-primary/5",
+            "ring-offset-background focus-within:border-primary/50 focus-within:ring-2 focus-within:ring-ring focus-within:ring-offset-2 focus-within:shadow-md focus-within:shadow-primary/5",
             isStreaming ? "border-primary/30" : "border-input",
           )}
         >
@@ -608,8 +608,10 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
             onPaste={handlePaste}
             placeholder={isStreaming ? "Generating..." : "Message... (Enter to send · Shift+Enter for newline · / for commands)"}
             className={cn(
+              // Bare muted-foreground placeholder: the /60 override measured
+              // 2.45:1 on the card surface in light theme (#777/UI-R3-03).
               "min-h-[44px] max-h-[200px] resize-none border-0 bg-transparent px-4 py-3",
-              "text-sm placeholder:text-muted-foreground/60",
+              "text-sm placeholder:text-muted-foreground",
               "focus-visible:ring-0 focus-visible:ring-offset-0",
             )}
             readOnly={isStreaming}

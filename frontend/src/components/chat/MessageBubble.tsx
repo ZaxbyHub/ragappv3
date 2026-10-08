@@ -48,7 +48,7 @@ export const MessageBubble = memo(function MessageBubble({
             <div className="flex items-center gap-2 mb-2">
               {message.created_at && (
                 <time
-                  className="text-[10px] text-muted-foreground/50 opacity-0 group-hover:opacity-100 pointer-coarse:opacity-100 transition-opacity"
+                  className="text-[10px] text-muted-foreground opacity-0 group-hover:opacity-100 pointer-coarse:opacity-100 transition-opacity"
                   dateTime={message.created_at}
                   title={new Date(message.created_at).toLocaleString()}
                 >
@@ -75,7 +75,7 @@ export const MessageBubble = memo(function MessageBubble({
                 <AlertCircle className="h-4 w-4 text-destructive shrink-0 mt-0.5" aria-hidden />
                 <div>
                   <p className="text-sm font-medium text-destructive">Error</p>
-                  <p className="text-xs text-destructive/80 mt-0.5">{message.error}</p>
+                  <p className="text-xs text-destructive mt-0.5">{message.error}</p>
                 </div>
               </div>
             )}

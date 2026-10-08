@@ -151,7 +151,7 @@ export function WikiPageList({ pages, loading, onSelect, vaultId, onRefresh, has
           <Checkbox
             checked={selectedIds.length === pages.length && pages.length > 0}
             onCheckedChange={toggleSelectAll}
-            className="h-3.5 w-3.5"
+            className="h-6 w-6"
             aria-label="Select all pages"
           />
           <span className="text-xs text-muted-foreground">Select all</span>
@@ -180,7 +180,7 @@ export function WikiPageList({ pages, loading, onSelect, vaultId, onRefresh, has
                   }
                 }}
                 onClick={(e) => e.stopPropagation()}
-                className="h-3.5 w-3.5 mt-1 shrink-0"
+                className="h-6 w-6 mt-1 shrink-0"
                 aria-label={`Select ${page.title}`}
               />
               <div className="flex items-start justify-between gap-2 flex-1 min-w-0">

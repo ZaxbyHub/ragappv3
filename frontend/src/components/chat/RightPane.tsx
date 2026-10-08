@@ -259,7 +259,7 @@ function SourceListItem({
             </span>
           </div>
           {source.section && (
-            <div className="text-[11px] text-muted-foreground/80 mt-0.5 truncate">
+            <div className="text-[11px] text-muted-foreground mt-0.5 truncate">
               <span className="font-medium">§</span> {source.section}
             </div>
           )}
@@ -559,7 +559,7 @@ function SourcePreview({ source, query, onJumpToAnswer }: SourcePreviewProps) {
           )}
           {evidenceView.availability.state === "unavailable" && (
             <>
-              <span className="text-warning-foreground" role="status">
+              <span className="text-warning" role="status">
                 Showing saved excerpt — original context unavailable
               </span>
               <Button
@@ -573,7 +573,7 @@ function SourcePreview({ source, query, onJumpToAnswer }: SourcePreviewProps) {
             </>
           )}
           {documentError && (
-            <span className="text-warning-foreground">{documentError}</span>
+            <span className="text-warning">{documentError}</span>
           )}
           {source.snippet && (
             <span className="min-w-0 flex-1 truncate italic">
@@ -622,7 +622,7 @@ function SourcePreview({ source, query, onJumpToAnswer }: SourcePreviewProps) {
         <ScrollArea className="flex-1 min-h-0 rounded-sm border p-4">
           <div className="text-sm leading-relaxed whitespace-pre-wrap">
             {artifactError && (
-              <span className="text-warning-foreground">{artifactError}</span>
+              <span className="text-warning">{artifactError}</span>
             )}
             {previewContent ? (
               supportSpanRange ? (

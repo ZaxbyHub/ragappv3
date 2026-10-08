@@ -97,7 +97,11 @@ function ReasoningBlock({
       {expanded && (
         <div className="mt-1.5 rounded-md border border-primary/30 bg-primary/5 px-3 py-2">
           <p className="text-xs whitespace-pre-wrap text-muted-foreground">{text}</p>
-          <p className="mt-1.5 text-[10px] font-medium text-primary/80">
+          {/* Caption matches the sibling line above: bare text-primary
+              measured 4.44:1 on the primary/5 wash over the transcript's
+              --background in light theme (#777 sweep); muted-foreground on
+              the same wash is 5.27 light / 6.75 dark. */}
+          <p className="mt-1.5 text-[10px] font-medium text-muted-foreground">
             {`~${tokensEstimate} tokens`}
           </p>
         </div>
@@ -480,7 +484,9 @@ export function AssistantMessage({
             <AlertCircle className="h-4 w-4 text-destructive shrink-0 mt-0.5" aria-hidden />
             <div className="min-w-0">
               <p className="text-sm font-medium text-destructive">Error</p>
-              <p className="text-xs text-destructive/80 mt-0.5">{message.error}</p>
+              {/* Bare destructive token: the /80 override measured 3.02:1 on
+                  the /10 tint in light theme (#777/UI-R5-05). */}
+              <p className="text-xs text-destructive mt-0.5">{message.error}</p>
               {onRetry && (
                 <Button variant="link" size="sm" className="text-destructive text-xs h-auto p-0 mt-2" onClick={onRetry}>
                   Try again →

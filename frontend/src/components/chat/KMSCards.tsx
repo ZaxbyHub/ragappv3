@@ -37,25 +37,25 @@ function KMSCard({ kmsRef }: KMSCardProps) {
           {kmsRef.kms_label}
         </span>
         <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-1.5 flex-wrap text-xs text-success/80 mb-1">
+          <div className="flex items-center gap-1.5 flex-wrap text-xs text-foreground mb-1">
             <Library className="h-3 w-3 shrink-0" aria-hidden />
             <span className="font-semibold truncate">{kmsRef.title}</span>
             {kmsRef.source_type && (
               <>
-                <span aria-hidden className="text-success">·</span>
+                <span aria-hidden>·</span>
                 <span className="capitalize">{kmsRef.source_type}</span>
               </>
             )}
             {statusLabel && (
               <>
-                <span aria-hidden className="text-success">·</span>
+                <span aria-hidden>·</span>
                 <span className="capitalize">{statusLabel}</span>
               </>
             )}
             <button
               type="button"
               onClick={handleNavigate}
-              className="ml-auto -mr-1.5 inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-sm text-success hover:underline focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+              className="ml-auto -mr-1.5 inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-sm text-foreground hover:underline focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
               aria-label={`Open knowledge entry ${kmsRef.title}`}
             >
               <ExternalLink className="h-2.5 w-2.5" aria-hidden />
@@ -68,7 +68,7 @@ function KMSCard({ kmsRef }: KMSCardProps) {
                 <button
                   type="button"
                   onClick={() => setExpanded((v) => !v)}
-                  className="mt-1 text-[10px] text-success hover:underline flex items-center gap-0.5"
+                  className="mt-1 text-[10px] text-foreground hover:underline flex items-center gap-0.5"
                   aria-expanded={expanded}
                 >
                   {expanded ? (

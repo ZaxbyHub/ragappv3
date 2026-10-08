@@ -640,17 +640,23 @@
     
     /* Muted - Very subtle teal-gray */
     --muted: 195 10% 94%;
-    /* Darkened from 45% → 40% lightness so the token clears WCAG 1.4.3 AA
-       (4.5:1) on --background/--card in light theme (UI-A11Y-1, #294).
-       Was a marginal 4.284:1 failure at 45%. */
-    --muted-foreground: 195 10% 40%;
+    /* Darkened from 40% → 38% lightness so the token clears WCAG 1.4.3 AA
+       (4.5:1) on every surface it is drawn over — background, card, popover,
+       muted AND input (the TabsList strip) — in light theme (UI-R4-11, #777;
+       the earlier 45% → 40% fix in #294 only checked background/card). */
+    --muted-foreground: 195 10% 38%;
     
     /* Accent - Light grey with barely perceptible blue tint */
     --accent: 195 42% 86%;
     --accent-foreground: 215 15% 12%;
     
-    /* Destructive - Rose red */
-    --destructive: 345 65% 52%;
+    /* Destructive - Rose red.
+       Darkened 52% → 44% lightness so every role the token plays clears
+       WCAG AA (4.5:1): the destructive Button label at rest (/90 over
+       background, 5.10) and hover (5.93), and the token as text on card
+       (5.93), background (5.68) and its own /10 error-tint wash (4.86)
+       — UI-R2-04/UI-R5-05, #777. */
+    --destructive: 345 65% 44%;
     --destructive-foreground: 200 8% 99%;
     
     /* Borders and Inputs */
@@ -705,18 +711,29 @@
     --accent: 215 10% 30%;
     --accent-foreground: 215 10% 95%;
     
-    /* Destructive */
-    --destructive: 345 50% 58%;
-    --destructive-foreground: 200 10% 95%;
+    /* Destructive — brightened 58% → 62% lightness and given a DARK
+       foreground: no single value can pair a light foreground at >= 4.5:1
+       while also serving as text on dark surfaces (empty window, #777),
+       the same pattern dark --primary/--primary-foreground already uses.
+       62% clears AA in every role: dark-fg on token 5.55, on /10 tint
+       4.97, on /90 rest 4.70, and the token as text on card 5.18. Do not
+       put white text on this token. */
+    --destructive: 345 50% 62%;
+    --destructive-foreground: 210 12% 7%;
     
-    /* Success - Lighter green for dark backgrounds */
+    /* Success - Lighter green for dark backgrounds.
+       Foregrounds flipped white → dark (210 12% 7%): a white foreground on
+       these mid-tone greens computes 2.10-3.79:1, below AA; the dark
+       foreground gives 5.42-8.94:1. --success-foreground currently has no
+       class consumer beyond the @theme mapping; the pair is contract-
+       pinned by src/index.css.contrast.test.ts (#777). */
     --success: 142 60% 50%;
-    --success-foreground: 0 0% 100%;
-    --success-subdued: 142 45% 40%;
-    --success-subdued-foreground: 0 0% 100%;
+    --success-foreground: 210 12% 7%;
+    --success-subdued: 142 45% 42%;
+    --success-subdued-foreground: 210 12% 7%;
 
     --warning: 40 70% 55%;
-    --warning-foreground: 0 0% 100%;
+    --warning-foreground: 210 12% 7%;
 
     /* Filetype colors */
     --filetype-pdf: 0 100% 70%;
