@@ -46,7 +46,9 @@ class SchemaParser:
     name) plus one whitespace-normalized ``other_sql`` chunk per other
     top-level statement — views, inserts, indexes, procedures, ... —
     so no SQL construct is silently dropped (issue #703). Comments
-    (``--``, ``/* */``, MySQL ``#``) never become chunks, and
+    (``--``, ``/* */``) never become chunks — deliberately NOT MySQL
+    ``#`` comments, which are ambiguous with T-SQL ``#temp`` table
+    names — and
     PostgreSQL dollar-quoted bodies ($$...$$, $tag$...$tag$) stay one
     statement.
     """
@@ -297,10 +299,9 @@ class SchemaParser:
         and `...` quoted identifiers, and PostgreSQL dollar-quoted
         bodies — are content, not comments, and survive verbatim (a
         doubled quote escapes inside its span). Comment markers inside
-        comments are consumed with their comment. ``#`` runs to
-        end-of-line like ``--`` (MySQL dumps; harmless for dialects
-        where ``#`` otherwise appears inside literals, which stay
-        protected).
+        comments are consumed with their comment. MySQL ``#`` line
+        comments are deliberately NOT stripped ('#' is ambiguous with
+        T-SQL ``#temp`` table names — see the loop note).
         """
         out: List[str] = []
         i, n = 0, len(text)
@@ -336,10 +337,11 @@ class SchemaParser:
                 newline = text.find('\n', i)
                 i = n if newline == -1 else newline
                 continue
-            if ch == '#':
-                newline = text.find('\n', i)
-                i = n if newline == -1 else newline
-                continue
+            # NOTE: MySQL '#' line comments are deliberately NOT stripped:
+            # '#' is ambiguous across dialects (T-SQL #temp tables are
+            # identifiers) and silent stripping corrupted valid T-SQL
+            # (issue #703 owner review). Unstripped '#' text surfaces as
+            # other_sql content instead — noisy but never lossy.
             if ch == '/' and i + 1 < n and text[i + 1] == '*':
                 close = text.find('*/', i + 2)
                 i = n if close == -1 else close + 2
@@ -403,8 +405,8 @@ class SchemaParser:
     ) -> List[Dict[str, Any]]:
         """Extract one chunk per top-level SQL statement.
 
-        Comments are stripped (quote-aware, including MySQL ``#``) once
-        up front, the residual is split on ``;`` outside quotes and
+        Comments are stripped (quote-aware) once up front, the residual
+        is split on ``;`` outside quotes and
         dollar-quoted bodies, and each statement is classified: a
         statement whose (bounded) CREATE TABLE match covers it becomes a
         structured ``table`` chunk — original quoted spelling

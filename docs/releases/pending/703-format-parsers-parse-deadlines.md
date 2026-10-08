@@ -17,8 +17,11 @@ Workstream B PR 14 of 16 (frontier audit 20260923T174456Z, findings T1-02-K-05/-
 - The statement split is quote-aware, so a semicolon inside a `'...'`,
   `"..."`, or `` `...` `` span keeps its statement whole; PostgreSQL
   dollar-quoted bodies (`$$...$$`, `$tag$...$tag$`) stay one statement; and
-  MySQL `#` line comments are stripped alongside `--` and `/* */`.
-  Comments never become chunks — including commented-out statements — and
+  MySQL `#` line comments are deliberately NOT stripped: '#' is ambiguous
+  across dialects (T-SQL `#temp` tables are identifiers), and silently
+  stripping it corrupted valid T-SQL; `#` text surfaces as `other_sql`
+  content instead — noisy but never lossy. Comments of the stripped kinds
+  never become chunks — including commented-out statements — and
   table classification is anchored to statement start, so a "CREATE TABLE"
   inside a string literal of another statement neither splits it nor mints
   a phantom table chunk.

@@ -959,10 +959,15 @@ def _reserve_parse_slot(file_path: str) -> str:
     key = _parse_registry_key(file_path)
     with _PARSE_IN_FLIGHT_GUARD:
         if key in _PARSE_IN_FLIGHT:
-            raise ParseInFlightError(
+            error = ParseInFlightError(
                 "Another parse of this file is still in flight (a timed-out "
                 f"parse has not finished yet): {file_path}"
             )
+            # Same deadline family as the timeout itself: the refusal
+            # persists the distinct PARSE_TIMEOUT code, not a generic
+            # parse failure (issue #703 review round 6, F2).
+            error.ingest_error_code = INGEST_ERROR_PARSE_TIMEOUT
+            raise error
         _PARSE_IN_FLIGHT.add(key)
     return key
 
@@ -3166,9 +3171,10 @@ class DocumentProcessor:
         single ``IMAGE`` document atom with exact provenance, and produces a
         single chunk that flows through the standard embedding/indexing pipeline.
 
-        Graceful degradation: if image libraries are missing or the image is
-        corrupt, logs a warning and returns an empty chunk list / empty atom list
-        so the file is recorded but not searchable.
+        Failure: if image processing fails (missing OCR stack, unreadable
+        image), raises DocumentProcessingError carrying the
+        PARSER_UNAVAILABLE ingest code so the file is failed with an
+        accurate, distinguishable cause (issue #703).
 
         Args:
             file_path: Path to the image file.
@@ -3179,8 +3185,11 @@ class DocumentProcessor:
 
         Returns:
             Tuple of (list of ProcessedChunk objects, searchable document text,
-            ParsedDocument with atoms and assets). Returns ([], "", empty parsed)
-            when processing fails.
+            ParsedDocument with atoms and assets).
+
+        Raises:
+            DocumentProcessingError: When image processing fails (with the
+                PARSER_UNAVAILABLE ingest code) or the parse deadline fires.
         """
         # Route the SYNCHRONOUS image worker through the same deadline
         # wrapper as the other parsers (issue #703). The async public
@@ -3207,7 +3216,7 @@ class DocumentProcessor:
         # (a synthetic single-page element carries the OCR text), so an
         # unreadable or text-less image reveals its zero-text page in the
         # same payload that reports chunk/index state. Computed before the
-        # failure return. ocr_used records whether OCR actually
+        # failure raise. ocr_used records whether OCR actually
         # contributed — a failed image must not present itself as
         # OCR-sourced (issue #703 review).
         try:
