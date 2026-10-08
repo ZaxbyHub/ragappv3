@@ -2309,7 +2309,7 @@ class DocumentProcessor:
                         "chunk_count = ?, "
                         "status = CASE WHEN (SELECT COUNT(*) FROM failed_chunks "
                         "WHERE file_id = ?) = 0 THEN 'indexed' ELSE status END "
-                        "WHERE id = ?",
+                        "WHERE id = ? AND status IN ('indexed', 'partial')",
                         (file_id, file_id, int(live_count), file_id, file_id),
                     )
                 else:

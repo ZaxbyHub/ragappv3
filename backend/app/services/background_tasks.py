@@ -4904,13 +4904,18 @@ class BackgroundProcessor:
         # payloads are redacted, because the persisted error fields are
         # user-facing (issue #562).
         safe_error = error if isinstance(error, str) else redact_ingest_error(error)
-        # Mark file as error in database so it doesn't stay in 'processing'
+        # Mark file as error in database so it doesn't stay in 'processing'.
+        # issue #704 (T1-25-S2-04, review R1): guarded like every other
+        # terminal writer — a concurrently settled row (cancel, or an
+        # AC3-style prior-status restore that already landed) must not be
+        # demoted to 'error' by the attempt cap.
         if task.file_id is not None and self.processor.pool is not None:
             try:
                 with self.processor.pool.connection() as conn:
                     conn.execute(
                         "UPDATE files SET status='error', "
-                        "error_message=?, phase='error' WHERE id = ?",
+                        "error_message=?, phase='error' WHERE id = ? "
+                        "AND status IN ('pending', 'processing')",
                         (safe_error[:500], task.file_id),
                     )
                     conn.commit()
