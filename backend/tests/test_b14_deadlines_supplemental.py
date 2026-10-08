@@ -19,7 +19,6 @@ from app.config import settings
 from app.services import document_processor as dp
 from app.services.background_tasks import TaskItem
 from app.services.document_processor import (
-    _PARSE_EXECUTOR,
     _PARSE_IN_FLIGHT,
     _PARSE_IN_FLIGHT_GUARD,
     DocumentProcessingError,
@@ -805,3 +804,112 @@ def test_retry_delay_floors_to_timeout_for_parse_failures(tmp_path, monkeypatch)
     captured.clear()
     asyncio.run(proc._handle_failure(task, RuntimeError("ordinary")))
     assert captured["delay"] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Round-1/2 pins restored (round-7 F1-p): deleted by the feedback delta's
+# guardrail rewrite; behavioral expectations unchanged.
+# ---------------------------------------------------------------------------
+
+def test_schema_comments_with_semicolons_never_become_chunks(tmp_path):
+    """A ';' inside a comment can neither create a chunk nor merge two
+    statements: comments are stripped (quote-aware) BEFORE the residual
+    is split (implementation-review R3)."""
+    path = tmp_path / "comment_semicolons.sql"
+    path.write_text(
+        "-- note; still the same comment\n"
+        "/* block; comment */ INSERT INTO t (v) VALUES (1);\n"
+        "UPDATE t SET v = 2;\n"
+        "-- trailing; tail\n",
+        encoding="utf-8",
+    )
+    chunks = SchemaParser().parse(str(path))
+    others = [c for c in chunks if c["metadata"]["object_type"] == "other_sql"]
+    texts = [c["text"] for c in others]
+    assert len(others) == 2  # the INSERT and the UPDATE only
+    assert any("INSERT INTO t (v) VALUES (1);" == t for t in texts)
+    assert any("UPDATE t SET v = 2;" == t for t in texts)
+    assert not any("note" in t or "comment" in t or "tail" in t for t in texts)
+
+def test_schema_comment_markers_inside_literals_survive(tmp_path):
+    """-- and /* */ inside string literals are CONTENT, not comments."""
+    path = tmp_path / "literals2.sql"
+    path.write_text(
+        "INSERT INTO t (v) VALUES ('a--b; /* not a comment */');\n",
+        encoding="utf-8",
+    )
+    chunks = SchemaParser().parse(str(path))
+    assert len(chunks) == 1
+    assert chunks[0]["text"] == "INSERT INTO t (v) VALUES ('a--b; /* not a comment */');"
+
+def test_schema_commented_out_create_table_not_extracted(tmp_path):
+    """A commented-out CREATE TABLE (line style) mints no phantom table
+    chunk: comments are stripped before BOTH extraction passes
+    (implementation-review R2-1)."""
+    path = tmp_path / "commented_table.sql"
+    path.write_text(
+        "-- CREATE TABLE commented_out (id INT);\n", encoding="utf-8"
+    )
+    assert SchemaParser().parse(str(path)) == []
+
+def test_schema_block_commented_create_table_not_extracted(tmp_path):
+    """Block-style commented-out CREATE TABLE is likewise not extracted."""
+    path = tmp_path / "block_commented_table.sql"
+    path.write_text(
+        "/* CREATE TABLE block_commented (id INT); */\n", encoding="utf-8"
+    )
+    assert SchemaParser().parse(str(path)) == []
+
+def test_schema_commented_table_plus_real_statement(tmp_path):
+    """A commented-out table followed by a real statement extracts ONLY
+    the real content."""
+    path = tmp_path / "mixed_commented.sql"
+    path.write_text(
+        "-- CREATE TABLE phantom (id INT);\n"
+        "CREATE TABLE real_one (id INT);\n",
+        encoding="utf-8",
+    )
+    chunks = SchemaParser().parse(str(path))
+    tables = [c for c in chunks if c["metadata"]["object_type"] == "table"]
+    assert len(tables) == 1
+    assert tables[0]["metadata"]["table_name"] == "real_one"
+    assert "phantom" not in " ".join(c["text"] for c in chunks)
+
+def test_schema_quoted_identifiers_with_comment_markers_extract(tmp_path):
+    """Comment markers inside "..." and `...` identifiers are content:
+    the table still extracts with its original spelling (table path), and
+    an INSERT into such an identifier stays one whole statement (residual
+    path) — implementation-review round 3."""
+    path = tmp_path / "quoted_markers.sql"
+    path.write_text(
+        'CREATE TABLE "weird--name" (id INT);\n'
+        "CREATE TABLE `weird/*x*/name` (id INT);\n"
+        'INSERT INTO "weird--name" VALUES (1);\n',
+        encoding="utf-8",
+    )
+    chunks = SchemaParser().parse(str(path))
+    tables = [c for c in chunks if c["metadata"]["object_type"] == "table"]
+    inserts = [
+        c
+        for c in chunks
+        if c["metadata"]["object_type"] == "other_sql"
+        and c["metadata"]["statement_type"] == "INSERT"
+    ]
+    assert {t["metadata"]["table_name"] for t in tables} == {
+        "weird--name",
+        "weird/*x*/name",
+    }
+    assert any('CREATE TABLE "weird--name"' in t["text"] for t in tables)
+    assert len(inserts) == 1
+    assert inserts[0]["text"] == 'INSERT INTO "weird--name" VALUES (1);'
+
+def test_schema_semicolon_inside_literal_keeps_statement_whole(tmp_path):
+    """A ';' inside a single-quoted literal does not split the statement
+    (quote-aware split; supersedes the earlier boundary-approximation)."""
+    path = tmp_path / "literal_semicolon.sql"
+    path.write_text(
+        "INSERT INTO t VALUES ('a;b');\n", encoding="utf-8"
+    )
+    chunks = SchemaParser().parse(str(path))
+    assert len(chunks) == 1
+    assert chunks[0]["text"] == "INSERT INTO t VALUES ('a;b');"

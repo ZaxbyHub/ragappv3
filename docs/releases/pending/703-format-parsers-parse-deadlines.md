@@ -85,7 +85,7 @@ Workstream B PR 14 of 16 (frontier audit 20260923T174456Z, findings T1-02-K-05/-
 ## Tests
 
 - `backend/tests/test_b14_parser_deadlines.py` (frozen acceptance checks,
-  C1-C8) and `backend/tests/test_b14_deadlines_supplemental.py` (25 pins:
+  C1-C8) and `backend/tests/test_b14_deadlines_supplemental.py` (36 pins:
   image-path deadline + in-flight refusal, queued-cancel release, registry
   liveness, splitter/comment/dollar-quote/`#` edge cases, encoding-gate
   legs, statement cap, bounded-scan regression, PARSER_UNAVAILABLE and
@@ -100,6 +100,16 @@ Workstream B PR 14 of 16 (frontier audit 20260923T174456Z, findings T1-02-K-05/-
 
 - Encoding gates catch NUL-interleaved and replacement-heavy payloads;
   full charset detection (e.g. pure-GBK content whose bytes all fall in
-  cp1252's defined range) remains out of scope and indexes as mojibake.
+  cp1252's defined range) remains out of scope and indexes as mojibake,
+  and the NUL sniff samples the first 4KB (NULs appearing only after
+  that window stream through as text).
 - A parse thread that truly never returns keeps refusing that file's
-  retries until process restart.
+  retries until process restart; with the retry floor, a repeatedly
+  refusing file reaches its terminal state after roughly one
+  timeout-window wait per remaining attempt (minutes, not seconds).
+- An unterminated PostgreSQL dollar-quoted body runs to end of input
+  (SQL-correct semantics): the remainder after the opening tag is kept
+  as one statement's content.
+- Retry-delay floors interact with the attempts cap as accepted design:
+  a file whose parses keep timing out goes terminal after its attempt
+  budget with one timeout-window wait between attempts.
