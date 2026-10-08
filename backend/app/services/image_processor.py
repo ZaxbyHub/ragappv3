@@ -153,9 +153,11 @@ def _process_image_sync(file_path: str) -> ImageProcessingResult:
     """
     Synchronous implementation of image processing (blocking PIL/pytesseract).
 
-    Runs off the event loop inside :func:`process_image`. Kept private; callers
-    must use the async :func:`process_image` so the pipeline never mis-uses
-    ``asyncio.to_thread`` on an already-async function (issue #460 defect 2).
+    Runs off the event loop inside :func:`process_image`, or directly on the
+    ingest parser's dedicated bounded executor via
+    ``DocumentProcessor._parse_with_deadline`` (issue #703) — never wrapped
+    in ``asyncio.to_thread`` as an already-async function (issue #460
+    defect 2).
     """
     if not _PIL_AVAILABLE and not _pytesseract_AVAILABLE:
         return ImageProcessingResult(

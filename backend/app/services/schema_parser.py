@@ -12,16 +12,62 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
+def raise_for_suspicious_decode(text: str, *, what: str) -> None:
+    """Reject a decoded payload that is almost certainly mis-decoded.
+
+    Two gates shared by the schema and CSV decode chains (issue #703
+    review): a replacement-character ratio above 1% means the lossy
+    legacy leg mangled a non-cp1252 encoding (mojibake success is worse
+    than an honest failure), and a NUL ratio above 10% means binary
+    content or BOM-less UTF-16 leaked through as interleaved-NUL text.
+    Raises ``ValueError`` naming ``what``; callers wrap it into their
+    own parse-error type.
+    """
+    if not text:
+        return
+    n = len(text)
+    if text.count("\ufffd") * 100 > n:
+        raise ValueError(
+            f"{what} is not valid UTF-8 or a supported legacy encoding "
+            "(too many undecodable bytes)"
+        )
+    if text.count("\x00") * 10 > n:
+        raise ValueError(
+            f"{what} looks like binary content or BOM-less UTF-16, not text"
+        )
+
+
 class SchemaParser:
     """
     Parser for SQL/DDL schema files.
 
-    Extracts CREATE TABLE blocks from .sql and .ddl files,
-    capturing table names and column definitions.
+    Emits a structured chunk per CREATE TABLE block (original quoted
+    identifier spelling round-trips; metadata carries the bare table
+    name) plus one whitespace-normalized ``other_sql`` chunk per other
+    top-level statement — views, inserts, indexes, procedures, ... —
+    so no SQL construct is silently dropped (issue #703). Comments
+    (``--``, ``/* */``, MySQL ``#``) never become chunks, and
+    PostgreSQL dollar-quoted bodies ($$...$$, $tag$...$tag$) stay one
+    statement.
     """
 
     # Maximum file size in bytes (100MB)
     MAX_FILE_SIZE = 100 * 1024 * 1024
+
+    # A CREATE TABLE column block longer than this is emitted as a plain
+    # other_sql statement instead of a structured table chunk. The bound
+    # keeps the lazy capture linear-bounded per attempt (issue #703
+    # review: the unbounded DOTALL scan was quadratic on unterminated
+    # input), and a >1MB column block has no retrieval value as a
+    # "table" anyway — the content is still indexed verbatim.
+    MAX_COLUMN_BLOCK_CHARS = 1_000_000
+
+    # Upper bound on statements extracted from one file. A 100MB dump of
+    # one-INSERT-per-line statements would otherwise mint millions of
+    # chunks and overwhelm the embedding pipeline downstream (issue #703
+    # review); exceeding the cap fails the file with an accurate message
+    # instead.
+    MAX_STATEMENT_CHUNKS = 20_000
 
     # Regex pattern to match CREATE TABLE blocks.
     # Handles optional VIRTUAL keyword, IF NOT EXISTS, qualified schema
@@ -29,21 +75,23 @@ class SchemaParser:
     # 'single-quoted') for both the schema prefix and the table name —
     # bare names keep the conventional [A-Za-z_]\w* form. The terminator
     # allows whitespace/newlines between the closing ')' and the ';'
-    # (issue #513 W5 / RC-12). The non-greedy column capture stops at the
-    # FIRST ')\s*;' after each CREATE, so multi-statement files yield one
-    # match per block.
+    # (issue #513 W5 / RC-12). The column capture is bounded to
+    # MAX_COLUMN_BLOCK_CHARS so the lazy scan can never run to
+    # end-of-input on unterminated statements (the unbounded form was
+    # quadratic there).
     #
     # Capture groups:
     #   1-4: optional schema prefix (double-quoted / backticked /
     #        single-quoted / bare), each holding the prefix's inner text
     #   5-8: table name (double-quoted / backticked / single-quoted / bare),
     #        each holding the identifier's inner (unquoted) text
+    #   9:   the column block
     _QUOTED_IDENTIFIER = r'(?:"([^"]+)"|`([^`]+)`|\'([^\']+)\'|([A-Za-z_][\w$]*))'
     CREATE_TABLE_PATTERN = re.compile(
         r'CREATE\s+(?:VIRTUAL\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?'
         r'(?:' + _QUOTED_IDENTIFIER + r'\s*\.\s*)?'
         + _QUOTED_IDENTIFIER
-        + r'\s*\((.*?)\)\s*;',
+        + r'\s*\(([\s\S]{0,' + str(MAX_COLUMN_BLOCK_CHARS) + r'}?)\)\s*;',
         re.IGNORECASE | re.DOTALL
     )
 
@@ -60,39 +108,65 @@ class SchemaParser:
         (codecs.BOM_UTF16_BE, 'utf-16'),
     )
 
+    # A $-tag that opens a PostgreSQL dollar-quoted body: $$ or
+    # $tag$ where the tag starts with a letter/underscore (pg identifier
+    # rules) — a bare "$5" or "$100" is ordinary text, not a tag.
+    _DOLLAR_TAG = re.compile(r'\$\$|\$[A-Za-z_][A-Za-z_0-9]*\$')
+
     @classmethod
     def _decode(cls, data: bytes) -> str:
         """Decode schema-file bytes with a real-world encoding chain.
 
-        Order: an unambiguous BOM wins; otherwise strict UTF-8 (covering
-        plain ASCII/UTF-8 and BOM'd UTF-8); on failure a lossy cp1252
-        leg — the encoding Windows tools most commonly export — with
-        ``errors='replace'`` as the final fallback so undecodable bytes
-        degrade characters instead of failing the whole file. UTF-16
-        without a BOM is not detected (not distinguishable with
-        confidence) and remains out of scope.
+        Order: an unambiguous BOM selects its codec (a body that fails
+        that codec falls through to the legacy chain on the BOM-stripped
+        bytes rather than failing the file); otherwise strict UTF-8; on
+        failure a lossy cp1252 leg — the encoding Windows tools most
+        commonly export — with ``errors='replace'``. Every leg passes
+        through :func:`raise_for_suspicious_decode`, so a mis-decode
+        (mojibake or BOM-less UTF-16) fails with an accurate error
+        instead of indexing garbage. UTF-16 without a BOM is not
+        detected (not distinguishable with confidence) and remains out
+        of scope.
         """
         for bom, codec in cls._BOM_CODECS:
             if data.startswith(bom):
-                return data.decode(codec)
+                try:
+                    return cls._validated(data.decode(codec), what="Schema file")
+                except UnicodeDecodeError:
+                    # The BOM lied about the body (truncated/odd-length
+                    # or foreign bytes): retry the plain chain below on
+                    # the BOM-stripped bytes instead of failing the file.
+                    data = data[len(bom):]
+                    break
         try:
-            return data.decode('utf-8')
+            decoded = data.decode('utf-8')
         except UnicodeDecodeError:
-            return data.decode('cp1252', errors='replace')
+            decoded = data.decode('cp1252', errors='replace')
+        return cls._validated(decoded, what="Schema file")
+
+    @staticmethod
+    def _validated(text: str, *, what: str) -> str:
+        raise_for_suspicious_decode(text, what=what)
+        return text
 
     def parse(self, file_path: str) -> List[Dict[str, Any]]:
         """
-        Parse a SQL/DDL file and extract CREATE TABLE definitions.
+        Parse a SQL/DDL file into statement chunks.
 
         Args:
             file_path: Path to the .sql or .ddl file
 
         Returns:
             List of chunk dictionaries with 'text' and 'metadata' keys
+            (``object_type='table'`` chunks for CREATE TABLE blocks,
+            ``object_type='other_sql'`` chunks for every other
+            top-level statement)
 
         Raises:
             FileNotFoundError: If the file does not exist
-            ValueError: If the file has an invalid extension
+            ValueError: If the file has an invalid extension, exceeds
+                the size limit, cannot be decoded accurately, or
+                exceeds MAX_STATEMENT_CHUNKS
         """
         path = Path(file_path)
 
@@ -204,13 +278,29 @@ class SchemaParser:
     _QUOTE_CLOSER = {"'": "'", '"': '"', '`': '`'}
 
     @classmethod
-    def _strip_comments(cls, text: str) -> str:
-        """Remove -- line comments and /* */ block comments, quote-aware.
+    def _dollar_tag_at(cls, text: str, i: int) -> Optional[str]:
+        """Return the dollar-tag opening at ``text[i] == '$'``, if any.
 
-        Comment markers inside ANY quoted span — '...' strings, "..."
-        and `...` quoted identifiers — are content, not comments, and
-        survive verbatim (a doubled quote escapes inside its span).
-        Comment markers inside comments are consumed with their comment.
+        PostgreSQL dollar quotes look like ``$$`` or ``$tag$``; a lone
+        ``$`` (e.g. an operator or placeholder) is ordinary text.
+        """
+        if i >= len(text) or text[i] != '$':
+            return None
+        match = cls._DOLLAR_TAG.match(text, i)
+        return match.group(0) if match else None
+
+    @classmethod
+    def _strip_comments(cls, text: str) -> str:
+        """Remove ``--``, ``/* */`` and MySQL ``#`` comments, quote-aware.
+
+        Comment markers inside ANY protected span — '...' strings, "..."
+        and `...` quoted identifiers, and PostgreSQL dollar-quoted
+        bodies — are content, not comments, and survive verbatim (a
+        doubled quote escapes inside its span). Comment markers inside
+        comments are consumed with their comment. ``#`` runs to
+        end-of-line like ``--`` (MySQL dumps; harmless for dialects
+        where ``#`` otherwise appears inside literals, which stay
+        protected).
         """
         out: List[str] = []
         i, n = 0, len(text)
@@ -232,7 +322,21 @@ class SchemaParser:
                 out.append(ch)
                 i += 1
                 continue
+            if ch == '$':
+                tag = cls._dollar_tag_at(text, i)
+                if tag:
+                    close = text.find(tag, i + len(tag))
+                    if close == -1:
+                        i = n
+                        continue
+                    out.append(text[i:close + len(tag)])
+                    i = close + len(tag)
+                    continue
             if ch == '-' and i + 1 < n and text[i + 1] == '-':
+                newline = text.find('\n', i)
+                i = n if newline == -1 else newline
+                continue
+            if ch == '#':
                 newline = text.find('\n', i)
                 i = n if newline == -1 else newline
                 continue
@@ -247,11 +351,13 @@ class SchemaParser:
 
     @classmethod
     def _split_statements(cls, text: str) -> List[str]:
-        """Split SQL text on ';' OUTSIDE quoted spans.
+        """Split SQL text on ';' OUTSIDE protected spans.
 
-        Same quote model as _strip_comments ('...', "...", `...` with
-        doubled-quote escapes), so a semicolon inside any literal no
-        longer splits a statement's chunk boundary.
+        Protects '...' / "..." / `...` quoted spans (with doubled-quote
+        escapes) and PostgreSQL dollar-quoted bodies, so a semicolon
+        inside any literal or function body keeps its statement whole.
+        Runs on comment-stripped text, so comment semicolons are
+        already gone.
         """
         statements: List[str] = []
         current: List[str] = []
@@ -274,6 +380,14 @@ class SchemaParser:
                 current.append(ch)
                 i += 1
                 continue
+            if ch == '$':
+                tag = cls._dollar_tag_at(text, i)
+                if tag:
+                    close = text.find(tag, i + len(tag))
+                    body_end = n if close == -1 else close + len(tag)
+                    current.append(text[i:body_end])
+                    i = body_end
+                    continue
             if ch == ';':
                 statements.append(''.join(current))
                 current = []
@@ -287,63 +401,58 @@ class SchemaParser:
     def _extract_chunks(
         self, content: str, source_file: Optional[str] = None
     ) -> List[Dict[str, Any]]:
-        """Extract CREATE TABLE chunks plus every other SQL statement.
+        """Extract one chunk per top-level SQL statement.
 
-        CREATE TABLE blocks keep their structured extraction (original
-        quoted spelling round-trips; metadata carries the bare table
-        name). Comments are stripped (quote-aware) once up front, and
-        BOTH the CREATE TABLE match and the residual statement split run
-        on the stripped text — a commented-out CREATE TABLE can no
-        longer mint a phantom table chunk. Every other top-level
-        statement in the residual — views, inserts, indexes,
-        procedures, ... — becomes an ``other_sql`` chunk carrying the
-        statement's whitespace-normalized text, so no SQL construct is
-        silently dropped (issue #703 / T1-02-K-05). A semicolon inside a
-        comment can neither create a chunk nor merge two statements, and
-        the statement split itself is quote-aware, so a semicolon inside
-        any literal keeps its statement whole. A file whose residual is
-        only comments/whitespace yields zero chunks.
+        Comments are stripped (quote-aware, including MySQL ``#``) once
+        up front, the residual is split on ``;`` outside quotes and
+        dollar-quoted bodies, and each statement is classified: a
+        statement whose (bounded) CREATE TABLE match covers it becomes a
+        structured ``table`` chunk — original quoted spelling
+        round-trips, metadata carries the bare table name — everything
+        else becomes a whitespace-normalized ``other_sql`` chunk. No
+        SQL construct is silently dropped (issue #703 / T1-02-K-05), a
+        commented-out statement (of any kind) never becomes a chunk,
+        and chunks emerge in document order. More than
+        MAX_STATEMENT_CHUNKS statements fails the file with an accurate
+        error instead of flooding the embedding pipeline.
         """
-        chunks = []
+        chunks: List[Dict[str, Any]] = []
 
-        # Strip comments once (quote-aware); every extraction below runs
-        # on the stripped text so commented-out SQL is never extracted.
-        content = self._strip_comments(content)
-
-        # Find all CREATE TABLE blocks
-        table_spans: List[tuple] = []
-        for match in self.CREATE_TABLE_PATTERN.finditer(content):
-            table_spans.append((match.start(), match.end()))
-            bare_name, original_name = self._identifier_parts(match)
-            column_block = match.group(9).strip()
-
-            # Reconstruct the full table definition using the original
-            # identifier spelling so the definition round-trips.
-            table_definition = f"CREATE TABLE {original_name} (\n{column_block}\n);"
-
-            chunk = {
-                'text': table_definition,
-                'metadata': {
-                    'table_name': bare_name,
-                    'object_type': 'table',
-                    'source_file': source_file
-                }
-            }
-            chunks.append(chunk)
-
-        # Blank out the matched table blocks, then emit every remaining
-        # top-level statement (issue #703: nothing is dropped, and
-        # comments never masquerade as statements).
-        residual_parts: List[str] = []
-        cursor = 0
-        for start, end in table_spans:
-            residual_parts.append(content[cursor:start])
-            cursor = end
-        residual_parts.append(content[cursor:])
-        residual = ''.join(residual_parts)
-
-        for statement in self._split_statements(residual):
+        stripped = self._strip_comments(content)
+        for statement in self._split_statements(stripped):
             if not statement.strip():
+                continue
+            if len(chunks) >= self.MAX_STATEMENT_CHUNKS:
+                raise ValueError(
+                    f"Schema file contains more than {self.MAX_STATEMENT_CHUNKS} "
+                    "SQL statements; split the file or raise "
+                    "SchemaParser.MAX_STATEMENT_CHUNKS"
+                )
+            # The statement carries no trailing ';' (the split consumed
+            # it), so probe with the terminator re-attached. Match is
+            # anchored to the statement START: a "CREATE TABLE" appearing
+            # inside a string literal further into some other statement
+            # must not reclassify it (issue #703 review). The bounded
+            # column capture keeps this linear per statement even for
+            # unterminated input.
+            match = self.CREATE_TABLE_PATTERN.match(statement.lstrip() + ';')
+            if match is not None:
+                bare_name, original_name = self._identifier_parts(match)
+                column_block = match.group(9).strip()
+                # Reconstruct the full table definition using the
+                # original identifier spelling so the definition
+                # round-trips.
+                table_definition = (
+                    f"CREATE TABLE {original_name} (\n{column_block}\n);"
+                )
+                chunks.append({
+                    'text': table_definition,
+                    'metadata': {
+                        'table_name': bare_name,
+                        'object_type': 'table',
+                        'source_file': source_file,
+                    },
+                })
                 continue
             text = ' '.join(statement.split())
             chunks.append({

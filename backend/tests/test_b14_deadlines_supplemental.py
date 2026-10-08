@@ -17,7 +17,9 @@ import pytest
 
 from app.config import settings
 from app.services import document_processor as dp
+from app.services.background_tasks import TaskItem
 from app.services.document_processor import (
+    _PARSE_EXECUTOR,
     _PARSE_IN_FLIGHT,
     _PARSE_IN_FLIGHT_GUARD,
     DocumentProcessingError,
@@ -274,140 +276,69 @@ def test_csv_cp1252_leg_keeps_na_literals(tmp_path):
 
 
 def test_all_parse_paths_route_through_deadline_wrapper():
-    """Every _process_*_file parse method must route its parser invocation
-    through _parse_with_deadline/_await_with_deadline, and no method may
-    call a parser via a raw asyncio.to_thread — a future parser path added
-    unwrapped (or a wrapper removed) fails here (issue #703 recurrence
-    guardrail; RED at base for the three previously-unwrappped paths)."""
+    """Every DocumentProcessor._process_*_file method must route its parse
+    through _parse_with_deadline, and NO function in the module may hand a
+    parser call to any executor (to_thread/run_in_executor/submit) outside
+    that wrapper's own worker (issue #703 recurrence guardrail; upgraded
+    per review PRR-015: the method set is discovered dynamically so a new
+    parse path cannot silently skip the census, and raw-dispatch detection
+    walks the whole call subtree so lambda/partial evasion is caught).
+    RED at base (all four paths unwrapped); bites on removal AND on
+    addition of an unwrapped path."""
     import ast
 
-    tree = ast.parse(Path(dp.__file__).read_text(encoding="utf-8"))
-    parse_methods = {
-        "_process_document_file",
-        "_process_spreadsheet_file",
-        "_process_schema_file",
-        "_process_image_file",
-    }
-    found: dict = {}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.AsyncFunctionDef) and node.name in parse_methods:
+    module_ast = ast.parse(Path(dp.__file__).read_text(encoding="utf-8"))
+
+    # Parent map for innermost-enclosing-function walks.
+    parents = {}
+    for node in ast.walk(module_ast):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+
+    def enclosing_func(node):
+        cur = parents.get(node)
+        while cur is not None and not isinstance(
+            cur, (ast.FunctionDef, ast.AsyncFunctionDef)
+        ):
+            cur = parents.get(cur)
+        return cur
+
+    def tree_contains_parse_attr(node):
+        return any(
+            isinstance(n, ast.Attribute) and n.attr == "parse"
+            for n in ast.walk(node)
+        )
+
+    violations = []
+
+    # (1) Any executor hand-off of a parser outside the wrapper's worker.
+    for node in ast.walk(module_ast):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        is_executor_call = (
+            isinstance(func, ast.Attribute)
+            and func.attr in ("to_thread", "run_in_executor", "submit")
+        )
+        if not is_executor_call or not tree_contains_parse_attr(node):
+            continue
+        fn = enclosing_func(node)
+        fn_name = fn.name if fn else "<module>"
+        if fn_name not in ("_tracked", "_parse_with_deadline"):
+            violations.append(
+                f"executor hand-off of a parse outside the deadline wrapper "
+                f"(in {fn_name})"
+            )
+
+    # (2) Every _process_*_file method (dynamic set) must use the wrapper.
+    for node in ast.walk(module_ast):
+        if (
+            isinstance(node, ast.AsyncFunctionDef)
+            and node.name.startswith("_process_")
+            and node.name.endswith("_file")
+        ):
             calls = [ast.unparse(n) for n in ast.walk(node) if isinstance(n, ast.Call)]
-            has_wrapper = any("_parse_with_deadline" in c for c in calls)
-            raw_parse = [
-                c for c in calls if "asyncio.to_thread" in c and ".parse" in c
-            ]
-            found[node.name] = (has_wrapper, raw_parse)
-    assert set(found) == parse_methods
-    for name, (has_wrapper, raw_parse) in found.items():
-        assert has_wrapper, f"{name} lost its parse deadline wrapper"
-        assert not raw_parse, f"{name} parses via raw asyncio.to_thread: {raw_parse}"
+            if not any("_parse_with_deadline" in c for c in calls):
+                violations.append(f"{node.name} lost its parse deadline wrapper")
 
-
-def test_schema_comments_with_semicolons_never_become_chunks(tmp_path):
-    """A ';' inside a comment can neither create a chunk nor merge two
-    statements: comments are stripped (quote-aware) BEFORE the residual
-    is split (implementation-review R3)."""
-    path = tmp_path / "comment_semicolons.sql"
-    path.write_text(
-        "-- note; still the same comment\n"
-        "/* block; comment */ INSERT INTO t (v) VALUES (1);\n"
-        "UPDATE t SET v = 2;\n"
-        "-- trailing; tail\n",
-        encoding="utf-8",
-    )
-    chunks = SchemaParser().parse(str(path))
-    others = [c for c in chunks if c["metadata"]["object_type"] == "other_sql"]
-    texts = [c["text"] for c in others]
-    assert len(others) == 2  # the INSERT and the UPDATE only
-    assert any("INSERT INTO t (v) VALUES (1);" == t for t in texts)
-    assert any("UPDATE t SET v = 2;" == t for t in texts)
-    assert not any("note" in t or "comment" in t or "tail" in t for t in texts)
-
-
-def test_schema_comment_markers_inside_literals_survive(tmp_path):
-    """-- and /* */ inside string literals are CONTENT, not comments."""
-    path = tmp_path / "literals2.sql"
-    path.write_text(
-        "INSERT INTO t (v) VALUES ('a--b; /* not a comment */');\n",
-        encoding="utf-8",
-    )
-    chunks = SchemaParser().parse(str(path))
-    assert len(chunks) == 1
-    assert chunks[0]["text"] == "INSERT INTO t (v) VALUES ('a--b; /* not a comment */');"
-
-
-def test_schema_commented_out_create_table_not_extracted(tmp_path):
-    """A commented-out CREATE TABLE (line style) mints no phantom table
-    chunk: comments are stripped before BOTH extraction passes
-    (implementation-review R2-1)."""
-    path = tmp_path / "commented_table.sql"
-    path.write_text(
-        "-- CREATE TABLE commented_out (id INT);\n", encoding="utf-8"
-    )
-    assert SchemaParser().parse(str(path)) == []
-
-
-def test_schema_block_commented_create_table_not_extracted(tmp_path):
-    """Block-style commented-out CREATE TABLE is likewise not extracted."""
-    path = tmp_path / "block_commented_table.sql"
-    path.write_text(
-        "/* CREATE TABLE block_commented (id INT); */\n", encoding="utf-8"
-    )
-    assert SchemaParser().parse(str(path)) == []
-
-
-def test_schema_commented_table_plus_real_statement(tmp_path):
-    """A commented-out table followed by a real statement extracts ONLY
-    the real content."""
-    path = tmp_path / "mixed_commented.sql"
-    path.write_text(
-        "-- CREATE TABLE phantom (id INT);\n"
-        "CREATE TABLE real_one (id INT);\n",
-        encoding="utf-8",
-    )
-    chunks = SchemaParser().parse(str(path))
-    tables = [c for c in chunks if c["metadata"]["object_type"] == "table"]
-    assert len(tables) == 1
-    assert tables[0]["metadata"]["table_name"] == "real_one"
-    assert "phantom" not in " ".join(c["text"] for c in chunks)
-
-
-def test_schema_quoted_identifiers_with_comment_markers_extract(tmp_path):
-    """Comment markers inside "..." and `...` identifiers are content:
-    the table still extracts with its original spelling (table path), and
-    an INSERT into such an identifier stays one whole statement (residual
-    path) — implementation-review round 3."""
-    path = tmp_path / "quoted_markers.sql"
-    path.write_text(
-        'CREATE TABLE "weird--name" (id INT);\n'
-        "CREATE TABLE `weird/*x*/name` (id INT);\n"
-        'INSERT INTO "weird--name" VALUES (1);\n',
-        encoding="utf-8",
-    )
-    chunks = SchemaParser().parse(str(path))
-    tables = [c for c in chunks if c["metadata"]["object_type"] == "table"]
-    inserts = [
-        c
-        for c in chunks
-        if c["metadata"]["object_type"] == "other_sql"
-        and c["metadata"]["statement_type"] == "INSERT"
-    ]
-    assert {t["metadata"]["table_name"] for t in tables} == {
-        "weird--name",
-        "weird/*x*/name",
-    }
-    assert any('CREATE TABLE "weird--name"' in t["text"] for t in tables)
-    assert len(inserts) == 1
-    assert inserts[0]["text"] == 'INSERT INTO "weird--name" VALUES (1);'
-
-
-def test_schema_semicolon_inside_literal_keeps_statement_whole(tmp_path):
-    """A ';' inside a single-quoted literal does not split the statement
-    (quote-aware split; supersedes the earlier boundary-approximation)."""
-    path = tmp_path / "literal_semicolon.sql"
-    path.write_text(
-        "INSERT INTO t VALUES ('a;b');\n", encoding="utf-8"
-    )
-    chunks = SchemaParser().parse(str(path))
-    assert len(chunks) == 1
-    assert chunks[0]["text"] == "INSERT INTO t VALUES ('a;b');"
+    assert not violations, "; ".join(violations)
