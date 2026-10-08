@@ -27,6 +27,8 @@ from .document_processor import (
     DocumentProcessingError,
     DocumentProcessor,
     IngestCancelledError,
+    ParseDeadlineError,
+    ParseInFlightError,
     redact_ingest_error,
 )
 from .embeddings import EmbeddingService
@@ -1571,6 +1573,13 @@ class BackgroundProcessor:
             # code settled shutdown failures as `release`, whose refund
             # handed the consumed attempt back.)
             delay = self.retry_delay * (2 ** (task.attempt - 1))
+            if isinstance(
+                outcome_exc, (ParseDeadlineError, ParseInFlightError)
+            ):
+                # The abandoned parse worker still holds the file's
+                # parse slot for at least the timeout window; retrying
+                # sooner is guaranteed to be refused (issue #703).
+                delay = max(delay, settings.document_parse_timeout)
             if task.attempt < max_attempts:
                 await self._settle_ingest_job(
                     job_id,
@@ -4809,6 +4818,12 @@ class BackgroundProcessor:
         if task.attempt < self.max_retries:
             # Calculate exponential backoff delay
             delay = self.retry_delay * (2 ** (task.attempt - 1))
+            if isinstance(
+                error, (ParseDeadlineError, ParseInFlightError)
+            ):
+                # Same floor as the lease transport (issue #703): wait
+                # out the parse-timeout window before retrying.
+                delay = max(delay, settings.document_parse_timeout)
             logger.warning(
                 f"Task failed for {task.file_path}, "
                 f"retrying in {delay}s (attempt {task.attempt + 1}/{self.max_retries})"

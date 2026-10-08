@@ -33,6 +33,10 @@ SHIPPED_INGEST_ERROR_CODES = frozenset(
         # issue #691: dimension-changing single-file ingests are refused with
         # this stable code (reindex remediation), never a raw message.
         "DIMENSION_CHANGED",
+        # issue #703: a parse that hits document_parse_timeout (or is
+        # refused while a timed-out parse of the same file is still in
+        # flight) persists this stable code, never a raw message.
+        "PARSE_TIMEOUT",
     }
 )
 

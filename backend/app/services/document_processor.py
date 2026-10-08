@@ -7,16 +7,19 @@ while tracking processing status in SQLite and handling file deduplication.
 
 import asyncio
 import hashlib
+import io
 import json
 import logging
+import os
 import sqlite3
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, TypeVar
 
 import pandas as pd
 
@@ -67,7 +70,7 @@ from .embedding_cache import (
     store as embedding_cache_store,
 )
 from .embeddings import EmbeddingService
-from .image_processor import ImageProcessingResult, process_image
+from .image_processor import ImageProcessingResult, _process_image_sync
 from .image_search import build_searchable_text
 from .llm_client import LLMClient
 from .schema_parser import SchemaParser
@@ -341,6 +344,10 @@ class DocumentParseError(Exception):
 
 INGEST_ERROR_PARSER_UNAVAILABLE = "PARSER_UNAVAILABLE"
 INGEST_ERROR_PARSE_FAILED = "PARSE_FAILED"
+# issue #703 review: a timed-out (or in-flight-refused) parse persists a
+# distinct stable code so operators can tell a deadline hit from a
+# content failure.
+INGEST_ERROR_PARSE_TIMEOUT = "PARSE_TIMEOUT"
 INGEST_ERROR_FILE_MISSING = "FILE_MISSING"
 INGEST_ERROR_ENRICHMENT_FAILED = "ENRICHMENT_FAILED"
 INGEST_ERROR_DIMENSION_CHANGED = "DIMENSION_CHANGED"
@@ -348,6 +355,7 @@ INGEST_ERROR_DIMENSION_CHANGED = "DIMENSION_CHANGED"
 _INGEST_ERROR_REASONS = {
     INGEST_ERROR_PARSER_UNAVAILABLE: "document parser is unavailable",
     INGEST_ERROR_PARSE_FAILED: "document could not be parsed",
+    INGEST_ERROR_PARSE_TIMEOUT: "document parsing exceeded its time limit",
     INGEST_ERROR_FILE_MISSING: "uploaded file is missing from storage",
     INGEST_ERROR_ENRICHMENT_FAILED: (
         "content enrichment failed; the indexed document is unaffected"
@@ -378,6 +386,12 @@ def classify_ingest_error(exc: BaseException) -> str:
     current: Optional[BaseException] = exc
     depth = 0
     while current is not None and depth <= _INGEST_ERROR_CAUSE_DEPTH:
+        # Errors that carry an explicit ingest code (parse deadline,
+        # OCR-unavailable images) classify by that code first (issue
+        # #703 review).
+        code = getattr(current, "ingest_error_code", None)
+        if code:
+            return code
         if isinstance(current, EmbeddingDimensionChangedError):
             return INGEST_ERROR_DIMENSION_CHANGED
         if isinstance(current, ImportError):
@@ -655,6 +669,75 @@ class SpreadsheetParser:
             },
         }
 
+    # Byte-order marks that unambiguously identify a CSV's codec before
+    # any fallback guessing runs (issue #703 / T1-25-K-05).
+    _CSV_BOM_CODECS = (
+        (b"\xff\xfe\x00\x00", "utf-32"),
+        (b"\x00\x00\xfe\xff", "utf-32"),
+        (b"\xef\xbb\xbf", "utf-8-sig"),
+        (b"\xff\xfe", "utf-16"),
+        (b"\xfe\xff", "utf-16"),
+    )
+
+    # A NUL byte in the sniff window means binary content or BOM-less
+    # UTF-16 (whose ASCII text decodes as "valid" UTF-8 with interleaved
+    # NULs); route those to the gated buffered path instead of streaming.
+    _CSV_SNIFF_BYTES = 4096
+
+    @classmethod
+    def _decode_csv_buffer(cls, data: bytes) -> str:
+        """Buffered decode for the non-streaming legs (BOM'd or non-UTF-8).
+
+        An unambiguous BOM selects its codec (an undecodable body falls
+        through to the plain chain on the BOM-stripped bytes); otherwise
+        strict UTF-8, then a lossy cp1252 leg. Every leg passes the
+        shared decode gates so mis-decodes fail accurately instead of
+        indexing mojibake (issue #703 review).
+        """
+        text: Optional[str] = None
+        for bom, codec in cls._CSV_BOM_CODECS:
+            if data.startswith(bom):
+                try:
+                    text = data.decode(codec)
+                except UnicodeDecodeError:
+                    data = data[len(bom):]
+                break
+        if text is None:
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError:
+                text = data.decode("cp1252", errors="replace")
+        return SchemaParser._validated(text, what="CSV file")
+
+    @classmethod
+    def _read_csv_with_encoding_fallback(cls, file_path: str) -> "pd.DataFrame":
+        """Read a CSV through a real-world encoding fallback chain.
+
+        The common case streams straight from the path (no whole-file
+        copies): strict UTF-8 covers plain ASCII, UTF-8, and — via
+        pandas' own handling — files pandas accepts. Only two cases
+        pay the buffered path: an explicit BOM (selects the codec), and
+        a streaming ``UnicodeDecodeError`` (falls back to a lossy
+        cp1252 leg — the encoding of Excel's default "CSV (Comma
+        delimited)" Windows export). Every buffered leg keeps the
+        issue-#513 NA-preservation flags (``dtype=str``,
+        ``keep_default_na=False``) and passes the shared decode gates.
+        """
+        with open(file_path, "rb") as handle:
+            sniff = handle.read(cls._CSV_SNIFF_BYTES)
+        if not any(sniff.startswith(bom) for bom, _ in cls._CSV_BOM_CODECS) and b"\x00" not in sniff:
+            try:
+                return pd.read_csv(
+                    file_path, dtype=str, keep_default_na=False
+                ).fillna("")
+            except UnicodeDecodeError:
+                pass
+        data = Path(file_path).read_bytes()
+        text = cls._decode_csv_buffer(data)
+        return pd.read_csv(
+            io.StringIO(text), dtype=str, keep_default_na=False
+        ).fillna("")
+
     def parse(self, file_path: str) -> List[dict]:
         """
         Parse a spreadsheet file and return a list of chunk dicts.
@@ -689,8 +772,9 @@ class SpreadsheetParser:
                 # coercion turns literal cell strings like "NA"/"N/A"/"NULL" into
                 # NaN, which ``.fillna("")`` then empties and the non-empty cell
                 # filter drops — destroying literal text. With the flag, empties
-                # stay "" and every literal value round-trips.
-                df = pd.read_csv(file_path, dtype=str, keep_default_na=False).fillna("")
+                # stay "" and every literal value round-trips. The encoding
+                # fallback below keeps the flag on every leg.
+                df = self._read_csv_with_encoding_fallback(file_path)
                 sheets: dict = {"Sheet1": df}
             elif ext in {".xls", ".xlsx"}:
                 xf = pd.ExcelFile(file_path)
@@ -813,6 +897,144 @@ class IngestCancelledError(Exception):
     def __init__(self, message: str, file_id: Optional[int] = None) -> None:
         super().__init__(message)
         self.file_id = file_id
+
+
+# --- Parse deadline + per-file in-flight registry (issue #703) --------------
+#
+# The schema, spreadsheet, image and general document parse paths all run
+# synchronous parser work through asyncio.to_thread under the same
+# settings.document_parse_timeout deadline. Cancelling the await cannot
+# kill the worker thread, so a timed-out parse keeps running; the retry
+# transports requeue after 1s/2s/4s — far below the 300s default timeout —
+# which used to stack concurrent parse attempts of the SAME file on the
+# shared default executor (T1-25-S2-08). The process-wide registry below
+# refuses a new parse of a file whose previous parse has not finished.
+
+class ParseDeadlineError(DocumentProcessingError):
+    """A parse exceeded settings.document_parse_timeout (issue #703).
+
+    Distinct from the base class so the retry transports wait out the
+    timeout window before requeueing instead of burning the
+    short-backoff ladder while the abandoned worker still runs, and so
+    the persisted cause can name the timeout (PARSE_TIMEOUT).
+    """
+
+
+class ParseInFlightError(DocumentProcessingError):
+    """A parse was refused because the same file already has one in
+    flight (issue #703). Same transport treatment as
+    ParseDeadlineError.
+    """
+
+
+# Parses run on a dedicated bounded pool rather than the shared default
+# executor, so slow parses queue here instead of delaying the route/DB
+# to_thread work that also shares the default pool (issue #703 review).
+_PARSE_EXECUTOR = ThreadPoolExecutor(
+    max_workers=4, thread_name_prefix="ingest-parse"
+)
+
+_PARSE_IN_FLIGHT_GUARD = threading.Lock()
+_PARSE_IN_FLIGHT: set = set()
+
+_PARSE_T = TypeVar("_PARSE_T")
+
+
+def _parse_registry_key(file_path: str) -> str:
+    """Normalize a parse input path so retries always collide on one key."""
+    return os.path.normcase(os.path.abspath(file_path))
+
+
+def _reserve_parse_slot(file_path: str) -> str:
+    """Atomically reserve the per-file parse slot or refuse the parse.
+
+    Registry key lifetime is the worker's lifetime: the reservation is
+    released only by the worker itself when the parse returns or raises
+    (and by process restart, since the registry is memory-only). A parse
+    whose thread never returns therefore refuses that file's retries
+    until restart — deliberately, because a wall-clock TTL shorter than
+    a legitimate long parse would re-open the overlap this guard exists
+    to prevent.
+    """
+    key = _parse_registry_key(file_path)
+    with _PARSE_IN_FLIGHT_GUARD:
+        if key in _PARSE_IN_FLIGHT:
+            error = ParseInFlightError(
+                "Another parse of this file is still in flight (a timed-out "
+                f"parse has not finished yet): {file_path}"
+            )
+            # Same deadline family as the timeout itself: the refusal
+            # persists the distinct PARSE_TIMEOUT code, not a generic
+            # parse failure (issue #703 review round 6, F2).
+            error.ingest_error_code = INGEST_ERROR_PARSE_TIMEOUT
+            raise error
+        _PARSE_IN_FLIGHT.add(key)
+    return key
+
+
+def _release_parse_slot(key: str) -> None:
+    with _PARSE_IN_FLIGHT_GUARD:
+        _PARSE_IN_FLIGHT.discard(key)
+
+
+def _deadline_error(stage: str, file_path: str) -> ParseDeadlineError:
+    error = ParseDeadlineError(
+        f"{stage} timed out after {settings.document_parse_timeout}s: {file_path}"
+    )
+    error.ingest_error_code = INGEST_ERROR_PARSE_TIMEOUT
+    return error
+
+
+async def _parse_with_deadline(
+    file_path: str,
+    parse_fn: Callable[[], _PARSE_T],
+    *,
+    stage: str,
+    stage_timings: Optional[dict[str, float]] = None,
+    timing_key: Optional[str] = None,
+) -> _PARSE_T:
+    """Run a synchronous parse in a worker thread under the parse deadline.
+
+    Wraps ``asyncio.to_thread`` in ``asyncio.wait_for`` against
+    ``settings.document_parse_timeout`` and refuses to start while
+    another parse of the same file is in flight (see _reserve_parse_slot
+    for the lifetime/semantics). The worker releases the slot in its
+    ``finally``; if the deadline fires first, the abandoned thread keeps
+    the slot until it exits, so retries are refused rather than piled
+    on. The timeout value is read from settings live at every call.
+    """
+    key = _reserve_parse_slot(file_path)
+    started_at = time.monotonic()
+
+    def _tracked() -> _PARSE_T:
+        try:
+            return parse_fn()
+        finally:
+            _release_parse_slot(key)
+
+    # submit() (not run_in_executor) so we hold the CONCURRENT future:
+    # its cancel() is the precise queued-vs-running discriminator the
+    # timeout handler needs (issue #703 owner review). The asyncio-side
+    # future reads cancelled in both cases once wait_for cancels it.
+    concurrent = _PARSE_EXECUTOR.submit(_tracked)
+    fut = asyncio.wrap_future(concurrent)
+    try:
+        return await asyncio.wait_for(
+            fut,
+            timeout=settings.document_parse_timeout,
+        )
+    except asyncio.TimeoutError:
+        # cancel() returns True only when the queued work item was
+        # dropped (or is dropped now): _tracked never runs, so its
+        # finally would never release the slot — release it here. A
+        # running worker cannot be cancelled, so its own finally
+        # releases the slot when it exits.
+        if concurrent.cancel():
+            _release_parse_slot(key)
+        raise _deadline_error(stage, file_path) from None
+    finally:
+        if stage_timings is not None and timing_key is not None:
+            _add_elapsed_ms(stage_timings, timing_key, started_at)
 
 
 class DocumentProcessor:
@@ -2657,8 +2879,10 @@ class DocumentProcessor:
             DocumentProcessingError: If the file parses but produces no chunks
                 (e.g., all sheets are empty).
         """
-        sheet_chunks = await asyncio.to_thread(
-            self.spreadsheet_parser.parse, file_path
+        sheet_chunks = await _parse_with_deadline(
+            file_path,
+            lambda: self.spreadsheet_parser.parse(file_path),
+            stage="Spreadsheet parsing",
         )
 
         if not sheet_chunks:
@@ -2727,7 +2951,18 @@ class DocumentProcessor:
         Returns:
             Tuple of (List of ProcessedChunk objects, joined text, ParsedDocument).
         """
-        schema_chunks = await asyncio.to_thread(self.schema_parser.parse, file_path)
+        schema_chunks = await _parse_with_deadline(
+            file_path,
+            lambda: self.schema_parser.parse(file_path),
+            stage="Schema parsing",
+        )
+
+        if not schema_chunks:
+            raise DocumentProcessingError(
+                f"Schema file '{Path(file_path).name}' contains no CREATE "
+                "TABLE statements and no other SQL statements to index "
+                "(only comments or whitespace)."
+            )
 
         processed_chunks = []
         atoms: List[DocumentAtom] = []
@@ -2936,9 +3171,10 @@ class DocumentProcessor:
         single ``IMAGE`` document atom with exact provenance, and produces a
         single chunk that flows through the standard embedding/indexing pipeline.
 
-        Graceful degradation: if image libraries are missing or the image is
-        corrupt, logs a warning and returns an empty chunk list / empty atom list
-        so the file is recorded but not searchable.
+        Failure: if image processing fails (missing OCR stack, unreadable
+        image), raises DocumentProcessingError carrying the
+        PARSER_UNAVAILABLE ingest code so the file is failed with an
+        accurate, distinguishable cause (issue #703).
 
         Args:
             file_path: Path to the image file.
@@ -2949,14 +3185,24 @@ class DocumentProcessor:
 
         Returns:
             Tuple of (list of ProcessedChunk objects, searchable document text,
-            ParsedDocument with atoms and assets). Returns ([], "", empty parsed)
-            when processing fails.
+            ParsedDocument with atoms and assets).
+
+        Raises:
+            DocumentProcessingError: When image processing fails (with the
+                PARSER_UNAVAILABLE ingest code) or the parse deadline fires.
         """
-        # process_image is async and already offloads its blocking PIL/OCR work
-        # to a worker thread internally, so we await it directly here. Wrapping
-        # it in asyncio.to_thread would dead-return a coroutine object and crash
-        # on `.success` (issue #460 defect 2).
-        image_result: ImageProcessingResult = await process_image(file_path)
+        # Route the SYNCHRONOUS image worker through the same deadline
+        # wrapper as the other parsers (issue #703). The async public
+        # entry (process_image) wraps this same sync helper in its own
+        # to_thread; going through the wrapper's thread keeps the
+        # in-flight slot held until the OCR worker thread itself exits —
+        # wrapping the coroutine instead would release the slot at
+        # coroutine cancellation while the abandoned OCR thread ran on.
+        image_result: ImageProcessingResult = await _parse_with_deadline(
+            file_path,
+            lambda: _process_image_sync(file_path),
+            stage="Image processing",
+        )
 
         filename = Path(file_path).name
         searchable_text = (
@@ -2967,10 +3213,12 @@ class DocumentProcessor:
 
         # Parse-quality diagnostics (issue #514 PRODUCT-ENH-06): this IS the
         # OCR seam — the raster page is reported through the shared producer
-        # with ocr_used=True (a synthetic single-page element carries the OCR
-        # text), so an unreadable or text-less image reveals its zero-text
-        # page in the same payload that reports chunk/index state. Computed
-        # before the degradation returns so failed parses are recorded too.
+        # (a synthetic single-page element carries the OCR text), so an
+        # unreadable or text-less image reveals its zero-text page in the
+        # same payload that reports chunk/index state. Computed before the
+        # failure raise. ocr_used records whether OCR actually
+        # contributed — a failed image must not present itself as
+        # OCR-sourced (issue #703 review).
         try:
             from types import SimpleNamespace as _SimpleNamespace
 
@@ -2988,7 +3236,7 @@ class DocumentProcessor:
                             metadata=_SimpleNamespace(page_number=1),
                         )
                     ],
-                    ocr_used=True,
+                    ocr_used=image_result.success,
                 ),
             )
         except Exception as exc:  # noqa: BLE001 — advisory parse metadata only
@@ -3000,12 +3248,21 @@ class DocumentProcessor:
 
         if not image_result.success:
             logger.warning(
-                "Image processing failed for %s: %s. "
-                "File recorded but not searchable.",
+                "Image processing failed for %s: %s. File not indexed "
+                "(issue #703: an image whose OCR could not run is a "
+                "degraded failure, not a clean success).",
                 file_path,
                 image_result.error,
             )
-            return [], "", ParsedDocument(atoms=(), parser_fingerprint=parser_fingerprint)
+            error = DocumentProcessingError(
+                "Image processing failed; OCR is unavailable or the "
+                f"image could not be read ({image_result.error_code})."
+            )
+            # The issue's own named classification: a missing/broken OCR
+            # stack is a parser-unavailability failure, distinguishable
+            # from a content parse failure (issue #703 review).
+            error.ingest_error_code = INGEST_ERROR_PARSER_UNAVAILABLE
+            raise error
 
         if not searchable_text or not searchable_text.strip():
             logger.warning(
@@ -3127,19 +3384,13 @@ class DocumentProcessor:
             Tuple of (List of ProcessedChunk objects, document text as string,
             ParsedDocument of typed atoms).
         """
-        parse_started_at = time.monotonic()
-        try:
-            elements = await asyncio.wait_for(
-                asyncio.to_thread(self.parser.parse, file_path),
-                timeout=settings.document_parse_timeout,
-            )
-        except asyncio.TimeoutError:
-            raise DocumentProcessingError(
-                f"Document parsing timed out after {settings.document_parse_timeout}s: {file_path}"
-            )
-        finally:
-            if stage_timings is not None:
-                _add_elapsed_ms(stage_timings, "parse_ms", parse_started_at)
+        elements = await _parse_with_deadline(
+            file_path,
+            lambda: self.parser.parse(file_path),
+            stage="Document parsing",
+            stage_timings=stage_timings,
+            timing_key="parse_ms",
+        )
         # Parse-quality diagnostics (issue #514 PRODUCT-ENH-06): derived from
         # the elements this parse actually produced and persisted as JSON so
         # the status payload can reveal omissions (low-content pages, dropped
