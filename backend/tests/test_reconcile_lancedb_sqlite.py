@@ -472,7 +472,7 @@ def test_delete_stale_multiscale_only_when_requested_and_confirmed(
     }
 
 
-def test_delete_orphan_file_ids_removes_only_rows_without_indexed_sqlite_file(
+def test_delete_orphan_file_ids_deletes_only_unprotected_rows(
     capsys, monkeypatch, tmp_path
 ):
     exit_code, table = run_main(
@@ -508,17 +508,22 @@ def test_delete_orphan_file_ids_removes_only_rows_without_indexed_sqlite_file(
     report, output = parse_report(capsys)
 
     assert exit_code == 0, output.err
+    # The report stays a truthful snapshot: file 11 is a 'pending' row, so it
+    # IS present in LanceDB without being sqlite-indexed. Issue #705 only
+    # changes the DELETE side — a pending file's rows are protected from
+    # orphan cleanup (in-flight rows own their vectors), so only file 99
+    # (no SQLite row at all) is actually deleted.
     assert report["file_ids_present_in_lancedb_but_not_sqlite_indexed"] == [
         "11",
         "99",
     ]
     assert report["cleanup_result"]["deleted_counts"] == {
-        "orphan_file_id_rows": 2
+        "orphan_file_id_rows": 1
     }
     assert report["cleanup_result"]["remaining_after_delete_counts"] == {
         "orphan_file_id_rows": 0
     }
-    assert [row["file_id"] for row in table.rows] == ["10"]
+    assert [row["file_id"] for row in table.rows] == ["10", "11"]
 
 
 def test_delete_stale_multiscale_is_noop_when_multiscale_enabled(
