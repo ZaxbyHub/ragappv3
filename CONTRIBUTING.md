@@ -80,11 +80,11 @@ frontend, and embedding/LLM services together.
 
 ## Before you push — run the CI gates locally
 
-CI (`.github/workflows/ci.yml`) runs seven jobs — Frontend, Playwright e2e
-smoke, Quality contracts, Detect docker scope, Docker build smoke,
-SAST (bandit), and Backend (full inventory: `docs/engineering/testing.md`,
-section 4). Reproduce them locally so your PR goes
-green on the first try:
+CI (`.github/workflows/ci.yml`) runs eight jobs — Frontend, Playwright e2e
+smoke, Playwright a11y matrix, Quality contracts, Detect docker scope, Docker
+build smoke, SAST (bandit), and Backend (full inventory:
+`docs/engineering/testing.md`, section 4). Reproduce them locally so your PR
+goes green on the first try:
 
 **Backend** (from `backend/`):
 
@@ -118,6 +118,7 @@ python scripts/check_a04_http500_detail_hygiene.py   # no raw-exception 500 deta
 python scripts/check_b03_upload_migration_timeout.py   # upload migration timeout contract
 python scripts/check_l05_raw_palette.py   # raw Tailwind palette classes within budget
 python scripts/check_l05_page_headers.py   # pages use the shared PageTitleHeader
+python scripts/check_l07_a11y_gate_wired.py  # the a11y matrix gate is wired in CI
 ```
 
 **Closure evidence gate** (from repo root; standalone workflow

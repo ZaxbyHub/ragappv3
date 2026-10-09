@@ -258,7 +258,7 @@ describe('AdminUsersPage error handling', () => {
       if (pathname.endsWith('/groups')) {
         return Promise.resolve(DEFAULT_GROUPS_RESPONSE);
       }
-      if (pathname.endsWith('/organizations')) {
+      if (pathname.endsWith('/organizations') || pathname.endsWith('/organizations/')) {
         return Promise.resolve(DEFAULT_ORGS_RESPONSE);
       }
       return Promise.resolve({ data: {} });
@@ -821,7 +821,8 @@ describe('AdminUsersPage error handling', () => {
     await vi.waitFor(() => expect(toastError).toHaveBeenCalledWith('Failed to load user groups'));
   });
 
-  it('fetchUserGroups: renders empty groups when response.data.groups is missing', async () => {
+  it('fetchUserGroups: treats a missing groups payload as an error and enables save after a valid retry', async () => {
+    const api = await import('@/lib/api');
     registerUrlResponse('/groups', { data: {} });
     registerUrlResponse(`/users/2/groups`, { data: {} });
 
@@ -833,7 +834,25 @@ describe('AdminUsersPage error handling', () => {
       fireEvent.click(groupButton!);
     });
 
-    await vi.waitFor(() => expect(screen.getByText('No groups available')).toBeInTheDocument());
+    await vi.waitFor(() =>
+      expect(screen.getByRole('alert')).toHaveTextContent('Failed to load groups or user memberships.')
+    );
+    expect(screen.queryByText('No groups available')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Save group changes' })).toBeDisabled();
+    expect(api.default.put).not.toHaveBeenCalled();
+
+    registerUrlResponse('/groups', {
+      data: { groups: [{ id: 1, name: 'Admins', description: null }] },
+    });
+    registerUrlResponse(`/users/2/groups`, { data: { groups: [] } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Retry groups' }));
+    });
+
+    await vi.waitFor(() =>
+      expect(screen.getByRole('checkbox', { name: 'Select Admins' })).toBeInTheDocument()
+    );
+    expect(screen.getByRole('button', { name: 'Save group changes' })).toBeEnabled();
   });
 
   // ============================================================
@@ -869,8 +888,10 @@ describe('AdminUsersPage error handling', () => {
     await vi.waitFor(() => expect(toastError).toHaveBeenCalledWith('Failed to load organizations'));
   });
 
-  it('fetchAllOrgs: renders empty organizations when response.data.organizations is missing', async () => {
+  it('fetchAllOrgs: treats a missing organizations payload as an error and enables save after a valid retry', async () => {
+    const api = await import('@/lib/api');
     registerUrlResponse('/organizations/', { data: {} });
+    registerUrlResponse('/users/2/organizations', { data: {} });
 
     await act(async () => { render(<AdminUsersPage />); });
     await vi.waitFor(() => expect(screen.getByText('alice')).toBeInTheDocument());
@@ -880,7 +901,25 @@ describe('AdminUsersPage error handling', () => {
       fireEvent.click(orgButton!);
     });
 
-    await vi.waitFor(() => expect(screen.getByText('No organizations available')).toBeInTheDocument());
+    await vi.waitFor(() =>
+      expect(screen.getByRole('alert')).toHaveTextContent('Failed to load organizations or user memberships.')
+    );
+    expect(screen.queryByText('No organizations available')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Save organization changes' })).toBeDisabled();
+    expect(api.default.put).not.toHaveBeenCalled();
+
+    registerUrlResponse('/organizations/', {
+      data: { organizations: [{ id: 1, name: 'Org A', description: 'desc' }] },
+    });
+    registerUrlResponse('/users/2/organizations', { data: { organizations: [] } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Retry organizations' }));
+    });
+
+    await vi.waitFor(() =>
+      expect(screen.getByRole('checkbox', { name: 'Select Org A' })).toBeInTheDocument()
+    );
+    expect(screen.getByRole('button', { name: 'Save organization changes' })).toBeEnabled();
   });
 
   // ============================================================

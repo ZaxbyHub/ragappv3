@@ -81,6 +81,7 @@ vi.mock("@/lib/api", () => ({
     documents: [
       { id: "1", filename: "test.pdf", size: 1024, created_at: "2024-01-01", metadata: { status: "processed", chunk_count: 5 } },
     ],
+    total: 1,
   }),
   scanDocuments: vi.fn().mockResolvedValue({ added: 0, scanned: 0 }),
   deleteDocument: vi.fn().mockResolvedValue({}),
@@ -249,6 +250,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
         documents: [
           { filename: "test.pdf", size: 1024, created_at: "2024-01-01", metadata: { status: "processed", chunk_count: 5 } } as any,
         ],
+        total: 1,
       });
 
       await act(async () => {
@@ -266,6 +268,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
         documents: [
           { id: "1", filename: null, size: 1024, created_at: "2024-01-01", metadata: { status: "processed", chunk_count: 5 } } as any,
         ],
+        total: 1,
       });
 
       await act(async () => {
@@ -283,6 +286,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
         documents: [
           { id: "1", filename: "test.pdf", size: 1024, created_at: "2024-01-01", metadata: undefined } as any,
         ],
+        total: 1,
       });
 
       await act(async () => {
@@ -300,6 +304,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
         documents: [
           { id: "1", filename: "test.pdf", size: 1024, created_at: "2024-01-01", metadata: null } as any,
         ],
+        total: 1,
       });
 
       await act(async () => {
@@ -317,6 +322,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
         documents: [
           { id: null, filename: "test.pdf", size: 1024, created_at: "2024-01-01", metadata: { status: "processed", chunk_count: 5 } } as any,
         ],
+        total: 1,
       });
 
       await act(async () => {
@@ -332,6 +338,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
       const { listDocuments } = await import("@/lib/api");
       listDocuments.mockResolvedValueOnce({
         documents: [{} as any],
+        total: 1,
       });
 
       await act(async () => {
@@ -350,6 +357,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
         documents: [
           { id: symId, filename: "test.pdf", size: 1024, created_at: "2024-01-01", metadata: { status: "processed", chunk_count: 5 } } as any,
         ],
+        total: 1,
       });
 
       await act(async () => {
@@ -367,6 +375,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
         documents: [
           { id: 0, filename: "Zero id.pdf", size: 1024, created_at: "2024-01-01", metadata: { status: "processed", chunk_count: 5 } } as any,
         ],
+        total: 1,
       });
 
       await act(async () => {
@@ -384,6 +393,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
         documents: [
           { id: "", filename: "Empty id.pdf", size: 1024, created_at: "2024-01-01", metadata: { status: "processed", chunk_count: 5 } } as any,
         ],
+        total: 1,
       });
 
       await act(async () => {
@@ -401,6 +411,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
         documents: [
           { id: "1", filename: undefined, size: 1024, created_at: "2024-01-01", metadata: { status: "processed", chunk_count: 5 } } as any,
         ],
+        total: 1,
       });
 
       await act(async () => {
@@ -427,7 +438,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
       }));
 
       const { listDocuments } = await import("@/lib/api");
-      listDocuments.mockResolvedValueOnce({ documents: manyDocs });
+      listDocuments.mockResolvedValueOnce({ documents: manyDocs, total: 500 });
 
       await act(async () => {
         const result = render(<DocumentsPage />);
@@ -449,7 +460,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
       }));
 
       const { listDocuments } = await import("@/lib/api");
-      listDocuments.mockResolvedValueOnce({ documents: manyDocs });
+      listDocuments.mockResolvedValueOnce({ documents: manyDocs, total: 1000 });
 
       await act(async () => {
         const result = render(<DocumentsPage />);
@@ -473,7 +484,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
         metadata: { status: "processed", chunk_count: 5 },
       }));
 
-      listDocuments.mockResolvedValueOnce({ documents: currentDocs });
+      listDocuments.mockResolvedValueOnce({ documents: currentDocs, total: 10 });
 
       let result: ReturnType<typeof render>;
       await act(async () => {
@@ -491,7 +502,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
         metadata: { status: "processed", chunk_count: 5 },
       }));
 
-      listDocuments.mockResolvedValueOnce({ documents: currentDocs });
+      listDocuments.mockResolvedValueOnce({ documents: currentDocs, total: 500 });
 
       await act(async () => {
         result!.rerender(<DocumentsPage />);
@@ -513,6 +524,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
         documents: [
           { id: "1", filename: largeFilename, size: 1024, created_at: "2024-01-01", metadata: { status: "processed", chunk_count: 5 } },
         ],
+        total: 1,
       });
 
       await act(async () => {
@@ -532,6 +544,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
         documents: [
           { id: "1", filename: hugeFilename, size: 1024, created_at: "2024-01-01", metadata: { status: "processed", chunk_count: 5 } },
         ],
+        total: 1,
       });
 
       await act(async () => {
@@ -553,6 +566,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
           { id: "2", filename: largeFilename + "_2.pdf", size: 1024, created_at: "2024-01-01", metadata: { status: "processed", chunk_count: 5 } },
           { id: "3", filename: largeFilename + "_3.pdf", size: 1024, created_at: "2024-01-01", metadata: { status: "processed", chunk_count: 5 } },
         ],
+        total: 3,
       });
 
       await act(async () => {
@@ -572,6 +586,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
         documents: [
           { id: "1", filename: singleWordFilename, size: 1024, created_at: "2024-01-01", metadata: { status: "processed", chunk_count: 5 } },
         ],
+        total: 1,
       });
 
       await act(async () => {
@@ -594,6 +609,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
         documents: [
           { id: "1", filename: "", size: 1024, created_at: "2024-01-01", metadata: { status: "processed", chunk_count: 5 } },
         ],
+        total: 1,
       });
 
       await act(async () => {
@@ -613,6 +629,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
           { id: "2", filename: "", size: 2048, created_at: "2024-01-02", metadata: { status: "processed", chunk_count: 10 } },
           { id: "3", filename: "", size: 4096, created_at: "2024-01-03", metadata: { status: "processed", chunk_count: 20 } },
         ],
+        total: 3,
       });
 
       await act(async () => {
@@ -632,6 +649,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
           { id: "2", filename: "", size: 2048, created_at: "2024-01-02", metadata: { status: "processed", chunk_count: 10 } },
           { id: "3", filename: null as any, size: 4096, created_at: "2024-01-03", metadata: { status: "processed", chunk_count: 20 } },
         ],
+        total: 3,
       });
 
       await act(async () => {
@@ -731,7 +749,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
         metadata: { status: "processed", chunk_count: 5 },
       }));
 
-      listDocuments.mockResolvedValueOnce({ documents: docs });
+      listDocuments.mockResolvedValueOnce({ documents: docs, total: docs.length });
 
       await act(async () => {
         result = render(<DocumentsPage />);
@@ -749,7 +767,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
           metadata: { status: "processed", chunk_count: 5 },
         }));
 
-        listDocuments.mockResolvedValueOnce({ documents: docs });
+        listDocuments.mockResolvedValueOnce({ documents: docs, total: docs.length });
 
         await act(async () => {
           result!.rerender(<DocumentsPage />);
@@ -772,6 +790,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
           { id: "new-1", filename: "new_document_1.pdf", size: 1024, created_at: "2024-01-01", metadata: { status: "processed", chunk_count: 5 } },
           { id: "new-2", filename: "new_document_2.pdf", size: 2048, created_at: "2024-01-02", metadata: { status: "pending", chunk_count: 0 } },
         ],
+        total: 2,
       });
 
       await act(async () => {
@@ -803,6 +822,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
         documents: [
           { id: "1", filename: "test.pdf", size: 1024, created_at: "2024-01-01", metadata: { status: "processed", chunk_count: 5 } },
         ],
+        total: 1,
       });
 
       await act(async () => {
@@ -823,6 +843,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
         documents: [
           { id: "1", filename: "test.pdf", size: 1024, created_at: "2024-01-01", metadata: { status: "processed", chunk_count: 5 } },
         ],
+        total: 1,
       });
 
       await act(async () => {
@@ -858,6 +879,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
         documents: [
           { id: "1", filename: payload + ".pdf", size: 1024, created_at: "2024-01-01", metadata: { status: "processed", chunk_count: 5 } },
         ],
+        total: 1,
       });
 
       await act(async () => {
@@ -876,6 +898,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
         documents: [
           { id: "1", filename: "test.pdf", size: 1024, created_at: "2024-01-01", metadata: { status: payload, chunk_count: 5 } } as any,
         ],
+        total: 1,
       });
 
       await act(async () => {
@@ -896,6 +919,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
           { id: "2", filename: 'normal.pdf', size: 2048, created_at: "2024-01-02", metadata: { status: '<img onerror="alert(2)" src=x>', chunk_count: 10 } as any },
           { id: "3", filename: 'another.pdf', size: 4096, created_at: "2024-01-03", metadata: { status: "pending", chunk_count: 0 } },
         ],
+        total: 3,
       });
 
       await act(async () => {
@@ -921,6 +945,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
         documents: [
           { id: "1", filename: rtlFilename, size: 1024, created_at: "2024-01-01", metadata: { status: "processed", chunk_count: 5 } },
         ],
+        total: 1,
       });
 
       await act(async () => {
@@ -940,6 +965,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
         documents: [
           { id: "1", filename: nullByteFilename, size: 1024, created_at: "2024-01-01", metadata: { status: "processed", chunk_count: 5 } },
         ],
+        total: 1,
       });
 
       await act(async () => {
@@ -959,6 +985,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
         documents: [
           { id: "1", filename: combiningFilename, size: 1024, created_at: "2024-01-01", metadata: { status: "processed", chunk_count: 5 } },
         ],
+        total: 1,
       });
 
       await act(async () => {
@@ -978,6 +1005,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
         documents: [
           { id: "1", filename: zwspFilename, size: 1024, created_at: "2024-01-01", metadata: { status: "processed", chunk_count: 5 } },
         ],
+        total: 1,
       });
 
       await act(async () => {
@@ -997,6 +1025,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
         documents: [
           { id: "1", filename: emojiFilename, size: 1024, created_at: "2024-01-01", metadata: { status: "processed", chunk_count: 5 } },
         ],
+        total: 1,
       });
 
       await act(async () => {
@@ -1019,6 +1048,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
         documents: [
           { id: String(NaN), filename: "NaN id.pdf", size: 1024, created_at: "2024-01-01", metadata: { status: "processed", chunk_count: 5 } },
         ],
+        total: 1,
       });
 
       await act(async () => {
@@ -1036,6 +1066,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
         documents: [
           { id: String(Infinity), filename: "Infinity id.pdf", size: 1024, created_at: "2024-01-01", metadata: { status: "processed", chunk_count: 5 } },
         ],
+        total: 1,
       });
 
       await act(async () => {
@@ -1053,6 +1084,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
         documents: [
           { id: String(-Infinity), filename: "-Infinity id.pdf", size: 1024, created_at: "2024-01-01", metadata: { status: "processed", chunk_count: 5 } },
         ],
+        total: 1,
       });
 
       await act(async () => {
@@ -1070,6 +1102,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
         documents: [
           { id: String(Number.MAX_SAFE_INTEGER), filename: "Max safe int.pdf", size: 1024, created_at: "2024-01-01", metadata: { status: "processed", chunk_count: 5 } },
         ],
+        total: 1,
       });
 
       await act(async () => {
@@ -1087,6 +1120,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
         documents: [
           { id: "-5", filename: "Negative index.pdf", size: 1024, created_at: "2024-01-01", metadata: { status: "processed", chunk_count: 5 } },
         ],
+        total: 1,
       });
 
       await act(async () => {
@@ -1104,6 +1138,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
         documents: [
           { id: "-0", filename: "Negative zero id.pdf", size: 1024, created_at: "2024-01-01", metadata: { status: "processed", chunk_count: 5 } },
         ],
+        total: 1,
       });
 
       await act(async () => {
@@ -1121,6 +1156,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
         documents: [
           { id: "1", filename: "negativesize.pdf", size: -1024, created_at: "2024-01-01", metadata: { status: "processed", chunk_count: 5 } } as any,
         ],
+        total: 1,
       });
 
       await act(async () => {
@@ -1143,6 +1179,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
         documents: [
           { id: "1", filename: 12345 as any, size: 1024, created_at: "2024-01-01", metadata: { status: "processed", chunk_count: 5 } },
         ],
+        total: 1,
       });
 
       await act(async () => {
@@ -1160,6 +1197,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
         documents: [
           { id: "1", filename: ["array", "filename"] as any, size: 1024, created_at: "2024-01-01", metadata: { status: "processed", chunk_count: 5 } },
         ],
+        total: 1,
       });
 
       await act(async () => {
@@ -1177,6 +1215,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
         documents: [
           { id: "1", filename: { nested: "object" } as any, size: 1024, created_at: "2024-01-01", metadata: { status: "processed", chunk_count: 5 } },
         ],
+        total: 1,
       });
 
       await act(async () => {
@@ -1194,6 +1233,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
         documents: [
           { id: "1", filename: undefined, size: 1024, created_at: "2024-01-01", metadata: { status: "processed", chunk_count: 5 } } as any,
         ],
+        total: 1,
       });
 
       await act(async () => {
@@ -1211,6 +1251,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
         documents: [
           { id: "1", filename: "test.pdf", size: 1024, created_at: "2024-01-01", metadata: { status: 123 as any, chunk_count: 5 } },
         ],
+        total: 1,
       });
 
       await act(async () => {
@@ -1228,6 +1269,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
         documents: [
           { id: "1", filename: "test.pdf", size: 1024, created_at: "2024-01-01", metadata: { status: ["array", "status"] as any, chunk_count: 5 } },
         ],
+        total: 1,
       });
 
       await act(async () => {

@@ -267,7 +267,10 @@ export default function KMSPage() {
           />
         </div>
         <Select value={statusFilter} onValueChange={setStatusFilter}>
-          <SelectTrigger className="w-40">
+          {/* Issue #778: the trigger needs an explicit accessible name —
+              placeholder-only SelectValue leaves the combobox unnamed
+              (axe button-name, critical). */}
+          <SelectTrigger className="w-40" aria-label="Status filter">
             <SelectValue placeholder="Status" />
           </SelectTrigger>
           <SelectContent>

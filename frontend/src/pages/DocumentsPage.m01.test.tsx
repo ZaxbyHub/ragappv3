@@ -46,7 +46,8 @@ vi.mock('@/lib/api', () => ({
     documents: [
       { id: '1', filename: 'test.pdf', size: 1024, created_at: '2024-01-01', metadata: { status: 'processed', chunk_count: 5 } },
       { id: '2', filename: 'test2.pdf', size: 2048, created_at: '2024-01-02', metadata: { status: 'processed', chunk_count: 10 } },
-    ]
+    ],
+    total: 2,
   }),
   scanDocuments: vi.fn().mockResolvedValue({ added: 0, scanned: 0 }),
   deleteDocument: vi.fn().mockResolvedValue({}),

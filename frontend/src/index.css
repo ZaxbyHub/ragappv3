@@ -640,11 +640,11 @@
     
     /* Muted - Very subtle teal-gray */
     --muted: 195 10% 94%;
-    /* Darkened from 40% → 38% lightness so the token clears WCAG 1.4.3 AA
-       (4.5:1) on every surface it is drawn over — background, card, popover,
-       muted AND input (the TabsList strip) — in light theme (UI-R4-11, #777;
-       the earlier 45% → 40% fix in #294 only checked background/card). */
-    --muted-foreground: 195 10% 38%;
+    /* Darkened 45% → 40% (#294, background/card only) → 38% (#777, added
+       popover/muted/input) → 36% (#778 review: 38 measured 4.47:1 on the
+       tinted canvas version rail) so the token clears WCAG 1.4.3 AA (4.5:1)
+       on every light surface it is drawn over. */
+    --muted-foreground: 195 10% 36%;
     
     /* Accent - Light grey with barely perceptible blue tint */
     --accent: 195 42% 86%;
@@ -665,12 +665,12 @@
     --ring: 195 45% 38%;
     
     /* Success - Green for positive states */
-    --success: 142 70% 30%;
+    --success: 142 70% 26%; /* #778: 30 measured 4.21:1 on success/10 tints */
     --success-foreground: 0 0% 100%;
     --success-subdued: 142 50% 32%;
     --success-subdued-foreground: 0 0% 100%;
 
-    --warning: 35 90% 33%;
+    --warning: 35 90% 28%; /* #778: warning/10 alert text needed AA margin */
     --warning-foreground: 0 0% 100%;
 
     /* Filetype colors */
@@ -820,6 +820,14 @@
     font-family: 'Spline Sans', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
     font-weight: 400;
     min-height: 100vh;
+    /* Issue #778: opaque base coat under the decorative ::before gradient.
+       Without it the body has no background color, so every alpha-tinted
+       surface (bg-accent/50 title chips, /10 status badges) composites
+       against nothing for accessibility measurement — contrast tools walk
+       the ancestor chain for an opaque color, miss the fixed pseudo-element
+       gradient, and mis-measure. Visually neutral: the gradient paints the
+       same hue on top. */
+    background-color: hsl(var(--background));
   }
 
   /*

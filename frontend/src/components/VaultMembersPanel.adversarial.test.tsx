@@ -332,7 +332,10 @@ describe('VaultMembersPanel ADVERSARIAL', () => {
       await act(async () => { render(<VaultMembersPanel vaultId={999} />); });
 
       await waitFor(() => {
-        expect(api.default.get).toHaveBeenCalledWith('/vaults/999/members');
+        expect(api.default.get).toHaveBeenCalledWith(
+          '/vaults/999/members',
+          expect.objectContaining({ signal: expect.any(AbortSignal) }),
+        );
       });
     });
 
@@ -342,7 +345,10 @@ describe('VaultMembersPanel ADVERSARIAL', () => {
       await act(async () => { render(<VaultMembersPanel vaultId={0} />); });
 
       await waitFor(() => {
-        expect(api.default.get).toHaveBeenCalledWith('/vaults/0/members');
+        expect(api.default.get).toHaveBeenCalledWith(
+          '/vaults/0/members',
+          expect.objectContaining({ signal: expect.any(AbortSignal) }),
+        );
       });
     });
 
@@ -352,7 +358,10 @@ describe('VaultMembersPanel ADVERSARIAL', () => {
       await act(async () => { render(<VaultMembersPanel vaultId={-1} />); });
 
       await waitFor(() => {
-        expect(api.default.get).toHaveBeenCalledWith('/vaults/-1/members');
+        expect(api.default.get).toHaveBeenCalledWith(
+          '/vaults/-1/members',
+          expect.objectContaining({ signal: expect.any(AbortSignal) }),
+        );
       });
     });
   });

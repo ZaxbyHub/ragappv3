@@ -1,17 +1,33 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type MutableRefObject,
+  type SetStateAction,
+} from "react";
 import { toast } from "sonner";
 import {
-  listDocuments,
+  captureAuthPrincipalGeneration,
+  isCurrentAuthOwner,
+  subscribeAuthPrincipal,
+  type AuthOwner,
+} from "@/lib/api/auth-lifecycle";
+import {
+  compileDocumentWiki,
   getDocumentStats,
   getDocumentWikiStatus,
-  compileDocumentWiki,
+  listDocuments,
   type Document,
+  type DocumentSortBy,
   type DocumentStatsResponse,
   type DocumentWikiStatus,
-  type DocumentSortBy,
   type SortOrder,
 } from "@/lib/api";
 import type { UploadFile } from "@/stores/useUploadStore";
+import { useAuthOwner } from "@/hooks/useAuthOwner";
 
 interface UseDocumentPollingArgs {
   activeVaultId: number | null;
@@ -23,14 +39,73 @@ interface UseDocumentPollingArgs {
   uploads: UploadFile[];
 }
 
+type Scope = Readonly<{
+  owner: AuthOwner;
+  principalGeneration: number;
+  vaultId: number | null;
+  serial: number;
+}>;
+
+type Lease = {
+  readonly scope: Scope;
+  readonly serial: number;
+  retired: boolean;
+};
+
+type ReadDomain = "list" | "stats" | "wiki";
+
+type ReadToken = Readonly<{
+  domain: ReadDomain;
+  scope: Scope;
+  lease: Lease;
+  key: string;
+  readContext: object;
+  attempt: number;
+}>;
+
+type CompileToken = Readonly<{
+  scope: Scope;
+  lease: Lease;
+  serial: number;
+  docId: string;
+}>;
+
+type WikiPollFlight = Readonly<{
+  scope: Scope;
+  lease: Lease;
+  serial: number;
+}>;
+
+type CompileTimer = {
+  readonly token: CompileToken;
+  timer: ReturnType<typeof setTimeout>;
+};
+
+const PAGE_SIZE = 50;
+const MAX_PAGE_SIZE = 1000;
+const WIKI_POLL_INTERVAL_MS = 5_000;
+
+function isDocumentListResponse(
+  value: unknown
+): value is { documents: Document[]; total: number } {
+  if (value === null || typeof value !== "object") return false;
+  const candidate = value as { documents?: unknown; total?: unknown };
+  return (
+    Array.isArray(candidate.documents) &&
+    typeof candidate.total === "number" &&
+    Number.isFinite(candidate.total) &&
+    candidate.total >= 0
+  );
+}
+
+function isTransientWikiStatus(status: string | null | undefined): boolean {
+  return status === "compiling" || status === "running";
+}
+
 /**
- * Owns the document list lifecycle: initial load, query-driven refetch (search,
- * sort, tag filter), adaptive status polling for in-flight documents, wiki
- * status hydration, and refresh-on-upload-complete.
- *
- * The skeleton (`loading`) is only shown on the first load per vault — search,
- * sort, and tag changes refresh in place (the search box surfaces its own
- * pending indicator), matching the pre-refactor behavior.
+ * Owns the document list lifecycle while treating authentication, principal,
+ * and vault changes as hard publication boundaries. Query changes keep the
+ * current window visible while their replacement reads settle.
  */
 export function useDocumentPolling({
   activeVaultId,
@@ -41,35 +116,186 @@ export function useDocumentPolling({
   folderFilterId,
   uploads,
 }: UseDocumentPollingArgs) {
-  const [documents, setDocuments] = useState<Document[]>([]);
-  const [stats, setStats] = useState<DocumentStatsResponse | null>(null);
-  const [loading, setLoading] = useState(true);
-  // True when the LAST list fetch failed (cleared by a successful one). Drives
-  // the page-level retry affordance — an empty list after a failure must not
-  // read as an empty vault (issue #258 / legacy-14).
-  const [listError, setListError] = useState(false);
-  const [wikiStatusMap, setWikiStatusMap] = useState<Record<string, DocumentWikiStatus>>({});
-  const [compilingDocIds, setCompilingDocIds] = useState<Set<string>>(new Set());
-  // Total documents matching the current query (drives the "load more" control),
-  // and the size of the fetched window. Rather than accumulate discrete pages
-  // (which would fight the status poller that always refetches the window), we
-  // fetch a single window of `pageSize` rows and grow it on demand. The poller
-  // and search/sort refetch the same window, so the list stays consistent.
-  const PAGE_SIZE = 50;
-  const [total, setTotal] = useState(0);
-  const [pageSize, setPageSize] = useState(PAGE_SIZE);
+  const authOwner = useAuthOwner();
+  const principalGeneration = useSyncExternalStore(
+    subscribeAuthPrincipal,
+    captureAuthPrincipalGeneration,
+    captureAuthPrincipalGeneration
+  );
+
+  const scopeRef = useRef<Scope | null>(null);
+  const scopeSerialRef = useRef(0);
+  if (
+    scopeRef.current === null ||
+    scopeRef.current.owner !== authOwner ||
+    scopeRef.current.principalGeneration !== principalGeneration ||
+    scopeRef.current.vaultId !== activeVaultId
+  ) {
+    scopeRef.current = {
+      owner: authOwner,
+      principalGeneration,
+      vaultId: activeVaultId,
+      serial: ++scopeSerialRef.current,
+    };
+  }
+  const scope = scopeRef.current;
+
+  const leaseRef = useRef<Lease | null>(null);
+  const leaseSerialRef = useRef(0);
+  if (leaseRef.current === null || leaseRef.current.scope !== scope) {
+    leaseRef.current = {
+      scope,
+      serial: ++leaseSerialRef.current,
+      retired: false,
+    };
+  }
+
+  const [documents, setDocumentsState] = useState<Document[]>([]);
+  const [stats, setStatsState] = useState<DocumentStatsResponse | null>(null);
+  const [loading, setLoadingState] = useState(true);
+  const [listError, setListErrorState] = useState(false);
+  const [wikiStatusMap, setWikiStatusMapState] = useState<
+    Record<string, DocumentWikiStatus>
+  >({});
+  const [compilingDocIds, setCompilingDocIdsState] = useState<Set<string>>(
+    new Set()
+  );
+  const [total, setTotalState] = useState(0);
+  const [pageWindow, setPageWindow] = useState<{
+    scope: Scope | null; query: string | null; size: number;
+  }>({ scope: null, query: null, size: PAGE_SIZE });
+  const initialSettledScopeRef = useRef<Scope | null>(null);
+
+  const documentsScopeRef = useRef<Scope | null>(null);
+  const statsScopeRef = useRef<Scope | null>(null);
+  const loadingScopeRef = useRef<Scope | null>(null);
+  const listErrorScopeRef = useRef<Scope | null>(null);
+  const wikiScopeRef = useRef<Scope | null>(null);
+  const compilingScopeRef = useRef<Scope | null>(null);
+  const totalScopeRef = useRef<Scope | null>(null);
+
+  const queryBaseKey = JSON.stringify([
+    activeVaultId,
+    search,
+    sortBy,
+    sortOrder,
+    tagFilterId,
+    folderFilterId,
+  ]);
+  const queryBaseKeyRef = useRef<string | null>(null);
+  queryBaseKeyRef.current = queryBaseKey;
+  const queryContext = useMemo(() => ({ scope, key: queryBaseKey }), [scope, queryBaseKey]);
+  const queryContextRef = useRef(queryContext);
+  queryContextRef.current = queryContext;
+  const effectivePageSize = pageWindow.scope === scope && pageWindow.query === queryBaseKey
+    ? pageWindow.size : PAGE_SIZE;
+  const listReadKey = JSON.stringify([queryBaseKey, effectivePageSize]);
+  const readContext = useMemo(() => ({ queryContext, key: listReadKey }), [queryContext, listReadKey]);
+  const readContextRef = useRef(readContext);
+  readContextRef.current = readContext;
+
+  const liveLeaseFor = useCallback((capturedScope: Scope): Lease | null => {
+    if (scopeRef.current !== capturedScope) return null;
+    const lease = leaseRef.current;
+    return lease !== null && lease.scope === capturedScope && !lease.retired ? lease : null;
+  }, []);
+
+  const isContextLive = useCallback(
+    (capturedScope: Scope, capturedLease: Lease): boolean =>
+      scopeRef.current === capturedScope &&
+      leaseRef.current === capturedLease &&
+      !capturedLease.retired &&
+      isCurrentAuthOwner(capturedScope.owner) &&
+      captureAuthPrincipalGeneration() === capturedScope.principalGeneration,
+    []
+  );
+
+  const listLatestRef = useRef<ReadToken | null>(null);
+  const listPendingRef = useRef<ReadToken | null>(null);
+  const statsLatestRef = useRef<ReadToken | null>(null);
+  const statsPendingRef = useRef<ReadToken | null>(null);
+  const wikiLatestRef = useRef<ReadToken | null>(null);
+  const wikiPendingRef = useRef<ReadToken | null>(null);
+  const listAttemptRef = useRef(0);
+  const statsAttemptRef = useRef(0);
+  const wikiAttemptRef = useRef(0);
+
+  const latestFor = useCallback(
+    (domain: ReadDomain): MutableRefObject<ReadToken | null> => {
+    if (domain === "list") return listLatestRef;
+    if (domain === "stats") return statsLatestRef;
+    return wikiLatestRef;
+    },
+    []
+  );
+
+  const pendingFor = useCallback(
+    (domain: ReadDomain): MutableRefObject<ReadToken | null> => {
+    if (domain === "list") return listPendingRef;
+    if (domain === "stats") return statsPendingRef;
+    return wikiPendingRef;
+    },
+    []
+  );
+
+  const nextAttemptFor = useCallback((domain: ReadDomain): number => {
+    if (domain === "list") return ++listAttemptRef.current;
+    if (domain === "stats") return ++statsAttemptRef.current;
+    return ++wikiAttemptRef.current;
+  }, []);
+
+  const beginRead = useCallback(
+    (domain: ReadDomain, key: string, capturedScope: Scope): ReadToken | null => {
+      const lease = liveLeaseFor(capturedScope);
+      if (lease === null || !isContextLive(capturedScope, lease)) return null;
+      const token: ReadToken = {
+        domain,
+        scope: capturedScope,
+        lease,
+        key,
+        readContext: readContextRef.current,
+        attempt: nextAttemptFor(domain),
+      };
+      latestFor(domain).current = token;
+      pendingFor(domain).current = token;
+      return token;
+    },
+    [isContextLive, latestFor, liveLeaseFor, nextAttemptFor, pendingFor]
+  );
+
+  const isReadCurrent = useCallback(
+    (token: ReadToken): boolean =>
+      isContextLive(token.scope, token.lease) && latestFor(token.domain).current === token &&
+      (token.domain === "stats" || readContextRef.current === token.readContext),
+    [isContextLive, latestFor]
+  );
+
+  const finishRead = useCallback(
+    (token: ReadToken): void => {
+      if (!isContextLive(token.scope, token.lease)) return;
+      const pending = pendingFor(token.domain);
+      if (pending.current === token) pending.current = null;
+    },
+    [isContextLive, pendingFor]
+  );
+
+  const commitLoading = useCallback(
+    (capturedScope: Scope, capturedLease: Lease, value: boolean) => {
+      setLoadingState((previous) => {
+        if (!isContextLive(capturedScope, capturedLease)) return previous;
+        loadingScopeRef.current = capturedScope;
+        return value;
+      });
+    },
+    [isContextLive]
+  );
+
   const pollIntervalMsRef = useRef(2_000);
-  const initialLoadDone = useRef(false);
-  // Monotonic generation for list fetches: only the most recently issued
-  // fetchDocuments may commit. A late response (success or rejection) for an
-  // abandoned query must never overwrite or clear a newer query's results.
-  const fetchGenerationRef = useRef(0);
-  // Same ordering guarantee for wiki-status fetches (hydration effect vs the
-  // poll-to-terminal interval; post-unmount commits are dropped).
-  const wikiFetchAttemptRef = useRef(0);
 
   const fetchDocuments = useCallback(async () => {
-    const generation = ++fetchGenerationRef.current;
+    if (scopeRef.current !== scope || readContextRef.current !== readContext) return;
+    const token = beginRead("list", listReadKey, scope);
+    if (token === null) return;
     try {
       const response = await listDocuments({
         vaultId: activeVaultId ?? undefined,
@@ -78,242 +304,427 @@ export function useDocumentPolling({
         sortOrder,
         tagId: tagFilterId ?? undefined,
         folderId: folderFilterId ?? undefined,
-        perPage: pageSize,
+        perPage: effectivePageSize,
       });
-      if (fetchGenerationRef.current !== generation) return;
-      setDocuments(response?.documents || []);
-      setTotal(response?.total ?? 0);
-      setListError(false);
-    } catch (err) {
-      if (fetchGenerationRef.current !== generation) return;
-      console.error("Failed to fetch documents:", err);
-      toast.error(err instanceof Error ? err.message : "Failed to load documents");
-      setDocuments([]);
-      setTotal(0);
-      setListError(true);
+      if (!isReadCurrent(token)) return;
+      if (!isDocumentListResponse(response)) {
+        throw new Error("Invalid document list response");
+      }
+      setDocumentsState((previous) => {
+        if (!isReadCurrent(token)) return previous;
+        documentsScopeRef.current = token.scope;
+        return response.documents;
+      });
+      setTotalState((previous) => {
+        if (!isReadCurrent(token)) return previous;
+        totalScopeRef.current = token.scope;
+        return response.total;
+      });
+      setListErrorState((previous) => {
+        if (!isReadCurrent(token)) return previous;
+        listErrorScopeRef.current = token.scope;
+        return false;
+      });
+    } catch (error) {
+      if (!isReadCurrent(token)) return;
+      console.error("Failed to fetch documents:", error);
+      toast.error(error instanceof Error ? error.message : "Failed to load documents");
+      setDocumentsState((previous) => {
+        if (!isReadCurrent(token)) return previous;
+        documentsScopeRef.current = token.scope;
+        return [];
+      });
+      setTotalState((previous) => {
+        if (!isReadCurrent(token)) return previous;
+        totalScopeRef.current = token.scope;
+        return 0;
+      });
+      setListErrorState((previous) => {
+        if (!isReadCurrent(token)) return previous;
+        listErrorScopeRef.current = token.scope;
+        return true;
+      });
+    } finally {
+      finishRead(token);
     }
-  }, [activeVaultId, search, sortBy, sortOrder, tagFilterId, folderFilterId, pageSize]);
-
-  // Reset the fetch window to the first page whenever the query changes, so a
-  // new vault/search/sort/filter starts at 50 rows rather than carrying a large
-  // window over. (Capped at the backend per_page max of 1000.)
-  useEffect(() => {
-    setPageSize(PAGE_SIZE);
-  }, [activeVaultId, search, sortBy, sortOrder, tagFilterId, folderFilterId]);
-
-  const loadMore = useCallback(() => {
-    setPageSize((prev) => Math.min(prev + PAGE_SIZE, 1000));
-  }, []);
-
-  const hasMore = documents.length < total;
+  }, [
+    activeVaultId,
+    beginRead,
+    effectivePageSize,
+    finishRead,
+    folderFilterId,
+    isReadCurrent,
+    listReadKey,
+    readContext,
+    scope,
+    search,
+    sortBy,
+    sortOrder,
+    tagFilterId,
+  ]);
 
   const fetchStats = useCallback(async () => {
+    if (scopeRef.current !== scope) return;
+    const key = JSON.stringify([activeVaultId]);
+    const token = beginRead("stats", key, scope);
+    if (token === null) return;
     try {
       const response = await getDocumentStats(activeVaultId ?? undefined);
-      setStats(response);
-    } catch (err) {
-      console.error("Failed to fetch stats:", err);
-      toast.error(err instanceof Error ? err.message : "Failed to load document stats");
+      if (!isReadCurrent(token)) return;
+      setStatsState((previous) => {
+        if (!isReadCurrent(token)) return previous;
+        statsScopeRef.current = token.scope;
+        return response;
+      });
+    } catch (error) {
+      if (!isReadCurrent(token)) return;
+      console.error("Failed to fetch stats:", error);
+      toast.error(error instanceof Error ? error.message : "Failed to load document stats");
+    } finally {
+      finishRead(token);
     }
-  }, [activeVaultId]);
+  }, [activeVaultId, beginRead, finishRead, isReadCurrent, scope]);
+
+  const documentsVisible = useMemo(
+    () => (documentsScopeRef.current === scope ? documents : []),
+    [documents, scope],
+  );
+  const statsVisible = statsScopeRef.current === scope ? stats : null;
+  const wikiStatusVisible = useMemo(
+    () => (wikiScopeRef.current === scope ? wikiStatusMap : {}),
+    [scope, wikiStatusMap],
+  );
+  const compilingVisible =
+    compilingScopeRef.current === scope ? compilingDocIds : new Set<string>();
+  const totalVisible = totalScopeRef.current === scope ? total : 0;
+  const listErrorVisible =
+    listErrorScopeRef.current === scope ? listError : false;
+  const loadingVisible = loadingScopeRef.current === scope ? loading : true;
+
+  const documentsRef = useRef<Document[]>([]);
+  documentsRef.current = documentsVisible;
 
   const fetchWikiStatuses = useCallback(
     async (docs: Document[]) => {
-      if (!activeVaultId) return;
-      // Monotonic attempt token (mirrors fetchDocuments' generation guard):
-      // only the most recently issued fetchWikiStatuses may commit, so a
-      // hydration effect and the poll-to-terminal interval can interleave
-      // without a stale response regressing a newer wiki status, and an
-      // in-flight fetch that resolves after unmount commits nothing.
-      const attempt = ++wikiFetchAttemptRef.current;
-      const indexed = docs.filter((d) => d.metadata?.status === "indexed");
-      // Bound concurrency so a large vault (hundreds of indexed docs) cannot
-      // fire one request per document simultaneously on every refresh (F-003).
-      const CONCURRENCY = 6;
+      if (scopeRef.current !== scope || activeVaultId === null) return;
+      const indexed = docs.filter((document) => document.metadata?.status === "indexed");
+      if (indexed.length === 0) return;
+      const key = JSON.stringify(indexed.map((document) => String(document.id)));
+      const token = beginRead("wiki", key, scope);
+      if (token === null) return;
       const results: (DocumentWikiStatus | undefined)[] = new Array(indexed.length);
       let cursor = 0;
       const worker = async () => {
-        while (cursor < indexed.length) {
-          const i = cursor++;
+        while (true) {
+          if (!isReadCurrent(token)) return;
+          const index = cursor;
+          if (index >= indexed.length) return;
+          cursor += 1;
           try {
-            results[i] = await getDocumentWikiStatus(Number(indexed[i].id), activeVaultId);
+            if (!isReadCurrent(token)) return;
+            results[index] = await getDocumentWikiStatus(
+              Number(indexed[index].id),
+              activeVaultId
+            );
+            if (!isReadCurrent(token)) return;
           } catch {
-            results[i] = undefined;
+            if (!isReadCurrent(token)) return;
           }
         }
       };
-      await Promise.all(
-        Array.from({ length: Math.min(CONCURRENCY, indexed.length) }, worker)
-      );
-      if (wikiFetchAttemptRef.current !== attempt) return;
-      setWikiStatusMap((prev) => {
-        const next = { ...prev };
-        indexed.forEach((d, i) => {
-          const r = results[i];
-          if (r !== undefined) next[String(d.id)] = r;
+      try {
+        await Promise.all(
+          Array.from({ length: Math.min(6, indexed.length) }, () => worker())
+        );
+        if (!isReadCurrent(token)) return;
+        setWikiStatusMapState((previous) => {
+          if (!isReadCurrent(token)) return previous;
+          const next = wikiScopeRef.current === token.scope ? { ...previous } : {};
+          wikiScopeRef.current = token.scope;
+          indexed.forEach((document, index) => {
+            const result = results[index];
+            if (result !== undefined) next[String(document.id)] = result;
+          });
+          return next;
         });
-        return next;
-      });
+      } finally {
+        finishRead(token);
+      }
     },
-    [activeVaultId]
+    [activeVaultId, beginRead, finishRead, isReadCurrent, scope]
+  );
+
+  const compileInFlightRef = useRef(new Map<string, CompileToken>());
+  const compileLatestRef = useRef(new Map<string, CompileToken>());
+  const compileSerialRef = useRef(0);
+  const compileTimersRef = useRef(new Set<CompileTimer>());
+  const wikiPollFlightRef = useRef<WikiPollFlight | null>(null);
+  const wikiPollSerialRef = useRef(0);
+
+  const isMutationCurrent = useCallback(
+    (token: CompileToken): boolean => isContextLive(token.scope, token.lease) &&
+      compileLatestRef.current.get(token.docId) === token,
+    [isContextLive]
+  );
+
+  const scheduleCompileWikiRefresh = useCallback(
+    (token: CompileToken) => {
+      if (!isMutationCurrent(token)) return;
+      const entry: CompileTimer = {
+        token,
+        timer: undefined as unknown as ReturnType<typeof setTimeout>,
+      };
+      entry.timer = setTimeout(() => {
+        compileTimersRef.current.delete(entry);
+        if (!isMutationCurrent(token)) return;
+        const currentDocs = documentsRef.current.filter(
+          (document) => document.metadata?.status === "indexed"
+        );
+        if (currentDocs.length > 0) void fetchWikiStatuses(currentDocs);
+      }, 2_000);
+      compileTimersRef.current.add(entry);
+    },
+    [fetchWikiStatuses, isMutationCurrent]
   );
 
   const handleCompileDocument = useCallback(
     async (docId: string) => {
-      if (!activeVaultId) return;
-      setCompilingDocIds((prev) => new Set(prev).add(docId));
+      if (activeVaultId === null) return;
+      const lease = liveLeaseFor(scope);
+      if (lease === null || !isContextLive(scope, lease)) return;
+      const existing = compileInFlightRef.current.get(docId);
+      if (existing !== undefined) {
+        if (isMutationCurrent(existing)) return;
+        if (compileInFlightRef.current.get(docId) === existing) {
+          compileInFlightRef.current.delete(docId);
+        }
+      }
+      const token: CompileToken = {
+        scope,
+        lease,
+        serial: ++compileSerialRef.current,
+        docId,
+      };
+      compileInFlightRef.current.set(docId, token);
+      compileLatestRef.current.set(docId, token);
+      setCompilingDocIdsState((previous) => {
+        if (!isMutationCurrent(token)) return previous;
+        const next = new Set(compilingScopeRef.current === token.scope ? previous : []);
+        compilingScopeRef.current = token.scope;
+        next.add(docId);
+        return next;
+      });
       try {
         await compileDocumentWiki(Number(docId), activeVaultId);
+        if (!isMutationCurrent(token)) return;
         toast.success("Wiki compile job queued");
-        setTimeout(() => fetchWikiStatuses(documents), 2000);
-      } catch (err) {
-        toast.error(err instanceof Error ? err.message : "Failed to queue wiki compile");
+        scheduleCompileWikiRefresh(token);
+      } catch (error) {
+        if (!isMutationCurrent(token)) return;
+        toast.error(error instanceof Error ? error.message : "Failed to queue wiki compile");
       } finally {
-        setCompilingDocIds((prev) => {
-          const s = new Set(prev);
-          s.delete(docId);
-          return s;
-        });
+        if (isMutationCurrent(token) && compileInFlightRef.current.get(docId) === token) {
+          compileInFlightRef.current.delete(docId);
+          setCompilingDocIdsState((previous) => {
+            if (!isMutationCurrent(token)) return previous;
+            const next = new Set(compilingScopeRef.current === token.scope ? previous : []);
+            compilingScopeRef.current = token.scope;
+            next.delete(docId);
+            return next;
+          });
+        }
       }
     },
-    [activeVaultId, documents, fetchWikiStatuses]
+    [activeVaultId, isContextLive, isMutationCurrent, liveLeaseFor, scheduleCompileWikiRefresh, scope]
   );
 
-  // Reset the skeleton gate on vault switch so the next load shows it, but
-  // search/sort/tag changes refresh in place. Declared before the load effect
-  // so the ref is reset before the load effect reads it.
-  useEffect(() => {
-    initialLoadDone.current = false;
-  }, [activeVaultId]);
+  const guardedSetDocuments = useCallback(
+    (action: SetStateAction<Document[]>) => {
+      const lease = liveLeaseFor(scope);
+      if (lease === null || !isContextLive(scope, lease)) return;
+      setDocumentsState((previous) => {
+        if (!isContextLive(scope, lease)) return previous;
+        const ownedPrevious = documentsScopeRef.current === scope ? previous : [];
+        documentsScopeRef.current = scope;
+        return typeof action === "function" ? action(ownedPrevious) : action;
+      });
+    },
+    [isContextLive, liveLeaseFor, scope]
+  );
 
-  // Initial + query-driven load. fetchDocuments/fetchStats change together on a
-  // vault switch, so this fires once per change (no double-fetch).
+  const guardedSetStats = useCallback(
+    (action: SetStateAction<DocumentStatsResponse | null>) => {
+      const lease = liveLeaseFor(scope);
+      if (lease === null || !isContextLive(scope, lease)) return;
+      setStatsState((previous) => {
+        if (!isContextLive(scope, lease)) return previous;
+        const ownedPrevious = statsScopeRef.current === scope ? previous : null;
+        statsScopeRef.current = scope;
+        return typeof action === "function" ? action(ownedPrevious) : action;
+      });
+    },
+    [isContextLive, liveLeaseFor, scope]
+  );
+
   useEffect(() => {
-    let cancelled = false;
-    const showSkeleton = !initialLoadDone.current;
-    (async () => {
-      if (showSkeleton) setLoading(true);
-      await Promise.all([fetchDocuments(), fetchStats()]);
-      if (!cancelled) {
-        initialLoadDone.current = true;
-        if (showSkeleton) setLoading(false);
+    if (scopeRef.current !== scope || !isCurrentAuthOwner(scope.owner) ||
+      captureAuthPrincipalGeneration() !== scope.principalGeneration) return;
+    let lease = leaseRef.current;
+    if (lease === null || lease.scope !== scope || lease.retired) {
+      lease = { scope, serial: ++leaseSerialRef.current, retired: false };
+      leaseRef.current = lease;
+    }
+    if (!isContextLive(scope, lease)) return;
+    const mountedLease = lease;
+    const compileTimers = compileTimersRef.current;
+    return () => {
+      mountedLease.retired = true;
+      for (const entry of compileTimers) {
+        if (entry.token.lease === mountedLease) {
+          clearTimeout(entry.timer);
+          compileTimers.delete(entry);
+        }
       }
+      if (wikiPollFlightRef.current?.lease === mountedLease) {
+        wikiPollFlightRef.current = null;
+      }
+    };
+  }, [isContextLive, liveLeaseFor, scope]);
+
+  const loadMore = useCallback(() => {
+    const lease = liveLeaseFor(scope);
+    if (lease === null || !isContextLive(scope, lease)) return;
+    if (queryContextRef.current !== queryContext) return;
+    setPageWindow((previous) => {
+      if (!isContextLive(scope, lease) || queryContextRef.current !== queryContext) return previous;
+      const size = previous.scope === scope && previous.query === queryBaseKey ? previous.size : PAGE_SIZE;
+      return { scope, query: queryBaseKey, size: Math.min(size + PAGE_SIZE, MAX_PAGE_SIZE) };
+    });
+  }, [isContextLive, liveLeaseFor, queryBaseKey, queryContext, scope]);
+
+  useEffect(() => {
+    const lease = liveLeaseFor(scope);
+    if (lease === null || !isContextLive(scope, lease)) return;
+    let cancelled = false;
+    const showSkeleton = initialSettledScopeRef.current !== scope;
+    if (showSkeleton) commitLoading(scope, lease, true);
+    void (async () => {
+      await Promise.resolve();
+      if (cancelled || !isContextLive(scope, lease) || readContextRef.current !== readContext) return;
+      await Promise.all([fetchDocuments(), fetchStats()]);
+      if (cancelled || !isContextLive(scope, lease)) return;
+      initialSettledScopeRef.current = scope;
+      if (showSkeleton) commitLoading(scope, lease, false);
     })();
     return () => {
       cancelled = true;
     };
-  }, [fetchDocuments, fetchStats]);
+  }, [commitLoading, fetchDocuments, fetchStats, isContextLive, liveLeaseFor, readContext, scope]);
 
-  // Adaptive status polling for in-flight documents. Starts at 2 s and backs
-  // off up to 30 s while no change is detected, resetting when idle.
   useEffect(() => {
-    const hasProcessingDocs = documents?.some(
-      (doc) => doc.metadata?.status === "processing" || doc.metadata?.status === "pending"
+    const lease = liveLeaseFor(scope);
+    if (lease === null || !isContextLive(scope, lease)) return;
+    const hasProcessingDocs = documentsVisible.some(
+      (document) =>
+        document.metadata?.status === "processing" ||
+        document.metadata?.status === "pending"
     );
-
     if (!hasProcessingDocs) {
       pollIntervalMsRef.current = 2_000;
       return;
     }
-
     const delay = pollIntervalMsRef.current;
     const timer = setTimeout(() => {
-      pollIntervalMsRef.current = Math.min(pollIntervalMsRef.current * 1.5, 30_000);
-      fetchDocuments();
-      fetchStats();
+      if (!isContextLive(scope, lease) || readContextRef.current !== readContext) return;
+      const nextDelay = Math.min(delay * 1.5, 30_000);
+      pollIntervalMsRef.current = nextDelay;
+      void fetchDocuments();
+      void fetchStats();
     }, delay);
-
     return () => clearTimeout(timer);
-  }, [documents, fetchDocuments, fetchStats]);
+  }, [documentsVisible, fetchDocuments, fetchStats, isContextLive, liveLeaseFor, readContext, scope]);
 
-  // Hydrate wiki statuses when the doc-ID set changes (best-effort). Keyed on
-  // the ID join — NOT the array identity — so the adaptive status poll's
-  // fetchDocuments() refresh (new array, same IDs) doesn't refire a wiki GET
-  // per document on every cycle. Only docs with no cached status or a
-  // transient status (compiling) are re-polled; terminal wiki statuses don't
-  // change without user action.
-  const wikiDocKey = documents.map((d) => String(d.id)).join(",");
+  const wikiDocKey = documentsVisible.map((document) => String(document.id)).join(",");
+  const wikiHydrationRef = useRef<{ lease: Lease; key: string; context: object } | null>(null);
   useEffect(() => {
-    if (documents.length === 0) return;
-    const need = documents.filter((d) => {
-      if (d.metadata?.status !== "indexed") return false;
-      const w = wikiStatusMap[String(d.id)];
-      return !w || isTransientWikiStatus(w.wiki_status);
+    const lease = liveLeaseFor(scope);
+    if (lease === null || !isContextLive(scope, lease) || documentsVisible.length === 0) {
+      return;
+    }
+    if (wikiHydrationRef.current?.lease === lease && wikiHydrationRef.current.key === wikiDocKey &&
+      wikiHydrationRef.current.context === readContext) return;
+    wikiHydrationRef.current = { lease, key: wikiDocKey, context: readContext };
+    const need = documentsVisible.filter((document) => {
+      if (document.metadata?.status !== "indexed") return false;
+      const cached = wikiStatusVisible[String(document.id)];
+      return !cached || isTransientWikiStatus(cached.wiki_status);
     });
-    if (need.length > 0) fetchWikiStatuses(need);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [wikiDocKey, fetchWikiStatuses]);
+    if (need.length > 0) void fetchWikiStatuses(need);
+  }, [documentsVisible, fetchWikiStatuses, isContextLive, liveLeaseFor, readContext, scope, wikiDocKey, wikiStatusVisible]);
 
-  // Independent poll-to-terminal for transient wiki statuses (e.g. compiling):
-  // while any listed doc's CACHED wiki status is transient, re-run the batched
-  // fetchWikiStatuses on a fixed ~5s cadence until every transient status
-  // reaches a terminal state. This is decoupled from document-list changes and
-  // from the indexing poller above — a compiling wiki can finish long after
-  // the document itself is indexed, and the list must not be refetched for the
-  // wiki cell to advance. One fetch per tick, skipped while a fetch is already
-  // in flight, and the interval is cancelled on unmount or when nothing is
-  // transient anymore.
-  const WIKI_POLL_INTERVAL_MS = 5_000;
-  const transientWikiKey = documents
+  const transientWikiKey = documentsVisible
     .filter(
-      (d) =>
-        d.metadata?.status === "indexed" &&
-        isTransientWikiStatus(wikiStatusMap[String(d.id)]?.wiki_status)
+      (document) =>
+        document.metadata?.status === "indexed" &&
+        isTransientWikiStatus(wikiStatusVisible[String(document.id)]?.wiki_status)
     )
-    .map((d) => String(d.id))
+    .map((document) => String(document.id))
     .join(",");
-  const wikiFetchInFlightRef = useRef(false);
+
   useEffect(() => {
-    if (!transientWikiKey) return;
-    const transientDocs = documents.filter((d) =>
-      transientWikiKey.split(",").includes(String(d.id))
-    );
+    const lease = liveLeaseFor(scope);
+    if (lease === null || !isContextLive(scope, lease) || !transientWikiKey) return;
     const timer = setInterval(() => {
-      if (wikiFetchInFlightRef.current) return;
-      wikiFetchInFlightRef.current = true;
-      void fetchWikiStatuses(transientDocs).finally(() => {
-        wikiFetchInFlightRef.current = false;
+      if (!isContextLive(scope, lease) || readContextRef.current !== readContext) return;
+      const currentFlight = wikiPollFlightRef.current;
+      if (currentFlight !== null) {
+        if (isContextLive(currentFlight.scope, currentFlight.lease)) return;
+        if (wikiPollFlightRef.current === currentFlight) wikiPollFlightRef.current = null;
+      }
+      const flight: WikiPollFlight = {
+        scope,
+        lease,
+        serial: ++wikiPollSerialRef.current,
+      };
+      wikiPollFlightRef.current = flight;
+      const currentDocs = documentsRef.current.filter((document) =>
+        transientWikiKey.split(",").includes(String(document.id))
+      );
+      void fetchWikiStatuses(currentDocs).finally(() => {
+        if (!isContextLive(flight.scope, flight.lease)) return;
+        if (wikiPollFlightRef.current === flight) wikiPollFlightRef.current = null;
       });
     }, WIKI_POLL_INTERVAL_MS);
     return () => clearInterval(timer);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [transientWikiKey, fetchWikiStatuses]);
+  }, [fetchWikiStatuses, isContextLive, liveLeaseFor, readContext, scope, transientWikiKey]);
 
-  // Refresh documents shortly after uploads finish indexing.
   useEffect(() => {
-    const completedCount = uploads.filter((u) => u.status === "indexed").length;
-    if (completedCount > 0) {
-      const timeout = setTimeout(() => {
-        fetchDocuments();
-        fetchStats();
-      }, 1000);
-      return () => clearTimeout(timeout);
-    }
-  }, [uploads, fetchDocuments, fetchStats]);
+    const lease = liveLeaseFor(scope);
+    if (lease === null || !isContextLive(scope, lease)) return;
+    const completedCount = uploads.filter((upload) => upload.status === "indexed").length;
+    if (completedCount === 0) return;
+    const timeout = setTimeout(() => {
+      if (!isContextLive(scope, lease) || readContextRef.current !== readContext) return;
+      void fetchDocuments();
+      void fetchStats();
+    }, 1_000);
+    return () => clearTimeout(timeout);
+  }, [fetchDocuments, fetchStats, isContextLive, liveLeaseFor, readContext, scope, uploads]);
 
   return {
-    documents,
-    setDocuments,
-    stats,
-    setStats,
-    loading,
-    listError,
+    documents: documentsVisible,
+    setDocuments: guardedSetDocuments,
+    stats: statsVisible,
+    setStats: guardedSetStats,
+    loading: loadingVisible,
+    listError: listErrorVisible,
     fetchDocuments,
     fetchStats,
-    wikiStatusMap,
-    compilingDocIds,
+    wikiStatusMap: wikiStatusVisible,
+    compilingDocIds: compilingVisible,
     handleCompileDocument,
-    total,
-    hasMore,
+    total: totalVisible,
+    hasMore: documentsVisible.length < totalVisible,
     loadMore,
   };
-}
-
-/**
- * Transient wiki statuses are still moving toward a terminal state and must be
- * re-polled; terminal statuses (compiled/failed/not_compiled/skipped) only
- * change through user action.
- */
-function isTransientWikiStatus(status: string | null | undefined): boolean {
-  return status === "compiling" || status === "running";
 }

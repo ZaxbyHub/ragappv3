@@ -848,7 +848,10 @@ export default function DocumentsPage() {
         </div>
       </div>
 
-      <div className="flex gap-6">
+      {/* Issue #778 (WCAG 1.4.10 reflow): the folder tree stacks above the
+          list below lg — a flat flex row squeezed the document list to ~8px
+          at 320px. */}
+      <div className="flex flex-col gap-6 lg:flex-row">
         {hasSelectedVault && (
           <FolderTree
             folders={folders}

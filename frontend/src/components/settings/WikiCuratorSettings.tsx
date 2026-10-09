@@ -14,7 +14,7 @@
  * When vaultId is provided, a per-vault enrichment override toggle is
  * also shown (admin vault members only).
  */
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -34,18 +34,15 @@ import {
   toggleVaultEnrichment,
   getVault,
 } from "@/lib/api";
-/**
- * Tiny "always reflect the latest value" ref helper. Used by handleTest
- * so the post-await guard can compare the URL/model the test was
- * launched with against whatever the operator has now typed.
- */
-function useLatestRef<T>(value: T) {
-  const ref = useRef(value);
-  ref.current = value;
-  return ref;
-}
 import type { CuratorTestResult } from "@/lib/api";
 import type { SettingsErrors, SettingsFormData } from "@/stores/useSettingsStore";
+import { useAuthOwner } from "@/hooks/useAuthOwner";
+import {
+  captureAuthPrincipalGeneration,
+  isCurrentAuthOwner,
+  subscribeAuthPrincipal,
+  type AuthOwner,
+} from "@/lib/api/auth-lifecycle";
 
 export interface WikiCuratorSettingsProps {
   formData: SettingsFormData;
@@ -57,131 +54,223 @@ export interface WikiCuratorSettingsProps {
   ) => void;
 }
 
-export function WikiCuratorSettings({
+type OwnerScope = { owner: AuthOwner; generation: number; vaultId: number | null };
+type VaultEnrichment = {
+  enrichment_enabled: boolean | null;
+  effective_enrichment_enabled: boolean;
+  current_user_permission: string | null;
+};
+
+function isVaultEnrichment(value: unknown): value is VaultEnrichment {
+  if (!value || typeof value !== "object") return false;
+  const vault = value as Record<string, unknown>;
+  return (
+    (vault.enrichment_enabled === null || typeof vault.enrichment_enabled === "boolean") &&
+    typeof vault.effective_enrichment_enabled === "boolean" &&
+    (vault.current_user_permission === null || typeof vault.current_user_permission === "string")
+  );
+}
+
+export function WikiCuratorSettings(props: WikiCuratorSettingsProps) {
+  const owner = useAuthOwner();
+  const generation = useSyncExternalStore(
+    subscribeAuthPrincipal,
+    captureAuthPrincipalGeneration,
+    captureAuthPrincipalGeneration,
+  );
+  const scope = useMemo<OwnerScope>(
+    () => ({ owner, generation, vaultId: props.vaultId ?? null }),
+    [generation, owner, props.vaultId],
+  );
+  const scopeSerial = useRef(0);
+  const previousScope = useRef<OwnerScope | null>(null);
+  if (
+    previousScope.current?.owner !== scope.owner ||
+    previousScope.current?.generation !== scope.generation ||
+    previousScope.current?.vaultId !== scope.vaultId
+  ) {
+    scopeSerial.current += 1;
+    previousScope.current = scope;
+  }
+  return <WikiCuratorSettingsContent key={`curator-scope-${scopeSerial.current}`} {...props} scope={scope} />;
+}
+
+function WikiCuratorSettingsContent({
   formData,
   errors,
   vaultId,
-  onChange,
-}: WikiCuratorSettingsProps) {
+  onChange: originalOnChange,
+  scope,
+}: WikiCuratorSettingsProps & { scope: OwnerScope }) {
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<CuratorTestResult | null>(null);
 
   // Per-vault enrichment override state
-  const [vaultEnrichment, setVaultEnrichment] = useState<{
-    enrichment_enabled: boolean | null;
-    effective_enrichment_enabled: boolean;
-    current_user_permission?: string | null;
-  } | null>(null);
+  const [vaultEnrichment, setVaultEnrichment] = useState<VaultEnrichment | null>(null);
   const [togglingEnrichment, setTogglingEnrichment] = useState(false);
+  const [vaultReadState, setVaultReadState] = useState<"idle" | "loading" | "ready" | "error">(vaultId ? "loading" : "idle");
+  const [vaultReadError, setVaultReadError] = useState<string | null>(null);
+  const scopeRef = useRef(scope);
+  const mountedLeaseRef = useRef<symbol | null>(null);
+  const readIntentRef = useRef<symbol | null>(null);
+  const readPendingRef = useRef<symbol | null>(null);
+  const toggleIntentRef = useRef<symbol | null>(null);
+  const togglePendingRef = useRef<symbol | null>(null);
+  const testIntentRef = useRef<symbol | null>(null);
+  const testPendingRef = useRef<{ intent: symbol; config: { enabled: boolean; url: string; model: string } } | null>(null);
+  scopeRef.current = scope;
 
-  // Fetch vault enrichment state when vaultId changes
   useEffect(() => {
-    if (!vaultId) {
-      setVaultEnrichment(null);
-      return;
-    }
-    getVault(vaultId)
-      .then((vault) => {
-        setVaultEnrichment({
-          enrichment_enabled: vault.enrichment_enabled ?? null,
-          effective_enrichment_enabled: vault.effective_enrichment_enabled,
-          current_user_permission: vault.current_user_permission,
-        });
-      })
-      .catch(() => {
-        setVaultEnrichment(null);
-      });
-  }, [vaultId]);
+    const lease = Symbol("curator-mounted");
+    mountedLeaseRef.current = lease;
+    return () => {
+      if (mountedLeaseRef.current === lease) mountedLeaseRef.current = null;
+    };
+  }, []);
 
-  const handleToggleEnrichment = async (checked: boolean) => {
+  const isLive = useCallback((lease: symbol | null = mountedLeaseRef.current) =>
+    lease !== null && mountedLeaseRef.current === lease && scopeRef.current === scope &&
+    isCurrentAuthOwner(scope.owner) && captureAuthPrincipalGeneration() === scope.generation,
+    [scope]);
+
+  const onChange = <K extends keyof SettingsFormData>(field: K, value: SettingsFormData[K]) => {
+    if (isLive()) originalOnChange(field, value);
+  };
+
+  const loadVault = useCallback(async (lease: symbol | null, supersede = false) => {
+    if (!isLive(lease) || (readPendingRef.current && !supersede)) return;
     if (!vaultId) return;
-    setTogglingEnrichment(true);
+    const intent = Symbol("vault-read");
+    readIntentRef.current = intent;
+    readPendingRef.current = intent;
+    const currentRead = () => isLive(lease) && readIntentRef.current === intent;
+    setVaultReadState((current) => currentRead() ? "loading" : current);
+    setVaultReadError((current) => currentRead() ? null : current);
     try {
-      const updated = await toggleVaultEnrichment(vaultId, {
-        enabled: checked,
-      });
-      setVaultEnrichment({
-        enrichment_enabled: updated.enrichment_enabled ?? null,
-        effective_enrichment_enabled: updated.effective_enrichment_enabled,
-        current_user_permission: updated.current_user_permission,
-      });
-    } catch {
-      // On error, refetch to restore correct state
-      if (vaultId) {
-        getVault(vaultId)
-          .then((vault) =>
-            setVaultEnrichment({
-              enrichment_enabled: vault.enrichment_enabled ?? null,
-              effective_enrichment_enabled: vault.effective_enrichment_enabled,
-              current_user_permission: vault.current_user_permission,
-            }),
-          )
-          .catch(() => setVaultEnrichment(null));
-      }
+      const vault = await getVault(vaultId);
+      if (!currentRead()) return;
+      if (!isVaultEnrichment(vault)) throw new Error("Malformed vault response");
+      setVaultEnrichment((current) => currentRead() ? vault : current);
+      setVaultReadState((current) => currentRead() ? "ready" : current);
+    } catch (error) {
+      if (!currentRead()) return;
+      const message = error instanceof Error ? error.message : "Could not load vault settings. Retry to continue.";
+      setVaultReadState((current) => currentRead() ? "error" : current);
+      setVaultReadError((current) => currentRead() ? message : current);
     } finally {
-      setTogglingEnrichment(false);
+      if (readPendingRef.current === intent) readPendingRef.current = null;
+    }
+  }, [isLive, vaultId]);
+
+  useEffect(() => {
+    const lease = mountedLeaseRef.current;
+    void loadVault(lease, true);
+    const intent = readIntentRef.current;
+    return () => {
+      if (readIntentRef.current === intent) readIntentRef.current = null;
+      if (readPendingRef.current === intent) readPendingRef.current = null;
+    };
+  }, [loadVault]);
+
+  const handleToggleEnrichment = async (checked: boolean): Promise<void> => {
+    if (!vaultId || !canToggleEnrichment || togglePendingRef.current || !isLive()) return;
+    const lease = mountedLeaseRef.current;
+    const intent = Symbol("vault-toggle");
+    toggleIntentRef.current = intent;
+    togglePendingRef.current = intent;
+    // A mutation supersedes an older Retry before the physical write starts.
+    readIntentRef.current = null;
+    readPendingRef.current = null;
+    const currentToggle = () => isLive(lease) && toggleIntentRef.current === intent;
+    setTogglingEnrichment((current) => currentToggle() ? true : current);
+    try {
+      try {
+        const updated = await toggleVaultEnrichment(vaultId, { enabled: checked });
+        if (!currentToggle()) return;
+        if (!isVaultEnrichment(updated)) throw new Error("Malformed vault response");
+        setVaultEnrichment((current) => currentToggle() ? updated : current);
+      } catch {
+        if (!currentToggle()) return;
+      }
+      if (currentToggle()) await loadVault(lease, true);
+    } finally {
+      if (togglePendingRef.current === intent) togglePendingRef.current = null;
+      setTogglingEnrichment((current) => currentToggle() ? false : current);
     }
   };
 
-  const canToggleEnrichment =
-    vaultEnrichment?.current_user_permission === "admin";
+  const canToggleEnrichment = vaultEnrichment?.current_user_permission === "admin";
+
+  const testConfig = useMemo(
+    () => ({ enabled: formData.wiki_llm_curator_enabled, url: formData.wiki_llm_curator_url, model: formData.wiki_llm_curator_model }),
+    [formData.wiki_llm_curator_enabled, formData.wiki_llm_curator_model, formData.wiki_llm_curator_url],
+  );
+  const testConfigRef = useRef(testConfig);
+  testConfigRef.current = testConfig;
 
   // Clear any stale test result when the operator toggles curator off,
   // changes the URL, or changes the model — the previous OK / error no
   // longer reflects the current configuration and would mislead.
   useEffect(() => {
-    setTestResult(null);
-  }, [
-    formData.wiki_llm_curator_enabled,
-    formData.wiki_llm_curator_url,
-    formData.wiki_llm_curator_model,
-  ]);
+    const pending = testPendingRef.current;
+    // Do not clear a replacement test dispatched between render and this
+    // effect. Only the pending test that belongs to an older config retires.
+    if (pending && pending.config !== testConfig) {
+      if (testIntentRef.current === pending.intent) testIntentRef.current = null;
+      if (testPendingRef.current === pending) testPendingRef.current = null;
+    }
+    if ((!pending || pending.config !== testConfig) && isLive()) {
+      setTesting(false);
+      setTestResult(null);
+    }
+  }, [isLive, testConfig, scope]);
 
   const handleTest = async () => {
+    // A retained callback from an earlier URL/model render must not begin a
+    // request after the current config has changed.
+    if (testPendingRef.current || testConfigRef.current !== testConfig || !isLive()) return;
+    const lease = mountedLeaseRef.current;
+    const intent = Symbol("curator-test");
+    const config = testConfig;
+    testIntentRef.current = intent;
+    testPendingRef.current = { intent, config };
     // Capture the URL/model snapshot we are testing. If the operator
     // edits the URL/model while the request is in flight, the
     // useEffect below will null out testResult; we additionally
     // guard the post-await write so a late response can't repaint
     // a stale OK label against the now-changed config.
-    const requestedUrl = formData.wiki_llm_curator_url;
-    const requestedModel = formData.wiki_llm_curator_model;
+    const requestedUrl = config.url;
+    const requestedModel = config.model;
     setTesting(true);
     setTestResult(null);
     try {
       const out = await testCuratorConnection(requestedUrl, requestedModel);
-      // Latest formData read AFTER await — guard against in-flight edits.
-      const latest = useFormDataSnapshot.current;
-      if (
-        latest.url === requestedUrl &&
-        latest.model === requestedModel
-      ) {
-        setTestResult(out);
+      if (isLive(lease) && testIntentRef.current === intent && testConfigRef.current === config) {
+        setTestResult((current) => isLive(lease) && testIntentRef.current === intent && testConfigRef.current === config ? out : current);
       }
     } catch (e) {
-      const latest = useFormDataSnapshot.current;
-      if (
-        latest.url === requestedUrl &&
-        latest.model === requestedModel
-      ) {
-        setTestResult({
+      if (isLive(lease) && testIntentRef.current === intent && testConfigRef.current === config) {
+        const errorResult: CuratorTestResult = {
           ok: false,
           model: requestedModel,
           latency_ms: null,
           error: e instanceof Error ? e.message : "Test failed",
-        });
+        };
+        setTestResult((current) => isLive(lease) && testIntentRef.current === intent && testConfigRef.current === config ? errorResult : current);
       }
     } finally {
-      setTesting(false);
+      if (isLive(lease) && testIntentRef.current === intent) {
+        if (testPendingRef.current?.intent === intent) testPendingRef.current = null;
+        setTesting((current) => isLive(lease) && testIntentRef.current === intent ? false : current);
+      }
     }
   };
 
-  // Live snapshot of the URL/model used by the test handler's
-  // post-await guard. We need a ref so the closure inside handleTest
-  // sees the latest values without re-binding the callback.
-  const useFormDataSnapshot = useLatestRef({
-    url: formData.wiki_llm_curator_url,
-    model: formData.wiki_llm_curator_model,
-  });
+  const retryVaultRead = () => {
+    const lease = mountedLeaseRef.current;
+    if (!isLive(lease) || togglePendingRef.current || readPendingRef.current) return;
+    void loadVault(lease);
+  };
 
   return (
     <div className="space-y-4">
@@ -239,7 +328,18 @@ export function WikiCuratorSettings({
             />
             <Label htmlFor="wiki-lint-enabled" className="text-sm font-normal">Wiki lint enabled</Label>
           </div>
-          {vaultId && (
+          {vaultId && vaultReadState === "loading" && !vaultEnrichment && (
+            <p role="status">Loading vault enrichment</p>
+          )}
+          {vaultId && vaultReadState === "error" && (
+            <div role="alert" className="space-y-2">
+              <p>{vaultReadError}</p>
+              {!togglingEnrichment && (<Button type="button" variant="outline" onClick={retryVaultRead}>
+                Retry
+              </Button>)}
+            </div>
+          )}
+          {vaultId && vaultEnrichment && (
             <div className="flex items-center gap-2 pt-2 border-t mt-3">
               <Checkbox
                 id="vault-enrichment-enabled"

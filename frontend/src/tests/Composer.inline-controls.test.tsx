@@ -77,9 +77,16 @@ vi.mock("@/stores/useVaultStore", () => ({
 }));
 
 vi.mock("@/lib/api", () => ({
+  API_BASE_URL: "/api",
   uploadDocument: vi.fn(),
   getDocumentStatus: vi.fn(),
   chatStream: vi.fn(),
+  attachCsrfInterceptor: vi.fn(),
+}));
+
+vi.mock("react-router-dom", () => ({
+  useInRouterContext: () => false,
+  useLocation: () => ({ pathname: "/" }),
 }));
 
 vi.mock("react-dropzone", () => ({

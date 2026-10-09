@@ -7,6 +7,8 @@ import * as useChatShellStoreModule from "@/stores/useChatShellStore";
 
 // Mock the API module
 vi.mock("@/lib/api", () => ({
+  API_BASE_URL: "/api",
+  attachCsrfInterceptor: vi.fn(),
   listChatSessions: vi.fn(),
   deleteChatSession: vi.fn(),
   updateChatSession: vi.fn(),

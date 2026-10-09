@@ -90,7 +90,7 @@ function controllableSse() {
           else pending = resolve;
         })
     ),
-    cancel: vi.fn(),
+    cancel: vi.fn().mockResolvedValue(undefined),
   };
   const emit = (chunk: string) => {
     const item = { value: encoder.encode(chunk), done: false };

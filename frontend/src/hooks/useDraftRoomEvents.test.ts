@@ -41,7 +41,7 @@ function controllableSse() {
           }
         })
     ),
-    cancel: vi.fn(),
+    cancel: vi.fn().mockResolvedValue(undefined),
   };
   const emit = (chunk: string) => {
     const item = { value: encoder.encode(chunk), done: false };
@@ -102,7 +102,7 @@ function doneResponse(): Response {
     body: {
       getReader: () => ({
         read: vi.fn().mockResolvedValue({ done: true, value: undefined }),
-        cancel: vi.fn(),
+        cancel: vi.fn().mockResolvedValue(undefined),
       }),
     },
   } as unknown as Response;

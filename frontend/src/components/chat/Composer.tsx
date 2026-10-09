@@ -1,7 +1,10 @@
 // Composer — extracted from TranscriptPane for maintainability.
 // Handles draft persistence, auto-grow, slash commands, IME guard, file attachments.
 
-import { useRef, useEffect, useState, useCallback } from "react";
+import { useRef, useEffect, useLayoutEffect, useState, useCallback, useMemo } from "react";
+import { flushSync } from "react-dom";
+import { useInRouterContext, useLocation } from "react-router-dom";
+import { useCommandPaletteAction, type CommandPaletteActionGuard } from "@/lib/commandPaletteActions";
 import { useDropzone } from "react-dropzone";
 import {
   Send,
@@ -139,7 +142,51 @@ export const LARGE_PASTE_THRESHOLD = 4_000;
 // Composer
 // =============================================================================
 
+// The receiver lives inside the router in the app; isolated Composer consumers
+// retain their ordinary attachment controls without requiring a router provider.
+function ComposerPaletteAction({ open, guardRef, isStreaming }: {
+  open: () => void;
+  guardRef: React.MutableRefObject<CommandPaletteActionGuard | null>;
+  isStreaming: boolean;
+}) {
+  const { pathname } = useLocation();
+  const chatRevision = useRef(0);
+  useLayoutEffect(() => useChatStore.subscribe((next, previous) => {
+    if (next.activeChatId !== previous.activeChatId) chatRevision.current += 1;
+  }), []);
+  const consumerGuard = useCommandPaletteAction({
+    id: "attach-file",
+    label: "Attach file",
+    enabled: pathname === "/chat" && !isStreaming,
+    execute: (dispatchGuard) => {
+      if (dispatchGuard.isCurrent()) open();
+    },
+  });
+  const revision = chatRevision.current;
+  const chatId = useChatStore.getState().activeChatId;
+  const attachmentGuard = useMemo(() => ({
+    isCurrent: () => consumerGuard.isCurrent()
+      && chatRevision.current === revision
+      && useChatStore.getState().activeChatId === chatId,
+  }), [chatId, consumerGuard, revision]);
+  guardRef.current = attachmentGuard;
+  useLayoutEffect(() => {
+    guardRef.current = attachmentGuard;
+    return () => {
+      if (guardRef.current === attachmentGuard) guardRef.current = null;
+    };
+  }, [attachmentGuard, guardRef]);
+  return null;
+}
+
 export function Composer({ onSend, onStop, isStreaming, className, inputRef }: ComposerProps) {
+  const inRouter = useInRouterContext();
+  const attachmentGuardRef = useRef<CommandPaletteActionGuard | null>(null);
+  const selectionGuards = useRef(new WeakMap<object, CommandPaletteActionGuard | null>());
+  const pickerSequence = useRef(0);
+  const [pickerOpening, setPickerOpening] = useState<{
+    id: number; guard: CommandPaletteActionGuard | null;
+  }>({ id: 0, guard: null });
   const internalRef = useRef<HTMLTextAreaElement>(null);
   const textareaRef = (inputRef ?? internalRef) as React.RefObject<HTMLTextAreaElement>;
 
@@ -436,19 +483,43 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
   // pool; the returned ids register the files as chat attachments so the
   // chips live in the store (surviving navigation) instead of this mount.
   const enqueueFiles = useCallback(
-    (files: File[]) => {
-      if (files.length === 0) return;
+    (files: File[], guard = attachmentGuardRef.current) => {
+      if (files.length === 0 || (inRouter && !guard) || (guard && !guard.isCurrent())) return;
       const queuedIds = addUploads(files, activeVaultId ?? undefined);
-      queuedIds.forEach((id) => attachToChat(id));
+      for (const id of queuedIds) {
+        if (guard && !guard.isCurrent()) return;
+        attachToChat(id);
+      }
     },
-    [activeVaultId, addUploads, attachToChat]
+    [activeVaultId, addUploads, attachToChat, inRouter]
   );
 
   const { getRootProps, getInputProps, isDragActive, open: openFilePicker } = useDropzone({
     noClick: true,
     noKeyboard: true,
-    onDrop: enqueueFiles,
+    onDrop: (files, _rejections, event) => {
+      // react-dropzone reads files asynchronously. The event retains the guard
+      // captured before that work, including the native input's own opening.
+      const guard = event && selectionGuards.current.has(event)
+        ? selectionGuards.current.get(event) ?? null
+        : attachmentGuardRef.current;
+      if (event) selectionGuards.current.delete(event);
+      enqueueFiles(files, guard);
+    },
   });
+  const openAttachmentPicker = () => {
+    const guard = attachmentGuardRef.current;
+    if (isStreaming || (inRouter && !guard) || (guard && !guard.isCurrent())) return;
+    const id = ++pickerSequence.current;
+    const selectionGuard = {
+      isCurrent: () => pickerSequence.current === id && (!guard || guard.isCurrent()),
+    };
+    // Replace the input before its synchronous click. An old native dialog
+    // cannot deliver a selection through a later opening's input handler;
+    // the sequence also retires extraction that has already begun.
+    flushSync(() => setPickerOpening({ id, guard: selectionGuard }));
+    if (selectionGuard.isCurrent()) openFilePicker();
+  };
 
   // Handle paste with files, and large plain-text pastes as attachments
   // (issue #616): paste-sized text becomes a text/plain File through the
@@ -490,7 +561,11 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
 
   return (
     <TooltipProvider>
-      <div className={cn("relative", className)} {...getRootProps()}>
+      {inRouter && <ComposerPaletteAction open={openAttachmentPicker} guardRef={attachmentGuardRef} isStreaming={isStreaming} />}
+      <div className={cn("relative", className)} {...getRootProps({
+        onDrop: (event) => { selectionGuards.current.set(event, attachmentGuardRef.current); },
+        onPaste: (event) => { selectionGuards.current.set(event, attachmentGuardRef.current); },
+      })}>
         {/* Drag overlay */}
         {isDragActive && (
           <div className="absolute inset-0 z-20 flex items-center justify-center rounded-xl border-2 border-dashed border-primary bg-primary/5">
@@ -697,6 +772,7 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
                       textareaRef.current?.focus();
                     }}
                     aria-label="Open slash commands"
+                    tabIndex={0}
                   >
                     <Slash className="h-4 w-4" />
                   </Button>
@@ -711,8 +787,9 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
                     variant="ghost"
                     size="icon"
                     className="h-8 w-8 text-muted-foreground active:scale-95"
-                    onClick={openFilePicker}
+                    onClick={openAttachmentPicker}
                     aria-label="Attach file"
+                    tabIndex={0}
                     disabled={isStreaming}
                   >
                     <Paperclip className="h-4 w-4" />
@@ -721,7 +798,9 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
                 <TooltipContent><p>Attach file</p></TooltipContent>
               </Tooltip>
               {/* Hidden dropzone input */}
-              <input {...getInputProps()} />
+              <input key={pickerOpening.id} {...getInputProps({
+                onChange: (event) => { selectionGuards.current.set(event, pickerOpening.guard); },
+              })} />
             </div>
 
             {/* Generation status label */}

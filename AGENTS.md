@@ -60,8 +60,8 @@ there is no consumer for a routing YAML, and adding one would be unwired
 
 `.github/workflows/ci.yml` — jobs: **Backend** (ruff + targeted pytest),
 **Frontend** (typecheck, lint `--max-warnings 0`, test, build, subpath build),
-**Playwright e2e** (`frontend/e2e/` smoke suite against the production build + stub backend; separate job, issue #573),
-**Quality contracts** (`check_runtime_contract.py`, `check_config_contract.py`, `check_settings_consumers.py`, `check_batch_mock_seq.py`, `check_pr_scope_drift.py`, `check_sast_baseline.py`, `check_secretscan.py`, `check_test_collection_scope.py`, `check_a04_http500_detail_hygiene.py`, `check_b03_upload_migration_timeout.py`, `check_l05_raw_palette.py`, `check_l05_page_headers.py`),
+**Playwright e2e** (`frontend/e2e/` smoke suite against the production build + stub backend; separate job, issue #573), **Playwright a11y matrix** (`frontend/e2e/a11y-matrix.spec.ts` route x viewport accessibility gate; separate job, issue #778),
+**Quality contracts** (`check_runtime_contract.py`, `check_config_contract.py`, `check_settings_consumers.py`, `check_batch_mock_seq.py`, `check_pr_scope_drift.py`, `check_sast_baseline.py`, `check_secretscan.py`, `check_test_collection_scope.py`, `check_a04_http500_detail_hygiene.py`, `check_b03_upload_migration_timeout.py`, `check_l05_raw_palette.py`, `check_l05_page_headers.py`, `check_l07_a11y_gate_wired.py`),
 **Detect docker scope** + **Docker build smoke** (the smoke builds the images when the docker surface changed),
 **SAST** (`scripts/run_bandit.py` — bandit baseline gate, fails on new findings or unused `# nosec` suppressions).
 **Closure evidence** (`.github/workflows/closure-evidence.yml` — PRs whose bodies `Closes #N` an issue must name verifiable closure evidence; `high`/`critical` issues need a cross-family approval; warn-mode rollout — see `docs/ci/closure-evidence-gate.md`).

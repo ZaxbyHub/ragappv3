@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, waitFor, act } from '@testing-library/react';
+import { render, screen, waitFor, act, fireEvent } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { VaultMembersPanel } from '@/components/VaultMembersPanel';
 
@@ -46,7 +46,8 @@ vi.mock('@/components/ui/input', () => ({
 }));
 
 vi.mock('@/components/ui/dialog', () => ({
-  Dialog: ({ children, open }: { children: React.ReactNode; open?: boolean }) => open ? <div data-testid="dialog">{children}</div> : null,
+  Dialog: ({ children, open, onOpenChange }: { children: React.ReactNode; open?: boolean; onOpenChange?: (open: boolean) => void }) =>
+    open ? <div data-testid="dialog"><button aria-label="Simulate dialog dismissal" onClick={() => onOpenChange?.(false)} />{children}</div> : null,
   DialogContent: ({ children }: { children: React.ReactNode }) => <div data-testid="dialog-content">{children}</div>,
   DialogDescription: ({ children }: { children: React.ReactNode }) => <p>{children}</p>,
   DialogFooter: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
@@ -198,7 +199,58 @@ describe('VaultMembersPanel', () => {
     });
 
     await waitFor(() => {
-      expect(apiClient.get).toHaveBeenCalledWith('/vaults/42/members');
+      expect(apiClient.get).toHaveBeenCalledWith(
+        '/vaults/42/members',
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      );
     });
+  });
+
+  it('keeps the selected member until a pending removal succeeds, then reconciles and reports success', async () => {
+    const { default: apiClient } = await import('@/lib/api');
+    const { toast } = await import('sonner');
+    let resolveRemoval!: (value: { data: Record<string, never> }) => void;
+    vi.mocked(apiClient.delete).mockImplementationOnce(
+      () => new Promise((resolve) => { resolveRemoval = resolve; }),
+    );
+    await act(async () => { render(<VaultMembersPanel vaultId={1} />); });
+    await waitFor(() => expect(screen.getByText('Alice Johnson')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: 'Remove alice from vault' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Remove', exact: true }));
+    await waitFor(() => expect(apiClient.delete).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole('button', { name: 'Simulate dialog dismissal' }));
+
+    expect(screen.getByTestId('dialog')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Cancel' })).toBeDisabled();
+    await act(async () => { resolveRemoval({ data: {} }); });
+
+    await waitFor(() => expect(screen.queryByText('Alice Johnson')).not.toBeInTheDocument());
+    expect(toast.success).toHaveBeenCalledWith('Member removed from vault');
+    expect(screen.queryByTestId('dialog')).not.toBeInTheDocument();
+  });
+
+  it('unlocks member removal cancellation after the delete fails', async () => {
+    const { default: apiClient } = await import('@/lib/api');
+    const { toast } = await import('sonner');
+    let rejectRemoval!: (error: Error) => void;
+    vi.mocked(apiClient.delete).mockImplementationOnce(
+      () => new Promise((_, reject) => { rejectRemoval = reject; }),
+    );
+    await act(async () => { render(<VaultMembersPanel vaultId={1} />); });
+    await waitFor(() => expect(screen.getByText('Alice Johnson')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: 'Remove alice from vault' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Remove', exact: true }));
+    await waitFor(() => expect(apiClient.delete).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole('button', { name: 'Simulate dialog dismissal' }));
+    expect(screen.getByTestId('dialog')).toBeInTheDocument();
+
+    await act(async () => { rejectRemoval(new Error('network')); });
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith('Failed to remove member'));
+    expect(screen.getByRole('button', { name: 'Cancel' })).toBeEnabled();
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(screen.queryByTestId('dialog')).not.toBeInTheDocument();
+    expect(screen.getByText('Alice Johnson')).toBeInTheDocument();
   });
 });

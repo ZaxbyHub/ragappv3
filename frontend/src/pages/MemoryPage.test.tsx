@@ -3,6 +3,7 @@ import { render, screen, waitFor, act } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import MemoryPage from '@/pages/MemoryPage';
 import { MemoryRouter } from 'react-router-dom';
+import type { ReactNode } from 'react';
 
 // Hoisted mock functions
 const mockFetchVaults = vi.hoisted(() => vi.fn());
@@ -35,6 +36,7 @@ vi.mock('@/stores/useVaultStore', () => ({
       fetchVaults: mockFetchVaults,
       setActiveVault: mockSetActiveVault,
     })),
+    subscribe: vi.fn(() => () => {}),
   }),
 }));
 
@@ -149,19 +151,18 @@ vi.mock('@/components/vault/VaultSelector', () => ({
 }));
 
 vi.mock('@/components/layout/PageTitleHeader', () => ({
-  PageTitleHeader: ({ title, description, actions, before, srOnly, id }: any) =>
-    srOnly ? (
-      <h1 id={id} className="sr-only">{title}</h1>
-    ) : (
-      <div data-testid="page-title">
-        {before}
-        <div>
-          <h1 id={id}>{title}</h1>
-          {description ?? null}
-        </div>
-        {actions ?? null}
-      </div>
-    ),
+  PageTitleHeader: ({
+    title,
+    actions,
+  }: {
+    title: string;
+    actions?: ReactNode;
+  }) => (
+    <div data-testid="page-title">
+      {title}
+      {actions}
+    </div>
+  ),
 }));
 
 // Lucide icons
@@ -226,6 +227,7 @@ describe('MemoryPage', () => {
           error: null,
           fetchVaults: mockFetchVaults,
           setActiveVault: mockSetActiveVault,
+          getActiveVault: () => state.vaults.find((vault) => vault.id === state.activeVaultId),
         };
         if (typeof selector === 'function') {
           return selector(state);
@@ -257,6 +259,7 @@ describe('MemoryPage', () => {
           error: null,
           fetchVaults: mockFetchVaults,
           setActiveVault: mockSetActiveVault,
+          getActiveVault: () => state.vaults.find((vault) => vault.id === state.activeVaultId),
         };
         if (typeof selector === 'function') {
           return selector(state);
@@ -289,6 +292,7 @@ describe('MemoryPage', () => {
           error: null,
           fetchVaults: mockFetchVaults,
           setActiveVault: mockSetActiveVault,
+          getActiveVault: () => state.vaults.find((vault) => vault.id === state.activeVaultId),
         };
         if (typeof selector === 'function') {
           return selector(state);
@@ -321,6 +325,7 @@ describe('MemoryPage', () => {
           error: null,
           fetchVaults: mockFetchVaults,
           setActiveVault: mockSetActiveVault,
+          getActiveVault: () => state.vaults.find((vault) => vault.id === state.activeVaultId),
         };
         if (typeof selector === 'function') {
           return selector(state);
@@ -352,6 +357,7 @@ describe('MemoryPage', () => {
           error: null,
           fetchVaults: mockFetchVaults,
           setActiveVault: mockSetActiveVault,
+          getActiveVault: () => state.vaults.find((vault) => vault.id === state.activeVaultId),
         };
         if (typeof selector === 'function') {
           return selector(state);
@@ -386,6 +392,7 @@ describe('MemoryPage', () => {
           error: null,
           fetchVaults: mockFetchVaults,
           setActiveVault: mockSetActiveVault,
+          getActiveVault: () => state.vaults.find((vault) => vault.id === state.activeVaultId),
         };
         if (typeof selector === 'function') {
           return selector(state);
@@ -417,6 +424,7 @@ describe('MemoryPage', () => {
           error: null,
           fetchVaults: mockFetchVaults,
           setActiveVault: mockSetActiveVault,
+          getActiveVault: () => state.vaults.find((vault) => vault.id === state.activeVaultId),
         };
         if (typeof selector === 'function') {
           return selector(state);
@@ -447,6 +455,7 @@ describe('MemoryPage', () => {
           error: null,
           fetchVaults: mockFetchVaults,
           setActiveVault: mockSetActiveVault,
+          getActiveVault: () => state.vaults.find((vault) => vault.id === state.activeVaultId),
         };
         if (typeof selector === 'function') {
           return selector(state);
@@ -485,6 +494,7 @@ describe('MemoryPage', () => {
           error: null,
           fetchVaults: mockFetchVaults,
           setActiveVault: mockSetActiveVault,
+          getActiveVault: () => state.vaults.find((vault) => vault.id === state.activeVaultId),
         };
         if (typeof selector === 'function') {
           return selector(state);
@@ -524,6 +534,7 @@ describe('MemoryPage', () => {
           error: null,
           fetchVaults: mockFetchVaults,
           setActiveVault: mockSetActiveVault,
+          getActiveVault: () => state.vaults.find((vault) => vault.id === state.activeVaultId),
         };
         if (typeof selector === 'function') {
           return selector(state);
@@ -568,6 +579,7 @@ describe('MemoryPage', () => {
           error: null,
           fetchVaults: mockFetchVaults,
           setActiveVault: mockSetActiveVault,
+          getActiveVault: () => state.vaults.find((vault) => vault.id === state.activeVaultId),
         };
         if (typeof selector === 'function') {
           return selector(state);
