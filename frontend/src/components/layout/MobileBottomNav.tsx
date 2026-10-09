@@ -17,7 +17,8 @@ import { useDraftRoomVisible } from "@/hooks/useDraftRoomCapabilities";
 import { DRAFT_ROOM_NAV_LABEL } from "@/components/draft-room/labels";
 
 interface MobileBottomNavProps {
-  activeItem: NavItemId;
+  // null = no item active (unmapped routes like /search; issue #779/UI-R1-08).
+  activeItem: NavItemId | null;
   onItemSelect: (id: NavItemId) => void;
 }
 
