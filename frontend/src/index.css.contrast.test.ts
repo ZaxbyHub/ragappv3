@@ -62,12 +62,10 @@
 //      six findings; the tabs consumer this PR created was fixed by making
 //      the count spans inherit the trigger color. Needs a light/dark
 //      --accent token decision — follow-up, not silently green here.
-//   5. the warning-tint text family (text-warning on bg-warning/10) in LIGHT
-//      theme: full-opacity warning on its own /10 wash is 4.12 light —
-//      below AA until the light --warning token moves (disclosed #777
-//      follow-up). The dark leg passes (7.41) and the solid
-//      warning-foreground-on-warning pair is pinned above; the light /10
-//      family is re-includable the day the token moves.
+//   5. (CLOSED by the #778 review) the warning-tint text family in LIGHT
+//      theme moved with --warning (33% -> 28%) and is now pinned in
+//      COMPOSITE_PAIRS (warning on warning/10 over background); the success
+//      /10 family joined it when --success moved 30% -> 26%.
 
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
@@ -201,6 +199,12 @@ const COMPOSITE_PAIRS: ReadonlyArray<readonly [string, string, number, string, s
   ["warning-foreground", "warning", 0.95, "background", "warning-foreground on warning/95 over background"],
   // destructive Badge hover (badge.tsx): label on destructive/90 over card
   ["destructive-foreground", "destructive", 0.9, "card", "destructive-foreground on destructive/90 over card"],
+  // issue #778 review F-04: the light /10 wash families the token moves fixed.
+  // success/10 badges (WikiPageList "verified", draft "Ready") and warning/10
+  // alerts over background — sub-AA (4.02 / 4.12) at the pre-review token
+  // values, passing at the moved values.
+  ["success", "success", 0.1, "background", "success text on success/10 over background"],
+  ["warning", "warning", 0.1, "background", "warning text on warning/10 over background"],
 ];
 
 describe("token-contrast guardrail — every text/background token pair meets WCAG AA (issue #777 AC7 / UI-ENH-12)", () => {

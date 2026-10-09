@@ -269,7 +269,11 @@ export default function DocumentDetailPage() {
 
   return (
     <ScrollArea className="h-full">
-      <div className="flex flex-col gap-4 p-6 max-w-3xl mx-auto">
+      {/* Issue #778 (WCAG 1.4.10): w-full min-w-0 pins this column to the
+          shell content width — without it the column sized to its content
+          (~346px) inside the 272px shell at 320px viewport and pushed the
+          Tags card's Save button past the right edge. */}
+      <div className="flex flex-col gap-4 p-6 max-w-3xl mx-auto w-full min-w-0">
         {/* Header */}
         <PageTitleHeader
           before={
@@ -280,7 +284,13 @@ export default function DocumentDetailPage() {
               <FileIcon filename={doc.filename} className="w-5 h-5 shrink-0" />
             </div>
           }
-          title={<span className="block truncate" title={doc.filename}>{doc.filename}</span>}
+          // Issue #778 (WCAG 1.4.10): truncate is nowrap, so a long
+          // filename's full width became the page column's min-content and
+          // pushed the whole column past the viewport at 320px. line-clamp-1
+          // keeps a single-line ellipsis look (it sets its own display, so no
+          // `block` — a later .block rule would defeat the clamp);
+          // break-all lets the min-content collapse.
+          title={<span className="line-clamp-1 break-all" title={doc.filename}>{doc.filename}</span>}
           actions={
             <>
               <Button
@@ -310,7 +320,10 @@ export default function DocumentDetailPage() {
           <CardHeader className="pb-2 pt-3 px-4">
             <CardTitle className="text-sm">Details</CardTitle>
           </CardHeader>
-          <CardContent className="px-4 pb-3 grid grid-cols-2 gap-3 text-sm">
+          {/* Issue #778 (WCAG 1.4.10): break-words + min-w-0 lets the
+              two-column details grid shrink below its longest unbreakable
+              value at 320px. */}
+          <CardContent className="px-4 pb-3 grid grid-cols-2 gap-3 text-sm min-w-0 break-words">
             <div>
               <p className="text-muted-foreground">Status</p>
               <StatusBadge status={status} chunksFailed={Number(doc.metadata?.chunks_failed ?? 0)} />
@@ -338,7 +351,7 @@ export default function DocumentDetailPage() {
 
         {/* Tags */}
         <Card>
-          <CardHeader className="pb-2 pt-3 px-4 flex flex-row items-center justify-between">
+          <CardHeader className="pb-2 pt-3 px-4 flex flex-row flex-wrap items-center justify-between gap-2">
             <CardTitle className="text-sm">Tags</CardTitle>
             {doc.vault_id != null && (
               <Button size="sm" variant="outline" onClick={handleSaveTags} disabled={!tagsDirty || savingTags}>
@@ -385,11 +398,19 @@ export default function DocumentDetailPage() {
                   {previewText}
                 </pre>
               ) : previewUrl != null ? (
-                <iframe
-                  src={previewUrl}
-                  title={`Preview of ${doc.filename}`}
-                  className="w-full h-[70vh] border rounded"
-                />
+                /* Issue #778 (WCAG 1.4.10): the iframe's intrinsic min-width
+                   (~300px as a replaced element) leaked into the page's
+                   shrink-to-fit chain (Radix ScrollArea content wrapper) and
+                   pushed the Tags card's Save button past the viewport edge
+                   at 320px. An overflow-hidden wrapper zeroes the min-content
+                   contribution (CSS: overflow != visible -> min-content 0). */
+                <div className="min-w-0 overflow-hidden rounded border">
+                  <iframe
+                    src={previewUrl}
+                    title={`Preview of ${doc.filename}`}
+                    className="w-full h-[70vh] border-0"
+                  />
+                </div>
               ) : null}
             </CardContent>
           </Card>

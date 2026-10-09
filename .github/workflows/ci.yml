@@ -103,7 +103,9 @@ jobs:
           npm run build
 
       - name: Run e2e smoke suite
-        run: npx playwright test --reporter=line
+        # Issue #778: the spec list is explicit so this job never absorbs new
+        # spec files implicitly — the a11y matrix runs in its own job below.
+        run: npx playwright test --reporter=line chat-smoke.spec.ts first-run-baseline.m01.spec.ts activity-tray.m04.spec.ts chat-width-budget.a07.spec.ts
 
       - name: Upload e2e failure artifacts
         if: failure()
@@ -160,6 +162,55 @@ jobs:
 
       - name: Page header ownership check
         run: python scripts/check_l05_page_headers.py
+
+      - name: A11y gate wiring check
+        run: python scripts/check_l07_a11y_gate_wired.py
+
+  # Issue #778 (Workstream L PR 7): the route x viewport accessibility gate.
+  # Separate from the e2e smoke job — the matrix is 141 serial tests and
+  # must not share the smoke budget — and wired by
+  # scripts/check_l07_a11y_gate_wired.py (Quality contracts).
+  a11y-matrix:
+    name: Playwright a11y matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: frontend/e2e
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: "22.22.2"
+          cache: npm
+          cache-dependency-path: frontend/e2e/package-lock.json
+
+      - name: Install e2e dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Install app dependencies and build
+        working-directory: frontend
+        run: |
+          npm ci --engine-strict
+          npm run build
+
+      - name: Run a11y route x viewport matrix
+        # --retries=1 rides out single-row flakes (config-level retries is 0);
+        # --max-failures=20 stops a wholesale break early so failure artifacts
+        # still upload inside the job budget (issue #778 review F-13).
+        run: npx playwright test --reporter=line a11y-matrix.spec.ts --retries=1 --max-failures=20
+
+      - name: Upload a11y failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: a11y-matrix-report
+          path: frontend/e2e/test-results/
+          retention-days: 7
 
   # BUILD-002: detect whether this run touches the docker build surface, so the
   # docker-smoke job below only spends CI minutes when the image definition

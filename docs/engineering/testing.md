@@ -74,7 +74,11 @@ vaults, sessions, durable-turn batch writes, and progressive SSE with
 
 ```bash
 cd frontend && npm ci && npm run build
-cd e2e && npm ci && npx playwright install --with-deps chromium && npx playwright test
+cd e2e && npm ci && npx playwright install --with-deps chromium
+# Smoke suite (always name the specs — a bare run absorbs the a11y matrix):
+npx playwright test chat-smoke.spec.ts first-run-baseline.m01.spec.ts activity-tray.m04.spec.ts chat-width-budget.a07.spec.ts
+# A11y matrix (its own CI job; needs the frontend build above):
+npx playwright test a11y-matrix.spec.ts
 ```
 
 Write specs with resilient selectors (roles/aria-labels) and remember two
@@ -116,11 +120,12 @@ the new behavior.
 
 ## 4. What CI runs vs. what you should run
 
-CI (`.github/workflows/ci.yml`) runs the full suite across seven jobs:
+CI (`.github/workflows/ci.yml`) runs the full suite across eight jobs:
 
 - **Frontend job:** `npm run typecheck`, `npm run typecheck:contracts`, `npm run lint`, API smoke tests, the accessibility smoke (`npm run test:a11y`), full `npm test`, the coverage gate (`npm run test:coverage`), the toolchain-graph print (`node --version`, `npm --version`, `npm ls vite vitest @vitejs/plugin-react jsdom`, and the resolved `vite`/`vitest` versions — it fails the build when the two disagree), and three builds (production plus two subpath variants).
-- **Playwright e2e smoke job:** the `frontend/e2e/` browser smoke suite (send / stop-mid-stream / reload-restores-history / citation-opens-source) against the production build with a stub backend (issue #573).
-- **Quality contracts job:** all twelve contract scripts, in CI order: `scripts/check_runtime_contract.py`, `scripts/check_config_contract.py`, `scripts/check_settings_consumers.py`, `scripts/check_batch_mock_seq.py`, `scripts/check_pr_scope_drift.py`, `scripts/check_sast_baseline.py`, `scripts/check_secretscan.py`, `scripts/check_test_collection_scope.py`, `scripts/check_a04_http500_detail_hygiene.py`, `scripts/check_b03_upload_migration_timeout.py`, `scripts/check_l05_raw_palette.py`, `scripts/check_l05_page_headers.py` (mirrored by the `justfile` `quality-contracts` recipe).
+- **Playwright e2e smoke job:** the `frontend/e2e/` browser smoke suite (`chat-smoke.spec.ts`, `first-run-baseline.m01.spec.ts`, `activity-tray.m04.spec.ts`, `chat-width-budget.a07.spec.ts`) against the production build with a stub backend (issue #573). The step names its spec files explicitly so new specs never join it implicitly. Locally: `npx playwright test chat-smoke.spec.ts first-run-baseline.m01.spec.ts activity-tray.m04.spec.ts chat-width-budget.a07.spec.ts` from `frontend/e2e` (a bare `npx playwright test` also runs the 141-test a11y matrix below).
+- **Playwright a11y matrix job:** `frontend/e2e/a11y-matrix.spec.ts` (issue #778) — gate 1 (axe-core serious/critical-zero) runs every route x 320x568/640x360 x light/dark with a below-fold scroll-and-rescan pass; the interactive-offender probe (gate 2, WCAG 1.4.10 table-scoped exemption) and the outermost-main-landmark count (gate 4) run per route at 320x568 light only. Axe Waiver: four rule families are disabled by user-sanctioned amendment and owned by #865 (aria-valid-attr-value), #866 (nested-interactive), #867 (button-name), #868 (aria-required-children) — each issue's AC1 re-enables its rule. Locally: `npx playwright test a11y-matrix.spec.ts` from `frontend/e2e`. Wired by `scripts/check_l07_a11y_gate_wired.py`.
+- **Quality contracts job:** all thirteen contract scripts, in CI order: `scripts/check_runtime_contract.py`, `scripts/check_config_contract.py`, `scripts/check_settings_consumers.py`, `scripts/check_batch_mock_seq.py`, `scripts/check_pr_scope_drift.py`, `scripts/check_sast_baseline.py`, `scripts/check_secretscan.py`, `scripts/check_test_collection_scope.py`, `scripts/check_a04_http500_detail_hygiene.py`, `scripts/check_b03_upload_migration_timeout.py`, `scripts/check_l05_raw_palette.py`, `scripts/check_l05_page_headers.py`, `scripts/check_l07_a11y_gate_wired.py` (mirrored by the `justfile` `quality-contracts` recipe).
 - **Detect docker scope job:** a paths-filter that arms the docker-smoke job only when the docker build surface changed (BUILD-002).
 - **Docker build smoke job:** builds the root and frontend images (no push) when the docker surface changed, proving a green run ships a buildable image.
 - **SAST (bandit) job:** `scripts/run_bandit.py` — fails on new bandit findings or unused `# nosec` suppressions against the committed baseline.

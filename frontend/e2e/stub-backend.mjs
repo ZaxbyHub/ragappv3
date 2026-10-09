@@ -110,6 +110,7 @@ const USER = {
   full_name: "E2E User",
   role: "superadmin",
   is_active: true,
+  created_at: nowIso(),
 };
 
 const VAULT = {
@@ -175,10 +176,10 @@ function resetE2eJobs() {
   for (const family of E2E_JOB_FAMILIES) {
     e2eSeeds[family] = [];
   }
-  // Ingest seeds materialize document rows; drop only the rows the seeder
+  // Ingest seeds materialize document rows; drop only the rows a seeder
   // created (flagged at seed time), never walkthrough-uploaded documents.
   for (let i = documents.length - 1; i >= 0; i -= 1) {
-    if (documents[i].e2eSeed) documents.splice(i, 1);
+    if (documents[i].e2eSeed || documents[i].e2eA11ySeed) documents.splice(i, 1);
   }
 }
 
@@ -270,6 +271,337 @@ function addMessage(sessionId, { role, content, sources = null, turn_id = null, 
   entry.session.updated_at = nowIso();
   return message;
 }
+
+// ---- a11y-matrix fixtures (issue #778) ---------------------------------------
+//
+// Two tiers, per the frozen a11y-matrix.spec.ts seeding contract:
+//   STATIC (always served, no seed call needed): /api/settings,
+//   /api/users/, /api/groups, /api/auth/sessions, /api/draft-room/
+//   capabilities. /api/canvas/capabilities is always SERVED but its VALUE
+//   is seed-gated (enabled flips false->true on a11y-seed; review PRR-003).
+//   GET /api/organizations/ is
+//   always SERVED but returns [] until the a11y seed runs —
+//   first-run-baseline.m01.spec.ts reads this endpoint on /vaults and must
+//   not observe fixture rows.
+//   SEED-GATED (POST /_e2e/a11y-seed, undone by /_e2e/a11y-reset): the
+//   seeded document/tags/folders/memory/wiki/KMS/canvas/draft/search rows
+//   and chat session 1. Mutable families (documents list, draft-room list)
+//   route through the EXISTING stores above so sibling specs' assertions
+//   stay intact when unseeded.
+
+const SETTINGS_FIXTURE = {
+  port: 8000,
+  data_dir: "/data",
+  ollama_embedding_url: "http://localhost:11435",
+  ollama_chat_url: "http://localhost:11434",
+  embedding_model: "nomic-embed-text",
+  chat_model: "llama3.1",
+  chat_configured: true,
+  instant_configured: true,
+  default_chat_mode: "thinking",
+  chunk_size_chars: 1200,
+  chunk_overlap_chars: 200,
+  retrieval_top_k: 8,
+  max_distance_threshold: 1.2,
+  retrieval_window: 4,
+  vector_metric: "cosine",
+  embedding_doc_prefix: "search_document",
+  embedding_query_prefix: "search_query",
+  maintenance_mode: false,
+  auto_scan_enabled: false,
+  auto_scan_interval_minutes: 30,
+  enable_model_validation: false,
+  embedding_batch_size: 32,
+  reranking_enabled: false,
+  wiki_enabled: true,
+  wiki_lint_enabled: true,
+  kms_enabled: true,
+  draft_room_enabled: true,
+  effective_sources: {},
+  max_file_size_mb: 50,
+  allowed_extensions: [".pdf", ".txt", ".md", ".csv"],
+  backend_cors_origins: [],
+};
+
+const GROUPS_FIXTURE = {
+  groups: [
+    {
+      id: 1,
+      name: "e2e-group",
+      description: "a11y fixture group",
+      created_at: nowIso(),
+      org_id: null,
+      organization_name: null,
+    },
+  ],
+  total: 1,
+  page: 1,
+  per_page: 20,
+};
+
+const AUTH_SESSIONS_FIXTURE = {
+  sessions: [
+    {
+      id: "s1",
+      user_id: 1,
+      user_agent: "e2e-stub",
+      ip_address: "127.0.0.1",
+      created_at: nowIso(),
+      expires_at: nowIso(),
+      is_current: true,
+    },
+  ],
+};
+
+const DRAFT_CAPABILITIES_FIXTURE = {
+  enabled: true,
+  modes: ["rewrite", "compose"],
+  tiers: ["standard", "high_stakes", "sensitive"],
+  piece_types: ["memo", "article"],
+  transformation_strengths: ["light", "medium", "heavy"],
+  limits: { max_inputs: 10 },
+  export_formats: ["md"],
+  logical_model_modes: ["thinking", "instant"],
+  default_logical_mode: "thinking",
+  compile_start_stages: ["research", "outline", "draft", "lint", "copy", "standards", "fact"],
+  compile_stage_order: [
+    "intake",
+    "research",
+    "outline",
+    "draft",
+    "lint",
+    "copy",
+    "standards",
+    "fact",
+    "assemble",
+  ],
+  prompt_bundle_version: "e2e",
+  editorial_gates_installed: false,
+  compile_available: true,
+  findings_available: true,
+  claims_available: true,
+  evidence_available: true,
+  ready_available: true,
+  promote_available: true,
+};
+
+// Seed-gated fixture rows (populated by seedA11yFixtures()).
+let a11ySeeded = false;
+let a11yOrgs = [];
+const A11Y_DOC_ID = "1";
+const A11Y_SESSION_ID = 1;
+const A11Y_DRAFT_ID = 1;
+
+function a11yDocumentRow() {
+  return {
+    id: A11Y_DOC_ID,
+    filename: "handbook-a11y.pdf",
+    vault_id: 1,
+    content_type: "application/pdf",
+    size: 2048,
+    created_at: nowIso(),
+    processed_at: nowIso(),
+    error_message: null,
+    metadata: { status: "indexed", chunk_count: 7, phase: "done" },
+    e2eA11ySeed: true,
+  };
+}
+
+function a11yWikiPage() {
+  return {
+    id: 1,
+    vault_id: 1,
+    slug: "coolant-maintenance",
+    title: "Coolant Maintenance Wiki",
+    page_type: "entity",
+    markdown: "Coolant intervals run every 500 hours.",
+    summary: "Maintenance cadence for the coolant system.",
+    status: "verified",
+    confidence: 0.9,
+    version: 1,
+    created_by: null,
+    created_at: nowIso(),
+    updated_at: nowIso(),
+    last_compiled_at: null,
+    claims: [],
+    entities: [],
+    lint_findings: [],
+  };
+}
+
+function a11yKmsEntry() {
+  return {
+    id: 1,
+    vault_id: 1,
+    file_id: null,
+    slug: "coolant-schedule",
+    title: "Coolant Schedule Entry",
+    body: "Replace coolant every 500 hours of runtime.",
+    summary: "Coolant replacement cadence.",
+    tags_json: '["guide"]',
+    tags: ["guide"],
+    source_type: "manual",
+    status: "published",
+    created_by: null,
+    created_at: nowIso(),
+    updated_at: nowIso(),
+    last_compiled_at: null,
+  };
+}
+
+function a11yCanvasPayload() {
+  const artifact = {
+    artifact_uid: "cav_a11y_fixture_0",
+    session_id: A11Y_SESSION_ID,
+    message_id: null,
+    turn_id: null,
+    kind: "code",
+    name: "A11Y Fixture Canvas",
+    language: "javascript",
+    current_version_no: 1,
+    source_refs: [],
+    vault_id: 1,
+    created_by: null,
+    created_at: nowIso(),
+    updated_at: nowIso(),
+  };
+  const version = {
+    version_no: 1,
+    name: null,
+    origin: "created",
+    model_edit: null,
+    content_sha256: "e2e-fixture",
+    created_by: null,
+    created_at: nowIso(),
+    content: "// fixture",
+  };
+  return { artifact, version };
+}
+
+function a11yDraftDetail() {
+  const summary = {
+    id: A11Y_DRAFT_ID,
+    vault_id: 1,
+    vault_access: "write",
+    title: "A11Y Fixture Draft",
+    mode: "rewrite",
+    status: "ready",
+    tier: "standard",
+    lock_version: 1,
+    current_revision_id: null,
+    active_job_id: null,
+    input_count: 0,
+    open_blocker_count: 0,
+    created_at: nowIso(),
+    updated_at: nowIso(),
+    ready_at: null,
+    ready_by: null,
+    ready_by_username: null,
+  };
+  const brief = {
+    piece_type: "memo",
+    audience: "operators",
+    purpose: "fixture",
+    tone: "neutral",
+    target_words: 200,
+    transformation_strength: "light",
+    primary_input_id: null,
+    must_include: [],
+    must_avoid: [],
+    preserve_quotes: true,
+    preserve_numbers: true,
+    preserve_uncertainty: true,
+    drafting_priority: "accuracy",
+    additional_instructions: "",
+  };
+  return {
+    summary,
+    brief,
+    inputs: [],
+    current_revision_summary: null,
+    active_compile_job: null,
+    revision_count: 0,
+    evidence_count: 0,
+    claim_counts_by_status: {},
+    finding_counts_by_severity: {},
+  };
+}
+
+function seedA11yFixtures() {
+  if (!documents.some((d) => d.e2eA11ySeed)) {
+    documents.push(a11yDocumentRow());
+    // Reserve the hardcoded fixture ids so later allocators cannot mint a
+    // second row with the same id on a reused stub (issue #778 review).
+    nextDocumentId = Math.max(nextDocumentId, Number(A11Y_DOC_ID) + 1);
+  }
+  // Chat session 1 with the transcript the /chat/1 sentinel waits for. Only
+  // created when absent so a chat-smoke run sharing the stub is untouched.
+  if (!sessions.has(A11Y_SESSION_ID)) {
+    const session = {
+      id: A11Y_SESSION_ID,
+      vault_id: 1,
+      title: "A11Y fixture session",
+      created_at: nowIso(),
+      updated_at: nowIso(),
+      message_count: 0,
+      forked_from_session_id: null,
+      fork_message_index: null,
+    };
+    sessions.set(A11Y_SESSION_ID, { session, messages: [], a11ySeed: true });
+    nextSessionId = Math.max(nextSessionId, A11Y_SESSION_ID + 1);
+    addMessage(A11Y_SESSION_ID, {
+      role: "user",
+      content: "What did the maintenance manual say about coolant?",
+    });
+    addMessage(A11Y_SESSION_ID, {
+      role: "assistant",
+      content: "The coolant interval is 500 hours.",
+      sources: [SOURCE],
+    });
+  }
+  // Draft list row through the shared seeds array (idempotent by title).
+  if (!e2eSeeds["draft-room"].some((s) => s.title === "A11Y Fixture Draft")) {
+    e2eSeeds["draft-room"].push({
+      id: nextE2eJobId++,
+      family: "draft-room",
+      status: "completed",
+      title: "A11Y Fixture Draft",
+      created_at: nowIso(),
+      vaultId: 1,
+      draftId: A11Y_DRAFT_ID,
+      a11ySeed: true,
+    });
+    nextE2eDraftId = Math.max(nextE2eDraftId, A11Y_DRAFT_ID + 1);
+  }
+  a11yOrgs = [
+    {
+      id: 1,
+      name: "e2e-org",
+      description: "a11y fixture org",
+      member_count: 1,
+      vault_count: 1,
+      created_at: nowIso(),
+    },
+  ];
+  a11ySeeded = true;
+  return { ok: true };
+}
+
+function resetA11yFixtures() {
+  for (let i = documents.length - 1; i >= 0; i -= 1) {
+    if (documents[i].e2eA11ySeed) documents.splice(i, 1);
+  }
+  const entry = sessions.get(A11Y_SESSION_ID);
+  if (entry?.a11ySeed) sessions.delete(A11Y_SESSION_ID);
+  e2eSeeds["draft-room"] = e2eSeeds["draft-room"].filter((s) => !s.a11ySeed);
+  a11yOrgs = [];
+  a11ySeeded = false;
+  // Full unseeded state includes the identity flag /_e2e/user-flags flips —
+  // a crashed run must not leave later specs redirecting to /change-password.
+  USER.must_change_password = false;
+  return { ok: true };
+}
+
 
 // ---- helpers ----------------------------------------------------------------
 
@@ -811,6 +1143,153 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       setupMode = Boolean(body.needs_setup);
       return sendJson(req, res, 200, { needs_setup: setupMode });
+    }
+
+    // ---- a11y-matrix fixture routes (issue #778; see the fixture block
+    // above for the static-vs-seed-gated split) ----
+    if (method === "GET" && path === "/api/settings") {
+      return sendJson(req, res, 200, SETTINGS_FIXTURE);
+    }
+    if (method === "GET" && path === "/api/users") {
+      const q = (url.searchParams.get("q") || "").toLowerCase();
+      const rows = q ? [USER].filter((u) => u.username.includes(q)) : [USER];
+      return sendJson(req, res, 200, { users: rows, total: rows.length });
+    }
+    if (method === "GET" && path === "/api/organizations") {
+      return sendJson(req, res, 200, a11yOrgs);
+    }
+    if (method === "GET" && path === "/api/groups") {
+      return sendJson(req, res, 200, GROUPS_FIXTURE);
+    }
+    if (method === "GET" && path === "/api/auth/sessions") {
+      return sendJson(req, res, 200, AUTH_SESSIONS_FIXTURE);
+    }
+    if (method === "GET" && path === "/api/draft-room/capabilities") {
+      return sendJson(req, res, 200, DRAFT_CAPABILITIES_FIXTURE);
+    }
+    if (method === "GET" && path === "/api/canvas/capabilities") {
+      // Seed-gated (issue #778 review PRR-003): an always-enabled capability
+      // flips the "Open in canvas" affordance on for the sibling chat specs.
+      if (!a11ySeeded) return sendJson(req, res, 200, { enabled: false });
+      return sendJson(req, res, 200, { enabled: true });
+    }
+    // Seed-gated rows below: 404 until POST /_e2e/a11y-seed.
+    if (method === "GET" && path === "/api/tags") {
+      if (!a11ySeeded) return sendJson(req, res, 404, { detail: "not seeded" });
+      return sendJson(req, res, 200, {
+        tags: [
+          {
+            id: 1,
+            vault_id: 1,
+            name: "maintenance",
+            color: "#2563eb",
+            created_at: nowIso(),
+            updated_at: nowIso(),
+            document_count: 1,
+          },
+        ],
+      });
+    }
+    if (method === "GET" && path === "/api/folders") {
+      if (!a11ySeeded) return sendJson(req, res, 404, { detail: "not seeded" });
+      return sendJson(req, res, 200, {
+        folders: [{ id: 1, vault_id: 1, name: "Manuals", parent_id: null, created_at: nowIso() }],
+      });
+    }
+    if (method === "GET" && path === "/api/memories") {
+      if (!a11ySeeded) return sendJson(req, res, 404, { detail: "not seeded" });
+      return sendJson(req, res, 200, {
+        memories: [
+          {
+            id: "m1",
+            content: "Coolant intervals run every 500 hours.",
+            metadata: { category: "maintenance" },
+            updated_at: nowIso(),
+          },
+        ],
+      });
+    }
+    if (method === "GET" && path === "/api/wiki/pages") {
+      if (!a11ySeeded) return sendJson(req, res, 404, { detail: "not seeded" });
+      return sendJson(req, res, 200, { pages: [a11yWikiPage()], page: 1, per_page: 20, total: 1 });
+    }
+    if (method === "GET" && path === "/api/wiki/lint") {
+      if (!a11ySeeded) return sendJson(req, res, 404, { detail: "not seeded" });
+      return sendJson(req, res, 200, { findings: [] });
+    }
+    if (method === "GET" && path === "/api/wiki/claims") {
+      if (!a11ySeeded) return sendJson(req, res, 404, { detail: "not seeded" });
+      return sendJson(req, res, 200, { claims: [] });
+    }
+    if (method === "GET" && path === "/api/kms/entries") {
+      if (!a11ySeeded) return sendJson(req, res, 404, { detail: "not seeded" });
+      return sendJson(req, res, 200, { entries: [a11yKmsEntry()], total: 1, page: 1, per_page: 200 });
+    }
+    if (method === "GET" && path === "/api/kms/entries/1") {
+      if (!a11ySeeded) return sendJson(req, res, 404, { detail: "not seeded" });
+      return sendJson(req, res, 200, a11yKmsEntry());
+    }
+    if (method === "GET" && path === `/api/documents/${A11Y_DOC_ID}`) {
+      const doc = documents.find((d) => d.id === A11Y_DOC_ID && d.e2eA11ySeed);
+      if (!doc) return sendJson(req, res, 404, { detail: "file not found" });
+      return sendJson(req, res, 200, doc);
+    }
+    if (method === "GET" && path === `/api/documents/${A11Y_DOC_ID}/raw`) {
+      const doc = documents.find((d) => d.id === A11Y_DOC_ID && d.e2eA11ySeed);
+      if (!doc) return sendJson(req, res, 404, { detail: "file not found" });
+      res.writeHead(200, {
+        "Content-Type": "application/pdf",
+        "Content-Disposition": 'attachment; filename="handbook-a11y.pdf"',
+        ...corsHeaders(req),
+      });
+      res.end("a11y fixture document body");
+      return;
+    }
+    if (method === "GET" && path === "/api/search/unified") {
+      if (!a11ySeeded) return sendJson(req, res, 404, { detail: "not seeded" });
+      const q = (url.searchParams.get("q") || "").toLowerCase();
+      const results = q.includes("coolant")
+        ? [
+            {
+              type: "document",
+              id: 1,
+              title: "handbook-a11y.pdf",
+              snippet: "The coolant interval is 500 hours.",
+              vault_id: 1,
+              url_hint: "/documents/1",
+              score: 1.0,
+            },
+          ]
+        : [];
+      return sendJson(req, res, 200, { results });
+    }
+    if (method === "GET" && path === "/api/canvas/artifacts/cav_a11y_fixture_0") {
+      if (!a11ySeeded) return sendJson(req, res, 404, { detail: "not seeded" });
+      return sendJson(req, res, 200, a11yCanvasPayload());
+    }
+    if (method === "GET" && path === "/api/canvas/artifacts/cav_a11y_fixture_0/versions") {
+      if (!a11ySeeded) return sendJson(req, res, 404, { detail: "not seeded" });
+      const { version } = a11yCanvasPayload();
+      return sendJson(req, res, 200, { versions: [version] });
+    }
+    if (method === "GET" && path === `/api/draft-room/drafts/${A11Y_DRAFT_ID}`) {
+      if (!a11ySeeded) return sendJson(req, res, 404, { detail: "draft not found" });
+      return sendJson(req, res, 200, a11yDraftDetail());
+    }
+    if (method === "POST" && path === "/_e2e/a11y-seed") {
+      await readBody(req);
+      return sendJson(req, res, 200, seedA11yFixtures());
+    }
+    if (method === "POST" && path === "/_e2e/a11y-reset") {
+      await readBody(req);
+      return sendJson(req, res, 200, resetA11yFixtures());
+    }
+    if (method === "POST" && path === "/_e2e/user-flags") {
+      const body = await readBody(req);
+      if (typeof body.must_change_password === "boolean") {
+        USER.must_change_password = body.must_change_password;
+      }
+      return sendJson(req, res, 200, USER);
     }
 
     // ---- fallback ----
