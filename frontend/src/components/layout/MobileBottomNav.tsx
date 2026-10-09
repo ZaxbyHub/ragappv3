@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { MessageSquare, FileText, Brain, MoreHorizontal, Database, Settings, Users, User, Building2, UserCog, BookOpen, Library, LogOut, PenLine } from "lucide-react";
 import {
   Sheet,
@@ -10,6 +10,7 @@ import {
 } from "@/components/ui/sheet";
 import { cn } from "@/lib/utils";
 import { useAuthStore } from "@/stores/useAuthStore";
+import { captureAuthOwner, isCurrentAuthOwner } from "@/lib/api/auth-lifecycle";
 import { useNavigate } from "react-router-dom";
 import type { NavItemId } from "./navigationTypes";
 import { useDraftRoomVisible } from "@/hooks/useDraftRoomCapabilities";
@@ -42,16 +43,32 @@ const moreNavItems: { id: NavItemId; label: string; icon: React.ComponentType<{ 
 
 export function MobileBottomNav({ activeItem, onItemSelect }: MobileBottomNavProps) {
   const [moreOpen, setMoreOpen] = useState(false);
+  const isMounted = useRef(true);
+  useEffect(() => {
+    isMounted.current = true;
+    return () => { isMounted.current = false; };
+  }, []);
   const navigate = useNavigate();
   const userRole = useAuthStore((state) => state.user?.role);
   const logout = useAuthStore((state) => state.logout);
   const isAdmin = userRole === "admin" || userRole === "superadmin";
   const draftRoomVisible = useDraftRoomVisible();
 
-  const handleLogout = async () => {
+  const handleLogout = () => {
     setMoreOpen(false);
-    await logout();
-    navigate("/login", { replace: true });
+    // The store deliberately rejects stale/deadline logout to its callers.
+    // This UI boundary consumes that rejection so a dropped click never leaks
+    // an unhandled promise, and it navigates only after the current success.
+    const operation = logout();
+    const logoutOwner = captureAuthOwner();
+    return operation.then(
+      () => {
+        if (isMounted.current && isCurrentAuthOwner(logoutOwner)) {
+          navigate("/login", { replace: true });
+        }
+      },
+      () => undefined,
+    );
   };
 
   return (

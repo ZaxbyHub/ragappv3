@@ -46,6 +46,7 @@ vi.mock("@/lib/api", () => ({
       { id: "4", filename: "doc.docx", size: 8192, created_at: "2024-01-04", metadata: { status: "pending", chunk_count: 0 } },
       { id: "5", filename: "notes.md", size: 512, created_at: "2024-01-05", metadata: { status: "processed", chunk_count: 3 } },
     ],
+    total: 5,
   }),
   scanDocuments: vi.fn().mockResolvedValue({ added: 0, scanned: 0 }),
   deleteDocument: vi.fn().mockResolvedValue({}),
@@ -453,7 +454,7 @@ describe("DocumentsPage - Virtualization", () => {
     it("should show empty state when no documents", async () => {
       // Re-mock API to return empty documents
       const { listDocuments } = await import("@/lib/api");
-      vi.mocked(listDocuments).mockResolvedValueOnce({ documents: [] });
+      vi.mocked(listDocuments).mockResolvedValueOnce({ documents: [], total: 0 });
 
       await act(async () => {
         const result = render(<DocumentsPage />);

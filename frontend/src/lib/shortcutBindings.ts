@@ -130,6 +130,7 @@ export function isEditableTarget(target: EventTarget | null): boolean {
   return (
     target.tagName === "INPUT" ||
     target.tagName === "TEXTAREA" ||
+    target.tagName === "SELECT" ||
     target.isContentEditable === true
   );
 }
@@ -148,4 +149,9 @@ export function comboToKeyboardEventInit(combo: string): KeyboardEventInit {
     return { key, ctrlKey: true, cancelable: true };
   }
   return { key: combo, cancelable: true };
+}
+
+/** Shared execution guard for window/document shortcut owners. */
+export function canHandleShortcutEvent(e: Pick<KeyboardEvent, "defaultPrevented" | "repeat" | "isComposing" | "target">): boolean {
+  return !e.defaultPrevented && !e.repeat && !e.isComposing && !isEditableTarget(e.target);
 }

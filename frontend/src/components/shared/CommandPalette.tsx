@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { useLocation, useNavigate } from "react-router-dom";
 import {
   Dialog,
   DialogContent,
@@ -8,71 +8,90 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { HugeiconsIcon } from "@hugeicons/react";
-import { Keyboard, SunMoon, Monitor, Contrast, Link2, Search } from "lucide-react";
-import { toast } from "sonner";
 import {
-  navItems,
-  isAdminRole,
-  isNavItemVisible,
-  isHugeicon,
-} from "@/components/layout/NavigationRail";
-import { useAuthStore } from "@/stores/useAuthStore";
-import { useDraftRoomVisible } from "@/hooks/useDraftRoomCapabilities";
-import { useThemeStore } from "@/stores/useThemeStore";
-import { useNavigationGuardStore } from "@/stores/useNavigationGuardStore";
-import { bindingFor } from "@/components/shared/KeyboardShortcuts";
+  type UnifiedSearchResult,
+  unifiedSearch,
+} from "@/lib/api/search";
 import {
-  comboFromEvent,
   comboToKeyboardEventInit,
   PALETTE_TOGGLE_COMBOS,
+  comboFromEvent,
 } from "@/lib/shortcutBindings";
-import { unifiedSearch, type UnifiedSearchResult } from "@/lib/api/search";
+import type { NavItemId } from "@/components/layout/navigationTypes";
+import { useAuthOwner } from "@/hooks/useAuthOwner";
+import { useDraftRoomVisible } from "@/hooks/useDraftRoomCapabilities";
+import { navItems, isAdminRole, isNavItemVisible, isHugeicon } from "@/components/layout/NavigationRail";
+import { bindingFor } from "@/components/shared/KeyboardShortcuts";
+import { useThemeStore } from "@/stores/useThemeStore";
+import { useNavigationGuardStore } from "@/stores/useNavigationGuardStore";
+import { captureAuthPrincipalGeneration, subscribeAuthPrincipal } from "@/lib/api/auth-lifecycle";
+import { Keyboard, SunMoon, Monitor, Contrast, Link2 } from "lucide-react";
+import { toast } from "sonner";
+import { useAuthStore } from "@/stores/useAuthStore";
+import { useVaultStore } from "@/stores/useVaultStore";
+import { COMMAND_PALETTE_OPEN_EVENT } from "@/lib/commandPaletteEvents";
+import {
+  getCommandPaletteActionSnapshot,
+  invokeCommandPaletteAction,
+  subscribeCommandPaletteActions,
+  type CommandPaletteActionSnapshot,
+} from "@/lib/commandPaletteActions";
 
-type PaletteIcon = React.ComponentType<{ className?: string }> | Parameters<typeof HugeiconsIcon>[0]["icon"];
-
-interface NavCommand {
-  id: string;
-  kind: "nav";
-  /** Short imperative label. Keep each destination word unique per command
-   * (e.g. only the Documents row says "Documents") so palette text queries
-   * resolve to exactly one command. */
+interface Command {
+  id: NavItemId;
   label: string;
   to: string;
-  icon: PaletteIcon;
+  icon: (typeof navItems)[number]["icon"];
 }
 
-interface ActionCommand {
-  id: string;
-  kind: "action";
-  label: string;
-  run: () => void;
-  icon: PaletteIcon;
+interface PaletteContext {
+  generation: number;
+  owner: ReturnType<typeof useAuthOwner>;
+  principalGeneration: number;
+  principalId: number | string | null;
+  role: string | null;
+  vaultId: number | null;
 }
 
-const ENTITY_SEARCH_DEBOUNCE_MS = 300;
-const ENTITY_SEARCH_MIN_CHARS = 2;
-const ENTITY_SEARCH_LIMIT = 5;
-
-function renderIcon(icon: PaletteIcon, className: string) {
-  if (isHugeicon(icon as Parameters<typeof isHugeicon>[0])) {
-    return <HugeiconsIcon strokeWidth={1.2} icon={icon as Parameters<typeof HugeiconsIcon>[0]["icon"]} size={16} className={className} aria-hidden="true" />;
-  }
-  const Icon = icon as React.ComponentType<{ className?: string }>;
-  return <Icon className={className} aria-hidden="true" />;
+interface CommandPaletteProps {
+  draftRoomVisible?: boolean;
+  /** Retained for callers during the active-vault migration; the store is authoritative. */
+  vaultId?: number | string | null;
 }
 
-/**
- * Copy the page URL with user-visible feedback on every outcome (issue #775
- * review PRR-408): clipboard API when available, execCommand fallback (the
- * CopyButton pattern) for non-secure-context deployments, and an error toast
- * when neither path can copy — never a silent no-op.
- */
-function copyPageLink(url: string): void {
+type SearchStatus = "idle" | "loading" | "success" | "error";
+
+interface SearchState {
+  status: SearchStatus;
+  results: UnifiedSearchResult[];
+  error: string | null;
+}
+
+interface SearchRequest {
+  context: PaletteContext;
+  queryGeneration: number;
+  query: string;
+  vaultId: number | null;
+  controller: AbortController | null;
+  timer: ReturnType<typeof setTimeout> | null;
+  removeOwnerAbortListener: (() => void) | null;
+}
+
+const SEARCH_DEBOUNCE_MS = 300;
+const SEARCH_MIN_QUERY_LENGTH = 2;
+const idleSearchState: SearchState = { status: "idle", results: [], error: null };
+
+function searchErrorMessage(error: unknown): string {
+  if (error instanceof Error && error.message) return error.message;
+  return "Search failed. Try again.";
+}
+
+function copyPageLink(url: string, isCurrent: () => boolean): void {
   const write = navigator.clipboard?.writeText(url);
   if (write) {
     void write.then(
-      () => toast.success("Page link copied"),
-      () => toast.error("Couldn't copy — try copying the address bar URL")
+      () => { if (isCurrent()) toast.success("Page link copied"); },
+      () => { if (isCurrent()) toast.error("Couldn't copy — try copying the address bar URL"); }
     );
     return;
   }
@@ -87,286 +106,540 @@ function copyPageLink(url: string): void {
     const copied = document.execCommand("copy");
     document.body.removeChild(textarea);
     if (!copied) throw new Error("execCommand failed");
-    toast.success("Page link copied");
+    if (isCurrent()) toast.success("Page link copied");
   } catch {
-    toast.error("Couldn't copy — try copying the address bar URL");
+    if (isCurrent()) toast.error("Couldn't copy — try copying the address bar URL");
   }
 }
 
-/**
- * Global command palette (issue #258 / legacy-14; v2 per issue #775), mounted
- * once at the app shell. Ctrl/Cmd+K (PALETTE_TOGGLE_COMBOS — the single
- * shared definition) opens a dialog-role palette listing EVERY nav
- * destination (derived from NavigationRail's canonical navItems under the
- * same adminOnly/capabilityGated visibility rule), five non-navigating
- * actions, and entity hits from the existing unified search API (#515).
- * Executing a command closes the palette and navigates / runs the action.
- * Escape/outside-click close via the Radix Dialog primitive.
- *
- * One owner per combo (issue #775): the handler yields to any earlier
- * claimant via e.defaultPrevented (e.g. the chat rail's focusSearch on
- * /chat), and the rebind capture refuses combos in PALETTE_TOGGLE_COMBOS so
- * nothing can be persisted that this handler would shadow.
- */
-export function CommandPalette() {
+const builtinActions = [
+  { id: "action-show-shortcuts", label: "Show keyboard shortcuts", icon: Keyboard },
+  { id: "action-toggle-theme", label: "Toggle light/dark theme", icon: SunMoon },
+  { id: "action-system-theme", label: "Use system theme", icon: Monitor },
+  { id: "action-high-contrast-theme", label: "Use high contrast theme", icon: Contrast },
+  { id: "action-copy-link", label: "Copy page link", icon: Link2 },
+] as const;
+
+export function CommandPalette({ draftRoomVisible: draftRoomOverride }: CommandPaletteProps = {}) {
+  const capabilityDraftRoomVisible = useDraftRoomVisible();
+  const draftRoomVisible = draftRoomOverride ?? capabilityDraftRoomVisible;
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
-  const [hits, setHits] = useState<UnifiedSearchResult[]>([]);
-  const hitSeqRef = useRef(0);
-  // Mirrors `open` for the []-dep keydown effect (PRR-103: the keyboard
-  // toggle-close must reset like every other close path).
-  const openRef = useRef(false);
+  const [retryNonce, setRetryNonce] = useState(0);
+  const [searchState, setSearchState] = useState<SearchState>(idleSearchState);
   const navigate = useNavigate();
-
-  const userRole = useAuthStore((state) => state.user?.role);
-  const draftRoomVisible = useDraftRoomVisible();
+  const { pathname } = useLocation();
+  const pathnameRef = useRef(pathname);
+  pathnameRef.current = pathname;
+  const actionDispatchRef = useRef(false);
+  const actions = useSyncExternalStore(
+    subscribeCommandPaletteActions, getCommandPaletteActionSnapshot, getCommandPaletteActionSnapshot
+  );
+  const authOwner = useAuthOwner();
+  const principalGeneration = useSyncExternalStore(
+    subscribeAuthPrincipal, captureAuthPrincipalGeneration, captureAuthPrincipalGeneration
+  );
   const theme = useThemeStore((state) => state.theme);
   const setTheme = useThemeStore((state) => state.setTheme);
+  const themeRef = useRef(theme);
+  themeRef.current = theme;
+  const user = useAuthStore((state) => state.user);
+  const activeVaultId = useVaultStore((state) => state.activeVaultId);
+  const principalId = user?.id ?? null;
+  const role = user?.role ?? null;
+  const isAdmin = isAdminRole(role ?? undefined);
+
+  const generationRef = useRef(0);
+  const queryGenerationRef = useRef(0);
+  const contextRef = useRef<PaletteContext | null>(null);
+  const activeSearchRef = useRef<SearchRequest | null>(null);
+  const resultContextRef = useRef<SearchRequest | null>(null);
+  const mountedRef = useRef(false);
+  const queryRef = useRef(query);
+  const openRef = useRef(open);
+  const authOwnerRef = useRef(authOwner);
+  const principalRoleCapabilityRef = useRef({
+    principalId,
+    role,
+    isAdmin,
+    draftRoomVisible,
+    vaultId: activeVaultId,
+  });
+
+  authOwnerRef.current = authOwner;
+  principalRoleCapabilityRef.current = {
+    principalId,
+    role,
+    isAdmin,
+    draftRoomVisible,
+    vaultId: activeVaultId,
+  };
+  queryRef.current = query;
+  openRef.current = open;
+
+  const cancelActiveSearch = useCallback(() => {
+    const active = activeSearchRef.current;
+    if (active && active.timer !== null) {
+      clearTimeout(active.timer);
+      active.timer = null;
+    }
+    active?.controller?.abort();
+    active?.removeOwnerAbortListener?.();
+    if (active) active.removeOwnerAbortListener = null;
+    activeSearchRef.current = null;
+    resultContextRef.current = null;
+  }, []);
+
+  const isCurrentContext = useCallback((context: PaletteContext, command?: Command): boolean => {
+    const currentIdentity = principalRoleCapabilityRef.current;
+    return (
+      mountedRef.current &&
+      openRef.current &&
+      contextRef.current === context &&
+      context.generation === generationRef.current &&
+      context.owner === authOwnerRef.current &&
+      !context.owner.signal.aborted &&
+      context.principalGeneration === captureAuthPrincipalGeneration() &&
+      context.principalId === currentIdentity.principalId &&
+      context.role === currentIdentity.role &&
+      context.vaultId === currentIdentity.vaultId &&
+      (!command ||
+        navItems.filter((item) => isNavItemVisible(item, currentIdentity.isAdmin, currentIdentity.draftRoomVisible)).some(
+          (item) => item.id === command.id && item.to === command.to
+        ))
+    );
+  }, []);
+
+  const isCurrentSearch = useCallback(
+    (request: SearchRequest): boolean =>
+      isCurrentContext(request.context) &&
+      request.queryGeneration === queryGenerationRef.current &&
+      request.query === queryRef.current.trim().toLowerCase() &&
+      request.vaultId === principalRoleCapabilityRef.current.vaultId &&
+      activeSearchRef.current === request,
+    [isCurrentContext]
+  );
+
+  const retirePalette = useCallback(
+    (context?: PaletteContext) => {
+      if (context && contextRef.current !== context) return;
+      cancelActiveSearch();
+      queryGenerationRef.current += 1;
+      generationRef.current += 1;
+      contextRef.current = null;
+      openRef.current = false;
+      setOpen(false);
+      setQuery("");
+      setSearchState(idleSearchState);
+    },
+    [cancelActiveSearch]
+  );
+
+  const openPalette = useCallback(() => {
+    if (
+      !mountedRef.current ||
+      openRef.current ||
+      authOwnerRef.current !== authOwner ||
+      authOwner.signal.aborted
+    ) {
+      return;
+    }
+    const currentIdentity = principalRoleCapabilityRef.current;
+    if (
+      currentIdentity.principalId !== principalId ||
+      currentIdentity.role !== role ||
+      currentIdentity.vaultId !== activeVaultId
+    ) {
+      return;
+    }
+    const context: PaletteContext = {
+      generation: ++generationRef.current,
+      owner: authOwner,
+      principalGeneration,
+      principalId,
+      role,
+      vaultId: activeVaultId,
+    };
+    contextRef.current = context;
+    openRef.current = true;
+    setQuery("");
+    setSearchState(idleSearchState);
+    setOpen(true);
+  }, [activeVaultId, authOwner, principalGeneration, principalId, role]);
 
   useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      // Issue #775: exactly one owner per combo — if an earlier listener
-      // already claimed this keydown (focusSearch's document-level handler
-      // on /chat, or any capture-phase claimant), the palette yields.
-      if (e.defaultPrevented) return;
-      if (e.isComposing) return;
-      const combo = comboFromEvent(e);
-      if (combo === null || !PALETTE_TOGGLE_COMBOS.has(combo)) return;
-      e.preventDefault();
-      // PRR-103: closing via the keyboard toggle must leave the same clean
-      // state as Escape, outside click, or executing a command — no restored
-      // query, no stale hits, no in-flight response landing into a closed
-      // palette.
-      if (openRef.current) {
-        setQuery("");
-        setHits([]);
-        hitSeqRef.current += 1;
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      contextRef.current = null;
+      cancelActiveSearch();
+    };
+  }, [cancelActiveSearch]);
+
+  useEffect(() => {
+    const context = contextRef.current;
+    if (
+      !context ||
+      !openRef.current ||
+      (context.owner === authOwner &&
+        context.principalGeneration === principalGeneration &&
+        context.principalId === principalId &&
+        context.role === role &&
+        context.vaultId === activeVaultId)
+    ) {
+      return;
+    }
+
+    cancelActiveSearch();
+    queryGenerationRef.current += 1;
+    const replacement: PaletteContext = {
+      generation: ++generationRef.current,
+      owner: authOwner,
+      principalGeneration,
+      principalId,
+      role,
+      vaultId: activeVaultId,
+    };
+    contextRef.current = replacement;
+    setQuery("");
+    setSearchState(idleSearchState);
+  }, [activeVaultId, authOwner, cancelActiveSearch, principalGeneration, principalId, role]);
+
+  useEffect(() => {
+    const context = contextRef.current;
+    const normalizedQuery = query.trim().toLowerCase();
+    const queryGeneration = queryGenerationRef.current;
+    if (!context || !isCurrentContext(context) || normalizedQuery.length < SEARCH_MIN_QUERY_LENGTH) {
+      setSearchState(idleSearchState);
+      return;
+    }
+
+    const request: SearchRequest = {
+      context,
+      queryGeneration,
+      query: normalizedQuery,
+      vaultId: activeVaultId,
+      controller: null,
+      timer: null,
+      removeOwnerAbortListener: null,
+    };
+    activeSearchRef.current = request;
+    resultContextRef.current = request;
+    setSearchState({ status: "loading", results: [], error: null });
+    request.timer = setTimeout(() => {
+      request.timer = null;
+      if (!isCurrentSearch(request)) return;
+
+      const controller = new AbortController();
+      const abortForOwner = () => controller.abort();
+      request.controller = controller;
+      request.removeOwnerAbortListener = () =>
+        request.context.owner.signal.removeEventListener("abort", abortForOwner);
+      request.context.owner.signal.addEventListener("abort", abortForOwner, { once: true });
+      if (request.context.owner.signal.aborted) controller.abort();
+
+      void unifiedSearch({
+        q: request.query,
+        limit: 5,
+        ...(request.vaultId === null ? {} : { vault_id: request.vaultId }),
+        signal: controller.signal,
+      })
+        .then((response) => {
+          if (!isCurrentSearch(request)) return;
+          setSearchState({ status: "success", results: response.results, error: null });
+        })
+        .catch((error: unknown) => {
+          if (!isCurrentSearch(request) || controller.signal.aborted) return;
+          setSearchState({ status: "error", results: [], error: searchErrorMessage(error) });
+        })
+        .finally(() => {
+          request.removeOwnerAbortListener?.();
+          request.removeOwnerAbortListener = null;
+        });
+    }, SEARCH_DEBOUNCE_MS);
+
+    return () => {
+      if (activeSearchRef.current !== request) return;
+      if (request.timer !== null) {
+        clearTimeout(request.timer);
+        request.timer = null;
       }
-      setOpen((prev) => !prev);
+      request.controller?.abort();
+      request.removeOwnerAbortListener?.();
+      request.removeOwnerAbortListener = null;
+      activeSearchRef.current = null;
+      resultContextRef.current = null;
+    };
+  }, [activeVaultId, isCurrentContext, isCurrentSearch, query, retryNonce]);
+
+  const retrySearch = useCallback(
+    (request: SearchRequest) => {
+      if (!isCurrentSearch(request)) return;
+      setRetryNonce((value) => value + 1);
+    },
+    [isCurrentSearch]
+  );
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.repeat || event.isComposing) return;
+      const combo = comboFromEvent(event);
+      if (combo === null || !PALETTE_TOGGLE_COMBOS.has(combo)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (openRef.current) retirePalette();
+      else openPalette();
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, []);
+  }, [openPalette, retirePalette]);
 
   useEffect(() => {
-    openRef.current = open;
-  }, [open]);
+    window.addEventListener(COMMAND_PALETTE_OPEN_EVENT, openPalette);
+    return () => window.removeEventListener(COMMAND_PALETTE_OPEN_EVENT, openPalette);
+  }, [openPalette]);
 
-  // Entity search (issue #775 / #515): queries of 2+ characters hit the
-  // existing global search API after a debounce; a request-sequence guard
-  // drops stale responses, and failures are swallowed (static filtering
-  // always remains available).
-  useEffect(() => {
-    const q = query.trim();
-    if (q.length < ENTITY_SEARCH_MIN_CHARS) {
-      hitSeqRef.current += 1;
-      setHits([]);
-      return;
-    }
-    const seq = ++hitSeqRef.current;
-    const timer = window.setTimeout(() => {
-      unifiedSearch({ q, limit: ENTITY_SEARCH_LIMIT })
-        .then((response) => {
-          if (hitSeqRef.current === seq) setHits(response.results);
-        })
-        .catch(() => {
-          if (hitSeqRef.current === seq) setHits([]);
-        });
-    }, ENTITY_SEARCH_DEBOUNCE_MS);
-    return () => window.clearTimeout(timer);
-  }, [query]);
-
-  const closePalette = () => {
-    setOpen(false);
-    setQuery("");
-    setHits([]);
-    hitSeqRef.current += 1;
-  };
-
-  // Navigation commands derive from the rail's canonical destination list
-  // under the rail's own visibility rule (issue #775: no hand-copied subset,
-  // no second gating definition). RENDER ORDER CONTRACT: every navigation
-  // command precedes every action and entity hit.
-  const navCommands: NavCommand[] = useMemo(() => {
-    const isAdmin = isAdminRole(userRole);
-    return navItems
-      .filter((item) => isNavItemVisible(item, isAdmin, draftRoomVisible))
-      .map((item) => ({
+  const visibleCommands = useMemo<Command[]>(
+    () =>
+      navItems.filter((item) => isNavItemVisible(item, isAdmin, draftRoomVisible)).map((item) => ({
         id: item.id,
-        kind: "nav" as const,
         label: `Go to ${item.label}`,
         to: item.to,
         icon: item.icon,
-      }));
-  }, [userRole, draftRoomVisible]);
+      })),
+    [draftRoomVisible, isAdmin]
+  );
+  const filteredCommands = useMemo(() => {
+    const normalizedQuery = query.trim().toLowerCase();
+    if (!normalizedQuery) return visibleCommands;
+    return visibleCommands.filter((command) => command.label.toLowerCase().includes(normalizedQuery));
+  }, [query, visibleCommands]);
 
-  // Non-navigating actions (issue #775): executing one never changes the
-  // route. The shortcuts action drives the SINGLE existing shortcut
-  // dispatcher — it dispatches the bound showShortcuts combo instead of
-  // opening the dialog through a second channel.
-  const actionCommands: ActionCommand[] = useMemo(() => {
-    return [
-      {
-        id: "action-show-shortcuts",
-        kind: "action" as const,
-        label: "Show keyboard shortcuts",
-        icon: Keyboard,
-        run: () => {
-          closePalette();
-          window.dispatchEvent(
-            new KeyboardEvent("keydown", comboToKeyboardEventInit(bindingFor("showShortcuts")))
-          );
-        },
-      },
-      {
-        id: "action-toggle-theme",
-        kind: "action" as const,
-        label: "Toggle light/dark theme",
-        icon: SunMoon,
-        run: () => {
+  const filteredActions = useMemo(() => {
+    const normalizedQuery = query.trim().toLowerCase();
+    return actions.filter((action) => action.label.toLowerCase().includes(normalizedQuery));
+  }, [actions, query]);
+  const filteredBuiltinActions = useMemo(() => {
+    const normalizedQuery = query.trim().toLowerCase();
+    return builtinActions.filter((action) => action.label.toLowerCase().includes(normalizedQuery));
+  }, [query]);
+  const executeBuiltinAction = useCallback((
+    context: PaletteContext,
+    queryGeneration: number,
+    route: string,
+    action: (typeof builtinActions)[number],
+  ) => {
+    if (actionDispatchRef.current || !isCurrentContext(context) ||
+      queryGenerationRef.current !== queryGeneration || pathnameRef.current !== route) return;
+    // A physically admitted copy may report its result after this dialog closes.
+    // Its publication still belongs to this mounted auth/principal/vault/route.
+    const isPublicationCurrent = () => {
+      const identity = principalRoleCapabilityRef.current;
+      return mountedRef.current && context.owner === authOwnerRef.current &&
+        !context.owner.signal.aborted && context.principalGeneration === captureAuthPrincipalGeneration() &&
+        context.principalId === identity.principalId && context.role === identity.role &&
+        context.vaultId === identity.vaultId && pathnameRef.current === route;
+    };
+    actionDispatchRef.current = true;
+    try {
+      switch (action.id) {
+        case "action-show-shortcuts":
+          retirePalette(context);
+          if (isPublicationCurrent()) window.dispatchEvent(new KeyboardEvent(
+            "keydown", comboToKeyboardEventInit(bindingFor("showShortcuts"))
+          ));
+          break;
+        case "action-toggle-theme": {
           const systemDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
-          const resolvedDark = theme === "dark" || (theme === "system" && systemDark);
-          setTheme(resolvedDark ? "light" : "dark");
-          closePalette();
-        },
-      },
-      {
-        id: "action-system-theme",
-        kind: "action" as const,
-        label: "Use system theme",
-        icon: Monitor,
-        run: () => {
-          setTheme("system");
-          closePalette();
-        },
-      },
-      {
-        id: "action-high-contrast-theme",
-        kind: "action" as const,
-        label: "Use high contrast theme",
-        icon: Contrast,
-        run: () => {
-          setTheme("high-contrast");
-          closePalette();
-        },
-      },
-      {
-        id: "action-copy-link",
-        kind: "action" as const,
-        label: "Copy page link",
-        icon: Link2,
-        run: () => {
-          closePalette();
-          copyPageLink(window.location.href);
-        },
-      },
-    ];
-  }, [theme, setTheme]);
+          const resolvedDark = themeRef.current === "dark" || (themeRef.current === "system" && systemDark);
+          if (isPublicationCurrent()) setTheme(resolvedDark ? "light" : "dark");
+          retirePalette(context);
+          break;
+        }
+        case "action-system-theme":
+          if (isPublicationCurrent()) setTheme("system");
+          retirePalette(context);
+          break;
+        case "action-high-contrast-theme":
+          if (isPublicationCurrent()) setTheme("high-contrast");
+          retirePalette(context);
+          break;
+        case "action-copy-link":
+          retirePalette(context);
+          if (isPublicationCurrent()) copyPageLink(window.location.href, isPublicationCurrent);
+          break;
+      }
+    } finally {
+      actionDispatchRef.current = false;
+    }
+  }, [isCurrentContext, retirePalette, setTheme]);
 
-  const q = query.trim().toLowerCase();
-  const filteredNav = useMemo(
-    () => (q ? navCommands.filter((c) => c.label.toLowerCase().includes(q)) : navCommands),
-    [navCommands, q]
+  const executeAction = useCallback((
+    context: PaletteContext,
+    queryGeneration: number,
+    route: string,
+    action: CommandPaletteActionSnapshot,
+  ) => {
+    if (actionDispatchRef.current) return;
+    const guard = { isCurrent: () => isCurrentContext(context) &&
+      queryGenerationRef.current === queryGeneration && pathnameRef.current === route };
+    if (!guard.isCurrent()) return;
+    actionDispatchRef.current = true;
+    try {
+      if (invokeCommandPaletteAction(action, guard) && guard.isCurrent()) retirePalette(context);
+    } finally {
+      actionDispatchRef.current = false;
+    }
+  }, [isCurrentContext, retirePalette]);
+
+  const executeCommand = useCallback(
+    (context: PaletteContext, command: Command) => {
+      if (!isCurrentContext(context, command)) return;
+      const confirmLeave = useNavigationGuardStore.getState().confirmLeave;
+      if (confirmLeave && !confirmLeave()) return;
+      if (!isCurrentContext(context, command)) return;
+      navigate(command.to);
+      if (!isCurrentContext(context)) return;
+      retirePalette(context);
+    },
+    [isCurrentContext, navigate, retirePalette]
   );
-  const filteredActions = useMemo(
-    () => (q ? actionCommands.filter((c) => c.label.toLowerCase().includes(q)) : actionCommands),
-    [actionCommands, q]
+  const executeSearchResult = useCallback(
+    (request: SearchRequest, result: UnifiedSearchResult) => {
+      if (!isCurrentSearch(request)) return;
+      const confirmLeave = useNavigationGuardStore.getState().confirmLeave;
+      if (confirmLeave && !confirmLeave()) return;
+      if (!isCurrentSearch(request)) return;
+      navigate(result.url_hint);
+      if (!isCurrentSearch(request)) return;
+      retirePalette(request.context);
+    },
+    [isCurrentSearch, navigate, retirePalette]
+  );
+  const handleQueryChange = useCallback(
+    (nextQuery: string) => {
+      const context = contextRef.current;
+      if (!context || !isCurrentContext(context)) return;
+      cancelActiveSearch();
+      queryGenerationRef.current += 1;
+      setSearchState(idleSearchState);
+      setQuery(nextQuery);
+    },
+    [cancelActiveSearch, isCurrentContext]
   );
 
-  // Button-triggered programmatic navigation must consult the shared
-  // unsaved-changes guard before navigate() — the same contract App.tsx's
-  // handleItemSelect follows for the mobile bottom nav (a declined
-  // confirmation leaves the current route, and any dirty page, intact).
-  const guardedNavigate = (to: string) => {
-    const confirmLeave = useNavigationGuardStore.getState().confirmLeave;
-    if (confirmLeave && !confirmLeave()) return;
-    navigate(to);
-  };
-
-  const executeNav = (command: NavCommand) => {
-    closePalette();
-    guardedNavigate(command.to);
-  };
+  const requestForRender = resultContextRef.current;
+  const displayedSearchState =
+    requestForRender && isCurrentSearch(requestForRender) ? searchState : idleSearchState;
+  const openingContext = contextRef.current;
+  const renderContext = openingContext && isCurrentContext(openingContext) ? openingContext : null;
+  const renderQueryGeneration = queryGenerationRef.current;
+  const displayedQuery = renderContext ? query : "";
+  const searchingEntities = displayedQuery.trim().length >= SEARCH_MIN_QUERY_LENGTH;
 
   return (
     <Dialog
       open={open}
       onOpenChange={(nextOpen) => {
-        setOpen(nextOpen);
-        if (!nextOpen) {
-          setQuery("");
-          setHits([]);
-          hitSeqRef.current += 1;
-        }
+        if (nextOpen) openPalette();
+        else if (openingContext) retirePalette(openingContext);
       }}
     >
       <DialogContent className="sm:max-w-md" aria-describedby="command-palette-desc">
         <DialogHeader>
           <DialogTitle className="sr-only">Command palette</DialogTitle>
           <DialogDescription id="command-palette-desc" className="sr-only">
-            Search destinations, actions and entities
+            Search and run a navigation command
           </DialogDescription>
         </DialogHeader>
         <input
-          // eslint-disable-next-line jsx-a11y-x/no-autofocus -- the palette is a modal surface; moving focus into its filter input on open is the standard palette interaction.
+          // eslint-disable-next-line jsx-a11y-x/no-autofocus -- modal palette input receives initial focus
           autoFocus
-          type="text"
           aria-label="Search commands"
           placeholder="Type a command or search..."
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
+          value={displayedQuery}
+          onChange={(event) => handleQueryChange(event.target.value)}
           className="w-full rounded-sm border border-border bg-transparent px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
         />
         <ul aria-label="Commands" className="max-h-72 overflow-auto">
-          {filteredNav.length === 0 && filteredActions.length === 0 && hits.length === 0 ? (
-            <li className="px-3 py-6 text-center text-sm text-muted-foreground">
-              No matching commands
-            </li>
+          {filteredCommands.length === 0 ? (
+            <li className="px-3 py-6 text-center text-sm text-muted-foreground">No matching commands</li>
           ) : (
-            <>
-              {filteredNav.map((command) => (
-                <li key={command.id}>
-                  <button
-                    type="button"
-                    onClick={() => executeNav(command)}
-                    className="flex w-full items-center gap-3 rounded-sm px-3 py-2 text-left text-sm hover:bg-muted/50 focus-visible:bg-muted/50 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                  >
-                    {renderIcon(command.icon, "h-4 w-4 shrink-0 text-muted-foreground")}
-                    <span className="flex-1 truncate">{command.label}</span>
-                  </button>
-                </li>
-              ))}
-              {filteredActions.map((command) => (
-                <li key={command.id}>
-                  <button
-                    type="button"
-                    onClick={() => command.run()}
-                    className="flex w-full items-center gap-3 rounded-sm px-3 py-2 text-left text-sm hover:bg-muted/50 focus-visible:bg-muted/50 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                  >
-                    {renderIcon(command.icon, "h-4 w-4 shrink-0 text-muted-foreground")}
-                    <span className="flex-1 truncate">{command.label}</span>
-                  </button>
-                </li>
-              ))}
-              {hits.map((hit) => (
-                <li key={`${hit.type}-${hit.id}`}>
+            filteredCommands.map((command) => {
+              const Icon = command.icon;
+              return (
+                <li key={`${renderContext?.generation ?? 0}:${command.id}`}>
                   <button
                     type="button"
                     onClick={() => {
-                      closePalette();
-                      guardedNavigate(hit.url_hint);
+                      if (renderContext) executeCommand(renderContext, command);
                     }}
                     className="flex w-full items-center gap-3 rounded-sm px-3 py-2 text-left text-sm hover:bg-muted/50 focus-visible:bg-muted/50 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                   >
-                    <Search className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden="true" />
-                    <span className="flex-1 truncate">{hit.title}</span>
-                    <span className="shrink-0 text-xs uppercase text-muted-foreground">{hit.type}</span>
+                    {isHugeicon(Icon) ? <HugeiconsIcon icon={Icon} size={18} aria-hidden="true" /> : <Icon className="h-4 w-4" aria-hidden="true" />}
+                    <span>{command.label}</span>
                   </button>
                 </li>
-              ))}
-            </>
+              );
+            })
           )}
         </ul>
+        {searchingEntities ? (
+          <div aria-live="polite">
+            {displayedSearchState.status === "loading" ? (
+              <p className="px-3 py-3 text-center text-sm text-muted-foreground">Searching...</p>
+            ) : displayedSearchState.status === "error" && requestForRender ? (
+              <div className="px-3 py-3 text-center text-sm text-destructive">
+                <p>{displayedSearchState.error}</p>
+                <button type="button" onClick={() => retrySearch(requestForRender)} className="mt-2 underline underline-offset-2">
+                  Retry
+                </button>
+              </div>
+            ) : displayedSearchState.status === "success" && displayedSearchState.results.length === 0 ? (
+              <p className="px-3 py-3 text-center text-sm text-muted-foreground">No search results</p>
+            ) : displayedSearchState.status === "success" ? (
+              <ul aria-label="Search results" className="max-h-48 overflow-auto">
+                {displayedSearchState.results.map((result) => (
+                  <li key={`${requestForRender?.context.generation ?? 0}:${requestForRender?.queryGeneration ?? 0}:${result.type}:${result.id}`}>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (requestForRender) executeSearchResult(requestForRender, result);
+                      }}
+                      className="flex w-full flex-col items-start rounded-sm px-3 py-2 text-left text-sm hover:bg-muted/50 focus-visible:bg-muted/50 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    >
+                      <span className="w-full truncate">{result.title}</span>
+                      {result.snippet ? <span className="w-full truncate text-xs text-muted-foreground">{result.snippet}</span> : null}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+          </div>
+        ) : null}
+        {renderContext && (filteredActions.length > 0 || filteredBuiltinActions.length > 0) ? (
+          <ul aria-label="Actions" className="max-h-48 overflow-auto">
+            {filteredBuiltinActions.map((action) => (
+              <li key={`${renderContext.generation}:${renderQueryGeneration}:${action.id}`}>
+                <button type="button" onClick={() =>
+                  executeBuiltinAction(renderContext, renderQueryGeneration, pathname, action)}
+                  className="flex w-full items-center gap-3 rounded-sm px-3 py-2 text-left text-sm hover:bg-muted/50 focus-visible:bg-muted/50 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+                  <action.icon className="h-4 w-4" aria-hidden="true" />
+                  {action.label}
+                </button>
+              </li>
+            ))}
+            {filteredActions.map((action) => (
+              <li key={`${renderContext.generation}:${renderQueryGeneration}:${action.id}`}>
+                <button type="button" onClick={() =>
+                  executeAction(renderContext, renderQueryGeneration, pathname, action)}
+                  className="flex w-full items-center gap-3 rounded-sm px-3 py-2 text-left text-sm hover:bg-muted/50 focus-visible:bg-muted/50 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+                  {action.label}
+                </button>
+              </li>
+            ))}
+          </ul>
+        ) : null}
       </DialogContent>
     </Dialog>
   );

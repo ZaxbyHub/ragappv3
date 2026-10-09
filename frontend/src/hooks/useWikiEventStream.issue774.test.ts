@@ -28,7 +28,7 @@ function sseResponse() {
           resolveRead = resolve;
         })
     ),
-    cancel: vi.fn(),
+    cancel: vi.fn(() => Promise.resolve()),
   };
   const response = {
     ok: true,
@@ -102,7 +102,13 @@ describe("useWikiEventStream issue 774 hardening", () => {
     fetchMock.mockImplementation(() => new Promise<Response>(() => undefined));
 
     let addCount = 0;
+    let allAddCount = 0;
+    let allRemoveCount = 0;
     let removeCount = 0;
+    // Count the backoff timer listener by callback identity; the owner
+    // abort listener is a separate once-only registration.
+    const timerListeners = new Set<Parameters<AbortSignal["addEventListener"]>[1]>();
+    const activeHookListeners = new Set<Parameters<AbortSignal["addEventListener"]>[1]>();
     const origAdd = AbortSignal.prototype.addEventListener;
     const origRemove = AbortSignal.prototype.removeEventListener;
     const spyAdd = vi
@@ -112,7 +118,10 @@ describe("useWikiEventStream issue 774 hardening", () => {
         ...args: Parameters<AbortSignal["addEventListener"]>
       ) {
         if (args[0] === "abort" && (new Error().stack || "").includes("useWikiEventStream.ts")) {
-          addCount += 1;
+          activeHookListeners.add(args[1]);
+          allAddCount += 1;
+          if (args[2] === undefined) addCount += 1;
+          if (args[2] === undefined) timerListeners.add(args[1]);
         }
         return origAdd.apply(this, args);
       });
@@ -123,13 +132,14 @@ describe("useWikiEventStream issue 774 hardening", () => {
         ...args: Parameters<AbortSignal["removeEventListener"]>
       ) {
         if (args[0] === "abort" && (new Error().stack || "").includes("useWikiEventStream.ts")) {
-          removeCount += 1;
+          if (activeHookListeners.delete(args[1])) allRemoveCount += 1;
+          if (timerListeners.delete(args[1])) removeCount += 1;
         }
         return origRemove.apply(this, args);
       });
 
     try {
-      renderHook(() => useWikiEventStream(42, vi.fn()));
+      const { unmount } = renderHook(() => useWikiEventStream(42, vi.fn()));
       await vi.advanceTimersByTimeAsync(2_000);
 
       // Deterministic exact balance: the timer-win settle path detached.
@@ -138,12 +148,78 @@ describe("useWikiEventStream issue 774 hardening", () => {
       expect(addCount).toBe(1);
       expect(removeCount).toBe(1);
       expect(removeCount).toBe(addCount);
+      unmount();
+      expect(activeHookListeners.size).toBe(0);
+      expect(allRemoveCount).toBe(allAddCount);
     } finally {
       spyAdd.mockRestore();
       spyRemove.mockRestore();
     }
   });
 
+  it("balances per-read abort listeners as chunks settle and an unmounted read is cancelled", async () => {
+    const listenersBySignal = new Map<AbortSignal, Set<Parameters<AbortSignal["addEventListener"]>[1]>>();
+    let additions = 0;
+    let removals = 0;
+    const trackedListenerCount = () => [...listenersBySignal.values()].reduce((total, listeners) => total + listeners.size, 0);
+    const origAdd = AbortSignal.prototype.addEventListener;
+    const origRemove = AbortSignal.prototype.removeEventListener;
+    const spyAdd = vi.spyOn(AbortSignal.prototype, "addEventListener").mockImplementation(
+      function (this: AbortSignal, ...args: Parameters<AbortSignal["addEventListener"]>) {
+        if (args[0] === "abort" && (new Error().stack || "").includes("useWikiEventStream.ts")) {
+          let listeners = listenersBySignal.get(this);
+          if (!listeners) {
+            listeners = new Set();
+            listenersBySignal.set(this, listeners);
+          }
+          if (!listeners.has(args[1])) {
+            listeners.add(args[1]);
+            additions += 1;
+          }
+        }
+        return origAdd.apply(this, args);
+      },
+    );
+    const spyRemove = vi.spyOn(AbortSignal.prototype, "removeEventListener").mockImplementation(
+      function (this: AbortSignal, ...args: Parameters<AbortSignal["removeEventListener"]>) {
+        if (args[0] === "abort" && (new Error().stack || "").includes("useWikiEventStream.ts")) {
+          const listeners = listenersBySignal.get(this);
+          if (listeners?.delete(args[1])) {
+            removals += 1;
+            if (listeners.size === 0) listenersBySignal.delete(this);
+          }
+        }
+        return origRemove.apply(this, args);
+      },
+    );
+    try {
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("first"));
+          controller.enqueue(new TextEncoder().encode("second"));
+        },
+      });
+      fetchMock.mockResolvedValueOnce(new Response(body, { status: 200 }));
+
+      const { unmount } = renderHook(() => useWikiEventStream(42, vi.fn()));
+      await waitFor(() => {
+        expect(additions).toBe(4); // Owner listener and three per-read listeners.
+        expect(removals).toBe(2); // The first two reads settled and removed their listeners.
+        expect(trackedListenerCount()).toBe(2); // Owner plus the pending third read.
+      });
+
+      unmount();
+      await waitFor(() => {
+        expect(removals).toBe(4);
+        expect(trackedListenerCount()).toBe(0);
+      });
+      expect(spyAdd).toHaveBeenCalled();
+      expect(spyRemove).toHaveBeenCalled();
+    } finally {
+      spyAdd.mockRestore();
+      spyRemove.mockRestore();
+    }
+  });
   it("does not fetch again after dispose during the reconnect backoff", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     // Non-401 failure -> "error" -> reconnect after RECONNECT_BASE_MS (1s).

@@ -1,6 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { getJwtAccessToken, refreshAccessToken } from "@/lib/api";
+import { captureAuthPrincipalGeneration, isCurrentAuthOwner, subscribeAuthPrincipal } from "@/lib/api/auth-lifecycle";
+import { useAuthOwner } from "@/hooks/useAuthOwner";
 import {
   draftRoomKeys,
   getDraftEventsUrl,
@@ -118,20 +120,23 @@ function detailHasActiveWork(detail: DraftDetail): boolean {
  */
 function readWithInactivityTimeout(
   reader: ReadableStreamDefaultReader<Uint8Array>,
-  timeoutMs: number
+  timeoutMs: number,
+  signal: AbortSignal,
 ): Promise<ReadableStreamReadResult<Uint8Array>> {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("draft_room_stream_inactivity_timeout")), timeoutMs);
-    reader.read().then(
-      (result) => {
-        clearTimeout(timer);
-        resolve(result);
-      },
-      (err) => {
-        clearTimeout(timer);
-        reject(err);
-      }
-    );
+    if (signal.aborted) { reject(new DOMException("Aborted", "AbortError")); return; }
+    let settled = false;
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      callback();
+    };
+    const onAbort = () => finish(() => reject(new DOMException("Aborted", "AbortError")));
+    const timer = setTimeout(() => finish(() => reject(new Error("draft_room_stream_inactivity_timeout"))), timeoutMs);
+    signal.addEventListener("abort", onAbort, { once: true });
+    reader.read().then((result) => finish(() => resolve(result)), (error) => finish(() => reject(error)));
   });
 }
 
@@ -154,26 +159,48 @@ export function useDraftRoomEvents(
 ): UseDraftRoomEventsResult {
   const enabled = options?.enabled ?? true;
   const queryClient = useQueryClient();
-  const [connected, setConnected] = useState(false);
-  const [pollingFallback, setPollingFallback] = useState(false);
-  const [lastEvent, setLastEvent] = useState<DraftRoomEvent | null>(null);
+  // A mounted private stream belongs to the principal that opened it.
+  // Owner replacement retires this mount; a new mount admits the new owner.
+  const owner = useRef(useAuthOwner()).current;
+  const generation = useRef(useSyncExternalStore(subscribeAuthPrincipal, captureAuthPrincipalGeneration, captureAuthPrincipalGeneration)).current;
+  const scope = useMemo(() => ({ owner, generation, draftId, enabled, queryClient }), [owner, generation, draftId, enabled, queryClient]);
+  const scopeRef = useRef(scope);
+  scopeRef.current = scope;
+  const [streamState, setStreamState] = useState<{ scope: typeof scope | null; connected: boolean; pollingFallback: boolean; lastEvent: DraftRoomEvent | null }>({ scope: null, connected: false, pollingFallback: false, lastEvent: null });
 
   useEffect(() => {
-    setConnected(false);
-    setPollingFallback(false);
-    setLastEvent(null);
-
-    if (!enabled || draftId == null) return;
-    // jsdom unit tests without a fetch streaming shim should mount cleanly.
-    if (typeof fetch === "undefined") return;
-
+    if (!enabled || draftId == null || typeof fetch === "undefined") return;
     const id = draftId;
     const controller = new AbortController();
+    let activeReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+    const current = () => !controller.signal.aborted && scopeRef.current === scope && isCurrentAuthOwner(scope.owner) && captureAuthPrincipalGeneration() === scope.generation;
+    const publish = (change: Partial<{ connected: boolean; pollingFallback: boolean; lastEvent: DraftRoomEvent | null }>) => {
+      if (current()) setStreamState((previous) => current() ? ({ ...previous, ...change, scope }) : previous);
+    };
+    const setConnected = (connected: boolean) => publish({ connected });
+    const setPollingFallback = (pollingFallback: boolean) => publish({ pollingFallback });
+    const setLastEvent = (lastEvent: DraftRoomEvent | null) => publish({ lastEvent });
+    let pollTimer: ReturnType<typeof setInterval> | null = null;
+    let retired = false;
+    const retire = () => {
+      if (retired) return;
+      retired = true;
+      controller.abort();
+      if (pollTimer !== null) { clearInterval(pollTimer); pollTimer = null; }
+      setStreamState((previous) => scopeRef.current === scope && previous.scope === scope
+        ? { scope: null, connected: false, pollingFallback: false, lastEvent: null } : previous);
+      const reader = activeReader;
+      activeReader = null;
+      void reader?.cancel().catch(() => {});
+    };
+    const onOwnerAbort = () => retire();
+    scope.owner.signal.addEventListener("abort", onOwnerAbort, { once: true });
+    const unsubscribePrincipal = subscribeAuthPrincipal(() => { if (!current()) retire(); });
+    publish({ connected: false, pollingFallback: false, lastEvent: null });
     const encoder = new TextEncoder();
     let failureCount = 0;
     let lastStageProgressInvalidateAt = 0;
     let firstByteAt: number | null = null;
-    let pollTimer: ReturnType<typeof setInterval> | null = null;
 
     const stopPolling = () => {
       if (pollTimer != null) {
@@ -184,12 +211,13 @@ export function useDraftRoomEvents(
     };
 
     const startPolling = () => {
-      if (pollTimer != null) return;
+      if (!current() || pollTimer != null) return;
       setPollingFallback(true);
       const capabilities = queryClient.getQueryData<DraftRoomCapabilities>(draftRoomKeys.capabilities());
       const configuredSeconds = capabilities?.limits?.poll_interval_seconds;
       const intervalMs = getDraftRoomPollIntervalMs(configuredSeconds);
       pollTimer = setInterval(() => {
+        if (!current()) { stopPolling(); return; }
         const detail = queryClient.getQueryData<DraftDetail>(draftRoomKeys.detail(id));
         // Stop only when there is no active work anywhere — no compile job
         // AND no parse job; a parse-only draft keeps refreshing until parse
@@ -198,18 +226,19 @@ export function useDraftRoomEvents(
           stopPolling();
           return;
         }
-        queryClient.invalidateQueries({ queryKey: draftRoomKeys.detail(id) });
-        queryClient.invalidateQueries({ queryKey: draftRoomKeys.jobs(id) });
+        if (current()) void queryClient.invalidateQueries({ queryKey: draftRoomKeys.detail(id) });
+        if (current()) void queryClient.invalidateQueries({ queryKey: draftRoomKeys.jobs(id) });
       }, intervalMs);
     };
 
     // Invalidate the canonical React Query keys for a state-changing event —
     // never hand-patch a cache, since the stream guarantees no replay.
     const invalidateForEvent = (evt: DraftRoomEvent) => {
+      if (!current()) return;
       switch (evt.type) {
         case "job_started":
-          queryClient.invalidateQueries({ queryKey: draftRoomKeys.detail(id) });
-          queryClient.invalidateQueries({ queryKey: draftRoomKeys.jobs(id) });
+          if (current()) void queryClient.invalidateQueries({ queryKey: draftRoomKeys.detail(id) });
+          if (current()) void queryClient.invalidateQueries({ queryKey: draftRoomKeys.jobs(id) });
           return;
         case "stage_started":
         case "stage_completed":
@@ -221,7 +250,7 @@ export function useDraftRoomEvents(
           // jobs/job/stages/evidence/findings/claims/revisions under this draft,
           // matching every other branch below and every mutation onSuccess in
           // DraftWorkspace.tsx.
-          queryClient.invalidateQueries({ queryKey: draftRoomKeys.detail(id) });
+          if (current()) void queryClient.invalidateQueries({ queryKey: draftRoomKeys.detail(id) });
           return;
         case "stage_progress": {
           // No known publisher emits this today (see finding_created below) —
@@ -234,7 +263,7 @@ export function useDraftRoomEvents(
           const now = Date.now();
           if (now - lastStageProgressInvalidateAt < STAGE_PROGRESS_COALESCE_MS) return;
           lastStageProgressInvalidateAt = now;
-          queryClient.invalidateQueries({ queryKey: draftRoomKeys.detail(id) });
+          if (current()) void queryClient.invalidateQueries({ queryKey: draftRoomKeys.detail(id) });
           return;
         }
         case "finding_created":
@@ -245,20 +274,20 @@ export function useDraftRoomEvents(
           // unpublished (issue #436 reviewer finding 3) — so this branch is
           // presently untested-in-production; verify a live publisher exists
           // before assuming this path is exercised.
-          queryClient.invalidateQueries({ queryKey: draftRoomKeys.detail(id) });
-          queryClient.invalidateQueries({ queryKey: draftRoomKeys.findings(id) });
+          if (current()) void queryClient.invalidateQueries({ queryKey: draftRoomKeys.detail(id) });
+          if (current()) void queryClient.invalidateQueries({ queryKey: draftRoomKeys.findings(id) });
           return;
         case "job_completed":
-          queryClient.invalidateQueries({ queryKey: draftRoomKeys.detail(id) });
-          queryClient.invalidateQueries({ queryKey: draftRoomKeys.jobs(id) });
-          queryClient.invalidateQueries({ queryKey: draftRoomKeys.revisions(id) });
-          queryClient.invalidateQueries({ queryKey: draftRoomKeys.findings(id) });
-          queryClient.invalidateQueries({ queryKey: draftRoomKeys.claims(id) });
+          if (current()) void queryClient.invalidateQueries({ queryKey: draftRoomKeys.detail(id) });
+          if (current()) void queryClient.invalidateQueries({ queryKey: draftRoomKeys.jobs(id) });
+          if (current()) void queryClient.invalidateQueries({ queryKey: draftRoomKeys.revisions(id) });
+          if (current()) void queryClient.invalidateQueries({ queryKey: draftRoomKeys.findings(id) });
+          if (current()) void queryClient.invalidateQueries({ queryKey: draftRoomKeys.claims(id) });
           return;
         case "job_failed":
         case "job_cancelled":
-          queryClient.invalidateQueries({ queryKey: draftRoomKeys.detail(id) });
-          queryClient.invalidateQueries({ queryKey: draftRoomKeys.jobs(id) });
+          if (current()) void queryClient.invalidateQueries({ queryKey: draftRoomKeys.detail(id) });
+          if (current()) void queryClient.invalidateQueries({ queryKey: draftRoomKeys.jobs(id) });
           return;
         case "subscribed":
           // The stream guarantees no replay (no Last-Event-ID support): any
@@ -266,8 +295,8 @@ export function useDraftRoomEvents(
           // is gone forever, so every (re)subscription must re-sync the
           // canonical detail/jobs caches — the `subscribed` frame alone is
           // the only signal that a gap just healed (issue #516 UI-018).
-          queryClient.invalidateQueries({ queryKey: draftRoomKeys.detail(id) });
-          queryClient.invalidateQueries({ queryKey: draftRoomKeys.jobs(id) });
+          if (current()) void queryClient.invalidateQueries({ queryKey: draftRoomKeys.detail(id) });
+          if (current()) void queryClient.invalidateQueries({ queryKey: draftRoomKeys.jobs(id) });
           return;
         case "heartbeat":
         default:
@@ -276,6 +305,7 @@ export function useDraftRoomEvents(
     };
 
     const dispatch = (raw: string) => {
+      if (!current()) return;
       let parsed: unknown;
       try {
         parsed = JSON.parse(raw);
@@ -323,6 +353,7 @@ export function useDraftRoomEvents(
     //   'clean' — server closed the stream cleanly (done=true); reconnect from
     //             base delay (backoff reset).
     const connectOnce = async (): Promise<"stop" | "error" | "clean"> => {
+      if (!current()) return "stop";
       const headers: Record<string, string> = {};
       const token = getJwtAccessToken();
       if (token) headers["Authorization"] = `Bearer ${token}`;
@@ -335,12 +366,14 @@ export function useDraftRoomEvents(
           signal: controller.signal,
         });
       } catch {
-        return controller.signal.aborted ? "stop" : "error";
+        return !current() ? "stop" : "error";
       }
 
+      if (!current()) return "stop";
       if (!response.ok) {
         if (response.status === 401 && token) {
           const body = await response.json().catch(() => null);
+          if (!current()) return "stop";
           const detail = body && typeof body.detail === "string" ? body.detail : "";
           if (detail.includes("token_invalid") || detail.includes("user_inactive")) {
             return "stop"; // fatal — refreshing won't help; stop looping.
@@ -351,11 +384,11 @@ export function useDraftRoomEvents(
             // rather than letting it escape as an unhandled rejection.
             let newToken: string | null;
             try {
-              newToken = await refreshAccessToken();
+              newToken = await refreshAccessToken(scope.owner);
             } catch {
               newToken = null;
             }
-            return newToken && !controller.signal.aborted ? "error" : "stop";
+            return newToken && current() ? "error" : "stop";
           }
         }
         if (response.status === 403) {
@@ -365,12 +398,19 @@ export function useDraftRoomEvents(
           // pure waste. Fatal, like token_invalid/user_inactive above.
           return "stop";
         }
-        return controller.signal.aborted ? "stop" : "error";
+        return !current() ? "stop" : "error";
       }
 
       const reader = response.body?.getReader();
-      if (!reader) return controller.signal.aborted ? "stop" : "error";
+      if (!reader) return !current() ? "stop" : "error";
 
+      activeReader = reader;
+      if (!current()) {
+        activeReader = null;
+        void reader.cancel().catch(() => {});
+        try { reader.releaseLock(); } catch { /* A pending native read may still own the lock. */ }
+        return "stop";
+      }
       stopPolling();
       setConnected(true);
 
@@ -380,7 +420,8 @@ export function useDraftRoomEvents(
       let receivedBytes = false;
       try {
         for (;;) {
-          const { value, done } = await readWithInactivityTimeout(reader, STREAM_INACTIVITY_TIMEOUT_MS);
+          const { value, done } = await readWithInactivityTimeout(reader, STREAM_INACTIVITY_TIMEOUT_MS, controller.signal);
+          if (!current()) return "stop";
           if (done) {
             cleanEnd = true;
             break;
@@ -403,19 +444,25 @@ export function useDraftRoomEvents(
         // either way cancel the reader so a hung-but-open connection is
         // actually torn down rather than merely abandoned, then fall
         // through; cleanEnd stays false.
-        await Promise.resolve(reader.cancel()).catch(() => {});
+        if (activeReader === reader) {
+          activeReader = null;
+          void reader.cancel().catch(() => {});
+        }
+      } finally {
+        if (activeReader === reader) activeReader = null;
+        try { reader.releaseLock(); } catch { /* Cancellation can be non-cooperative. */ }
       }
       setConnected(false);
-      if (controller.signal.aborted) return "stop";
+      if (!current()) return "stop";
       return cleanEnd ? "clean" : "error";
     };
 
     void (async () => {
       let backoff = RECONNECT_BASE_MS;
-      while (!controller.signal.aborted) {
+      while (current()) {
         firstByteAt = null;
         const result = await connectOnce();
-        if (result === "stop" || controller.signal.aborted) break;
+        if (result === "stop" || !current()) break;
         const streamedHealthily =
           firstByteAt != null && Date.now() - firstByteAt >= STREAM_HEALTHY_MS;
         if (result === "clean" || streamedHealthily) {
@@ -441,15 +488,13 @@ export function useDraftRoomEvents(
           const timer = setTimeout(onAbort, backoff);
           controller.signal.addEventListener("abort", onAbort);
         });
+        if (!current()) break;
         backoff = Math.min(backoff * 2, RECONNECT_MAX_MS);
       }
     })();
 
-    return () => {
-      controller.abort();
-      stopPolling();
-    };
-  }, [draftId, enabled, queryClient]);
+    return () => { unsubscribePrincipal(); scope.owner.signal.removeEventListener("abort", onOwnerAbort); retire(); stopPolling(); };
+  }, [draftId, enabled, queryClient, owner, generation, scope]);
 
-  return { connected, pollingFallback, lastEvent };
+  return streamState.scope === scope && isCurrentAuthOwner(owner) && captureAuthPrincipalGeneration() === generation ? streamState : { connected: false, pollingFallback: false, lastEvent: null };
 }

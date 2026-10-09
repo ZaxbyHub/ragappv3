@@ -1,6 +1,13 @@
-import { useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { useNavigate } from "react-router-dom";
-import { changePassword } from "@/lib/api";
+import { changePassword, setJwtAccessToken } from "@/lib/api";
+import {
+  captureAuthOwner,
+  captureAuthPrincipalGeneration,
+  isCurrentAuthOwner,
+  onAuthOwnerReplacement,
+  subscribeAuthPrincipal,
+} from "@/lib/api/auth-lifecycle";
 import { useAuthStore } from "@/stores/useAuthStore";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -23,9 +30,37 @@ import { MeridianLogo } from "@/components/icons/MeridianLogo";
  * route until the change succeeds, at which point the flag is cleared and the
  * user is sent into the app.
  */
+function subscribePasswordScope(listener: () => void): () => void {
+  const owner = onAuthOwnerReplacement(() => listener());
+  const principal = subscribeAuthPrincipal(listener);
+  return () => { owner(); principal(); };
+}
+
+function passwordScopeKey(): string {
+  return `${captureAuthOwner().id}:${captureAuthPrincipalGeneration()}`;
+}
+
 export default function ChangePasswordRequiredPage() {
+  const key = useSyncExternalStore(subscribePasswordScope, passwordScopeKey, passwordScopeKey);
+  return <ChangePasswordRequiredContent key={key} />;
+}
+
+function ChangePasswordRequiredContent() {
   const navigate = useNavigate();
   const user = useAuthStore((s) => s.user);
+  const ownerRef = useRef(captureAuthOwner());
+  const principalRef = useRef(captureAuthPrincipalGeneration());
+  const mountedRef = useRef(true);
+  const latestIntentRef = useRef<symbol | null>(null);
+  const pendingRef = useRef(false);
+  const current = () => mountedRef.current && isCurrentAuthOwner(ownerRef.current)
+    && captureAuthPrincipalGeneration() === principalRef.current;
+  const owns = (intent: symbol) => current() && latestIntentRef.current === intent;
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
 
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
@@ -35,42 +70,60 @@ export default function ChangePasswordRequiredPage() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    setError("");
+    if (!current() || pendingRef.current) return;
+    const intent = Symbol("required-password");
+    latestIntentRef.current = intent;
+    const publishError = (message: string) => setError(previous => owns(intent) ? message : previous);
+    publishError("");
 
     if (!currentPassword) {
-      setError("Current password is required");
+      publishError("Current password is required");
       return;
     }
     if (newPassword.length < 8) {
-      setError("New password must be at least 8 characters long");
+      publishError("New password must be at least 8 characters long");
       return;
     }
     if (newPassword !== confirmPassword) {
-      setError("Passwords do not match");
+      publishError("Passwords do not match");
       return;
     }
 
-    setSubmitting(true);
+    pendingRef.current = true;
+    setSubmitting(previous => owns(intent) ? true : previous);
     try {
-      await changePassword(currentPassword, newPassword);
-      // Clear the flag locally so ProtectedRoute lets the user through, then
-      // refresh the user from the server (now reachable, flag cleared).
-      const current = useAuthStore.getState().user;
-      if (current) {
-        useAuthStore.setState({ user: { ...current, must_change_password: false } });
+      const result = await changePassword(currentPassword, newPassword);
+      if (!owns(intent)) return;
+      // Real responses contain rotated credentials; old void test doubles remain valid.
+      const accessToken = result?.access_token;
+      if (typeof accessToken === "string" && accessToken.length > 0) {
+        setJwtAccessToken(accessToken);
+        if (!owns(intent)) return;
+        useAuthStore.setState({ accessToken });
+        if (!owns(intent)) return;
       }
+      // Preserve local flag clearing before the non-fatal user refresh.
+      const currentUser = useAuthStore.getState().user;
+      if (currentUser) {
+        useAuthStore.setState({ user: { ...currentUser, must_change_password: false } });
+      }
+      if (!owns(intent)) return;
       try {
         await useAuthStore.getState().fetchMe();
       } catch {
-        // Non-fatal: the local flag clear above already unblocks navigation.
+        // The locally cleared flag still allows the existing successful navigation.
       }
+      if (!owns(intent)) return;
       navigate("/", { replace: true });
     } catch (err: unknown) {
-      const message =
-        err instanceof Error ? err.message : "Failed to change password";
-      setError(message);
+      if (!owns(intent)) return;
+      publishError(err instanceof Error ? err.message : "Failed to change password");
     } finally {
-      setSubmitting(false);
+      if (owns(intent)) {
+        pendingRef.current = false;
+        // Retain the last intent so a newer admission can retire this queued reducer.
+        setSubmitting(previous => owns(intent) ? false : previous);
+      }
     }
   };
 

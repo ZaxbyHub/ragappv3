@@ -1,8 +1,8 @@
 // frontend/src/pages/AdminGroupsPage.tsx
 
-import { useState, useCallback, useRef } from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import type { JSX } from "react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Plus } from "lucide-react";
 import { AdminGuard } from "@/components/auth/RoleGuard";
@@ -29,250 +29,226 @@ import {
   type VaultAccessItem,
 } from "@/lib/api";
 import { PageTitleHeader } from "@/components/layout/PageTitleHeader";
+import {
+  captureAuthOwner,
+  captureAuthPrincipalGeneration,
+  isCurrentAuthOwner,
+  onAuthOwnerReplacement,
+  subscribeAuthPrincipal,
+  type AuthOwner,
+} from "@/lib/api/auth-lifecycle";
 
-interface EditorIdentity {
-  groupId: number;
+type EditorKind = "create" | "edit" | "delete" | "members" | "vaults";
+
+const isScopedLeaseCurrent = (leaseRef: { current: number }, lease: number): boolean =>
+  leaseRef.current === lease;
+
+interface MutationContext {
   openingToken: number;
+  groupId?: number;
+  owner: AuthOwner;
+  principalGeneration: number;
+  mutationToken: number;
 }
 
-interface GroupEditMutationVariables {
+interface GroupCreateMutationVariables extends MutationContext {
+  openingToken: number;
+  data: GroupFormData;
+}
+
+interface GroupEditMutationVariables extends MutationContext {
   groupId: number;
   openingToken: number;
   data: GroupFormData;
 }
 
-interface GroupDeleteMutationVariables {
+interface GroupDeleteMutationVariables extends MutationContext {
   groupId: number;
   openingToken: number;
 }
 
-interface MembersMutationVariables {
+interface MembersMutationVariables extends MutationContext {
   groupId: number;
   openingToken: number;
   userIds: number[];
 }
 
-interface VaultsMutationVariables {
+interface VaultsMutationVariables extends MutationContext {
   groupId: number;
   openingToken: number;
   vaultAccess: VaultAccessItem[];
 }
 
+const subscribeAuthOwner = (listener: () => void): (() => void) =>
+  onAuthOwnerReplacement(() => listener());
+
 // ============================================================================
 // Main Page Component
 // ============================================================================
 
-function AdminGroupsPageContent(): JSX.Element {
+function AdminGroupsPageContent({ outerQueryClient, authOwner, principalGeneration }: { outerQueryClient: QueryClient; authOwner: AuthOwner; principalGeneration: number }): JSX.Element {
   const queryClient = useQueryClient();
-
-  // Modal/Sheet states
+  const mountedRef = useRef(false);
+  const editorTokenRef = useRef(0);
+  const mutationTokenRef = useRef(0);
+  const activeMutationRef = useRef<MutationContext | null>(null);
+  const startedMutationsRef = useRef(new WeakSet<MutationContext>());
+  const [activeMutation, setActiveMutation] = useState<MutationContext | null>(null);
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [editDialogOpen, setEditDialogOpen] = useState(false);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [membersSheetOpen, setMembersSheetOpen] = useState(false);
   const [vaultsSheetOpen, setVaultsSheetOpen] = useState(false);
-  const [membersEditorToken, setMembersEditorToken] = useState(0);
-  const [vaultsEditorToken, setVaultsEditorToken] = useState(0);
+  const [createEditorToken, setCreateEditorToken] = useState(0);
   const [editEditorToken, setEditEditorToken] = useState(0);
   const [deleteEditorToken, setDeleteEditorToken] = useState(0);
-
-  // Selected group for actions
+  const [membersEditorToken, setMembersEditorToken] = useState(0);
+  const [vaultsEditorToken, setVaultsEditorToken] = useState(0);
   const [selectedGroup, setSelectedGroup] = useState<Group | null>(null);
-  const selectedGroupRef = useRef<Group | null>(selectedGroup);
-  selectedGroupRef.current = selectedGroup;
-  const editorTokenRef = useRef(0);
-  const membersEditorRef = useRef<EditorIdentity | null>(null);
-  const vaultsEditorRef = useRef<EditorIdentity | null>(null);
-  const editEditorRef = useRef<EditorIdentity | null>(null);
-  const deleteEditorRef = useRef<EditorIdentity | null>(null);
+  const selectedGroupRef = useRef<Group | null>(null);
+  const openingRef = useRef<{ kind: EditorKind; openingToken: number; groupId: number | null } | null>(null);
 
-  // Invalidate all groups queries (list + any sub-queries)
-  const invalidateGroups = useCallback(() => {
-    queryClient.invalidateQueries({ queryKey: ["groups"] });
-  }, [queryClient]);
-
-  // ============================================================================
-  // Mutations
-  // ============================================================================
-
-  const createMutation = useMutation({
-    mutationFn: (data: GroupFormData) => createGroup(data.name, data.description ?? null, data.org_id),
-    onSuccess: () => {
-      toast.success("Group created successfully");
-      setCreateDialogOpen(false);
-      invalidateGroups();
-    },
-    onError: () => {
-      toast.error("Failed to create group");
-    },
-  });
-
-  const updateMutation = useMutation({
-    mutationFn: ({ groupId, data }: GroupEditMutationVariables) => {
-      return updateGroup(groupId, data.name, data.description ?? null);
-    },
-    onSuccess: (_group, variables) => {
-      toast.success("Group updated successfully");
-      const currentEditor = editEditorRef.current;
-      if (
-        currentEditor?.groupId === variables.groupId &&
-        currentEditor.openingToken === variables.openingToken &&
-        selectedGroupRef.current?.id === variables.groupId
-      ) {
-        setEditDialogOpen(false);
-      }
-      invalidateGroups();
-    },
-    onError: () => {
-      toast.error("Failed to update group");
-    },
-  });
-
-  const deleteMutation = useMutation({
-    mutationFn: ({ groupId }: GroupDeleteMutationVariables) => {
-      return deleteGroup(groupId);
-    },
-    onSuccess: (_result, variables) => {
-      toast.success("Group deleted successfully");
-      const currentEditor = deleteEditorRef.current;
-      if (
-        currentEditor?.groupId === variables.groupId &&
-        currentEditor.openingToken === variables.openingToken &&
-        selectedGroupRef.current?.id === variables.groupId
-      ) {
-        setDeleteDialogOpen(false);
-      }
-      invalidateGroups();
-    },
-    onError: () => {
-      toast.error("Failed to delete group");
-    },
-  });
-
-  const membersMutation = useMutation({
-    mutationFn: ({ groupId, userIds }: MembersMutationVariables) => {
-      return updateGroupMembers(groupId, userIds);
-    },
-    onSuccess: (_result, variables) => {
-      toast.success("Group members updated");
-      const currentEditor = membersEditorRef.current;
-      if (
-        currentEditor?.groupId === variables.groupId &&
-        currentEditor.openingToken === variables.openingToken &&
-        selectedGroupRef.current?.id === variables.groupId
-      ) {
-        setMembersSheetOpen(false);
-      }
-      queryClient.invalidateQueries({ queryKey: ["groups", variables.groupId, "members"] });
-    },
-    onError: (error: Error) => {
-      toast.error(error.message || "Failed to update group members");
-    },
-  });
-
-  const vaultsMutation = useMutation({
-    mutationFn: ({ groupId, vaultAccess }: VaultsMutationVariables) => {
-      return updateGroupVaults(groupId, vaultAccess);
-    },
-    onSuccess: (_result, variables) => {
-      toast.success("Vault access updated");
-      const currentEditor = vaultsEditorRef.current;
-      if (
-        currentEditor?.groupId === variables.groupId &&
-        currentEditor.openingToken === variables.openingToken &&
-        selectedGroupRef.current?.id === variables.groupId
-      ) {
-        setVaultsSheetOpen(false);
-      }
-      queryClient.invalidateQueries({ queryKey: ["groups", variables.groupId, "vaults"] });
-    },
-    onError: (error: Error) => {
-      toast.error(error.message || "Failed to update vault access");
-    },
-  });
-
-  // ============================================================================
-  // Event Handlers
-  // ============================================================================
-
-  const handleCreateClick = useCallback(() => {
-    setCreateDialogOpen(true);
+  const isCurrentPageContext = useCallback((owner: AuthOwner, generation: number): boolean => (
+    mountedRef.current && isCurrentAuthOwner(owner) && captureAuthPrincipalGeneration() === generation &&
+    owner === authOwner && generation === principalGeneration
+  ), [authOwner, principalGeneration]);
+  const isCurrentOpening = useCallback((kind: EditorKind, token: number, groupId?: number): boolean => {
+    const opening = openingRef.current;
+    return isCurrentPageContext(authOwner, principalGeneration) && opening?.kind === kind &&
+      opening.openingToken === token && (kind === "create" || (
+        groupId !== undefined && opening.groupId === groupId && selectedGroupRef.current?.id === groupId
+      ));
+  }, [authOwner, isCurrentPageContext, principalGeneration]);
+  const isCurrentMutation = useCallback((variables: MutationContext): boolean => (
+    isCurrentPageContext(variables.owner, variables.principalGeneration) &&
+    activeMutationRef.current?.mutationToken === variables.mutationToken &&
+    activeMutationRef.current.openingToken === variables.openingToken
+  ), [isCurrentPageContext]);
+  const releaseMutation = useCallback((variables: MutationContext): void => {
+    if (!isCurrentMutation(variables)) return;
+    activeMutationRef.current = null;
+    setActiveMutation((current) => current?.mutationToken === variables.mutationToken ? null : current);
+  }, [isCurrentMutation]);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      openingRef.current = null;
+      selectedGroupRef.current = null;
+      activeMutationRef.current = null;
+    };
   }, []);
 
-  const handleEditClick = useCallback((group: Group) => {
+  const openEditor = useCallback((kind: EditorKind, group?: Group): void => {
+    if (!isCurrentPageContext(authOwner, principalGeneration) || (kind !== "create" && !group)) return;
     const openingToken = ++editorTokenRef.current;
-    selectedGroupRef.current = group;
-    editEditorRef.current = { groupId: group.id, openingToken };
-    setEditEditorToken(openingToken);
-    setSelectedGroup(group);
-    setEditDialogOpen(true);
-  }, []);
+    openingRef.current = { kind, openingToken, groupId: group?.id ?? null };
+    selectedGroupRef.current = group ?? null;
+    // Retire A logically; its in-flight API call never owns the new B opening.
+    activeMutationRef.current = null;
+    setActiveMutation(null);
+    setSelectedGroup(group ?? null);
+    setCreateDialogOpen(kind === "create");
+    setEditDialogOpen(kind === "edit");
+    setDeleteDialogOpen(kind === "delete");
+    setMembersSheetOpen(kind === "members");
+    setVaultsSheetOpen(kind === "vaults");
+    if (kind === "create") setCreateEditorToken(openingToken);
+    if (kind === "edit") setEditEditorToken(openingToken);
+    if (kind === "delete") setDeleteEditorToken(openingToken);
+    if (kind === "members") setMembersEditorToken(openingToken);
+    if (kind === "vaults") setVaultsEditorToken(openingToken);
+  }, [authOwner, isCurrentPageContext, principalGeneration]);
+  const closeEditor = useCallback((kind: EditorKind, token: number, groupId?: number): void => {
+    if (!isCurrentOpening(kind, token, groupId)) return;
+    openingRef.current = null;
+    selectedGroupRef.current = null;
+    activeMutationRef.current = null;
+    setActiveMutation(null);
+    setSelectedGroup(null);
+    if (kind === "create") setCreateDialogOpen(false);
+    if (kind === "edit") setEditDialogOpen(false);
+    if (kind === "delete") setDeleteDialogOpen(false);
+    if (kind === "members") setMembersSheetOpen(false);
+    if (kind === "vaults") setVaultsSheetOpen(false);
+  }, [isCurrentOpening]);
+  const beginMutation = useCallback((kind: EditorKind, openingToken: number, groupId?: number): MutationContext | null => {
+    if (!isCurrentOpening(kind, openingToken, groupId) || activeMutationRef.current?.openingToken === openingToken) return null;
+    const variables: MutationContext = { owner: authOwner, principalGeneration, openingToken, groupId, mutationToken: ++mutationTokenRef.current };
+    activeMutationRef.current = variables;
+    setActiveMutation(variables);
+    return variables;
+  }, [authOwner, isCurrentOpening, principalGeneration]);
 
-  const handleDeleteClick = useCallback((group: Group) => {
-    const openingToken = ++editorTokenRef.current;
-    selectedGroupRef.current = group;
-    deleteEditorRef.current = { groupId: group.id, openingToken };
-    setDeleteEditorToken(openingToken);
-    setSelectedGroup(group);
-    setDeleteDialogOpen(true);
-  }, []);
+  function mutationOptions<T extends MutationContext>(kind: EditorKind, request: (variables: T) => Promise<unknown>, success: string, failure: string) {
+    const canPublish = (variables: T): boolean => isCurrentMutation(variables) && isCurrentOpening(kind, variables.openingToken, variables.groupId);
+    return {
+      mutationFn: (variables: T): Promise<unknown> => {
+        if (!canPublish(variables)) return Promise.reject(new Error("Group editor was replaced"));
+        startedMutationsRef.current.add(variables);
+        return request(variables);
+      },
+      onSuccess: (_result: unknown, variables: T): void => {
+        // A successful request may refresh its own session after its editor closes.
+        const ownsSession = (): boolean => isCurrentPageContext(variables.owner, variables.principalGeneration);
+        if (!ownsSession()) return;
+        toast.success(success);
+        if (!ownsSession()) return;
+        const queryKey = kind === "members" || kind === "vaults" ? ["groups", variables.groupId, kind] : ["groups"];
+        void queryClient.invalidateQueries({ queryKey }).catch(() => undefined);
+        if (!ownsSession()) return;
+        void outerQueryClient.invalidateQueries({ queryKey }).catch(() => undefined);
+        if (!ownsSession()) return;
+        if (canPublish(variables)) closeEditor(kind, variables.openingToken, variables.groupId);
+      },
+      onError: (error: Error, variables: T): void => {
+        if (!startedMutationsRef.current.has(variables) || !isCurrentPageContext(variables.owner, variables.principalGeneration)) return;
+        toast.error(kind === "members" || kind === "vaults" ? error.message || failure : failure);
+      },
+      onSettled: (_result: unknown, _error: Error | null, variables: T): void => { releaseMutation(variables); },
+    };
+  }
+  const createMutation = useMutation<unknown, Error, GroupCreateMutationVariables>(mutationOptions("create", ({ data }: GroupCreateMutationVariables) => createGroup(data.name, data.description ?? null, data.org_id), "Group created successfully", "Failed to create group"));
+  const updateMutation = useMutation<unknown, Error, GroupEditMutationVariables>(mutationOptions("edit", ({ groupId, data }: GroupEditMutationVariables) => updateGroup(groupId, data.name, data.description ?? null), "Group updated successfully", "Failed to update group"));
+  const deleteMutation = useMutation<unknown, Error, GroupDeleteMutationVariables>(mutationOptions("delete", ({ groupId }: GroupDeleteMutationVariables) => deleteGroup(groupId), "Group deleted successfully", "Failed to delete group"));
+  const membersMutation = useMutation<unknown, Error, MembersMutationVariables>(mutationOptions("members", ({ groupId, userIds }: MembersMutationVariables) => updateGroupMembers(groupId, userIds), "Group members updated", "Failed to update group members"));
+  const vaultsMutation = useMutation<unknown, Error, VaultsMutationVariables>(mutationOptions("vaults", ({ groupId, vaultAccess }: VaultsMutationVariables) => updateGroupVaults(groupId, vaultAccess), "Vault access updated", "Failed to update vault access"));
 
-  const handleManageMembersClick = useCallback((group: Group) => {
-    const openingToken = ++editorTokenRef.current;
-    selectedGroupRef.current = group;
-    membersEditorRef.current = { groupId: group.id, openingToken };
-    setMembersEditorToken(openingToken);
-    setSelectedGroup(group);
-    setMembersSheetOpen(true);
-  }, []);
-
-  const handleManageVaultsClick = useCallback((group: Group) => {
-    const openingToken = ++editorTokenRef.current;
-    selectedGroupRef.current = group;
-    vaultsEditorRef.current = { groupId: group.id, openingToken };
-    setVaultsEditorToken(openingToken);
-    setSelectedGroup(group);
-    setVaultsSheetOpen(true);
-  }, []);
-
-  const handleCreateSubmit = useCallback(async (data: GroupFormData) => {
-    await createMutation.mutateAsync(data);
-  }, [createMutation]);
-
-  const handleEditSubmit = useCallback(async (data: GroupFormData) => {
-    if (!selectedGroup) throw new Error("No group selected");
-    await updateMutation.mutateAsync({
-      groupId: selectedGroup.id,
-      openingToken: editEditorToken,
-      data,
-    });
-  }, [editEditorToken, selectedGroup, updateMutation]);
-
-  const handleDeleteConfirm = useCallback(async () => {
-    if (!selectedGroup) throw new Error("No group selected");
-    await deleteMutation.mutateAsync({
-      groupId: selectedGroup.id,
-      openingToken: deleteEditorToken,
-    });
-  }, [deleteEditorToken, deleteMutation, selectedGroup]);
-
-  const handleMembersSave = useCallback(async (userIds: number[]) => {
-    if (!selectedGroup) throw new Error("No group selected");
-    await membersMutation.mutateAsync({
-      groupId: selectedGroup.id,
-      openingToken: membersEditorToken,
-      userIds,
-    });
-  }, [membersEditorToken, membersMutation, selectedGroup]);
-
-  const handleVaultsSave = useCallback(async (vaultAccess: VaultAccessItem[]) => {
-    if (!selectedGroup) throw new Error("No group selected");
-    await vaultsMutation.mutateAsync({
-      groupId: selectedGroup.id,
-      openingToken: vaultsEditorToken,
-      vaultAccess,
-    });
-  }, [selectedGroup, vaultsEditorToken, vaultsMutation]);
+  const handleCreateClick = useCallback(() => openEditor("create"), [openEditor]);
+  const handleEditClick = useCallback((group: Group) => openEditor("edit", group), [openEditor]);
+  const handleDeleteClick = useCallback((group: Group) => openEditor("delete", group), [openEditor]);
+  const handleManageMembersClick = useCallback((group: Group) => openEditor("members", group), [openEditor]);
+  const handleManageVaultsClick = useCallback((group: Group) => openEditor("vaults", group), [openEditor]);
+  const handleCreateSubmit = async (data: GroupFormData): Promise<void> => {
+    const context = beginMutation("create", createEditorToken);
+    if (!context) return;
+    try { await createMutation.mutateAsync({ ...context, data }); } finally { releaseMutation(context); }
+  };
+  const handleEditSubmit = async (data: GroupFormData): Promise<void> => {
+    if (!selectedGroup) return;
+    const context = beginMutation("edit", editEditorToken, selectedGroup.id);
+    if (!context) return;
+    try { await updateMutation.mutateAsync({ ...context, groupId: selectedGroup.id, data }); } finally { releaseMutation(context); }
+  };
+  const handleDeleteConfirm = async (): Promise<void> => {
+    if (!selectedGroup) return;
+    const context = beginMutation("delete", deleteEditorToken, selectedGroup.id);
+    if (!context) return;
+    try { await deleteMutation.mutateAsync({ ...context, groupId: selectedGroup.id }); } finally { releaseMutation(context); }
+  };
+  const handleMembersSave = async (userIds: number[]): Promise<void> => {
+    if (!selectedGroup) return;
+    const context = beginMutation("members", membersEditorToken, selectedGroup.id);
+    if (!context) return;
+    try { await membersMutation.mutateAsync({ ...context, groupId: selectedGroup.id, userIds }); } finally { releaseMutation(context); }
+  };
+  const handleVaultsSave = async (vaultAccess: VaultAccessItem[]): Promise<void> => {
+    if (!selectedGroup) return;
+    const context = beginMutation("vaults", vaultsEditorToken, selectedGroup.id);
+    if (!context) return;
+    try { await vaultsMutation.mutateAsync({ ...context, groupId: selectedGroup.id, vaultAccess }); } finally { releaseMutation(context); }
+  };
+  const isOpeningPending = (token: number): boolean => activeMutation?.openingToken === token && isCurrentMutation(activeMutation);
 
   // ============================================================================
   // Render
@@ -302,21 +278,23 @@ function AdminGroupsPageContent(): JSX.Element {
 
       {/* Create Group Dialog */}
       <GroupFormDialog
+        key={`create:${createEditorToken}`}
         mode="create"
         open={createDialogOpen}
-        onOpenChange={setCreateDialogOpen}
+        onOpenChange={(next) => { if (!next) closeEditor("create", createEditorToken); }}
         onSubmit={handleCreateSubmit}
-        isLoading={createMutation.isPending}
+        isLoading={isOpeningPending(createEditorToken)}
       />
 
       {/* Edit Group Dialog */}
       <GroupFormDialog
+        key={`edit:${editEditorToken}`}
         mode="edit"
         group={selectedGroup}
         open={editDialogOpen}
-        onOpenChange={setEditDialogOpen}
+        onOpenChange={(next) => { if (!next) closeEditor("edit", editEditorToken, selectedGroup?.id); }}
         onSubmit={handleEditSubmit}
-        isLoading={updateMutation.isPending}
+        isLoading={isOpeningPending(editEditorToken)}
       />
 
       {/* Manage Members Sheet */}
@@ -324,7 +302,7 @@ function AdminGroupsPageContent(): JSX.Element {
         group={selectedGroup}
         open={membersSheetOpen}
         editorToken={membersEditorToken}
-        onOpenChange={setMembersSheetOpen}
+        onOpenChange={(next) => { if (!next) closeEditor("members", membersEditorToken, selectedGroup?.id); }}
         onSave={handleMembersSave}
       />
 
@@ -333,12 +311,12 @@ function AdminGroupsPageContent(): JSX.Element {
         group={selectedGroup}
         open={vaultsSheetOpen}
         editorToken={vaultsEditorToken}
-        onOpenChange={setVaultsSheetOpen}
+        onOpenChange={(next) => { if (!next) closeEditor("vaults", vaultsEditorToken, selectedGroup?.id); }}
         onSave={handleVaultsSave}
       />
 
       {/* Delete Confirmation Dialog */}
-      <Dialog open={deleteDialogOpen} onOpenChange={setDeleteDialogOpen}>
+      <Dialog open={deleteDialogOpen} onOpenChange={(next) => { if (!next) closeEditor("delete", deleteEditorToken, selectedGroup?.id); }}>
         <DialogContent className="sm:max-w-[400px]" aria-labelledby="delete-title" aria-describedby="delete-desc">
           <DialogHeader>
             <DialogTitle id="delete-title">Delete Group</DialogTitle>
@@ -351,8 +329,8 @@ function AdminGroupsPageContent(): JSX.Element {
             <Button
               type="button"
               variant="outline"
-              onClick={() => setDeleteDialogOpen(false)}
-              disabled={deleteMutation.isPending}
+              onClick={() => closeEditor("delete", deleteEditorToken, selectedGroup?.id)}
+              disabled={isOpeningPending(deleteEditorToken)}
               className="w-full sm:w-auto"
             >
               Cancel
@@ -360,12 +338,12 @@ function AdminGroupsPageContent(): JSX.Element {
             <Button
               type="button"
               variant="destructive"
-              onClick={handleDeleteConfirm}
-              disabled={deleteMutation.isPending}
+              onClick={() => { void handleDeleteConfirm().catch(() => undefined); }}
+              disabled={isOpeningPending(deleteEditorToken)}
               className="w-full sm:w-auto"
               aria-label="Confirm delete group"
             >
-              {deleteMutation.isPending ? "Deleting..." : "Delete Group"}
+              {isOpeningPending(deleteEditorToken) ? "Deleting..." : "Delete Group"}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -374,10 +352,27 @@ function AdminGroupsPageContent(): JSX.Element {
   );
 }
 
+function ScopedGroupsPage({ outerQueryClient, authOwner, principalGeneration }: { outerQueryClient: QueryClient; authOwner: AuthOwner; principalGeneration: number }): JSX.Element {
+  const [queryClient] = useState(() => new QueryClient({ defaultOptions: outerQueryClient.getDefaultOptions() }));
+  const leaseRef = useRef(0);
+  useEffect(() => {
+    const lease = ++leaseRef.current;
+    return () => {
+      // StrictMode reattaches the same scope before this microtask.
+      void Promise.resolve().then(() => {
+        if (!isScopedLeaseCurrent(leaseRef, lease)) return;
+        void queryClient.cancelQueries().catch(() => undefined);
+        queryClient.clear();
+      });
+    };
+  }, [queryClient]);
+  return <QueryClientProvider client={queryClient}><AdminGroupsPageContent outerQueryClient={outerQueryClient} authOwner={authOwner} principalGeneration={principalGeneration} /></QueryClientProvider>;
+}
+
 export default function AdminGroupsPage(): JSX.Element {
-  return (
-    <AdminGuard>
-      <AdminGroupsPageContent />
-    </AdminGuard>
-  );
+  const outerQueryClient = useQueryClient();
+  const authOwner = useSyncExternalStore(subscribeAuthOwner, captureAuthOwner, captureAuthOwner);
+  const principalGeneration = useSyncExternalStore(subscribeAuthPrincipal, captureAuthPrincipalGeneration, captureAuthPrincipalGeneration);
+  const scopeKey = `${authOwner.id}:${principalGeneration}`;
+  return <AdminGuard><ScopedGroupsPage key={scopeKey} outerQueryClient={outerQueryClient} authOwner={authOwner} principalGeneration={principalGeneration} /></AdminGuard>;
 }

@@ -705,7 +705,7 @@ export default function ChatShell() {
           </SheetContent>
         </Sheet>
       )}
-      {/* Keyboard Shortcuts Dialog — mounted app-wide in App.tsx (issue #775). */}
+      {/* Keyboard Shortcuts Dialog - mounted app-wide in App.tsx (issue #775). */}
     </div>
   );
 }

@@ -38,6 +38,8 @@ export const MAX_INPUT_LENGTH = 100_000;
 // The module slot survives the remount; it is single-slot because sendingRef
 // makes turns strictly sequential.
 let activeTurnPersistence: CurrentTurnPersistence | null = null;
+let activeStreamToken: symbol | null = null;
+let stoppingStreamToken: symbol | null = null;
 
 export interface UseSendMessageReturn {
   handleSend: () => Promise<void>;
@@ -128,15 +130,22 @@ export function useSendMessage(
       sendingRef.current = true;
       setIsStreaming(true);
       const gen = ++sendGenRef.current;
+      const streamToken = Symbol("chat-stream");
+      activeStreamToken = streamToken;
+      stoppingStreamToken = null;
 
       // UI-003: install the abort handle BEFORE the first await. A Stop
       // pressed during session creation (while no stream exists to abort)
       // invalidates this send's generation so generation can never start
       // afterward with no visible Stop control.
       setAbortFn(() => {
+        const ownsActive = activeStreamToken === streamToken && sendGenRef.current === gen;
+        const ownsStop = stoppingStreamToken === streamToken;
+        if (!ownsActive && !ownsStop) return;
+        activeStreamToken = null;
+        stoppingStreamToken = null;
         sendGenRef.current += 1;
-        setIsStreaming(false);
-        setAbortFn(null);
+        useChatStore.setState({ isStreaming: false, abortFn: null, streamingMessageId: null });
         sendingRef.current = false;
       });
 
@@ -564,6 +573,15 @@ export function useSendMessage(
       const abort = chatStream(
         chatMessages,
         {
+          onRetired: () => {
+            if (activeStreamToken !== streamToken || sendGenRef.current !== gen) return;
+            activeStreamToken = null;
+            sendGenRef.current++;
+            clearTurnPersistence();
+            sendingRef.current = false;
+            setCurrentStage(null);
+            useChatStore.setState({ isStreaming: false, abortFn: null, streamingMessageId: null });
+          },
           onMessage: (chunk) => {
             setCurrentStage(null);
             // Coalesce SSE appends behind requestAnimationFrame (UI-PERF-2):
@@ -668,7 +686,8 @@ export function useSendMessage(
             // leaves this generation alive so its later terminal callback can
             // still clear the UI, while a session switch/Stop bumps the token
             // and makes this callback a no-op.
-            if (sendGenRef.current !== gen) return;
+            if (sendGenRef.current !== gen || activeStreamToken !== streamToken) return;
+            activeStreamToken = null;
             // Flush any buffered streaming content before reading store state
             // (UI-PERF-2): rAF-batched appends may not have fired yet, so
             // synchronously drain the buffer to avoid losing the partial tail.
@@ -763,7 +782,8 @@ export function useSendMessage(
             // A pagehide callback may have already claimed the one-shot save.
             // Terminal cleanup still belongs to this live generation; only the
             // durable persistence call is skipped when the claim is consumed.
-            if (sendGenRef.current !== gen) return;
+            if (sendGenRef.current !== gen || activeStreamToken !== streamToken) return;
+            activeStreamToken = null;
             const ownsPersistence = claimTurnPersistence();
             clearTurnPersistence();
             // Flush any buffered streaming content before reading store state
@@ -839,7 +859,13 @@ export function useSendMessage(
       // navigation would leave sendingRef stuck true and block the next send.
       // Stop-path candidate clearing lives in stopStreaming, which owns the
       // message write in that flow.
+      if (activeStreamToken !== streamToken || sendGenRef.current !== gen) return;
       setAbortFn(() => {
+        const ownsActive = activeStreamToken === streamToken && sendGenRef.current === gen;
+        const ownsStop = stoppingStreamToken === streamToken;
+        if (!ownsActive && !ownsStop) return;
+        activeStreamToken = null;
+        stoppingStreamToken = null;
         abort();
         clearTurnPersistence();
         sendingRef.current = false;
@@ -900,6 +926,9 @@ export function useSendMessage(
     // Invalidate the in-flight generation BEFORE touching the store: a Stop
     // pressed during session creation has no stream to abort, and without
     // this bump the send would start generating once creation resolved.
+    const stopToken = activeStreamToken;
+    activeStreamToken = null;
+    stoppingStreamToken = stopToken;
     sendGenRef.current += 1;
     // Issue #685 (PRR-001): the mounted instance may be a REMOUNT (PageShell
     // keys page content by pathname, so the first-send navigate replaces the
