@@ -376,7 +376,7 @@ function OrgsPageContent() {
           {orgs.map((org) => (
             <Card key={org.id} className="overflow-hidden">
               <CardHeader className="pb-4">
-                <div className="flex items-center justify-between">
+                <div className="flex flex-wrap items-center justify-between gap-2">
                   <div className="flex items-center gap-3">
                     <div className="w-10 h-10 rounded-sm bg-primary/10 flex items-center justify-center">
                       <Building2 className="w-5 h-5 text-primary" />

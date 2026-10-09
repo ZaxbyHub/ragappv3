@@ -1077,7 +1077,10 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
               second row, so it never causes page-level horizontal overflow. */}
           <nav aria-label="Draft sections">
             <Tabs value={workspaceTab} onValueChange={(value) => setWorkspaceTab(value as WorkspaceTab)}>
-              <TabsList className="h-auto w-full flex-nowrap justify-start overflow-x-auto">
+              {/* Issue #778 (WCAG 1.4.10 reflow): the bar wraps instead of
+                  scrolling — overflow-x-auto put the right-most section tabs
+                  past the viewport at 320px. */}
+              <TabsList className="h-auto w-full flex-wrap justify-start gap-1">
                 {WORKSPACE_TAB_ITEMS.map((item) => (
                   <TabsTrigger key={item.value} value={item.value} className="shrink-0">
                     {item.label}

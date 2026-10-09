@@ -121,6 +121,7 @@ quality-contracts:
     python scripts/check_b03_upload_migration_timeout.py
     python scripts/check_l05_raw_palette.py
     python scripts/check_l05_page_headers.py
+    python scripts/check_l07_a11y_gate_wired.py
 
 # SAST job (CI installs backend/requirements-dev.txt first)
 sast:

@@ -69,7 +69,12 @@ export function MobileBottomNav({ activeItem, onItemSelect }: MobileBottomNavPro
               className={cn(
                 "flex flex-col items-center gap-1 min-w-[44px] min-h-[44px] px-3 py-2 rounded-sm transition-all duration-200",
                 "hover:bg-secondary focus:outline-hidden focus-visible:ring-2 focus-visible:ring-ring",
-                isActive && "bg-primary/10"
+                // Issue #778: the active label is foreground text + an inset
+                // ring cue (the #862 tabs pattern) — text-primary at text-xs
+                // on the bg-primary/10 pill measured ~4.4:1 in light theme,
+                // under the 4.5:1 AA floor; the pill alone measured ~1.1:1,
+                // so the ring restores a >=3:1 non-text state cue.
+                isActive && "bg-primary/10 ring-2 ring-inset ring-foreground"
               )}
               aria-label={item.label}
               aria-current={isActive ? "page" : undefined}
@@ -83,7 +88,7 @@ export function MobileBottomNav({ activeItem, onItemSelect }: MobileBottomNavPro
               <span
                 className={cn(
                   "text-xs font-medium transition-colors",
-                  isActive ? "text-primary" : "text-muted-foreground"
+                  isActive ? "text-foreground" : "text-muted-foreground"
                 )}
               >
                 {item.label}
@@ -99,7 +104,9 @@ export function MobileBottomNav({ activeItem, onItemSelect }: MobileBottomNavPro
               className={cn(
                 "flex flex-col items-center gap-1 min-w-[44px] min-h-[44px] px-3 py-2 rounded-sm transition-all duration-200",
                 "hover:bg-secondary focus:outline-hidden focus-visible:ring-2 focus-visible:ring-ring",
-                moreOpen && "bg-primary/10"
+                // Issue #778: same open-state cue contract as the active tab
+                // above (foreground label + inset ring, not text-primary).
+                moreOpen && "bg-primary/10 ring-2 ring-inset ring-foreground"
               )}
               aria-label="More navigation options"
               aria-expanded={moreOpen}
@@ -114,7 +121,7 @@ export function MobileBottomNav({ activeItem, onItemSelect }: MobileBottomNavPro
               <span
                 className={cn(
                   "text-xs font-medium transition-colors",
-                  moreOpen ? "text-primary" : "text-muted-foreground"
+                  moreOpen ? "text-foreground" : "text-muted-foreground"
                 )}
               >
                 More
@@ -149,7 +156,9 @@ export function MobileBottomNav({ activeItem, onItemSelect }: MobileBottomNavPro
                     className={cn(
                       "flex flex-col items-center gap-3 p-4 rounded-xl border border-border transition-all duration-200",
                       "hover:bg-secondary focus:outline-hidden focus-visible:ring-2 focus-visible:ring-ring",
-                      isActive && "bg-primary/10 border-primary/20"
+                      // Issue #778: foreground label + inset ring cue for the
+                      // active tile (same contract as the primary tabs).
+                      isActive && "bg-primary/10 border-primary/20 ring-2 ring-inset ring-foreground"
                     )}
                     aria-label={item.label}
                   >
@@ -159,12 +168,7 @@ export function MobileBottomNav({ activeItem, onItemSelect }: MobileBottomNavPro
                         isActive ? "text-primary" : "text-muted-foreground"
                       )}
                     />
-                    <span
-                      className={cn(
-                        "text-sm font-medium transition-colors",
-                        isActive ? "text-primary" : "text-foreground"
-                      )}
-                    >
+                    <span className="text-sm font-medium transition-colors text-foreground">
                       {item.label}
                     </span>
                   </button>
