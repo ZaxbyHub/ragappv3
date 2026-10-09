@@ -18,15 +18,21 @@ UI-R2-06, UI-R3-08, class C17).
   it cannot introduce a rightward overflow.
 - **Route-scoped error containment**: `PageShell` wraps its routed content in
   the existing `ErrorBoundary` (default "Something went wrong" / Try Again
-  fallback, scoped to the page area) keyed by `location.pathname` and placed
-  outside the page-transition `AnimatePresence`. A render error in any routed
+  fallback, scoped to the page area), and the boundary component gained a
+  `resetOnChange` prop: when the value changes (PageShell passes
+  `location.pathname`), a caught error resets in that same render pass — the
+  `resetKeys` pattern from react-error-boundary. A render error in any routed
   page now leaves navigation mounted and usable, and navigating away renders
-  the new route instead of holding the fallback (or waiting out the page
-  transition's exit before recovering). The existing top-level boundary in
-  `App.tsx` remains as the last resort. Trade-off accepted with this change:
-  shell route transitions lose the exit half of the cross-fade (the old page
-  unmounts with the keyed boundary; the enter animation is preserved) — the
-  keyed remount is what makes crashed-route recovery immediate.
+  the new route instead of holding the fallback. The existing top-level
+  boundary in `App.tsx` remains as the last resort. Design note: the reset is
+  a state reset, NOT a keyed remount — a key change at crash time re-throws
+  inside React's error-recovery commit and escapes to the outer boundary,
+  and keying by pathname on every navigation would remount the subtree for
+  same-component transitions like `/chat` -> `/chat/:id`, whose
+  AnimatePresence exit window is load-bearing for the chat send and
+  stop-stream flows (the #821 regression class; an earlier iteration of this
+  fix did exactly that and broke the chat e2e). Page-transition animations
+  are fully preserved for non-crash navigation.
 - **Test-mode demo session seeds synchronously**: the demo-session seed moved
   from `ProtectedRoute`'s `useEffect` (which ran one commit AFTER
   `RoleGuard`'s synchronous `isAuthenticated` read, bouncing every `/admin/*`

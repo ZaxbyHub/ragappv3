@@ -112,18 +112,22 @@ export function PageShell({ children, activeItem, onItemSelect, healthStatus }: 
               other boundary wraps the whole router (App.tsx), so a page
               render error used to unmount navigation entirely and its
               Retry re-rendered the same cached failing tree. This boundary
-              is keyed by pathname and sits OUTSIDE AnimatePresence so a
-              navigation remounts it instantly — the crashed fallback cannot
-              hold the screen through the page-transition exit animation
-              (mode="wait" delayed recovery past a user's perception of
-              "navigated away"). Trade-off, accepted with issue #779: shell
-              route transitions lose the exit half of the cross-fade (the
-              old page unmounts with the keyed boundary; the enter
-              animation is preserved). The fallback is the default
-              ErrorBoundary copy ("Something went wrong" + Try Again)
-              scoped to the page area; the top-level boundary remains as
-              the last resort. */}
-          <ErrorBoundary key={location.pathname}>
+              wraps the routed content area with the default fallback
+              ("Something went wrong" + Try Again); the top-level boundary
+              remains as the last resort.
+
+              Recovery-on-navigation is a STATE reset, not a remount
+              (resetOnChange={location.pathname}): a key-based remount at
+              crash time re-throws inside React's error-recovery commit and
+              escapes to the outer boundary, and a pathname key on every
+              navigation would also remount this subtree for same-component
+              route transitions like /chat -> /chat/:id, whose
+              AnimatePresence exit window is load-bearing for the chat
+              send/stream flow (the #821 regression class). The boundary
+              instance persists across navigations, so the original
+              exit/enter cross-fade behavior is unchanged for every
+              non-crash transition. */}
+          <ErrorBoundary resetOnChange={location.pathname}>
             <AnimatePresence mode="wait">
               <motion.div
                 key={location.pathname}
