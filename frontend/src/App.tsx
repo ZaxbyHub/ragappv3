@@ -253,7 +253,8 @@ function MainAppShell({ children, testMode = false }: { children: React.ReactNod
 }
 
 // Demo user for the dev-only fixture mode (moved from ProtectedRoute with
-// issue #779 / UI-R3-08 — see seedDemoSession below).
+// issue #779 / UI-R3-08 — the synchronous seed block lives in App's render,
+// below).
 function getDemoUser() {
   const role = import.meta.env.VITE_DEMO_ROLE || "superadmin";
   return {
