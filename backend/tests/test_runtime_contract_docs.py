@@ -404,12 +404,12 @@ def test_ci_job_display_names_parser():
         f"substring check cannot fail on ''): {names}"
     )
 
-    # A one-of-seven omission can never silently truncate the inventory: with
+    # A one-of-eight omission can never silently truncate the inventory: with
     # the name: gone the parser falls back to the job key, so the job stays in
     # the ground truth (as 'docker-smoke') and the gate flags the doc naming it.
     mutated = _ci_text().replace("    name: Docker build smoke\n", "    runs-on: ubuntu-latest\n")
     names = module._ci_job_display_names(mutated)
-    assert "docker-smoke" in names and "Docker build smoke" not in names and len(names) == 7, (
+    assert "docker-smoke" in names and "Docker build smoke" not in names and len(names) == 8, (
         f"a name:-less job must fall back to its key so the inventory stays "
         f"complete: {names}"
     )
