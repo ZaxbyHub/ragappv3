@@ -91,7 +91,10 @@ the guard repo-wide so a new on-loop checkout fails CI.
   they are not regressions of this PR.
 - `utils/transaction.py::db_transaction` has no production callers today; it
   is fixed in place rather than deleted (public util surface — removal is an
-  owner decision).
+  owner decision). [Amended by #705: that owner decision has now been made —
+  the unwired helper, whose `finally` released the pooled connection
+  unguarded outside the convention every live caller follows, is removed by
+  issue #705 (S06-SK-05).]
 - Adjacent on-loop SQL retained by written disposition (the issue lists both
   as adjacent/bounded-latency; neither performs a pooled checkout on the
   loop, which is the class this issue closes):

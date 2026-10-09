@@ -13,7 +13,7 @@ import os
 import sqlite3
 import sys
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +27,19 @@ LANCEDB_SCAN_BATCH_SIZE = 10_000
 VECTOR_INDEX_MIN_ROWS = 256
 DEFAULT_EMBEDDING_DIM = 1024
 DEFAULT_VECTOR_METRIC = "cosine"
+
+# Issue #705: the app's status model (database.py files CHECK) treats a
+# 'partial' file's vectors as live and searchable (issue #513), so the report's
+# "live claim" membership must cover both statuses.
+REPORT_LIVE_STATUSES = ("indexed", "partial")
+
+# Issue #705: orphan deletion must never touch the vectors of a file that is
+# live OR in flight. A 'pending' row can legitimately own vectors (the
+# reset_embeddings reset-before-wipe crash window keeps the old index as the
+# rollback source), and 'processing' rows are mid-write. 'error'/'cancelled'
+# rows stay deletable: cancelled ingests roll their vectors back on cancel
+# (issue #783) and error rows are re-enqueued and re-written by recovery.
+DELETE_PROTECTED_STATUSES = ("indexed", "partial", "pending", "processing")
 
 
 def _lance_escape(value: Any) -> str:
@@ -80,15 +93,17 @@ def _load_indexed_files(sqlite_path: Path) -> dict[str, IndexedFile]:
     if not sqlite_path.exists():
         raise FileNotFoundError(f"SQLite database not found: {sqlite_path}")
 
+    placeholders = ", ".join("?" for _ in REPORT_LIVE_STATUSES)
     with sqlite3.connect(sqlite_path) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            """
+            f"""
             SELECT id, vault_id, file_name, COALESCE(chunk_count, 0) AS chunk_count
             FROM files
-            WHERE status = 'indexed'
+            WHERE status IN ({placeholders})
             ORDER BY vault_id, id
-            """
+            """,
+            REPORT_LIVE_STATUSES,
         ).fetchall()
 
     return {
@@ -184,11 +199,16 @@ def build_report(
         if indexed_file.chunk_count > 0 and lancedb_by_file.get(file_id, 0) == 0
     }
 
+    # Issue #705: index the chunk list by file_id ONCE instead of rescanning
+    # the full list per indexed file (the old pass cost files x chunks).
+    chunks_by_file: dict[str, list[ChunkRow]] = {}
+    for chunk in chunks:
+        chunks_by_file.setdefault(chunk.file_id, []).append(chunk)
+
     mismatches_by_file: dict[str, dict[str, Any]] = {}
     for file_id, indexed_file in indexed_files.items():
-        observed_vaults = sorted(
-            {chunk.vault_id for chunk in chunks if chunk.file_id == file_id}
-        )
+        file_chunks = chunks_by_file.get(file_id, ())
+        observed_vaults = sorted({chunk.vault_id for chunk in file_chunks})
         mismatched_vaults = [
             vault_id
             for vault_id in observed_vaults
@@ -201,9 +221,8 @@ def build_report(
                 "mismatched_lancedb_vault_ids": mismatched_vaults,
                 "row_count": sum(
                     1
-                    for chunk in chunks
-                    if chunk.file_id == file_id
-                    and chunk.vault_id in mismatched_vaults
+                    for chunk in file_chunks
+                    if chunk.vault_id in mismatched_vaults
                 ),
             }
 
@@ -401,7 +420,30 @@ def _resolve_multi_scale_indexing_enabled(value: str) -> bool:
         return True
     if value == "false":
         return False
-    return _env_bool("MULTI_SCALE_INDEXING_ENABLED", False)
+    # Issue #705: 'auto' must follow the app's shipped default, not an
+    # independently-decided one — config.py ships multi_scale_indexing_enabled
+    # True and backend/scripts is absent from the container image, so the env
+    # var is normally unset here.
+    return _env_bool("MULTI_SCALE_INDEXING_ENABLED", True)
+
+
+def _protected_file_ids(sqlite_path: Path, file_ids: list[str]) -> set[str]:
+    """Return the subset of ``file_ids`` whose files row is delete-protected.
+
+    Uses only the ``id``/``status`` columns so minimal schemas (the test
+    harness builds a 5-column files table) stay queryable.
+    """
+    if not file_ids or not sqlite_path.exists():
+        return set()
+    placeholders = ", ".join("?" for _ in file_ids)
+    status_marks = ", ".join("?" for _ in DELETE_PROTECTED_STATUSES)
+    with sqlite3.connect(sqlite_path) as conn:
+        rows = conn.execute(
+            f"SELECT id FROM files WHERE id IN ({placeholders}) "
+            f"AND status IN ({status_marks})",
+            (*file_ids, *DELETE_PROTECTED_STATUSES),
+        ).fetchall()
+    return {str(row[0]) for row in rows}
 
 
 async def _run(args: argparse.Namespace) -> dict[str, Any]:
@@ -422,6 +464,22 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
     )
 
     plan = _cleanup_plan_from_report(args, report)
+
+    # Issue #705: delete protection at plan-build time. The report above stays
+    # a truthful snapshot; the DELETE set excludes any candidate whose files
+    # row is live or in flight ('indexed'/'partial'/'pending'/'processing').
+    if plan.orphan_file_ids:
+        protected = _protected_file_ids(sqlite_path, list(plan.orphan_file_ids))
+        if protected:
+            plan = replace(
+                plan,
+                orphan_file_ids=tuple(
+                    file_id
+                    for file_id in plan.orphan_file_ids
+                    if file_id not in protected
+                ),
+            )
+
     planned_delete_counts = _planned_delete_counts(report, plan)
     mutating_flags_requested = bool(planned_delete_counts) or bool(
         args.optimize_after_cleanup
@@ -443,6 +501,34 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                 "remaining_after_delete_counts": {},
             }
         else:
+            # Issue #705: re-check SQLite immediately before deleting. This
+            # NARROWS the read-then-act window to [recheck, delete] — a file
+            # ingested after this re-check can still be deleted (cross-store
+            # atomicity is impossible for a CLI over two stores; disclosed).
+            dropped: tuple[str, ...] = ()
+            if plan.orphan_file_ids:
+                protected = _protected_file_ids(
+                    sqlite_path, list(plan.orphan_file_ids)
+                )
+                if protected:
+                    dropped = tuple(
+                        file_id
+                        for file_id in plan.orphan_file_ids
+                        if file_id in protected
+                    )
+                    plan = replace(
+                        plan,
+                        orphan_file_ids=tuple(
+                            file_id
+                            for file_id in plan.orphan_file_ids
+                            if file_id not in protected
+                        ),
+                    )
+                    planned_delete_counts = _planned_delete_counts(report, plan)
+                    report["cleanup_plan"]["planned_delete_counts"] = (
+                        planned_delete_counts
+                    )
+            report["cleanup_plan"]["recheck_dropped_orphan_ids"] = list(dropped)
             report["cleanup_result"] = await apply_cleanup(table, plan)
 
     if args.optimize_after_cleanup:
@@ -476,7 +562,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--multi-scale-indexing-enabled",
         choices=("auto", "true", "false"),
         default="auto",
-        help="Whether non-default chunk_scale rows are current. auto reads MULTI_SCALE_INDEXING_ENABLED, default false.",
+        help="Whether non-default chunk_scale rows are current. auto reads MULTI_SCALE_INDEXING_ENABLED, default true (the app's shipped default).",
     )
     parser.add_argument(
         "--dry-run",
