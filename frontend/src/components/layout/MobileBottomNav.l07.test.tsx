@@ -52,7 +52,8 @@ describe("MobileBottomNav active-state label cues (issue #778)", () => {
     const active = screen.getByRole("button", { name: "Chat" });
     expect(active.getAttribute("aria-current")).toBe("page");
     expect(active.className, "active cue carries the inset ring").toContain("ring-inset");
-    expect(active.className, "active cue carries the ring").toContain("ring-foreground");
+    expect(active.className, "active cue carries the ring color").toContain("ring-foreground");
+    expect(active.className, "active cue carries the ring width").toContain("ring-2");
     expect(labelClasses(active), "active label is foreground").toContain("text-foreground");
     expect(labelClasses(active), "active label must not be text-primary").not.toContain("text-primary");
 
@@ -69,6 +70,7 @@ describe("MobileBottomNav active-state label cues (issue #778)", () => {
 
     expect(more.getAttribute("aria-expanded")).toBe("true");
     expect(more.className, "open state carries the inset ring").toContain("ring-inset");
+    expect(more.className, "open state carries the ring width").toContain("ring-2");
     expect(labelClasses(more), "open label is foreground").toContain("text-foreground");
     expect(labelClasses(more), "open label must not be text-primary").not.toContain("text-primary");
   });
@@ -80,6 +82,7 @@ describe("MobileBottomNav active-state label cues (issue #778)", () => {
 
     const tile = screen.getByRole("button", { name: "Settings" });
     expect(tile.className, "active tile carries the inset ring").toContain("ring-inset");
+    expect(tile.className, "active tile carries the ring width").toContain("ring-2");
     expect(labelClasses(tile), "tile label is foreground").toContain("text-foreground");
     expect(labelClasses(tile), "tile label must not be text-primary").not.toContain("text-primary");
   });

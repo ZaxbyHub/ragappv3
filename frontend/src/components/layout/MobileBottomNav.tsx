@@ -68,7 +68,7 @@ export function MobileBottomNav({ activeItem, onItemSelect }: MobileBottomNavPro
               onClick={() => onItemSelect(item.id)}
               className={cn(
                 "flex flex-col items-center gap-1 min-w-[44px] min-h-[44px] px-3 py-2 rounded-sm transition-all duration-200",
-                "hover:bg-secondary focus:outline-hidden focus-visible:ring-2 focus-visible:ring-ring",
+                "hover:bg-secondary focus:outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
                 // Issue #778: the active label is foreground text + an inset
                 // ring cue (the #862 tabs pattern) — text-primary at text-xs
                 // on the bg-primary/10 pill measured ~4.4:1 in light theme,
@@ -103,7 +103,7 @@ export function MobileBottomNav({ activeItem, onItemSelect }: MobileBottomNavPro
             <button
               className={cn(
                 "flex flex-col items-center gap-1 min-w-[44px] min-h-[44px] px-3 py-2 rounded-sm transition-all duration-200",
-                "hover:bg-secondary focus:outline-hidden focus-visible:ring-2 focus-visible:ring-ring",
+                "hover:bg-secondary focus:outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
                 // Issue #778: same open-state cue contract as the active tab
                 // above (foreground label + inset ring, not text-primary).
                 moreOpen && "bg-primary/10 ring-2 ring-inset ring-foreground"
@@ -155,7 +155,7 @@ export function MobileBottomNav({ activeItem, onItemSelect }: MobileBottomNavPro
                     }}
                     className={cn(
                       "flex flex-col items-center gap-3 p-4 rounded-xl border border-border transition-all duration-200",
-                      "hover:bg-secondary focus:outline-hidden focus-visible:ring-2 focus-visible:ring-ring",
+                      "hover:bg-secondary focus:outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
                       // Issue #778: foreground label + inset ring cue for the
                       // active tile (same contract as the primary tabs).
                       isActive && "bg-primary/10 border-primary/20 ring-2 ring-inset ring-foreground"

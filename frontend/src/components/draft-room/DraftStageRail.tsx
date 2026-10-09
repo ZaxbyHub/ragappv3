@@ -118,7 +118,8 @@ function formatElapsed(startedAt: string | null | undefined, nowMs: number): str
 }
 
 /**
- * Horizontally-scrollable rail of compile stage buttons. Keyboard operable with arrow-key
+ * Wrapping rail of compile stage buttons (issue #778: a single-row scroll put
+ * the right-most stages past the 320px viewport). Keyboard operable with arrow-key
  * roving focus (Left/Right, Home/End) and a single tab stop; each button's accessible name
  * states its stage's status so colour is never the only signal.
  */

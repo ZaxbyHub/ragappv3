@@ -640,11 +640,11 @@
     
     /* Muted - Very subtle teal-gray */
     --muted: 195 10% 94%;
-    /* Darkened from 40% → 38% lightness so the token clears WCAG 1.4.3 AA
-       (4.5:1) on every surface it is drawn over — background, card, popover,
-       muted AND input (the TabsList strip) — in light theme (UI-R4-11, #777;
-       the earlier 45% → 40% fix in #294 only checked background/card). */
-    --muted-foreground: 195 10% 36%; /* #778: 38 measured 4.47:1 on tinted rails */
+    /* Darkened 45% → 40% (#294, background/card only) → 38% (#777, added
+       popover/muted/input) → 36% (#778 review: 38 measured 4.47:1 on the
+       tinted canvas version rail) so the token clears WCAG 1.4.3 AA (4.5:1)
+       on every light surface it is drawn over. */
+    --muted-foreground: 195 10% 36%;
     
     /* Accent - Light grey with barely perceptible blue tint */
     --accent: 195 42% 86%;

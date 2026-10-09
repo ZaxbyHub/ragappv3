@@ -92,8 +92,8 @@ def test_guard_flags_missing_wiring(tmp_path: Path) -> None:
     result = _run_guard(tmp_path)
     assert result.returncode == 1
     assert "MISSING a11y-matrix" in result.stdout
-    assert "no CI job outside the 'e2e' job references" in result.stdout
-    assert "bare 'npx playwright test'" in result.stdout
+    assert "no CI job outside the 'e2e' job runs a11y-matrix.spec.ts" in result.stdout
+    assert "job 'e2e' runs playwright without naming a spec file" in result.stdout
 
 
 def test_guard_flags_missing_spec_file(tmp_path: Path) -> None:
@@ -119,8 +119,8 @@ def test_guard_flags_missing_viewport_literals(tmp_path: Path) -> None:
 
     result = _run_guard(tmp_path)
     assert result.returncode == 1
-    assert "viewport literal 640 missing" in result.stdout
-    assert "viewport literal 360 missing" in result.stdout
+    assert "viewport literal width: 640 missing" in result.stdout
+    assert "viewport literal height: 360 missing" in result.stdout
 
 
 def test_guard_fails_closed_without_workflow(tmp_path: Path) -> None:

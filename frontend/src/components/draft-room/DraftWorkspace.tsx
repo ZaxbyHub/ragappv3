@@ -1073,14 +1073,12 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
               (one hidden via CSS below `lg`, one above) would leave two live
               tablists in the DOM at once, which is both wasted markup and a
               trap for assistive tech that doesn't honour the same media query
-              context. The bar scrolls horizontally instead of wrapping to a
-              second row, so it never causes page-level horizontal overflow. */}
+              context. Below lg the bar wraps (issue #778: a single-row
+              scroll put the right-most tabs past the 320px viewport); at lg+,
+              where the tabs fit, it keeps the original single-row scroll. */}
           <nav aria-label="Draft sections">
             <Tabs value={workspaceTab} onValueChange={(value) => setWorkspaceTab(value as WorkspaceTab)}>
-              {/* Issue #778 (WCAG 1.4.10 reflow): the bar wraps instead of
-                  scrolling — overflow-x-auto put the right-most section tabs
-                  past the viewport at 320px. */}
-              <TabsList className="h-auto w-full flex-wrap justify-start gap-1">
+              <TabsList className="h-auto w-full flex-wrap justify-start gap-1 lg:flex-nowrap lg:overflow-x-auto">
                 {WORKSPACE_TAB_ITEMS.map((item) => (
                   <TabsTrigger key={item.value} value={item.value} className="shrink-0">
                     {item.label}

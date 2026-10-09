@@ -86,7 +86,13 @@
 // for local-run hygiene — guarded with try/catch so a restarted stub can
 // never fail the suite from afterAll.
 
-import { test, expect, request as playwrightRequest, type Page } from "@playwright/test";
+import {
+  test,
+  expect,
+  request as playwrightRequest,
+  type APIRequestContext,
+  type Page,
+} from "@playwright/test";
 import path from "node:path";
 import fs from "node:fs";
 
@@ -182,11 +188,13 @@ const ROUTES: RouteRow[] = [
     auth: "login",
     kind: "shell",
     // Seeded document row filename — DocumentTable.tsx:268 {doc.filename}.
-    // Amendment 5: viewport-stable sentinel — text=handbook-a11y.pdf matched
-    // the desktop table row that is display:none below the sm breakpoint
-    // (the mobile card list renders instead), so .first() resolved a hidden
-    // node at 320x568. The page h1 is visible at every width.
-    sentinel: { selector: "role=heading[name='Documents']" },
+    // Amendment 5 + review F-18: viewport-stable AND readiness-correct.
+    // text=handbook-a11y.pdf matched the desktop table row that is
+    // display:none below sm (mobile card list renders instead); the page h1
+    // is visible at every width but renders while the list skeleton is still
+    // up. `>> visible=true` waits for a VISIBLE seeded-row match at either
+    // breakpoint, which only exists once the document list has loaded.
+    sentinel: { selector: "text=handbook-a11y.pdf >> visible=true" },
   },
   {
     path: "/documents/1",
@@ -434,6 +442,26 @@ async function postControl(page: Page, routePath: string, data: Record<string, u
   }
 }
 
+// Page-independent control context (issue #778 review PRR-037): the toggle
+// release in a test's finally must survive the page/context teardown that a
+// 60s test timeout triggers — page.request dies with the context, this
+// standalone context does not.
+let controlApi: APIRequestContext | null = null;
+async function controlContext(): Promise<APIRequestContext> {
+  if (!controlApi) {
+    controlApi = await playwrightRequest.newContext({ baseURL: STUB_ORIGIN });
+  }
+  return controlApi;
+}
+
+async function postControlStandalone(routePath: string, data: Record<string, unknown>) {
+  const api = await controlContext();
+  const res = await api.post(routePath, { data });
+  if (!res.ok()) {
+    throw new Error(`stub control ${routePath} failed: ${res.status()} ${await res.text()}`);
+  }
+}
+
 // POST /_e2e/a11y-seed once per worker (module-level guard), AFTER login.
 let a11ySeeded = false;
 async function ensureA11ySeed(page: Page) {
@@ -488,12 +516,14 @@ async function visitRoute(page: Page, route: RouteRow) {
 
 // End-of-test toggle release (belt and suspenders on top of visitRoute's
 // per-visit finally — post-fix wiring must never leak a flag to later rows).
-async function releaseRouteToggles(page: Page, route: RouteRow) {
+async function releaseRouteToggles(_page: Page, route: RouteRow) {
+  // Uses the standalone context on purpose (PRR-037): this runs in finally
+  // blocks that race teardown after a test timeout.
   if (route.path === "/change-password") {
-    await postControl(page, "/_e2e/user-flags", { must_change_password: false });
+    await postControlStandalone("/_e2e/user-flags", { must_change_password: false });
   }
   if (route.path === "/setup") {
-    await postControl(page, "/_e2e/setup-mode", { needs_setup: false });
+    await postControlStandalone("/_e2e/setup-mode", { needs_setup: false });
   }
 }
 
@@ -524,10 +554,13 @@ async function runAxe(page: Page): Promise<AxeViolation[]> {
     // classes after the body base-coat fix.
     const results = await win.axe.run({
       rules: {
-        "aria-valid-attr-value": { enabled: false },
-        "nested-interactive": { enabled: false },
-        "button-name": { enabled: false },
-        "aria-required-children": { enabled: false },
+        // Each disabled family is owned by an open follow-up issue whose AC1
+        // re-enables it (issue #778 review F-05 — keep the refs beside the
+        // rules so the waiver never outlives its issues).
+        "aria-valid-attr-value": { enabled: false }, // #865
+        "nested-interactive": { enabled: false }, // #866
+        "button-name": { enabled: false }, // #867
+        "aria-required-children": { enabled: false }, // #868
       },
     });
     return results.violations
@@ -588,16 +621,19 @@ test.describe("a11y matrix (issue #778 — routes x viewports x themes)", () => 
   test.afterAll(async () => {
     // Local-run hygiene only — CI boots the stub fresh. Guarded so a
     // restarted stub (or a control route that never existed) cannot fail
-    // the suite from afterAll.
-    const api = await playwrightRequest.newContext({ baseURL: STUB_ORIGIN });
+    // the suite from afterAll. Reuses the standalone control context.
     try {
+      const api = await controlContext();
       await api.post("/_e2e/setup-mode", { data: { needs_setup: false } });
       await api.post("/_e2e/user-flags", { data: { must_change_password: false } });
       await api.post("/_e2e/a11y-reset", { data: {} });
     } catch {
       // Best-effort reset — see comment above.
     } finally {
-      await api.dispose();
+      if (controlApi) {
+        await controlApi.dispose();
+        controlApi = null;
+      }
     }
   });
 
@@ -611,9 +647,19 @@ test.describe("a11y matrix (issue #778 — routes x viewports x themes)", () => 
         test(`[${route.path}][${viewport.width}x${viewport.height}][${theme}] no serious or critical axe violations`, async ({ page }) => {
           await page.setViewportSize({ width: viewport.width, height: viewport.height });
           await setTheme(page, theme);
-          await prepareRoute(page, route);
+          // prepareRoute is INSIDE the try (issue #778 review PRR-002): its
+          // /_e2e/user-flags flip precedes login, so a login/seed throw before
+          // the try would skip the release and cascade /change-password
+          // redirects across every later row.
           try {
+            await prepareRoute(page, route);
             await visitRoute(page, route);
+            // Dark legs pin the theme store actually applied (issue #778
+            // review F-18): a kv-theme regression would otherwise run the
+            // dark combination silently against light styles.
+            if (theme === "dark") {
+              await expect(page.locator("html")).toHaveClass(/dark/, { timeout: 5_000 });
+            }
             const violations = await runAxeBothPasses(page);
             const details = violations
               .map((v) => `[${v.impact}] ${v.id}: ${v.html}`)
@@ -635,8 +681,8 @@ test.describe("a11y matrix (issue #778 — routes x viewports x themes)", () => 
     test(`[${route.path}] no interactive element overflows the viewport`, async ({ page }) => {
       await page.setViewportSize({ width: 320, height: 568 });
       await setTheme(page, "light");
-      await prepareRoute(page, route);
       try {
+        await prepareRoute(page, route);
         await visitRoute(page, route);
         await scrollAllToBottom(page);
         const offenders = (await page.evaluate(
@@ -716,8 +762,8 @@ test.describe("a11y matrix (issue #778 — routes x viewports x themes)", () => 
     test(`[${route.path}] exactly one main landmark per route`, async ({ page }) => {
       await page.setViewportSize({ width: 320, height: 568 });
       await setTheme(page, "light");
-      await prepareRoute(page, route);
       try {
+        await prepareRoute(page, route);
         await visitRoute(page, route);
         const landmarks = await page.evaluate(() => {
           const all = Array.from(document.querySelectorAll('main, [role="main"]'));

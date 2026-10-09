@@ -30,8 +30,11 @@ export function DocumentCardsList({
     measureElement: (el) => el?.getBoundingClientRect().height ?? 0,
   });
 
+  // overflow-y-auto is redundant with the inline style but gives the
+  // a11y gate's below-fold scroll pass a class selector to match
+  // (issue #778 review PRR-005).
   return (
-    <div ref={mobileScrollRef} className="sm:hidden" style={{ maxHeight: "70vh", overflowY: "auto" }}>
+    <div ref={mobileScrollRef} className="sm:hidden overflow-y-auto" style={{ maxHeight: "70vh" }}>
       <div style={{ height: mobileVirtualizer.getTotalSize(), position: "relative" }}>
         {mobileVirtualizer.getVirtualItems().map((virtualItem) => {
           const doc = documents[virtualItem.index];

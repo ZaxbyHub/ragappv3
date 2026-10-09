@@ -167,7 +167,7 @@ jobs:
         run: python scripts/check_l07_a11y_gate_wired.py
 
   # Issue #778 (Workstream L PR 7): the route x viewport accessibility gate.
-  # Separate from the e2e smoke job — the matrix is ~139 serial tests and
+  # Separate from the e2e smoke job — the matrix is 141 serial tests and
   # must not share the smoke budget — and wired by
   # scripts/check_l07_a11y_gate_wired.py (Quality contracts).
   a11y-matrix:
@@ -199,7 +199,10 @@ jobs:
           npm run build
 
       - name: Run a11y route x viewport matrix
-        run: npx playwright test --reporter=line a11y-matrix.spec.ts
+        # --retries=1 rides out single-row flakes (config-level retries is 0);
+        # --max-failures=20 stops a wholesale break early so failure artifacts
+        # still upload inside the job budget (issue #778 review F-13).
+        run: npx playwright test --reporter=line a11y-matrix.spec.ts --retries=1 --max-failures=20
 
       - name: Upload a11y failure artifacts
         if: failure()

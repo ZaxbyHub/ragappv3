@@ -110,6 +110,7 @@ const USER = {
   full_name: "E2E User",
   role: "superadmin",
   is_active: true,
+  created_at: nowIso(),
 };
 
 const VAULT = {
@@ -175,10 +176,10 @@ function resetE2eJobs() {
   for (const family of E2E_JOB_FAMILIES) {
     e2eSeeds[family] = [];
   }
-  // Ingest seeds materialize document rows; drop only the rows the seeder
+  // Ingest seeds materialize document rows; drop only the rows a seeder
   // created (flagged at seed time), never walkthrough-uploaded documents.
   for (let i = documents.length - 1; i >= 0; i -= 1) {
-    if (documents[i].e2eSeed) documents.splice(i, 1);
+    if (documents[i].e2eSeed || documents[i].e2eA11ySeed) documents.splice(i, 1);
   }
 }
 
@@ -360,8 +361,18 @@ const DRAFT_CAPABILITIES_FIXTURE = {
   export_formats: ["md"],
   logical_model_modes: ["thinking", "instant"],
   default_logical_mode: "thinking",
-  compile_start_stages: ["research", "outline", "draft"],
-  compile_stage_order: ["research", "outline", "draft", "lint"],
+  compile_start_stages: ["research", "outline", "draft", "lint", "copy", "standards", "fact"],
+  compile_stage_order: [
+    "intake",
+    "research",
+    "outline",
+    "draft",
+    "lint",
+    "copy",
+    "standards",
+    "fact",
+    "assemble",
+  ],
   prompt_bundle_version: "e2e",
   editorial_gates_installed: false,
   compile_available: true,
@@ -515,7 +526,12 @@ function a11yDraftDetail() {
 }
 
 function seedA11yFixtures() {
-  if (!documents.some((d) => d.e2eA11ySeed)) documents.push(a11yDocumentRow());
+  if (!documents.some((d) => d.e2eA11ySeed)) {
+    documents.push(a11yDocumentRow());
+    // Reserve the hardcoded fixture ids so later allocators cannot mint a
+    // second row with the same id on a reused stub (issue #778 review).
+    nextDocumentId = Math.max(nextDocumentId, Number(A11Y_DOC_ID) + 1);
+  }
   // Chat session 1 with the transcript the /chat/1 sentinel waits for. Only
   // created when absent so a chat-smoke run sharing the stub is untouched.
   if (!sessions.has(A11Y_SESSION_ID)) {
@@ -530,6 +546,7 @@ function seedA11yFixtures() {
       fork_message_index: null,
     };
     sessions.set(A11Y_SESSION_ID, { session, messages: [], a11ySeed: true });
+    nextSessionId = Math.max(nextSessionId, A11Y_SESSION_ID + 1);
     addMessage(A11Y_SESSION_ID, {
       role: "user",
       content: "What did the maintenance manual say about coolant?",
@@ -552,6 +569,7 @@ function seedA11yFixtures() {
       draftId: A11Y_DRAFT_ID,
       a11ySeed: true,
     });
+    nextE2eDraftId = Math.max(nextE2eDraftId, A11Y_DRAFT_ID + 1);
   }
   a11yOrgs = [
     {
@@ -576,6 +594,9 @@ function resetA11yFixtures() {
   e2eSeeds["draft-room"] = e2eSeeds["draft-room"].filter((s) => !s.a11ySeed);
   a11yOrgs = [];
   a11ySeeded = false;
+  // Full unseeded state includes the identity flag /_e2e/user-flags flips —
+  // a crashed run must not leave later specs redirecting to /change-password.
+  USER.must_change_password = false;
   return { ok: true };
 }
 
@@ -1127,12 +1148,12 @@ const server = http.createServer(async (req, res) => {
     if (method === "GET" && path === "/api/settings") {
       return sendJson(req, res, 200, SETTINGS_FIXTURE);
     }
-    if (method === "GET" && (path === "/api/users/" || path === "/api/users")) {
+    if (method === "GET" && path === "/api/users") {
       const q = (url.searchParams.get("q") || "").toLowerCase();
       const rows = q ? [USER].filter((u) => u.username.includes(q)) : [USER];
       return sendJson(req, res, 200, { users: rows, total: rows.length });
     }
-    if (method === "GET" && (path === "/api/organizations/" || path === "/api/organizations")) {
+    if (method === "GET" && path === "/api/organizations") {
       return sendJson(req, res, 200, a11yOrgs);
     }
     if (method === "GET" && path === "/api/groups") {
@@ -1145,6 +1166,9 @@ const server = http.createServer(async (req, res) => {
       return sendJson(req, res, 200, DRAFT_CAPABILITIES_FIXTURE);
     }
     if (method === "GET" && path === "/api/canvas/capabilities") {
+      // Seed-gated (issue #778 review PRR-003): an always-enabled capability
+      // flips the "Open in canvas" affordance on for the sibling chat specs.
+      if (!a11ySeeded) return sendJson(req, res, 200, { enabled: false });
       return sendJson(req, res, 200, { enabled: true });
     }
     // Seed-gated rows below: 404 until POST /_e2e/a11y-seed.

@@ -287,9 +287,10 @@ export default function DocumentDetailPage() {
           // Issue #778 (WCAG 1.4.10): truncate is nowrap, so a long
           // filename's full width became the page column's min-content and
           // pushed the whole column past the viewport at 320px. line-clamp-1
-          // keeps the single-line ellipsis look; break-all lets the
-          // min-content collapse.
-          title={<span className="block line-clamp-1 break-all" title={doc.filename}>{doc.filename}</span>}
+          // keeps a single-line ellipsis look (it sets its own display, so no
+          // `block` — a later .block rule would defeat the clamp);
+          // break-all lets the min-content collapse.
+          title={<span className="line-clamp-1 break-all" title={doc.filename}>{doc.filename}</span>}
           actions={
             <>
               <Button
