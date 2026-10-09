@@ -96,8 +96,13 @@ def _lance_escape(value) -> str:
     return str(value).replace("'", "''")
 
 
-class VectorStoreError(Exception):
-    """Custom exception for vector store errors."""
+class VectorStoreError(RuntimeError):
+    """Custom exception for vector store errors.
+
+    Subclasses ``RuntimeError`` so the "Table not initialized" guard (issue
+    #704) keeps satisfying every ``except RuntimeError`` / ``assertRaises(
+    RuntimeError)`` contract that predated the classification wrap.
+    """
 
     pass
 
