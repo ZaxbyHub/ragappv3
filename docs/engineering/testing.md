@@ -116,7 +116,7 @@ the new behavior.
 
 ## 4. What CI runs vs. what you should run
 
-CI (`.github/workflows/ci.yml`) runs the full suite across seven jobs:
+CI (`.github/workflows/ci.yml`) runs the full suite across eight jobs:
 
 - **Frontend job:** `npm run typecheck`, `npm run typecheck:contracts`, `npm run lint`, API smoke tests, the accessibility smoke (`npm run test:a11y`), full `npm test`, the coverage gate (`npm run test:coverage`), the toolchain-graph print (`node --version`, `npm --version`, `npm ls vite vitest @vitejs/plugin-react jsdom`, and the resolved `vite`/`vitest` versions — it fails the build when the two disagree), and three builds (production plus two subpath variants).
 - **Playwright e2e smoke job:** the `frontend/e2e/` browser smoke suite (send / stop-mid-stream / reload-restores-history / citation-opens-source) against the production build with a stub backend (issue #573). The step names its spec files explicitly so new specs never join it implicitly.
