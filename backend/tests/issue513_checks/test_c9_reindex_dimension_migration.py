@@ -57,6 +57,7 @@ def _hermetic_env() -> None:
     os.environ["JWT_SECRET_KEY"] = "test-jwt-secret-key-for-testing-only"
     os.environ["REDIS_URL"] = ""
 
+
 OLD_DIM = 4
 NEW_DIM = 6
 
@@ -69,9 +70,7 @@ class _FakeEmbeddingService:
         self._dim = dim
 
     async def embed_batch(self, texts, fail_fast=False):  # noqa: ANN001, ANN202
-        return [
-            [((i + 1) * 0.25) for i in range(self._dim)] for _ in texts
-        ], []
+        return [[((i + 1) * 0.25) for i in range(self._dim)] for _ in texts], []
 
 
 def _record(rec_id: str, file_id: int, text: str, dim: int) -> dict:
@@ -105,7 +104,15 @@ def _cleanup_tmp(*paths) -> None:  # noqa: ANN001
             shutil.rmtree(path, ignore_errors=True)
 
 
-async def _reprocess_file(store, pool, db_vault_id: int, file_id: int, upload_path: Path, new_dim: int, vector_target=None):  # noqa: ANN001, ANN202
+async def _reprocess_file(
+    store,
+    pool,
+    db_vault_id: int,
+    file_id: int,
+    upload_path: Path,
+    new_dim: int,
+    vector_target=None,
+):  # noqa: ANN001, ANN202
     """Drive the ingest step for one file.
 
     Without ``vector_target`` this is the bare call the async upload worker
@@ -127,20 +134,23 @@ async def _reprocess_file(store, pool, db_vault_id: int, file_id: int, upload_pa
         embedding_service=_FakeEmbeddingService(dim=new_dim),
         vector_store=store,
     )
-    with patch.object(
-        processor,
-        "_process_document_file",
-        new=AsyncMock(
-            return_value=(
-                [chunk],
-                "reindexed content",
-                ParsedDocument(atoms=()),
-            )
+    with (
+        patch.object(
+            processor,
+            "_process_document_file",
+            new=AsyncMock(
+                return_value=(
+                    [chunk],
+                    "reindexed content",
+                    ParsedDocument(atoms=()),
+                )
+            ),
         ),
-    ), patch(
-        "app.services.document_processor.compute_file_hash", return_value="hashc9file"
-    ), patch(
-        "app.services.document_processor.compute_parent_windows"
+        patch(
+            "app.services.document_processor.compute_file_hash",
+            return_value="hashc9file",
+        ),
+        patch("app.services.document_processor.compute_parent_windows"),
     ):
         await processor.process_existing_file(
             file_id=file_id,
@@ -155,7 +165,7 @@ async def _scenario() -> tuple[str, str, str, str]:
     import sqlite3
 
     from app.config import settings
-    from app.models.database import get_pool, init_db
+    from app.models.database import get_pool, init_db, run_migrations
     from app.services.document_processor import DocumentProcessingError
     from app.services.vector_store import (
         DIMENSION_REBUILD_TABLE,
@@ -168,6 +178,7 @@ async def _scenario() -> tuple[str, str, str, str]:
     tmp = Path(tempfile.mkdtemp(prefix="c9_db_"))
     db_path = str(tmp / "app.db")
     init_db(db_path)
+    run_migrations(db_path)
 
     conn = sqlite3.connect(db_path)
     conn.execute("INSERT INTO vaults (name) VALUES ('v')")
@@ -191,17 +202,20 @@ async def _scenario() -> tuple[str, str, str, str]:
     part3_reason = ""
     part4_reason = ""
 
-    with patch.object(settings, "data_dir", tmp), \
-            patch.object(settings, "wiki_enabled", False), \
-            patch.object(settings, "wiki_compile_on_ingest", False), \
-            patch.object(settings, "kms_enabled", False), \
-            patch.object(settings, "multi_scale_indexing_enabled", False), \
-            patch.object(settings, "contextual_chunking_enabled", False), \
-            patch.object(settings, "optimize_mode", "manual"):
-
+    with (
+        patch.object(settings, "data_dir", tmp),
+        patch.object(settings, "wiki_enabled", False),
+        patch.object(settings, "wiki_compile_on_ingest", False),
+        patch.object(settings, "kms_enabled", False),
+        patch.object(settings, "multi_scale_indexing_enabled", False),
+        patch.object(settings, "contextual_chunking_enabled", False),
+        patch.object(settings, "optimize_mode", "manual"),
+    ):
         # Seed the old-dimension native index.
         await store.init_table(OLD_DIM)
-        await store.add_chunks([_record(f"{file_id}_0", file_id, "seed content", OLD_DIM)])
+        await store.add_chunks(
+            [_record(f"{file_id}_0", file_id, "seed content", OLD_DIM)]
+        )
         seeded_count = await store.count_by_file(str(file_id))
         if seeded_count != 1:
             _cleanup_tmp(tmp)
@@ -247,7 +261,9 @@ async def _scenario() -> tuple[str, str, str, str]:
                         results = await store.search(
                             _record("q", file_id, "q", OLD_DIM)["embedding"], limit=5
                         )
-                        searchable = any(r.get("file_id") == str(file_id) for r in results)
+                        searchable = any(
+                            r.get("file_id") == str(file_id) for r in results
+                        )
                     except Exception:  # noqa: BLE001
                         searchable = False
                 if dim != OLD_DIM or count < 1 or not searchable:
@@ -275,6 +291,7 @@ async def _scenario() -> tuple[str, str, str, str]:
         tmp2 = Path(tempfile.mkdtemp(prefix="c9_db2_"))
         db_path2 = str(tmp2 / "app.db")
         init_db(db_path2)
+        run_migrations(db_path2)
         conn = sqlite3.connect(db_path2)
         conn.execute("INSERT INTO vaults (name) VALUES ('v2')")
         vault_id2 = conn.execute("SELECT id FROM vaults LIMIT 1").fetchone()[0]
@@ -291,7 +308,9 @@ async def _scenario() -> tuple[str, str, str, str]:
         pool2 = get_pool(db_path2, max_size=3)
         store2 = VectorStore(db_path=tmp2 / "lancedb")
         await store2.init_table(OLD_DIM)
-        await store2.add_chunks([_record(f"{file_id2}_0", file_id2, "seed content two", OLD_DIM)])
+        await store2.add_chunks(
+            [_record(f"{file_id2}_0", file_id2, "seed content two", OLD_DIM)]
+        )
         old_count = await store2.count_by_file(str(file_id2))
         if old_count != 1:
             _cleanup_tmp(tmp, tmp2)
@@ -305,7 +324,9 @@ async def _scenario() -> tuple[str, str, str, str]:
         rebuild_failed = False
         with patch.object(settings, "reupload_safe_order", False):
             try:
-                await _reprocess_file(store2, pool2, vault_id2, file_id2, tmp2 / "doc.txt", NEW_DIM)
+                await _reprocess_file(
+                    store2, pool2, vault_id2, file_id2, tmp2 / "doc.txt", NEW_DIM
+                )
             except Exception:  # noqa: BLE001
                 rebuild_failed = True
         survivors = await store2.count_by_file(str(file_id2))
@@ -324,6 +345,7 @@ async def _scenario() -> tuple[str, str, str, str]:
         tmp3 = Path(tempfile.mkdtemp(prefix="c9_db3_"))
         db_path3 = str(tmp3 / "app.db")
         init_db(db_path3)
+        run_migrations(db_path3)
         conn = sqlite3.connect(db_path3)
         conn.execute("INSERT INTO vaults (name) VALUES ('v3')")
         vault_id3 = conn.execute("SELECT id FROM vaults LIMIT 1").fetchone()[0]
@@ -385,7 +407,12 @@ async def _scenario() -> tuple[str, str, str, str]:
             _install_spy(_name, _fn)
         try:
             await _reprocess_file(
-                store3, pool3, vault_id3, file_id3, tmp3 / "doc.txt", NEW_DIM,
+                store3,
+                pool3,
+                vault_id3,
+                file_id3,
+                tmp3 / "doc.txt",
+                NEW_DIM,
                 vector_target=handle3,
             )
             # Live OLD_DIM table untouched during the window; new-dim rows
@@ -405,16 +432,12 @@ async def _scenario() -> tuple[str, str, str, str]:
             results3 = await store3.search(
                 _record("q", file_id3, "q", NEW_DIM)["embedding"], limit=5
             )
-            after_searchable = any(
-                r.get("file_id") == str(file_id3) for r in results3
-            )
+            after_searchable = any(r.get("file_id") == str(file_id3) for r in results3)
         except Exception:  # noqa: BLE001
             after_searchable = False
 
         unthreaded = {
-            name: [
-                kw for kw in spy_calls[name] if kw.get("target") is not handle3
-            ]
+            name: [kw for kw in spy_calls[name] if kw.get("target") is not handle3]
             for name in spy_names
         }
         missing = [name for name in spy_names if not spy_calls[name]]
@@ -441,6 +464,7 @@ async def _scenario() -> tuple[str, str, str, str]:
         tmp4 = Path(tempfile.mkdtemp(prefix="c9_db4_"))
         db_path4 = str(tmp4 / "app.db")
         init_db(db_path4)
+        run_migrations(db_path4)
         conn = sqlite3.connect(db_path4)
         conn.execute("INSERT INTO vaults (name) VALUES ('v4')")
         vault_id4 = conn.execute("SELECT id FROM vaults LIMIT 1").fetchone()[0]
@@ -457,7 +481,9 @@ async def _scenario() -> tuple[str, str, str, str]:
         pool4 = get_pool(db_path4, max_size=3)
         store4 = VectorStore(db_path=tmp4 / "lancedb")
         await store4.init_table(OLD_DIM)
-        await store4.add_chunks([_record(f"{file_id4}_0", file_id4, "old-gen four", OLD_DIM)])
+        await store4.add_chunks(
+            [_record(f"{file_id4}_0", file_id4, "old-gen four", OLD_DIM)]
+        )
         baseline4 = await store4.count_by_file(str(file_id4))
         if baseline4 != 1:
             _cleanup_tmp(tmp, tmp2, tmp3, tmp4)
@@ -497,7 +523,11 @@ async def _scenario() -> tuple[str, str, str, str]:
         except Exception:  # noqa: BLE001
             aborted_searchable = False
         table_names4 = await store4.db.table_names()
-        if aborted_dim != OLD_DIM or aborted_count != baseline4 or not aborted_searchable:
+        if (
+            aborted_dim != OLD_DIM
+            or aborted_count != baseline4
+            or not aborted_searchable
+        ):
             part4_reason = (
                 f"aborted rebuild damaged the live index: dim={aborted_dim}, "
                 f"rows={aborted_count}, old-dimension content "

@@ -36,7 +36,7 @@
       "SEVERITY.LOW": 62,
       "SEVERITY.MEDIUM": 60,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 86218,
+      "loc": 86747,
       "nosec": 0,
       "skipped_tests": 66
     },
@@ -634,7 +634,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 476,
+      "loc": 524,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -686,7 +686,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 3966,
+      "loc": 3987,
       "nosec": 0,
       "skipped_tests": 6
     },
@@ -777,7 +777,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 355,
+      "loc": 357,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -829,7 +829,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 1,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 3917,
+      "loc": 4336,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -842,7 +842,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 1,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 176,
+      "loc": 202,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1661,7 +1661,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 2748,
+      "loc": 2761,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -3598,9 +3598,9 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "2242                 conn.execute(\n2243                     f\"DELETE FROM failed_chunks WHERE id IN ({placeholders})\",\n2244                     clear_ids,\n",
-      "col_offset": 20,
-      "end_col_offset": 77,
+      "code": "2281                     conn.execute(\n2282                         f\"DELETE FROM failed_chunks WHERE id IN ({placeholders})\",\n2283                         clear_ids,\n",
+      "col_offset": 24,
+      "end_col_offset": 81,
       "filename": "backend/app/services/document_processor.py",
       "issue_confidence": "MEDIUM",
       "issue_cwe": {
@@ -3609,16 +3609,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 2243,
+      "line_number": 2282,
       "line_range": [
-        2243
+        2282
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "130             conn.execute(\n131                 f\"UPDATE files SET {', '.join(sets)} WHERE id = ?\",\n132                 params,\n",
+      "code": "172             conn.execute(\n173                 f\"UPDATE files SET {', '.join(sets)} WHERE id = ?\",\n174                 params,\n",
       "col_offset": 16,
       "end_col_offset": 66,
       "filename": "backend/app/services/document_progress.py",
@@ -3629,9 +3629,9 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 131,
+      "line_number": 173,
       "line_range": [
-        131
+        173
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
@@ -4554,7 +4554,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "3462         # Create a deterministic seed from the text\n3463         seed_value = int(hashlib.md5(text.encode(\"utf-8\")).hexdigest(), 16) % (2**32)\n3464         random.seed(seed_value)\n",
+      "code": "3483         # Create a deterministic seed from the text\n3484         seed_value = int(hashlib.md5(text.encode(\"utf-8\")).hexdigest(), 16) % (2**32)\n3485         random.seed(seed_value)\n",
       "col_offset": 25,
       "end_col_offset": 58,
       "filename": "backend/app/services/vector_store.py",
@@ -4565,9 +4565,9 @@
       },
       "issue_severity": "HIGH",
       "issue_text": "Use of weak MD5 hash for security. Consider usedforsecurity=False",
-      "line_number": 3463,
+      "line_number": 3484,
       "line_range": [
-        3463
+        3484
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b324_hashlib.html",
       "test_id": "B324",

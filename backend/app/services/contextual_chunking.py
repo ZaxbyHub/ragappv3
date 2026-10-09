@@ -143,9 +143,7 @@ class ContextualChunker:
             return escaped_doc[:doc_budget]
         head = usable // 2
         tail = usable - head
-        view = (
-            escaped_doc[:head] + marker + escaped_doc[len(escaped_doc) - tail :]
-        )
+        view = escaped_doc[:head] + marker + escaped_doc[len(escaped_doc) - tail :]
         if len(escaped_doc) > len(view):
             message = (
                 f"Document view truncated from {len(escaped_doc)} to "
@@ -344,7 +342,11 @@ class ContextualChunker:
         Generate and add context to a single chunk.
 
         Uses the LLM to generate a context prefix and prepends it to the
-        chunk text. Always sets contextualized=True in metadata, even on failure.
+        chunk text. Sets contextualized=True in metadata on success; on LLM
+        failure the flag is set to False and the chunk text is left unchanged
+        (issue #704, T1-25-KR-15 — this docstring previously claimed the flag
+        was always True; the pinned test
+        test_metadata_contextualized_always_set documents the False branch).
 
         Args:
             chunk: The ProcessedChunk to modify.

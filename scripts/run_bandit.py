@@ -264,7 +264,7 @@ def update_baseline() -> int:
         sys.stderr.write("run_bandit: failed to generate baseline JSON\n")
         return 1
     data = _normalize_for_commit(data)
-    with open(BASELINE, "w", encoding="utf-8") as fh:
+    with open(BASELINE, "w", encoding="utf-8", newline="\n") as fh:
         json.dump(data, fh, indent=2, sort_keys=True)
         fh.write("\n")
 
