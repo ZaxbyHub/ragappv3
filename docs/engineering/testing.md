@@ -74,7 +74,11 @@ vaults, sessions, durable-turn batch writes, and progressive SSE with
 
 ```bash
 cd frontend && npm ci && npm run build
-cd e2e && npm ci && npx playwright install --with-deps chromium && npx playwright test
+cd e2e && npm ci && npx playwright install --with-deps chromium
+# Smoke suite (always name the specs — a bare run absorbs the a11y matrix):
+npx playwright test chat-smoke.spec.ts first-run-baseline.m01.spec.ts activity-tray.m04.spec.ts chat-width-budget.a07.spec.ts
+# A11y matrix (its own CI job; needs the frontend build above):
+npx playwright test a11y-matrix.spec.ts
 ```
 
 Write specs with resilient selectors (roles/aria-labels) and remember two

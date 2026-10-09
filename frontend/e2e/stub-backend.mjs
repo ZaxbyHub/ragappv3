@@ -277,7 +277,9 @@ function addMessage(sessionId, { role, content, sources = null, turn_id = null, 
 // Two tiers, per the frozen a11y-matrix.spec.ts seeding contract:
 //   STATIC (always served, no seed call needed): /api/settings,
 //   /api/users/, /api/groups, /api/auth/sessions, /api/draft-room/
-//   capabilities, /api/canvas/capabilities. GET /api/organizations/ is
+//   capabilities. /api/canvas/capabilities is always SERVED but its VALUE
+//   is seed-gated (enabled flips false->true on a11y-seed; review PRR-003).
+//   GET /api/organizations/ is
 //   always SERVED but returns [] until the a11y seed runs —
 //   first-run-baseline.m01.spec.ts reads this endpoint on /vaults and must
 //   not observe fixture rows.
