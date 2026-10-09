@@ -365,6 +365,7 @@ def test_ci_job_display_names_parser():
         "Frontend",
         "Playwright e2e smoke",
         "Quality contracts",
+        "Playwright a11y matrix",
         "Detect docker scope",
         "Docker build smoke",
         "SAST (bandit)",
