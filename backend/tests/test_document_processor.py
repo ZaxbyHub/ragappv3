@@ -11,18 +11,20 @@ import unittest
 from pathlib import Path
 
 # Add parent directory to path for imports
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 # Stub missing optional dependencies
 try:
     import lancedb
 except ImportError:
     import types
-    sys.modules['lancedb'] = types.ModuleType('lancedb')
+
+    sys.modules["lancedb"] = types.ModuleType("lancedb")
 
 try:
     import pyarrow
-    if not hasattr(pyarrow, 'Array'):
+
+    if not hasattr(pyarrow, "Array"):
         # A stub module (no Array attribute) was registered by an earlier test
         # file. pandas needs pyarrow.Array and pyarrow.ChunkedArray for its
         # internal is_pyarrow_array() check. Provide dummy classes so pandas
@@ -33,15 +35,15 @@ try:
             def __instancecheck__(cls, instance):
                 return False
 
-        _stub_class = _StubMeta('_PyArrowStub', (), {})
+        _stub_class = _StubMeta("_PyArrowStub", (), {})
 
         class _PyArrowModule(types.ModuleType):
             def __getattr__(self, name):
                 return _stub_class
 
-        _pa = _PyArrowModule('pyarrow')
+        _pa = _PyArrowModule("pyarrow")
         _pa.__dict__.update(pyarrow.__dict__)
-        sys.modules['pyarrow'] = _pa
+        sys.modules["pyarrow"] = _pa
 except ImportError:
     import types
 
@@ -49,43 +51,46 @@ except ImportError:
         def __instancecheck__(cls, instance):
             return False
 
-    _stub_class = _StubMeta('_PyArrowStub', (), {})
+    _stub_class = _StubMeta("_PyArrowStub", (), {})
 
     class _PyArrowModule(types.ModuleType):
         def __getattr__(self, name):
             return _stub_class
 
-    _pa = _PyArrowModule('pyarrow')
-    sys.modules['pyarrow'] = _pa
+    _pa = _PyArrowModule("pyarrow")
+    sys.modules["pyarrow"] = _pa
 
 try:
     from unstructured.partition.auto import partition
 except ImportError:
     import types
-    _unstructured = types.ModuleType('unstructured')
+
+    _unstructured = types.ModuleType("unstructured")
     _unstructured.__path__ = []
-    _unstructured.partition = types.ModuleType('unstructured.partition')
+    _unstructured.partition = types.ModuleType("unstructured.partition")
     _unstructured.partition.__path__ = []
-    _unstructured.partition.auto = types.ModuleType('unstructured.partition.auto')
+    _unstructured.partition.auto = types.ModuleType("unstructured.partition.auto")
     _unstructured.partition.auto.partition = lambda *args, **kwargs: []
-    _unstructured.chunking = types.ModuleType('unstructured.chunking')
+    _unstructured.chunking = types.ModuleType("unstructured.chunking")
     _unstructured.chunking.__path__ = []
-    _unstructured.chunking.title = types.ModuleType('unstructured.chunking.title')
+    _unstructured.chunking.title = types.ModuleType("unstructured.chunking.title")
     _unstructured.chunking.title.chunk_by_title = lambda *args, **kwargs: []
-    _unstructured.documents = types.ModuleType('unstructured.documents')
+    _unstructured.documents = types.ModuleType("unstructured.documents")
     _unstructured.documents.__path__ = []
-    _unstructured.documents.elements = types.ModuleType('unstructured.documents.elements')
-    _unstructured.documents.elements.Element = type('Element', (), {})
-    sys.modules['unstructured'] = _unstructured
-    sys.modules['unstructured.partition'] = _unstructured.partition
-    sys.modules['unstructured.partition.auto'] = _unstructured.partition.auto
-    sys.modules['unstructured.chunking'] = _unstructured.chunking
-    sys.modules['unstructured.chunking.title'] = _unstructured.chunking.title
-    sys.modules['unstructured.documents'] = _unstructured.documents
-    sys.modules['unstructured.documents.elements'] = _unstructured.documents.elements
+    _unstructured.documents.elements = types.ModuleType(
+        "unstructured.documents.elements"
+    )
+    _unstructured.documents.elements.Element = type("Element", (), {})
+    sys.modules["unstructured"] = _unstructured
+    sys.modules["unstructured.partition"] = _unstructured.partition
+    sys.modules["unstructured.partition.auto"] = _unstructured.partition.auto
+    sys.modules["unstructured.chunking"] = _unstructured.chunking
+    sys.modules["unstructured.chunking.title"] = _unstructured.chunking.title
+    sys.modules["unstructured.documents"] = _unstructured.documents
+    sys.modules["unstructured.documents.elements"] = _unstructured.documents.elements
 
 from app.config import settings
-from app.models.database import SQLiteConnectionPool, init_db
+from app.models.database import SQLiteConnectionPool, init_db, run_migrations
 from app.services.chunk_enrichment import ChunkEnrichment
 from app.services.chunking import ProcessedChunk
 from app.services.document_processor import (
@@ -105,10 +110,11 @@ class TestDocumentProcessor(unittest.TestCase):
         self.temp_dir = tempfile.mkdtemp()
 
         # Create temp sqlite file
-        self.temp_db_path = os.path.join(self.temp_dir, 'test.db')
+        self.temp_db_path = os.path.join(self.temp_dir, "test.db")
 
         # Initialize the database
         init_db(self.temp_db_path)
+        run_migrations(self.temp_db_path)
         conn = sqlite3.connect(self.temp_db_path)
         conn.execute(
             "INSERT OR IGNORE INTO vaults (id, name, description) VALUES (1, 'Default', '')"
@@ -117,7 +123,7 @@ class TestDocumentProcessor(unittest.TestCase):
         conn.close()
 
         # Create temp .sql file with CREATE TABLE statement
-        self.sql_file_path = os.path.join(self.temp_dir, 'test_schema.sql')
+        self.sql_file_path = os.path.join(self.temp_dir, "test_schema.sql")
         sql_content = """
 CREATE TABLE users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -134,7 +140,7 @@ CREATE TABLE posts (
     FOREIGN KEY (user_id) REFERENCES users(id)
 );
 """
-        with open(self.sql_file_path, 'w', encoding='utf-8') as f:
+        with open(self.sql_file_path, "w", encoding="utf-8") as f:
             f.write(sql_content)
 
         # Monkeypatch settings.data_dir so sqlite_path resolves to temp path
@@ -145,7 +151,9 @@ CREATE TABLE posts (
         self.test_pool = SQLiteConnectionPool(self.temp_db_path, max_size=2)
 
         # Create DocumentProcessor instance with pool
-        self.processor = DocumentProcessor(chunk_size_chars=2000, chunk_overlap_chars=200, pool=self.test_pool)
+        self.processor = DocumentProcessor(
+            chunk_size_chars=2000, chunk_overlap_chars=200, pool=self.test_pool
+        )
 
     def tearDown(self):
         """Clean up temporary files."""
@@ -248,20 +256,20 @@ CREATE TABLE posts (
         conn.row_factory = sqlite3.Row
         cursor = conn.execute(
             "SELECT status, chunk_count, chunks_failed FROM files WHERE id = ?",
-            (result.file_id,)
+            (result.file_id,),
         )
         row = cursor.fetchone()
         conn.close()
 
         # Assert status is 'indexed'
         self.assertIsNotNone(row)
-        self.assertEqual(row['status'], 'indexed')
+        self.assertEqual(row["status"], "indexed")
 
         # Assert chunk_count matches number of chunks
-        self.assertEqual(row['chunk_count'], len(result.chunks))
+        self.assertEqual(row["chunk_count"], len(result.chunks))
 
         # No embedding failures occurred, so chunks_failed stays 0 (Issue #221)
-        self.assertEqual(row['chunks_failed'], 0)
+        self.assertEqual(row["chunks_failed"], 0)
 
     def test_process_file_raises_duplicate_error_on_second_call(self):
         """Test that second call with same file raises DuplicateFileError."""
@@ -285,12 +293,12 @@ CREATE TABLE posts (
         # Verify chunk content contains expected table names
         chunk_texts = [chunk.text for chunk in result.chunks]
         self.assertTrue(
-            any('users' in text for text in chunk_texts),
-            "Expected one chunk to contain 'users' table"
+            any("users" in text for text in chunk_texts),
+            "Expected one chunk to contain 'users' table",
         )
         self.assertTrue(
-            any('posts' in text for text in chunk_texts),
-            "Expected one chunk to contain 'posts' table"
+            any("posts" in text for text in chunk_texts),
+            "Expected one chunk to contain 'posts' table",
         )
 
     def test_process_file_marks_error_when_vector_rows_not_visible(self):
@@ -348,8 +356,12 @@ CREATE TABLE posts (
         # Issue #562: persisted error_message is the stable user-facing code;
         # the raw detail ("zero LanceDB rows") stays in the raised exception
         # and the server log only.
+        # issue #704 review (PRR-001): a zero-rows visibility failure IS a
+        # vector-store rejection and persists VECTOR_STORE_FAILED.
         self.assertEqual(
-            row["error_message"], "PARSE_FAILED: document could not be parsed"
+            row["error_message"],
+            "VECTOR_STORE_FAILED: the vector store rejected the write; the "
+            "document itself parsed correctly",
         )
 
     def test_process_file_persists_chunks_failed_on_partial_embedding_failure(self):
@@ -436,7 +448,11 @@ CREATE TABLE posts (
                 # Every batch fails → 100% failure → >50% abort.
                 # With batch_size=1, each text is its own batch; return every
                 # batch index as failed.
-                n_batches = max(1, (len(texts) + max(1, batch_size or 1) - 1) // max(1, batch_size or 1))
+                n_batches = max(
+                    1,
+                    (len(texts) + max(1, batch_size or 1) - 1)
+                    // max(1, batch_size or 1),
+                )
                 embeddings = [None for _ in texts]
                 return (embeddings, list(range(n_batches)))
 
@@ -466,9 +482,7 @@ CREATE TABLE posts (
 
         try:
             with self.assertRaises(DocumentProcessingError):
-                asyncio.run(
-                    self.processor.process_file(self.sql_file_path, vault_id=1)
-                )
+                asyncio.run(self.processor.process_file(self.sql_file_path, vault_id=1))
         finally:
             settings.embedding_batch_size = original_batch_size
 
@@ -930,9 +944,7 @@ CREATE TABLE posts (
                         document_text="indexed text",
                     )
                 )
-            self.assertIn(
-                "LLM offline", "\n".join(captured.output)
-            )
+            self.assertIn("LLM offline", "\n".join(captured.output))
         finally:
             settings.chunk_enrichment_enabled = original_enabled
 
@@ -1000,6 +1012,11 @@ CREATE TABLE posts (
                 task.cancel()
                 with self.assertRaises(asyncio.CancelledError):
                     await task
+                # issue #704 review (PRR-006): the status write now runs as a
+                # referenced detached task — drain it before asserting.
+                pending = list(getattr(self.processor, "_detached_status_tasks", ()))
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
             finally:
                 settings.chunk_enrichment_enabled = original_enabled
 
@@ -1228,7 +1245,9 @@ CREATE TABLE posts (
             settings.reupload_safe_order = original_safe_order
 
         self.assertEqual(vector_store.old_ids, ["89_abcdef01_default_0"])
-        self.assertEqual(vector_store.records[0]["id"], "89_abcdef01_default_0__enriched")
+        self.assertEqual(
+            vector_store.records[0]["id"], "89_abcdef01_default_0__enriched"
+        )
         self.assertIn("Summary: fresh enrichment", vector_store.records[0]["text"])
 
     def test_candidate_enrichment_skips_multiscale_duplicates_by_parent_window(self):
@@ -1260,7 +1279,9 @@ CREATE TABLE posts (
         candidates = self.processor._candidate_chunks_for_enrichment(42, chunks)
 
         self.assertEqual(len(candidates), 2)
-        self.assertEqual([chunk.text for chunk, _ in candidates], ["small window", "second window"])
+        self.assertEqual(
+            [chunk.text for chunk, _ in candidates], ["small window", "second window"]
+        )
 
     def test_candidate_enrichment_keeps_nondefault_chunks_without_parent_windows(self):
         """Non-default chunks without parent offsets must not dedupe by text prefix alone."""
@@ -1281,7 +1302,9 @@ CREATE TABLE posts (
         candidates = self.processor._candidate_chunks_for_enrichment(42, chunks)
 
         self.assertEqual(len(candidates), 2)
-        self.assertEqual([chunk.text for chunk, _ in candidates], [chunks[0].text, chunks[1].text])
+        self.assertEqual(
+            [chunk.text for chunk, _ in candidates], [chunks[0].text, chunks[1].text]
+        )
 
 
 class TestSpreadsheetAdaptiveChunking(unittest.TestCase):
@@ -1294,6 +1317,7 @@ class TestSpreadsheetAdaptiveChunking(unittest.TestCase):
     def tearDown(self):
         """Clean up temp files."""
         import shutil
+
         if os.path.exists(self.temp_dir):
             shutil.rmtree(self.temp_dir)
 
@@ -1322,6 +1346,7 @@ class TestSpreadsheetAdaptiveChunking(unittest.TestCase):
         df.to_csv(csv_path, index=False)
 
         from app.services.document_processor import SpreadsheetParser
+
         parser = SpreadsheetParser()
         chunks = parser.parse(csv_path)
 
@@ -1375,6 +1400,7 @@ class TestSpreadsheetAdaptiveChunking(unittest.TestCase):
         df.to_csv(csv_path, index=False)
 
         from app.services.document_processor import SpreadsheetParser
+
         parser = SpreadsheetParser()
         chunks = parser.parse(csv_path)
 
@@ -1420,6 +1446,7 @@ class TestSpreadsheetAdaptiveChunking(unittest.TestCase):
         df.to_csv(csv_path, index=False)
 
         from app.services.document_processor import SpreadsheetParser
+
         parser = SpreadsheetParser()
         chunks = parser.parse(csv_path)
 
@@ -1450,7 +1477,9 @@ class TestSpreadsheetAdaptiveChunking(unittest.TestCase):
             )
 
         # Verify column-group metadata is present (proves column splitting happened)
-        col_group_chunks = [c for c in chunks if c["metadata"].get("col_group") is not None]
+        col_group_chunks = [
+            c for c in chunks if c["metadata"].get("col_group") is not None
+        ]
         self.assertGreaterEqual(
             len(col_group_chunks),
             1,
@@ -1475,20 +1504,21 @@ class TestSpreadsheetAdaptiveChunking(unittest.TestCase):
         short_val = "s"
         long_val = "x" * 500
 
-        data = {
-            f"col_{i}": [short_val, long_val, short_val] for i in range(num_cols)
-        }
+        data = {f"col_{i}": [short_val, long_val, short_val] for i in range(num_cols)}
         df = pd.DataFrame(data)
 
         csv_path = os.path.join(self.temp_dir, "mixed_rows.csv")
         df.to_csv(csv_path, index=False)
 
         from app.services.document_processor import SpreadsheetParser
+
         parser = SpreadsheetParser()
         chunks = parser.parse(csv_path)
 
         # Should produce multiple chunks due to row 1 column splitting
-        self.assertGreater(len(chunks), 1, "Expected multiple chunks due to column splitting")
+        self.assertGreater(
+            len(chunks), 1, "Expected multiple chunks due to column splitting"
+        )
 
         # Verify all chunks respect max size
         for i, chunk in enumerate(chunks):
@@ -1530,6 +1560,7 @@ class TestSpreadsheetAdaptiveChunking(unittest.TestCase):
         df.to_csv(csv_path, index=False)
 
         from app.services.document_processor import SpreadsheetParser
+
         parser = SpreadsheetParser()
         chunks = parser.parse(csv_path)
 
@@ -1550,7 +1581,11 @@ class TestSpreadsheetAdaptiveChunking(unittest.TestCase):
         all_text = " ".join(c["text"] for c in chunks)
         self.assertIn("col_0", all_text, "col_0 missing")
         self.assertIn("col_5", all_text, "col_5 missing")
-        self.assertIn("huge", all_text, "col_5 value data missing — may have been dropped instead of truncated")
+        self.assertIn(
+            "huge",
+            all_text,
+            "col_5 value data missing — may have been dropped instead of truncated",
+        )
 
     def test_single_column_overflow_truncation(self):
         """
@@ -1571,10 +1606,13 @@ class TestSpreadsheetAdaptiveChunking(unittest.TestCase):
         df.to_csv(csv_path, index=False)
 
         from app.services.document_processor import SpreadsheetParser
+
         parser = SpreadsheetParser()
         chunks = parser.parse(csv_path)
 
-        self.assertEqual(len(chunks), 1, "Expected exactly 1 chunk for single-column overflow")
+        self.assertEqual(
+            len(chunks), 1, "Expected exactly 1 chunk for single-column overflow"
+        )
 
         chunk = chunks[0]
         self.assertLessEqual(
@@ -1582,13 +1620,19 @@ class TestSpreadsheetAdaptiveChunking(unittest.TestCase):
             parser.MAX_CHUNK_CHARS,
             f"Chunk size {len(chunk['text'])} exceeds MAX_CHUNK_CHARS {parser.MAX_CHUNK_CHARS}",
         )
-        self.assertIn("col_overflow", chunk["text"], "Column name missing from truncated chunk")
-        self.assertIn("overflow", chunk["text"], "Cell data missing — value may have been dropped instead of truncated")
+        self.assertIn(
+            "col_overflow", chunk["text"], "Column name missing from truncated chunk"
+        )
+        self.assertIn(
+            "overflow",
+            chunk["text"],
+            "Cell data missing — value may have been dropped instead of truncated",
+        )
         self.assertIsNotNone(
             chunk["metadata"].get("col_group"),
             "col_group metadata missing — column-split path was not taken",
         )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()
