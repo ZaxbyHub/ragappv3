@@ -159,18 +159,22 @@ describe("WikiPageList row selection checkbox hit area (issue #777 AC6 / TQ-sibl
     );
 
     // The per-row checkbox: aria-label "Select <title>", not the select-all.
-    const rowCheckbox = screen
+    // The match must be UNIQUE — a copy edit to the select-all label (e.g.
+    // "Select all") would otherwise satisfy this predicate and silently
+    // measure the wrong control (#777 feedback hardening).
+    const rowCandidates = screen
       .getAllByRole("checkbox")
-      .find(
+      .filter(
         (el) =>
           (el.getAttribute("aria-label") ?? "").startsWith("Select ") &&
           el.getAttribute("aria-label") !== "Select all pages"
       );
-    if (!rowCheckbox) {
+    if (rowCandidates.length !== 1) {
       throw new Error(
-        "source anchor not found: per-row selection checkbox (aria-label 'Select <page title>')"
+        `source anchor not found: expected exactly 1 per-row selection checkbox, found ${rowCandidates.length}`
       );
     }
+    const rowCheckbox = rowCandidates[0];
 
     let box = boxOfClasses(rowCheckbox.getAttribute("class") ?? "");
     // Per the AC: a wrapping <label> with padding may lawfully provide the

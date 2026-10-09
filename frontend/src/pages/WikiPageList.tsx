@@ -180,7 +180,7 @@ export function WikiPageList({ pages, loading, onSelect, vaultId, onRefresh, has
                   }
                 }}
                 onClick={(e) => e.stopPropagation()}
-                className="h-6 w-6 mt-1 shrink-0"
+                className="h-6 w-6 -mt-0.5 shrink-0"
                 aria-label={`Select ${page.title}`}
               />
               <div className="flex items-start justify-between gap-2 flex-1 min-w-0">

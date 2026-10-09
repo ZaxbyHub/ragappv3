@@ -9,20 +9,28 @@
 // destructive-on-background 4.40 — the muted-foreground-on-input 4.44 RED
 // belongs to the frozen C5 check, not this file, because that pair's only
 // text consumer moved to bg-muted; see exclusion 2); GREEN after the
-// #777 token moves. Asserting the FULL-opacity composited token values is
-// deliberate: components layer /NN opacity modifiers over these pairs, and
-// an alpha modifier over a lighter surface can only lower contrast — the
-// exact mistake the input.tsx placeholder comment documented in reverse
-// before #777 corrected it.
+// #777 token moves. The COMPOSITE_PAIRS section additionally asserts the
+// alpha-composited states components actually paint (token x /NN modifier
+// blended over its real under-surface) — full-opacity pairs alone cannot see
+// those, which is exactly how the RejectedFilesBanner dark regression and the
+// Badge hover regression slipped the first cut of this file (#777 feedback).
+// Direction caveat the first cut got wrong: "an alpha modifier over a lighter
+// surface can only lower contrast" holds for light themes, but a DARK theme
+// wash is barely lighter than the background, so a dark foreground's ratio
+// can move either way — composited pairs must be measured, not inferred.
 //
-// Pair scope (25 pairs x 3 themes):
+// Pair scope (25 full-opacity pairs + composited states, x 3 themes):
 //   - every X-foreground token on its own X surface (the system's pairing
 //     convention), plus foreground-family pairs on their base surfaces;
-//   - muted-foreground on every surface it is drawn over (muted, card,
+//   - muted-foreground on every solid surface it is drawn over (muted, card,
 //     background, popover);
 //   - accent-foreground on input (the outline Button's hover surface);
 //   - the status hues (primary/destructive/success/warning) as TEXT on card
-//     and background, the surfaces they are actually painted on.
+//     and background, the surfaces they are actually painted on;
+//   - composited: destructive text on its own /10 wash over background (the
+//     chat error bubble), warning-foreground on warning/95 over background
+//     (ReconnectingBanner), destructive-foreground on destructive/90 over
+//     card (Badge hover).
 //
 // Documented exclusions (each re-checked by the Phase 4.2 sweep predicates,
 // see the #777 trace's 08a):
@@ -46,7 +54,20 @@
 //      -foreground-only member). Related wash margins, all passing today:
 //      DocumentTable rows (hover:bg-muted/50, bg-muted/30 selected) over
 //      their Card under-surface — light success 4.53 hover / 4.63 selected,
-//      warning 4.64, dark destructive 4.77; WikiPageList bulk bar 5.5+.
+//      warning 4.64, dark destructive 4.73 (over card); WikiPageList bulk bar 5.5+.
+//   4. muted-foreground on --accent HOVER surfaces (4.48 light / 3.37 dark /
+//      2.11 high-contrast) and foreground on --accent in high-contrast
+//      (3.50): pre-existing hover-only consumers (DraftClaimsPanel:279,
+//      DraftFindingsPanel:137 pills; Composer hover chips) outside #777's
+//      six findings; the tabs consumer this PR created was fixed by making
+//      the count spans inherit the trigger color. Needs a light/dark
+//      --accent token decision — follow-up, not silently green here.
+//   5. the warning-tint text family (text-warning on bg-warning/10) in LIGHT
+//      theme: full-opacity warning on its own /10 wash is 4.12 light —
+//      below AA until the light --warning token moves (disclosed #777
+//      follow-up). The dark leg passes (7.41) and the solid
+//      warning-foreground-on-warning pair is pinned above; the light /10
+//      family is re-includable the day the token moves.
 
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
@@ -167,6 +188,21 @@ const PAIRS: ReadonlyArray<readonly [string, string]> = [
 
 const THEMES: readonly Theme[] = ["light", "dark", "high-contrast"];
 
+// Composited states components actually paint: [text token, wash hue token,
+// wash alpha, under-surface token, label]. The rendered surface is
+// wash x alpha blended over the under-surface. All values verified >= 4.5 in
+// all three themes with the #777 tokens (see the header for the states that
+// CANNOT be pinned yet — exclusions 4 and 5).
+const COMPOSITE_PAIRS: ReadonlyArray<readonly [string, string, number, string, string]> = [
+  // the chat error bubble (AssistantMessage/MessageBubble): destructive text
+  // on the bg-destructive/10 wash over the page background
+  ["destructive", "destructive", 0.1, "background", "destructive text on destructive/10 over background"],
+  // ReconnectingBanner degraded mode: warning-foreground on bg-warning/95
+  ["warning-foreground", "warning", 0.95, "background", "warning-foreground on warning/95 over background"],
+  // destructive Badge hover (badge.tsx): label on destructive/90 over card
+  ["destructive-foreground", "destructive", 0.9, "card", "destructive-foreground on destructive/90 over card"],
+];
+
 describe("token-contrast guardrail — every text/background token pair meets WCAG AA (issue #777 AC7 / UI-ENH-12)", () => {
   const themes = parseThemes(readFileSync(cssPath, "utf-8"));
 
@@ -206,4 +242,25 @@ describe("token-contrast guardrail — every text/background token pair meets WC
     }
     expect(round2(min)).toBeGreaterThanOrEqual(4.5);
   });
+
+  it.each(COMPOSITE_PAIRS)(
+    "%s on %s/%s over %s is >= 4.5:1 in light, dark and high-contrast",
+    (fg, wash, alpha, under, label) => {
+      let min = Infinity;
+      for (const theme of THEMES) {
+        const fgRgb = themes[theme][fg];
+        const washRgb = themes[theme][wash];
+        const underRgb = themes[theme][under];
+        expect(fgRgb, `${theme} --${fg}`).toBeDefined();
+        expect(washRgb, `${theme} --${wash}`).toBeDefined();
+        expect(underRgb, `${theme} --${under}`).toBeDefined();
+        // the rendered surface: wash hue x alpha over the under-surface
+        const surface = washRgb.map(
+          (v, i) => v * alpha + underRgb[i] * (1 - alpha)
+        ) as Rgb;
+        min = Math.min(min, contrastRatio(fgRgb, surface));
+      }
+      expect(round2(min), label).toBeGreaterThanOrEqual(4.5);
+    }
+  );
 });

@@ -74,7 +74,7 @@ export function ReindexConfirmDialog({
           <Button
             onClick={onConfirm}
             disabled={saving}
-            className="bg-warning hover:bg-warning/90 text-warning-foreground"
+            className="bg-warning hover:bg-warning text-warning-foreground"
           >
             {saving ? "Saving…" : "Save and acknowledge"}
           </Button>

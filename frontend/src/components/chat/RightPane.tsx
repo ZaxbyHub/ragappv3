@@ -840,7 +840,7 @@ export function RightPane() {
           <TabsTrigger value="sources" className="text-xs flex items-center gap-1.5">
             Sources
             {hasSources && (
-              <span className="text-[11px] text-muted-foreground">
+              <span className="text-[11px]">
                 ({sources.length})
               </span>
             )}
@@ -851,7 +851,7 @@ export function RightPane() {
           <TabsTrigger value="extracted" disabled={!hasStructuredOutputs} className="text-xs flex items-center gap-1.5">
             Extracted
             {hasStructuredOutputs && (
-              <span className="text-[11px] text-muted-foreground">
+              <span className="text-[11px]">
                 ({structuredOutputs.length})
               </span>
             )}
@@ -859,7 +859,7 @@ export function RightPane() {
           {hasWikiRefs && (
             <TabsTrigger value="wiki" className="text-xs flex items-center gap-1.5">
               Wiki
-              <span className="text-[11px] text-muted-foreground">
+              <span className="text-[11px]">
                 ({lastCompletedWikiRefs!.length})
               </span>
             </TabsTrigger>
@@ -867,7 +867,7 @@ export function RightPane() {
           {hasKmsRefs && (
             <TabsTrigger value="kms">
               Knowledge
-              <span className="ml-1.5 text-xs text-muted-foreground">
+              <span className="ml-1.5 text-xs">
                 ({lastCompletedKmsRefs!.length})
               </span>
             </TabsTrigger>

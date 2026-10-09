@@ -715,9 +715,11 @@
        foreground: no single value can pair a light foreground at >= 4.5:1
        while also serving as text on dark surfaces (empty window, #777),
        the same pattern dark --primary/--primary-foreground already uses.
-       62% clears AA in every role: dark-fg on token 5.55, on /10 tint
-       4.97, on /90 rest 4.70, and the token as text on card 5.18. Do not
-       put white text on this token. */
+       62% clears AA in every role: dark-fg on token 5.55, on /90 rest
+       4.70, and the token as text on card 5.18 / on its own /10 tint 4.97.
+       Do not put white text on this token — and on a /NN wash of this hue,
+       text must be the hue token itself (the dark foreground on a /10 wash
+       computes ~1.1:1; #777 feedback). */
     --destructive: 345 50% 62%;
     --destructive-foreground: 210 12% 7%;
     
@@ -726,7 +728,10 @@
        these mid-tone greens computes 2.10-3.79:1, below AA; the dark
        foreground gives 5.42-8.94:1. --success-foreground currently has no
        class consumer beyond the @theme mapping; the pair is contract-
-       pinned by src/index.css.contrast.test.ts (#777). */
+       pinned by src/index.css.contrast.test.ts (#777). Note for /10 wash
+       consumers: on a /NN wash of one of these hues the TEXT token must be
+       the hue itself (--warning etc.), never the foreground — the dark
+       foreground on its own /10 wash computes ~1.1:1 (#777 feedback). */
     --success: 142 60% 50%;
     --success-foreground: 210 12% 7%;
     --success-subdued: 142 45% 42%;

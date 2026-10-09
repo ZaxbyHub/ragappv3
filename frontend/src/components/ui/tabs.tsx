@@ -35,8 +35,13 @@ const TabsTrigger = React.forwardRef<
     className={cn(
       // hover:bg-accent keeps the hover label pair (accent-foreground on
       // accent) at 12.56/7.83/6.00 across themes now that the strip is
-      // bg-muted (#777).
-      "inline-flex items-center justify-center whitespace-nowrap rounded-sm px-3 py-1.5 text-sm font-medium ring-offset-background transition-all focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 data-[state=active]:bg-background data-[state=active]:text-foreground data-[state=active]:shadow-xs hover:bg-accent hover:text-accent-foreground",
+      // bg-muted (#777). The inset data-[state=active] ring restores a >=3:1
+      // selected-state cue in every theme: the white active pill sits on the
+      // bg-muted strip at only 1.07/1.31/1.20 (light/dark/high-contrast), and
+      // in high-contrast that collapsed from 21:1 when the strip was
+      // bg-input (#777 feedback). ring-foreground vs the strip is
+      // 14.44/12.90/17.55.
+      "inline-flex items-center justify-center whitespace-nowrap rounded-sm px-3 py-1.5 text-sm font-medium ring-offset-background transition-all focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 data-[state=active]:bg-background data-[state=active]:text-foreground data-[state=active]:shadow-xs data-[state=active]:ring-2 data-[state=active]:ring-inset data-[state=active]:ring-foreground hover:bg-accent hover:text-accent-foreground",
       className
     )}
     {...props}

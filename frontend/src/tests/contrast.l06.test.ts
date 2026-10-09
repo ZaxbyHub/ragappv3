@@ -39,6 +39,15 @@
 // The .high-contrast tokens are parsed too (the parser is generic), but per
 // the issue the five checks assert light + dark only.
 
+// Known extraction limits (documented #777 feedback, not silently green):
+//   - extraction reads UNPREFIXED utilities only — a variant-scoped override
+//     (dark:bg-*, hover:bg-*) of a measured token is invisible to these
+//     checks; keep theme/hover overrides of measured tokens out of the
+//     audited strings or extend the extractor deliberately;
+//   - the surface/indicator helpers resolve FIRST match in source order,
+//     not tailwind-merge last-wins — do not reorder measured strings;
+//   - C4 models the ring against --card; with ring-offset-background the
+//     offset band adjoins --background (both frames pass 3:1).
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -87,7 +96,7 @@ function tokenRgb(theme: Record<string, Hsl>, name: string): [number, number, nu
   const x = c * (1 - Math.abs(hp - 1));
   const m = l - c / 2;
   let rgb: [number, number, number];
-  if (h < 60) rgb = [c, 0, x];
+  if (h < 60) rgb = [c, x, 0];
   else if (h < 120) rgb = [x, c, 0];
   else if (h < 180) rgb = [0, c, x];
   else if (h < 240) rgb = [0, x, c];
