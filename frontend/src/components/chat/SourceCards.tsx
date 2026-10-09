@@ -181,7 +181,7 @@ export function SourceCards({ sources, onSourceClick, onViewAll, hideIfEmpty = t
 
   if (sources.length === 0) {
     return (
-      <p className="mt-3 text-xs text-muted-foreground/60 italic">No sources found.</p>
+      <p className="mt-3 text-xs text-muted-foreground italic">No sources found.</p>
     );
   }
 

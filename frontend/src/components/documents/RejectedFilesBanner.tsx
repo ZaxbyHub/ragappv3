@@ -26,7 +26,7 @@ export function RejectedFilesBanner({ files, onDismiss }: RejectedFilesBannerPro
           size="sm"
           onClick={onDismiss}
           aria-label="Dismiss rejected files list"
-          className="h-7 text-xs"
+          className="h-7 text-xs text-foreground"
         >
           Dismiss
         </Button>
