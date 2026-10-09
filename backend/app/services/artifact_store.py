@@ -327,6 +327,20 @@ def sweep_pending_asset_deletes(conn) -> tuple[int, int]:
     removed = 0
     remaining = 0
     for row in rows:
+        # issue #704 review (OOB-5): defense-in-depth for the tombstone-side
+        # filter — never unlink a path a committed document_assets row still
+        # references (the tombstone row is dropped instead; a later delete of
+        # the owning file re-enqueues it).
+        referenced = conn.execute(
+            "SELECT 1 FROM document_assets WHERE file_id = ? AND rel_path = ?",
+            (row["file_id"], row["rel_path"]),
+        ).fetchone()
+        if referenced is not None:
+            conn.execute(
+                "DELETE FROM artifact_delete_pending WHERE id = ?", (row["id"],)
+            )
+            remaining += 1
+            continue
         ok = unlink_asset_rel(row["rel_path"], row["vault_id"])
         if ok:
             conn.execute(

@@ -265,6 +265,25 @@ class TestIssue645DocumentProgressDispatch(unittest.TestCase):
                 f"{name} must acquire its connection via "
                 f"`async with write_session(pool)` (issue #704)",
             )
+            # issue #704 review (PRR-022): the helper must pass ITS pool (not
+            # another object) as write_session's first positional argument.
+            pool_args_ok = all(
+                (
+                    len(item.context_expr.args) >= 1
+                    and isinstance(item.context_expr.args[0], ast.Name)
+                    and item.context_expr.args[0].id == "pool"
+                )
+                for sub in ast.walk(node)
+                if isinstance(sub, ast.AsyncWith)
+                for item in sub.items
+                if isinstance(item.context_expr, ast.Call)
+                and isinstance(item.context_expr.func, ast.Name)
+                and item.context_expr.func.id == "write_session"
+            )
+            self.assertTrue(
+                pool_args_ok,
+                f"{name} must pass its own `pool` to write_session",
+            )
         # The awaited get_connection_async checkout lexically inside a
         # try block (the outer best-effort try), plus a finally block
         # releasing the connection (the inner try/finally) — on write_session.

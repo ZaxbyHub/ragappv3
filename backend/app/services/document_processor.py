@@ -1145,6 +1145,9 @@ class DocumentProcessor:
         # 409 refusal path, and on every re-enqueue so a cancelled ingest
         # never poisons a later ingest of the same row.
         self._cancel_requested: set = set()
+        # issue #704 review (PRR-006): detached (referenced) enrichment-status
+        # writes spawned from a cancelled scope; done-callbacks discard.
+        self._detached_status_tasks: set = set()
 
     def set_llm_client(self, llm_client: Optional[LLMClient]) -> None:
         """Rebind optional ingestion LLM work to a different live client."""
@@ -1352,9 +1355,15 @@ class DocumentProcessor:
         else:
             visible_rows = await self.vector_store.count_by_file(str(file_id))
         if visible_rows <= 0:
-            raise DocumentProcessingError(
+            _vis_error = DocumentProcessingError(
                 f"Vector store visibility check failed: file_id={file_id} has zero LanceDB rows"
             )
+            # issue #704 (PRR-001): a zero-rows visibility failure IS a
+            # vector-store rejection — without this code it persisted as
+            # PARSE_FAILED and an operator could not tell it from a parse
+            # failure.
+            _vis_error.ingest_error_code = INGEST_ERROR_VECTOR_STORE_FAILED
+            raise _vis_error
 
     async def _ensure_live_dimension_compatible(self, embedding_dim: int) -> None:
         """Refuse single-file ingests that would need a dimension migration.
@@ -1534,12 +1543,6 @@ class DocumentProcessor:
                 "Failed to update enrichment status for file_id=%s: %s", file_id, e
             )
             return None
-
-    async def _set_enrichment_status(
-        self, file_id: int, status: str, error_message: Optional[str] = None
-    ) -> Optional[str]:
-        """Backward-compatible wrapper for tests and older call sites."""
-        return await self.set_enrichment_status(file_id, status, error_message)
 
     async def _mark_enrichment_stale_if_current_job(
         self, file_id: int, processing_started_at: Optional[str]
@@ -2318,7 +2321,8 @@ class DocumentProcessor:
                         "(SELECT COUNT(*) FROM failed_chunks WHERE file_id = ?), "
                         "partial_embeddings = (SELECT CASE WHEN COUNT(*) > 0 "
                         "THEN 1 ELSE 0 END FROM failed_chunks WHERE file_id = ?) "
-                        "WHERE id = ?",
+                        "WHERE id = ? "
+                        "AND status IN ('indexed', 'partial')",
                         (file_id, file_id, file_id),
                     )
                 conn.commit()
@@ -2568,18 +2572,23 @@ class DocumentProcessor:
             await self._verify_vector_rows_visible(file_id)
             await self.set_enrichment_status(file_id, "complete")
         except asyncio.CancelledError:
-            # Shielded: the status write must survive a pending cancellation
-            # (the sync-era write always completed; issue #704 made it async).
-            try:
-                await asyncio.shield(
-                    self.set_enrichment_status(
-                        file_id,
-                        "error",
-                        "Enrichment job cancelled before completion",
-                    )
+            # The status write must survive a pending cancellation (the
+            # sync-era write always completed; issue #704 made it async).
+            # Run it as a REFERENCED detached task: a bare asyncio.shield
+            # orphan loses its only reference when this handler re-raises,
+            # so a second cancel or loop close could destroy it mid-write
+            # ("Task was destroyed but it is pending"), leaking the permit
+            # and a pool slot and leaving enrichment_status='processing'
+            # forever (issue #704 review, PRR-006).
+            status_task = asyncio.ensure_future(
+                self.set_enrichment_status(
+                    file_id,
+                    "error",
+                    "Enrichment job cancelled before completion",
                 )
-            except asyncio.CancelledError:
-                pass
+            )
+            self._detached_status_tasks.add(status_task)
+            status_task.add_done_callback(self._detached_status_tasks.discard)
             raise
         except Exception as e:
             # Raw exception stays in the server log; enrichment_error is
@@ -2885,10 +2894,15 @@ class DocumentProcessor:
                 (status, chunk_count, chunks_failed, int(marker), now, now, file_id),
             )
         elif status == "error":
+            # issue #704 review (PRR-002): guarded like the other terminal
+            # writers — an accepted cancel (or an AC3 restore) that landed
+            # between the caller's registry check and this commit must not
+            # be buried under 'error'.
             conn.execute(
                 """UPDATE files
                    SET status = ?, error_message = ?, modified_at = ?
-                   WHERE id = ?""",
+                   WHERE id = ?
+                   AND status IN ('pending', 'processing')""",
                 (status, error_message, now, file_id),
             )
         else:
@@ -3094,15 +3108,21 @@ class DocumentProcessor:
         generation_hash: str,
         parsed: ParsedDocument,
         conn: Optional[sqlite3.Connection] = None,
+        materialized: Optional[List[DocumentAsset]] = None,
     ) -> None:
         """Persist a generation's atoms/assets/stage rows (issue #460).
 
         Production callers pass ``conn`` from a ``_write_session`` so the
-        publish runs under the shared write permit. The ``conn=None`` path
-        (tests and legacy sync callers only) checks out its own pooled
-        connection — a sync function cannot acquire the asyncio permit — and
-        releases it iff it created it; a passed-in connection is never
-        released here (its session owns it).
+        publish runs under the shared write permit, and pre-materialize the
+        asset bytes via ``_materialize_generation_assets`` BEFORE the session
+        so synchronous disk I/O never runs under the permit (issue #704
+        review, PRR-005). The ``conn=None`` path (tests and legacy sync
+        callers only) checks out its own pooled connection — a sync function
+        cannot acquire the asyncio permit — and releases it iff it created
+        it; a passed-in connection is never released here (its session owns
+        it). ``materialized=None`` materializes internally on the given
+        connection's clock (permit-held for callers passing ``conn``), which
+        keeps the test/legacy path byte-compatible.
 
         See ``_publish_artifacts_on`` for the transaction and failure
         contract.
@@ -3111,10 +3131,76 @@ class DocumentProcessor:
         if own_conn:
             conn = self.pool.get_connection()
         try:
-            self._publish_artifacts_on(conn, file_id, vault_id, generation_hash, parsed)
+            if materialized is None:
+                materialized_bucket: List[DocumentAsset] = []
+                try:
+                    self._materialize_generation_assets(
+                        file_id,
+                        vault_id,
+                        generation_hash,
+                        parsed,
+                        bucket=materialized_bucket,
+                    )
+                except Exception:
+                    # issue #704 review: a materialization failure must STILL
+                    # tombstone the partial bytes written so far (issue #460
+                    # property) and pair the failed file with its durable
+                    # publish marker (plan change 6, publish_reached=False
+                    # branch) before re-raising so the caller errors the file.
+                    conn.rollback()
+                    self._tombstone_materialized_assets_on(
+                        conn,
+                        materialized_bucket,
+                        file_id,
+                        vault_id,
+                        generation_hash,
+                    )
+                    self._record_publish_failure(
+                        conn, file_id, vault_id, generation_hash, parsed
+                    )
+                    raise
+                materialized = materialized_bucket
+            self._publish_artifacts_on(
+                conn,
+                file_id,
+                vault_id,
+                generation_hash,
+                parsed,
+                materialized=materialized,
+            )
         finally:
             if own_conn:
                 self.pool.release_connection(conn)
+
+    def _materialize_generation_assets(
+        self,
+        file_id: int,
+        vault_id: int,
+        generation_hash: str,
+        parsed: ParsedDocument,
+        bucket: Optional[List[DocumentAsset]] = None,
+    ) -> List[DocumentAsset]:
+        """Materialize deferred asset bytes to disk (NO connection/permit).
+
+        Split out of the publish transaction so synchronous disk I/O does not
+        extend the shared write permit's hold (issue #704 review, PRR-005).
+        A materialization failure here raises to the caller before any
+        session is opened. ``bucket`` (optional) receives every asset as it
+        materializes, so a mid-loop failure still exposes the partial bytes
+        for tombstoning (issue #460 property).
+        """
+        materialized = bucket if bucket is not None else []
+        for asset in list(parsed.assets):
+            materialized.append(
+                self._materialize_asset(
+                    asset,
+                    parsed.asset_payloads,
+                    file_id,
+                    vault_id,
+                    generation_hash,
+                )
+            )
+        return materialized
 
     def _publish_artifacts_on(
         self,
@@ -3123,6 +3209,7 @@ class DocumentProcessor:
         vault_id: int,
         generation_hash: str,
         parsed: ParsedDocument,
+        materialized: Optional[List[DocumentAsset]] = None,
     ) -> None:
         """Publish one generation on the caller's connection (issue #460/#704).
 
@@ -3138,9 +3225,10 @@ class DocumentProcessor:
         tombstoned for the sweep, and a durable ``stage='publish',
         status='failed_retryable'`` row in ``ingestion_stage_states`` records
         the stranded generation — the marker a later reprocess/reindex
-        republish resolves and the one operators/sweeps can query (issue
-        #704, T1-25-KR-14: the old docstring implied a scheduled republish
-        that nothing scheduled). A materialization (disk I/O) failure before
+        republish resolves and the one operators can query directly (SQL;
+        no automated sweep consumes publish rows — issue #704, T1-25-KR-14,
+        review PRR-013: the prior wording implied machinery that does not
+        exist). A materialization (disk I/O) failure before
         any rows were published re-raises so the caller marks the file
         errored; the marker is recorded on that path too.
         """
@@ -3162,22 +3250,16 @@ class DocumentProcessor:
                 "completed_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
             },
         ]
-        materialized: List[DocumentAsset] = []
+        if materialized is None:
+            materialized = self._materialize_generation_assets(
+                file_id, vault_id, generation_hash, parsed
+            )
         publish_reached = False
         try:
-            # Materialize any deferred asset bytes onto disk inside the protected
-            # region so a partial I/O failure tombstones exactly the bytes written
-            # so far (issue #460 review, PRR-002/012).
-            for asset in asset_specs:
-                materialized.append(
-                    self._materialize_asset(
-                        asset,
-                        parsed.asset_payloads,
-                        file_id,
-                        vault_id,
-                        generation_hash,
-                    )
-                )
+            # Materialization may have happened before the session opened
+            # (production callers, PRR-005); the in-session path above keeps
+            # the issue #460 property that a partial I/O failure tombstones
+            # exactly the bytes written so far.
             publish_reached = True
             artifact_store.publish_generation(
                 conn,
@@ -3241,6 +3323,25 @@ class DocumentProcessor:
         operator (issue #460 reconciliation + issue #704 T1-25-KR-14).
         """
         try:
+            # issue #704 review (concurrency-M11): a FAILED RE-publish of a
+            # generation whose rows are already committed strands nothing
+            # (the rollback restores them) — writing the marker would
+            # overwrite the committed succeeded row. Only a generation with
+            # no committed atoms gets the marker.
+            existing = conn.execute(
+                "SELECT COUNT(*) FROM document_atoms "
+                "WHERE file_id = ? AND generation_hash = ?",
+                (file_id, generation_hash),
+            ).fetchone()[0]
+            if existing:
+                logger.info(
+                    "Publish retry failed for file_id=%s gen=%s but the "
+                    "generation's committed rows are intact; no marker "
+                    "written",
+                    file_id,
+                    generation_hash,
+                )
+                return
             artifact_store.record_stage_failure(
                 conn,
                 file_id=file_id,
@@ -3262,31 +3363,6 @@ class DocumentProcessor:
                 marker_exc,
             )
 
-    def _tombstone_materialized_assets(
-        self,
-        materialized: List[DocumentAsset],
-        file_id: int,
-        vault_id: int,
-        generation_hash: str,
-        conn: Optional[sqlite3.Connection] = None,
-    ) -> None:
-        """Enqueue cleanup of asset bytes written for a failed publish attempt.
-
-        Connection ownership matches ``_publish_artifacts``: production
-        callers pass the session-held conn; ``conn=None`` (tests/legacy)
-        checks out and releases its own.
-        """
-        own_conn = conn is None
-        if own_conn:
-            conn = self.pool.get_connection()
-        try:
-            self._tombstone_materialized_assets_on(
-                conn, materialized, file_id, vault_id, generation_hash
-            )
-        finally:
-            if own_conn:
-                self.pool.release_connection(conn)
-
     def _tombstone_materialized_assets_on(
         self,
         conn: sqlite3.Connection,
@@ -3304,11 +3380,34 @@ class DocumentProcessor:
         if not materialized:
             return
         try:
+            # issue #704 review (OOB-5, pre-existing): a failed RE-publish of
+            # a generation whose asset rows are already committed must not
+            # tombstone bytes those committed rows still reference — filter
+            # the tombstone set against the file's committed rel_paths.
+            committed = {
+                row["rel_path"]
+                for row in conn.execute(
+                    "SELECT rel_path FROM document_assets WHERE file_id = ?",
+                    (file_id,),
+                ).fetchall()
+            }
+            rel_paths = [
+                a.rel_path for a in materialized if a.rel_path not in committed
+            ]
+            if not rel_paths:
+                logger.info(
+                    "Publish compensation for file_id=%s gen=%s: all "
+                    "materialized assets are still referenced by committed "
+                    "rows; nothing tombstoned",
+                    file_id,
+                    generation_hash,
+                )
+                return
             artifact_store.enqueue_asset_cleanup(
                 conn,
                 file_id=file_id,
                 vault_id=vault_id,
-                rel_paths=[a.rel_path for a in materialized],
+                rel_paths=rel_paths,
                 generation_hash=generation_hash,
             )
             conn.commit()
@@ -3834,12 +3933,17 @@ class DocumentProcessor:
             # deadlock once every checkout routes through the shared write
             # permit.
             async with self._write_session() as conn:
-                # Mark wiki_pending=1 synchronously BEFORE the wiki job is created
-                # so the status route can report wiki_status="pending" during the
-                # brief window before the wiki_compile_jobs row exists.
+                # Mark wiki_pending=1 and COMMIT before the wiki job is created
+                # so the status route can report wiki_status="pending" during
+                # the window before the wiki_compile_jobs row exists (issue
+                # #704 review: set+clear inside ONE transaction made the flag
+                # unobservable). A crash in the window strands wiki_pending=1,
+                # exactly like base; the route falls back to the latest job
+                # row and the next ingest clears the flag.
                 conn.execute(
                     "UPDATE files SET wiki_pending = 1 WHERE id = ?", (file_id,)
                 )
+                conn.commit()
                 if settings.wiki_enabled and settings.wiki_compile_on_ingest:
                     _WikiStore(conn).create_job(
                         vault_id=vault_id,
@@ -3968,6 +4072,7 @@ class DocumentProcessor:
         # the insert resets it to 'pending' — a failure that predates any
         # vector write must restore it instead of demoting to 'error'.
         pre_ingest_status: Optional[str] = None
+        pre_ingest_file_hash: Optional[str] = None
         prior_generation_disturbed = False
         async with self._write_session() as conn:
             # Check for duplicates
@@ -3977,11 +4082,18 @@ class DocumentProcessor:
                     f"File with hash {file_hash} already indexed as '{duplicate['file_path']}'"
                 )
 
+            # issue #704 review (PRR-004b): capture the CONTENT hash too —
+            # the insert below overwrites it with the new attempt's hash, and
+            # a restore that left the new hash over the old generation's
+            # vectors would make the duplicate check 409 the new content
+            # forever.
             prior_row = conn.execute(
-                "SELECT status FROM files WHERE file_path = ?", (str(file_path),)
+                "SELECT status, file_hash FROM files WHERE file_path = ?",
+                (str(file_path),),
             ).fetchone()
             if prior_row is not None:
                 pre_ingest_status = prior_row["status"]
+                pre_ingest_file_hash = prior_row["file_hash"]
 
             # Insert or get file record (handles its own commit)
             file_id = self._insert_or_get_file_record(
@@ -4289,7 +4401,7 @@ class DocumentProcessor:
                                     file_id,
                                     exc_info=True,
                                 )
-                            raise DocumentProcessingError(
+                            _abort_error = DocumentProcessingError(
                                 "Too many embedding failures: %d/%d chunks failed (%.0f%%). "
                                 "Aborting document ingest."
                                 % (
@@ -4298,6 +4410,15 @@ class DocumentProcessor:
                                     failure_pct,
                                 ),
                             )
+                            # issue #704 (PRR-001): an embedder outage lands
+                            # here because embed_batch(fail_fast=False)
+                            # converts batch failures to None placeholders —
+                            # without this code the outage persisted as
+                            # PARSE_FAILED.
+                            _abort_error.ingest_error_code = (
+                                INGEST_ERROR_EMBEDDING_FAILED
+                            )
+                            raise _abort_error
                     else:
                         embeddings = batch_embeddings
                     chunk_embeddings = embeddings
@@ -4427,6 +4548,42 @@ class DocumentProcessor:
                     # retired only once the replacement retrieval state is in place.
                     # issue #704 (T1-25-KR-09): the publish runs under the
                     # shared write permit like every other committing write.
+                    # issue #704 review (PRR-005): asset bytes materialize
+                    # BEFORE the session so synchronous disk I/O does not
+                    # extend the permit's hold.
+                    _materialized: List[DocumentAsset] = []
+                    try:
+                        # bucket= exposes partial bytes so a mid-loop disk
+                        # failure still tombstones exactly what was written
+                        # (issue #460 property; delta re-gate).
+                        self._materialize_generation_assets(
+                            file_id,
+                            vault_id,
+                            generation_hash,
+                            parsed,
+                            bucket=_materialized,
+                        )
+                    except Exception:
+                        # issue #704 review: materialization failure still
+                        # pairs the failed file with its durable marker
+                        # (publish_reached=False branch semantics) and
+                        # tombstones the partial bytes.
+                        async with self._write_session() as _mk_conn:
+                            self._tombstone_materialized_assets_on(
+                                _mk_conn,
+                                _materialized,
+                                file_id,
+                                vault_id,
+                                generation_hash,
+                            )
+                            self._record_publish_failure(
+                                _mk_conn,
+                                file_id,
+                                vault_id,
+                                generation_hash,
+                                parsed,
+                            )
+                        raise
                     async with self._write_session() as _pub_conn:
                         self._publish_artifacts(
                             file_id,
@@ -4434,6 +4591,7 @@ class DocumentProcessor:
                             generation_hash,
                             parsed,
                             conn=_pub_conn,
+                            materialized=_materialized,
                         )
         except IngestCancelledError:
             # issue #783: a user cancellation is not a failure — never write
@@ -4465,13 +4623,24 @@ class DocumentProcessor:
                 # demoting the row to 'error'. Guarded so a concurrent
                 # cancel/settle still wins the race.
                 async with self._write_session() as conn:
+                    # issue #704 review (PRR-004): restore the CONTENT hash
+                    # too — the failed attempt overwrote it, and leaving the
+                    # new hash over the old generation's vectors would make
+                    # the duplicate check 409 the new content forever. The
+                    # aborted attempt's failed_chunks rows (parsed from the
+                    # NEW content) are foreign to the restored generation —
+                    # drop them; the pre-attempt counters are unrecoverable
+                    # (the ingest start deleted the ledger), so the restored
+                    # row reports zero remaining chunks.
                     restored = (
                         conn.execute(
-                            "UPDATE files SET status = ?, error_message = ?, "
-                            "modified_at = ? WHERE id = ? "
+                            "UPDATE files SET status = ?, file_hash = ?, "
+                            "chunks_failed = 0, partial_embeddings = 0, "
+                            "error_message = ?, modified_at = ? WHERE id = ? "
                             "AND status IN ('pending', 'processing')",
                             (
                                 pre_ingest_status,
+                                pre_ingest_file_hash,
                                 safe_error,
                                 datetime.now(UTC).isoformat(),
                                 file_id,
@@ -4479,6 +4648,11 @@ class DocumentProcessor:
                         ).rowcount
                         > 0
                     )
+                    if restored:
+                        conn.execute(
+                            "DELETE FROM failed_chunks WHERE file_id = ?",
+                            (file_id,),
+                        )
                     conn.commit()
                 if restored:
                     logger.warning(
@@ -4487,12 +4661,16 @@ class DocumentProcessor:
                         file_id,
                         pre_ingest_status,
                     )
-                    await set_phase(
+                    # clear_progress (not set_phase): a terminal row must not
+                    # keep the aborted attempt's in-flight progress counters
+                    # (PRR-016).
+                    await clear_progress(
                         self.pool,
                         file_id,
                         phase=PHASE_INDEXED,
-                        message="Last ingest attempt failed before replacing "
-                        "the index; the previous version remains searchable",
+                        phase_message="Last ingest attempt failed before "
+                        "replacing the index; the previous version remains "
+                        "searchable",
                     )
                     raise
             # Phase 3: Update status to error on failure
@@ -4658,13 +4836,15 @@ class DocumentProcessor:
         # status in the SAME session, atomically before the flip — a failure
         # that predates any vector write restores it instead of demoting.
         pre_ingest_status: Optional[str] = None
+        pre_ingest_file_hash: Optional[str] = None
         prior_generation_disturbed = False
         async with self._write_session() as conn:
             status_row = conn.execute(
-                "SELECT status FROM files WHERE id = ?", (file_id,)
+                "SELECT status, file_hash FROM files WHERE id = ?", (file_id,)
             ).fetchone()
             if status_row is not None:
                 pre_ingest_status = status_row["status"]
+                pre_ingest_file_hash = status_row["file_hash"]
             flipped = (
                 conn.execute(
                     "UPDATE files SET status = 'processing', modified_at = ? "
@@ -4926,7 +5106,7 @@ class DocumentProcessor:
                                     file_id,
                                     exc_info=True,
                                 )
-                            raise DocumentProcessingError(
+                            _abort_error = DocumentProcessingError(
                                 "Too many embedding failures: %d/%d chunks failed (%.0f%%). "
                                 "Aborting document ingest."
                                 % (
@@ -4935,6 +5115,15 @@ class DocumentProcessor:
                                     failure_pct,
                                 ),
                             )
+                            # issue #704 (PRR-001): an embedder outage lands
+                            # here because embed_batch(fail_fast=False)
+                            # converts batch failures to None placeholders —
+                            # without this code the outage persisted as
+                            # PARSE_FAILED.
+                            _abort_error.ingest_error_code = (
+                                INGEST_ERROR_EMBEDDING_FAILED
+                            )
+                            raise _abort_error
                     else:
                         embeddings = batch_embeddings
                     chunk_embeddings = embeddings
@@ -5079,6 +5268,42 @@ class DocumentProcessor:
                     # new vectors are durable (issue #460).
                     # issue #704 (T1-25-KR-09): the publish runs under the
                     # shared write permit like every other committing write.
+                    # issue #704 review (PRR-005): asset bytes materialize
+                    # BEFORE the session so synchronous disk I/O does not
+                    # extend the permit's hold.
+                    _materialized: List[DocumentAsset] = []
+                    try:
+                        # bucket= exposes partial bytes so a mid-loop disk
+                        # failure still tombstones exactly what was written
+                        # (issue #460 property; delta re-gate).
+                        self._materialize_generation_assets(
+                            file_id,
+                            vault_id,
+                            generation_hash,
+                            parsed,
+                            bucket=_materialized,
+                        )
+                    except Exception:
+                        # issue #704 review: materialization failure still
+                        # pairs the failed file with its durable marker
+                        # (publish_reached=False branch semantics) and
+                        # tombstones the partial bytes.
+                        async with self._write_session() as _mk_conn:
+                            self._tombstone_materialized_assets_on(
+                                _mk_conn,
+                                _materialized,
+                                file_id,
+                                vault_id,
+                                generation_hash,
+                            )
+                            self._record_publish_failure(
+                                _mk_conn,
+                                file_id,
+                                vault_id,
+                                generation_hash,
+                                parsed,
+                            )
+                        raise
                     async with self._write_session() as _pub_conn:
                         self._publish_artifacts(
                             file_id,
@@ -5086,6 +5311,7 @@ class DocumentProcessor:
                             generation_hash,
                             parsed,
                             conn=_pub_conn,
+                            materialized=_materialized,
                         )
         except IngestCancelledError:
             # issue #783: a user cancellation is not a failure — never write
@@ -5118,13 +5344,18 @@ class DocumentProcessor:
                 # demoting the row to 'error'. Guarded so a concurrent
                 # cancel/settle still wins the race.
                 async with self._write_session() as conn:
+                    # issue #704 review (PRR-004): restore the CONTENT hash
+                    # too and drop the aborted attempt's foreign ledger —
+                    # same rationale as the process_file restore block.
                     restored = (
                         conn.execute(
-                            "UPDATE files SET status = ?, error_message = ?, "
-                            "modified_at = ? WHERE id = ? "
+                            "UPDATE files SET status = ?, file_hash = ?, "
+                            "chunks_failed = 0, partial_embeddings = 0, "
+                            "error_message = ?, modified_at = ? WHERE id = ? "
                             "AND status IN ('pending', 'processing')",
                             (
                                 pre_ingest_status,
+                                pre_ingest_file_hash,
                                 safe_error,
                                 datetime.now(UTC).isoformat(),
                                 file_id,
@@ -5132,6 +5363,11 @@ class DocumentProcessor:
                         ).rowcount
                         > 0
                     )
+                    if restored:
+                        conn.execute(
+                            "DELETE FROM failed_chunks WHERE file_id = ?",
+                            (file_id,),
+                        )
                     conn.commit()
                 if restored:
                     logger.warning(
@@ -5141,11 +5377,11 @@ class DocumentProcessor:
                         file_id,
                         pre_ingest_status,
                     )
-                    await set_phase(
+                    await clear_progress(
                         self.pool,
                         file_id,
                         phase=PHASE_INDEXED,
-                        message="Last re-ingest attempt failed before "
+                        phase_message="Last re-ingest attempt failed before "
                         "replacing the index; the previous version remains "
                         "searchable",
                     )

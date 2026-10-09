@@ -100,6 +100,21 @@ class PublishMarkerShapeTest(unittest.TestCase):
         proc.pool = pool
         return proc
 
+
+    def _fresh_marker_count(self) -> int:
+        """Read the marker through a FRESH connection (issue #704 review:
+        reading on the writing connection cannot detect a missing commit —
+        the in-transaction view hides the durability the marker promises)."""
+        fresh = sqlite3.connect(self.sqlite_path)
+        try:
+            return fresh.execute(
+                "SELECT COUNT(*) FROM ingestion_stage_states WHERE file_id = 1"
+                " AND generation_hash = 'genA' AND stage = 'publish'"
+                " AND status = 'failed_retryable'"
+            ).fetchone()[0]
+        finally:
+            fresh.close()
+
     def test_compensated_marker_row_shape(self):
         import unittest.mock as mock
 
@@ -119,10 +134,16 @@ class PublishMarkerShapeTest(unittest.TestCase):
             DocumentProcessor._publish_artifacts(
                 proc, 1, 1, "genA", _parsed(self.asset, self.payloads)
             )
-        row = self.db.execute(
-            "SELECT * FROM ingestion_stage_states WHERE file_id = 1 "
-            "AND generation_hash = 'genA' AND stage = 'publish'"
-        ).fetchone()
+        self.db.close()
+        fresh = sqlite3.connect(self.sqlite_path)
+        fresh.row_factory = sqlite3.Row
+        try:
+            row = fresh.execute(
+                "SELECT * FROM ingestion_stage_states WHERE file_id = 1 "
+                "AND generation_hash = 'genA' AND stage = 'publish'"
+            ).fetchone()
+        finally:
+            fresh.close()
         self.assertIsNotNone(row)
         self.assertEqual(row["status"], "failed_retryable")
         self.assertEqual(row["error_code"], "PUBLISH_COMPENSATED")
@@ -150,12 +171,9 @@ class PublishMarkerShapeTest(unittest.TestCase):
                 DocumentProcessor._publish_artifacts(
                     proc, 1, 1, "genA", _parsed(self.asset, self.payloads)
                 )
-        count = self.db.execute(
-            "SELECT COUNT(*) FROM ingestion_stage_states WHERE file_id = 1 "
-            "AND generation_hash = 'genA' AND stage = 'publish' "
-            "AND status = 'failed_retryable'"
-        ).fetchone()[0]
-        self.assertEqual(count, 1)
+        self.db.close()
+        self.assertEqual(self._fresh_marker_count(), 1)
+        self.db = sqlite3.connect(self.sqlite_path)
 
     def test_fallback_conn_ownership_no_leak(self):
         import unittest.mock as mock

@@ -229,6 +229,8 @@ class TestWikiJobEnqueueGating(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(wiki_writes), 2)
         self.assertIn("wiki_pending = 1", str(wiki_writes[0].args[0]))
         self.assertIn("wiki_pending = 0", str(wiki_writes[1].args[0]))
+        self.assertIn(123, wiki_writes[0].args[1])
+        self.assertIn(123, wiki_writes[1].args[1])
 
     async def test_wiki_job_not_created_when_wiki_compile_on_ingest_false(self):
         """When wiki_compile_on_ingest=False, _WikiStore.create_job must NOT be called."""
@@ -248,6 +250,8 @@ class TestWikiJobEnqueueGating(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(wiki_writes), 2)
         self.assertIn("wiki_pending = 1", str(wiki_writes[0].args[0]))
         self.assertIn("wiki_pending = 0", str(wiki_writes[1].args[0]))
+        self.assertIn(123, wiki_writes[0].args[1])
+        self.assertIn(123, wiki_writes[1].args[1])
 
     async def test_wiki_job_created_when_both_flags_true(self):
         """When both wiki_enabled AND wiki_compile_on_ingest are True, create_job MUST be called."""
@@ -274,6 +278,8 @@ class TestWikiJobEnqueueGating(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(wiki_writes), 2)
         self.assertIn("wiki_pending = 1", str(wiki_writes[0].args[0]))
         self.assertIn("wiki_pending = 0", str(wiki_writes[1].args[0]))
+        self.assertIn(123, wiki_writes[0].args[1])
+        self.assertIn(123, wiki_writes[1].args[1])
 
     async def test_wiki_pending_flag_always_cleared(self):
         """Verify wiki_pending is always cleared after processing, regardless of gating."""

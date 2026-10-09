@@ -356,8 +356,12 @@ CREATE TABLE posts (
         # Issue #562: persisted error_message is the stable user-facing code;
         # the raw detail ("zero LanceDB rows") stays in the raised exception
         # and the server log only.
+        # issue #704 review (PRR-001): a zero-rows visibility failure IS a
+        # vector-store rejection and persists VECTOR_STORE_FAILED.
         self.assertEqual(
-            row["error_message"], "PARSE_FAILED: document could not be parsed"
+            row["error_message"],
+            "VECTOR_STORE_FAILED: the vector store rejected the write; the "
+            "document itself parsed correctly",
         )
 
     def test_process_file_persists_chunks_failed_on_partial_embedding_failure(self):
@@ -1008,6 +1012,11 @@ CREATE TABLE posts (
                 task.cancel()
                 with self.assertRaises(asyncio.CancelledError):
                     await task
+                # issue #704 review (PRR-006): the status write now runs as a
+                # referenced detached task — drain it before asserting.
+                pending = list(getattr(self.processor, "_detached_status_tasks", ()))
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
             finally:
                 settings.chunk_enrichment_enabled = original_enabled
 

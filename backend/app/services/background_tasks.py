@@ -2182,9 +2182,14 @@ class BackgroundProcessor:
                     continue
 
                 async with self.processor.pool.connection_async() as conn:
+                    # issue #704 review (PRR-011): guarded like the sibling
+                    # reset — the sweep's row set is a snapshot, so a row that
+                    # settled through another path between SELECT and UPDATE
+                    # must not be demoted or have its error wiped.
                     conn.execute(
                         "UPDATE files SET status='pending', phase='queued', "
-                        "error_message=NULL WHERE id = ?",
+                        "error_message=NULL WHERE id = ? "
+                        "AND status = 'processing'",
                         (row_id,),
                     )
                     conn.commit()
@@ -3244,6 +3249,13 @@ class BackgroundProcessor:
             state = getattr(self, state_name, None)
             if state is not None:
                 state.clear()
+        # issue #704 review (PRR-009): release the pool-carried permit so
+        # post-stop writers return to the documented no-serialization
+        # contract instead of acquiring an orphaned loop-bound semaphore.
+        if getattr(self.processor, "pool", None) is not None:
+            self.processor.pool.write_permit = None
+        self.processor._write_semaphore = None
+        self._write_semaphore = None
         self._running = False
         logger.info("Background processor stopped")
 

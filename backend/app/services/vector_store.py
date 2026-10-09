@@ -1161,7 +1161,9 @@ class VectorStore:
             expected_dim = target.dim
         else:
             if self.table is None:
-                raise RuntimeError("Table not initialized. Call init_table() first.")
+                raise VectorStoreError(
+                    "Table not initialized. Call init_table() first."
+                )
             table = self.table
             # Get expected embedding dimension from table schema
             expected_dim = await self._get_expected_embedding_dim()
@@ -1285,12 +1287,19 @@ class VectorStore:
                             len(incoming_ids),
                         )
                         t0 = time.monotonic()
-                        await (
-                            table.merge_insert(on="id")
-                            .when_matched_update_all()
-                            .when_not_matched_insert_all()
-                            .execute(processed_records)
-                        )
+                        try:
+                            await (
+                                table.merge_insert(on="id")
+                                .when_matched_update_all()
+                                .when_not_matched_insert_all()
+                                .execute(processed_records)
+                            )
+                        except Exception as e:
+                            # issue #704 (PRR-001): same classification
+                            # contract as the plain-add wrap above.
+                            raise VectorStoreError(
+                                f"lancedb upsert failed: {e}"
+                            ) from e
                         timings["vector_write_ms"] += (
                             time.monotonic() - t0
                         ) * 1000
@@ -1315,7 +1324,14 @@ class VectorStore:
 
         if not upserted:
             t0 = time.monotonic()
-            await table.add(processed_records)
+            try:
+                await table.add(processed_records)
+            except Exception as e:
+                # issue #704 (PRR-001): a raw lance write failure classified
+                # as PARSE_FAILED downstream; raise the store's own error
+                # family so classify_ingest_error maps it to
+                # VECTOR_STORE_FAILED.
+                raise VectorStoreError(f"lancedb add failed: {e}") from e
             timings["vector_write_ms"] += (time.monotonic() - t0) * 1000
 
         if target is not None:
