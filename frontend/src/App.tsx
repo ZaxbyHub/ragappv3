@@ -154,8 +154,11 @@ function MainAppShell({ children, testMode = false }: { children: React.ReactNod
   const navigate = useNavigate();
   const location = useLocation();
 
-  // Determine active nav item from current route
-  const getActiveItemFromPath = (pathname: string): NavItemId => {
+  // Determine active nav item from current route. null means no nav item
+  // owns the route (e.g. /search, per its own route comment) — the mobile
+  // bottom nav then marks nothing aria-current, matching the desktop rail's
+  // own null-returning mapper (issue #779 / UI-R1-08).
+  const getActiveItemFromPath = (pathname: string): NavItemId | null => {
     if (pathname.startsWith("/chat")) return "chat";
     if (pathname.startsWith("/documents")) return "documents";
     if (pathname.startsWith("/memory")) return "memory";
@@ -168,7 +171,7 @@ function MainAppShell({ children, testMode = false }: { children: React.ReactNod
     if (pathname.startsWith("/admin/users")) return "users";
     if (pathname.startsWith("/admin/organizations")) return "organizations";
     if (pathname.startsWith("/profile")) return "profile";
-    return "documents";
+    return null;
   };
 
   const activeItem = getActiveItemFromPath(location.pathname);
@@ -249,9 +252,48 @@ function MainAppShell({ children, testMode = false }: { children: React.ReactNod
   );
 }
 
+// Demo user for the dev-only fixture mode (moved from ProtectedRoute with
+// issue #779 / UI-R3-08 — see seedDemoSession below).
+function getDemoUser() {
+  const role = import.meta.env.VITE_DEMO_ROLE || "superadmin";
+  return {
+    id: 1,
+    username: import.meta.env.VITE_DEMO_USERNAME || "demo",
+    full_name: import.meta.env.VITE_DEMO_FULL_NAME || "Demo User",
+    role: role as "superadmin" | "admin" | "member" | "viewer",
+    is_active: true,
+  };
+}
+
+// Issue #779 (UI-R3-08): seed the demo session synchronously, BEFORE any
+// guard or auth-reading page renders. The old seed lived in ProtectedRoute's
+// useEffect — one commit too late for RoleGuard's synchronous
+// isAuthenticated read (every /admin/* visit bounced to /login on the first
+// render) and invisible to LoginPage/SetupPage, which skip init() in test
+// mode and spun on needsSetup === null forever. Writing here, in App's
+// render before the router subtree mounts, makes the same seed visible to
+// all three consumers on the very first render. The write is mock-safe:
+// suites that stub useAuthStore as a bare selector (no setState) no-op
+// through the optional call; on the first render no other component is
+// subscribed yet, and the isAuthenticated guard keeps it idempotent
+// (re-seeding after logout matches the old effect's behavior).
 function App() {
   const initAuth = useAuthStore((state) => state.init);
+  const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
   const health = useHealthCheck({ pollInterval: 30000 });
+
+  if (TEST_MODE && !isAuthenticated) {
+    const setState = useAuthStore.setState as typeof useAuthStore.setState | undefined;
+    setState?.({
+      user: getDemoUser(),
+      accessToken: "demo-token",
+      isAuthenticated: true,
+      isInitialized: true,
+      needsSetup: false,
+      isLoading: false,
+      authMode: "jwt",
+    });
+  }
 
   useEffect(() => {
     if (!TEST_MODE) {

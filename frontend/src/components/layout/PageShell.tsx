@@ -2,6 +2,7 @@ import { ReactNode, useEffect, useState } from "react";
 import { useLocation } from "react-router-dom";
 import { motion, AnimatePresence, useReducedMotion } from "framer-motion";
 import { Navigation } from "./Navigation";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { ActivityTray } from "./ActivityTray";
 import { UploadIndicator } from "@/components/shared/UploadIndicator";
 import UnconfiguredChatBanner from "@/components/UnconfiguredChatBanner";
@@ -12,7 +13,8 @@ import type { NavItemId } from "./navigationTypes";
 
 interface PageShellProps {
   children: ReactNode;
-  activeItem: NavItemId;
+  // null = no nav item owns the route (issue #779 / UI-R1-08).
+  activeItem: NavItemId | null;
   onItemSelect: (id: NavItemId) => void;
   healthStatus: HealthStatus;
 }
@@ -106,19 +108,36 @@ export function PageShell({ children, activeItem, onItemSelect, healthStatus }: 
             branch caps the content measure so `mx-auto` actually centers wide
             screens. Desktop chat keeps its exact edge-to-edge layout (md:pb-0). */}
         <div className={isChat ? "flex-1 min-h-0 overflow-hidden pb-20 md:pb-0" : "flex-1 min-h-0 p-6 lg:p-8 overflow-auto pb-20 md:pb-6 max-w-[1536px] mx-auto w-full"}>
-          <AnimatePresence mode="wait">
-            <motion.div
-              key={location.pathname}
-              variants={pageVariants}
-              initial="initial"
-              animate="animate"
-              exit="exit"
-              transition={{ duration: prefersReducedMotion ? 0.1 : 0.15, ease: "easeOut" }}
-              className="h-full"
-            >
-              {children}
-            </motion.div>
-          </AnimatePresence>
+          {/* Issue #779 (UI-R2-06): route-scoped containment. The only
+              other boundary wraps the whole router (App.tsx), so a page
+              render error used to unmount navigation entirely and its
+              Retry re-rendered the same cached failing tree. This boundary
+              is keyed by pathname and sits OUTSIDE AnimatePresence so a
+              navigation remounts it instantly — the crashed fallback cannot
+              hold the screen through the page-transition exit animation
+              (mode="wait" delayed recovery past a user's perception of
+              "navigated away"). Trade-off, accepted with issue #779: shell
+              route transitions lose the exit half of the cross-fade (the
+              old page unmounts with the keyed boundary; the enter
+              animation is preserved). The fallback is the default
+              ErrorBoundary copy ("Something went wrong" + Try Again)
+              scoped to the page area; the top-level boundary remains as
+              the last resort. */}
+          <ErrorBoundary key={location.pathname}>
+            <AnimatePresence mode="wait">
+              <motion.div
+                key={location.pathname}
+                variants={pageVariants}
+                initial="initial"
+                animate="animate"
+                exit="exit"
+                transition={{ duration: prefersReducedMotion ? 0.1 : 0.15, ease: "easeOut" }}
+                className="h-full"
+              >
+                {children}
+              </motion.div>
+            </AnimatePresence>
+          </ErrorBoundary>
         </div>
       </main>
 
