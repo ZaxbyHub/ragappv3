@@ -472,7 +472,7 @@ def test_delete_stale_multiscale_only_when_requested_and_confirmed(
     }
 
 
-def test_delete_orphan_file_ids_removes_only_rows_without_indexed_sqlite_file(
+def test_delete_orphan_file_ids_deletes_only_unprotected_rows(
     capsys, monkeypatch, tmp_path
 ):
     exit_code, table = run_main(

@@ -8,7 +8,9 @@ Issue #705: the SQLite status reset runs BEFORE the LanceDB wipe (the same
 ordering scripts/migrate_embeddings.py adopted for issue #694). The wipe is
 the only irreversible step, so a failed or interrupted SQLite reset leaves
 the old vectors intact as the rollback source instead of stranding rows that
-claim vectors over an empty index.
+claim vectors over an empty index. If the wipe step itself fails after the
+reset has committed, simply re-run this script: the reset is idempotent and
+the wipe resumes from wherever it stopped.
 """
 
 import shutil
@@ -27,7 +29,6 @@ RESET_TABLE_STATUSES = ("indexed", "partial", "pending")
 
 def _table_columns(conn: sqlite3.Connection) -> set[str]:
     """Column names of the ``files`` table (empty when the table is absent)."""
-    # nosec B608 - static table literal, never user input
     cursor = conn.execute("PRAGMA table_info(files)")
     return {row[1] for row in cursor.fetchall()}
 
@@ -67,6 +68,8 @@ def reset_all_embeddings():
             set_fragments.append("error_message = NULL")
 
         placeholders = ", ".join("?" for _ in RESET_TABLE_STATUSES)
+        # nosec B608 - the SET fragments and WHERE statuses are literal SQL /
+        # bound parameters; no user input is interpolated.
         cursor = conn.execute(
             "UPDATE files SET "
             + ", ".join(set_fragments)
@@ -101,9 +104,14 @@ def reset_all_embeddings():
     print("   Recommended: qwen3-embed:4b (text embedding)")
     print("   Note: qwen3-vl-embedding-2b is vision-language, not ideal for text RAG")
     print("2. Restart backend service:")
-    print("   docker compose restart backend")
+    print("   docker compose restart knowledgevault")
     print(
         f"3. Background processor will auto-reprocess the {updated_count} reset file(s)"
+    )
+    print(
+        "   (a file whose ingestion retry budget was exhausted by a previous"
+        " run settles to 'error' instead — retry it per-file via the admin"
+        " retry endpoint)"
     )
     print()
 

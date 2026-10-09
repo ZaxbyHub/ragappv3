@@ -70,6 +70,37 @@ def backup_sqlite_fallback(output_dir: Path) -> Path:
     return backup_path
 
 
+def _stage_and_replace(target_path: Path, fill) -> None:
+    """Stage a restore copy and atomically replace ``target_path``.
+
+    Issue #705 review (PRR-001/C01): a restore that truncates the live file
+    in place is torn by any mid-copy failure, and — worse — leaves the
+    target's SQLite sidecars (``-wal``/``-shm``/``-journal``) behind, so the
+    next connection replays the PRE-restore WAL over the restored file and
+    silently resurrects the old database. The staged file makes the copy
+    crash-safe, the sidecars are removed only after staging succeeded, and
+    ``os.replace`` swaps the restored file in atomically. ``copyfile`` plus
+    an explicit writable mode keeps a read-only backup's mode/attribute from
+    propagating to the live database (``copy2``'s ``copystat`` would).
+    """
+    staged = target_path.with_name(target_path.name + ".restore-tmp")
+    try:
+        fill(staged)
+        os.chmod(staged, 0o644)
+        for suffix in ("-wal", "-shm", "-journal"):
+            try:
+                target_path.with_name(target_path.name + suffix).unlink()
+            except FileNotFoundError:
+                pass
+        os.replace(staged, target_path)
+    except BaseException:
+        try:
+            staged.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
 def decrypt_backup(backup_path: Path, target_path: Path | None = None) -> Path:
     """
     Decrypt and restore a backup file.
@@ -94,8 +125,8 @@ def decrypt_backup(backup_path: Path, target_path: Path | None = None) -> Path:
     
     # Simple heuristic: if file starts with SQLite header, it's not encrypted
     if data[:16] == b'SQLite format 3\x00':
-        # Plain SQLite backup - just copy
-        shutil.copy2(backup_path, target_path)
+        # Plain SQLite backup - staged copy + atomic replace
+        _stage_and_replace(target_path, lambda staged: shutil.copyfile(backup_path, staged))
         print(f"Restored plain SQLite backup to {target_path}")
         return target_path
     
@@ -112,7 +143,7 @@ def decrypt_backup(backup_path: Path, target_path: Path | None = None) -> Path:
         nonce = data[:12]
         ciphertext = data[12:]
         plaintext = AESGCM(key).decrypt(nonce, ciphertext, None)
-        target_path.write_bytes(plaintext)
+        _stage_and_replace(target_path, lambda staged: staged.write_bytes(plaintext))
         print(f"Restored encrypted backup using key {key_version}")
         return target_path
     except ImportError:
@@ -140,19 +171,21 @@ def _bootstrap_system_flags(pool: SQLiteConnectionPool) -> None:
         pool.release_connection(conn)
 
 
-def _force_clear_maintenance(sqlite_path: str) -> None:
-    """Best-effort maintenance clear on a connection opened AFTER a restore.
+def _force_clear_maintenance(sqlite_path: str) -> bool:
+    """Clear maintenance mode on a connection opened AFTER a restore.
 
     The pre-migration backup is taken while maintenance is enabled, so a
     restored backup carries maintenance=1 and would boot the app straight
     into maintenance mode (issue #705). The clear handles restored databases
-    in any state (no system_flags table, no maintenance row, row stuck at 1).
-    Its own failure is swallowed with a loud warning: a half-copied database
-    must not turn a successful restore into a crash — but the operator is
-    told the flag may need manual clearing.
+    in any state (no system_flags table, no maintenance row, row stuck at 1)
+    and bumps the flag row's version/reason so the change is auditable.
+
+    Returns True when the clear committed AND a ``PRAGMA quick_check`` on the
+    restored database passes; False otherwise. The caller must treat False
+    as a failed rollback verification, not print an unconditional success.
     """
     try:
-        conn = sqlite3.connect(sqlite_path)
+        conn = sqlite3.connect(sqlite_path, timeout=30)
         try:
             conn.execute(_SYSTEM_FLAGS_DDL)
             conn.execute(
@@ -160,9 +193,14 @@ def _force_clear_maintenance(sqlite_path: str) -> None:
                 " VALUES ('maintenance', 0, 0, '')"
             )
             conn.execute(
-                "UPDATE system_flags SET value = 0 WHERE name = 'maintenance'"
+                "UPDATE system_flags"
+                " SET value = 0, reason = 'rollback maintenance clear',"
+                " version = version + 1"
+                " WHERE name = 'maintenance'"
             )
             conn.commit()
+            check = conn.execute("PRAGMA quick_check").fetchone()
+            return bool(check) and check[0] == "ok"
         finally:
             conn.close()
     except sqlite3.Error as exc:
@@ -171,6 +209,7 @@ def _force_clear_maintenance(sqlite_path: str) -> None:
             " The restored database may boot the application in maintenance"
             " mode — clear it manually (system_flags name='maintenance' -> 0)."
         )
+        return False
 
 
 def migrate(rollback: bool, backup: Path | None, retention: int) -> None:
@@ -200,18 +239,33 @@ def migrate(rollback: bool, backup: Path | None, retention: int) -> None:
             if not backup.exists():
                 raise SystemExit(f"Backup file not found: {backup}")
 
-            # Release every pool handle BEFORE decrypt_backup replaces the
-            # database file: writing through a pre-restore connection to a
-            # just-replaced file is a lost-write/corruption hazard on POSIX
-            # and a sharing violation on Windows (issue #705). This branch
-            # deliberately never enables maintenance — a decrypt_backup
+            print(
+                "WARNING: stop the application before rolling back. The"
+                " restore replaces the database file; a live writer can"
+                " corrupt or resurrect pre-restore content."
+            )
+            # Release every pooled handle BEFORE the restore so no script
+            # connection writes through a replaced database file (issue
+            # #705). The restore itself is staged and atomic and removes the
+            # target's stale WAL sidecars (see _stage_and_replace). This
+            # branch deliberately never enables maintenance — a decrypt_backup
             # failure must not strand maintenance=1 — and returns before the
             # migration try/finally below, whose finally must never run
             # set_flag on the closed pool.
             maintenance_pool.close_all()
             decrypt_backup(backup)
-            _force_clear_maintenance(str(settings.sqlite_path))
-            print(f"Rollback completed successfully from {backup}")
+            if _force_clear_maintenance(str(settings.sqlite_path)):
+                print(f"Rollback completed successfully from {backup}")
+            else:
+                print(
+                    f"Rollback restored {backup}, but the maintenance flag"
+                    " could not be cleared or the restored database failed"
+                    " its integrity check — set system_flags"
+                    " name='maintenance' to 0 manually (and restore from the"
+                    " backup again if integrity failed) before starting the"
+                    " app."
+                )
+                raise SystemExit(1)
             return
 
         # Enable maintenance mode during migration — before the backup and

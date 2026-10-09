@@ -94,7 +94,8 @@ the guard repo-wide so a new on-loop checkout fails CI.
   owner decision). [Amended by #705: that owner decision has now been made —
   the unwired helper, whose `finally` released the pooled connection
   unguarded outside the convention every live caller follows, is removed by
-  issue #705 (S06-SK-05).]
+  issue #705 (S06-SK-05); the module no longer exists, so the site count
+  above is one lower than written.]
 - Adjacent on-loop SQL retained by written disposition (the issue lists both
   as adjacent/bounded-latency; neither performs a pooled checkout on the
   loop, which is the class this issue closes):

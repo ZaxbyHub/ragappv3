@@ -37,8 +37,9 @@ REPORT_LIVE_STATUSES = ("indexed", "partial")
 # live OR in flight. A 'pending' row can legitimately own vectors (the
 # reset_embeddings reset-before-wipe crash window keeps the old index as the
 # rollback source), and 'processing' rows are mid-write. 'error'/'cancelled'
-# rows stay deletable: cancelled ingests roll their vectors back on cancel
-# (issue #783) and error rows are re-enqueued and re-written by recovery.
+# rows stay deletable: they are TERMINAL states — no recovery sweep
+# re-enqueues them, and the only path back to re-ingestion is the per-file
+# admin retry — so their leftover rows are garbage, not live data.
 DELETE_PROTECTED_STATUSES = ("indexed", "partial", "pending", "processing")
 
 
@@ -50,7 +51,11 @@ def _env_bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
     if raw is None:
         return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
+    # Token set matches pydantic-settings' bool coercion for the app's
+    # Settings field (issue #705 review PRR-005): 't'/'y' must resolve the
+    # same way here as they do for the running app, or 'auto' disagrees with
+    # the config it is supposed to mirror.
+    return raw.strip().lower() in {"1", "true", "yes", "on", "t", "y"}
 
 
 def _default_data_dir() -> Path:
@@ -431,19 +436,43 @@ def _protected_file_ids(sqlite_path: Path, file_ids: list[str]) -> set[str]:
     """Return the subset of ``file_ids`` whose files row is delete-protected.
 
     Uses only the ``id``/``status`` columns so minimal schemas (the test
-    harness builds a 5-column files table) stay queryable.
+    harness builds a 5-column files table) stay queryable. Fail-closed: a
+    database that cannot be opened raises instead of reporting an empty
+    protected set (issue #705 review A09). The IN-list is chunked because
+    the parameter count, not the query text, is the binding limit.
     """
-    if not file_ids or not sqlite_path.exists():
+    if not file_ids:
         return set()
-    placeholders = ", ".join("?" for _ in file_ids)
     status_marks = ", ".join("?" for _ in DELETE_PROTECTED_STATUSES)
-    with sqlite3.connect(sqlite_path) as conn:
-        rows = conn.execute(
-            f"SELECT id FROM files WHERE id IN ({placeholders}) "
-            f"AND status IN ({status_marks})",
-            (*file_ids, *DELETE_PROTECTED_STATUSES),
-        ).fetchall()
-    return {str(row[0]) for row in rows}
+    protected: set[str] = set()
+    chunk_size = 500
+    for start in range(0, len(file_ids), chunk_size):
+        batch = file_ids[start : start + chunk_size]
+        placeholders = ", ".join("?" for _ in batch)
+        with sqlite3.connect(sqlite_path, timeout=30) as conn:
+            rows = conn.execute(
+                f"SELECT id FROM files WHERE id IN ({placeholders}) "
+                f"AND status IN ({status_marks})",
+                (*batch, *DELETE_PROTECTED_STATUSES),
+            ).fetchall()
+        protected |= {str(row[0]) for row in rows}
+    return protected
+
+
+def _vault_has_in_flight_files(sqlite_path: Path, vault_id: str) -> bool:
+    """True when the vault still owns a 'processing' (mid-ingest) file.
+
+    A vault-scoped delete is an explicit operator override for everything
+    else (issue #705 AC10 pins that it deletes that vault's rows), but rows
+    of a file that is being ingested RIGHT NOW must not be destroyed under
+    it (review PRR-002).
+    """
+    with sqlite3.connect(sqlite_path, timeout=30) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM files WHERE vault_id = ? AND status = 'processing' LIMIT 1",
+            (vault_id,),
+        ).fetchone()
+    return row is not None
 
 
 async def _run(args: argparse.Namespace) -> dict[str, Any]:
@@ -468,9 +497,17 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
     # Issue #705: delete protection at plan-build time. The report above stays
     # a truthful snapshot; the DELETE set excludes any candidate whose files
     # row is live or in flight ('indexed'/'partial'/'pending'/'processing').
+    vault_skipped_in_flight = False
+    if plan.orphan_vault_id is not None and _vault_has_in_flight_files(
+        sqlite_path, plan.orphan_vault_id
+    ):
+        plan = replace(plan, orphan_vault_id=None)
+        vault_skipped_in_flight = True
+    plan_protected_orphan_ids: list[str] = []
     if plan.orphan_file_ids:
         protected = _protected_file_ids(sqlite_path, list(plan.orphan_file_ids))
         if protected:
+            plan_protected_orphan_ids = sorted(protected)
             plan = replace(
                 plan,
                 orphan_file_ids=tuple(
@@ -484,11 +521,18 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
     mutating_flags_requested = bool(planned_delete_counts) or bool(
         args.optimize_after_cleanup
     )
+    # The cleanup_plan keys keep a stable shape on every path (dry run,
+    # no-table, all-protected) so report consumers never hit KeyError on a
+    # key whose presence used to depend on flags (issue #705 review
+    # PRR-011/PRR-013).
     report["cleanup_plan"] = {
         "dry_run": args.dry_run or not args.confirm,
         "requires_confirm": mutating_flags_requested
         and (args.dry_run or not args.confirm),
         "planned_delete_counts": planned_delete_counts,
+        "plan_protected_orphan_ids": plan_protected_orphan_ids,
+        "recheck_dropped_orphan_ids": [],
+        "vault_delete_skipped_in_flight": vault_skipped_in_flight,
     }
 
     if mutating_flags_requested and (args.dry_run or not args.confirm):
@@ -545,7 +589,8 @@ def build_parser() -> argparse.ArgumentParser:
         description="Report and optionally clean LanceDB rows that disagree with indexed SQLite files.",
         epilog=(
             "Exit codes: 0 report completed; 1 unrecoverable error; "
-            "2 destructive or optimize action requested without --confirm."
+            "2 a non-empty deletion plan (unprotected rows to delete) or an "
+            "optimize request was supplied without --confirm."
         ),
     )
     parser.add_argument(
@@ -572,7 +617,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--delete-orphan-file-ids",
         action="store_true",
-        help="Delete LanceDB rows whose file_id is not an indexed SQLite file.",
+        help="Delete LanceDB rows whose file_id has no live SQLite file (status 'indexed'/'partial'). Rows of 'pending'/'processing' files are protected.",
     )
     parser.add_argument(
         "--delete-orphan-vault",
@@ -603,6 +648,20 @@ def main(argv: list[str] | None = None) -> int:
     try:
         report = asyncio.run(_run(args))
         print(json.dumps(report, indent=2, sort_keys=True))
+        if (
+            (
+                args.delete_orphan_file_ids
+                or args.delete_stale_multiscale
+                or args.delete_orphan_vault is not None
+            )
+            and not report["cleanup_plan"]["planned_delete_counts"]
+            and not report["cleanup_plan"]["requires_confirm"]
+        ):
+            print(
+                "No unprotected rows match the requested deletion flags; "
+                "nothing to delete.",
+                file=sys.stderr,
+            )
         if report["cleanup_plan"]["requires_confirm"]:
             print(
                 "Destructive cleanup was not run. Re-run with --confirm after reviewing row counts.",
