@@ -151,3 +151,168 @@ def test_no_indexed_only_status_filters_in_operator_scripts():
         "(the 'partial' status owns live rows — issue #705 class C8): "
         + ", ".join(hits)
     )
+
+
+# ---------------------------------------------------------------------------
+# Implementation-review round-1 coverage gaps (mutation probes P-b / P-c):
+# each of the two reconcile mechanisms — the report live-set widening and the
+# pre-delete re-check — is individually sufficient for the frozen checks, so
+# each needs a test that bites when THAT mechanism alone is reverted.
+# ---------------------------------------------------------------------------
+
+import importlib.util  # noqa: E402
+import json  # noqa: E402
+
+RECONCILE_PATH = (
+    Path(__file__).resolve().parents[1] / "scripts" / "reconcile_lancedb_sqlite.py"
+)
+RECONCILE_SPEC = importlib.util.spec_from_file_location(
+    "reconcile_lancedb_sqlite_b16b", RECONCILE_PATH
+)
+reconcile = importlib.util.module_from_spec(RECONCILE_SPEC)
+sys.modules[RECONCILE_SPEC.name] = reconcile
+RECONCILE_SPEC.loader.exec_module(reconcile)
+
+
+class _Arrow:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def to_pylist(self):
+        return list(self._rows)
+
+
+class _Table:
+    def __init__(self, rows):
+        self.rows = list(rows)
+
+    async def to_arrow(self):
+        return _Arrow(self.rows)
+
+    async def count_rows(self, filter_expr=None):
+        if not filter_expr:
+            return len(self.rows)
+        return sum(1 for row in self.rows if self._matches(row, filter_expr))
+
+    async def delete(self, filter_expr):
+        self.rows = [row for row in self.rows if not self._matches(row, filter_expr)]
+
+    def _matches(self, row, filter_expr):
+        if filter_expr.startswith("file_id IN ("):
+            raw = filter_expr.removeprefix("file_id IN (").removesuffix(")")
+            values = {v.strip().strip("'") for v in raw.split(",")}
+            return row["file_id"] in values
+        raise AssertionError(f"unexpected filter: {filter_expr}")
+
+
+def _sqlite_db(db_path, rows):
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """CREATE TABLE files (
+            id INTEGER PRIMARY KEY, vault_id INTEGER NOT NULL,
+            file_name TEXT NOT NULL, chunk_count INTEGER DEFAULT 0,
+            status TEXT NOT NULL)"""
+    )
+    conn.executemany(
+        "INSERT INTO files (id, vault_id, file_name, chunk_count, status)"
+        " VALUES (?, ?, ?, ?, ?)",
+        rows,
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_partial_file_is_live_in_report_snapshot(tmp_path, monkeypatch, capsys):
+    """Probe P-b pin: a 'partial' file with LanceDB rows is report-live.
+
+    Bites when _load_indexed_files is reverted to WHERE status='indexed':
+    the partial file would leave the live snapshot (totals 2 -> 1), appear in
+    the orphan key, and drop out of the per-vault live counter.
+    """
+    db_path = tmp_path / "app.db"
+    _sqlite_db(
+        db_path,
+        [(10, 1, "a.txt", 1, "indexed"), (20, 1, "p.txt", 1, "partial")],
+    )
+    table = _Table(
+        [
+            {"id": "c10", "file_id": "10", "vault_id": "1", "chunk_scale": "default"},
+            {"id": "c20", "file_id": "20", "vault_id": "1", "chunk_scale": "default"},
+        ]
+    )
+
+    async def open_chunks_table(lancedb_path):
+        return table
+
+    monkeypatch.setattr(reconcile, "_open_chunks_table", open_chunks_table)
+    exit_code = reconcile.main(
+        [
+            "--sqlite-path", str(db_path),
+            "--lancedb-path", str(tmp_path / "lancedb"),
+            "--delete-orphan-file-ids", "--confirm",
+        ]
+    )
+    report = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert report["totals"]["sqlite_indexed_files"] == 2
+    assert report["sqlite_indexed_files_by_vault_id"] == {"1": 2}
+    assert "20" not in report["file_ids_present_in_lancedb_but_not_sqlite_indexed"]
+    assert [row["file_id"] for row in table.rows] == ["10", "20"]
+
+
+def test_recheck_drops_candidate_protected_after_plan_build(
+    tmp_path, monkeypatch, capsys
+):
+    """Probe P-c pin: the pre-delete re-check drops a candidate whose SQLite
+    row appears (protected) only AFTER the plan-build filter ran.
+
+    The seam wraps _planned_delete_counts — invoked between the plan-build
+    protection filter and the re-check — and inserts the candidate row at
+    'processing' from inside it. If the re-check block is removed (or moved
+    after apply_cleanup), file 30's row is deleted and this test fails.
+    """
+    db_path = tmp_path / "app.db"
+    _sqlite_db(db_path, [(10, 1, "a.txt", 1, "indexed")])
+    table = _Table(
+        [
+            {"id": "c10", "file_id": "10", "vault_id": "1", "chunk_scale": "default"},
+            {"id": "c30", "file_id": "30", "vault_id": "1", "chunk_scale": "default"},
+        ]
+    )
+
+    async def open_chunks_table(lancedb_path):
+        return table
+
+    original_counts = reconcile._planned_delete_counts
+
+    def counts_with_late_ingest(report, plan):
+        # File 30 appears in SQLite only now — after the report snapshot AND
+        # after the plan-build protection filter, before the re-check.
+        # INSERT OR IGNORE: the seam is invoked a second time inside the
+        # re-check block itself, where the late row is already present.
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO files (id, vault_id, file_name, chunk_count, status)"
+                " VALUES (30, 1, 'late.txt', 1, 'processing')"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return original_counts(report, plan)
+
+    monkeypatch.setattr(reconcile, "_open_chunks_table", open_chunks_table)
+    monkeypatch.setattr(reconcile, "_planned_delete_counts", counts_with_late_ingest)
+    exit_code = reconcile.main(
+        [
+            "--sqlite-path", str(db_path),
+            "--lancedb-path", str(tmp_path / "lancedb"),
+            "--delete-orphan-file-ids", "--confirm",
+        ]
+    )
+    report = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert report["cleanup_plan"]["recheck_dropped_orphan_ids"] == ["30"]
+    assert [row["file_id"] for row in table.rows] == ["10", "30"]
