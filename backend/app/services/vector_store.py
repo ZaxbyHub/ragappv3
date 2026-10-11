@@ -2562,8 +2562,19 @@ class VectorStore:
                     staging_rows,
                 )
                 return
-            if canonical_ids < staging_ids and await self._reconcile_overlap_content_matches(
-                canonical, staging, overlap, migration_name
+            if (
+                canonical_ids < staging_ids
+                and await self._reconcile_overlap_content_matches(
+                    canonical, staging, overlap, migration_name
+                )
+                # The generation gate applies to BOTH dispositions: rebuilding
+                # from a staging copy staged under a different embedding
+                # model/dimension would replace new-generation vectors with
+                # previous-generation ones (#706, final-critic finding — the
+                # drop leg alone left this half-open).
+                and await self._reconcile_generation_matches(
+                    canonical, staging, overlap, migration_name
+                )
             ):
                 # Canonical incomplete (a STRICT subset of staging) — the
                 # staging copy is authoritative; rebuild from it.

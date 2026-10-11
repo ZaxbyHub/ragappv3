@@ -242,3 +242,38 @@ def test_identical_generation_strict_subset_still_rebuilds_from_staging(
         "restored incomplete" in record.getMessage()
         for record in _scoped_records(caplog, logging.INFO)
     ), "the strict-subset recovery must still announce the restore"
+
+
+def test_strict_subset_rebuild_with_mismatched_generation_is_divergent(
+    tmp_path, caplog
+) -> None:
+    """The REBUILD leg is generation-gated too (final-critic finding).
+
+    Canonical is a strict subset of staging, so the row-count reasoning would
+    elect staging as authoritative — but staging's vectors come from an
+    earlier generation. Rebuilding would replace new-generation vectors with
+    previous-generation ones and resurrect the deleted row, silently.
+    """
+
+    async def scenario(caplog):  # noqa: ANN001
+        with caplog.at_level(logging.CRITICAL, logger=_LOGGER_PREFIX):
+            return await _drive(
+                tmp_path,
+                canonical_rows=[_gen_record("g-1")],
+                staging_rows=[
+                    _gen_record("g-1", value=0.5),
+                    _gen_record("g-2", value=0.5),
+                ],
+            )
+
+    raised, names, canonical_ids, staging_ids = asyncio.run(scenario(caplog))
+    assert raised is not None and isinstance(raised, VectorStoreError)
+    assert any(
+        record.levelno >= logging.CRITICAL
+        for record in _scoped_records(caplog, logging.CRITICAL)
+    ), "a generation mismatch on the rebuild leg must log CRITICAL too"
+    # NEITHER table was modified.
+    assert "chunks" in names
+    assert CHUNKS_STAGING_TABLE in names
+    assert canonical_ids == {"g-1"}
+    assert staging_ids == {"g-1", "g-2"}
