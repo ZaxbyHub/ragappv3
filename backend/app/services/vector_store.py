@@ -4,6 +4,7 @@ LanceDB vector store service for semantic search.
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import sqlite3
@@ -167,6 +168,12 @@ CHUNKS_STAGING_TABLE = "chunks_rebuild"
 # Distinct from CHUNKS_STAGING_TABLE so a dimension rebuild never collides
 # with the migration machinery's own staging reconciliation.
 DIMENSION_REBUILD_TABLE = "chunks_dim_rebuild"
+
+# How many overlapping chunk ids the recovery reconcile projects when comparing
+# the two tables' vector GENERATION (issue #706). Ids and text already matched;
+# this samples embeddings so a stale copy from a different model/dimension cannot
+# pass as the same generation. Bounded so recovery stays cheap.
+_RECONCILE_EMBEDDING_SAMPLE = 8
 
 
 class DimensionRebuildHandle:
@@ -2313,9 +2320,105 @@ class VectorStore:
         """
         try:
             df = await table.query().select(["id"]).to_pandas()
-        except (AttributeError, TypeError):
+        except (AttributeError, TypeError, ValueError):
             df = await self._safe_table_to_pandas(table, label)
+        if "id" not in getattr(df, "columns", ()):
+            raise VectorStoreError(
+                f"{label}: table has no 'id' column; refusing to reconcile a "
+                f"generation whose row identity cannot be read."
+            )
         return set(df["id"].astype(str))
+
+    @staticmethod
+    async def _schema_embedding_dim(table) -> Optional[int]:
+        """Read a table's fixed embedding width from its schema (no data load).
+
+        ``AsyncTable.schema`` is a coroutine on real LanceDB, so this must be
+        awaited; an un-awaited call would leak a never-awaited coroutine (which
+        the repo's session-warning gate fails) and silently read as "no width".
+        """
+        schema_fn = getattr(table, "schema", None)
+        if schema_fn is None:
+            return None
+        try:
+            schema = schema_fn()
+            if inspect.isawaitable(schema):
+                schema = await schema
+            field = schema.field("embedding")
+            size = getattr(field.type, "list_size", None)
+            return int(size) if size is not None else None
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return None
+
+    async def _reconcile_generation_matches(
+        self, canonical, staging, overlap_ids: set[str], migration_name: str
+    ) -> bool:
+        """Verify the two tables carry the same VECTOR GENERATION.
+
+        ``id`` and ``text`` equality does not imply embedding equality: chunk ids
+        are deterministic, so a stale ``chunks_rebuild`` left over from an
+        earlier generation can match on every id and every text cell while
+        holding previous-model (or previous-width) vectors — swapping it back
+        would serve wrong-generation vectors under a sidecar that already
+        records the new one (issue #706, PR review PRR-002).
+
+        Bounded by design: the width check reads only the schema, and the value
+        check projects a small deterministic sample of overlapping ids. When
+        either side cannot answer (older table, backend without the projection,
+        the fakes used in tests) the check reports "no evidence of difference"
+        and the id/text comparison stands alone.
+        """
+        if not overlap_ids:
+            return True
+        canonical_dim = await self._schema_embedding_dim(canonical)
+        staging_dim = await self._schema_embedding_dim(staging)
+        if (
+            canonical_dim is not None
+            and staging_dim is not None
+            and canonical_dim != staging_dim
+        ):
+            return False
+        sample = sorted(overlap_ids)[:_RECONCILE_EMBEDDING_SAMPLE]
+        for chunk_id in sample:
+            canonical_vector = await self._reconcile_sample_embedding(
+                canonical, chunk_id, migration_name
+            )
+            staging_vector = await self._reconcile_sample_embedding(
+                staging, chunk_id, migration_name
+            )
+            if canonical_vector is None or staging_vector is None:
+                continue
+            if canonical_vector != staging_vector:
+                return False
+        return True
+
+    async def _reconcile_sample_embedding(self, table, chunk_id: str, label: str):
+        """Project one row's embedding vector, or None when unanswerable."""
+        try:
+            df = await table.query().where(f"id = '{chunk_id}'").select(
+                ["embedding"]
+            ).to_pandas()
+        except (AttributeError, TypeError, ValueError, KeyError):
+            return None
+        if "embedding" not in getattr(df, "columns", ()) or df.empty:
+            return None
+        return list(df["embedding"].iloc[0])
+
+    @staticmethod
+    def _reconcile_texts_by_id(df) -> dict:
+        """Map id → text without the ambiguous-truth crash duplicates cause.
+
+        ``Series.get`` on a duplicate-indexed Series returns a Series, so the
+        comparison used to raise ``ValueError`` (issue #706, PR review PRR-006).
+        Duplicate ids also mean neither table is a clean generation pair, which
+        the caller treats as unverifiable.
+        """
+        if "text" not in getattr(df, "columns", ()):
+            return {}
+        ids = df["id"].astype(str)
+        if ids.duplicated().any():
+            return {}
+        return dict(zip(ids, df["text"]))
 
     async def _reconcile_overlap_content_matches(
         self, canonical, staging, overlap_ids: set[str], migration_name: str
@@ -2325,10 +2428,11 @@ class VectorStore:
         Chunk ids are deterministic (``{file_id}[_scale]_{chunk_index}``), so a
         post-cancel re-ingest collides with the stale staging copy; a subset
         test alone would silently swap stale content back in. A missing
-        ``text`` column on either side, or two null cells on the same id,
-        counts as unverifiable → mismatch (conservative: raise rather than
-        silently choose a generation). Loads both frames only when an overlap
-        actually exists (recovery path only).
+        ``text`` column on either side, or a duplicate id, counts as
+        unverifiable → mismatch (conservative: raise rather than silently
+        choose a generation). Two null cells on the SAME id are equal content,
+        not divergence. Loads both frames only when an overlap actually exists
+        (recovery path only).
         """
         if not overlap_ids:
             return True
@@ -2340,14 +2444,25 @@ class VectorStore:
         )
         if "text" not in canonical_df.columns or "text" not in staging_df.columns:
             return False
-        canonical_texts = canonical_df.set_index(
-            canonical_df["id"].astype(str)
-        )["text"]
-        staging_texts = staging_df.set_index(staging_df["id"].astype(str))["text"]
+        canonical_texts = self._reconcile_texts_by_id(canonical_df)
+        staging_texts = self._reconcile_texts_by_id(staging_df)
+        if not canonical_texts or not staging_texts:
+            return False
         for chunk_id in overlap_ids:
             c_text = canonical_texts.get(chunk_id)
             s_text = staging_texts.get(chunk_id)
-            if c_text is None or s_text is None or c_text != s_text:
+            if chunk_id not in canonical_texts or chunk_id not in staging_texts:
+                return False
+            # Two nulls are the same content; one null is a real difference.
+            c_is_null = c_text is None or (
+                isinstance(c_text, float) and c_text != c_text
+            )
+            s_is_null = s_text is None or (
+                isinstance(s_text, float) and s_text != s_text
+            )
+            if c_is_null and s_is_null:
+                continue
+            if c_is_null or s_is_null or c_text != s_text:
                 return False
         return True
 
@@ -2421,11 +2536,37 @@ class VectorStore:
                 staging, f"{migration_name} (reconcile staging ids)"
             )
             overlap = canonical_ids & staging_ids
-            if canonical_ids <= staging_ids and await self._reconcile_overlap_content_matches(
+            # The subset checks run DROP-STAGING FIRST: when both tables hold
+            # the same ids (the routine crash window between the swap's final
+            # create and its staging drop) canonical is already complete, and
+            # base resolved that state with a single cheap drop. Rebuilding
+            # there cost a full-table load plus a destructive drop+recreate of
+            # a healthy live table (#706, PR review PRR-001). The rebuild leg
+            # therefore requires a STRICT subset.
+            if staging_ids <= canonical_ids and await self._reconcile_overlap_content_matches(
+                canonical, staging, overlap, migration_name
+            ) and await self._reconcile_generation_matches(
                 canonical, staging, overlap, migration_name
             ):
-                # Canonical incomplete (or equal) — the staging copy is
-                # authoritative; rebuild from it.
+                # Staging holds nothing canonical lacks — a stale leftover
+                # from a completed swap (the swap validates the final create
+                # BEFORE deleting staging, so a surviving canonical table is
+                # complete).
+                await self.db.drop_table(CHUNKS_STAGING_TABLE)
+                logger.info(
+                    "%s: dropped stale staging table '%s' (canonical 'chunks' "
+                    "holds every staging row: %d rows vs staging %d)",
+                    migration_name,
+                    CHUNKS_STAGING_TABLE,
+                    canonical_rows,
+                    staging_rows,
+                )
+                return
+            if canonical_ids < staging_ids and await self._reconcile_overlap_content_matches(
+                canonical, staging, overlap, migration_name
+            ):
+                # Canonical incomplete (a STRICT subset of staging) — the
+                # staging copy is authoritative; rebuild from it.
                 staging_df = await self._safe_table_to_pandas(
                     staging, f"{migration_name} (staging recovery)"
                 )
@@ -2433,8 +2574,30 @@ class VectorStore:
                 # startup before the app serves requests; acquiring the lock
                 # here would risk re-entrant deadlock if a future caller
                 # holds it.
+                #
+                # The drop/create pair is the destructive window: if the create
+                # fails the corpus survives ONLY in staging, so it is wrapped
+                # in the same CRITICAL-and-raise contract as the parity check
+                # (#706, PR review PRR-005) rather than escaping into the
+                # caller's fail-soft warn-and-continue.
                 await self.db.drop_table("chunks")
-                self.table = await self.db.create_table("chunks", data=staging_df)
+                try:
+                    self.table = await self.db.create_table("chunks", data=staging_df)
+                except Exception as exc:
+                    logger.critical(
+                        "%s: rebuilding 'chunks' from '%s' failed after the "
+                        "original table was dropped (%s). The corpus survives "
+                        "ONLY in '%s', which is preserved for manual recovery.",
+                        migration_name,
+                        CHUNKS_STAGING_TABLE,
+                        exc,
+                        CHUNKS_STAGING_TABLE,
+                    )
+                    raise VectorStoreError(
+                        f"{migration_name}: canonical 'chunks' rebuild from "
+                        f"'{CHUNKS_STAGING_TABLE}' failed ({exc}); the "
+                        f"staging table is the only surviving copy."
+                    ) from exc
                 recovered_rows = await self.table.count_rows()
                 if recovered_rows != len(staging_df):
                     logger.critical(
@@ -2464,26 +2627,9 @@ class VectorStore:
                     CHUNKS_STAGING_TABLE,
                 )
                 return
-            if staging_ids <= canonical_ids and await self._reconcile_overlap_content_matches(
-                canonical, staging, overlap, migration_name
-            ):
-                # Staging holds nothing canonical lacks — a stale leftover
-                # from a completed swap (the swap validates the final create
-                # BEFORE deleting staging, so a surviving canonical table is
-                # complete).
-                await self.db.drop_table(CHUNKS_STAGING_TABLE)
-                logger.info(
-                    "%s: dropped stale staging table '%s' (canonical 'chunks' "
-                    "is a superset: %d rows vs staging %d)",
-                    migration_name,
-                    CHUNKS_STAGING_TABLE,
-                    canonical_rows,
-                    staging_rows,
-                )
-                return
             self._raise_reconcile_divergence(
                 migration_name,
-                "canonical-only ids or content mismatch",
+                "row sets or content/generation differ",
                 canonical_rows,
                 staging_rows,
             )
@@ -2925,10 +3071,19 @@ class VectorStore:
                 # logged CRITICAL (the waiter window reopens loudly) and the
                 # R1-guarded job-completion write remains the second chance.
                 metadata = getattr(handle, "staged_metadata", None)
-                if metadata:
+                if isinstance(metadata, dict):
                     model_id = metadata.get("model_id")
                     prefix_hash = metadata.get("prefix_hash")
-                    if model_id is not None or prefix_hash is not None:
+                    # BOTH or NEITHER: a partial snapshot would persist the
+                    # job-start model id next to a LIVE-settings prefix hash,
+                    # a triple that describes neither generation (#706, PR
+                    # review PRR-012).
+                    if (
+                        isinstance(model_id, str)
+                        and isinstance(prefix_hash, str)
+                        and model_id
+                        and prefix_hash
+                    ):
                         try:
                             await self.record_embedding_metadata(
                                 handle.dim,
@@ -2936,7 +3091,7 @@ class VectorStore:
                                 prefix_hash=prefix_hash,
                                 raise_on_error=True,
                             )
-                        except sqlite3.Error as exc:  # noqa: PERF203
+                        except sqlite3.Error as exc:
                             logger.critical(
                                 "dimension rebuild commit: embedding-metadata "
                                 "write failed after the swap (%s). The swapped "
@@ -2946,6 +3101,15 @@ class VectorStore:
                                 "another reindex until it completes.",
                                 exc,
                             )
+                    else:
+                        logger.warning(
+                            "dimension rebuild commit: staged identity snapshot "
+                            "was incomplete (model_id=%r prefix_hash=%r); "
+                            "skipped the commit-time sidecar write so a "
+                            "partial snapshot cannot mix generations.",
+                            model_id,
+                            prefix_hash,
+                        )
         finally:
             # Release the admission slot once the swap (and metadata write)
             # are complete, so waiters wake on the terminal state (#706).

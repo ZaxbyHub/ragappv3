@@ -11,10 +11,16 @@ fail-closed.
 
 Stores created by v1.1.0 or any version before the embedding-identity sidecar
 (#353, resolving #220) intentionally **fail closed** on first boot after upgrading:
-chat and search return **503 "admin reindex required"** until a full reindex runs.
-Clear it with `POST /api/documents/reindex` (admin-authenticated; re-embeds every
-vault and records the embedding identity). This has been the behavior since #353 —
-it is now documented in README's Upgrading section as well.
+chat and search return **503 "Embedding model mismatch — admin reindex required"**
+until a full reindex runs. Clear it with `POST /api/documents/reindex`
+(admin-authenticated; re-embeds every vault and records the embedding identity —
+README's Upgrading section shows a copy-paste-ready curl, including the CSRF
+double-submit). The call returns immediately with a `job_id`; poll
+`GET /api/documents/reindex/jobs/{job_id}` for completion. Caveat: the job
+re-embeds only files with status `indexed`/`error` — a store with no such rows
+completes with `processed: 0` without recording an identity, and the 503
+persists. This has been the behavior since #353 — it is now documented in
+README's Upgrading section as well.
 
 ## What changed
 
@@ -70,7 +76,10 @@ it is now documented in README's Upgrading section as well.
   `begin_dimension_rebuild`, handles the converged `None` return by re-embedding
   bare without a staged rebuild, and records the job-start identity at the
   completion-time metadata write (closing the guard→write TOCTOU; identical
-  values whenever the R1 in-flight guard passes).
+  values whenever the R1 in-flight guard passes). `document_processor.py` is
+  deliberately untouched: since #691 it refuses dimension-changing single-file
+  ingests (`EmbeddingDimensionChangedError`), so index-shape migration belongs
+  exclusively to the reindex job.
 
 ### Tests
 
@@ -94,7 +103,19 @@ it is now documented in README's Upgrading section as well.
 
 - Rebuild admission serialization is single-process (same scope as the #696
   serving gate); multi-worker/lease-mode overlap across processes remains a
-  documented limitation.
+  documented limitation. More precisely: the serialization is in-process
+  store-level (one admission slot per VectorStore instance), and the
+  cross-task wait plus converged-`None` path has no production exerciser —
+  production runs a single serial reindex worker, and cross-process overlap
+  uses separate VectorStore instances, so it is not covered.
+- A caller that neither commits nor aborts a `begin_dimension_rebuild` handle
+  (a leaked handle) strands cross-task admission waiters until process exit —
+  the production reindex flow aborts on every `BaseException` path, so this
+  requires a caller that breaks that contract.
+- An unresolved canonical/`chunks_rebuild` divergence re-emits 4 CRITICALs plus
+  4 warnings on every boot: all four `migrate_add_*` migrations reconcile first,
+  each divergent reconcile logs CRITICAL and raises, and each boot-time
+  `_await_migration` caller warn-and-continues.
 - Migrations now run unbounded by design: a boot that genuinely must backfill a
   large corpus takes as long as the swap needs (previously it was cancelled at
   10s and could silently corrupt state). Already-migrated boots are strictly
@@ -103,3 +124,7 @@ it is now documented in README's Upgrading section as well.
   on every boot, with both tables preserved, until an operator resolves the
   divergence manually — by design; silently discarding one generation is the
   bug this removes.
+- The full-reindex remedy for a pre-#353 fail-closed store only re-embeds files
+  with status `indexed`/`error`: a store with no such rows completes with
+  `processed: 0` without recording an identity, and the 503 persists (see the
+  upgrade note above and README's Upgrading section).

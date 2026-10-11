@@ -288,8 +288,21 @@ def test_divergent_canonical_and_staging_not_silently_dropped(
     final_ids = asyncio.run(_table_ids(fake_db, "chunks"))
     all_ids = {"post-1", "post-2", "orig-1", "orig-2", "orig-3"}
     all_present = all_ids.issubset(final_ids)
+    # Scoped to the vector_store logger (PRR-019): an unrelated module's
+    # CRITICAL record must not satisfy this acceptance.
     critical_logged = any(
-        record.levelno >= logging.CRITICAL for record in caplog.records
+        record.levelno >= logging.CRITICAL
+        and record.name.startswith("app.services.vector_store")
+        for record in caplog.records
     )
     ok = all_present or (critical_logged and raised is not None)
     assert ok is True
+    # Strengthened acceptance (PRR-019): the OR above must not be
+    # satisfiable by a destroy-then-raise implementation — after the run
+    # BOTH tables still exist with their ORIGINAL row ids, and nothing was
+    # dropped.
+    assert final_ids == {"post-1", "post-2"}
+    assert CHUNKS_STAGING_TABLE in fake_db._tables
+    staging_ids_after = asyncio.run(_table_ids(fake_db, CHUNKS_STAGING_TABLE))
+    assert staging_ids_after == {"orig-1", "orig-2", "orig-3"}
+    assert fake_db.calls["drop_table"] == []

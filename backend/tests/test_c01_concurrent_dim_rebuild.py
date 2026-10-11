@@ -284,6 +284,14 @@ async def _scenario() -> int:
         ).fetchall()
     ]
     conn.close()
+
+    # The live table must still hold rows for BOTH files (PRR-016): a run
+    # whose files.status says 'indexed' while one file's vectors were
+    # silently wiped is not a pass. Read before cleanup (Windows keeps
+    # handles open past rmtree).
+    live_rows_per_file = [
+        await store.count_by_file(str(file_id)) for file_id in file_ids
+    ]
     _cleanup_tmp(tmp)
 
     if len(statuses) != 2:
@@ -291,11 +299,26 @@ async def _scenario() -> int:
     error_count = sum(1 for status in statuses if status == "error")
     # Each flow catches its own exception and settles its file as 'error',
     # so the returned exceptions and the statuses agree by construction;
-    # the verdict is the settled status of both files.
-    _ = results
-    return error_count
+    # the verdict is the settled status of both files — AND (PRR-022) the
+    # gathered outcomes themselves, which the caller now asserts instead of
+    # discarding: a raise whose error-settling UPDATE also failed cannot
+    # slip through on statuses alone.
+    return error_count, live_rows_per_file, list(results), statuses
 
 
 def test_two_concurrent_ingests_across_dimension_change_both_succeed() -> None:
-    error_count = asyncio.run(_scenario())
+    error_count, live_rows_per_file, results, statuses = asyncio.run(_scenario())
     assert error_count == 0
+    # PRR-016: neither file's vectors were silently wiped — the live table
+    # holds rows for BOTH file ids after the concurrent rebuild.
+    assert len(live_rows_per_file) == 2
+    assert all(
+        rows >= 1 for rows in live_rows_per_file
+    ), f"live 'chunks' lost a file's vectors: {live_rows_per_file}"
+    # PRR-022: every gathered outcome is either success (None) or a flow
+    # whose file settled 'error' — a raise plus failed bookkeeping fails.
+    for outcome, status in zip(results, statuses):
+        if outcome is not None:
+            assert status == "error", (
+                f"flow raised {outcome!r} but its file settled {status!r}"
+            )

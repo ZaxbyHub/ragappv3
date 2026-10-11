@@ -64,13 +64,22 @@ async def _seed_record(store: VectorStore) -> None:
     await store.add_chunks([record])
 
 
+async def _assert_seeded(store: VectorStore, expected: int) -> None:
+    """Precondition: the seed really landed (sibling-harness idiom)."""
+    seeded = await store.count_by_file("1")
+    if seeded != expected:
+        raise RuntimeError(f"harness invalid: seeded index has {seeded} rows")
+
+
 async def _run_noop_migration(tmp_path, monkeypatch, migration: str):
     """Harness: real LanceDB store, one fully-populated row, counters
     installed around the migration call only.
 
-    Returns (migration_return_value, whole_table_loads) where
-    whole_table_loads is the CLASS-level ``AsyncTable.to_pandas`` call
-    count.
+    Returns (migration_return_value, whole_table_loads, guarded_loads)
+    where whole_table_loads is the CLASS-level ``AsyncTable.to_pandas``
+    call count and guarded_loads is the instance-level
+    ``_safe_table_to_pandas`` call count (the fallback probe must not be
+    needed when the server-side count answers).
     """
     monkeypatch.setattr(settings, "data_dir", tmp_path)
 
@@ -78,6 +87,7 @@ async def _run_noop_migration(tmp_path, monkeypatch, migration: str):
     await store.connect()
     await store.init_table(EMBED_DIM)
     await _seed_record(store)
+    await _assert_seeded(store, 1)
 
     # Counters installed AFTER seeding: only the migration's loads count.
     loads = {"n": 0}
@@ -102,28 +112,120 @@ async def _run_noop_migration(tmp_path, monkeypatch, migration: str):
 
     migration_method = getattr(store, f"migrate_add_{migration}")
     ret = await migration_method()
-    return ret, loads["n"]
+    return ret, loads["n"], safe_calls["n"]
 
 
 def test_vault_id_noop_does_not_load_table(tmp_path, monkeypatch) -> None:
-    ret, whole_table_loads = asyncio.run(
+    ret, whole_table_loads, guarded_loads = asyncio.run(
         _run_noop_migration(tmp_path, monkeypatch, "vault_id")
     )
     assert ret == 0
     assert whole_table_loads == 0
+    # The server-side count answered; the guarded full-load fallback of
+    # ``_count_null_rows`` was never needed on the no-op path.
+    assert guarded_loads == 0
 
 
 def test_chunk_scale_noop_does_not_load_table(tmp_path, monkeypatch) -> None:
-    ret, whole_table_loads = asyncio.run(
+    ret, whole_table_loads, guarded_loads = asyncio.run(
         _run_noop_migration(tmp_path, monkeypatch, "chunk_scale")
     )
     assert ret == 0
     assert whole_table_loads == 0
+    assert guarded_loads == 0
 
 
 def test_parent_window_noop_does_not_load_table(tmp_path, monkeypatch) -> None:
-    ret, whole_table_loads = asyncio.run(
+    ret, whole_table_loads, guarded_loads = asyncio.run(
         _run_noop_migration(tmp_path, monkeypatch, "parent_window")
     )
     assert ret == 0
     assert whole_table_loads == 0
+    assert guarded_loads == 0
+
+
+# ---------------------------------------------------------------------------
+# Non-null branch: the server-side probe must SEE the nulls and the
+# backfill must run (PRR-018). Real LanceDB only.
+# ---------------------------------------------------------------------------
+
+
+async def _run_null_backfill_migration(tmp_path, monkeypatch):
+    """Harness: real LanceDB store, ONE row whose ``vault_id`` is NULL.
+
+    A class-level ``AsyncTable.count_rows`` spy (installed after seeding,
+    removed by monkeypatch at test end) records every ``filter=`` probe the
+    migration makes and the count real LanceDB answered, so the test can
+    assert the server-side null probe ran AND saw the null — not just that
+    the end state is filled. Returns
+    ``(migration_return_value, probe_saw_nulls, remaining_nulls,
+    vault_values_after)``.
+    """
+    monkeypatch.setattr(settings, "data_dir", tmp_path)
+
+    store = VectorStore(db_path=str(Path(tmp_path) / "lancedb"))
+    await store.connect()
+    await store.init_table(EMBED_DIM)
+    record = {
+        "id": "c01_null_0",
+        "text": "chunk with a null vault_id",
+        "file_id": "1",
+        "vault_id": None,  # <- the NULL the probe must see
+        "embedding": [0.25] * EMBED_DIM,
+        "chunk_scale": "default",
+        "parent_doc_id": "1",
+        "parent_window_start": 0,
+        "parent_window_end": 7,
+        "chunk_position": 0,
+        "chunk_index": 0,
+        "sparse_embedding": None,
+        "metadata": "{}",
+    }
+    await store.add_chunks([record])
+    await _assert_seeded(store, 1)
+
+    probes: dict = {}
+    original_count_rows = lancedb_table_module.AsyncTable.count_rows
+
+    async def _spying_count_rows(self, *args, **kwargs):  # noqa: ANN001, ANN202
+        result = await original_count_rows(self, *args, **kwargs)
+        flt = kwargs.get("filter")
+        if flt is not None:
+            probes[flt] = result
+        return result
+
+    monkeypatch.setattr(
+        lancedb_table_module.AsyncTable, "count_rows", _spying_count_rows
+    )
+
+    ret = await store.migrate_add_vault_id()
+    probe_saw_nulls = probes.get("vault_id IS NULL")
+
+    # Post-state (spy still installed; re-reading only adds new evidence).
+    table = await store.db.open_table("chunks")
+    remaining_nulls = await table.count_rows(filter="vault_id IS NULL")
+    df = await store.table.to_pandas()
+    vault_values_after = df["vault_id"].tolist()
+    return ret, probe_saw_nulls, remaining_nulls, vault_values_after
+
+
+def test_vault_id_null_row_is_seen_by_probe_and_backfilled(
+    tmp_path, monkeypatch
+) -> None:
+    """The server-side ``count_rows(filter="vault_id IS NULL")`` probe must
+    answer > 0 against real LanceDB on a nullable column, and the migration
+    must take the BACKFILL path (return > 0, fill the column) — pinning the
+    non-zero branch of the probe (PRR-018)."""
+    ret, probe_saw_nulls, remaining_nulls, vault_values_after = asyncio.run(
+        _run_null_backfill_migration(tmp_path, monkeypatch)
+    )
+    # Real LanceDB answered the filter server-side and SAW the null.
+    assert probe_saw_nulls == 1, (
+        "the server-side null probe must run against real LanceDB and "
+        f"return > 0; got {probe_saw_nulls!r}"
+    )
+    # The backfill path ran: the migration reports the migrated row...
+    assert ret == 1
+    # ...and the row's vault_id is actually filled afterwards.
+    assert remaining_nulls == 0
+    assert vault_values_after == [""]

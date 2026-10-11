@@ -442,11 +442,23 @@ async def _await_migration(coro, name):
     handling, leaving a half-swapped table whose next-boot reconcile could
     silently discard one generation. Migrations run unbounded; genuine
     failures are still caught-and-logged (fail-soft startup).
+
+    A shutdown cancellation (SIGTERM/restart mid-boot) is the remaining
+    cancel source: it is logged CRITICAL before propagating, so the operator
+    gets the same "swap was interrupted, staging holds the recoverable
+    copy" evidence the removed deadline used to suppress.
     """
     try:
         await coro
     except Exception as e:
         logger.warning(f"{name} failed: {e} (continuing)")
+    except BaseException:
+        logger.critical(
+            f"{name} was interrupted by cancellation mid-swap; the staging "
+            f"table holds the recoverable copy and a restart reconciles it "
+            f"before the app serves."
+        )
+        raise
 
 
 async def _validate_tei_embedding_model(embedding_service) -> None:

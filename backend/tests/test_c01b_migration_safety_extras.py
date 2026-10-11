@@ -35,6 +35,7 @@ from app.services.vector_store import (  # noqa: E402
     CHUNKS_STAGING_TABLE,
     DimensionRebuildHandle,
     VectorStore,
+    VectorStoreConnectionError,
     VectorStoreError,
 )
 
@@ -363,3 +364,277 @@ def test_ge_branch_safe_drop_when_staging_is_subset(
     assert not raised
     assert CHUNKS_STAGING_TABLE not in db.tables
     assert len(db.tables["chunks"].rows) == 3
+
+
+# ---------------------------------------------------------------------------
+# Server-side query() projections (PRR-017): the id-projection fast path and
+# the bounded embedding sample must go through query().select().to_pandas()
+# when the table offers it, and a projection that cannot answer row identity
+# must be refused rather than guessed.
+# ---------------------------------------------------------------------------
+
+
+class _QueryBuilder:
+    """Chained ``query()`` builder for ``_QueryingFakeTable``.
+
+    Implements the exact surface the reconcile path drives: ``.where()``,
+    ``.select([...])``, ``.to_pandas()`` (plus ``.limit()``/``.to_list()``
+    for add_chunks' guard, unused here). Counts which projections were
+    actually answered so tests can pin WHICH path ran.
+    """
+
+    def __init__(self, rows: list[dict], stats: dict, drop_id: bool = False):
+        self._rows = rows
+        self._stats = stats
+        self._drop_id = drop_id
+        self._where = None
+        self._columns = None
+
+    def where(self, predicate):  # noqa: ANN001, ANN202
+        self._where = predicate
+        return self
+
+    def select(self, columns):  # noqa: ANN001, ANN202
+        self._columns = list(columns)
+        return self
+
+    def limit(self, n):  # noqa: ANN001, ANN202
+        return self
+
+    def _filtered(self) -> list[dict]:
+        rows = self._rows
+        predicate = self._where
+        if (
+            predicate is not None
+            and predicate.startswith("id = '")
+            and predicate.endswith("'")
+        ):
+            wanted = predicate[len("id = '") : -1]
+            rows = [row for row in rows if str(row.get("id")) == wanted]
+        return rows
+
+    async def to_list(self):  # noqa: ANN202
+        return [dict(row) for row in self._filtered()]
+
+    async def to_pandas(self):  # noqa: ANN202
+        import pandas as pd
+
+        columns = self._columns
+        if columns is None:
+            columns = list(self._rows[0].keys()) if self._rows else []
+        if self._drop_id:
+            columns = [name for name in columns if name != "id"]
+        if self._columns == ["id"]:
+            self._stats["select_id"] += 1
+        elif self._columns == ["embedding"]:
+            self._stats["select_embedding"] += 1
+        return pd.DataFrame(
+            [{c: row.get(c) for c in columns} for row in self._filtered()],
+            columns=columns,
+        )
+
+
+class _QueryingFakeTable(_FakeTable):
+    """``_FakeTable`` plus a real ``query()`` projection surface."""
+
+    def __init__(self, rows: list[dict]):
+        super().__init__(rows)
+        self.query_stats = {"select_id": 0, "select_embedding": 0}
+
+    def query(self) -> _QueryBuilder:
+        return _QueryBuilder(self.rows, self.query_stats)
+
+
+class _NoFallbackQueryTable(_QueryingFakeTable):
+    """Querying table whose FULL-table load is poison: any use of the
+    guarded pandas fallback fails the test outright."""
+
+    async def to_pandas(self):  # noqa: ANN202
+        raise AssertionError(
+            "guarded full-table fallback used although query() projection "
+            "is available"
+        )
+
+
+class _NoIdProjectionTable(_QueryingFakeTable):
+    """Querying table whose projection never yields an 'id' column."""
+
+    def query(self) -> _QueryBuilder:
+        return _QueryBuilder(self.rows, self.query_stats, drop_id=True)
+
+
+def _drive_reconcile_db(db: _FakeDB, tmp_path, monkeypatch) -> list:  # noqa: ANN001
+    """Run the reconcile against a prebuilt FakeDB; returns raised errors."""
+    store = _store_with(db)
+    monkeypatch.setattr(settings, "data_dir", tmp_path)
+    raised: list[BaseException] = []
+    try:
+        asyncio.run(
+            store._reconcile_chunks_rebuild_state(migration_name="c01b probe")
+        )
+    except BaseException as exc:  # noqa: BLE001
+        raised.append(exc)
+    return raised
+
+
+def test_reconcile_ids_use_query_projection_never_fallback(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    """PRR-017: with query() available the id sets come from the server-side
+    projection; the guarded full load is never touched."""
+    with caplog.at_level(logging.INFO, logger="app.services.vector_store"):
+        canonical = _NoFallbackQueryTable(
+            [_record("k-1", OLD_DIM), _record("k-2", OLD_DIM)]
+        )
+        # Empty staging: a subset with NO overlap, so neither the content
+        # check nor the generation check may load a frame — any to_pandas()
+        # call above is the fallback being taken (and raises).
+        staging = _NoFallbackQueryTable([])
+        db = _FakeDB({"chunks": canonical, CHUNKS_STAGING_TABLE: staging})
+        raised = _drive_reconcile_db(db, tmp_path, monkeypatch)
+    assert not raised
+    assert CHUNKS_STAGING_TABLE not in db.tables, "stale staging must be dropped"
+    select_id_calls = (
+        canonical.query_stats["select_id"] + staging.query_stats["select_id"]
+    )
+    assert select_id_calls == 2, (
+        "both sides' id sets must be read via query().select(['id']) "
+        f"(got {select_id_calls} projections)"
+    )
+
+
+def test_reconcile_generation_sample_uses_query_projection(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    """PRR-017/PRR-002: the bounded embedding sample is projected through
+    query().where(...).select(['embedding']) — matching generation, staging
+    dropped, no divergence raised."""
+    with caplog.at_level(logging.INFO, logger="app.services.vector_store"):
+        canonical = _QueryingFakeTable(
+            [_record("k-1", OLD_DIM), _record("k-2", OLD_DIM)]
+        )
+        staging = _QueryingFakeTable([_record("k-1", OLD_DIM)])
+        db = _FakeDB({"chunks": canonical, CHUNKS_STAGING_TABLE: staging})
+        raised = _drive_reconcile_db(db, tmp_path, monkeypatch)
+    assert not raised
+    assert CHUNKS_STAGING_TABLE not in db.tables
+    assert canonical.query_stats["select_id"] == 1
+    assert staging.query_stats["select_id"] == 1
+    # One overlapping sample id, projected on BOTH sides.
+    assert canonical.query_stats["select_embedding"] == 1
+    assert staging.query_stats["select_embedding"] == 1
+
+
+def test_reconcile_refuses_projection_without_id_column(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    """A query()-capable table whose projection cannot answer row identity
+    is refused with VectorStoreError — never reconciled by guess."""
+    with caplog.at_level(logging.CRITICAL, logger="app.services.vector_store"):
+        canonical = _NoIdProjectionTable([_record("k-1", OLD_DIM)])
+        staging = _QueryingFakeTable([_record("k-1", OLD_DIM)])
+        db = _FakeDB({"chunks": canonical, CHUNKS_STAGING_TABLE: staging})
+        raised = _drive_reconcile_db(db, tmp_path, monkeypatch)
+    assert raised and isinstance(raised[0], VectorStoreError)
+    assert "no 'id' column" in str(raised[0])
+
+
+# ---------------------------------------------------------------------------
+# Commit-time identity snapshot: BOTH or NEITHER (PRR-021)
+# ---------------------------------------------------------------------------
+
+
+def _read_embedding_sidecar(db_path) -> dict:  # noqa: ANN001
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return dict(
+            conn.execute(
+                "SELECT key, value FROM settings_kv WHERE key LIKE 'embedding_%'"
+            ).fetchall()
+        )
+    finally:
+        conn.close()
+
+
+def test_commit_partial_staged_metadata_skips_sidecar_and_warns(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    """A PARTIAL snapshot (model_id without prefix_hash) must NOT reach the
+    settings_kv sidecar — persisting it would mix generations — and the
+    skip must be visible as a WARNING (PRR-021)."""
+
+    async def main(monkeypatch, caplog) -> tuple[dict, dict]:
+        from app.models.database import init_db
+
+        monkeypatch.setattr(settings, "data_dir", tmp_path)
+        db_path = tmp_path / "app.db"
+        init_db(str(db_path))
+
+        store = await _make_store(tmp_path, OLD_DIM)
+        handle = await store.begin_dimension_rebuild(
+            NEW_DIM,
+            staged_metadata={"model_id": "m"},  # no prefix_hash: partial
+        )
+        await store.add_chunks([_record("staged-1", NEW_DIM)], target=handle)
+        before = _read_embedding_sidecar(db_path)
+        with caplog.at_level(logging.WARNING, logger="app.services.vector_store"):
+            await store.commit_dimension_rebuild(handle)  # must NOT raise
+        after = _read_embedding_sidecar(db_path)
+        return before, after
+
+    before, after = asyncio.run(main(monkeypatch, caplog))
+    # No sidecar write happened for the partial snapshot.
+    assert after == before, (
+        "commit with a partial staged_metadata must leave the embedding "
+        f"sidecar untouched (before={before} after={after})"
+    )
+    assert after.get("embedding_model_id") != "m"
+    # The skip is loud.
+    assert any(
+        record.levelno == logging.WARNING
+        and record.name == "app.services.vector_store"
+        and "incomplete" in record.getMessage()
+        for record in caplog.records
+    ), "skipping a partial identity snapshot must log a WARNING"
+
+
+# ---------------------------------------------------------------------------
+# begin_dimension_rebuild failure path: the admission slot must not strand
+# waiters when the create fails after the slot was claimed (PRR-020).
+# ---------------------------------------------------------------------------
+
+
+def test_begin_dimension_rebuild_releases_slot_when_create_fails(
+    tmp_path, monkeypatch
+) -> None:
+    """A create-table failure after the slot is claimed releases the slot,
+    so a later begin is not stranded."""
+
+    async def scenario() -> None:
+        monkeypatch.setattr(settings, "data_dir", tmp_path)
+        store = await _make_store(tmp_path, OLD_DIM)
+        original_create = store.db.create_table
+
+        async def _failing_create(*args, **kwargs):  # noqa: ANN001, ANN202
+            raise RuntimeError("simulated create_table failure")
+
+        store.db.create_table = _failing_create
+        raised: BaseException | None = None
+        try:
+            await store.begin_dimension_rebuild(NEW_DIM)
+        except BaseException as exc:  # noqa: BLE001
+            raised = exc
+        finally:
+            store.db.create_table = original_create
+
+        assert raised is not None
+        assert isinstance(raised, VectorStoreConnectionError)
+        # The slot was released — a later begin is not stranded by it.
+        assert store._rebuild_slot_open is False
+        assert store._rebuild_owner_task is None
+        handle = await store.begin_dimension_rebuild(NEW_DIM)
+        assert isinstance(handle, DimensionRebuildHandle)
+        await store.abort_dimension_rebuild(handle)
+        assert store._rebuild_slot_open is False
+
+    asyncio.run(scenario())

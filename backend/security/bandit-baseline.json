@@ -36,7 +36,7 @@
       "SEVERITY.LOW": 62,
       "SEVERITY.MEDIUM": 60,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 87001,
+      "loc": 87145,
       "nosec": 0,
       "skipped_tests": 66
     },
@@ -413,7 +413,7 @@
       "SEVERITY.LOW": 7,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 885,
+      "loc": 896,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1661,7 +1661,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 2988,
+      "loc": 3121,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -3243,70 +3243,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1153         await app.state.thinking_llm_client.close()\n1154     except Exception:\n1155         pass\n1156     try:\n",
-      "col_offset": 4,
-      "end_col_offset": 12,
-      "filename": "backend/app/lifespan.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 703,
-        "link": "https://cwe.mitre.org/data/definitions/703.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1154,
-      "line_range": [
-        1154,
-        1155
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
-      "test_id": "B110",
-      "test_name": "try_except_pass"
-    },
-    {
-      "code": "1157         await app.state.instant_llm_client.close()\n1158     except Exception:\n1159         pass\n1160     try:\n",
-      "col_offset": 4,
-      "end_col_offset": 12,
-      "filename": "backend/app/lifespan.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 703,
-        "link": "https://cwe.mitre.org/data/definitions/703.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1158,
-      "line_range": [
-        1158,
-        1159
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
-      "test_id": "B110",
-      "test_name": "try_except_pass"
-    },
-    {
-      "code": "1161         await app.state.embedding_service.close()\n1162     except Exception:\n1163         pass\n1164     try:\n",
-      "col_offset": 4,
-      "end_col_offset": 12,
-      "filename": "backend/app/lifespan.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 703,
-        "link": "https://cwe.mitre.org/data/definitions/703.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1162,
-      "line_range": [
-        1162,
-        1163
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
-      "test_id": "B110",
-      "test_name": "try_except_pass"
-    },
-    {
-      "code": "1165         await app.state.reranking_service.close()\n1166     except Exception:\n1167         pass\n1168     try:\n",
+      "code": "1165         await app.state.thinking_llm_client.close()\n1166     except Exception:\n1167         pass\n1168     try:\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3327,7 +3264,7 @@
       "test_name": "try_except_pass"
     },
     {
-      "code": "1169         app.state.vector_store.close()\n1170     except Exception:\n1171         pass\n1172     try:\n",
+      "code": "1169         await app.state.instant_llm_client.close()\n1170     except Exception:\n1171         pass\n1172     try:\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3348,7 +3285,7 @@
       "test_name": "try_except_pass"
     },
     {
-      "code": "1173         app.state.db_pool.close_all()\n1174     except Exception:\n1175         pass\n1176     try:\n",
+      "code": "1173         await app.state.embedding_service.close()\n1174     except Exception:\n1175         pass\n1176     try:\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3369,7 +3306,7 @@
       "test_name": "try_except_pass"
     },
     {
-      "code": "1178         _auth_executor.shutdown(wait=False)\n1179     except Exception:\n1180         pass\n1181     with contextlib_suppress(Exception):\n",
+      "code": "1177         await app.state.reranking_service.close()\n1178     except Exception:\n1179         pass\n1180     try:\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3380,10 +3317,73 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1179,
+      "line_number": 1178,
       "line_range": [
-        1179,
-        1180
+        1178,
+        1179
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
+      "test_id": "B110",
+      "test_name": "try_except_pass"
+    },
+    {
+      "code": "1181         app.state.vector_store.close()\n1182     except Exception:\n1183         pass\n1184     try:\n",
+      "col_offset": 4,
+      "end_col_offset": 12,
+      "filename": "backend/app/lifespan.py",
+      "issue_confidence": "HIGH",
+      "issue_cwe": {
+        "id": 703,
+        "link": "https://cwe.mitre.org/data/definitions/703.html"
+      },
+      "issue_severity": "LOW",
+      "issue_text": "Try, Except, Pass detected.",
+      "line_number": 1182,
+      "line_range": [
+        1182,
+        1183
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
+      "test_id": "B110",
+      "test_name": "try_except_pass"
+    },
+    {
+      "code": "1185         app.state.db_pool.close_all()\n1186     except Exception:\n1187         pass\n1188     try:\n",
+      "col_offset": 4,
+      "end_col_offset": 12,
+      "filename": "backend/app/lifespan.py",
+      "issue_confidence": "HIGH",
+      "issue_cwe": {
+        "id": 703,
+        "link": "https://cwe.mitre.org/data/definitions/703.html"
+      },
+      "issue_severity": "LOW",
+      "issue_text": "Try, Except, Pass detected.",
+      "line_number": 1186,
+      "line_range": [
+        1186,
+        1187
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
+      "test_id": "B110",
+      "test_name": "try_except_pass"
+    },
+    {
+      "code": "1190         _auth_executor.shutdown(wait=False)\n1191     except Exception:\n1192         pass\n1193     with contextlib_suppress(Exception):\n",
+      "col_offset": 4,
+      "end_col_offset": 12,
+      "filename": "backend/app/lifespan.py",
+      "issue_confidence": "HIGH",
+      "issue_cwe": {
+        "id": 703,
+        "link": "https://cwe.mitre.org/data/definitions/703.html"
+      },
+      "issue_severity": "LOW",
+      "issue_text": "Try, Except, Pass detected.",
+      "line_number": 1191,
+      "line_range": [
+        1191,
+        1192
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
@@ -4541,7 +4541,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "3765         # Create a deterministic seed from the text\n3766         seed_value = int(hashlib.md5(text.encode(\"utf-8\")).hexdigest(), 16) % (2**32)\n3767         random.seed(seed_value)\n",
+      "code": "3929         # Create a deterministic seed from the text\n3930         seed_value = int(hashlib.md5(text.encode(\"utf-8\")).hexdigest(), 16) % (2**32)\n3931         random.seed(seed_value)\n",
       "col_offset": 25,
       "end_col_offset": 58,
       "filename": "backend/app/services/vector_store.py",
@@ -4552,9 +4552,9 @@
       },
       "issue_severity": "HIGH",
       "issue_text": "Use of weak MD5 hash for security. Consider usedforsecurity=False",
-      "line_number": 3766,
+      "line_number": 3930,
       "line_range": [
-        3766
+        3930
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b324_hashlib.html",
       "test_id": "B324",
