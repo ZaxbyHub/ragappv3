@@ -84,9 +84,9 @@ fixture-mode semantics, not production behavior.
   What changed) plus `components/ErrorBoundary.test.tsx` — unit coverage for
   all three `resetOnChange` branches including the two-cycle
   crash→recover→crash→recover-back sequence — and `App.l08-feedback.test.tsx` /
-  `App.l08-search-reset.test.tsx` — positive pins from the review round
+  `App.l08-search-reset.test.tsx` / `App.l08-query-reset.test.tsx` — positive pins from the review round
   (the admin page itself renders in test mode; `/search` passes an empty
-  active item; a query-only navigation recovers a crashed `/search`).
+  active item; a query-only navigation recovers a crashed `/search` through the real route boundary, pinned in query-reset).
 
 ## Migration
 
