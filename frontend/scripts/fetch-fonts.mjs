@@ -34,7 +34,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -90,6 +90,14 @@ if (blocks.length === 0) {
 }
 
 mkdirSync(OUT_DIR, { recursive: true });
+// Sweep staging files orphaned by earlier interrupted runs (#780 review): a
+// hard kill (power loss / SIGKILL) mid-curl bypasses the per-file catch and
+// would otherwise leave a foo.woff2.part behind that no gate scans.
+for (const stale of readdirSync(OUT_DIR)) {
+  if (stale.endsWith(".part")) {
+    rmSync(join(OUT_DIR, stale), { force: true });
+  }
+}
 const slug = (s) => s.replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "").toLowerCase();
 const cssOut = [];
 const seen = new Set();
