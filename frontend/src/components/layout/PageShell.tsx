@@ -117,16 +117,16 @@ export function PageShell({ children, activeItem, onItemSelect, healthStatus }: 
               remains as the last resort.
 
               Recovery-on-navigation is a STATE reset, not a remount
-              (resetOnChange={location.pathname}): a key-based remount at
-              crash time re-throws inside React's error-recovery commit and
-              escapes to the outer boundary, and a pathname key on every
-              navigation would also remount this subtree for same-component
-              route transitions like /chat -> /chat/:id, whose
-              AnimatePresence exit window is load-bearing for the chat
-              send/stream flow (the #821 regression class). The boundary
-              instance persists across navigations, so the original
-              exit/enter cross-fade behavior is unchanged for every
-              non-crash transition. */}
+              (resetOnChange={location.pathname + location.search}): a
+              key-based remount at crash time re-throws inside React's
+              error-recovery commit and escapes to the outer boundary, and
+              a pathname key on every navigation would also remount this
+              subtree for same-component route transitions like /chat ->
+              /chat/:id, whose AnimatePresence exit window is load-bearing
+              for the chat send/stream flow (the #821 regression class).
+              The boundary instance persists across navigations, so the
+              original exit/enter cross-fade behavior is unchanged for
+              every non-crash transition. */}
           {/* pathname + search (not location.key): manual history entries in
               tests carry no router key, so keys can degenerate to equal —
               the composite string is deterministic. A query-only navigation

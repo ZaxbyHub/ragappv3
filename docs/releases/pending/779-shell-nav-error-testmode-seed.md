@@ -20,7 +20,8 @@ UI-R2-06, UI-R3-08, class C17).
   the existing `ErrorBoundary` (default "Something went wrong" / Try Again
   fallback, scoped to the page area), and the boundary component gained a
   `resetOnChange` prop: when the value changes (PageShell passes
-  `location.key`), a caught error resets in that same render pass — the
+  `location.pathname + location.search`), a caught error resets in that
+  same render pass — the
   `resetKeys` pattern from react-error-boundary. A render error in any routed
   page now leaves navigation mounted and usable, and ANY navigation away —
   including a query-only re-search (`/search?q=a` → `/search?q=b`, which does
