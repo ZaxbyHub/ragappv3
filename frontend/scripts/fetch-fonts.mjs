@@ -19,6 +19,14 @@
  * (<family>-<subset>-<style>-<weight>.woff2), and prints the matching
  * @font-face CSS block to stdout (the canonical block lives in src/index.css).
  *
+ * #780 (L09) failure hygiene: each woff2 downloads to a `.part` staging file
+ * and is renamed onto its final path only after a completed transfer, so an
+ * interrupted run leaves no truncated bytes at any final path; a css2 response
+ * that yields zero @font-face blocks (or is missing any requested family)
+ * fails the run instead of "succeeding" with a manifest regenerated from
+ * whatever is already on disk; the manifest itself is written atomically and
+ * covers only the files this run actually vendored.
+ *
  * No dependencies: node stdlib + curl via execSync, like the original.
  *
  * Run from anywhere:  node frontend/scripts/fetch-fonts.mjs
@@ -26,13 +34,14 @@
  */
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const OUT_DIR = join(scriptDir, "..", "src", "assets", "fonts");
 
+const EXPECTED_FAMILIES = ["Inter", "Spline Sans", "Commissioner", "Electrolize"];
 const CSS2_URL =
   "https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Spline+Sans:wght@300..700&family=Commissioner:wght@100..900&family=Electrolize&display=swap";
 const UA =
@@ -72,10 +81,19 @@ while ((m = re.exec(css)) !== null) {
   });
 }
 
+// T1-20-MH-07 (#780): a css2 response that parsed to zero @font-face blocks
+// (e.g. Google changes the response format) must fail loudly BEFORE anything
+// is downloaded, never "succeed" by regenerating the manifest from disk.
+if (blocks.length === 0) {
+  console.error(`fetch-fonts: css2 response parsed to 0 @font-face blocks (${CSS2_URL}) — aborting without touching the vendored fonts`);
+  process.exit(1);
+}
+
 mkdirSync(OUT_DIR, { recursive: true });
 const slug = (s) => s.replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "").toLowerCase();
 const cssOut = [];
 const seen = new Set();
+const downloadedFiles = []; // files vendored by THIS run — the only manifest source (#780)
 let totalBytes = 0;
 for (const b of blocks) {
   const fam = b.family.replace(/'/g, "");
@@ -83,10 +101,21 @@ for (const b of blocks) {
   const dest = join(OUT_DIR, file);
   if (!seen.has(file)) {
     seen.add(file);
-    execFileSync(
-      "curl",
-      ["-sfL", "--max-time", String(CSS_TIMEOUT_S), "-A", UA, "-o", dest, b.url],
-    );
+    // T1-20-S2-12 (#780): download to a staging name and rename into place
+    // only after a completed transfer, so an interrupted download leaves the
+    // previous vendored bytes intact at the final path and no truncated file.
+    const part = join(OUT_DIR, `${file}.part`);
+    try {
+      execFileSync(
+        "curl",
+        ["-sfL", "--max-time", String(CSS_TIMEOUT_S), "-A", UA, "-o", part, b.url],
+      );
+      renameSync(part, dest);
+    } catch (err) {
+      rmSync(part, { force: true });
+      throw err;
+    }
+    downloadedFiles.push(file);
   }
   const bytes = statSync(dest).size; // cross-platform size (was `stat -c%s`)
   totalBytes += seen.has(file + "c") ? 0 : bytes;
@@ -107,14 +136,33 @@ for (const b of blocks) {
   );
 }
 
+// T1-20-MH-07 (#780, second half): every family this run requested must have
+// been seen. Runs AFTER the download loop and BEFORE the manifest write on
+// purpose — a pre-download family guard would let the frozen interrupted-
+// download check pass without exercising the staging fix, and this ordering
+// leaves a failed family check detectable by the font-integrity CI test
+// (files downloaded, manifest not rewritten) instead of silently partial.
+const seenFamilies = new Set(blocks.map((b) => b.family.replace(/'/g, "")));
+const missingFamilies = EXPECTED_FAMILIES.filter((f) => !seenFamilies.has(f));
+if (missingFamilies.length > 0) {
+  console.error(`fetch-fonts: css2 response is missing requested font families: ${missingFamilies.join(", ")} — aborting before writing SHA256SUMS`);
+  process.exit(1);
+}
+
 // Provenance manifest (issue #640): `<sha256>  <filename>` (two spaces), one
-// line per woff2 in the directory, sorted by filename — the format the
-// integrity tests and the frozen #640 acceptance check parse.
-const manifestLines = readdirSync(OUT_DIR)
-  .filter((name) => name.toLowerCase().endsWith(".woff2"))
+// line per woff2 vendored by THIS run, sorted by filename — the format the
+// integrity tests and the frozen #640 acceptance check parse. Written via a
+// staging name + rename so a crash mid-write cannot leave a truncated
+// manifest behind (#780). For a clean vendored directory this is byte-identical
+// to the previous disk-sourced manifest; orphan files from older runs no
+// longer get legitimized into it.
+const manifestLines = downloadedFiles
+  .slice()
   .sort()
   .map((name) => `${createHash("sha256").update(readFileSync(join(OUT_DIR, name))).digest("hex")}  ${name}`);
-writeFileSync(join(OUT_DIR, "SHA256SUMS"), manifestLines.join("\n") + "\n", "utf8");
+const manifestPart = join(OUT_DIR, "SHA256SUMS.part");
+writeFileSync(manifestPart, manifestLines.join("\n") + "\n", "utf8");
+renameSync(manifestPart, join(OUT_DIR, "SHA256SUMS"));
 
 console.log(`files: ${seen.size / 2}, blocks: ${blocks.length}, total woff2 bytes: ${totalBytes}`);
 console.log(`SHA256SUMS written (${manifestLines.length} entries) to ${join(OUT_DIR, "SHA256SUMS")}`);

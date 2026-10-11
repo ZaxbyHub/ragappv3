@@ -119,6 +119,9 @@ python scripts/check_b03_upload_migration_timeout.py   # upload migration timeou
 python scripts/check_l05_raw_palette.py   # raw Tailwind palette classes within budget
 python scripts/check_l05_page_headers.py   # pages use the shared PageTitleHeader
 python scripts/check_l07_a11y_gate_wired.py  # the a11y matrix gate is wired in CI
+python scripts/check_l09_skill_trigger_paths.py  # generated skill trigger globs reference existing paths
+python scripts/check_l09_index_assets.py   # %BASE_URL% links in index.html exist under public/
+python scripts/check_l09_memory_response_fields.py   # AddMemoryResponse matches the backend MemoryResponse
 ```
 
 **Closure evidence gate** (from repo root; standalone workflow

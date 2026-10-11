@@ -166,6 +166,15 @@ jobs:
       - name: A11y gate wiring check
         run: python scripts/check_l07_a11y_gate_wired.py
 
+      - name: Generated skill trigger paths check
+        run: python scripts/check_l09_skill_trigger_paths.py
+
+      - name: Index asset links check
+        run: python scripts/check_l09_index_assets.py
+
+      - name: Memory response fields check
+        run: python scripts/check_l09_memory_response_fields.py
+
   # Issue #778 (Workstream L PR 7): the route x viewport accessibility gate.
   # Separate from the e2e smoke job — the matrix is 141 serial tests and
   # must not share the smoke budget — and wired by

@@ -39,25 +39,30 @@ export const useVaultStore = create<VaultState>((set, get) => ({
     try {
       const data = await listAccessibleVaults();
       const vaults = data.vaults ?? [];
-      set((state) => {
-        // Validate that the persisted activeVaultId is still accessible.
-        // If not, auto-select the first vault or clear to null.
-        const currentId = state.activeVaultId;
-        // null is a valid "All Vaults" selection — only replace a non-null ID that
-        // no longer exists in the fetched vault list (e.g. vault was deleted).
-        const isValid = currentId === null || vaults.some((v) => v.id === currentId);
-        if (!isValid) {
-          const first = vaults[0] ?? null;
-          const newId = first ? first.id : null;
-          if (newId != null) {
-            localStorage.setItem("kv_active_vault_id", String(newId));
-          } else {
-            localStorage.removeItem("kv_active_vault_id");
-          }
-          return { vaults, activeVaultId: newId, loading: false, error: null };
+      // Validate that the persisted activeVaultId is still accessible.
+      // If not, auto-select the first vault or clear to null.
+      const currentId = get().activeVaultId;
+      // null is a valid "All Vaults" selection — only replace a non-null ID that
+      // no longer exists in the fetched vault list (e.g. vault was deleted).
+      const isValid = currentId === null || vaults.some((v) => v.id === currentId);
+      // Commit the state slice first, pure of side effects (#780): persisting
+      // the corrected selection below is best-effort, so a storage failure
+      // (e.g. QuotaExceededError) must not discard an already-successful fetch.
+      set(
+        isValid
+          ? { vaults, loading: false, error: null }
+          : { vaults, activeVaultId: vaults[0]?.id ?? null, loading: false, error: null },
+      );
+      if (!isValid) {
+        // Same pattern addVault uses (59f387b3): the state above already
+        // reflects the correction; the persisted selection is secondary.
+        try {
+          get().setActiveVault(vaults[0]?.id ?? null);
+        } catch {
+          // localStorage unavailable (quota/private mode): keep the corrected
+          // in-memory selection.
         }
-        return { vaults, loading: false, error: null };
-      });
+      }
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : "Failed to fetch vaults";
       set({ error: errorMessage, loading: false });
@@ -98,16 +103,22 @@ export const useVaultStore = create<VaultState>((set, get) => ({
 
   removeVault: async (id: number) => {
     await deleteVault(id);
-    set((state) => {
-      const isActiveVault = state.activeVaultId === id;
-      if (isActiveVault) {
-        localStorage.removeItem("kv_active_vault_id");
-      }
-      return {
-        vaults: state.vaults.filter((v) => v.id !== id),
-        ...(isActiveVault && { activeVaultId: null }),
-      };
+    // The vault is already deleted server-side, so the state update is pure
+    // and the persisted-selection clear below is best-effort (#780): a
+    // storage failure must not reject the removal after the delete succeeded.
+    const { vaults, activeVaultId } = get();
+    const isActiveVault = activeVaultId === id;
+    set({
+      vaults: vaults.filter((v) => v.id !== id),
+      ...(isActiveVault && { activeVaultId: null }),
     });
+    if (isActiveVault) {
+      try {
+        get().setActiveVault(null);
+      } catch {
+        // localStorage unavailable: the in-memory selection is already cleared.
+      }
+    }
   },
 
   getActiveVault: () => {

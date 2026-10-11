@@ -21,10 +21,11 @@ export interface AddMemoryRequest {
   source?: string;
 }
 
-export interface AddMemoryResponse {
-  id: string;
-  status: string;
-}
+// #780 (L09): POST /memories returns the backend MemoryResponse shape
+// ({id, content, metadata?, score?, updated_at?} per MemoryResult) — the old
+// hand-written {id, status} declared a `status` field the backend never
+// sends. Alias the real shape so the type cannot drift again.
+export type AddMemoryResponse = MemoryResult;
 
 export interface SearchMemoriesResponse {
   results: MemoryResult[];
