@@ -79,8 +79,11 @@ def parse_interface_fields(text: str, type_name: str) -> list[str] | None:
                 line = line[: line.index("/*")]
             else:
                 line = line[:block_start] + line[end + 2 :]
+        # Inline trailing comments must not feed the depth accounting (a `}`
+        # inside `field: string; // }` would otherwise close the interface).
+        code_part = line.split("//", 1)[0] if "//" in line else line
         depth_before = depth
-        depth += line.count("{") - line.count("}")
+        depth += code_part.count("{") - code_part.count("}")
         if depth_before <= 0:
             break
         if depth_before != 1:

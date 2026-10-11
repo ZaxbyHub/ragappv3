@@ -13,10 +13,11 @@
 // OUT_DIR lands inside the tree) with only the two `execFileSync("curl", [`
 // call sites repointed at a deterministic stub (asserted to apply exactly
 // twice). The stub serves a multi-block css whose families are LOAD-BEARING:
-// one block per EXPECTED_FAMILIES entry (Inter, Spline Sans, Commissioner,
-// Electrolize) plus an extra subset block, so the script's post-download
-// family guard passes without relaxation — weakening or reordering the guard
-// to satisfy a fixture is the exact regression this file exists to prevent.
+// the fixture must keep serving one block per EXPECTED_FAMILIES entry (the
+// assertion below derives them from the script source), so the script's
+// post-download family guard passes without relaxation. The orphan-pruning
+// and missing-family behaviours are pinned separately in
+// fetch-fonts.l09-feedback.test.ts.
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { copyFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";

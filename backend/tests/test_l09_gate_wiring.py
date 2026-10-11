@@ -101,7 +101,9 @@ def test_guards_wired_into_ci_and_justfile() -> None:
             f"{name} missing from the quality-contracts job's non-comment run steps "
             f"(got: {ci_steps})"
         )
-        assert "NEUTERED" not in ci_steps, "quality-contracts job is if:false/continue-on-error"
+        assert not any("NEUTERED" in step for step in ci_steps), (
+            f"quality-contracts job is if:false/continue-on-error (steps: {ci_steps})"
+        )
         # justfile: only non-comment recipe lines count, and the recipe block
         # (not any other recipe) must carry the step.
         recipe = re.search(
