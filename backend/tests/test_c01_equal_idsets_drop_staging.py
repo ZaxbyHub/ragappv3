@@ -82,16 +82,14 @@ def _row(chunk_id: str) -> dict:
 
 @contextlib.contextmanager
 def _swallow_schema_probe_coroutine_noise():  # noqa: ANN202
-    """Capture the never-awaited-coroutine RuntimeWarning locally.
+    """Keep any schema-probe RuntimeWarning inside the test.
 
-    PRODUCTION DEFECT (reported, not fixed here — tests may not touch
-    production files): ``VectorStore._schema_embedding_dim`` calls
-    ``table.schema()`` without ``await``; on the real async backend that
-    leaks a never-awaited coroutine per call, which trips the repo-wide
-    issue #565 session gate whenever the reconcile generation check runs
-    against real tables (no prior test did). tests/conftest.py explicitly
-    exempts warnings captured inside a test's own
-    ``warnings.catch_warnings(record=True)`` block from that gate.
+    ``VectorStore._schema_embedding_dim`` awaits ``table.schema()`` when the
+    backend returns a coroutine and accepts a plain schema object otherwise,
+    so the probe is correct and should raise no warning; this simply stops
+    one from ever reaching the repo-wide issue #565 session gate.
+    tests/conftest.py explicitly exempts warnings captured inside a test's
+    own ``warnings.catch_warnings(record=True)`` block from that gate.
     """
     with warnings.catch_warnings(record=True):
         warnings.simplefilter("always", RuntimeWarning)

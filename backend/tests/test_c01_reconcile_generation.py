@@ -143,22 +143,18 @@ def _scoped_records(caplog, minimum_level: int) -> list:  # noqa: ANN001
 
 @contextlib.contextmanager
 def _swallow_schema_probe_coroutine_noise():  # noqa: ANN202
-    """Capture the never-awaited-coroutine RuntimeWarning locally.
+    """Capture schema-probe RuntimeWarnings locally.
 
-    PRODUCTION DEFECT (reported, not fixed here — tests may not touch
-    production files): ``VectorStore._schema_embedding_dim`` calls
-    ``table.schema()`` WITHOUT ``await``. On the real async backend that
-    (a) leaves the width comparison dead — the coroutine has no
-    ``.field()``, so the probe always answers None — and (b) leaks a
-    never-awaited coroutine per call, which trips the repo-wide issue
-    #565 session gate whenever this code runs against real tables (no
-    prior test did). The divergence detection below therefore exercises
-    the BOUNDED VALUE SAMPLE path, which does work against real LanceDB.
+    ``VectorStore._schema_embedding_dim`` awaits ``table.schema()`` when the
+    backend returns a coroutine, but a double that returns a plain schema
+    object is also accepted. This helper simply keeps any warning the probe
+    raises inside the test rather than letting it reach the repo-wide
+    issue #565 session gate; the probe itself is correct, so no warning
+    should be raised at all.
 
     tests/conftest.py explicitly exempts warnings captured inside a test's
-    own ``warnings.catch_warnings(record=True)`` block from the #565 gate;
-    this uses exactly that blessed mechanism so the pin can exist while
-    the defect is reported.
+    own ``warnings.catch_warnings(record=True)`` block from the #565 gate,
+    so this uses exactly that mechanism.
     """
     with warnings.catch_warnings(record=True):
         warnings.simplefilter("always", RuntimeWarning)
