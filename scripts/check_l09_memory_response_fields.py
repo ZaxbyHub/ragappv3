@@ -15,6 +15,15 @@ backend/app/api/routes/memories.py. Any TS field absent from the pydantic
 field set prints "PHANTOM AddMemoryResponse.<field>" (one line per phantom)
 and the script exits 1; none prints "PHANTOM 0" and exits 0. A missing or
 unparseable declaration on either side fails closed with exit 2.
+
+Parser hardening (review feedback, PR #880): the TS side tracks brace depth
+AFTER skipping // and /* */ comment text, so a `}` inside a comment can no
+longer truncate the compared field list, and only fields at the interface's
+top level (depth 1, before the field's own brace) are collected, so nested
+object keys no longer count as fields. The pydantic side counts only lines
+at exactly class-body indent (4 spaces) with a `name:` annotation, with
+triple-quoted docstrings stripped first, so docstring prose and
+method-local annotations no longer mask phantoms.
 """
 
 from __future__ import annotations
@@ -29,12 +38,12 @@ API_DIR = ROOT / "frontend" / "src" / "lib" / "api"
 PY_FILE = ROOT / "backend" / "app" / "api" / "routes" / "memories.py"
 
 TS_FIELD_RE = re.compile(r"^\s*([A-Za-z_$][\w$]*)\s*\??\s*:")
-PY_FIELD_RE = re.compile(r"^\s+([A-Za-z_]\w*)\s*:")
+PY_FIELD_RE = re.compile(r"^    ([A-Za-z_]\w*)\s*:")
 ALIAS_RE = re.compile(r"export\s+type\s+AddMemoryResponse\s*=\s*([A-Za-z_$][\w$]*)\s*;")
 
 
 def parse_interface_fields(text: str, type_name: str) -> list[str] | None:
-    """Field names of `export interface <type_name> { ... }`, or None if absent."""
+    """Top-level field names of `export interface <type_name> { ... }`, or None if absent."""
     marker = f"export interface {type_name} {{"
     start = text.find(marker)
     if start == -1:
@@ -42,17 +51,40 @@ def parse_interface_fields(text: str, type_name: str) -> list[str] | None:
     lines = text[start:].splitlines()
     fields: list[str] = []
     depth = lines[0].count("{") - lines[0].count("}")
+    in_block_comment = False
     for line in lines[1:]:
         if depth <= 0:
             break
         stripped = line.strip()
         if not stripped:
             continue
-        depth += line.count("{") - line.count("}")
-        if depth <= 0:
-            break
-        if stripped.startswith(("//", "*", "/*")):
+        # Comment handling precedes depth accounting so a `}` inside a
+        # comment cannot end the interface early.
+        if in_block_comment:
+            end = stripped.find("*/")
+            if end == -1:
+                continue
+            line = line[line.index("*/") + 2 :]
+            in_block_comment = False
+            stripped = line.strip()
+            if not stripped:
+                continue
+        if stripped.startswith("//"):
             continue
+        block_start = stripped.find("/*")
+        if block_start != -1:
+            end = stripped.find("*/", block_start + 2)
+            if end == -1:
+                in_block_comment = True
+                line = line[: line.index("/*")]
+            else:
+                line = line[:block_start] + line[end + 2 :]
+        depth_before = depth
+        depth += line.count("{") - line.count("}")
+        if depth_before <= 0:
+            break
+        if depth_before != 1:
+            continue  # nested object keys are not interface fields
         match = TS_FIELD_RE.match(line)
         if match:
             fields.append(match.group(1))
@@ -81,20 +113,42 @@ def resolve_ts_fields(ts_text: str) -> list[str] | None:
 
 
 def parse_pydantic_fields(py_text: str) -> list[str] | None:
-    """Annotated field names of `class MemoryResponse(BaseModel):`, or None."""
+    """Annotated field names of `class MemoryResponse(BaseModel):`, or None.
+
+    Only lines at exactly class-body indent (4 spaces) with a `name:`
+    annotation count; triple-quoted docstrings are stripped first so their
+    prose and any method-local `name:` annotations cannot masquerade as
+    fields.
+    """
     class_match = re.search(
         r"^class\s+MemoryResponse\s*\([^)]*\)\s*:", py_text, re.MULTILINE
     )
     if class_match is None:
         return None
     fields: list[str] = []
+    in_docstring = False
+    docstring_delim = ""
     for line in py_text[class_match.end() :].splitlines():
         if line.strip() and not line[0].isspace():
             # Next top-level statement (class / @ / async def / ...) ends the
             # class body.
             break
         stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
+        if not stripped:
+            continue
+        if in_docstring:
+            if docstring_delim in stripped:
+                in_docstring = False
+            continue
+        triple = re.match(r'"""|\'\'\'', stripped)
+        if triple:
+            docstring_delim = triple.group(0)
+            rest = stripped[3:]
+            if docstring_delim not in rest:
+                in_docstring = True
+                continue
+            continue
+        if stripped.startswith("#"):
             continue
         field_match = PY_FIELD_RE.match(line)
         if field_match:

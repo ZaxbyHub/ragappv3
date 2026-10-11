@@ -5,11 +5,17 @@ frontend/index.html references build-served assets with Vite's %BASE_URL%
 prefix. Issue #780 defect 4: the favicon links %BASE_URL%vite.svg, but
 frontend/public/ has never contained it — production nginx try_files serves
 /index.html (HTML) for the icon, so the browser falls back to its default.
-This check scans index.html for every href="%BASE_URL%<target>" occurrence
-and requires frontend/public/<target> to exist. Any missing target prints
-"MISSING frontend/public/<target>" (one line per missing target) and the
-script exits 1; all present prints "MISSING 0" and exits 0. A missing
-index.html or public/ dir fails closed with exit 2.
+This check scans index.html for every href= or src= attribute whose value is
+%BASE_URL%-prefixed (both quote styles, optional whitespace around =, case
+insensitive) and requires frontend/public/<target> to exist. A leading `/`
+or a `..` segment in the target escapes public/ and is reported MISSING.
+Query strings are stripped before the existence check (they must not mask a
+missing file, and a missing file must not be reported present). Any missing
+target prints "MISSING frontend/public/<target>" and the script exits 1; all
+present prints "MISSING 0" and exits 0. Fail-closed (review feedback, PR
+#880): when the text contains %BASE_URL% but the attribute scan finds zero
+occurrences, the parser has drifted — exit 2. A missing index.html or
+public/ dir also exits 2.
 """
 
 from __future__ import annotations
@@ -22,7 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 INDEX_HTML = ROOT / "frontend" / "index.html"
 PUBLIC_DIR = ROOT / "frontend" / "public"
 
-BASE_URL_HREF_RE = re.compile(r"href=\"%BASE_URL%([^\"]+)\"")
+BASE_URL_ATTR_RE = re.compile(r"""(?:href|src)\s*=\s*["']%BASE_URL%([^"']+)["']""", re.IGNORECASE)
 
 
 def main() -> int:
@@ -36,11 +42,23 @@ def main() -> int:
         print(f"index-assets: {exc}", file=sys.stderr)
         return 2
 
-    missing_targets = [
-        target
-        for target in BASE_URL_HREF_RE.findall(text)
-        if not (PUBLIC_DIR / target).is_file()
-    ]
+    targets = BASE_URL_ATTR_RE.findall(text)
+    if not targets and "%BASE_URL%" in text:
+        # Parser drift: the file references %BASE_URL% but the attribute
+        # regex matched none of the occurrences (quote/attr-form change).
+        print("index-assets: %BASE_URL% present but zero attributes parsed (parser drift)", file=sys.stderr)
+        return 2
+
+    missing_targets = []
+    for target in targets:
+        path = target.lstrip("/")
+        path = path.split("?", 1)[0]  # a query string must not mask a missing file
+        if not path or ".." in path.split("/"):
+            # Escapes frontend/public/ — nothing the build serves can back it.
+            missing_targets.append(target)
+            continue
+        if not (PUBLIC_DIR / path).is_file():
+            missing_targets.append(target)
     if missing_targets:
         for target in missing_targets:
             print(f"MISSING frontend/public/{target}")

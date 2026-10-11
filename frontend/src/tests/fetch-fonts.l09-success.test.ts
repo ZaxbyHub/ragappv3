@@ -49,7 +49,7 @@ const fontUrl = (b: { family: string; subset: string; weight: string }) =>
 // Deterministic, per-URL payload bytes (512 each, distinct per font).
 function payloadFor(url: string): Buffer {
   const digest = createHash("sha256").update(url).digest();
-  return Buffer.concat(Array.from({ length: 16 }, () => digest));
+  return Buffer.concat([Buffer.from("wOF2", "latin1"), ...Array.from({ length: 170 }, () => digest)]).subarray(0, 5120);
 }
 
 const SUCCESS_CSS = CSS_BLOCKS.map(
@@ -69,7 +69,7 @@ if (args.includes("-o")) {
   fs.mkdirSync(path.dirname(dest), { recursive: true });
   const url = args[args.length - 1];
   const digest = crypto.createHash("sha256").update(url).digest();
-  const payload = Buffer.concat(new Array(16).fill(digest));
+  const payload = Buffer.concat([Buffer.from("wOF2", "latin1"), ...new Array(170).fill(digest)]).subarray(0, 5120);
   fs.writeFileSync(dest, payload);
   process.exit(0);
 }
@@ -107,6 +107,19 @@ describe("fetch-fonts.mjs success path (issue #780 L09)", () => {
     });
     expect(patchedCallSites).toBe(2);
     writeFileSync(join(scriptsDir, "fetch-fonts.mjs"), patched, "utf8");
+
+    // The fixture families must cover the script's OWN EXPECTED_FAMILIES —
+    // asserted from the script source, so adding a family to the script
+    // fails here with a pointing finger instead of an opaque family-guard
+    // exit (and the cheapest fix is extending the fixture, not relaxing the
+    // guard).
+    const scriptFamilies = source.match(/const EXPECTED_FAMILIES = \[([^\]]+)\]/)?.[1] ?? "";
+    for (const family of scriptFamilies.split(",").map((s) => s.trim().replace(/^["']|["']$/g, "")).filter(Boolean)) {
+      expect(
+        CSS_BLOCKS.some((b) => b.family === family),
+        `fixture must serve a block for EXPECTED_FAMILIES entry "${family}"`,
+      ).toBe(true);
+    }
 
     const cssFile = join(root, "css2-response.css");
     writeFileSync(cssFile, SUCCESS_CSS, "utf8");

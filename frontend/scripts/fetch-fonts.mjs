@@ -19,13 +19,16 @@
  * (<family>-<subset>-<style>-<weight>.woff2), and prints the matching
  * @font-face CSS block to stdout (the canonical block lives in src/index.css).
  *
- * #780 (L09) failure hygiene: each woff2 downloads to a `.part` staging file
- * and is renamed onto its final path only after a completed transfer, so an
- * interrupted run leaves no truncated bytes at any final path; a css2 response
+ * #780 (L09) failure hygiene: each woff2 downloads to a `.part` staging file,
+ * is validated (wOF2 magic + minimum size) and renamed onto its final path
+ * only after a completed transfer, so an interrupted run leaves the previous
+ * vendored bytes intact at the final paths it had not reached yet; orphaned
+ * `.part` staging files are swept at the start of every run; a css2 response
  * that yields zero @font-face blocks (or is missing any requested family)
- * fails the run instead of "succeeding" with a manifest regenerated from
- * whatever is already on disk; the manifest itself is written atomically and
- * covers only the files this run actually vendored.
+ * fails the run instead of "succeeding"; the manifest itself is written
+ * atomically, covers only the files this run actually vendored, and a
+ * successful run prunes vendored `.woff2` files the css2 response no longer
+ * references so the tree it leaves behind is self-consistent.
  *
  * No dependencies: node stdlib + curl via execSync, like the original.
  *
@@ -34,7 +37,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -46,15 +49,27 @@ const CSS2_URL =
   "https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Spline+Sans:wght@300..700&family=Commissioner:wght@100..900&family=Electrolize&display=swap";
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36";
+// Publish-point floor, matching the repo's font-integrity contract
+// (src/tests/helpers/font-integrity.ts): a shorter transfer is a truncated
+// body even when curl exited 0 (chunked close / proxy error page).
+const WOFF2_MIN_BYTES = 5000;
 
 // F-004/F-005 (#651 review): execFileSync (no shell -> no injection
 // surface if the URL ever becomes dynamic) and a bounded network time.
 const CSS_TIMEOUT_S = 60;
-const css = execFileSync(
-  "curl",
-  ["-sfL", "--max-time", String(CSS_TIMEOUT_S), "-A", UA, CSS2_URL],
-  { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 },
-);
+let css;
+try {
+  css = execFileSync(
+    "curl",
+    ["-sfL", "--max-time", String(CSS_TIMEOUT_S), "-A", UA, CSS2_URL],
+    { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 },
+  );
+} catch (err) {
+  console.error(
+    `fetch-fonts: css2 stylesheet fetch failed (${err.message.split("\n")[0]}) — aborting without touching the vendored fonts`,
+  );
+  process.exit(1);
+}
 
 // css2 output: /* subset */\n@font-face { ... } blocks.
 const blocks = [];
@@ -81,6 +96,28 @@ while ((m = re.exec(css)) !== null) {
   });
 }
 
+mkdirSync(OUT_DIR, { recursive: true });
+// Sweep staging files orphaned by earlier interrupted runs (#780 review): a
+// hard kill (power loss / SIGKILL) mid-curl bypasses the per-file catch and
+// would otherwise leave a foo.woff2.part behind that no gate scans. Runs on
+// every invocation (before the zero-block guard) so even an aborted run
+// cleans stale staging state; only regular files are removed, and a refusal
+// to unlink is reported, never fatal.
+for (const entry of readdirSync(OUT_DIR, { withFileTypes: true })) {
+  if (!entry.name.endsWith(".part")) {
+    continue;
+  }
+  if (!entry.isFile()) {
+    console.error(`fetch-fonts: skipping non-file staging entry ${entry.name}`);
+    continue;
+  }
+  try {
+    rmSync(join(OUT_DIR, entry.name), { force: true });
+  } catch (err) {
+    console.error(`fetch-fonts: could not remove stale staging file ${entry.name}: ${err.message.split("\n")[0]}`);
+  }
+}
+
 // T1-20-MH-07 (#780): a css2 response that parsed to zero @font-face blocks
 // (e.g. Google changes the response format) must fail loudly BEFORE anything
 // is downloaded, never "succeed" by regenerating the manifest from disk.
@@ -89,16 +126,27 @@ if (blocks.length === 0) {
   process.exit(1);
 }
 
-mkdirSync(OUT_DIR, { recursive: true });
-// Sweep staging files orphaned by earlier interrupted runs (#780 review): a
-// hard kill (power loss / SIGKILL) mid-curl bypasses the per-file catch and
-// would otherwise leave a foo.woff2.part behind that no gate scans.
-for (const stale of readdirSync(OUT_DIR)) {
-  if (stale.endsWith(".part")) {
-    rmSync(join(OUT_DIR, stale), { force: true });
-  }
-}
 const slug = (s) => s.replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "").toLowerCase();
+// Windows replace-by-rename (MoveFileExW REPLACE_EXISTING) fails with
+// EPERM/EBUSY while another handle holds the destination open; a short
+// bounded retry keeps a transient lock (AV scan, editor) from discarding a
+// fully downloaded staging file (#780 review).
+const renameWithRetry = (from, to) => {
+  const delays = [100, 300];
+  for (let attempt = 0; ; attempt++) {
+    try {
+      renameSync(from, to);
+      return;
+    } catch (err) {
+      if (attempt >= delays.length) {
+        throw err;
+      }
+      const shared = new Int32Array(new SharedArrayBuffer(4));
+      Atomics.wait(shared, 0, 0, delays[attempt]);
+    }
+  }
+};
+
 const cssOut = [];
 const seen = new Set();
 const downloadedFiles = []; // files vendored by THIS run — the only manifest source (#780)
@@ -109,18 +157,28 @@ for (const b of blocks) {
   const dest = join(OUT_DIR, file);
   if (!seen.has(file)) {
     seen.add(file);
-    // T1-20-S2-12 (#780): download to a staging name and rename into place
-    // only after a completed transfer, so an interrupted download leaves the
-    // previous vendored bytes intact at the final path and no truncated file.
+    // T1-20-S2-12 (#780): download to a staging name, validate the payload,
+    // and rename into place only after a completed transfer, so an
+    // interrupted download leaves the previous vendored bytes intact at the
+    // final path and no truncated file.
     const part = join(OUT_DIR, `${file}.part`);
     try {
       execFileSync(
         "curl",
         ["-sfL", "--max-time", String(CSS_TIMEOUT_S), "-A", UA, "-o", part, b.url],
       );
-      renameSync(part, dest);
+      const payload = readFileSync(part);
+      if (payload.length < WOFF2_MIN_BYTES || payload.subarray(0, 4).toString("latin1") !== "wOF2") {
+        throw new Error(
+          `downloaded payload failed validation (${payload.length} bytes, magic ${payload.subarray(0, 4).toString("latin1") || "empty"}) — curl exited 0 but the body is not a plausible woff2`,
+        );
+      }
+      renameWithRetry(part, dest);
     } catch (err) {
       rmSync(part, { force: true });
+      if (downloadedFiles.length > 0) {
+        console.error(`fetch-fonts: files already renamed onto final paths before this failure: ${downloadedFiles.join(", ")}`);
+      }
       throw err;
     }
     downloadedFiles.push(file);
@@ -147,13 +205,20 @@ for (const b of blocks) {
 // T1-20-MH-07 (#780, second half): every family this run requested must have
 // been seen. Runs AFTER the download loop and BEFORE the manifest write on
 // purpose — a pre-download family guard would let the frozen interrupted-
-// download check pass without exercising the staging fix, and this ordering
-// leaves a failed family check detectable by the font-integrity CI test
-// (files downloaded, manifest not rewritten) instead of silently partial.
+// download check pass without exercising the staging fix. NOTE: at this exit
+// the present families' final paths have ALREADY been replaced (byte-identical
+// bytes on a normal re-vendor) and SHA256SUMS is intentionally left
+// unwritten — this exit and the unwritten manifest are the only signals; the
+// font-integrity CI test compares the UNCHANGED manifest against the
+// UNCHANGED files and would still pass, so an operator must act on the
+// non-zero exit here.
 const seenFamilies = new Set(blocks.map((b) => b.family.replace(/'/g, "")));
 const missingFamilies = EXPECTED_FAMILIES.filter((f) => !seenFamilies.has(f));
 if (missingFamilies.length > 0) {
   console.error(`fetch-fonts: css2 response is missing requested font families: ${missingFamilies.join(", ")} — aborting before writing SHA256SUMS`);
+  if (downloadedFiles.length > 0) {
+    console.error(`fetch-fonts: final paths already replaced by this run: ${downloadedFiles.join(", ")}`);
+  }
   process.exit(1);
 }
 
@@ -161,9 +226,9 @@ if (missingFamilies.length > 0) {
 // line per woff2 vendored by THIS run, sorted by filename — the format the
 // integrity tests and the frozen #640 acceptance check parse. Written via a
 // staging name + rename so a crash mid-write cannot leave a truncated
-// manifest behind (#780). For a clean vendored directory this is byte-identical
-// to the previous disk-sourced manifest; orphan files from older runs no
-// longer get legitimized into it.
+// manifest behind (#780). Orphan files the css2 response no longer
+// references are pruned after the manifest lands, so a successful run leaves
+// a self-consistent tree (manifest set == on-disk set).
 const manifestLines = downloadedFiles
   .slice()
   .sort()
@@ -171,6 +236,16 @@ const manifestLines = downloadedFiles
 const manifestPart = join(OUT_DIR, "SHA256SUMS.part");
 writeFileSync(manifestPart, manifestLines.join("\n") + "\n", "utf8");
 renameSync(manifestPart, join(OUT_DIR, "SHA256SUMS"));
+
+const pruned = readdirSync(OUT_DIR).filter(
+  (name) => name.toLowerCase().endsWith(".woff2") && !downloadedFiles.includes(name),
+);
+for (const orphan of pruned) {
+  rmSync(join(OUT_DIR, orphan), { force: true });
+}
+if (pruned.length > 0) {
+  console.log(`pruned ${pruned.length} orphaned woff2 file(s) no longer referenced by the css2 response: ${pruned.join(", ")}`);
+}
 
 console.log(`files: ${seen.size / 2}, blocks: ${blocks.length}, total woff2 bytes: ${totalBytes}`);
 console.log(`SHA256SUMS written (${manifestLines.length} entries) to ${join(OUT_DIR, "SHA256SUMS")}`);

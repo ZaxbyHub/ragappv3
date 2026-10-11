@@ -17,6 +17,8 @@ trigger:
         - "backend/app/api/routes/*.py"
         - "backend/app/services/*.py"
         - "frontend/src/lib/api/**/*.ts"
+        - "frontend/src/stores/**/*.ts"
+        - "frontend/src/hooks/**/*.ts"
         - "frontend/src/pages/*.tsx"
         - "backend/app/models/database.py"
       exclude:

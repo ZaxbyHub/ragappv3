@@ -146,18 +146,18 @@ export type { MemoryResult };
 
 // Metadata helper functions (pure functions, not hooks)
 /** Extract category string from memory metadata, defaulting to 'Uncategorized'. */
-export function getCategoryFromMetadata(metadata?: Record<string, unknown>): string {
+export function getCategoryFromMetadata(metadata?: Record<string, unknown> | null): string {
   return (metadata?.category as string) || "Uncategorized";
 }
 
 /** Extract tags array from memory metadata, defaulting to empty array. */
-export function getTagsFromMetadata(metadata?: Record<string, unknown>): string[] {
+export function getTagsFromMetadata(metadata?: Record<string, unknown> | null): string[] {
   const tags = metadata?.tags;
   if (Array.isArray(tags)) return tags;
   return [];
 }
 
 /** Extract source string from memory metadata, defaulting to empty string. */
-export function getSourceFromMetadata(metadata?: Record<string, unknown>): string {
+export function getSourceFromMetadata(metadata?: Record<string, unknown> | null): string {
   return (metadata?.source as string) || "";
 }

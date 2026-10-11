@@ -70,6 +70,11 @@ export const useVaultStore = create<VaultState>((set, get) => ({
   },
 
   setActiveVault: (id: number | null) => {
+    // Storage write happens BEFORE the state set, so a throwing caller gets
+    // NEITHER the persistence NOR the in-memory change. Callers that wrap
+    // this in a best-effort try/catch (fetchVaults/removeVault below,
+    // addVault) must therefore commit the corrected state slice FIRST — the
+    // guard only contains the persistence failure, never the state change.
     if (id != null) {
       localStorage.setItem("kv_active_vault_id", String(id));
     } else {
