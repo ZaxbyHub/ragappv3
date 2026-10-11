@@ -10,7 +10,10 @@ export interface NavItem {
 }
 
 export interface NavigationProps {
-  activeItem: NavItemId;
+  // null = no nav item owns the current route (e.g. /search); only the
+  // mobile bottom nav consumes this — the desktop rail derives its own
+  // NavItemId | null from the location (issue #779 / UI-R1-08).
+  activeItem: NavItemId | null;
   onItemSelect: (id: NavItemId) => void;
   healthStatus: HealthStatus;
 }

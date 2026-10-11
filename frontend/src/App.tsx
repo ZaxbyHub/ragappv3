@@ -154,8 +154,11 @@ function MainAppShell({ children, testMode = false }: { children: React.ReactNod
   const navigate = useNavigate();
   const location = useLocation();
 
-  // Determine active nav item from current route
-  const getActiveItemFromPath = (pathname: string): NavItemId => {
+  // Determine active nav item from current route. null means no nav item
+  // owns the route (e.g. /search, per its own route comment) — the mobile
+  // bottom nav then marks nothing aria-current, matching the desktop rail's
+  // own null-returning mapper (issue #779 / UI-R1-08).
+  const getActiveItemFromPath = (pathname: string): NavItemId | null => {
     if (pathname.startsWith("/chat")) return "chat";
     if (pathname.startsWith("/documents")) return "documents";
     if (pathname.startsWith("/memory")) return "memory";
@@ -168,7 +171,7 @@ function MainAppShell({ children, testMode = false }: { children: React.ReactNod
     if (pathname.startsWith("/admin/users")) return "users";
     if (pathname.startsWith("/admin/organizations")) return "organizations";
     if (pathname.startsWith("/profile")) return "profile";
-    return "documents";
+    return null;
   };
 
   const activeItem = getActiveItemFromPath(location.pathname);
@@ -249,15 +252,78 @@ function MainAppShell({ children, testMode = false }: { children: React.ReactNod
   );
 }
 
+// Demo user for the dev-only fixture mode (moved from ProtectedRoute with
+// issue #779 / UI-R3-08 — the synchronous seed block lives in App's render,
+// below).
+function getDemoUser() {
+  const role = import.meta.env.VITE_DEMO_ROLE || "superadmin";
+  return {
+    id: 1,
+    username: import.meta.env.VITE_DEMO_USERNAME || "demo",
+    full_name: import.meta.env.VITE_DEMO_FULL_NAME || "Demo User",
+    role: role as "superadmin" | "admin" | "member" | "viewer",
+    is_active: true,
+  };
+}
+
+// Issue #779 (UI-R3-08): seed the demo session synchronously, BEFORE any
+// guard or auth-reading page renders. The old seed lived in ProtectedRoute's
+// useEffect — one commit too late for RoleGuard's synchronous
+// isAuthenticated read (every /admin route visit bounced to /login on the
+// first render) and invisible to LoginPage/SetupPage, which skip init() in
+// test mode and spun on needsSetup === null forever.
+//
+// Split in two after review feedback (PRR-003/F-3): the FIRST-RENDER seed
+// below stays synchronous — at that point no component is subscribed to the
+// store yet, so the write cannot trigger React's "cannot update a component
+// while rendering" warning — while the post-logout re-seed arm lives in the
+// effect further down, because a render-phase write on a MOUNTED tree
+// notifies subscribers mid-render. Mock-safe: suites that stub useAuthStore
+// as a bare selector no-op through the optional call. Idempotent: the ref
+// guard runs the synchronous arm once per mount, and the effect arm
+// converges on the already-seeded state. (Comment note: avoid literal
+// "admin-slash-star" sequences in comments here — the recurrence
+// guardrail's comment stripper is line-first, but keeping the text free of
+// comment delimiters is cheap insurance.)
+function seedDemoSession(): void {
+  const setState = useAuthStore.setState as typeof useAuthStore.setState | undefined;
+  setState?.({
+    user: getDemoUser(),
+    accessToken: "demo-token",
+    isAuthenticated: true,
+    isInitialized: true,
+    needsSetup: false,
+    isLoading: false,
+    authMode: "jwt",
+  });
+}
+
 function App() {
   const initAuth = useAuthStore((state) => state.init);
+  const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
   const health = useHealthCheck({ pollInterval: 30000 });
+  const demoSeededRef = useRef(false);
+
+  if (TEST_MODE && !isAuthenticated && !demoSeededRef.current) {
+    demoSeededRef.current = true;
+    seedDemoSession();
+  }
 
   useEffect(() => {
     if (!TEST_MODE) {
       initAuth();
     }
   }, [initAuth]);
+
+  // Post-logout re-seed arm (parity with the original ProtectedRoute
+  // effect's [testMode, isAuthenticated] behavior): an effect, not a
+  // render-phase write — see the comment above. TEST_MODE is a module
+  // constant (eslint exhaustive-deps excludes it deliberately).
+  useEffect(() => {
+    if (TEST_MODE && !isAuthenticated) {
+      seedDemoSession();
+    }
+  }, [isAuthenticated]);
 
   return (
     <ErrorBoundary>
