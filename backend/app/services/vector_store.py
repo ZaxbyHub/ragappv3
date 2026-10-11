@@ -179,12 +179,23 @@ class DimensionRebuildHandle:
     table and leaves the old index fully intact.
     """
 
-    __slots__ = ("table_name", "dim", "table")
+    __slots__ = ("table_name", "dim", "table", "staged_metadata")
 
-    def __init__(self, table_name: str, dim: int, table: Any) -> None:
+    def __init__(
+        self,
+        table_name: str,
+        dim: int,
+        table: Any,
+        staged_metadata: Optional[dict] = None,
+    ) -> None:
         self.table_name = table_name
         self.dim = int(dim)
         self.table = table
+        # Optional caller-supplied embedding-identity snapshot (issue #706):
+        # commit_dimension_rebuild persists it to the settings_kv sidecar as
+        # part of the swap so concurrent reindex jobs observe convergence
+        # immediately instead of racing the job-completion metadata write.
+        self.staged_metadata = staged_metadata
 
 
 def _chunks_table_schema(embedding_dim: int) -> pa.Schema:
@@ -270,6 +281,19 @@ class VectorStore:
         # Serialize LanceDB table mutations, including deferred index creation that
         # may run before search, when callers share one VectorStore instance.
         self._write_lock = asyncio.Lock()
+        # Dimension-rebuild admission serialization (issue #706): a DEDICATED
+        # slot, deliberately separate from ``rebuild_in_progress`` (which
+        # keeps its #696 serving-gate lifecycle: set at rebuild open, cleared
+        # at commit/abort ENTRY). The slot is claimed atomically under the
+        # condition before any await and held through FULL commit/abort
+        # completion, so a concurrent begin can never observe a half-swapped
+        # table or stale-drop the temp table another commit is swapping in.
+        # Same-task re-entry keeps the #696 loud raise (programming error);
+        # cross-task contention waits for the open rebuild's terminal state
+        # and then re-checks convergence instead of failing the second job.
+        self._rebuild_admission = asyncio.Condition()
+        self._rebuild_slot_open: bool = False
+        self._rebuild_owner_task: Optional[asyncio.Task] = None
         # Shared semaphore limiting concurrent LanceDB search operations across all callers.
         # Lazily initialised on first use to avoid event-loop binding issues.
         self._search_semaphore: Optional[asyncio.Semaphore] = None
@@ -296,7 +320,11 @@ class VectorStore:
         return hashlib.sha256(combined).hexdigest()[:16]
 
     async def record_embedding_metadata(
-        self, embedding_dim: int, raise_on_error: bool = False
+        self,
+        embedding_dim: int,
+        raise_on_error: bool = False,
+        model_id: Optional[str] = None,
+        prefix_hash: Optional[str] = None,
     ) -> None:
         """Persist embedding model metadata to the SQLite settings_kv table.
 
@@ -308,15 +336,31 @@ class VectorStore:
             raise_on_error: When True, re-raise sqlite3.Error instead of logging
                 it as non-fatal. When False (default), errors are logged and
                 swallowed so startup/validate_schema paths are unaffected.
+            model_id: When supplied, persist THIS identity instead of the live
+                ``settings.embedding_model`` (issue #706: the dimension-rebuild
+                commit persists the job-start identity the swapped table was
+                actually built under, so a concurrent waiter's convergence
+                check cannot race an in-flight settings save).
+            prefix_hash: When supplied, persist THIS prefix hash instead of
+                recomputing it from live settings (same rationale).
         """
+        resolved_model = (
+            model_id if model_id is not None else (settings.embedding_model or "")
+        )
+        resolved_hash = (
+            prefix_hash
+            if prefix_hash is not None
+            else self._compute_embedding_prefix_hash()
+        )
+
         def _write() -> None:
             conn = sqlite3.connect(str(settings.sqlite_path))
             try:
                 cursor = conn.cursor()
                 keys_values = [
-                    ("embedding_model_id", settings.embedding_model or ""),
+                    ("embedding_model_id", resolved_model),
                     ("embedding_dim", str(embedding_dim)),
-                    ("embedding_prefix_hash", self._compute_embedding_prefix_hash()),
+                    ("embedding_prefix_hash", resolved_hash),
                 ]
                 for key, value in keys_values:
                     cursor.execute(
@@ -331,9 +375,9 @@ class VectorStore:
             await asyncio.to_thread(_write)
             logger.info(
                 "Embedding metadata persisted: model=%s dim=%d hash=%s",
-                settings.embedding_model,
+                resolved_model,
                 embedding_dim,
-                self._compute_embedding_prefix_hash(),
+                resolved_hash,
             )
         except sqlite3.Error as e:
             if raise_on_error:
@@ -2217,6 +2261,22 @@ class VectorStore:
 
         return await table.to_pandas()
 
+    async def _count_null_rows(self, table, column: str, operation_name: str) -> int:
+        """Count rows whose ``column`` is null WITHOUT a full-table load.
+
+        Real LanceDB answers ``count_rows(filter=...)`` server-side (issue
+        #706: the no-op boot path must not materialize the whole table,
+        embeddings included, just to count nulls). Test doubles and
+        alternative backends may only implement ``count_rows(where=...)`` or
+        a naive filter parser — on ``TypeError`` this falls back to the
+        guarded pandas probe, which preserves the previous semantics exactly.
+        """
+        try:
+            return await table.count_rows(filter=f"{column} IS NULL")
+        except TypeError:
+            df = await self._safe_table_to_pandas(table, operation_name)
+            return int(df[column].isna().sum())
+
     async def _restore_default_indices(self, *, migration_name: str) -> None:
         """Recreate FTS (always) and ANN (rows >= threshold) on ``self.table``.
 
@@ -2242,6 +2302,82 @@ class VectorStore:
                 replace=True,
             )
 
+    async def _reconcile_table_ids(self, table, label: str) -> set:
+        """Read a reconcile-side table's chunk-id set, cheaply when possible.
+
+        Real LanceDB answers an ``id``-column projection server-side; test
+        doubles and alternative backends may not implement ``query()`` at all
+        (issue #706), so the fallback is the guarded full load. This only runs
+        on the recovery path — a boot with no leftover staging table never
+        reaches it.
+        """
+        try:
+            df = await table.query().select(["id"]).to_pandas()
+        except (AttributeError, TypeError):
+            df = await self._safe_table_to_pandas(table, label)
+        return set(df["id"].astype(str))
+
+    async def _reconcile_overlap_content_matches(
+        self, canonical, staging, overlap_ids: set[str], migration_name: str
+    ) -> bool:
+        """Verify overlapping chunk ids carry identical ``text`` on both sides.
+
+        Chunk ids are deterministic (``{file_id}[_scale]_{chunk_index}``), so a
+        post-cancel re-ingest collides with the stale staging copy; a subset
+        test alone would silently swap stale content back in. A missing
+        ``text`` column on either side, or two null cells on the same id,
+        counts as unverifiable → mismatch (conservative: raise rather than
+        silently choose a generation). Loads both frames only when an overlap
+        actually exists (recovery path only).
+        """
+        if not overlap_ids:
+            return True
+        canonical_df = await self._safe_table_to_pandas(
+            canonical, f"{migration_name} (reconcile canonical check)"
+        )
+        staging_df = await self._safe_table_to_pandas(
+            staging, f"{migration_name} (reconcile staging check)"
+        )
+        if "text" not in canonical_df.columns or "text" not in staging_df.columns:
+            return False
+        canonical_texts = canonical_df.set_index(
+            canonical_df["id"].astype(str)
+        )["text"]
+        staging_texts = staging_df.set_index(staging_df["id"].astype(str))["text"]
+        for chunk_id in overlap_ids:
+            c_text = canonical_texts.get(chunk_id)
+            s_text = staging_texts.get(chunk_id)
+            if c_text is None or s_text is None or c_text != s_text:
+                return False
+        return True
+
+    def _raise_reconcile_divergence(
+        self, migration_name: str, reason: str, canonical_rows: int, staging_rows: int
+    ) -> None:
+        """Fail closed on divergent canonical/staging generations (#706).
+
+        Neither table is modified: the live canonical keeps serving, staging
+        stays on disk for manual recovery, and the boot-time caller
+        warn-and-continues (fail-soft) while the CRITICAL points the operator
+        at both recoverable copies.
+        """
+        logger.critical(
+            "%s: divergent 'chunks' (%d rows) and '%s' (%d rows) generations "
+            "detected (%s). NEITHER table was modified — both are preserved "
+            "for manual recovery. Resolve the divergence (merge or delete one "
+            "side) before restarting.",
+            migration_name,
+            canonical_rows,
+            CHUNKS_STAGING_TABLE,
+            staging_rows,
+            reason,
+        )
+        raise VectorStoreError(
+            f"{migration_name}: 'chunks' and '{CHUNKS_STAGING_TABLE}' hold "
+            f"divergent row sets ({reason}); refusing to silently discard "
+            f"either generation."
+        )
+
     async def _reconcile_chunks_rebuild_state(self, *, migration_name: str) -> None:
         """Recovery-first reconciliation of a crashed ``chunks`` table swap.
 
@@ -2251,10 +2387,15 @@ class VectorStore:
         table (issue #512 VECTOR-001b):
 
         - staging absent → nothing to do;
-        - canonical present → validate the canonical table holds at least the
-          staging row count (the swap validates the final create BEFORE
-          deleting staging, so a surviving canonical table is complete), then
-          drop the stale staging table;
+        - canonical present, staging empty or a subset of canonical (ids and
+          overlap content) → drop the stale staging table;
+        - canonical present, canonical a subset of staging (ids and overlap
+          content) → the staging copy is authoritative: rebuild canonical
+          from it, validate row parity, then drop staging;
+        - any other combination (divergent generations — the state a
+          cancelled swap plus post-boot ingestion leaves) → log CRITICAL and
+          RAISE without touching either table (issue #706): a row-count
+          majority must never silently choose which generation survives;
         - canonical absent → the staging table holds the last durable copy of
           the data: rebuild the canonical table from its data, validate row
           parity, then drop staging.
@@ -2273,54 +2414,79 @@ class VectorStore:
             staging = await self.db.open_table(CHUNKS_STAGING_TABLE)
             canonical_rows = await canonical.count_rows()
             staging_rows = await staging.count_rows()
-            if canonical_rows >= staging_rows:
+            canonical_ids = await self._reconcile_table_ids(
+                canonical, f"{migration_name} (reconcile canonical ids)"
+            )
+            staging_ids = await self._reconcile_table_ids(
+                staging, f"{migration_name} (reconcile staging ids)"
+            )
+            overlap = canonical_ids & staging_ids
+            if canonical_ids <= staging_ids and await self._reconcile_overlap_content_matches(
+                canonical, staging, overlap, migration_name
+            ):
+                # Canonical incomplete (or equal) — the staging copy is
+                # authoritative; rebuild from it.
+                staging_df = await self._safe_table_to_pandas(
+                    staging, f"{migration_name} (staging recovery)"
+                )
+                # Rebind outside _write_lock: recovery runs during lifespan
+                # startup before the app serves requests; acquiring the lock
+                # here would risk re-entrant deadlock if a future caller
+                # holds it.
+                await self.db.drop_table("chunks")
+                self.table = await self.db.create_table("chunks", data=staging_df)
+                recovered_rows = await self.table.count_rows()
+                if recovered_rows != len(staging_df):
+                    logger.critical(
+                        "%s: parity check failed rebuilding 'chunks' from '%s' "
+                        "(%d -> %d); staging table preserved for manual recovery.",
+                        migration_name,
+                        CHUNKS_STAGING_TABLE,
+                        len(staging_df),
+                        recovered_rows,
+                    )
+                    raise VectorStoreError(
+                        f"{migration_name}: canonical 'chunks' rebuild from "
+                        f"'{CHUNKS_STAGING_TABLE}' failed row parity "
+                        f"({len(staging_df)} -> {recovered_rows})."
+                    )
+                # No index restore here (NF-A, PR #526 feedback): when the
+                # calling migration's swap follows, the swap recreates the
+                # indices itself; in the worst case where every migration
+                # then early-returns, init_table heals FTS later in the same
+                # startup and ANN self-heals on first search. The
+                # canonical-absent path below is where the restore is
+                # load-bearing (no swap follows).
+                await self.db.drop_table(CHUNKS_STAGING_TABLE)
+                logger.warning(
+                    "%s: restored incomplete 'chunks' from staging table '%s'",
+                    migration_name,
+                    CHUNKS_STAGING_TABLE,
+                )
+                return
+            if staging_ids <= canonical_ids and await self._reconcile_overlap_content_matches(
+                canonical, staging, overlap, migration_name
+            ):
+                # Staging holds nothing canonical lacks — a stale leftover
+                # from a completed swap (the swap validates the final create
+                # BEFORE deleting staging, so a surviving canonical table is
+                # complete).
                 await self.db.drop_table(CHUNKS_STAGING_TABLE)
                 logger.info(
                     "%s: dropped stale staging table '%s' (canonical 'chunks' "
-                    "has %d rows >= staging %d)",
+                    "is a superset: %d rows vs staging %d)",
                     migration_name,
                     CHUNKS_STAGING_TABLE,
                     canonical_rows,
                     staging_rows,
                 )
                 return
-            # Canonical incomplete — the staging copy is authoritative.
-            staging_df = await self._safe_table_to_pandas(
-                staging, f"{migration_name} (staging recovery)"
-            )
-            # Rebind outside _write_lock: recovery runs during lifespan
-            # startup before the app serves requests; acquiring the lock here
-            # would risk re-entrant deadlock if a future caller holds it.
-            await self.db.drop_table("chunks")
-            self.table = await self.db.create_table("chunks", data=staging_df)
-            recovered_rows = await self.table.count_rows()
-            if recovered_rows != len(staging_df):
-                logger.critical(
-                    "%s: parity check failed rebuilding 'chunks' from '%s' "
-                    "(%d -> %d); staging table preserved for manual recovery.",
-                    migration_name,
-                    CHUNKS_STAGING_TABLE,
-                    len(staging_df),
-                    recovered_rows,
-                )
-                raise VectorStoreError(
-                    f"{migration_name}: canonical 'chunks' rebuild from "
-                    f"'{CHUNKS_STAGING_TABLE}' failed row parity "
-                    f"({len(staging_df)} -> {recovered_rows})."
-                )
-            # No index restore here (NF-A, PR #526 feedback): when the
-            # calling migration's swap follows, the swap recreates the
-            # indices itself; in the worst case where every migration then
-            # early-returns, init_table heals FTS later in the same startup
-            # and ANN self-heals on first search. The canonical-absent path
-            # below is where the restore is load-bearing (no swap follows).
-            await self.db.drop_table(CHUNKS_STAGING_TABLE)
-            logger.warning(
-                "%s: restored incomplete 'chunks' from staging table '%s'",
+            self._raise_reconcile_divergence(
                 migration_name,
-                CHUNKS_STAGING_TABLE,
+                "canonical-only ids or content mismatch",
+                canonical_rows,
+                staging_rows,
             )
-            return
 
         # Canonical absent: the staging table is the only durable copy.
         staging = await self.db.open_table(CHUNKS_STAGING_TABLE)
@@ -2489,7 +2655,18 @@ class VectorStore:
                 return None
         return await self._get_expected_embedding_dim()
 
-    async def begin_dimension_rebuild(self, new_dim: int) -> DimensionRebuildHandle:
+    async def _live_dim_equals(self, new_dim: int) -> bool:
+        """Default convergence check for a waited rebuild begin (#706)."""
+        live_dim = await self.get_live_embedding_dim()
+        return live_dim is not None and int(live_dim) == int(new_dim)
+
+    async def begin_dimension_rebuild(
+        self,
+        new_dim: int,
+        *,
+        converged: Optional[Any] = None,
+        staged_metadata: Optional[dict] = None,
+    ) -> Optional[DimensionRebuildHandle]:
         """Open a dimension-migrating rebuild of the ``chunks`` table (W13).
 
         Creates a temp table (``chunks_dim_rebuild``) with the FULL canonical
@@ -2498,99 +2675,147 @@ class VectorStore:
         temp table from a previously aborted/crashed run is dropped first — it
         was never committed, so the live table remains the only authority.
 
-        Refuses when a rebuild is already open on THIS store instance (issue
-        #696): a second concurrent begin would drop the first job's temp table
-        mid-build. Single-process guard (same per-process scope as the
-        readiness flip); multi-worker/lease-mode overlap is a documented
-        limitation.
+        Admission (issue #706): the admission slot is claimed atomically under
+        ``_rebuild_admission`` before any await. SAME-TASK re-entry raises
+        (the #696 guard — a second begin from the same task would destroy the
+        first job's temp table mid-build). CROSS-TASK contention WAITS for the
+        open rebuild to reach its terminal state (commit or abort, including
+        the commit-time metadata write) and then re-checks convergence:
+
+        - ``converged`` — optional async callable run ONLY after actually
+          blocking; returns True when the live index has already converged to
+          what this caller wanted (default: live dimension equals ``new_dim``).
+          While it runs, the admission condition's lock is held: the callback
+          must not acquire the store's write lock nor call begin/commit/abort.
+          True → this method returns ``None`` and the caller proceeds WITHOUT
+          a rebuild (bare writes against the already-migrated live table).
+        - ``staged_metadata`` — optional embedding-identity snapshot the
+          caller captured at job start; commit persists it to the settings_kv
+          sidecar as part of the swap.
+
+        Single-process serialization (same per-process scope as the readiness
+        flip); multi-worker/lease-mode overlap remains a documented limitation.
+        A caller that neither commits nor aborts (a leaked handle) strands
+        cross-task waiters until process exit — the production reindex flow
+        aborts on every BaseException path.
 
         Raises VectorStoreConnectionError when the connection or table
-        creation fails (no state is left behind on failure).
+        creation fails (the admission slot is released on any failure).
         """
-        if self.rebuild_in_progress is True:
-            raise VectorStoreError(
-                "a dimension rebuild is already in progress on this vector "
-                "store; wait for it to commit or abort before opening another "
-                "(a second rebuild would destroy the first one's staged table)"
-            )
-        async with self._acquire_write_lock():
-            if self.db is None:
-                await self.connect()
-            if self.db is None:
-                raise VectorStoreConnectionError(
-                    "Database connection is not available."
-                )
-            try:
-                table_names = await self.db.table_names()
-                if DIMENSION_REBUILD_TABLE in table_names:
-                    await self.db.drop_table(DIMENSION_REBUILD_TABLE)
-                    logger.warning(
-                        "Dropped stale dimension-rebuild table '%s' from a "
-                        "prior aborted run (live 'chunks' untouched)",
-                        DIMENSION_REBUILD_TABLE,
+        waited = False
+        async with self._rebuild_admission:
+            while self._rebuild_slot_open:
+                if asyncio.current_task() is self._rebuild_owner_task:
+                    raise VectorStoreError(
+                        "a dimension rebuild is already in progress on this "
+                        "vector store; wait for it to commit or abort before "
+                        "opening another (a second rebuild would destroy the "
+                        "first one's staged table)"
                     )
-                table = await self.db.create_table(
-                    DIMENSION_REBUILD_TABLE,
-                    schema=_chunks_table_schema(new_dim),
-                )
-            except (OSError, RuntimeError, ValueError) as e:
-                raise VectorStoreConnectionError(
-                    f"Failed to create dimension-rebuild table: {e}"
-                ) from e
-            # FTS on the temp table so the post-swap index is immediately
-            # hybrid-searchable; a failure here is non-fatal (commit recreates
-            # indices on the swapped-in table anyway).
-            try:
-                await table.create_index(column="text", config=FTS(), replace=False)
-            except (OSError, RuntimeError, ValueError) as e:
-                logger.warning(
-                    "FTS index creation on dimension-rebuild table failed "
-                    "(non-fatal; recreated at commit): %s",
-                    e,
-                )
-            # From here the live table is the previous, fully consistent
-            # generation being served while the staged one builds (#696).
-            self.rebuild_in_progress = True
-            # Resolve the serving pin ONCE, at open: gate, healthz, and the
-            # query funnel all read this single value, and an unresolved pin
-            # is logged here (not lazily at first query). Two failure legs:
-            # an Exception (sqlite lock, read failure) is SOFT — the rebuild
-            # opens unpinned and loudly logged; a BaseException beyond that
-            # (cancellation at shutdown) rolls the flag back and drops the
-            # just-created staged table (we still hold the write lock, so
-            # abort_dimension_rebuild cannot be used here) instead of leaking
-            # both until process exit.
-            try:
-                self._serving_pin = await self._resolve_serving_pin()
-            except Exception:  # noqa: BLE001 - pin must never fail the begin
-                self._serving_pin = None
-                self._serving_pin_resolved = True
-                logger.warning(
-                    "Serving-pin resolution failed at rebuild open; serving "
-                    "WITHOUT a pin (degraded dense retrieval until cutover).",
-                    exc_info=True,
-                )
-            except BaseException:
-                self._serving_pin = None
-                self._serving_pin_resolved = False
-                self.rebuild_in_progress = False
+                waited = True
+                await self._rebuild_admission.wait()
+            if waited:
+                conv = converged or (lambda: self._live_dim_equals(new_dim))
+                if await conv():
+                    logger.info(
+                        "Dimension rebuild admission: live index already "
+                        "converged to dim=%d after waiting for the previous "
+                        "rebuild; proceeding WITHOUT a new rebuild",
+                        new_dim,
+                    )
+                    return None
+            # Claim BEFORE releasing the condition's lock: a concurrent begin
+            # can never observe a slot-free state mid-claim.
+            self._rebuild_slot_open = True
+            self._rebuild_owner_task = asyncio.current_task()
+        try:
+            async with self._acquire_write_lock():
+                if self.db is None:
+                    await self.connect()
+                if self.db is None:
+                    raise VectorStoreConnectionError(
+                        "Database connection is not available."
+                    )
                 try:
-                    await self.db.drop_table(DIMENSION_REBUILD_TABLE)
-                except Exception:  # noqa: BLE001 - best-effort rollback
-                    logger.warning(
-                        "Failed to drop the staged table '%s' after "
-                        "cancellation at rebuild open (the next begin's "
-                        "stale-reclaim will reclaim it).",
+                    table_names = await self.db.table_names()
+                    if DIMENSION_REBUILD_TABLE in table_names:
+                        await self.db.drop_table(DIMENSION_REBUILD_TABLE)
+                        logger.warning(
+                            "Dropped stale dimension-rebuild table '%s' from a "
+                            "prior aborted run (live 'chunks' untouched)",
+                            DIMENSION_REBUILD_TABLE,
+                        )
+                    table = await self.db.create_table(
                         DIMENSION_REBUILD_TABLE,
+                        schema=_chunks_table_schema(new_dim),
                     )
-                raise
-            self._serving_pin_resolved = True
-            logger.info(
-                "Opened dimension rebuild into '%s' at dim=%d (live 'chunks' untouched)",
-                DIMENSION_REBUILD_TABLE,
-                new_dim,
-            )
-            return DimensionRebuildHandle(DIMENSION_REBUILD_TABLE, new_dim, table)
+                except (OSError, RuntimeError, ValueError) as e:
+                    raise VectorStoreConnectionError(
+                        f"Failed to create dimension-rebuild table: {e}"
+                    ) from e
+                # FTS on the temp table so the post-swap index is immediately
+                # hybrid-searchable; a failure here is non-fatal (commit recreates
+                # indices on the swapped-in table anyway).
+                try:
+                    await table.create_index(column="text", config=FTS(), replace=False)
+                except (OSError, RuntimeError, ValueError) as e:
+                    logger.warning(
+                        "FTS index creation on dimension-rebuild table failed "
+                        "(non-fatal; recreated at commit): %s",
+                        e,
+                    )
+                # From here the live table is the previous, fully consistent
+                # generation being served while the staged one builds (#696).
+                self.rebuild_in_progress = True
+                # Resolve the serving pin ONCE, at open: gate, healthz, and the
+                # query funnel all read this single value, and an unresolved pin
+                # is logged here (not lazily at first query). Two failure legs:
+                # an Exception (sqlite lock, read failure) is SOFT — the rebuild
+                # opens unpinned and loudly logged; a BaseException beyond that
+                # (cancellation at shutdown) rolls the flag back and drops the
+                # just-created staged table (we still hold the write lock, so
+                # abort_dimension_rebuild cannot be used here) instead of leaking
+                # both until process exit.
+                try:
+                    self._serving_pin = await self._resolve_serving_pin()
+                except Exception:  # noqa: BLE001 - pin must never fail the begin
+                    self._serving_pin = None
+                    self._serving_pin_resolved = True
+                    logger.warning(
+                        "Serving-pin resolution failed at rebuild open; serving "
+                        "WITHOUT a pin (degraded dense retrieval until cutover).",
+                        exc_info=True,
+                    )
+                except BaseException:
+                    self._serving_pin = None
+                    self._serving_pin_resolved = False
+                    self.rebuild_in_progress = False
+                    try:
+                        await self.db.drop_table(DIMENSION_REBUILD_TABLE)
+                    except Exception:  # noqa: BLE001 - best-effort rollback
+                        logger.warning(
+                            "Failed to drop the staged table '%s' after "
+                            "cancellation at rebuild open (the next begin's "
+                            "stale-reclaim will reclaim it).",
+                            DIMENSION_REBUILD_TABLE,
+                        )
+                    raise
+                self._serving_pin_resolved = True
+                logger.info(
+                    "Opened dimension rebuild into '%s' at dim=%d (live 'chunks' untouched)",
+                    DIMENSION_REBUILD_TABLE,
+                    new_dim,
+                )
+                return DimensionRebuildHandle(DIMENSION_REBUILD_TABLE, new_dim, table, staged_metadata=staged_metadata)
+        except BaseException:
+            # Release the admission slot on ANY failure (including
+            # cancellation) so cross-task waiters are not stranded (#706).
+            async with self._rebuild_admission:
+                self._rebuild_slot_open = False
+                self._rebuild_owner_task = None
+                self._rebuild_admission.notify_all()
+            raise
+
 
     async def commit_dimension_rebuild(self, handle: DimensionRebuildHandle) -> None:
         """Atomically swap the rebuild temp table in as the live ``chunks``.
@@ -2614,82 +2839,120 @@ class VectorStore:
         self.rebuild_in_progress = False
         self._serving_pin = None
         self._serving_pin_resolved = False
-        async with self._acquire_write_lock():
-            if self.db is None:
-                raise VectorStoreConnectionError(
-                    "Database connection is not available."
-                )
-            if handle is None or handle.table is None:
-                raise VectorStoreError(
-                    "Dimension rebuild handle has no temp table to commit."
-                )
-            df = await self._safe_table_to_pandas(
-                handle.table, "dimension rebuild commit"
-            )
-            expected_rows = len(df)
-            try:
-                await self.db.drop_table("chunks")
-                # Explicit schema keeps the fixed-size embedding list type at
-                # the NEW dimension (create-from-data alone would infer a
-                # variable-width list and lose the schema dim).
-                self.table = await self.db.create_table(
-                    "chunks", data=df, schema=_chunks_table_schema(handle.dim)
-                )
-                final_rows = await self.table.count_rows()
-                if final_rows != expected_rows:
+        try:
+            async with self._acquire_write_lock():
+                if self.db is None:
+                    raise VectorStoreConnectionError(
+                        "Database connection is not available."
+                    )
+                if handle is None or handle.table is None:
                     raise VectorStoreError(
-                        f"dimension rebuild: final 'chunks' row count "
-                        f"{final_rows} != expected {expected_rows}."
+                        "Dimension rebuild handle has no temp table to commit."
                     )
-                self._embedding_dim = handle.dim
-                await self.table.create_index(
-                    column="text", config=FTS(), replace=True
+                df = await self._safe_table_to_pandas(
+                    handle.table, "dimension rebuild commit"
                 )
-                if final_rows >= VECTOR_INDEX_MIN_ROWS:
+                expected_rows = len(df)
+                try:
+                    await self.db.drop_table("chunks")
+                    # Explicit schema keeps the fixed-size embedding list type at
+                    # the NEW dimension (create-from-data alone would infer a
+                    # variable-width list and lose the schema dim).
+                    self.table = await self.db.create_table(
+                        "chunks", data=df, schema=_chunks_table_schema(handle.dim)
+                    )
+                    final_rows = await self.table.count_rows()
+                    if final_rows != expected_rows:
+                        raise VectorStoreError(
+                            f"dimension rebuild: final 'chunks' row count "
+                            f"{final_rows} != expected {expected_rows}."
+                        )
+                    self._embedding_dim = handle.dim
                     await self.table.create_index(
-                        column="embedding",
-                        config=IvfPq(
-                            distance_type=cast(
-                                "Literal['l2', 'cosine', 'dot']", settings.vector_metric
+                        column="text", config=FTS(), replace=True
+                    )
+                    if final_rows >= VECTOR_INDEX_MIN_ROWS:
+                        await self.table.create_index(
+                            column="embedding",
+                            config=IvfPq(
+                                distance_type=cast(
+                                    "Literal['l2', 'cosine', 'dot']", settings.vector_metric
+                                ),
+                                num_partitions=256,
+                                num_sub_vectors=handle.dim // 8,
                             ),
-                            num_partitions=256,
-                            num_sub_vectors=handle.dim // 8,
-                        ),
-                        replace=True,
+                            replace=True,
+                        )
+                        self._last_index_build_row_count = final_rows
+                        self._last_index_build_generation = self._index_mutation_generation
+                except Exception as exc:
+                    logger.critical(
+                        "dimension rebuild: 'chunks' swap failed after the old table "
+                        "was dropped (%s). The replacement data is durably preserved "
+                        "in the recoverable temp table '%s'.",
+                        exc,
+                        handle.table_name,
                     )
-                    self._last_index_build_row_count = final_rows
-                    self._last_index_build_generation = self._index_mutation_generation
-            except Exception as exc:
-                logger.critical(
-                    "dimension rebuild: 'chunks' swap failed after the old table "
-                    "was dropped (%s). The replacement data is durably preserved "
-                    "in the recoverable temp table '%s'.",
-                    exc,
-                    handle.table_name,
-                )
-                raise
-            await self.db.drop_table(handle.table_name)
-            self._index_mutation_generation += 1
-            self._optimize_counter = 0
-            try:
-                publish_index_generation(
-                    detail=(
-                        f"dimension rebuild: 'chunks' swapped via temp table "
-                        f"'{handle.table_name}' at dim={handle.dim} "
-                        f"({expected_rows} rows)"
+                    raise
+                await self.db.drop_table(handle.table_name)
+                self._index_mutation_generation += 1
+                self._optimize_counter = 0
+                try:
+                    publish_index_generation(
+                        detail=(
+                            f"dimension rebuild: 'chunks' swapped via temp table "
+                            f"'{handle.table_name}' at dim={handle.dim} "
+                            f"({expected_rows} rows)"
+                        )
                     )
+                except Exception as exc:
+                    logger.warning(
+                        "dimension rebuild: index-generation publication failed "
+                        "(swap already complete): %s",
+                        exc,
+                    )
+                logger.info(
+                    "Committed dimension rebuild: 'chunks' now dim=%d (%d rows)",
+                    handle.dim,
+                    expected_rows,
                 )
-            except Exception as exc:
-                logger.warning(
-                    "dimension rebuild: index-generation publication failed "
-                    "(swap already complete): %s",
-                    exc,
-                )
-            logger.info(
-                "Committed dimension rebuild: 'chunks' now dim=%d (%d rows)",
-                handle.dim,
-                expected_rows,
-            )
+                # Persist the caller's job-start embedding identity as part of
+                # the swap (issue #706): a concurrent reindex job waiting on the
+                # admission slot re-checks convergence only after this write, so
+                # the commit-to-completion window cannot trick it into opening a
+                # partial same-dimension rebuild whose commit would wipe this
+                # one's rows. The swap is already durable — a sidecar failure is
+                # logged CRITICAL (the waiter window reopens loudly) and the
+                # R1-guarded job-completion write remains the second chance.
+                metadata = getattr(handle, "staged_metadata", None)
+                if metadata:
+                    model_id = metadata.get("model_id")
+                    prefix_hash = metadata.get("prefix_hash")
+                    if model_id is not None or prefix_hash is not None:
+                        try:
+                            await self.record_embedding_metadata(
+                                handle.dim,
+                                model_id=model_id,
+                                prefix_hash=prefix_hash,
+                                raise_on_error=True,
+                            )
+                        except sqlite3.Error as exc:  # noqa: PERF203
+                            logger.critical(
+                                "dimension rebuild commit: embedding-metadata "
+                                "write failed after the swap (%s). The swapped "
+                                "table is durable; the admission-waiter "
+                                "convergence window is REOPENED until the "
+                                "job-completion metadata write - do not start "
+                                "another reindex until it completes.",
+                                exc,
+                            )
+        finally:
+            # Release the admission slot once the swap (and metadata write)
+            # are complete, so waiters wake on the terminal state (#706).
+            async with self._rebuild_admission:
+                self._rebuild_slot_open = False
+                self._rebuild_owner_task = None
+                self._rebuild_admission.notify_all()
 
     async def abort_dimension_rebuild(self, handle: DimensionRebuildHandle) -> None:
         """Drop the rebuild temp table; the old index is left fully intact.
@@ -2705,29 +2968,37 @@ class VectorStore:
         self.rebuild_in_progress = False
         self._serving_pin = None
         self._serving_pin_resolved = False
-        if handle is None:
-            return
-        async with self._acquire_write_lock():
-            if self.db is None:
+        try:
+            if handle is None:
                 return
-            try:
-                table_names = await self.db.table_names()
-                if handle.table_name in table_names:
-                    await self.db.drop_table(handle.table_name)
-                    logger.info(
-                        "Aborted dimension rebuild: dropped temp table '%s' "
-                        "(live 'chunks' untouched)",
+            async with self._acquire_write_lock():
+                if self.db is None:
+                    return
+                try:
+                    table_names = await self.db.table_names()
+                    if handle.table_name in table_names:
+                        await self.db.drop_table(handle.table_name)
+                        logger.info(
+                            "Aborted dimension rebuild: dropped temp table '%s' "
+                            "(live 'chunks' untouched)",
+                            handle.table_name,
+                        )
+                except (OSError, RuntimeError, ValueError) as e:
+                    logger.warning(
+                        "Failed to drop dimension-rebuild temp table '%s': %s "
+                        "(left for the next begin_dimension_rebuild to reclaim)",
                         handle.table_name,
+                        e,
                     )
-            except (OSError, RuntimeError, ValueError) as e:
-                logger.warning(
-                    "Failed to drop dimension-rebuild temp table '%s': %s "
-                    "(left for the next begin_dimension_rebuild to reclaim)",
-                    handle.table_name,
-                    e,
-                )
-            finally:
-                handle.table = None
+                finally:
+                    handle.table = None
+        finally:
+            # Release the admission slot on abort too, so cross-task waiters
+            # wake and re-check convergence (#706).
+            async with self._rebuild_admission:
+                self._rebuild_slot_open = False
+                self._rebuild_owner_task = None
+                self._rebuild_admission.notify_all()
 
     async def migrate_add_vault_id(self) -> int:
         """
@@ -2775,14 +3046,18 @@ class VectorStore:
         field_names = [schema.field(i).name for i in range(len(schema))]
 
         if "vault_id" in field_names:
-            # Column exists — check if any rows have null vault_id
-            df = await self._safe_table_to_pandas(table, "vault_id migration")
-            null_count = df["vault_id"].isna().sum()
+            # Column exists — answer the no-op check server-side; the whole
+            # table (embeddings included) is materialized only when a
+            # backfill is actually required (issue #706).
+            null_count = await self._count_null_rows(
+                table, "vault_id", "vault_id migration"
+            )
             if null_count == 0:
                 logger.info("LanceDB vault_id migration: no migration needed")
                 return 0  # All records already have vault_id
 
             # Backfill null vault_ids with empty string (truly unassigned)
+            df = await self._safe_table_to_pandas(table, "vault_id migration")
             df["vault_id"] = df["vault_id"].fillna("")
             count = int(null_count)
 
@@ -2871,14 +3146,17 @@ class VectorStore:
         field_names = [schema.field(i).name for i in range(len(schema))]
 
         if "chunk_scale" in field_names:
-            # Column exists — check if any rows have null chunk_scale
-            df = await self._safe_table_to_pandas(table, "chunk_scale migration")
-            null_count = df["chunk_scale"].isna().sum()
+            # Column exists — server-side no-op check (issue #706); the full
+            # load happens only on the backfill path.
+            null_count = await self._count_null_rows(
+                table, "chunk_scale", "chunk_scale migration"
+            )
             if null_count == 0:
                 logger.info("LanceDB chunk_scale migration: no migration needed")
                 return 0  # All records already have chunk_scale
 
             # Backfill null chunk_scales with "default"
+            df = await self._safe_table_to_pandas(table, "chunk_scale migration")
             df["chunk_scale"] = df["chunk_scale"].fillna("default")
             count = int(null_count)
 
@@ -3069,9 +3347,12 @@ class VectorStore:
         missing_cols = new_cols - set(field_names)
 
         if not missing_cols:
-            # All columns present — check if any rows still have null parent_doc_id
-            df = await self._safe_table_to_pandas(table, "parent_window migration (check)")
-            null_count = int(df["parent_doc_id"].isna().sum())
+            # All columns present — server-side no-op check (issue #706); the
+            # full load happens only when a backfill is actually required
+            # (and never for a dry run, which only reports the count).
+            null_count = await self._count_null_rows(
+                table, "parent_doc_id", "parent_window migration (check)"
+            )
             if null_count == 0:
                 logger.info("LanceDB parent_window migration: all rows already backfilled")
                 return 0
@@ -3082,6 +3363,7 @@ class VectorStore:
                 )
                 return null_count
             # Backfill rows where parent_doc_id is null
+            df = await self._safe_table_to_pandas(table, "parent_window migration (check)")
             mask = df["parent_doc_id"].isna()
             df.loc[mask, "parent_doc_id"] = df.loc[mask, "file_id"]
             df.loc[mask, "chunk_position"] = df.loc[mask, "chunk_index"]

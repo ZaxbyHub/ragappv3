@@ -403,6 +403,27 @@ docker compose logs knowledgevault
 
 ## Upgrading
 
+### Upgrading from v1.1.0 or any pre-#353 store (embedding identity fail-closed)
+
+If your data directory was created by v1.1.0 or any version before the embedding
+identity sidecar landed (#353, resolving #220), the vector store intentionally
+**fails closed** on the first boot after upgrading: chat and search return
+**503 "admin reindex required"** because the stored index predates embedding-model
+identity tracking, and serving it against an unknown model would silently corrupt
+retrieval. This is by design.
+
+To clear it, start a full reindex:
+
+```bash
+curl -X POST /api/documents/reindex   # admin-authenticated; re-embeds every
+                                     # vault into a fresh index and records
+                                     # the embedding identity
+```
+
+Once that job completes, chat and search come back up automatically. (The
+Harrier dimension-change migration below is the heavier, offline variant of the
+same re-index requirement.)
+
 ### Embedding Dimension Change (Harrier Migration)
 
 If you are upgrading from a version that used BGE-M3 (768-dim) embeddings to Harrier

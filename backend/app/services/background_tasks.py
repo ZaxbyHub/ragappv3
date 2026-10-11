@@ -4249,6 +4249,9 @@ class BackgroundProcessor:
             vector_store = self.processor.vector_store
             rebuild_handle = None
             probe_dim: Optional[int] = None
+            # [issue #706] Set on the staged path; read by the completion-time
+            # metadata write.
+            job_identity_snapshot: Optional[dict] = None
             job_start_identity = _job_identity()
             if vector_store is not None and vaults_files:
                 emb_service = self.processor.embedding_service
@@ -4325,21 +4328,76 @@ class BackgroundProcessor:
                             "service is unavailable; re-run the reindex when "
                             "the embedding service is reachable"
                         )
+
+                    # [issue #706] Job-start embedding identity snapshot:
+                    # settings-only plus a guarded shape-probe (the
+                    # _embedding_identity_changed idiom) — stub stores lack
+                    # store methods and never reach this call's effects. The
+                    # snapshot rides the handle so commit persists the
+                    # identity THIS job built with, closing the
+                    # commit-to-completion metadata window for concurrent
+                    # reindex jobs.
+                    snapshot_model_id = str(settings.embedding_model or "")
+                    hash_fn = getattr(
+                        vector_store, "_compute_embedding_prefix_hash", None
+                    )
+                    snapshot_prefix_hash = (
+                        hash_fn() if callable(hash_fn) else None
+                    )
+                    if not isinstance(snapshot_prefix_hash, str):
+                        snapshot_prefix_hash = None
+                    job_identity_snapshot = {
+                        "model_id": snapshot_model_id,
+                        "prefix_hash": snapshot_prefix_hash,
+                    }
+
+                    async def _converged_after_wait() -> bool:
+                        # Re-derive the staging decision AFTER the admission
+                        # wait (issue #706): another job may have committed
+                        # the migration while this one waited. Runs under the
+                        # store's admission-condition lock — no write-lock or
+                        # begin/commit/abort calls here.
+                        post_live_dim = await vector_store.get_live_embedding_dim()
+                        post_identity = await _embedding_identity_changed(
+                            vector_store
+                        )
+                        return not (
+                            (
+                                probe_dim is not None
+                                and post_live_dim is not None
+                                and probe_dim != post_live_dim
+                            )
+                            or post_identity
+                        )
+
                     rebuild_handle = await vector_store.begin_dimension_rebuild(
-                        probe_dim
+                        probe_dim,
+                        converged=_converged_after_wait,
+                        staged_metadata=job_identity_snapshot,
                     )
-                    logger.info(
-                        "Reindex job %d: %s — rebuilding into temp table '%s' "
-                        "(live index untouched until commit)",
-                        job_id,
-                        (
-                            f"embedding dimension {probe_dim} != live table "
-                            f"dimension {live_dim}"
-                            if dim_changed
-                            else "embedding model identity changed at equal dimension"
-                        ),
-                        getattr(rebuild_handle, "table_name", "?"),
-                    )
+                    if rebuild_handle is None:
+                        # Converged while waiting: the live index already
+                        # holds the target generation (another job's commit);
+                        # re-embed every file bare against it.
+                        logger.info(
+                            "Reindex job %d: live index already converged "
+                            "after waiting for a concurrent rebuild — "
+                            "proceeding WITHOUT a new staged rebuild",
+                            job_id,
+                        )
+                    else:
+                        logger.info(
+                            "Reindex job %d: %s — rebuilding into temp table "
+                            "'%s' (live index untouched until commit)",
+                            job_id,
+                            (
+                                f"embedding dimension {probe_dim} != live table "
+                                f"dimension {live_dim}"
+                                if dim_changed
+                                else "embedding model identity changed at equal dimension"
+                            ),
+                            getattr(rebuild_handle, "table_name", "?"),
+                        )
 
             # Initialize counters
             total_files = 0
@@ -4553,6 +4611,13 @@ class BackgroundProcessor:
                         # snapshot; the table may hold a mixed in-place
                         # rewrite, which the surfaced 503 state already gates.
                         if commit_attempted:
+                            # [issue #706] The dimension-rebuild commit already
+                            # persisted THIS job's start identity to the
+                            # sidecar as part of the swap, so the sidecar
+                            # already holds the committed table's true build
+                            # identity; the skip-write/skip-lift behavior below
+                            # is unchanged and still correct (a live-identity
+                            # write here would corrupt it).
                             try:
                                 clear_moved = getattr(
                                     vector_store,
@@ -4607,8 +4672,22 @@ class BackgroundProcessor:
                                 "readiness NOT lifted (re-run the reindex job)"
                             ),
                         )
+                    # [issue #706] Record the JOB-START identity, not the live
+                    # one: when the R1 guard above passed, job-start == live,
+                    # so behavior is identical — and a settings save landing
+                    # between the guard and this write can no longer record
+                    # the wrong identity over a table embedded under the old
+                    # one. On the staged path the same values were already
+                    # persisted at commit; this re-write is idempotent.
                     await vector_store.record_embedding_metadata(
-                        probe_dim or settings.embedding_dim, raise_on_error=True
+                        probe_dim or settings.embedding_dim,
+                        raise_on_error=True,
+                        model_id=job_identity_snapshot.get("model_id")
+                        if commit_attempted and job_identity_snapshot
+                        else None,
+                        prefix_hash=job_identity_snapshot.get("prefix_hash")
+                        if commit_attempted and job_identity_snapshot
+                        else None,
                     )
                     await vector_store.mark_ready(True)
                     # Cutover complete: the draining snapshot that pinned

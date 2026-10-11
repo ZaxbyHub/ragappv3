@@ -36,7 +36,7 @@
       "SEVERITY.LOW": 62,
       "SEVERITY.MEDIUM": 60,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 86747,
+      "loc": 87001,
       "nosec": 0,
       "skipped_tests": 66
     },
@@ -413,7 +413,7 @@
       "SEVERITY.LOW": 7,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 877,
+      "loc": 885,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -686,7 +686,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 3987,
+      "loc": 4031,
       "nosec": 0,
       "skipped_tests": 6
     },
@@ -1661,7 +1661,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 2761,
+      "loc": 2988,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1909,19 +1909,6 @@
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
       "loc": 31,
-      "nosec": 0,
-      "skipped_tests": 0
-    },
-    "backend/app/utils/transaction.py": {
-      "CONFIDENCE.HIGH": 0,
-      "CONFIDENCE.LOW": 0,
-      "CONFIDENCE.MEDIUM": 0,
-      "CONFIDENCE.UNDEFINED": 0,
-      "SEVERITY.HIGH": 0,
-      "SEVERITY.LOW": 0,
-      "SEVERITY.MEDIUM": 0,
-      "SEVERITY.UNDEFINED": 0,
-      "loc": 25,
       "nosec": 0,
       "skipped_tests": 0
     }
@@ -3256,7 +3243,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1139         await app.state.thinking_llm_client.close()\n1140     except Exception:\n1141         pass\n1142     try:\n",
+      "code": "1153         await app.state.thinking_llm_client.close()\n1154     except Exception:\n1155         pass\n1156     try:\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3267,17 +3254,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1140,
+      "line_number": 1154,
       "line_range": [
-        1140,
-        1141
+        1154,
+        1155
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "1143         await app.state.instant_llm_client.close()\n1144     except Exception:\n1145         pass\n1146     try:\n",
+      "code": "1157         await app.state.instant_llm_client.close()\n1158     except Exception:\n1159         pass\n1160     try:\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3288,17 +3275,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1144,
+      "line_number": 1158,
       "line_range": [
-        1144,
-        1145
+        1158,
+        1159
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "1147         await app.state.embedding_service.close()\n1148     except Exception:\n1149         pass\n1150     try:\n",
+      "code": "1161         await app.state.embedding_service.close()\n1162     except Exception:\n1163         pass\n1164     try:\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3309,17 +3296,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1148,
+      "line_number": 1162,
       "line_range": [
-        1148,
-        1149
+        1162,
+        1163
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "1151         await app.state.reranking_service.close()\n1152     except Exception:\n1153         pass\n1154     try:\n",
+      "code": "1165         await app.state.reranking_service.close()\n1166     except Exception:\n1167         pass\n1168     try:\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3330,17 +3317,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1152,
+      "line_number": 1166,
       "line_range": [
-        1152,
-        1153
+        1166,
+        1167
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "1155         app.state.vector_store.close()\n1156     except Exception:\n1157         pass\n1158     try:\n",
+      "code": "1169         app.state.vector_store.close()\n1170     except Exception:\n1171         pass\n1172     try:\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3351,17 +3338,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1156,
+      "line_number": 1170,
       "line_range": [
-        1156,
-        1157
+        1170,
+        1171
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "1159         app.state.db_pool.close_all()\n1160     except Exception:\n1161         pass\n1162     try:\n",
+      "code": "1173         app.state.db_pool.close_all()\n1174     except Exception:\n1175         pass\n1176     try:\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3372,17 +3359,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1160,
+      "line_number": 1174,
       "line_range": [
-        1160,
-        1161
+        1174,
+        1175
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "1164         _auth_executor.shutdown(wait=False)\n1165     except Exception:\n1166         pass\n1167     with contextlib_suppress(Exception):\n",
+      "code": "1178         _auth_executor.shutdown(wait=False)\n1179     except Exception:\n1180         pass\n1181     with contextlib_suppress(Exception):\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3393,10 +3380,10 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1165,
+      "line_number": 1179,
       "line_range": [
-        1165,
-        1166
+        1179,
+        1180
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
@@ -4554,7 +4541,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "3483         # Create a deterministic seed from the text\n3484         seed_value = int(hashlib.md5(text.encode(\"utf-8\")).hexdigest(), 16) % (2**32)\n3485         random.seed(seed_value)\n",
+      "code": "3765         # Create a deterministic seed from the text\n3766         seed_value = int(hashlib.md5(text.encode(\"utf-8\")).hexdigest(), 16) % (2**32)\n3767         random.seed(seed_value)\n",
       "col_offset": 25,
       "end_col_offset": 58,
       "filename": "backend/app/services/vector_store.py",
@@ -4565,9 +4552,9 @@
       },
       "issue_severity": "HIGH",
       "issue_text": "Use of weak MD5 hash for security. Consider usedforsecurity=False",
-      "line_number": 3484,
+      "line_number": 3766,
       "line_range": [
-        3484
+        3766
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b324_hashlib.html",
       "test_id": "B324",
