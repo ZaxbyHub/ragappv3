@@ -78,13 +78,21 @@ class DraftDeletionService:
         record = store.get_input(draft_id=draft_id, owner_id=owner_id, input_id=input_id)
         relpath = record.storage_relpath
 
-        token = self._storage.tombstone(relpath)
+        try:
+            token = self._storage.tombstone(relpath)
+        except FileNotFoundError:
+            # Bytes already absent (a crash-window tombstone reconciled away,
+            # or external cleanup): removing the row is still the honest end
+            # state, and there is nothing to restore or commit.
+            token = None
         try:
             store.delete_input_row(draft_id=draft_id, owner_id=owner_id, input_id=input_id)
         except Exception:
-            self._storage.restore_tombstone(token, relpath)
+            if token is not None:
+                self._storage.restore_tombstone(token, relpath)
             raise
-        self._storage.commit_tombstone(token)
+        if token is not None:
+            self._storage.commit_tombstone(token)
         logger.info("draft_input_deleted draft_id=%s input_id=%s", draft_id, input_id)
 
     # ── whole draft ──────────────────────────────────────────────────────

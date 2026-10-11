@@ -2925,6 +2925,7 @@ async def delete_draft_input(
     storage: DraftInputStorage = Depends(get_draft_input_storage),
     _csrf_token: str = Depends(csrf_protect),
 ) -> None:
+    _require_enabled()
     owner_id = int(user["id"])
     store = DraftStore(db)
     draft = await _run_store(lambda: store.get_draft(draft_id, owner_id))
