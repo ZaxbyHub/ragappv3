@@ -10,17 +10,6 @@ interface ProtectedRouteProps {
   testMode?: boolean;
 }
 
-function getDemoUser() {
-  const role = import.meta.env.VITE_DEMO_ROLE || "superadmin";
-  return {
-    id: 1,
-    username: import.meta.env.VITE_DEMO_USERNAME || "demo",
-    full_name: import.meta.env.VITE_DEMO_FULL_NAME || "Demo User",
-    role: role as "superadmin" | "admin" | "member" | "viewer",
-    is_active: true,
-  };
-}
-
 export function ProtectedRoute({ children, testMode = false }: ProtectedRouteProps) {
   const location = useLocation();
 
@@ -36,22 +25,10 @@ export function ProtectedRoute({ children, testMode = false }: ProtectedRoutePro
 
   // testMode is a development-only convenience (see App.tsx, where it is gated
   // by import.meta.env.DEV so it can never be enabled in a production build).
-  // Seed a demo session once — in an effect, not during render — so protected
-  // routes are reachable without a backend. Pages use useTestMode() for mock data.
-  useEffect(() => {
-    if (testMode && !isAuthenticated) {
-      useAuthStore.setState({
-        user: getDemoUser(),
-        accessToken: "demo-token",
-        isAuthenticated: true,
-        isInitialized: true,
-        needsSetup: false,
-        isLoading: false,
-        authMode: "jwt",
-      });
-    }
-  }, [testMode, isAuthenticated]);
-
+  // The demo session itself is seeded in App's render (issue #779 / UI-R3-08),
+  // BEFORE this component or any guard renders — the old seed here lived in a
+  // useEffect, one commit too late for RoleGuard's synchronous
+  // isAuthenticated read. Pages use useTestMode() for mock data.
   if (testMode) {
     return <>{children}</>;
   }
