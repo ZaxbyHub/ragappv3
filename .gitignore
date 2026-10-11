@@ -94,3 +94,6 @@ backend/data_schemathesis/
 backend/mutation-stats/
 frontend/.stryker-tmp/
 frontend/reports/
+
+# fetch-fonts staging residue (issue #780 review: a hard-killed run must not be committable)
+frontend/src/assets/fonts/*.part

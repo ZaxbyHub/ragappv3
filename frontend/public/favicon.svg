@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- Meridian favicon (issue #780 L09): original mark — an "M" meridian arc
+       over a horizon line, on the app's dark card background. -->
+  <rect width="64" height="64" rx="12" fill="#151a23"/>
+  <path d="M14 46 V18 L32 38 L50 18 V46" fill="none" stroke="#e7eaf0" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M12 52 H52" stroke="#6b7c93" stroke-width="3" stroke-linecap="round"/>
+</svg>
