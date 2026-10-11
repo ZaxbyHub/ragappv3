@@ -18,8 +18,11 @@ repo's contract requires for them:
 - **`fetch-fonts.mjs` can no longer corrupt the vendored fonts on a failed or
   zero-effect run.** Each woff2 downloads to a `.part` staging file and is
   renamed onto its final path only after a completed transfer, with the
-  staging file cleaned up on failure — an interrupted run leaves every final
-  `.woff2` byte-identical instead of truncated. A css2 response that parses
+  staging file cleaned up on failure — and any `.part` file orphaned by an
+  earlier hard-killed run (power loss/SIGKILL bypasses the failure cleanup,
+  including a stranded `SHA256SUMS.part`) is swept at the start of the next
+  run — so an interrupted run leaves every final `.woff2` byte-identical
+  instead of truncated. A css2 response that parses
   to zero `@font-face` blocks fails the run before touching disk, and a
   response missing any requested family (Inter, Spline Sans, Commissioner,
   Electrolize) fails after the downloads but before the manifest write (the
