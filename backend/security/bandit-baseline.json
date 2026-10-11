@@ -36,7 +36,7 @@
       "SEVERITY.LOW": 62,
       "SEVERITY.MEDIUM": 60,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 87145,
+      "loc": 87151,
       "nosec": 0,
       "skipped_tests": 66
     },
@@ -1661,7 +1661,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 3121,
+      "loc": 3127,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -4541,7 +4541,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "3929         # Create a deterministic seed from the text\n3930         seed_value = int(hashlib.md5(text.encode(\"utf-8\")).hexdigest(), 16) % (2**32)\n3931         random.seed(seed_value)\n",
+      "code": "3940         # Create a deterministic seed from the text\n3941         seed_value = int(hashlib.md5(text.encode(\"utf-8\")).hexdigest(), 16) % (2**32)\n3942         random.seed(seed_value)\n",
       "col_offset": 25,
       "end_col_offset": 58,
       "filename": "backend/app/services/vector_store.py",
@@ -4552,9 +4552,9 @@
       },
       "issue_severity": "HIGH",
       "issue_text": "Use of weak MD5 hash for security. Consider usedforsecurity=False",
-      "line_number": 3930,
+      "line_number": 3941,
       "line_range": [
-        3930
+        3941
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b324_hashlib.html",
       "test_id": "B324",
