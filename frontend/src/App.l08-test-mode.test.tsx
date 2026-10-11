@@ -1,7 +1,7 @@
 import { render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-// Issue #779 (UI-R4-08): VITE_TEST_MODE must yield a usable app. This file
+// Issue #779 (UI-R3-08): VITE_TEST_MODE must yield a usable app. This file
 // keeps the REAL useAuthStore, ProtectedRoute, RoleGuard, PageShell and
 // LoginPage so the demo-session seeding path is exercised end to end. Only
 // sibling page modules (and shell data hooks) are stubbed to markers.
@@ -83,7 +83,7 @@ async function renderAppAt(path: string) {
   return render(<App />);
 }
 
-describe("App test-mode session seeding (issue #779, UI-R4-08)", { timeout: 30_000 }, () => {
+describe("App test-mode session seeding (issue #779, UI-R3-08)", { timeout: 30_000 }, () => {
   beforeEach(async () => {
     // Reset the real store so each test starts from the boot state
     // (test-mode seeding happens per mount, never via persisted state).

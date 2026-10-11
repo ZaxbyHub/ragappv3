@@ -8,7 +8,7 @@ interface ErrorBoundaryProps {
   // showing, the caught-error state resets — so a route-scoped boundary can
   // recover on navigation WITHOUT remounting (a key-based remount during
   // error recovery re-throws inside the recovery commit and escapes to the
-  // outer boundary; a state reset in componentDidUpdate does not).
+  // outer boundary; the getDerivedStateFromProps reset below does not).
   resetOnChange?: string | number;
 }
 

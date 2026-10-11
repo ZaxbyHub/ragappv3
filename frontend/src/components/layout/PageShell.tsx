@@ -127,7 +127,13 @@ export function PageShell({ children, activeItem, onItemSelect, healthStatus }: 
               instance persists across navigations, so the original
               exit/enter cross-fade behavior is unchanged for every
               non-crash transition. */}
-          <ErrorBoundary resetOnChange={location.pathname}>
+          {/* pathname + search (not location.key): manual history entries in
+              tests carry no router key, so keys can degenerate to equal —
+              the composite string is deterministic. A query-only navigation
+              (/search?q=a -> /search?q=b from the rail) therefore also
+              resets a crashed page, not just path changes (issue #779
+              feedback, PRR-013/F-4). */}
+          <ErrorBoundary resetOnChange={location.pathname + location.search}>
             <AnimatePresence mode="wait">
               <motion.div
                 key={location.pathname}
