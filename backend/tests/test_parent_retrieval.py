@@ -321,7 +321,13 @@ class TestMigrateAddParentWindow:
 
         mock_table = MagicMock()
         mock_table.schema = AsyncMock(return_value=FakeSchema())
-        mock_table.count_rows = AsyncMock(return_value=1)
+        # [issue #706] The no-op probe calls count_rows(filter="... IS NULL")
+        # server-side; the plain (filterless) call still answers the total
+        # row count for _safe_table_to_pandas's OOM logging. Model both:
+        # 1 row total, 0 rows matching any null filter.
+        mock_table.count_rows = AsyncMock(
+            side_effect=lambda filter=None: 0 if filter is not None else 1
+        )
 
         # Simulate a pandas-like DataFrame where parent_doc_id has zero nulls.
         # We avoid importing pandas to keep the test self-contained.
