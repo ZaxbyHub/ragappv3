@@ -434,6 +434,33 @@ async def _safe_await(coro, name, timeout=10):
         logger.warning(f"{name} failed: {e} (continuing)")
 
 
+async def _await_migration(coro, name):
+    """Await a migration WITHOUT a cancel-on-timeout deadline (issue #706).
+
+    A wall-clock deadline can cancel a staging swap mid-drop — CancelledError
+    is a BaseException and bypasses the swap's except-Exception critical
+    handling, leaving a half-swapped table whose next-boot reconcile could
+    silently discard one generation. Migrations run unbounded; genuine
+    failures are still caught-and-logged (fail-soft startup).
+
+    A shutdown cancellation (SIGTERM/restart mid-boot) is the remaining
+    cancel source: it is logged CRITICAL before propagating, so the operator
+    gets the same "swap was interrupted, staging holds the recoverable
+    copy" evidence the removed deadline used to suppress.
+    """
+    try:
+        await coro
+    except Exception as e:
+        logger.warning(f"{name} failed: {e} (continuing)")
+    except BaseException:
+        logger.critical(
+            f"{name} was interrupted by cancellation mid-swap; the staging "
+            f"table holds the recoverable copy and a restart reconciles it "
+            f"before the app serves."
+        )
+        raise
+
+
 async def _validate_tei_embedding_model(embedding_service) -> None:
     """Validate that the live TEI model matches the configured EMBEDDING_MODEL.
 
@@ -718,25 +745,24 @@ async def lifespan(app: FastAPI):
     # Critical: fail fast if the vector store cannot connect or initialize its table.
     # Without these two, no search or ingestion is possible.
     await asyncio.wait_for(app.state.vector_store.connect(), timeout=15)
-    await _safe_await(
+    # [issue #706] Migrations run WITHOUT a cancel-on-timeout deadline: a
+    # deadline cancelling a mid-swap migration can silently drop a corpus
+    # generation (see _await_migration).
+    await _await_migration(
         app.state.vector_store.migrate_add_vault_id(),
         "Vector store migrate vault_id",
-        timeout=10,
     )
-    await _safe_await(
+    await _await_migration(
         app.state.vector_store.migrate_add_chunk_scale(),
         "Vector store migrate chunk_scale",
-        timeout=10,
     )
-    await _safe_await(
+    await _await_migration(
         app.state.vector_store.migrate_add_sparse_embedding(),
         "Vector store migrate sparse",
-        timeout=10,
     )
-    await _safe_await(
+    await _await_migration(
         app.state.vector_store.migrate_add_parent_window(),
         "Vector store migrate parent_window",
-        timeout=10,
     )
 
     # Initialize vector store table before FTS validation
