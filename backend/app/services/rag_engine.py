@@ -870,8 +870,16 @@ class RAGEngine:
         try:
             from app.services.metadata_filter import resolve_metadata_filter
 
-            active_filter_expr = resolve_metadata_filter(
-                metadata_filter, vault_id
+            # Off-loop resolution (issue #707): the resolver performs a
+            # blocking pool checkout + SQLite query; run it on a worker
+            # thread so the event loop stays responsive. Same shape as the
+            # _check_supersession/_get_indexed_file_ids precedents in this
+            # file. Under pool saturation the bounded checkout wait (up to
+            # ~15s) occupies a default-executor worker; the dedicated
+            # checkout-executor routing (#645/#592) is the established
+            # remedy should filtered turns ever run hot (plan trade-off).
+            active_filter_expr = await asyncio.to_thread(
+                resolve_metadata_filter, metadata_filter, vault_id
             )
         except Exception as exc:  # noqa: BLE001 — validation errors surface above
             logger.warning("[query] metadata_filter rejected: %s", exc)

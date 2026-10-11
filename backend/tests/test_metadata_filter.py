@@ -78,8 +78,14 @@ def real_pool(tmp_path):
 @pytest.fixture
 def pool_patched(monkeypatch, real_pool):
     """Point app.models.database.get_pool (imported inside _resolve_file_ids)
-    at the temp-DB pool."""
-    monkeypatch.setattr("app.models.database.get_pool", lambda *a, **kw: real_pool)
+    at the temp-DB pool. The double mirrors get_pool's real signature
+    (sqlite_path positional, max_size keyword-only default) so a call-site
+    arity drift — the #707 defect class — fails loudly here instead of
+    being silently absorbed by a ``*a, **kw`` lambda."""
+    def _real_get_pool(sqlite_path, max_size=5):
+        return real_pool
+
+    monkeypatch.setattr("app.models.database.get_pool", _real_get_pool)
     return real_pool
 
 
@@ -149,8 +155,33 @@ class TestResolveMetadataFilterEdgeCases:
     def test_resolution_failure_yields_sentinel_not_none(self, monkeypatch):
         """If the metadata DB is unavailable the sentinel still applies — the
         filter is not silently ignored."""
-        def _raise(*a, **kw):
+        def _raise(sqlite_path, max_size=5):
             raise RuntimeError("metadata db unavailable")
+
+        monkeypatch.setattr("app.models.database.get_pool", _raise)
+        expr = resolve_metadata_filter({"tags": ["finance"]}, vault_id=1)
+        assert expr is not None
+        assert expr == ZERO_MATCH_FILTER_EXPR
+
+    @pytest.mark.parametrize(
+        "unavailability_error",
+        [
+            sqlite3.OperationalError("no such table: files"),
+            OSError("read-only file system"),
+        ],
+        ids=["sqlite3-error", "os-error"],
+    )
+    def test_typed_unavailability_yields_sentinel_not_none(
+        self, monkeypatch, unavailability_error
+    ):
+        """Both remaining documented fallback classes keep the sentinel:
+        sqlite3.Error (schema/DB-file problems) and OSError (filesystem
+        failures surfacing from pool connection creation). Issue #707
+        narrowed the fallback to (OSError, RuntimeError, sqlite3.Error);
+        each class is pinned so future narrowing cannot silently widen or
+        flip the documented degradation."""
+        def _raise(sqlite_path, max_size=5):
+            raise unavailability_error
 
         monkeypatch.setattr("app.models.database.get_pool", _raise)
         expr = resolve_metadata_filter({"tags": ["finance"]}, vault_id=1)
@@ -217,7 +248,7 @@ class TestEngineLevelFilterWiring:
             def get_fts_exceptions(self):
                 return 0
 
-        def _raise(*a, **kw):
+        def _raise(sqlite_path, max_size=5):
             raise RuntimeError("metadata db unavailable")
 
         monkeypatch.setattr("app.models.database.get_pool", _raise)
@@ -256,9 +287,13 @@ class TestEngineLevelFilterWiring:
             reranking_service=None,
         )
 
+        def _no_db():
+            # Signature-faithful zero-arg double for rag_engine._get_pool
+            # (the #707 defect class: doubles must not absorb arity drift).
+            raise RuntimeError("no db in test")
+
         with patch("app.services.rag_engine.settings") as mock_settings, patch(
-            "app.services.rag_engine._get_pool",
-            side_effect=RuntimeError("no db in test"),
+            "app.services.rag_engine._get_pool", side_effect=_no_db
         ):
             mock_settings.agentic_rag_enabled = False
             mock_settings.default_chat_mode = "thinking"

@@ -18,9 +18,17 @@ resolution is intentionally unscoped — admin callers already hold cross-vault
 read authority, and the filter narrows within the full corpus.
 
 Zero-match semantics: when no file satisfies the filter — or the metadata
-tables are unavailable — the resolver returns the zero-match sentinel
+database is unavailable — the resolver returns the zero-match sentinel
 ``file_id IN ('')`` which matches no chunk. A user-supplied filter is NEVER
-silently dropped: "no documents match" is a real, visible result.
+silently dropped: "no documents match" is a real, visible result. The
+unavailability fallback is typed to the three classes the checkout/query
+surface can actually raise for environmental causes — ``OSError``
+(filesystem/parent-directory failure in pool connection creation),
+``RuntimeError`` (pool closed or checkout wait exhausted), and
+``sqlite3.Error`` (schema or database-file problems). Everything else —
+notably ``TypeError`` from signature/arity drift — is a programming error
+and propagates to the caller instead of masquerading as "no matches"
+(issue #707).
 """
 
 from __future__ import annotations
@@ -109,6 +117,9 @@ def _resolve_file_ids(
     """Vault-scoped file-id resolution across the supported filter fields."""
     # Import here (not from rag_engine) so engine-level pool patching cannot
     # break resolution, and to avoid an import cycle at module load.
+    # settings is the same configured source every other get_pool caller
+    # uses (rag_engine._get_pool idiom, issue #707).
+    from app.config import settings
     from app.models.database import get_pool
 
     conditions: list[str] = []
@@ -149,13 +160,18 @@ def _resolve_file_ids(
     )
 
     try:
-        pool = get_pool()
+        pool = get_pool(str(settings.sqlite_path))
         with pool.connection() as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute(query, params)
             rows = cursor.fetchall()
         return {str(row["id"]) for row in rows}
-    except Exception as exc:  # noqa: BLE001 — schema/DB unavailable
+    except (OSError, RuntimeError, sqlite3.Error) as exc:
+        # Typed unavailability fallback (pool closed / checkout exhausted,
+        # filesystem failure, schema or DB-file problems): the documented
+        # zero-match sentinel applies. Programming errors (e.g. TypeError
+        # from signature drift) deliberately do NOT match this clause and
+        # propagate (issue #707).
         logger.warning(
             "Metadata filter resolution failed (zero-match sentinel applied, "
             "filter NOT ignored): %s",
