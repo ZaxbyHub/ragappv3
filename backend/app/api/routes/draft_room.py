@@ -323,11 +323,17 @@ async def _run_store(func: Callable[[], T]) -> T:
 
 
 def _require_enabled() -> None:
-    """Gate create/edit/upload/revision-create behind ``draft_room_enabled``.
+    """Gate every mutating Draft Room route behind ``draft_room_enabled``.
+
+    That covers create, edit, upload, revision-create, archive/restore, compile,
+    Ready, promote, job retry, finding disposition, and single-input delete —
+    each mutates private data or project state.
 
     Capability discovery, owner list/read/export, job cancel, and whole-draft
-    delete stay available even when disabled so an owner can always inspect
-    and clean up their private data (SPEC section 9.2).
+    delete stay available even when disabled so an owner can always inspect and
+    clean up their private data (SPEC section 9.2). Single-input delete is a
+    piecemeal mutation and is NOT on that allowlist: with the room disabled,
+    whole-draft delete is the cleanup path.
     """
     if not settings.draft_room_enabled:
         raise DraftRoomHTTPError(503, "draft room is disabled", "draft_room_disabled")
@@ -1429,13 +1435,20 @@ def _validate_locked_spans(
 async def _delete_input_row_best_effort(
     store: DraftStore, *, draft_id: int, owner_id: int, input_id: int
 ) -> None:
-    """Best-effort rollback of a reserved input row after a later upload step fails."""
+    """Best-effort rollback of a reserved input row after a later upload step fails.
+
+    Uses ``best_effort=True``: the row was created by this same request and its
+    bytes have already been discarded, so the in-use / active-job refusal guards
+    do not apply. Applying them here would strand a row whose file is gone and
+    permanently 409 the owner's re-upload on ``UNIQUE(draft_id, content_sha256)``.
+    """
     try:
         await asyncio.to_thread(
             store.delete_input_row,
             draft_id=draft_id,
             owner_id=owner_id,
             input_id=input_id,
+            best_effort=True,
         )
     except DraftStoreError:
         logger.error(

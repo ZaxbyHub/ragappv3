@@ -296,6 +296,11 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
   // Upload is a mutating capability. Fail closed until the capability response
   // is hydrated, and keep the server's explicit deployment switch authoritative.
   const uploadCapabilityBlocked = capabilities == null || capabilities.enabled === false;
+  // Editing and deleting a stored source are mutations too: PATCH input and
+  // DELETE .../inputs/{input_id} both answer 503 while the room is disabled.
+  // Gate their affordances on the same flag so the UI never offers a control
+  // that can only fail.
+  const editSourceCapabilityBlocked = uploadCapabilityBlocked;
 
   // ---- Job / stage lookups -------------------------------------------------
   const jobsQuery = useQuery({
@@ -858,6 +863,7 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
         locked={hasActiveJob}
         lockedReason={activeJob ? STAGE_LABELS[activeJob.active_stage ?? ""] : undefined}
         canEdit={canManageContent}
+        editCapabilityBlocked={editSourceCapabilityBlocked}
       />
     </div>
   );

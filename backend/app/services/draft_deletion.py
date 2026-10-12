@@ -26,8 +26,12 @@ import logging
 import shutil
 from dataclasses import dataclass, field
 
-from app.services.draft_input_storage import DraftInputPathError, DraftInputStorage
-from app.services.draft_store import DraftConflictError, DraftStore
+from app.services.draft_input_storage import (
+    DraftInputPathError,
+    DraftInputStorage,
+    DraftInputStorageError,
+)
+from app.services.draft_store import DraftConflictError, DraftNotFoundError, DraftStore
 
 logger = logging.getLogger(__name__)
 
@@ -63,11 +67,14 @@ class DraftDeletionService:
 
         Raises:
             DraftNotFoundError: The input does not exist for this owner.
-            DraftConflictError: ``code='input_in_use'`` — a completed compile
-                used this input, or a parse job is currently active for it.
+            DraftConflictError: ``code='input_in_use'`` — a compile used this
+                input, or a parse job is currently active for it;
+                ``code='active_job'`` — a compile is running for the draft.
         """
         if store.input_is_in_use(draft_id=draft_id, input_id=input_id):
-            err = DraftConflictError("input has been used by a completed artifact")
+            err = DraftConflictError(
+                "input was used by a compile and may back derived artifacts"
+            )
             err.code = "input_in_use"
             raise err
         if store.get_active_parse_job_id(input_id) is not None:
@@ -81,15 +88,40 @@ class DraftDeletionService:
         try:
             token = self._storage.tombstone(relpath)
         except FileNotFoundError:
-            # Bytes already absent (a crash-window tombstone reconciled away,
-            # or external cleanup): removing the row is still the honest end
-            # state, and there is nothing to restore or commit.
+            # Bytes already absent (a crash-window tombstone reconciled away, or
+            # external cleanup): removing the row is still the honest end state,
+            # and there is nothing to restore or commit. Logged because the
+            # storage/DB drift is otherwise invisible to an operator.
             token = None
+            logger.warning(
+                "draft_input_bytes_already_absent draft_id=%s input_id=%s",
+                draft_id,
+                input_id,
+            )
         try:
             store.delete_input_row(draft_id=draft_id, owner_id=owner_id, input_id=input_id)
+        except DraftNotFoundError:
+            # A concurrent delete already removed the row. Committing our own
+            # tombstone is the only end state that keeps bytes and rows in
+            # agreement: restoring would leave the user's bytes on disk with no
+            # row referencing them, which nothing reclaims.
+            if token is not None:
+                self._storage.commit_tombstone(token)
+            raise
         except Exception:
             if token is not None:
-                self._storage.restore_tombstone(token, relpath)
+                try:
+                    self._storage.restore_tombstone(token, relpath)
+                except (OSError, DraftInputStorageError) as restore_exc:
+                    # A failed restore must never replace the error that caused
+                    # it; the bytes stay in .trash for startup reconcile.
+                    logger.error(
+                        "draft_input_restore_failed draft_id=%s input_id=%s "
+                        "exception_class=%s",
+                        draft_id,
+                        input_id,
+                        type(restore_exc).__name__,
+                    )
             raise
         if token is not None:
             self._storage.commit_tombstone(token)

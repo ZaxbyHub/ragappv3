@@ -217,7 +217,18 @@ class DraftInputStorage:
     # ── two-phase tombstone deletion ────────────────────────────────────
 
     def tombstone(self, relpath: str) -> str:
-        """Atomically rename the resolved path into ``.trash`` and return its token."""
+        """Atomically rename the resolved path into ``.trash`` and return its token.
+
+        Raises:
+            DraftInputPathError: The storage root itself is missing. Creating it
+                here would relocate the user's bytes into a fresh tree while the
+                caller reads the resulting ``FileNotFoundError`` as "bytes are
+                gone", so this fails closed instead.
+            FileNotFoundError: The source path does not exist — the bytes really
+                are absent, which callers may tolerate.
+        """
+        if not self._root.is_dir():
+            raise DraftInputPathError("draft storage root is missing")
         source = self.resolve(relpath)
         trash_dir = self._root / _TRASH_DIR
         trash_dir.mkdir(parents=True, exist_ok=True)

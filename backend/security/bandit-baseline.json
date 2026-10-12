@@ -36,7 +36,7 @@
       "SEVERITY.LOW": 62,
       "SEVERITY.MEDIUM": 60,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 87166,
+      "loc": 87242,
       "nosec": 0,
       "skipped_tests": 66
     },
@@ -140,7 +140,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 3680,
+      "loc": 3681,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -868,7 +868,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 188,
+      "loc": 193,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1011,7 +1011,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 3500,
+      "loc": 3569,
       "nosec": 0,
       "skipped_tests": 25
     },
@@ -1310,7 +1310,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 135,
+      "loc": 136,
       "nosec": 0,
       "skipped_tests": 1
     },

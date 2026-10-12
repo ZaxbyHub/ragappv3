@@ -19,7 +19,6 @@ class; this module deliberately stays naive about it.
 
 import asyncio
 import os
-import re
 import sys
 import unittest
 from pathlib import Path
@@ -132,8 +131,32 @@ class TestN01InputDeleteRoutes(DraftRoomTestBase):
         finally:
             self._connection_pool.release_connection(conn)
 
+    def _input_count(self, draft_id: int) -> int:
+        conn = self._connection_pool.get_connection()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM draft_inputs WHERE draft_id = ?", (draft_id,)
+            ).fetchone()
+            return int(row[0])
+        finally:
+            self._connection_pool.release_connection(conn)
+
+    def _input_relpath(self, draft_id: int, input_id: int) -> str:
+        conn = self._connection_pool.get_connection()
+        try:
+            row = conn.execute(
+                "SELECT storage_relpath FROM draft_inputs WHERE draft_id = ? AND id = ?",
+                (draft_id, input_id),
+            ).fetchone()
+            return str(row[0])
+        finally:
+            self._connection_pool.release_connection(conn)
+
     def test_used_input_delete_is_409(self):
         draft_id, input_id = self._seed_input(used=True)
+        storage = DraftInputStorage(Path(settings.data_dir) / "draft-room")
+        relpath = self._input_relpath(draft_id, input_id)
+        before = self._input_count(draft_id)
 
         resp = self.client.delete(
             f"/api/draft-room/drafts/{draft_id}/inputs/{input_id}",
@@ -142,21 +165,38 @@ class TestN01InputDeleteRoutes(DraftRoomTestBase):
 
         self.assertEqual(resp.status_code, 409, resp.text)
         self.assertEqual(resp.json()["code"], "input_in_use")
+        # A refusal must not have removed the row or the bytes on the way out.
+        self.assertEqual(self._input_count(draft_id), before)
+        self.assertTrue(storage.exists(relpath))
+
+    def test_active_compile_delete_is_409_active_job(self):
+        draft_id, input_id = self._seed_input(used=False)
+        conn = self._connection_pool.get_connection()
+        try:
+            conn.execute(
+                "INSERT INTO draft_jobs (draft_id, vault_id, created_by, job_type, "
+                "status, max_model_calls, timeout_seconds) "
+                "VALUES (?, ?, ?, 'compile', 'running', 0, 60)",
+                (draft_id, self.READ_VAULT_ID, self.OWNER_ID),
+            )
+            conn.commit()
+        finally:
+            self._connection_pool.release_connection(conn)
+
+        resp = self.client.delete(
+            f"/api/draft-room/drafts/{draft_id}/inputs/{input_id}",
+            headers=self._owner_headers(),
+        )
+
+        self.assertEqual(resp.status_code, 409, resp.text)
+        self.assertEqual(resp.json()["code"], "active_job")
 
     def test_disabled_input_delete_matches_spec(self):
+        # Name retained: the frozen C6 acceptance check selects this node id.
+        # Asserted directly rather than against a SPEC-line disjunction: once
+        # the spec and the code agree, a doc edit must not be able to satisfy
+        # this test for any status.
         draft_id, input_id = self._seed_input(used=False)
-
-        spec_path = (
-            Path(__file__).resolve().parents[3] / "specs" / "draft-room" / "SPEC.md"
-        )
-        spec_line = ""
-        for line in spec_path.read_text(encoding="utf-8").splitlines():
-            if "draft_room_enabled=false" in line:
-                spec_line = line
-                break
-        spec_line_names_input_delete = bool(
-            re.search(r"input delete|delete input", spec_line, re.IGNORECASE)
-        )
 
         original_enabled = settings.draft_room_enabled
         settings.draft_room_enabled = False
@@ -165,15 +205,14 @@ class TestN01InputDeleteRoutes(DraftRoomTestBase):
                 f"/api/draft-room/drafts/{draft_id}/inputs/{input_id}",
                 headers=self._owner_headers(),
             )
-            observed_status = resp.status_code
         finally:
             settings.draft_room_enabled = original_enabled
 
-        consistent = observed_status == 503 or spec_line_names_input_delete
-        self.assertTrue(
-            consistent,
-            f"observed status {observed_status}; spec line: {spec_line}",
-        )
+        # Asserted directly rather than against a SPEC-line disjunction: once
+        # the spec and the code agree, a doc edit must not be able to satisfy
+        # this test for any status.
+        self.assertEqual(resp.status_code, 503, resp.text)
+        self.assertEqual(resp.json()["code"], "draft_room_disabled")
 
 
 if __name__ == "__main__":

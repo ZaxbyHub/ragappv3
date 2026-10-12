@@ -126,6 +126,12 @@ class TestN01InputDelete(DraftDeletionTestBase):
 
         self.assertEqual(outcome, "ok")
         self.assertEqual(self.store.list_inputs(draft_id=draft.id, owner_id=1), [])
+        # The reconciled tombstone is already gone; this delete must not leave a
+        # new one behind either.
+        trash_dir = self.root / ".trash"
+        self.assertEqual(
+            list(trash_dir.iterdir()) if trash_dir.is_dir() else [], []
+        )
 
 
 if __name__ == "__main__":

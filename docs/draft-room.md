@@ -75,7 +75,11 @@ off later):
 - Exporting a revision
 - `POST .../jobs/{job_id}/cancel` — cancelling an active job
 - `DELETE /api/draft-room/drafts/{draft_id}` — whole-draft deletion
-- `DELETE .../inputs/{input_id}` — deleting a single input
+
+Everything else is a mutation and returns `503 draft_room_disabled` while the
+room is off, **including `DELETE .../inputs/{input_id}`** — single-input delete
+removes part of a draft, so it is gated like the other edits. Whole-draft
+deletion above stays available as the cleanup path.
 
 **While disabled, these return `503 draft_room_disabled`:**
 
@@ -185,9 +189,11 @@ This storage is never read by ordinary document ingestion and is only ever writt
 to by Draft Room's own upload/promotion code paths.
 
 **Deleting a single input** (`DELETE .../inputs/{input_id}`) tombstones and removes
-its stored bytes and database row — but only if the input has not been used by a
-completed compile and has no active parse job. If it has been used, the request
-returns `409 input_in_use`: the derived revisions and evidence that reference it
+its stored bytes and database row — but only if no compile used it and no job is
+active for it. It refuses with `409 input_in_use` when the input was used by a
+compile (either cited in that compile's evidence or listed in its frozen input
+snapshot), and with `409 active_job` when a compile is pending or running for the
+draft. On `input_in_use` the derived revisions and evidence that reference it
 are immutable project history and are not deleted along with the input. Deleting
 those derivatives selectively is out of scope — the only way to remove them is
 whole-draft deletion.
@@ -366,7 +372,7 @@ Stable error codes an operator or user is most likely to see, and what they mean
 | `model_call_budget_exceeded` | — (job failure) | `DRAFT_JOB_MAX_MODEL_CALLS` would be exceeded. |
 | `job_timeout` | — (job failure) | `DRAFT_JOB_TIMEOUT_SECONDS` (or `DRAFT_PARSE_TIMEOUT_SECONDS` for a parse job) elapsed. |
 | `active_job` | 409 | A job is already running/pending for this draft; wait for it or cancel it before retrying the requested action. |
-| `input_in_use` | 409 | Attempted to delete an input that a completed compile already used, or that has an active parse job. Delete the whole draft instead if the derived artifacts must go too. |
+| `input_in_use` | 409 | Attempted to delete an input a compile used (cited in its evidence or listed in its frozen input snapshot), or that has an active parse job. Delete the whole draft instead if the input must go. |
 | `fact_not_current` / `fact_candidate_mismatch` | 409 | The revision has no current fact-check result, or the successful Fact candidate doesn't match this exact revision's text. Re-run compile from the Fact stage. |
 | `non_waivable_blocker` / `unresolved_blocker` / `invalid_waiver` / `stale_waiver` / `unresolved_claim_blocker` | 409 | A Ready-blocking condition; see [Ready](#what-ready-means-and-does-not-mean) for the full list. |
 | `evidence_changed` / `source_deleted` | 409 | Evidence the revision depended on changed or disappeared; the draft is returned to `needs_review` and a new compile run is required. |

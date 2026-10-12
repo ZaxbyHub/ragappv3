@@ -21,15 +21,21 @@ plan-critic Round-1 gap tests live here instead:
 * T4 -- precedence: an in-use input whose bytes are already absent still
   refuses with ``input_in_use`` (SPEC 6.3's 409 is unconditional) and keeps
   the row; whole-draft delete remains the escape hatch.
-* T5 -- upload rollback: ``_delete_input_row_best_effort`` swallows the new
-  guard raises (they are ``DraftStoreError`` subclasses) so a failing upload
-  never masks its original error with a guard conflict.
+* T5 -- upload rollback: ``_delete_input_row_best_effort`` runs in best-effort
+  mode, so a compile enqueued between the reserve and the rollback cannot leave
+  a stranded row whose bytes are already gone.
+* T6-T13 -- active-job ``pending`` arm, concurrent-delete tombstone handling, a
+  missing storage root failing closed, restore failure not masking the conflict,
+  the in-transaction re-check closing the service→transaction window,
+  snapshot membership beyond the first entry, and the reader pinned against
+  the production snapshot writer.
 """
 
 import asyncio
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import sys
 import unittest
@@ -37,7 +43,12 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-from app.services.draft_store import DraftStore
+from app.services.draft_input_storage import DraftInputPathError
+from app.services.draft_store import (
+    DraftConflictError,
+    DraftNotFoundError,
+    DraftStore,
+)
 from draft_room.test_draft_deletion import DraftDeletionTestBase
 
 
@@ -50,16 +61,19 @@ class TestN01bInputDeleteEdges(DraftDeletionTestBase):
         vault_id=1,
         status,
         snapshot_input=None,
+        snapshot_inputs=None,
     ):
         """Compile job in the production writer shape.
 
-        ``snapshot_input`` optionally freezes the ``input_json`` snapshot the
-        route enqueue writes (``_sync_input_snapshot`` element order:
-        ``[id, role, authority, content_sha256, parsed_text_sha256]``).
+        ``snapshot_input``/``snapshot_inputs`` optionally freeze the ``input_json``
+        snapshot the enqueue writes (``_sync_input_snapshot`` element order:
+        ``[id, role, authority, sha, sha]``), in the given order.
         """
+        entries = snapshot_inputs
+        if entries is None and snapshot_input is not None:
+            entries = [snapshot_input]
         input_json = "{}"
-        if snapshot_input is not None:
-            record, role = snapshot_input
+        if entries:
             input_json = json.dumps(
                 {
                     "inputs": [
@@ -70,6 +84,7 @@ class TestN01bInputDeleteEdges(DraftDeletionTestBase):
                             record.content_sha256,
                             record.parsed_text_sha256 or "",
                         ]
+                        for record, role in entries
                     ]
                 }
             )
@@ -180,13 +195,21 @@ class TestN01bInputDeleteEdges(DraftDeletionTestBase):
             len(self.store.list_inputs(draft_id=draft.id, owner_id=1)), 1
         )
 
-    def test_t5_upload_rollback_swallows_guard_conflicts(self):
+    def test_t5_upload_rollback_still_removes_the_row_under_a_compile(self):
+        """Compensation must not be blocked by the guards added for real deletes.
+
+        A compile can be enqueued by the worker's auto-retry between an upload's
+        reserve and its rollback. The rollback deletes the row this request just
+        created, whose bytes have already been discarded; applying the in-use /
+        active-job guards there stranded a row with no file that permanently 409'd
+        the owner's re-upload on UNIQUE(draft_id, content_sha256).
+        """
         from app.api.routes.draft_room import _delete_input_row_best_effort
 
         draft = self.make_draft()
         record = self.add_input(draft.id)
-        # A compile enqueued after the reserve makes the in-transaction guard
-        # refuse the row delete; the rollback helper must swallow it.
+        # A compile enqueued after the reserve: the non-compensation delete path
+        # must refuse it (see test_t6), but compensation must still clean up.
         self._insert_compile_job(draft_id=draft.id, status="running")
 
         # The helper hops to a worker thread (asyncio.to_thread) like the
@@ -195,8 +218,6 @@ class TestN01bInputDeleteEdges(DraftDeletionTestBase):
         conn = sqlite3.connect(self._db_path, check_same_thread=False)
         try:
             store = DraftStore(conn)
-
-            # Must not raise despite the guard conflict inside delete_input_row.
             asyncio.run(
                 _delete_input_row_best_effort(
                     store, draft_id=draft.id, owner_id=1, input_id=record.id
@@ -205,16 +226,17 @@ class TestN01bInputDeleteEdges(DraftDeletionTestBase):
         finally:
             conn.close()
 
+        # The row must be gone; a surviving row is the permanent wedge.
         self.assertEqual(
-            len(self.store.list_inputs(draft_id=draft.id, owner_id=1)), 1
+            self.store.list_inputs(draft_id=draft.id, owner_id=1), []
         )
 
     def test_t6_running_compile_with_snapshot_answers_active_job(self):
         # Production writes the input snapshot at ENQUEUE time, so a running
         # compile already carries it. The delete must answer the active-job
-        # conflict, not input_in_use: this pins the snapshot leg's
-        # status = 'completed' filter (dropping it would make the leg match
-        # the running job and shadow the active_job refusal).
+        # conflict, not input_in_use: this pins the snapshot leg's exclusion of
+        # non-terminal jobs (dropping it would make the leg match the running
+        # job and shadow the active_job refusal).
         draft = self.make_draft()
         record = self.add_input(draft.id)
         self._insert_compile_job(
@@ -230,6 +252,164 @@ class TestN01bInputDeleteEdges(DraftDeletionTestBase):
         self.assertEqual(
             len(self.store.list_inputs(draft_id=draft.id, owner_id=1)), 1
         )
+
+    def test_t7_pending_compile_answers_active_job(self):
+        # SPEC 8.2 says "reject if active". An enqueued-but-not-started compile
+        # is active; only pinning `running` would let the delete through.
+        draft = self.make_draft()
+        record = self.add_input(draft.id)
+        self._insert_compile_job(draft_id=draft.id, status="pending")
+
+        outcome = self._delete_outcome(draft, record)
+
+        self.assertEqual(outcome, "active_job")
+        self.assertTrue(self.storage.exists(record.storage_relpath))
+        self.assertEqual(
+            len(self.store.list_inputs(draft_id=draft.id, owner_id=1)), 1
+        )
+
+    def test_t8_concurrent_delete_commits_tombstone_instead_of_restoring(self):
+        """Two DELETEs of one input must not end with bytes and no row.
+
+        Request A tombstones the bytes; request B sees them absent, deletes the
+        row and returns 204; request A's row delete then finds nothing. Restoring
+        A's tombstone would put the bytes back with no row referencing them, and
+        nothing reclaims them.
+        """
+        draft = self.make_draft()
+        record = self.add_input(draft.id)
+        relpath = record.storage_relpath
+
+        def concurrent_delete(**kwargs):
+            # Stand in for the other request having already removed the row.
+            self.conn.execute(
+                "DELETE FROM draft_inputs WHERE id = ?", (kwargs["input_id"],)
+            )
+            self.conn.commit()
+            raise DraftNotFoundError("input not found")
+
+        with patch.object(
+            self.store, "delete_input_row", side_effect=concurrent_delete
+        ):
+            with self.assertRaises(DraftNotFoundError):
+                self.deletion.delete_input(
+                    self.store, draft_id=draft.id, owner_id=1, input_id=record.id
+                )
+
+        # No orphan bytes, and no tombstone left behind.
+        self.assertFalse(self.storage.exists(relpath))
+        trash_dir = self.root / ".trash"
+        self.assertEqual(
+            list(trash_dir.iterdir()) if trash_dir.is_dir() else [], []
+        )
+
+    def test_t9_missing_storage_root_fails_closed(self):
+        # mkdir(parents=True) inside tombstone() would silently recreate the
+        # tree, so a vanished root used to read as "bytes are gone" and delete
+        # the row while the bytes stayed wherever they had been moved.
+        draft = self.make_draft()
+        record = self.add_input(draft.id)
+        shutil.rmtree(self.root)
+
+        with self.assertRaises(DraftInputPathError):
+            self.deletion.delete_input(
+                self.store, draft_id=draft.id, owner_id=1, input_id=record.id
+            )
+
+        self.assertEqual(
+            len(self.store.list_inputs(draft_id=draft.id, owner_id=1)), 1
+        )
+
+    def test_t10_restore_failure_does_not_mask_the_conflict(self):
+        # A Windows file lock makes restore_tombstone raise OSError. That must
+        # not replace the DraftConflictError the caller needs to see (409), nor
+        # escape the route's typed handlers as an untranslated 500.
+        draft = self.make_draft()
+        record = self.add_input(draft.id)
+        self._insert_compile_job(draft_id=draft.id, status="running")
+
+        with patch.object(
+            self.storage,
+            "restore_tombstone",
+            side_effect=OSError(13, "Permission denied"),
+        ):
+            with self.assertRaises(DraftConflictError) as ctx:
+                self.deletion.delete_input(
+                    self.store, draft_id=draft.id, owner_id=1, input_id=record.id
+                )
+
+        self.assertEqual(ctx.exception.code, "active_job")
+
+    def test_t11_in_transaction_recheck_catches_usage_appearing_mid_delete(self):
+        # The service pre-check runs outside the transaction; usage can appear
+        # between it and the DELETE. Only the in-transaction recheck closes
+        # that window, so it needs a test that fails when it is removed.
+        draft = self.make_draft()
+        record = self.add_input(draft.id)
+        self._insert_compile_job(
+            draft_id=draft.id, status="completed", snapshot_input=(record, "reference")
+        )
+        calls = {"n": 0}
+        real = self.store.input_is_in_use
+
+        def appears_between_checks(**kwargs):
+            # First call is the service pre-check (must miss); the second is
+            # the in-transaction re-check (must hit).
+            calls["n"] += 1
+            return calls["n"] > 1 and real(**kwargs)
+
+        with patch.object(
+            self.store, "input_is_in_use", side_effect=appears_between_checks
+        ):
+            outcome = self._delete_outcome(draft, record)
+
+        self.assertEqual(outcome, "input_in_use")
+        self.assertTrue(self.storage.exists(record.storage_relpath))
+
+    def test_t12_snapshot_membership_is_not_first_entry_only(self):
+        # Production snapshots list every input id-ordered, so the target is
+        # routinely NOT the first entry. A parser that only inspected the first
+        # entry would let a genuinely used input be deleted.
+        draft = self.make_draft()
+        first = self.add_input(draft.id, name="a.txt", content=b"first")
+        target = self.add_input(draft.id, name="b.txt", content=b"second")
+        self._insert_compile_job(
+            draft_id=draft.id,
+            status="completed",
+            snapshot_inputs=[(first, "reference"), (target, "manuscript")],
+        )
+
+        outcome = self._delete_outcome(draft, target)
+
+        self.assertEqual(outcome, "input_in_use")
+        self.assertTrue(self.storage.exists(target.storage_relpath))
+        self.assertTrue(self.storage.exists(first.storage_relpath))
+
+    def test_t13_snapshot_built_by_the_production_writer_is_parsed(self):
+        # Pins the reader against the WRITER, not a hand-built literal: if
+        # _sync_input_snapshot reorders its elements or the enqueue key is
+        # renamed, every leg goes inert and this test fails.
+        from app.api.routes.draft_room import _sync_input_snapshot
+
+        draft = self.make_draft()
+        record = self.add_input(draft.id)
+        self.conn.execute(
+            "INSERT INTO draft_jobs (draft_id, vault_id, created_by, job_type, "
+            "status, input_json, max_model_calls, timeout_seconds) "
+            "VALUES (?, 1, 1, 'compile', 'completed', ?, 0, 60)",
+            (
+                draft.id,
+                json.dumps(
+                    {"inputs": _sync_input_snapshot(self.store, self.store.get_draft(draft.id, 1))}
+                ),
+            ),
+        )
+        self.conn.commit()
+
+        outcome = self._delete_outcome(draft, record)
+
+        self.assertEqual(outcome, "input_in_use")
+        self.assertTrue(self.storage.exists(record.storage_relpath))
 
 
 if __name__ == "__main__":
