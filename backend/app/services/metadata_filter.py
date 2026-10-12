@@ -20,10 +20,11 @@ read authority, and the filter narrows within the full corpus.
 Zero-match semantics: when no file satisfies the filter — including when an
 explicitly supplied field has an empty value (an empty author or an empty
 tag name is a filter that matches nothing, never a filter that matches
-everything) — or the metadata database is unavailable, the resolver returns
-the zero-match sentinel ``file_id IN ('')`` which matches no chunk. A
-user-supplied filter is NEVER silently dropped: "no documents match" is a
-real, visible result. The
+everything; the author is matched by exact equality, so a row that literally
+stores an empty sender is the only thing an empty author can match) — or the
+metadata database is unavailable, the resolver returns the zero-match
+sentinel ``file_id IN ('')`` which matches no chunk. A user-supplied filter
+is NEVER silently dropped: "no documents match" is a real, visible result. The
 unavailability fallback is typed to the three classes the checkout/query
 surface can actually raise for environmental causes — ``OSError``
 (filesystem/parent-directory failure in pool connection creation),
