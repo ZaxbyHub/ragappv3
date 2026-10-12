@@ -119,3 +119,11 @@ workflow's verify-test).
 
 Omit `## Review follow-up` when there was no review feedback. Omit
 `## Closure evidence` when the PR does not close an issue.
+
+## Contract addendum (2026-10-12)
+
+- **Publication-time re-derivation.** As the LAST step before `gh pr create`
+  / `pr edit`, re-derive every claim in the body from the final tree: PR head
+  SHA, test counts, file lists, closure evidence. A body drafted earlier is
+  stale by construction — the head moves with every amend — and a stale
+  `PR head:` line in particular is guarded by no validator.
