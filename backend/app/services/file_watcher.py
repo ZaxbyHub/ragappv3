@@ -13,6 +13,7 @@ from typing import Dict, Optional, Set
 
 from ..config import settings
 from ..models.database import SQLiteConnectionPool
+from .atomic_write import is_temp_artifact
 from .background_tasks import BackgroundProcessor
 from .upload_path import UploadPathProvider
 from .upload_validation import validate_ingest_candidate
@@ -320,8 +321,31 @@ class FileWatcher:
         files_on_disk: Set[Path] = set()
         if directory.exists():
             for file_path in directory.rglob("*"):
-                if file_path.is_file():
-                    files_on_disk.add(file_path.resolve())
+                if not file_path.is_file():
+                    continue
+                # Canonical atomic-write temp artifacts (.{name}.{uuid}.part,
+                # app.services.atomic_write) are mid-write or crash-leftover
+                # partials, never documents: skipping them is what makes a
+                # killed write un-ingestible (issue #786). The predicate
+                # matches only the exact generated shape, so no legitimate
+                # file (e.g. a library-dir ".notes.part") is ever dropped.
+                if is_temp_artifact(file_path):
+                    continue
+                # Zero-byte files are never ingestible — validate_ingest_candidate
+                # rejects them as "empty" — so they are not candidates at all.
+                # Filtering them here rather than downstream keeps a healthy
+                # IN-FLIGHT upload (whose final path holds the 0-byte O_EXCL
+                # reservation for the whole write) from producing a structural
+                # rejection warning on every scan tick, and keeps a crash-left
+                # placeholder from warning forever (issue #786 review PRR-014).
+                try:
+                    if file_path.stat().st_size == 0:
+                        continue
+                except OSError:
+                    # Unreadable entry: leave it in the candidate set so the
+                    # existing validation reports it with its normal reason.
+                    pass
+                files_on_disk.add(file_path.resolve())
 
         # Get files from database. The stored ``file_path`` form depends on
         # how the row was written (absolute for route uploads, either form
