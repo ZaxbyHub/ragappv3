@@ -380,6 +380,32 @@ def _truncate(value: Optional[str], limit: int) -> Optional[str]:
     return value[:limit]
 
 
+def _snapshot_lists_input(input_json: Optional[str], input_id: int) -> bool:
+    """True when a compile job's frozen input snapshot lists ``input_id``.
+
+    The snapshot shape is ``{"inputs": [[id, role, authority, sha, sha], ...]}``
+    as written by the compile enqueue (``_sync_input_snapshot`` in the route
+    module) and copied verbatim by compile-retry inserts. Rows with an absent,
+    malformed, or legacy-empty snapshot are skipped: no production compile
+    writer omits the snapshot, so an empty one cannot mean the compile used
+    nothing.
+    """
+    if not input_json:
+        return False
+    try:
+        snapshot = json.loads(input_json)
+    except (TypeError, ValueError, RecursionError):
+        return False
+    entries = snapshot.get("inputs") if isinstance(snapshot, dict) else None
+    if not isinstance(entries, list):
+        return False
+    return any(
+        isinstance(entry, list) and entry and entry[0] is not None
+        and type(entry[0]) is int and entry[0] == input_id
+        for entry in entries
+    )
+
+
 def validate_evidence_identity(
     *,
     source_kind: str,
@@ -1196,7 +1222,9 @@ class DraftStore:
             (draft_id,),
         ).fetchone()
         if row is not None:
-            raise DraftConflictError("a compile job is active for this draft")
+            err = DraftConflictError("a compile job is active for this draft")
+            err.code = "active_job"
+            raise err
 
     def _assert_no_active_job(self, draft_id: int) -> None:
         row = self._db.execute(
@@ -1613,20 +1641,52 @@ class DraftStore:
         return int(row[0])
 
     def delete_input_row(
-        self, *, draft_id: int, owner_id: int, input_id: int
+        self, *, draft_id: int, owner_id: int, input_id: int, best_effort: bool = False
     ) -> None:
         """Delete an input row (phase 2 of the tombstone flow) and audit it.
 
         The file is renamed into ``.trash`` *before* this runs and is restored if
-        this transaction fails, so bytes and rows can never disagree.
+        this transaction fails, so bytes and rows can never disagree. Inside the
+        same transaction the delete refuses when the input was used by a compile
+        (SPEC 6.3), when a parse job is active for it, or when a compile is active
+        for the draft (SPEC 8.2 route table); the evidence CHECK's integrity
+        error — the only ``ON DELETE SET NULL``-into-CHECK foreign key on this
+        table — is translated to the same conflict as a backstop for a race the
+        checks above cannot see.
+
+        ``best_effort=True`` skips the refusal checks. It exists only for upload
+        compensation, which deletes the row it just created in the same request:
+        that row cannot have been used by a compile, and applying the guards
+        there would strand a row whose bytes have already been discarded.
         """
         self._begin_immediate()
         try:
             self._locked_draft(draft_id, owner_id, None)
-            cur = self._db.execute(
-                "DELETE FROM draft_inputs WHERE id = ? AND draft_id = ?",
-                (input_id, draft_id),
-            )
+            if not best_effort:
+                # Order matches DraftDeletionService.delete_input so the same
+                # observable state always produces the same conflict code.
+                if self.input_is_in_use(draft_id=draft_id, input_id=input_id):
+                    err = DraftConflictError(
+                        "input was used by a compile and may back derived artifacts"
+                    )
+                    err.code = "input_in_use"
+                    raise err
+                if self.get_active_parse_job_id(input_id) is not None:
+                    err = DraftConflictError("input has an active parse job")
+                    err.code = "input_in_use"
+                    raise err
+                self._assert_no_active_compile(draft_id)
+            try:
+                cur = self._db.execute(
+                    "DELETE FROM draft_inputs WHERE id = ? AND draft_id = ?",
+                    (input_id, draft_id),
+                )
+            except sqlite3.IntegrityError as exc:
+                err = DraftConflictError(
+                    "input was used by a compile and may back derived artifacts"
+                )
+                err.code = "input_in_use"
+                raise err from exc
             if cur.rowcount == 0:
                 raise DraftNotFoundError("input not found")
             self._insert_event(
@@ -1641,15 +1701,46 @@ class DraftStore:
             raise
 
     def input_is_in_use(self, *, draft_id: int, input_id: int) -> bool:
-        """True when a completed job derived durable artifacts from this input.
+        """True when a compile used this input, so it may back derived artifacts.
 
         A used input cannot be deleted piecemeal (``409 input_in_use``): immutable
         revisions contain derivatives, and pretending otherwise would be dishonest.
         Whole-draft deletion is the comprehensive purge.
+
+        Provenance is read from the shapes production actually writes: the
+        compile's evidence ledger (``draft_evidence`` rows citing the input)
+        and the immutable ``input_json`` snapshot every compile enqueue freezes.
+        Both legs accept a compile in any terminal state — a run that was
+        cancelled or that failed after writing evidence still holds derivative
+        data, and the FK CHECK would refuse the delete anyway, so restricting the
+        query to ``completed`` would only turn a correct refusal into a misleading
+        one. Snapshot membership is deliberately broader than citation: the
+        snapshot records which inputs a compile was given, which is the only
+        durable record of usage when a run finishes without evidence rows. The
+        legacy ``draft_jobs.input_id`` legs stay for rows written before those
+        writers existed.
         """
         row = self._db.execute(
+            "SELECT 1 FROM draft_evidence e JOIN draft_jobs j ON j.id = e.job_id "
+            "WHERE j.draft_id = ? AND e.draft_input_id = ? "
+            "AND j.job_type = 'compile' "
+            "AND j.status IN ('completed','failed','cancelled') LIMIT 1",
+            (draft_id, input_id),
+        ).fetchone()
+        if row is not None:
+            return True
+        for (input_json,) in self._db.execute(
+            "SELECT input_json FROM draft_jobs "
+            "WHERE draft_id = ? AND job_type = 'compile' "
+            "AND status IN ('completed','failed','cancelled')",
+            (draft_id,),
+        ).fetchall():
+            if _snapshot_lists_input(input_json, input_id):
+                return True
+        row = self._db.execute(
             "SELECT 1 FROM draft_jobs WHERE draft_id = ? AND input_id = ? "
-            "AND job_type = 'compile' AND status = 'completed' LIMIT 1",
+            "AND job_type = 'compile' "
+            "AND status IN ('completed','failed','cancelled') LIMIT 1",
             (draft_id, input_id),
         ).fetchone()
         if row is not None:

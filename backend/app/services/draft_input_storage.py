@@ -217,7 +217,22 @@ class DraftInputStorage:
     # ── two-phase tombstone deletion ────────────────────────────────────
 
     def tombstone(self, relpath: str) -> str:
-        """Atomically rename the resolved path into ``.trash`` and return its token."""
+        """Atomically rename the resolved path into ``.trash`` and return its token.
+
+        Raises:
+            DraftInputPathError: The storage root itself is missing. Creating
+                it here would relocate the user's bytes into a fresh tree while
+                the caller reads the resulting ``FileNotFoundError`` as "bytes
+                are gone", so this fails closed instead.
+            FileNotFoundError: The source file does not exist, which callers may
+                tolerate as "bytes are absent". A missing PARENT directory is
+                deliberately not treated this way: SPEC 6.3/AC5 requires an
+                input to stay deletable after startup reconcile removes its
+                project directory, so the two states are indistinguishable
+                here and the tolerant reading is kept.
+        """
+        if not self._root.is_dir():
+            raise DraftInputPathError("draft storage root is missing")
         source = self.resolve(relpath)
         trash_dir = self._root / _TRASH_DIR
         trash_dir.mkdir(parents=True, exist_ok=True)

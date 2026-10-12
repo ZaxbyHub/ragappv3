@@ -21,7 +21,11 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { formatDate, formatFileSize } from "@/lib/formatters";
-import { INPUT_AUTHORITY_LABELS, INPUT_ROLE_LABELS } from "./labels";
+import {
+  DRAFT_ROOM_DISABLED_MESSAGE,
+  INPUT_AUTHORITY_LABELS,
+  INPUT_ROLE_LABELS,
+} from "./labels";
 import {
   DRAFT_INPUT_AUTHORITIES,
   DRAFT_INPUT_ROLES,
@@ -44,6 +48,8 @@ export interface DraftSourceListProps {
   locked: boolean;
   lockedReason?: string;
   canEdit: boolean;
+  /** The deployment switch disables every mutation; gate the affordances too. */
+  editCapabilityBlocked?: boolean;
 }
 
 const PARSE_STATUS_TEXT: Record<DraftInputParseStatus, string> = {
@@ -141,16 +147,28 @@ interface DraftSourceRowProps {
   locked: boolean;
   lockedReason?: string;
   canEdit: boolean;
+  editCapabilityBlocked: boolean;
 }
 
-function DraftSourceRow({ draftId, input, locked, lockedReason, canEdit }: DraftSourceRowProps) {
+function DraftSourceRow({
+  draftId,
+  input,
+  locked,
+  lockedReason,
+  canEdit,
+  editCapabilityBlocked,
+}: DraftSourceRowProps) {
   const queryClient = useQueryClient();
   const [isEditing, setIsEditing] = useState(false);
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
+  // Kept in-dialog so a refusal is announced where focus already is, rather
+  // than only in a toast outside the dialog's focus scope.
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const [editRole, setEditRole] = useState<DraftInputRole>(input.role);
   const [editAuthority, setEditAuthority] = useState<DraftInputAuthority>(input.authority);
   const [editAsOfDate, setEditAsOfDate] = useState(input.as_of_date ?? "");
   const deleteHeadingRef = useRef<HTMLHeadingElement>(null);
+  const deleteErrorRef = useRef<HTMLParagraphElement>(null);
 
   const invalidate = () => {
     queryClient.invalidateQueries({ queryKey: draftRoomKeys.detail(draftId) });
@@ -174,10 +192,26 @@ function DraftSourceRow({ draftId, input, locked, lockedReason, canEdit }: Draft
     onSuccess: () => {
       toast.success("Source removed");
       setConfirmDeleteOpen(false);
+      setDeleteError(null);
       invalidate();
     },
     onError: (err) => {
-      toast.error(parseDraftRoomError(err).detail);
+      const parsed = parseDraftRoomError(err);
+      // Refusals are expected outcomes here (409 input_in_use / active_job,
+      // 503 while the room is disabled), so give each one its own wording
+      // rather than echoing a raw server string.
+      toast.error(
+        parsed.code === "draft_room_disabled"
+          ? DRAFT_ROOM_DISABLED_MESSAGE
+          : parsed.detail,
+      );
+      setDeleteError(
+        parsed.code === "draft_room_disabled"
+          ? DRAFT_ROOM_DISABLED_MESSAGE
+          : parsed.detail,
+      );
+      // Focus the refusal so it is announced inside the dialog.
+      requestAnimationFrame(() => deleteErrorRef.current?.focus());
     },
   });
 
@@ -198,7 +232,7 @@ function DraftSourceRow({ draftId, input, locked, lockedReason, canEdit }: Draft
     updateMutation.mutate(payload);
   };
 
-  const editingDisabled = locked || !canEdit;
+  const editingDisabled = locked || !canEdit || editCapabilityBlocked;
   const idBase = `draft-source-${input.id}`;
 
   return (
@@ -240,7 +274,10 @@ function DraftSourceRow({ draftId, input, locked, lockedReason, canEdit }: Draft
                 type="button"
                 size="sm"
                 variant="ghost"
-                onClick={() => setConfirmDeleteOpen(true)}
+                onClick={() => {
+                  setDeleteError(null);
+                  setConfirmDeleteOpen(true);
+                }}
                 disabled={editingDisabled}
                 aria-label={`Remove ${input.original_name}`}
               >
@@ -326,7 +363,13 @@ function DraftSourceRow({ draftId, input, locked, lockedReason, canEdit }: Draft
         </div>
       )}
 
-      <Dialog open={confirmDeleteOpen} onOpenChange={setConfirmDeleteOpen}>
+      <Dialog
+        open={confirmDeleteOpen}
+        onOpenChange={(open) => {
+          setConfirmDeleteOpen(open);
+          if (!open) setDeleteError(null);
+        }}
+      >
         <DialogContent
           onOpenAutoFocus={(event) => {
             event.preventDefault();
@@ -340,9 +383,26 @@ function DraftSourceRow({ draftId, input, locked, lockedReason, canEdit }: Draft
             <DialogDescription>
               This permanently deletes the source file from this project. This cannot be undone.
             </DialogDescription>
+            {deleteError != null && (
+              <p
+                ref={deleteErrorRef}
+                tabIndex={-1}
+                role="alert"
+                className="text-sm text-destructive"
+              >
+                {deleteError}
+              </p>
+            )}
           </DialogHeader>
           <DialogFooter>
-            <Button type="button" variant="ghost" onClick={() => setConfirmDeleteOpen(false)}>
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={() => {
+                setDeleteError(null);
+                setConfirmDeleteOpen(false);
+              }}
+            >
               Cancel
             </Button>
             <Button
@@ -360,7 +420,14 @@ function DraftSourceRow({ draftId, input, locked, lockedReason, canEdit }: Draft
   );
 }
 
-export function DraftSourceList({ draftId, inputs, locked, lockedReason, canEdit }: DraftSourceListProps) {
+export function DraftSourceList({
+  draftId,
+  inputs,
+  locked,
+  lockedReason,
+  canEdit,
+  editCapabilityBlocked = false,
+}: DraftSourceListProps) {
   if (inputs.length === 0) {
     return (
       <div className="rounded-md border border-dashed border-border p-6 text-center text-sm text-muted-foreground">
@@ -380,6 +447,7 @@ export function DraftSourceList({ draftId, inputs, locked, lockedReason, canEdit
           locked={locked}
           lockedReason={lockedReason}
           canEdit={canEdit}
+          editCapabilityBlocked={editCapabilityBlocked}
         />
       ))}
     </ul>

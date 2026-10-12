@@ -747,7 +747,7 @@ class Settings(BaseSettings):
     # PR 1 subset. Compile/model-routing limits below this block (issue #436)
     # complete the SPEC.md §15 settings table.
     draft_room_enabled: bool = False
-    """Master switch for Draft Room. Default False: create/edit/upload return 503 draft_room_disabled while capability discovery and owner cleanup stay available."""
+    """Master switch for Draft Room. Default False: every mutating route (create, edit, upload, compile, Ready, promote, single-input delete) returns 503 draft_room_disabled, while capability discovery, owner list/read/export, job cancel, revision export, and whole-draft delete stay available for cleanup."""
     draft_max_inputs: int = 10
     """Maximum number of uploaded inputs per Draft Room project."""
     draft_max_total_input_mb: int = 250
