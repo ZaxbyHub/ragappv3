@@ -1041,19 +1041,32 @@ class ScopedPartialFileIdsTest(DocumentsDeleteAuditTestBase):
         self.assertEqual(engine._get_scoped_partial_file_ids([], 2), set())
 
 
+def _get_pool_unavailable(sqlite_path, max_size=5):
+    """Signature-faithful get_pool double (issue #707 defect class: doubles
+    must not absorb arity drift — a bare ``get_pool()`` call site raises
+    TypeError from THIS double's signature instead of being silently
+    accepted by a MagicMock)."""
+    raise RuntimeError("no db in test")
+
+
+def _engine_pool_unavailable():
+    """Signature-faithful zero-arg double for rag_engine._get_pool."""
+    raise RuntimeError("no db in test")
+
+
 class _patch_pool_unavailable:
     """Context manager forcing pool lookups to fail (zero-match semantics)."""
 
     def __enter__(self):
         self._patcher = unittest.mock.patch(
             "app.services.rag_engine._get_pool",
-            side_effect=RuntimeError("no db in test"),
+            side_effect=_engine_pool_unavailable,
         )
         # metadata_filter resolution imports get_pool from
         # app.models.database directly, so patch that too.
         self._patcher2 = unittest.mock.patch(
             "app.models.database.get_pool",
-            side_effect=RuntimeError("no db in test"),
+            side_effect=_get_pool_unavailable,
         )
         self._patcher.start()
         self._patcher2.start()
