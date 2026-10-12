@@ -539,11 +539,11 @@ class RAGEngine:
                 return None, None
             finally:
                 conn.close()
-        except Exception:
+        except Exception as exc:
             # Prompt resolution failures should not crash queries; fall through
             # to normal builder resolution.
             logger.warning(
-                "Could not resolve effective prompt for vault_id=%s", vault_id
+                "Could not resolve effective prompt for vault_id=%s: %s", vault_id, exc
             )
             return None, None
 
@@ -561,16 +561,18 @@ class RAGEngine:
              version directly (issue #708)
           2. A/B experiment override (if an active global experiment exists)
 
-        A/B layering is additional to the 3.5 org override: when an active
-        experiment exists, its assigned variant takes precedence over the 3.5
-        effective version for this query.  This lets experiments run across
-        all orgs uniformly (global experiment scope for v1 simplicity).
+        A/B layering is additional to the 3.5 effective version: when an
+        active experiment exists, its assigned variant takes precedence over
+        the 3.5 effective version for this query.  This lets experiments run
+        across all orgs uniformly (global experiment scope for v1 simplicity).
 
         Exposure is recorded idempotently (INSERT OR IGNORE) so re-exposure of
         the same subject_key to the same experiment does not double-count.
 
         Args:
             vault_id: Vault ID to look up org_id from (for 3.5 resolution).
+                None, an unknown id, or a vault with no org all resolve the
+                global active version (issue #708).
             user_id: User ID for per-user sticky A/B assignment (SC-017).
                 If None and vault_id is available, org_id is derived from
                 vault_id for an org-scoped fallback subject_key.
@@ -1994,8 +1996,10 @@ class RAGEngine:
         }
 
         # Build messages using prompt builder service.
-        # Resolve the org-specific prompt (if any) per-query so different orgs
-        # always get their own version without stale caching on the builder.
+        # Resolve the effective prompt per-query (org override, else the global
+        # active version; org-less/All-Vaults queries get the global active one)
+        # so different orgs always get their own version, and an activated
+        # version is served everywhere, without stale caching on the builder.
         # FR-007 part 3: A/B experiment layering — if an active global experiment
         # exists, its assigned variant takes precedence over the 3.5 effective version.
         effective_prompt_override, ab_eid, ab_var, p_version = await asyncio.to_thread(

@@ -32,6 +32,7 @@ def fresh_db():
     """Create a temporary DB with the full schema including A/B tables."""
     fd, path = tempfile.mkstemp(suffix=".db")
     os.close(fd)
+    conn = None
     try:
         run_migrations(path)
         conn = sqlite3.connect(path)
@@ -45,7 +46,10 @@ def fresh_db():
         conn.commit()
         yield conn
     finally:
-        conn.close()
+        # conn is bound only after run_migrations succeeds; guard so a schema
+        # failure surfaces its own traceback instead of an UnboundLocalError.
+        if conn is not None:
+            conn.close()
         os.unlink(path)
 
 
@@ -74,7 +78,10 @@ class _FakeVec:
         return results[:limit]
 
     async def get_chunks_by_uid(self, chunk_uids):
-        return []
+        # Return the searched chunks back so the retrieved evidence survives
+        # into the message build (returning [] silently drops every chunk and
+        # would let the done-chunk assertions pass without a real query path).
+        return list(self._results)
 
     def get_fts_exceptions(self):
         return 0
@@ -207,30 +214,37 @@ def test_query_orgless_serves_active_prompt_end_to_end(fresh_db, store):
     _insert_orgless_vault(fresh_db, 9301)
 
     # settings is a process-wide singleton: restore every write (same pattern
-    # as test_agentic_control_parity.py).
+    # as test_agentic_control_parity.py). The mutation block sits INSIDE the
+    # try so an exception mid-loop still restores everything already written.
     snapshot = {}
 
     def _set(attr, value):
-        if hasattr(settings, attr):
-            snapshot[attr] = getattr(settings, attr)
-            setattr(settings, attr, value)
+        # Fail loudly if a setting is renamed: silently skipping it would leave
+        # the feature ENABLED and quietly exercise a different engine branch.
+        assert hasattr(settings, attr), f"settings.{attr} no longer exists"
+        snapshot[attr] = getattr(settings, attr)
+        setattr(settings, attr, value)
 
-    for attr in (
-        "hybrid_search_enabled",
-        "context_distillation_enabled",
-        "retrieval_evaluation_enabled",
-        "query_transformation_enabled",
-        "reranking_enabled",
-        "wiki_enabled",
-        "parent_retrieval_enabled",
-        "anchor_best_chunk",
-        "context_distillation_synthesis_enabled",
-        "instant_skip_retrieval_evaluation",
-        "instant_skip_query_transformation",
-    ):
-        _set(attr, False)
-    _set("retrieval_top_k", 5)
     try:
+        for attr in (
+            "hybrid_search_enabled",
+            "context_distillation_enabled",
+            "retrieval_evaluation_enabled",
+            "query_transformation_enabled",
+            "reranking_enabled",
+            "wiki_enabled",
+            "parent_retrieval_enabled",
+            "anchor_best_chunk",
+            "context_distillation_synthesis_enabled",
+            "instant_skip_retrieval_evaluation",
+            "instant_skip_query_transformation",
+        ):
+            _set(attr, False)
+        # The agentic early-return path bypasses the resolver entirely (it is a
+        # known out-of-scope boundary), so neutralise it or this test would fail
+        # for an unrelated reason on a flag-enabled deployment.
+        _set("agentic_rag_enabled", False)
+        _set("retrieval_top_k", 5)
         llm = _CapturingLLM(response="answer [S1]")
         engine = _make_engine(
             fresh_db,
@@ -253,6 +267,18 @@ def test_query_orgless_serves_active_prompt_end_to_end(fresh_db, store):
 
         engine._check_supersession_file_ids = _no_supersession
 
+        # _get_indexed_file_ids/_check_supersession read settings.sqlite_path
+        # (the developer's ./data/app.db), NOT the injected db_path, which would
+        # make this test's outcome depend on the local machine. Stub both seams
+        # and assert a real chunk reaches the done payload below.
+        async def _no_supersession_chunks(sources):
+            return None
+
+        engine._check_supersession = _no_supersession_chunks
+        # Must return the fake chunk's file id, not an empty set: an empty
+        # result makes the atomic visibility filter drop every chunk.
+        engine._get_indexed_file_ids = lambda vault_id: {"file1"}
+
         chunks = []
 
         async def _collect():
@@ -274,6 +300,9 @@ def test_query_orgless_serves_active_prompt_end_to_end(fresh_db, store):
     done = [c for c in chunks if c.get("type") == "done"]
     assert len(done) == 1
     assert done[0].get("prompt_version") == "c03-active"
+    # The retrieved chunk must reach the payload, so the assertions above can
+    # only pass if the whole query path actually ran.
+    assert done[0].get("sources"), "no sources reached the done chunk"
 
 
 # ---------------------------------------------------------------------------
@@ -303,3 +332,109 @@ def test_orgless_ab_variant_overrides_global_active(fresh_db, store):
     assert ab_var == "challenger"
     assert content == "c03b challenger content"
     assert p_version == "c03b_chlg"
+
+
+# ---------------------------------------------------------------------------
+# 5. Feedback-round coverage (swarm-pr-feedback on PR #883)
+#    Each block below kills a mutant that survived the pre-feedback suite.
+# ---------------------------------------------------------------------------
+
+
+def test_all_vaults_resolves_active_content_not_just_label(fresh_db, store):
+    """All-Vaults resolution must serve the ACTIVE version's CONTENT.
+
+    Kills the mutant that returns the right label but wrong (or no) content
+    for ``vault_id=None``; the label-only frozen check cannot see that.
+    """
+    store.create_version(
+        "c03-active", "C03-ACTIVE-PROMPT-MARKER all-vaults content", activate=True
+    )
+
+    engine = _make_engine(fresh_db)
+    content, _ab_eid, _ab_var, p_version = engine._resolve_prompt_with_ab_sync(
+        vault_id=None, user_id=None
+    )
+
+    assert p_version == "c03-active"
+    assert content == "C03-ACTIVE-PROMPT-MARKER all-vaults content"
+
+
+def test_inactive_newer_version_does_not_shadow_active_older(fresh_db, store):
+    """Only the is_active row is served, and the choice is re-read per query.
+
+    Kills two mutants: ignoring ``is_active`` (which would serve the newest
+    inactive row) and caching the first resolution (which would miss a
+    re-activation between two calls on the same long-lived engine).
+    """
+    store.create_version("c03-active", "C03-ACTIVE-PROMPT-MARKER original", activate=True)
+    store.create_version("c03-newer-inactive", "C03-SHOULD-NOT-BE-SERVED")
+
+    engine = _make_engine(fresh_db)
+
+    content, _ab_eid, _ab_var, p_version = engine._resolve_prompt_with_ab_sync(
+        vault_id=None, user_id=None
+    )
+    assert p_version == "c03-active"
+    assert content == "C03-ACTIVE-PROMPT-MARKER original"
+    assert "C03-SHOULD-NOT-BE-SERVED" not in content
+
+    # Admin activates the newer version: the next query must pick it up with
+    # no engine restart (resolution is per-query, never cached).
+    store.activate("c03-newer-inactive")
+    content2, _ab_eid2, _ab_var2, p_version2 = engine._resolve_prompt_with_ab_sync(
+        vault_id=None, user_id=None
+    )
+    assert p_version2 == "c03-newer-inactive"
+    assert content2 == "C03-SHOULD-NOT-BE-SERVED"
+
+
+def test_orgless_vault_ignores_other_orgs_override(fresh_db, store):
+    """Org-less resolution never consults another org's override.
+
+    Kills the mutant that resolves an override regardless of the vault's org
+    (e.g. resolving an org override for an org the query does not belong to).
+    """
+    store.create_version("c03-active", "C03-ACTIVE-PROMPT-MARKER global", activate=True)
+    store.create_version("c03-other-org", "OTHER-ORG-PRIVATE-PROMPT")
+    store.set_org_override(org_id=10, version="c03-other-org")
+    _insert_orgless_vault(fresh_db, 9303)
+
+    engine = _make_engine(fresh_db)
+    content, _ab_eid, _ab_var, p_version = engine._resolve_prompt_with_ab_sync(
+        vault_id=9303, user_id=None
+    )
+
+    assert p_version == "c03-active"
+    assert content == "C03-ACTIVE-PROMPT-MARKER global"
+    assert "OTHER-ORG-PRIVATE-PROMPT" not in content
+
+
+def test_resolver_fails_open_when_db_is_unusable(fresh_db, store, caplog):
+    """A DB failure degrades to (None, None) and logs the cause — never raises.
+
+    Kills the mutant that re-raises out of the exception handler: prompt
+    resolution must never fail a query. Uses a DB file with no schema so the
+    prompt_versions lookup genuinely fails.
+    """
+    import logging
+
+    from app.services.rag_engine import RAGEngine
+
+    empty_fd, empty_path = tempfile.mkstemp(suffix=".db")
+    os.close(empty_fd)
+    try:
+        engine = RAGEngine(
+            db_path=empty_path,
+            embedding_service=_FakeEmbSvc(),
+            vector_store=_FakeVec([]),
+            memory_store=_FakeMem(),
+            llm_client=_CapturingLLM(),
+        )
+        with caplog.at_level(logging.WARNING):
+            content, ab_eid, ab_var, p_version = engine._resolve_prompt_with_ab_sync(
+                vault_id=None, user_id=None
+            )
+        assert (content, ab_eid, ab_var, p_version) == (None, None, None, None)
+        assert any("Could not resolve effective prompt" in r.message for r in caplog.records)
+    finally:
+        os.unlink(empty_path)

@@ -271,8 +271,9 @@ class PromptBuilderService:
             system_prompt_override: Per-query system prompt override.
                 When provided, prepended as a system message with highest
                 precedence (bypasses constructor override and cached DB
-                version). Used by the RAG engine to inject the org-specific
-                effective prompt version resolved at query time.
+                version). Used by the RAG engine to inject the effective
+                prompt version resolved at query time (org override, else the
+                global active version).
 
         Returns:
             List of message dictionaries for the LLM
@@ -357,7 +358,7 @@ class PromptBuilderService:
             if mem.content
         ]
 
-        # system_prompt_override (org-specific per-query) takes absolute
+        # system_prompt_override (per-query effective version) takes absolute
         # precedence. Falls through to normal resolution chain otherwise.
         effective_prompt = (
             system_prompt_override
