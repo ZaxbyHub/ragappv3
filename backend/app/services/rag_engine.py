@@ -492,46 +492,58 @@ class RAGEngine:
         return planner
 
     def _resolve_effective_prompt_sync(self, vault_id: Optional[int]) -> Tuple[Optional[str], Optional[str]]:
-        """Resolve the effective system-prompt content and version label for a vault's org.
+        """Resolve the effective system-prompt content and version label for a query.
 
-        Called per-query so the org-specific prompt is always current and is not
+        Resolution order on the standard pipeline (issue #708): the vault's
+        org override, else the global active version, else None (the caller
+        falls back to the builder's built-in default). Vaults without an org
+        (``org_id`` NULL — e.g. the built-in Default vault), unknown vault
+        ids, and All-Vaults queries (``vault_id`` None) resolve the global
+        active version directly.
+
+        Called per-query so the effective prompt is always current and is not
         cached on the long-lived engine instance.
 
         Returns:
             Tuple of (prompt_content, prompt_version_label).
-            prompt_content is None when no org-specific override is set.
+            prompt_content is None when neither an org override nor a global
+            active version exists.
             prompt_version_label is the version string (e.g. 'v3.5') or None.
         """
-        if vault_id is None:
-            return None, None
         try:
             conn = sqlite3.connect(self._db_path)
             try:
                 conn.execute("PRAGMA foreign_keys = ON")
                 conn.row_factory = sqlite3.Row
-                # Look up org_id for the vault
-                row = conn.execute(
-                    "SELECT org_id FROM vaults WHERE id = ?",
-                    (vault_id,),
-                ).fetchone()
-                if row is None or row["org_id"] is None:
-                    return None, None
-                org_id = row["org_id"]
+                org_id: Optional[int] = None
+                if vault_id is not None:
+                    # Look up org_id for the vault
+                    row = conn.execute(
+                        "SELECT org_id FROM vaults WHERE id = ?",
+                        (vault_id,),
+                    ).fetchone()
+                    if row is not None:
+                        org_id = row["org_id"]
                 # Resolve effective version via store
                 from app.services.prompt_store import PromptVersionStore
 
                 store = PromptVersionStore(conn)
-                effective = store.resolve_for_org(org_id)
+                if org_id is not None:
+                    effective = store.resolve_for_org(org_id)
+                else:
+                    # Org-less vault, unknown vault, or All-Vaults query:
+                    # serve the global active version (issue #708).
+                    effective = store.get_active()
                 if effective is not None:
                     return effective.content, effective.version
                 return None, None
             finally:
                 conn.close()
-        except Exception:
+        except Exception as exc:
             # Prompt resolution failures should not crash queries; fall through
             # to normal builder resolution.
             logger.warning(
-                "Could not resolve org-specific prompt for vault_id=%s", vault_id
+                "Could not resolve effective prompt for vault_id=%s: %s", vault_id, exc
             )
             return None, None
 
@@ -542,20 +554,25 @@ class RAGEngine:
     ) -> Tuple[Optional[str], Optional[int], Optional[str], Optional[str]]:
         """Resolve the effective prompt with A/B experiment layering (FR-007 part 3).
 
-        Resolution order:
-          1. 3.5 org override (if set for this vault's org)
+        Resolution order (standard pipeline):
+          1. 3.5 effective version: org override (if set for this vault's
+             org), else the global active version — org-less vaults, unknown
+             vault ids, and All-Vaults queries resolve the global active
+             version directly (issue #708)
           2. A/B experiment override (if an active global experiment exists)
 
-        A/B layering is additional to the 3.5 org override: when an active
-        experiment exists, its assigned variant takes precedence over the 3.5
-        effective version for this query.  This lets experiments run across
-        all orgs uniformly (global experiment scope for v1 simplicity).
+        A/B layering is additional to the 3.5 effective version: when an
+        active experiment exists, its assigned variant takes precedence over
+        the 3.5 effective version for this query.  This lets experiments run
+        across all orgs uniformly (global experiment scope for v1 simplicity).
 
         Exposure is recorded idempotently (INSERT OR IGNORE) so re-exposure of
         the same subject_key to the same experiment does not double-count.
 
         Args:
             vault_id: Vault ID to look up org_id from (for 3.5 resolution).
+                None, an unknown id, or a vault with no org all resolve the
+                global active version (issue #708).
             user_id: User ID for per-user sticky A/B assignment (SC-017).
                 If None and vault_id is available, org_id is derived from
                 vault_id for an org-scoped fallback subject_key.
@@ -1979,8 +1996,10 @@ class RAGEngine:
         }
 
         # Build messages using prompt builder service.
-        # Resolve the org-specific prompt (if any) per-query so different orgs
-        # always get their own version without stale caching on the builder.
+        # Resolve the effective prompt per-query (org override, else the global
+        # active version; org-less/All-Vaults queries get the global active one)
+        # so different orgs always get their own version, and an activated
+        # version is served everywhere, without stale caching on the builder.
         # FR-007 part 3: A/B experiment layering — if an active global experiment
         # exists, its assigned variant takes precedence over the 3.5 effective version.
         effective_prompt_override, ab_eid, ab_var, p_version = await asyncio.to_thread(
