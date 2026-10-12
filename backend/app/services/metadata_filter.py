@@ -17,10 +17,22 @@ boundaries. When ``vault_id`` is None (the admin "All Vaults" surface), the
 resolution is intentionally unscoped — admin callers already hold cross-vault
 read authority, and the filter narrows within the full corpus.
 
-Zero-match semantics: when no file satisfies the filter — or the metadata
-tables are unavailable — the resolver returns the zero-match sentinel
-``file_id IN ('')`` which matches no chunk. A user-supplied filter is NEVER
-silently dropped: "no documents match" is a real, visible result.
+Zero-match semantics: when no file satisfies the filter — including when an
+explicitly supplied field has an empty value (an empty author or an empty
+tag name is a filter that matches nothing, never a filter that matches
+everything; the author is matched by exact equality, so a row that literally
+stores an empty sender is the only thing an empty author can match) — or the
+metadata database is unavailable, the resolver returns the zero-match
+sentinel ``file_id IN ('')`` which matches no chunk. A user-supplied filter
+is NEVER silently dropped: "no documents match" is a real, visible result. The
+unavailability fallback is typed to the three classes the checkout/query
+surface can actually raise for environmental causes — ``OSError``
+(filesystem/parent-directory failure in pool connection creation),
+``RuntimeError`` (pool closed or checkout wait exhausted), and
+``sqlite3.Error`` (schema or database-file problems). Everything else —
+notably ``TypeError`` from signature/arity drift — is a programming error
+and propagates to the caller instead of masquerading as "no matches"
+(issue #707).
 """
 
 from __future__ import annotations
@@ -109,6 +121,9 @@ def _resolve_file_ids(
     """Vault-scoped file-id resolution across the supported filter fields."""
     # Import here (not from rag_engine) so engine-level pool patching cannot
     # break resolution, and to avoid an import cycle at module load.
+    # settings is the same configured source every other get_pool caller
+    # uses (rag_engine._get_pool idiom, issue #707).
+    from app.config import settings
     from app.models.database import get_pool
 
     conditions: list[str] = []
@@ -122,7 +137,13 @@ def _resolve_file_ids(
     if parsed.date_to is not None:
         conditions.append("f.document_date IS NOT NULL AND f.document_date <= ?")
         params.append(parsed.date_to.isoformat())
-    if parsed.author:
+    # `is not None`, not truthiness: an empty-string author is a
+    # USER-SUPPLIED filter, and a truthiness test silently dropped the
+    # predicate entirely, making ``{"author": ""}`` resolve to EVERY file in
+    # scope (issue #707 review F-02). SQL ``= ''`` does not match NULL, so an
+    # empty author now yields the zero-match sentinel — the same contract the
+    # empty-string-tag case already has.
+    if parsed.author is not None:
         conditions.append("f.email_sender = ?")
         params.append(parsed.author)
 
@@ -149,13 +170,18 @@ def _resolve_file_ids(
     )
 
     try:
-        pool = get_pool()
+        pool = get_pool(str(settings.sqlite_path))
         with pool.connection() as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute(query, params)
             rows = cursor.fetchall()
         return {str(row["id"]) for row in rows}
-    except Exception as exc:  # noqa: BLE001 — schema/DB unavailable
+    except (OSError, RuntimeError, sqlite3.Error) as exc:
+        # Typed unavailability fallback (pool closed / checkout exhausted,
+        # filesystem failure, schema or DB-file problems): the documented
+        # zero-match sentinel applies. Programming errors (e.g. TypeError
+        # from signature drift) deliberately do NOT match this clause and
+        # propagate (issue #707).
         logger.warning(
             "Metadata filter resolution failed (zero-match sentinel applied, "
             "filter NOT ignored): %s",
