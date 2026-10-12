@@ -24,11 +24,12 @@ plan-critic Round-1 gap tests live here instead:
 * T5 -- upload rollback: ``_delete_input_row_best_effort`` runs in best-effort
   mode, so a compile enqueued between the reserve and the rollback cannot leave
   a stranded row whose bytes are already gone.
-* T6-T13 -- active-job ``pending`` arm, concurrent-delete tombstone handling, a
+* T6-T14 -- active-job ``pending`` arm, concurrent-delete tombstone handling, a
   missing storage root failing closed, restore failure not masking the conflict,
   the in-transaction re-check closing the service→transaction window,
-  snapshot membership beyond the first entry, and the reader pinned against
-  the production snapshot writer.
+  snapshot membership beyond the first entry, the reader pinned against the
+  production snapshot writer, and the evidence leg pinned independently of the
+  IntegrityError backstop that would otherwise mask it.
 """
 
 import asyncio
@@ -320,39 +321,6 @@ class TestN01bInputDeleteEdges(DraftDeletionTestBase):
             len(self.store.list_inputs(draft_id=draft.id, owner_id=1)), 1
         )
 
-    def test_t14_evidence_leg_is_pinned_independently_of_the_backstop(self):
-        # The evidence leg is otherwise masked: the row DELETE trips the
-        # draft_evidence CHECK and the IntegrityError backstop returns the
-        # same conflict, so deleting the leg leaves every other test green.
-        # Assert the store-level predicate directly, with a compile that
-        # carries NEITHER the input in its snapshot NOR a legacy input_id.
-        draft = self.make_draft()
-        record = self.add_input(draft.id)
-        other = self.add_input(draft.id, name="b.txt", content=b"other")
-        # No snapshot content at all: neither input is named by the compile,
-        # so the evidence row below is the ONLY thing that can mark `record`
-        # as in use.
-        job_id = self._insert_compile_job(draft_id=draft.id, status="completed")
-        self.store.insert_evidence(
-            job_id=job_id,
-            label="n01b-ev-only",
-            source_kind="draft_input",
-            draft_input_id=record.id,
-            title="a.txt",
-            passage="The passage the compile cited from this input.",
-            source_content_sha256=record.content_sha256,
-        )
-
-        self.assertTrue(
-            self.store.input_is_in_use(draft_id=draft.id, input_id=record.id),
-            "an input cited by a compile's evidence must read as in use even "
-            "when it is absent from that compile's snapshot",
-        )
-        self.assertFalse(
-            self.store.input_is_in_use(draft_id=draft.id, input_id=other.id),
-            "an input the compile never cited must stay deletable",
-        )
-
     def test_t10_restore_failure_does_not_mask_the_conflict(self):
         # A Windows file lock makes restore_tombstone raise OSError. That must
         # not replace the DraftConflictError the caller needs to see (409), nor
@@ -443,6 +411,40 @@ class TestN01bInputDeleteEdges(DraftDeletionTestBase):
 
         self.assertEqual(outcome, "input_in_use")
         self.assertTrue(self.storage.exists(record.storage_relpath))
+
+
+    def test_t14_evidence_leg_is_pinned_independently_of_the_backstop(self):
+        # The evidence leg is otherwise masked: the row DELETE trips the
+        # draft_evidence CHECK and the IntegrityError backstop returns the
+        # same conflict, so deleting the leg leaves every other test green.
+        # Assert the store-level predicate directly, with a compile that
+        # carries NEITHER the input in its snapshot NOR a legacy input_id.
+        draft = self.make_draft()
+        record = self.add_input(draft.id)
+        other = self.add_input(draft.id, name="b.txt", content=b"other")
+        # No snapshot content at all: neither input is named by the compile,
+        # so the evidence row below is the ONLY thing that can mark `record`
+        # as in use.
+        job_id = self._insert_compile_job(draft_id=draft.id, status="completed")
+        self.store.insert_evidence(
+            job_id=job_id,
+            label="n01b-ev-only",
+            source_kind="draft_input",
+            draft_input_id=record.id,
+            title="a.txt",
+            passage="The passage the compile cited from this input.",
+            source_content_sha256=record.content_sha256,
+        )
+
+        self.assertTrue(
+            self.store.input_is_in_use(draft_id=draft.id, input_id=record.id),
+            "an input cited by a compile's evidence must read as in use even "
+            "when it is absent from that compile's snapshot",
+        )
+        self.assertFalse(
+            self.store.input_is_in_use(draft_id=draft.id, input_id=other.id),
+            "an input the compile never cited must stay deletable",
+        )
 
 
 if __name__ == "__main__":
