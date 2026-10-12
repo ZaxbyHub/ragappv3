@@ -13,7 +13,8 @@ one FAILS at the buggy tree (verified against HEAD):
   retrieve nothing.
 * AC2 — a programming error (TypeError from a signature-faithful
   ``get_pool`` double) must propagate, not be swallowed into the sentinel.
-  Only genuine database errors (``sqlite3.Error``) may degrade to
+  Only the three documented environmental-unavailability classes
+  (``OSError``, ``RuntimeError``, ``sqlite3.Error``) may degrade to
   zero-match.
 * AC3 — the legacy suite's signature-blind ``lambda *a, **kw`` replacement
   of ``app.models.database.get_pool`` (the double that let the buggy

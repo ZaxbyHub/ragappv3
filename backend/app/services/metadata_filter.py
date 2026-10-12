@@ -17,10 +17,13 @@ boundaries. When ``vault_id`` is None (the admin "All Vaults" surface), the
 resolution is intentionally unscoped — admin callers already hold cross-vault
 read authority, and the filter narrows within the full corpus.
 
-Zero-match semantics: when no file satisfies the filter — or the metadata
-database is unavailable — the resolver returns the zero-match sentinel
-``file_id IN ('')`` which matches no chunk. A user-supplied filter is NEVER
-silently dropped: "no documents match" is a real, visible result. The
+Zero-match semantics: when no file satisfies the filter — including when an
+explicitly supplied field has an empty value (an empty author or an empty
+tag name is a filter that matches nothing, never a filter that matches
+everything) — or the metadata database is unavailable, the resolver returns
+the zero-match sentinel ``file_id IN ('')`` which matches no chunk. A
+user-supplied filter is NEVER silently dropped: "no documents match" is a
+real, visible result. The
 unavailability fallback is typed to the three classes the checkout/query
 surface can actually raise for environmental causes — ``OSError``
 (filesystem/parent-directory failure in pool connection creation),
@@ -133,7 +136,13 @@ def _resolve_file_ids(
     if parsed.date_to is not None:
         conditions.append("f.document_date IS NOT NULL AND f.document_date <= ?")
         params.append(parsed.date_to.isoformat())
-    if parsed.author:
+    # `is not None`, not truthiness: an empty-string author is a
+    # USER-SUPPLIED filter, and a truthiness test silently dropped the
+    # predicate entirely, making ``{"author": ""}`` resolve to EVERY file in
+    # scope (issue #707 review F-02). SQL ``= ''`` does not match NULL, so an
+    # empty author now yields the zero-match sentinel — the same contract the
+    # empty-string-tag case already has.
+    if parsed.author is not None:
         conditions.append("f.email_sender = ?")
         params.append(parsed.author)
 
