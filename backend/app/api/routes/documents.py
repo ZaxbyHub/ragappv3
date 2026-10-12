@@ -59,6 +59,7 @@ from app.services.artifact_store import (
     resolve_confined,
     sniff_raster_mime,
 )
+from app.services.atomic_write import temp_sibling
 from app.services.background_tasks import BackgroundProcessor
 from app.services.document_processor import (
     DocumentProcessingError,
@@ -2489,6 +2490,40 @@ async def _compensate_failed_registration(
     _best_effort_unlink(file_path)
 
 
+async def _discard_upload_artifacts(file_path: Path, temp_file_path: Path) -> None:
+    """Remove the reserved final-path placeholder and the temp sibling.
+
+    Both artifacts get a SYNCHRONOUS best-effort unlink first, so neither is
+    left behind when a cancellation lands on the first ``await`` below: the
+    retry separator is an await point, and a task already inside a cancelled
+    scope raises there immediately (issue #786 review PRR-001). After that,
+    each artifact is retried across the loop with short sleeps — on
+    cancellation mid-stream the aiofiles executor close of the temp file may
+    still be in flight on Windows. A leftover canonical ``.part`` is skipped
+    by ``FileWatcher``, so a failed unlink is logged, never raised.
+    """
+    artifacts = (temp_file_path, file_path)
+    for artifact in artifacts:
+        try:
+            artifact.unlink(missing_ok=True)
+        except OSError:
+            pass  # Retried below, across an await point.
+    for artifact in artifacts:
+        for attempt in range(5):
+            try:
+                artifact.unlink(missing_ok=True)
+                break
+            except OSError:
+                if attempt == 4:
+                    logger.warning(
+                        "could not remove upload artifact %s; a canonical "
+                        ".part leftover is watcher-skipped",
+                        artifact,
+                    )
+                else:
+                    await asyncio.sleep(0.05)
+
+
 async def _do_upload(
     request: Request,
     file: Optional[UploadFile],
@@ -2550,8 +2585,10 @@ async def _do_upload(
     original_path = file_path
     while True:
         try:
-            # O_EXCL ensures atomic create — fails if file exists
-            fd = os.open(str(file_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            # O_EXCL ensures atomic create — fails if file exists. No write
+            # flag: the fd only reserves the name; bytes land via a temp
+            # sibling and os.replace (issue #786).
+            fd = os.open(str(file_path), os.O_CREAT | os.O_EXCL)
             os.close(fd)
             break
         except FileExistsError:
@@ -2600,55 +2637,65 @@ async def _do_upload(
                 ),
             )
 
-        # Save file using aiofiles with chunked reading and size validation
+        # Save file using aiofiles with chunked reading and size validation.
+        # Bytes stream to a canonical temp SIBLING of the final path and are
+        # os.replace'd onto the reserved placeholder only after every
+        # validation passes, so a kill mid-write leaves a FileWatcher-skipped
+        # .part artifact instead of a truncated document at the watched path
+        # (issue #786).
         total_bytes = len(header_bytes)
-        temp_file_path = file_path
-        async with aiofiles.open(temp_file_path, "wb") as f:
-            await f.write(header_bytes)
-            while chunk := await file.read(1024 * 1024):  # Read 1MB chunks
-                total_bytes += len(chunk)
-                if total_bytes > max_size_bytes:
-                    # Close and delete partial file
-                    await f.close()
-                    if temp_file_path.exists():
-                        temp_file_path.unlink(missing_ok=True)
+        temp_file_path = temp_sibling(file_path)
+        try:
+            async with aiofiles.open(temp_file_path, "wb") as f:
+                await f.write(header_bytes)
+                while chunk := await file.read(1024 * 1024):  # Read 1MB chunks
+                    total_bytes += len(chunk)
+                    if total_bytes > max_size_bytes:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"File too large. Max size: {settings_dep.max_file_size_mb} MB",
+                        )
+                    await f.write(chunk)
+
+            # OOXML structural validation (B3-1): the upload-time 8-byte check only
+            # proves the file is *a* ZIP. Now that the full file is on disk, verify
+            # a .docx/.xlsx/.pptx actually contains its format-specific member
+            # (word/document.xml | xl/workbook.xml | ppt/presentation.xml) so a
+            # non-OOXML ZIP or a cross-typed OOXML is rejected before ingestion.
+            required_member = _OOXML_REQUIRED_MEMBERS.get(file_suffix)
+            if required_member is not None:
+                if not _validate_ooxml_member(temp_file_path, required_member):
                     raise HTTPException(
-                        status_code=413,
-                        detail=f"File too large. Max size: {settings_dep.max_file_size_mb} MB",
+                        status_code=400,
+                        detail=f"File is not a valid {file_suffix} archive (missing {required_member}).",
                     )
-                await f.write(chunk)
 
-        # OOXML structural validation (B3-1): the upload-time 8-byte check only
-        # proves the file is *a* ZIP. Now that the full file is on disk, verify
-        # a .docx/.xlsx/.pptx actually contains its format-specific member
-        # (word/document.xml | xl/workbook.xml | ppt/presentation.xml) so a
-        # non-OOXML ZIP or a cross-typed OOXML is rejected before ingestion.
-        required_member = _OOXML_REQUIRED_MEMBERS.get(file_suffix)
-        if required_member is not None:
-            if not _validate_ooxml_member(temp_file_path, required_member):
-                if temp_file_path.exists():
-                    temp_file_path.unlink(missing_ok=True)
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"File is not a valid {file_suffix} archive (missing {required_member}).",
-                )
+            # Raster image content verification (issue #460): suffix acceptance alone
+            # is insufficient. Actually decode the image and enforce decompression /
+            # frame bounds; on any failure the partial upload is removed. SVG/HTML and
+            # corrupt/spoofed payloads are rejected here rather than reaching OCR.
+            if file_suffix in _IMAGE_MAGIC_BYTES:
+                image_ok, image_code = validate_image_content(temp_file_path)
+                if not image_ok:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"File is not a valid {file_suffix} image"
+                            + (f" ({image_code})" if image_code else "")
+                        ),
+                    )
 
-        # Raster image content verification (issue #460): suffix acceptance alone
-        # is insufficient. Actually decode the image and enforce decompression /
-        # frame bounds; on any failure the partial upload is removed. SVG/HTML and
-        # corrupt/spoofed payloads are rejected here rather than reaching OCR.
-        if file_suffix in _IMAGE_MAGIC_BYTES:
-            image_ok, image_code = validate_image_content(temp_file_path)
-            if not image_ok:
-                if temp_file_path.exists():
-                    temp_file_path.unlink(missing_ok=True)
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"File is not a valid {file_suffix} image"
-                        + (f" ({image_code})" if image_code else "")
-                    ),
-                )
+            # Bytes are complete and validated: place them at the final path
+            # atomically (replacing the empty O_EXCL placeholder).
+            os.replace(temp_file_path, file_path)
+        except BaseException:
+            # Any failure on the write/validate/place path — including the
+            # CancelledError a client disconnect delivers mid-stream, which
+            # bypasses `except Exception` below — removes both the reserved
+            # placeholder and the temp sibling (best-effort; a leftover
+            # canonical .part is watcher-skipped).
+            await _discard_upload_artifacts(file_path, temp_file_path)
+            raise
 
         # Async ingestion: register the file row synchronously (so duplicate
         # detection still happens at the request, not in the worker), then
@@ -2810,8 +2857,13 @@ async def _do_upload(
         raise
     except Exception:
         logger.exception("Error uploading file: %s", file_name)
-        if temp_file_path and temp_file_path.exists():
-            temp_file_path.unlink(missing_ok=True)
+        if temp_file_path is not None:
+            # Remove both the temp sibling and the reserved placeholder /
+            # placed bytes — matching the pre-#786 single-path cleanup, where
+            # temp and final were the same path.
+            await _discard_upload_artifacts(file_path, temp_file_path)
+        else:
+            file_path.unlink(missing_ok=True)
         raise HTTPException(status_code=500, detail="Upload failed")
 
 

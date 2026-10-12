@@ -3554,85 +3554,66 @@ class BackgroundProcessor:
         if file_id is not None:
             await self.processor.rollback_cancelled_ingest(file_id)
 
-    def cancel_pending_jobs(self, **match: object) -> int:
-        """Best-effort cancellation of queued, not-yet-started ingestion tasks
-        (issue #516 / DRAFT-023).
-
-        Marks every :class:`TaskItem` still sitting on the ingestion queue
-        whose attributes match ``match`` (e.g. ``file_id=42`` — each keyword
-        must compare equal on the item) as ``cancelled``. The worker-skip
-        contract: the ingestion worker checks the flag at the top of item
-        handling and drops cancelled items without processing them; the
-        enqueueing side (draft promotion compensation) has already deleted the
-        ``files`` row and the bytes, and the worker's existing missing-file
-        failure path remains as a second guard for an item a worker already
-        claimed past the flag check. Only the ingestion queue is scanned —
-        enrichment/reindex queues hold post-index work, never a
-        not-yet-started ingestion. Matching applies only to items still
-        QUEUED: one already claimed by a worker is past cancellation.
-
-        ``asyncio.Queue`` supports no removal, so the queue is drained and
-        refilled in FIFO order. This method is deliberately synchronous — it
-        never awaits, so the drain-and-refill is atomic with respect to the
-        event-loop workers (no coroutine can run mid-drain and observe a
-        partially drained queue, and a concurrently-blocked producer cannot
-        interleave). ``task_done()``/``put_nowait()`` pairs keep the
-        ``queue.join()`` unfinished-task bookkeeping balanced.
-
-        An empty ``match`` is a caller bug (it would match everything) and is
-        refused. Never raises — a cancellation failure is logged and the
-        count so far is returned — because callers invoke it from
-        failure-path compensation where a second exception would mask the
-        original one.
-
-        Returns the number of items marked cancelled.
-        """
-        if not match:
-            logger.error("cancel_pending_jobs called with an empty match; refusing")
-            return 0
-        cancelled = 0
-        # Lease mode (issue #559): queued-but-unclaimed work lives in the jobs
-        # table, not on the in-memory queue. Cancel matching pending rows; a
-        # claimed row is past cancellation exactly like a dequeued TaskItem.
-        if (
+    def _cancel_pending_jobs_lease_active(self) -> bool:
+        """True when queued work lives in the jobs table (issue #559 lease mode)."""
+        return bool(
             getattr(self, "_ingest_lease_enabled", False)
             and self.processor is not None
             and self.processor.pool is not None
-        ):
-            try:
-                with self.processor.pool.connection() as conn:
-                    rows = conn.execute(
-                        "SELECT id, payload_json FROM jobs "
-                        "WHERE queue = ? AND status = 'pending'",
-                        (INGESTION_QUEUE,),
-                    ).fetchall()
-                    for row in rows:
-                        payload = json.loads(row["payload_json"] or "{}")
-                        if not all(
-                            payload.get(key) == value for key, value in match.items()
-                        ):
-                            continue
-                        conn.execute(
-                            "UPDATE jobs SET status = 'cancelled', "
-                            "worker_id = NULL, heartbeat_at = NULL, "
-                            "completed_at = CURRENT_TIMESTAMP WHERE id = ?",
-                            (row["id"],),
-                        )
-                        cancelled += 1
-                    conn.commit()
-            except Exception as exc:  # noqa: BLE001 — must never raise
-                logger.warning(
-                    "cancel_pending_jobs jobs-row pass failed after %d item(s): %s",
-                    cancelled,
-                    exc,
-                )
-            if cancelled:
-                logger.info(
-                    "Cancelled %d queued ingestion job row(s) matching %s",
-                    cancelled,
-                    match,
-                )
-            return cancelled
+        )
+
+    def _cancel_pending_jobs_rows(self, **match: object) -> int:
+        """Lease-mode jobs-row cancellation pass (sync, blocking pooled SQL).
+
+        Runs on whatever thread calls it — ``cancel_pending_jobs_async`` runs
+        it on a worker thread via ``asyncio.to_thread`` so the blocking pooled
+        checkout never lands on the event loop (issue #786). Never raises.
+        """
+        cancelled = 0
+        try:
+            with self.processor.pool.connection() as conn:
+                rows = conn.execute(
+                    "SELECT id, payload_json FROM jobs "
+                    "WHERE queue = ? AND status = 'pending'",
+                    (INGESTION_QUEUE,),
+                ).fetchall()
+                for row in rows:
+                    payload = json.loads(row["payload_json"] or "{}")
+                    if not all(
+                        payload.get(key) == value for key, value in match.items()
+                    ):
+                        continue
+                    conn.execute(
+                        "UPDATE jobs SET status = 'cancelled', "
+                        "worker_id = NULL, heartbeat_at = NULL, "
+                        "completed_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        (row["id"],),
+                    )
+                    cancelled += 1
+                conn.commit()
+        except Exception as exc:  # noqa: BLE001 — must never raise
+            logger.warning(
+                "cancel_pending_jobs jobs-row pass failed after %d item(s): %s",
+                cancelled,
+                exc,
+            )
+        if cancelled:
+            logger.info(
+                "Cancelled %d queued ingestion job row(s) matching %s",
+                cancelled,
+                match,
+            )
+        return cancelled
+
+    def _cancel_pending_jobs_queue(self, **match: object) -> int:
+        """In-memory queue drain (sync; MUST run on the event-loop thread).
+
+        ``asyncio.Queue`` is not thread-safe and the drain-and-refill is
+        deliberately atomic with respect to the event-loop workers (see
+        ``cancel_pending_jobs``), so this helper is only ever called inline
+        from the event loop — never through ``asyncio.to_thread``.
+        """
+        cancelled = 0
         try:
             drained: List[TaskItem] = []
             while True:
@@ -3665,6 +3646,77 @@ class BackgroundProcessor:
                 match,
             )
         return cancelled
+
+    def cancel_pending_jobs(self, **match: object) -> int:
+        """Best-effort cancellation of queued, not-yet-started ingestion tasks
+        (issue #516 / DRAFT-023).
+
+        Marks every :class:`TaskItem` still sitting on the ingestion queue
+        whose attributes match ``match`` (e.g. ``file_id=42`` — each keyword
+        must compare equal on the item) as ``cancelled``. The worker-skip
+        contract: the ingestion worker checks the flag at the top of item
+        handling and drops cancelled items without processing them; the
+        enqueueing side (draft promotion compensation) has already deleted the
+        ``files`` row and the bytes, and the worker's existing missing-file
+        failure path remains as a second guard for an item a worker already
+        claimed past the flag check. Only the ingestion queue is scanned —
+        enrichment/reindex queues hold post-index work, never a
+        not-yet-started ingestion. Matching applies only to items still
+        QUEUED: one already claimed by a worker is past cancellation.
+
+        Lease mode (issue #559): queued-but-unclaimed work lives in the jobs
+        table, not on the in-memory queue; the jobs-row pass runs directly on
+        the calling thread (blocking pooled checkout included).
+
+        ``asyncio.Queue`` supports no removal, so the queue is drained and
+        refilled in FIFO order. This method is deliberately synchronous — it
+        never awaits, so the drain-and-refill is atomic with respect to the
+        event-loop workers (no coroutine can run mid-drain and observe a
+        partially drained queue, and a concurrently-blocked producer cannot
+        interleave). ``task_done()``/``put_nowait()`` pairs keep the
+        ``queue.join()`` unfinished-task bookkeeping balanced. Async callers
+        that must not block the event loop use ``cancel_pending_jobs_async``.
+
+        An empty ``match`` is a caller bug (it would match everything) and is
+        refused. Never raises — a cancellation failure is logged and the
+        count so far is returned — because callers invoke it from
+        failure-path compensation where a second exception would mask the
+        original one.
+
+        Returns the number of items marked cancelled.
+        """
+        if not match:
+            logger.error("cancel_pending_jobs called with an empty match; refusing")
+            return 0
+        if self._cancel_pending_jobs_lease_active():
+            return self._cancel_pending_jobs_rows(**match)
+        return self._cancel_pending_jobs_queue(**match)
+
+    async def cancel_pending_jobs_async(self, **match: object) -> int:
+        """Async twin of :meth:`cancel_pending_jobs` (issue #786).
+
+        In lease mode (``ingestion_job_lease_enabled=True``, the default) the
+        jobs-row pass performs a blocking pooled checkout plus SQL; running
+        that on the event loop froze every request whenever
+        ``_compensate`` cancelled under a busy pool, and the surrounding
+        ``move_on_after`` timeout could not interrupt a blocking sync call.
+        This variant runs the jobs-row pass on a worker thread via
+        ``asyncio.to_thread``, so the timeout is enforceable at the await.
+        The in-memory queue drain still runs inline on the event loop —
+        ``asyncio.Queue`` is not thread-safe and the drain must stay atomic
+        with respect to loop workers.
+
+        An empty ``match`` is refused exactly like the sync method. Never
+        raises; returns the number of items/rows cancelled.
+        """
+        if not match:
+            logger.error(
+                "cancel_pending_jobs_async called with an empty match; refusing"
+            )
+            return 0
+        if self._cancel_pending_jobs_lease_active():
+            return await asyncio.to_thread(self._cancel_pending_jobs_rows, **match)
+        return self._cancel_pending_jobs_queue(**match)
 
     async def enqueue_enrichment(self, item: EnrichmentTaskItem) -> None:
         """Add a post-index enrichment job to the enrichment queue."""
