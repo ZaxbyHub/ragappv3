@@ -1,4 +1,4 @@
-# 779: The shell stops misreporting where you are, contains a render error, and seeds its test-mode demo session before guards render
+# 779: The shell stops misreporting where you are, contains a render error, and controls its test-mode demo session
 
 Issue: #779 ([Workstream L] PR 8 of 9; audit findings UI-R1-08, UI-R3-06,
 UI-R2-06, UI-R3-08, class C17).
@@ -16,60 +16,42 @@ UI-R2-06, UI-R3-08, class C17).
   instead of overflowing off the left edge (clipping the first badge's icon)
   under the header's right-anchored stacking; the wrap stays right-anchored so
   it cannot introduce a rightward overflow.
-- **Route-scoped error containment**: `PageShell` wraps its routed content in
-  the existing `ErrorBoundary` (default "Something went wrong" / Try Again
-  fallback, scoped to the page area), and the boundary component gained a
-  `resetOnChange` prop: when the value changes (PageShell passes
-  `location.pathname + location.search`), a caught error resets in that
-  same render pass — the
-  `resetKeys` pattern from react-error-boundary. A render error in any routed
-  page now leaves navigation mounted and usable, and ANY navigation away —
-  including a query-only re-search (`/search?q=a` → `/search?q=b`, which does
-  not change the pathname) — renders the new content instead of holding the
-  fallback. The existing top-level boundary in `App.tsx` remains as the last
-  resort. Design note: the reset is a state reset, NOT a keyed remount — a
-  key change at crash time re-throws inside React's error-recovery commit and
-  escapes to the outer boundary, and remounting on every navigation would
-  break same-component transitions like `/chat` -> `/chat/:id`, whose
-  AnimatePresence exit window is load-bearing for the chat send and
-  stop-stream flows (the #821 regression class; an earlier iteration of this
-  fix did exactly that and broke the chat e2e). Page-transition animations
-  are fully preserved for non-crash navigation. Known hazard (no current
-  trigger): a page that throws during the exit window of a navigation AWAY
-  from it shows the fallback at the destination URL; Try Again recovers.
-- **Test-mode demo session seeds before guards render**: the demo-session
-  seed moved from `ProtectedRoute`'s `useEffect` (which ran one commit AFTER
-  `RoleGuard`'s synchronous `isAuthenticated` read, bouncing every `/admin/*`
-  visit to the login form) into `App`, in two arms: a synchronous first-
-  render seed — before the router subtree mounts, while no component is
-  subscribed to the store yet — and an effect-based re-seed arm that restores
-  the demo session after a later logout (a render-phase write on a mounted
-  tree would trip React's "cannot update a component while rendering"
-  warning). One seed — including `needsSetup: false` — is visible to
-  `RoleGuard`, `LoginPage` and `SetupPage` alike, fixing the admin-route
-  bounce and the eternal "Loading Meridian…" / "Verifying your instance"
-  spinners on `/login` and `/setup`. The store write is mock-safe (optional
-  call) so suites stubbing `useAuthStore` as a bare selector are unaffected.
-  Production bundles get strictly smaller: the base bundle still shipped the
-  old `ProtectedRoute` seed; this move is dead-code-eliminated behind the
-  `import.meta.env.DEV` TEST_MODE gate.
-- **Recurrence guardrail**: `frontend/src/shell-recurrence.l08.test.tsx`
-  pins the class structurally — the synchronous first-render seed block must
-  exist in `App`'s render body and precede every effect registration; raw
-  `useAuthStore.setState` calls may not appear inside any effect body in
-  `App.tsx` or `ProtectedRoute.tsx` (comment-stripped, brace-matched
-  effect-body scan); `ProtectedRoute` stays seed-free; and the mobile nav
-  must mark nothing `aria-current` for a neutral (null) active item.
+- **Route-scoped error containment**: `PageShell` keeps one persistent
+  `ErrorBoundary` around routed content and passes a boundary token made from
+  `location.pathname`, `location.search`, and `location.hash`. A page render
+  error stays inside the page area, so navigation remains mounted and a route
+  change can recover the content. The existing pathname motion key stays in
+  place for page transitions; the tuple token also lets query/hash state
+  changes at a constant pathname reset the caught page state without changing
+  the navigation shell. The real chat smoke covers the send and stop-stream
+  flows. A page that throws while it is exiting during navigation away can
+  still leave the fallback visible at the destination URL; Try Again recovers
+  that page. This correction does not resolve the exit-window hazard. A
+  fragment-only change on a crashed route can also reset and
+  re-render the child once, which is bounded and part of the hash-recovery
+  behavior.
+- **Test-mode demo session bootstrap**: `App` now uses a one-time router-local
+  layout-effect gate for DEV-only `TEST_MODE` bootstrap. The gate skips
+  `/register` and preserves logout, then seeds one demo session (including
+  `needsSetup: false`) before guarded admin/session routes settle. This avoids
+  the admin-route bounce and the eternal "Loading Meridian…" /
+  "Verifying your instance" spinners on `/login` and `/setup`.
+  The existing base already gates this demo-only seed behind
+  `import.meta.env.DEV`; this corrective change moves its lifecycle ownership
+  into the router-local layout effect while keeping the seed development-only.
+  The initial `/register` form stays public; after a session exists, registration
+  retains its normal authenticated redirect.
+  In DEV-only `TEST_MODE`, the seeded `needsSetup: false` makes `/setup`
+  redirect to `/login`, where the demo-credential form is rendered; the setup
+  wizard remains the production setup flow.
 
-## Test-mode visibility notes (DEV + `VITE_TEST_MODE=true` only)
+## Why
 
-The demo session signs the fixture user in for the whole dev session, so:
-`/login` renders its form over the already-authenticated store (submitting
-non-demo credentials reports "Invalid demo credentials"), and `/setup` and
-`/register` redirect away (`/setup` to `/login` via the completed-setup
-guard, `/register` via its own authenticated early-return) — the setup
-wizard and registration form are unreachable in demo mode. All three are
-fixture-mode semantics, not production behavior.
+Audit 20260923T174456Z findings (all re-verified at merge base 16925def): the
+mobile nav misreported location on unmapped routes; a capture-invisible
+leftward overflow; one error boundary wider than any page's blast radius; and
+a dev-fixture seed racing the guards it was meant to satisfy (all 48 `/admin/*`
+capture runs showed the login form; `/login` and `/setup` spun forever).
 
 ## Tests
 
@@ -77,22 +59,16 @@ fixture-mode semantics, not production behavior.
   checkpoint-manifested and anchor-published on the issue): C1–C6 RED at base,
   GREEN after; C7–C9 (production auth redirect, RoleGuard fallback, More-sheet
   logout) GREEN throughout.
-- Behavioral files carrying C1–C6: `App.l08-active-nav.test.tsx` (C1),
-  `ConnectionStatusBadges.l08.test.tsx` (C2), `App.l08-error-boundary.test.tsx`
-  (C3/C4), `App.l08-test-mode.test.tsx` (C5/C6).
-- New recurrence guardrail `frontend/src/shell-recurrence.l08.test.tsx` (see
-  What changed) plus `components/ErrorBoundary.test.tsx` — unit coverage for
-  all three `resetOnChange` branches including the two-cycle
-  crash→recover→crash→recover-back sequence — and `App.l08-feedback.test.tsx` /
-  `App.l08-search-reset.test.tsx` / `App.l08-query-reset.test.tsx` — positive pins from the review round
-  (the admin page itself renders in test mode; `/search` passes an empty
-  active item; a query-only navigation recovers a crashed `/search` through the real route boundary, pinned in query-reset).
+- Recurrence coverage combines minimal structural checks for the DEV-only
+  `TEST_MODE` condition and absence of guard-owned store writes with a
+  null-activeItem mobile-nav component contract. Real App tests cover
+  bootstrap ordering, the `/register` transition, and logout preservation.
+- The real chat smoke validates the send and stop-stream flows, while the
+  route-scoped boundary coverage preserves query/hash state at a constant
+  pathname.
 
 ## Migration
 
-None for API, store-persistence, or production-auth behavior. Visible
-deltas: the badge row wraps at very narrow widths; the mobile nav no longer
-highlights Documents on unmapped routes such as `/search`; a crashed page
-recovers on any navigation (previously the whole shell was replaced); and
-the dev-only test-mode notes above (`/login` form over the fixture session,
-`/setup` and `/register` redirect away).
+No API, store-persistence, or production-auth-behavior contract change. The frontend
+migration includes the DEV-only test bootstrap and explicit mobile /search active-nav handling:
+the mobile nav leaves every control unselected on /search, while /documents and /chat map to their respective controls. The other visible production deltas are badge wrapping at very narrow widths and the crash-containment/navigation behavior above.

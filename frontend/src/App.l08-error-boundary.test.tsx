@@ -105,8 +105,8 @@ describe("App page render error containment (issue #779, UI-R2-06)", { timeout: 
     window.history.pushState({}, "", "/vaults");
     window.dispatchEvent(new PopStateEvent("popstate"));
 
-    // Give React Router a moment to react to the popstate.
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    // Wait for React Router to commit the route change.
+    await screen.findByText("Vaults Page");
 
     expect(screen.queryAllByText("Vaults Page").length).toBeGreaterThan(0);
   });

@@ -105,7 +105,7 @@ jobs:
       - name: Run e2e smoke suite
         # Issue #778: the spec list is explicit so this job never absorbs new
         # spec files implicitly — the a11y matrix runs in its own job below.
-        run: npx playwright test --reporter=line chat-smoke.spec.ts first-run-baseline.m01.spec.ts activity-tray.m04.spec.ts chat-width-budget.a07.spec.ts
+        run: npx playwright test --reporter=line chat-smoke.spec.ts first-run-baseline.m01.spec.ts activity-tray.m04.spec.ts chat-width-budget.a07.spec.ts settings-badge-geometry.fb.spec.ts
 
       - name: Upload e2e failure artifacts
         if: failure()

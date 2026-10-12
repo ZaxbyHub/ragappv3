@@ -25,11 +25,11 @@ export function ProtectedRoute({ children, testMode = false }: ProtectedRoutePro
 
   // testMode is a development-only convenience (see App.tsx, where it is gated
   // by import.meta.env.DEV so it can never be enabled in a production build).
-  // The demo session itself is seeded in App's render (issue #779 / UI-R3-08),
-  // BEFORE this component or any guard renders — the old seed here lived in a
-  // useEffect, one commit too late for RoleGuard's synchronous
-  // isAuthenticated read. Pages use useTestMode() for mock data.
-  if (testMode) {
+  // App's router-local bootstrap (issue #779 / UI-R3-08) renders PageLoader
+  // until its layout effect has prepared the demo session, so this guard mounts
+  // only after its first auth-state read is ready. This component never seeds
+  // the store; pages use useTestMode() for mock data.
+  if (testMode && isAuthenticated) {
     return <>{children}</>;
   }
 

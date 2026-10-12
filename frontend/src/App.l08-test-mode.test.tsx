@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // Issue #779 (UI-R3-08): VITE_TEST_MODE must yield a usable app. This file
@@ -101,7 +101,7 @@ describe("App test-mode session seeding (issue #779, UI-R3-08)", { timeout: 30_0
 
   it("test mode renders admin routes without bouncing to login", async () => {
     await renderAppAt("/admin/users");
-    await new Promise((resolve) => setTimeout(resolve, 2000));
+    await screen.findByText("Admin Users Page");
 
     // The admin page (behind the real AdminGuard) must own the screen — the
     // real LoginPage's "Welcome Back" card must never appear.
@@ -110,7 +110,11 @@ describe("App test-mode session seeding (issue #779, UI-R3-08)", { timeout: 30_0
 
   it("test mode login route does not spin forever", async () => {
     await renderAppAt("/login");
-    await new Promise((resolve) => setTimeout(resolve, 5000));
+    await waitFor(() => {
+      const hasUsernameField = screen.queryByLabelText(/username/i) !== null;
+      const leftLogin = window.location.pathname !== "/login";
+      expect(hasUsernameField || leftLogin).toBe(true);
+    });
 
     // Either the real login form rendered (its username field is labelled
     // via htmlFor="login-username") or the route redirected — anything but

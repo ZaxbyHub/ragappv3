@@ -1,10 +1,10 @@
-import { BrowserRouter, Routes, Route, Navigate, useNavigate, useLocation } from "react-router-dom";
+import { BrowserRouter, Routes, Route, Navigate, useNavigate, useLocation, useMatch } from "react-router-dom";
 import { TestModeProvider } from "@/fixtures/TestModeContext";
 import { ProtectedRoute } from "@/components/auth/ProtectedRoute";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { PageShell } from "@/components/layout/PageShell";
 import { useHealthCheck } from "@/hooks/useHealthCheck";
-import { useCallback, useEffect, useRef, lazy, Suspense } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, lazy, Suspense, type ReactNode } from "react";
 import { useAuthStore } from "@/stores/useAuthStore";
 import { useNavigationGuardStore } from "@/stores/useNavigationGuardStore";
 import type { NavItemId } from "@/components/layout/navigationTypes";
@@ -252,9 +252,8 @@ function MainAppShell({ children, testMode = false }: { children: React.ReactNod
   );
 }
 
-// Demo user for the dev-only fixture mode (moved from ProtectedRoute with
-// issue #779 / UI-R3-08 — the synchronous seed block lives in App's render,
-// below).
+// Demo user for the dev-only fixture mode. TestModeSessionBootstrap seeds it
+// after the router establishes a basename-relative location.
 function getDemoUser() {
   const role = import.meta.env.VITE_DEMO_ROLE || "superadmin";
   return {
@@ -266,48 +265,49 @@ function getDemoUser() {
   };
 }
 
-// Issue #779 (UI-R3-08): seed the demo session synchronously, BEFORE any
-// guard or auth-reading page renders. The old seed lived in ProtectedRoute's
-// useEffect — one commit too late for RoleGuard's synchronous
-// isAuthenticated read (every /admin route visit bounced to /login on the
-// first render) and invisible to LoginPage/SetupPage, which skip init() in
-// test mode and spun on needsSetup === null forever.
-//
-// Split in two after review feedback (PRR-003/F-3): the FIRST-RENDER seed
-// below stays synchronous — at that point no component is subscribed to the
-// store yet, so the write cannot trigger React's "cannot update a component
-// while rendering" warning — while the post-logout re-seed arm lives in the
-// effect further down, because a render-phase write on a MOUNTED tree
-// notifies subscribers mid-render. Mock-safe: suites that stub useAuthStore
-// as a bare selector no-op through the optional call. Idempotent: the ref
-// guard runs the synchronous arm once per mount, and the effect arm
-// converges on the already-seeded state. (Comment note: avoid literal
-// "admin-slash-star" sequences in comments here — the recurrence
-// guardrail's comment stripper is line-first, but keeping the text free of
-// comment delimiters is cheap insurance.)
-function seedDemoSession(): void {
-  const setState = useAuthStore.setState as typeof useAuthStore.setState | undefined;
-  setState?.({
-    user: getDemoUser(),
-    accessToken: "demo-token",
-    isAuthenticated: true,
-    isInitialized: true,
-    needsSetup: false,
-    isLoading: false,
-    authMode: "jwt",
-  });
+// Issue #779 (UI-R3-08): in DEV fixture mode, hold every non-registration
+// route behind PageLoader until this router-local bootstrap writes the demo
+// session from a layout effect. Guards and auth-reading pages therefore mount
+// only after their first state read can see the session, without an external
+// store mutation during render. /register is deliberately ungated so its
+// public form stays reachable; readiness never resets, so logout cannot
+// reseed the demo user.
+function TestModeSessionBootstrap({ children }: { children: ReactNode }) {
+  const [ready, setReady] = useState(() => !TEST_MODE);
+  const isRegisterRoute = useMatch({ path: "/register", caseSensitive: false, end: true }) !== null;
+  const gated = TEST_MODE && !isRegisterRoute && !ready;
+
+  useLayoutEffect(() => {
+    if (!gated) return;
+
+    const getState = useAuthStore.getState as typeof useAuthStore.getState | undefined;
+    const currentState = getState?.();
+    if (!currentState?.isAuthenticated) {
+      const setState = useAuthStore.setState as typeof useAuthStore.setState | undefined;
+      setState?.({
+        user: getDemoUser(),
+        accessToken: "demo-token",
+        isAuthenticated: true,
+        isInitialized: true,
+        needsSetup: false,
+        isLoading: false,
+        authMode: "jwt",
+      });
+    }
+    setReady(true);
+  }, [gated]);
+
+  if (gated) {
+    return <PageLoader />;
+  }
+
+  return <>{children}</>;
 }
 
 function App() {
   const initAuth = useAuthStore((state) => state.init);
-  const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
-  const health = useHealthCheck({ pollInterval: 30000 });
-  const demoSeededRef = useRef(false);
 
-  if (TEST_MODE && !isAuthenticated && !demoSeededRef.current) {
-    demoSeededRef.current = true;
-    seedDemoSession();
-  }
+  const health = useHealthCheck({ pollInterval: 30000 });
 
   useEffect(() => {
     if (!TEST_MODE) {
@@ -315,24 +315,15 @@ function App() {
     }
   }, [initAuth]);
 
-  // Post-logout re-seed arm (parity with the original ProtectedRoute
-  // effect's [testMode, isAuthenticated] behavior): an effect, not a
-  // render-phase write — see the comment above. TEST_MODE is a module
-  // constant (eslint exhaustive-deps excludes it deliberately).
-  useEffect(() => {
-    if (TEST_MODE && !isAuthenticated) {
-      seedDemoSession();
-    }
-  }, [isAuthenticated]);
-
   return (
     <ErrorBoundary>
       <ReconnectingBanner health={health} />
       <BrowserRouter
         basename={APP_BASENAME || undefined}
       >
-        <Suspense fallback={<PageLoader />}>
-          <Routes>
+        <TestModeSessionBootstrap>
+          <Suspense fallback={<PageLoader />}>
+            <Routes>
               <Route path="/setup" element={<SetupPage />} />
               <Route path="/register" element={<RegisterPage />} />
               <Route path="/login" element={<LoginPage />} />
@@ -554,8 +545,9 @@ function App() {
 
               {/* H-12 fix: Proper 404 page instead of silently rendering DocumentsPage */}
               <Route path="/*" element={<NotFoundPage />} />
-            </Routes>
+              </Routes>
           </Suspense>
+        </TestModeSessionBootstrap>
       </BrowserRouter>
     </ErrorBoundary>
   );
