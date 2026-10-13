@@ -33,8 +33,34 @@ CENSUSED_TEMPLATES = ("copy", "standards", "research", "fact")
 
 
 class TestN03CheckpointGuardrails(unittest.TestCase):
+    def _deserializations_of_artifact_json(self, tree):
+        """Every ``<anything>.model_validate_json(<expr>.artifact_json)`` call.
+
+        Deliberately receiver-agnostic: keying on a local's *name* (the old
+        form matched only the identifier ``reused``) let a rename, an alias,
+        or a bound-method call reintroduce the unguarded deserialize while
+        the census stayed green.
+        """
+        hits = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not isinstance(func, ast.Attribute):
+                continue
+            if func.attr != "model_validate_json" or not node.args:
+                continue
+            arg = node.args[0]
+            if isinstance(arg, ast.Attribute) and arg.attr == "artifact_json":
+                hits.append(node.lineno)
+        return sorted(hits)
+
+    def _pipeline_tree(self):
+        source = PIPELINE.read_text(encoding="utf-8")
+        return source, ast.parse(source)
+
     def test_no_unguarded_checkpoint_deserialization_remains(self):
-        tree = ast.parse(PIPELINE.read_text(encoding="utf-8"))
+        source, tree = self._pipeline_tree()
         guarded_spans = [
             (node.lineno, node.end_lineno or node.lineno)
             for node in ast.walk(tree)
@@ -43,26 +69,11 @@ class TestN03CheckpointGuardrails(unittest.TestCase):
         ]
         self.assertEqual(len(guarded_spans), 1, "one _load_checkpoint expected")
         guard_lo, guard_hi = guarded_spans[0]
-        unguarded = []
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            func = node.func
-            if not isinstance(func, ast.Attribute):
-                continue
-            if func.attr != "model_validate_json":
-                continue
-            if not node.args:
-                continue
-            arg = node.args[0]
-            if (
-                isinstance(arg, ast.Attribute)
-                and arg.attr == "artifact_json"
-                and isinstance(arg.value, ast.Name)
-                and arg.value.id == "reused"
-                and not (guard_lo <= node.lineno <= guard_hi)
-            ):
-                unguarded.append(node.lineno)
+        unguarded = [
+            line
+            for line in self._deserializations_of_artifact_json(tree)
+            if not (guard_lo <= line <= guard_hi)
+        ]
         self.assertEqual(
             unguarded,
             [],
@@ -70,12 +81,37 @@ class TestN03CheckpointGuardrails(unittest.TestCase):
             "the guarded _load_checkpoint helper "
             f"(unguarded at lines: {unguarded})",
         )
+        # The census is a real guard, not a tautology: the helper itself must
+        # contain the deserialization it is trusted to guard.
+        self.assertTrue(
+            any(
+                guard_lo <= line <= guard_hi
+                for line in self._deserializations_of_artifact_json(tree)
+            ),
+            "the census must be able to see the guarded call (self-check)",
+        )
 
     def test_guarded_loader_exists_and_is_used(self):
-        source = PIPELINE.read_text(encoding="utf-8")
+        source, tree = self._pipeline_tree()
         self.assertIn("def _load_checkpoint(", source)
-        # One definition plus at least the eight call sites.
-        self.assertGreaterEqual(source.count("_load_checkpoint("), 9)
+        # Count CALLS structurally, not as a substring (a comment or docstring
+        # mention used to satisfy this proxy, and the floor of 9 sat exactly on
+        # the live count so a removed site failed for the wrong reason).
+        definitions = 0
+        calls = 0
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if node.name == "_load_checkpoint":
+                    definitions += 1
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                if node.func.id == "_load_checkpoint":
+                    calls += 1
+        self.assertEqual(definitions, 1, "exactly one _load_checkpoint definition")
+        self.assertEqual(
+            calls,
+            8,
+            "all eight stage reuse sites must go through _load_checkpoint",
+        )
 
     def test_desk_templates_do_not_request_server_computed_digests(self):
         for stage in CENSUSED_TEMPLATES:

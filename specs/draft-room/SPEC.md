@@ -1065,7 +1065,7 @@ Atomic claim verdicts are a separate process:
 - `unsupported`: no passage supports it after claim-specific retrieval;
 - `opinion`: the value judgment, recommendation, or prediction itself rather than a verifiable proposition.
 
-`supported`, `contradicted`, `ambiguous`, and `stale` store the exact passage and chunk/source identity used. `unsupported` may have no passage; its `retrieval_audit_json` instead records normalized query, vault/scope hash, retrieval configuration, timestamp, returned labels or zero-result state, and nearest-context metadata without implying support. `supported` means supported by the captured evidence, not verified as universally true.
+`supported`, `contradicted`, `ambiguous`, and `stale` store the exact passage and chunk/source identity used. `unsupported` may have no passage; its `retrieval_audit_json` instead records normalized query, vault/scope hash, retrieval configuration, timestamp, returned labels or zero-result state, and nearest-context metadata without implying support. That audit is recorded for FACTUAL claims, which are the claims the pipeline re-searches; a non-factual claim (`quote`, `opinion`) is not re-searched and stores an empty audit object. The desk never supplies the audit — a model-invented one is discarded (issue #787). `supported` means supported by the captured evidence, not verified as universally true.
 
 A named person's authorship, utterance, position, or quotation is a separate factual attribution claim and requires evidence even when the attributed content is an opinion. Only the expressed judgment receives `opinion` status.
 
@@ -1162,7 +1162,7 @@ Persist prompt ID, version, SHA-256 of rendered system/developer content, model,
 
 | Stage | Client | Default temperature |
 |---|---|---:|
-| facet extraction/research synthesis | thinking | 0.1 |
+| research contradictions/gaps classification (facets and retrieval are pipeline-derived) | thinking | 0.1 |
 | outline/critic | thinking | 0.2 |
 | section drafting | thinking | 0.5 |
 | lint rewrite | thinking | 0.3 |

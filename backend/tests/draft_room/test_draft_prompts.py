@@ -551,6 +551,11 @@ class TestForbiddenFieldNames(unittest.TestCase):
         all_models: set[type[BaseModel]] = set()
         for prompt in PROMPTS.values():
             all_models |= _walk_models(prompt.output_model)
+        # Issue #787: the research desk's output_model is the narrow
+        # ResearchModelPacket, so the persisted ResearchPacket graph is
+        # walked explicitly here exactly as in the forbidden-name census
+        # above - otherwise these two parallel guards drift apart.
+        all_models |= _walk_models(ResearchPacket)
         for model in all_models:
             for field_name in model.model_fields:
                 lowered = field_name.lower()

@@ -325,16 +325,24 @@ class LintReport(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+#: Upper bound on one desk edit's excerpt, so a single model response cannot
+#: drive unbounded ``count``/``index`` scans over the candidate.
+_MAX_EDIT_EXCERPT = 2000
+
+
 class CopyEdit(BaseModel):
     """One desk edit.
 
-    ``start``/``end``/``before_sha256``/``after_sha256`` are SERVER-COMPUTED:
-    a language model cannot hash text or count offsets against live bytes, so
-    the desk prompts ask only for the excerpt pair, and :func:`_apply_edits`
-    locates the span (by the supplied offsets when they verify, else by a
-    unique ``before_excerpt`` match) and fills the pins itself. The neutral
-    defaults mark "not supplied"; a JSON ``null`` fails validation and takes
-    the existing one-repair path rather than crashing the comparisons.
+    ``start``/``end``/``before_sha256``/``after_sha256`` are NOT part of what
+    the desk is asked for: a language model cannot hash text or count offsets
+    against live bytes, so the prompts ask only for the excerpt pair and
+    :func:`_apply_edits` resolves every pin server-side (a supplied span is
+    used only when its ``before_sha256`` verifies against live text; the
+    applied record always carries server-computed pins). The neutral defaults
+    mark "not supplied"; a JSON ``null`` fails validation and takes the
+    existing one-repair path rather than crashing the comparisons. The
+    excerpt lengths are bounded so one desk response cannot drive unbounded
+    substring scans over the candidate.
     """
 
     section_id: str
@@ -342,17 +350,32 @@ class CopyEdit(BaseModel):
     end: int = -1
     before_sha256: str = ""
     after_sha256: str = ""
-    before_excerpt: str
-    after_excerpt: str
-    category: str
-    rationale: str
+    before_excerpt: str = Field(min_length=1, max_length=_MAX_EDIT_EXCERPT)
+    after_excerpt: str = Field(max_length=_MAX_EDIT_EXCERPT)
+    category: str = Field(max_length=200)
+    rationale: str = Field(max_length=2000)
     semantic_change: bool
     affected_claim_ids: list[str] = Field(default_factory=list)
     affected_evidence_labels: list[str] = Field(default_factory=list)
 
 
-class CopyReport(BaseModel):
-    """Copy-desk report.
+class CopyModelReport(BaseModel):
+    """The MODEL-FACING copy-desk output: edits and free-form findings only.
+
+    The persisted :class:`CopyReport` adds ``unapplied_edits``, which is
+    computed by the pipeline and must never appear in a provider schema (the
+    desk cannot fill it, and a value the consumer overwrites is a field the
+    model is only misled into guessing) — the same separation
+    :class:`ResearchModelPacket` gives the research desk. Extra keys in a
+    response are ignored, so legacy full reports still parse.
+    """
+
+    edits: list[CopyEdit] = Field(default_factory=list)
+    findings: list[str] = Field(default_factory=list)
+
+
+class CopyReport(CopyModelReport):
+    """Persisted copy-desk artifact.
 
     ``unapplied_edits`` is SERVER-POPULATED (never requested from the model):
     the record of edits the pipeline could not safely locate or apply. It
@@ -362,8 +385,6 @@ class CopyReport(BaseModel):
     finding, never silently discarded).
     """
 
-    edits: list[CopyEdit] = Field(default_factory=list)
-    findings: list[str] = Field(default_factory=list)
     unapplied_edits: list[CopyEdit] = Field(default_factory=list)
 
 
@@ -372,11 +393,16 @@ class CopyReport(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class StandardsReport(BaseModel):
-    """Standards-desk report; ``unapplied_edits`` mirrors CopyReport's."""
+class StandardsModelReport(BaseModel):
+    """The MODEL-FACING standards-desk output; mirrors CopyModelReport."""
 
     edits: list[CopyEdit] = Field(default_factory=list)
     findings: list[str] = Field(default_factory=list)
+
+
+class StandardsReport(StandardsModelReport):
+    """Persisted standards-desk artifact; mirrors CopyReport's shape."""
+
     unapplied_edits: list[CopyEdit] = Field(default_factory=list)
 
 
@@ -674,11 +700,11 @@ _FACT_TEMPLATE = _frame(
         "verifiable proposition). Verify direct quotes match the source text "
         "exactly; if wording changed, treat it as a paraphrase, not a quote. "
         "Never fabricate corroboration. The pipeline, not you, performs the "
-        "additional per-claim retrieval after you report: every claim you "
-        "mark unsupported is searched again against the vault by the "
-        "pipeline, and factual claims carry the pipeline's own retrieval "
-        "audit. You do not edit the text yourself — only report claims and "
-        "findings."
+        "additional per-claim retrieval after you report: EVERY factual "
+        "claim — whatever status you give it, including unsupported — is "
+        "searched again against the vault by the pipeline, and that is the "
+        "only retrieval audit the record keeps. You do not edit the text "
+        "yourself — only report claims and findings."
     ),
     schema_section=(
         "OUTPUT SCHEMA (JSON object matching FactReport): claims[] (claim_id, "
@@ -721,7 +747,7 @@ PROMPTS: dict[str, PromptDefinition] = {
         version=_COPY_VERSION,
         logical_mode="editorial",
         template=_COPY_TEMPLATE,
-        output_model=CopyReport,
+        output_model=CopyModelReport,
         temperature=0.2,
     ),
     "standards": PromptDefinition(
@@ -729,7 +755,7 @@ PROMPTS: dict[str, PromptDefinition] = {
         version=_STANDARDS_VERSION,
         logical_mode="editorial",
         template=_STANDARDS_TEMPLATE,
-        output_model=StandardsReport,
+        output_model=StandardsModelReport,
         temperature=0.2,
     ),
     "fact": PromptDefinition(

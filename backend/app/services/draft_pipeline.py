@@ -80,6 +80,7 @@ from app.services.draft_prompts import (
     PROMPT_BUNDLE_VERSION,
     PROMPTS,
     CopyEdit,
+    CopyModelReport,
     CopyReport,
     DraftArtifact,
     DraftSection,
@@ -94,6 +95,7 @@ from app.services.draft_prompts import (
     ResearchModelPacket,
     ResearchPacket,
     RetrievalAudit,
+    StandardsModelReport,
     StandardsReport,
 )
 from app.services.draft_provider_policy import (
@@ -636,13 +638,29 @@ class _ClaimRow:
 
 
 @dataclass
+class _UnappliedEdit:
+    """A desk edit the pipeline declined to apply, and why.
+
+    Two structurally different causes share one ledger channel, so the reason
+    is carried rather than flattened into prose: ``not_located`` means the
+    desk's span could not be tied to a unique occurrence of its excerpt,
+    ``invalidated`` means the span resolved but a higher-offset application
+    (an overlap or a duplicate proposal) moved the bytes underneath it before
+    it could be applied. Operators triage the two differently.
+    """
+
+    edit: CopyEdit
+    reason: str
+
+
+@dataclass
 class _TextResult:
     """Outcome of an editing desk: new text plus whether meaning moved."""
 
     text: str
     semantic_changed: bool
     applied_edits: tuple[CopyEdit, ...]
-    unapplied_edits: tuple[CopyEdit, ...] = ()
+    unapplied_edits: tuple[_UnappliedEdit, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -844,6 +862,28 @@ def _quoted_spans(text: str) -> tuple[str, ...]:
     return tuple(s for s in out if s)
 
 
+def _unapplied_from_persisted(
+    edits: Sequence[CopyEdit],
+) -> tuple[_UnappliedEdit, ...]:
+    """Rehydrate persisted unapplied edits, defaulting the decline reason.
+
+    Artifacts written before the reason tag existed, and desk responses that
+    never carried a resolved span, surface as ``not_located`` - the honest
+    reading of a record with no server pins.
+    """
+    return tuple(
+        _UnappliedEdit(
+            edit=edit,
+            reason=(
+                "invalidated"
+                if edit.start >= 0 and edit.before_sha256
+                else "not_located"
+            ),
+        )
+        for edit in edits
+    )
+
+
 def _apply_edits(text: str, edits: Sequence[CopyEdit]) -> _TextResult:
     """Apply precise, in-range desk edits highest-offset-first.
 
@@ -852,22 +892,34 @@ def _apply_edits(text: str, edits: Sequence[CopyEdit]) -> _TextResult:
     actually see is surfaced rather than allowed to corrupt neighbouring
     prose (SPEC §11.6: never an unexplained wholesale rewrite).
 
-    Pins resolve per span origin. SUPPLIED offsets that are in-range and
-    whose ``before_sha256`` verifies keep today's byte-for-byte fast path.
-    Every other shape — missing or garbage offsets, a wrong before-hash, a
-    wrong after-hash — is located by a unique ``before_excerpt`` occurrence
-    in the CURRENT text and pinned server-side (a language model cannot
-    compute digests or live offsets, so the prompts ask only for the excerpt
-    pair). An excerpt matching zero or multiple locations, or a located span
-    that went stale under an overlapping application, is returned in
-    ``unapplied_edits`` for the caller to surface as a finding — never
-    silently dropped. A replacement identical to the live span text is
-    silently skipped: nothing is lost, the requested end state already
-    holds.
+    Every pin is SERVER-COMPUTED, whichever path resolves the span: a
+    SUPPLIED span is used only when it is in range and its ``before_sha256``
+    verifies against live text, and every applied record is then normalized so
+    ``after_sha256`` describes the replacement actually written. Any other
+    shape — missing or garbage offsets, an unverified before-hash — is
+    located by a unique ``before_excerpt`` occurrence in the CURRENT text (a
+    language model cannot compute digests or live offsets, so the prompts ask
+    only for the excerpt pair). An excerpt matching zero or multiple
+    locations, or a located span that went stale under an overlapping
+    application, is returned in ``unapplied_edits`` for the caller to surface
+    as a finding — never silently dropped. A replacement identical to the
+    live span text is silently skipped: nothing is lost, the requested end
+    state already holds.
     """
     applied: list[CopyEdit] = []
-    unapplied: list[CopyEdit] = []
+    unapplied: list[_UnappliedEdit] = []
     new_text = text
+
+    def _pin(edit: CopyEdit, start: int, end: int) -> CopyEdit:
+        """Server-computed pins for a span of the current text."""
+        return edit.model_copy(
+            update={
+                "start": start,
+                "end": end,
+                "before_sha256": sha256_text(edit.before_excerpt),
+                "after_sha256": sha256_text(edit.after_excerpt),
+            }
+        )
 
     def _locate(edit: CopyEdit) -> Optional[CopyEdit]:
         """Resolve one edit against the current text, or return None."""
@@ -875,24 +927,19 @@ def _apply_edits(text: str, edits: Sequence[CopyEdit]) -> _TextResult:
             0 <= edit.start < edit.end <= len(new_text)
             and sha256_text(new_text[edit.start : edit.end]) == edit.before_sha256
         ):
-            return edit
+            # The span verified, but normalize the after-pin anyway so the
+            # persisted record always describes what was written.
+            return _pin(edit, edit.start, edit.end)
         if new_text.count(edit.before_excerpt) == 1:
             start = new_text.index(edit.before_excerpt)
-            return edit.model_copy(
-                update={
-                    "start": start,
-                    "end": start + len(edit.before_excerpt),
-                    "before_sha256": sha256_text(edit.before_excerpt),
-                    "after_sha256": sha256_text(edit.after_excerpt),
-                }
-            )
+            return _pin(edit, start, start + len(edit.before_excerpt))
         return None
 
     resolved: list[CopyEdit] = []
     for edit in edits:
         pinned = _locate(edit)
         if pinned is None:
-            unapplied.append(edit)
+            unapplied.append(_UnappliedEdit(edit=edit, reason="not_located"))
         else:
             resolved.append(pinned)
 
@@ -906,7 +953,7 @@ def _apply_edits(text: str, edits: Sequence[CopyEdit]) -> _TextResult:
                 )
             )
             if relocated is None:
-                unapplied.append(pinned)
+                unapplied.append(_UnappliedEdit(edit=pinned, reason="invalidated"))
                 continue
             pinned = relocated
         replacement = pinned.after_excerpt
@@ -1885,28 +1932,41 @@ class _CompileRun:
             )
 
     def _surface_unapplied_edits(
-        self, stage: str, edits: Sequence[CopyEdit]
+        self, stage: str, unapplied: Sequence[_UnappliedEdit]
     ) -> None:
         """Record desk edits that could not be safely located or applied.
 
         Called AFTER ``_collect_desk_findings`` (which clears the stage's
         findings first) so convergence re-runs replace rather than duplicate;
-        each pass's findings reflect that pass's candidate. The excerpts ride
-        on ``original_text``/``suggestion`` so the review workflow can see
-        exactly what was not applied.
+        each pass's findings reflect that pass's candidate. The two decline
+        reasons get distinct rule ids and messages: a hallucinated span
+        (``not_located``) and a span invalidated by an overlapping or
+        duplicate proposal (``invalidated``) are different operational
+        problems. The excerpts ride on ``original_text``/``suggestion`` so
+        the review workflow can see exactly what was not applied.
         """
-        for edit in edits:
+        for item in unapplied:
+            edit = item.edit
+            if item.reason == "invalidated":
+                rule = f"{stage}.edit_invalidated"
+                message = (
+                    "a desk edit's span was invalidated by an overlapping edit "
+                    f"and was not applied ({edit.category}: {edit.rationale})"
+                )
+            else:
+                rule = f"{stage}.edit_not_located"
+                message = (
+                    "a desk edit could not be located in the candidate "
+                    f"and was not applied ({edit.category}: {edit.rationale})"
+                )
             self._findings.append(
                 _PendingFinding(
                     stage=stage,
-                    rule_id=f"{stage}.edit_not_located",
+                    rule_id=rule,
                     rule_version=PROMPT_BUNDLE_VERSION,
                     category="style",
                     severity="warning",
-                    message=(
-                        "a desk edit could not be located in the candidate "
-                        f"and was not applied ({edit.category}: {edit.rationale})"
-                    ),
+                    message=message,
                     waivable=True,
                     original_text=edit.before_excerpt or None,
                     suggestion=edit.after_excerpt or None,
@@ -1947,11 +2007,13 @@ class _CompileRun:
                 # A reused checkpoint re-surfaces its unapplied edits: the
                 # pending findings died with the failed parent job, and the
                 # persisted report is the only record left (issue #787).
-                self._surface_unapplied_edits("copy", tuple(report.unapplied_edits))
+                unapplied = _unapplied_from_persisted(report.unapplied_edits)
+                self._surface_unapplied_edits("copy", unapplied)
                 return _TextResult(
                     text=self._candidate,
                     semantic_changed=bool(reused.semantic_changed),
                     applied_edits=tuple(report.edits),
+                    unapplied_edits=unapplied,
                 )
 
         definition = PROMPTS["copy"]
@@ -1962,17 +2024,19 @@ class _CompileRun:
                 self._candidate,
                 correction_feedback=self._correction_feedback_text(),
             ),
-            output_model=CopyReport,
+            output_model=CopyModelReport,
         )
-        report: CopyReport = model  # type: ignore[assignment]
-        result = _apply_edits(self._candidate, report.edits)
+        desk: CopyModelReport = model  # type: ignore[assignment]
+        # Off the event loop: locating N excerpts costs O(N x len(text)) and
+        # the desks run again in every convergence/correction pass.
+        result = await asyncio.to_thread(_apply_edits, self._candidate, desk.edits)
         self._candidate = result.text
-        self._collect_desk_findings("copy", report.findings)
+        self._collect_desk_findings("copy", desk.findings)
         self._surface_unapplied_edits("copy", result.unapplied_edits)
         applied_report = CopyReport(
             edits=list(result.applied_edits),
-            findings=report.findings,
-            unapplied_edits=list(result.unapplied_edits),
+            findings=desk.findings,
+            unapplied_edits=[item.edit for item in result.unapplied_edits],
         )
         await self._persist_stage(
             "copy",
@@ -1998,13 +2062,13 @@ class _CompileRun:
             if report is not None:
                 self._candidate = reused.content_md or self._candidate
                 self._collect_desk_findings("standards", report.findings)
-                self._surface_unapplied_edits(
-                    "standards", tuple(report.unapplied_edits)
-                )
+                unapplied = _unapplied_from_persisted(report.unapplied_edits)
+                self._surface_unapplied_edits("standards", unapplied)
                 return _TextResult(
                     text=self._candidate,
                     semantic_changed=bool(reused.semantic_changed),
                     applied_edits=tuple(report.edits),
+                    unapplied_edits=unapplied,
                 )
 
         definition = PROMPTS["standards"]
@@ -2015,17 +2079,19 @@ class _CompileRun:
                 self._candidate,
                 correction_feedback=self._correction_feedback_text(),
             ),
-            output_model=StandardsReport,
+            output_model=StandardsModelReport,
         )
-        report: StandardsReport = model  # type: ignore[assignment]
-        result = _apply_edits(self._candidate, report.edits)
+        desk: StandardsModelReport = model  # type: ignore[assignment]
+        result = await asyncio.to_thread(
+            _apply_edits, self._candidate, desk.edits
+        )
         self._candidate = result.text
-        self._collect_desk_findings("standards", report.findings)
+        self._collect_desk_findings("standards", desk.findings)
         self._surface_unapplied_edits("standards", result.unapplied_edits)
         applied_report = StandardsReport(
             edits=list(result.applied_edits),
-            findings=report.findings,
-            unapplied_edits=list(result.unapplied_edits),
+            findings=desk.findings,
+            unapplied_edits=[item.edit for item in result.unapplied_edits],
         )
         await self._persist_stage(
             "standards",

@@ -16,7 +16,7 @@ Issue #787 (Workstream N PR 3 of 6). Audit findings MUT-GX-026, TQ-sweep-B06-04,
 - Copy and Standards prompts no longer ask the model for per-edit character offsets or SHA-256 digests (a language model cannot compute them); they identify the span by `before_excerpt` and the pipeline computes offsets/hashes server-side. `CopyEdit` offsets/hashes are now optional with neutral defaults.
 - `_apply_edits` locates edits by their `before_excerpt` whenever the supplied offsets/hashes do not verify (wrong hashes, garbage offsets, or omitted), applying uniquely-matching edits with server-computed pins and surfacing unlocatable edits (zero or multiple occurrences) as `draft_findings` rows instead of silently dropping them.
 - The Research desk is asked only for `contradictions` and `gaps` — the only fields `run_research` keeps from the model response. The template, the parsed model, and the provider-side `response_format` schema are narrowed together; the persisted `ResearchPacket` artifact shape is unchanged.
-- The Fact desk prompt states its real contract (classify against the provided evidence registry; the pipeline performs claim-specific retrieval afterwards and downgrades unsupported claims) and stops asking the model to fabricate a `retrieval_audit` object whose `vault_scope_hash` the desk cannot know; `_resolve_claims` no longer persists model-supplied audits for non-factual claims (factual claims keep their deterministic pipeline audit).
+- The Fact desk prompt states its real contract (classify against the provided evidence registry; the pipeline downgrades sourced verdicts whose evidence labels are not snapshotted, then re-searches every factual claim for its own audit record) and stops asking the model to fabricate a `retrieval_audit` object whose `vault_scope_hash` the desk cannot know; `_resolve_claims` no longer persists model-supplied audits for non-factual claims (factual claims keep their deterministic pipeline audit).
 
 ## Why
 
@@ -24,7 +24,7 @@ All six audit findings share one theme: a persisted or model-supplied artifact s
 
 ## Migration
 
-No schema migration. Old compile checkpoints for research/copy/standards/fact no longer match after upgrade (their prompt hashes changed) and those stages re-run once on the next resume — the designed invalidation path.
+No schema migration. Old compile checkpoints for research/copy/standards/fact no longer match after upgrade (their prompt hashes changed). Those stages re-run once on the next resume — the designed invalidation path — and because every stage input hash folds its upstream artifacts, a research re-run whose packet differs also cascades into outline/draft/lint/fact, i.e. the practical cost after upgrade is one full pipeline re-run from Research. Persisted copy/standards stage artifacts gain one additive, server-populated `unapplied_edits` key; rows written before it still validate.
 
 ## Caveats
 

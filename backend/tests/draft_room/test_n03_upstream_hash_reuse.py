@@ -13,6 +13,7 @@ import logging
 import os
 import sys
 import unittest
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -21,7 +22,7 @@ from app.services.draft_pipeline import (  # noqa: E402
     _stage_input_hash,
 )
 from app.services.draft_prompts import CopyEdit  # noqa: E402
-from app.services.draft_store import sha256_text  # noqa: E402
+from app.services.draft_store import DraftStore, sha256_text  # noqa: E402
 from draft_room import test_draft_pipeline as tdp  # noqa: E402
 
 #: One wrong-typed value for a list field of each stage's artifact model, so
@@ -52,7 +53,87 @@ MATRIX = [
 ]
 
 
-class TestN03UpstreamHashReuse(tdp.TestRetryStartStageInheritance):
+class _RetryFixtures:
+    """Retry helpers lifted from the harness as a mixin.
+
+    Subclassing ``TestRetryStartStageInheritance`` for its fixtures re-ran the
+    harness's 11 compile-based tests verbatim under each new class name
+    (33 duplicate full-pipeline runs in the Backend CI job). These three
+    helpers are all the N03 companions need, and ``PipelineTestBase`` itself
+    declares no tests, so the fixtures cost nothing.
+    """
+
+    CLOCK = datetime(2026, 8, 1, tzinfo=timezone.utc)
+
+    def _context_for(self, job_id):
+        with self.pool.connection() as conn:
+            job = DraftStore(conn).get_job(
+                draft_id=self.draft_id, owner_id=tdp.OWNER_ID, job_id=job_id
+            )
+            return tdp._build_context(conn, job, self.CLOCK)
+
+    def _seal(self, job_id, start_stage):
+        """Write the fingerprint the retry route would have stored."""
+        self.conn.execute(
+            "UPDATE draft_jobs SET start_stage = ? WHERE id = ?",
+            (start_stage, job_id),
+        )
+        self.conn.commit()
+        self.conn.execute(
+            "UPDATE draft_jobs SET compile_input_sha256 = ?, "
+            "prompt_bundle_version = ? WHERE id = ?",
+            (
+                self._context_for(job_id).compile_fingerprint,
+                tdp.PROMPT_BUNDLE_VERSION,
+                job_id,
+            ),
+        )
+        self.conn.commit()
+
+    def _make_retry(self, start_stage):
+        job_id = self._make_compile_job(
+            parent_job_id=self.job_id, start_stage=start_stage, attempt_no=2
+        )
+        self._seal(job_id, start_stage)
+        self.conn.execute(
+            "UPDATE drafts SET status = 'running' WHERE id = ?", (self.draft_id,)
+        )
+        self.conn.commit()
+        return job_id
+
+    async def _run_job(self, job_id, model=None):
+        model = model or tdp.FakeModel(tdp.happy_responses())
+        await tdp.run_compile(
+            job_id=job_id,
+            pool=self.pool,
+            deps=tdp.PipelineDeps(
+                retrieve_sources=tdp.FakeRetriever(),
+                complete=model,
+                now=tdp.FakeClock(self.CLOCK),
+            ),
+        )
+        return model
+
+    async def _seed_failed_parent(self):
+        """Run this job to a real failure at Copy (genuine stage rows)."""
+        self._seal(self.job_id, "research")
+        model = tdp.FakeModel(tdp.happy_responses(copy=["not json at all"]))
+        failure = await self._run_expect_failure(model=model)
+        self.assertEqual(failure.code, tdp.CODE_INVALID_STAGE_OUTPUT)
+        return model
+
+    def _completed_for(self, job_id):
+        return [
+            row[0]
+            for row in self.conn.execute(
+                "SELECT stage FROM draft_job_stages WHERE job_id = ? AND "
+                "status = 'completed' ORDER BY id",
+                (job_id,),
+            ).fetchall()
+        ]
+
+
+class TestN03UpstreamHashReuse(_RetryFixtures, tdp.PipelineTestBase):
     """GX-026 killers: the upstream-artifact fold must invalidate checkpoints."""
 
     async def test_input_hash_folds_upstream_artifact_hashes(self):
@@ -190,6 +271,45 @@ class TestN03UpstreamHashReuse(tdp.TestRetryStartStageInheritance):
             "terminal failure",
         )
 
+    def _legacy_copy_report_json(self, extra: str = "") -> str:
+        """A pre-#787 copy report artifact: no ``unapplied_edits`` key."""
+        return (
+            '{"edits": [], "findings": ["legacy desk note"]%s}'
+            % (", " + extra if extra else "")
+        )
+
+    async def test_legacy_keyless_copy_checkpoint_reuses_without_raising(self):
+        # An artifact written before the field existed must still validate
+        # (defaults to []) and its desk findings must re-surface (FB-25).
+        self._seal(self.job_id, None)
+        model = tdp.FakeModel(
+            tdp.happy_responses(copy=[self._legacy_copy_report_json()])
+        )
+        await self._run_job(self.job_id, model=model)
+
+        rows = self.conn.execute(
+            "SELECT rule_id, message FROM draft_findings WHERE job_id = ?",
+            (self.job_id,),
+        ).fetchall()
+        messages = [row[1] for row in rows]
+        self.assertTrue(
+            any("legacy desk note" in m for m in messages),
+            "the reused legacy report's desk findings must re-surface",
+        )
+
+    async def test_legacy_reuse_does_not_invent_edit_rows(self):
+        self._seal(self.job_id, None)
+        model = tdp.FakeModel(
+            tdp.happy_responses(copy=[self._legacy_copy_report_json()])
+        )
+        await self._run_job(self.job_id, model=model)
+        invented = self.conn.execute(
+            "SELECT COUNT(*) FROM draft_findings WHERE job_id = ? AND "
+            "rule_id LIKE 'copy.edit_%'",
+            (self.job_id,),
+        ).fetchone()[0]
+        self.assertEqual(invented, 0, "an empty legacy list must surface nothing")
+
     async def test_corrupted_fact_checkpoint_reruns_on_restart(self):
         """The fact deserialize site fires through the job's OWN rows only."""
         await self._successful_parent()
@@ -295,7 +415,7 @@ def unlocatable_edit_json() -> str:
     )
 
 
-class TestN03EditSurfacing(tdp.TestRetryStartStageInheritance):
+class TestN03EditSurfacing(_RetryFixtures, tdp.PipelineTestBase):
     """The unapplied-edit finding channel, end to end (issue #787 review)."""
 
     def _edit_findings(self, job_id):
@@ -424,15 +544,18 @@ class TestN03ApplyEditsMatrix(unittest.TestCase):
         self.assertEqual(text, result.text)
         self.assertEqual(len(result.unapplied_edits), 1)
 
-    def test_overlapping_pair_relocates_or_surfaces_never_stale_apply(self):
-        # The higher-offset edit applies first; the lower edit's supplied span
-        # is invalidated by that application, so it must re-locate (unique
-        # excerpt) rather than apply at a stale offset.
+    def test_overlapping_pair_surfaces_the_invalidated_span(self):
+        # The spans genuinely OVERLAP: the high edit rewrites the tail of the
+        # low edit's span, so when the high edit applies first the low edit's
+        # pinned bytes no longer verify. Its excerpt ("alpha beta") then
+        # matches nothing in the mutated text, so it must be surfaced as
+        # invalidated rather than applied at a stale offset (this is the only
+        # arm of the apply loop that can produce an overlap-surfacing).
         text = "keep alpha beta keep"
         old_hi = "beta"
         new_hi = "BETA!"
-        old_lo = "alpha"
-        new_lo = "ALPHA!"
+        old_lo = "alpha beta"
+        new_lo = "ALPHA+BETA"
         hi = _edit(
             before_excerpt=old_hi,
             after_excerpt=new_hi,
@@ -450,10 +573,74 @@ class TestN03ApplyEditsMatrix(unittest.TestCase):
             after_sha256=sha256_text(new_lo),
         )
         result = _apply_edits(text, [lo, hi])
-        self.assertIn(new_hi, result.text)
-        self.assertIn(new_lo, result.text)
-        self.assertNotIn(old_lo, result.text)
-        self.assertNotIn(old_hi, result.text)
+        self.assertEqual(len(result.applied_edits), 1)
+        self.assertEqual(result.applied_edits[0].after_excerpt, new_hi)
+        self.assertEqual(len(result.unapplied_edits), 1)
+        surfaced = result.unapplied_edits[0]
+        self.assertEqual(surfaced.reason, "invalidated")
+        self.assertEqual(surfaced.edit.before_excerpt, old_lo)
+        # The invalidated edit is NOT applied at its stale offset: the only
+        # replacement present is the high edit's ("beta" -> "BETA!").
+        self.assertNotIn(new_lo, result.text)
+        self.assertEqual(result.text, "keep alpha BETA! keep")
+
+    def test_disjoint_pair_both_applies_and_serves_their_pins(self):
+        text = "keep alpha and beta"
+        lo = _edit(
+            before_excerpt="alpha",
+            after_excerpt="ALPHA",
+            start=text.index("alpha"),
+            end=text.index("alpha") + 5,
+            before_sha256=sha256_text("alpha"),
+        )
+        hi = _edit(
+            before_excerpt="beta",
+            after_excerpt="BETA",
+            start=text.index("beta"),
+            end=text.index("beta") + 4,
+            before_sha256=sha256_text("beta"),
+        )
+        result = _apply_edits(text, [lo, hi])
+        self.assertEqual(len(result.applied_edits), 2)
+        self.assertEqual(result.unapplied_edits, ())
+        self.assertIn("ALPHA", result.text)
+        self.assertIn("BETA", result.text)
+
+    def test_applied_edit_always_carries_server_computed_after_pin(self):
+        # Even on the supplied-span fast path the persisted after-pin must
+        # describe the replacement actually written (FB-09), so a model that
+        # hallucinates after_sha256 cannot put a lie in a durable artifact.
+        text = "keep thirty days"
+        edit = _edit(
+            start=text.index("thirty days"),
+            end=text.index("thirty days") + len("thirty days"),
+            before_sha256=sha256_text("thirty days"),
+            after_sha256="0" * 64,
+            after_excerpt="30 days",
+        )
+        result = _apply_edits(text, [edit])
+        self.assertEqual(len(result.applied_edits), 1)
+        self.assertEqual(
+            result.applied_edits[0].after_sha256, sha256_text("30 days")
+        )
+
+    def test_unicode_excerpt_round_trips_and_a_normalized_variant_is_surfaced(self):
+        # Real model output copies prose verbatim: a curly apostrophe locates
+        # exactly, while a normalized (NFC) variant of a decomposed excerpt is
+        # NOT the same codepoint sequence and must surface rather than apply.
+        text = "keep café thirty days"  # NFC in the source text
+        curly = _edit(before_excerpt="café", after_excerpt="CAFE")
+        result = _apply_edits(text, [curly])
+        self.assertIn("CAFE", result.text)
+        # NFD ("cafe" + U+0301) is a DIFFERENT codepoint sequence than the NFC
+        # text above; the locator is exact, so it must surface, not apply.
+        decomposed = _edit(
+            before_excerpt="café", after_excerpt="COFFEE"
+        )  # NFD: a different codepoint sequence
+        result2 = _apply_edits(text, [decomposed])
+        self.assertEqual(len(result2.unapplied_edits), 1)
+        self.assertEqual(result2.unapplied_edits[0].reason, "not_located")
+        self.assertEqual(result2.text, text)
 
     def test_no_op_edit_stays_silent(self):
         old = "thirty days"
