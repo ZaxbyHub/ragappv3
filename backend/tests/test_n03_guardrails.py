@@ -113,6 +113,63 @@ class TestN03CheckpointGuardrails(unittest.TestCase):
             "all eight stage reuse sites must go through _load_checkpoint",
         )
 
+    def test_census_rejects_an_unguarded_deserialize(self):
+        """Negative meta-test: the census must FAIL on a planted violation.
+
+        A census that can only ever pass proves nothing. This feeds it a
+        synthetic module carrying one unguarded
+        ``<anything>.model_validate_json(<x>.artifact_json)`` call with a
+        receiver name the OLD name-keyed census would never have matched, and
+        requires the scan to flag it.
+        """
+        planted = (
+            "import json\n"
+            "from pydantic import BaseModel\n"
+            "\n"
+            "class Report(BaseModel):\n"
+            "    findings: list[str] = []\n"
+            "\n"
+            "def load(row, reused_helper):\n"
+            "    return Report.model_validate_json(row.artifact_json)\n"
+        )
+        tree = ast.parse(planted)
+        found = self._deserializations_of_artifact_json(tree)
+        self.assertEqual(
+            len(found),
+            1,
+            "the census must flag exactly the planted deserialization",
+        )
+        self.assertEqual(
+            found,
+            [
+                node.lineno
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "model_validate_json"
+                and node.args
+                and isinstance(node.args[0], ast.Attribute)
+                and node.args[0].attr == "artifact_json"
+            ],
+            "the census must flag a planted unguarded artifact_json "
+            "deserialization regardless of the receiver's name",
+        )
+        # And the same planted shape is invisible to the superseded
+        # name-keyed rule, which is exactly why this one exists.
+        name_keyed = [
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "model_validate_json"
+            and node.args
+            and isinstance(node.args[0], ast.Attribute)
+            and node.args[0].attr == "artifact_json"
+            and isinstance(node.args[0].value, ast.Name)
+            and node.args[0].value.id == "reused"
+        ]
+        self.assertEqual(name_keyed, [], "the planted receiver is not 'reused'")
+
     def test_desk_templates_do_not_request_server_computed_digests(self):
         for stage in CENSUSED_TEMPLATES:
             with self.subTest(stage=stage):

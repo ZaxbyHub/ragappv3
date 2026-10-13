@@ -927,12 +927,22 @@ def _apply_edits(text: str, edits: Sequence[CopyEdit]) -> _TextResult:
     new_text = text
 
     def _pin(edit: CopyEdit, start: int, end: int) -> CopyEdit:
-        """Server-computed pins for a span of the current text."""
+        """Server-computed pins for ``new_text[start:end]``.
+
+        The before-pin hashes the LIVE SLICE the span actually resolved to,
+        never the independently supplied excerpt: when a response's offsets
+        verify but its excerpt disagrees with those bytes, the excerpt is the
+        unverified part, and pinning from it would make the apply loop's
+        re-check fail on an untouched span and relocate the edit to a
+        different occurrence. Hashing the resolved slice keeps normalization
+        identity-preserving, so the apply-time re-check only fires when a
+        higher-offset application really did move the bytes.
+        """
         return edit.model_copy(
             update={
                 "start": start,
                 "end": end,
-                "before_sha256": sha256_text(edit.before_excerpt),
+                "before_sha256": sha256_text(new_text[start:end]),
                 "after_sha256": sha256_text(edit.after_excerpt),
             }
         )

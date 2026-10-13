@@ -42,6 +42,10 @@ CORRUPT = {
 #: Consulted stages grouped by the retry start_stage that makes their
 #: inherited rows reachable (inheritance is strictly before start_stage;
 #: fact/assemble are never inherited cross-job).
+#: Stages whose checkpoint the job re-consults from its OWN rows after a
+#: restart (the same-job path); each gets a poisoned-row case.
+OWN_ROW_STAGES = ("intake", "research", "outline", "draft", "lint", "copy")
+
 MATRIX = [
     ("intake", "copy"),
     ("research", "copy"),
@@ -346,6 +350,27 @@ class TestN03UpstreamHashReuse(_RetryFixtures, tdp.PipelineTestBase):
             "a legacy artifact with no unapplied_edits must surface nothing",
         )
 
+    async def _own_row_corruption_reruns_the_stage(self, stage: str) -> None:
+        """Same-job restart with a hash-consistent poisoned OWN row.
+
+        The cross-job matrix only ever poisons a PARENT row that a retry
+        inherits; the ``_load_checkpoint`` guard is also reached when a job's
+        own completed row is re-consulted after a restart, which is the shape a
+        real schema change produces. Every stage is covered, not just fact.
+        """
+        self._seal(self.job_id, None)
+        await self._run_job(self.job_id)
+        self._restore_pre_run_world(reopen_job=True)
+        self._poison_parent_stage(stage)
+        await self._run_job(self.job_id)
+        rows = self.conn.execute(
+            "SELECT COUNT(*) FROM draft_job_stages WHERE job_id = ? AND stage = ?",
+            (self.job_id, stage),
+        ).fetchone()[0]
+        self.assertGreaterEqual(
+            rows, 2, f"a poisoned own {stage} row must force a re-run"
+        )
+
     async def test_corrupted_fact_checkpoint_reruns_on_restart(self):
         """The fact deserialize site fires through the job's OWN rows only."""
         await self._successful_parent()
@@ -361,6 +386,22 @@ class TestN03UpstreamHashReuse(_RetryFixtures, tdp.PipelineTestBase):
         self.assertGreaterEqual(
             rows, 2, "the corrupted own fact row must force a fact re-run"
         )
+
+
+def _make_own_row_test(stage: str):
+    async def test(self) -> None:
+        await self._own_row_corruption_reruns_the_stage(stage)
+
+    test.__name__ = f"test_corrupted_own_{stage}_checkpoint_reruns"
+    return test
+
+
+for _stage in OWN_ROW_STAGES:
+    setattr(
+        TestN03UpstreamHashReuse,
+        f"test_corrupted_own_{_stage}_checkpoint_reruns",
+        _make_own_row_test(_stage),
+    )
 
 
 def _make_corruption_test(stage: str, start_stage: str):
@@ -497,6 +538,114 @@ class TestN03EditSurfacing(_RetryFixtures, tdp.PipelineTestBase):
             "the parent's pending findings died with the failed job",
         )
         self.assertEqual(rows[0][1], "copy.edit_not_located")
+
+
+def unlocatable_standards_edit_json() -> str:
+    """A standards-desk edit whose excerpt names nothing in the candidate."""
+    return json.dumps(
+        {
+            "edits": [
+                {
+                    "section_id": "sec-01",
+                    "before_excerpt": "absent from the candidate entirely",
+                    "after_excerpt": "replacement text",
+                    "category": "style",
+                    "rationale": "n03 unlocatable standards probe",
+                    "semantic_change": False,
+                    "affected_claim_ids": [],
+                    "affected_evidence_labels": ["S1"],
+                }
+            ],
+            "findings": [],
+        }
+    )
+
+
+class TestN03FactRetrievalPromise(_RetryFixtures, tdp.PipelineTestBase):
+    """The Fact desk's contract (FB-23), pinned by BEHAVIOR, not by prose.
+
+    The frozen AC7 check keys off a phrase this PR removed, so it is a
+    spent-but-armed tripwire for the OLD contract; the NEW contract the
+    template now states - every FACTUAL claim is re-searched by the pipeline
+    regardless of the desk's verdict, and that is the only retrieval audit the
+    record keeps - is asserted here where it can actually fail: a factual
+    claim the desk marked SUPPORTED must still produce a retrieval audit, and a
+    model-fabricated audit must never reach the record.
+    """
+
+    async def test_every_factual_claim_gets_a_pipeline_retrieval_audit(self):
+        await self._run()
+        audit_json = self.conn.execute(
+            "SELECT c.retrieval_audit_json FROM draft_claims c "
+            "JOIN draft_revisions r ON r.id = c.revision_id "
+            "WHERE r.job_id = ? AND c.claim_type = 'factual' LIMIT 1",
+            (self.job_id,),
+        ).fetchone()
+        self.assertIsNotNone(audit_json, "the fact stage must have completed")
+        audit = json.loads(audit_json[0])
+        # The harness fact report's claim is factual and supported; the
+        # pipeline re-searched it anyway (DRAFT-013/SPEC 11.8), so the audit is
+        # populated even though the desk needed no rescue.
+        self.assertTrue(
+            audit, "a supported FACTUAL claim must still carry its pipeline audit"
+        )
+        self.assertIn("normalized_query", audit)
+        self.assertIn("vault_scope_hash", audit)
+        # The audit is the pipeline's, so its scope hash is the pipeline's
+        # (sha256 of "vault:<id>"), never anything the model could supply.
+        self.assertEqual(
+            audit["vault_scope_hash"],
+            sha256_text(f"vault:{tdp.VAULT_ID}"),
+            "the recorded scope hash must be the pipeline's own identity",
+        )
+
+
+class TestN03StandardsSurfacing(_RetryFixtures, tdp.PipelineTestBase):
+    """The standards desk's surfacing is an independent copy-pasted block
+    (draft_pipeline's ``_run_standards``), so it needs its own e2e proof -
+    fresh run AND checkpoint reuse, which re-reads the persisted report."""
+
+    def _standards_findings(self, job_id):
+        return self.conn.execute(
+            "SELECT rule_id, message FROM draft_findings WHERE job_id = ? AND "
+            "rule_id LIKE 'standards.edit_%'",
+            (job_id,),
+        ).fetchall()
+
+    async def test_unlocatable_standards_edit_surfaces_as_a_finding(self):
+        model = tdp.FakeModel(
+            tdp.happy_responses(standards=[unlocatable_standards_edit_json()])
+        )
+        await self._run(model=model)
+        rows = self._standards_findings(self.job_id)
+        self.assertEqual(len(rows), 1, "one standards surfacing row expected")
+        self.assertEqual(rows[0][0], "standards.edit_not_located")
+
+    async def test_standards_surfacing_survives_checkpoint_reuse(self):
+        # Parent surfaces it, then fails at fact; the retry from fact reuses
+        # the standards checkpoint and must re-surface from the persisted
+        # unapplied_edits (the copy desk's reuse path is proven separately).
+        self._seal(self.job_id, None)
+        failure = await self._run_expect_failure(
+            model=tdp.FakeModel(
+                tdp.happy_responses(
+                    standards=[unlocatable_standards_edit_json()],
+                    fact=["not json at all"],
+                )
+            )
+        )
+        self.assertEqual(failure.code, tdp.CODE_INVALID_STAGE_OUTPUT)
+
+        retry_id = self._make_retry("fact")
+        model = tdp.FakeModel(tdp.happy_responses())
+        await self._run_job(retry_id, model=model)
+        self.assertEqual(model.count("standards"), 0, "retry must reuse the desk")
+        rows = self._standards_findings(retry_id)
+        self.assertEqual(
+            len(rows),
+            1,
+            "the reused standards checkpoint must re-surface its unapplied edit",
+        )
 
 
 def _edit(
@@ -659,6 +808,30 @@ class TestN03ApplyEditsMatrix(unittest.TestCase):
         self.assertEqual(
             result.applied_edits[0].after_sha256, sha256_text("30 days")
         )
+
+    def test_verified_supplied_span_is_not_redirected_by_a_stray_excerpt(self):
+        # Reproduced defect: the offsets and before-hash verify against the
+        # LIVE slice, but the response's excerpt names a different span.
+        # Normalizing the before-pin from the excerpt made the apply loop read
+        # that as an overlap and relocate the edit - silently rewriting a
+        # DIFFERENT occurrence than the one that had verified. Normalization
+        # must preserve the span's identity.
+        text = "alpha beta"
+        edit = _edit(
+            start=0,
+            end=5,
+            before_sha256=sha256_text("alpha"),
+            after_sha256=sha256_text("NEW"),
+            before_excerpt="beta",  # disagrees with the verified slice
+            after_excerpt="NEW",
+        )
+        result = _apply_edits(text, [edit])
+        self.assertEqual(len(result.applied_edits), 1)
+        applied = result.applied_edits[0]
+        self.assertEqual((applied.start, applied.end), (0, 5))
+        self.assertEqual(result.text, "NEW beta")
+        self.assertEqual(result.unapplied_edits, ())
+        self.assertEqual(applied.before_sha256, sha256_text("alpha"))
 
     def test_unicode_excerpt_round_trips_and_a_normalized_variant_is_surfaced(self):
         # Real model output copies prose verbatim: an exact accent copy locates
