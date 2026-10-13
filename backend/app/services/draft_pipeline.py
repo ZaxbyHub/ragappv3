@@ -862,14 +862,30 @@ def _quoted_spans(text: str) -> tuple[str, ...]:
     return tuple(s for s in out if s)
 
 
+def _strip_unpinned(edit: CopyEdit) -> CopyEdit:
+    """Drop every model-supplied pin from an edit the pipeline never located.
+
+    The desk schema still accepts the pin fields (a provider may fill them
+    whether or not it is asked), but a hallucinated pin on a span we could
+    not locate is exactly the value this pipeline refuses to trust: the
+    excerpt is what was checked, and the excerpt did not resolve. Persisting
+    neutral pins keeps the persisted artifact's meaning unambiguous - pins
+    present means the pipeline computed them.
+    """
+    return edit.model_copy(
+        update={"start": -1, "end": -1, "before_sha256": "", "after_sha256": ""}
+    )
+
+
 def _unapplied_from_persisted(
     edits: Sequence[CopyEdit],
 ) -> tuple[_UnappliedEdit, ...]:
     """Rehydrate persisted unapplied edits, defaulting the decline reason.
 
-    Artifacts written before the reason tag existed, and desk responses that
-    never carried a resolved span, surface as ``not_located`` - the honest
-    reading of a record with no server pins.
+    Artifacts written before the reason tag existed surface as
+    ``not_located`` unless they carry pipeline-computed pins, which only a
+    located-then-invalidated span does: unlocatable edits are persisted with
+    their pins stripped, so a present pin is a reliable server signal.
     """
     return tuple(
         _UnappliedEdit(
@@ -2036,7 +2052,10 @@ class _CompileRun:
         applied_report = CopyReport(
             edits=list(result.applied_edits),
             findings=desk.findings,
-            unapplied_edits=[item.edit for item in result.unapplied_edits],
+            unapplied_edits=[
+                _strip_unpinned(item.edit) if item.reason == "not_located" else item.edit
+                for item in result.unapplied_edits
+            ],
         )
         await self._persist_stage(
             "copy",
@@ -2091,7 +2110,10 @@ class _CompileRun:
         applied_report = StandardsReport(
             edits=list(result.applied_edits),
             findings=desk.findings,
-            unapplied_edits=[item.edit for item in result.unapplied_edits],
+            unapplied_edits=[
+                _strip_unpinned(item.edit) if item.reason == "not_located" else item.edit
+                for item in result.unapplied_edits
+            ],
         )
         await self._persist_stage(
             "standards",

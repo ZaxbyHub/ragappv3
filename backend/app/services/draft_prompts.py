@@ -636,7 +636,7 @@ _COPY_TEMPLATE = _frame(
         "it — record a finding instead and leave the text unchanged."
     ),
     schema_section=(
-        "OUTPUT SCHEMA (JSON object matching CopyReport): edits[] (section_id, "
+        "OUTPUT SCHEMA (JSON object matching the copy desk report): edits[] (section_id, "
         "before_excerpt, after_excerpt, category, rationale, semantic_change, "
         "affected_claim_ids[], affected_evidence_labels[]), findings[] (short "
         "strings). The pipeline resolves each edit's location and integrity "
@@ -670,7 +670,7 @@ _STANDARDS_TEMPLATE = _frame(
         "to evade AI-detection tools."
     ),
     schema_section=(
-        "OUTPUT SCHEMA (JSON object matching StandardsReport): edits[] "
+        "OUTPUT SCHEMA (JSON object matching the standards desk report): edits[] "
         "(section_id, before_excerpt, after_excerpt, category, rationale, "
         "semantic_change, affected_claim_ids[], affected_evidence_labels[]), "
         "findings[] (short strings). The pipeline resolves each edit's "

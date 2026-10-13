@@ -189,6 +189,24 @@ def _run_pytest(copy_root: Path, basetemp: Path):
     return proc.returncode, _outcome_nodes(output)
 
 
+def _run_pytest_guarded(copy_root: Path, basetemp: Path):
+    """``_run_pytest`` that turns a hung suite into an ABORT, never a verdict.
+
+    An uncaught TimeoutExpired would exit 1 - the documented SURVIVED code -
+    which is exactly the false-survival channel the exit contract exists to
+    close.
+    """
+    try:
+        return _run_pytest(copy_root, basetemp)
+    except subprocess.TimeoutExpired:
+        print(
+            f"ABORT: the pytest run in {copy_root.name} exceeded "
+            f"{_SUBPROCESS_TIMEOUT}s and was killed",
+            file=sys.stderr,
+        )
+        raise SystemExit(3)
+
+
 def _apply_mutation(pipeline_py: Path) -> None:
     """Delete the ``**payload,`` splat; refuse an ambiguous mutation site."""
     source = pipeline_py.read_text(encoding="utf-8")
@@ -225,7 +243,7 @@ def main() -> int:
         shutil.copytree(REPO / "backend", mutated_root, ignore=COPY_IGNORE)
         _apply_mutation(mutated_root / "app" / "services" / "draft_pipeline.py")
 
-        clean_status, clean_failed = _run_pytest(clean_root, tmp / "bt-clean")
+        clean_status, clean_failed = _run_pytest_guarded(clean_root, tmp / "bt-clean")
         if clean_status != 0 or clean_failed:
             print(
                 "ABORT: the CLEAN run was not green (exit "
@@ -239,7 +257,9 @@ def main() -> int:
             return 3
         print(f"  clean run: green ({len(clean_failed)} failing nodes)")
 
-        mutated_status, mutated_failed = _run_pytest(mutated_root, tmp / "bt-mutated")
+        mutated_status, mutated_failed = _run_pytest_guarded(
+            mutated_root, tmp / "bt-mutated"
+        )
         print(
             f"  mutated run: exit {mutated_status}, "
             f"{len(mutated_failed)} failing/erroring nodes"

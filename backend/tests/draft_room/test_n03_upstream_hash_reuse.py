@@ -271,44 +271,80 @@ class TestN03UpstreamHashReuse(_RetryFixtures, tdp.PipelineTestBase):
             "terminal failure",
         )
 
-    def _legacy_copy_report_json(self, extra: str = "") -> str:
-        """A pre-#787 copy report artifact: no ``unapplied_edits`` key."""
-        return (
-            '{"edits": [], "findings": ["legacy desk note"]%s}'
-            % (", " + extra if extra else "")
-        )
+    def _legacy_copy_report_json(self) -> str:
+        """A pre-#787 persisted copy artifact: no ``unapplied_edits`` key."""
+        return '{"edits": [], "findings": ["legacy desk note"]}'
 
-    async def test_legacy_keyless_copy_checkpoint_reuses_without_raising(self):
-        # An artifact written before the field existed must still validate
-        # (defaults to []) and its desk findings must re-surface (FB-25).
+    async def _retry_over_legacy_copy_checkpoint(self):
+        """Retry that really REUSES a keyless copy checkpoint (FB-25).
+
+        A spy on the review round proved the previous version of this test
+        never entered the reuse branch: the keyless JSON was fed as a MODEL
+        RESPONSE, which parses through ``CopyModelReport`` and is then
+        re-persisted WITH the key by the server. Here the parent genuinely
+        writes a checkpoint row whose stored artifact_json lacks the key, and
+        the retry inherits that row.
+        """
+        # Parent: real desk edits and findings, then a failure at Fact so the
+        # copy checkpoint survives as a reusable row.
         self._seal(self.job_id, None)
-        model = tdp.FakeModel(
-            tdp.happy_responses(copy=[self._legacy_copy_report_json()])
+        failure = await self._run_expect_failure(
+            model=tdp.FakeModel(
+                tdp.happy_responses(fact=["not json at all"])
+            )
         )
-        await self._run_job(self.job_id, model=model)
+        self.assertEqual(failure.code, tdp.CODE_INVALID_STAGE_OUTPUT)
+        self.assertIn("copy", self._completed_for(self.job_id))
 
-        rows = self.conn.execute(
-            "SELECT rule_id, message FROM draft_findings WHERE job_id = ?",
-            (self.job_id,),
-        ).fetchall()
-        messages = [row[1] for row in rows]
+        # Rewrite that row's artifact to the legacy shape, hash-consistently.
+        legacy = self._legacy_copy_report_json()
+        self.conn.execute(
+            "UPDATE draft_job_stages SET artifact_json = ?, artifact_sha256 = ? "
+            "WHERE job_id = ? AND stage = 'copy'",
+            (legacy, sha256_text(legacy), self.job_id),
+        )
+        self.conn.commit()
+
+        # start_stage="fact" makes copy an INHERITED stage that still runs with
+        # reason="pre_fact" — the only shape that enters the reuse branch.
+        retry_id = self._make_retry("fact")
+        # The copy model must NOT be consulted: that call is what proves the
+        # retry reused the checkpoint rather than re-running the desk.
+        model = tdp.FakeModel(tdp.happy_responses())
+        await self._run_job(retry_id, model=model)
+        self.assertEqual(
+            model.count("copy"),
+            0,
+            "the retry must reuse the legacy copy checkpoint, not re-run the desk",
+        )
+        return retry_id
+
+    async def test_legacy_keyless_copy_checkpoint_reuses_and_re_surfaces(self):
+        retry_id = await self._retry_over_legacy_copy_checkpoint()
+        messages = [
+            row[0]
+            for row in self.conn.execute(
+                "SELECT message FROM draft_findings WHERE job_id = ?", (retry_id,)
+            ).fetchall()
+        ]
         self.assertTrue(
             any("legacy desk note" in m for m in messages),
-            "the reused legacy report's desk findings must re-surface",
+            "a keyless legacy report must still validate and re-surface its "
+            "desk findings when its checkpoint is reused",
         )
 
-    async def test_legacy_reuse_does_not_invent_edit_rows(self):
-        self._seal(self.job_id, None)
-        model = tdp.FakeModel(
-            tdp.happy_responses(copy=[self._legacy_copy_report_json()])
-        )
-        await self._run_job(self.job_id, model=model)
+    async def test_legacy_reuse_invents_no_edit_findings(self):
+        retry_id = await self._retry_over_legacy_copy_checkpoint()
         invented = self.conn.execute(
             "SELECT COUNT(*) FROM draft_findings WHERE job_id = ? AND "
             "rule_id LIKE 'copy.edit_%'",
-            (self.job_id,),
+            (retry_id,),
         ).fetchone()[0]
-        self.assertEqual(invented, 0, "an empty legacy list must surface nothing")
+        self.assertEqual(
+            invented,
+            0,
+            "a legacy artifact with no unapplied_edits must surface nothing",
+        )
 
     async def test_corrupted_fact_checkpoint_reruns_on_restart(self):
         """The fact deserialize site fires through the job's OWN rows only."""
@@ -625,7 +661,7 @@ class TestN03ApplyEditsMatrix(unittest.TestCase):
         )
 
     def test_unicode_excerpt_round_trips_and_a_normalized_variant_is_surfaced(self):
-        # Real model output copies prose verbatim: a curly apostrophe locates
+        # Real model output copies prose verbatim: an exact accent copy locates
         # exactly, while a normalized (NFC) variant of a decomposed excerpt is
         # NOT the same codepoint sequence and must surface rather than apply.
         text = "keep café thirty days"  # NFC in the source text
