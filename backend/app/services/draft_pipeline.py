@@ -91,6 +91,7 @@ from app.services.draft_prompts import (
     ModelCallAudit,
     OutlineArtifact,
     PromptDefinition,
+    ResearchModelPacket,
     ResearchPacket,
     RetrievalAudit,
     StandardsReport,
@@ -641,6 +642,7 @@ class _TextResult:
     text: str
     semantic_changed: bool
     applied_edits: tuple[CopyEdit, ...]
+    unapplied_edits: tuple[CopyEdit, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -660,6 +662,32 @@ def _normalize_line_endings(text: str) -> str:
 def _artifact_json(model: BaseModel) -> str:
     """UTF-8, sorted-key, compact-separator canonical JSON for an artifact."""
     return canonical_json(model.model_dump(mode="json"))
+
+
+def _load_checkpoint(
+    model_cls: type[BaseModel], reused: "DraftStageRecord"
+) -> Optional[BaseModel]:
+    """Deserialize a reused checkpoint, degrading to ``None`` on schema rot.
+
+    ``_reusable`` proves the row is internally consistent (stored digest,
+    input hash, candidate hash), but a checkpoint written by an older build
+    can still fail validation against the current schema — an old-shape blob
+    whose digest was correct when it was written. The right degraded
+    behavior is the non-reuse re-run branch sitting directly below every
+    call site, never a terminal job failure. Logged at WARNING on purpose:
+    the job did not fail, and outcome-classifying consumers treat
+    ERROR-level records as pipeline failures.
+    """
+    try:
+        return model_cls.model_validate_json(reused.artifact_json)
+    except (ValidationError, ValueError) as exc:
+        logger.warning(
+            "draft compile: checkpoint artifact failed schema validation, "
+            "re-running stage (model=%s error=%s)",
+            model_cls.__name__,
+            type(exc).__name__,
+        )
+        return None
 
 
 def _stage_input_hash(stage: str, ctx: CompileContext, payload: dict[str, Any]) -> str:
@@ -819,29 +847,79 @@ def _quoted_spans(text: str) -> tuple[str, ...]:
 def _apply_edits(text: str, edits: Sequence[CopyEdit]) -> _TextResult:
     """Apply precise, in-range desk edits highest-offset-first.
 
-    An edit is applied only when the live text at ``[start:end)`` still hashes
-    to the edit's ``before_sha256`` — a desk that describes a span it did not
-    actually see is dropped rather than allowed to corrupt neighbouring prose
-    (SPEC §11.6: never an unexplained wholesale rewrite).
+    An edit is applied only when the live text at its span still satisfies
+    the edit's integrity pin — a desk that describes a span it did not
+    actually see is surfaced rather than allowed to corrupt neighbouring
+    prose (SPEC §11.6: never an unexplained wholesale rewrite).
+
+    Pins resolve per span origin. SUPPLIED offsets that are in-range and
+    whose ``before_sha256`` verifies keep today's byte-for-byte fast path.
+    Every other shape — missing or garbage offsets, a wrong before-hash, a
+    wrong after-hash — is located by a unique ``before_excerpt`` occurrence
+    in the CURRENT text and pinned server-side (a language model cannot
+    compute digests or live offsets, so the prompts ask only for the excerpt
+    pair). An excerpt matching zero or multiple locations, or a located span
+    that went stale under an overlapping application, is returned in
+    ``unapplied_edits`` for the caller to surface as a finding — never
+    silently dropped. A replacement identical to the live span text is
+    silently skipped: nothing is lost, the requested end state already
+    holds.
     """
     applied: list[CopyEdit] = []
+    unapplied: list[CopyEdit] = []
     new_text = text
-    for edit in sorted(edits, key=lambda e: e.start, reverse=True):
-        if edit.start < 0 or edit.end > len(new_text) or edit.end < edit.start:
+
+    def _locate(edit: CopyEdit) -> Optional[CopyEdit]:
+        """Resolve one edit against the current text, or return None."""
+        if (
+            0 <= edit.start < edit.end <= len(new_text)
+            and sha256_text(new_text[edit.start : edit.end]) == edit.before_sha256
+        ):
+            return edit
+        if new_text.count(edit.before_excerpt) == 1:
+            start = new_text.index(edit.before_excerpt)
+            return edit.model_copy(
+                update={
+                    "start": start,
+                    "end": start + len(edit.before_excerpt),
+                    "before_sha256": sha256_text(edit.before_excerpt),
+                    "after_sha256": sha256_text(edit.after_excerpt),
+                }
+            )
+        return None
+
+    resolved: list[CopyEdit] = []
+    for edit in edits:
+        pinned = _locate(edit)
+        if pinned is None:
+            unapplied.append(edit)
+        else:
+            resolved.append(pinned)
+
+    for pinned in sorted(resolved, key=lambda e: e.start, reverse=True):
+        if sha256_text(new_text[pinned.start : pinned.end]) != pinned.before_sha256:
+            # A higher-offset application overlapped this span; re-locate
+            # against the mutated text instead of applying at a dead offset.
+            relocated = _locate(
+                pinned.model_copy(
+                    update={"start": -1, "end": -1, "before_sha256": ""}
+                )
+            )
+            if relocated is None:
+                unapplied.append(pinned)
+                continue
+            pinned = relocated
+        replacement = pinned.after_excerpt
+        if replacement == new_text[pinned.start : pinned.end]:
             continue
-        current = new_text[edit.start : edit.end]
-        if sha256_text(current) != edit.before_sha256:
-            continue
-        replacement = edit.after_excerpt
-        if sha256_text(replacement) != edit.after_sha256:
-            continue
-        if replacement == current:
-            continue
-        new_text = new_text[: edit.start] + replacement + new_text[edit.end :]
-        applied.append(edit)
+        new_text = new_text[: pinned.start] + replacement + new_text[pinned.end :]
+        applied.append(pinned)
     semantic = any(e.semantic_change for e in applied)
     return _TextResult(
-        text=new_text, semantic_changed=semantic, applied_edits=tuple(applied)
+        text=new_text,
+        semantic_changed=semantic,
+        applied_edits=tuple(applied),
+        unapplied_edits=tuple(unapplied),
     )
 
 
@@ -1327,8 +1405,10 @@ class _CompileRun:
         )
         reused = self._reusable("intake", input_sha)
         if reused is not None:
-            self._manifest = IntakeManifest.model_validate_json(reused.artifact_json)
-            return
+            manifest = _load_checkpoint(IntakeManifest, reused)
+            if manifest is not None:
+                self._manifest = manifest  # type: ignore[assignment]
+                return
 
         try:
             brief = json.loads(ctx.brief_json or "{}")
@@ -1425,10 +1505,12 @@ class _CompileRun:
         )
         reused = self._reusable("research", input_sha)
         if reused is not None:
-            self._packet = ResearchPacket.model_validate_json(reused.artifact_json)
-            await asyncio.to_thread(self._db_load_evidence_index)
-            self._source_snapshot_sha256 = self._compute_source_snapshot()
-            return
+            packet = _load_checkpoint(ResearchPacket, reused)
+            if packet is not None:
+                self._packet = packet  # type: ignore[assignment]
+                await asyncio.to_thread(self._db_load_evidence_index)
+                self._source_snapshot_sha256 = self._compute_source_snapshot()
+                return
 
         run_research = _load_research_runner()
         try:
@@ -1477,11 +1559,17 @@ class _CompileRun:
         definition = PROMPTS["research"]
         # Issue #571: the research packet is schema-validated JSON
         # (draft_research parses + model_validates it), so the same schema
-        # constrains the response provider-side.
+        # constrains the response provider-side. Issue #787: the schema the
+        # model must satisfy is the narrow model-facing packet — the
+        # deterministic fields (facets, evidence, digests) are recomputed by
+        # the pipeline, so asking for them provider-side only manufactured
+        # discarded values.
         return await self._provider_call(
             definition,
             prompt,
-            response_format=_stage_json_schema("research_packet", ResearchPacket),
+            response_format=_stage_json_schema(
+                "research_packet", ResearchModelPacket
+            ),
         )
 
     def _compute_source_snapshot(self) -> str:
@@ -1536,9 +1624,11 @@ class _CompileRun:
         )
         reused = self._reusable("outline", input_sha)
         if reused is not None:
-            self._outline = OutlineArtifact.model_validate_json(reused.artifact_json)
-            self._enforce_section_budget(self._outline)
-            return
+            outline_artifact = _load_checkpoint(OutlineArtifact, reused)
+            if outline_artifact is not None:
+                self._outline = outline_artifact  # type: ignore[assignment]
+                self._enforce_section_budget(self._outline)
+                return
 
         definition = PROMPTS["outline"]
         outline: Optional[OutlineArtifact] = None
@@ -1610,11 +1700,11 @@ class _CompileRun:
         )
         reused = self._reusable("draft", input_sha)
         if reused is not None:
-            self._draft_artifact = DraftArtifact.model_validate_json(
-                reused.artifact_json
-            )
-            self._candidate = reused.content_md or ""
-            return
+            draft_artifact = _load_checkpoint(DraftArtifact, reused)
+            if draft_artifact is not None:
+                self._draft_artifact = draft_artifact  # type: ignore[assignment]
+                self._candidate = reused.content_md or ""
+                return
 
         definition = PROMPTS["draft"]
         sections: list[DraftSection] = []
@@ -1704,11 +1794,11 @@ class _CompileRun:
         )
         reused = self._reusable("lint", input_sha)
         if reused is not None:
-            self._candidate = reused.content_md or self._candidate
-            self._collect_lint_findings(
-                LintReport.model_validate_json(reused.artifact_json)
-            )
-            return
+            lint_report = _load_checkpoint(LintReport, reused)
+            if lint_report is not None:
+                self._candidate = reused.content_md or self._candidate
+                self._collect_lint_findings(lint_report)  # type: ignore[arg-type]
+                return
 
         locked = self._candidate_locked_spans()
         report = run_deterministic_lint(
@@ -1794,6 +1884,35 @@ class _CompileRun:
                 )
             )
 
+    def _surface_unapplied_edits(
+        self, stage: str, edits: Sequence[CopyEdit]
+    ) -> None:
+        """Record desk edits that could not be safely located or applied.
+
+        Called AFTER ``_collect_desk_findings`` (which clears the stage's
+        findings first) so convergence re-runs replace rather than duplicate;
+        each pass's findings reflect that pass's candidate. The excerpts ride
+        on ``original_text``/``suggestion`` so the review workflow can see
+        exactly what was not applied.
+        """
+        for edit in edits:
+            self._findings.append(
+                _PendingFinding(
+                    stage=stage,
+                    rule_id=f"{stage}.edit_not_located",
+                    rule_version=PROMPT_BUNDLE_VERSION,
+                    category="style",
+                    severity="warning",
+                    message=(
+                        "a desk edit could not be located in the candidate "
+                        f"and was not applied ({edit.category}: {edit.rationale})"
+                    ),
+                    waivable=True,
+                    original_text=edit.before_excerpt or None,
+                    suggestion=edit.after_excerpt or None,
+                )
+            )
+
     # -- stages 5/6: copy and standards ------------------------------------
 
     async def _stage_copy_first_pass(self) -> None:
@@ -1821,14 +1940,15 @@ class _CompileRun:
         )
         reused = self._reusable("copy", input_sha)
         if reused is not None and reason == "pre_fact":
-            report = CopyReport.model_validate_json(reused.artifact_json)
-            self._candidate = reused.content_md or self._candidate
-            self._collect_desk_findings("copy", report.findings)
-            return _TextResult(
-                text=self._candidate,
-                semantic_changed=bool(reused.semantic_changed),
-                applied_edits=tuple(report.edits),
-            )
+            report = _load_checkpoint(CopyReport, reused)
+            if report is not None:
+                self._candidate = reused.content_md or self._candidate
+                self._collect_desk_findings("copy", report.findings)
+                return _TextResult(
+                    text=self._candidate,
+                    semantic_changed=bool(reused.semantic_changed),
+                    applied_edits=tuple(report.edits),
+                )
 
         definition = PROMPTS["copy"]
         model, _audit = await self._call_model(
@@ -1844,6 +1964,7 @@ class _CompileRun:
         result = _apply_edits(self._candidate, report.edits)
         self._candidate = result.text
         self._collect_desk_findings("copy", report.findings)
+        self._surface_unapplied_edits("copy", result.unapplied_edits)
         applied_report = CopyReport(
             edits=list(result.applied_edits), findings=report.findings
         )
@@ -1867,14 +1988,15 @@ class _CompileRun:
         )
         reused = self._reusable("standards", input_sha)
         if reused is not None and reason == "pre_fact":
-            report = StandardsReport.model_validate_json(reused.artifact_json)
-            self._candidate = reused.content_md or self._candidate
-            self._collect_desk_findings("standards", report.findings)
-            return _TextResult(
-                text=self._candidate,
-                semantic_changed=bool(reused.semantic_changed),
-                applied_edits=tuple(report.edits),
-            )
+            report = _load_checkpoint(StandardsReport, reused)
+            if report is not None:
+                self._candidate = reused.content_md or self._candidate
+                self._collect_desk_findings("standards", report.findings)
+                return _TextResult(
+                    text=self._candidate,
+                    semantic_changed=bool(reused.semantic_changed),
+                    applied_edits=tuple(report.edits),
+                )
 
         definition = PROMPTS["standards"]
         model, _audit = await self._call_model(
@@ -1890,6 +2012,7 @@ class _CompileRun:
         result = _apply_edits(self._candidate, report.edits)
         self._candidate = result.text
         self._collect_desk_findings("standards", report.findings)
+        self._surface_unapplied_edits("standards", result.unapplied_edits)
         applied_report = StandardsReport(
             edits=list(result.applied_edits), findings=report.findings
         )
@@ -2105,11 +2228,12 @@ class _CompileRun:
         )
         reused = self._reusable("fact", input_sha)
         if reused is not None and reused.candidate_sha256 == candidate_sha:
-            report = FactReport.model_validate_json(reused.artifact_json)
-            self._fact_report = report
-            self._fact_candidate_sha256 = candidate_sha
-            self._claims = await self._resolve_claims(report, candidate)
-            return
+            report = _load_checkpoint(FactReport, reused)
+            if report is not None:
+                self._fact_report = report  # type: ignore[assignment]
+                self._fact_candidate_sha256 = candidate_sha
+                self._claims = await self._resolve_claims(report, candidate)
+                return
 
         definition = PROMPTS["fact"]
         model, _audit = await self._call_model(
@@ -2233,7 +2357,10 @@ class _CompileRun:
                 for label in claim.evidence_labels
                 if label not in self._evidence_ids
             ]
-            audit: Optional[RetrievalAudit] = claim.retrieval_audit
+            # Issue #787: never persist a model-fabricated audit. The desk
+            # cannot know the pipeline's retrieval identity, so the seed is
+            # None; factual claims get the real deterministic audit below.
+            audit: Optional[RetrievalAudit] = None
 
             if status in _SOURCED_CLAIM_STATUSES and not labels:
                 # Claimed a sourced verdict with no snapshotted passage.

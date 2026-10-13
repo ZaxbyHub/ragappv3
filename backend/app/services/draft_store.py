@@ -3872,6 +3872,9 @@ class DraftStore:
 
         Returns:
             The decoded object, or ``{}`` when the row or value is absent.
+            A present-but-undecodable or non-object value also returns ``{}``
+            (issue #787), with a WARNING naming the job id and field so the
+            corruption is distinguishable from absence in operations.
 
         Raises:
             ValueError: if ``field`` is not one of the four allowed names.
@@ -3891,8 +3894,23 @@ class DraftStore:
         try:
             decoded = json.loads(row[0])
         except (TypeError, ValueError):
+            # A present-but-undecodable body is corruption, not absence; the
+            # {} return contract stays, but the swallow must leave a trace so
+            # operators can distinguish rot from never-written (issue #787).
+            logger.warning(
+                "draft_jobs json field undecodable: job=%s field=%s",
+                job_id,
+                field,
+            )
             return {}
-        return decoded if isinstance(decoded, dict) else {}
+        if not isinstance(decoded, dict):
+            logger.warning(
+                "draft_jobs json field not an object: job=%s field=%s",
+                job_id,
+                field,
+            )
+            return {}
+        return decoded
 
     def set_job_json_field(self, *, job_id: int, field: str, value: dict) -> None:
         """Persist one large compile JSON body for ``job_id``.

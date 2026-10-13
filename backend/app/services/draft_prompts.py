@@ -218,6 +218,20 @@ class ResearchPacket(BaseModel):
     source_only: bool = False
 
 
+class ResearchModelPacket(BaseModel):
+    """The MODEL-FACING research output: only what ``run_research`` keeps.
+
+    Facets, retrieval status, source-kind tallies, evidence and
+    ``source_only`` are all recomputed deterministically by the pipeline from
+    the real retrieval, so asking the model to re-emit them (passages, scores,
+    digests) only produced fabricated values that were discarded. Extra keys
+    in a response are ignored, so legacy full-packet responses still parse.
+    """
+
+    contradictions: list[ResearchContradiction] = Field(default_factory=list)
+    gaps: list[ResearchGap] = Field(default_factory=list)
+
+
 # ---------------------------------------------------------------------------
 # Stage 2 — Outline and plan gate
 # ---------------------------------------------------------------------------
@@ -312,11 +326,22 @@ class LintReport(BaseModel):
 
 
 class CopyEdit(BaseModel):
+    """One desk edit.
+
+    ``start``/``end``/``before_sha256``/``after_sha256`` are SERVER-COMPUTED:
+    a language model cannot hash text or count offsets against live bytes, so
+    the desk prompts ask only for the excerpt pair, and :func:`_apply_edits`
+    locates the span (by the supplied offsets when they verify, else by a
+    unique ``before_excerpt`` match) and fills the pins itself. The neutral
+    defaults mark "not supplied"; a JSON ``null`` fails validation and takes
+    the existing one-repair path rather than crashing the comparisons.
+    """
+
     section_id: str
-    start: int
-    end: int
-    before_sha256: str
-    after_sha256: str
+    start: int = -1
+    end: int = -1
+    before_sha256: str = ""
+    after_sha256: str = ""
     before_excerpt: str
     after_excerpt: str
     category: str
@@ -451,54 +476,40 @@ def _frame(
 # ---------------------------------------------------------------------------
 
 _RESEARCH_PROMPT_ID = "draft_room.research.v1"
-_RESEARCH_VERSION = "1.1.0"
+_RESEARCH_VERSION = "1.2.0"
 _RESEARCH_TEMPLATE = _frame(
     prompt_id=_RESEARCH_PROMPT_ID,
     version=_RESEARCH_VERSION,
     role=(
         "You are the Research desk of an editorial drafting pipeline. You "
-        "extract research facets and candidate claims from the project's "
-        "inputs, honoring each input's declared role (manuscript, reference, "
-        "style, background, challenge), and report retrieved vault evidence "
-        "for each facet."
+        "review the project's inputs and the retrieved vault evidence, "
+        "honoring each input's declared role (manuscript, reference, "
+        "style, background, challenge)."
     ),
     brief_section=(
-        "TASK: For each research facet you identify, produce a stable facet id, "
-        "the retrieval query used, the originating input ids, and a short "
-        "rationale. Report every evidence item's stable label, source kind, "
-        "exact passage, and content hash exactly as retrieved — do not "
-        "paraphrase evidence passages. Report contradictions between evidence "
-        "items and any gaps where a fact or authority is missing, noting "
-        "whether drafting may continue despite the gap. Never infer authority "
-        "from an input's role, filename, or retrieval rank."
+        "TASK: Report contradictions between the evidence items shown in the "
+        "registry, and any gaps where a fact or authority is missing for the "
+        "draft, noting whether drafting may continue despite the gap. The "
+        "pipeline itself derives the research facets, performs the retrieval, "
+        "and snapshots every evidence item with its exact passage and "
+        "integrity pins — do not re-emit, re-rank, or re-derive any of that; "
+        "your entire output is the contradictions and gaps you observed. "
+        "Never infer authority from an input's role, filename, or retrieval "
+        "rank."
     ),
     schema_section=(
-        "OUTPUT SCHEMA (JSON object matching ResearchPacket): "
-        "facets[] (facet_id, query, source_input_ids[], rationale), "
-        "retrieval_status ('ok'|'partial'|'unavailable'), "
-        "requested_source_kinds[], successful_source_kinds[], failed_source_kinds[] "
-        "(each 'document'|'wiki'|'kms'), "
-        "evidence[] (label, kind, title, passage, chunk_ref, observed_at, "
-        "retrieval_score, content_sha256, plus exactly one of "
-        "file_id/chunk_uid, wiki_page_id/wiki_claim_id, kms_entry_id), "
+        "OUTPUT SCHEMA (JSON object matching ResearchModelPacket): "
         "contradictions[] (evidence_label_a, evidence_label_b, proposition, "
-        "explanation), gaps[] (description, impact, blocks_drafting), "
-        "source_only (bool)."
+        "explanation), gaps[] (description, impact, blocks_drafting)."
     ),
     example_section=(
         "CANONICAL EXAMPLE (structure only — replace every value with real "
         "content; NEVER copy example values verbatim): "
-        '{{"facets": [{{"facet_id": "F001", "query": "...", '
-        '"source_input_ids": [1, 2], "rationale": "..."}}], '
-        '"retrieval_status": "ok", '
-        '"requested_source_kinds": ["document"], '
-        '"successful_source_kinds": ["document"], '
-        '"failed_source_kinds": [], '
-        '"evidence": [{{"label": "S1", "kind": "document", "title": "...", '
-        '"passage": "...", "chunk_ref": "1:0", '
-        '"observed_at": "2026-01-01T00:00:00Z", '
-        '"retrieval_score": 0.9, "content_sha256": "0000000000000000000000000000000000000000000000000000000000000000", "file_id": 1}}], '
-        '"contradictions": [], "gaps": [], "source_only": false}}'
+        '{{"contradictions": [{{"evidence_label_a": "S1", '
+        '"evidence_label_b": "S2", "proposition": "...", '
+        '"explanation": "..."}}], '
+        '"gaps": [{{"description": "...", "impact": "...", '
+        '"blocks_drafting": false}}]}}'
     ),
 )
 
@@ -563,7 +574,7 @@ _DRAFT_TEMPLATE = _frame(
 )
 
 _COPY_PROMPT_ID = "draft_room.copy.v1"
-_COPY_VERSION = "1.0.0"
+_COPY_VERSION = "1.1.0"
 _COPY_TEMPLATE = _frame(
     prompt_id=_COPY_PROMPT_ID,
     version=_COPY_VERSION,
@@ -575,23 +586,28 @@ _COPY_TEMPLATE = _frame(
     ),
     brief_section=(
         "TASK: Return only precise, targeted edits with a category and short "
-        "rationale for each — never an unexplained wholesale rewrite. Mark "
-        "`semantic_change: true` and list affected claim ids or evidence "
+        "rationale for each — never an unexplained wholesale rewrite. Identify "
+        "each edit's span by its exact before_excerpt as it appears in the "
+        "candidate text; the pipeline locates the span and verifies it "
+        "server-side, so do not attempt to count offsets or compute digests. "
+        "Mark `semantic_change: true` and list affected claim ids or evidence "
         "labels whenever an edit could change meaning. If a change would "
         "assert something the current evidence does not support, do not make "
         "it — record a finding instead and leave the text unchanged."
     ),
     schema_section=(
         "OUTPUT SCHEMA (JSON object matching CopyReport): edits[] (section_id, "
-        "start, end, before_sha256, after_sha256, before_excerpt, "
-        "after_excerpt, category, rationale, semantic_change, "
+        "before_excerpt, after_excerpt, category, rationale, semantic_change, "
         "affected_claim_ids[], affected_evidence_labels[]), findings[] (short "
-        "strings)."
+        "strings). The pipeline resolves each edit's location and integrity "
+        "pins from the excerpts itself; edits whose before_excerpt does not "
+        "appear exactly once in the candidate are surfaced as findings, not "
+        "applied."
     ),
 )
 
 _STANDARDS_PROMPT_ID = "draft_room.standards.v1"
-_STANDARDS_VERSION = "1.0.0"
+_STANDARDS_VERSION = "1.1.0"
 _STANDARDS_TEMPLATE = _frame(
     prompt_id=_STANDARDS_PROMPT_ID,
     version=_STANDARDS_VERSION,
@@ -606,53 +622,57 @@ _STANDARDS_TEMPLATE = _frame(
     brief_section=(
         "TASK: Return only precise, targeted edits with a category and short "
         "rationale for each, using the same edit shape as the Copy desk — "
-        "never an unexplained wholesale rewrite. Mark `semantic_change: true` "
+        "never an unexplained wholesale rewrite. Identify each edit's span by "
+        "its exact before_excerpt; the pipeline locates the span and verifies "
+        "it server-side. Mark `semantic_change: true` "
         "and list affected claim ids or evidence labels whenever an edit could "
         "change meaning or structure. You must never score, mention, or claim "
         "to evade AI-detection tools."
     ),
     schema_section=(
         "OUTPUT SCHEMA (JSON object matching StandardsReport): edits[] "
-        "(section_id, start, end, before_sha256, after_sha256, before_excerpt, "
-        "after_excerpt, category, rationale, semantic_change, "
-        "affected_claim_ids[], affected_evidence_labels[]), findings[] (short "
-        "strings)."
+        "(section_id, before_excerpt, after_excerpt, category, rationale, "
+        "semantic_change, affected_claim_ids[], affected_evidence_labels[]), "
+        "findings[] (short strings). The pipeline resolves each edit's "
+        "location and integrity pins from the excerpts itself."
     ),
 )
 
 _FACT_PROMPT_ID = "draft_room.fact.v1"
-_FACT_VERSION = "1.0.0"
+_FACT_VERSION = "1.1.0"
 _FACT_TEMPLATE = _frame(
     prompt_id=_FACT_PROMPT_ID,
     version=_FACT_VERSION,
     role=(
         "You are the Fact desk, the final semantic gate of an editorial "
         "drafting pipeline. You decompose the complete candidate text into "
-        "atomic claims and verify each one against claim-specific evidence "
-        "retrieval, never against drafting-time evidence alone."
+        "atomic claims and classify each one against the evidence registry "
+        "provided below."
     ),
     brief_section=(
         "TASK: For every atomic claim, assign exactly one status: "
-        "'supported' (a cited passage directly supports the complete "
-        "proposition), 'contradicted' (credible evidence directly conflicts "
-        "with it), 'ambiguous' (evidence is relevant but does not resolve it), "
-        "'stale' (a newer/superseding source changes the proposition), "
-        "'unsupported' (no passage supports it after claim-specific "
-        "retrieval), or 'opinion' (a value judgment/recommendation/prediction, "
-        "not a verifiable proposition). Verify direct quotes match the source "
-        "text exactly; if wording changed, treat it as a paraphrase, not a "
-        "quote. Never fabricate corroboration and never treat drafting "
-        "evidence as verification without an explicit claim-specific query. "
-        "You do not edit the text yourself — only report findings."
+        "'supported' (a registry passage directly supports the complete "
+        "proposition), 'contradicted' (registry evidence directly conflicts "
+        "with it), 'ambiguous' (registry evidence is relevant but does not "
+        "resolve it), 'stale' (a newer/superseding source changes the "
+        "proposition), 'unsupported' (no registry passage supports it), or "
+        "'opinion' (a value judgment/recommendation/prediction, not a "
+        "verifiable proposition). Verify direct quotes match the source text "
+        "exactly; if wording changed, treat it as a paraphrase, not a quote. "
+        "Never fabricate corroboration. The pipeline, not you, performs the "
+        "additional per-claim retrieval after you report: every claim you "
+        "mark unsupported is searched again against the vault by the "
+        "pipeline, and factual claims carry the pipeline's own retrieval "
+        "audit. You do not edit the text yourself — only report claims and "
+        "findings."
     ),
     schema_section=(
         "OUTPUT SCHEMA (JSON object matching FactReport): claims[] (claim_id, "
         "claim_type: 'factual'|'quote'|'opinion', proposition, "
         "status: 'supported'|'contradicted'|'ambiguous'|'stale'|'unsupported'|"
-        "'opinion', evidence_labels[], retrieval_audit (normalized_query, "
-        "vault_scope_hash, retrieval_config, retrieved_at, returned_labels[], "
-        "nearest_context) or null, single_source_warning, high_stakes), "
-        "findings[] (short strings)."
+        "'opinion', evidence_labels[], single_source_warning, high_stakes), "
+        "findings[] (short strings). Retrieval auditing is recorded by the "
+        "pipeline itself; do not attempt to report any."
     ),
 )
 
@@ -663,7 +683,7 @@ PROMPTS: dict[str, PromptDefinition] = {
         version=_RESEARCH_VERSION,
         logical_mode="thinking",
         template=_RESEARCH_TEMPLATE,
-        output_model=ResearchPacket,
+        output_model=ResearchModelPacket,
         temperature=0.1,
     ),
     "outline": PromptDefinition(
