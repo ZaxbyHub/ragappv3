@@ -4,11 +4,10 @@ import { ErrorState } from '@/components/shared/ErrorState';
 interface ErrorBoundaryProps {
   children: React.ReactNode;
   fallback?: React.ReactNode | ((resetErrorBoundary: () => void) => React.ReactNode);
-  // Issue #779 (UI-R2-06): when this value changes while an error is
-  // showing, the caught-error state resets — so a route-scoped boundary can
-  // recover on navigation WITHOUT remounting (a key-based remount during
-  // error recovery re-throws inside the recovery commit and escapes to the
-  // outer boundary; the getDerivedStateFromProps reset below does not).
+  // Issue #779 (UI-R2-06): when this pathname/search/hash token changes while
+  // an error is showing, the caught-error state resets. The route-scoped
+  // boundary then recovers without remounting. getDerivedStateFromProps clears
+  // the caught error in the render carrying the changed token.
   resetOnChange?: string | number;
 }
 
@@ -32,11 +31,11 @@ export class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoun
     return { hasError: true, error };
   }
 
-  // Issue #779 (UI-R2-06): navigation away from a crashed route resets the
-  // caught error DURING the render that carries the new location — the same
-  // resetKeys pattern react-error-boundary uses. A key-based remount must
-  // not be used here: remounting during error recovery re-throws inside
-  // the recovery commit and escapes to the outer boundary.
+  // Issue #779 (UI-R2-06): a pathname, query, or hash change after a crashed
+  // route resets the caught error DURING the render that carries the new token —
+  // the same resetKeys pattern react-error-boundary uses. A key-based remount
+  // must not be used here: remounting during error recovery re-throws inside the
+  // recovery commit and escapes to the outer boundary.
   static getDerivedStateFromProps(
     props: ErrorBoundaryProps,
     state: ErrorBoundaryState,

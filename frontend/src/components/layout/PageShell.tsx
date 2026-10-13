@@ -116,24 +116,15 @@ export function PageShell({ children, activeItem, onItemSelect, healthStatus }: 
               ("Something went wrong" + Try Again); the top-level boundary
               remains as the last resort.
 
-              Recovery-on-navigation is a STATE reset, not a remount
-              (resetOnChange={location.pathname + location.search}): a
-              key-based remount at crash time re-throws inside React's
-              error-recovery commit and escapes to the outer boundary, and
-              a pathname key on every navigation would also remount this
-              subtree for same-component route transitions like /chat ->
-              /chat/:id, whose AnimatePresence exit window is load-bearing
-              for the chat send/stream flow (the #821 regression class).
-              The boundary instance persists across navigations, so the
-              original exit/enter cross-fade behavior is unchanged for
-              every non-crash transition. */}
-          {/* pathname + search (not location.key): manual history entries in
-              tests carry no router key, so keys can degenerate to equal —
-              the composite string is deterministic. A query-only navigation
-              (/search?q=a -> /search?q=b from the rail) therefore also
-              resets a crashed page, not just path changes (issue #779
-              feedback, PRR-013/F-4). */}
-          <ErrorBoundary resetOnChange={location.pathname + location.search}>
+              Recovery-on-navigation is a STATE reset, not a remount. The
+              boundary stays persistent while resetOnChange serializes pathname,
+              search, and hash, so query/hash-only transitions recover a fault.
+              The pathname key remains on the motion subtree to preserve the
+              existing exit/enter behavior for same-component route transitions
+              like /chat -> /chat/:id (the #821 regression class). */}
+          <ErrorBoundary
+            resetOnChange={JSON.stringify([location.pathname, location.search, location.hash])}
+          >
             <AnimatePresence mode="wait">
               <motion.div
                 key={location.pathname}
