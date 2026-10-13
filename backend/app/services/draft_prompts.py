@@ -352,8 +352,19 @@ class CopyEdit(BaseModel):
 
 
 class CopyReport(BaseModel):
+    """Copy-desk report.
+
+    ``unapplied_edits`` is SERVER-POPULATED (never requested from the model):
+    the record of edits the pipeline could not safely locate or apply. It
+    rides in the persisted stage artifact so a retry that reuses this
+    checkpoint can re-surface the same findings instead of permanently
+    dropping them (issue #787: a genuine-mismatch edit must be surfaced as a
+    finding, never silently discarded).
+    """
+
     edits: list[CopyEdit] = Field(default_factory=list)
     findings: list[str] = Field(default_factory=list)
+    unapplied_edits: list[CopyEdit] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -362,8 +373,11 @@ class CopyReport(BaseModel):
 
 
 class StandardsReport(BaseModel):
+    """Standards-desk report; ``unapplied_edits`` mirrors CopyReport's."""
+
     edits: list[CopyEdit] = Field(default_factory=list)
     findings: list[str] = Field(default_factory=list)
+    unapplied_edits: list[CopyEdit] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

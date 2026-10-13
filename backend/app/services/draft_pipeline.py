@@ -1944,6 +1944,10 @@ class _CompileRun:
             if report is not None:
                 self._candidate = reused.content_md or self._candidate
                 self._collect_desk_findings("copy", report.findings)
+                # A reused checkpoint re-surfaces its unapplied edits: the
+                # pending findings died with the failed parent job, and the
+                # persisted report is the only record left (issue #787).
+                self._surface_unapplied_edits("copy", tuple(report.unapplied_edits))
                 return _TextResult(
                     text=self._candidate,
                     semantic_changed=bool(reused.semantic_changed),
@@ -1966,7 +1970,9 @@ class _CompileRun:
         self._collect_desk_findings("copy", report.findings)
         self._surface_unapplied_edits("copy", result.unapplied_edits)
         applied_report = CopyReport(
-            edits=list(result.applied_edits), findings=report.findings
+            edits=list(result.applied_edits),
+            findings=report.findings,
+            unapplied_edits=list(result.unapplied_edits),
         )
         await self._persist_stage(
             "copy",
@@ -1992,6 +1998,9 @@ class _CompileRun:
             if report is not None:
                 self._candidate = reused.content_md or self._candidate
                 self._collect_desk_findings("standards", report.findings)
+                self._surface_unapplied_edits(
+                    "standards", tuple(report.unapplied_edits)
+                )
                 return _TextResult(
                     text=self._candidate,
                     semantic_changed=bool(reused.semantic_changed),
@@ -2014,7 +2023,9 @@ class _CompileRun:
         self._collect_desk_findings("standards", report.findings)
         self._surface_unapplied_edits("standards", result.unapplied_edits)
         applied_report = StandardsReport(
-            edits=list(result.applied_edits), findings=report.findings
+            edits=list(result.applied_edits),
+            findings=report.findings,
+            unapplied_edits=list(result.unapplied_edits),
         )
         await self._persist_stage(
             "standards",

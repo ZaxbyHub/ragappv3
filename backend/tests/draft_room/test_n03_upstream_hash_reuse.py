@@ -267,6 +267,82 @@ class TestN03JobJsonFieldNonDict(tdp.PipelineTestBase):
         )
 
 
+UNLOCATABLE_RATIONALE = "n03 unlocatable edit probe"
+
+
+def unlocatable_edit_json() -> str:
+    """One desk edit whose excerpt matches nothing in the candidate."""
+    return json.dumps(
+        {
+            "edits": [
+                {
+                    "section_id": "sec-01",
+                    "start": -1,
+                    "end": -1,
+                    "before_sha256": "",
+                    "after_sha256": "",
+                    "before_excerpt": "absent from the candidate entirely",
+                    "after_excerpt": "replacement text",
+                    "category": "precision",
+                    "rationale": UNLOCATABLE_RATIONALE,
+                    "semantic_change": False,
+                    "affected_claim_ids": [],
+                    "affected_evidence_labels": ["S1"],
+                }
+            ],
+            "findings": [],
+        }
+    )
+
+
+class TestN03EditSurfacing(tdp.TestRetryStartStageInheritance):
+    """The unapplied-edit finding channel, end to end (issue #787 review)."""
+
+    def _edit_findings(self, job_id):
+        return self.conn.execute(
+            "SELECT stage, rule_id, original_text, suggestion FROM "
+            "draft_findings WHERE job_id = ? AND rule_id = 'copy.edit_not_located'",
+            (job_id,),
+        ).fetchall()
+
+    async def test_unlocatable_edit_surfaces_as_a_persisted_finding(self):
+        model = tdp.FakeModel(
+            tdp.happy_responses(copy=[unlocatable_edit_json()])
+        )
+        await self._run(model=model)
+
+        rows = self._edit_findings(self.job_id)
+        self.assertEqual(len(rows), 1, "exactly one surfacing row expected")
+        stage, rule_id, original_text, suggestion = rows[0]
+        self.assertEqual(stage, "copy")
+        self.assertEqual(original_text, "absent from the candidate entirely")
+        self.assertEqual(suggestion, "replacement text")
+
+    async def test_surfaced_finding_survives_checkpoint_reuse_on_retry(self):
+        # Parent: the copy desk reports an unlocatable edit, and Fact then
+        # fails on invalid output, so the retry reuses the copy checkpoint.
+        self._seal(self.job_id, None)
+        model = tdp.FakeModel(
+            tdp.happy_responses(
+                copy=[unlocatable_edit_json()], fact=["not json at all"]
+            )
+        )
+        failure = await self._run_expect_failure(model=model)
+        self.assertEqual(failure.code, tdp.CODE_INVALID_STAGE_OUTPUT)
+
+        retry_id = self._make_retry("fact")
+        await self._run_job(retry_id)
+
+        rows = self._edit_findings(retry_id)
+        self.assertEqual(
+            len(rows),
+            1,
+            "the reused copy checkpoint must re-surface its unapplied edit — "
+            "the parent's pending findings died with the failed job",
+        )
+        self.assertEqual(rows[0][1], "copy.edit_not_located")
+
+
 def _edit(
     *,
     start=-1,
