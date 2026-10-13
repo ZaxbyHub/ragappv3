@@ -217,3 +217,21 @@ If every finding is DISPROVED or PRE_EXISTING:
 | Silent event drop (wrong dispatcher) | Route event to correct handler | Emit the event; assert callback fires |
 | Cookie path mismatch under subpath | Use path helper, not hardcoded string | Monkeypatch `app_root_path`; assert cookie path |
 | Token in URL (security) | Move to header or POST body | Assert no token in logged URL |
+
+## Contract addendum (2026-10-12)
+
+- **Body-claim audit.** Before the reviewer gate, grep the LIVE published
+  artifact (PR body, issue body) against every ledger row whose fix-ref is
+  that artifact: the fixed phrasing present, the contradicting phrasing
+  absent. A row marked FIXED for a file never edited is an unbacked claim —
+  record CLOSED only after the grep matches.
+- **Probe hygiene.** Mutation/revert probes must leave the tree as found:
+  restore with `git checkout -- <file>` after every probe and verify
+  `git status --porcelain` clean before the first commit of the round. An
+  uncommitted mutant left in a tracked source file can ride explicit-path
+  staging into the fix commit — or `git add -A` into the release.
+- **Stable obligation identity.** Never substitute the obligation between
+  ledger and proof: if the ledger defined mutant M4 as X, closing it with a
+  different mutant Y is a new row, not a closure. Coverage-diff the ledger
+  against EVERY source finding table by ID, both directions, before
+  implementing.
