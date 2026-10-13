@@ -626,23 +626,67 @@ class RAGEngine:
                         active = ab_service.get_active_experiment()
                         if active is not None:
                             variant = ABTestingService.assign(active, subject_key)
-                            # Record exposure idempotently
-                            ab_service.record_exposure(active.id, subject_key, variant)
                             # Pick the prompt content from the assigned variant
                             if variant == "challenger":
                                 ab_content = active.challenger_version
                             else:
                                 ab_content = active.control_version
-                            # ab_content is a VERSION STRING — look up its content
-                            from app.services.prompt_store import PromptVersionStore
-
-                            store = PromptVersionStore(conn)
-                            pv = store.get_version(ab_content)
-                            if pv is not None:
-                                effective_content = pv.content
+                            # Record the assignment BEFORE any write or lookup:
+                            # a failure in exposure telemetry or content
+                            # retrieval must never silently drop the variant
+                            # the subject was assigned (issue #709 / T1-02-S2-06).
                             ab_experiment_id = active.id
                             ab_variant = variant
                             prompt_version = ab_content  # A/B version label
+                            # Record exposure idempotently. Exposure logging is
+                            # telemetry — a failed write (e.g. sqlite
+                            # writer-lock timeout) logs and continues while the
+                            # assigned variant above is still served.
+                            try:
+                                ab_service.record_exposure(
+                                    active.id, subject_key, variant
+                                )
+                            except Exception as exc:
+                                logger.warning(
+                                    "A/B exposure recording failed for "
+                                    "experiment=%s subject=%s (serving "
+                                    "assigned variant anyway): %s",
+                                    active.id,
+                                    subject_key,
+                                    exc,
+                                )
+                            # ab_content is a VERSION STRING — look up its
+                            # content. Best-effort: on failure keep the 3.5
+                            # effective content (same semantic as a missing
+                            # version directly below) while retaining the
+                            # assigned-variant metadata.
+                            from app.services.prompt_store import PromptVersionStore
+
+                            try:
+                                store = PromptVersionStore(conn)
+                                pv = store.get_version(ab_content)
+                            except Exception as exc:
+                                logger.warning(
+                                    "A/B variant content lookup failed for "
+                                    "version=%s (serving 3.5 effective "
+                                    "content; assignment attribution "
+                                    "retained): %s",
+                                    ab_content,
+                                    exc,
+                                )
+                                pv = None
+                                # prompt_version labels what SERVED: the
+                                # variant content did not load, so report the
+                                # 3.5 effective version while ab_variant keeps
+                                # the assignment truth (review finding).
+                                prompt_version = effective_version
+                            if pv is not None:
+                                effective_content = pv.content
+                            else:
+                                # Missing version row (get_version -> None):
+                                # same honesty rule as the exception path —
+                                # prompt_version labels what SERVED.
+                                prompt_version = effective_version
                 finally:
                     conn.close()
             except Exception as exc:
@@ -2201,34 +2245,77 @@ class RAGEngine:
         # silently return an ordinary uncited answer — emit an explicit
         # enforcement status consumers can display.
         if active_citation_mode == "required":
-            # Label-set membership (Copilot review thread + prior probe): a
-            # phantom [S99] in the raw parse output must not count as
-            # "satisfied" — validity requires the label to name an
-            # actually-provided source, matching the agentic path's semantics.
+            # Label-set membership for EVERY citation family (issue #709 /
+            # T1-32-K-03): a label is a valid citation only if it names an
+            # actually-provided item of its own family. Parsed labels that do
+            # not resolve — a phantom [M9] with no memories offered, [W4] past
+            # the wiki evidence count, [S99] past the source count — must not
+            # count toward "satisfied". (The agentic path enforces S-family
+            # membership only; extending phantom checks there is tracked
+            # separately — do not read parity into this comment.)
             from app.services.citation_validator import _CITATION_RE
 
-            source_labels = {
-                s.get("source_label")
-                for s in done_msg.get("sources", [])
-                if s.get("source_label")
+            offered_labels = {
+                "S": {
+                    s.get("source_label")
+                    for s in done_msg.get("sources", [])
+                    if s.get("source_label")
+                },
+                "M": {f"M{i + 1}" for i in range(len(memories))},
+                "W": {
+                    ev.label_placeholder
+                    for ev in (wiki_evidence or [])
+                },
+                "K": {
+                    ev.label_placeholder
+                    for ev in (kms_evidence or [])
+                },
             }
-            parsed_source_labels = {
-                f"{kind}{num}"
-                for kind, num in _CITATION_RE.findall(full_response or "")
+            parsed_by_kind: Dict[str, set] = {
+                "S": set(),
+                "M": set(),
+                "W": set(),
+                "K": set(),
             }
-            has_valid_source_citation = bool(parsed_source_labels & source_labels)
-            if (
-                not has_valid_source_citation
-                and not cited_memories and not cited_wikis
-                and not cited_kms and done_msg.get("sources")
+            for kind, num in _CITATION_RE.findall(full_response or ""):
+                if kind in parsed_by_kind:
+                    parsed_by_kind[kind].add(f"{kind}{num}")
+            phantom_labels = {
+                label
+                for kind, offered in offered_labels.items()
+                for label in parsed_by_kind.get(kind, set()) - offered
+            }
+            has_valid_citation = any(
+                parsed_by_kind[kind] & offered_labels[kind]
+                for kind in parsed_by_kind
+            )
+            # Citations can only be required when citable evidence was
+            # offered at all — documents, memories, wiki, or KMS.
+            any_citable_evidence = bool(
+                done_msg.get("sources")
+                or memories
+                or wiki_evidence
+                or kms_evidence
+            )
+            if any_citable_evidence and (
+                not has_valid_citation or phantom_labels
             ):
+                if phantom_labels:
+                    detail = (
+                        "Citations were required but the answer cites labels "
+                        "that were not offered: "
+                        + ", ".join(sorted(phantom_labels))
+                        + "."
+                    )
+                else:
+                    detail = (
+                        "Citations were required but the answer contains no "
+                        "valid citation labels."
+                    )
                 done_msg["citation_enforcement"] = {
                     "mode": "required",
                     "status": "missing_citations",
-                    "detail": (
-                        "Citations were required but the answer contains no "
-                        "valid citation labels."
-                    ),
+                    "detail": detail,
                 }
             else:
                 done_msg["citation_enforcement"] = {

@@ -447,7 +447,8 @@ export function AssistantMessage({
                 Citations Required
               </p>
               <p className="text-xs text-warning/80">
-                Citations were required but none were found in this answer
+                {message.citationEnforcement.detail ||
+                  "Citations were required but none were found in this answer"}
               </p>
             </div>
           </div>

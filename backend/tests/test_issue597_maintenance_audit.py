@@ -44,6 +44,7 @@ from fastapi.testclient import TestClient
 from app.api.routes import admin as admin_module
 from app.config import settings
 from app.models.database import SQLiteConnectionPool, init_db
+from app.security import admin_scope_fingerprint
 from app.services.maintenance import MaintenanceError, MaintenanceService
 
 CSRF_TEST_POLICY = "naive"
@@ -226,8 +227,11 @@ def test_issue597_ac1_audit_row_written():
                 f"toggle (2 for enable+disable), found {len(rows)}"
             )
             expected = [
-                ("maintenance", 1, ADMIN_TOKEN, TESTCLIENT_HOST),
-                ("maintenance", 0, ADMIN_TOKEN, TESTCLIENT_HOST),
+                # Issue #709: the audit identity is the non-secret scope
+                # fingerprint of the acting token, never the raw bearer
+                # (the route computes it before the HMAC + INSERT).
+                ("maintenance", 1, admin_scope_fingerprint(ADMIN_TOKEN), TESTCLIENT_HOST),
+                ("maintenance", 0, admin_scope_fingerprint(ADMIN_TOKEN), TESTCLIENT_HOST),
             ]
             actual = [(r[0], r[1], r[2], r[3]) for r in rows]
             assert actual == expected, (

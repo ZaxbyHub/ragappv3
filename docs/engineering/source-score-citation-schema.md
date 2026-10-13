@@ -95,9 +95,13 @@ Present when the request's `citation_mode` is `"required"`:
 {"mode": "required", "status": "satisfied" | "missing_citations", "detail": "…"}
 ```
 
-`missing_citations` means the answer contained no valid citation labels while
-citable sources existed — the response is flagged, never silently returned as
-an ordinary uncited answer.
+`missing_citations` means the answer's citation labels did not resolve
+against what was actually offered, while citable evidence (documents,
+memories, wiki, or KMS entries) existed: either no valid citation label was
+found, or the answer cited labels that were never offered (phantom labels,
+named in `detail`). The response is flagged, never silently returned as an
+ordinary uncited answer. With zero citable evidence offered, the status is
+`satisfied` (there is nothing citations could be required against).
 
 ## Request controls
 
@@ -112,8 +116,10 @@ previous behavior):
   accepted arbitrary strings and ignored them; they are now Literal-validated,
   so a caller passing an unsupported value (e.g. `"hybrid"`) gets a 422
   instead of silent no-op behavior.
-- `citation_mode: "enabled" | "disabled" | "required"` — `disabled` removes
-  the citation instruction from the prompt; `required` strengthens it and
+- `citation_mode: "enabled" | "disabled" | "required"` — `disabled` strips the
+  citation instruction block when present and appends an explicit
+  no-citations directive (so the mode takes effect on any prompt chain,
+  including stored custom overrides); `required` strengthens it and
   enables the `citation_enforcement` field. Unknown values are rejected (422)
   (same Literal tightening as above). Both controls apply on the standard
   pipeline AND the agentic path (`agentic_rag_enabled=True`): the agentic

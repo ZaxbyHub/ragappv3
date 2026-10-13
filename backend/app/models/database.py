@@ -2023,6 +2023,7 @@ def run_migrations(sqlite_path: str) -> None:
     migrate_add_prompt_versions(sqlite_path)
     migrate_add_prompt_org_overrides(sqlite_path)
     migrate_add_prompt_ab_experiments(sqlite_path)
+    migrate_redact_prompt_created_by(sqlite_path)
     migrate_add_password_changed_at(sqlite_path)
     migrate_add_draft_room_core(sqlite_path)
     migrate_add_draft_room_pipeline(sqlite_path)
@@ -7236,6 +7237,109 @@ def migrate_add_prompt_ab_experiments(sqlite_path: str) -> None:
     finally:
         conn.close()
 
+
+def migrate_redact_prompt_created_by(sqlite_path: str) -> None:
+    """
+    Migration: redact admin bearer tokens persisted as prompt_versions.created_by.
+
+    The pre-fix prompts create route wrote the verified admin token itself into
+    the durable ``created_by`` column (issue #709 / T1-01-K-01), so the secret
+    outlived token rotation in every copy of the database. Legacy rows are
+    redacted to the non-secret scope fingerprint the route now records.
+
+    Legacy values are detected two ways (review finding: rotated tokens are
+    format-detectable): the pre-fix route was the ONLY writer before this
+    change, so every ``created_by`` that is neither NULL/empty nor a 16-hex
+    fingerprint is a leaked token — including rows written under previously
+    rotated tokens. Documented edge: a hand-configured admin token that is
+    itself exactly 16 lowercase hex chars would be indistinguishable from a
+    fingerprint; the configured generator emits 64-char urlsafe tokens.
+
+    Scope note: ``audit_toggle_log.user_id`` (the other class-(a) writer, fixed
+    at the route in the same change) is deliberately NOT rewritten here — its
+    ``hmac_sha256`` covers ``user_id``, so rewriting rows would break audit
+    integrity verification. Historical audit rows are disclosed in the release
+    note; new audit rows carry the fingerprint.
+
+    Idempotent: re-runs match nothing (rewritten values are fingerprints).
+    Journals start/succeeded outcomes (issue #699 pattern) so an operator can
+    prove the scrub ran.
+
+    Args:
+        sqlite_path: Path to the SQLite database file.
+    """
+    from app.config import settings
+    from app.models.migration_journal import record_migration_outcome
+    from app.security import admin_scope_fingerprint
+
+    token = getattr(settings, "admin_secret_token", "")
+    if not token:
+        # No admin token configured (e.g. USERS_ENABLED=False deployments):
+        # nothing to match, nothing to redact.
+        return
+    fingerprint = admin_scope_fingerprint(token)
+    # A fingerprint is exactly 16 lowercase hex chars (sha256 hexdigest[:16]).
+    # Anything else non-empty is legacy token material by elimination.
+    fingerprint_glob = "[0-9a-f]" * 16
+    # Autocommit: the failed journal row must survive a rollback of the data
+    # work (issue #699 journal contract; see the _us_journal block).
+    conn = sqlite3.connect(
+        sqlite_path,
+        timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS,
+        isolation_level=None,
+    )
+    try:
+        conn.execute("PRAGMA foreign_keys = ON;")
+        table_exists = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='prompt_versions'"
+        ).fetchone()
+        work_remains = table_exists is not None and conn.execute(
+            "SELECT 1 FROM prompt_versions WHERE created_by = ? "
+            "OR (created_by IS NOT NULL AND created_by != '' "
+            "    AND created_by NOT GLOB ?) LIMIT 1",
+            (token, fingerprint_glob),
+        ).fetchone()
+        if work_remains is None:
+            # Journal-silent no-op path (issue #699 AC2): clean boots and
+            # already-redacted databases write no rows.
+            return
+        record_migration_outcome(
+            conn,
+            migration_name="migrate_redact_prompt_created_by",
+            phase="start",
+            outcome="ok",
+        )
+        cur = conn.execute(
+            "UPDATE prompt_versions SET created_by = ? "
+            "WHERE created_by = ? "
+            "OR (created_by IS NOT NULL AND created_by != '' "
+            "    AND created_by NOT GLOB ?)",
+            (fingerprint, token, fingerprint_glob),
+        )
+        if cur.rowcount:
+            logger.info(
+                "Redacted %d prompt_versions.created_by row(s) that held "
+                "admin token material (issue #709).",
+                cur.rowcount,
+            )
+        record_migration_outcome(
+            conn,
+            migration_name="migrate_redact_prompt_created_by",
+            phase="succeeded",
+            outcome="ok",
+            detail=f"redacted_rows={cur.rowcount}",
+        )
+    except Exception as exc:
+        record_migration_outcome(
+            conn,
+            migration_name="migrate_redact_prompt_created_by",
+            phase="failed",
+            outcome="error",
+            detail=f"{type(exc).__name__}: {exc}",
+        )
+        raise
+    finally:
+        conn.close()
 
 def migrate_add_password_changed_at(sqlite_path: str) -> None:
     """

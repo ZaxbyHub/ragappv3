@@ -19,7 +19,7 @@ from pydantic import BaseModel
 
 from app.config import settings
 from app.models.database import get_pool
-from app.security import require_scope
+from app.security import admin_scope_fingerprint, require_scope
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/service-accounts", tags=["service-accounts"])
@@ -120,12 +120,9 @@ async def create_service_account(
             VALUES (?, ?, ?, ?, ?)
             """,
             (payload.name.strip(), key_hash, scopes_str, now,
-             # created_by is a non-secret fingerprint of the creating admin's SCOPES (not the token) —
-             # the admin-token auth model exposes no per-admin identity besides the secret token,
-             # so scope-set is the available non-secret distinguisher.
-             hashlib.sha256(",".join(sorted(
-                 settings.admin_token_scopes.get(_auth.get("user_id", ""), [])
-             )).encode()).hexdigest()[:16]),
+             # created_by is a non-secret fingerprint of the creating admin's
+             # SCOPES (not the token), via the shared security helper.
+             admin_scope_fingerprint(_auth.get("user_id", ""))),
         )
         await asyncio.to_thread(conn.commit)
         sa_id = cursor.lastrowid

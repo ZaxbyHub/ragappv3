@@ -11,6 +11,7 @@ from html import escape as _xml_escape
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 from app.config import settings
+from app.services.citation_validator import PROMPT_REFUSAL_SENTENCE
 from app.services.document_retrieval import RAGSource
 from app.services.memory_store import MemoryRecord
 from app.services.token_accounting import count_tokens
@@ -66,7 +67,7 @@ CITATION_INSTRUCTION = (
     "- Do NOT cite by filename. Always use the assigned labels.\n"
     "- If wiki evidence directly answers and is fresh/high-confidence, answer from "
     "[W#] without forcing unnecessary [S#] citations.\n"
-    "- If no context supports the answer, clearly state it is not available.\n"
+    f"- If no context supports the answer, reply with \"{PROMPT_REFUSAL_SENTENCE}\"\n"
     "- Do not fabricate information not present in the context.\n"
     "- Prefer citing primary evidence over supporting evidence when both are available.\n\n"
     "Follow-up handling:\n"
@@ -87,6 +88,16 @@ CITATION_INSTRUCTION = (
     "more than 4 columns. Do not embed long prose inside table cells.\n"
     "- Place citation labels ([S#], [M#], [W#]) in normal sentences, not inside table "
     "cells, so the rendered output stays readable."
+)
+
+# Appended to the system prompt whenever citation_mode="disabled" (issue
+# #709 / TQ-instruction-batch-4-10): the disable decision must be visible
+# to the model for EVERY prompt chain, including stored overrides that do
+# not contain the CITATION_INSTRUCTION constant. Kept free of the phrases
+# the disabled-strip tests assert are absent from the default prompt.
+CITATION_DISABLED_DIRECTIVE = (
+    "\n\nCitations are disabled for this answer: do not attach [S#], [W#], "
+    "[K#] or [M#] citation labels to any claim."
 )
 
 
@@ -370,7 +381,16 @@ class PromptBuilderService:
         # DB-cached, or override); "required" strengthens it. "enabled"/None
         # leaves the prompt exactly as before.
         if citation_mode == "disabled":
-            effective_prompt = effective_prompt.replace(CITATION_INSTRUCTION, "")
+            # Strip the instruction block when present AND always append an
+            # explicit disable directive, so the mode changes ANY prompt
+            # chain (default, DB-cached, or custom override), never just
+            # the ones containing the exact constant string (issue #709 /
+            # TQ-instruction-batch-4-10). Mirrors the agentic
+            # SynthesisTool's directive-based composition.
+            effective_prompt = (
+                effective_prompt.replace(CITATION_INSTRUCTION, "")
+                + CITATION_DISABLED_DIRECTIVE
+            )
         elif citation_mode == "required":
             if CITATION_INSTRUCTION not in effective_prompt:
                 effective_prompt = effective_prompt + CITATION_INSTRUCTION

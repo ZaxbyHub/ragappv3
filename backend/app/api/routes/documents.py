@@ -2980,7 +2980,6 @@ async def get_reindex_job_status(
     job_id: int,
     conn: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(require_admin_role),
-    csrf_token: str = Depends(csrf_protect),
 ) -> ReindexJobStatusResponse:
     """Return the full status of a reindex job by ID."""
 
