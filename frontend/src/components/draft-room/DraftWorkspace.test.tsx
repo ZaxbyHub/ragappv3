@@ -151,8 +151,20 @@ vi.mock("@/components/ui/select", async () => {
   return {
     Select: ({ onValueChange, children }: { onValueChange: (v: string) => void; children: React.ReactNode }) =>
       React.createElement(Ctx.Provider, { value: onValueChange }, children),
-    SelectTrigger: ({ children, id }: { children: React.ReactNode; id?: string }) =>
-      React.createElement("div", { role: "group", "aria-label": "Retry from", id }, children),
+    SelectTrigger: ({
+      children,
+      id,
+      ...rest
+    }: {
+      children: React.ReactNode;
+      id?: string;
+      "aria-describedby"?: string;
+    }) =>
+      React.createElement(
+        "div",
+        { role: "group", "aria-label": "Retry from", id, ...rest },
+        children,
+      ),
     SelectValue: () => null,
     SelectContent: ({ children }: { children: React.ReactNode }) => React.createElement("div", null, children),
     SelectItem: ({ value, children }: { value: string; children: React.ReactNode }) => {
@@ -669,6 +681,40 @@ describe("DraftWorkspace", () => {
     await screen.findByRole("group", { name: "Retry from" });
     expect(screen.getByRole("button", { name: "Retry" })).toBeDisabled();
     expect(mockRetryDraftJob).not.toHaveBeenCalled();
+  });
+
+  it("associates the disabled compile and retry controls with their reason", async () => {
+    // Issue #789 review F-010: a disabled control is unfocusable, so its
+    // explanation must be programmatically associated or a keyboard/screen-
+    // reader user never learns why the action is unavailable.
+    mockListDraftJobs.mockReset().mockResolvedValue({
+      items: [makeJob({ status: "failed" })],
+      total: 1,
+      page: 1,
+      per_page: 10,
+    });
+    renderWorkspace({ capabilities: makeCapabilities({ enabled: false, compile_available: false }) });
+
+    const compileBtn = await screen.findByRole("button", { name: "Create draft" });
+    expect(compileBtn).toBeDisabled();
+    const describedBy = compileBtn.getAttribute("aria-describedby");
+    expect(describedBy).toBeTruthy();
+    const reason = describedBy ? document.getElementById(describedBy) : null;
+    expect(reason).not.toBeNull();
+    expect(reason).toHaveTextContent(DRAFT_ROOM_DISABLED_MESSAGE);
+
+    const retryBtn = await screen.findByRole("button", { name: "Retry" });
+    expect(retryBtn.getAttribute("aria-describedby")).toBe(describedBy);
+    const retryTrigger = await screen.findByRole("group", { name: "Retry from" });
+    expect(retryTrigger.getAttribute("aria-describedby")).toBe(describedBy);
+  });
+
+  it("adds no description attribute to compile while it is available", async () => {
+    renderWorkspace({ capabilities: makeCapabilities({ compile_available: true }) });
+
+    const compileBtn = await screen.findByRole("button", { name: "Create draft" });
+    expect(compileBtn).toBeEnabled();
+    expect(compileBtn.getAttribute("aria-describedby")).toBeNull();
   });
 
   it("shows Restore for an authorized archived project and blocks compile with the archived reason", async () => {

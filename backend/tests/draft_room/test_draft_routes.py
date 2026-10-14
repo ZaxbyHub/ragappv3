@@ -202,6 +202,10 @@ class DraftRoomTestBase(unittest.TestCase):
         # by tests that remove the csrf_protect override to exercise the real
         # dependency.
         app.state.csrf_manager = CSRFManager(redis_url="redis://localhost:6379/0", ttl=900)
+        # get_capabilities derives compile_available from the live worker
+        # (#789); these tests never run lifespan, so stand in for a started
+        # DraftJobProcessor (presence is the liveness contract).
+        app.state.draft_job_processor = object()
 
         self._mock_vector_store = MagicMock()
         self._mock_vector_store.db = MagicMock()
@@ -260,6 +264,8 @@ class DraftRoomTestBase(unittest.TestCase):
             del app.state.db_pool
         if hasattr(app.state, "csrf_manager"):
             del app.state.csrf_manager
+        if hasattr(app.state, "draft_job_processor"):
+            del app.state.draft_job_processor
         if hasattr(self, "_connection_pool"):
             self._connection_pool.close_all()
         shutil.rmtree(self._temp_dir, ignore_errors=True)

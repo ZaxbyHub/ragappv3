@@ -332,6 +332,11 @@ export const READY_BLOCKER_LABELS: Record<string, string> = {
   source_only_acknowledgment_required: SOURCE_ONLY_WARNING,
   vault_access_revoked: "You no longer have read access to this project's vault.",
   conflict: "This project changed in another tab. Reload and try again.",
+  // Issue #789: the backend unified every stale-`lock_version` raise on the
+  // precise `stale_lock_version` code (the Ready path included), so the
+  // curated label must be keyed on the code that is actually emitted — the
+  // `conflict` entry above is retained only for paths that still raise it.
+  stale_lock_version: "This project changed in another tab. Reload and try again.",
 };
 
 /** Export filename suffix explanations, shown before download. */
