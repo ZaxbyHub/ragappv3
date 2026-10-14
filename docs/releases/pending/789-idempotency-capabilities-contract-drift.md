@@ -92,11 +92,18 @@ sanitizer, and a TS interface contradicting the emitting model.
 
 ## Migration
 
-No schema migration. Request fingerprints computed by earlier versions no
-longer match, so an `Idempotency-Key` enqueued before this upgrade and
-replayed after it returns 409 `idempotency_key_conflict` instead of the
-original job — keys are scoped to a single request attempt and the frontend
-generates a fresh key per dialog, so no supported flow crosses the upgrade.
+No schema migration. The request fingerprint formula changes, so a
+pre-upgrade `Idempotency-Key` stops matching wherever the request dimension it
+now hashes differs from what the old formula hashed: a compile whose
+**requested** start stage differs from the normalized one (anything other than
+the default `research`, whose old and new formulas hash identically), and a
+retry whose draft has since gained a new current revision or whose requested
+stage normalizes backward to a different stage (unreachable from the shipped
+client, which sends no retry key — see #905). Those replays
+return 409 `idempotency_key_conflict` instead of the original job; every other
+pre-upgrade key still replays to its original job. Keys are scoped to a single
+request attempt and the frontend generates a fresh key per dialog, so no
+supported flow crosses the upgrade.
 The stale-lock error *code* changes from `conflict` to `stale_lock_version`
 on the compile/apply-finding/mark-ready/update/archive/restore/manual-revision
 paths (status and semantics unchanged; clients matching the precise new code
@@ -114,4 +121,33 @@ unchanged.
   (pre-existing; the backend replay contract is now correct and pinned
   regardless) — declared out of scope by the issue; tracked as #905.
 - The ASCII `filename` parameter still ASCII-folds non-ASCII titles by
-  design; the additive `filename*` parameter carries the full title.
+  design; the additive `filename*` parameter carries the full title. A title
+  at the 300-character cap made of multi-byte characters yields a
+  Content-Disposition value of roughly 3.7 KB and a decoded name longer than
+  the 255-byte limit some client filesystems impose, so an extreme title can
+  be truncated or rejected by the browser on save. No server-side header limit
+  is approached and the ASCII name stays short.
+
+## Review round (swarm-pr-review at head 558c64e0)
+
+An independent `swarm-pr-review` of this PR returned APPROVE_WITH_NOTES (zero
+CRITICAL, zero HIGH). This round folds in its validated findings: the export
+`filename*` parameter now has HTTP-level coverage; the stale-lock code is
+pinned at the store and cross-checked against the route helper; the promotion
+de-leak, the compensation error identity, and the race-simulation engagement
+are pinned by assertions; the race tests' docstrings now state that their
+window is manufactured (SQLite's `BEGIN IMMEDIATE` makes it unproducible
+today, so the IntegrityError arm is defense-in-depth); the enqueue race arms
+carry the `active_job_id` context and a single detail wording; deliberate
+configuration 503s log at WARNING rather than ERROR; the error-code rename
+reaches the frontend label table; disabled compile/retry controls are
+programmatically associated with their reason; and the DraftClaim parity gate
+is bidirectional, annotation-spelling agnostic, fails closed on structural
+drift, and has its own wiring test.
+
+Follow-ups filed for what stays out of scope: **#911** (worker-liveness honesty
+beyond compile — upload/parse is still ungated), **#912** (parity-gate scope
+beyond the nullability contract — its nullability ACs are closed here, so it
+narrows to whatever remains after merge), **#913** (compensation cancellation safety
+and unreaped orphan bytes), **#914** (the local CI-mirror skill drifting behind
+`ci.yml`).

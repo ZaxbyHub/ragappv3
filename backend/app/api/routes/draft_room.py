@@ -160,6 +160,21 @@ from app.services.upload_validation import secure_filename
 
 logger = logging.getLogger(__name__)
 
+# 503 codes that are a deliberate configuration decision, not a server fault:
+# the room is switched off (`DRAFT_ROOM_ENABLED` defaults to false) or the
+# configured model provider is not permitted. `draft_room_exception_handler`
+# logs these at WARNING so a deployment that has not enabled the room does not
+# emit one ERROR record per mutating request (issue #789 review F-013). Every
+# other 5xx stays ERROR.
+_CONFIGURATION_5XX_CODES: frozenset[str] = frozenset(
+    {
+        "draft_room_disabled",
+        "provider_origin_not_allowed",
+        "provider_scheme_not_allowed",
+        "provider_policy_misconfigured",
+    }
+)
+
 # Draft Room's own upload allowlist excludes raster images (parse-only text
 # seam, issue #460). The vault image allowlist is a document-ingestion feature,
 # so raster images are filtered out here and Draft Room does not accept
@@ -280,7 +295,18 @@ async def draft_room_exception_handler(
     operators. 4xx stays unlogged — client errors are normal traffic.
     """
     if exc.status_code >= 500:
-        logger.error(
+        # A deliberate configuration/feature gate is not a server fault: 503s
+        # for `draft_room_disabled` and the provider-policy codes are expected
+        # traffic on a deployment that has not enabled the room, and the
+        # feature flag defaults to off — logging them at ERROR turned every
+        # mutating attempt on such a deployment into an alert-grade record
+        # (issue #789 review F-013). Genuine 5xx stays ERROR.
+        log = (
+            logger.warning
+            if exc.status_code == 503 and exc.code in _CONFIGURATION_5XX_CODES
+            else logger.error
+        )
+        log(
             "draft_room: %s %s -> %s %s cause=%r",
             request.method,
             request.url.path,
@@ -1956,7 +1982,7 @@ def _sync_enqueue_compile(
             # keeps CHECK/NOT NULL/FK messages out. When one INSERT violates
             # both indexes at once, whichever sqlite reports first picks the
             # arm — both outcomes are correct (replay-return the winner, or
-            # active_job with its id).
+            # active_job).
             msg = str(exc)
             if msg.startswith("UNIQUE constraint failed") and (
                 "idempotency_key" in msg or "idx_draft_jobs_idempotency" in msg
@@ -1977,12 +2003,27 @@ def _sync_enqueue_compile(
                         and stored.get("request_fingerprint") == request_fingerprint
                     ):
                         return int(winner[0]), False
+                # Same wording as the pre-check conflict above so one condition
+                # answers with one detail string (issue #789 review F-021).
                 raise _conflict(
-                    "the idempotency-key is already in use", "idempotency_key_conflict"
+                    "this idempotency-key was already used for a different request",
+                    "idempotency_key_conflict",
                 ) from exc
+            # The one-active-compile index lost the race. Re-read the winner so
+            # this arm carries the same `active_job_id` context the pre-check arm
+            # gives the identical condition (issue #789 review F-009); the read
+            # is best-effort and the conflict stands without it.
+            conn.rollback()
+            active_row = conn.execute(
+                "SELECT id FROM draft_jobs WHERE draft_id = ? "
+                "AND status IN ('pending','running') LIMIT 1",
+                (draft_id,),
+            ).fetchone()
+            context = {"active_job_id": int(active_row[0])} if active_row else None
             raise _conflict(
-                "a compile job is already active for this draft",
+                "a job is already active for this draft",
                 "active_job",
+                **(context or {}),
             ) from exc
         job_id = int(cur.lastrowid)
 

@@ -40,10 +40,10 @@ export interface DraftReadyDialogProps {
 /**
  * Ordered checklist of Ready eligibility conditions (SPEC 12.5). Every entry is a
  * possible `POST .../ready` 409 `code`, keyed against `READY_BLOCKER_LABELS`.
- * `invalid_state`, `not_current_revision`, `vault_access_revoked` and `conflict`
- * are route-level preconditions the shell already guards against opening this
- * dialog for, so they are surfaced as a fallback banner rather than a checklist
- * row (see `handleSubmit`'s catch branch).
+ * `invalid_state`, `not_current_revision`, `vault_access_revoked` and
+ * `stale_lock_version` are route-level preconditions the shell already guards
+ * against opening this dialog for, so they are surfaced as a fallback banner
+ * rather than a checklist row (see `handleSubmit`'s catch branch).
  */
 const CHECKLIST_CODES = [
   "active_job",

@@ -113,6 +113,10 @@ const STAGES_LOOKUP_PAGE_SIZE = 100;
 const REVISIONS_LOOKUP_PAGE_SIZE = 50;
 const OPEN_FINDINGS_LOOKUP_PAGE_SIZE = 100;
 
+/** id of the paragraph explaining why compile/retry are disabled; the disabled
+ *  controls reference it with aria-describedby (issue #789 review F-010). */
+const CAPABILITY_BLOCK_REASON_ID = "draft-capability-block-reason";
+
 const FACT_CURRENT = new Set<string>(FACT_CURRENT_STATUSES);
 
 export const DEFAULT_DRAFT_MAX_INPUTS = 10;
@@ -962,6 +966,7 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
           type="button"
           onClick={() => openCompileDialog(undefined)}
           disabled={blockedReason != null}
+          aria-describedby={blockedReason != null ? CAPABILITY_BLOCK_REASON_ID : undefined}
         >
           {compileCtaLabel(draft.mode)}
         </Button>
@@ -1015,7 +1020,19 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
           Delete project
         </Button>
       </div>
-      {blockedReason != null && <p className="text-sm text-muted-foreground">{blockedReason}</p>}
+      {/* Issue #789 review F-010: the disabled compile/retry controls below are
+          unfocusable, so their reason must be programmatically associated or a
+          keyboard/screen-reader user never learns why the action is unavailable.
+          Deliberately NOT role="status": the loading paragraph already owns that
+          role and the workspace contract keeps exactly one live region. */}
+      {blockedReason != null && (
+        <p
+          id={CAPABILITY_BLOCK_REASON_ID}
+          className="text-sm text-muted-foreground"
+        >
+          {blockedReason}
+        </p>
+      )}
       {archiveBlockedReason != null && (
         <p className="text-sm text-muted-foreground">{archiveBlockedReason}</p>
       )}
@@ -1033,7 +1050,15 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
             onValueChange={(value) => setRetryStage(value as DraftCompileStartStage)}
             disabled={retryCapabilityBlocked}
           >
-            <SelectTrigger id={`draft-${draftId}-retry-stage`} className="w-48">
+            <SelectTrigger
+              id={`draft-${draftId}-retry-stage`}
+              className="w-48"
+              aria-describedby={
+                retryCapabilityBlocked && blockedReason != null
+                  ? CAPABILITY_BLOCK_REASON_ID
+                  : undefined
+              }
+            >
               <SelectValue placeholder="Choose a stage" />
             </SelectTrigger>
             <SelectContent>
@@ -1049,6 +1074,11 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
             size="sm"
             onClick={() => retryStage && retryMutation.mutate(retryStage)}
             disabled={!retryStage || retryMutation.isPending || retryCapabilityBlocked}
+            aria-describedby={
+              retryCapabilityBlocked && blockedReason != null
+                ? CAPABILITY_BLOCK_REASON_ID
+                : undefined
+            }
           >
             {retryMutation.isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" aria-hidden="true" />}
             Retry

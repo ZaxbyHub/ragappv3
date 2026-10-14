@@ -213,6 +213,16 @@ class TestN05UploadCompensation(CompileRouteTestBase):
                 headers=self._owner_headers(),
             )
         self.assertEqual(resp.status_code, 409, resp.text)
+        # Issue #789 review F-008: pin the ERROR IDENTITY, not just the status —
+        # the original DraftConflictError translation (code `conflict`) must
+        # survive compensation; any other 409 (active_job, stale_lock_version,
+        # …) would be a compensation that replaced the client's error.
+        self.assertEqual(
+            resp.json()["code"],
+            "conflict",
+            "compensation must not replace the original domain error the "
+            "client sees",
+        )
 
         detail = self.client.get(
             f"/api/draft-room/drafts/{draft_id}", headers=self._owner_headers()
@@ -424,12 +434,25 @@ class TestN05ErrorCodes(CompileRouteTestBase):
                 headers={**self._owner_headers(), "Idempotency-Key": key},
             )
         finally:
+            engaged = _IdempotencyRaceConnection.lookups_hidden
+            _IdempotencyRaceConnection.lookups_hidden = 0
             _IdempotencyRaceConnection.hide_idempotency_lookups = False
             if original_override is None:
                 app.dependency_overrides.pop(get_db, None)
             else:
                 app.dependency_overrides[get_db] = original_override
 
+        # Issue #789 review F-004: without this the test passes vacuously when
+        # the injection stops matching (any edit to the production lookup's SQL
+        # text/spacing), because the ordinary pre-check fingerprint-mismatch
+        # path yields the identical 409 + code.
+        self.assertGreaterEqual(
+            engaged,
+            2,
+            "the race simulation never engaged: the production idempotency "
+            "lookup's SQL text drifted, so this test silently fell back to the "
+            "ordinary pre-check conflict path",
+        )
         self.assertEqual(resp.status_code, 409, resp.text)
         self.assertEqual(
             resp.json()["code"],
@@ -468,15 +491,27 @@ class _IdempotencyRaceConnection(sqlite3.Connection):
 
     While ``hide_idempotency_lookups`` is armed, the enqueue's
     ``(created_by, idempotency_key)`` lookup SELECT is answered as a miss
-    even though a committed row holds the key -- exactly the window in which
-    a concurrent winner commits between a request's lookup and its INSERT.
-    The request's own INSERT then fails on the real unique index (no fake
-    exception), so any disambiguation strategy (re-query the key on any
-    connection, before or after rollback, or read the real index name from
-    the IntegrityError) observes the race truthfully.
+    even though a committed row holds the key. The request's own INSERT then
+    fails on the real unique index (no fake exception), so any
+    disambiguation strategy (re-query the key on any connection, before or
+    after rollback, or read the real index identity from the IntegrityError)
+    observes the race truthfully.
+
+    HONEST SCOPE (issue #789 review F-003): ``_sync_enqueue_compile`` takes
+    ``BEGIN IMMEDIATE`` before the pre-check SELECT and holds the write lock
+    through the INSERT, so SQLite's single-writer discipline makes this window
+    **unproducible today** — the IntegrityError arm is defense-in-depth that
+    becomes reachable if the pre-check moves outside the transaction, BEGIN
+    DEFERRED is adopted, a stale read transaction leaks from the pool, or the
+    store is not SQLite. This test pins that protection; it does not claim the
+    window occurs in production.
     """
 
     hide_idempotency_lookups = False
+    #: how many key lookups this simulation actually hid (issue #789 review
+    #: F-004 — asserted by the test so SQL-text drift cannot silently de-fang
+    #: the race coverage).
+    lookups_hidden = 0
 
     def execute(self, sql, params=()):  # type: ignore[override]
         if (
@@ -484,6 +519,7 @@ class _IdempotencyRaceConnection(sqlite3.Connection):
             and sql.lstrip().upper().startswith("SELECT")
             and "idempotency_key = ?" in sql
         ):
+            type(self).lookups_hidden += 1
             return super().execute(
                 "SELECT id, draft_id, input_json FROM draft_jobs WHERE 1 = 0", ()
             )

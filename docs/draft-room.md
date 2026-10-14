@@ -373,6 +373,7 @@ Stable error codes an operator or user is most likely to see, and what they mean
 | `job_timeout` | — (job failure) | `DRAFT_JOB_TIMEOUT_SECONDS` (or `DRAFT_PARSE_TIMEOUT_SECONDS` for a parse job) elapsed. |
 | `active_job` | 409 | A job is already running/pending for this draft; wait for it or cancel it before retrying the requested action. |
 | `stale_lock_version` | 409 | The draft changed since the client last read it (`lock_version` mismatch); reload the draft and retry with the fresh `lock_version`. |
+| `idempotency_key_conflict` | 409 | The `Idempotency-Key` was already used for a different request (another draft, input snapshot, base revision, or requested start stage). A key is scoped to one identical request; send a new key to start a new one. |
 | `input_in_use` | 409 | Attempted to delete an input a compile used (cited in its evidence or listed in its frozen input snapshot), or that has an active parse job. Delete the whole draft instead if the input must go. |
 | `fact_not_current` / `fact_candidate_mismatch` | 409 | The revision has no current fact-check result, or the successful Fact candidate doesn't match this exact revision's text. Re-run compile from the Fact stage. |
 | `non_waivable_blocker` / `unresolved_blocker` / `invalid_waiver` / `stale_waiver` / `unresolved_claim_blocker` | 409 | A Ready-blocking condition; see [Ready](#what-ready-means-and-does-not-mean) for the full list. |

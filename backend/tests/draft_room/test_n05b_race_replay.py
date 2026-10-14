@@ -5,12 +5,21 @@ The frozen module's ``_IdempotencyRaceConnection`` answers EVERY
 discriminator's replay-RETURN sub-branch (lookup missed, INSERT lost the key
 index, post-rollback re-read finds a fingerprint-identical winner → return
 it) can never execute under it — only the 409 sub-arm can. This companion
-models the faithful window instead: the FIRST lookup (the enqueue pre-check)
-misses — the winner committed between the request's lookup and its INSERT —
-and every later lookup, including the discriminator's post-rollback re-read,
-sees the truth. RED at base (the pre-fix handler maps the race to
-``active_job`` 409), GREEN after the fix (202, the winner's id, no second
-row).
+narrows the simulation: the FIRST lookup (the enqueue pre-check) misses and
+every later lookup, including the discriminator's post-rollback re-read, sees
+the truth. RED at base (the pre-fix handler maps the race to ``active_job``
+409), GREEN after the fix (202, the winner's id, no second row).
+
+HONEST SCOPE (issue #789 review F-003). This models a window that SQLite's
+single-writer discipline currently makes **unproducible**:
+``_sync_enqueue_compile`` takes ``BEGIN IMMEDIATE`` before the pre-check
+SELECT and holds the write lock through the INSERT, so no concurrent winner
+can commit in between. The race arm is therefore defense-in-depth — it becomes
+reachable if the pre-check ever moves outside the transaction, ``BEGIN
+DEFERRED`` is adopted, a stale read transaction leaks from the pool, or the
+store is not SQLite. The test pins that protection (a regression in the
+discriminator fails it); it does not claim the window occurs in production
+today.
 """
 
 import sqlite3
@@ -110,12 +119,27 @@ class TestN05BRaceReplay(CompileRouteTestBase):
                 headers={**self._owner_headers(), "Idempotency-Key": key},
             )
         finally:
+            engaged = _FirstLookupOnlyRaceConnection.hidden_so_far
             _FirstLookupOnlyRaceConnection.hide_first_lookup = False
             _FirstLookupOnlyRaceConnection.hidden_so_far = 0
             if original_override is None:
                 app.dependency_overrides.pop(get_db, None)
             else:
                 app.dependency_overrides[get_db] = original_override
+
+        # Issue #789 review F-004: this test proves the same outcome through the
+        # ORDINARY pre-check replay path when the fault injection silently stops
+        # matching (any edit to the production lookup's SQL text, spacing, or
+        # parameter style). Assert the injection actually engaged — at least
+        # the hidden pre-check AND the discriminator's re-read — so future SQL
+        # drift fails loudly instead of leaving this green-but-vacuous.
+        self.assertGreaterEqual(
+            engaged,
+            2,
+            "the race simulation never engaged: the production idempotency "
+            "lookup's SQL text drifted, so this test silently fell back to the "
+            "ordinary replay path",
+        )
 
         self.assertEqual(resp.status_code, 202, resp.text)
         self.assertEqual(
