@@ -780,7 +780,7 @@ Append an immutable `draft_events` row for at least:
 - draft creation, archive, unarchive, and deletion request;
 - compile enqueue, cancel, retry, failure, and completion;
 - manual revision save;
-- finding disposition or waiver, including the user's reason;
+- finding disposition or waiver, recording that a note was supplied (`has_note`); the note text itself is stored on `draft_findings.resolution_note` and never in the audit row;
 - Ready approval and Ready invalidation;
 - export, including format and revision ID;
 - promotion, including the new vault file/document ID.
@@ -825,6 +825,7 @@ draft -> queued -> running -> needs_review
 draft -> archived
 queued|running -> failed|cancelled
 running -> queued                       startup orphan recovery only
+failed|cancelled -> needs_review        manual revision or applied finding; keeps a draft with a current revision editable
 failed|cancelled|needs_review -> queued
 needs_review -> ready                    human action only
 ready -> needs_review                    new revision, brief/input change, or factual invalidation

@@ -201,10 +201,13 @@ _RETRY_STAGE_NORMALIZATION: dict[str, str] = {"assemble": "fact", "intake": "res
 #: transaction, so the write always lands on ``queued`` from a legal prior.
 #: Draft statuses from which applying a finding may legally land on
 #: ``needs_review``. Mirrors the ``_DRAFT_TRANSITIONS`` edges into
-#: ``needs_review``; ``failed``/``cancelled``/``archived`` are excluded because
-#: those may only move to ``queued``/``archived``/``draft``.
+#: ``needs_review``; ``archived`` is excluded (an archived draft accepts no
+#: revisions), and ``failed``/``cancelled`` are included since the
+#: stuck-draft recovery edge landed (issue #788): applying a finding is one
+#: of the paths that recovers a compile-cancelled/failed draft with a current
+#: revision back into review.
 _APPLY_FINDING_ALLOWED_PRIOR_STATUSES: frozenset[str] = frozenset(
-    {"draft", "needs_review", "ready"}
+    {"draft", "needs_review", "ready", "failed", "cancelled"}
 )
 
 _COMPILE_ALLOWED_PRIOR_STATUSES: frozenset[str] = frozenset(
@@ -237,14 +240,6 @@ _MAX_LIST_SCAN_ROWS = 2000
 _MAX_CLAIM_SOURCES = 50
 
 _IDEMPOTENCY_HEADER = "Idempotency-Key"
-
-#: ``draft_events.event_type`` written for each human finding disposition
-#: (SPEC section 5.8 requires at minimum ``finding_waived``).
-_DISPOSITION_EVENT_TYPES: dict[str, str] = {
-    "apply": "finding_applied",
-    "dismiss": "finding_dismissed",
-    "waive": "finding_waived",
-}
 
 
 # ── error contract (SPEC section 8.3) ───────────────────────────────────────
@@ -835,8 +830,17 @@ class DraftClaim(BaseModel):
 class DraftFinding(BaseModel):
     """A finding plus its disposition eligibility (SPEC section 8.2).
 
-    ``can_dismiss`` is False for every blocker — blockers may only be applied
-    or validly waived. ``can_waive`` additionally requires ``waivable``.
+    The flags mirror the guards the disposition route actually enforces
+    (issue #788), so a client never offers an action the server refuses:
+
+    * ``can_apply`` requires an open finding with a suggestion and span, the
+      finding raised against the draft's **current** revision, a draft status
+      the apply path accepts (``_APPLY_FINDING_ALLOWED_PRIOR_STATUSES``), and
+      no active compile job.
+    * ``can_dismiss`` is False for every blocker — blockers may only be applied
+      or validly waived — and False once the draft is archived.
+    * ``can_waive`` additionally requires ``waivable`` and, like dismiss, an
+      unarchived draft.
     """
 
     id: int
@@ -1078,7 +1082,25 @@ def _to_claim(
     )
 
 
-def _to_finding(record: DraftFindingRecord) -> DraftFinding:
+def _to_finding(
+    record: DraftFindingRecord,
+    *,
+    current_revision_id: Optional[int] = None,
+    draft_status: Optional[str] = None,
+    has_active_compile: bool = False,
+) -> DraftFinding:
+    """Render a finding with disposition flags the route can actually honor.
+
+    ``can_apply``/``can_dismiss``/``can_waive`` agree with the disposition
+    route's guards (issue #788): apply additionally requires revision
+    currency, a draft status the apply path accepts, and no active compile;
+    dismiss/waive are refused only on archived drafts. Parameter defaults
+    are asymmetric by design: ``draft_status=None`` keeps the legacy
+    status-blind behavior for callers that pass nothing, while
+    ``current_revision_id=None`` yields ``can_apply=False`` — a caller that
+    cannot determine the current revision must not advertise apply (the
+    route 409s ``finding_revision_stale``).
+    """
     is_open = record.status == "open"
     is_blocker = record.severity == "blocker"
     return DraftFinding(
@@ -1110,10 +1132,23 @@ def _to_finding(record: DraftFindingRecord) -> DraftFinding:
             and record.suggestion is not None
             and record.span_start is not None
             and record.span_end is not None
+            and record.revision_id is not None
+            and record.revision_id == current_revision_id
+            and (draft_status is None or draft_status in _APPLY_FINDING_ALLOWED_PRIOR_STATUSES)
+            and not has_active_compile
         ),
-        # SPEC section 8.2: dismiss is allowed only for non-blockers.
-        can_dismiss=bool(is_open and not is_blocker),
-        can_waive=bool(is_open and record.waivable),
+        # SPEC section 8.2: dismiss is allowed only for non-blockers; the
+        # store refuses every disposition on an archived draft.
+        can_dismiss=bool(
+            is_open
+            and not is_blocker
+            and (draft_status is None or draft_status != "archived")
+        ),
+        can_waive=bool(
+            is_open
+            and record.waivable
+            and (draft_status is None or draft_status != "archived")
+        ),
     )
 
 
@@ -2086,10 +2121,13 @@ def _sync_apply_finding(
             (owner_id, note, finding_id),
         )
         # Any prior factual approval described the old bytes. Guard the prior
-        # status: _DRAFT_TRANSITIONS allows failed/cancelled -> queued|archived
-        # only, so moving one of those straight to needs_review would corrupt
-        # the state machine. Mirrors DraftStore.create_manual_revision, which
-        # routes the same edge through _check_transition.
+        # status against _DRAFT_TRANSITIONS: applying a finding lands on
+        # needs_review, so a failed/cancelled draft is now a legal prior (the
+        # stuck-draft recovery edge, issue #788) exactly as it is for a manual
+        # revision, while queued/running (a compile is in flight) and archived
+        # remain refused here. Mirrors DraftStore.create_manual_revision, which
+        # routes the same edge through _check_transition; the allowlist itself
+        # is _APPLY_FINDING_ALLOWED_PRIOR_STATUSES above.
         prior_status_row = conn.execute(
             "SELECT status FROM drafts WHERE id = ? AND created_by = ?",
             (draft_id, owner_id),
@@ -2308,10 +2346,14 @@ def _sync_mark_ready(
                     )
 
         # Rule 3: unqualified factual claim verdicts are non-waivable blockers.
+        # Resolution is deliberately NOT part of this predicate (issue #788 /
+        # S05-SK-04): ``set_claim_resolution`` documents resolution as "an
+        # audit annotation, not a gate", so a blocking verdict blocks Ready
+        # regardless of its audit resolution.
         unresolved_claims = int(
             conn.execute(
                 "SELECT COUNT(*) FROM draft_claims WHERE revision_id = ? "
-                "AND resolution = 'open' AND status IN "
+                "AND status IN "
                 "('contradicted','unsupported','ambiguous','stale')",
                 (revision_id,),
             ).fetchone()[0]
@@ -4184,6 +4226,18 @@ async def list_draft_findings(
     draft = await _run_store(lambda: store.get_draft(draft_id, owner_id))
     await _require_vault_read(evaluate, user, draft.vault_id)
 
+    # The disposition flags must agree with the disposition route (issue
+    # #788): fetch the current revision and the compile-liveness probe once
+    # so every item's can_apply reflects revision currency, draft status,
+    # and active-compile eligibility.
+    current_revision = await _run_store(
+        lambda: store.get_current_revision(draft_id=draft_id, owner_id=owner_id)
+    )
+    current_revision_id = None if current_revision is None else current_revision.id
+    has_active_compile = await _run_store(
+        lambda: store.has_active_compile_job(draft_id)
+    )
+
     # The store binds status/severity in SQL and returns the exact filtered
     # total, so pages reach rows older than any scan window and the count is
     # never capped by one.
@@ -4199,7 +4253,15 @@ async def list_draft_findings(
         )
     )
     return PaginatedResponse[DraftFinding](
-        items=[_to_finding(f) for f in findings],
+        items=[
+            _to_finding(
+                f,
+                current_revision_id=current_revision_id,
+                draft_status=draft.status,
+                has_active_compile=has_active_compile,
+            )
+            for f in findings
+        ],
         total=total,
         page=page,
         per_page=per_page,
@@ -4230,6 +4292,12 @@ async def dispose_draft_finding(
     * ``dismiss`` is prohibited for blockers (409 ``blocker_not_dismissable``).
     * ``waive`` needs ``waivable=1``, an unchanged span text and rule version,
       a user actor, and a non-empty ``note``.
+
+    Dismiss and waive additionally refuse an archived draft (409
+    ``invalid_state``) and a stale ``lock_version`` (409
+    ``stale_lock_version``) from inside the same transaction that writes the
+    status change, the lock bump, and the audit event — so all three persist
+    together or not at all (issue #788).
 
     Pipeline-authored resolutions use the internal ``resolved_by_revision``
     status and never travel through this route, so they cannot impersonate a
@@ -4286,6 +4354,7 @@ async def dispose_draft_finding(
                 finding_id=finding_id,
                 resolved_by=owner_id,
                 resolution_note=body.note,
+                lock_version=body.lock_version,
             )
         )
     else:
@@ -4306,25 +4375,15 @@ async def dispose_draft_finding(
                 # text it was granted against, so a later edit invalidates it.
                 waiver_rule_version=finding.rule_version,
                 waiver_text_sha256=finding.span_text_sha256,
+                lock_version=body.lock_version,
             )
         )
 
-    await _run_store(
-        lambda: store.record_event(
-            draft_id=draft_id,
-            owner_id=owner_id,
-            event_type=_DISPOSITION_EVENT_TYPES[body.action],
-            actor_user_id=owner_id,
-            revision_id=new_revision.id if new_revision else finding.revision_id,
-            payload={
-                "finding_id": finding_id,
-                "rule_id": finding.rule_id,
-                "rule_version": finding.rule_version,
-                "severity": finding.severity,
-                "reason": (body.note or "")[:500],
-            },
-        )
-    )
+    # No route-tail event: each disposition writes exactly one audit row
+    # inside its own transaction — apply's has existed there all along, and
+    # dismiss/waive moved theirs into DraftStore with the same guards (issue
+    # #788 / T1-08-K-02). The note text stays in
+    # ``draft_findings.resolution_note``; payloads carry IDs and codes only.
     await safe_record_security_event(
         db,
         event_type=f"draft_finding_{body.action}",
@@ -4346,7 +4405,17 @@ async def dispose_draft_finding(
             db, draft_id=draft_id, owner_id=owner_id, finding_id=finding_id
         )
     )
+    refreshed = await _run_store(lambda: store.get_draft(draft_id, owner_id))
     return FindingDispositionResponse(
-        finding=_to_finding(updated),
+        finding=_to_finding(
+            updated,
+            current_revision_id=(
+                new_revision.id if new_revision is not None else finding.revision_id
+            ),
+            draft_status=refreshed.status,
+            has_active_compile=await _run_store(
+                lambda: store.has_active_compile_job(draft_id)
+            ),
+        ),
         revision=_to_revision_summary(new_revision) if new_revision else None,
     )
