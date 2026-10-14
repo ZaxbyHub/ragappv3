@@ -1639,9 +1639,14 @@ class RAGEngine:
                 _multi_sub_rerank_status = rerank_status
                 trace.fusion_used = fusion_applied
                 if sub_queries_failed:
+                    # Sub-query text is user-derived — count-only at INFO,
+                    # full (truncated) text at DEBUG only (#287/#710).
                     logger.info(
-                        "[query] %d sub-queries failed (degraded fusion): %s",
+                        "[query] %d sub-queries failed (degraded fusion)",
                         len(sub_queries_failed),
+                    )
+                    logger.debug(
+                        "[query] failed sub-queries (degraded fusion): %s",
                         [sq[:40] for sq in sub_queries_failed],
                     )
             except SearchSemaphoreTimeoutError:
@@ -2508,10 +2513,15 @@ class RAGEngine:
                 emb = await self.embedding_service.embed_single(sq)
                 return sq, emb, None
             except Exception as exc:
+                # Sub-query text is user-derived — keep it out of default
+                # (WARNING) logs; DEBUG carries the truncated text (#710).
                 logger.warning(
-                    "[_orchestrate_sub_query_retrieval] sub-query embedding failed: %s (%s)",
-                    sq[:60],
+                    "[_orchestrate_sub_query_retrieval] sub-query embedding failed (%s)",
                     exc,
+                )
+                logger.debug(
+                    "[_orchestrate_sub_query_retrieval] failed sub-query text: %s",
+                    sq[:60],
                 )
                 return sq, None, str(exc)
 
@@ -2526,10 +2536,14 @@ class RAGEngine:
                 sq = unique_plan[i] if i < len(unique_plan) else f"<sub_query_{i}>"
                 failed_sub_queries.append(sq)
                 logger.warning(
-                    "[_orchestrate_sub_query_retrieval] embed task %d (%s) raised: %s",
+                    "[_orchestrate_sub_query_retrieval] embed task %d raised: %s",
+                    i,
+                    result,
+                )
+                logger.debug(
+                    "[_orchestrate_sub_query_retrieval] failed sub-query text (task %d): %s",
                     i,
                     sq[:60],
-                    result,
                 )
             else:
                 sq, emb, exc = result
@@ -2537,9 +2551,12 @@ class RAGEngine:
                     failed_sub_queries.append(sq)
                     if exc:
                         logger.warning(
-                            "[_orchestrate_sub_query_retrieval] sub-query '%s' embedding failed: %s",
-                            sq[:60],
+                            "[_orchestrate_sub_query_retrieval] sub-query embedding failed: %s",
                             exc,
+                        )
+                        logger.debug(
+                            "[_orchestrate_sub_query_retrieval] failed sub-query text: %s",
+                            sq[:60],
                         )
                 else:
                     sub_query_embeddings.append((sq, emb))
@@ -2639,9 +2656,12 @@ class RAGEngine:
             if isinstance(result, BaseException):
                 failed_sub_queries.append(sq)
                 logger.warning(
-                    "[_orchestrate_sub_query_retrieval] sub-query '%s' retrieval failed: %s",
-                    sq[:60],
+                    "[_orchestrate_sub_query_retrieval] sub-query retrieval failed: %s",
                     result,
+                )
+                logger.debug(
+                    "[_orchestrate_sub_query_retrieval] failed sub-query text: %s",
+                    sq[:60],
                 )
                 per_sub_results.append([])
             else:

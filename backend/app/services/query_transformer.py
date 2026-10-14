@@ -804,7 +804,13 @@ class QueryPlanner:
                 logger.warning("QueryPlanner Redis cache set failed: %s", e)
         self._lru_set(cache_key, sub_queries)
 
+        # Raw user/query text is logged at DEBUG only — it must not land in
+        # default (INFO) logs as routine chat traffic (#287/#710 contract).
         logger.info(
+            "QueryPlanner: decomposed query into %d sub-queries",
+            len(sub_queries),
+        )
+        logger.debug(
             "QueryPlanner: decomposed '%s' into %d sub-queries",
             query[:60],
             len(sub_queries),
