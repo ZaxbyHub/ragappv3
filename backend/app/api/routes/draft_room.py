@@ -68,9 +68,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import sqlite3
 from pathlib import Path
 from typing import Annotated, Any, Callable, Generic, Optional, TypeVar
+from urllib.parse import quote
 
 from fastapi import (
     APIRouter,
@@ -272,7 +274,20 @@ async def draft_room_exception_handler(
 
     Registered in ``app.main`` above the SPA catch-all. ``context`` is
     omitted (not sent as ``{}``) when empty, matching SPEC section 8.3.
+
+    5xx responses are logged with their cause and target before rendering
+    (issue #789): a server error that leaves no ERROR record is invisible to
+    operators. 4xx stays unlogged — client errors are normal traffic.
     """
+    if exc.status_code >= 500:
+        logger.error(
+            "draft_room: %s %s -> %s %s cause=%r",
+            request.method,
+            request.url.path,
+            exc.status_code,
+            exc.code,
+            exc.__cause__,
+        )
     body: dict[str, Any] = {"detail": exc.detail, "code": exc.code}
     if exc.context:
         body["context"] = exc.context
@@ -1493,8 +1508,21 @@ async def _delete_input_row_best_effort(
         )
 
 
+_EXPORT_TITLE_SEPARATOR_RE = re.compile(r"[/\\]")
+
+
 def _export_filename(title: str, revision_no: int, tag: str) -> str:
-    safe_title = secure_filename(title.replace(" ", "_")) or "draft"
+    """Filesystem-safe export name preserving as much of the title as possible.
+
+    ``secure_filename`` strips client *paths* (``os.path.basename`` first), so
+    feeding it a raw title would silently drop everything before a ``/`` or
+    ``\\`` (issue #789: ``A/B test results`` exported as
+    ``B_test_results-rev1-REVIEW.md``). In a title the separator is content,
+    not a path, so it is rewritten to an underscore before sanitizing; the
+    ASCII-safe name itself is unchanged for pure-ASCII separator-free titles.
+    """
+    folded = _EXPORT_TITLE_SEPARATOR_RE.sub("_", title)
+    safe_title = secure_filename(folded.replace(" ", "_")) or "draft"
     base = f"{safe_title}-rev{revision_no}"
     if tag:
         base = f"{base}-{tag}"
@@ -1581,6 +1609,16 @@ def _request_fingerprint(
     across a prompt-bundle upgrade, can never alias. The authenticated user is
     not hashed in — it is the other half of the key's scope and is enforced by
     the ``(created_by, idempotency_key)`` unique index.
+
+    ``start_stage`` is the client's *requested* stage, deliberately not the
+    server-normalized one: for a fresh compile the normalized value is always
+    ``research`` (issue #789), which would alias every requested stage under
+    one key. The *compile* fingerprint (checkpoint-resume identity,
+    ``_sync_compile_fingerprint``) keeps hashing the normalized stage — the
+    two fingerprints answer different questions. A retry hashes the parent
+    job's frozen ``input_revision_id`` rather than the live current revision,
+    because the retried job itself changes the current revision on success and
+    must not invalidate its own replay (issue #789).
     """
     return sha256_text(
         canonical_json(
@@ -1733,6 +1771,20 @@ def _conflict(detail: str, code: str, **context: Any) -> DraftRoomHTTPError:
     return DraftRoomHTTPError(409, detail, code, context or None)
 
 
+def _stale_lock_conflict() -> DraftConflictError:
+    """The one error every stale-``lock_version`` raise emits (issue #789).
+
+    The store's ``DraftConflictError`` default code is the generic
+    ``conflict``; the same condition on the disposition path already used the
+    precise ``stale_lock_version``. One condition, one code, everywhere —
+    clients can distinguish "reload and retry" from every other conflict
+    without parsing detail strings.
+    """
+    err = DraftConflictError("draft was modified by another request; reload and retry")
+    err.code = "stale_lock_version"
+    return err
+
+
 def _sync_enqueue_compile(
     conn: sqlite3.Connection,
     *,
@@ -1795,9 +1847,7 @@ def _sync_enqueue_compile(
                 )
 
         if current_lock != lock_version:
-            raise DraftConflictError(
-                "draft was modified by another request; reload and retry"
-            )
+            raise _stale_lock_conflict()
         if status not in _COMPILE_ALLOWED_PRIOR_STATUSES:
             raise _conflict(
                 "draft is not in a state that can start a compile", "invalid_state"
@@ -1898,9 +1948,40 @@ def _sync_enqueue_compile(
         except sqlite3.IntegrityError as exc:
             # Either the one-active-compile index or the (created_by,
             # idempotency_key) index lost a race. Both are conflicts, never 500s.
+            # Discriminate by the violated constraint's identity (issue #789):
+            # sqlite reports plain unique-index violations as a COLUMN list
+            # ("UNIQUE constraint failed: draft_jobs.created_by,
+            # draft_jobs.idempotency_key") and names the index only for
+            # expression indexes, so match either shape; the prefix anchor
+            # keeps CHECK/NOT NULL/FK messages out. When one INSERT violates
+            # both indexes at once, whichever sqlite reports first picks the
+            # arm — both outcomes are correct (replay-return the winner, or
+            # active_job with its id).
+            msg = str(exc)
+            if msg.startswith("UNIQUE constraint failed") and (
+                "idempotency_key" in msg or "idx_draft_jobs_idempotency" in msg
+            ):
+                # The key index lost the race. This path may RETURN (a racing
+                # identical replay gets the winner), so it owns its rollback —
+                # a return must not rely on the outer except's conn.rollback().
+                conn.rollback()
+                winner = conn.execute(
+                    "SELECT id, draft_id, input_json FROM draft_jobs "
+                    "WHERE created_by = ? AND idempotency_key = ?",
+                    (owner_id, idempotency_key),
+                ).fetchone()
+                if winner is not None:
+                    stored = _json_or(winner[2], {})
+                    if (
+                        int(winner[1]) == draft_id
+                        and stored.get("request_fingerprint") == request_fingerprint
+                    ):
+                        return int(winner[0]), False
+                raise _conflict(
+                    "the idempotency-key is already in use", "idempotency_key_conflict"
+                ) from exc
             raise _conflict(
-                "a compile job is already active for this draft or the "
-                "idempotency-key is already in use",
+                "a compile job is already active for this draft",
                 "active_job",
             ) from exc
         job_id = int(cur.lastrowid)
@@ -2006,9 +2087,7 @@ def _sync_apply_finding(
             draft_row[2],
         )
         if current_lock != lock_version:
-            raise DraftConflictError(
-                "draft was modified by another request; reload and retry"
-            )
+            raise _stale_lock_conflict()
         if status == "archived":
             raise _conflict(
                 "archived draft cannot accept new revisions", "invalid_state"
@@ -2219,9 +2298,7 @@ def _sync_mark_ready(
             str(draft_row[2]),
         )
         if current_lock != lock_version:
-            raise DraftConflictError(
-                "draft was modified by another request; reload and retry"
-            )
+            raise _stale_lock_conflict()
         # 'needs_review' is the only prior status with a legal edge to 'ready'.
         if status != "needs_review":
             raise _conflict(
@@ -2483,6 +2560,7 @@ def _sync_get_finding(
 
 @router.get("/capabilities", response_model=DraftRoomCapabilities)
 async def get_capabilities(
+    request: Request,
     user: dict = Depends(get_current_active_user),
 ) -> DraftRoomCapabilities:
     return DraftRoomCapabilities(
@@ -2524,8 +2602,14 @@ async def get_capabilities(
         # Honest capability reporting (SPEC section 8.2). Each flag below is
         # True because the feature is reachable end to end: the route exists
         # here, its store accessors shipped in draft_store, and the compile
-        # orchestrator that populates the ledgers shipped in draft_pipeline.
-        compile_available=True,
+        # orchestrator that populates the ledgers shipped in draft_pipeline —
+        # except ``compile_available``, which is derived from the live worker:
+        # startup continues with ``app.state.draft_job_processor = None`` when
+        # DraftJobProcessor fails to start, and advertising compile as
+        # available then would promise jobs nothing will ever claim (#789).
+        compile_available=(
+            getattr(request.app.state, "draft_job_processor", None) is not None
+        ),
         findings_available=True,
         claims_available=True,
         evidence_available=True,
@@ -2874,12 +2958,12 @@ async def upload_draft_input(
             )
         )
     except DraftRoomHTTPError:
-        await asyncio.to_thread(
-            lambda: storage.resolve(input_record.storage_relpath).unlink(missing_ok=True)
-        )
-        await _delete_input_row_best_effort(
-            store, draft_id=draft_id, owner_id=owner_id, input_id=input_record.id
-        )
+        # Same guarded compensation as the generic branch below: a translated
+        # domain error must still roll back BOTH the staged bytes and the input
+        # row, and a fault inside the compensation itself (e.g. an OSError from
+        # unlink on a Windows sharing violation) must neither skip the row
+        # rollback nor replace the domain error the client sees (issue #789).
+        await _compensate_enqueue_phase()
         raise
     except Exception:
         # Same compensation as the translated-domain-error branch above, but
@@ -3184,8 +3268,10 @@ async def retry_draft_job(
     idempotency_key = _validate_idempotency_key(request.headers.get(_IDEMPOTENCY_HEADER))
 
     def _prepare_retry() -> dict[str, Any]:
-        # ``start_stage`` is part of the compile fingerprint (SPEC section
-        # 5.4), so the NORMALIZED value must be resolved first.
+        # The *compile* fingerprint hashes the NORMALIZED stage (SPEC section
+        # 5.4) because it is the checkpoint-resume identity; the *request*
+        # fingerprint below hashes the client's requested stage because it is
+        # the idempotency identity (SPEC section 8.2, issue #789).
         normalized = _sync_normalize_start_stage(db, job_id=job_id, requested=requested)
         return {
             "input_snapshot": _sync_input_snapshot(store, draft),
@@ -3204,8 +3290,11 @@ async def retry_draft_job(
     fingerprint = _request_fingerprint(
         operation="retry",
         draft=draft,
-        base_revision_id=base_revision_id,
-        start_stage=prepared["normalized"],
+        # The parent's frozen base, not the live current revision: the retried
+        # job itself changes the current revision on success, and a replay
+        # after that must still match this fingerprint (issue #789).
+        base_revision_id=parent.input_revision_id,
+        start_stage=requested,
         parent_job_id=job_id,
         input_snapshot=prepared["input_snapshot"],
     )
@@ -3283,8 +3372,10 @@ async def compile_draft(
     idempotency_key = _validate_idempotency_key(request.headers.get(_IDEMPOTENCY_HEADER))
 
     def _prepare_compile() -> dict[str, Any]:
-        # ``start_stage`` is part of the compile fingerprint (SPEC section
-        # 5.4), so the NORMALIZED value must be resolved first.
+        # The *compile* fingerprint hashes the NORMALIZED stage (SPEC section
+        # 5.4) because it is the checkpoint-resume identity; the *request*
+        # fingerprint below hashes the client's requested stage because it is
+        # the idempotency identity (SPEC section 8.2, issue #789).
         normalized = _sync_normalize_start_stage(
             db, job_id=None, requested=body.start_stage
         )
@@ -3301,7 +3392,7 @@ async def compile_draft(
         operation="compile",
         draft=draft,
         base_revision_id=body.base_revision_id,
-        start_stage=prepared["normalized"],
+        start_stage=body.start_stage,
         parent_job_id=None,
         input_snapshot=prepared["input_snapshot"],
     )
@@ -3679,11 +3770,24 @@ async def export_draft_revision(
             "content_sha256": revision.content_sha256,
         },
     )
+    # RFC 6266: the ASCII-safe ``filename`` parameter stays for legacy
+    # clients, and the additive ``filename*`` parameter carries the raw title
+    # (percent-encoded, ``safe=""`` so a title's own ``/`` never passes
+    # through) so non-ASCII titles survive end-to-end for modern clients
+    # (issue #789 — the ASCII name deliberately ASCII-folds them).
+    raw_name = _EXPORT_TITLE_SEPARATOR_RE.sub("_", draft.title or "draft")
+    disposition = (
+        f'attachment; filename="{filename}"; '
+        f"filename*=UTF-8''{quote(raw_name, safe='')}-rev{revision.revision_no}"
+    )
+    if tag:
+        disposition += f"-{tag}"
+    disposition += ".md"
     return Response(
         content=revision.content_md or "",
         media_type="text/markdown; charset=utf-8",
         headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Disposition": disposition,
             "X-Draft-Fact-Status": fact_status,
             "X-Draft-Approval-Status": approval_status,
             "X-Draft-Content-Sha256": revision.content_sha256,
@@ -3781,10 +3885,18 @@ async def _run_promotion(
             await _record_promotion_cleanup_failure(db, request, user, draft_id, exc)
         raise DraftRoomHTTPError(409, str(exc), "promotion_path_conflict") from exc
     except DraftPromotionError as exc:
+        # A 500 must never be silent (issue #789): every exit from this branch
+        # carries the exception into the server log. The cleanup-incomplete
+        # sub-branch answers with a fixed client detail — the raw wrapped
+        # exception text (which embeds infra errors like pool exhaustion) is
+        # logged here and recorded in the audit event, not echoed to clients.
+        logger.exception("draft_room: promotion failed draft_id=%s", draft_id)
         if exc.cleanup_incomplete:
             await _record_promotion_cleanup_failure(db, request, user, draft_id, exc)
             raise DraftRoomHTTPError(
-                500, str(exc), "promotion_failed_incomplete_cleanup"
+                500,
+                "promotion failed and cleanup could not be verified",
+                "promotion_failed_incomplete_cleanup",
             ) from exc
         raise DraftRoomHTTPError(500, "promotion failed", "internal_error") from exc
 

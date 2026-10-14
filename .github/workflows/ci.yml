@@ -175,6 +175,10 @@ jobs:
       - name: Memory response fields check
         run: python scripts/check_l09_memory_response_fields.py
 
+      # Issue #789 (Workstream N PR 5): backend/frontend DraftClaim nullability parity.
+      - name: DraftClaim nullable parity check
+        run: python scripts/check_n05_draftclaim_nullable.py
+
   # Issue #778 (Workstream L PR 7): the route x viewport accessibility gate.
   # Separate from the e2e smoke job — the matrix is 141 serial tests and
   # must not share the smoke budget — and wired by

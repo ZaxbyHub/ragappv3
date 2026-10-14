@@ -125,6 +125,7 @@ quality-contracts:
     python scripts/check_l09_skill_trigger_paths.py
     python scripts/check_l09_index_assets.py
     python scripts/check_l09_memory_response_fields.py
+    python scripts/check_n05_draftclaim_nullable.py
 
 # SAST job (CI installs backend/requirements-dev.txt first)
 sast:

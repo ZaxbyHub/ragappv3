@@ -1249,9 +1249,13 @@ class DraftStore:
             raise DraftNotFoundError("draft not found")
         draft = _row_to_draft(row)
         if lock_version is not None and draft.lock_version != lock_version:
-            raise DraftConflictError(
+            # Same precise code as every other stale-lock raise (issue #789);
+            # the class default ``conflict`` is reserved for other conflicts.
+            err = DraftConflictError(
                 "draft was modified by another request; reload and retry"
             )
+            err.code = "stale_lock_version"
+            raise err
         return draft
 
     def _assert_no_active_compile(self, draft_id: int) -> None:

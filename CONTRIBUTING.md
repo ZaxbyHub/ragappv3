@@ -223,6 +223,7 @@ python scripts/check_l07_a11y_gate_wired.py  # the a11y matrix gate is wired in 
 python scripts/check_l09_skill_trigger_paths.py  # generated skill trigger globs reference existing paths
 python scripts/check_l09_index_assets.py   # %BASE_URL% links in index.html exist under public/
 python scripts/check_l09_memory_response_fields.py   # no phantom fields in AddMemoryResponse vs the backend MemoryResponse
+python scripts/check_n05_draftclaim_nullable.py   # DraftClaim TS nullability matches the backend claim model
 ```
 
 **Closure evidence gate** (from repo root; standalone workflow
