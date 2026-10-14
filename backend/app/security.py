@@ -276,6 +276,21 @@ def get_csrf_manager(request: Request) -> CSRFManager:
     return manager
 
 
+def admin_scope_fingerprint(token: str) -> str:
+    """Non-secret fingerprint of the admin token's scope set.
+
+    The admin-token auth model exposes no per-admin identity besides the
+    secret token itself, so durable audit columns (``created_by``) record
+    this fingerprint instead of the token — the secret must never be
+    persisted or echoed. Scope-set is the available non-secret
+    distinguisher (same formula the service-accounts route uses).
+    """
+    scopes = settings.admin_token_scopes.get(token, [])
+    return hashlib.sha256(
+        ",".join(sorted(scopes)).encode()
+    ).hexdigest()[:16]
+
+
 def require_scope(scope: str) -> Callable:
     """Require a specific scope derived from a server-side token→scopes mapping.
 

@@ -42,6 +42,7 @@ repository root.
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
@@ -263,11 +264,33 @@ def tracked_files() -> list[str]:
 
 
 def on_disk_files() -> list[str]:
-    """Return on-disk file paths (relative, posix) under ROOT, excluding .git."""
+    """Return on-disk file paths (relative, posix) under ROOT, excluding .git.
+
+    Walks with os.scandir instead of Path.rglob so a directory that is
+    created/removed by a concurrent process mid-walk (e.g. the coverage
+    gate's npm run under pytest-xdist) skips the vanished entry instead of
+    crashing the whole scan with FileNotFoundError.
+    """
     out: list[str] = []
-    for path in ROOT.rglob("*"):
-        if path.is_file() and ".git" not in path.parts:
-            out.append(path.relative_to(ROOT).as_posix())
+    stack = [ROOT]
+    while stack:
+        current = stack.pop()
+        try:
+            entries = list(os.scandir(current))
+        except OSError:
+            # Vanished, replaced, or unreadable between listing and walking.
+            continue
+        for entry in entries:
+            try:
+                if entry.is_file():
+                    path = Path(entry.path)
+                    if ".git" not in path.parts:
+                        out.append(path.relative_to(ROOT).as_posix())
+                elif entry.is_dir(follow_symlinks=False):
+                    if ".git" not in Path(entry.path).parts:
+                        stack.append(Path(entry.path))
+            except OSError:
+                continue
     return out
 
 

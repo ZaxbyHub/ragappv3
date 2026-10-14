@@ -59,6 +59,25 @@ def _labels_from_count(prefix: str, count: int) -> set[str]:
     return {f"{prefix}{i}" for i in range(1, count + 1)}
 
 
+# The exact refusal sentence the default prompt prescribes (issue #709 /
+# TQ-instruction-batch-4-11). prompt_builder embeds this constant in
+# CITATION_INSTRUCTION so the prompt and the refusal detector below share ONE
+# wording instead of drifting apart.
+PROMPT_REFUSAL_SENTENCE = "This information is not available in the provided context."
+
+# Substrings that mark an answer as a no-match refusal rather than factual
+# claims. Includes the shared prompt sentence's key fragments plus
+# "provided documents" so paraphrases of the instructed wording are caught.
+REFUSAL_PHRASES = (
+    "not available in the retrieved",
+    "not available in the provided context",
+    "not available in the provided documents",
+    "i don't have enough",
+    "no relevant",
+    "the retrieved documents",
+)
+
+
 _LABEL_FORMAT_RE = re.compile(r"^([SMWKD])(\d+)$")
 
 
@@ -119,13 +138,7 @@ def _looks_factual(content: str) -> bool:
     if not content or len(content) < 80:
         return False
     lower = content.lower()
-    refusal_phrases = (
-        "not available in the retrieved",
-        "i don't have enough",
-        "no relevant",
-        "the retrieved documents",
-    )
-    if any(p in lower for p in refusal_phrases):
+    if any(p in lower for p in REFUSAL_PHRASES):
         return False
     # Count sentence-terminating punctuation.
     return sum(1 for ch in content if ch in ".!?") >= 2

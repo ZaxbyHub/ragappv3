@@ -17,7 +17,7 @@ from app.api.deps import (
     get_toggle_manager,
 )
 from app.config import settings
-from app.security import csrf_protect, require_scope
+from app.security import admin_scope_fingerprint, csrf_protect, require_scope
 from app.services.maintenance import MaintenanceAudit, MaintenanceService
 from app.services.secret_manager import SecretManager
 from app.services.toggle_manager import ToggleManager
@@ -110,12 +110,16 @@ async def set_toggle(
     auth: dict = Depends(require_scope("admin:config")),
 ):
     key, key_version = secret_manager.get_hmac_key()
+    # Audit identity is the non-secret scope fingerprint, never the bearer
+    # token (issue #709 class (a)): the token must not live in a durable
+    # audit column or an HMAC message derived into one.
+    actor = admin_scope_fingerprint(auth.get("user_id", ""))
     try:
         hmac_digest, timestamp = _compute_hmac(
             key,
             payload.feature,
             payload.enabled,
-            auth.get("user_id"),
+            actor,
             request.client.host if request.client else None,
         )
     except Exception:
@@ -128,7 +132,7 @@ async def set_toggle(
             toggle_manager,
             payload.feature,
             payload.enabled,
-            auth.get("user_id"),
+            actor,
             request.client.host if request.client else None,
             key_version,
             hmac_digest,
@@ -164,12 +168,14 @@ async def set_maintenance(
     """Set write-blocking maintenance flag state."""
     key, key_version = secret_manager.get_hmac_key()
     ip = request.client.host if request.client else None
+    # Non-secret audit identity (issue #709 class (a)) — see set_toggle.
+    actor = admin_scope_fingerprint(auth.get("user_id", ""))
     try:
         hmac_digest, timestamp = _compute_hmac(
             key,
             MaintenanceService.FLAG_NAME,
             payload.enabled,
-            auth.get("user_id"),
+            actor,
             ip,
         )
     except Exception:
@@ -183,7 +189,7 @@ async def set_maintenance(
             payload.enabled,
             payload.reason,
             MaintenanceAudit(
-                user_id=auth.get("user_id"),
+                user_id=actor,
                 ip=ip,
                 key_version=key_version,
                 hmac_sha256=hmac_digest,
