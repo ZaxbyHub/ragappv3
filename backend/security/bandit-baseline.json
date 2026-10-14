@@ -36,7 +36,7 @@
       "SEVERITY.LOW": 62,
       "SEVERITY.MEDIUM": 60,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 88356,
+      "loc": 88388,
       "nosec": 0,
       "skipped_tests": 66
     },
@@ -1427,7 +1427,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 623,
+      "loc": 655,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -3932,7 +3932,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "205         }, sort_keys=True)\n206         return f\"query_transform:{hashlib.md5(key_data.encode()).hexdigest()}\"\n207 \n",
+      "code": "225         }, sort_keys=True)\n226         return f\"query_transform:{hashlib.md5(key_data.encode()).hexdigest()}\"\n227 \n",
       "col_offset": 34,
       "end_col_offset": 64,
       "filename": "backend/app/services/query_transformer.py",
@@ -3943,16 +3943,16 @@
       },
       "issue_severity": "HIGH",
       "issue_text": "Use of weak MD5 hash for security. Consider usedforsecurity=False",
-      "line_number": 206,
+      "line_number": 226,
       "line_range": [
-        206
+        226
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b324_hashlib.html",
       "test_id": "B324",
       "test_name": "hashlib"
     },
     {
-      "code": "585         )\n586         return f\"query_plan:{hashlib.md5(key_data.encode()).hexdigest()}\"\n587 \n",
+      "code": "626         )\n627         return f\"query_plan:{hashlib.md5(key_data.encode()).hexdigest()}\"\n628 \n",
       "col_offset": 29,
       "end_col_offset": 59,
       "filename": "backend/app/services/query_transformer.py",
@@ -3963,9 +3963,9 @@
       },
       "issue_severity": "HIGH",
       "issue_text": "Use of weak MD5 hash for security. Consider usedforsecurity=False",
-      "line_number": 586,
+      "line_number": 627,
       "line_range": [
-        586
+        627
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b324_hashlib.html",
       "test_id": "B324",
