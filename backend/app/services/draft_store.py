@@ -1,8 +1,32 @@
 """SQLite persistence for Draft Room (issue #435, ``specs/draft-room/SPEC.md``).
 
-``DraftStore`` owns *all* Draft Room CRUD, atomic job claims, centralized status
-transitions, revision numbering, and audit-event records. Routes and the durable
-job processor go through it; no other module writes these tables.
+``DraftStore`` is the default owner of the six Draft Room tables (``drafts``,
+``draft_jobs``, ``draft_revisions``, ``draft_events``, ``draft_inputs``,
+``draft_findings``). It implements the atomic job claim, the status transition
+tables, revision-number allocation, and audit-event recording. Three declared
+co-owners write these tables directly as well, each owning the write families
+listed below (issue #790):
+
+* ``api/routes/draft_room.py`` — cross-table transactional helpers: compile
+  enqueue/retry (``drafts``, ``draft_jobs``), apply-finding and manual
+  revisions (``draft_revisions``, ``draft_findings``, ``drafts``), and the
+  Ready transition (``drafts``).
+* ``services/draft_job_processor.py`` — worker-lifecycle writes:
+  ``drafts.status`` fail/requeue settles, retry ``draft_jobs`` rows, and
+  ``draft_inputs.parse_status``.
+* ``services/draft_pipeline.py`` — compile-time writes: ``draft_jobs``
+  progress columns, revision publication (``draft_revisions`` including the
+  ``is_current`` flip), ``draft_events`` inserts, and the ``drafts.status``
+  settle.
+
+A fourth writer exists by design and is not Draft Room-specific:
+``services/job_lease.py`` is a shared lease primitive parameterized on a table
+name, and this module constructs it with ``table="draft_jobs"`` for claims,
+heartbeats, and reclaims. Because the table is a Python attribute rather than
+static SQL, it is invisible to
+``backend/tests/draft_room/test_table_ownership_census.py``, which AST-censuses
+``backend/app`` and fails the build for a module outside the owner set that
+writes these tables through static SQL.
 
 Invariants enforced here that SQLite cannot express (SPEC sections 5.7, 9.1, 10.3):
 
@@ -14,8 +38,11 @@ Invariants enforced here that SQLite cannot express (SPEC sections 5.7, 9.1, 10.
 * ``draft_revisions.job_id`` is null for manual revisions and otherwise names a
   job on the same draft; ``parent_revision_id`` belongs to the same draft.
 * A draft's owner and vault are immutable after creation.
-* No caller may write an arbitrary status string — every status change goes
-  through the transition tables below and is rejected otherwise.
+* A caller of this store may not write an arbitrary status string — every
+  status change routed through here goes through the transition tables below
+  and is rejected otherwise. The declared co-owners above write
+  ``drafts.status`` directly and therefore keep their own mirrored prior-status
+  allowlists instead of calling the module-private tables below.
 * Revision-number allocation and current-revision replacement happen inside a
   single ``BEGIN IMMEDIATE`` transaction.
 
