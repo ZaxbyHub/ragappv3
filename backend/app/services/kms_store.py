@@ -302,6 +302,11 @@ class KMSStore:
             f"UPDATE kms_entries SET {set_clause} WHERE id = ? AND vault_id = ?", values
         )
         if cur.rowcount == 0:
+            # The 0-row UPDATE opened an implicit transaction on a
+            # default-isolation connection; every sibling 0-row path in this
+            # store rolls back before returning so the pooled connection is
+            # never handed back in-transaction (issue #791).
+            self._db.rollback()
             return None
         if "body" in updates:
             # SPEC section 12.6: an entry-body change invalidates Draft Room

@@ -143,7 +143,10 @@ export interface WikiLintFinding {
   details: string;
   related_page_ids_json: string;
   related_claim_ids_json: string;
-  status: "open" | "acknowledged" | "resolved" | "dismissed";
+  // "auto_resolved" is system-only (issue #791): the lint reconciler writes
+  // it when detection stops, and it reopens on recurrence; users can only
+  // set resolved/dismissed/acknowledged.
+  status: "open" | "acknowledged" | "resolved" | "dismissed" | "auto_resolved";
   created_at: string;
   updated_at: string;
 }

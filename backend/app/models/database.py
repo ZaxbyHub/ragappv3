@@ -1258,7 +1258,15 @@ CREATE TABLE IF NOT EXISTS wiki_lint_findings (
     related_claim_ids_json TEXT NOT NULL DEFAULT '[]'
         CHECK (json_type(related_claim_ids_json) = 'array'),
     status TEXT NOT NULL DEFAULT 'open' CHECK (status IN (
-        'open','acknowledged','resolved','dismissed')),
+        'open','acknowledged','resolved','dismissed','auto_resolved')),
+    -- Producer provenance (issue #791): 'linter' rows are owned by the lint
+    -- reconciler (the only origin it may auto-resolve); 'invalidation'
+    -- (stale/weak_provenance), 'compiler' (unverified query-answer claims)
+    -- and 'curator' rows are never force-resolved by a lint run. Any future
+    -- rebuild of this table MUST enumerate this canonical shape, including
+    -- the json CHECKs and the five-value status CHECK above.
+    origin TEXT NOT NULL DEFAULT 'linter' CHECK (origin IN (
+        'linter','invalidation','compiler','curator')),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -2068,6 +2076,10 @@ def run_migrations(sqlite_path: str) -> None:
     migrate_add_chat_stream_events(sqlite_path)
     # Per-user onboarding milestone state (issue #782) — purely additive.
     migrate_add_user_onboarding_state(sqlite_path)
+    # Producer provenance + auto_resolved status for wiki lint findings
+    # (issue #791): table rebuild, so it runs after every other migration
+    # that may create or rebuild wiki_lint_findings.
+    migrate_wiki_lint_findings_origin_auto_resolved(sqlite_path)
 
     # Partial unique index for duplicate hash detection (HIGH-10), widened to
     # treat a `partial` row the same as an `indexed` one (issue #693 /
@@ -7111,6 +7123,241 @@ def migrate_add_wiki_lint_findings_json_check(sqlite_path: str) -> None:
         invalidate_derived_data(
             conn,
             reason="wiki_lint_findings rebuilt with JSON CHECK constraints",
+            migration_name=_journal,
+        )
+        if recovered:
+            record_migration_outcome(
+                conn, migration_name=_journal, phase="recovered",
+                outcome="recovered_from_backup",
+                detail="wiki_lint_findings restored from _wiki_lint_findings_old",
+            )
+        record_migration_outcome(
+            conn, migration_name=_journal, phase="succeeded", outcome="ok",
+            detail=f"rows={before_count}",
+        )
+    finally:
+        conn.close()
+
+
+def migrate_wiki_lint_findings_origin_auto_resolved(sqlite_path: str) -> None:
+    """
+    Migration: add producer provenance and a system auto-resolve status to
+    wiki_lint_findings (issue #791).
+
+    - New ``origin`` column ('linter' / 'invalidation' / 'compiler' /
+      'curator'): the lint reconciler may only auto-resolve ``origin='linter'``
+      rows, so invalidation (stale/weak_provenance), compiler (unverified
+      query-answer claims) and curator rows are never force-resolved by a
+      lint run that did not create them.
+    - Status vocabulary gains ``auto_resolved`` — the value the reconciler
+      writes, distinct from every user disposition (resolved/dismissed/
+      acknowledged), so a recurring issue can reopen while user dispositions
+      keep suppressing.
+
+    Backfill: the compile_query_job writer is identified by its fixed title
+    prefix ("Unverified claim: extracted from query answer..."); stale and
+    weak_provenance rows are invalidation-only; everything else backfills as
+    'linter'. Legacy curator rows carrying linter-emitted finding_types are
+    data-indistinguishable from linter rows and backfill as 'linter' — the
+    same resolvability they have today, disclosed in issue #791's plan.
+    Legacy rows with status='resolved' written by the pre-#791 reconciler are
+    equally indistinguishable from user resolves and stay user-terminal.
+
+    SQLite cannot ALTER a column's CHECK, so the table is recreated — modeled
+    on migrate_add_wiki_lint_findings_json_check (journal, recovery prologue
+    for a stale/partial ``_wiki_lint_findings_old``, row-count parity, and
+    autoincrement high-water preservation). Idempotent: exits early when the
+    schema already carries the origin CHECK.
+    """
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
+    conn.isolation_level = None
+    _journal = "migrate_wiki_lint_findings_origin_auto_resolved"
+    try:
+        conn.execute("PRAGMA foreign_keys = ON;")
+        recovered = False
+
+        # Recovery prologue: disposition a leftover backup table the same way
+        # migrate_add_wiki_lint_findings_json_check does (that migration shares
+        # the _wiki_lint_findings_old name; run-order dispositions its own
+        # leftovers before this one runs).
+        old_present = conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='_wiki_lint_findings_old'"
+        ).fetchone()
+        new_present = conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='wiki_lint_findings'"
+        ).fetchone()
+
+        if old_present and not new_present:
+            logger.warning(
+                "migrate_wiki_lint_findings_origin_auto_resolved: detected "
+                "_wiki_lint_findings_old without wiki_lint_findings; restoring."
+            )
+            conn.execute("PRAGMA legacy_alter_table = ON")
+            conn.execute(
+                "ALTER TABLE _wiki_lint_findings_old "
+                "RENAME TO wiki_lint_findings"
+            )
+            conn.execute("PRAGMA legacy_alter_table = OFF")
+            recovered = True
+            old_present = None
+        elif old_present and new_present:
+            dest_sql = conn.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type='table' AND name='wiki_lint_findings'"
+            ).fetchone()[0]
+            dest_new_shape = "CHECK (origin IN" in (dest_sql or "")
+            dest_count = conn.execute(
+                "SELECT COUNT(*) FROM wiki_lint_findings"
+            ).fetchone()[0]
+            backup_count = conn.execute(
+                "SELECT COUNT(*) FROM _wiki_lint_findings_old"
+            ).fetchone()[0]
+            missing_ids = conn.execute(
+                "SELECT COUNT(*) FROM (SELECT id FROM _wiki_lint_findings_old"
+                " EXCEPT SELECT id FROM wiki_lint_findings)"
+            ).fetchone()[0]
+            if dest_new_shape and dest_count >= backup_count and missing_ids == 0:
+                logger.warning(
+                    "migrate_wiki_lint_findings_origin_auto_resolved: detected "
+                    "stale _wiki_lint_findings_old alongside complete "
+                    "wiki_lint_findings; dropping stale table."
+                )
+                _preserve_autoincrement_high_water(
+                    conn, "_wiki_lint_findings_old", "wiki_lint_findings"
+                )
+                conn.execute("DROP TABLE _wiki_lint_findings_old")
+            else:
+                logger.warning(
+                    "migrate_wiki_lint_findings_origin_auto_resolved: detected "
+                    "failed partial copy in wiki_lint_findings; restoring "
+                    "authoritative _wiki_lint_findings_old."
+                )
+                conn.execute("DROP TABLE wiki_lint_findings")
+                conn.execute("PRAGMA legacy_alter_table = ON")
+                conn.execute(
+                    "ALTER TABLE _wiki_lint_findings_old "
+                    "RENAME TO wiki_lint_findings"
+                )
+                conn.execute("PRAGMA legacy_alter_table = OFF")
+                recovered = True
+            old_present = None
+
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='table' AND name='wiki_lint_findings'"
+        ).fetchone()
+        # Journal-silent no-op probes (issue #699 AC2).
+        if not row:
+            return
+        if "CHECK (origin IN" in row[0]:
+            return
+
+        record_migration_outcome(
+            conn, migration_name=_journal, phase="start", outcome="ok"
+        )
+        before_count = conn.execute(
+            "SELECT COUNT(*) FROM wiki_lint_findings"
+        ).fetchone()[0]
+
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "ALTER TABLE wiki_lint_findings RENAME TO _wiki_lint_findings_old"
+            )
+            # Canonical shape (must match the fresh-schema CREATE exactly,
+            # including both json CHECKs — the json_check migration's own
+            # idempotence marker greps for json_type(related_page_ids_json)):
+            # 5-value status CHECK + origin CHECK.
+            conn.execute("""
+                CREATE TABLE wiki_lint_findings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    vault_id INTEGER NOT NULL,
+                    finding_type TEXT NOT NULL CHECK (finding_type IN (
+                        'contradiction','stale','orphan','missing_page',
+                        'unsupported_claim','duplicate_entity','weak_provenance')),
+                    severity TEXT NOT NULL DEFAULT 'medium' CHECK (severity IN (
+                        'low','medium','high','critical')),
+                    title TEXT NOT NULL,
+                    details TEXT DEFAULT '',
+                    related_page_ids_json TEXT NOT NULL DEFAULT '[]'
+                        CHECK (json_type(related_page_ids_json) = 'array'),
+                    related_claim_ids_json TEXT NOT NULL DEFAULT '[]'
+                        CHECK (json_type(related_claim_ids_json) = 'array'),
+                    status TEXT NOT NULL DEFAULT 'open' CHECK (status IN (
+                        'open','acknowledged','resolved','dismissed','auto_resolved')),
+                    origin TEXT NOT NULL DEFAULT 'linter' CHECK (origin IN (
+                        'linter','invalidation','compiler','curator')),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.execute("""
+                INSERT INTO wiki_lint_findings
+                    (id, vault_id, finding_type, severity, title, details,
+                     related_page_ids_json, related_claim_ids_json,
+                     status, origin, created_at, updated_at)
+                SELECT
+                    id, vault_id, finding_type, severity, title, details,
+                    related_page_ids_json, related_claim_ids_json,
+                    status,
+                    CASE
+                        WHEN title LIKE 'Unverified claim: extracted from query answer%'
+                            THEN 'compiler'
+                        WHEN finding_type IN ('stale','weak_provenance')
+                            THEN 'invalidation'
+                        ELSE 'linter'
+                    END,
+                    created_at, updated_at
+                FROM _wiki_lint_findings_old
+            """)
+            after_count = conn.execute(
+                "SELECT COUNT(*) FROM wiki_lint_findings"
+            ).fetchone()[0]
+            if after_count != before_count:
+                raise RuntimeError(
+                    f"migrate_wiki_lint_findings_origin_auto_resolved: "
+                    f"row-count parity failed ({before_count} -> {after_count}). "
+                    f"_wiki_lint_findings_old has been preserved."
+                )
+            _preserve_autoincrement_high_water(
+                conn, "_wiki_lint_findings_old", "wiki_lint_findings"
+            )
+            conn.execute("DROP TABLE _wiki_lint_findings_old")
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_wiki_lint_findings_vault_status_severity
+                ON wiki_lint_findings(vault_id, status, severity)
+            """)
+            conn.commit()
+        except Exception as exc:
+            conn.rollback()
+            record_migration_outcome(
+                conn, migration_name=_journal, phase="failed", outcome="error",
+                detail=f"{type(exc).__name__}: {exc}",
+            )
+            raise
+        logger.info(
+            "Added origin provenance and auto_resolved status to wiki_lint_findings"
+        )
+
+        violations = conn.execute(
+            "PRAGMA foreign_key_check(wiki_lint_findings)"
+        ).fetchall()
+        if violations:
+            record_migration_outcome(
+                conn, migration_name=_journal, phase="failed", outcome="error",
+                detail=f"foreign_key_check(wiki_lint_findings) violations: {len(violations)}",
+            )
+            raise RuntimeError(
+                f"migrate_wiki_lint_findings_origin_auto_resolved: "
+                f"foreign_key_check(wiki_lint_findings) reported "
+                f"{len(violations)} violation(s) post-swap: {violations[:5]}"
+            )
+
+        invalidate_derived_data(
+            conn,
+            reason="wiki_lint_findings rebuilt with origin and auto_resolved",
             migration_name=_journal,
         )
         if recovered:

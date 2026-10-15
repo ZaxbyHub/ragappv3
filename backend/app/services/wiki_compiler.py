@@ -741,13 +741,15 @@ class WikiCompiler:
             self._db.commit()
             claims_created.append(self._store.get_claim(claim.id))
 
-            # Lint finding for every unverified claim (only on first creation)
+            # Lint finding for every unverified claim (only on first creation).
+            # origin='compiler' (issue #791): the lint reconciler must never
+            # auto-resolve these rows — they belong to the compile path.
             if _created and claim_status == "unverified":
                 self._db.execute(
                     """INSERT INTO wiki_lint_findings
                        (vault_id, finding_type, severity, title, details,
-                        related_page_ids_json, related_claim_ids_json, status, created_at, updated_at)
-                       VALUES (?, 'unsupported_claim', 'low', ?, ?, '[]', ?, 'open', ?, ?)""",
+                        related_page_ids_json, related_claim_ids_json, status, origin, created_at, updated_at)
+                       VALUES (?, 'unsupported_claim', 'low', ?, ?, '[]', ?, 'open', 'compiler', ?, ?)""",
                     (
                         vault_id,
                         "Unverified claim: extracted from query answer with no per-claim citations",
@@ -1203,31 +1205,53 @@ class WikiCompiler:
             for accepted in cur_result.accepted:
                 self._db.execute("SAVEPOINT claim_pair")
                 try:
-                    claim = self._store.create_claim(
-                        vault_id=vault_id,
-                        claim_text=accepted.claim_text,
-                        source_type="document",
-                        page_id=page_id,
-                        claim_type=accepted.claim_type,
-                        subject=accepted.subject,
-                        predicate=accepted.predicate,
-                        object=accepted.object,
-                        status=accepted.status,
-                        confidence=accepted.confidence,
-                        created_by_kind="llm_curator",
-                        commit=False,
+                    # Find-or-create (issue #791 / T1-35-S-03): a repeated
+                    # claim_text used to hit UNIQUE(vault_id, claim_text),
+                    # roll the claim+source savepoint back, and silently drop
+                    # this file's provenance. Replicate _find_or_create_claim's
+                    # lookup + source-dedupe semantics INLINE — its own
+                    # promotion/reactivation branches commit internally, which
+                    # would break the pair-atomicity established above.
+                    existing = self._store.find_claim_by_text(
+                        vault_id, accepted.claim_text
+                    ) or self._store.find_claim_by_normalized_text(
+                        vault_id, accepted.claim_text
                     )
-                    self._store.attach_source(
-                        claim_id=claim.id,
-                        source_kind="document",
-                        file_id=accepted.file_id,
-                        chunk_id=accepted.chunk_id,
-                        source_label=accepted.source_label or (
-                            f"file:{accepted.file_id}" if accepted.file_id else "curator"
-                        ),
-                        quote=accepted.source_quote,
-                        confidence=accepted.confidence,
-                    )
+                    if existing is not None:
+                        claim = existing
+                        already = any(
+                            s.source_kind == "document"
+                            and s.file_id == accepted.file_id
+                            for s in existing.sources
+                        )
+                    else:
+                        claim = self._store.create_claim(
+                            vault_id=vault_id,
+                            claim_text=accepted.claim_text,
+                            source_type="document",
+                            page_id=page_id,
+                            claim_type=accepted.claim_type,
+                            subject=accepted.subject,
+                            predicate=accepted.predicate,
+                            object=accepted.object,
+                            status=accepted.status,
+                            confidence=accepted.confidence,
+                            created_by_kind="llm_curator",
+                            commit=False,
+                        )
+                        already = False
+                    if not already:
+                        self._store.attach_source(
+                            claim_id=claim.id,
+                            source_kind="document",
+                            file_id=accepted.file_id,
+                            chunk_id=accepted.chunk_id,
+                            source_label=accepted.source_label or (
+                                f"file:{accepted.file_id}" if accepted.file_id else "curator"
+                            ),
+                            quote=accepted.source_quote,
+                            confidence=accepted.confidence,
+                        )
                     self._db.execute("RELEASE claim_pair")
                 except Exception as e:  # pragma: no cover - defensive
                     # Undo this pair only; RELEASE the (still-open) savepoint
@@ -1242,15 +1266,31 @@ class WikiCompiler:
                         "wiki curator: failed to persist accepted claim: %s", e
                     )
 
-        # Persist lint findings.
-        for finding in cur_result.lint_findings:
+        # Persist lint findings. One fingerprint-aware upsert carries the
+        # whole list with origin='curator' (issue #791 / T1-35-S-03): a
+        # curator rerun used to insert a fresh open copy of each finding via
+        # the raw create_lint_finding INSERT. Curator rows are also outside
+        # the linter's origin-scoped resolve pass, so a lint run can never
+        # force-resolve them. The try/except keeps the per-finding loop's
+        # recorded-never-raised contract (the orchestration catch above
+        # returns early and does not cover this block): a persist failure is
+        # recorded into the summary, never raised into the compile job.
+        if cur_result.lint_findings:
             try:
-                self._store.create_lint_finding(
-                    vault_id=vault_id,
-                    finding_type=finding["finding_type"],
-                    severity=finding.get("severity", "medium"),
-                    title=finding.get("title", "Curator lint"),
-                    details=finding.get("details", ""),
+                self._store.upsert_lint_findings(
+                    vault_id,
+                    [
+                        {
+                            "finding_type": finding["finding_type"],
+                            "severity": finding.get("severity", "medium"),
+                            "title": finding.get("title", "Curator lint"),
+                            "details": finding.get("details", ""),
+                            "related_page_ids": finding.get("related_page_ids", []),
+                            "related_claim_ids": finding.get("related_claim_ids", []),
+                        }
+                        for finding in cur_result.lint_findings
+                    ],
+                    origin="curator",
                 )
             except Exception as e:  # pragma: no cover - defensive
                 cur_result.errors.append(
