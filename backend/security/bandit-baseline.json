@@ -28,15 +28,15 @@
       "skipped_tests": 1
     },
     "_totals": {
-      "CONFIDENCE.HIGH": 39,
+      "CONFIDENCE.HIGH": 37,
       "CONFIDENCE.LOW": 28,
       "CONFIDENCE.MEDIUM": 63,
       "CONFIDENCE.UNDEFINED": 0,
-      "SEVERITY.HIGH": 8,
+      "SEVERITY.HIGH": 6,
       "SEVERITY.LOW": 62,
       "SEVERITY.MEDIUM": 60,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 88356,
+      "loc": 88395,
       "nosec": 0,
       "skipped_tests": 66
     },
@@ -1419,15 +1419,15 @@
       "skipped_tests": 0
     },
     "backend/app/services/query_transformer.py": {
-      "CONFIDENCE.HIGH": 2,
+      "CONFIDENCE.HIGH": 0,
       "CONFIDENCE.LOW": 0,
       "CONFIDENCE.MEDIUM": 0,
       "CONFIDENCE.UNDEFINED": 0,
-      "SEVERITY.HIGH": 2,
+      "SEVERITY.HIGH": 0,
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 623,
+      "loc": 662,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -3930,46 +3930,6 @@
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
-    },
-    {
-      "code": "205         }, sort_keys=True)\n206         return f\"query_transform:{hashlib.md5(key_data.encode()).hexdigest()}\"\n207 \n",
-      "col_offset": 34,
-      "end_col_offset": 64,
-      "filename": "backend/app/services/query_transformer.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 327,
-        "link": "https://cwe.mitre.org/data/definitions/327.html"
-      },
-      "issue_severity": "HIGH",
-      "issue_text": "Use of weak MD5 hash for security. Consider usedforsecurity=False",
-      "line_number": 206,
-      "line_range": [
-        206
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b324_hashlib.html",
-      "test_id": "B324",
-      "test_name": "hashlib"
-    },
-    {
-      "code": "585         )\n586         return f\"query_plan:{hashlib.md5(key_data.encode()).hexdigest()}\"\n587 \n",
-      "col_offset": 29,
-      "end_col_offset": 59,
-      "filename": "backend/app/services/query_transformer.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 327,
-        "link": "https://cwe.mitre.org/data/definitions/327.html"
-      },
-      "issue_severity": "HIGH",
-      "issue_text": "Use of weak MD5 hash for security. Consider usedforsecurity=False",
-      "line_number": 586,
-      "line_range": [
-        586
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b324_hashlib.html",
-      "test_id": "B324",
-      "test_name": "hashlib"
     },
     {
       "code": "1580         token_pack_stats: Dict[str, int] = {\n1581             \"token_pack_included\": 0,\n1582             \"token_pack_skipped\": 0,\n1583             \"token_pack_truncated\": 0,\n1584         }\n1585         # ------------------------------------------------------------------\n1586         # FR-002 part 2: Multi-sub-query orchestration \u2014 fan out independent\n",
