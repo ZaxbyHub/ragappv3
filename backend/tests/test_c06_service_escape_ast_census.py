@@ -4,9 +4,19 @@ Structural guardrail for the RC-07 escape/boundary defect class: every
 f-string interpolation of the shape ``<tag>{expr}</tag>`` under ``app/``
 must either be a direct call to an escape helper or be listed in the
 ALLOWED table below with (a) a human-readable justification and (b) a
-``paired_escape`` regex that is re-verified against the module source on
+``paired_escape`` regex that is re-matched against the module source on
 every run — so an allowlisted "pre-escaped local" stops being allowlisted
-the moment its upstream escape call disappears or is renamed.
+the moment the escape it names disappears or is renamed.
+
+Scope note (honest limits of this guard, tracked separately): the detector
+matches only adjacent-constant tag pairs in ``ast.JoinedStr`` nodes, so
+``.format()``/``%``/concatenation forms and newline-padded tags are outside
+its reach. A ``paired_escape`` pattern is searched over the whole module
+text, so it can pin a specific expression but cannot distinguish two sites
+that share the same text — entries whose second source shares text say so
+explicitly and name the behavioural tests that cover it. Those gaps are
+tracked for hardening; this guard is a backstop, not a proof of repo-wide
+coverage.
 
 RED against the pre-#711 tree (the unescaped ``{prior_assistant_clipped}``
 in query_transformer.py offended); GREEN on the fixed tree.
@@ -46,8 +56,22 @@ ALLOWED = {
         "document",
         "doc_view",
     ): (
-        "pre-escaped view: chunk_view/doc_view derive from _xml_escape(...) text",
-        re.compile(r"chunk_view\s*=\s*_xml_escape\("),
+        "pre-escaped view: doc_view is built from escaped_doc, and the "
+        "_build_prompt fallback escapes document_text when the caller passes "
+        "no escaped_document. The paired regex pins that exact expression, so "
+        "removing the fallback escape fails the census; the fallback is also "
+        "pinned behaviourally by "
+        "test_contextual_chunking.py::TestBuildPromptInjectionDefense. The "
+        "module's SECOND doc_view source — the escape-once path in "
+        "contextualize_chunks — shares the _xml_escape(document_text) text, so "
+        "the module-scoped paired search cannot distinguish it and it is not "
+        "regex-verifiable per site; it is pinned behaviourally by "
+        "test_b09_contextual_budget_clamps.py::"
+        "test_escape_once_path_matches_direct_escape",
+        re.compile(
+            r"escaped_document\s+if escaped_document is not None\s+else "
+            r"_xml_escape\(document_text\)"
+        ),
     ),
     (
         "services/contextual_chunking.py",

@@ -133,10 +133,13 @@ def is_followup_query(query: str) -> bool:
     return False
 
 
-# Trailing sentence punctuation only (end-anchored) — interior punctuation is
-# deliberately untouched so distinct facets like "C++" and "C" can never
-# normalize alike.
-_TRAILING_SENTENCE_PUNCT_RE = re.compile(r"[.?!,;:]+$")
+# Trailing sentence punctuation only. str.rstrip on this set is exactly
+# equivalent to an end-anchored "[.?!,;:]+$" substitution and, unlike that
+# regex, stays linear on a mid-string punctuation run (the regex is
+# quadratic there: ~25 s on an 80k query). Interior punctuation is
+# deliberately untouched, so punctuation-distinct facets like "C++" and "C"
+# can never normalize alike.
+_TRAILING_SENTENCE_PUNCT = ".?!,;:"
 
 
 def _normalize_sub_query(text: str) -> str:
@@ -145,11 +148,16 @@ def _normalize_sub_query(text: str) -> str:
     The planner prompt shows the model an XML-escaped copy of the query, so a
     compliant single-facet echo comes back escaped (``&#x27;`` for ``'``);
     unescape first, then case-fold, strip surrounding whitespace, and strip
-    trailing sentence punctuation. Interior punctuation is preserved (#711).
+    trailing sentence punctuation.
+
+    The comparison is deliberately lossy (case-folded and entity-decoded), so
+    near-duplicates of the original also collapse — that is the intended
+    dedupe. Interior punctuation is preserved, but case-folding and entity
+    decoding can still merge distinct spellings (e.g. "Strasse" and
+    "Straße"); such a collision drops a redundant sub-query, never a facet
+    the original query did not already carry.
     """
-    return _TRAILING_SENTENCE_PUNCT_RE.sub(
-        "", _xml_unescape(text).casefold().strip()
-    )
+    return _xml_unescape(text).casefold().strip().rstrip(_TRAILING_SENTENCE_PUNCT)
 
 
 def _is_exact_or_document_query(query: str) -> bool:
@@ -223,7 +231,10 @@ class QueryTransformer:
             "type": transform_type,
             "query": query_text
         }, sort_keys=True)
-        return f"query_transform:{hashlib.md5(key_data.encode()).hexdigest()}"
+        # usedforsecurity=False: this is a cache-key digest, never a security
+        # primitive (same convention as rag_trace._text_hash). It also keeps
+        # the call valid on FIPS-enabled interpreters.
+        return f"query_transform:{hashlib.md5(key_data.encode(), usedforsecurity=False).hexdigest()}"
 
     def _lru_get(self, key: str) -> Optional[List[Tuple[str, str]]]:
         if key in self._lru_cache:
@@ -266,8 +277,10 @@ class QueryTransformer:
         Returns:
             List of (variant_type, text) tuples containing original query, step-back variant,
             and optionally HyDE passage. variant_type values are 'original', 'step_back', 'hyde'.
-            On LLM error for step-back, returns [('original', query)] only; the failure is NOT
-            cached, so the next transform of the same query retries the LLM (#711).
+            On LLM error for step-back, returns [('original', query)] only;
+            the failure is NOT cached, so the next transform of the same
+            query retries the LLM (#711). When hyde_enabled is set and HyDE
+            succeeds, a HyDE variant is appended to that list.
             On HyDE failure alone, returns [('original', query), ('step_back', step_back_text)].
         """
         # Skip transformation for exact/document-specific queries
@@ -313,13 +326,16 @@ class QueryTransformer:
                 cached_variants = lru_cached
 
         if cached_variants is not None:
-            # Cache hit — compose from the cached components only. A hit must
-            # not re-write the entry: no Redis setex (the TTL would refresh on
-            # every read, keeping a degraded entry alive forever) and no LRU
-            # rewrite (#711).
+            # Cache hit — serve the cached components. The Redis entry must
+            # NOT be re-written: refreshing its TTL on every read would keep
+            # a degraded entry alive forever (#711 AC8). The in-process LRU
+            # IS still warmed from the hit, as it was before #711: it is the
+            # only Redis-independent fallback for this worker, so a Redis
+            # outage would otherwise turn every hot query into an LLM call.
             # Copy: the returned list may gain the HyDE variant below and must
             # never mutate the object the LRU cache holds.
             variants: List[Tuple[str, str]] = list(cached_variants)
+            self._lru_set(cache_key, list(variants))
         else:
             # Cache miss - proceed with transformation
             step_back_succeeded = False
@@ -624,7 +640,9 @@ class QueryPlanner:
             {"model": self._cache_model, "type": "query_plan", "query": query_text},
             sort_keys=True,
         )
-        return f"query_plan:{hashlib.md5(key_data.encode()).hexdigest()}"
+        # usedforsecurity=False: cache-key digest, not a security primitive
+        # (see QueryTransformer._make_cache_key).
+        return f"query_plan:{hashlib.md5(key_data.encode(), usedforsecurity=False).hexdigest()}"
 
     def _lru_get(self, key: str) -> Optional[List[str]]:
         if key in self._lru_cache:
