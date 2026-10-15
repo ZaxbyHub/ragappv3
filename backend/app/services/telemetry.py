@@ -135,8 +135,9 @@ class Telemetry:
             self._queue_waits.setdefault(str(admission_class), []).append(
                 float(wait_seconds)
             )
-        with self._lock:
-            self._queue_depths.setdefault(str(admission_class), []).append(int(depth))
+            self._queue_depths.setdefault(str(admission_class), []).append(
+                int(depth)
+            )
 
     def record_first_useful_content(self, turn_id: str, seconds: float) -> None:
         if not self.enabled or not turn_id:

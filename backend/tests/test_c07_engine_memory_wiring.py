@@ -244,3 +244,48 @@ async def test_remember_directive_embeds_only_new_rows(tmp_path):
         assert rows == 1
     finally:
         pool.close_all()
+
+
+async def test_search_warning_semantics_never_attempted_vs_attempted(tmp_path, caplog):
+    """Reviewer R1 probe-3 gap: the never-attempted tripwire (service
+    configured + NO query_embedding kwarg -> "Memory dense search skipped"
+    WARNING) and its inverse (query_embedding=None passed after a failed
+    precompute -> NO second warning) are plan-named invariants and must be
+    pinned, and with them the embed_query failure WARNING itself — so the
+    three WARNING semantics of the sentinel design each have a direct test."""
+    db_file = tmp_path / "store-warn.db"
+    init_db(str(db_file))
+    run_migrations(str(db_file))
+    pool = SQLiteConnectionPool(str(db_file), max_size=2)
+    store = MemoryStore(pool=pool, embedding_service=_RecordingEmbedder(exc=RuntimeError("down")))
+    store.add_memory("quarterly roadmap planning notes", category="task", vault_id=1)
+    try:
+        with caplog.at_level(logging.WARNING, logger="app.services.memory_store"):
+            # Attempted-and-failed precompute: embed_query warns, and the
+            # search (which receives query_embedding=None) must NOT add the
+            # never-attempted warning.
+            query_embedding = await store.embed_query("quarterly roadmap")
+            assert query_embedding is None
+            results = store.search_memories(
+                "quarterly roadmap", limit=5, query_embedding=None
+            )
+        msgs = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any("degraded to FTS-only" in m for m in msgs), msgs
+        assert not any("dense search skipped" in m for m in msgs), (
+            f"attempted-but-failed precompute must not trigger the "
+            f"never-attempted tripwire: {msgs}"
+        )
+        assert len(results) == 1  # FTS still serves the row
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="app.services.memory_store"):
+            # Never-attempted: service configured, kwarg absent entirely.
+            results = store.search_memories("quarterly roadmap", limit=5)
+        msgs = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(
+            "Memory dense search skipped: no precomputed query embedding" in m
+            for m in msgs
+        ), f"the never-attempted tripwire must fire: {msgs}"
+        assert len(results) == 1  # FTS still serves the row here too
+    finally:
+        pool.close_all()
