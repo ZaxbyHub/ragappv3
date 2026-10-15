@@ -269,5 +269,64 @@ class TestO01Recovery(unittest.TestCase):
             conn.close()
 
 
+class TestO01FreshMigratedConvergence(unittest.TestCase):
+    """A pre-migration database walked through run_migrations must land on
+    the same wiki_lint_findings shape a fresh database gets — the property
+    the fresh-schema comment at the CREATE site declares a MUST (any future
+    rebuild that silently drops a CHECK or the origin column fails here)."""
+
+    @staticmethod
+    def _normalized_shape(conn):
+        import re
+
+        def norm(sql):
+            stripped = re.sub(r"--[^\n]*", "", sql or "")
+            return re.sub(r"\s+", " ", stripped).strip()
+
+        table_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='wiki_lint_findings'"
+        ).fetchone()[0]
+        indexes = sorted(
+            row[0]
+            for row in conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index'"
+                " AND tbl_name='wiki_lint_findings' AND sql IS NOT NULL"
+            )
+        )
+        columns = [
+            (row[1], row[2], row[3], row[4], row[5])
+            for row in conn.execute("PRAGMA table_info(wiki_lint_findings)")
+        ]
+        return norm(table_sql), [norm(i) for i in indexes], columns
+
+    def test_migrated_shape_equals_fresh_shape(self):
+        fresh_db = _tmp_db()
+        run_migrations(fresh_db)
+
+        upgraded_db = _tmp_db()
+        conn = sqlite3.connect(upgraded_db)
+        try:
+            conn.execute(_OLD_LINT_DDL)
+            conn.execute(
+                "INSERT INTO wiki_lint_findings (vault_id, finding_type, title)"
+                " VALUES (1, 'stale', 'legacy row')"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        run_migrations(upgraded_db)
+
+        fresh_conn = sqlite3.connect(fresh_db)
+        upgraded_conn = sqlite3.connect(upgraded_db)
+        try:
+            self.assertEqual(
+                self._normalized_shape(fresh_conn),
+                self._normalized_shape(upgraded_conn),
+            )
+        finally:
+            fresh_conn.close()
+            upgraded_conn.close()
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
