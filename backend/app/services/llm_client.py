@@ -144,6 +144,11 @@ class LLMError(Exception):
 # None itself is a meaningful value there (omit the kwarg from the payload).
 _KEEP_TEMPLATE_KWARGS = object()
 
+# Sentinel for per-call chat_completion overrides: "leave the client's
+# reasoning_effort unchanged for this call". An explicit value (including
+# None, which strips the field) wins for that call only (issue #712).
+_KEEP_REASONING = object()
+
 
 class LLMClient:
     """OpenAI-compatible LLM chat client."""
@@ -491,6 +496,8 @@ class LLMClient:
         temperature: float = 0.7,
         max_tokens: int = _UNSET_MAX_TOKENS,
         response_format: Optional[Dict[str, Any]] = None,
+        reasoning_effort: object = _KEEP_REASONING,
+        chat_template_kwargs: object = _KEEP_TEMPLATE_KWARGS,
     ) -> str:
         """
         Send a chat completion request and return the full response.
@@ -526,10 +533,25 @@ class LLMClient:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
-        if self.chat_template_kwargs:
-            payload["chat_template_kwargs"] = self.chat_template_kwargs
-        if self.reasoning_effort is not None:
-            payload["reasoning_effort"] = self.reasoning_effort
+        # Per-call overrides (issue #712): sentinel keeps the client default;
+        # an explicit value — including None, which strips the field — wins
+        # for this call only. The retrieval evaluator uses this to ask
+        # thinking-mode servers not to reason on its one-word classification
+        # call, so the small token budget is not consumed by reasoning.
+        effective_template_kwargs = (
+            self.chat_template_kwargs
+            if chat_template_kwargs is _KEEP_TEMPLATE_KWARGS
+            else chat_template_kwargs
+        )
+        if effective_template_kwargs:
+            payload["chat_template_kwargs"] = effective_template_kwargs
+        effective_reasoning_effort = (
+            self.reasoning_effort
+            if reasoning_effort is _KEEP_REASONING
+            else reasoning_effort
+        )
+        if effective_reasoning_effort is not None:
+            payload["reasoning_effort"] = effective_reasoning_effort
         if self.ttl is not None:
             # LM Studio idle TTL (issue #571): seconds until an idle JIT-loaded
             # model is unloaded; the timer resets on every request. LM Studio

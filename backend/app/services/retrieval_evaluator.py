@@ -5,6 +5,7 @@ from html import escape as _xml_escape
 from typing import Any, Dict, List
 
 from .llm_client import LLMClient
+from .telemetry import get_telemetry
 
 logger = logging.getLogger(__name__)
 
@@ -75,16 +76,36 @@ class RetrievalEvaluator:
                 },
             ]
 
-            # One-word classification. Keep max_tokens small but with enough
-            # slack for a reasoning model that may emit a few tokens before the
-            # word (8 was too tight and truncated to empty → silent CONFIDENT).
+            # One-word classification with a small budget — BUT a
+            # thinking-mode server asked to reason (the thinking client sends
+            # reasoning_effort="high" on every call, issue #554) burns the
+            # whole budget on reasoning tokens and returns EMPTY visible
+            # content, silently pinning the verdict to CONFIDENT (issue #712).
+            # Ask this call NOT to reason via the provider-native control;
+            # max_tokens stays small because the verdict is one word.
             response = await self._llm_client.chat_completion(
-                messages=messages, max_tokens=64, temperature=0.1
+                messages=messages,
+                max_tokens=64,
+                temperature=0.1,
+                reasoning_effort="none",
             )
-
+            if not response:
+                # Bounded secondary arm (issue #712): a server that ignored
+                # the first control may honor the second verified no-think
+                # control (Qwen-family chat-template kwarg). The retry
+                # carries the UNION of controls — omitting reasoning_effort
+                # would re-arm the client's "high" default.
+                response = await self._llm_client.chat_completion(
+                    messages=messages,
+                    max_tokens=64,
+                    temperature=0.1,
+                    reasoning_effort="none",
+                    chat_template_kwargs={"enable_thinking": False},
+                )
             if not response:
                 logger.warning("Retrieval evaluator returned empty response")
                 RetrievalEvaluator.fail_open_count += 1
+                get_telemetry().record_evaluator_fail_open("empty_response")
                 return "CONFIDENT"
 
             # Parse response - look for one of the three keywords
@@ -103,6 +124,7 @@ class RetrievalEvaluator:
                     response,
                 )
                 RetrievalEvaluator.fail_open_count += 1
+                get_telemetry().record_evaluator_fail_open("unexpected_response")
                 return "CONFIDENT"
 
         except Exception as e:
@@ -115,4 +137,5 @@ class RetrievalEvaluator:
                 "Retrieval evaluation failed: %s, defaulting to CONFIDENT", e
             )
             RetrievalEvaluator.fail_open_count += 1
+            get_telemetry().record_evaluator_fail_open("exception")
             return "CONFIDENT"
