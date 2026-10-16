@@ -36,6 +36,14 @@ SUMMARY_CHARS = 500  # leading characters of body used as the entry summary
 # draft_job_processor's CODE_* set; KMS has no SSE stream to fan out to).
 FAILED_ERROR_CODE = "COMPILE_FAILED: KMS compile dispatch failed; see server logs"
 
+# Issue #792 feedback: the error code for a claimed job whose payload_json
+# degraded at claim (unparseable or non-object JSON). Such a row is settled
+# terminally failed without dispatch; unlike a dispatch failure it is never
+# requeued, so the lease cap composition does not apply.
+PAYLOAD_MALFORMED_ERROR = (
+    "PAYLOAD_MALFORMED: compile job payload is corrupt; see server logs"
+)
+
 
 def _lease_enabled() -> bool:
     """Stage-2 lease switch (issue #559): env-only, process-start-stable."""
@@ -189,8 +197,24 @@ class KMSCompileProcessor:
                     await asyncio.sleep(POLL_INTERVAL)
                     continue
 
+                # Issue #792 feedback: a row whose payload degraded to the
+                # empty mapping at claim (unparseable or non-object
+                # payload_json — every writer stores a dict carrying
+                # vault_id) can never be dispatched meaningfully. Settle it
+                # terminally failed instead of dispatching it as a
+                # vault-less "manual" job, which would complete as a false
+                # success.
+                if job.vault_id is None:
+                    logger.warning(
+                        "KMSCompileProcessor: job id=%d has a malformed "
+                        "payload (no vault_id); settling failed",
+                        job.id,
+                    )
+                    await asyncio.to_thread(self._settle_malformed_payload, job)
+                    continue
+
                 logger.info(
-                    "KMSCompileProcessor: claimed job id=%d type=%s vault=%d",
+                    "KMSCompileProcessor: claimed job id=%d type=%s vault=%s",
                     job.id,
                     job.trigger_type,
                     job.vault_id,
@@ -292,6 +316,28 @@ class KMSCompileProcessor:
 
         with self._pool.connection() as conn:
             return KMSStore(conn).complete_job(job_id, result, worker_id=worker_id)
+
+    def _settle_malformed_payload(self, job) -> bool:
+        """Terminally fail a claimed job whose payload_json was degraded.
+
+        Lease mode fences the terminal write on the claiming worker id;
+        legacy mode's ``fail_job`` UPDATE is terminal by construction. The
+        row is never requeued: a corrupt payload cannot succeed on retry.
+        """
+        from app.services.job_lease import JobLease
+        from app.services.kms_store import KMSStore
+
+        with self._pool.connection() as conn:
+            if _lease_enabled():
+                return bool(
+                    JobLease(conn).fail(
+                        job.id, self._worker_id, PAYLOAD_MALFORMED_ERROR
+                    )
+                )
+            KMSStore(conn).fail_job(
+                job.id, PAYLOAD_MALFORMED_ERROR, worker_id=self._worker_id
+            )
+            return True
 
     def _fail_job(self, job_id: int, error: str, worker_id: str) -> int:
         """Fail a job and return the durable attempt count.

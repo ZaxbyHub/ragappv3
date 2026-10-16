@@ -384,12 +384,19 @@ def _to_compile_job(row: sqlite3.Row) -> WikiCompileJob:
 def _compile_job_from_jobs_row(row: sqlite3.Row) -> WikiCompileJob:
     """Map a unified ``jobs`` row (queue='wiki') onto the unchanged DTO."""
     d = _row_to_dict(row)
-    # Issue #792: a malformed payload_json row degrades to the empty payload
-    # (the guard pattern every sibling JSON-column parse in this file uses)
-    # instead of raising out of every reader of the vault's job list.
+    # Issue #792 feedback: a payload that is unparseable, or valid JSON that
+    # is not an object (scalar, array, or nested deep enough to overflow the
+    # parser), degrades to the empty payload — the guard pattern the file's
+    # other JSON-column reads (aliases, lint fingerprints) use — so no reader
+    # of the vault's job list ever raises on a stored row. (The complete_job
+    # result_json parse is different: its input is the caller's own dict,
+    # re-dumped in-process, never a stored column read.) The processors
+    # settle such rows terminally failed at claim (vault_id is None).
     try:
         payload = json.loads(d.get("payload_json") or "{}")
-    except (json.JSONDecodeError, TypeError):
+    except (TypeError, ValueError, RecursionError):
+        payload = {}
+    if not isinstance(payload, dict):
         payload = {}
     return WikiCompileJob(
         id=d["id"],

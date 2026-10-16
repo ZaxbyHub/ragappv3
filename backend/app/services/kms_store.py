@@ -119,12 +119,17 @@ def _to_job(row: sqlite3.Row) -> KMSCompileJob:
 def _compile_job_from_jobs_row(row: sqlite3.Row) -> KMSCompileJob:
     """Map a unified ``jobs`` row (queue='kms') onto the unchanged DTO."""
     d = dict(row)
-    # Issue #792: a malformed payload_json row degrades to the empty payload
-    # (the guard pattern every sibling JSON-column parse in this file uses)
-    # instead of raising out of every reader of the vault's job list.
+    # Issue #792 feedback: a payload that is unparseable, or valid JSON that
+    # is not an object (scalar, array, or nested deep enough to overflow the
+    # parser), degrades to the empty payload — the guard pattern the file's
+    # other JSON-column reads (tags) use — so no reader of the vault's job
+    # list ever raises on a stored row. The processors settle such rows
+    # terminally failed at claim (vault_id is None).
     try:
         payload = json.loads(d.get("payload_json") or "{}")
-    except (json.JSONDecodeError, TypeError):
+    except (TypeError, ValueError, RecursionError):
+        payload = {}
+    if not isinstance(payload, dict):
         payload = {}
     return KMSCompileJob(
         id=d["id"],
