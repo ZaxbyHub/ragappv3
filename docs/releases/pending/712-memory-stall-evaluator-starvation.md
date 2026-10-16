@@ -27,17 +27,27 @@
   `_fts_search` routes through `fts_query.build_fts_match_query` (issue #515
   convergence completed), so CJK ("北京") and accented ("café") queries
   recall via the always-on FTS leg; stop-word removal now precedes the token
-  cap. Two disclosed semantic narrowings inherited from the converged
-  tokenizer (pinned by tests): bare FTS5 operator words (AND/OR/NOT/NEAR)
-  become literal prefix terms instead of accidental live operators, and
-  underscore-joined queries are single `\w+` tokens.
+  cap. Disclosed semantic changes to the memory FTS arm (pinned by tests):
+  uppercase OR/AND/NOT/NEAR are now **literal, conjunctive** prefix terms
+  instead of accidental live FTS5 operators (so `chief OR deputy` matches
+  rows containing all three terms); underscore-joined queries are single
+  `\w+` tokens; and **every** term is now prefix-matched, so `cat` also
+  matches `cats` and `category` (a broadening — recall up, precision down,
+  competing with the dense arm in RRF fusion).
 - **Evaluator is reasoning-safe (TQ-instruction-batch-5-01).** The
   one-word classification call sends a per-call `reasoning_effort="none"`
   override (new sentinel-based per-call `chat_completion` parameters), so a
   thinking-mode server no longer burns the 64-token budget on reasoning and
-  returns empty. An empty response retries once with the UNION of controls
-  (`reasoning_effort="none"` + `chat_template_kwargs={"enable_thinking":
-  False}`) before failing open.
+  returns empty. SCOPE: the override is UNCONDITIONAL and applies to EVERY
+  evaluator client, thinking or instant — deliberately NOT gated on the
+  client's own `reasoning_effort`, because a deployment whose client sends
+  none can still be served by a model that reasons, which is the starvation
+  this change removes. A provider that validates the enum and rejects
+  `"none"` (e.g. vLLM before it gained `"none"` support) therefore fails
+  every evaluation open to a VISIBLE counter, never silently. An empty
+  response retries once with a widened budget plus, only for model families
+  that document it, the family-gated template control from
+  `select_no_think_chat_template_kwargs`.
 - **Fail-opens observable (TQ-instruction-batch-5-02).** Every evaluator
   fail-open is counted by cause (exception / empty_response /
   unexpected_response) in telemetry and exposed at `GET /metrics` as
@@ -58,6 +68,12 @@ backfill heals them (same outcome as a down embedding service before);
 no `query_embedding` now logs a WARNING naming the required helper.
 
 ## Known limitations
+- A provider that rejects the `reasoning_effort` field on the evaluator path
+  (enum-validating servers older than their `"none"` support) fails every
+  retrieval evaluation open; the outage is counted and alertable, and the
+  per-deployment remedy is to remove the override.
+- Memory FTS recall/precision changes are disclosed above; an operator who
+  relied on bare OR/AND/NOT behaving as query operators must adapt.
 - A provider that ignores BOTH no-think controls keeps the evaluator verdict
   fail-open CONFIDENT; the outage is observable per-reason on `/metrics`
   (the issue's stated operator remedy) but the verdict itself stays pinned

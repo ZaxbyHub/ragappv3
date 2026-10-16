@@ -45,9 +45,17 @@ def test_flush_runtime_error_does_not_escape_recorder(tmp_path, monkeypatch):
     def _explode(*args, **kwargs):
         raise RuntimeError("dictionary changed size during iteration")
 
-    # Patch the json reference the telemetry module uses; the monkeypatch
-    # fixture restores it after the test.
-    monkeypatch.setattr("app.services.telemetry.json.dumps", _explode)
+    # Poison telemetry's shard serializer. Post-fix it calls its own
+    # module-local ``_dumps`` alias (patching the stdlib json module would
+    # mutate it process-wide — #931 review PRR-022); on the pre-fix tree the
+    # alias does not exist and it calls ``json.dumps`` directly, so fall back.
+    # Either way the check must run on BOTH trees.
+    import app.services.telemetry as telemetry_module
+
+    if hasattr(telemetry_module, "_dumps"):
+        monkeypatch.setattr(telemetry_module, "_dumps", _explode)
+    else:  # pre-fix tree
+        monkeypatch.setattr(telemetry_module.json, "dumps", _explode)
 
     telemetry = Telemetry(enabled=True, registry_dir=tmp_path)
 

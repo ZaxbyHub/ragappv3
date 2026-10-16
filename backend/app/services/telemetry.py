@@ -41,6 +41,11 @@ logger = logging.getLogger(__name__)
 
 PROVIDER_OUTCOMES = ("ok", "partial", "unavailable", "empty")
 
+# Module-local alias for the shard serializer. Tests patch THIS, not
+# ``json.dumps`` — telemetry imports the stdlib module, so patching
+# ``telemetry.json.dumps`` would mutate json for the whole process.
+_dumps = json.dumps
+
 METRIC_CHAT_TURNS = "ragapp_chat_turns_total"
 METRIC_QUEUE_DEPTH = "ragapp_queue_depth"
 METRIC_QUEUE_WAIT = "ragapp_queue_wait_seconds"
@@ -91,10 +96,12 @@ class Telemetry:
         self._shard_name = f"telemetry-{os.getpid()}-{secrets.token_hex(4)}.json"
         self._otel_observers: list = []
         # Guards every counter/dict mutation and the shard serialization so a
-        # recorder reached from a worker thread (memory-store to_thread paths)
-        # cannot interleave with another thread's json.dumps iteration
-        # (RuntimeError: dictionary changed size during iteration) or lose +=
-        # updates. Reentrant: _flush_shard/metrics_text re-enter record paths.
+        # recorder can never interleave with another thread's serializer
+        # iteration (RuntimeError: dictionary changed size during iteration)
+        # or lose += updates. Every recorder call site is on the event loop
+        # today, so the lock is currently uncontended; it makes the invariant
+        # hold for any future worker-thread caller. Reentrant: _flush_shard /
+        # metrics_text / the OTel observer re-enter guarded paths.
         self._lock = threading.RLock()
 
     # ----------------------------------------------------------- recorders
@@ -270,7 +277,7 @@ class Telemetry:
                     "evaluator_fail_opens": self._evaluator_fail_opens,
                 }
                 (self.registry_dir / self._shard_name).write_text(
-                    json.dumps(counts), encoding="utf-8"
+                    _dumps(counts), encoding="utf-8"
                 )
             except Exception:  # noqa: BLE001 — telemetry must never raise
                 logger.debug("telemetry shard flush failed", exc_info=True)

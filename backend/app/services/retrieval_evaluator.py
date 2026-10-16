@@ -4,10 +4,15 @@ import logging
 from html import escape as _xml_escape
 from typing import Any, Dict, List
 
-from .llm_client import LLMClient
+from .llm_client import LLMClient, select_no_think_chat_template_kwargs
 from .telemetry import get_telemetry
 
 logger = logging.getLogger(__name__)
+
+# One-word verdict budget; the retry widens it so a server that reasons
+# anyway can finish and still emit the verdict (#712).
+_EVALUATOR_MAX_TOKENS = 64
+_EVALUATOR_RETRY_MAX_TOKENS = 512
 
 
 class RetrievalEvaluator:
@@ -81,26 +86,46 @@ class RetrievalEvaluator:
             # reasoning_effort="high" on every call, issue #554) burns the
             # whole budget on reasoning tokens and returns EMPTY visible
             # content, silently pinning the verdict to CONFIDENT (issue #712).
-            # Ask this call NOT to reason via the provider-native control;
-            # max_tokens stays small because the verdict is one word.
+            # One-word verdict, small budget. Ask the server NOT to reason via
+            # the provider-native control. This override is UNCONDITIONAL and
+            # applies to EVERY evaluator client, thinking or instant (#712
+            # review C13): it must not be gated on the client's own
+            # reasoning_effort, because a deployment whose client sends no
+            # reasoning_effort can still be served by a model that reasons —
+            # that is precisely the starvation AC6 forbids. A provider that
+            # validates the enum and rejects "none" fails every evaluation
+            # open to a VISIBLE counter (fail_open_total{reason=exception}),
+            # never silently; that deployment risk is disclosed in the
+            # release fragment.
             response = await self._llm_client.chat_completion(
                 messages=messages,
-                max_tokens=64,
+                max_tokens=_EVALUATOR_MAX_TOKENS,
                 temperature=0.1,
                 reasoning_effort="none",
             )
             if not response:
-                # Bounded secondary arm (issue #712): a server that ignored
-                # the first control may honor the second verified no-think
-                # control (Qwen-family chat-template kwarg). The retry
-                # carries the UNION of controls — omitting reasoning_effort
-                # would re-arm the client's "high" default.
+                # Bounded secondary arm (issue #712). The first control is
+                # ignored by some servers; the retry therefore (a) widens the
+                # budget so a server that reasons anyway can still finish its
+                # reasoning and emit the one-word verdict, and (b) adds the
+                # template-level no-think control ONLY for model families that
+                # document it — the same family gate the instant client uses
+                # (C12), so no deployment is handed a control it has no
+                # documented support for. The retry re-asserts
+                # reasoning_effort: omitting it would re-arm the client's
+                # configured default.
+                retry_kwargs: dict = {}
+                template_control = select_no_think_chat_template_kwargs(
+                    getattr(self._llm_client, "model", None)
+                )
+                if template_control:
+                    retry_kwargs["chat_template_kwargs"] = template_control
                 response = await self._llm_client.chat_completion(
                     messages=messages,
-                    max_tokens=64,
+                    max_tokens=_EVALUATOR_RETRY_MAX_TOKENS,
                     temperature=0.1,
                     reasoning_effort="none",
-                    chat_template_kwargs={"enable_thinking": False},
+                    **retry_kwargs,
                 )
             if not response:
                 logger.warning("Retrieval evaluator returned empty response")

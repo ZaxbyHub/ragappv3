@@ -15,7 +15,8 @@ Retrieval flow:
 Embedding generation is opportunistic: if the embedding service is
 unavailable when a memory is added or updated, the row is still
 persisted and indexed lexically. A later background pass (or a fresh
-``add_memory`` call) can populate the embedding without reindexing.
+a caller-driven ``embed_and_store`` pass) can populate the embedding
+without reindexing.
 """
 
 import asyncio
@@ -274,8 +275,9 @@ class MemoryStore:
         cross-loop pool corruption that stalled 30-40s on a quarter to half
         of chat turns.
 
-        Best-effort: returns None (with an operator-visible WARNING) when
-        the service raises or returns a falsy embedding; never raises.
+        Best-effort: returns None with an operator-visible WARNING when the
+        service raises OR returns a falsy (empty) embedding — both branches
+        log, so no dense-memory degradation is silent; never raises.
         """
         if self.embedding_service is None or not query or not query.strip():
             return None
@@ -289,6 +291,15 @@ class MemoryStore:
             )
             return None
         if not query_emb:
+            # A provider that returns an empty vector without raising is the
+            # silent half of the dense-degradation class (#712 review PRR-002 /
+            # C19): the callers pass query_embedding=None (the "attempted"
+            # encoding), so the store's never-attempted tripwire stays quiet —
+            # this log is the only operator signal on that path.
+            logger.warning(
+                "Memory query embedding returned empty; dense memory search "
+                "degraded to FTS-only"
+            )
             return None
         return query_emb
 
@@ -579,8 +590,9 @@ class MemoryStore:
         # thread against the main-loop-bound embedding client — the stall
         # vector this fix removes. Async callers embed via
         # ``embed_and_store`` right after the row write (memories.py routes,
-        # the chat remember-directive path), and the background backfill
-        # heals rows that missed it.
+        # the chat remember-directive path). A caller that misses it leaves a
+        # FTS-only row; only the startup backfill task and the superadmin
+        # backfill route heal it — there is no periodic retry.
         return MemoryRecord(
             id=memory_id,
             content=content,
@@ -663,12 +675,16 @@ class MemoryStore:
 
         # Tokenize via the SHARED Unicode tokenizer (issue #515 convergence,
         # completed here by issue #712): CJK and accented query terms survive
-        # (the old ASCII-only regex silently discarded them), punctuation and
-        # FTS5 operators are neutralized to literal prefix terms, and
-        # stop-word removal runs BEFORE the token cap so a stop-word-heavy
-        # question is never decapitated. ``build_fts_match_query`` caps raw
-        # tokens at ``max_tokens``; we pass a generous raw cap and apply the
-        # memory-search term cap after filtering (plan-critic R1-2).
+        # (the old ASCII-only regex silently discarded them) and punctuation
+        # plus bare FTS5 operator words are neutralized to literal prefix
+        # terms. ``build_fts_match_query`` caps RAW tokens at ``max_tokens``
+        # BEFORE we filter, so we pass a generous raw cap and apply the
+        # memory-search term cap AFTER stop-word removal — that ordering is
+        # what keeps a stop-word-heavy question from being decapitated at the
+        # 8-term memory cap. The generous raw cap is not unbounded: a query
+        # whose FIRST ``max_tokens`` raw tokens are ALL stop words still
+        # yields no terms (the builder drops the rest) and returns [] — a
+        # deliberate bound, not a silent one.
         match_tokens = build_fts_match_query(query, max_tokens=64).split()
         tokens = [
             t

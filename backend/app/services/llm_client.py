@@ -99,7 +99,7 @@ def select_no_think_chat_template_kwargs(
     if model and "qwen" in model.lower():
         return {"enable_thinking": False}
     logger.warning(
-        "No verified no-think control for instant model %r; sending none "
+        "No verified no-think control for model %r; sending none "
         "(fail open — provider default governs)",
         model,
     )
@@ -508,6 +508,16 @@ class LLMClient:
             max_tokens: Maximum tokens to generate (default: 32768, or the
                 client's configured per-mode budget when one was supplied
                 at construction — ENH-015, issue #494)
+            reasoning_effort: PER-CALL override of the client's reasoning
+                control (issue #712). Omit it to keep the client's configured
+                value; pass an explicit string (e.g. ``"none"``) to override
+                it for this call only; pass ``None`` to REMOVE the field from
+                this call's payload without mutating the client.
+            chat_template_kwargs: PER-CALL override of the client's
+                chat-template controls (issue #712), same sentinel semantics
+                as ``reasoning_effort`` — omit to keep the client default,
+                pass a dict to override for this call, pass ``None`` to drop
+                the field.
 
         Returns:
             The generated content string

@@ -4,8 +4,15 @@ check file).
 Guardrail: MemoryStore must contain ZERO fresh-event-loop bridges
 (``asyncio.run`` calls / ``self._run_coro_sync`` calls) anywhere in the
 module — the frozen C1 check covers the search path one hop deep; this
-census bans the mechanism module-wide. Demonstrated RED at base
-0a43a0a00fe64c13ed246145407fa09862fd2c79e with three call sites
+census bans the mechanism module-wide.
+
+SCOPE (stated precisely, per review C30): the census matches exactly the
+two spellings ``asyncio.run(...)`` and ``self._run_coro_sync(...)`` as
+CALL nodes anywhere in ``backend/app/services/memory_store.py``. It does
+not claim to police other event-loop constructions (an alias, a from-import,
+or ``new_event_loop().run_until_complete`` would not match) and it does not
+scan any other file. Demonstrated RED at base
+0a43a0a00fe64c13ed246145407fa09862fd2c79 with three call sites
 (memory_store.py:577 add_memory, :630 update_memory_content, :950
 search_memories).
 
@@ -17,7 +24,6 @@ the broadening cap note.
 import ast
 import os
 import sys
-import tempfile
 import types
 from pathlib import Path
 
@@ -84,24 +90,24 @@ def test_memory_store_module_has_no_fresh_event_loop_bridges():
     )
 
 
-def _store_with_rows():
-    tmp = tempfile.mkdtemp()
-    db_path = Path(tmp) / "census.db"
+def _store_with_rows(tmp_path):
+    """Build a real MemoryStore under pytest's tmp_path so nothing leaks."""
+    db_path = Path(str(tmp_path)) / "census.db"
     init_db(str(db_path))
     pool = SQLiteConnectionPool(str(db_path), max_size=2)
     store = MemoryStore(pool=pool)
     store.add_memory("Justice Sakyi is the AFOMIS Chief", category="facts")
     store.add_memory("choose the chief or the deputy for review", category="facts")
     store.add_memory("the foo_bar integration endpoint", category="doc")
-    return store, pool, tmp
+    return store, pool
 
 
-def test_fts_operator_words_are_neutralized_not_live_operators():
+def test_fts_operator_words_are_neutralized_not_live_operators(tmp_path):
     """Disclosed narrowing class (a): 'chief OR deputy' previously leaked the
     bare OR into FTS5 as a live operator (matching chief-only rows). The
     shared tokenizer neutralizes it to a literal prefix term, so the query
     now ANDs chief + or + deputy and the chief-only row no longer matches."""
-    store, pool, tmp = _store_with_rows()
+    store, pool = _store_with_rows(tmp_path)
     try:
         results = store.search_memories("chief OR deputy", limit=5)
         contents = [r.content for r in results]
@@ -118,11 +124,11 @@ def test_fts_operator_words_are_neutralized_not_live_operators():
         pool.close_all()
 
 
-def test_fts_underscore_query_is_one_token():
+def test_fts_underscore_query_is_one_token(tmp_path):
     """Disclosed narrowing class (b): 'foo_bar' is a single \\w+ token (not
     two AND terms), so it matches only rows carrying the literal
     underscore-joined token."""
-    store, pool, tmp = _store_with_rows()
+    store, pool = _store_with_rows(tmp_path)
     try:
         results = store.search_memories("foo_bar", limit=5)
         contents = [r.content for r in results]
@@ -133,10 +139,10 @@ def test_fts_underscore_query_is_one_token():
         pool.close_all()
 
 
-def test_fts_stopword_heavy_query_not_decapitated():
+def test_fts_stopword_heavy_query_not_decapitated(tmp_path):
     """Cap-semantics broadening pin: a query whose first 8 raw tokens are
     stop words still reaches the content tokens (filter precedes the cap)."""
-    store, pool, tmp = _store_with_rows()
+    store, pool = _store_with_rows(tmp_path)
     try:
         results = store.search_memories(
             "who is the what is the who are the afomis chief", limit=5

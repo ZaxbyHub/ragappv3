@@ -36,7 +36,7 @@
       "SEVERITY.LOW": 62,
       "SEVERITY.MEDIUM": 60,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 88671,
+      "loc": 88713,
       "nosec": 0,
       "skipped_tests": 66
     },
@@ -231,7 +231,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 1,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 783,
+      "loc": 797,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1271,7 +1271,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 997,
+      "loc": 1007,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1310,7 +1310,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 814,
+      "loc": 820,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1440,7 +1440,7 @@
       "SEVERITY.LOW": 19,
       "SEVERITY.MEDIUM": 1,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 3515,
+      "loc": 3517,
       "nosec": 0,
       "skipped_tests": 2
     },
@@ -1492,7 +1492,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 95,
+      "loc": 103,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1609,7 +1609,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 547,
+      "loc": 549,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -2909,7 +2909,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "766 \n767                 sql = f\"\"\"\n768                     UPDATE memories\n769                     SET {\", \".join(sql_fields)}, updated_at = CURRENT_TIMESTAMP\n770                     WHERE id = ?\n771                 \"\"\"\n772                 await asyncio.to_thread(conn.execute, sql, params)\n",
+      "code": "768 \n769                 sql = f\"\"\"\n770                     UPDATE memories\n771                     SET {\", \".join(sql_fields)}, updated_at = CURRENT_TIMESTAMP\n772                     WHERE id = ?\n773                 \"\"\"\n774                 await asyncio.to_thread(conn.execute, sql, params)\n",
       "col_offset": 22,
       "end_col_offset": 19,
       "filename": "backend/app/api/routes/memories.py",
@@ -2920,13 +2920,13 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 767,
+      "line_number": 769,
       "line_range": [
-        767,
-        768,
         769,
         770,
-        771
+        771,
+        772,
+        773
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
@@ -3932,57 +3932,9 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1642         token_pack_stats: Dict[str, int] = {\n1643             \"token_pack_included\": 0,\n1644             \"token_pack_skipped\": 0,\n1645             \"token_pack_truncated\": 0,\n1646         }\n1647         # ------------------------------------------------------------------\n1648         # FR-002 part 2: Multi-sub-query orchestration \u2014 fan out independent\n",
+      "code": "1644         token_pack_stats: Dict[str, int] = {\n1645             \"token_pack_included\": 0,\n1646             \"token_pack_skipped\": 0,\n1647             \"token_pack_truncated\": 0,\n1648         }\n1649         # ------------------------------------------------------------------\n1650         # FR-002 part 2: Multi-sub-query orchestration \u2014 fan out independent\n",
       "col_offset": 12,
       "end_col_offset": 33,
-      "filename": "backend/app/services/rag_engine.py",
-      "issue_confidence": "MEDIUM",
-      "issue_cwe": {
-        "id": 259,
-        "link": "https://cwe.mitre.org/data/definitions/259.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "Possible hardcoded password: '0'",
-      "line_number": 1643,
-      "line_range": [
-        1642,
-        1643,
-        1644,
-        1645,
-        1646
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
-      "test_id": "B105",
-      "test_name": "hardcoded_password_string"
-    },
-    {
-      "code": "1643             \"token_pack_included\": 0,\n1644             \"token_pack_skipped\": 0,\n1645             \"token_pack_truncated\": 0,\n1646         }\n1647         # ------------------------------------------------------------------\n1648         # FR-002 part 2: Multi-sub-query orchestration \u2014 fan out independent\n1649         # retrievals for each sub-query and RRF-fuse the results before\n",
-      "col_offset": 12,
-      "end_col_offset": 32,
-      "filename": "backend/app/services/rag_engine.py",
-      "issue_confidence": "MEDIUM",
-      "issue_cwe": {
-        "id": 259,
-        "link": "https://cwe.mitre.org/data/definitions/259.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "Possible hardcoded password: '0'",
-      "line_number": 1644,
-      "line_range": [
-        1642,
-        1643,
-        1644,
-        1645,
-        1646
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
-      "test_id": "B105",
-      "test_name": "hardcoded_password_string"
-    },
-    {
-      "code": "1644             \"token_pack_skipped\": 0,\n1645             \"token_pack_truncated\": 0,\n1646         }\n1647         # ------------------------------------------------------------------\n1648         # FR-002 part 2: Multi-sub-query orchestration \u2014 fan out independent\n1649         # retrievals for each sub-query and RRF-fuse the results before\n1650         # feeding the fused, deduplicated set into distillation.\n",
-      "col_offset": 12,
-      "end_col_offset": 34,
       "filename": "backend/app/services/rag_engine.py",
       "issue_confidence": "MEDIUM",
       "issue_cwe": {
@@ -3993,18 +3945,66 @@
       "issue_text": "Possible hardcoded password: '0'",
       "line_number": 1645,
       "line_range": [
-        1642,
-        1643,
         1644,
         1645,
-        1646
+        1646,
+        1647,
+        1648
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "1791             token_pack_stats = {\n1792                 \"token_pack_included\": 0,\n1793                 \"token_pack_skipped\": 0,\n1794                 \"token_pack_truncated\": 0,\n1795             }\n1796         elif not _skip_standard_retrieval:\n1797             # Standard single-query (or fallback) retrieval path.\n",
+      "code": "1645             \"token_pack_included\": 0,\n1646             \"token_pack_skipped\": 0,\n1647             \"token_pack_truncated\": 0,\n1648         }\n1649         # ------------------------------------------------------------------\n1650         # FR-002 part 2: Multi-sub-query orchestration \u2014 fan out independent\n1651         # retrievals for each sub-query and RRF-fuse the results before\n",
+      "col_offset": 12,
+      "end_col_offset": 32,
+      "filename": "backend/app/services/rag_engine.py",
+      "issue_confidence": "MEDIUM",
+      "issue_cwe": {
+        "id": 259,
+        "link": "https://cwe.mitre.org/data/definitions/259.html"
+      },
+      "issue_severity": "LOW",
+      "issue_text": "Possible hardcoded password: '0'",
+      "line_number": 1646,
+      "line_range": [
+        1644,
+        1645,
+        1646,
+        1647,
+        1648
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
+      "test_id": "B105",
+      "test_name": "hardcoded_password_string"
+    },
+    {
+      "code": "1646             \"token_pack_skipped\": 0,\n1647             \"token_pack_truncated\": 0,\n1648         }\n1649         # ------------------------------------------------------------------\n1650         # FR-002 part 2: Multi-sub-query orchestration \u2014 fan out independent\n1651         # retrievals for each sub-query and RRF-fuse the results before\n1652         # feeding the fused, deduplicated set into distillation.\n",
+      "col_offset": 12,
+      "end_col_offset": 34,
+      "filename": "backend/app/services/rag_engine.py",
+      "issue_confidence": "MEDIUM",
+      "issue_cwe": {
+        "id": 259,
+        "link": "https://cwe.mitre.org/data/definitions/259.html"
+      },
+      "issue_severity": "LOW",
+      "issue_text": "Possible hardcoded password: '0'",
+      "line_number": 1647,
+      "line_range": [
+        1644,
+        1645,
+        1646,
+        1647,
+        1648
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
+      "test_id": "B105",
+      "test_name": "hardcoded_password_string"
+    },
+    {
+      "code": "1793             token_pack_stats = {\n1794                 \"token_pack_included\": 0,\n1795                 \"token_pack_skipped\": 0,\n1796                 \"token_pack_truncated\": 0,\n1797             }\n1798         elif not _skip_standard_retrieval:\n1799             # Standard single-query (or fallback) retrieval path.\n",
       "col_offset": 16,
       "end_col_offset": 37,
       "filename": "backend/app/services/rag_engine.py",
@@ -4015,20 +4015,20 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: '0'",
-      "line_number": 1792,
+      "line_number": 1794,
       "line_range": [
-        1791,
-        1792,
         1793,
         1794,
-        1795
+        1795,
+        1796,
+        1797
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "1792                 \"token_pack_included\": 0,\n1793                 \"token_pack_skipped\": 0,\n1794                 \"token_pack_truncated\": 0,\n1795             }\n1796         elif not _skip_standard_retrieval:\n1797             # Standard single-query (or fallback) retrieval path.\n1798             if self.maintenance_mode:\n",
+      "code": "1794                 \"token_pack_included\": 0,\n1795                 \"token_pack_skipped\": 0,\n1796                 \"token_pack_truncated\": 0,\n1797             }\n1798         elif not _skip_standard_retrieval:\n1799             # Standard single-query (or fallback) retrieval path.\n1800             if self.maintenance_mode:\n",
       "col_offset": 16,
       "end_col_offset": 36,
       "filename": "backend/app/services/rag_engine.py",
@@ -4039,20 +4039,20 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: '0'",
-      "line_number": 1793,
+      "line_number": 1795,
       "line_range": [
-        1791,
-        1792,
         1793,
         1794,
-        1795
+        1795,
+        1796,
+        1797
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "1793                 \"token_pack_skipped\": 0,\n1794                 \"token_pack_truncated\": 0,\n1795             }\n1796         elif not _skip_standard_retrieval:\n1797             # Standard single-query (or fallback) retrieval path.\n1798             if self.maintenance_mode:\n1799                 fallback_reason = \"RAG index is under maintenance\"\n",
+      "code": "1795                 \"token_pack_skipped\": 0,\n1796                 \"token_pack_truncated\": 0,\n1797             }\n1798         elif not _skip_standard_retrieval:\n1799             # Standard single-query (or fallback) retrieval path.\n1800             if self.maintenance_mode:\n1801                 fallback_reason = \"RAG index is under maintenance\"\n",
       "col_offset": 16,
       "end_col_offset": 38,
       "filename": "backend/app/services/rag_engine.py",
@@ -4063,20 +4063,20 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: '0'",
-      "line_number": 1794,
+      "line_number": 1796,
       "line_range": [
-        1791,
-        1792,
         1793,
         1794,
-        1795
+        1795,
+        1796,
+        1797
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "1839                     token_pack_stats = {\n1840                         \"token_pack_included\": 0,\n1841                         \"token_pack_skipped\": 0,\n1842                         \"token_pack_truncated\": 0,\n1843                     }\n1844 \n1845         # Fetch indexed file IDs for atomic visibility filter (Issue #13)\n",
+      "code": "1841                     token_pack_stats = {\n1842                         \"token_pack_included\": 0,\n1843                         \"token_pack_skipped\": 0,\n1844                         \"token_pack_truncated\": 0,\n1845                     }\n1846 \n1847         # Fetch indexed file IDs for atomic visibility filter (Issue #13)\n",
       "col_offset": 24,
       "end_col_offset": 45,
       "filename": "backend/app/services/rag_engine.py",
@@ -4087,20 +4087,20 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: '0'",
-      "line_number": 1840,
+      "line_number": 1842,
       "line_range": [
-        1839,
-        1840,
         1841,
         1842,
-        1843
+        1843,
+        1844,
+        1845
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "1840                         \"token_pack_included\": 0,\n1841                         \"token_pack_skipped\": 0,\n1842                         \"token_pack_truncated\": 0,\n1843                     }\n1844 \n1845         # Fetch indexed file IDs for atomic visibility filter (Issue #13)\n1846         # Only chunks from fully-indexed files are returned \u2014 pending/processing files are hidden.\n",
+      "code": "1842                         \"token_pack_included\": 0,\n1843                         \"token_pack_skipped\": 0,\n1844                         \"token_pack_truncated\": 0,\n1845                     }\n1846 \n1847         # Fetch indexed file IDs for atomic visibility filter (Issue #13)\n1848         # Only chunks from fully-indexed files are returned \u2014 pending/processing files are hidden.\n",
       "col_offset": 24,
       "end_col_offset": 44,
       "filename": "backend/app/services/rag_engine.py",
@@ -4111,20 +4111,20 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: '0'",
-      "line_number": 1841,
+      "line_number": 1843,
       "line_range": [
-        1839,
-        1840,
         1841,
         1842,
-        1843
+        1843,
+        1844,
+        1845
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "1841                         \"token_pack_skipped\": 0,\n1842                         \"token_pack_truncated\": 0,\n1843                     }\n1844 \n1845         # Fetch indexed file IDs for atomic visibility filter (Issue #13)\n1846         # Only chunks from fully-indexed files are returned \u2014 pending/processing files are hidden.\n1847         indexed_file_ids: Optional[Set[str]] = None\n",
+      "code": "1843                         \"token_pack_skipped\": 0,\n1844                         \"token_pack_truncated\": 0,\n1845                     }\n1846 \n1847         # Fetch indexed file IDs for atomic visibility filter (Issue #13)\n1848         # Only chunks from fully-indexed files are returned \u2014 pending/processing files are hidden.\n1849         indexed_file_ids: Optional[Set[str]] = None\n",
       "col_offset": 24,
       "end_col_offset": 46,
       "filename": "backend/app/services/rag_engine.py",
@@ -4135,70 +4135,22 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: '0'",
-      "line_number": 1842,
+      "line_number": 1844,
       "line_range": [
-        1839,
-        1840,
         1841,
         1842,
-        1843
+        1843,
+        1844,
+        1845
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "3263         token_pack_stats: Dict[str, int] = {\n3264             \"token_pack_included\": 0,\n3265             \"token_pack_skipped\": 0,\n3266             \"token_pack_truncated\": 0,\n3267         }\n3268         if vector_results:\n3269             try:\n",
+      "code": "3265         token_pack_stats: Dict[str, int] = {\n3266             \"token_pack_included\": 0,\n3267             \"token_pack_skipped\": 0,\n3268             \"token_pack_truncated\": 0,\n3269         }\n3270         if vector_results:\n3271             try:\n",
       "col_offset": 12,
       "end_col_offset": 33,
-      "filename": "backend/app/services/rag_engine.py",
-      "issue_confidence": "MEDIUM",
-      "issue_cwe": {
-        "id": 259,
-        "link": "https://cwe.mitre.org/data/definitions/259.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "Possible hardcoded password: '0'",
-      "line_number": 3264,
-      "line_range": [
-        3263,
-        3264,
-        3265,
-        3266,
-        3267
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
-      "test_id": "B105",
-      "test_name": "hardcoded_password_string"
-    },
-    {
-      "code": "3264             \"token_pack_included\": 0,\n3265             \"token_pack_skipped\": 0,\n3266             \"token_pack_truncated\": 0,\n3267         }\n3268         if vector_results:\n3269             try:\n3270                 # Token packing (only if we have results)\n",
-      "col_offset": 12,
-      "end_col_offset": 32,
-      "filename": "backend/app/services/rag_engine.py",
-      "issue_confidence": "MEDIUM",
-      "issue_cwe": {
-        "id": 259,
-        "link": "https://cwe.mitre.org/data/definitions/259.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "Possible hardcoded password: '0'",
-      "line_number": 3265,
-      "line_range": [
-        3263,
-        3264,
-        3265,
-        3266,
-        3267
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
-      "test_id": "B105",
-      "test_name": "hardcoded_password_string"
-    },
-    {
-      "code": "3265             \"token_pack_skipped\": 0,\n3266             \"token_pack_truncated\": 0,\n3267         }\n3268         if vector_results:\n3269             try:\n3270                 # Token packing (only if we have results)\n3271                 if settings.context_max_tokens > 0:\n",
-      "col_offset": 12,
-      "end_col_offset": 34,
       "filename": "backend/app/services/rag_engine.py",
       "issue_confidence": "MEDIUM",
       "issue_cwe": {
@@ -4209,42 +4161,18 @@
       "issue_text": "Possible hardcoded password: '0'",
       "line_number": 3266,
       "line_range": [
-        3263,
-        3264,
         3265,
         3266,
-        3267
+        3267,
+        3268,
+        3269
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "3626         _pack_stats = token_pack_stats or {\n3627             \"token_pack_included\": 0,\n3628             \"token_pack_skipped\": 0,\n3629             \"token_pack_truncated\": 0,\n3630         }\n3631         retrieval_debug: Dict[str, Any] = {\n3632             \"max_distance_threshold\": self.max_distance_threshold,\n",
-      "col_offset": 12,
-      "end_col_offset": 33,
-      "filename": "backend/app/services/rag_engine.py",
-      "issue_confidence": "MEDIUM",
-      "issue_cwe": {
-        "id": 259,
-        "link": "https://cwe.mitre.org/data/definitions/259.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "Possible hardcoded password: '0'",
-      "line_number": 3627,
-      "line_range": [
-        3626,
-        3627,
-        3628,
-        3629,
-        3630
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
-      "test_id": "B105",
-      "test_name": "hardcoded_password_string"
-    },
-    {
-      "code": "3627             \"token_pack_included\": 0,\n3628             \"token_pack_skipped\": 0,\n3629             \"token_pack_truncated\": 0,\n3630         }\n3631         retrieval_debug: Dict[str, Any] = {\n3632             \"max_distance_threshold\": self.max_distance_threshold,\n3633             \"vector_metric\": self.vector_metric,\n",
+      "code": "3266             \"token_pack_included\": 0,\n3267             \"token_pack_skipped\": 0,\n3268             \"token_pack_truncated\": 0,\n3269         }\n3270         if vector_results:\n3271             try:\n3272                 # Token packing (only if we have results)\n",
       "col_offset": 12,
       "end_col_offset": 32,
       "filename": "backend/app/services/rag_engine.py",
@@ -4255,22 +4183,46 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: '0'",
-      "line_number": 3628,
+      "line_number": 3267,
       "line_range": [
-        3626,
-        3627,
-        3628,
-        3629,
-        3630
+        3265,
+        3266,
+        3267,
+        3268,
+        3269
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "3628             \"token_pack_skipped\": 0,\n3629             \"token_pack_truncated\": 0,\n3630         }\n3631         retrieval_debug: Dict[str, Any] = {\n3632             \"max_distance_threshold\": self.max_distance_threshold,\n3633             \"vector_metric\": self.vector_metric,\n3634             \"retrieval_top_k\": self.retrieval_top_k,\n",
+      "code": "3267             \"token_pack_skipped\": 0,\n3268             \"token_pack_truncated\": 0,\n3269         }\n3270         if vector_results:\n3271             try:\n3272                 # Token packing (only if we have results)\n3273                 if settings.context_max_tokens > 0:\n",
       "col_offset": 12,
       "end_col_offset": 34,
+      "filename": "backend/app/services/rag_engine.py",
+      "issue_confidence": "MEDIUM",
+      "issue_cwe": {
+        "id": 259,
+        "link": "https://cwe.mitre.org/data/definitions/259.html"
+      },
+      "issue_severity": "LOW",
+      "issue_text": "Possible hardcoded password: '0'",
+      "line_number": 3268,
+      "line_range": [
+        3265,
+        3266,
+        3267,
+        3268,
+        3269
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
+      "test_id": "B105",
+      "test_name": "hardcoded_password_string"
+    },
+    {
+      "code": "3628         _pack_stats = token_pack_stats or {\n3629             \"token_pack_included\": 0,\n3630             \"token_pack_skipped\": 0,\n3631             \"token_pack_truncated\": 0,\n3632         }\n3633         retrieval_debug: Dict[str, Any] = {\n3634             \"max_distance_threshold\": self.max_distance_threshold,\n",
+      "col_offset": 12,
+      "end_col_offset": 33,
       "filename": "backend/app/services/rag_engine.py",
       "issue_confidence": "MEDIUM",
       "issue_cwe": {
@@ -4281,42 +4233,18 @@
       "issue_text": "Possible hardcoded password: '0'",
       "line_number": 3629,
       "line_range": [
-        3626,
-        3627,
         3628,
         3629,
-        3630
+        3630,
+        3631,
+        3632
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "3780         _empty_stats: Dict[str, int] = {\n3781             \"token_pack_included\": 0,\n3782             \"token_pack_skipped\": 0,\n3783             \"token_pack_truncated\": 0,\n3784         }\n3785         if not chunks:\n3786             return [], _empty_stats\n",
-      "col_offset": 12,
-      "end_col_offset": 33,
-      "filename": "backend/app/services/rag_engine.py",
-      "issue_confidence": "MEDIUM",
-      "issue_cwe": {
-        "id": 259,
-        "link": "https://cwe.mitre.org/data/definitions/259.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "Possible hardcoded password: '0'",
-      "line_number": 3781,
-      "line_range": [
-        3780,
-        3781,
-        3782,
-        3783,
-        3784
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
-      "test_id": "B105",
-      "test_name": "hardcoded_password_string"
-    },
-    {
-      "code": "3781             \"token_pack_included\": 0,\n3782             \"token_pack_skipped\": 0,\n3783             \"token_pack_truncated\": 0,\n3784         }\n3785         if not chunks:\n3786             return [], _empty_stats\n3787 \n",
+      "code": "3629             \"token_pack_included\": 0,\n3630             \"token_pack_skipped\": 0,\n3631             \"token_pack_truncated\": 0,\n3632         }\n3633         retrieval_debug: Dict[str, Any] = {\n3634             \"max_distance_threshold\": self.max_distance_threshold,\n3635             \"vector_metric\": self.vector_metric,\n",
       "col_offset": 12,
       "end_col_offset": 32,
       "filename": "backend/app/services/rag_engine.py",
@@ -4327,20 +4255,20 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: '0'",
-      "line_number": 3782,
+      "line_number": 3630,
       "line_range": [
-        3780,
-        3781,
-        3782,
-        3783,
-        3784
+        3628,
+        3629,
+        3630,
+        3631,
+        3632
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "3782             \"token_pack_skipped\": 0,\n3783             \"token_pack_truncated\": 0,\n3784         }\n3785         if not chunks:\n3786             return [], _empty_stats\n3787 \n3788         strategy = settings.token_pack_strategy\n",
+      "code": "3630             \"token_pack_skipped\": 0,\n3631             \"token_pack_truncated\": 0,\n3632         }\n3633         retrieval_debug: Dict[str, Any] = {\n3634             \"max_distance_threshold\": self.max_distance_threshold,\n3635             \"vector_metric\": self.vector_metric,\n3636             \"retrieval_top_k\": self.retrieval_top_k,\n",
       "col_offset": 12,
       "end_col_offset": 34,
       "filename": "backend/app/services/rag_engine.py",
@@ -4351,20 +4279,92 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: '0'",
-      "line_number": 3783,
+      "line_number": 3631,
       "line_range": [
-        3780,
-        3781,
-        3782,
-        3783,
-        3784
+        3628,
+        3629,
+        3630,
+        3631,
+        3632
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "3801                 \"token_pack_skipped\": max(0, len(chunks) - len(packed)),\n3802                 \"token_pack_truncated\": 0,\n3803             }\n3804             return packed, stats\n3805 \n3806         # reserved_best_fit (default)\n3807         n_reserved = min(3, len(chunks))\n",
+      "code": "3782         _empty_stats: Dict[str, int] = {\n3783             \"token_pack_included\": 0,\n3784             \"token_pack_skipped\": 0,\n3785             \"token_pack_truncated\": 0,\n3786         }\n3787         if not chunks:\n3788             return [], _empty_stats\n",
+      "col_offset": 12,
+      "end_col_offset": 33,
+      "filename": "backend/app/services/rag_engine.py",
+      "issue_confidence": "MEDIUM",
+      "issue_cwe": {
+        "id": 259,
+        "link": "https://cwe.mitre.org/data/definitions/259.html"
+      },
+      "issue_severity": "LOW",
+      "issue_text": "Possible hardcoded password: '0'",
+      "line_number": 3783,
+      "line_range": [
+        3782,
+        3783,
+        3784,
+        3785,
+        3786
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
+      "test_id": "B105",
+      "test_name": "hardcoded_password_string"
+    },
+    {
+      "code": "3783             \"token_pack_included\": 0,\n3784             \"token_pack_skipped\": 0,\n3785             \"token_pack_truncated\": 0,\n3786         }\n3787         if not chunks:\n3788             return [], _empty_stats\n3789 \n",
+      "col_offset": 12,
+      "end_col_offset": 32,
+      "filename": "backend/app/services/rag_engine.py",
+      "issue_confidence": "MEDIUM",
+      "issue_cwe": {
+        "id": 259,
+        "link": "https://cwe.mitre.org/data/definitions/259.html"
+      },
+      "issue_severity": "LOW",
+      "issue_text": "Possible hardcoded password: '0'",
+      "line_number": 3784,
+      "line_range": [
+        3782,
+        3783,
+        3784,
+        3785,
+        3786
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
+      "test_id": "B105",
+      "test_name": "hardcoded_password_string"
+    },
+    {
+      "code": "3784             \"token_pack_skipped\": 0,\n3785             \"token_pack_truncated\": 0,\n3786         }\n3787         if not chunks:\n3788             return [], _empty_stats\n3789 \n3790         strategy = settings.token_pack_strategy\n",
+      "col_offset": 12,
+      "end_col_offset": 34,
+      "filename": "backend/app/services/rag_engine.py",
+      "issue_confidence": "MEDIUM",
+      "issue_cwe": {
+        "id": 259,
+        "link": "https://cwe.mitre.org/data/definitions/259.html"
+      },
+      "issue_severity": "LOW",
+      "issue_text": "Possible hardcoded password: '0'",
+      "line_number": 3785,
+      "line_range": [
+        3782,
+        3783,
+        3784,
+        3785,
+        3786
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
+      "test_id": "B105",
+      "test_name": "hardcoded_password_string"
+    },
+    {
+      "code": "3803                 \"token_pack_skipped\": max(0, len(chunks) - len(packed)),\n3804                 \"token_pack_truncated\": 0,\n3805             }\n3806             return packed, stats\n3807 \n3808         # reserved_best_fit (default)\n3809         n_reserved = min(3, len(chunks))\n",
       "col_offset": 16,
       "end_col_offset": 38,
       "filename": "backend/app/services/rag_engine.py",
@@ -4375,20 +4375,20 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: '0'",
-      "line_number": 3802,
+      "line_number": 3804,
       "line_range": [
-        3799,
-        3800,
         3801,
         3802,
-        3803
+        3803,
+        3804,
+        3805
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "3890                     sql = (\n3891                         f\"SELECT file_name FROM files \"\n3892                         f\"WHERE supersedes_file_id IN ({placeholders}) AND status='indexed'\"\n3893                     )\n",
+      "code": "3892                     sql = (\n3893                         f\"SELECT file_name FROM files \"\n3894                         f\"WHERE supersedes_file_id IN ({placeholders}) AND status='indexed'\"\n3895                     )\n",
       "col_offset": 24,
       "end_col_offset": 92,
       "filename": "backend/app/services/rag_engine.py",
@@ -4399,10 +4399,10 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 3891,
+      "line_number": 3893,
       "line_range": [
-        3891,
-        3892
+        3893,
+        3894
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",

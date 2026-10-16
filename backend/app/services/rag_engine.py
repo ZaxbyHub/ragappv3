@@ -1180,9 +1180,9 @@ class RAGEngine:
                     # Embed on THIS loop right after the insert (issue #712):
                     # add_memory no longer bridges into the embedding service
                     # synchronously. Only the newly-inserted branch embeds —
-                    # the idempotent found-existing branch already carries the
-                    # embedding from its first insert (and the revision guard
-                    # would make a re-embed a no-op anyway).
+                    # a re-sent directive hits the found-existing branch and
+                    # leaves that row's embedding as it stands (a prior
+                    # failed embed stays NULL; healing is the backfill's job).
                     if (
                         getattr(self.memory_store, "embedding_service", None)
                         is not None
@@ -1195,7 +1195,9 @@ class RAGEngine:
                                 logger.warning(
                                     "Memory stored without embedding (id=%s, "
                                     "outcome=%s); dense recall degraded to "
-                                    "FTS-only for this row until backfill",
+                                    "FTS-only for this row (healed by the "
+                                    "startup backfill task or the superadmin "
+                                    "backfill route, not on a timer)",
                                     memory.id,
                                     outcome,
                                 )

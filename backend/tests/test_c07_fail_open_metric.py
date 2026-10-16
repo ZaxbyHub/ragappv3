@@ -7,7 +7,6 @@ empty→retry→empty path (one fail-open, both no-think controls on the retry),
 and the recorder's thread-safety contract.
 """
 
-import asyncio
 import os
 import sys
 import threading
@@ -34,21 +33,31 @@ from app.services.telemetry import Telemetry, get_telemetry
 
 
 class _ReasoningFakeClient:
-    """Records every chat_completion's kwargs; models a thinking server that
-    consumes the completion budget with reasoning unless the request disables
-    it (mirrors the frozen C6 fake's semantics)."""
+    """Records every chat_completion call (kwargs AND max_tokens); models a
+    thinking server that consumes the completion budget with reasoning unless
+    the request disables it (mirrors the frozen C6 fake's semantics)."""
 
-    def __init__(self, responses):
+    def __init__(self, responses, model="some-reasoning-model", reasoning_effort="high"):
         self.responses = list(responses)
         self.calls = []
+        self.model = model
+        self.reasoning_effort = reasoning_effort
 
     async def chat_completion(self, messages, max_tokens=None, temperature=None, **kw):
-        self.calls.append(dict(kw))
+        self.calls.append({**kw, "_max_tokens": max_tokens})
         return self.responses.pop(0)
 
 
 async def test_each_fail_open_reason_records_and_exposes_on_metrics(tmp_path):
     tel = Telemetry(enabled=True, registry_dir=tmp_path)
+    prior = RetrievalEvaluator.fail_open_count
+    try:
+        await _exercise_all_fail_open_reasons(tel)
+    finally:
+        RetrievalEvaluator.fail_open_count = prior
+
+
+async def _exercise_all_fail_open_reasons(tel):
     with patch("app.services.telemetry._singleton", tel):
         # exception path
         class _Boom:
@@ -82,20 +91,35 @@ async def test_each_fail_open_reason_records_and_exposes_on_metrics(tmp_path):
     )
 
 
-async def test_empty_response_retries_once_with_union_of_no_think_controls():
-    client = _ReasoningFakeClient(["", "NO_MATCH"])
-    verdict = await RetrievalEvaluator(client).evaluate(
+async def test_empty_response_retries_once_with_widened_budget_and_gated_control():
+    """The bounded retry (issue #712): re-assert reasoning_effort (omitting
+    it would re-arm the client's "high"), widen the budget so a server that
+    reasons anyway can finish, and add the template-level control ONLY for a
+    family that documents it (the C12 family gate)."""
+    qwen = _ReasoningFakeClient(["", "NO_MATCH"], model="qwen/qwen3.5")
+    verdict = await RetrievalEvaluator(qwen).evaluate(
         "q", [{"text": "unrelated"}]
     )
     assert verdict == "NO_MATCH"
-    assert len(client.calls) == 2
-    first, retry = client.calls
+    assert len(qwen.calls) == 2
+    first, retry = qwen.calls
     assert first.get("reasoning_effort") == "none"
-    assert "chat_template_kwargs" not in first
-    # The retry carries the UNION: reasoning_effort stays "none" (omitting it
-    # would re-arm the client's default "high") plus the template control.
+    assert "chat_template_kwargs" not in first, "the primary call sends one control"
+    assert first["_max_tokens"] == 64
     assert retry.get("reasoning_effort") == "none"
+    assert retry["_max_tokens"] > first["_max_tokens"], "the retry widens the budget"
     assert retry.get("chat_template_kwargs") == {"enable_thinking": False}
+
+    # A family with no documented template control is never handed one.
+    other = _ReasoningFakeClient(["", "NO_MATCH"], model="llama3.1")
+    assert await RetrievalEvaluator(other).evaluate(
+        "q", [{"text": "unrelated"}]
+    ) == "NO_MATCH"
+    assert "chat_template_kwargs" not in other.calls[1], (
+        "an undocumented per-family control must not be hard-coded "
+        f"({other.calls[1]})"
+    )
+    assert other.calls[1]["_max_tokens"] > other.calls[0]["_max_tokens"]
 
 
 async def test_empty_response_fails_open_exactly_once():
@@ -127,8 +151,11 @@ def test_runtime_error_during_flush_cannot_escape_concurrent_recorders(tmp_path)
 
     import app.services.telemetry as telemetry_module
 
+    # Patch telemetry's module-local alias, NOT the stdlib json module:
+    # telemetry does `import json`, so patching json.dumps would mutate it
+    # process-wide for the duration (#931 review PRR-022).
     with patch.object(
-        telemetry_module.json, "dumps", side_effect=RuntimeError("dictionary changed size during iteration")
+        telemetry_module, "_dumps", side_effect=RuntimeError("dictionary changed size during iteration")
     ):
         def worker():
             try:
@@ -157,8 +184,52 @@ def test_record_evaluator_fail_open_validates_reason():
         pass
     else:
         raise AssertionError("unknown reason must raise ValueError")
-    asyncio.run(_noop())
 
 
-async def _noop():
-    return None
+def test_recorders_hold_the_lock_for_their_critical_section(tmp_path):
+    """PRR-006 / C34: the concurrency guard must be FALSIFIABLE. The 8-thread
+    stress below proves the flush never raises, but it stayed green with the
+    lock replaced by a no-op — because under the GIL the counters rarely lose
+    an update. This test asserts the invariant directly: while a recorder is
+    mid-flush, another thread must NOT be able to acquire the lock. A no-op
+    lock makes this fail, so removing the guard cannot pass silently.
+    """
+    tel = Telemetry(enabled=True, registry_dir=tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def _blocking_flush():
+        entered.set()
+        release.wait(timeout=5)
+
+    with patch.object(tel, "_flush_shard", side_effect=_blocking_flush):
+        worker = threading.Thread(target=tel.record_embedding_cache, args=(True,))
+        worker.start()
+        try:
+            assert entered.wait(timeout=5), "the recorder never reached the flush"
+            acquired = []
+            probe_error = []
+
+            def _probe():
+                try:
+                    if tel._lock.acquire(blocking=False):
+                        acquired.append(True)
+                        tel._lock.release()
+                except Exception as exc:  # noqa: BLE001 - surfaced below
+                    probe_error.append(repr(exc))
+
+            prober = threading.Thread(target=_probe)
+            prober.start()
+            prober.join(timeout=5)
+            assert probe_error == [], (
+                f"the lock probe itself failed, so this test would pass "
+                f"vacuously: {probe_error}"
+            )
+            assert acquired == [], (
+                "a recorder must hold Telemetry._lock across its critical "
+                "section; another thread acquired it mid-flush, so the lock is "
+                "not doing the work the concurrency guard claims"
+            )
+        finally:
+            release.set()
+            worker.join(timeout=5)

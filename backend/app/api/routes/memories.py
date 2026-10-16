@@ -547,8 +547,10 @@ async def create_memory(
 
     # Embed on THIS loop right after the insert (issue #712): add_memory no
     # longer bridges into the embedding service synchronously. Best-effort —
-    # a failure leaves the row FTS-only (observable via the WARNING) until
-    # the background backfill heals it.
+    # a failure leaves the row FTS-only (observable via the WARNING); the
+    # healing paths are the startup backfill task and the superadmin
+    # backfill route, NOT a periodic timer, so the row stays FTS-only for
+    # this process's lifetime if both are missed.
     if getattr(memory_store, "embedding_service", None) is not None:
         try:
             outcome = await memory_store.embed_and_store(record.id, body.content)
@@ -792,9 +794,25 @@ async def update_memory(
         # embed_and_store is best-effort: if the embedding service is down, FTS
         # fallback remains intact and the old embedding (now stale) is NULLed first
         # inside the method so searches won't use misleading vectors.
-        if content_changed and body.content is not None:
+        if (
+            content_changed
+            and body.content is not None
+            # "skipped" means no embedding service is configured at all — an
+            # FTS-only deployment, not a degradation to warn about.
+            and getattr(memory_store, "embedding_service", None) is not None
+        ):
             try:
-                await memory_store.embed_and_store(memory_id, body.content)
+                outcome = await memory_store.embed_and_store(memory_id, body.content)
+                if outcome != "stored":
+                    logger.warning(
+                        "Memory update left the row without an embedding "
+                        "(id=%s, outcome=%s); dense recall degraded to "
+                        "FTS-only for this row (healed by the startup "
+                        "backfill task or the superadmin backfill route, not "
+                        "on a timer)",
+                        memory_id,
+                        outcome,
+                    )
             except Exception:
                 logger.warning(
                     "Could not recompute embedding for memory %d after content update",
