@@ -29,6 +29,13 @@ POLL_INTERVAL = 5  # seconds between polls when queue is empty
 MAX_RETRIES = 3    # max automatic retries before a job is permanently failed
 SUMMARY_CHARS = 500  # leading characters of body used as the entry summary
 
+# Issue #792: the value persisted to jobs.error when a dispatch raises.
+# GET /kms/jobs returns that column to any vault reader, so it carries this
+# stable code only — the full exception text stays in the server log via
+# logger.exception above (same convention as the #562 ingest error codes and
+# draft_job_processor's CODE_* set; KMS has no SSE stream to fan out to).
+FAILED_ERROR_CODE = "COMPILE_FAILED: KMS compile dispatch failed; see server logs"
+
 
 def _lease_enabled() -> bool:
     """Stage-2 lease switch (issue #559): env-only, process-start-stable."""
@@ -227,7 +234,7 @@ class KMSCompileProcessor:
                     )
                     try:
                         new_retry_count = await asyncio.to_thread(
-                            self._fail_job, job.id, str(exc), self._worker_id
+                            self._fail_job, job.id, FAILED_ERROR_CODE, self._worker_id
                         )
                         if _lease_enabled():
                             # fail_job already requeued the row with a durable

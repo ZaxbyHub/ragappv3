@@ -25,6 +25,13 @@ MAX_RETRIES = 3           # max automatic retries before a job is permanently fa
 RESET_RETRY_ATTEMPTS = 3  # attempts to recover a job from 'failed' → 'pending' after a transient DB error
 RESET_RETRY_BASE_DELAY = 0.5  # seconds; doubled per attempt (0.5, 1.0, 2.0)
 
+# Issue #792: the value persisted to jobs.error and the job_failed SSE event
+# when a dispatch raises. Reader-visible surfaces (GET /wiki/jobs, the event
+# stream) carry this stable code only — the full exception text stays in the
+# server log via logger.exception above. Same convention as the #562 ingest
+# error codes and draft_job_processor's CODE_* set.
+FAILED_ERROR_CODE = "COMPILE_FAILED: wiki compile dispatch failed; see server logs"
+
 
 def _lease_enabled() -> bool:
     """Stage-2 lease switch (issue #559): env-only, process-start-stable."""
@@ -241,7 +248,7 @@ class WikiCompileProcessor:
                     )
                     try:
                         new_retry_count = await asyncio.to_thread(
-                            self._fail_job, job.id, str(exc), self._worker_id
+                            self._fail_job, job.id, FAILED_ERROR_CODE, self._worker_id
                         )
                         if _lease_enabled():
                             # fail_job already requeued the row with a durable
@@ -251,7 +258,7 @@ class WikiCompileProcessor:
                                 int(settings.jobs_max_attempts), 1
                             ):
                                 self._publish_event(
-                                    job, "job_failed", error=str(exc)
+                                    job, "job_failed", error=FAILED_ERROR_CODE
                                 )
                         elif new_retry_count < MAX_RETRIES:
                             backoff = 2.0 ** new_retry_count
@@ -272,7 +279,7 @@ class WikiCompileProcessor:
                                 "WikiCompileProcessor: job id=%d permanently failed after %d retries",
                                 job.id, new_retry_count,
                             )
-                            self._publish_event(job, "job_failed", error=str(exc))
+                            self._publish_event(job, "job_failed", error=FAILED_ERROR_CODE)
                     except Exception as e2:
                         logger.error(
                             "WikiCompileProcessor: could not mark job id=%d failed: %s", job.id, e2

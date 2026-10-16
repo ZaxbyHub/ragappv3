@@ -119,7 +119,13 @@ def _to_job(row: sqlite3.Row) -> KMSCompileJob:
 def _compile_job_from_jobs_row(row: sqlite3.Row) -> KMSCompileJob:
     """Map a unified ``jobs`` row (queue='kms') onto the unchanged DTO."""
     d = dict(row)
-    payload = json.loads(d.get("payload_json") or "{}")
+    # Issue #792: a malformed payload_json row degrades to the empty payload
+    # (the guard pattern every sibling JSON-column parse in this file uses)
+    # instead of raising out of every reader of the vault's job list.
+    try:
+        payload = json.loads(d.get("payload_json") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        payload = {}
     return KMSCompileJob(
         id=d["id"],
         vault_id=payload.get("vault_id"),
@@ -444,7 +450,9 @@ class KMSStore:
             ensure_jobs_schema(self._db)
             sql = (
                 "SELECT * FROM jobs WHERE queue = ? "
-                "AND CAST(json_extract(payload_json, '$.vault_id') AS INTEGER) = ?"
+                "AND CASE WHEN json_valid(payload_json) "
+                "THEN CAST(json_extract(payload_json, '$.vault_id') AS INTEGER) "
+                "ELSE NULL END = ?"
             )
             params: list[Any] = [KMS_QUEUE, vault_id]
             if status:
@@ -470,7 +478,9 @@ class KMSStore:
             ensure_jobs_schema(self._db)
             row = self._db.execute(
                 "SELECT * FROM jobs WHERE id = ? AND queue = ? "
-                "AND CAST(json_extract(payload_json, '$.vault_id') AS INTEGER) = ?",
+                "AND CASE WHEN json_valid(payload_json) "
+                "THEN CAST(json_extract(payload_json, '$.vault_id') AS INTEGER) "
+                "ELSE NULL END = ?",
                 (job_id, KMS_QUEUE, vault_id),
             ).fetchone()
             return _compile_job_from_jobs_row(row) if row else None
@@ -631,7 +641,9 @@ class KMSStore:
             cur = self._db.execute(
                 "UPDATE jobs SET status = 'cancelled', completed_at = ? "
                 "WHERE id = ? AND queue = ? "
-                "AND CAST(json_extract(payload_json, '$.vault_id') AS INTEGER) = ? "
+                "AND CASE WHEN json_valid(payload_json) "
+                "THEN CAST(json_extract(payload_json, '$.vault_id') AS INTEGER) "
+                "ELSE NULL END = ? "
                 "AND status IN ('pending', 'running')",
                 (datetime.utcnow().isoformat(), job_id, KMS_QUEUE, vault_id),
             )
@@ -665,7 +677,9 @@ class KMSStore:
                 "worker_id = NULL, lease_generation = lease_generation + 1, "
                 "heartbeat_at = NULL "
                 "WHERE id = ? AND queue = ? "
-                "AND CAST(json_extract(payload_json, '$.vault_id') AS INTEGER) = ? "
+                "AND CASE WHEN json_valid(payload_json) "
+                "THEN CAST(json_extract(payload_json, '$.vault_id') AS INTEGER) "
+                "ELSE NULL END = ? "
                 "AND status = 'failed'",
                 (job_id, KMS_QUEUE, vault_id),
             )
