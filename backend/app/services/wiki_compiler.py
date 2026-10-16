@@ -16,7 +16,7 @@ import re
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from app.config import settings as _app_settings
 from app.services.wiki_curator import (
@@ -1276,28 +1276,75 @@ class WikiCompiler:
         # returns early and does not cover this block): a persist failure is
         # recorded into the summary, never raised into the compile job.
         if cur_result.lint_findings:
-            try:
-                self._store.upsert_lint_findings(
-                    vault_id,
-                    [
-                        {
-                            "finding_type": finding["finding_type"],
-                            "severity": finding.get("severity", "medium"),
-                            "title": finding.get("title", "Curator lint"),
-                            "details": finding.get("details", ""),
-                            "related_page_ids": finding.get("related_page_ids", []),
-                            "related_claim_ids": finding.get("related_claim_ids", []),
-                        }
-                        for finding in cur_result.lint_findings
-                    ],
-                    origin="curator",
+            # Issue #791 review: the single upsert is one transaction, so a
+            # malformed spec would abort the whole batch where the old
+            # per-finding loop dropped only the offender. Validate each spec
+            # first and quarantine the invalid ones into errors, restoring
+            # that isolation without giving up the batch dedupe.
+            specs = []
+            for finding in cur_result.lint_findings:
+                problem = self._curator_spec_problem(finding)
+                if problem is not None:
+                    cur_result.errors.append(f"lint_spec_error: {problem}")
+                    continue
+                specs.append(
+                    {
+                        "finding_type": finding["finding_type"],
+                        "severity": finding.get("severity", "medium"),
+                        "title": finding.get("title", "Curator lint"),
+                        "details": finding.get("details", ""),
+                        "related_page_ids": finding.get("related_page_ids", []),
+                        "related_claim_ids": finding.get("related_claim_ids", []),
+                    }
                 )
-            except Exception as e:  # pragma: no cover - defensive
-                cur_result.errors.append(
-                    f"lint_persist_error: {type(e).__name__}: {e}"
-                )
+            if specs:
+                try:
+                    self._store.upsert_lint_findings(vault_id, specs, origin="curator")
+                except Exception as e:  # pragma: no cover - defensive
+                    # Exception CLASS only (issue #791 review): sqlite3 driver
+                    # messages quote CHECK expressions and table/column names,
+                    # and this string reaches vault readers through the job's
+                    # result_json.
+                    cur_result.errors.append(
+                        f"lint_persist_error: {type(e).__name__}"
+                    )
 
         return cur_result.to_summary()
+
+    # Vocabularies enforced by the wiki_lint_findings CHECK constraints
+    # (backend/app/models/database.py). A curator spec outside them would
+    # abort the whole batched upsert.
+    _LINT_FINDING_TYPES = frozenset(
+        {
+            "contradiction",
+            "stale",
+            "orphan",
+            "missing_page",
+            "unsupported_claim",
+            "duplicate_entity",
+            "weak_provenance",
+        }
+    )
+    _LINT_SEVERITIES = frozenset({"low", "medium", "high", "critical"})
+
+    @classmethod
+    def _curator_spec_problem(cls, finding: Any) -> Optional[str]:
+        """Return None when a curator lint spec is persistable, else a short
+        reason string for the run's error list (issue #791 review)."""
+        if not isinstance(finding, dict):
+            return "spec_not_a_dict"
+        if "finding_type" not in finding:
+            return "missing_finding_type"
+        if finding["finding_type"] not in cls._LINT_FINDING_TYPES:
+            return "unknown_finding_type"
+        severity = finding.get("severity", "medium")
+        if severity not in cls._LINT_SEVERITIES:
+            return "unknown_severity"
+        for key in ("related_page_ids", "related_claim_ids"):
+            value = finding.get(key, [])
+            if not isinstance(value, list):
+                return f"{key}_not_a_list"
+        return None
 
     @staticmethod
     def _build_curator_chunks(

@@ -53,6 +53,33 @@ describe("WikiLintPanel", () => {
     expect(screen.getByText("high · contradiction")).toBeInTheDocument();
   });
 
+  it("does NOT offer Resolve/Dismiss on an auto_resolved finding (issue #791 review)", () => {
+    // auto_resolved is the reconciler's system-only status: it reopens on its
+    // own when the issue recurs, so a user disposition would silently convert
+    // it into a permanent suppression and defeat that contract.
+    render(
+      <WikiLintPanel
+        {...defaultProps()}
+        findings={[makeFinding({ status: "auto_resolved" })]}
+      />
+    );
+    expect(screen.queryByTitle("Resolve")).not.toBeInTheDocument();
+    expect(screen.queryByTitle("Dismiss")).not.toBeInTheDocument();
+    expect(screen.getByText(/auto-resolved/)).toBeInTheDocument();
+    expect(resolveWikiLintFinding).not.toHaveBeenCalled();
+  });
+
+  it("does NOT offer Resolve/Dismiss on an already terminal finding", () => {
+    render(
+      <WikiLintPanel
+        {...defaultProps()}
+        findings={[makeFinding({ status: "dismissed" })]}
+      />
+    );
+    expect(screen.queryByTitle("Resolve")).not.toBeInTheDocument();
+    expect(screen.queryByTitle("Dismiss")).not.toBeInTheDocument();
+  });
+
   it("Run Lint button calls onRunLint", () => {
     const props = defaultProps();
     render(<WikiLintPanel {...props} />);

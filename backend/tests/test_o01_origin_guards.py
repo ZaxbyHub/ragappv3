@@ -15,8 +15,23 @@ candidate (finding_type-scoped resolve pass + suppression that excludes all
       pins the source-dedupe semantics;
 (v)   a detect -> undetect -> re-detect cycle holds exactly one row per
       fingerprint — pins the reopen-by-flip design (no per-flap growth).
+
+swarm-pr-review round (pr930-20261015) additions:
+(vi)   the mixed state is SEEDED directly (two same-fingerprint rows, one
+       dismissed and one auto_resolved) so the precedence rule is actually
+       exercised — the original guard (iii) only ever held one row;
+(vii)  update_lint_finding rejects the system-only 'auto_resolved' status;
+(viii) curator lint findings carry a per-instance discriminator, so two
+       DIFFERENT claims in one rejection class are two rows and dismissing
+       one does not silence the other;
+(ix)   the flip refreshes the mutable payload (severity/details/related ids)
+       from the new detection;
+(x)    a non-integer related_page_ids element cannot abort the whole
+       reconciliation.
 """
 
+import asyncio
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -26,7 +41,12 @@ from unittest.mock import patch
 from app.config import settings
 from app.models.database import run_migrations
 from app.services.wiki_compiler import WikiCompiler
-from app.services.wiki_curator import CuratorAcceptedClaim, CuratorResult
+from app.services.wiki_curator import (
+    CuratorAcceptedClaim,
+    CuratorChunk,
+    CuratorResult,
+    WikiCurator,
+)
 from app.services.wiki_linter import WikiLinter
 from app.services.wiki_store import WikiStore
 
@@ -181,6 +201,175 @@ class TestUserTerminalSuppression(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["status"], "dismissed")
 
+    def test_seeded_mixed_state_suppresses_and_reordering_rule3_first_fails(self):
+        """PRR-008 (swarm-pr-review round): construct the mixed state the
+        original guard only described — two rows sharing one fingerprint,
+        one dismissed and one auto_resolved — and pin that rule 2 wins.
+
+        A mutation that evaluates rule 3 (flip) before rule 2 (suppress)
+        reopens the auto_resolved sibling here, so this guard is
+        discriminating for the precedence itself.
+        """
+        now = "2026-10-15T12:00:00.000000"
+        # Same fingerprint: identical finding_type + normalized title + pages.
+        self.conn.execute(
+            "INSERT INTO wiki_lint_findings (vault_id, finding_type, severity,"
+            " title, details, related_page_ids_json, related_claim_ids_json,"
+            " status, origin, created_at, updated_at)"
+            " VALUES (1, 'unsupported_claim', 'medium', 'Mixed state probe', '',"
+            " '[]', '[]', 'dismissed', 'linter', ?, ?)",
+            (now, now),
+        )
+        self.conn.execute(
+            "INSERT INTO wiki_lint_findings (vault_id, finding_type, severity,"
+            " title, details, related_page_ids_json, related_claim_ids_json,"
+            " status, origin, created_at, updated_at)"
+            " VALUES (1, 'unsupported_claim', 'medium', 'mixed   STATE probe', '',"
+            " '[]', '[]', 'auto_resolved', 'linter', ?, ?)",
+            (now, now),
+        )
+        self.conn.commit()
+        specs = [
+            {
+                "finding_type": "unsupported_claim",
+                "severity": "medium",
+                "title": "Mixed state probe",
+                "details": "",
+                "related_page_ids": [],
+                "related_claim_ids": [],
+            }
+        ]
+        result = self.store.upsert_lint_findings(1, specs, origin="linter")
+        # Rule 2 must suppress: nothing returned, nothing flipped open.
+        self.assertEqual(result, [])
+        rows = self.conn.execute(
+            "SELECT status FROM wiki_lint_findings"
+            " WHERE finding_type='unsupported_claim'"
+            " AND title IN ('Mixed state probe', 'mixed   STATE probe')"
+            " ORDER BY id"
+        ).fetchall()
+        self.assertEqual([r["status"] for r in rows], ["dismissed", "auto_resolved"])
+
+    def test_update_lint_finding_rejects_system_only_status(self):
+        """PRR-009: 'auto_resolved' is reconciler-owned; the user-settable set
+        is unchanged, so a client cannot mint the system status."""
+        self.store.create_lint_finding(
+            vault_id=1, finding_type="orphan", title="System-only probe"
+        )
+        row = self.conn.execute(
+            "SELECT id FROM wiki_lint_findings WHERE title='System-only probe'"
+        ).fetchone()
+        with self.assertRaises(ValueError):
+            self.store.update_lint_finding(row["id"], 1, "auto_resolved")
+        # The row is untouched and the connection is usable.
+        status = self.conn.execute(
+            "SELECT status FROM wiki_lint_findings WHERE id = ?", (row["id"],)
+        ).fetchone()["status"]
+        self.assertEqual(status, "open")
+        self.assertFalse(self.conn.in_transaction)
+
+    def test_flip_refreshes_mutable_payload_from_new_detection(self):
+        """PRR-005: the fingerprint does not cover severity/details, so a
+        re-detection with a changed payload must not keep the stale one."""
+        claim = self.store.create_claim(
+            vault_id=1, claim_text="Payload refresh probe", source_type="manual"
+        )
+        self.linter.run_lint(1)
+        self.store.attach_source(
+            claim_id=claim.id, source_kind="document", file_id=1, chunk_id="1_0"
+        )
+        self.conn.commit()
+        self.linter.run_lint(1)  # auto-resolves
+        row_id = self.conn.execute(
+            "SELECT id, details FROM wiki_lint_findings"
+            " WHERE finding_type='unsupported_claim'"
+        ).fetchone()["id"]
+        # Mutate the payload the way a changed detection would (identity is
+        # unchanged: same type + normalized title + page ids).
+        self.conn.execute(
+            "UPDATE wiki_lint_findings SET details = 'stale payload' WHERE id = ?",
+            (row_id,),
+        )
+        self.conn.commit()
+        self.conn.execute("DELETE FROM wiki_claim_sources WHERE claim_id = ?",
+                          (claim.id,))
+        self.conn.commit()
+        self.linter.run_lint(1)  # recurrence -> flip
+        details = self.conn.execute(
+            "SELECT details FROM wiki_lint_findings WHERE id = ?", (row_id,)
+        ).fetchone()["details"]
+        self.assertNotEqual(details, "stale payload")
+
+    def test_kept_open_row_refreshes_payload_only_when_it_differs(self):
+        """PRR-005 (review round): rule 1 keeps the row but must refresh the
+        mutable payload when the new detection differs — and must not write
+        when it does not (no per-run write amplification)."""
+        claim = self.store.create_claim(
+            vault_id=1, claim_text="Keep refresh probe", source_type="manual"
+        )
+        self.linter.run_lint(1)
+        row_id = self.conn.execute(
+            "SELECT id, updated_at FROM wiki_lint_findings"
+            " WHERE finding_type='unsupported_claim'"
+        ).fetchone()["id"]
+
+        # 1. Same payload again: no write (updated_at unchanged).
+        before = self.conn.execute(
+            "SELECT updated_at FROM wiki_lint_findings WHERE id = ?", (row_id,)
+        ).fetchone()["updated_at"]
+        self.linter.run_lint(1)
+        after_same = self.conn.execute(
+            "SELECT updated_at FROM wiki_lint_findings WHERE id = ?", (row_id,)
+        ).fetchone()["updated_at"]
+        self.assertEqual(before, after_same)
+
+        # 2. Changed payload (details is not part of the fingerprint): the
+        #    stored row is refreshed from the new detection.
+        self.conn.execute(
+            "UPDATE wiki_lint_findings SET details = 'stale keep payload'"
+            " WHERE id = ?",
+            (row_id,),
+        )
+        self.conn.commit()
+        self.linter.run_lint(1)
+        details = self.conn.execute(
+            "SELECT details FROM wiki_lint_findings WHERE id = ?", (row_id,)
+        ).fetchone()["details"]
+        self.assertNotEqual(details, "stale keep payload")
+        # Identity is untouched: same row id, same title, still open.
+        row = self.conn.execute(
+            "SELECT id, title, status FROM wiki_lint_findings WHERE id = ?",
+            (row_id,),
+        ).fetchone()
+        self.assertEqual(row["id"], row_id)
+        self.assertEqual(row["status"], "open")
+
+    def test_non_integer_page_id_cannot_abort_reconciliation(self):
+        """PRR-023: the CHECK constrains related_page_ids_json to a JSON array,
+        not to integers; one malformed legacy row must not abort the run."""
+        self.conn.execute(
+            "INSERT INTO wiki_lint_findings (vault_id, finding_type, severity,"
+            " title, related_page_ids_json, related_claim_ids_json, status)"
+            " VALUES (1, 'orphan', 'low', 'Malformed page id probe',"
+            " '[\"abc\"]', '[]', 'open')"
+        )
+        self.conn.commit()
+        # Must not raise (a ValueError here would 500 the lint route).
+        result = self.store.upsert_lint_findings(
+            1,
+            [{"finding_type": "orphan", "severity": "low",
+              "title": "Fresh probe", "details": ""}],
+            origin="linter",
+        )
+        self.assertEqual(len(result), 1)
+        statuses = {
+            r["status"]
+            for r in self.conn.execute(
+                "SELECT status FROM wiki_lint_findings"
+            ).fetchall()
+        }
+        self.assertIn("auto_resolved", statuses)
+
 
 class TestCuratorSourceDedupe(unittest.TestCase):
     """Guard (iv) + (v): same-file reruns attach no duplicate source; the
@@ -272,6 +461,126 @@ class TestCuratorSourceDedupe(unittest.TestCase):
         ).fetchall()
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["status"], "open")
+
+
+class TestCuratorFindingIdentity(unittest.TestCase):
+    """PRR-001 (swarm-pr-review round): curator lint findings must carry a
+    per-instance discriminator, so two DIFFERENT claims in one rejection class
+    are two rows — and dismissing one does not silence the other."""
+
+    class _StubClient:
+        def __init__(self, payload: str):
+            self.payload = payload
+
+        async def propose(self, *_args, **_kwargs):
+            return self.payload
+
+    def setUp(self):
+        self.conn, self.store = _make_env()
+        self._settings = settings
+        self._snap = {
+            f: getattr(settings, f)
+            for f in (
+                "wiki_llm_curator_enabled",
+                "wiki_llm_curator_url",
+                "wiki_llm_curator_model",
+                "wiki_llm_curator_mode",
+                "wiki_llm_curator_require_quote_match",
+                "wiki_llm_curator_require_chunk_id",
+            )
+        }
+        self._settings.wiki_llm_curator_enabled = True
+        self._settings.wiki_llm_curator_url = "https://api.example.com"
+        self._settings.wiki_llm_curator_model = "qwen-1b"
+        self._settings.wiki_llm_curator_mode = "active_if_verified"
+        self._settings.wiki_llm_curator_require_quote_match = True
+        self._settings.wiki_llm_curator_require_chunk_id = True
+
+    def tearDown(self):
+        for name, value in self._snap.items():
+            setattr(self._settings, name, value)
+        self.conn.close()
+
+    @staticmethod
+    def _chunks():
+        return [
+            CuratorChunk(
+                chunk_id="42_0",
+                source_text="Alice founded the company. Bob is the CTO.",
+                file_id=42,
+                source_label="file:42",
+            )
+        ]
+
+    def _curate(self, payload: str) -> CuratorResult:
+        curator = WikiCurator(
+            client=self._StubClient(payload), store=self.store
+        )
+        return asyncio.run(
+            curator.curate(vault_id=1, file_id=42, chunks=self._chunks())
+        )
+
+    def test_two_rejections_in_one_class_are_two_distinct_findings(self):
+        payload = json.dumps(
+            {
+                "claims": [
+                    {"claim_text": "First unsupported assertion",
+                     "source_quote": "", "chunk_id": "42_0"},
+                    {"claim_text": "Second unsupported assertion",
+                     "source_quote": "", "chunk_id": "42_0"},
+                ]
+            }
+        )
+        result = self._curate(payload)
+        titles = [f["title"] for f in result.lint_findings]
+        self.assertEqual(len(titles), 2)
+        self.assertNotEqual(titles[0], titles[1])
+        self.assertIn("First unsupported assertion", titles[0])
+        self.assertIn("Second unsupported assertion", titles[1])
+
+    def test_dismissing_one_claim_does_not_silence_the_class(self):
+        """The regression this class of bug caused: with constant titles the
+        two claims shared one fingerprint, so dismissing either suppressed
+        both — permanently and silently."""
+        payload = json.dumps(
+            {
+                "claims": [
+                    {"claim_text": "Alpha unsupported assertion",
+                     "source_quote": "", "chunk_id": "42_0"},
+                    {"claim_text": "Beta unsupported assertion",
+                     "source_quote": "", "chunk_id": "42_0"},
+                ]
+            }
+        )
+        result = self._curate(payload)
+        specs = [
+            {
+                "finding_type": f["finding_type"],
+                "severity": f.get("severity", "medium"),
+                "title": f["title"],
+                "details": f.get("details", ""),
+                "related_page_ids": f.get("related_page_ids", []),
+                "related_claim_ids": f.get("related_claim_ids", []),
+            }
+            for f in result.lint_findings
+        ]
+        self.store.upsert_lint_findings(1, specs, origin="curator")
+        rows = self.conn.execute(
+            "SELECT id, title FROM wiki_lint_findings"
+            " WHERE finding_type='unsupported_claim' AND status='open'"
+            " ORDER BY id"
+        ).fetchall()
+        self.assertEqual(len(rows), 2)
+
+        # Dismiss the first claim's row, then re-detect BOTH claims: the
+        # second must still be reported (and the first stay suppressed).
+        self.store.update_lint_finding(rows[0]["id"], 1, "dismissed")
+        again = self.store.upsert_lint_findings(1, specs, origin="curator")
+        self.assertEqual([f.id for f in again], [rows[1]["id"]])
+        dismissed = self.conn.execute(
+            "SELECT status FROM wiki_lint_findings WHERE id = ?", (rows[0]["id"],)
+        ).fetchone()["status"]
+        self.assertEqual(dismissed, "dismissed")
 
 
 if __name__ == "__main__":  # pragma: no cover

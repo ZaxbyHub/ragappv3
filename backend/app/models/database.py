@@ -2876,6 +2876,10 @@ def migrate_add_wiki_tables(sqlite_path: str) -> None:
                 completed_at TIMESTAMP
             );
 
+            -- Canonical shape (issue #791): must match the fresh-schema CREATE
+            -- and the origin/auto_resolved rebuild migration exactly — the
+            -- five-value status CHECK and the origin CHECK included, so any
+            -- path that creates the table here lands on the post-#791 shape.
             CREATE TABLE IF NOT EXISTS wiki_lint_findings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 vault_id INTEGER NOT NULL,
@@ -2891,7 +2895,9 @@ def migrate_add_wiki_tables(sqlite_path: str) -> None:
                 related_claim_ids_json TEXT NOT NULL DEFAULT '[]'
                     CHECK (json_type(related_claim_ids_json) = 'array'),
                 status TEXT NOT NULL DEFAULT 'open' CHECK (status IN (
-                    'open','acknowledged','resolved','dismissed')),
+                    'open','acknowledged','resolved','dismissed','auto_resolved')),
+                origin TEXT NOT NULL DEFAULT 'linter' CHECK (origin IN (
+                    'linter','invalidation','compiler','curator')),
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );

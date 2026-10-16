@@ -1710,11 +1710,16 @@ class WikiStore:
         AC35 (#515): callers that re-detect the same issue across runs should
         prefer ``upsert_lint_findings`` (fingerprint-aware, respects
         dismissals); this direct insert is for one-off findings a lint run
-        did not detect (e.g. claim invalidation writing 'stale'/
-        'weak_provenance' rows). The ``origin`` default is therefore
-        'invalidation' — a non-linter marker, so the lint reconciler never
-        auto-resolves rows seeded here — and producers that re-detect must
-        call ``upsert_lint_findings`` with their own origin instead.
+        did not detect. The ``origin`` default is therefore 'invalidation' —
+        a non-linter marker, so the lint reconciler never auto-resolves rows
+        seeded here — and producers that re-detect must call
+        ``upsert_lint_findings`` with their own origin instead.
+
+        Note: the invalidation writers (``mark_claims_stale_by_file`` /
+        ``mark_claims_stale_by_memory``) do NOT route through this method;
+        they issue their own origin-tagged INSERTs. After #791 moved the
+        curator onto the upsert path, this method's remaining callers are
+        one-off seeders and tests.
         """
         return self._insert_lint_finding_row(
             vault_id=vault_id,
@@ -1782,9 +1787,21 @@ class WikiStore:
         drift without changing identity; whitespace/case differences in the
         title do not either.
         """
-        pages = tuple(sorted({int(p) for p in (related_page_ids or []) if p}))
+        # Issue #791 review: the CHECK constrains related_page_ids_json to a
+        # JSON *array*, not to integer elements, so a legacy/hand-edited row
+        # could carry a non-castable element. Skip those instead of raising —
+        # an exception here would abort the whole reconciliation (and 500 the
+        # lint route) over one malformed row.
+        pages = set()
+        for p in (related_page_ids or []):
+            if not p:
+                continue
+            try:
+                pages.add(int(p))
+            except (TypeError, ValueError):
+                continue
         normalized_title = re.sub(r"\s+", " ", (title or "").strip().lower())
-        return (finding_type, pages, normalized_title)
+        return (finding_type, tuple(sorted(pages)), normalized_title)
 
     @staticmethod
     def _row_lint_fingerprint(row: sqlite3.Row) -> tuple:
@@ -1885,8 +1902,41 @@ class WikiStore:
                 if matches:
                     open_rows = [r for r in matches if r["status"] == "open"]
                     if open_rows:
-                        # Rule 1: still open — keep the existing row as-is.
-                        result.append(_to_lint_finding(open_rows[0]))
+                        # Rule 1: still open — keep the existing row, but
+                        # refresh the mutable payload when the new detection
+                        # carries different severity/details/related ids
+                        # (issue #791 review: the fingerprint does not cover
+                        # them, so a growing contradiction would otherwise
+                        # keep showing its first-detection payload forever).
+                        kept = open_rows[0]
+                        if (
+                            kept["severity"] != spec.get("severity", "medium")
+                            or kept["details"] != spec.get("details", "")
+                            or kept["related_page_ids_json"]
+                            != json.dumps(spec.get("related_page_ids") or [])
+                            or kept["related_claim_ids_json"]
+                            != json.dumps(spec.get("related_claim_ids") or [])
+                        ):
+                            self._db.execute(
+                                "UPDATE wiki_lint_findings SET severity = ?,"
+                                " details = ?, related_page_ids_json = ?,"
+                                " related_claim_ids_json = ?, updated_at = ?"
+                                " WHERE id = ? AND vault_id = ?",
+                                (
+                                    spec.get("severity", "medium"),
+                                    spec.get("details", ""),
+                                    json.dumps(spec.get("related_page_ids") or []),
+                                    json.dumps(spec.get("related_claim_ids") or []),
+                                    now,
+                                    kept["id"],
+                                    vault_id,
+                                ),
+                            )
+                            kept = self._db.execute(
+                                "SELECT * FROM wiki_lint_findings WHERE id = ?",
+                                (kept["id"],),
+                            ).fetchone()
+                        result.append(_to_lint_finding(kept))
                         continue
                     # Rule 2: a user disposition (dismissed / resolved /
                     # acknowledged) permanently suppresses this fingerprint —
@@ -1909,17 +1959,38 @@ class WikiStore:
                     ]
                     if flippable:
                         newest = max(flippable, key=lambda r: (r["created_at"], r["id"]))
+                        # Refresh the mutable payload from the new detection
+                        # (issue #791 review): identity is the fingerprint, so
+                        # severity/details/related ids may legitimately have
+                        # changed since the row was auto-resolved — e.g. a
+                        # contradiction that gained a third claim. Without
+                        # this the reopened row would keep the stale payload.
                         self._db.execute(
-                            "UPDATE wiki_lint_findings SET status = 'open', updated_at = ? "
-                            "WHERE id = ? AND vault_id = ?",
-                            (now, newest["id"], vault_id),
+                            "UPDATE wiki_lint_findings SET status = 'open',"
+                            " severity = ?, details = ?,"
+                            " related_page_ids_json = ?, related_claim_ids_json = ?,"
+                            " updated_at = ? WHERE id = ? AND vault_id = ?",
+                            (
+                                spec.get("severity", "medium"),
+                                spec.get("details", ""),
+                                json.dumps(spec.get("related_page_ids") or []),
+                                json.dumps(spec.get("related_claim_ids") or []),
+                                now,
+                                newest["id"],
+                                vault_id,
+                            ),
                         )
                         fresh = self._db.execute(
                             "SELECT * FROM wiki_lint_findings WHERE id = ?",
                             (newest["id"],),
                         ).fetchone()
-                        result.append(_to_lint_finding(fresh))
-                        continue
+                        if fresh is not None:
+                            result.append(_to_lint_finding(fresh))
+                            continue
+                        # The row vanished between the snapshot read and the
+                        # UPDATE (a concurrent delete). Fall through to rule 4
+                        # rather than crashing the whole reconciliation on an
+                        # unguarded re-read.
                 # Rule 4: fresh open row for this producer.
                 result.append(
                     self._insert_lint_finding_row(
