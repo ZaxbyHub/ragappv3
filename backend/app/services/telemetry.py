@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import secrets
+import threading
 import time
 from contextvars import ContextVar
 from pathlib import Path
@@ -40,10 +41,19 @@ logger = logging.getLogger(__name__)
 
 PROVIDER_OUTCOMES = ("ok", "partial", "unavailable", "empty")
 
+# Module-local alias for the shard serializer. Tests patch THIS, not
+# ``json.dumps`` — telemetry imports the stdlib module, so patching
+# ``telemetry.json.dumps`` would mutate json for the whole process.
+_dumps = json.dumps
+
 METRIC_CHAT_TURNS = "ragapp_chat_turns_total"
 METRIC_QUEUE_DEPTH = "ragapp_queue_depth"
 METRIC_QUEUE_WAIT = "ragapp_queue_wait_seconds"
 METRIC_PROVIDER_CALLS = "ragapp_provider_calls_total"
+METRIC_EVALUATOR_FAIL_OPEN = "ragapp_retrieval_evaluator_fail_open_total"
+
+# Valid reasons for record_evaluator_fail_open (issue #712, AC7 wiring).
+EVALUATOR_FAIL_OPEN_REASONS = ("exception", "empty_response", "unexpected_response")
 
 _turn_var: ContextVar[Optional[str]] = ContextVar("ragapp_turn_id", default=None)
 
@@ -82,48 +92,65 @@ class Telemetry:
         self._provider_calls: Dict[str, Dict[str, int]] = {}
         self._stage_totals: Dict[str, float] = {}
         self._embedding_cache_hits = 0
+        self._evaluator_fail_opens: Dict[str, int] = {}
         self._shard_name = f"telemetry-{os.getpid()}-{secrets.token_hex(4)}.json"
         self._otel_observers: list = []
+        # Guards every counter/dict mutation and the shard serialization so a
+        # recorder can never interleave with another thread's serializer
+        # iteration (RuntimeError: dictionary changed size during iteration)
+        # or lose += updates. Every recorder call site is on the event loop
+        # today, so the lock is currently uncontended; it makes the invariant
+        # hold for any future worker-thread caller. Reentrant: _flush_shard /
+        # metrics_text / the OTel observer re-enter guarded paths.
+        self._lock = threading.RLock()
 
     # ----------------------------------------------------------- recorders
 
     def record_chat_turn(self, turn_id: str) -> None:
         if not self.enabled or not turn_id:
             return
-        self._chat_turns += 1
-        # Write-through: the shard is the cross-process aggregation surface,
-        # so counters land on disk as they are recorded (not only on scrape).
-        self._flush_shard()
+        with self._lock:
+            self._chat_turns += 1
+            # Write-through: the shard is the cross-process aggregation surface,
+            # so counters land on disk as they are recorded (not only on scrape).
+            self._flush_shard()
+        # Observers are foreign code — never inside the critical section.
         self._notify_otel_observers()
 
     def record_stage(self, turn_id: str, stage: str, duration_seconds: float) -> None:
         if not self.enabled or not turn_id:
             return
-        self._stage_durations.setdefault(turn_id, {})[stage] = float(
-            duration_seconds
-        )
-        # PR #595 review F-002: keep a running per-stage accumulator so the
-        # OTel observer can read totals in O(1) — the previous
-        # re-scan-all-history implementation blocked the event loop with
-        # O(every-turn-ever) work on every record.
-        self._stage_totals[stage] = (
-            self._stage_totals.get(stage, 0.0) + float(duration_seconds)
-        )
+        with self._lock:
+            self._stage_durations.setdefault(turn_id, {})[stage] = float(
+                duration_seconds
+            )
+            # PR #595 review F-002: keep a running per-stage accumulator so the
+            # OTel observer can read totals in O(1) — the previous
+            # re-scan-all-history implementation blocked the event loop with
+            # O(every-turn-ever) work on every record.
+            self._stage_totals[stage] = (
+                self._stage_totals.get(stage, 0.0) + float(duration_seconds)
+            )
+        # Observers are foreign code — never inside the critical section.
         self._notify_otel_observers()
 
     def record_queue_wait(self, admission_class: str, wait_seconds: float,
                           depth: int = 0) -> None:
         if not self.enabled:
             return
-        self._queue_waits.setdefault(str(admission_class), []).append(
-            float(wait_seconds)
-        )
-        self._queue_depths.setdefault(str(admission_class), []).append(int(depth))
+        with self._lock:
+            self._queue_waits.setdefault(str(admission_class), []).append(
+                float(wait_seconds)
+            )
+            self._queue_depths.setdefault(str(admission_class), []).append(
+                int(depth)
+            )
 
     def record_first_useful_content(self, turn_id: str, seconds: float) -> None:
         if not self.enabled or not turn_id:
             return
-        self._first_useful[turn_id] = float(seconds)
+        with self._lock:
+            self._first_useful[turn_id] = float(seconds)
 
     def record_provider_call(self, provider: str, outcome: str) -> None:
         if outcome not in PROVIDER_OUTCOMES:
@@ -133,37 +160,66 @@ class Telemetry:
             )
         if not self.enabled:
             return
-        per_provider = self._provider_calls.setdefault(str(provider), {})
-        per_provider[outcome] = per_provider.get(outcome, 0) + 1
-        self._flush_shard()
+        with self._lock:
+            per_provider = self._provider_calls.setdefault(str(provider), {})
+            per_provider[outcome] = per_provider.get(outcome, 0) + 1
+            self._flush_shard()
 
     def record_embedding_cache(self, hit: bool) -> None:
         if not self.enabled:
             return
-        if hit:
-            self._embedding_cache_hits += 1
-        self._flush_shard()
+        with self._lock:
+            if hit:
+                self._embedding_cache_hits += 1
+            self._flush_shard()
+
+    def record_evaluator_fail_open(self, reason: str) -> None:
+        """Count one RetrievalEvaluator fail-open by cause (issue #712).
+
+        The counter is exposed at ``GET /metrics`` as
+        ``ragapp_retrieval_evaluator_fail_open_total{reason=...}`` — the
+        production read site for the evaluator-outage signal the class
+        attribute ``RetrievalEvaluator.fail_open_count`` documents but
+        nothing used to read (audit TQ-instruction-batch-5-02). Write-through
+        like every counter so cross-process scrapers see it immediately.
+        """
+        if not self.enabled:
+            return
+        if reason not in EVALUATOR_FAIL_OPEN_REASONS:
+            raise ValueError(
+                f"unknown evaluator fail-open reason {reason!r}; expected one "
+                f"of {EVALUATOR_FAIL_OPEN_REASONS}"
+            )
+        with self._lock:
+            self._evaluator_fail_opens[reason] = (
+                self._evaluator_fail_opens.get(reason, 0) + 1
+            )
+            self._flush_shard()
 
     # ------------------------------------------------------------- reading
 
     def snapshot(self) -> dict:
-        return {
-            "chat_turns": self._chat_turns,
-            "stage_durations": {
-                turn: dict(stages)
-                for turn, stages in self._stage_durations.items()
-            },
-            "queue_waits": {cls: list(v) for cls, v in self._queue_waits.items()},
-            "queue_depths": {
-                cls: list(v) for cls, v in self._queue_depths.items()
-            },
-            "first_useful_content": dict(self._first_useful),
-            "provider_calls": {
-                provider: dict(outcomes)
-                for provider, outcomes in self._provider_calls.items()
-            },
-            "embedding_cache_hits": self._embedding_cache_hits,
-        }
+        with self._lock:
+            return {
+                "chat_turns": self._chat_turns,
+                "stage_durations": {
+                    turn: dict(stages)
+                    for turn, stages in self._stage_durations.items()
+                },
+                "queue_waits": {
+                    cls: list(v) for cls, v in self._queue_waits.items()
+                },
+                "queue_depths": {
+                    cls: list(v) for cls, v in self._queue_depths.items()
+                },
+                "first_useful_content": dict(self._first_useful),
+                "provider_calls": {
+                    provider: dict(outcomes)
+                    for provider, outcomes in self._provider_calls.items()
+                },
+                "embedding_cache_hits": self._embedding_cache_hits,
+                "evaluator_fail_opens": dict(self._evaluator_fail_opens),
+            }
 
     def attach_otel_observer(self, observer) -> None:
         """Register the OTLP bridge observer (called on its export cadence)."""
@@ -178,43 +234,53 @@ class Telemetry:
 
     def stage_totals(self) -> Dict[str, float]:
         """Running per-stage duration totals (O(1); PR #595 review F-002)."""
-        return dict(self._stage_totals)
+        with self._lock:
+            return dict(self._stage_totals)
 
     def reset(self) -> None:
-        self._chat_turns = 0
-        self._stage_durations = {}
-        self._stage_totals = {}
-        self._queue_waits = {}
-        self._queue_depths = {}
-        self._first_useful = {}
-        self._provider_calls = {}
-        self._embedding_cache_hits = 0
-        if self.registry_dir is not None:
-            shard = self.registry_dir / self._shard_name
-            try:
-                shard.unlink(missing_ok=True)
-            except OSError:  # pragma: no cover — best effort
-                pass
+        with self._lock:
+            self._chat_turns = 0
+            self._stage_durations = {}
+            self._stage_totals = {}
+            self._queue_waits = {}
+            self._queue_depths = {}
+            self._first_useful = {}
+            self._provider_calls = {}
+            self._embedding_cache_hits = 0
+            self._evaluator_fail_opens = {}
+            if self.registry_dir is not None:
+                shard = self.registry_dir / self._shard_name
+                try:
+                    shard.unlink(missing_ok=True)
+                except OSError:  # pragma: no cover — best effort
+                    pass
 
     # ------------------------------------------------------ multiprocess
 
     def _flush_shard(self) -> None:
         if self.registry_dir is None:
             return
-        try:
-            self.registry_dir.mkdir(parents=True, exist_ok=True)
-            counts = {
-                "chat_turns": self._chat_turns,
-                "queue_waits": self._queue_waits,
-                "queue_depths": self._queue_depths,
-                "provider_calls": self._provider_calls,
-                "embedding_cache_hits": self._embedding_cache_hits,
-            }
-            (self.registry_dir / self._shard_name).write_text(
-                json.dumps(counts), encoding="utf-8"
-            )
-        except OSError:  # pragma: no cover — registry on read-only mount
-            logger.debug("telemetry shard flush failed", exc_info=True)
+        # Serialize the LIVE dicts under the lock: without it, a recorder on
+        # another thread mutating self._queue_waits et al. during json.dumps
+        # raises RuntimeError (dictionary changed size during iteration)
+        # straight out of the recorder call (issue #712, P01-SK2-12). The
+        # guard is Exception, not OSError, for exactly that reason.
+        with self._lock:
+            try:
+                self.registry_dir.mkdir(parents=True, exist_ok=True)
+                counts = {
+                    "chat_turns": self._chat_turns,
+                    "queue_waits": self._queue_waits,
+                    "queue_depths": self._queue_depths,
+                    "provider_calls": self._provider_calls,
+                    "embedding_cache_hits": self._embedding_cache_hits,
+                    "evaluator_fail_opens": self._evaluator_fail_opens,
+                }
+                (self.registry_dir / self._shard_name).write_text(
+                    _dumps(counts), encoding="utf-8"
+                )
+            except Exception:  # noqa: BLE001 — telemetry must never raise
+                logger.debug("telemetry shard flush failed", exc_info=True)
 
     def _aggregate_counts(self) -> dict:
         totals = {
@@ -223,6 +289,7 @@ class Telemetry:
             "queue_depths": {},
             "provider_calls": {},
             "embedding_cache_hits": 0,
+            "evaluator_fail_opens": {},
         }
         shards: list = []
         if self.registry_dir is not None and self.registry_dir.exists():
@@ -251,19 +318,26 @@ class Telemetry:
                     continue
         else:
             shards.append(self._local_counts())
-        for shard in shards:
-            totals["chat_turns"] += int(shard.get("chat_turns", 0))
-            totals["embedding_cache_hits"] += int(
-                shard.get("embedding_cache_hits", 0)
-            )
-            for cls, waits in shard.get("queue_waits", {}).items():
-                totals["queue_waits"].setdefault(cls, []).extend(waits)
-            for cls, depths in shard.get("queue_depths", {}).items():
-                totals["queue_depths"].setdefault(cls, []).extend(depths)
-            for provider, outcomes in shard.get("provider_calls", {}).items():
-                merged = totals["provider_calls"].setdefault(provider, {})
-                for outcome, count in outcomes.items():
-                    merged[outcome] = merged.get(outcome, 0) + int(count)
+        # Merge under the lock: the local shard references LIVE dicts, so an
+        # unlocked .items() iteration races concurrent recorders (the same
+        # RuntimeError class _flush_shard guards against).
+        with self._lock:
+            for shard in shards:
+                totals["chat_turns"] += int(shard.get("chat_turns", 0))
+                totals["embedding_cache_hits"] += int(
+                    shard.get("embedding_cache_hits", 0)
+                )
+                for reason, count in shard.get("evaluator_fail_opens", {}).items():
+                    merged_eval = totals["evaluator_fail_opens"]
+                    merged_eval[reason] = merged_eval.get(reason, 0) + int(count)
+                for cls, waits in shard.get("queue_waits", {}).items():
+                    totals["queue_waits"].setdefault(cls, []).extend(waits)
+                for cls, depths in shard.get("queue_depths", {}).items():
+                    totals["queue_depths"].setdefault(cls, []).extend(depths)
+                for provider, outcomes in shard.get("provider_calls", {}).items():
+                    merged = totals["provider_calls"].setdefault(provider, {})
+                    for outcome, count in outcomes.items():
+                        merged[outcome] = merged.get(outcome, 0) + int(count)
         return totals
 
     def _local_counts(self) -> dict:
@@ -273,6 +347,7 @@ class Telemetry:
             "queue_depths": self._queue_depths,
             "provider_calls": self._provider_calls,
             "embedding_cache_hits": self._embedding_cache_hits,
+            "evaluator_fail_opens": self._evaluator_fail_opens,
         }
 
     def metrics_text(self) -> str:
@@ -307,6 +382,19 @@ class Telemetry:
         lines.append(
             f"ragapp_embedding_cache_hits_total {totals['embedding_cache_hits']}"
         )
+
+        lines.append(
+            "# HELP ragapp_retrieval_evaluator_fail_open_total Retrieval "
+            "evaluator fail-opens by cause (issue #712)."
+        )
+        lines.append(
+            "# TYPE ragapp_retrieval_evaluator_fail_open_total counter"
+        )
+        for reason in sorted(totals["evaluator_fail_opens"]):
+            count = totals["evaluator_fail_opens"][reason]
+            lines.append(
+                f'{METRIC_EVALUATOR_FAIL_OPEN}{{reason="{reason}"}} {count}'
+            )
         return "\n".join(lines) + "\n"
 
 

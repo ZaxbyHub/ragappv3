@@ -215,7 +215,10 @@ roles, not capacity claims.
   published" is a deployment fact, not an access control; restrict scraping
   at your ingress. Metric families: `ragapp_chat_turns_total`,
   `ragapp_queue_depth`, `ragapp_queue_wait_seconds`,
-  `ragapp_provider_calls_total`, `ragapp_embedding_cache_hits_total`.
+  `ragapp_provider_calls_total`, `ragapp_embedding_cache_hits_total`,
+  `ragapp_retrieval_evaluator_fail_open_total` (labelled by `reason=`;
+  a non-zero value means the CRAG retrieval evaluator failed open —
+  see `docs/releases/pending/712-memory-stall-evaluator-starvation.md`).
   Multiprocess aggregation: set `TELEMETRY_REGISTRY_DIR` to one shared
   writable directory (all workers/replicas) and the counter/gauge families
   above are summed across shards; empty = single-process counters. Note:

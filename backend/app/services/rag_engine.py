@@ -1177,6 +1177,37 @@ class RAGEngine:
                         source="chat",
                         vault_id=vault_id,
                     )
+                    # Embed on THIS loop right after the insert (issue #712):
+                    # add_memory no longer bridges into the embedding service
+                    # synchronously. Only the newly-inserted branch embeds —
+                    # a re-sent directive hits the found-existing branch and
+                    # leaves that row's embedding as it stands (a prior
+                    # failed embed stays NULL; healing is the backfill's job).
+                    if (
+                        getattr(self.memory_store, "embedding_service", None)
+                        is not None
+                    ):
+                        try:
+                            outcome = await self.memory_store.embed_and_store(
+                                memory.id, memory_content
+                            )
+                            if outcome != "stored":
+                                logger.warning(
+                                    "Memory stored without embedding (id=%s, "
+                                    "outcome=%s); dense recall degraded to "
+                                    "FTS-only for this row (healed by the "
+                                    "startup backfill task or the superadmin "
+                                    "backfill route, not on a timer)",
+                                    memory.id,
+                                    outcome,
+                                )
+                        except Exception as exc:  # noqa: BLE001 — chat hot path
+                            logger.warning(
+                                "Memory embedding after remember-directive "
+                                "failed (id=%s): %s",
+                                memory.id,
+                                exc,
+                            )
                 yield {
                     "type": "content",
                     "content": f"Memory stored: {memory.content}",
@@ -1320,12 +1351,45 @@ class RAGEngine:
 
             async def _memory_retrieve() -> List[Any]:
                 try:
+                    # Precompute the query embedding ON THIS LOOP (issue #712):
+                    # awaiting the embedding service here and passing the
+                    # result down means search_memories never spins a fresh
+                    # event loop against the main-loop-bound httpx client.
+                    # Own try/except so ANY precompute failure (service error
+                    # or a store double without an awaitable embed_query)
+                    # degrades to WARNING + FTS-only instead of aborting the
+                    # memory search; the kwarg is still PASSED (as None) so
+                    # the store's never-attempted WARNING cannot misfire.
+                    # Store doubles without an embedding_service attribute
+                    # (plain test stubs) get no kwarg at all.
+                    has_embedder = (
+                        getattr(self.memory_store, "embedding_service", None)
+                        is not None
+                    )
+                    query_embedding: Optional[List[float]] = None
+                    if has_embedder and user_input and user_input.strip():
+                        try:
+                            query_embedding = await self.memory_store.embed_query(
+                                user_input
+                            )
+                        except Exception as exc:  # noqa: BLE001 — degrade, not abort
+                            logger.warning(
+                                "Memory query embedding precompute failed; "
+                                "continuing FTS-only: %s",
+                                exc,
+                            )
+                            query_embedding = None
+                    search_kwargs: Dict[str, Any] = {
+                        "vault_id": vault_id,
+                        "include_global": include_global,
+                    }
+                    if has_embedder:
+                        search_kwargs["query_embedding"] = query_embedding
                     candidates = await asyncio.to_thread(
                         self.memory_store.search_memories,
                         user_input,
                         settings.memory_retrieval_top_k,
-                        vault_id=vault_id,
-                        include_global=include_global,
+                        **search_kwargs,
                     )
                     # Apply context_top_k cap so prompt context stays bounded
                     # even when memory_retrieval_top_k is large.

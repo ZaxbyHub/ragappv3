@@ -15,7 +15,8 @@ Retrieval flow:
 Embedding generation is opportunistic: if the embedding service is
 unavailable when a memory is added or updated, the row is still
 persisted and indexed lexically. A later background pass (or a fresh
-``add_memory`` call) can populate the embedding without reindexing.
+a caller-driven ``embed_and_store`` pass) can populate the embedding
+without reindexing.
 """
 
 import asyncio
@@ -30,11 +31,18 @@ import numpy as np
 
 from app.config import settings
 from app.models.database import SQLiteConnectionPool
+from app.services.fts_query import build_fts_match_query
 from app.services.store_utils import cosine_similarity as _cosine_similarity_shared
 from app.utils.fusion import rrf_fuse
 from app.utils.retry import with_retry
 
 logger = logging.getLogger(__name__)
+
+
+# Sentinel distinguishing "caller never attempted a query-embedding precompute"
+# (WARNING — API misuse signal) from "caller attempted and passed None because
+# the precompute failed" (embed_query already logged the failure; issue #712).
+_UNSET_QUERY_EMBEDDING: Any = object()
 
 
 # Stop words stripped before building the FTS5 AND query. Natural-language
@@ -257,34 +265,43 @@ class MemoryStore:
             model_used = getattr(settings, "embedding_model", None) or ""
         return embedding, "ok", model_used
 
-    async def _embed_text(self, text: str) -> Optional[List[float]]:
-        """Best-effort embed; never raises. Returns None on failure or when
-        no embedding service is wired in.
-        """
-        embedding, _outcome, _model = await self._embed_text_with_outcome(text)
-        return embedding
+    async def embed_query(self, query: str) -> Optional[List[float]]:
+        """Compute the QUERY embedding on the CALLER's event loop (issue #712).
 
-    async def _embed_text_with_model(
-        self, text: str
-    ) -> "tuple[Optional[List[float]], str]":
-        """Best-effort embed returning the model id whose space the vector
-        occupies (serving pin during a staged rebuild — issue #696)."""
-        embedding, _outcome, model_used = await self._embed_text_with_outcome(text)
-        return embedding, model_used
+        Async callers (RAG engine, memories routes) await this before
+        dispatching the synchronous :meth:`search_memories` to a worker
+        thread, so no fresh event loop is ever spun against the process-wide
+        embedding service's main-loop-bound ``httpx.AsyncClient`` — the
+        cross-loop pool corruption that stalled 30-40s on a quarter to half
+        of chat turns.
 
-    def _run_coro_sync(self, coro):
-        """asyncio.run bridge that does not leak the coroutine when called
-        from inside a running event loop: asyncio.run refuses with
-        RuntimeError *before* consuming the coroutine, and a refused
-        coroutine would otherwise be destroyed un-awaited (tripping the
-        issue-#565 never-awaited warning gate). Close it explicitly and
-        re-raise; the surrounding best-effort handlers swallow as before.
+        Best-effort: returns None with an operator-visible WARNING when the
+        service raises OR returns a falsy (empty) embedding — both branches
+        log, so no dense-memory degradation is silent; never raises.
         """
+        if self.embedding_service is None or not query or not query.strip():
+            return None
         try:
-            return asyncio.run(coro)
-        except RuntimeError:
-            coro.close()
-            raise
+            query_emb = await self.embedding_service.embed_single(query)
+        except Exception as exc:  # noqa: BLE001 — best effort, observable
+            logger.warning(
+                "Memory query embedding failed; dense memory search "
+                "degraded to FTS-only: %s",
+                exc,
+            )
+            return None
+        if not query_emb:
+            # A provider that returns an empty vector without raising is the
+            # silent half of the dense-degradation class (#712 review PRR-002 /
+            # C19): the callers pass query_embedding=None (the "attempted"
+            # encoding), so the store's never-attempted tripwire stays quiet —
+            # this log is the only operator signal on that path.
+            logger.warning(
+                "Memory query embedding returned empty; dense memory search "
+                "degraded to FTS-only"
+            )
+            return None
+        return query_emb
 
     def _store_embedding(
         self,
@@ -568,24 +585,14 @@ class MemoryStore:
         finally:
             self.pool.release_connection(conn)
 
-        # Best-effort embedding generation. We compute the embedding via a
-        # synchronous bridge — callers that already provide an event loop
-        # should use ``embed_and_store`` directly. Failures are swallowed
-        # because lexical search continues to work without the embedding.
-        if self.embedding_service is not None:
-            try:
-                embedding, model_used = self._run_coro_sync(
-                    self._embed_text_with_model(content)
-                )
-                if embedding is not None:
-                    self._store_embedding(
-                        memory_id, embedding, content, model_used
-                    )
-            except Exception as exc:  # noqa: BLE001
-                logger.debug(
-                    "Memory embedding skipped on add (id=%s): %s", memory_id, exc
-                )
-
+        # No inline embedding here (issue #712): computing one synchronously
+        # would require spinning a fresh event loop on this (possibly worker)
+        # thread against the main-loop-bound embedding client — the stall
+        # vector this fix removes. Async callers embed via
+        # ``embed_and_store`` right after the row write (memories.py routes,
+        # the chat remember-directive path). A caller that misses it leaves a
+        # FTS-only row; only the startup backfill task and the superadmin
+        # backfill route heal it — there is no periodic retry.
         return MemoryRecord(
             id=memory_id,
             content=content,
@@ -603,9 +610,14 @@ class MemoryStore:
 
     @with_retry(max_attempts=3, retry_exceptions=(sqlite3.Error,), raise_last_exception=True)
     def update_memory_content(self, memory_id: int, new_content: str) -> None:
-        """Update a memory's content + reset its embedding so the next
-        retrieval pass either uses the freshly recomputed embedding
-        (best-effort here) or falls back to FTS for the row.
+        """Update a memory's content and reset its embedding to NULL.
+
+        No inline re-embed (issue #712): the old synchronous bridge span a
+        fresh event loop against the main-loop-bound embedding client.
+        Callers that care about dense recall for the updated row follow up
+        with ``await embed_and_store(memory_id, new_content)`` on their own
+        loop (the update route already does; FTS stays authoritative for
+        un-embedded rows in the meantime).
         """
         if not new_content or not new_content.strip():
             raise MemoryStoreError("Memory content cannot be empty")
@@ -624,20 +636,6 @@ class MemoryStore:
             conn.commit()
         finally:
             self.pool.release_connection(conn)
-
-        if self.embedding_service is not None:
-            try:
-                embedding, model_used = self._run_coro_sync(
-                    self._embed_text_with_model(new_content)
-                )
-                if embedding is not None:
-                    self._store_embedding(
-                        memory_id, embedding, new_content, model_used
-                    )
-            except Exception as exc:  # noqa: BLE001
-                logger.debug(
-                    "Memory embedding refresh skipped (id=%s): %s", memory_id, exc
-                )
 
     @with_retry(max_attempts=3, retry_exceptions=(sqlite3.Error,), raise_last_exception=True)
     def delete_memory(self, memory_id: int) -> None:
@@ -675,17 +673,27 @@ class MemoryStore:
         if not query or not query.strip():
             return []
 
-        # Tokenize and remove stop words so natural-language questions like
-        # "who is the afomis chief?" produce a valid FTS5 AND query ("afomis
-        # chief") rather than failing on punctuation or stop-word tokens that
-        # are absent from memory content.
+        # Tokenize via the SHARED Unicode tokenizer (issue #515 convergence,
+        # completed here by issue #712): CJK and accented query terms survive
+        # (the old ASCII-only regex silently discarded them) and punctuation
+        # plus bare FTS5 operator words are neutralized to literal prefix
+        # terms. ``build_fts_match_query`` caps RAW tokens at ``max_tokens``
+        # BEFORE we filter, so we pass a generous raw cap and apply the
+        # memory-search term cap AFTER stop-word removal — that ordering is
+        # what keeps a stop-word-heavy question from being decapitated at the
+        # 8-term memory cap. The generous raw cap is not unbounded: a query
+        # whose FIRST ``max_tokens`` raw tokens are ALL stop words still
+        # yields no terms (the builder drops the rest) and returns [] — a
+        # deliberate bound, not a silent one.
+        match_tokens = build_fts_match_query(query, max_tokens=64).split()
         tokens = [
-            t for t in re.findall(r'[a-zA-Z0-9]+', query)
-            if t.lower() not in _FTS_STOP_WORDS
-        ]
+            t
+            for t in match_tokens
+            if t[:-1] not in _FTS_STOP_WORDS  # builder emits tok* (lowercased)
+        ][:8]
         if not tokens:
             return []
-        sanitized_query = ' '.join(tokens)
+        sanitized_query = " ".join(tokens)
 
         conn = self.pool.get_connection()
         try:
@@ -912,12 +920,23 @@ class MemoryStore:
         limit: int = 5,
         vault_id: Optional[int] = None,
         include_global: bool = False,
+        query_embedding: Optional[List[float]] = _UNSET_QUERY_EMBEDDING,
     ) -> List[MemoryRecord]:
         """Hybrid memory retrieval: FTS5 lexical + dense semantic + RRF fusion.
 
+        Dense arm (issue #712): the query embedding must be PRECOMPUTED by
+        the caller on its own event loop (``await embed_query(query)``) and
+        passed via ``query_embedding`` — this sync method never spins a
+        fresh event loop against the main-loop-bound embedding client.
+        Passing ``query_embedding=None`` records that the caller attempted
+        the precompute and it failed (``embed_query`` already logged the
+        WARNING); omitting the parameter entirely while an embedding
+        service is configured logs a WARNING because the dense arm is being
+        skipped without an attempt (API misuse signal).
+
         Falls back to FTS-only when:
           * no embedding service is configured;
-          * the embedding service raises;
+          * no precomputed query embedding was supplied (or it failed);
           * no memory rows in the vault have stored embeddings.
 
         ``score_type`` on returned records reflects which path produced
@@ -930,38 +949,34 @@ class MemoryStore:
         callers must not see global memories). Admin code paths pass
         ``True``. The flag is applied identically to both FTS and dense
         arms so RRF fusion sees matching candidate universes (issue #404,
-        MEDIUM-11). It has no effect when ``vault_id is None``.
+        MEDIUM-11). It has no effect when ``vault_id`` is None.
         """
         # FTS results — always run.
         fts_records = self._fts_search(query, limit, vault_id, include_global)
 
-        # Dense results — best-effort, run UNFILTERED across the vault.
-        # Synchronously embed when we already have an event loop (this method
-        # is invoked via to_thread from async code). Never let dense errors
-        # break the call.
-        dense_records: List[MemoryRecord] = []
-        if self.embedding_service is not None and query and query.strip():
-            try:
-                # The embedding service exposes async methods; bridge them
-                # to this sync entry point using a fresh event loop only
-                # when we're not already inside one. The RAG engine calls
-                # ``search_memories`` via ``asyncio.to_thread``, so we are
-                # always on a worker thread without a current loop here.
-                query_emb = self._run_coro_sync(self.embedding_service.embed_single(query))
-            except Exception as exc:  # noqa: BLE001 — best effort
-                logger.debug(
-                    "Memory dense embedding failed; falling back to FTS-only: %s",
-                    exc,
+        # Dense results — best-effort over the PRECOMPUTED query embedding,
+        # run on the caller's chosen thread; never embeds here (issue #712).
+        if query_embedding is _UNSET_QUERY_EMBEDDING:
+            if (
+                self.embedding_service is not None
+                and query
+                and query.strip()
+            ):
+                logger.warning(
+                    "Memory dense search skipped: no precomputed query "
+                    "embedding supplied (callers must await "
+                    "MemoryStore.embed_query on their event loop)"
                 )
-                query_emb = None
-            if query_emb:
-                # Run dense UNFILTERED (no candidate_ids restriction) so a
-                # semantically-relevant memory sharing no lexical tokens with the
-                # query can still surface. Previously dense was pre-filtered to the
-                # FTS hit set, which made semantic-only recall impossible whenever
-                # FTS returned any candidate. RRF fusion below still rewards
-                # memories found by both arms.
-                dense_records = self._dense_search(query_emb, limit, vault_id, include_global=include_global)
+            query_embedding = None
+        dense_records: List[MemoryRecord] = []
+        if query_embedding:
+            # Run dense UNFILTERED (no candidate_ids restriction) so a
+            # semantically-relevant memory sharing no lexical tokens with the
+            # query can still surface. Previously dense was pre-filtered to the
+            # FTS hit set, which made semantic-only recall impossible whenever
+            # FTS returned any candidate. RRF fusion below still rewards
+            # memories found by both arms.
+            dense_records = self._dense_search(query_embedding, limit, vault_id, include_global=include_global)
 
         # No dense path → return FTS as-is.
         if not dense_records:

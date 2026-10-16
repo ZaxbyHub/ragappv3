@@ -99,7 +99,7 @@ def select_no_think_chat_template_kwargs(
     if model and "qwen" in model.lower():
         return {"enable_thinking": False}
     logger.warning(
-        "No verified no-think control for instant model %r; sending none "
+        "No verified no-think control for model %r; sending none "
         "(fail open — provider default governs)",
         model,
     )
@@ -143,6 +143,11 @@ class LLMError(Exception):
 # Sentinel for LLMClient.reconfigure: "leave chat_template_kwargs unchanged".
 # None itself is a meaningful value there (omit the kwarg from the payload).
 _KEEP_TEMPLATE_KWARGS = object()
+
+# Sentinel for per-call chat_completion overrides: "leave the client's
+# reasoning_effort unchanged for this call". An explicit value (including
+# None, which strips the field) wins for that call only (issue #712).
+_KEEP_REASONING = object()
 
 
 class LLMClient:
@@ -491,6 +496,8 @@ class LLMClient:
         temperature: float = 0.7,
         max_tokens: int = _UNSET_MAX_TOKENS,
         response_format: Optional[Dict[str, Any]] = None,
+        reasoning_effort: object = _KEEP_REASONING,
+        chat_template_kwargs: object = _KEEP_TEMPLATE_KWARGS,
     ) -> str:
         """
         Send a chat completion request and return the full response.
@@ -501,6 +508,16 @@ class LLMClient:
             max_tokens: Maximum tokens to generate (default: 32768, or the
                 client's configured per-mode budget when one was supplied
                 at construction — ENH-015, issue #494)
+            reasoning_effort: PER-CALL override of the client's reasoning
+                control (issue #712). Omit it to keep the client's configured
+                value; pass an explicit string (e.g. ``"none"``) to override
+                it for this call only; pass ``None`` to REMOVE the field from
+                this call's payload without mutating the client.
+            chat_template_kwargs: PER-CALL override of the client's
+                chat-template controls (issue #712), same sentinel semantics
+                as ``reasoning_effort`` — omit to keep the client default,
+                pass a dict to override for this call, pass ``None`` to drop
+                the field.
 
         Returns:
             The generated content string
@@ -526,10 +543,25 @@ class LLMClient:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
-        if self.chat_template_kwargs:
-            payload["chat_template_kwargs"] = self.chat_template_kwargs
-        if self.reasoning_effort is not None:
-            payload["reasoning_effort"] = self.reasoning_effort
+        # Per-call overrides (issue #712): sentinel keeps the client default;
+        # an explicit value — including None, which strips the field — wins
+        # for this call only. The retrieval evaluator uses this to ask
+        # thinking-mode servers not to reason on its one-word classification
+        # call, so the small token budget is not consumed by reasoning.
+        effective_template_kwargs = (
+            self.chat_template_kwargs
+            if chat_template_kwargs is _KEEP_TEMPLATE_KWARGS
+            else chat_template_kwargs
+        )
+        if effective_template_kwargs:
+            payload["chat_template_kwargs"] = effective_template_kwargs
+        effective_reasoning_effort = (
+            self.reasoning_effort
+            if reasoning_effort is _KEEP_REASONING
+            else reasoning_effort
+        )
+        if effective_reasoning_effort is not None:
+            payload["reasoning_effort"] = effective_reasoning_effort
         if self.ttl is not None:
             # LM Studio idle TTL (issue #571): seconds until an idle JIT-loaded
             # model is unloaded; the timer resets on every request. LM Studio
