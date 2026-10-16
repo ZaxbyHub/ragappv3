@@ -132,7 +132,12 @@ roles, not capacity claims.
   OBS-002) — per-response diagnostics never report the previous query.
 - Embedding/reranker outage: reranking degrades to distance scores and the
   embedding path surfaces `EMBEDDING_ERROR`; admission rejection of these
-  stages degrades the same way (skip, log, distance scores).
+  stages degrades the same way (skip, log, distance scores). Two
+  #713 additions to that contract: an embedding-admission rejection on the
+  retrieval-only surfaces reports `status: "unavailable"` (eval endpoints)
+  or records the document kind as failed (retrieve_sources), and a
+  non-stream completion that is blank on every configured client fails with
+  HTTP 503 instead of returning an empty answer.
 - Redis outage: rate limiting and the embedding L2 cache degrade as before
   (E1/E2 behavior); admission fails open with `.degraded` set.
 - Telemetry outage: telemetry is best-effort and never on the request

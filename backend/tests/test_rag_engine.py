@@ -527,7 +527,10 @@ class RAGEngineTests(unittest.IsolatedAsyncioTestCase):
         engine.embedding_service = cast(EmbeddingService, FakeEmbeddingService([0.1, 0.2]))
         engine.vector_store = cast(VectorStore, FakeVectorStore([]))
         engine.memory_store = cast(MemoryStore, FakeMemoryStore())
-        engine.llm_client = cast(LLMClient, FakeLLMClient(response=""))
+        # Non-empty response: this test pins the vault guard, not LLM content,
+        # and since #713 a blank non-stream completion is a failed visible
+        # answer (raises instead of yielding empty content).
+        engine.llm_client = cast(LLMClient, FakeLLMClient(response="ok"))
 
         gen = engine.query("test", [], require_vault=True, vault_id=42)
         vault_error_raised = False
