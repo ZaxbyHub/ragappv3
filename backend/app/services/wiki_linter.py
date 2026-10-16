@@ -4,8 +4,11 @@ WikiLinter: Detects quality issues in wiki content and writes wiki_lint_findings
 run_lint() detects issues into plain specs, then reconciles them against the
 existing findings BY FINGERPRINT (WikiStore.upsert_lint_findings) so a
 dismissed or resolved finding is never resurrected as a fresh open row on the
-next run, while open rows for issues that went away transition to 'resolved'
-(AC35 / issue #515).
+next run, while open rows for issues that went away transition to
+'auto_resolved' (AC35 / issue #515; issue #791 made that status distinct from
+every user disposition). The reconciliation is scoped to origin='linter' rows:
+findings the linter did not create (invalidation stale/weak_provenance,
+compiler and curator rows) are never force-resolved.
 """
 
 import json
@@ -30,11 +33,13 @@ class WikiLinter:
         Run all lint checks for vault_id.
 
         Detection produces specs; ``WikiStore.upsert_lint_findings`` reconciles
-        them by fingerprint: previously dismissed/resolved findings stay
-        suppressed (no open resurrection), still-present open findings keep
-        their rows, newly detected issues insert open rows, and open rows whose
-        issue disappeared become 'resolved'. Returns the list of open findings
-        representing this run (kept + newly created).
+        them by fingerprint: previously dismissed/resolved/acknowledged findings
+        stay suppressed (no open resurrection), still-present open findings keep
+        their rows, newly detected issues insert open rows, and open
+        linter-owned rows whose issue disappeared flip to the system-only
+        'auto_resolved' status — which reopens if the issue recurs (issue
+        #791). Returns the list of open findings representing this run (kept +
+        newly created).
         """
         specs: list[dict] = []
         specs += self._detect_unsupported_claims(vault_id)

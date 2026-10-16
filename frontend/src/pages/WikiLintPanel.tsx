@@ -34,6 +34,22 @@ interface WikiLintPanelProps {
   onRefresh?: () => void;
 }
 
+/**
+ * Only OPEN findings are actionable (issue #791 review). 'auto_resolved' is
+ * the reconciler's system-only status: it reopens on its own when the issue
+ * recurs, so a user disposition on such a row would silently convert it into
+ * a permanent suppression and defeat that contract. Terminal user statuses
+ * (resolved/dismissed/acknowledged) are equally non-actionable.
+ */
+function isActionable(status: WikiLintFinding["status"]): boolean {
+  return status === "open";
+}
+
+function statusLabel(status: WikiLintFinding["status"]): string | null {
+  if (status === "open") return null;
+  return status === "auto_resolved" ? "auto-resolved" : status;
+}
+
 export function WikiLintPanel({ findings, loading, onRunLint, onRefresh, vaultId }: WikiLintPanelProps) {
   const [resolving, setResolving] = useState<number | null>(null);
 
@@ -77,8 +93,11 @@ export function WikiLintPanel({ findings, loading, onRunLint, onRefresh, vaultId
             <div className="flex items-center justify-between mt-1">
               <div className="text-xs text-muted-foreground uppercase tracking-wide">
                 {finding.severity} · {finding.finding_type.replace(/_/g, " ")}
+                {statusLabel(finding.status) && (
+                  <span className="ml-1 normal-case">· {statusLabel(finding.status)}</span>
+                )}
               </div>
-              {vaultId && (
+              {vaultId && isActionable(finding.status) && (
                 <div className="flex gap-1">
                   <Button
                     variant="ghost"

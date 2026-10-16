@@ -488,7 +488,15 @@ class WikiCurator:
                     result.lint_findings.append({
                         "finding_type": "unsupported_claim",
                         "severity": "medium",
-                        "title": "Curator claim missing source_quote",
+                        # Issue #791 review: the title carries the per-claim
+                        # discriminator so each rejected claim is its own
+                        # fingerprint (and its own dismissable row). A
+                        # constant title would make the fingerprint
+                        # class-level, so one dismissal would permanently
+                        # suppress every future instance vault-wide.
+                        "title": (
+                            f"Curator claim missing source_quote: {claim_text[:80]}"
+                        ),
                         "details": json.dumps({
                             "subtype": "curator",
                             "claim_text": claim_text,
@@ -504,7 +512,9 @@ class WikiCurator:
                     result.lint_findings.append({
                         "finding_type": "unsupported_claim",
                         "severity": "medium",
-                        "title": "Curator claim references unknown chunk",
+                        "title": (
+                            f"Curator claim references unknown chunk: {claim_text[:80]}"
+                        ),
                         "details": json.dumps({
                             "subtype": "curator",
                             "claim_text": claim_text,
@@ -532,7 +542,11 @@ class WikiCurator:
                     result.lint_findings.append({
                         "finding_type": "unsupported_claim",
                         "severity": "high",
-                        "title": "Curator source_quote not verifiable",
+                        # Per-claim discriminator — see the missing_quote
+                        # emitter above (issue #791 review).
+                        "title": (
+                            f"Curator source_quote not verifiable: {claim_text[:80]}"
+                        ),
                         "details": json.dumps({
                             "subtype": "curator",
                             "claim_text": claim_text,
@@ -596,10 +610,15 @@ class WikiCurator:
         for c in merged_contradictions:
             if not isinstance(c, dict):
                 continue
+            claim_a = str(c.get("claim_a") or "")[:80]
+            claim_b = str(c.get("claim_b") or "")[:80]
             result.lint_findings.append({
                 "finding_type": "contradiction",
                 "severity": "high",
-                "title": "Curator-detected contradiction",
+                # Per-pair discriminator — a constant title would make every
+                # contradiction pair share one class-level fingerprint
+                # (issue #791 review).
+                "title": f"Curator-detected contradiction: {claim_a} vs {claim_b}",
                 "details": json.dumps({
                     "subtype": "curator",
                     "claim_a": c.get("claim_a"),
