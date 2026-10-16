@@ -23,9 +23,10 @@ const RECONNECT_MAX_MS = 30000;
  * `refreshAccessToken` retry pattern used by `chatStream` in `@/lib/api`, with
  * explicit, bounded reconnect instead of EventSource's unbounded retry.
  *
- * `onJobTerminal` fires for terminal job events (`job_completed`/`job_failed`).
- * It is held in a ref so the live connection only resets when `vaultId` changes,
- * not on every render.
+ * `onJobTerminal` fires for terminal job events (`job_completed`,
+ * `job_failed`, `job_cancelled` — issue #792 wired the cancellation the
+ * processor already published). It is held in a ref so the live connection
+ * only resets when `vaultId` changes, not on every render.
  */
 export function useWikiEventStream(
   vaultId: number | null | undefined,
@@ -64,7 +65,11 @@ export function useWikiEventStream(
     const dispatch = (raw: string) => {
       try {
         const data = JSON.parse(raw) as WikiStreamEvent;
-        if (data.type === "job_completed" || data.type === "job_failed") {
+        if (
+          data.type === "job_completed" ||
+          data.type === "job_failed" ||
+          data.type === "job_cancelled"
+        ) {
           if (!current() || callbackRef.current.scope !== scope) return; callbackRef.current.callback();
         }
       } catch {
