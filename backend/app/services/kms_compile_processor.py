@@ -29,11 +29,12 @@ POLL_INTERVAL = 5  # seconds between polls when queue is empty
 MAX_RETRIES = 3    # max automatic retries before a job is permanently failed
 SUMMARY_CHARS = 500  # leading characters of body used as the entry summary
 
-# Issue #792: the value persisted to jobs.error when a dispatch raises.
+# Issue #792: the error code handed to _fail_job when a dispatch raises.
 # GET /kms/jobs returns that column to any vault reader, so it carries this
 # stable code only — the full exception text stays in the server log via
 # logger.exception above (same convention as the #562 ingest error codes and
-# draft_job_processor's CODE_* set; KMS has no SSE stream to fan out to).
+# draft_job_processor's CODE_* set; KMS has no SSE stream to fan out to, and
+# the lease cap settles it as "attempt_cap_exceeded: <this code>").
 FAILED_ERROR_CODE = "COMPILE_FAILED: KMS compile dispatch failed; see server logs"
 
 # Issue #792 feedback: the error code for a claimed job whose payload_json

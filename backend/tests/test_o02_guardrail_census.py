@@ -19,8 +19,11 @@ shape-level pins so a refactor cannot silently drop the invariants):
 (c) Every ``json_extract(payload_json`` in both store files sits on a source
     line that also carries ``THEN`` (the THEN branch of the
     ``CASE WHEN json_valid(payload_json)`` guard), with per-file occurrence
-    counts pinned — a removed guard, a decoy comment, or a degenerate
-    ``THEN 1`` guard leaves the extract on an unguarded line and fails.
+    counts pinned — a removed guard, a decoy comment, or a multi-line
+    degenerate guard leaves the extract on an unguarded line and fails
+    (a same-line ``THEN 1 ELSE json_extract`` degenerate shape passes the
+    line check and is caught by the behavioral layer below — two layers,
+    one per shape).
 (d) Both ``_compile_job_from_jobs_row`` payload parses catch the widened
     tuple (TypeError / ValueError / RecursionError — ValueError subsumes
     JSONDecodeError) AND degrade non-dict payloads via an
