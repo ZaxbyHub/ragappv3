@@ -1936,6 +1936,11 @@ class WikiStore:
                                 "SELECT * FROM wiki_lint_findings WHERE id = ?",
                                 (kept["id"],),
                             ).fetchone()
+                            if kept is None:
+                                # Vanished between the snapshot read and the
+                                # UPDATE (same unreachable trigger as rule 3);
+                                # fall through instead of crashing.
+                                kept = open_rows[0]
                         result.append(_to_lint_finding(kept))
                         continue
                     # Rule 2: a user disposition (dismissed / resolved /

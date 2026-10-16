@@ -119,14 +119,14 @@ runtime schema probe is tracked as follow-up work.
   in `active_if_verified` deployments a quote-verified curator claim matching
   an existing unverified/superseded claim attaches provenance without
   promoting it — strictly better than today (the source was dropped entirely
-  via the UNIQUE violation), with full parity filed as **#929**.
+  via the UNIQUE violation), with full parity filed as **#929**. The persistence/migration robustness items (schema probe, concurrent-upsert duplicates, immortal duplicate open rows, compile-query retry loss, multi-worker migration race) are filed as **#948**; exposing `origin` on the read path is **#949**.
 - `compile_query_job`'s unverified-claim rows are now origin-scoped against
   resolution, but their per-query creation semantics are unchanged (a re-asked
   query answer can still insert a second row); only reconciler ownership was
   in scope.
 - The `origin` column is currently write-only: it is not projected into
   `WikiLintFinding` or any API response, so no consumer can yet distinguish a
-  compiler/curator/invalidation row from a linter row. Exposing it is tracked
-  as follow-up work.
+  compiler/curator/invalidation row from a linter row. Exposing it is filed as
+  **#949**.
 - The `origin` vocabulary decision gates Workstream O PR 5 (#795, curator
   lint interaction), per #791's Dependencies note.
