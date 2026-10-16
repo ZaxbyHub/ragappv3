@@ -1529,17 +1529,20 @@ class RAGEngine:
                     for vt, text in transformed_queries
                     if vt == 'original'
                 ] or [('original', retrieval_query)]
-            embed_tasks = [_embed_one(vt, t) for vt, t in variants_to_embed]
             # E3 admission (issue #518): the embedding device budget is shared
-            # process-wide (and cross-process via ADMISSION_STORE_URL).
+            # process-wide (and cross-process via ADMISSION_STORE_URL). The
+            # variant coroutines are built INSIDE the admitted context so a
+            # rejected admission never leaves un-awaited coroutines behind.
             try:
                 async with get_admission_controller().admit(
                     AdmissionClass.EMBEDDING
                 ):
+                    embed_tasks = [_embed_one(vt, t) for vt, t in variants_to_embed]
                     raw_embeddings = await asyncio.gather(
                         *embed_tasks, return_exceptions=True
                     )
             except AdmissionRejected as exc:
+                _cancel_overlap_tasks()
                 if stream:
                     _merge_request_llm_failure(
                         {"status": "admission_rejected", "detail": str(exc)}
@@ -1681,7 +1684,7 @@ class RAGEngine:
                 ) = await self._orchestrate_sub_query_retrieval(
                     plan=plan,
                     vault_id=vault_id,
-                    user_input=user_input,
+                    user_input=retrieval_query,
                     effective_alpha=effective_alpha,
                     variants_dropped=[],
                     effective_initial_top_k=effective_initial_top_k,
@@ -1767,19 +1770,19 @@ class RAGEngine:
                         )
                     _fusion_evaluator = self._retrieval_evaluators[evaluator_key]
                     eval_result = await _fusion_evaluator.evaluate(
-                        user_input, vector_results
+                        retrieval_query, vector_results
                     )
                     if eval_result == "NO_MATCH":
                         relevance_hint = "Note: The retrieved documents may not be directly relevant to your query."
                         if logger.isEnabledFor(logging.DEBUG):
                             logger.debug(
                                 "Multi-sub-query fusion evaluation: NO_MATCH for query (len=%d)",
-                                len(user_input),
+                                len(retrieval_query),
                             )
                     elif eval_result == "AMBIGUOUS" and logger.isEnabledFor(logging.DEBUG):
                         logger.debug(
                             "Multi-sub-query fusion evaluation: AMBIGUOUS for query (len=%d)",
-                            len(user_input),
+                            len(retrieval_query),
                         )
                 except Exception as _fusion_eval_exc:
                     logger.warning(
@@ -1807,7 +1810,7 @@ class RAGEngine:
                 try:
                     vector_results, relevance_hint, eval_result, rerank_success, score_type, hybrid_status, fts_exceptions, rerank_status, variants_dropped, exact_match_promoted, token_pack_stats = await self._execute_retrieval(
                         query_embeddings,
-                        user_input,
+                        retrieval_query,
                         vault_id,
                         effective_alpha=effective_alpha,
                         variants_dropped=variants_dropped,
@@ -1943,7 +1946,7 @@ class RAGEngine:
                 )
                 trace.distillation_before = len(relevant_chunks)
                 distill_result = await distiller.distill(
-                    user_input, relevant_chunks, eval_result
+                    retrieval_query, relevant_chunks, eval_result
                 )
                 relevant_chunks = distill_result.sources
                 sentence_provenance = distill_result.sentence_provenance
@@ -2589,8 +2592,14 @@ class RAGEngine:
                 )
                 return sq, None, str(exc)
 
-        embed_tasks = [_embed_sub_query(sq) for sq in unique_plan]
-        embed_results = await asyncio.gather(*embed_tasks, return_exceptions=True)
+        # E3 admission (issue #518): sub-query embeds share the process-wide
+        # embedding budget; the coroutines are built inside the admitted
+        # context so a rejection never leaves un-awaited coroutines behind.
+        async with get_admission_controller().admit(AdmissionClass.EMBEDDING):
+            embed_tasks = [_embed_sub_query(sq) for sq in unique_plan]
+            embed_results = await asyncio.gather(
+                *embed_tasks, return_exceptions=True
+            )
 
         # Collect successful embeddings; track failures.
         sub_query_embeddings: List[Tuple[str, List[float]]] = []
@@ -2635,7 +2644,10 @@ class RAGEngine:
                 and user_input == original_query_text
             ):
                 return original_query_embedding
-            return await self.embedding_service.embed_single(user_input)
+            async with get_admission_controller().admit(
+                AdmissionClass.EMBEDDING
+            ):
+                return await self.embedding_service.embed_single(user_input)
 
         # If ALL sub-query embeddings failed, fall back to single-query retrieval.
         if not sub_query_embeddings:
@@ -3522,6 +3534,18 @@ class RAGEngine:
                 content = await candidate.chat_completion(
                     messages, **completion_kwargs
                 )
+                # Same visible-answer contract as _stream_llm_response: a
+                # blank (or reasoning-only) completion is a failed visible
+                # answer, not a success to persist as an empty 200.
+                if not content or not content.strip():
+                    last_error = LLMError(
+                        "LLM completion returned no user-visible content"
+                    )
+                    logger.warning(
+                        "[_get_llm_response] Empty visible response from %s; trying fallback",
+                        getattr(candidate, "base_url", "<unknown>"),
+                    )
+                    continue
                 metrics = dict(getattr(candidate, "last_metrics", {}) or {})
                 if candidate is not target:
                     metrics["fallback_from"] = getattr(target, "base_url", None)
@@ -4122,8 +4146,15 @@ class RAGEngine:
                 return await self.embedding_service.embed_passage(text)
             return await self.embedding_service.embed_single(text)
 
-        embed_tasks = [_embed_one(vt, t) for vt, t in transformed_queries]
-        raw_embeddings = await asyncio.gather(*embed_tasks, return_exceptions=True)
+        # E3 admission (issue #518): the eval/retrieve_sources query embeds
+        # share the process-wide embedding budget; the coroutines are built
+        # inside the admitted context so a rejection never leaves un-awaited
+        # coroutines behind.
+        async with get_admission_controller().admit(AdmissionClass.EMBEDDING):
+            embed_tasks = [_embed_one(vt, t) for vt, t in transformed_queries]
+            raw_embeddings = await asyncio.gather(
+                *embed_tasks, return_exceptions=True
+            )
 
         query_embeddings: List[Tuple[str, List[float]]] = []
         variants_dropped: List[str] = []
@@ -4221,7 +4252,7 @@ class RAGEngine:
             # ``retrieve_eval_results`` docstring) rather than propagating and
             # aborting the whole eval run. It therefore sits inside this try.
             query_embeddings, variants_dropped = await self._build_query_embeddings(query)
-            vector_results, _, _, _, _, _, _, _, _, _, _ = await self._execute_retrieval(
+            vector_results, _, _, rerank_success, _, _, _, _, _, _, _ = await self._execute_retrieval(
                 query_embeddings,
                 query,
                 vault_id,
@@ -4248,7 +4279,7 @@ class RAGEngine:
         self._sync_document_retrieval_settings()
         relevant_chunks = await self.document_retrieval.filter_relevant(
             vector_results,
-            reranked=False,
+            reranked=rerank_success if rerank_success is not None else False,
             indexed_file_ids=indexed_file_ids,
         )
         capped = relevant_chunks[:top_k]
