@@ -2512,7 +2512,13 @@ class RAGEngine:
         Args:
             plan: List of sub-query strings from QueryPlanner.plan().
             vault_id: Vault scope for retrieval.
-            user_input: Original user query (used as fallback if all sub-queries fail).
+            user_input: The retrieval query text for this fan-out — the
+                follow-up rewrite threaded from query() (the raw input when
+                no rewrite fired). Drives every seam inside: the per-sub-query
+                BM25/FTS ``query_text``, the consolidated rerank ``query``,
+                the fusion CRAG evaluator, and the all-failed fallback
+                single-query retrieval (including the reuse check against
+                ``original_query_text``).
             effective_alpha: Hybrid search alpha weight.
             variants_dropped: Accumulated list of variant types that failed.
             effective_initial_top_k: Initial retrieval top-k.
@@ -2634,9 +2640,11 @@ class RAGEngine:
                 else:
                     sub_query_embeddings.append((sq, emb))
 
-        # Fallback embedding of the original user query for the two
-        # all-failed paths below — reuse the query()-level original
-        # embedding when the text matches (RAG-DEEP-01).
+        # Fallback embedding of the retrieval query for the two all-failed
+        # paths below — reuse the query()-level original embedding when the
+        # text matches (RAG-DEEP-01). With a follow-up rewrite active,
+        # original_query_text IS the rewrite, so the reuse check keys on the
+        # rewrite, not the raw user input.
         async def _fallback_embedding() -> List[float]:
             if (
                 original_query_embedding is not None
@@ -2932,7 +2940,11 @@ class RAGEngine:
 
         Args:
             query_embeddings: List of (variant_type, embedding) tuples to search
-            user_input: Original user query
+            user_input: Query text for the lexical (BM25/FTS) arm, the
+                reranker, and the CRAG evaluator. Callers pass the retrieval
+                query for their route: query() passes the follow-up rewrite
+                (``retrieval_query``); the eval/retrieve_sources surfaces
+                pass their own query verbatim.
             vault_id: Optional vault ID to filter by
             effective_alpha: Hybrid search alpha weight
             variants_dropped: List of variant types that failed embedding (e.g., step_back, hyde)
@@ -3534,7 +3546,9 @@ class RAGEngine:
                 content = await candidate.chat_completion(
                     messages, **completion_kwargs
                 )
-                # Same visible-answer contract as _stream_llm_response: a
+                # Same visible-answer contract as _stream_llm_response,
+                # classified at the content level (the streaming sibling
+                # tracks emitted chunks instead of a completed string): a
                 # blank (or reasoning-only) completion is a failed visible
                 # answer, not a success to persist as an empty 200.
                 if not content or not content.strip():
