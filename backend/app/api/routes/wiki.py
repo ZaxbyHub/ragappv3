@@ -813,7 +813,7 @@ async def wiki_events_stream(
     """SSE stream of terminal-state wiki compile job events for a vault.
 
     Emits ``data: {json}\\n\\n`` lines whenever a wiki compile job finishes
-    (completed / permanently failed). Clients refetch the canonical state via
+    (completed / failed / cancelled). Clients refetch the canonical state via
     the existing REST endpoints on each event. A 15-second keepalive comment
     keeps proxies and load balancers from idling the connection out.
 

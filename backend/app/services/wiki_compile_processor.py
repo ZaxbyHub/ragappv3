@@ -25,6 +25,23 @@ MAX_RETRIES = 3           # max automatic retries before a job is permanently fa
 RESET_RETRY_ATTEMPTS = 3  # attempts to recover a job from 'failed' → 'pending' after a transient DB error
 RESET_RETRY_BASE_DELAY = 0.5  # seconds; doubled per attempt (0.5, 1.0, 2.0)
 
+# Issue #792: the error code handed to _fail_job and (lease mode) the
+# job_failed SSE event when a dispatch raises. Reader-visible surfaces (GET
+# /wiki/jobs, the event stream) carry this stable code only — the full
+# exception text stays in the server log via logger.exception above. Same
+# convention as the #562 ingest error codes and draft_job_processor's
+# CODE_* set; the lease cap settles it as
+# "attempt_cap_exceeded: <this code>".
+FAILED_ERROR_CODE = "COMPILE_FAILED: wiki compile dispatch failed; see server logs"
+
+# Issue #792 feedback: the error code for a claimed job whose payload_json
+# degraded at claim (unparseable or non-object JSON). Such a row is settled
+# terminally failed without dispatch; unlike a dispatch failure it is never
+# requeued, so the lease cap composition does not apply.
+PAYLOAD_MALFORMED_ERROR = (
+    "PAYLOAD_MALFORMED: compile job payload is corrupt; see server logs"
+)
+
 
 def _lease_enabled() -> bool:
     """Stage-2 lease switch (issue #559): env-only, process-start-stable."""
@@ -180,8 +197,30 @@ class WikiCompileProcessor:
                     await asyncio.sleep(POLL_INTERVAL)
                     continue
 
+                # Issue #792 feedback: a row whose payload degraded to the
+                # empty mapping at claim (unparseable or non-object
+                # payload_json — every writer stores a dict carrying
+                # vault_id) can never be dispatched meaningfully. Settle it
+                # terminally failed instead of dispatching it as a
+                # vault-less "manual" job, which would complete as a false
+                # success.
+                if job.vault_id is None:
+                    logger.warning(
+                        "WikiCompileProcessor: job id=%d has a malformed "
+                        "payload (no vault_id); settling failed",
+                        job.id,
+                    )
+                    settled = await asyncio.to_thread(
+                        self._settle_malformed_payload, job
+                    )
+                    if settled:
+                        self._publish_event(
+                            job, "job_failed", error=PAYLOAD_MALFORMED_ERROR
+                        )
+                    continue
+
                 logger.info(
-                    "WikiCompileProcessor: claimed job id=%d type=%s vault=%d",
+                    "WikiCompileProcessor: claimed job id=%d type=%s vault=%s",
                     job.id,
                     job.trigger_type,
                     job.vault_id,
@@ -241,7 +280,7 @@ class WikiCompileProcessor:
                     )
                     try:
                         new_retry_count = await asyncio.to_thread(
-                            self._fail_job, job.id, str(exc), self._worker_id
+                            self._fail_job, job.id, FAILED_ERROR_CODE, self._worker_id
                         )
                         if _lease_enabled():
                             # fail_job already requeued the row with a durable
@@ -251,7 +290,7 @@ class WikiCompileProcessor:
                                 int(settings.jobs_max_attempts), 1
                             ):
                                 self._publish_event(
-                                    job, "job_failed", error=str(exc)
+                                    job, "job_failed", error=FAILED_ERROR_CODE
                                 )
                         elif new_retry_count < MAX_RETRIES:
                             backoff = 2.0 ** new_retry_count
@@ -272,7 +311,7 @@ class WikiCompileProcessor:
                                 "WikiCompileProcessor: job id=%d permanently failed after %d retries",
                                 job.id, new_retry_count,
                             )
-                            self._publish_event(job, "job_failed", error=str(exc))
+                            self._publish_event(job, "job_failed", error=FAILED_ERROR_CODE)
                     except Exception as e2:
                         logger.error(
                             "WikiCompileProcessor: could not mark job id=%d failed: %s", job.id, e2
@@ -305,6 +344,28 @@ class WikiCompileProcessor:
 
         with self._pool.connection() as conn:
             return WikiStore(conn).complete_job(job_id, result, worker_id=worker_id)
+
+    def _settle_malformed_payload(self, job) -> bool:
+        """Terminally fail a claimed job whose payload_json was degraded.
+
+        Lease mode fences the terminal write on the claiming worker id;
+        legacy mode's ``fail_job`` UPDATE is terminal by construction. The
+        row is never requeued: a corrupt payload cannot succeed on retry.
+        """
+        from app.services.job_lease import JobLease
+        from app.services.wiki_store import WikiStore
+
+        with self._pool.connection() as conn:
+            if _lease_enabled():
+                return bool(
+                    JobLease(conn).fail(
+                        job.id, self._worker_id, PAYLOAD_MALFORMED_ERROR
+                    )
+                )
+            WikiStore(conn).fail_job(
+                job.id, PAYLOAD_MALFORMED_ERROR, worker_id=self._worker_id
+            )
+            return True
 
     def _fail_job(
         self, job_id: int, error: str, worker_id: Optional[str] = None
