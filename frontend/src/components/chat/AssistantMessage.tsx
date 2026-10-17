@@ -313,7 +313,13 @@ export function AssistantMessage({
   // Do NOT fall back to all sources — uncited sources must not appear as evidence.
   const sourcesForCards = citedSources;
   // Validated citation labels: the done event's citation_confidence carries
-  // one entry per VALID [S#] label, so its keys are the valid-label set.
+  // one entry per VALID label — [S#] since FR-004, and since issue #714 also
+  // the cited [M#]/[W#]/[K#] labels — so its keys are the valid-label set
+  // across families. SourceCards resolves each source's own [S#] label against
+  // this set; the derivation and every [S#]-bearing answer's Cited/Retrieved
+  // outcome are unchanged. (The set's non-emptiness gates badge visibility;
+  // answers citing only non-S labels render no source cards, because cards
+  // require a cited source in the answer text.)
   // Undefined when the validator produced nothing — cards then show no badge.
   // An empty object means the same thing, so it maps to undefined too (an
   // empty set would otherwise flip every card to a "Retrieved" badge).
@@ -454,14 +460,21 @@ export function AssistantMessage({
           </div>
         )}
 
-        {/* Wiki cards — compiled knowledge cited as [W#] */}
+        {/* Wiki cards — compiled knowledge cited as [W#]. Support scores from
+            the done payload surface as a per-card "Support NN%" chip (#714). */}
         {!isStreaming && wikiRefsForCards.length > 0 && (
-          <WikiCards wikiRefs={wikiRefsForCards} />
+          <WikiCards
+            wikiRefs={wikiRefsForCards}
+            citationConfidence={message.citationConfidence}
+          />
         )}
 
         {/* KMS cards — user-curated knowledge cited as [K#] */}
         {!isStreaming && kmsRefsForCards.length > 0 && (
-          <KMSCards kmsRefs={kmsRefsForCards} />
+          <KMSCards
+            kmsRefs={kmsRefsForCards}
+            citationConfidence={message.citationConfidence}
+          />
         )}
 
         {/* Source cards — shown below the message body */}
@@ -476,7 +489,10 @@ export function AssistantMessage({
 
         {/* Memory cards — distinct from document sources */}
         {!isStreaming && memoriesForCards.length > 0 && (
-          <MemoryCards memories={memoriesForCards} />
+          <MemoryCards
+            memories={memoriesForCards}
+            citationConfidence={message.citationConfidence}
+          />
         )}
 
         {/* Error */}
