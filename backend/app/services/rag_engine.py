@@ -2425,6 +2425,24 @@ class RAGEngine:
         # query observation). Wire-facing source metadata does not carry a `text`
         # key; scoring must use this internal registry (issue #462). Lexical/Jaccard
         # overlap here is support-scoring only — never pixel-level entailment.
+        #
+        # Issue #714: a SECOND registry maps every cited non-document label
+        # (M#/W#/K#) to the evidence BODY the prompt rendered for it — memory
+        # `content` (rendered inline by PromptBuilderService.build_messages),
+        # wiki `claim_text or excerpt` (prompt_builder.format_wiki_evidence),
+        # KMS `excerpt or summary` (prompt_builder.format_kms_evidence).
+        # Bodies only, by necessity: EVERY family's rendered block embeds the
+        # label token itself — "[W1] Title…", "[K1] Title…", "[M1] <memory>…"
+        # — and _tokenize strips punctuation, so scoring the full rendered
+        # block would put token "w1"/"m1" in both the claim and evidence sets
+        # and force Jaccard > 0 for every citation, breaking the zero-overlap
+        # contract. The registries hold only offered-and-cited
+        # evidence (memories_used/wiki_used/kms_used are built by intersecting
+        # candidates with cited labels), so phantom labels never reach scoring —
+        # the same label-membership base as repair_against_sources_and_memories.
+        # Empty bodies score a natural 0.0 (flagged, not omitted). Full
+        # rendered-evidence parity (headers and escaping included) stays with
+        # #716.
         try:
             support_texts: List[str] = []
             for chunk in relevant_chunks:
@@ -2437,10 +2455,28 @@ class RAGEngine:
                 if getattr(chunk, "vision_observation", None):
                     parts.append(chunk.vision_observation)
                 support_texts.append("\n".join(parts))
+            support_by_label: Dict[str, str] = {}
+            for mem in done_msg.get("memories_used", []) or []:
+                label = mem.get("memory_label")
+                if label:
+                    support_by_label[label] = mem.get("content") or ""
+            for ev in done_msg.get("wiki_used", []) or []:
+                label = ev.get("wiki_label")
+                if label:
+                    support_by_label[label] = (
+                        ev.get("claim_text") or ev.get("excerpt") or ""
+                    )
+            for ev in done_msg.get("kms_used", []) or []:
+                label = ev.get("kms_label")
+                if label:
+                    support_by_label[label] = (
+                        ev.get("excerpt") or ev.get("summary") or ""
+                    )
             confidence_result = score_citations(
                 full_response,
                 support_texts,
                 sentence_provenance=_request_distillation_provenance.get(),
+                support_texts_by_label=support_by_label,
             )
             trace.citation_confidence = confidence_result.citation_confidence
             trace.unverifiable_claims = list(confidence_result.unverifiable_claims)
