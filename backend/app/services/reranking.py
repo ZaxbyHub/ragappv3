@@ -62,6 +62,18 @@ def _iter_local_model_ids():
         return list(_local_models.keys())
 
 
+def _identity_activation(x):
+    """Torch-free identity passed as ``activation_fn`` to CrossEncoder.predict.
+
+    sentence-transformers >= 5.6 applies Sigmoid inside ``predict`` for
+    single-label CrossEncoders; the identity keeps ``predict`` returning raw
+    logits so the caller-side ``_safe_sigmoid`` remains the single sigmoid
+    (#716 T1-35-K-01). Deliberately not ``torch.nn.Identity`` — the reranker
+    local path must stay importable in CI environments without torch.
+    """
+    return x
+
+
 def _safe_sigmoid(logit: float) -> float:
     """Unconditional sigmoid with overflow protection for BGE-M3 logits.
 
@@ -256,6 +268,20 @@ class RerankingService:
         # Attach score and return top_n
         result = []
         for idx, score in scored:
+            # #716 T1-35-K-09 (consumption-layer backstop): the producer
+            # paths validate against their own bound (len(texts) for TEI,
+            # enumerate positions for the local path), but this loop is the
+            # last line of defense before chunks[idx] — anything outside
+            # [0, len(chunks)) (positive OR negative) takes the documented
+            # fallback instead of raising or mis-attaching.
+            if not 0 <= idx < len(chunks):
+                logger.warning(
+                    "Rerank result index %r outside [0, %d) — returning "
+                    "original order",
+                    idx,
+                    len(chunks),
+                )
+                return (chunks[:n], False)
             chunk = dict(chunks[idx])
             chunk["_rerank_score"] = score
             result.append(chunk)
@@ -326,7 +352,9 @@ class RerankingService:
                 "gen_ai rerank",
                 attributes={
                     "gen_ai.operation.name": "rerank",
-                    "gen_ai.request.model": str(payload.get("model", "")),
+                    # #716 T1-35-K-10: the TEI payload never carries a
+                    # "model" key — advertise the CONFIGURED reranker.
+                    "gen_ai.request.model": str(self.reranker_model),
                 },
             ):
                 response = await reranking_cb(_checked_post)()
@@ -338,6 +366,17 @@ class RerankingService:
         # data is list of {"index": int, "score": float}
         # Sort by score descending before slicing to ensure correct results
         sorted_data = sorted(data, key=lambda x: x.get("score", 0), reverse=True)
+        # #716 T1-35-K-09: a malformed response may carry indices outside
+        # [0, len(texts)) — validate here (this method runs inside the
+        # caller's guarded region) so the documented (chunks[:n], False)
+        # fallback absorbs it, instead of an IndexError escaping rerank()
+        # or a negative index silently mis-attaching a score.
+        for item in sorted_data[:top_n]:
+            idx = item["index"]
+            if not isinstance(idx, int) or not 0 <= idx < len(texts):
+                raise ValueError(
+                    f"rerank response index out of range [0, {len(texts)}): {idx!r}"
+                )
         raw_scores = [item["score"] for item in sorted_data[:top_n]]
 
         # Unconditional sigmoid with overflow protection for BGE-M3 logits
@@ -361,7 +400,12 @@ class RerankingService:
         def _score():
             model = _get_local_model(self.reranker_model)
             pairs = [(query, text) for text in texts]
-            scores = model.predict(pairs)
+            # #716 T1-35-K-01: sentence-transformers >= 5.6 applies Sigmoid
+            # inside CrossEncoder.predict for single-label models; pass an
+            # identity activation so predict returns raw logits and the
+            # single _safe_sigmoid below is the ONLY sigmoid. Torch-free on
+            # purpose — the installed callable protocol just calls it.
+            scores = model.predict(pairs, activation_fn=_identity_activation)
             indexed = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)
 
             # Unconditional sigmoid with overflow protection for BGE-M3 logits

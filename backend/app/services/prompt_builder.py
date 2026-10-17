@@ -823,17 +823,44 @@ class PromptBuilderService:
         # The matched small chunk is bracketed with [[MATCH: …]] markers inside
         # the parent window text so the LLM can orient the exact evidence.
         if settings.parent_retrieval_enabled and chunk.parent_window_text:
-            # Use raw_text (pre-enrichment) for the MATCH region when available
-            match_text = (
-                chunk.metadata.get("raw_text") or chunk.text or ""
-            ).strip()
+            # Use chunk.text (post-distillation / wiki-suppression) for the
+            # MATCH region (#716 TQ-instruction-batch-4-05): raw_text is the
+            # PRE-pipeline text, so preferring it re-injects sentences the
+            # distiller or suppression removed and breaks the substring
+            # containment the in-place branch relies on. Containment is
+            # whitespace-tolerant (#716 PRR-004 feedback): the distiller
+            # rebuilds chunk.text with normalized single-space joins while
+            # parent_window_text is a raw document slice, so exact
+            # containment failed on the default config and every
+            # multi-sentence chunk fell to the append fallback, duplicating
+            # the chunk after the window.
+            match_text = (chunk.text or "").strip()
             parent_text = chunk.parent_window_text
 
+            marked = None
             if match_text and match_text in parent_text:
                 marked = parent_text.replace(
                     match_text, f"[[MATCH: {match_text}]]", 1
                 )
-            else:
+            elif match_text:
+                # Whitespace-tolerant in-place wrap: find the parent span
+                # whose flexible-whitespace form equals match_text and mark
+                # THAT parent span, so the marker carries the parent's own
+                # characters (nothing new injected, orientation preserved).
+
+                _pattern = re.compile(
+                    r"\s+".join(re.escape(w) for w in match_text.split())
+                )
+                _m = _pattern.search(parent_text)
+                if _m:
+                    marked = (
+                        parent_text[: _m.start()]
+                        + "[[MATCH: "
+                        + parent_text[_m.start() : _m.end()]
+                        + "]]"
+                        + parent_text[_m.end() :]
+                    )
+            if marked is None:
                 # Fallback: append the small chunk as a MATCH annotation at the end
                 marked = f"{parent_text}\n\n[[MATCH: {match_text}]]"
 
