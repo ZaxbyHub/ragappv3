@@ -251,9 +251,11 @@ class WikiCompiler:
             # re-derives the claim text unchanged from a current source (e.g. a
             # reindex re-promoting a memory whose claim sentence survived an
             # edit). Only the found-by-text claim is touched, and only from
-            # 'superseded' — a claim whose supporting content changed resolves to
-            # a DIFFERENT sentence, so it never reaches this branch and stays
-            # superseded while its replacement gets its own claim row.
+            # 'superseded' — a claim whose supporting content changed resolves
+            # to a DIFFERENT sentence, so it never reaches this branch; on the
+            # file-recompile path such claims are retired by the post-pass in
+            # compile_ingest_job (issue #794), and on the memory-edit path by
+            # mark_claims_stale_by_memory.
             if existing.status == "superseded" and new_status == "active":
                 if self._store.reactivate_claim(existing.id):
                     existing.status = "active"
@@ -1026,6 +1028,22 @@ class WikiCompiler:
                 confidence=0.7,
             )
             relations_count += 1
+
+        # Issue #794: retire claims left behind by a content change. Claims
+        # bound to this file's page whose stored source quotes are verifiably
+        # absent from the CURRENT text, and that this run did not re-derive
+        # (claims_created covers found-by-text reuse too), stop co-serving in
+        # retrieval next to their replacements. Page-scoped inside the store
+        # method: query-synthesis claims carry no page binding and are never
+        # touched; undecidable provenance (no stored quote) fails open.
+        self._store.supersede_unrederived_file_claims(
+            file_id=file_id,
+            vault_id=vault_id,
+            page_id=page_id,
+            keep_claim_ids={c["id"] for c in claims_created},
+            current_text=text,
+        )
+        self._db.commit()
 
         # ----------- Optional LLM Wiki Curator (PR C) -----------
         # Gated by settings.wiki_llm_curator_enabled AND the per-trigger
