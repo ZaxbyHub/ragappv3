@@ -19,6 +19,19 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# #715 TQ-instruction-batch-4-07: SynthesisTool evidence bounds. Per-source
+# cap for the full chunk text channel, plus an 8000-char global budget that
+# is shared proportionally across every source (feedback: a first-come
+# budget silently dropped retrieve_more rounds). The 300-char floor takes
+# priority when there are more than TOTAL//FLOOR sources, so the total is
+# bounded by max(TOTAL, FLOOR x n) — at floor-priority n it matches the old
+# 300-char-preview envelope (max_rounds x top_k x 300 with top_k=12 =
+# 10.8k) rather than regressing below it. top_k config default resolves to
+# 12, not 10 (config.py migrate_retrieval_top_k).
+_SYNTHESIS_EVIDENCE_MAX_CHARS = 2000
+_SYNTHESIS_EVIDENCE_TOTAL_CHARS = 8000
+_SYNTHESIS_EVIDENCE_FLOOR_CHARS = 300
+
 
 # ---------------------------------------------------------------------------
 # Result type
@@ -126,7 +139,8 @@ class RetrievalTool(AgenticTool):
             "Retrieve relevant document chunks for a natural-language query. "
             "Returns a list of ranked sources with id, file_id, filename, "
             "section, snippet, and relevance score.  "
-            "Arguments: query (str), vault_id (int | None, optional)."
+            "Arguments: query (str), vault_id (int | None, optional), "
+            "top_k (int | None, optional)."
         )
 
     async def execute(
@@ -194,12 +208,19 @@ class RetrievalTool(AgenticTool):
                 indexed_file_ids=None,
             )
 
-            sources = [
-                engine.document_retrieval.to_source_metadata(
+            sources = []
+            for idx, chunk in enumerate(relevant_chunks):
+                src = engine.document_retrieval.to_source_metadata(
                     chunk, source_index=self._next_label + idx
                 )
-                for idx, chunk in enumerate(relevant_chunks)
-            ]
+                # #715 TQ-instruction-batch-4-07: the wire `snippet` is the
+                # 300-char UI preview — far too thin to synthesize from.
+                # Attach the full chunk text on a private `_`-prefixed key
+                # (engine convention for internal transport, like
+                # `_rerank_score`); SynthesisTool renders it and the engine
+                # strips it at the agentic wire boundary before any yield.
+                src["_chunk_text"] = chunk.text
+                sources.append(src)
             self._next_label += len(sources)
 
             return ToolResult(
@@ -285,8 +306,29 @@ class SynthesisTool(AgenticTool):
         # Build source context for the LLM prompt
         if sources:
             source_lines = []
+            # #715 TQ-instruction-batch-4-07: render the FULL chunk text
+            # (private `_chunk_text` channel), not the 300-char UI preview,
+            # under a global evidence budget (8000 chars; the old worst
+            # case was max_rounds × top_k × 300 = 10.8k at the config
+            # default top_k=12). The budget is shared
+            # PROPORTIONALLY across every source (floor: the old 300-char
+            # preview depth) instead of first-come-first-served, so
+            # retrieve_more rounds always contribute evidence to synthesis
+            # instead of being silently dropped once early rounds exhaust
+            # the cap (#715 feedback — probe: 10×2000-char sources rendered
+            # 4 passages first-come vs 10 proportional).
+            _per_source = min(
+                _SYNTHESIS_EVIDENCE_MAX_CHARS,
+                max(
+                    _SYNTHESIS_EVIDENCE_FLOOR_CHARS,
+                    _SYNTHESIS_EVIDENCE_TOTAL_CHARS // max(1, len(sources)),
+                ),
+            )
             for i, src in enumerate(sources, start=1):
-                raw_snippet = str(src.get("snippet", ""))[:500]
+                _full_text = src.get("_chunk_text")
+                raw_snippet = str(
+                    _full_text if _full_text is not None else src.get("snippet", "")
+                )[:_per_source]
                 escaped_snippet = xml.sax.saxutils.escape(raw_snippet)
                 # Use the [S#] label scheme that the rest of the citation
                 # pipeline (prompt_builder, parse_citations, citation_validator)

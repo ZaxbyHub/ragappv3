@@ -11,6 +11,7 @@ import sqlite3
 import threading
 import time
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, cast
 
@@ -28,6 +29,29 @@ logger = logging.getLogger(__name__)
 
 # Thread lock for FTS exceptions counter
 _fts_lock = threading.Lock()
+
+# Issue #715 (T1-32-S-06): request-scoped FTS failure attribution. The
+# instance counter below is process-wide, so two concurrent requests could
+# steal each other's counts via get_fts_exceptions()' read-and-reset. The
+# engine brackets each retrieval with start/end_request_fts_attribution();
+# increments inside that window append to the request's buffer (Task-created
+# coroutines share the buffer object through their copied context), and
+# get_fts_exceptions() prefers the buffer when one is active.
+_request_fts_buffer: ContextVar[Optional[List[int]]] = ContextVar(
+    "_request_fts_buffer", default=None
+)
+
+
+def start_request_fts_attribution():
+    """Open a request-scoped FTS failure window; returns (token, buffer)."""
+    buffer: List[int] = []
+    token = _request_fts_buffer.set(buffer)
+    return token, buffer
+
+
+def end_request_fts_attribution(token) -> None:
+    """Close the request-scoped FTS failure window opened by the matching start."""
+    _request_fts_buffer.reset(token)
 
 # Minimum rows before creating vector index (deferred creation)
 VECTOR_INDEX_MIN_ROWS = 256
@@ -842,7 +866,24 @@ class VectorStore:
         return self
 
     def get_fts_exceptions(self) -> int:
-        """Return the number of FTS exceptions since last reset and reset counter."""
+        """Return the number of FTS exceptions since last reset and reset counter.
+
+        Issue #715 (T1-32-S-06): when a request-scoped attribution window is
+        active, the count is that request's own failures (and the window's
+        buffer is consumed), never another concurrent request's. Without an
+        active window, this is the legacy process-wide read-and-reset.
+        """
+        buffer = _request_fts_buffer.get()
+        if buffer is not None:
+            with _fts_lock:
+                count = len(buffer)
+                buffer.clear()
+                # Drain the legacy counter too: the increment sites write
+                # both, and this is the only reset path left, so skipping it
+                # leaves a stale monotonic value on the instance (Copilot
+                # review, PR #969).
+                self._fts_exceptions = 0
+                return count
         with _fts_lock:
             count = self._fts_exceptions
             self._fts_exceptions = 0
@@ -1596,6 +1637,9 @@ class VectorStore:
                 )
                 with _fts_lock:
                     self._fts_exceptions += 1
+                    _buffer = _request_fts_buffer.get()
+                    if _buffer is not None:
+                        _buffer.append(1)
                 return [], 'failed'
 
         # Run the dense (ANN) and BM25 FTS arms concurrently — independent
@@ -1767,6 +1811,14 @@ class VectorStore:
                 # making ``multi_scale_rrf_k`` a no-op.
                 per_scale_lists: List[List[Dict[str, Any]]] = []
                 for i, scale_results in enumerate(scale_results_list):
+                    if isinstance(scale_results, SearchSemaphoreTimeoutError):
+                        # OPS-006 (issue #494/#715 T1-32-S-01): a search-capacity
+                        # timeout is a server-busy signal for the whole turn —
+                        # propagate it so the outer handlers surface the 503
+                        # contract instead of fusing the surviving scales into a
+                        # silently ungrounded answer. Generic per-scale failures
+                        # keep the graceful degrade below.
+                        raise scale_results
                     if isinstance(scale_results, list):
                         per_scale_lists.append(scale_results)
                     else:
@@ -1867,6 +1919,9 @@ class VectorStore:
                     logger.warning(f"FTS search failed (falling back to dense-only): {type(e).__name__}: {e}")
                     with _fts_lock:
                         self._fts_exceptions += 1
+                        _buffer = _request_fts_buffer.get()
+                        if _buffer is not None:
+                            _buffer.append(1)
                     return [], 'failed'
 
             # Run the dense (ANN) and BM25 FTS arms concurrently — independent

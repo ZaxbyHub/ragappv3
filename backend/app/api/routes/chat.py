@@ -1718,6 +1718,13 @@ async def non_stream_chat_response(
             # evidence_candidates is intentionally ignored here — candidates surface only in streaming responses.
             if chunk_type == "content":
                 collected_content.append(chunk.get("content", ""))
+            elif chunk_type == "fallback":
+                # #715 T1-32-K-01: surface the degraded-retrieval notice in
+                # the non-streaming answer exactly as the stream route's
+                # fallback branch does, so both surfaces behave identically.
+                fallback_content = chunk.get("content", "")
+                if fallback_content:
+                    collected_content.append(fallback_content)
             elif chunk_type == "done":
                 sources = chunk.get("sources", [])
                 memories_used = chunk.get("memories_used", [])
