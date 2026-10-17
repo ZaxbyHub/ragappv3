@@ -6,9 +6,11 @@ import type { UsedMemory } from "@/lib/api";
 
 interface MemoryCardProps {
   memory: UsedMemory;
+  /** Per-label support score from the done payload (issue #714); undefined = none. */
+  supportScore?: number;
 }
 
-function MemoryCard({ memory }: MemoryCardProps) {
+function MemoryCard({ memory, supportScore }: MemoryCardProps) {
   const [expanded, setExpanded] = useState(false);
   const isLong = memory.content.length > 160;
   const display = expanded || !isLong ? memory.content : memory.content.slice(0, 160) + "…";
@@ -45,6 +47,16 @@ function MemoryCard({ memory }: MemoryCardProps) {
               <>
                 <span aria-hidden>·</span>
                 <span className="italic">{memory.source}</span>
+              </>
+            )}
+            {supportScore != null && (
+              <>
+                <span aria-hidden>·</span>
+                <span
+                  title="Word overlap between the claim sentence and the cited evidence — a lexical measure, not a correctness probability"
+                >
+                  Support {Math.round(supportScore * 100)}%
+                </span>
               </>
             )}
           </div>
@@ -102,9 +114,11 @@ function parseTagList(tags: string | null | undefined): string[] {
 
 interface MemoryCardsProps {
   memories: UsedMemory[];
+  /** Per-label support scores from the done payload; key = memory_label (issue #714). */
+  citationConfidence?: Record<string, number>;
 }
 
-export function MemoryCards({ memories }: MemoryCardsProps) {
+export function MemoryCards({ memories, citationConfidence }: MemoryCardsProps) {
   if (!memories || memories.length === 0) return null;
   return (
     <div className="mt-3 space-y-2" data-testid="memory-cards">
@@ -114,7 +128,11 @@ export function MemoryCards({ memories }: MemoryCardsProps) {
       </div>
       <div className="space-y-1.5">
         {memories.map((m) => (
-          <MemoryCard key={m.id || m.memory_label} memory={m} />
+          <MemoryCard
+            key={m.id || m.memory_label}
+            memory={m}
+            supportScore={citationConfidence?.[m.memory_label]}
+          />
         ))}
       </div>
     </div>

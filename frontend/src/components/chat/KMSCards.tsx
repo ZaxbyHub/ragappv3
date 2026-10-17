@@ -6,9 +6,11 @@ import type { KMSReference } from "@/lib/api";
 
 interface KMSCardProps {
   kmsRef: KMSReference;
+  /** Per-label support score from the done payload (issue #714); undefined = none. */
+  supportScore?: number;
 }
 
-function KMSCard({ kmsRef }: KMSCardProps) {
+function KMSCard({ kmsRef, supportScore }: KMSCardProps) {
   const [expanded, setExpanded] = useState(false);
   const body = kmsRef.excerpt ?? kmsRef.summary ?? "";
   const isLong = body.length > 160;
@@ -50,6 +52,16 @@ function KMSCard({ kmsRef }: KMSCardProps) {
               <>
                 <span aria-hidden>·</span>
                 <span className="capitalize">{statusLabel}</span>
+              </>
+            )}
+            {supportScore != null && (
+              <>
+                <span aria-hidden>·</span>
+                <span
+                  title="Word overlap between the claim sentence and the cited evidence — a lexical measure, not a correctness probability"
+                >
+                  Support {Math.round(supportScore * 100)}%
+                </span>
               </>
             )}
             <button
@@ -104,9 +116,11 @@ function KMSCard({ kmsRef }: KMSCardProps) {
 
 interface KMSCardsProps {
   kmsRefs: KMSReference[];
+  /** Per-label support scores from the done payload; key = kms_label (issue #714). */
+  citationConfidence?: Record<string, number>;
 }
 
-export function KMSCards({ kmsRefs }: KMSCardsProps) {
+export function KMSCards({ kmsRefs, citationConfidence }: KMSCardsProps) {
   if (!kmsRefs || kmsRefs.length === 0) return null;
   return (
     <div className="mt-3 space-y-2" data-testid="kms-cards">
@@ -116,7 +130,11 @@ export function KMSCards({ kmsRefs }: KMSCardsProps) {
       </div>
       <div className="space-y-1.5">
         {kmsRefs.map((k) => (
-          <KMSCard key={k.kms_label} kmsRef={k} />
+          <KMSCard
+            key={k.kms_label}
+            kmsRef={k}
+            supportScore={citationConfidence?.[k.kms_label]}
+          />
         ))}
       </div>
     </div>
