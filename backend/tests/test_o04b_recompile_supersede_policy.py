@@ -67,11 +67,13 @@ def _make_env(vaults=(1,)):
         )
     conn.execute(
         "INSERT OR IGNORE INTO files (id, vault_id, file_path, file_name, file_size, status) "
-        "VALUES (1, 1, '/tmp/test.txt', 'test.txt', 100, 'indexed')"
+        "VALUES (1, 1, ?, 'test.txt', 100, 'indexed')",
+        (str(Path(td) / "test.txt"),),
     )
     conn.execute(
         "INSERT OR IGNORE INTO files (id, vault_id, file_path, file_name, file_size, status) "
-        "VALUES (2, 1, '/tmp/other.txt', 'other.txt', 100, 'indexed')"
+        "VALUES (2, 1, ?, 'other.txt', 100, 'indexed')",
+        (str(Path(td) / "other.txt"),),
     )
     conn.commit()
     store = WikiStore(conn)
@@ -99,18 +101,21 @@ class _O04bBase(unittest.TestCase):
         return dict(row)["page_id"] if row else None
 
     def _seed_claim(self, claim_text, *, quote, page_id, vault_id=1,
-                    status="active", source_kind="document", file_id=1):
+                    status="active", source_kind="document", file_id=1,
+                    created_by_kind=None):
         claim = self.store.create_claim(
             vault_id=vault_id,
             claim_text=claim_text,
             source_type="document",
             page_id=page_id,
             status=status,
+            created_by_kind=created_by_kind,
         )
         if source_kind == "document":
             self.store.attach_source(
                 claim_id=claim.id, source_kind="document", file_id=file_id,
-                source_label=f"file:{file_id}", quote=quote, confidence=0.8,
+                chunk_id=f"{file_id}_0", source_label=f"file:{file_id}",
+                quote=quote, confidence=0.8,
             )
         self.conn.commit()
         return claim.id
@@ -154,7 +159,7 @@ class TestMultiSourceSplit(_O04bBase):
 
 
 class TestSoleSourceFindingBounded(_O04bBase):
-    def test_sole_source_superseded_with_one_stale_finding(self):
+    def test_sole_source_superseded_stale_finding_not_duplicated(self):
         self.compiler.compile_ingest_job(1, {"file_id": 1, "text": V1})
         page = self._page_id_for_file()
         cid = self._seed_claim(
@@ -173,8 +178,9 @@ class TestQuotePresenceKeeps(_O04bBase):
     def test_extraction_skipped_sentence_still_present_is_kept(self):
         self.compiler.compile_ingest_job(1, {"file_id": 1, "text": V1})
         page = self._page_id_for_file()
-        # Pronoun sentence without org context: present in the text but the
-        # deterministic extractor skips it (wiki_compiler pronoun rule).
+        # Seeded directly (not extractor-derived): present verbatim in the
+        # text, so the QUOTE-presence arm must keep it even though the
+        # deterministic pass never re-derives this sentence.
         skipped_sentence = "He mentioned it briefly."
         cid = self._seed_claim(
             skipped_sentence, quote=skipped_sentence, page_id=page
@@ -187,14 +193,23 @@ class TestQuotePresenceKeeps(_O04bBase):
     def test_case_variant_quote_kept_via_normalized_presence(self):
         self.compiler.compile_ingest_job(1, {"file_id": 1, "text": V1})
         page = self._page_id_for_file()
+        # The claim TEXT is deliberately NOT re-derivable: it never matches the
+        # deterministic extractor and never appears verbatim in either text,
+        # so keep-by-id can never fire and the QUOTE arm alone decides. The
+        # quote is a case-variant of a sentence present in v2 — the
+        # normalized/token-boundary presence arm must keep the claim.
         cid = self._seed_claim(
-            "Zoe Quinn is the SIGMA Director.",
+            "sigma operations are led by zoe quinn",
             quote="Zoe quinn is the SIGMA director.",
             page_id=page,
         )
         v2_variant = V2 + " Zoe Quinn is the SIGMA Director."
         self.compiler.compile_ingest_job(1, {"file_id": 1, "text": v2_variant})
         self.assertEqual(self._claim_status(cid), "active")
+        # And when the variant sentence disappears, the quote is verifiably
+        # gone and the claim supersedes.
+        self.compiler.compile_ingest_job(1, {"file_id": 1, "text": V2})
+        self.assertEqual(self._claim_status(cid), "superseded")
 
 
 class TestIdenticalRecompileNoOp(_O04bBase):
@@ -204,7 +219,8 @@ class TestIdenticalRecompileNoOp(_O04bBase):
         # Curator-shaped claim: paraphrased claim_text, verbatim quote present.
         paraphrase = "The AFOMIS Director role is held by Alice Smith."
         cid = self._seed_claim(
-            paraphrase, quote="Alice Smith is the AFOMIS Director.", page_id=page
+            paraphrase, quote="Alice Smith is the AFOMIS Director.", page_id=page,
+            created_by_kind="llm_curator",
         )
         before = {
             tuple(r) for r in self.conn.execute(
@@ -247,7 +263,8 @@ class TestCuratorParaphraseQuoteDriven(_O04bBase):
         page = self._page_id_for_file()
         paraphrase = "The AFOMIS Director role is held by Alice Smith."
         cid = self._seed_claim(
-            paraphrase, quote="Alice Smith is the AFOMIS Director.", page_id=page
+            paraphrase, quote="Alice Smith is the AFOMIS Director.", page_id=page,
+            created_by_kind="llm_curator",
         )
         # Quote still present (as part of v1) → kept.
         self.compiler.compile_ingest_job(1, {"file_id": 1, "text": V1})

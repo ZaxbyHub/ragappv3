@@ -1029,14 +1029,11 @@ class WikiCompiler:
             )
             relations_count += 1
 
-        # Issue #794: retire claims left behind by a content change. Claims
-        # bound to this file's page whose stored source quotes are verifiably
-        # absent from the CURRENT text, and that this run did not re-derive
-        # (claims_created covers found-by-text reuse too), stop co-serving in
-        # retrieval next to their replacements. Page-scoped inside the store
-        # method: query-synthesis claims carry no page binding and are never
-        # touched; undecidable provenance (no stored quote) fails open.
-        self._store.supersede_unrederived_file_claims(
+        # Issue #794 feedback: surface what the supersede post-pass retired so
+        # the compile job's result_json (persisted with the job and returned
+        # by the document-status route) shows the
+        # retirement instead of leaving it observable only via lint rows.
+        supersede_counts = self._store.supersede_unrederived_file_claims(
             file_id=file_id,
             vault_id=vault_id,
             page_id=page_id,
@@ -1066,6 +1063,8 @@ class WikiCompiler:
             "claims": claims_created,
             "entities": [{"id": e.id, "name": e.canonical_name} for e in entities_created],
             "relations_count": relations_count,
+            "claims_superseded": supersede_counts["superseded"],
+            "claims_weak_provenance": supersede_counts["weak_provenance"],
         }
         if curator_summary is not None:
             result_dict["curator"] = curator_summary
@@ -1237,6 +1236,19 @@ class WikiCompiler:
                     )
                     if existing is not None:
                         claim = existing
+                        # Issue #794 feedback: the supersede post-pass runs
+                        # BEFORE the curator, so a claim it just superseded
+                        # (or one superseded by an earlier edit) can match
+                        # here by text while its quote is verifiably present
+                        # again. Reactivate it with the same no-commit
+                        # helper the deterministic path uses — leaving it
+                        # superseded would bury live, quote-verified
+                        # knowledge (the curator's find-or-create
+                        # deliberately omits reactivation to keep
+                        # pair-atomicity, so the flip must be inline too).
+                        if existing.status == "superseded":
+                            self._store.reactivate_claim_if_superseded(existing.id)
+                            existing.status = "active"
                         already = any(
                             s.source_kind == "document"
                             and s.file_id == accepted.file_id
