@@ -53,7 +53,7 @@ there is no consumer for a routing YAML, and adding one would be unwired
 - **CI is the source of truth.** Before any push or PR, run `ci-compatibility-audit`: backend `ruff check .` + targeted pytest, frontend `typecheck`/`lint`/`test`/`build`, and `scripts/check_*.py`. A lint/type error caught locally is free; caught in CI it costs a round trip.
 - **CI pins Python 3.11.** On local 3.14+, some tests fail with `RuntimeError: There is no current event loop` — that's a local-interpreter artifact, not a regression. See `docs/engineering/testing.md`.
 - **Frontend is Vitest, not `bun:test`.** Ignore any `bun:test` guidance.
-- **Never ship unwired code, never defer work, and never make scope decisions without explicit instruction.**
+- **Never ship unwired code, never defer work, and never make scope decisions without explicit instruction.** Work found in review that the PR does not fix is routed by `CONTRIBUTING.md` "Filing follow-up issues": a visible `RECORD` row is a closure, not a deferral, and anything consequential goes to an issue or to the maintainer.
 - New behavior ships with tests; assert real behavior, not just status codes.
 
 ## CI gates
