@@ -478,9 +478,16 @@ class KMSCompileProcessor:
         return {"entry_id": entry.id, "file_id": file_id, "skipped": False}
 
     def _compile_vault(self, conn, store, vault_id: int) -> dict:
-        """Recompile document entries for every indexed file in the vault."""
+        """Recompile document entries for every eligible (indexed or partial) file.
+
+        Eligibility matches the document retry/compile eligibility set:
+        ``partial`` rows hold retrievable parsed text and compile exactly
+        like ``indexed`` ones; every other status stays excluded. (The
+        per-file path applies no status filter — this selection is a strict
+        subset of it.)
+        """
         rows = conn.execute(
-            "SELECT id FROM files WHERE vault_id = ? AND status = 'indexed'",
+            "SELECT id FROM files WHERE vault_id = ? AND status IN ('indexed', 'partial')",
             (vault_id,),
         ).fetchall()
         compiled = 0
