@@ -53,6 +53,7 @@ function MemoryCard({ memory, supportScore }: MemoryCardProps) {
               <>
                 <span aria-hidden>·</span>
                 <span
+                  className="text-foreground"
                   title="Word overlap between the claim sentence and the cited evidence — a lexical measure, not a correctness probability"
                 >
                   Support {Math.round(supportScore * 100)}%

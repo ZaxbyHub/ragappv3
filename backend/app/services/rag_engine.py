@@ -2428,18 +2428,21 @@ class RAGEngine:
         #
         # Issue #714: a SECOND registry maps every cited non-document label
         # (M#/W#/K#) to the evidence BODY the prompt rendered for it — memory
-        # `content`, wiki `claim_text or excerpt`, KMS `excerpt or summary`
-        # (mirroring prompt_builder.format_*_evidence). Bodies only, by
-        # necessity: the rendered wiki/KMS headers embed the label token itself
-        # ("[W1] Title…") and _tokenize strips punctuation, so scoring the full
-        # rendered block would put token "w1" in both the claim and evidence
-        # sets and force Jaccard > 0 for every citation, breaking the
-        # zero-overlap contract. The registries hold only offered-and-cited
+        # `content` (rendered inline by PromptBuilderService.build_messages),
+        # wiki `claim_text or excerpt` (prompt_builder.format_wiki_evidence),
+        # KMS `excerpt or summary` (prompt_builder.format_kms_evidence).
+        # Bodies only, by necessity: EVERY family's rendered block embeds the
+        # label token itself — "[W1] Title…", "[K1] Title…", "[M1] <memory>…"
+        # — and _tokenize strips punctuation, so scoring the full rendered
+        # block would put token "w1"/"m1" in both the claim and evidence sets
+        # and force Jaccard > 0 for every citation, breaking the zero-overlap
+        # contract. The registries hold only offered-and-cited
         # evidence (memories_used/wiki_used/kms_used are built by intersecting
         # candidates with cited labels), so phantom labels never reach scoring —
         # the same label-membership base as repair_against_sources_and_memories.
         # Empty bodies score a natural 0.0 (flagged, not omitted). Full
-        # rendered-evidence parity (headers included) stays with #716.
+        # rendered-evidence parity (headers and escaping included) stays with
+        # #716.
         try:
             support_texts: List[str] = []
             for chunk in relevant_chunks:

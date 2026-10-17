@@ -315,8 +315,11 @@ export function AssistantMessage({
   // Validated citation labels: the done event's citation_confidence carries
   // one entry per VALID label — [S#] since FR-004, and since issue #714 also
   // the cited [M#]/[W#]/[K#] labels — so its keys are the valid-label set
-  // across families. SourceCards only queries its own [S#] labels against
-  // this set, so the added family keys cannot change source-card badges.
+  // across families. SourceCards resolves each source's own [S#] label against
+  // this set; the derivation and every [S#]-bearing answer's Cited/Retrieved
+  // outcome are unchanged. (The set's non-emptiness gates badge visibility;
+  // answers citing only non-S labels render no source cards, because cards
+  // require a cited source in the answer text.)
   // Undefined when the validator produced nothing — cards then show no badge.
   // An empty object means the same thing, so it maps to undefined too (an
   // empty set would otherwise flip every card to a "Retrieved" badge).
