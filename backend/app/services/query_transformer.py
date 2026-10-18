@@ -15,6 +15,12 @@ from app.services.redis_io import redis_call
 
 logger = logging.getLogger(__name__)
 
+
+# #716 T1-35-S2-06: producing-prompt version for cache identity. Bump when a
+# step-back/decomposition/query-plan prompt changes so cached rewrites from
+# the old prompt stop serving (one-time invalidation on deploy by design).
+PROMPT_VERSION = "v1"
+
 # ------------------------------------------------------------------
 # Constants
 # ------------------------------------------------------------------
@@ -229,7 +235,8 @@ class QueryTransformer:
         key_data = json.dumps({
             "model": chat_model,
             "type": transform_type,
-            "query": query_text
+            "query": query_text,
+            "version": PROMPT_VERSION
         }, sort_keys=True)
         # usedforsecurity=False: this is a cache-key digest, never a security
         # primitive (same convention as rag_trace._text_hash). It also keeps
@@ -637,7 +644,12 @@ class QueryPlanner:
 
     def _make_cache_key(self, query_text: str) -> str:
         key_data = json.dumps(
-            {"model": self._cache_model, "type": "query_plan", "query": query_text},
+            {
+                "model": self._cache_model,
+                "type": "query_plan",
+                "query": query_text,
+                "version": PROMPT_VERSION,
+            },
             sort_keys=True,
         )
         # usedforsecurity=False: cache-key digest, not a security primitive

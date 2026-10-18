@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import html
 import logging
 import re
 import sqlite3
@@ -2479,9 +2480,16 @@ class RAGEngine:
         # evidence (memories_used/wiki_used/kms_used are built by intersecting
         # candidates with cited labels), so phantom labels never reach scoring —
         # the same label-membership base as repair_against_sources_and_memories.
-        # Empty bodies score a natural 0.0 (flagged, not omitted). Full
-        # rendered-evidence parity (headers and escaping included) stays with
-        # #716.
+        # Empty bodies score a natural 0.0 (flagged, not omitted). #716 ships
+        # the ESCAPING half of rendered-evidence parity: every registry body
+        # is normalized with html.unescape() on the model side so entity
+        # encoding cancels regardless of whether the model echoed the
+        # escaped prompt fragments or emitted natural characters (PRR-003
+        # feedback: escaping the evidence side instead INVERTED the score
+        # for natural-character answers — 0.875 became 0.4545 on the probe
+        # pair). Sources stay RAW (wiki_curator's keep-source-raw pattern).
+        # The S#-arm SOURCE divergence (raw_text vs distilled text) stays
+        # with PR 9's disclosed limitation.
         try:
             support_texts: List[str] = []
             for chunk in relevant_chunks:
@@ -2512,7 +2520,7 @@ class RAGEngine:
                         ev.get("excerpt") or ev.get("summary") or ""
                     )
             confidence_result = score_citations(
-                full_response,
+                html.unescape(full_response),
                 support_texts,
                 sentence_provenance=_request_distillation_provenance.get(),
                 support_texts_by_label=support_by_label,

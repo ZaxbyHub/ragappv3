@@ -27,6 +27,20 @@ from app.services.store_utils import DualPoolMixin
 
 logger = logging.getLogger(__name__)
 
+
+def _conf_or(d: dict, default: float) -> float:
+    """None-aware confidence read (#716 T1-35-K-07): a stored 0.0 is a real
+    confidence and must not fall through to the default — only a missing
+    (None) key does."""
+    c = d.get("confidence")
+    return float(c) if c is not None else default
+
+
+def _chain_conf_or(d: dict, key: str, default: float) -> float:
+    """None-aware single-key chain read (first key of the relation chain)."""
+    c = d.get(key)
+    return float(c) if c is not None else default
+
 # ---------------------------------------------------------------------------
 # Stop words to strip from FTS queries
 # ---------------------------------------------------------------------------
@@ -395,6 +409,7 @@ class WikiRetrievalService(DualPoolMixin):
                LEFT JOIN wiki_pages p ON c.page_id = p.id
                WHERE r.vault_id = ? AND r.subject_entity_id = ?
                AND (c.status IS NULL OR c.status = 'active')
+               AND (p.status IS NULL OR p.status NOT IN ('archived','stale'))
                ORDER BY r.confidence DESC""",
             (vault_id, entity.id),
         ).fetchall()
@@ -407,7 +422,12 @@ class WikiRetrievalService(DualPoolMixin):
             predicate = (d.get("predicate") or "").lower()
 
             # Score based on predicate match
-            base_score = float(d.get("claim_confidence") or d.get("confidence") or 0.8)
+            # #716 T1-35-K-07: first non-None of the chain — a stored 0.0 at
+            # either key is a real confidence and must not fall through.
+            _raw_conf = d.get("claim_confidence")
+            if _raw_conf is None:
+                _raw_conf = d.get("confidence")
+            base_score = float(_raw_conf) if _raw_conf is not None else 0.8
             matched_pred = None
             if predicate_terms:
                 if any(pt in predicate for pt in predicate_terms):
@@ -431,7 +451,7 @@ class WikiRetrievalService(DualPoolMixin):
                 page_type=d.get("page_type") or "entity",
                 claim_text=d.get("claim_text"),
                 excerpt=d.get("summary") or d.get("claim_text") or "",
-                confidence=float(d.get("claim_confidence") or 0.8),
+                confidence=_chain_conf_or(d, "claim_confidence", 0.8),
                 page_status=d.get("page_status") or "draft",
                 claim_status=d.get("claim_status"),
                 score=max(0.0, score),
@@ -456,7 +476,8 @@ class WikiRetrievalService(DualPoolMixin):
         score_type: str,
     ) -> Optional[WikiEvidence]:
         row = conn.execute(
-            "SELECT * FROM wiki_pages WHERE id = ? AND vault_id = ?",
+            "SELECT * FROM wiki_pages WHERE id = ? AND vault_id = ? "
+            "AND status NOT IN ('archived','stale')",
             (page_id, vault_id),
         ).fetchone()
         if not row:
@@ -471,7 +492,7 @@ class WikiRetrievalService(DualPoolMixin):
             page_type=d["page_type"],
             claim_text=None,
             excerpt=d.get("summary") or "",
-            confidence=float(d.get("confidence") or 0.8),
+            confidence=_conf_or(d, 0.8),
             page_status=d.get("status") or "draft",
             claim_status=None,
             score=score,
@@ -496,6 +517,7 @@ class WikiRetrievalService(DualPoolMixin):
                    LEFT JOIN wiki_pages p ON c.page_id = p.id
                    WHERE wiki_claims_fts MATCH ? AND c.vault_id = ?
                    AND (c.status IS NULL OR c.status = 'active')
+                   AND (p.status IS NULL OR p.status NOT IN ('archived','stale'))
                    ORDER BY rank
                    LIMIT 10""",
                 (normalized_query, vault_id),
@@ -518,7 +540,7 @@ class WikiRetrievalService(DualPoolMixin):
                 page_type=d.get("page_type") or "entity",
                 claim_text=d.get("claim_text"),
                 excerpt=d.get("summary") or d.get("claim_text") or "",
-                confidence=float(d.get("confidence") or 0.7),
+                confidence=_conf_or(d, 0.7),
                 page_status=d.get("page_status") or "draft",
                 claim_status=d.get("status"),
                 score=max(0.1, 0.75 - i * 0.05),
@@ -542,6 +564,7 @@ class WikiRetrievalService(DualPoolMixin):
                    FROM wiki_pages_fts
                    JOIN wiki_pages p ON wiki_pages_fts.rowid = p.id
                    WHERE wiki_pages_fts MATCH ? AND p.vault_id = ?
+                   AND p.status NOT IN ('archived','stale')
                    ORDER BY rank
                    LIMIT 5""",
                 (normalized_query, vault_id),
@@ -562,7 +585,7 @@ class WikiRetrievalService(DualPoolMixin):
                 page_type=d.get("page_type") or "overview",
                 claim_text=None,
                 excerpt=d.get("summary") or "",
-                confidence=float(d.get("confidence") or 0.6),
+                confidence=_conf_or(d, 0.6),
                 page_status=d.get("status") or "draft",
                 claim_status=None,
                 score=max(0.1, 0.6 - i * 0.05),
