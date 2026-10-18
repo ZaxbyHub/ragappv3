@@ -315,10 +315,13 @@ def build_user_prompt(
     """Render the user message for a curator call.
 
     Bounds the input by ``settings.wiki_llm_curator_max_input_chars`` —
-    chunks are concatenated in order until the budget runs out. The
-    same budget is applied per call (not per document); when curator
-    is invoked in per-chunk mode the budget cap protects each call
-    individually.
+    chunks are concatenated in order until the budget runs out. This is
+    the per-call prompt budget: it caps the source text THIS call's
+    prompt carries. ``_build_curator_chunks`` separately applies the
+    same knob as the per-document curated span (the two scopes the
+    config docstring documents, issue #795), so a document is curated
+    from its start up to the knob's worth of source text and each
+    call's prompt re-applies the bound to its own chunk snippet.
     """
     budget = int(settings.wiki_llm_curator_max_input_chars or 6000)
     parts: list[str] = []
