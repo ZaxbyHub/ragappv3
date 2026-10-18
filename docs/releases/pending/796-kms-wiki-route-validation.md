@@ -58,16 +58,28 @@ unchanged.
 
 ## Known limitations / residuals
 
-- **Legacy out-of-range `confidence` rows** (`wiki_pages`, `wiki_claims`,
-  `wiki_claim_sources` — no DB CHECK ever bounded these columns): the wiki
-  edit dialog always echoes `confidence` in its PUT, so editing ANY field of
-  a page holding e.g. 7.5 now 422s until the row is repaired. No migration
-  and no silent coercion ship here (rewriting stored values on edit would be
-  worse); the API prevents new out-of-range rows, and existing rows can be
-  repaired with
+- **Legacy rows outside the new bounds — three same-class columns.** None
+  of `confidence`, `title`, or `claim_text` ever had a DB CHECK, and rows
+  beyond the new request bounds can pre-exist: out-of-range `confidence`
+  (the audit's probe persisted 7.5/-3), `title` longer than 500 chars
+  (the wiki compiler writes `wiki_pages.title` from the upload filename,
+  which has no length cap anywhere in the chain), and `claim_text` longer
+  than 2000 chars (curator/compiler-authored claims are uncapped at the
+  service layer). The wiki edit dialog always echoes `title`/`confidence`
+  in its PUT, so editing ANY field of such a page now 422s until the row is
+  repaired; the same applies to claim PUTs. No migration and no silent
+  coercion ship here (rewriting stored values on edit would be worse); the
+  API prevents new out-of-range rows, and existing rows can be repaired with
   `UPDATE wiki_pages SET confidence = MIN(MAX(confidence,0),1) WHERE confidence < 0 OR confidence > 1;`
-  (same statement for `wiki_claims` and `wiki_claim_sources`).
-  Flagged for maintainer review.
+  plus, if long titles/claim texts exist,
+  `UPDATE wiki_pages SET title = substr(title, 1, 500) WHERE length(title) > 500;`
+  `UPDATE wiki_claims SET claim_text = substr(claim_text, 1, 2000) WHERE length(claim_text) > 2000;`
+  (and the analogous confidence clamp for `wiki_claims` and
+  `wiki_claim_sources`). Flagged for maintainer review.
+- **Bulk unknown keys are silently ignored** (pydantic default), including
+  `expected_version` — deliberately excluded from the typed bulk model
+  (per-page optimistic concurrency has no bulk meaning). No in-repo caller
+  sends it; clients needing bulk OCC should use the per-page PUT.
 - The wiki create-page route's generic fixed-message 400 (the #792 form) is
   unchanged — this issue's claims targeted the KMS entry-create outlier.
 - `claim_type` remains unbounded `str` (no store CHECK to mirror).

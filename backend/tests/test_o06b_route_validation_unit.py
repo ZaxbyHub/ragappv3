@@ -116,6 +116,32 @@ class TestConfidenceBoundaries(unittest.TestCase):
         WikiClaimUpdateRequest()
         WikiPageBulkUpdateFields()
 
+    def test_literal_422_detail_names_allowed_values(self):
+        # Plan-promised pin (approved-plan edge cases): the validation
+        # error must name the expected vocabulary so clients can self-correct.
+        with self.assertRaises(ValidationError) as ctx:
+            WikiPageCreateRequest(vault_id=1, title="t", page_type="bogus")
+        msg = str(ctx.exception)
+        for value in ("entity", "procedure", "manual", "open_question"):
+            self.assertIn(value, msg)
+
+    def test_claim_source_type_oov_rejected_on_create_and_update(self):
+        # Implementation-review round-1 partial-fix kills: untyping either
+        # source_type field survives every other test; these go RED on it.
+        with self.assertRaises(ValidationError):
+            WikiClaimCreateRequest(vault_id=1, claim_text="c", source_type="bogus")
+        with self.assertRaises(ValidationError):
+            WikiClaimUpdateRequest(source_type="bogus")
+
+    def test_bulk_page_type_and_confidence_oov_rejected(self):
+        # Implementation-review round-1 partial-fix kills for the bulk model.
+        with self.assertRaises(ValidationError):
+            WikiBulkRequest(vault_id=1, page_ids=[1], action="update",
+                            updates=WikiPageBulkUpdateFields(page_type="bogus"))
+        with self.assertRaises(ValidationError):
+            WikiBulkRequest(vault_id=1, page_ids=[1], action="update",
+                            updates=WikiPageBulkUpdateFields(confidence=7.5))
+
 
 class TestKmsCreateContractPin(unittest.TestCase):
     def _drive(self):
@@ -195,6 +221,19 @@ class TestBulkRouteContract(unittest.TestCase):
             ))
         self.assertEqual(out["action"], "update")
         bulk.assert_called_once_with([1, 2], 1, status="verified")
+
+    def test_explicit_null_on_non_nullable_dropped(self):
+        # Same explicit-null semantics as update_wiki_page: title=None is a
+        # no-op, not a store IntegrityError; nullable fields (summary,
+        # parent_id) accept null.
+        import app.api.routes.wiki as wiki_mod
+        with patch.object(wiki_mod.WikiStore, "bulk_update_pages",
+                          return_value=[]) as bulk:
+            self._drive(WikiBulkRequest(
+                vault_id=1, page_ids=[1], action="update",
+                updates=WikiPageBulkUpdateFields(title=None, summary=None),
+            ))
+        bulk.assert_called_once_with([1], 1, summary=None)
 
 
 class TestPromoteAndLintContracts(unittest.TestCase):

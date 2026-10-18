@@ -523,9 +523,18 @@ async def bulk_wiki_pages(
         )
         if not fields_set:
             raise HTTPException(status_code=400, detail="updates field required for update action")
+        # Same explicit-null semantics as update_wiki_page: a null on a
+        # NOT NULL column is dropped (a no-op) instead of being written and
+        # turning into a store IntegrityError; nullable fields accept null.
+        nullable_update_fields = frozenset({"parent_id", "summary"})
         updates: Dict[str, object] = {}
         for field_name in fields_set:
-            updates[field_name] = getattr(request.updates, field_name)
+            value = getattr(request.updates, field_name)
+            if value is None and field_name not in nullable_update_fields:
+                continue
+            updates[field_name] = value
+        if not updates:
+            raise HTTPException(status_code=400, detail="updates field required for update action")
         pages = store.bulk_update_pages(request.page_ids, request.vault_id, **updates)
         return {"action": "update", "updated": len(pages), "pages": [_as_dict(p) for p in pages]}
     else:
