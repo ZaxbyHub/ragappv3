@@ -11,6 +11,7 @@ import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
+from html import unescape as _html_unescape
 from typing import Any, Iterator, Optional
 
 from app.config import settings
@@ -967,7 +968,24 @@ class WikiStore:
         ``status = 'superseded'`` predicate makes the check-and-flip atomic,
         so a claim that concurrently reached any other state can never be
         blanket-reactivated. Returns True when the transition committed.
+
+        On a successful flip this also deletes the OPEN invalidation 'stale'
+        findings that reference the claim (#794 feedback): the claim is
+        active and served again, so a permanently-open "source content
+        changed" row would be a false positive. Rows a user already
+        dispositioned (resolved/dismissed/acknowledged) are left alone.
         """
+        if not self.reactivate_claim_if_superseded(claim_id):
+            return False
+        self._db.commit()
+        return True
+
+    def reactivate_claim_if_superseded(self, claim_id: int) -> bool:
+        """No-commit reactivation: atomically flip a superseded claim to
+        'active' and, when the flip landed, delete its OPEN invalidation
+        'stale' findings (#794). The caller owns the transaction — the
+        curator's inline find-or-create calls this inside its SAVEPOINT, and
+        ``reactivate_claim`` wraps it with the commit."""
         cur = self._db.execute(
             "UPDATE wiki_claims SET status = 'active', updated_at = ? "
             "WHERE id = ? AND status = 'superseded'",
@@ -979,7 +997,12 @@ class WikiStore:
             # sqlite3 opened for the 0-row UPDATE so the connection stays clean.
             self._db.rollback()
             return False
-        self._db.commit()
+        self._db.execute(
+            "DELETE FROM wiki_lint_findings WHERE status = 'open' "
+            "AND finding_type = 'stale' AND EXISTS ("
+            "SELECT 1 FROM json_each(related_claim_ids_json) WHERE value = ?)",
+            (claim_id,),
+        )
         return True
 
     def get_claim_sources(self, claim_id: int) -> list[WikiClaimSource]:
@@ -1565,9 +1588,9 @@ class WikiStore:
         return cur.rowcount
 
     def mark_claims_stale_by_file(self, file_id: int, vault_id: int) -> dict:
-        """Mark wiki claims stale when their source document is deleted/reindexed.
+        """Mark wiki claims stale when their source document is deleted.
 
-        - Claims whose ONLY source was this file are set status='stale'.
+        - Claims whose ONLY source was this file are set status='superseded'.
         - Claims with other sources get a 'weak_provenance' lint finding only.
         Returns counts of stale/weak findings created.
         """
@@ -1635,10 +1658,247 @@ class WikiStore:
         # still exists, leaving orphan lint findings (DD-C009 / #108).
         return {"stale": stale_count, "weak_provenance": weak_count}
 
+    def supersede_unrederived_file_claims(
+        self,
+        file_id: int,
+        vault_id: int,
+        page_id: int,
+        keep_claim_ids: set,
+        current_text: str,
+    ) -> dict:
+        """Supersede claims left behind by a content change on recompile (#794).
+
+        Called from ``WikiCompiler.compile_ingest_job`` after the deterministic
+        claims pass: claims whose only file support is a stored quote that is
+        verifiably absent from the CURRENT text (and that this run did not
+        re-derive) must stop co-serving in retrieval next to their replacements.
+
+        Candidate/keep policy:
+        - Candidates are claims with a ``wiki_claim_sources`` row for this
+          file, bound to this file's page and this vault. Query-synthesis
+          claims carry no page binding and are never touched; neither are
+          non-active claims (retrieval serves 'active' only, and unverified /
+          contradicted / needs_review rows are not this defect).
+        - A claim is KEPT when it was re-derived this run (``keep_claim_ids``,
+          which includes normalized-text reuse), or when ANY of its
+          document-source quotes for this file still appears in
+          ``current_text`` — exact substring first (including the HTML-unescaped
+          form of the quote, mirroring the curator acceptance arms), then the
+          same normalization used by ``find_claim_by_normalized_text`` with
+          token-boundary padding (case / punctuation / whitespace variants,
+          without partial-word matches like "Director" inside "Directorate").
+        - Undecidable inputs fail open and never supersede: no non-empty quote
+          on any source row, a quote that normalizes to the empty string
+          (punctuation-only), or whitespace-only/empty ``current_text``.
+        - Sole-source claims are set status='superseded' plus one 'stale' lint
+          finding; claims with other INDEPENDENT sources stay active with one
+          'weak_provenance' finding (the delete-path policy split). Independent
+          support means another file, a memory, or a non-echo manual source:
+          chat-synthesis usage rows (``source_kind='manual'`` with
+          ``source_label='chat_synthesis'``) are usage echoes, not provenance,
+          and do not keep a stale document claim alive (#794 feedback F-1).
+
+        Finding lifecycle (#794 feedback round): findings use per-claim titles
+        keyed on (vault_id, finding_type, title), and a new row is inserted
+        only when NO row with that fingerprint exists in ANY status — a user's
+        resolved/dismissed/acknowledged disposition permanently suppresses the
+        fingerprint (the ``upsert_lint_findings`` Rule-2 semantics), and
+        reactivation via ``reactivate_claim`` deletes the OPEN finding whose
+        claim it restored, so a supersede→reactivate→supersede flap produces a
+        fresh finding per genuine stale event without resurrection or orphans.
+
+        Deliberate divergences from the delete-path siblings
+        (``mark_claims_stale_by_file``/``_by_memory``): this pass gates on
+        ``status='active'`` (retrieval-facing claims only), dedupes findings by
+        fingerprint, keys findings per claim, and binds ``related_page_ids``
+        for page-panel visibility — the siblings fire once at delete time on a
+        then-current claim set and keep their original shape.
+
+        Does NOT commit: the caller owns the transaction, same discipline as
+        ``mark_claims_stale_by_file`` (DD-C009 / #108).
+        """
+        superseded_count = 0
+        weak_count = 0
+        now = datetime.utcnow().isoformat()
+        current_text = current_text or ""
+        normalized_text = normalize_claim_text(current_text)
+        padded_normalized = f" {normalized_text} " if normalized_text else ""
+
+        candidate_rows = self._db.execute(
+            "SELECT DISTINCT wcs.claim_id FROM wiki_claim_sources wcs "
+            "JOIN wiki_claims c ON c.id = wcs.claim_id "
+            "WHERE wcs.file_id = ? AND wcs.claim_id IS NOT NULL "
+            "AND c.page_id = ? AND c.vault_id = ?",
+            (file_id, page_id, vault_id),
+        ).fetchall()
+
+        for row in candidate_rows:
+            claim_id = dict(row)["claim_id"]
+            if claim_id in keep_claim_ids:
+                continue
+            claim_row = self._db.execute(
+                "SELECT status, claim_text FROM wiki_claims WHERE id = ? AND vault_id = ?",
+                (claim_id, vault_id),
+            ).fetchone()
+            if not claim_row or dict(claim_row)["status"] != "active":
+                continue
+
+            quotes = [
+                dict(q)["quote"] or ""
+                for q in self._db.execute(
+                    "SELECT quote FROM wiki_claim_sources WHERE claim_id = ? AND file_id = ?",
+                    (claim_id, file_id),
+                ).fetchall()
+            ]
+            file_quotes = [q for q in quotes if q.strip()]
+            if not file_quotes:
+                # Undecidable provenance — fail open, never supersede on
+                # absence of evidence.
+                continue
+            if not normalized_text:
+                # Whitespace-only/empty current text carries no positive
+                # evidence about any quote — fail open (feedback F-7).
+                continue
+            quote_present = False
+            has_matchable_absence_evidence = False
+            padded_raw = f" {current_text} "
+            for q in file_quotes:
+                # Token-padded raw containment: a verbatim span that ends
+                # mid-word ("Director" inside "Directorate") is not a real
+                # span (feedback F-5). Edge padding keeps start/end-of-text
+                # spans matchable.
+                if f" {q} " in padded_raw:
+                    quote_present = True
+                    break
+                # Curator quotes may be stored XML-escaped (the curator
+                # accepts them via its HTML-unescape arm and persists the raw
+                # echo) — try the unescaped form before giving up (F-2).
+                unescaped = _html_unescape(q)
+                if unescaped != q and f" {unescaped} " in padded_raw:
+                    quote_present = True
+                    break
+                # Normalized/token-boundary arm: case, punctuation and
+                # whitespace variants count as present.
+                nq = normalize_claim_text(q)
+                if nq and f" {nq} " in padded_normalized:
+                    quote_present = True
+                    break
+                # A quote that normalizes to "" (punctuation-only) never
+                # textually matches anything, so its absence is NOT evidence
+                # of a content change (feedback F-6): only a quote with real
+                # word content that failed every arm counts as that evidence.
+                if nq:
+                    has_matchable_absence_evidence = True
+            if quote_present:
+                continue
+            if not has_matchable_absence_evidence:
+                # Every absent quote was unmatchable noise — undecidable,
+                # fail open.
+                continue
+
+            # Independent support only: chat-synthesis usage echoes do not
+            # keep a stale document claim co-serving next to its replacement
+            # (F-1). Other files, memories and non-echo manual sources do.
+            other_sources = self._db.execute(
+                "SELECT COUNT(*) FROM wiki_claim_sources WHERE claim_id = ? "
+                "AND (file_id != ? OR file_id IS NULL) "
+                "AND NOT (source_kind = 'manual' "
+                "AND IFNULL(source_label, '') = 'chat_synthesis')",
+                (claim_id, file_id),
+            ).fetchone()[0]
+            claim_text = dict(claim_row)["claim_text"]
+            if other_sources == 0:
+                # Vault-scoped, atomic check-and-flip (mirrors
+                # reactivate_claim's predicate discipline): a claim that
+                # concurrently left 'active' is not blanket-superseded.
+                flipped = self._db.execute(
+                    "UPDATE wiki_claims SET status = 'superseded', updated_at = ? "
+                    "WHERE id = ? AND vault_id = ? AND status = 'active'",
+                    (now, claim_id, vault_id),
+                ).rowcount
+                if flipped == 0:
+                    continue
+                self._insert_recompile_finding_once(
+                    vault_id=vault_id,
+                    finding_type="stale",
+                    severity="medium",
+                    title=(
+                        f"Claim stale: source content changed in recompile "
+                        f"(file_id={file_id}, claim_id={claim_id})"
+                    ),
+                    details=claim_text[:200],
+                    claim_id=claim_id,
+                    page_id=page_id,
+                    now=now,
+                )
+                superseded_count += 1
+            else:
+                self._insert_recompile_finding_once(
+                    vault_id=vault_id,
+                    finding_type="weak_provenance",
+                    severity="low",
+                    title=(
+                        f"Weak provenance: source content changed in recompile "
+                        f"(file_id={file_id}, claim_id={claim_id})"
+                    ),
+                    details=claim_text[:200],
+                    claim_id=claim_id,
+                    page_id=page_id,
+                    now=now,
+                )
+                weak_count += 1
+
+        return {"superseded": superseded_count, "weak_provenance": weak_count}
+
+    def _insert_recompile_finding_once(
+        self,
+        vault_id: int,
+        finding_type: str,
+        severity: str,
+        title: str,
+        details: str,
+        claim_id: int,
+        now: str,
+        page_id: Optional[int] = None,
+    ) -> None:
+        """Insert an invalidation lint finding unless a row with the same
+        (vault_id, finding_type, title) fingerprint already exists in ANY
+        status (per-claim titles make the fingerprint per-claim; #794).
+
+        No status filter means one stale event surfaces at most once ever per
+        claim: a user's resolved/dismissed/acknowledged disposition suppresses
+        the fingerprint permanently (Rule-2 semantics), and reactivation
+        deletes the OPEN row (see ``reactivate_claim``), so a later genuine
+        stale event after a flap is a new fingerprint-free insert."""
+        existing = self._db.execute(
+            "SELECT 1 FROM wiki_lint_findings WHERE vault_id = ? AND finding_type = ? "
+            "AND title = ? LIMIT 1",
+            (vault_id, finding_type, title),
+        ).fetchone()
+        if existing:
+            return
+        self._db.execute(
+            """INSERT INTO wiki_lint_findings
+               (vault_id, finding_type, severity, title, details,
+                related_page_ids_json, related_claim_ids_json, status, origin, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'open', 'invalidation', ?, ?)""",
+            (
+                vault_id,
+                finding_type,
+                severity,
+                title,
+                details,
+                json.dumps([page_id]) if page_id is not None else "[]",
+                json.dumps([claim_id]),
+                now,
+                now,
+            ),
+        )
+
     def mark_claims_stale_by_memory(self, memory_id: int, vault_id: int) -> dict:
         """Mark wiki claims stale when their source memory is edited or deleted.
 
-        Same policy as mark_claims_stale_by_file: sole-source → stale,
+        Same policy as mark_claims_stale_by_file: sole-source → superseded,
         multi-source → weak_provenance lint finding.
         """
         stale_count = 0
