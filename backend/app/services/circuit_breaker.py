@@ -10,6 +10,7 @@ import logging
 import time
 from enum import Enum
 from typing import Any, Callable, Optional, TypeVar
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +103,7 @@ class AsyncCircuitBreaker:
         self._fail_counter = 0
         self._success_counter = 0
         self._last_failure_time: Optional[float] = None
+        self._half_open_trial = False
         self._lock = asyncio.Lock()
 
     @property
@@ -117,7 +119,10 @@ class AsyncCircuitBreaker:
     def _transition_to_open(self) -> None:
         """Transition the circuit to OPEN state."""
         self._state = CircuitBreakerState.OPEN
-        self._last_failure_time = time.time()
+        # Monotonic clock: a backward wall-clock step (NTP correction, VM
+        # resume) must not pin an OPEN breaker past its reset timeout
+        # (issue #717).
+        self._last_failure_time = time.monotonic()
         logger.warning(
             "Circuit breaker '%s' opened after %d consecutive failures",
             self.name,
@@ -155,13 +160,14 @@ class AsyncCircuitBreaker:
         self._fail_counter = 0
         self._success_counter = 0
         self._last_failure_time = None
+        self._half_open_trial = False
         logger.info("Circuit breaker '%s' reset to CLOSED", self.name)
 
     def _check_timeout(self) -> None:
         """Check if the reset timeout has expired and transition to half-open."""
         if self._state == CircuitBreakerState.OPEN:
             if self._last_failure_time is not None:
-                elapsed = time.time() - self._last_failure_time
+                elapsed = time.monotonic() - self._last_failure_time
                 if elapsed >= self.reset_timeout:
                     self._transition_to_half_open()
 
@@ -203,6 +209,40 @@ class AsyncCircuitBreaker:
             return await self.call(func, *args, **kwargs)
         return wrapper
 
+    async def acquire_trial_or_raise(self) -> bool:
+        """Admit one caller through the breaker; raise when rejected.
+
+        Returns True when the caller holds the single HALF_OPEN trial slot
+        and MUST later call :meth:`release_trial` (both outcomes); returns
+        False for a CLOSED admission with no slot to release. Raises
+        :class:`CircuitBreakerError` when the breaker is OPEN, or when it is
+        HALF_OPEN and another trial is still in flight — HALF_OPEN admits
+        exactly one bounded trial at a time instead of every concurrent
+        caller (issue #717).
+
+        ``record_failure``/``record_success`` stay lock-free: they are called
+        under ``self._lock`` from :meth:`call`, and callers may already hold
+        the lock (asyncio.Lock is not reentrant).
+        """
+        async with self._lock:
+            self._check_timeout()
+            if self._state == CircuitBreakerState.OPEN:
+                raise CircuitBreakerError(
+                    f"Circuit breaker '{self.name}' is open"
+                )
+            if self._state == CircuitBreakerState.HALF_OPEN:
+                if self._half_open_trial:
+                    raise CircuitBreakerError(
+                        f"Circuit breaker '{self.name}' is half-open with a trial in flight"
+                    )
+                self._half_open_trial = True
+                return True
+        return False
+
+    def release_trial(self) -> None:
+        """Release the HALF_OPEN trial slot acquired via acquire_trial_or_raise."""
+        self._half_open_trial = False
+
     async def call(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         """Call a function with circuit breaker protection.
 
@@ -218,27 +258,24 @@ class AsyncCircuitBreaker:
             CircuitBreakerError: If the circuit is open
             Exception: Any exception raised by the function
         """
-        # Check state under lock
-        async with self._lock:
-            self._check_timeout()
-            if self._state == CircuitBreakerState.OPEN:
-                raise CircuitBreakerError(
-                    f"Circuit breaker '{self.name}' is open"
-                )
-
-        # Execute function without holding lock
+        holds_trial = await self.acquire_trial_or_raise()
         try:
-            result = await func(*args, **kwargs)
-        except Exception:
-            # Record failure under lock
-            async with self._lock:
-                self.record_failure()
-            raise
+            # Execute function without holding lock
+            try:
+                result = await func(*args, **kwargs)
+            except Exception:
+                # Record failure under lock
+                async with self._lock:
+                    self.record_failure()
+                raise
 
-        # Record success under lock
-        async with self._lock:
-            self.record_success()
-        return result
+            # Record success under lock
+            async with self._lock:
+                self.record_success()
+            return result
+        finally:
+            if holds_trial:
+                self.release_trial()
 
 
 def circuit_breaker(cb: AsyncCircuitBreaker) -> Callable[[F], F]:
@@ -295,7 +332,63 @@ reranking_cb = AsyncCircuitBreaker(
     name="reranking",
 )
 
-model_checker_cb = AsyncCircuitBreaker(
+
+def _derive_probe_host_key(base_url: str) -> str:
+    """Derive the per-host breaker key for a model-probe base URL.
+
+    Probes to the same server (scheme + host[:port], any API-route suffix)
+    share one breaker; different servers never do. The setup wizard's
+    operator-typed URL gets its own key, so it can neither charge nor be
+    blocked by a configured endpoint's breaker (issue #717).
+    """
+    parts = urlsplit(base_url.strip())
+    if parts.scheme and parts.netloc:
+        return f"{parts.scheme.lower()}://{parts.netloc}"
+    return base_url
+
+
+class ModelCheckerBreakerRegistry:
+    """Per-host circuit breakers for model probes (issue #717).
+
+    Replaces the single process-global breaker: consecutive failures on host
+    A open A's breaker only, so a dead endpoint can no longer flip healthy
+    endpoints to "unavailable" (FU-004's same-host fail-fast is preserved —
+    the registry exposes the attributes the existing pins read).
+    """
+
+    def __init__(
+        self,
+        fail_max: int = 3,
+        reset_timeout: float = 30,
+        name: str = "model_checker",
+    ) -> None:
+        self.fail_max = fail_max
+        self.reset_timeout = reset_timeout
+        self.name = name
+        self._breakers: "dict[str, AsyncCircuitBreaker]" = {}
+
+    def breaker_for(self, base_url: str) -> AsyncCircuitBreaker:
+        """Return the breaker for the probed host, creating it on first use."""
+        key = _derive_probe_host_key(base_url)
+        breaker = self._breakers.get(key)
+        if breaker is None:
+            breaker = AsyncCircuitBreaker(
+                fail_max=self.fail_max,
+                reset_timeout=self.reset_timeout,
+                name=f"{self.name}:{key}",
+            )
+            self._breakers[key] = breaker
+        return breaker
+
+    def reset(self) -> None:
+        """Reset every per-host breaker and clear the registry."""
+        for breaker in self._breakers.values():
+            breaker.reset()
+        self._breakers.clear()
+        logger.info("model-checker breaker registry reset")
+
+
+model_checker_cb = ModelCheckerBreakerRegistry(
     fail_max=3,
     reset_timeout=30,
     name="model_checker",

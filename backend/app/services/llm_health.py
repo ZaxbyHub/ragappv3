@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional
 
 import httpx
 
+from app.config import settings
 from app.services.embeddings import EmbeddingError, EmbeddingService
 from app.services.llm_client import LLMClient, LLMError
 
@@ -91,9 +92,24 @@ class LLMHealthChecker:
             Status dict with:
             - ok: bool indicating if the service is healthy
             - error: Error message if not healthy, None otherwise
+            - status: "not_configured" when no chat endpoint/model is set
+              (mirrors ModelChecker's first-class state, issue #717).
         """
         client = self._llm_client
         created_locally = False
+
+        if client is None and (
+            not settings.ollama_chat_url or not settings.chat_model
+        ):
+            # Same OR condition ModelChecker uses: an empty URL OR model is
+            # the designed unconfigured state — report it as such instead of
+            # constructing an LLMClient whose SSRF pre-check raises
+            # URLBlocked("URL is empty.") into the generic except branch.
+            return {
+                "ok": False,
+                "status": "not_configured",
+                "error": "chat endpoint not configured (set it in Settings -> Models)",
+            }
 
         try:
             if client is None:
