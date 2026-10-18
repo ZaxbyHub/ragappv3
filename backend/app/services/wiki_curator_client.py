@@ -6,6 +6,15 @@ when it fails. We mirror LLMClient's OpenAI-compatible request shape
 and reuse the same thinking-content sanitizer so the curator's output
 is treated exactly like chat output downstream.
 
+Circuit breaker sharing (issue #795 / T1-35-S-05): compile jobs build a
+fresh CuratorClient per job and cap input at a handful of chunks, so a
+per-instance breaker could never reach fail_max. Breakers now live in a
+module-level registry keyed by (base_url, model) and are shared by every
+client for that endpoint, letting failures accumulate across jobs. The
+registry is created under a threading lock because jobs run their curator
+loops on the single-worker wiki-curator offload executor while direct
+callers (tests, future code) may construct clients from any thread.
+
 SSRF guard: every outbound call assert_curator_url_safe()'s the URL
 first, even though the settings PUT validator did the same. Defense in
 depth: a curator URL persisted before the guard was tightened, or a
@@ -23,6 +32,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -33,6 +43,9 @@ from app.services.circuit_breaker import (
     AsyncCircuitBreaker,
     CircuitBreakerError,
 )
+from app.services.circuit_breaker import (
+    is_outage_status as _is_outage_status,
+)
 from app.services.curator_ssrf import (
     CuratorURLBlocked,
     assert_curator_url_safe,
@@ -41,6 +54,36 @@ from app.services.telemetry import correlation_headers as _correlation_headers
 from app.utils.assistant_sanitizer import sanitize_assistant_content
 
 logger = logging.getLogger(__name__)
+
+
+# One breaker per (endpoint, model), shared across the per-job
+# CuratorClient instances (issue #795 / T1-35-S-05): failure counts must
+# accumulate across compile jobs or fail_max is unreachable (a job makes
+# at most ~3 calls before its client is discarded). Registry growth is
+# bounded by the operator-configured endpoint/model set.
+_BREAKER_REGISTRY: dict[tuple[str, str], AsyncCircuitBreaker] = {}
+_BREAKER_REGISTRY_LOCK = threading.Lock()
+
+
+def _shared_curator_breaker(base_url: str, model: str) -> AsyncCircuitBreaker:
+    key = (base_url or "", model or "")
+    with _BREAKER_REGISTRY_LOCK:
+        breaker = _BREAKER_REGISTRY.get(key)
+        if breaker is None:
+            breaker = AsyncCircuitBreaker(
+                fail_max=5,
+                reset_timeout=60.0,
+                success_threshold=1,
+                name=f"curator:{base_url}",
+            )
+            _BREAKER_REGISTRY[key] = breaker
+        return breaker
+
+
+def _reset_shared_breakers() -> None:
+    """Test/ops helper: drop every shared breaker (fresh failure counts)."""
+    with _BREAKER_REGISTRY_LOCK:
+        _BREAKER_REGISTRY.clear()
 
 
 @dataclass
@@ -67,20 +110,16 @@ class CuratorClient:
         timeout: float = 120.0,
         max_tokens: int = 2048,
         temperature: float = 0.0,
-        breaker_name: str = "curator",
     ):
         self.base_url = (base_url or "").rstrip("/")
         self.model = model or ""
         self.timeout = float(timeout)
         self.max_tokens = int(max_tokens)
         self.temperature = float(temperature)
-        # Independent breaker so curator outages don't trip chat.
-        self._breaker = AsyncCircuitBreaker(
-            fail_max=5,
-            reset_timeout=60.0,
-            success_threshold=1,
-            name=breaker_name,
-        )
+        # Shared per (endpoint, model) so curator failures accumulate
+        # across the per-job client instances (issue #795); independent
+        # of the chat breaker so curator outages never trip chat.
+        self._breaker = _shared_curator_breaker(self.base_url, self.model)
 
     @property
     def endpoint(self) -> str:
@@ -119,7 +158,7 @@ class CuratorClient:
             "stream": False,
         }
 
-        async def _do_post() -> dict:
+        async def _do_post() -> Any:
             # SSRFSafeTransport re-validates the resolved IP at request time to
             # close the DNS-rebinding TOCTOU gap the per-call guard leaves open.
             from app.services.ssrf_transport import SSRFSafeTransport
@@ -137,16 +176,33 @@ class CuratorClient:
                 else:
                     resp = await client.post(self.endpoint, json=payload)
             if resp.status_code >= 300:
-                raise httpx.HTTPStatusError(
-                    f"Curator returned HTTP {resp.status_code}: {resp.text[:200]}",
-                    request=resp.request,
-                    response=resp,
-                )
+                if _is_outage_status(resp.status_code):
+                    raise httpx.HTTPStatusError(
+                        f"Curator returned HTTP {resp.status_code}: {resp.text[:200]}",
+                        request=resp.request,
+                        response=resp,
+                    )
+                # OPS-002 (#494): a non-outage status (4xx except 429) is an
+                # input/configuration error that would recur identically on
+                # every retry — raising it INSIDE the breaker would count a
+                # misconfigured request toward fail_max and open the shared
+                # endpoint breaker. Return the response and let propose raise
+                # AFTER breaker.call, mirroring llm_client's classification.
+                return resp
             return resp.json()
 
         # AsyncCircuitBreaker.call records success/failure for us and
         # raises CircuitBreakerError when the breaker is open.
         data = await self._breaker.call(_do_post)
+
+        if isinstance(data, httpx.Response):
+            # Non-outage error transported out of the breaker wrapper so it
+            # does not count as a breaker failure (see _do_post).
+            raise httpx.HTTPStatusError(
+                f"Curator returned HTTP {data.status_code}: {data.text[:200]}",
+                request=data.request,
+                response=data,
+            )
 
         try:
             content = data["choices"][0]["message"]["content"]
