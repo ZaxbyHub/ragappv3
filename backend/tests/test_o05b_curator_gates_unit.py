@@ -403,27 +403,33 @@ class TestSharedBreakerRegistry(unittest.TestCase):
         errors = []
 
         def worker():
-            with patch.object(wcc.httpx, "AsyncClient", _FailingTransportAsyncClient), \
-                 patch.object(wcc, "assert_curator_url_safe", lambda url: None):
-                c = _client("http://10.10.10.12:3/v1")
+            c = _client("http://10.10.10.12:3/v1")
 
-                def run():
-                    async def call():
-                        barrier.wait(timeout=10)
-                        try:
-                            await c.propose([{"role": "user", "content": "x"}])
-                        except Exception as e:  # noqa: BLE001 - recorded
-                            return e
-                    return asyncio.run(call())
+            def run():
+                async def call():
+                    barrier.wait(timeout=10)
+                    try:
+                        await c.propose([{"role": "user", "content": "x"}])
+                    except Exception as e:  # noqa: BLE001 - recorded
+                        return e
+                return asyncio.run(call())
 
-                errors.append(run())
+            errors.append(run())
 
-        t1 = threading.Thread(target=worker)
-        t2 = threading.Thread(target=worker)
-        t1.start()
-        t2.start()
-        t1.join(timeout=30)
-        t2.join(timeout=30)
+        # Patch in the MAIN thread only (impl-review round 3): two threads
+        # entering patch.object on the same module-global targets race their
+        # save/restore pairs, and the last thread out restores the OTHER
+        # thread's stub instead of the original — leaking the mock
+        # process-wide (intermittently disabled the real SSRF guard for
+        # later tests in the same pytest worker).
+        with patch.object(wcc.httpx, "AsyncClient", _FailingTransportAsyncClient), \
+             patch.object(wcc, "assert_curator_url_safe", lambda url: None):
+            t1 = threading.Thread(target=worker)
+            t2 = threading.Thread(target=worker)
+            t1.start()
+            t2.start()
+            t1.join(timeout=30)
+            t2.join(timeout=30)
         self.assertFalse(t1.is_alive() and t2.is_alive())
         self.assertEqual(len(errors), 2)
         for e in errors:
