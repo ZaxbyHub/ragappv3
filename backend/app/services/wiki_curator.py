@@ -210,12 +210,49 @@ def _quote_matches(quote: str, source_text: str, *, fuzzy_threshold: int = 92) -
     if alignment is None or alignment.score < fuzzy_threshold:
         return False
     # src_* indexes the quote (s1); dest_* indexes the source (s2).
-    window = ns[alignment.dest_start : alignment.dest_end]
+    window = ns[
+        _expand_to_digit_boundary(ns, alignment.dest_start, backward=True) :
+        _expand_to_digit_boundary(ns, alignment.dest_end, backward=False)
+    ]
     if not _numeric_submultiset(_numeric_multiset(nq), _numeric_multiset(window)):
         # A number the aligned window does not carry is a different fact,
         # no matter how highly the fuzzy score ranks it.
         return False
     return True
+
+
+def _expand_to_digit_boundary(text: str, index: int, *, backward: bool) -> int:
+    """Grow a window edge so it never lands mid-digit-run (issue #795 review).
+
+    A raw partial_ratio_alignment cut inside a longer source number would
+    tokenize the truncated prefix as if it were the source's whole number,
+    letting a mutated quote number verify against its own truncation
+    (e.g. quote "…1215." vs source "…121563981…"). Expand across digits
+    (and a decimal point between digits) until the edge sits on a
+    non-digit-run character.
+    """
+    n = len(text)
+    if backward:
+        while index > 0 and (
+            text[index - 1].isdigit()
+            or (
+                text[index - 1] == "."
+                and index - 2 >= 0
+                and text[index - 2].isdigit()
+            )
+        ):
+            index -= 1
+        return index
+    while index < n and (
+        text[index].isdigit()
+        or (
+            text[index] == "."
+            and index + 1 < n
+            and text[index + 1].isdigit()
+        )
+    ):
+        index += 1
+    return index
 
 
 def _dedupe_key(

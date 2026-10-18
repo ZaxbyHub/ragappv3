@@ -82,19 +82,46 @@ change (the settings label carries no per-call phrasing).
   rejected wholesale as `json_parse_failed` (the complete claims array is
   not salvaged); removing `entities`/`relations` shrank, not eliminated,
   that loss window. Pinned by test.
-- Numeric containment is position-blind within the aligned window: a quote
-  number that coincidentally occurs anywhere in its OWN tight window
-  satisfies the gate. Not constructable end-to-end at the >= 92 threshold
-  (probed shapes score 68-84); pinned at the helper level as documented
-  behavior.
+- Numeric containment is order/position-blind: the quote's numbers are
+  checked for multiset containment in the aligned window, so a quote whose
+  numbers are SWAPPED relative to the source ("region A had 5 ... region B
+  had 3" restated as "region A had 3 ... region B had 5") verifies at
+  >= 92 whenever the window carries both values. This IS constructable
+  end-to-end (shapes score 94-98) and is pinned as documented residual
+  behavior by test; a classical LLM paraphrase error can therefore
+  auto-activate under `active_if_verified`. Window edges are now expanded
+  to whole digit-token boundaries (a truncated prefix like "1215" for a
+  source "121563981" no longer verifies), but a quote that is a verbatim
+  character substring of the source (e.g. "5000" inside "50000") still
+  verifies via the strict substring path -- pre-existing behavior,
+  unchanged by this PR. An order-aware numeric check is future work.
 - A non-outage >= 300 response records SUCCESS on the shared breaker
   (OPS-002 pattern-consistent), so interleaved config errors reset the
-  CLOSED failure counter and can defer `fail_max` accumulation.
+  CLOSED failure counter and can defer `fail_max` accumulation; a 4xx
+  seen while HALF_OPEN likewise closes the breaker (success_threshold=1).
+  The breaker identity is the constant "curator" (the breaker identity
+  never carries the operator URL).
 - Cross-job curator calls now serialize through the single-worker offload
   executor (the concurrency knob still bounds parallel calls within one
-  job). Direct `CuratorClient.propose()` callers outside the compiler could
-  drive one breaker from concurrent event loops; the nanosecond lock window
-  is disclosed and pinned by a concurrency test.
+  job); the executor wait is untimed, so a very slow curator run delays
+  subsequent curator runs process-wide. Direct `CuratorClient.propose()`
+  callers outside the compiler could drive one breaker from concurrent
+  event loops; the nanosecond lock window is disclosed and pinned by a
+  concurrency test.
+- An accepted claim whose cited chunk was unknown (`require_chunk_id`
+  off) persists with a NULL-file source row: it can never be auto-promoted
+  via the claim PUT route (which requires a document-file source), it is
+  invisible to file-scoped bookkeeping (stale-marking, page staleness),
+  and the source dedupe treats all NULL-file document sources of the same
+  claim as one lineage (a second distinct quote/chunk for the same claim
+  text is not re-attached).
+- Claims that pre-date this PR and carry `chunks[0]`-fabricated file
+  lineage (minted before the fallback was removed) are not repaired or
+  re-attributed by this change.
+- Reactivation is now gated on the candidate's own computed status: a
+  `needs_review` candidate (draft mode, unknown chunk, quote check off)
+  can no longer flip a superseded claim to active; previously such a flip
+  also deleted the claim's open `stale` lint finding.
 - The per-document span is `max(2000, max_input_chars)` — a knob set below
   2000 still curates 2000 chars (one chunk); pre-existing behavior, now
   stated in the compiler comment.

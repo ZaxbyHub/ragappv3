@@ -7,10 +7,14 @@ and reuse the same thinking-content sanitizer so the curator's output
 is treated exactly like chat output downstream.
 
 Circuit breaker sharing (issue #795 / T1-35-S-05): compile jobs build a
-fresh CuratorClient per job and cap input at a handful of chunks, so a
-per-instance breaker could never reach fail_max. Breakers now live in a
-module-level registry keyed by (base_url, model) and are shared by every
-client for that endpoint, letting failures accumulate across jobs. The
+fresh CuratorClient per job. At the default bounds a job makes ~3 curator
+calls, and per-instance breakers discarded with the client could not
+accumulate enough failures to reach fail_max; at the documented
+max_input_chars maximum a single job makes up to 12 calls, so sharing (not
+just accumulation) is what keeps misconfiguration from opening the breaker.
+Breakers live in a module-level registry keyed by (base_url, model) and are
+shared by every client for that endpoint, letting genuine outage failures
+accumulate across jobs. The
 registry is created under a threading lock because jobs run their curator
 loops on the single-worker wiki-curator offload executor while direct
 callers (tests, future code) may construct clients from any thread.
@@ -74,14 +78,24 @@ def _shared_curator_breaker(base_url: str, model: str) -> AsyncCircuitBreaker:
                 fail_max=5,
                 reset_timeout=60.0,
                 success_threshold=1,
-                name=f"curator:{base_url}",
+                # Constant name (issue #795 review): the name reaches
+                # WARNING/INFO logs and CircuitBreakerError messages that
+                # flow into result_json.curator.errors, which vault READERS
+                # can fetch -- the operator URL must stay out of it (the URL
+                # is INFRA_REDACTED for exactly this reason). Sharing is
+                # keyed on (base_url, model) above, not on the name.
+                name="curator",
             )
             _BREAKER_REGISTRY[key] = breaker
         return breaker
 
 
 def _reset_shared_breakers() -> None:
-    """Test/ops helper: drop every shared breaker (fresh failure counts)."""
+    """Test helper: drop every shared breaker (fresh failure counts).
+
+    Not wired to settings reconfiguration -- no production caller (an
+    endpoint/model reconfiguration self-heals via a new registry key).
+    """
     with _BREAKER_REGISTRY_LOCK:
         _BREAKER_REGISTRY.clear()
 
@@ -189,20 +203,25 @@ class CuratorClient:
                 # endpoint breaker. Return the response and let propose raise
                 # AFTER breaker.call, mirroring llm_client's classification.
                 return resp
-            return resp.json()
+            # json() stays OUTSIDE the breaker wrap (mirrors llm_client): a
+            # 200 with a non-JSON body is a parse error, not an endpoint
+            # outage, and must not count toward fail_max.
+            return resp
 
         # AsyncCircuitBreaker.call records success/failure for us and
         # raises CircuitBreakerError when the breaker is open.
         data = await self._breaker.call(_do_post)
 
         if isinstance(data, httpx.Response):
-            # Non-outage error transported out of the breaker wrapper so it
-            # does not count as a breaker failure (see _do_post).
-            raise httpx.HTTPStatusError(
-                f"Curator returned HTTP {data.status_code}: {data.text[:200]}",
-                request=data.request,
-                response=data,
-            )
+            if data.status_code >= 300:
+                # Non-outage error transported out of the breaker wrapper so
+                # it does not count as a breaker failure (see _do_post).
+                raise httpx.HTTPStatusError(
+                    f"Curator returned HTTP {data.status_code}: {data.text[:200]}",
+                    request=data.request,
+                    response=data,
+                )
+            data = data.json()
 
         try:
             content = data["choices"][0]["message"]["content"]

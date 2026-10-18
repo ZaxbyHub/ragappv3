@@ -272,6 +272,12 @@ class TestPromptSchema(unittest.TestCase):
 
 
 class TestTruncationResidualPin(unittest.TestCase):
+    def setUp(self):
+        self._snap = _snapshot_flags()
+
+    def tearDown(self):
+        _restore_flags(self._snap)
+
     def test_truncated_in_open_questions_still_json_parse_failed(self):
         # Disclosed residual (approved plan): a reply truncated inside a
         # post-claims section (here open_questions) leaves an unbalanced
@@ -365,10 +371,14 @@ class TestSharedBreakerRegistry(unittest.TestCase):
                 except Exception as e:
                     last_a = e
             self.assertEqual(type(last_a).__name__, "CircuitBreakerError")
-            # Different endpoint: its own breaker is still CLOSED.
+            # Different endpoint: its own breaker is still CLOSED. Assert
+            # on BOTH paths -- a success must also fail the isolation check
+            # (the shared breaker must NOT have absorbed endpoint b).
             try:
                 self._propose(b)
-            except Exception as e:
+                self.fail("endpoint b should still be failing (its own "
+                          "breaker CLOSED means the raw ConnectError raises)")
+            except Exception as e:  # noqa: BLE001 - asserted below
                 self.assertEqual(type(e).__name__, "ConnectError")
 
     def test_non_outage_404_does_not_count(self):
@@ -430,7 +440,7 @@ class TestSharedBreakerRegistry(unittest.TestCase):
             t2.start()
             t1.join(timeout=30)
             t2.join(timeout=30)
-        self.assertFalse(t1.is_alive() and t2.is_alive())
+        self.assertFalse(t1.is_alive() or t2.is_alive())
         self.assertEqual(len(errors), 2)
         for e in errors:
             self.assertIsNotNone(e)

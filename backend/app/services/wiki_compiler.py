@@ -10,6 +10,7 @@ wiki claim when its source_quote verifies against the chunk it cites.
 
 import asyncio
 import concurrent.futures
+import contextvars
 import json
 import logging
 import re
@@ -1170,7 +1171,10 @@ class WikiCompiler:
             # two concurrent jobs could drive two concurrent event loops
             # against one shared curator breaker. The single worker
             # serializes every curator loop process-wide; within a job the
-            # concurrency knob still bounds parallel propose calls.
+            # concurrency knob still bounds parallel propose calls. The
+            # wait on the result is intentionally untimed: the per-call
+            # HTTP timeout bounds each request, and the curator must never
+            # fail the enclosing job.
             coro = curator.curate(
                 vault_id=vault_id,
                 file_id=file_id,
@@ -1179,8 +1183,14 @@ class WikiCompiler:
                 existing_entities_brief=existing_brief,
                 deterministic_dedupe_keys=dedupe_seed,
             )
+            # Issue #795 review: submit does NOT copy contextvars, so a bare
+            # submit(asyncio.run, coro) would drop the caller's request
+            # identity (traceparent/X-Request-ID) from every curator POST
+            # and log line. Copy the context here and run the coroutine
+            # inside it on the worker thread.
+            submit_ctx = contextvars.copy_context()
             cur_result = _CURATOR_OFFLOAD_EXECUTOR.submit(
-                asyncio.run, coro
+                submit_ctx.run, asyncio.run, coro
             ).result()
         except Exception as e:  # broad — curator must never fail the job
             logger.warning(
@@ -1238,7 +1248,16 @@ class WikiCompiler:
                         # knowledge (the curator's find-or-create
                         # deliberately omits reactivation to keep
                         # pair-atomicity, so the flip must be inline too).
-                        if existing.status == "superseded":
+                        # Issue #795 review: gate on THIS candidate's own
+                        # computed status — the deterministic twin gates
+                        # identically (new_status == "active") — so a
+                        # needs_review candidate (draft mode, unknown
+                        # chunk, quote check off) can never resurrect a
+                        # superseded claim as active.
+                        if (
+                            existing.status == "superseded"
+                            and accepted.status == "active"
+                        ):
                             self._store.reactivate_claim_if_superseded(existing.id)
                             existing.status = "active"
                         already = any(
@@ -1381,7 +1400,7 @@ class WikiCompiler:
         max_input = int(getattr(_app_settings, "wiki_llm_curator_max_input_chars", 6000))
         budget = max(_COMPILE_CHUNK_SIZE, max_input)
         # Take from the start of the text up to budget. This is the
-        # per-document curated span — the knob's documented semantics
+        # per-document curated span (never below one 2000-char chunk) — the knob's documented semantics
         # (issue #795) — NOT a per-call prompt bound; build_user_prompt
         # re-applies its own bound to each call's chunk snippet, so we
         # don't need to paginate here.
