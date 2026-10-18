@@ -1161,15 +1161,6 @@ class WikiCompiler:
 
         try:
             # The compiler is sync, but CuratorClient.propose is async.
-            # When called from inside a running event loop (e.g. an
-            # async FastAPI handler), we can't block on the same loop —
-            # run_coroutine_threadsafe().result() would deadlock it. The
-            # safe sync→async bridge from inside a running loop is to
-            # run the coroutine in a worker thread. Reuse a module-level
-            # executor (issue #109) so we don't pay the per-call cost
-            # of constructing+tearing-down a ThreadPoolExecutor on the
-            # curator hot path.
-            # The compiler is sync, but CuratorClient.propose is async.
             # Issue #795: ALWAYS dispatch through the module-level
             # single-worker offload executor (issue #109). The previous
             # inline asyncio.run branch ran whenever no loop was active in

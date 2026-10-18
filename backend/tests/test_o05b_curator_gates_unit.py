@@ -124,6 +124,19 @@ class TestQuoteMatchesWindows(unittest.TestCase):
             _quote_matches("The session lasts 300 minutes.", "The session lasts 30 minutes.")
         )
 
+    def test_mutated_number_co_occurring_outside_window_rejected(self):
+        # Implementation-review round 1 finding: the mutation's value DOES
+        # occur in the chunk ("Page 7.") but OUTSIDE the aligned window —
+        # whole-chunk CONTAINMENT (the wrong-scope gate in weakened form)
+        # accepts this materially mutated fact; the window gate rejects it.
+        # Probed score 96.00, window nums {30}, quote nums {7}.
+        q = "The upgrade took 7 minutes to complete the rollout"
+        src = "Page 7. The upgrade took 30 minutes to complete the rollout."
+        self.assertGreaterEqual(
+            __import__("rapidfuzz").fuzz.partial_ratio(q.lower(), src.lower()), 92
+        )
+        self.assertFalse(_quote_matches(q, src))
+
     def test_quote_at_end_of_long_numeric_chunk_accepted(self):
         # Discriminates the dest/src slicing bug (plan-critic round 1):
         # the quote's window is the FINAL sentence; a src-sliced window
