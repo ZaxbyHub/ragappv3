@@ -60,7 +60,12 @@ from app.services.query_transformer import QueryPlanner, QueryTransformer
 from app.services.rag_trace import RAGTrace
 from app.services.retrieval_evaluator import RetrievalEvaluator
 from app.services.telemetry import _status_to_outcome, current_turn_id, get_telemetry
-from app.services.vector_store import SearchSemaphoreTimeoutError, VectorStore
+from app.services.vector_store import (
+    SearchSemaphoreTimeoutError,
+    VectorStore,
+    end_request_fts_attribution,
+    start_request_fts_attribution,
+)
 from app.services.vision_evidence import (
     VisionRunContext,
     apply_vision_to_sources,
@@ -991,7 +996,14 @@ class RAGEngine:
         #   - full trace assembly (no extended trace logged to evidence)
         # Use the standard pipeline below for those features.
         # ------------------------------------------------------------------
-        if settings.agentic_rag_enabled:
+        # PRR-003 (#715 feedback): under maintenance the agentic path would
+        # swallow the choke-point raise (RetrievalTool converts it to a
+        # failed ToolResult) and synthesize an ungrounded answer with zero
+        # degraded signal. Fall through to the standard pipeline, whose
+        # maintenance gates produce the fallback notice and the
+        # "unavailable" abstention basis.
+        agentic_active = settings.agentic_rag_enabled and not self.maintenance_mode
+        if agentic_active:
             logger.info("[query] Agentic RAG enabled — routing through AgenticPlanner")
             # DEFENSE-IN-DEPTH NOTE (zaxbysauce review, Z-1): this early return
             # bypasses the include_global / can_write_memory gates below because
@@ -1020,6 +1032,14 @@ class RAGEngine:
                 registry.register(synthesis_tool)
                 planner = AgenticPlanner(registry, llm_client=self.llm_client)
                 result = await planner.plan_and_execute(user_input, vault_id=vault_id)
+                # #715 TQ-instruction-batch-4-07: the planner's source dicts
+                # carried a private _chunk_text evidence channel for
+                # SynthesisTool. Strip it in place BEFORE any yield — both
+                # wire boundaries below (agentic_done["sources"] and the
+                # evidence_candidates event) share these dicts, and neither
+                # may ship full chunk text to the client.
+                for _agentic_src in result.all_sources:
+                    _agentic_src.pop("_chunk_text", None)
                 yield {"type": "content", "content": result.output}
                 agentic_done: Dict[str, Any] = {
                     "sources": result.all_sources,
@@ -2030,6 +2050,20 @@ class RAGEngine:
                 "results": [],
                 "total": 0,
                 "fallback": True,
+                # #715 T1-32-K-01: every chunk consumer reads `content` — a
+                # degraded-retrieval notice here makes the outage visible in
+                # the transcript instead of rendering as an empty turn that
+                # looks like a legitimate abstention. FIXED generic text:
+                # fallback_reason is str(exc) on the generic error path, and
+                # exception detail belongs in the server-side WARNING (and
+                # the `reason` field), never in client-visible content
+                # (A04/#562 leak hygiene). The trailing "\n\n" keeps the
+                # notice a separate block from the answer in both route
+                # collectors.
+                "content": (
+                    "Retrieval is degraded, so this answer is not grounded "
+                    "in retrieved documents.\n\n"
+                ),
             }
 
         # Collect memories from the task launched concurrently above (hybrid:
@@ -2298,7 +2332,12 @@ class RAGEngine:
             abstention_decision: Optional[bool] = False
         elif not done_msg.get("sources") and not done_msg.get("memories_used") \
                 and not done_msg.get("wiki_used") and not done_msg.get("kms_used"):
-            abstention_decision = True
+            # #715 T1-32-K-01: a retrieval-degraded turn (fallback_reason set)
+            # never offered the model evidence to decide over — that is
+            # "unavailable", not a legitimate "nothing relevant" decision.
+            # Cited answers keep the explicit False above: citing
+            # memories/wiki/kms during document degradation is a real decision.
+            abstention_decision = None if fallback_reason else True
         else:
             abstention_decision = None
         done_msg["answer_contract"] = build_answer_contract(
@@ -2773,6 +2812,14 @@ class RAGEngine:
         per_sub_results: List[List[Dict[str, Any]]] = []
         for i, result in enumerate(gathered):
             sq = retrieval_tasks[i][0] if i < len(retrieval_tasks) else f"<sub_query_{i}>"
+            if isinstance(result, SearchSemaphoreTimeoutError):
+                # OPS-006 (issue #494/#715 T1-32-S2-01): a search-capacity
+                # timeout on ANY sub-query is a server-busy signal for the
+                # whole turn — propagate it before fusion (and before the
+                # all-failed fallback re-contends the same saturated
+                # semaphore a second time) so the outer handlers surface the
+                # documented 503 contract.
+                raise result
             if isinstance(result, BaseException):
                 failed_sub_queries.append(sq)
                 logger.warning(
@@ -2945,7 +2992,10 @@ class RAGEngine:
                         "failed, keeping fused order: %s",
                         exc,
                     )
-                    agg_rerank_success = None
+                    # #715 T1-32-K-06 (sibling): attempted-and-failed maps to
+                    # "fallback" here too, mirroring _execute_retrieval's
+                    # exception semantics, never the turned-off "disabled".
+                    agg_rerank_success = False
             score_type = "rerank" if agg_rerank_success else "distance"
             if agg_rerank_success is True:
                 agg_rerank_status = "ok"
@@ -3011,6 +3061,16 @@ class RAGEngine:
             self.retrieval_top_k,
             len(query_embeddings),
         )
+        # OPS-005 (issue #494) / #715 T1-32-K-08: single choke point. Every
+        # retrieval surface (standard query, multi-sub-query fan-out, eval,
+        # retrieve_sources' document kinds, agentic RetrievalTool) reaches the
+        # store through here, so the maintenance gate belongs here rather than
+        # at each call site. Callers absorb the raise: query()'s upstream gates
+        # keep their fallback-answer UX, retrieve_eval_results surfaces
+        # ``unavailable``, retrieve_sources records the kind as failed, and
+        # RetrievalTool returns a failed ToolResult.
+        if self.maintenance_mode:
+            raise RAGEngineError("RAG index is under maintenance")
         # Controls arrive exclusively via explicit parameters (PR #523 review
         # PRR-001): the former per-query engine-state fallback read
         # self._active_* instance attributes that raced across concurrent
@@ -3022,6 +3082,10 @@ class RAGEngine:
         rerank_success: Optional[bool] = None
         fts_exceptions = 0  # Initialize before try in case get_fts_exceptions() raises
         final_relevance_hint: Optional[str] = None  # Initialize before try block
+        # #715 T1-32-S-06: request-scoped FTS attribution window. Opened below
+        # just before the search tasks are created, closed in the finally after
+        # the diagnostics read — never left dangling on a raised path.
+        fts_attribution_token = None
 
         # Phase 1: Search phase - original query failures propagate immediately
         vector_results = []
@@ -3054,6 +3118,11 @@ class RAGEngine:
                 _alpha = effective_alpha
             _top_k = int(top_k_value) if top_k_value is not None else 10
             _vault = str(vault_id) if vault_id is not None else None
+            # #715 T1-32-S-06: open the per-request FTS attribution window
+            # BEFORE the search tasks exist — gather-created Tasks inherit the
+            # buffer object through their copied context, so every increment
+            # inside this request's searches lands on this request's buffer.
+            fts_attribution_token, _fts_buffer = start_request_fts_attribution()
             search_tasks = [
                 self.vector_store.search(
                     embedding_tuple[1],  # Extract embedding from (variant_type, embedding) tuple
@@ -3254,7 +3323,11 @@ class RAGEngine:
                     )
                 except Exception as e:
                     logger.warning("Reranking failed, using original results: %s", e)
-                    # rerank_success remains None (unattempted due to exception)
+                    # #715 T1-32-K-06: the rerank WAS attempted and failed —
+                    # that maps to status "fallback", not "disabled" (the
+                    # turned-off value), so operators can tell a reranker
+                    # outage from a configuration choice.
+                    rerank_success = False
 
             # Determine final rerank_success value
             # rerank_success is set inside the reranking block (from unpacking)
@@ -3280,8 +3353,11 @@ class RAGEngine:
             else:
                 score_type = "distance"
 
-            # Compute hybrid_status from _fts_status in results
-            if not self.hybrid_search_enabled:
+            # Compute hybrid_status from the EFFECTIVE per-query hybrid flag
+            # (#715 T1-32-K-06): retrieval_mode "semantic" resolves _hybrid to
+            # False above, and reporting "both"/"dense_only" for a dense-only
+            # query would claim a lexical arm that never ran.
+            if not _hybrid:
                 hybrid_status = "disabled"
             else:
                 # Check if any result has _fts_status='ok'
@@ -3320,6 +3396,14 @@ class RAGEngine:
             fts_exceptions = 0
             rerank_status = "disabled"
             exact_match_promoted = False
+        finally:
+            # #715 T1-32-S-06: close the attribution window on every exit
+            # path. On the normal path the get_fts_exceptions() read above
+            # has already consumed this request's buffer; on a raised path
+            # the unconsumed buffer is simply discarded.
+            if fts_attribution_token is not None:
+                end_request_fts_attribution(fts_attribution_token)
+                fts_attribution_token = None
 
         # Phase 2: Evaluation/post-processing phase (only reached if search succeeds with results)
         token_pack_stats: Dict[str, int] = {
@@ -3430,15 +3514,13 @@ class RAGEngine:
         else:
             score_type = "distance"
 
-        # Compute hybrid_status from _fts_status in results
-        if not self.hybrid_search_enabled:
-            hybrid_status = "disabled"
-        else:
-            # Check if any result has _fts_status='ok'
-            has_fts_ok = any(
-                r.get("_fts_status") == "ok" for r in vector_results
-            )
-            hybrid_status = "both" if has_fts_ok else "dense_only"
+        # hybrid_status was already derived inside the search try-block from
+        # the EFFECTIVE per-query hybrid flag (#715 T1-32-K-06); the former
+        # second derivation here was flag-blind (self.hybrid_search_enabled)
+        # and unconditionally overwrote that value before the return, so the
+        # per-query fix never reached callers. Removed — the in-try value is
+        # authoritative, including on the except path (which sets
+        # "disabled").
 
         # Compute rerank_status string from rerank_success boolean
         if rerank_success is True:
@@ -4036,7 +4118,11 @@ class RAGEngine:
             finally:
                 pool.release_connection(conn)
         except Exception as exc:
-            logger.debug("_get_indexed_file_ids failed: %s", exc)
+            # #715 T1-32-K-05: the atomic-visibility filter (issue #13) just
+            # silently disabled itself — that is an operational degradation,
+            # not debug noise. WARNING so operators can see partial-ingest
+            # state leaking into prompts when the DB layer fails.
+            logger.warning("_get_indexed_file_ids failed: %s", exc)
             return None
 
     def _get_scoped_partial_file_ids(
