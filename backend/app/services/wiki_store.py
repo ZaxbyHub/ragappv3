@@ -16,7 +16,11 @@ from typing import Any, Iterator, Optional
 
 from app.config import settings
 from app.services.fts_query import FTS_CANDIDATE_CAP, build_fts_match_query
-from app.services.job_lease import JobLease, ensure_jobs_schema
+from app.services.job_lease import (
+    JobLease,
+    ensure_jobs_schema,
+    redact_legacy_error_text,
+)
 
 WIKI_QUEUE = "wiki"
 
@@ -372,7 +376,9 @@ def _to_compile_job(row: sqlite3.Row) -> WikiCompileJob:
         trigger_type=d["trigger_type"],
         trigger_id=d.get("trigger_id"),
         status=d["status"],
-        error=d.get("error"),
+        # Issue #953: pre-redaction rows pass through the legacy-error mask
+        # so the lease-rollback read path never surfaces raw str(exc) text.
+        error=redact_legacy_error_text(d.get("error")),
         result_json=d.get("result_json") or "{}",
         created_at=d["created_at"],
         started_at=d.get("started_at"),
@@ -405,7 +411,10 @@ def _compile_job_from_jobs_row(row: sqlite3.Row) -> WikiCompileJob:
         trigger_type=payload.get("trigger_type") or "manual",
         trigger_id=payload.get("trigger_id"),
         status=d["status"],
-        error=d.get("error"),
+        # Issue #953: rows written before the #951 write-time redaction
+        # (and legacy rows the boot sync copies forward) still hold raw
+        # str(exc) text; mask it at read time, codes pass through.
+        error=redact_legacy_error_text(d.get("error")),
         result_json=d.get("result_json") or "{}",
         created_at=d["created_at"],
         started_at=d.get("started_at"),
@@ -1539,6 +1548,11 @@ class WikiStore:
 
         The ``status = 'failed'`` predicate makes the check-and-flip atomic:
         a job that was concurrently cancelled or completed cannot be reset.
+        Issue #956: an operator-initiated retry grants a full fresh attempt
+        budget — ``attempts`` resets to 0, so the next
+        ``jobs_max_attempts`` claims are real attempts instead of an
+        immediate cap-settle. The janitor's reclaim accounting is a
+        separate SQL path and is unaffected.
         """
         if _lease_enabled():
             ensure_jobs_schema(self._db)
@@ -1546,7 +1560,7 @@ class WikiStore:
                 "UPDATE jobs SET status = 'pending', error = NULL, "
                 "started_at = NULL, completed_at = NULL, run_after = NULL, "
                 "worker_id = NULL, lease_generation = lease_generation + 1, "
-                "heartbeat_at = NULL "
+                "heartbeat_at = NULL, attempts = 0 "
                 "WHERE id = ? AND queue = ? "
                 "AND CASE WHEN json_valid(payload_json) "
                 "THEN CAST(json_extract(payload_json, '$.vault_id') AS INTEGER) "

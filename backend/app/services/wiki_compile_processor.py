@@ -7,6 +7,7 @@ All DB work runs in threads via asyncio.to_thread() since SQLite is sync.
 """
 
 import asyncio
+import functools
 import json
 import logging
 from typing import TYPE_CHECKING, Optional
@@ -42,6 +43,12 @@ PAYLOAD_MALFORMED_ERROR = (
     "PAYLOAD_MALFORMED: compile job payload is corrupt; see server logs"
 )
 
+# Issue #955: on start(), re-announce wiki jobs that went terminal within
+# this window so a shutdown/crash between a terminal commit and its event
+# publish cannot strand the SSE UI on stale state (bounded: consumers are
+# refetch-driven, a duplicate terminal event is a benign extra refetch).
+WIKI_EVENT_RECONCILE_WINDOW_SECONDS = 30
+
 
 def _lease_enabled() -> bool:
     """Stage-2 lease switch (issue #559): env-only, process-start-stable."""
@@ -66,6 +73,11 @@ class WikiCompileProcessor:
         # complete/fail is fenced on this id, so a reclaimed worker's late
         # write can never mutate the new owner's row.
         self._worker_id = f"wiki-compile-{id(self)}"
+        # Issue #955 review: the app event loop, captured at start() so the
+        # threaded fail-and-publish / boot-reconcile units can marshal their
+        # event publishes onto the loop the bus and SSE subscribers run on
+        # (the bus's put_nowait is same-loop only).
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
         # Strong references to detached background tasks (e.g. delayed
         # auto-retry resets) so CPython does not garbage-collect them
         # mid-flight (issue #276 E2-3). Tasks remove themselves on completion
@@ -78,6 +90,7 @@ class WikiCompileProcessor:
         self._generation += 1
         generation = self._generation
         self._running = True
+        self._loop = asyncio.get_running_loop()
         try:
             # The startup reset task is created unconditionally in BOTH modes
             # so the lifecycle contract holds (reset task published first,
@@ -87,7 +100,7 @@ class WikiCompileProcessor:
             # settlement, and the blanket orphan reset must not run.
             reset_task = self._startup_reset_task
             if reset_task is None or reset_task.done():
-                reset_coro = asyncio.to_thread(self._reset_orphans)
+                reset_coro = asyncio.to_thread(self._startup_reset_and_reconcile)
                 try:
                     reset_task = asyncio.create_task(reset_coro)
                 except BaseException:
@@ -279,20 +292,17 @@ class WikiCompileProcessor:
                         "WikiCompileProcessor: job id=%d failed: %s", job.id, exc
                     )
                     try:
-                        new_retry_count = await asyncio.to_thread(
-                            self._fail_job, job.id, FAILED_ERROR_CODE, self._worker_id
+                        # Issue #955: the terminal commit AND its event
+                        # publish run as ONE threaded unit — the publish
+                        # used to sit after the await in the poll task, so
+                        # a stop() cancellation delivered at that await
+                        # committed the terminal row but skipped the event
+                        # (executor threads are not interrupted by task
+                        # cancellation, so both steps complete together).
+                        spawn_reset, new_retry_count = await asyncio.to_thread(
+                            self._fail_job_and_publish, job, self._worker_id
                         )
-                        if _lease_enabled():
-                            # fail_job already requeued the row with a durable
-                            # ``run_after`` backoff, or settled it terminally
-                            # at jobs_max_attempts — no detached reset here.
-                            if new_retry_count >= max(
-                                int(settings.jobs_max_attempts), 1
-                            ):
-                                self._publish_event(
-                                    job, "job_failed", error=FAILED_ERROR_CODE
-                                )
-                        elif new_retry_count < MAX_RETRIES:
+                        if spawn_reset:
                             backoff = 2.0 ** new_retry_count
                             logger.info(
                                 "WikiCompileProcessor: job id=%d will auto-retry (%d/%d) in %.0fs",
@@ -306,12 +316,6 @@ class WikiCompileProcessor:
                             # A6-1 status guard makes a cancel-during-delay a
                             # safe no-op.
                             self._spawn_delayed_reset(job.id, backoff)
-                        else:
-                            logger.error(
-                                "WikiCompileProcessor: job id=%d permanently failed after %d retries",
-                                job.id, new_retry_count,
-                            )
-                            self._publish_event(job, "job_failed", error=FAILED_ERROR_CODE)
                     except Exception as e2:
                         logger.error(
                             "WikiCompileProcessor: could not mark job id=%d failed: %s", job.id, e2
@@ -366,6 +370,142 @@ class WikiCompileProcessor:
                 job.id, PAYLOAD_MALFORMED_ERROR, worker_id=self._worker_id
             )
             return True
+
+    def _fail_job_and_publish(self, job, worker_id: str) -> tuple[bool, int]:
+        """Fail the job and publish its terminal event in ONE threaded unit.
+
+        Issue #955: runs ``_fail_job`` (the terminal commit) and, when the
+        row settles terminally, the ``job_failed`` publish together inside
+        the worker thread the poll loop awaits — a task cancellation
+        delivered at the ``await asyncio.to_thread(...)`` can no longer
+        land between the two (executor threads run to completion).
+        Returns ``(spawn_reset, new_retry_count)``: ``spawn_reset`` is True
+        only for the legacy-mode below-cap retry arm, whose delayed reset
+        is asyncio work the caller must schedule.
+        """
+        new_retry_count = self._fail_job(
+            job.id, FAILED_ERROR_CODE, worker_id
+        )
+        if _lease_enabled():
+            # fail_job already requeued the row with a durable
+            # ``run_after`` backoff, or settled it terminally
+            # at jobs_max_attempts — no detached reset here.
+            if new_retry_count >= max(int(settings.jobs_max_attempts), 1):
+                self._marshal_publish(
+                    functools.partial(
+                        self._publish_event,
+                        job,
+                        "job_failed",
+                        error=FAILED_ERROR_CODE,
+                    )
+                )
+            return False, new_retry_count
+        if new_retry_count < MAX_RETRIES:
+            return True, new_retry_count
+        logger.error(
+            "WikiCompileProcessor: job id=%d permanently failed after %d retries",
+            job.id, new_retry_count,
+        )
+        self._marshal_publish(
+            functools.partial(
+                self._publish_event,
+                job,
+                "job_failed",
+                error=FAILED_ERROR_CODE,
+            )
+        )
+        return False, new_retry_count
+
+    def _startup_reset_and_reconcile(self) -> None:
+        """Startup thread body: the orphan reset, then the #955 terminal-
+        event reconcile — ONE threaded unit so start() keeps exactly one
+        offload call (the lifecycle contract) and the reconcile runs
+        before the poll loop starts."""
+        self._reset_orphans()
+        self._reconcile_recent_terminal_events()
+
+    def _reconcile_recent_terminal_events(self) -> int:
+        """Re-announce wiki jobs that reached a terminal state recently.
+
+        Issue #955: a worker stopped (or crashed) between a terminal commit
+        and its event publish leaves a terminal row the SSE UI never hears
+        about — consumers only refetch on events. On start, re-publish the
+        terminal event for every wiki job that went terminal within the
+        reconcile window, in both stores (the jobs table serves lease mode,
+        the legacy table serves lease-off mode). Rows that DID get their
+        event are re-announced too: consumers are refetch-driven, so a
+        duplicate terminal event is a benign extra refetch (disclosed in
+        the release note). Best-effort — never raises into start().
+        """
+        announced = 0
+        try:
+            from app.services.wiki_events import get_wiki_event_bus
+
+            event_for_status = {
+                "completed": "job_completed",
+                "failed": "job_failed",
+                "cancelled": "job_cancelled",
+            }
+            cutoff = f"-{WIKI_EVENT_RECONCILE_WINDOW_SECONDS} seconds"
+            with self._pool.connection() as conn:
+                # jobs rows carry the domain fields in payload_json (with
+                # the #792 json_valid guard); the legacy table has real
+                # columns. Rows without a readable vault_id cannot be
+                # fanned out to a bus subscriber and are skipped.
+                rows = conn.execute(
+                    "SELECT id, status, completed_at, "
+                    "CASE WHEN json_valid(payload_json) "
+                    "THEN CAST(json_extract(payload_json, '$.vault_id') "
+                    "AS INTEGER) END AS vault_id, "
+                    "CASE WHEN json_valid(payload_json) "
+                    "THEN json_extract(payload_json, '$.trigger_type') "
+                    "END AS trigger_type "
+                    "FROM jobs WHERE queue = 'wiki' "
+                    "AND status IN ('completed','failed','cancelled') "
+                    "AND completed_at IS NOT NULL "
+                    # datetime() normalizes BOTH stored formats (SQLite
+                    # CURRENT_TIMESTAMP space-separated and Python
+                    # isoformat 'T'-separated) so the window compares
+                    # time-of-day, not byte order (review finding 1).
+                    "AND datetime(completed_at) >= datetime('now', ?) "
+                    "AND CASE WHEN json_valid(payload_json) "
+                    "THEN CAST(json_extract(payload_json, '$.vault_id') "
+                    "AS INTEGER) END IS NOT NULL",
+                    (cutoff,),
+                ).fetchall()
+                legacy_rows = conn.execute(
+                    "SELECT id, status, vault_id, trigger_type, completed_at "
+                    "FROM wiki_compile_jobs "
+                    "WHERE status IN ('completed','failed','cancelled') "
+                    "AND completed_at IS NOT NULL "
+                    "AND datetime(completed_at) >= datetime('now', ?)",
+                    (cutoff,),
+                ).fetchall()
+            bus = get_wiki_event_bus()
+            loop = self._loop
+            for row in (*rows, *legacy_rows):
+                event_type = event_for_status.get(row["status"])
+                if event_type is None:
+                    continue
+                payload = {
+                    "type": event_type,
+                    "job_id": row["id"],
+                    "vault_id": row["vault_id"],
+                    "trigger_type": row["trigger_type"] or "manual",
+                }
+                # Same-loop contract: the reconcile runs on a worker thread
+                # (the startup reset unit) - marshal the publish onto the
+                # app loop so the bus's put_nowait wakeup fires; with no
+                # running loop there are no subscribers to receive it
+                # (drop, matching _marshal_publish).
+                if loop is not None and loop.is_running():
+                    loop.call_soon_threadsafe(bus.publish, row["vault_id"], payload)
+                announced += 1
+        except Exception as exc:  # noqa: BLE001 — reconcile is best-effort
+            logger.warning(
+                "WikiCompileProcessor: terminal-event reconcile failed: %s", exc
+            )
+        return announced
 
     def _fail_job(
         self, job_id: int, error: str, worker_id: Optional[str] = None
@@ -479,12 +619,48 @@ class WikiCompileProcessor:
                 job_id, exc,
             )
 
+    def _marshal_publish(self, publish_fn) -> None:
+        """Run a terminal-event publish on the app event loop.
+
+        Issue #955 review: the wiki event bus is same-loop only (its
+        ``put_nowait`` wakeup is not thread-safe), and the threaded
+        fail-and-publish unit publishes from a worker thread — marshal
+        via ``call_soon_threadsafe`` (the self-pipe wakeup ``put_nowait``
+        lacks cross-thread). ``call_soon_threadsafe`` takes no kwargs, so
+        callers pass a ``functools.partial`` of the pinned-constant
+        ``_publish_event`` invocation (the o02 census contract). If the
+        loop is gone (processor never started, or closed at shutdown),
+        the event is dropped with a warning — subscribers are gone with
+        it, and SSE clients refetch canonical state on reconnect.
+        """
+        loop = self._loop
+        if loop is not None and loop.is_running():
+            try:
+                loop.call_soon_threadsafe(publish_fn)
+                return
+            except RuntimeError:
+                # Loop closed between the is_running() check and the
+                # cross-thread call — same disposition as no loop: the
+                # terminal row is already committed and the boot
+                # reconcile re-announces it, so drop with a warning
+                # instead of escaping into the poll loop's
+                # could-not-mark-failed handler.
+                pass
+        logger.warning(
+            "WikiCompileProcessor: terminal event dropped — no running"
+            " event loop to marshal the publish onto"
+        )
+
     def _publish_event(self, job, event_type: str, *, result: Optional[dict] = None, error: Optional[str] = None) -> None:
         """Fan out a terminal-state event to SSE subscribers for the vault.
 
         Best-effort: never raise out of the poll loop. The event payload is
         intentionally small — clients refetch the canonical state via the
         existing REST endpoints on receipt.
+
+        Threaded callers go through ``_marshal_publish`` (issue #955
+        review): the bus's ``put_nowait`` is same-loop only, so a publish
+        from a worker thread is marshalled onto the app loop first.
         """
         try:
             from app.services.wiki_events import get_wiki_event_bus

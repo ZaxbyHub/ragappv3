@@ -32,6 +32,45 @@ from typing import Any, Iterator, Optional
 
 logger = logging.getLogger(__name__)
 
+# Issue #953: the stable-code vocabulary that may appear in a jobs-table
+# ``error`` column written by this codebase. Rows written before the
+# redaction work (pre-#951) carry raw ``str(exc)`` text instead; the row
+# mappers mask those at read time (``redact_legacy_error_text``) so vault
+# readers never see them, while the raw text stays in server logs.
+# ``lease_attempt_cap_exceeded`` is the janitor's cap-settle code
+# (``_RECLAIM_SQL_TEMPLATE`` below); ``lease_disabled_rollback`` is the
+# reverse-sync settle code; ``admission rejected:`` is always followed by
+# one of AdmissionRejected.REASONS (a closed set).
+_LEGACY_ERROR_STABLE_PREFIXES = (
+    "COMPILE_FAILED:",
+    "PAYLOAD_MALFORMED:",
+    "attempt_cap_exceeded:",
+    "lease_attempt_cap_exceeded",
+    "lease_disabled_rollback",
+    "admission rejected:",
+)
+
+LEGACY_ERROR_REDACTED = (
+    "REDACTED_LEGACY_ERROR: pre-redaction failure detail withheld; "
+    "see server logs"
+)
+
+
+def redact_legacy_error_text(error: Optional[str]) -> Optional[str]:
+    """Mask pre-redaction raw error text on the wiki/KMS job read paths.
+
+    Issue #953: values that already match the stable-code vocabulary pass
+    through byte-identically (operators keep the codes they can act on);
+    anything else is a pre-#951 ``str(exc)`` remnant and is replaced with
+    the marker. Read-side only — writers, retries, and the janitor are
+    untouched, and the raw detail remains in the server logs.
+    """
+    if not error:
+        return error
+    if error.startswith(_LEGACY_ERROR_STABLE_PREFIXES):
+        return error
+    return LEGACY_ERROR_REDACTED
+
 _JOBS_TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

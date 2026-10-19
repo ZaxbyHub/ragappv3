@@ -1197,8 +1197,11 @@ class WikiCompiler:
                 "wiki curator: orchestration failed for vault=%s file=%s: %s",
                 vault_id, file_id, e,
             )
+            # Issue #958: these strings reach vault readers through the
+            # job's result_json — exception CLASS only (the adjacent lint
+            # path's discipline); the message stays in the log line above.
             return {
-                "errors": [f"orchestration_error: {type(e).__name__}: {e}"],
+                "errors": [f"orchestration_error: {type(e).__name__}"],
                 "accepted": 0,
                 "rejected": 0,
                 "lint": 0,
@@ -1301,7 +1304,7 @@ class WikiCompiler:
                     self._db.execute("ROLLBACK TO claim_pair")
                     self._db.execute("RELEASE claim_pair")
                     cur_result.errors.append(
-                        f"persist_error: {type(e).__name__}: {e}"
+                        f"persist_error: {type(e).__name__}"
                     )
                     logger.warning(
                         "wiki curator: failed to persist accepted claim: %s", e

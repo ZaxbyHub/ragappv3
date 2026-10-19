@@ -478,7 +478,10 @@ class WikiCurator:
                 except CuratorURLBlocked as e:
                     return None, f"ssrf_blocked: {e}"
                 except Exception as e:  # broad — never propagate
-                    return None, f"transport_error: {type(e).__name__}: {e}"
+                    # Issue #958: this string reaches vault readers through
+                    # the job's result_json — exception CLASS only; the
+                    # message stays in the server logs.
+                    return None, f"transport_error: {type(e).__name__}"
             parsed = extract_json(text)
             if parsed is None or not isinstance(parsed, dict):
                 return None, "json_parse_failed"
