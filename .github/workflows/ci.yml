@@ -7,10 +7,20 @@ on:
     branches: [master]
   merge_group:
 
+# A new push to a PR supersedes the in-flight run for the same PR ref. Only
+# pull_request runs are cancelled. Non-PR events get a unique group (run_id):
+# a shared group would still let GitHub drop an older PENDING run when a newer
+# one queues, so two quick pushes to master or two merge_group runs would lose
+# the middle run's required-check evidence.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   frontend:
     name: Frontend
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: frontend
@@ -118,6 +128,7 @@ jobs:
   quality-contracts:
     name: Quality contracts
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -231,6 +242,7 @@ jobs:
   changes:
     name: Detect docker scope
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       pull-requests: read
     outputs:
