@@ -28,6 +28,7 @@ import sys
 from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 # Add parent directory to path
@@ -227,3 +228,70 @@ async def test_token_overflow_body_not_logged(emb_settings):
         f"token-overflow provider body verbatim (the strongest #903 echo "
         f"risk): {[r.getMessage() for r in leaks]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Review follow-up (swarm-pr-review PRR-005, PR #981): the tenth site.
+#
+# The recurrence census enumerated the literal ``response.text`` attribute and
+# so missed the token-overflow branch of ``_embed_batch_with_retry``, which
+# reaches the same provider body through the ``resp`` alias. The pre-existing
+# HTTPError tests in tests/test_embeddings.py raise WITHOUT a ``.response``
+# (``exc.response`` is only populated for HTTPStatusError), so they cannot see
+# this site at all. The pin below constructs the shape that does.
+# ---------------------------------------------------------------------------
+
+BODY_MARKER_BATCH = "C15BATCHBODYMARKER"
+
+
+def _status_error_with_body(body: str) -> httpx.HTTPStatusError:
+    """A transport error that DOES carry a response with a body."""
+    request = httpx.Request("POST", "http://embeddings.invalid/v1/embeddings")
+    response = httpx.Response(
+        500,
+        request=request,
+        content=body.encode("utf-8"),
+        headers={"content-type": "text/plain"},
+    )
+    return httpx.HTTPStatusError("server error", request=request, response=response)
+
+
+async def test_batch_httpx_error_branch_does_not_log_provider_body(emb_settings):
+    """The HTTPError overflow branch logs ``body_len=``, never the body.
+
+    RED before the PRR-005 fix (the branch formatted the whole lowercased body
+    into the WARNING), GREEN after. Also pins that overflow DETECTION still
+    reads the full body — only the log line is truncated.
+    """
+    service = EmbeddingService()
+    _real_client = service._client
+    try:
+        service._client = MagicMock()
+        service._client.post = AsyncMock(
+            side_effect=_status_error_with_body(
+                f"token limit exceeded: {BODY_MARKER_BATCH} quoted provider text"
+            )
+        )
+
+        with capture_records(EMBEDDINGS_LOGGER, logging.WARNING) as captured:
+            with pytest.raises(Exception):
+                await service.embed_batch(["user derived operand text"])
+
+        warnings = [r for r in captured.records if r.levelno >= logging.WARNING]
+        leaks = [r for r in warnings if BODY_MARKER_BATCH in r.getMessage()]
+        assert leaks == [], (
+            "the batch HTTPError branch leaked the provider body at WARNING+: "
+            f"{[r.getMessage() for r in leaks]}"
+        )
+        overflow_lines = [
+            r.getMessage()
+            for r in warnings
+            if "Token overflow error" in r.getMessage()
+        ]
+        assert overflow_lines, (
+            "the overflow branch must still fire (detection reads the full "
+            f"body); captured: {[r.getMessage() for r in warnings]}"
+        )
+        assert "body_len=" in overflow_lines[0], overflow_lines[0]
+    finally:
+        await _real_client.aclose()

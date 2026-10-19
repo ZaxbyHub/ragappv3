@@ -29,8 +29,9 @@ level.
   params (`q`, `query`, `search`, `tag`, `entity`) after percent-decoding
   the parameter NAME (encoded spellings like `%71=` cannot bypass);
   credential-name scrubbing is unchanged and additive. The Dockerfile CMD
-  adds `--no-access-log` (the middleware record is the app-level access
-  log); `docs/admin-guide.md` documents the redacted log shape.
+  adds `--no-access-log` (for requests that reach the application stack,
+  the middleware record is the app-level access log — see the blind-spot
+  caveat below); `docs/admin-guide.md` documents the redacted log shape.
 - **Guard robustness (#906)** — the `no-query-text` AST guard bans
   `variant_type` and `title` (collision-checked), skips
   unreadable/unparseable files with a counted INFO note instead of an
@@ -51,10 +52,16 @@ census and PR #904 review identified and filed.
 None. Log consumers see `body_len=`/`title_len=` summaries and
 `name=[redacted]` query params where raw values used to appear; DEBUG
 carries the detail. Operators grepping uvicorn's access log in containers
-should use the application's `http_request` records instead (uvicorn's
-duplicate access log is now disabled).
+should use the application's `http_request` records for requests that reach
+the application stack (uvicorn's duplicate access log is now disabled).
 
 ## Known caveats
+
+- **Access-log blind spot.** With uvicorn's access log disabled, the response
+  classes answered before the logging middleware runs emit no application
+  access line: maintenance-window 503s, invalid-Host 400s, and unhandled 500s
+  (the logging middleware is the innermost one). uvicorn's own access log
+  covered them before; re-enable it per deployment if those lines are needed.
 
 - The recurrence census (trace `08a`) routes a wider same-class family to
   a follow-up issue: provider bodies composed into raised
