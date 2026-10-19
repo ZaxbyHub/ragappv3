@@ -864,6 +864,11 @@ export interface ChunkContextResponse {
   chunk_text: string;
   context_text: string;
   context_source: "parent_window" | "raw_text" | "chunk" | string;
+  /** Issue #718: neighbor window fields — optional because older sessions'
+   *  persisted context payloads predate the window. */
+  matched_text?: string;
+  before?: string[];
+  after?: string[];
 }
 
 /**
@@ -1322,7 +1327,11 @@ export async function getDocumentStats(vaultId?: number): Promise<DocumentStatsR
 
 export async function getChunkContext(chunkId: string): Promise<ChunkContextResponse> {
   const response = await apiClient.get<ChunkContextResponse>(
-    `/search/chunks/${encodeURIComponent(chunkId)}/context`
+    `/search/chunks/${encodeURIComponent(chunkId)}/context`,
+    // Issue #718: request a small neighbor window so the Evidence pane can
+    // render the chunks around the matched one. Defaults live here (not in
+    // callers) to keep the one-arg call sites stable.
+    { params: { context_before: 1, context_after: 1 } }
   );
   return response.data;
 }

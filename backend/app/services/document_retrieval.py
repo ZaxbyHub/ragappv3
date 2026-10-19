@@ -32,6 +32,7 @@ _RE_HASH8 = re.compile(r"^(?=[0-9a-f]{8}$)(?=[0-9a-f]*[a-f])[0-9a-f]{8}$")
 FALLBACK_SCORE_FLOOR = 0.5
 
 from app.config import settings  # noqa: E402
+from app.services.vector_store import VectorStoreError  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -633,9 +634,19 @@ class DocumentRetrievalService:
 
         # Fetch adjacent chunks from vector store
         if chunk_uids_to_fetch:
-            adjacent_chunks = await self.vector_store.get_chunks_by_uid(
-                chunk_uids_to_fetch
-            )
+            try:
+                adjacent_chunks = await self.vector_store.get_chunks_by_uid(
+                    chunk_uids_to_fetch
+                )
+            except VectorStoreError:
+                # Issue #718: get_chunks_by_uid now raises on store failures
+                # instead of swallowing them into []. Window expansion is a
+                # degrade-to-no-neighbors path — preserve today's semantics.
+                logger.warning(
+                    "Adjacent-chunk window fetch failed; expanding without neighbors",
+                    exc_info=True,
+                )
+                adjacent_chunks = []
 
             adjacent_lookup: Dict[str, Dict[str, Any]] = {}
             for chunk in adjacent_chunks:

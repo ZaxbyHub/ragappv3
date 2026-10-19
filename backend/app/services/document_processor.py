@@ -2207,7 +2207,20 @@ class DocumentProcessor:
                 )
             else:
                 record_id = chunk.chunk_uid or self._build_chunk_uid(file_id, chunk)
-            existing = await self.vector_store.get_chunks_by_uid([record_id])
+            try:
+                existing = await self.vector_store.get_chunks_by_uid([record_id])
+            except VectorStoreError:
+                # Issue #718: get_chunks_by_uid now raises on store failures
+                # instead of swallowing them into []. The reconcile pre-check
+                # degrades to "not yet indexed" (re-embed) — preserving
+                # today's []-on-error semantics for this retry pass.
+                logger.warning(
+                    "Failed-chunk reconcile pre-check failed for %s; "
+                    "treating as not indexed",
+                    record_id,
+                    exc_info=True,
+                )
+                existing = []
             if existing:
                 already_indexed_ids.append(int(srow["id"]))
                 continue

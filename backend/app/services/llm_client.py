@@ -15,12 +15,12 @@ import httpx
 
 from app.config import settings
 from app.services.circuit_breaker import (
+    BreakerNeutralError,
     CircuitBreakerError,
-    CircuitBreakerState,
     create_llm_circuit_breaker,
     is_outage_status,
 )
-from app.services.ssrf import assert_url_safe
+from app.services.ssrf import URLBlocked, assert_url_safe
 from app.services.telemetry import (
     correlation_headers as _correlation_headers,
 )
@@ -574,6 +574,13 @@ class LLMClient:
 
         started_at = time.perf_counter()
         prompt_tokens = self._prompt_token_estimate(messages)
+        # Per-call metrics state (issue #717): reset at entry so a failed
+        # turn can never report the previous call's success.
+        self.last_metrics = {
+            "provider_url": self.base_url,
+            "model": self.model,
+            "status": "started",
+        }
         try:
             # OPS-002 (issue #494): run the POST and the HTTP status check
             # as ONE breaker-wrapped operation so HTTPStatusError trips the
@@ -597,9 +604,18 @@ class LLMClient:
                 # (review RP-002, PR #576): ordinary 4xx are input/config
                 # errors that would recur on every retry — raising them
                 # here would open the shared breaker off a misconfigured
-                # request, not a provider outage.
+                # request, not a provider outage. They are raised as
+                # NEUTRAL (neither charge nor credit): the old behavior
+                # returned them as values, which the breaker recorded as a
+                # SUCCESS, erasing accumulated outage evidence for the
+                # host (issue #717 review).
                 if is_outage_status(response.status_code):
                     response.raise_for_status()
+                if response.status_code >= 400:
+                    try:
+                        response.raise_for_status()
+                    except httpx.HTTPStatusError as status_exc:
+                        raise BreakerNeutralError(status_exc) from status_exc
                 return response
 
             # E3 closure (#518): gen_ai client span for the non-stream
@@ -615,7 +631,23 @@ class LLMClient:
             response.raise_for_status()
             data = response.json()
 
+            if not isinstance(data, dict):
+                # A provider returning valid-but-non-object JSON (a list,
+                # scalar, or null) must surface as LLMError like any other
+                # malformed body, not escape as AttributeError (issue #717
+                # review).
+                self.last_metrics = {
+                    "provider_url": self.base_url,
+                    "model": self.model,
+                    "status": "invalid_response",
+                }
+                raise LLMError("Invalid response: expected a JSON object")
             if "choices" not in data or not data["choices"]:
+                self.last_metrics = {
+                    "provider_url": self.base_url,
+                    "model": self.model,
+                    "status": "invalid_response",
+                }
                 raise LLMError("Invalid response: no choices in response")
 
             message = data["choices"][0].get("message", {})
@@ -672,6 +704,12 @@ class LLMClient:
         except httpx.RequestError as e:
             self.last_metrics = {"provider_url": self.base_url, "model": self.model, "status": "request_error"}
             raise LLMError(f"Request failed: {str(e)}") from e
+        except URLBlocked as e:
+            # The SSRF guard's request-time re-resolution failure is a
+            # transport-layer failure: map it onto LLMError so every
+            # LLMError-catching fallback/degrade caller engages (issue #717).
+            self.last_metrics = {"provider_url": self.base_url, "model": self.model, "status": "url_blocked"}
+            raise LLMError(f"LLM provider URL blocked: {e}") from e
         except json.JSONDecodeError as e:
             self.last_metrics = {"provider_url": self.base_url, "model": self.model, "status": "invalid_json"}
             raise LLMError(f"Failed to parse response JSON: {str(e)}") from e
@@ -744,16 +782,32 @@ class LLMClient:
         # captured before the empty-choices skip so the reporting chunk is
         # never dropped.
         _usage: Dict[str, Any] = {}
+        # Per-call metrics state (issue #717): reset at entry so a failed
+        # stream can never report the previous call's success.
+        self.last_metrics = {
+            "provider_url": self.base_url,
+            "model": self.model,
+            "status": "started",
+        }
 
-        # Check circuit breaker state before attempting stream connection.
-        # Use the lock to avoid race conditions with concurrent requests.
-        async with self._circuit_breaker._lock:
-            if self._circuit_breaker.current_state == CircuitBreakerState.OPEN:
-                self._circuit_breaker._check_timeout()
-                if self._circuit_breaker.current_state == CircuitBreakerState.OPEN:
-                    raise LLMError(
-                        "LLM service is currently unavailable (circuit breaker open)"
-                    )
+        # Circuit-breaker admission (issue #717): the public seam admits at
+        # most ONE concurrent HALF_OPEN trial. The previous inline check
+        # rejected only OPEN, so every concurrent stream was admitted at
+        # exactly the moment the breaker should have been probing gently.
+        _holds_breaker_trial = False
+        try:
+            _holds_breaker_trial = (
+                await self._circuit_breaker.acquire_trial_or_raise()
+            )
+        except CircuitBreakerError as e:
+            self.last_metrics = {
+                "provider_url": self.base_url,
+                "model": self.model,
+                "status": "circuit_open",
+            }
+            raise LLMError(
+                "LLM service is currently unavailable (circuit breaker open)"
+            ) from e
 
         # State for filtering thinking content. Handles three open markers:
         #   <think>             — standard (gpt-oss-120b and most others)
@@ -813,15 +867,21 @@ class LLMClient:
         # span object instead of the CM, or letting the CM be GC'd early
         # (PR #595 review F-001c), ends the span at enter time — 0ms
         # duration, orphaned child spans, and SDK end-twice warnings.
-        _genai_stream_cm = start_span(
-            "gen_ai chat stream",
-            attributes={
-                "gen_ai.operation.name": "chat",
-                "gen_ai.request.model": str(payload.get("model", "")),
-            },
-        )
-        _genai_stream_cm.__enter__()
+        # Issue #717 review: the span is created and entered INSIDE the
+        # protected try below — every other tracer call site in the repo
+        # guarantees tracing can never break the record, and an exception
+        # here (before the finally that releases the HALF_OPEN trial) would
+        # wedge that trial permanently.
+        _genai_stream_cm: Optional[Any] = None
         try:
+            _genai_stream_cm = start_span(
+                "gen_ai chat stream",
+                attributes={
+                    "gen_ai.operation.name": "chat",
+                    "gen_ai.request.model": str(payload.get("model", "")),
+                },
+            )
+            _genai_stream_cm.__enter__()
             # E3 telemetry (issue #518): propagate correlation headers when
             # bound; kwarg omitted when empty (strict test fakes compat).
             _corr = _correlation_headers()
@@ -837,24 +897,43 @@ class LLMClient:
                 # Validate content-type for SSE
                 content_type = response.headers.get("content-type", "")
                 if "text/event-stream" not in content_type:
-                    # Fall back to non-stream completion for providers that don't return SSE
-                    content = await self.chat_completion(
-                        messages=messages,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        # Issue #652: keep the caller's schema contract on the
-                        # non-SSE fallback too, mirroring the streamed payload.
-                        response_format=response_format,
+                    # Non-SSE provider answer (issue #717): the complete JSON
+                    # answer is already in THIS response's body — read it and
+                    # yield it instead of discarding a finished generation
+                    # and re-POSTing a second one at double cost/latency.
+                    raw = await response.aread()
+                    data = json.loads(raw)
+                    if not isinstance(data, dict):
+                        self.last_metrics = {"provider_url": self.base_url, "model": self.model, "status": "invalid_response"}
+                        raise LLMError("Invalid response: expected a JSON object")
+                    choices = data.get("choices") or []
+                    if (
+                        not choices
+                        or not isinstance(choices[0], dict)
+                    ):
+                        self.last_metrics = {"provider_url": self.base_url, "model": self.model, "status": "invalid_response"}
+                        raise LLMError("Invalid response: no choices in response")
+                    body_choice = choices[0]
+                    content = self._strip_thinking_content(
+                        body_choice.get("message", {}).get("content", "")
                     )
-                    # Issue #571: keep the provider-exact usage the non-stream
-                    # call just recorded — the stream summary below would
-                    # otherwise overwrite last_metrics and drop those keys
-                    # (the fallback response never rode the SSE usage chunk).
-                    _fallback_metrics = self.last_metrics or {}
-                    if _fallback_metrics.get("prompt_tokens") is not None:
+                    # The answer text is visible output: count it and record
+                    # why the generation stopped, exactly as the SSE delta
+                    # paths and the old non-stream fallback did (issue #717
+                    # review — the estimate/finish_reason were lost here).
+                    completion_chars += len(content)
+                    _finish_reason = body_choice.get("finish_reason")
+                    # Issue #571 kept: provider-exact usage from the first
+                    # body feeds the stream summary below (the old
+                    # _fallback_metrics block read it off the nested
+                    # re-POST's metrics instead).
+                    _body_usage = data.get("usage") or {}
+                    if _body_usage.get("prompt_tokens") is not None or _body_usage.get(
+                        "completion_tokens"
+                    ) is not None:
                         _usage = {
-                            "prompt_tokens": _fallback_metrics["prompt_tokens"],
-                            "completion_tokens": _fallback_metrics.get("completion_tokens"),
+                            "prompt_tokens": _body_usage.get("prompt_tokens"),
+                            "completion_tokens": _body_usage.get("completion_tokens"),
                         }
                     if content:
                         yield content
@@ -1009,6 +1088,11 @@ class LLMClient:
                                 )
                                 pre_think, _, remainder = _buffer.partition("_lhs")
                                 if pre_think:
+                                    # Counted like the <think> sibling above
+                                    # (issue #717): text yielded before the
+                                    # marker is visible output and must be
+                                    # billed into the token estimate.
+                                    completion_chars += len(pre_think)
                                     yield pre_think
                                     _content_emitted = True
                                 _thinking_active = True
@@ -1112,18 +1196,25 @@ class LLMClient:
                     stream_succeeded = True
                     raise
         except LLMError:
-            # Don't record LLMError as transport failure — it may come from
-            # the chat_completion() fallback path and represent an app-level error,
-            # not a service-unavailability signal.
+            # Don't record LLMError as transport failure — it represents an
+            # app-level error (malformed body, admission refusal), not a
+            # service-unavailability signal.
             raise
         except httpx.TimeoutException as e:
             async with self._circuit_breaker._lock:
                 self._circuit_breaker.record_failure()
+            self.last_metrics = {"provider_url": self.base_url, "model": self.model, "status": "timeout"}
             raise LLMError(f"Streaming request timed out after {self.timeout}s") from e
         except httpx.HTTPStatusError as e:
             # Charge the breaker for OUTAGE statuses only (review RP-002,
             # PR #576): ordinary 4xx are input/config errors that would
             # recur on every retry, not provider outages.
+            self.last_metrics = {
+                "provider_url": self.base_url,
+                "model": self.model,
+                "status": "http_error",
+                "status_code": e.response.status_code,
+            }
             if is_outage_status(e.response.status_code):
                 async with self._circuit_breaker._lock:
                     self._circuit_breaker.record_failure()
@@ -1140,9 +1231,26 @@ class LLMClient:
         except httpx.RequestError as e:
             async with self._circuit_breaker._lock:
                 self._circuit_breaker.record_failure()
+            self.last_metrics = {"provider_url": self.base_url, "model": self.model, "status": "request_error"}
             raise LLMError(f"Streaming request failed: {str(e)}") from e
+        except URLBlocked as e:
+            # SSRF request-time re-resolution failure during the streamed
+            # POST: an outage-class transport failure — charge the breaker
+            # and surface LLMError (issue #717).
+            async with self._circuit_breaker._lock:
+                self._circuit_breaker.record_failure()
+            self.last_metrics = {"provider_url": self.base_url, "model": self.model, "status": "url_blocked"}
+            raise LLMError(f"LLM provider URL blocked: {e}") from e
+        except json.JSONDecodeError as e:
+            self.last_metrics = {"provider_url": self.base_url, "model": self.model, "status": "invalid_json"}
+            raise LLMError(f"Failed to parse response JSON: {str(e)}") from e
         finally:
-            _genai_stream_cm.__exit__(*sys.exc_info())
+            if _genai_stream_cm is not None:
+                _genai_stream_cm.__exit__(*sys.exc_info())
+            if _holds_breaker_trial:
+                # Release the HALF_OPEN trial slot on BOTH outcomes — a
+                # wedged slot would reject every later admission (issue #717).
+                self._circuit_breaker.release_trial()
             if stream_succeeded:
                 async with self._circuit_breaker._lock:
                     self._circuit_breaker.record_success()
@@ -1179,12 +1287,15 @@ class LLMClient:
                 # Streaming failed — record a failure metric so the done
                 # payload's llm_metrics does not report a stale/ok value for
                 # a failed turn (mirrors the non-streaming per-error
-                # branches above and in chat_completion). If the SSE-fallback
-                # path already set a more specific status (timeout/http_error/
-                # request_error/circuit_open via chat_completion), preserve it
-                # rather than overwriting with the generic "error".
+                # branches above and in chat_completion). The per-error
+                # handlers above now write their specific statuses
+                # (timeout/http_error/request_error/circuit_open/
+                # url_blocked/invalid_json); preserve those rather than
+                # overwriting with the generic "error". A fresh call's entry
+                # reset leaves "started", which the summary always replaces
+                # (issue #717).
                 _existing_status = (self.last_metrics or {}).get("status", "ok")
-                if _existing_status == "ok":
+                if _existing_status in ("ok", "started"):
                     self.last_metrics = {
                         "provider_url": self.base_url,
                         "model": self.model,

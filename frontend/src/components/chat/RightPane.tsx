@@ -354,6 +354,18 @@ function SourcePreview({ source, query, onJumpToAnswer }: SourcePreviewProps) {
   const [artifactError, setArtifactError] = useState<string | null>(null);
   const artifactAbortRef = useRef<AbortController | null>(null);
   const previewContent = chunkContext?.context_text || source.snippet || "";
+  // Issue #718: chunk-context neighbor window — the chunks immediately
+  // before/after the matched one, when the payload carries them. Neighbors
+  // whose text is already inside the loaded context (e.g. the parent-window
+  // payload typically spans them) are suppressed so the pane never shows
+  // the same passage twice (issue #718 review F-001).
+  const inContext = (text: string) => previewContent.includes(text);
+  const neighborBefore = (chunkContext?.before ?? []).filter(
+    (text) => !inContext(text)
+  );
+  const neighborAfter = (chunkContext?.after ?? []).filter(
+    (text) => !inContext(text)
+  );
   const highlightedContent = useMemo(
     () => highlightQueryTerms(previewContent, query),
     [previewContent, query]
@@ -624,6 +636,21 @@ function SourcePreview({ source, query, onJumpToAnswer }: SourcePreviewProps) {
             {artifactError && (
               <span className="text-warning">{artifactError}</span>
             )}
+            {neighborBefore.length > 0 && (
+              <div
+                className="mb-3 border-l-2 border-border pl-3"
+                aria-label="Preceding context"
+              >
+                {neighborBefore.map((text, index) => (
+                  <p
+                    key={`chunk-before-${index}`}
+                    className="text-xs text-muted-foreground whitespace-pre-wrap"
+                  >
+                    {text}
+                  </p>
+                ))}
+              </div>
+            )}
             {previewContent ? (
               supportSpanRange ? (
                 <>
@@ -649,6 +676,21 @@ function SourcePreview({ source, query, onJumpToAnswer }: SourcePreviewProps) {
               )
             ) : (
               !artifactError && "No preview content available."
+            )}
+            {neighborAfter.length > 0 && (
+              <div
+                className="mt-3 border-l-2 border-border pl-3"
+                aria-label="Following context"
+              >
+                {neighborAfter.map((text, index) => (
+                  <p
+                    key={`chunk-after-${index}`}
+                    className="text-xs text-muted-foreground whitespace-pre-wrap"
+                  >
+                    {text}
+                  </p>
+                ))}
+              </div>
             )}
           </div>
         </ScrollArea>

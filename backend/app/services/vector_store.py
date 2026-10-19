@@ -808,16 +808,25 @@ class VectorStore:
                     # IVF_PQ rebuild on the first search after every startup
                     # (issue #148). Name-based FTS detection (#557) repeated
                     # the same class.
-                    has_ivfpq = await has_index(self.table, "embedding", "IvfPq")
-                    if has_ivfpq:
-                        self._last_index_build_row_count = await self.table.count_rows()
-                        self._last_index_build_generation = (
-                            self._index_mutation_generation
-                        )
-                        logger.debug(
-                            "Seeded _last_index_build_row_count=%d from existing IVF_PQ index",
-                            self._last_index_build_row_count,
-                        )
+                    #
+                    # Issue #718: seed only on FIRST open. 0 is the
+                    # never-seeded sentinel (the field is int-typed and
+                    # compared numerically elsewhere) — re-seeding on every
+                    # init_table call would mark a stale index fresh after a
+                    # failed rebuild, suppressing search()'s retry.
+                    if self._last_index_build_row_count == 0:
+                        has_ivfpq = await has_index(self.table, "embedding", "IvfPq")
+                        if has_ivfpq:
+                            self._last_index_build_row_count = (
+                                await self.table.count_rows()
+                            )
+                            self._last_index_build_generation = (
+                                self._index_mutation_generation
+                            )
+                            logger.debug(
+                                "Seeded _last_index_build_row_count=%d from existing IVF_PQ index",
+                                self._last_index_build_row_count,
+                            )
                 except Exception as _seed_exc:
                     logger.debug("Could not seed index row count baseline: %s", _seed_exc)
             else:
@@ -3096,7 +3105,16 @@ class VectorStore:
                             replace=True,
                         )
                         self._last_index_build_row_count = final_rows
-                        self._last_index_build_generation = self._index_mutation_generation
+                        self._last_index_build_generation = (
+                            # Issue #718 review: the generation increments
+                            # AFTER the swap below (the swap itself is a
+                            # mutation); recording the baseline with the
+                            # pre-increment generation left it stale-by-one,
+                            # so the first /search after every dimension
+                            # rebuild re-ran a full IVF_PQ build under the
+                            # write lock.
+                            self._index_mutation_generation + 1
+                        )
                 except Exception as exc:
                     logger.critical(
                         "dimension rebuild: 'chunks' swap failed after the old table "
@@ -3690,8 +3708,13 @@ class VectorStore:
 
             return results
         except (OSError, RuntimeError, ValueError) as e:
-            logger.warning(f"Failed to fetch chunks by UID: {e}")
-            return []
+            # Issue #718: a transient store failure is NOT absence. Swallowing
+            # it into [] made the chunk-context route answer 404 "Chunk not
+            # found" for an unavailable store; raise the module's typed error
+            # so routes can distinguish "absent" ([]) from "unavailable".
+            raise VectorStoreError(
+                f"failed to fetch chunks by uid: {e}"
+            ) from e
 
     async def get_chunks_by_file_range(
         self,
@@ -3699,6 +3722,7 @@ class VectorStore:
         chunk_index: int,
         before: int,
         after: int,
+        chunk_scale: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Fetch neighbor chunks of a target chunk within the same file (Issue #396).
 
@@ -3710,6 +3734,11 @@ class VectorStore:
         not relied on elsewhere in this codebase). Non-contiguous indices (gaps
         from failed-chunk retries) are handled naturally: only existing rows
         return.
+
+        ``chunk_scale`` (issue #718 review F-018): multi-scale indexing numbers
+        every scale from 0, so without this filter the window mixes scales and
+        returns wrong-region rows. Callers should pass the center chunk's
+        scale; ``None`` keeps the legacy unfiltered behavior.
         """
         if self.table is None:
             return []
@@ -3722,6 +3751,8 @@ class VectorStore:
             f"file_id = '{esc_file}' "
             f"AND chunk_index BETWEEN {int(lo)} AND {int(hi)}"
         )
+        if chunk_scale is not None:
+            query += f" AND chunk_scale = '{_lance_escape(str(chunk_scale))}'"
         try:
             rows = await self.table.query().where(query).to_list()
         except (OSError, RuntimeError, ValueError) as e:
