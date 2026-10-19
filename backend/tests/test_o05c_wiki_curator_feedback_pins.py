@@ -341,6 +341,11 @@ class TestContextSurvivesDispatch(unittest.TestCase):
     """F5: caller contextvars must survive the offload dispatch so
     correlation headers keep the request identity."""
 
+    def setUp(self):
+        self._flag = _FlagSnapshot()
+        self._flag.__enter__()
+        self.addCleanup(self._flag.__exit__, None, None, None)
+
     def test_contextvar_reaches_propose_on_worker_thread(self):
         settings.wiki_llm_curator_enabled = True
         settings.wiki_llm_curator_run_on_ingest = True
@@ -399,6 +404,11 @@ class TestSerializationPremises(unittest.TestCase):
     """F6: the single-worker premise, the always-offload dispatch, and the
     per-call prompt budget are pinned (all three mutations executed green
     on 31d8fc28 before these tests existed)."""
+
+    def setUp(self):
+        self._flag = _FlagSnapshot()
+        self._flag.__enter__()
+        self.addCleanup(self._flag.__exit__, None, None, None)
 
     def test_offload_executor_is_single_worker(self):
         self.assertEqual(_CURATOR_OFFLOAD_EXECUTOR._max_workers, 1)
