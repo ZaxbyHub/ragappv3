@@ -97,10 +97,12 @@ What to feed `compare_runs` (issue #718): every `/api/eval/live` run is
 persisted TWICE under `data/eval-runs/` — the append-only audit log
 `runs.jsonl` (one JSON line per run) and a per-run single-object report
 `runs-<run_id>.json` carrying the `environment`/`metrics` envelope
-`load_run_report` requires. Point `compare_runs` at the per-run report
-files; `runs.jsonl` is the audit log (`load_run_report` parses a whole
-file as one JSON object, so a multi-run JSONL file is not a valid input).
-Commit both artifacts per experiment so downstream consumers (F2 / #36) can
+`load_run_report` requires. Load each per-run report with
+`load_run_report(path)`, then pass the returned `RunReport` objects to
+`compare_runs(baseline, candidate)` (it takes objects, not paths).
+`runs.jsonl` is the audit log (`load_run_report` parses a whole file as
+one JSON object, so a multi-run JSONL file is not a valid input). Commit
+both artifacts per experiment so downstream consumers (F2 / #36) can
 re-derive comparisons.
 
 ## 5. Optional: live judge evaluation (never in CI)

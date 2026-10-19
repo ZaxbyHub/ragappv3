@@ -625,7 +625,9 @@ async def live_eval(
        retrieved file_ids from the live vector store + reranker pipeline.
     2. Computes MRR, nDCG@k, and recall@k against the ground-truth ``relevant_ids``.
     3. Persists the run record (timestamp, release_id, per-query and aggregate
-       metrics) as JSONL to ``data/eval-runs/runs.jsonl``.
+       metrics) as JSONL to ``data/eval-runs/runs.jsonl``, plus a per-run
+       single-object report ``runs-<run_id>.json`` carrying the
+       ``load_run_report`` envelope — the documented ``compare_runs`` input.
 
     This bridges the offline eval harness (which consumes pre-supplied JSONL
     contexts) with the live retrieval pipeline, enabling production retrieval

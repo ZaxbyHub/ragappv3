@@ -537,19 +537,31 @@ class LiveEvalAdapter:
         cannot read a multi-line runs.jsonl once a second record exists;
         runs.jsonl stays the append-only audit log.
         """
-        async with self._persist_lock:
-            try:
+        try:
+            async with self._persist_lock:
                 runs_dir = _get_runs_dir()
                 run_file = runs_dir / "runs.jsonl"
                 record = result.to_dict()
+                # Issue #718 review: model_identity must carry the actual
+                # embedding model (a release-id-only dict made model_hash
+                # information-equal to code_hash), and the record needs a
+                # top-level `resources` key — load_run_report defaults it to
+                # [], leaving compare_runs' matched_resources permanently
+                # empty. Benchmark item ids are the run's resource set,
+                # matching the run_eval.py harness envelope.
+                benchmark_ids = sorted(
+                    qm.query_id for qm in result.query_metrics
+                )
                 record["environment"] = environment_fingerprint(
                     release_id=result.release_id,
-                    model_identity={"release_id": result.release_id},
+                    model_identity={
+                        "model": settings.embedding_model,
+                        "release_id": result.release_id,
+                    },
                     config_snapshot={"top_k": result.top_k},
-                    resource_ids=sorted(
-                        qm.query_id for qm in result.query_metrics
-                    ),
+                    resource_ids=benchmark_ids,
                 )
+                record["resources"] = benchmark_ids
                 record["metrics"] = {
                     key: value
                     for key, value in (
@@ -575,9 +587,9 @@ class LiveEvalAdapter:
                     result.recall_mean or 0.0,
                 )
                 return report_file
-            except Exception as exc:
-                logger.error("Failed to persist eval run %s: %s", result.run_id, exc)
-                return None
+        except Exception as exc:
+            logger.error("Failed to persist eval run %s: %s", result.run_id, exc)
+            return None
 
 
 __all__ = [

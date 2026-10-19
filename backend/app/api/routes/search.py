@@ -353,11 +353,27 @@ async def get_chunk_context(
             center_idx_int = int(center_idx)
         except (TypeError, ValueError):
             center_idx_int = 0
+        # Issue #718 review F-018: multi-scale indexing numbers every scale
+        # from 0, so the window MUST filter by the center chunk's scale or it
+        # mixes scales and returns wrong-region rows.
+        center_scale = _record_get(
+            chunk, "chunk_scale", metadata.get("chunk_scale")
+        )
         get_range = getattr(vector_store, "get_chunks_by_file_range", None)
         if get_range is not None:
+            # Only pass the scale filter when the center chunk carries one:
+            # duck-typed stores (and single-scale tables) keep the legacy
+            # unfiltered call shape.
+            range_kwargs: Dict[str, Any] = {}
+            if center_scale:
+                range_kwargs["chunk_scale"] = str(center_scale)
             try:
                 neighbors = await get_range(
-                    file_id, center_idx_int, context_before, context_after
+                    file_id,
+                    center_idx_int,
+                    context_before,
+                    context_after,
+                    **range_kwargs,
                 )
             except (OSError, RuntimeError, ValueError):
                 neighbors = []

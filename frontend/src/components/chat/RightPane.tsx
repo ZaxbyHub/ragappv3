@@ -355,9 +355,17 @@ function SourcePreview({ source, query, onJumpToAnswer }: SourcePreviewProps) {
   const artifactAbortRef = useRef<AbortController | null>(null);
   const previewContent = chunkContext?.context_text || source.snippet || "";
   // Issue #718: chunk-context neighbor window — the chunks immediately
-  // before/after the matched one, when the payload carries them.
-  const neighborBefore = chunkContext?.before ?? [];
-  const neighborAfter = chunkContext?.after ?? [];
+  // before/after the matched one, when the payload carries them. Neighbors
+  // whose text is already inside the loaded context (e.g. the parent-window
+  // payload typically spans them) are suppressed so the pane never shows
+  // the same passage twice (issue #718 review F-001).
+  const inContext = (text: string) => previewContent.includes(text);
+  const neighborBefore = (chunkContext?.before ?? []).filter(
+    (text) => !inContext(text)
+  );
+  const neighborAfter = (chunkContext?.after ?? []).filter(
+    (text) => !inContext(text)
+  );
   const highlightedContent = useMemo(
     () => highlightQueryTerms(previewContent, query),
     [previewContent, query]
