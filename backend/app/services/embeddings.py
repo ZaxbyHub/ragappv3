@@ -836,8 +836,9 @@ class EmbeddingService:
                     response.status_code
                 ):
                     logger.warning(
-                        f"Embedding API returned status {response.status_code} for {config.mode} mode: {response.text}"
+                        f"Embedding API returned status {response.status_code} for {config.mode} mode (body_len={len(response.text)})"
                     )
+                    logger.debug(f"Embedding API error body: {response.text[:2000]}")
                     raise EmbeddingError(
                         f"Embedding API returned status {response.status_code}"
                     )
@@ -858,8 +859,9 @@ class EmbeddingService:
                 # raised OUTSIDE the breaker: they are caller errors that
                 # would recur on every retry, not provider outages.
                 logger.warning(
-                    f"Embedding API returned status {response.status_code} for {config.mode} mode: {response.text}"
+                    f"Embedding API returned status {response.status_code} for {config.mode} mode (body_len={len(response.text)})"
                 )
+                logger.debug(f"Embedding API error body: {response.text[:2000]}")
                 raise EmbeddingError(
                     f"Embedding API returned status {response.status_code}"
                 )
@@ -868,8 +870,9 @@ class EmbeddingService:
                 data = response.json()
             except ValueError as e:
                 logger.warning(
-                    f"Invalid JSON response from embedding API for {config.mode} mode: {e}, response: {response.text}"
+                    f"Invalid JSON response from embedding API for {config.mode} mode: {e} (body_len={len(response.text)})"
                 )
+                logger.debug(f"Embedding API error body: {response.text[:2000]}")
                 raise EmbeddingError("Invalid response from embedding service")
 
             embedding = self._extract_embedding(data, config)
@@ -1035,8 +1038,9 @@ class EmbeddingService:
                 response.status_code
             ):
                 logger.warning(
-                    f"Embedding API returned status {response.status_code} for {config.mode} mode: {response.text}"
+                    f"Embedding API returned status {response.status_code} for {config.mode} mode (body_len={len(response.text)})"
                 )
+                logger.debug(f"Embedding API error body: {response.text[:2000]}")
                 raise EmbeddingError(
                     f"Embedding API returned status {response.status_code}"
                 )
@@ -1056,8 +1060,9 @@ class EmbeddingService:
 
         if response.status_code != 200:
             logger.warning(
-                f"Embedding API returned status {response.status_code} for {config.mode} mode: {response.text}"
+                f"Embedding API returned status {response.status_code} for {config.mode} mode (body_len={len(response.text)})"
             )
+            logger.debug(f"Embedding API error body: {response.text[:2000]}")
             raise EmbeddingError(
                 f"Embedding API returned status {response.status_code}"
             )
@@ -1066,8 +1071,9 @@ class EmbeddingService:
             data = response.json()
         except ValueError as e:
             logger.warning(
-                f"Invalid JSON response from embedding API for {config.mode} mode: {e}, response: {response.text}"
+                f"Invalid JSON response from embedding API for {config.mode} mode: {e} (body_len={len(response.text)})"
             )
+            logger.debug(f"Embedding API error body: {response.text[:2000]}")
             raise EmbeddingError("Invalid response from embedding service")
 
         # Validate the response shape (raises EmbeddingError when malformed).
@@ -1499,8 +1505,9 @@ class EmbeddingService:
                     ):
                         return response
                     logger.warning(
-                        f"Embedding API returned status {response.status_code} for {config.mode} mode: {response.text}"
+                        f"Embedding API returned status {response.status_code} for {config.mode} mode (body_len={len(response.text)})"
                     )
+                    logger.debug(f"Embedding API error body: {response.text[:2000]}")
                     raise EmbeddingError(
                         f"Embedding API returned status {response.status_code}"
                     )
@@ -1516,8 +1523,9 @@ class EmbeddingService:
                 error_text = response.text.lower()
                 if self._is_token_overflow_error(error_text):
                     logger.warning(
-                        f"Token overflow error for {config.mode} mode: {response.text}"
+                        f"Token overflow error for {config.mode} mode (body_len={len(response.text)})"
                     )
+                    logger.debug(f"Embedding API error body: {response.text[:2000]}")
                     # Handle overflow using the shared helper
                     return await self._handle_overflow_retry(
                         client, texts, max_retries, min_sub_size, retry_count, config
@@ -1525,8 +1533,9 @@ class EmbeddingService:
 
             if response.status_code != 200:
                 logger.warning(
-                    f"Embedding API returned status {response.status_code} for {config.mode} mode: {response.text}"
+                    f"Embedding API returned status {response.status_code} for {config.mode} mode (body_len={len(response.text)})"
                 )
+                logger.debug(f"Embedding API error body: {response.text[:2000]}")
                 raise EmbeddingError(
                     f"Embedding API returned status {response.status_code}"
                 )
@@ -1636,8 +1645,9 @@ class EmbeddingService:
                 error_msg
             ) or self._is_token_overflow_error(response_text):
                 logger.warning(
-                    f"Token overflow error for {config.mode} mode: {response_text}"
+                    f"Token overflow error for {config.mode} mode (body_len={len(response_text)})"
                 )
+                logger.debug(f"Embedding API error body: {response_text[:2000]}")
                 # Handle overflow using the shared helper
                 return await self._handle_overflow_retry(
                     client, texts, max_retries, min_sub_size, retry_count, config

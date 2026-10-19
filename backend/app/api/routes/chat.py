@@ -2966,10 +2966,10 @@ async def _auto_name_session(
                     if affected > 0:
                         await asyncio.to_thread(conn.commit)
                         logger.info(
-                            "Auto-named session %d: %s (rows_affected=%d)",
+                            "Auto-named session %d (rows_affected=%d, title_len=%d)",
                             session_id,
-                            title,
                             affected,
+                            len(title),
                         )
                     else:
                         logger.warning(
@@ -2992,12 +2992,19 @@ async def _auto_name_session(
                 affected = cursor.rowcount
                 if affected > 0:
                     await asyncio.to_thread(conn.commit)
-                    logger.info("Auto-named untitled session %d: %s", session_id, title)
+                    logger.info(
+                        "Auto-named untitled session %d (title_len=%d)",
+                        session_id,
+                        len(title),
+                    )
 
     except Exception as e:
         logger.warning(
-            "Auto-name session %d failed: %s. Using fallback.", session_id, e
+            "Auto-name session %d failed (%s). Using fallback.",
+            session_id,
+            type(e).__name__,
         )
+        logger.debug("Auto-name session %d failed: %s", session_id, e)
         try:
             auto_title = "New conversation"
             async with pool.connection_async() as conn:

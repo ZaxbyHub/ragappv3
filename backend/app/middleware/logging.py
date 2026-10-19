@@ -3,6 +3,7 @@
 import logging
 import time
 import uuid
+from urllib.parse import unquote
 
 from fastapi import FastAPI, Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
@@ -31,6 +32,17 @@ SCRUB_FIELDS = {
 }
 
 logger = logging.getLogger("http")
+
+# Parameter NAMES whose values are user-derived text on live routes (#910,
+# #287/#710 contract). Provenance census — every value is matched against
+# user-generated content by its consuming route: q/query/search are
+# full-text search operands (search.py, documents.py, kms.py, memories.py,
+# wiki.py); tag matches user-created KMS tag values (kms_store json_each);
+# entity matches wiki-claim subject/object text (wiki_store). Operational
+# selectors (status, page_type, severity, sort_by, sort_order, types, mode,
+# job_type, format, ids, pagination ints) are NOT user-derived and keep
+# their values in the access log.
+USER_TEXT_PARAMS = frozenset({"q", "query", "search", "tag", "entity"})
 
 
 def _scrub_value(value: str) -> str:
@@ -67,7 +79,31 @@ class SensitiveFieldFilter(logging.Filter):
 
 
 def _sanitize_query(query: str) -> str:
-    parts = [f"{param.split('=')[0]}=[redacted]" if any(field in param for field in SCRUB_FIELDS) else param for param in query.split("&") if param]
+    """Redact credential-name params and free-text search values (#910).
+
+    Each ``&``-fragment's parameter NAME is percent-decoded before both the
+    :data:`SCRUB_FIELDS` (credential substring) and :data:`USER_TEXT_PARAMS`
+    membership tests, so an encoded spelling (``%71=`` = ``q``) cannot slip a
+    user-derived value past redaction while the route still decodes it. The
+    emitted parameter name keeps its raw wire form. Operational parameters
+    (pagination ints, enum selectors like ``status``/``mode``/``sort_by``,
+    string-encoded id lists) keep ``name=value`` — only user-derived text is
+    redacted, additively to the pre-existing credential scrubbing.
+    """
+    parts = []
+    for param in query.split("&"):
+        if not param:
+            continue
+        raw_name = param.split("=", 1)[0]
+        name = unquote(raw_name)
+        if any(field in param for field in SCRUB_FIELDS) or any(
+            field in name for field in SCRUB_FIELDS
+        ):
+            parts.append(f"{raw_name}=[redacted]")
+        elif name in USER_TEXT_PARAMS:
+            parts.append(f"{raw_name}=[redacted]")
+        else:
+            parts.append(param)
     return "&".join(parts)
 
 
@@ -91,21 +127,27 @@ class LoggingMiddleware(BaseHTTPMiddleware):
         start = time.time()
         try:
             response = await call_next(request)
+            # Emit the access record BEFORE the contextvar reset: the
+            # lifespan-installed RequestIdFilter overwrites record.request_id
+            # with the CURRENT contextvar value on every emitted record, so
+            # logging after reset() blanked the field in production
+            # (swarm-pr-review PRR-004: the record asserted request_id, the
+            # shipped JSON never carried it).
+            duration = time.time() - start
+            sanitized_query = _sanitize_query(request.url.query)
+            logger.info(
+                "http_request",
+                extra={
+                    "request_id": request_id,
+                    "method": request.method,
+                    "path": request.url.path,
+                    "query": sanitized_query,
+                    "status_code": response.status_code,
+                    "client_ip": request.client.host if request.client else None,
+                    "duration_ms": round(duration * 1000, 2),
+                },
+            )
+            response.headers["X-Request-ID"] = request_id
+            return response
         finally:
             request_id_var.reset(token)
-        duration = time.time() - start
-        sanitized_query = _sanitize_query(request.url.query)
-        logger.info(
-            "http_request",
-            extra={
-                "request_id": request_id,
-                "method": request.method,
-                "path": request.url.path,
-                "query": sanitized_query,
-                "status_code": response.status_code,
-                "client_ip": request.client.host if request.client else None,
-                "duration_ms": round(duration * 1000, 2),
-            },
-        )
-        response.headers["X-Request-ID"] = request_id
-        return response

@@ -1576,9 +1576,9 @@ class RAGEngine:
                     return
                 raise RAGEngineError(f"Embedding admission rejected: {exc}")
 
-            for (variant_type, _), result in zip(variants_to_embed, raw_embeddings):
+            for (variant_label, _), result in zip(variants_to_embed, raw_embeddings):
                 if isinstance(result, EmbeddingError):
-                    if variant_type == 'original':
+                    if variant_label == 'original':
                         logger.error(
                             "Query embedding failure for original query: %s", result
                         )
@@ -1595,11 +1595,11 @@ class RAGEngine:
                             return
                         raise RAGEngineError(f"Original query embedding failed: {result}")
                     logger.warning(
-                        "Query embedding failure for variant '%s': %s", variant_type, result
+                        "Query embedding failure for variant '%s': %s", variant_label, result
                     )
-                    variants_dropped.append(variant_type)
+                    variants_dropped.append(variant_label)
                 elif isinstance(result, BaseException):
-                    if variant_type == 'original':
+                    if variant_label == 'original':
                         logger.error("Query embedding failure for original query: %s", result)
                         _cancel_overlap_tasks()
                         if stream:
@@ -1613,9 +1613,9 @@ class RAGEngine:
                             }
                             return
                         raise RAGEngineError(f"Original query embedding failed: {result}")
-                    variants_dropped.append(variant_type)
+                    variants_dropped.append(variant_label)
                 else:
-                    query_embeddings.append((variant_type, result))
+                    query_embeddings.append((variant_label, result))
 
             if not query_embeddings:
                 error_msg = "Unable to encode any query variants"
@@ -3163,8 +3163,8 @@ class RAGEngine:
 
                     # Paraphrase/step_back/hyde failure: log and track
                     logger.warning(
-                        "[_execute_retrieval] vector search variant=%d (%s) failed: %s",
-                        i, variant_type, result,
+                        "[_execute_retrieval] vector search variant=%d failed: %s",
+                        i, result,
                     )
                     if variant_type not in variants_dropped:
                         variants_dropped.append(variant_type)
@@ -4303,18 +4303,18 @@ class RAGEngine:
         query_embeddings: List[Tuple[str, List[float]]] = []
         variants_dropped: List[str] = []
 
-        for (variant_type, _), result in zip(transformed_queries, raw_embeddings):
+        for (variant_label, _), result in zip(transformed_queries, raw_embeddings):
             if isinstance(result, BaseException):
-                if variant_type == "original":
+                if variant_label == "original":
                     raise RAGEngineError(f"Original query embedding failed: {result}") from result
                 logger.warning(
                     "Query embedding failed for variant '%s': %s",
-                    variant_type,
+                    variant_label,
                     result,
                 )
-                variants_dropped.append(variant_type)
+                variants_dropped.append(variant_label)
             else:
-                query_embeddings.append((variant_type, result))
+                query_embeddings.append((variant_label, result))
 
         if not query_embeddings:
             raise RAGEngineError("Unable to encode any query variants")
