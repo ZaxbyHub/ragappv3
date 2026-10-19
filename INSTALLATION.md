@@ -567,6 +567,12 @@ EMBEDDING_MODEL=microsoft/harrier-oss-v1-0.6b
 # the host's own context and keep_alive reverts to Ollama's default
 # (5 minutes), discarding the configured residency. Keep
 # OLLAMA_NUM_CTX == the host's OLLAMA_CONTEXT_LENGTH.
+# OLLAMA_KEEP_ALIVE: residency duration sent on that preload call (-1 = keep
+#   the model loaded; duration strings like 30m also work).
+OLLAMA_KEEP_ALIVE=-1
+# OLLAMA_NUM_CTX: context window the preloaded model is loaded with
+#   (default 4096 = Ollama's documented default).
+OLLAMA_NUM_CTX=4096
 
 # Embedding Configuration
 # Batch size for embedding requests (default: 32)
@@ -581,7 +587,10 @@ EMBEDDING_BATCH_SIZE=32
 # file declares it via --max-client-batch-size). Candidate sets larger
 # than this are split into batched requests, so an over-cap set still
 # reranks instead of silently degrading to vector order. Match this to
-# your TEI's --max-client-batch-size when you change it there.
+# your TEI's --max-client-batch-size when you change it there; a mismatch
+# is not detected at runtime — client > host cap silently degrades back
+# to vector order (the behavior this setting exists to remove), and
+# client < host cap costs extra round-trips.
 RERANKER_MAX_BATCH=32
 
 # Optional Features

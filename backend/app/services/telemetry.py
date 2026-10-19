@@ -72,10 +72,13 @@ def _status_to_outcome(status: Optional[str]) -> str:
         return "ok"
     if status in ("timeout", "request_error", "unavailable", "circuit_open",
                   "http_error", "invalid_json", "admission_rejected",
-                  "url_blocked", "invalid_response"):
+                  "url_blocked", "invalid_response", "inband_error"):
         # url_blocked/invalid_response added by the issue #717 review: an
         # SSRF-blocked or unparseable provider response is an outage-class
-        # outcome, not a soft partial.
+        # outcome, not a soft partial. inband_error (issue #719 review PRR-003)
+        # is a mid-stream provider failure the LLM client charges the breaker
+        # for; counting it as partial would under-report provider health while
+        # the breaker simultaneously treats it as an outage.
         return "unavailable"
     if status == "empty":
         return "empty"

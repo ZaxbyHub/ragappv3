@@ -16,7 +16,7 @@ window instead of following provider server defaults (issue #571, audit finding 
 | `OLLAMA_KEEP_ALIVE` | `-1` | Ollama `keep_alive` sent on the one-shot native preload call for the thinking/editorial backends. `-1` keeps the model loaded indefinitely — the same effective residency the retired ping loop provided. Ollama also accepts duration strings (`"30m"`) or seconds. |
 | `OLLAMA_NUM_CTX` | `4096` | Explicit context window pinned on the loaded Ollama instance. 4096 is Ollama's documented default, so this is a controls change, not a capability change. The OpenAI-compatible surface cannot set it per request. |
 | `LM_STUDIO_TTL` | `86400` | Idle TTL in seconds carried on every Instant (LM Studio) chat payload. The idle timer resets on every request; 24h default is far more generous than LM Studio's 60-minute JIT default. |
-| `LM_STUDIO_CONTEXT_LENGTH` | `4096` | Context length requested from LM Studio's native model-load endpoint (v1, with a legacy v0 fallback for pre-0.4.0 servers). |
+| `LM_STUDIO_CONTEXT_LENGTH` | `4096` | Context length requested from LM Studio's native model-load endpoint (v1 only; the legacy v0 fallback was removed by #719 — it targeted an endpoint LM Studio never shipped). |
 
 All four are env/restart-applied: they are consumed when client factories run at startup
 and are intentionally not part of the runtime settings API (a hot change could not reach

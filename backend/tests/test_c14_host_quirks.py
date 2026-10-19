@@ -87,6 +87,83 @@ class TestInstantReasoningLeak:
         ]
         assert len(hits) >= 1
 
+    @pytest.mark.asyncio
+    async def test_reasoning_leak_warns_once_per_stream(self, caplog):
+        """PRR-007: the warning is one-shot PER STREAM, not per delta. Three
+        reasoning deltas must produce exactly one warning — an
+        implementation that warns on every delta fails here."""
+        client = LLMClient(
+            base_url="http://lm-studio.local:1234",
+            model="qwen3.5-8b-instant",
+            cb_name="llm_instant",
+            chat_template_kwargs={"enable_thinking": False},
+        )
+        client._client = FakeAsyncHTTP(
+            stream_lines=[
+                'data: {"choices": [{"delta": {"reasoning_content": "one"}}]}',
+                "",
+                'data: {"choices": [{"delta": {"reasoning_content": "two"}}]}',
+                "",
+                'data: {"choices": [{"delta": {"reasoning_content": "three"}}]}',
+                "",
+                "data: [DONE]",
+                "",
+            ]
+        )
+        with caplog.at_level(logging.WARNING, logger="app.services.llm_client"):
+            async for _ in client.chat_completion_stream(
+                [{"role": "user", "content": "q"}]
+            ):
+                pass
+        hits = [
+            record
+            for record in caplog.records
+            if record.name == "app.services.llm_client"
+            and record.levelno >= logging.WARNING
+            and re.search(r"(?i)reason|think", record.getMessage())
+        ]
+        assert len(hits) == 1
+
+    @pytest.mark.asyncio
+    async def test_new_lm_studio_404_warning_is_actionable(self, caplog):
+        """EXT-NEW-2: a 404 from the LM Studio load endpoint can mean either
+        a pre-v1 server or an unknown model id; the warning must not blame
+        the API version unconditionally, and must name the model."""
+        requests: list = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request.url.path)
+            return httpx.Response(
+                404, json={"error": "model not found"}, request=request
+            )
+
+        with patch("app.services.llm_client.assert_url_safe"):
+            llm = LLMClient(
+                base_url="http://lm-studio.local:1234",
+                model="ghost-model",
+                context_length=4096,
+            )
+        llm._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            with caplog.at_level(logging.WARNING, logger="app.services.llm_client"):
+                ok = await llm.prime_residency()
+        finally:
+            await llm._client.aclose()
+        assert ok is False
+        assert requests == ["/api/v1/models/load"]
+        warnings = [
+            record
+            for record in caplog.records
+            if record.name == "app.services.llm_client"
+            and record.levelno >= logging.WARNING
+        ]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        # Names the model so an operator can tell "wrong model id" from
+        # "old server", and does not assert the v1 API is the cause.
+        assert "ghost-model" in message
+        assert "does not know the model id" in message
+
 
 class TestNoV0LoadFallback:
     @pytest.mark.asyncio
