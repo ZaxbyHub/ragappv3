@@ -45,10 +45,17 @@ not this contract.
 """
 
 import ast
+import logging
 import os
+import shutil
+import subprocess
 import sys
+from contextlib import contextmanager
 from dataclasses import fields as dataclass_fields
 from pathlib import Path
+from unittest import mock
+
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -83,6 +90,16 @@ _QUERYISH_NAMES = frozenset(
         "rewritten",
         "hyde_passage",
         "original_query_text",
+        # C15 residuals (2026-10-19, #908/#909): `variant_type` holds the
+        # RAW sub-query string on the multi-sub-query orchestrator path
+        # (rag_engine `_execute_retrieval`) even though the name suggests a
+        # label — the label-only loops now use `variant_label`. `title`
+        # holds the LLM summary of the session's first chat message in
+        # chat.py `_auto_name_session`. Both were collision-checked against
+        # every default-level log call in backend/app after this fix's
+        # redactions/renames (zero remaining hits).
+        "variant_type",
+        "title",
     }
 )
 
@@ -186,17 +203,55 @@ def _guarded_level_ok(call: ast.Call) -> bool:
 
 
 def _iter_app_files():
-    app_dir = Path(__file__).resolve().parent.parent / "app"
-    for path in sorted(app_dir.rglob("*.py")):
-        yield path
+    """Yield TRACKED ``backend/app/*.py`` files only (#906 AC4).
+
+    The walk is scoped to ``git ls-files`` output so untracked/generated
+    trees under ``backend/app`` (e.g. graphify output) cannot change the
+    guard's verdict between developer machines and CI. If git is genuinely
+    unavailable (no repository context), the walk falls back to the full
+    ``rglob`` — the pre-#906 behavior — because failing the whole guard on
+    a tooling gap would be worse than the narrower scope; every environment
+    that ships this repo (CI, dev clones) has git.
+    """
+    backend_dir = Path(__file__).resolve().parent.parent
+    try:
+        listed = subprocess.run(
+            ["git", "-C", str(backend_dir), "ls-files", "--", "app"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        app_dir = backend_dir / "app"
+        for path in sorted(app_dir.rglob("*.py")):
+            yield path
+        return
+    for rel in sorted(line for line in listed.stdout.splitlines() if line.endswith(".py")):
+        yield backend_dir / rel
+
+
+_scan_logger = logging.getLogger(__name__)
 
 
 def _find_query_text_at_default_level():
     """Yield ``file:line: description`` for every guarded logging call in
-    backend/app that formats query-derived text."""
+    backend/app that formats query-derived text.
+
+    #906 AC3: unreadable or unparseable files (BOM, non-UTF-8 bytes —
+    ``read_text`` raises ``UnicodeDecodeError``, a ``ValueError`` — or any
+    ``SyntaxError``) are skipped with a counted INFO note instead of
+    failing the scan with an opaque error (conftest.py's census-loop
+    pattern)."""
+    skipped = 0
+    backend_dir = Path(__file__).resolve().parent.parent
     for path in _iter_app_files():
-        source = path.read_text(encoding="utf-8")
-        tree = ast.parse(source, filename=str(path))
+        try:
+            source = path.read_text(encoding="utf-8")
+            tree = ast.parse(source, filename=str(path))
+        except (OSError, ValueError, SyntaxError):
+            skipped += 1
+            continue
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
@@ -221,11 +276,21 @@ def _find_query_text_at_default_level():
             for arg in args:
                 hit = _contains_queryish_text(arg)
                 if hit is not None:
+                    try:
+                        rel = os.path.relpath(path, backend_dir)
+                    except ValueError:
+                        # Windows cross-drive relpath (planted file on
+                        # another mount): fall back to the path string.
+                        rel = str(path)
                     yield (
-                        f"{os.path.relpath(path, Path(__file__).resolve().parent.parent)}"
+                        f"{rel}"
                         f":{node.lineno}: logger.{func.attr} formats query-derived '{hit}'"
                     )
                     break
+    if skipped:
+        _scan_logger.info(
+            "no-query-text guard: skipped %d unreadable/unparseable file(s)", skipped
+        )
 
 
 def test_no_query_text_formatted_at_default_log_level():
@@ -351,3 +416,193 @@ def test_trace_fields_fully_classified_for_logging():
         "query_plan",
         "unverifiable_claims",
     }, "the redacted set is pinned: it is exactly the user-derived text fields"
+
+
+# ======================================================================
+# Guard-robustness checks for issue #906 (added by the c15 trace's
+# acceptance-check author). These pin the #906 hardening contract:
+#
+# - test_guard_scanned_a_real_file_set  (#906 AC1 / trace C14): a
+#   scanned-file floor so the guard cannot pass vacuously, with the
+#   failure message naming the expected minimum.
+# - test_detector_rejects_synthetic_query_leak (#906 AC2 / trace C15):
+#   a planted violation proves the shipped detector still detects.
+# - test_guard_skips_unreadable_files  (#906 AC3 / trace C16):
+#   BOM / non-UTF-8 / unparseable files are skipped with a counted
+#   note instead of an opaque error. RED at base, GREEN after the fix.
+# - test_guard_verdict_ignores_untracked_trees (#906 AC4 / trace C17):
+#   an untracked generated tree under backend/app cannot change the
+#   verdict. RED at base, GREEN after the fix.
+# ======================================================================
+
+# backend/app held 145 tracked .py files at fcc5144e (2026-10-19). The floor
+# is deliberately far below the live count so routine refactors do not trip
+# it while a moved scan root or broken glob (0-ish files) always does.
+_MIN_GUARDED_FILES = 50
+
+
+def _assert_scanned_floor(paths, label: str) -> list:
+    """Fail, naming the expected minimum, when a scan inspects too little."""
+    files = list(paths)
+    assert len(files) >= _MIN_GUARDED_FILES, (
+        f"{label}: the #710 guard scanned only {len(files)} files under "
+        f"backend/app — a real run must inspect at least {_MIN_GUARDED_FILES} "
+        "(backend/app held 145 at fcc5144e). If the scan root moved or the "
+        "glob broke, fix the scan; do not lower this floor."
+    )
+    return files
+
+
+def test_guard_scanned_a_real_file_set():
+    """#906 AC1: the guard must prove it scanned a real file set.
+
+    GREEN while backend/app exists (the live tree far exceeds the floor);
+    RED if the scan root is moved/renamed or the glob stops matching —
+    previously the guard reported zero violations and passed while
+    inspecting nothing. The failure-message path is exercised against an
+    empty scan so the message naming the expected minimum is itself pinned
+    (mirrors test_a06_contract_guards.py's guarded-count floor).
+    """
+    files = _assert_scanned_floor(_iter_app_files(), "guard scan")
+    assert any(path.name == "main.py" for path in files), (
+        "the scan must include backend/app/main.py; a scan that misses it is "
+        "scanning the wrong root"
+    )
+
+    with pytest.raises(AssertionError) as excinfo:
+        _assert_scanned_floor([], "empty probe")
+    assert str(_MIN_GUARDED_FILES) in str(excinfo.value), (
+        "the floor's failure message must name the expected minimum so a "
+        "vacuous scan fails diagnosably"
+    )
+
+
+_PLANTED_LEAK_SOURCE = (
+    "import logging\n"
+    "logger = logging.getLogger(__name__)\n"
+    "\n"
+    "def _planted_leak(query):\n"
+    '    logger.info("q=%s", query)\n'
+)
+
+
+def test_detector_rejects_synthetic_query_leak(tmp_path):
+    """#906 AC2: the shipped detector flags a planted query-text leak.
+
+    A detector that can only ever pass proves nothing. A synthetic module
+    carrying ``logger.info("q=%s", query)`` is fed through the REAL scan
+    pipeline (receiver recognition + containment walk + yield), and the
+    scan must flag exactly it (mirrors test_n03_guardrails.py's planted
+    census violation). GREEN at base and after the fix; RED if a refactor
+    of the containment walk silently stops detecting anything.
+    """
+    planted = tmp_path / "planted_leak.py"
+    planted.write_text(_PLANTED_LEAK_SOURCE, encoding="utf-8")
+
+    with mock.patch(
+        f"{__name__}._iter_app_files", return_value=iter([planted])
+    ):
+        violations = list(_find_query_text_at_default_level())
+
+    assert len(violations) == 1, (
+        "the detector must flag exactly the planted query-text log call; "
+        f"got: {violations}"
+    )
+    assert "planted_leak.py" in violations[0], (
+        f"the flagged site must be the planted file; got: {violations}"
+    )
+
+
+class _ListHandler(logging.Handler):
+    """Collect every record at or above its level; no assertion semantics."""
+
+    def __init__(self, level: int):
+        super().__init__(level=level)
+        self.records = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+@contextmanager
+def _capture_root_records(level: int = logging.INFO):
+    """Capture INFO+ records from ANY logger (skip notes may be logged on
+    this module's own logger, which has no configured handlers)."""
+    root = logging.getLogger()
+    handler = _ListHandler(level)
+    previous_level = root.level
+    root.setLevel(level)
+    root.addHandler(handler)
+    try:
+        yield handler
+    finally:
+        root.removeHandler(handler)
+        root.setLevel(previous_level)
+
+
+def test_guard_skips_unreadable_files(tmp_path):
+    """#906 AC3: unreadable/unparseable files are skipped with a counted note.
+
+    A UTF-8 BOM (ast.parse rejects the BOM char), a non-UTF-8 byte sequence
+    (read_text raises UnicodeDecodeError, which is a ValueError — NOT an
+    OSError), and plain broken syntax are planted next to a good file that
+    itself carries a violation. The scan must complete (RED at base: the
+    unguarded read_text/ast.parse raise), still flag the good file's
+    violation (skipping must not turn the scan vacuous), and surface the
+    skipped files as a counted note — an INFO-or-higher log record
+    mentioning "skip" — so unscannable files are never silently ignored.
+    GREEN after the fix.
+    """
+    good = tmp_path / "good.py"
+    good.write_text(_PLANTED_LEAK_SOURCE, encoding="utf-8")
+    bom = tmp_path / "bom.py"
+    bom.write_bytes("\ufeff".encode("utf-8") + _PLANTED_LEAK_SOURCE.encode("utf-8"))
+    latin1 = tmp_path / "latin1.py"
+    latin1.write_bytes("x = '\x80\x81'\n".encode("latin-1"))
+    broken = tmp_path / "broken.py"
+    broken.write_text("def broken(:\n    pass\n", encoding="utf-8")
+    files = [good, bom, latin1, broken]
+
+    with _capture_root_records(logging.INFO) as captured:
+        with mock.patch(
+            f"{__name__}._iter_app_files", return_value=iter(files)
+        ):
+            violations = list(_find_query_text_at_default_level())
+
+    assert len(violations) == 1 and "good.py" in violations[0], (
+        "the scan must complete AND still flag the readable file's planted "
+        f"violation; got: {violations}"
+    )
+    skip_notes = [
+        r.getMessage() for r in captured.records if "skip" in r.getMessage().lower()
+    ]
+    assert skip_notes, (
+        "unreadable/unparseable files must be reported as a counted note "
+        "(an INFO-or-higher log record mentioning 'skip'), never silently "
+        "ignored (#906 AC3)"
+    )
+
+
+def test_guard_verdict_ignores_untracked_trees():
+    """#906 AC4: untracked/generated trees cannot change the guard verdict.
+
+    An untracked generated directory carrying a planted violation is
+    created under backend/app for the duration of the scan (removed in the
+    finally block). RED at base (the walk judges every *.py it finds, so
+    the generated file flips the verdict); GREEN after the fix scopes the
+    scan to tracked sources.
+    """
+    app_dir = Path(__file__).resolve().parent.parent / "app"
+    probe_dir = app_dir / "_c17_untracked_probe"
+    probe = probe_dir / "zz_generated_probe.py"
+    try:
+        probe_dir.mkdir(parents=True, exist_ok=True)
+        probe.write_text(_PLANTED_LEAK_SOURCE, encoding="utf-8")
+        violations = list(_find_query_text_at_default_level())
+        assert violations == [], (
+            "the guard verdict changed because of an UNTRACKED generated file "
+            f"under backend/app ({violations}): the scan must judge tracked "
+            "sources only, so developer machines and CI agree (#906 AC4)"
+        )
+    finally:
+        shutil.rmtree(probe_dir, ignore_errors=True)

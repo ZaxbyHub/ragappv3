@@ -36,7 +36,7 @@
       "SEVERITY.LOW": 62,
       "SEVERITY.MEDIUM": 60,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 89666,
+      "loc": 89851,
       "nosec": 0,
       "skipped_tests": 66
     },
@@ -114,7 +114,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 3012,
+      "loc": 3019,
       "nosec": 0,
       "skipped_tests": 7
     },
@@ -387,7 +387,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1033,
+      "loc": 1079,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -400,7 +400,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1515,
+      "loc": 1518,
       "nosec": 0,
       "skipped_tests": 1
     },
@@ -452,7 +452,7 @@
       "SEVERITY.LOW": 1,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 90,
+      "loc": 115,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1063,7 +1063,7 @@
       "SEVERITY.LOW": 1,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1460,
+      "loc": 1469,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1726,7 +1726,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1074,
+      "loc": 1072,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1739,7 +1739,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 496,
+      "loc": 551,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1752,7 +1752,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 245,
+      "loc": 287,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -3423,7 +3423,7 @@
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "63                     setattr(record, field, \"[redacted]\")\n64                 except Exception:  # pragma: no cover \u2014 defensive\n65                     pass\n66         return True\n",
+      "code": "75                     setattr(record, field, \"[redacted]\")\n76                 except Exception:  # pragma: no cover \u2014 defensive\n77                     pass\n78         return True\n",
       "col_offset": 16,
       "end_col_offset": 24,
       "filename": "backend/app/middleware/logging.py",
@@ -3434,10 +3434,10 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 64,
+      "line_number": 76,
       "line_range": [
-        64,
-        65
+        76,
+        77
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
@@ -3718,7 +3718,7 @@
       "test_name": "hashlib"
     },
     {
-      "code": "1405                 )\n1406         except Exception:\n1407             pass  # Silently ignore any errors accessing internal pool state\n1408 \n",
+      "code": "1411                 )\n1412         except Exception:\n1413             pass  # Silently ignore any errors accessing internal pool state\n1414 \n",
       "col_offset": 8,
       "end_col_offset": 16,
       "filename": "backend/app/services/embeddings.py",
@@ -3729,10 +3729,10 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1406,
+      "line_number": 1412,
       "line_range": [
-        1406,
-        1407
+        1412,
+        1413
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",

@@ -364,6 +364,12 @@ fi
 
 ## Logs
 
+Access-log records (`http_request`) carry request_id, method, path,
+status_code, client_ip, and duration_ms; query-string VALUES are redacted
+(free-text search terms and credential parameters), so no user search text
+reaches the application log. The container disables uvicorn's duplicate
+access log (`--no-access-log`); the middleware record is the access log.
+
 ### Viewing Logs
 
 **Docker Compose:**
