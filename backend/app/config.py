@@ -716,7 +716,10 @@ class Settings(BaseSettings):
     wiki_llm_curator_temperature: float = 0.0
     """Temperature for curator calls. Default 0.0 for determinism."""
     wiki_llm_curator_max_input_chars: int = 6000
-    """Maximum source text passed to the curator per call (1000-24000)."""
+    """Maximum source characters, taken from the start of the document,
+    curated across all curator calls for one document (1000-24000); each
+    call's prompt re-applies this bound to its own chunk snippet. The
+    curated span never goes below one 2000-char chunk."""
     wiki_llm_curator_max_output_tokens: int = 2048
     """max_tokens passed to the curator per call."""
     wiki_llm_curator_timeout_sec: float = 120.0

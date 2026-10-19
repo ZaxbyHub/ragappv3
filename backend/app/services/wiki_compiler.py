@@ -10,6 +10,7 @@ wiki claim when its source_quote verifies against the chunk it cites.
 
 import asyncio
 import concurrent.futures
+import contextvars
 import json
 import logging
 import re
@@ -1161,14 +1162,19 @@ class WikiCompiler:
 
         try:
             # The compiler is sync, but CuratorClient.propose is async.
-            # When called from inside a running event loop (e.g. an
-            # async FastAPI handler), we can't block on the same loop —
-            # run_coroutine_threadsafe().result() would deadlock it. The
-            # safe sync→async bridge from inside a running loop is to
-            # run the coroutine in a worker thread. Reuse a module-level
-            # executor (issue #109) so we don't pay the per-call cost
-            # of constructing+tearing-down a ThreadPoolExecutor on the
-            # curator hot path.
+            # Issue #795: ALWAYS dispatch through the module-level
+            # single-worker offload executor (issue #109). The previous
+            # inline asyncio.run branch ran whenever no loop was active in
+            # the calling thread — exactly the case for both real callers,
+            # which reach the compiler via asyncio.to_thread pool threads
+            # (the background processor and the promote-memory route) — so
+            # two concurrent jobs could drive two concurrent event loops
+            # against one shared curator breaker. The single worker
+            # serializes every curator loop process-wide; within a job the
+            # concurrency knob still bounds parallel propose calls. The
+            # wait on the result is intentionally untimed: the per-call
+            # HTTP timeout bounds each request, and the curator must never
+            # fail the enclosing job.
             coro = curator.curate(
                 vault_id=vault_id,
                 file_id=file_id,
@@ -1177,19 +1183,15 @@ class WikiCompiler:
                 existing_entities_brief=existing_brief,
                 deterministic_dedupe_keys=dedupe_seed,
             )
-            try:
-                running_loop = asyncio.get_running_loop()
-            except RuntimeError:
-                running_loop = None
-            if running_loop is None:
-                cur_result = asyncio.run(coro)
-            else:
-                # The thread is required to break the event-loop deadlock;
-                # the executor is shared across calls so we only construct
-                # it once per process.
-                cur_result = _CURATOR_OFFLOAD_EXECUTOR.submit(
-                    asyncio.run, coro
-                ).result()
+            # Issue #795 review: submit does NOT copy contextvars, so a bare
+            # submit(asyncio.run, coro) would drop the caller's request
+            # identity (traceparent/X-Request-ID) from every curator POST
+            # and log line. Copy the context here and run the coroutine
+            # inside it on the worker thread.
+            submit_ctx = contextvars.copy_context()
+            cur_result = _CURATOR_OFFLOAD_EXECUTOR.submit(
+                submit_ctx.run, asyncio.run, coro
+            ).result()
         except Exception as e:  # broad — curator must never fail the job
             logger.warning(
                 "wiki curator: orchestration failed for vault=%s file=%s: %s",
@@ -1246,7 +1248,16 @@ class WikiCompiler:
                         # knowledge (the curator's find-or-create
                         # deliberately omits reactivation to keep
                         # pair-atomicity, so the flip must be inline too).
-                        if existing.status == "superseded":
+                        # Issue #795 review: gate on THIS candidate's own
+                        # computed status — the deterministic twin gates
+                        # identically (new_status == "active") — so a
+                        # needs_review candidate (draft mode, unknown
+                        # chunk, quote check off) can never resurrect a
+                        # superseded claim as active.
+                        if (
+                            existing.status == "superseded"
+                            and accepted.status == "active"
+                        ):
                             self._store.reactivate_claim_if_superseded(existing.id)
                             existing.status = "active"
                         already = any(
@@ -1388,9 +1399,11 @@ class WikiCompiler:
         out: list[CuratorChunk] = []
         max_input = int(getattr(_app_settings, "wiki_llm_curator_max_input_chars", 6000))
         budget = max(_COMPILE_CHUNK_SIZE, max_input)
-        # Take from the start of the text up to budget; bounded by the
-        # curator's own per-call max_input_chars, so we don't need to
-        # paginate here.
+        # Take from the start of the text up to budget. This is the
+        # per-document curated span (never below one 2000-char chunk) — the knob's documented semantics
+        # (issue #795) — NOT a per-call prompt bound; build_user_prompt
+        # re-applies its own bound to each call's chunk snippet, so we
+        # don't need to paginate here.
         bound_text = text[:budget]
         for i in range(0, len(bound_text), _COMPILE_CHUNK_SIZE):
             window = bound_text[i : i + _COMPILE_CHUNK_SIZE]

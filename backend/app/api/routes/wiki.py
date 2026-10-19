@@ -630,7 +630,8 @@ async def update_wiki_claim(
                     "Cannot auto-activate curator-authored claim: no source "
                     "row references a document file (this claim was likely "
                     "produced from a chat-query or manual-promote curator "
-                    "trigger). Edit the claim and attach a file source, or "
+                    "trigger, or its curator run could not verify a chunk "
+                    "id). Edit the claim and attach a file source, or "
                     "leave it in 'needs_review' status for manual handling."
                 )
             elif not any_quote:
