@@ -43,6 +43,35 @@ def _telemetry():
     return _get_telemetry()
 
 
+def _provider_body_summary(body: object) -> str:
+    """Bounded, non-echoing summary of a provider error body (C15, issue #903).
+
+    Embedding providers are third parties whose HTTP error bodies can echo
+    the request payload back — token-overflow errors in particular quote the
+    offending input text — and embedding inputs are user-derived document/
+    chunk/query content. The raw body therefore must never be formatted into
+    a default-level (WARNING+) log record (#287 contract). Call sites pass
+    ``response.text`` here in place of raw interpolation: the returned
+    summary exposes only bounded metadata (body length plus a short SHA-256
+    fingerprint) that correlates identical failures without disclosing any
+    body content. Length+hash is chosen over a truncated first-N-chars
+    preview because ANY body excerpt can carry echoed user text.
+
+    Side effect: the full body is emitted at DEBUG so operators running
+    elevated levels keep the diagnostic detail; DEBUG sits below the default
+    level and is outside the #287/#710 default-log contract.
+    """
+    text = body if isinstance(body, str) else str(body)
+    fingerprint = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:12]
+    logger.debug(
+        "Embedding provider error body (length %s, sha256 %s): %s",
+        len(text),
+        fingerprint,
+        text,
+    )
+    return f"body_length={len(text)} body_sha256={fingerprint}"
+
+
 class LRUCache:
     """Simple LRU cache with size limit and hit/miss statistics."""
 
@@ -836,7 +865,7 @@ class EmbeddingService:
                     response.status_code
                 ):
                     logger.warning(
-                        f"Embedding API returned status {response.status_code} for {config.mode} mode: {response.text}"
+                        f"Embedding API returned status {response.status_code} for {config.mode} mode: {_provider_body_summary(response.text)}"
                     )
                     raise EmbeddingError(
                         f"Embedding API returned status {response.status_code}"
@@ -858,7 +887,7 @@ class EmbeddingService:
                 # raised OUTSIDE the breaker: they are caller errors that
                 # would recur on every retry, not provider outages.
                 logger.warning(
-                    f"Embedding API returned status {response.status_code} for {config.mode} mode: {response.text}"
+                    f"Embedding API returned status {response.status_code} for {config.mode} mode: {_provider_body_summary(response.text)}"
                 )
                 raise EmbeddingError(
                     f"Embedding API returned status {response.status_code}"
@@ -868,7 +897,7 @@ class EmbeddingService:
                 data = response.json()
             except ValueError as e:
                 logger.warning(
-                    f"Invalid JSON response from embedding API for {config.mode} mode: {e}, response: {response.text}"
+                    f"Invalid JSON response from embedding API for {config.mode} mode: {e}, response: {_provider_body_summary(response.text)}"
                 )
                 raise EmbeddingError("Invalid response from embedding service")
 
@@ -1035,7 +1064,7 @@ class EmbeddingService:
                 response.status_code
             ):
                 logger.warning(
-                    f"Embedding API returned status {response.status_code} for {config.mode} mode: {response.text}"
+                    f"Embedding API returned status {response.status_code} for {config.mode} mode: {_provider_body_summary(response.text)}"
                 )
                 raise EmbeddingError(
                     f"Embedding API returned status {response.status_code}"
@@ -1056,7 +1085,7 @@ class EmbeddingService:
 
         if response.status_code != 200:
             logger.warning(
-                f"Embedding API returned status {response.status_code} for {config.mode} mode: {response.text}"
+                f"Embedding API returned status {response.status_code} for {config.mode} mode: {_provider_body_summary(response.text)}"
             )
             raise EmbeddingError(
                 f"Embedding API returned status {response.status_code}"
@@ -1066,7 +1095,7 @@ class EmbeddingService:
             data = response.json()
         except ValueError as e:
             logger.warning(
-                f"Invalid JSON response from embedding API for {config.mode} mode: {e}, response: {response.text}"
+                f"Invalid JSON response from embedding API for {config.mode} mode: {e}, response: {_provider_body_summary(response.text)}"
             )
             raise EmbeddingError("Invalid response from embedding service")
 
@@ -1499,7 +1528,7 @@ class EmbeddingService:
                     ):
                         return response
                     logger.warning(
-                        f"Embedding API returned status {response.status_code} for {config.mode} mode: {response.text}"
+                        f"Embedding API returned status {response.status_code} for {config.mode} mode: {_provider_body_summary(response.text)}"
                     )
                     raise EmbeddingError(
                         f"Embedding API returned status {response.status_code}"
@@ -1516,7 +1545,7 @@ class EmbeddingService:
                 error_text = response.text.lower()
                 if self._is_token_overflow_error(error_text):
                     logger.warning(
-                        f"Token overflow error for {config.mode} mode: {response.text}"
+                        f"Token overflow error for {config.mode} mode: {_provider_body_summary(response.text)}"
                     )
                     # Handle overflow using the shared helper
                     return await self._handle_overflow_retry(
@@ -1525,7 +1554,7 @@ class EmbeddingService:
 
             if response.status_code != 200:
                 logger.warning(
-                    f"Embedding API returned status {response.status_code} for {config.mode} mode: {response.text}"
+                    f"Embedding API returned status {response.status_code} for {config.mode} mode: {_provider_body_summary(response.text)}"
                 )
                 raise EmbeddingError(
                     f"Embedding API returned status {response.status_code}"
