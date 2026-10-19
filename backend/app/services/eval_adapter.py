@@ -55,6 +55,7 @@ from app.config import settings
 
 # Metric primitives — imported at top level so the pure eval functions are
 # available before any service class is instantiated.
+from app.services.eval_compare import environment_fingerprint
 from app.services.eval_metrics import mean_reciprocal_rank as _mrr
 from app.services.eval_metrics import ndcg_at_k as _ndcg
 from app.services.eval_metrics import recall_at_k as _recall
@@ -154,6 +155,11 @@ class QueryMetrics:
     # Issue #462 — surfaced artifact ids + explicit retrieval status (observation).
     artifact_ids: List[str] = field(default_factory=list)
     status: str = "ok"  # "ok" | "partial" | "unavailable"
+
+
+# Issue #718: module-level persistence lock — one lock per adapter instance
+# (adapters are created per request) serialized nothing across requests.
+_PERSIST_LOCK = asyncio.Lock()
 
 
 @dataclass
@@ -300,7 +306,10 @@ class LiveEvalAdapter:
 
     def __init__(self, top_k: int = 5) -> None:
         self.top_k = top_k
-        self._persist_lock = asyncio.Lock()  # serialize JSONL writes
+        # Issue #718: share the MODULE-level lock; a per-instance lock
+        # (one adapter per request) never serialized cross-request writes.
+        self.last_persist_report: Optional[Path] = None
+        self._persist_lock = _PERSIST_LOCK
 
     # ------------------------------------------------------------------
     # Public API
@@ -500,8 +509,10 @@ class LiveEvalAdapter:
             release_id=release_id,
         )
 
-        # Persist asynchronously
-        await self._persist_run(result)
+        # Persist; surface the outcome so the route can report
+        # ``persisted`` (issue #718: a silent persistence failure must not
+        # read as success).
+        self.last_persist_report = await self._persist_run(result)
 
         return result
 
@@ -509,29 +520,76 @@ class LiveEvalAdapter:
     # Persistence
     # ------------------------------------------------------------------
 
-    async def _persist_run(self, result: RunResult) -> None:
-        """Append a run record as JSONL to the eval-runs directory.
+    async def _persist_run(self, result: RunResult) -> Optional[Path]:
+        """Append a run record as JSONL and write a per-run report file.
 
-        Thread/async-safe via a lock to prevent interleaved writes.
+        Thread/async-safe via the module-level lock to prevent interleaved
+        writes (issue #718: the old per-instance lock serialized nothing
+        across requests). Returns the per-run report path on success and
+        None on failure (still logged) so callers can surface
+        ``persisted``. The record carries the ``load_run_report`` envelope
+        (top-level ``environment`` via ``eval_compare.environment_fingerprint``
+        and a ``metrics`` dict of the run's ``*_mean`` fields) — issue #718:
+        the documented operator workflow feeds persisted runs to
+        ``eval_compare.compare_runs``, which requires those keys. The
+        per-run single-object report file exists because
+        ``load_run_report`` parses a whole file as one JSON object and
+        cannot read a multi-line runs.jsonl once a second record exists;
+        runs.jsonl stays the append-only audit log.
         """
-        async with self._persist_lock:
-            try:
+        try:
+            async with self._persist_lock:
                 runs_dir = _get_runs_dir()
                 run_file = runs_dir / "runs.jsonl"
                 record = result.to_dict()
+                # Issue #718 review: model_identity must carry the actual
+                # embedding model (a release-id-only dict made model_hash
+                # information-equal to code_hash), and the record needs a
+                # top-level `resources` key — load_run_report defaults it to
+                # [], leaving compare_runs' matched_resources permanently
+                # empty. Benchmark item ids are the run's resource set,
+                # matching the run_eval.py harness envelope.
+                benchmark_ids = sorted(
+                    qm.query_id for qm in result.query_metrics
+                )
+                record["environment"] = environment_fingerprint(
+                    release_id=result.release_id,
+                    model_identity={
+                        "model": settings.embedding_model,
+                        "release_id": result.release_id,
+                    },
+                    config_snapshot={"top_k": result.top_k},
+                    resource_ids=benchmark_ids,
+                )
+                record["resources"] = benchmark_ids
+                record["metrics"] = {
+                    key: value
+                    for key, value in (
+                        ("mrr_mean", result.mrr_mean),
+                        ("ndcg_mean", result.ndcg_mean),
+                        ("recall_mean", result.recall_mean),
+                    )
+                    if value is not None
+                }
                 line = json.dumps(record, sort_keys=True)
                 with run_file.open("a", encoding="utf-8") as f:
                     f.write(line + "\n")
+                report_file = runs_dir / f"runs-{result.run_id}.json"
+                with report_file.open("w", encoding="utf-8") as f:
+                    json.dump(record, f, indent=2, sort_keys=True)
                 logger.info(
-                    "Eval run %s persisted to %s (MRR=%.3f, nDCG=%.3f, recall=%.3f)",
+                    "Eval run %s persisted to %s and %s (MRR=%.3f, nDCG=%.3f, recall=%.3f)",
                     result.run_id,
                     run_file,
+                    report_file,
                     result.mrr_mean or 0.0,
                     result.ndcg_mean or 0.0,
                     result.recall_mean or 0.0,
                 )
-            except Exception as exc:
-                logger.error("Failed to persist eval run %s: %s", result.run_id, exc)
+                return report_file
+        except Exception as exc:
+            logger.error("Failed to persist eval run %s: %s", result.run_id, exc)
+            return None
 
 
 __all__ = [

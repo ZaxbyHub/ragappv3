@@ -595,7 +595,7 @@ When disabled, the endpoint returns HTTP 501:
 Set EVAL_ENABLED=true to enable.
 ```
 
-**Run records** (timestamp, release ID, per-query and aggregate metrics) are persisted as JSONL to `data/eval-runs/runs.jsonl` for trend comparison across releases.
+**Run records** (timestamp, release ID, per-query and aggregate metrics) are persisted twice under `data/eval-runs/`: the append-only audit log `runs.jsonl`, and a per-run report `runs-<run_id>.json` — load the per-run reports with `load_run_report` when comparing runs across releases (`compare_runs` consumes the loaded `RunReport` objects).
 
 **Metrics computed:**
 
