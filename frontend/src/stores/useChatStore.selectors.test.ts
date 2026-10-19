@@ -7,6 +7,7 @@ import { renderHook } from "@testing-library/react";
 import {
   useChatStore,
   useLastCompletedAssistantSources,
+  useLastCompletedAssistantCitationConfidence,
   useLastUserContent,
   useSourcesForSourceId,
   useCompletedAssistantMessageIdsKey,
@@ -134,5 +135,74 @@ describe("granular RightPane selectors", () => {
     s.setStreamingMessageId(null);
     rerender();
     expect(parseCompletedAssistantIds(result.current)).toEqual(["a"]);
+  });
+});
+
+describe("useLastCompletedAssistantCitationConfidence (#965)", () => {
+  it("returns the most recent completed assistant message's score record", () => {
+    const s = useChatStore.getState();
+    s.addMessage({ id: "u", role: "user", content: "q" });
+    s.addMessage({
+      id: "a-old",
+      role: "assistant",
+      content: "old",
+      citationConfidence: { W1: 0.25 },
+    });
+    s.addMessage({
+      id: "a-new",
+      role: "assistant",
+      content: "new",
+      citationConfidence: { W1: 0.5, K1: 0 },
+    });
+
+    const { result } = renderHook(() =>
+      useLastCompletedAssistantCitationConfidence()
+    );
+    expect(result.current).toEqual({ W1: 0.5, K1: 0 });
+  });
+
+  it("skips the actively streaming message", () => {
+    const s = useChatStore.getState();
+    s.addMessage({ id: "u", role: "user", content: "q" });
+    s.addMessage({
+      id: "a-live",
+      role: "assistant",
+      content: "streaming",
+      citationConfidence: { W9: 0.9 },
+    });
+    s.setStreamingMessageId("a-live");
+
+    const { result } = renderHook(() =>
+      useLastCompletedAssistantCitationConfidence()
+    );
+    expect(result.current).toBeUndefined();
+  });
+
+  it("stops the scan at an explicitly empty record so older scores never leak", () => {
+    const s = useChatStore.getState();
+    s.addMessage({ id: "u", role: "user", content: "q" });
+    s.addMessage({
+      id: "a-old",
+      role: "assistant",
+      content: "old",
+      citationConfidence: { W1: 0.25 },
+    });
+    s.addMessage({ id: "a-new", role: "assistant", content: "new", citationConfidence: {} });
+
+    const { result } = renderHook(() =>
+      useLastCompletedAssistantCitationConfidence()
+    );
+    expect(result.current).toEqual({});
+  });
+
+  it("is undefined when no completed assistant message carries scores", () => {
+    const s = useChatStore.getState();
+    s.addMessage({ id: "u", role: "user", content: "q" });
+    s.addMessage({ id: "a", role: "assistant", content: "no scores" });
+
+    const { result } = renderHook(() =>
+      useLastCompletedAssistantCitationConfidence()
+    );
+    expect(result.current).toBeUndefined();
   });
 });

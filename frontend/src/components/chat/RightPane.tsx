@@ -11,6 +11,7 @@ import {
   useLastCompletedAssistantSources,
   useLastCompletedAssistantWikiRefs,
   useLastCompletedAssistantKmsRefs,
+  useLastCompletedAssistantCitationConfidence,
   useLastUserContent,
   useSourcesForSourceId,
   useCompletedAssistantMessageIdsKey,
@@ -732,6 +733,10 @@ export function RightPane() {
   const lastCompletedSources = useLastCompletedAssistantSources();
   const lastCompletedWikiRefs = useLastCompletedAssistantWikiRefs();
   const lastCompletedKmsRefs = useLastCompletedAssistantKmsRefs();
+  // Issue #965: the pane renders the same WikiCards/KMSCards components the
+  // assistant message does, so cited evidence cards here get the same
+  // "Support NN%" chip from the done payload's per-label scores.
+  const lastCompletedCitationConfidence = useLastCompletedAssistantCitationConfidence();
   const query = useLastUserContent();
   const completedAssistantIdsKey = useCompletedAssistantMessageIdsKey();
   // Streaming-only candidate preview (issue #508): the versioned evidence SSE
@@ -1041,7 +1046,10 @@ export function RightPane() {
           <TabsContent value="wiki" className="flex-1 min-h-0 mt-4">
             <ScrollArea className="h-full min-w-[320px]">
               <div className="pr-4">
-                <WikiCards wikiRefs={lastCompletedWikiRefs!} />
+                <WikiCards
+                  wikiRefs={lastCompletedWikiRefs!}
+                  citationConfidence={lastCompletedCitationConfidence}
+                />
               </div>
             </ScrollArea>
           </TabsContent>
@@ -1051,7 +1059,10 @@ export function RightPane() {
           <TabsContent value="kms" className="flex-1 min-h-0 mt-4">
             <ScrollArea className="h-full">
               <div className="pr-4">
-                <KMSCards kmsRefs={lastCompletedKmsRefs!} />
+                <KMSCards
+                  kmsRefs={lastCompletedKmsRefs!}
+                  citationConfidence={lastCompletedCitationConfidence}
+                />
               </div>
             </ScrollArea>
           </TabsContent>

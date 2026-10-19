@@ -481,6 +481,31 @@ export const useLastCompletedAssistantKmsRefs = (): KMSReference[] | undefined =
     })
   );
 
+/**
+ * Selector returning the citation-confidence record of the most recent
+ * *completed* assistant message (issue #965). Mirrors the
+ * useLastCompletedAssistant* scan-back pattern so the RightPane can feed the
+ * support chips without re-rendering on streaming token growth. Returns the
+ * record whenever the message carries the field at all — including an
+ * explicitly empty record, which stops the scan so an older message's scores
+ * are never paired with a newer message's refs — and undefined when no
+ * completed message carries scores, leaving the support chips hidden.
+ */
+export const useLastCompletedAssistantCitationConfidence = (): Record<string, number> | undefined =>
+  useChatStore(
+    useShallow((s) => {
+      const streamingId = s.streamingMessageId;
+      for (let i = s.messageIds.length - 1; i >= 0; i--) {
+        const id = s.messageIds[i];
+        if (id === streamingId) continue;
+        const msg = s.messagesById[id];
+        if (msg?.role === "assistant" && msg.citationConfidence)
+          return msg.citationConfidence;
+      }
+      return undefined;
+    })
+  );
+
 /** Last user message's content (the active query). */
 export const useLastUserContent = (): string =>
   useChatStore((s) => {
