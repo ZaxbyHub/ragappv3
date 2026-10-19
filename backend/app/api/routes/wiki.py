@@ -9,7 +9,7 @@ import json
 import logging
 import sqlite3
 from dataclasses import asdict
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
@@ -87,27 +87,57 @@ async def _require_vault_write(evaluate: Callable, user: dict, vault_id: int) ->
 # ---------------------------------------------------------------------------
 # Request / Response models
 # ---------------------------------------------------------------------------
+# Issue #796: request-model vocabularies mirror the schema CHECK constraints
+# exactly (wiki_pages / wiki_claims, database.py — both DDL occurrences).
+# Values the store always rejected now fail request validation (422) instead
+# of surfacing as SQLite IntegrityError (generic 400 on create, unhandled 500
+# on update). `claim_type` deliberately stays str: wiki_claims has no CHECK
+# on it, so a Literal would invent a vocabulary narrower than the store.
+
+WikiPageTypeName = Literal[
+    "entity", "procedure", "system", "acronym", "qa",
+    "contradiction", "open_question", "overview", "manual",
+]
+WikiPageStatusName = Literal[
+    "draft", "verified", "stale", "needs_review", "archived",
+]
+WikiClaimStatusName = Literal[
+    "active", "contradicted", "superseded", "unverified",
+    "archived", "needs_review",
+]
+WikiClaimSourceTypeName = Literal[
+    "document", "memory", "chat_synthesis", "manual", "mixed",
+]
+# 5-value CHECK vocabulary of wiki_lint_findings.status. The STORE's
+# actionable set (resolved/dismissed/acknowledged, wiki_store.py) is
+# deliberately narrower — users cannot SET open/auto_resolved (issue #791
+# contract, pinned by test_o01_lint_resolve_route.py) — so those two
+# in-vocabulary values still reach the store's ValueError -> 400.
+LintFindingStatusName = Literal[
+    "open", "acknowledged", "resolved", "dismissed", "auto_resolved",
+]
+
 
 class WikiPageCreateRequest(BaseModel):
     vault_id: int
     title: str = Field(..., min_length=1, max_length=500)
-    page_type: str
+    page_type: WikiPageTypeName
     slug: Optional[str] = None
     markdown: str = ""
     summary: str = ""
-    status: str = "draft"
-    confidence: float = 0.0
+    status: WikiPageStatusName = "draft"
+    confidence: float = Field(0.0, ge=0.0, le=1.0)
     parent_id: Optional[int] = None
 
 
 class WikiPageUpdateRequest(BaseModel):
-    title: Optional[str] = None
-    page_type: Optional[str] = None
+    title: Optional[str] = Field(None, min_length=1, max_length=500)
+    page_type: Optional[WikiPageTypeName] = None
     slug: Optional[str] = None
     markdown: Optional[str] = None
     summary: Optional[str] = None
-    status: Optional[str] = None
-    confidence: Optional[float] = None
+    status: Optional[WikiPageStatusName] = None
+    confidence: Optional[float] = Field(None, ge=0.0, le=1.0)
     parent_id: Optional[int] = None
     expected_version: Optional[int] = None
 
@@ -115,34 +145,34 @@ class WikiPageUpdateRequest(BaseModel):
 class WikiClaimCreateRequest(BaseModel):
     vault_id: int
     claim_text: str = Field(..., min_length=1, max_length=2000)
-    source_type: str
+    source_type: WikiClaimSourceTypeName
     page_id: Optional[int] = None
     claim_type: str = "fact"
     subject: Optional[str] = None
     predicate: Optional[str] = None
     object: Optional[str] = None
-    status: str = "active"
-    confidence: float = 0.0
+    status: WikiClaimStatusName = "active"
+    confidence: float = Field(0.0, ge=0.0, le=1.0)
 
 
 class WikiClaimUpdateRequest(BaseModel):
-    claim_text: Optional[str] = None
-    source_type: Optional[str] = None
+    claim_text: Optional[str] = Field(None, min_length=1, max_length=2000)
+    source_type: Optional[WikiClaimSourceTypeName] = None
     page_id: Optional[int] = None
     claim_type: Optional[str] = None
     subject: Optional[str] = None
     predicate: Optional[str] = None
     object: Optional[str] = None
-    status: Optional[str] = None
-    confidence: Optional[float] = None
+    status: Optional[WikiClaimStatusName] = None
+    confidence: Optional[float] = Field(None, ge=0.0, le=1.0)
 
 
 class PromoteMemoryRequest(BaseModel):
     memory_id: int
     vault_id: int
-    page_type: Optional[str] = None
+    page_type: Optional[WikiPageTypeName] = None
     target_page_id: Optional[int] = None
-    status: str = "needs_review"
+    status: WikiPageStatusName = "needs_review"
 
 
 class LintRunRequest(BaseModel):
@@ -154,11 +184,29 @@ class WikiFileAttachRequest(BaseModel):
     file_id: int
 
 
+class WikiPageBulkUpdateFields(BaseModel):
+    """Typed bulk-update payload (issue #796): the same bounds/vocabularies
+    as WikiPageUpdateRequest for every field a bulk caller may set.
+    ``expected_version`` is deliberately excluded (per-page optimistic
+    concurrency has no bulk meaning — mirroring it would flow version-
+    conflict ValueErrors into an unhandled bulk 500), as is
+    ``last_compiled_at`` (compile-internal; in the store's allowed set but
+    never sent by any bulk caller — exposing it would be new surface)."""
+    title: Optional[str] = Field(None, min_length=1, max_length=500)
+    page_type: Optional[WikiPageTypeName] = None
+    slug: Optional[str] = None
+    markdown: Optional[str] = None
+    summary: Optional[str] = None
+    status: Optional[WikiPageStatusName] = None
+    confidence: Optional[float] = Field(None, ge=0.0, le=1.0)
+    parent_id: Optional[int] = None
+
+
 class WikiBulkRequest(BaseModel):
     vault_id: int
     page_ids: list[int] = Field(..., min_length=1)
     action: str = Field(..., description="Action: delete or update")
-    updates: Optional[dict] = None
+    updates: Optional[WikiPageBulkUpdateFields] = None
 
 
 # ---------------------------------------------------------------------------
@@ -466,9 +514,28 @@ async def bulk_wiki_pages(
         count = store.bulk_delete_pages(request.page_ids, request.vault_id)
         return {"action": "delete", "deleted": count}
     elif request.action == "update":
-        if not request.updates:
+        # Issue #796: the typed model is always truthy (even when no field
+        # was set), so the old `if not request.updates` guard is replaced by
+        # an explicit no-fields-set check that preserves BOTH historical 400
+        # shapes: absent `updates` and an empty `{}` payload.
+        fields_set = (
+            request.updates.model_fields_set if request.updates is not None else set()
+        )
+        if not fields_set:
             raise HTTPException(status_code=400, detail="updates field required for update action")
-        pages = store.bulk_update_pages(request.page_ids, request.vault_id, **request.updates)
+        # Same explicit-null semantics as update_wiki_page: a null on a
+        # NOT NULL column is dropped (a no-op) instead of being written and
+        # turning into a store IntegrityError; nullable fields accept null.
+        nullable_update_fields = frozenset({"parent_id", "summary"})
+        updates: Dict[str, object] = {}
+        for field_name in fields_set:
+            value = getattr(request.updates, field_name)
+            if value is None and field_name not in nullable_update_fields:
+                continue
+            updates[field_name] = value
+        if not updates:
+            raise HTTPException(status_code=400, detail="updates field required for update action")
+        pages = store.bulk_update_pages(request.page_ids, request.vault_id, **updates)
         return {"action": "update", "updated": len(pages), "pages": [_as_dict(p) for p in pages]}
     else:
         raise HTTPException(status_code=400, detail=f"Unknown bulk action: {request.action}")
@@ -1280,7 +1347,7 @@ async def list_wiki_relations(
 # ---------------------------------------------------------------------------
 
 class LintFindingUpdateRequest(BaseModel):
-    status: str = Field(..., description="New status: resolved, dismissed, or acknowledged")
+    status: LintFindingStatusName = Field(..., description="New status: resolved, dismissed, or acknowledged")
 
 
 @router.post("/wiki/lint/{finding_id}/resolve", status_code=200)
