@@ -15,6 +15,7 @@ import httpx
 
 from app.config import settings
 from app.services.circuit_breaker import (
+    BreakerNeutralError,
     CircuitBreakerError,
     create_llm_circuit_breaker,
     is_outage_status,
@@ -603,9 +604,18 @@ class LLMClient:
                 # (review RP-002, PR #576): ordinary 4xx are input/config
                 # errors that would recur on every retry — raising them
                 # here would open the shared breaker off a misconfigured
-                # request, not a provider outage.
+                # request, not a provider outage. They are raised as
+                # NEUTRAL (neither charge nor credit): the old behavior
+                # returned them as values, which the breaker recorded as a
+                # SUCCESS, erasing accumulated outage evidence for the
+                # host (issue #717 review).
                 if is_outage_status(response.status_code):
                     response.raise_for_status()
+                if response.status_code >= 400:
+                    try:
+                        response.raise_for_status()
+                    except httpx.HTTPStatusError as status_exc:
+                        raise BreakerNeutralError(status_exc) from status_exc
                 return response
 
             # E3 closure (#518): gen_ai client span for the non-stream
@@ -621,7 +631,23 @@ class LLMClient:
             response.raise_for_status()
             data = response.json()
 
+            if not isinstance(data, dict):
+                # A provider returning valid-but-non-object JSON (a list,
+                # scalar, or null) must surface as LLMError like any other
+                # malformed body, not escape as AttributeError (issue #717
+                # review).
+                self.last_metrics = {
+                    "provider_url": self.base_url,
+                    "model": self.model,
+                    "status": "invalid_response",
+                }
+                raise LLMError("Invalid response: expected a JSON object")
             if "choices" not in data or not data["choices"]:
+                self.last_metrics = {
+                    "provider_url": self.base_url,
+                    "model": self.model,
+                    "status": "invalid_response",
+                }
                 raise LLMError("Invalid response: no choices in response")
 
             message = data["choices"][0].get("message", {})
@@ -841,15 +867,21 @@ class LLMClient:
         # span object instead of the CM, or letting the CM be GC'd early
         # (PR #595 review F-001c), ends the span at enter time — 0ms
         # duration, orphaned child spans, and SDK end-twice warnings.
-        _genai_stream_cm = start_span(
-            "gen_ai chat stream",
-            attributes={
-                "gen_ai.operation.name": "chat",
-                "gen_ai.request.model": str(payload.get("model", "")),
-            },
-        )
-        _genai_stream_cm.__enter__()
+        # Issue #717 review: the span is created and entered INSIDE the
+        # protected try below — every other tracer call site in the repo
+        # guarantees tracing can never break the record, and an exception
+        # here (before the finally that releases the HALF_OPEN trial) would
+        # wedge that trial permanently.
+        _genai_stream_cm: Optional[Any] = None
         try:
+            _genai_stream_cm = start_span(
+                "gen_ai chat stream",
+                attributes={
+                    "gen_ai.operation.name": "chat",
+                    "gen_ai.request.model": str(payload.get("model", "")),
+                },
+            )
+            _genai_stream_cm.__enter__()
             # E3 telemetry (issue #518): propagate correlation headers when
             # bound; kwarg omitted when empty (strict test fakes compat).
             _corr = _correlation_headers()
@@ -871,12 +903,26 @@ class LLMClient:
                     # and re-POSTing a second one at double cost/latency.
                     raw = await response.aread()
                     data = json.loads(raw)
+                    if not isinstance(data, dict):
+                        self.last_metrics = {"provider_url": self.base_url, "model": self.model, "status": "invalid_response"}
+                        raise LLMError("Invalid response: expected a JSON object")
                     choices = data.get("choices") or []
-                    if not choices:
+                    if (
+                        not choices
+                        or not isinstance(choices[0], dict)
+                    ):
+                        self.last_metrics = {"provider_url": self.base_url, "model": self.model, "status": "invalid_response"}
                         raise LLMError("Invalid response: no choices in response")
+                    body_choice = choices[0]
                     content = self._strip_thinking_content(
-                        choices[0].get("message", {}).get("content", "")
+                        body_choice.get("message", {}).get("content", "")
                     )
+                    # The answer text is visible output: count it and record
+                    # why the generation stopped, exactly as the SSE delta
+                    # paths and the old non-stream fallback did (issue #717
+                    # review — the estimate/finish_reason were lost here).
+                    completion_chars += len(content)
+                    _finish_reason = body_choice.get("finish_reason")
                     # Issue #571 kept: provider-exact usage from the first
                     # body feeds the stream summary below (the old
                     # _fallback_metrics block read it off the nested
@@ -1150,18 +1196,25 @@ class LLMClient:
                     stream_succeeded = True
                     raise
         except LLMError:
-            # Don't record LLMError as transport failure — it may come from
-            # the chat_completion() fallback path and represent an app-level error,
-            # not a service-unavailability signal.
+            # Don't record LLMError as transport failure — it represents an
+            # app-level error (malformed body, admission refusal), not a
+            # service-unavailability signal.
             raise
         except httpx.TimeoutException as e:
             async with self._circuit_breaker._lock:
                 self._circuit_breaker.record_failure()
+            self.last_metrics = {"provider_url": self.base_url, "model": self.model, "status": "timeout"}
             raise LLMError(f"Streaming request timed out after {self.timeout}s") from e
         except httpx.HTTPStatusError as e:
             # Charge the breaker for OUTAGE statuses only (review RP-002,
             # PR #576): ordinary 4xx are input/config errors that would
             # recur on every retry, not provider outages.
+            self.last_metrics = {
+                "provider_url": self.base_url,
+                "model": self.model,
+                "status": "http_error",
+                "status_code": e.response.status_code,
+            }
             if is_outage_status(e.response.status_code):
                 async with self._circuit_breaker._lock:
                     self._circuit_breaker.record_failure()
@@ -1178,6 +1231,7 @@ class LLMClient:
         except httpx.RequestError as e:
             async with self._circuit_breaker._lock:
                 self._circuit_breaker.record_failure()
+            self.last_metrics = {"provider_url": self.base_url, "model": self.model, "status": "request_error"}
             raise LLMError(f"Streaming request failed: {str(e)}") from e
         except URLBlocked as e:
             # SSRF request-time re-resolution failure during the streamed
@@ -1191,7 +1245,8 @@ class LLMClient:
             self.last_metrics = {"provider_url": self.base_url, "model": self.model, "status": "invalid_json"}
             raise LLMError(f"Failed to parse response JSON: {str(e)}") from e
         finally:
-            _genai_stream_cm.__exit__(*sys.exc_info())
+            if _genai_stream_cm is not None:
+                _genai_stream_cm.__exit__(*sys.exc_info())
             if _holds_breaker_trial:
                 # Release the HALF_OPEN trial slot on BOTH outcomes — a
                 # wedged slot would reject every later admission (issue #717).
@@ -1232,10 +1287,10 @@ class LLMClient:
                 # Streaming failed — record a failure metric so the done
                 # payload's llm_metrics does not report a stale/ok value for
                 # a failed turn (mirrors the non-streaming per-error
-                # branches above and in chat_completion). If this path or the
-                # SSE-fallback already set a more specific status
+                # branches above and in chat_completion). The per-error
+                # handlers above now write their specific statuses
                 # (timeout/http_error/request_error/circuit_open/
-                # url_blocked/invalid_json), preserve it rather than
+                # url_blocked/invalid_json); preserve those rather than
                 # overwriting with the generic "error". A fresh call's entry
                 # reset leaves "started", which the summary always replaces
                 # (issue #717).

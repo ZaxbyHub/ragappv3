@@ -21,6 +21,7 @@ import httpx
 
 from app.config import settings
 from app.services.circuit_breaker import (
+    BreakerNeutralError,
     CircuitBreakerError,
     is_outage_status,
     model_checker_cb,
@@ -47,10 +48,17 @@ class _ProbeFailureResult(dict):
     """An unavailable probe result caused by a transport/host failure.
 
     Produced only by :func:`_model_check_error` (timeouts, connection
-    errors, non-404/405 HTTP errors). The probe circuit breaker (FU-004,
-    issue #494) charges exactly these; listing-based "model not found"
-    results are authoritative answers from a healthy endpoint and must not
-    open the breaker. Serializes/compares exactly like a plain dict.
+    errors, non-404/405 HTTP errors; HTTP errors additionally carry a
+    ``status_code`` key so the breaker wrapper can classify them).
+    Outage-class failures (5xx/429/timeouts/connection errors) charge the
+    probe circuit breaker (FU-004, issue #494); non-outage HTTP 4xx
+    results (a 401 from a wrong key, for example) are NEUTRAL — they
+    would fail identically on every retry, so they neither charge the
+    breaker nor erase its accumulated failure evidence (they pass through
+    as :class:`BreakerNeutralError`); listing-based "model not found"
+    results are authoritative answers from a healthy endpoint and must
+    not open the breaker either. Serializes/compares exactly like a plain
+    dict.
     """
 
 
@@ -192,15 +200,20 @@ class ModelChecker:
             # Keyed remote providers reject unauthenticated /v1/models probes
             # with 401; send the configured key per endpoint so deep health
             # reflects the endpoint, not a missing header (issue #717 — the
-            # setup-wizard sibling probe already did this).
+            # setup-wizard sibling probe already did this). The instant
+            # endpoint falls back to the chat key, mirroring the runtime
+            # client's instant-key-with-thinking-fallback (issue #622).
             chat_headers = (
                 {"Authorization": f"Bearer {settings.chat_api_key}"}
                 if settings.chat_api_key
                 else None
             )
+            effective_instant_key = (
+                settings.instant_api_key or settings.chat_api_key
+            )
             instant_headers = (
-                {"Authorization": f"Bearer {settings.instant_api_key}"}
-                if settings.instant_api_key
+                {"Authorization": f"Bearer {effective_instant_key}"}
+                if effective_instant_key
                 else None
             )
             embedding_result, chat_result, instant_result = await asyncio.gather(
@@ -389,7 +402,14 @@ class ModelChecker:
                         and status_code >= 400
                         and not is_outage_status(status_code)
                     ):
-                        return result
+                        # Non-outage 4xx (auth/config error): NEUTRAL — the
+                        # old `return result` made the breaker record a
+                        # SUCCESS, erasing accumulated outage evidence for
+                        # the host (issue #717 review).
+                        neutral = BreakerNeutralError(
+                            _ProbeFailure(result), result=result
+                        )
+                        raise neutral
                     raise _ProbeFailure(result)
                 return result
 
@@ -401,6 +421,11 @@ class ModelChecker:
                     _breaker_probe
                 )
             except _ProbeFailure as e:
+                result = e.result
+            except BreakerNeutralError as e:
+                # Non-outage 4xx: authoritative failure answer from a
+                # reachable-but-misconfigured endpoint; recorded on neither
+                # side of the breaker (issue #717 review).
                 result = e.result
             except CircuitBreakerError as e:
                 # A tripped breaker means the host has failed consecutively;

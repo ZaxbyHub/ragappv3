@@ -158,7 +158,7 @@ class TestStreamSingleTrial(unittest.IsolatedAsyncioTestCase):
                     await gen.aclose()
 
             t1 = asyncio.create_task(first_stream())
-            await admitted.wait()
+            await asyncio.wait_for(admitted.wait(), timeout=2.0)
             # While the first stream holds the HALF_OPEN trial (parked inside
             # the transport CM), a second stream's admission must be rejected
             # with LLMError (mapped from CircuitBreakerError) — issue #717
@@ -174,7 +174,7 @@ class TestStreamSingleTrial(unittest.IsolatedAsyncioTestCase):
                     await gen.aclose()
 
             with self.assertRaises(LLMError):
-                await second_stream()
+                await asyncio.wait_for(second_stream(), timeout=2.0)
             release.set()
             # The parked transport CM raises ConnectError on release, which
             # the stream maps to LLMError - expected teardown noise.
@@ -234,6 +234,7 @@ def _leaking_metrics_engine():
                     "memories_used": [],
                     "llm_metrics": {
                         "provider_url": "http://provider.internal:8080/v1",
+                        "fallback_from": "http://fallback.internal:9090/v1",
                         "status": "ok",
                         "latency_ms": 5.0,
                     },
@@ -277,6 +278,7 @@ class TestSseDonePayloadWiring(unittest.IsolatedAsyncioTestCase):
         metrics = await self._done_metrics(is_admin=False)
         self.assertIsNotNone(metrics)
         self.assertNotIn("provider_url", metrics)
+        self.assertNotIn("fallback_from", metrics)
         self.assertEqual(metrics.get("status"), "ok")
 
     async def test_admin_done_frame_keeps_provider_url(self):

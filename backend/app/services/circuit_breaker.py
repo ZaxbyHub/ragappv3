@@ -6,6 +6,7 @@ cascading failures when external services become unavailable.
 
 import asyncio
 import functools
+import hashlib
 import logging
 import time
 from enum import Enum
@@ -58,6 +59,24 @@ class CircuitBreakerError(Exception):
         if self.original_error:
             return f"{self.message}: {self.original_error}"
         return self.message
+
+
+class BreakerNeutralError(Exception):
+    """Raised by a breaker-wrapped callable to skip BOTH recordings.
+
+    Some wrapped operations fail in ways that are neither an outage (which
+    must charge the breaker) nor a success (which must reset the failure
+    streak) — an HTTP 4xx input/config error, for example: it would fail
+    identically on every retry, and recording it as a success would erase
+    genuine outage evidence accumulated for the same host (issue #717
+    review). ``call`` re-raises the wrapped exception transparently without
+    touching the counters.
+    """
+
+    def __init__(self, original: BaseException, result: Any = None):
+        super().__init__(str(original))
+        self.original = original
+        self.result = result
 
 
 class AsyncCircuitBreaker:
@@ -144,6 +163,7 @@ class AsyncCircuitBreaker:
         self._fail_counter = 0
         self._success_counter = 0
         self._last_failure_time = None
+        self._half_open_trial = False
         logger.info(
             "Circuit breaker '%s' closed - service recovered",
             self.name,
@@ -263,6 +283,12 @@ class AsyncCircuitBreaker:
             # Execute function without holding lock
             try:
                 result = await func(*args, **kwargs)
+            except BreakerNeutralError as neutral:
+                # Neither outage nor success: re-raise transparently without
+                # touching the failure streak (issue #717 review — a 4xx
+                # input error must not erase accumulated outage evidence by
+                # recording a success).
+                raise neutral.original from neutral
             except Exception:
                 # Record failure under lock
                 async with self._lock:
@@ -337,13 +363,17 @@ def _derive_probe_host_key(base_url: str) -> str:
     """Derive the per-host breaker key for a model-probe base URL.
 
     Probes to the same server (scheme + host[:port], any API-route suffix)
-    share one breaker; different servers never do. The setup wizard's
-    operator-typed URL gets its own key, so it can neither charge nor be
-    blocked by a configured endpoint's breaker (issue #717).
+    share one breaker; different servers never do. Note the sharing is
+    host-granular by design: a setup-wizard probe typed against the SAME
+    host as a configured endpoint uses that endpoint's breaker (one
+    failure budget per server). The key is case-normalized so
+    ``http://Host:8080`` and ``http://host:8080`` share one breaker
+    (issue #717 review); URLs without a scheme+host fall back to the raw
+    string as their own key.
     """
     parts = urlsplit(base_url.strip())
     if parts.scheme and parts.netloc:
-        return f"{parts.scheme.lower()}://{parts.netloc}"
+        return f"{parts.scheme.lower()}://{parts.netloc.lower()}"
     return base_url
 
 
@@ -368,14 +398,22 @@ class ModelCheckerBreakerRegistry:
         self._breakers: "dict[str, AsyncCircuitBreaker]" = {}
 
     def breaker_for(self, base_url: str) -> AsyncCircuitBreaker:
-        """Return the breaker for the probed host, creating it on first use."""
+        """Return the breaker for the probed host, creating it on first use.
+
+        The breaker name carries a short hash of the host key, not the
+        host itself: breaker names surface in CircuitBreakerError text that
+        reaches non-admin deep-health responses, so the configured
+        provider endpoint must not be disclosed through them (issue #717
+        review).
+        """
         key = _derive_probe_host_key(base_url)
         breaker = self._breakers.get(key)
         if breaker is None:
+            short = hashlib.sha256(key.encode("utf-8")).hexdigest()[:10]
             breaker = AsyncCircuitBreaker(
                 fail_max=self.fail_max,
                 reset_timeout=self.reset_timeout,
-                name=f"{self.name}:{key}",
+                name=f"{self.name}:{short}",
             )
             self._breakers[key] = breaker
         return breaker

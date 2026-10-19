@@ -838,12 +838,15 @@ def _finalize_durable_turn_sync(db_pool, turn_state: Dict[str, Any], status: str
 def _redact_llm_metrics(
     metrics: Optional[Dict[str, Any]], *, redact: bool
 ) -> Optional[Dict[str, Any]]:
-    """Drop the configured provider base URL from llm_metrics for non-admins.
+    """Drop configured provider base URLs from llm_metrics for non-admins.
 
     ``LLMClient.last_metrics`` always carries ``provider_url`` (the
-    configured endpoint), which flows into the SSE done payload and
-    ``ChatResponse.llm_metrics``. Non-admin callers must not receive the
-    configured provider URL (the ``GET /settings`` redaction contract,
+    configured endpoint), and the LLM-fallback path adds ``fallback_from``
+    (the endpoint the answer fell back FROM — also a configured provider
+    URL; rag_engine sets it whenever a fallback candidate serves the
+    answer). Either value flows into the SSE done payload and
+    ``ChatResponse.llm_metrics``. Non-admin callers must not receive
+    configured provider URLs (the ``GET /settings`` redaction contract,
     extended to this path — issue #717). Returns the dict unchanged for
     admins (redact=False) and when metrics are absent.
     """
@@ -851,6 +854,7 @@ def _redact_llm_metrics(
         return metrics
     redacted = dict(metrics)
     redacted.pop("provider_url", None)
+    redacted.pop("fallback_from", None)
     return redacted
 
 
@@ -890,6 +894,12 @@ def stream_chat_response(
     finalized at stream end (complete / interrupted / failed) keyed on the
     client's ``turn_id`` — so a proxy drop, tab close, or crash never loses
     the question or the partial answer from server history.
+
+    Issue #717: ``is_admin`` (derived by the route from the caller's role)
+    controls ``llm_metrics`` redaction — non-admin done frames (and the
+    durable frames persisted for them) drop ``provider_url`` and
+    ``fallback_from``; admins keep the full metrics bag. Default False =
+    redact, so an un-mapped future caller fails closed.
 
     Issue #555 resumable streams: on the durable path the generation runs in
     a per-turn producer task decoupled from the HTTP connection, and every
@@ -1684,6 +1694,7 @@ async def non_stream_chat_response(
     mode: Optional[ChatMode] = None,
     metadata_filter: Optional[MetadataFilter] = None,
     require_vault: bool = False,
+    is_admin: bool = False,
     user_id: Optional[int] = None,
     temperature: Optional[float] = None,
     retrieval_mode: Optional[RetrievalMode] = None,
@@ -1765,10 +1776,11 @@ async def non_stream_chat_response(
                 citation_confidence = chunk.get("citation_confidence")
                 unverifiable_claims = chunk.get("unverifiable_claims")
                 answer_contract = chunk.get("answer_contract")
-                # Non-admin callers never receive the configured provider
-                # URL (issue #717); require_vault is True exactly for them.
+                # Non-admin callers never receive configured provider URLs
+                # (issue #717). is_admin defaults False = redact (fail-closed),
+                # matching the stream path's polarity.
                 llm_metrics = _redact_llm_metrics(
-                    chunk.get("llm_metrics"), redact=require_vault
+                    chunk.get("llm_metrics"), redact=not is_admin
                 )
     except RAGEngineError as exc:
         logger.warning("RAG engine error in non_stream_chat_response: %s", exc)
@@ -1943,6 +1955,9 @@ async def chat(
                     vault_id=body.vault_id,
                     mode=effective_mode,
                     require_vault=require_vault,
+                    # Admins keep full llm_metrics; non-admin responses drop
+                    # configured provider URLs (issue #717).
+                    is_admin=not require_vault,
                     user_id=user.get("id"),
                     include_global=include_global,
                     can_write_memory=can_write_memory,

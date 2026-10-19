@@ -98,13 +98,15 @@ class LLMHealthChecker:
         client = self._llm_client
         created_locally = False
 
-        if client is None and (
-            not settings.ollama_chat_url or not settings.chat_model
-        ):
+        if not settings.ollama_chat_url or not settings.chat_model:
             # Same OR condition ModelChecker uses: an empty URL OR model is
             # the designed unconfigured state — report it as such instead of
             # constructing an LLMClient whose SSRF pre-check raises
             # URLBlocked("URL is empty.") into the generic except branch.
+            # Issue #717 review: the emptiness check is deliberately NOT
+            # gated on `client is None` — production injects a long-lived
+            # client, and after a live settings-clear the parked client must
+            # not mask the unconfigured state with a misleading probe error.
             return {
                 "ok": False,
                 "status": "not_configured",
