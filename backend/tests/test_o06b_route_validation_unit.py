@@ -59,10 +59,17 @@ def _literal_values(alias):
 
 
 def _check_values(table, column):
-    """CHECK vocabulary for `table`.`column` across EVERY DDL occurrence in
-    database.py (the primary CREATE TABLE block and the legacy bootstrap
-    copy must agree; both are parsed, table-scoped)."""
+    """CHECK vocabulary for `table`.`column` across the two bootstrap DDL
+    copies in database.py (both must agree; both are parsed, table-scoped).
+    Mid-history migration copies deliberately differ and are out of scope
+    -- see the scope comment on the table_pattern below."""
     text = _SCHEMA.read_text(encoding="utf-8")
+    # Scope: the two bootstrap IF-NOT-EXISTS copies, both of which can
+    # materialize on fresh databases and must agree with each other and
+    # with the Literals. Mid-history MIGRATION copies deliberately differ
+    # (later rebuilds supersede earlier CHECKs -- probed: the final
+    # materialized wiki_lint_findings CHECK is the 5-value form even though
+    # an older rebuild copy carries 4), so they are out of parity scope.
     table_pattern = re.compile(
         r"CREATE TABLE IF NOT EXISTS " + table + r"\s*\((.*?)\);",
         re.IGNORECASE | re.DOTALL,

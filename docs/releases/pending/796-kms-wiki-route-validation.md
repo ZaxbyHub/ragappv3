@@ -12,9 +12,11 @@ TQ-differential-d-05):
   the file. Internal failures (DB errors, programming errors) are now a 500
   with a fixed generic message; the raw text stays in the server log via
   `logger.exception`. (`create_entry` has no deliberate input-validation
-  raises — slug uniqueness is resolved internally and status is validated
-  before the try — so no legitimate client 400 was ever guarded by the broad
-  except.)
+  raises — `_validate_status` runs before the try, and slug uniqueness is
+  resolved internally, though non-atomically: two concurrent same-title
+  creates can race the SELECT/INSERT and surface this 500 rather than a
+  4xx, a pre-existing pattern this change reclassifies but does not fix —
+  so no legitimate client 400 was ever guarded by the broad except.)
 - **Wiki Update models carry the Create-side bounds.**
   `WikiPageUpdateRequest.title` is bounded 1-500 and
   `WikiClaimUpdateRequest.claim_text` 1-2000, matching their Create
@@ -26,9 +28,10 @@ TQ-differential-d-05):
   on the page/claim create+update models; `confidence` is bounded
   `ge=0, le=1` on all four. Out-of-vocabulary or out-of-range values now
   fail request validation (422, listing the allowed values) instead of
-  reaching SQLite — which failed as a generic 400 on create and an
-  UNHANDLED 500 on update (the update route catches only `ValueError`;
-  `sqlite3.IntegrityError` is not one). Same class, same file, also typed:
+  reaching SQLite — where they surfaced as a generic 400 on page create
+  (the #792 form) and an UNHANDLED 500 on page update (the update route
+  catches only `ValueError`; `sqlite3.IntegrityError` is not one) and on
+  both claim routes (which have no handler at all). Same class, same file, also typed:
   `PromoteMemoryRequest` (`page_type`/`status`) and the previously untyped
   `WikiBulkRequest.updates` (new `WikiPageBulkUpdateFields` model; the bulk
   route's absent-AND-empty `updates` → 400 shapes are preserved — the typed
@@ -44,9 +47,12 @@ TQ-differential-d-05):
 
 Frontier-audit findings: an internal KMS failure reported as a client 400
 with the raw error text leaked; update-side requests bypassed create-side
-length bounds; and out-of-vocabulary `status`/`page_type` or out-of-range
-`confidence` (7.5 persisted and rendered as 750%) reached the store, failing
-inconsistently (400 on create, 500 on update).
+length bounds; and out-of-vocabulary `status`/`page_type` values reached
+the store, failing inconsistently (a generic 400 on page create, an
+unhandled 500 on page update, and an unhandled 500 on claim create, which
+has no handler at all). Out-of-range `confidence` was a different failure
+mode: no CHECK ever bounded it, so 7.5 persisted silently and rendered as
+750%.
 
 ## Migration / compatibility
 
@@ -75,7 +81,10 @@ unchanged.
   `UPDATE wiki_pages SET title = substr(title, 1, 500) WHERE length(title) > 500;`
   `UPDATE wiki_claims SET claim_text = substr(claim_text, 1, 2000) WHERE length(claim_text) > 2000;`
   (and the analogous confidence clamp for `wiki_claims` and
-  `wiki_claim_sources`). Flagged for maintainer review.
+  `wiki_claim_sources`). Caveat: `wiki_claims.claim_text` carries
+  `UNIQUE(vault_id, claim_text)` — if two long claims share their first
+  2000 chars the claim_text UPDATE aborts; run it per-row or add a
+  twin-check first. Flagged for maintainer review.
 - **Bulk unknown keys are silently ignored** (pydantic default), including
   `expected_version` — deliberately excluded from the typed bulk model
   (per-page optimistic concurrency has no bulk meaning). No in-repo caller
@@ -87,4 +96,9 @@ unchanged.
   separately (#950 / Workstream O PR 2).
 - The structural single-enum-module generation (CHECK vocabularies + Literals
   + TS unions from one source) was not undertaken; the battery's parity tests
-  parse BOTH DDL occurrences of the tables in database.py and fail on drift.
+  parse the two bootstrap DDL occurrences of the Literal-mirrored columns in
+  database.py and fail on drift between them (mid-history migration copies
+  deliberately differ; the final materialized shape was probed 5-value). A
+  live pre-existing drift in `wiki_claim_sources.source_kind` ('wiki' present
+  in one bootstrap copy, absent in the other) is outside this PR's
+  Literal-mirrored columns and is flagged for maintainer review.
