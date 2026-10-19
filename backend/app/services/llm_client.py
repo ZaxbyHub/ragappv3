@@ -333,8 +333,8 @@ class LLMClient:
         ``options.num_ctx`` sizes the loaded instance's context window (the
         OpenAI-compatible surface cannot express either). LM Studio clients
         (``context_length`` set) request the context length from the native
-        model-load endpoint, trying the current v1 API first and the legacy
-        v0 path on 404 for pre-0.4.0 servers; residency for LM Studio comes
+        v1 model-load endpoint (the never-existed ``/api/v0`` fallback was
+        removed in issue #719); residency for LM Studio comes
         from the per-payload ``ttl`` every chat request already carries.
 
         Best-effort by contract: any transport/HTTP failure is logged and
@@ -346,16 +346,25 @@ class LLMClient:
         client = await self._ensure_started()
         try:
             if self.context_length is not None:
-                # LM Studio native load (v1, with a v0 fallback for older
-                # servers). `ttl` is intentionally not part of the load
-                # request: it rides every chat payload instead.
+                # LM Studio native load via the v1 REST API. The pre-0.4.0
+                # `/api/v0/models/load` retry was removed (issue #719): that
+                # endpoint never existed in LM Studio's v0 reference, so the
+                # fallback 404'd on exactly the old servers it existed for.
+                # `ttl` is intentionally not part of the load request: it
+                # rides every chat payload instead.
                 body = {"model": self.model, "context_length": self.context_length}
                 url = f"{self.base_url}/api/v1/models/load"
                 response = await client.post(url, json=body)
                 if response.status_code == 404:
-                    response = await client.post(
-                        f"{self.base_url}/api/v0/models/load", json=body
+                    logger.warning(
+                        "LM Studio context-length priming requires the v1 REST "
+                        "API (%s returned 404) - LM_STUDIO_CONTEXT_LENGTH=%s "
+                        "will not be applied; the model will load on demand "
+                        "with provider defaults instead",
+                        url,
+                        self.context_length,
                     )
+                    return False
                 response.raise_for_status()
                 logger.info(
                     "Model residency primed via LM Studio load API (%s, ctx=%d)",
@@ -857,6 +866,8 @@ class LLMClient:
         _reasoning_chars = 0
         _reasoning_started_at: Optional[float] = None
         _reasoning_last_at: Optional[float] = None
+        # Issue #719: one-shot-per-stream flag for the no-think leak warning.
+        _no_think_leak_warned = False
 
         stream_succeeded = False
         # E3 closure (#518): gen_ai client span for the streaming chat call.
@@ -977,15 +988,53 @@ class LLMClient:
                         data_lines.clear()
 
                 try:
+                    done_seen = False
                     async for data_str in _sse_events():
+                        if done_seen:
+                            # [DONE] was seen: keep consuming to body EOF so
+                            # httpx can pool the connection instead of closing
+                            # it (issue #719 / R2-L5-C01). Trailing bytes are
+                            # legal after the marker and are NOT parsed — an
+                            # already-complete stream must not turn into an
+                            # error on its tail.
+                            continue
                         # Check for stream end marker
                         if data_str == "[DONE]":
-                            break
+                            done_seen = True
+                            continue
 
                         try:
                             data = json.loads(data_str)
                         except json.JSONDecodeError:
                             continue
+                        if not isinstance(data, dict):
+                            # Bare array/scalar payloads carry no choices and
+                            # no error; skip instead of crashing on .get
+                            # (issue #719).
+                            continue
+
+                        # In-band mid-stream failure (issue #719): vLLM and
+                        # other OpenAI-compatible servers can report an error
+                        # AFTER the 200 inside the SSE body. Treating it as
+                        # ignorable would record a breaker success and
+                        # last_metrics.status='ok' for a failed generation.
+                        error_obj = data.get("error")
+                        if error_obj:
+                            error_msg = (
+                                error_obj.get("message", "")
+                                if isinstance(error_obj, dict)
+                                else repr(error_obj)
+                            )
+                            async with self._circuit_breaker._lock:
+                                self._circuit_breaker.record_failure()
+                            self.last_metrics = {
+                                "provider_url": self.base_url,
+                                "model": self.model,
+                                "status": "inband_error",
+                            }
+                            raise LLMError(
+                                f"In-band stream error from provider: {error_msg}"
+                            )
 
                         # Extract content delta from choices
                         choices = data.get("choices", [])
@@ -1027,6 +1076,29 @@ class LLMClient:
                             if not isinstance(reasoning_text, str) or not reasoning_text:
                                 reasoning_text = None
                         if reasoning_text is not None:
+                            # Issue #719: a no-think control was requested for
+                            # this client, so a reasoning delta means the host
+                            # ignored it (reported for recent Qwen GGUF builds
+                            # on LM Studio). Surface that once per stream —
+                            # None-safe because reconfigure() stores None when
+                            # thinking is (re-)enabled.
+                            if (
+                                (self.chat_template_kwargs or {}).get(
+                                    "enable_thinking"
+                                )
+                                is False
+                                and not _no_think_leak_warned
+                            ):
+                                _no_think_leak_warned = True
+                                logger.warning(
+                                    "Model %s produced reasoning content despite "
+                                    "the instant-mode no-think control "
+                                    "(chat_template_kwargs enable_thinking=false); "
+                                    "the host ignored the control - reasoning is "
+                                    "being routed to the reasoning channel. Check "
+                                    "the model build/host capability.",
+                                    self.model,
+                                )
                             _now = time.perf_counter()
                             if _reasoning_started_at is None:
                                 _reasoning_started_at = _now

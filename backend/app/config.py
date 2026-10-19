@@ -428,6 +428,11 @@ class Settings(BaseSettings):
     """Number of chunks to keep after reranking."""
     initial_retrieval_top_k: int = 20
     """Chunks fetched from vector store BEFORE reranking."""
+    reranker_max_batch: int = 32
+    """Max texts per /rerank request (issue #719). TEI enforces a per-request
+    client batch cap (bundled default 32; host-side --max-client-batch-size).
+    A larger candidate set is split into batches of this size so an over-cap
+    set still reranks instead of silently degrading to vector order."""
     reranker_timeout_seconds: float = 12.0
     """HTTP timeout (seconds) for the TEI reranker endpoint. On timeout or failure the
     query degrades to un-reranked vector order, so keep this comfortably above the
@@ -1625,6 +1630,16 @@ class Settings(BaseSettings):
         query to un-reranked vector order — so we fail fast at startup instead."""
         if v <= 0:
             raise ValueError("reranker_timeout_seconds must be > 0")
+        return v
+
+    @field_validator("reranker_max_batch", mode="after")
+    @classmethod
+    def validate_reranker_max_batch(cls, v: int) -> int:
+        """Validate the rerank client batch size is positive (issue #719).
+        A value < 1 would slice every candidate set into zero-text batches
+        and fail every rerank call, silently degrading to vector order."""
+        if v < 1:
+            raise ValueError("reranker_max_batch must be >= 1")
         return v
 
     @field_validator("default_chat_mode", mode="after")
