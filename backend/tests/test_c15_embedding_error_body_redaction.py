@@ -241,7 +241,10 @@ async def test_token_overflow_body_not_logged(emb_settings):
 # this site at all. The pin below constructs the shape that does.
 # ---------------------------------------------------------------------------
 
-BODY_MARKER_BATCH = "C15BATCHBODYMARKER"
+# LOWERCASE on purpose: the branch logs ``response_text = resp.text.lower()``,
+# so an uppercase marker could never match a leaked line and the leak
+# assertion would be structurally dead (swarm-pr-feedback critic round).
+BODY_MARKER_BATCH = "c15batchbodymarker"
 
 
 def _status_error_with_body(body: str) -> httpx.HTTPStatusError:
