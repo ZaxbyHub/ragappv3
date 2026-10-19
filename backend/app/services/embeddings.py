@@ -1645,8 +1645,9 @@ class EmbeddingService:
                 error_msg
             ) or self._is_token_overflow_error(response_text):
                 logger.warning(
-                    f"Token overflow error for {config.mode} mode: {response_text}"
+                    f"Token overflow error for {config.mode} mode (body_len={len(response_text)})"
                 )
+                logger.debug(f"Embedding API error body: {response_text[:2000]}")
                 # Handle overflow using the shared helper
                 return await self._handle_overflow_retry(
                     client, texts, max_retries, min_sub_size, retry_count, config

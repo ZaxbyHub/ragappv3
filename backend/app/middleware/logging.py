@@ -127,21 +127,27 @@ class LoggingMiddleware(BaseHTTPMiddleware):
         start = time.time()
         try:
             response = await call_next(request)
+            # Emit the access record BEFORE the contextvar reset: the
+            # lifespan-installed RequestIdFilter overwrites record.request_id
+            # with the CURRENT contextvar value on every emitted record, so
+            # logging after reset() blanked the field in production
+            # (swarm-pr-review PRR-004: the record asserted request_id, the
+            # shipped JSON never carried it).
+            duration = time.time() - start
+            sanitized_query = _sanitize_query(request.url.query)
+            logger.info(
+                "http_request",
+                extra={
+                    "request_id": request_id,
+                    "method": request.method,
+                    "path": request.url.path,
+                    "query": sanitized_query,
+                    "status_code": response.status_code,
+                    "client_ip": request.client.host if request.client else None,
+                    "duration_ms": round(duration * 1000, 2),
+                },
+            )
+            response.headers["X-Request-ID"] = request_id
+            return response
         finally:
             request_id_var.reset(token)
-        duration = time.time() - start
-        sanitized_query = _sanitize_query(request.url.query)
-        logger.info(
-            "http_request",
-            extra={
-                "request_id": request_id,
-                "method": request.method,
-                "path": request.url.path,
-                "query": sanitized_query,
-                "status_code": response.status_code,
-                "client_ip": request.client.host if request.client else None,
-                "duration_ms": round(duration * 1000, 2),
-            },
-        )
-        response.headers["X-Request-ID"] = request_id
-        return response

@@ -47,7 +47,6 @@ not this contract.
 import ast
 import logging
 import os
-import shutil
 import subprocess
 import sys
 from contextlib import contextmanager
@@ -202,7 +201,7 @@ def _guarded_level_ok(call: ast.Call) -> bool:
     return True
 
 
-def _iter_app_files():
+def _iter_app_files(app_dir=None):
     """Yield TRACKED ``backend/app/*.py`` files only (#906 AC4).
 
     The walk is scoped to ``git ls-files`` output so untracked/generated
@@ -212,29 +211,35 @@ def _iter_app_files():
     ``rglob`` — the pre-#906 behavior — because failing the whole guard on
     a tooling gap would be worse than the narrower scope; every environment
     that ships this repo (CI, dev clones) has git.
+
+    ``app_dir`` is injectable so the tracked-scope test can exercise the real
+    walk against a throwaway git repo instead of planting a probe inside the
+    live source tree (where it raced other xdist workers' ``rglob`` walks —
+    swarm-pr-review PRR-001).
     """
     backend_dir = Path(__file__).resolve().parent.parent
+    root_dir = backend_dir if app_dir is None else Path(app_dir).resolve().parent
+    app_root = backend_dir / "app" if app_dir is None else Path(app_dir).resolve()
     try:
         listed = subprocess.run(
-            ["git", "-C", str(backend_dir), "ls-files", "--", "app"],
+            ["git", "-C", str(root_dir), "ls-files", "--", app_root.name],
             capture_output=True,
             text=True,
             check=True,
             timeout=30,
         )
     except (OSError, subprocess.SubprocessError):
-        app_dir = backend_dir / "app"
-        for path in sorted(app_dir.rglob("*.py")):
+        for path in sorted(app_root.rglob("*.py")):
             yield path
         return
     for rel in sorted(line for line in listed.stdout.splitlines() if line.endswith(".py")):
-        yield backend_dir / rel
+        yield root_dir / rel
 
 
 _scan_logger = logging.getLogger(__name__)
 
 
-def _find_query_text_at_default_level():
+def _find_query_text_at_default_level(app_dir=None):
     """Yield ``file:line: description`` for every guarded logging call in
     backend/app that formats query-derived text.
 
@@ -242,10 +247,16 @@ def _find_query_text_at_default_level():
     ``read_text`` raises ``UnicodeDecodeError``, a ``ValueError`` — or any
     ``SyntaxError``) are skipped with a counted INFO note instead of
     failing the scan with an opaque error (conftest.py's census-loop
-    pattern)."""
+    pattern).
+
+    ``app_dir`` is forwarded to :func:`_iter_app_files` so the tracked-scope
+    test can scan a throwaway git repo (swarm-pr-review PRR-001)."""
     skipped = 0
-    backend_dir = Path(__file__).resolve().parent.parent
-    for path in _iter_app_files():
+    backend_dir = (
+        Path(__file__).resolve().parent.parent if app_dir is None
+        else Path(app_dir).resolve().parent
+    )
+    for path in _iter_app_files(app_dir):
         try:
             source = path.read_text(encoding="utf-8")
             tree = ast.parse(source, filename=str(path))
@@ -583,26 +594,48 @@ def test_guard_skips_unreadable_files(tmp_path):
     )
 
 
-def test_guard_verdict_ignores_untracked_trees():
+def test_guard_verdict_ignores_untracked_trees(tmp_path):
     """#906 AC4: untracked/generated trees cannot change the guard verdict.
 
-    An untracked generated directory carrying a planted violation is
-    created under backend/app for the duration of the scan (removed in the
-    finally block). RED at base (the walk judges every *.py it finds, so
-    the generated file flips the verdict); GREEN after the fix scopes the
-    scan to tracked sources.
+    A throwaway git repo is built under ``tmp_path``: one tracked source file,
+    then an UNTRACKED generated file carrying a planted violation. The real
+    walk (tracked-only) must ignore it. RED at base (an rglob walk judges every
+    ``*.py`` it finds, so the generated file flips the verdict); GREEN after
+    the fix scopes the scan to tracked sources.
+
+    The fixture lives entirely outside the repository: the previous version
+    planted a fixed-path probe directory under the live ``backend/app`` tree,
+    where its ``finally``-only cleanup raced other xdist workers' unguarded
+    ``rglob`` walks and could fail unrelated guards (swarm-pr-review PRR-001).
     """
-    app_dir = Path(__file__).resolve().parent.parent / "app"
-    probe_dir = app_dir / "_c17_untracked_probe"
-    probe = probe_dir / "zz_generated_probe.py"
-    try:
-        probe_dir.mkdir(parents=True, exist_ok=True)
-        probe.write_text(_PLANTED_LEAK_SOURCE, encoding="utf-8")
-        violations = list(_find_query_text_at_default_level())
-        assert violations == [], (
-            "the guard verdict changed because of an UNTRACKED generated file "
-            f"under backend/app ({violations}): the scan must judge tracked "
-            "sources only, so developer machines and CI agree (#906 AC4)"
-        )
-    finally:
-        shutil.rmtree(probe_dir, ignore_errors=True)
+    repo = tmp_path / "repo"
+    app_dir = repo / "app"
+    app_dir.mkdir(parents=True)
+    (app_dir / "__init__.py").write_text("", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(repo), "init", "-q"], check=True, timeout=30
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "app/__init__.py"], check=True, timeout=30
+    )
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@e",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@e"}
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-qm", "base"], check=True, timeout=30, env=env
+    )
+    # Untracked: committed history does not contain it, so a tracked-only walk
+    # must never enumerate it.
+    (app_dir / "zz_generated_probe.py").write_text(_PLANTED_LEAK_SOURCE, encoding="utf-8")
+
+    scanned = list(_iter_app_files(app_dir))
+    assert any(path.name == "__init__.py" for path in scanned), scanned
+    assert not any(path.name == "zz_generated_probe.py" for path in scanned), (
+        f"the tracked-only walk enumerated an untracked file: {scanned}"
+    )
+
+    violations = list(_find_query_text_at_default_level(app_dir))
+    assert violations == [], (
+        "the guard verdict changed because of an UNTRACKED generated file "
+        f"({violations}): the scan must judge tracked sources only, so "
+        "developer machines and CI agree (#906 AC4)"
+    )

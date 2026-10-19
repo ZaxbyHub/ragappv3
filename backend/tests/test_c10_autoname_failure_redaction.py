@@ -146,8 +146,9 @@ def failing_env():
 
 
 async def _drive_failure(env: _FailingLLMEnv) -> None:
-    class LLMError(Exception):
-        pass
+    # The REAL production exception type (swarm-pr-review PRR-017c): a local
+    # subclass made the class-name assertion pass by construction.
+    from app.services.llm_client import LLMError
 
     async def raise_body_echo(*args, **kwargs):
         raise LLMError(f"HTTP error 400: {BODY_MARKER} provider echo")

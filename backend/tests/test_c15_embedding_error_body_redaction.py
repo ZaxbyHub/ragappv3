@@ -116,10 +116,14 @@ async def test_error_body_marker_absent_from_warning_log(emb_settings):
     WARNING formats ``response.text`` verbatim), GREEN after the fix.
     """
     service = EmbeddingService()
+    # PRR-017d: __init__ builds a real httpx.AsyncClient (SSRFSafeTransport);
+    # these tests swap in a stub, so close the original instead of leaking it.
+    _real_client = service._client
     marker_body = (
         "invalid request: input token limit exceeded near C15ET_MARKER "
         "secret user-derived segment quoted by the provider"
     )
+    await _real_client.aclose()
     service._client = MagicMock()
     service._client.post = AsyncMock(
         return_value=_error_response(400, marker_body)
@@ -129,6 +133,16 @@ async def test_error_body_marker_absent_from_warning_log(emb_settings):
         with pytest.raises(EmbeddingError):
             await service.embed_single("user derived operand text")
 
+    # Positive pairing (swarm-pr-review PRR-017a): pytest.raises can be
+    # satisfied by any of the module's ~44 raise sites, so an absence-only check
+    # could pass with ZERO captured records. Pin the failure record first.
+    assert any(
+        "Embedding API returned status 400" in r.getMessage()
+        for r in captured.records
+    ), (
+        "the 400 response must log its own WARNING+ record; captured: "
+        f"{[r.getMessage() for r in captured.records]}"
+    )
     leaks = [r for r in captured.records if "C15ET_MARKER" in r.getMessage()]
     assert leaks == [], (
         f"{len(leaks)} WARNING+ record(s) of {EMBEDDINGS_LOGGER} carry the "
@@ -144,6 +158,10 @@ async def test_failure_still_logged_with_status_and_mode(emb_settings):
     operational signal (outage detection keys on the status code).
     """
     service = EmbeddingService()
+    # PRR-017d: __init__ builds a real httpx.AsyncClient (SSRFSafeTransport);
+    # these tests swap in a stub, so close the original instead of leaking it.
+    _real_client = service._client
+    await _real_client.aclose()
     service._client = MagicMock()
     service._client.post = AsyncMock(
         return_value=_error_response(400, "bad request body C15ET_MARKER")
@@ -178,10 +196,14 @@ async def test_token_overflow_body_not_logged(emb_settings):
     base, GREEN after the fix.
     """
     service = EmbeddingService()
+    # PRR-017d: __init__ builds a real httpx.AsyncClient (SSRFSafeTransport);
+    # these tests swap in a stub, so close the original instead of leaking it.
+    _real_client = service._client
     marker_body = (
         "input token limit exceeded: provider quotes the offending segment "
         "C15ET_MARKER user text verbatim"
     )
+    await _real_client.aclose()
     service._client = MagicMock()
     service._client.post = AsyncMock(
         return_value=_error_response(500, marker_body)
@@ -191,6 +213,14 @@ async def test_token_overflow_body_not_logged(emb_settings):
         with pytest.raises(EmbeddingError):
             await service.embed_batch(["short operand under split floor"], batch_size=1)
 
+    # Positive pairing (PRR-017a): pytest.raises can be satisfied by any of the
+    # module's ~44 raise sites, so pin the overflow record before absence.
+    assert any(
+        "Token overflow error" in r.getMessage() for r in captured.records
+    ), (
+        "the token-overflow request must log its own WARNING+ record; captured: "
+        f"{[r.getMessage() for r in captured.records]}"
+    )
     leaks = [r for r in captured.records if "C15ET_MARKER" in r.getMessage()]
     assert leaks == [], (
         f"{len(leaks)} WARNING+ record(s) of {EMBEDDINGS_LOGGER} carry the "

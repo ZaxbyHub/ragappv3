@@ -8,8 +8,8 @@ level.
 
 - **Embedding provider bodies (#903)** — the nine `response.text` WARNING
   f-strings in `backend/app/services/embeddings.py` now emit
-  `body_len=<n>` summaries; the full body moved to `logger.debug` beside
-  each WARNING. Status codes, modes, outage detection, retry/breaker
+  `body_len=<n>` summaries; the first 2000 characters of the body moved to
+  `logger.debug` beside each WARNING (full body stays off the log). Status codes, modes, outage detection, retry/breaker
   behavior, and the raised `EmbeddingError` messages (which never carried
   the body) are unchanged.
 - **Sub-query text logged as a label (#908)** — the multi-sub-query

@@ -112,6 +112,7 @@ def test_repeated_free_text_params_each_redacted():
         response = client.get("/probe?q=FIRSTSECRET&q=SECONDSECRET&mode=x")
     assert response.status_code == 200
     access = _access_lines(_formatted_lines(captured.records))
+    assert access, "the middleware must still emit its http_request record"
     joined = "\n".join(access)
     assert "FIRSTSECRET" not in joined and "SECONDSECRET" not in joined, (
         f"repeated free-text params leaked: {joined}"
