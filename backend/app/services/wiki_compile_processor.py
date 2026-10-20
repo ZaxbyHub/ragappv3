@@ -49,6 +49,13 @@ PAYLOAD_MALFORMED_ERROR = (
 # refetch-driven, a duplicate terminal event is a benign extra refetch).
 WIKI_EVENT_RECONCILE_WINDOW_SECONDS = 30
 
+# PRR-004: the deferred fan-out delay — long enough for SSE clients to
+# reconnect after a restart, short enough that the UI converges quickly.
+_RECONCILE_DELAY_SECONDS = 5.0
+
+# PRR-006: bound the boot scans so the cost is O(window), not O(table).
+_RECONCILE_MAX_ROWS = 500
+
 
 def _lease_enabled() -> bool:
     """Stage-2 lease switch (issue #559): env-only, process-start-stable."""
@@ -299,14 +306,32 @@ class WikiCompileProcessor:
                         # committed the terminal row but skipped the event
                         # (executor threads are not interrupted by task
                         # cancellation, so both steps complete together).
-                        spawn_reset, new_retry_count = await asyncio.to_thread(
-                            self._fail_job_and_publish, job, self._worker_id
+                        #
+                        # PRR-020: the legacy auto-retry scheduling rides a
+                        # done-callback on the same future instead of the
+                        # post-await code path, so a stop() cancellation
+                        # delivered at the await can no longer discard it —
+                        # the callback fires on the loop when the executor
+                        # thread finishes, cancelled poll task or not.
+                        unit = asyncio.ensure_future(
+                            asyncio.to_thread(
+                                self._fail_job_and_publish, job, self._worker_id
+                            )
                         )
-                        if spawn_reset:
-                            backoff = 2.0 ** new_retry_count
+
+                        def _schedule_legacy_retry(
+                            _fut, _job_id=job.id
+                        ) -> None:
+                            try:
+                                spawn_reset, retry_count = _fut.result()
+                            except Exception:  # noqa: BLE001 — logged by caller
+                                return
+                            if not spawn_reset:
+                                return
+                            backoff = 2.0 ** retry_count
                             logger.info(
                                 "WikiCompileProcessor: job id=%d will auto-retry (%d/%d) in %.0fs",
-                                job.id, new_retry_count, MAX_RETRIES, backoff,
+                                _job_id, retry_count, MAX_RETRIES, backoff,
                             )
                             # Detach the backoff+reset so the single poll loop
                             # can keep claiming other pending jobs instead of
@@ -315,7 +340,10 @@ class WikiCompileProcessor:
                             # self._bg_tasks so it is not GC'd mid-flight; the
                             # A6-1 status guard makes a cancel-during-delay a
                             # safe no-op.
-                            self._spawn_delayed_reset(job.id, backoff)
+                            self._spawn_delayed_reset(_job_id, backoff)
+
+                        unit.add_done_callback(_schedule_legacy_retry)
+                        await asyncio.shield(unit)
                     except Exception as e2:
                         logger.error(
                             "WikiCompileProcessor: could not mark job id=%d failed: %s", job.id, e2
@@ -429,13 +457,27 @@ class WikiCompileProcessor:
 
         Issue #955: a worker stopped (or crashed) between a terminal commit
         and its event publish leaves a terminal row the SSE UI never hears
-        about — consumers only refetch on events. On start, re-publish the
-        terminal event for every wiki job that went terminal within the
-        reconcile window, in both stores (the jobs table serves lease mode,
-        the legacy table serves lease-off mode). Rows that DID get their
-        event are re-announced too: consumers are refetch-driven, so a
-        duplicate terminal event is a benign extra refetch (disclosed in
-        the release note). Best-effort — never raises into start().
+        about — consumers only refetch on events, and the SSE route sends no
+        state on (re)connect. On start, re-publish the terminal event for
+        every wiki job that went terminal within the reconcile window, in
+        both stores (the jobs table serves lease mode, the legacy table
+        serves lease-off mode).
+
+        PRR-004 review fix: the fan-out is DEFERRED past startup
+        (``call_soon_threadsafe`` + ``call_later``) because this method runs
+        inside ASGI lifespan startup, when no SSE subscriber can exist yet —
+        the bus drops publishes with an empty subscriber set, so a boot-time
+        fan-out reached nobody. Deferring by ``_RECONCILE_DELAY_SECONDS``
+        lets clients reconnect and then refetches them.
+
+        PRR-006 review fix: both scans are bounded by ``_RECONCILE_MAX_ROWS``
+        so the cost is O(window), not O(table), and the startup critical path
+        stays inside its budget.
+
+        Rows that DID get their event are re-announced too: consumers are
+        refetch-driven, so a duplicate terminal event is a benign extra
+        refetch (disclosed in the release note). Best-effort — never raises
+        into start().
         """
         announced = 0
         try:
@@ -470,42 +512,92 @@ class WikiCompileProcessor:
                     "AND datetime(completed_at) >= datetime('now', ?) "
                     "AND CASE WHEN json_valid(payload_json) "
                     "THEN CAST(json_extract(payload_json, '$.vault_id') "
-                    "AS INTEGER) END IS NOT NULL",
-                    (cutoff,),
+                    "AS INTEGER) END IS NOT NULL "
+                    # PRR-006: bound the scan so the cost is O(window), not
+                    # O(table) — this runs on the startup critical path.
+                    "ORDER BY completed_at DESC LIMIT ?",
+                    (cutoff, _RECONCILE_MAX_ROWS),
                 ).fetchall()
                 legacy_rows = conn.execute(
                     "SELECT id, status, vault_id, trigger_type, completed_at "
                     "FROM wiki_compile_jobs "
                     "WHERE status IN ('completed','failed','cancelled') "
                     "AND completed_at IS NOT NULL "
-                    "AND datetime(completed_at) >= datetime('now', ?)",
-                    (cutoff,),
+                    "AND datetime(completed_at) >= datetime('now', ?) "
+                    "ORDER BY completed_at DESC LIMIT ?",
+                    (cutoff, _RECONCILE_MAX_ROWS),
                 ).fetchall()
             bus = get_wiki_event_bus()
             loop = self._loop
+            payloads = []
             for row in (*rows, *legacy_rows):
                 event_type = event_for_status.get(row["status"])
                 if event_type is None:
                     continue
-                payload = {
-                    "type": event_type,
-                    "job_id": row["id"],
-                    "vault_id": row["vault_id"],
-                    "trigger_type": row["trigger_type"] or "manual",
-                }
-                # Same-loop contract: the reconcile runs on a worker thread
-                # (the startup reset unit) - marshal the publish onto the
-                # app loop so the bus's put_nowait wakeup fires; with no
-                # running loop there are no subscribers to receive it
-                # (drop, matching _marshal_publish).
-                if loop is not None and loop.is_running():
-                    loop.call_soon_threadsafe(bus.publish, row["vault_id"], payload)
-                announced += 1
+                payloads.append(
+                    (
+                        row["vault_id"],
+                        {
+                            "type": event_type,
+                            "job_id": row["id"],
+                            "vault_id": row["vault_id"],
+                            "trigger_type": row["trigger_type"] or "manual",
+                        },
+                    )
+                )
+            if payloads and loop is not None and loop.is_running():
+                # PRR-004: defer the fan-out past lifespan startup so
+                # reconnected SSE subscribers actually receive it. PRR-016:
+                # count only what was handed to the loop, and log the drop.
+                try:
+                    # Two hops: the thread-safe hop onto the loop, then the
+                    # delay (call_later is loop-only, so it must run ON the
+                    # loop) so the fan-out lands after SSE clients reconnect.
+                    loop.call_soon_threadsafe(
+                        functools.partial(
+                            loop.call_later,
+                            _RECONCILE_DELAY_SECONDS,
+                            functools.partial(
+                                self._drain_reconciled_events, bus, payloads
+                            ),
+                        )
+                    )
+                    announced = len(payloads)
+                except RuntimeError:
+                    logger.warning(
+                        "WikiCompileProcessor: terminal-event reconcile dropped"
+                        " %d event(s) — event loop closed before the fan-out"
+                        " could be scheduled",
+                        len(payloads),
+                    )
+            elif payloads:
+                logger.warning(
+                    "WikiCompileProcessor: terminal-event reconcile dropped %d"
+                    " event(s) — no running event loop to fan out on",
+                    len(payloads),
+                )
         except Exception as exc:  # noqa: BLE001 — reconcile is best-effort
             logger.warning(
                 "WikiCompileProcessor: terminal-event reconcile failed: %s", exc
             )
         return announced
+
+    @staticmethod
+    def _drain_reconciled_events(bus, payloads: list) -> None:
+        """Fan out deferred reconcile events on the app loop (PRR-004).
+
+        Best-effort: a late failure must not escape into the loop's callback
+        machinery (it would surface as an "Exception in callback" and the
+        remaining rows would never be announced).
+        """
+        try:
+            for vault_id, payload in payloads:
+                bus.publish(vault_id, payload)
+        except Exception as exc:  # noqa: BLE001 — fan-out is best-effort
+            logger.warning(
+                "WikiCompileProcessor: deferred reconcile fan-out failed: %s",
+                exc,
+            )
 
     def _fail_job(
         self, job_id: int, error: str, worker_id: Optional[str] = None

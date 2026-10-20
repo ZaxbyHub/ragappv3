@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 from contextlib import contextmanager
 from typing import Any, Iterator, Optional
@@ -44,11 +45,45 @@ logger = logging.getLogger(__name__)
 _LEGACY_ERROR_STABLE_PREFIXES = (
     "COMPILE_FAILED:",
     "PAYLOAD_MALFORMED:",
-    "attempt_cap_exceeded:",
     "lease_attempt_cap_exceeded",
     "lease_disabled_rollback",
     "admission rejected:",
 )
+
+# PRR-001 review fix: ``attempt_cap_exceeded:`` is a COMPOSITION prefix, not
+# a leaf code — the pre-#792 writer wrapped raw ``str(exc)`` in it
+# (``f"attempt_cap_exceeded: {error}"``), so a bare prefix match would pass
+# those historical rows through byte-identically. It is therefore checked
+# remainder-aware: whatever follows must itself be a stable code.
+_ATTEMPT_CAP_PREFIX = "attempt_cap_exceeded:"
+
+# PRR-005 review fix: the #562 ingest vocabulary (document_processor.py) is
+# part of the same stable-code family — the reindex detail composer emits
+# those codes, so a boundary that only knows the wiki/KMS vocabulary would
+# destroy them. Imported lazily: document_processor is a heavy module and
+# job_lease sits below it in the import graph.
+_INGEST_ERROR_STABLE_PREFIXES: tuple[str, ...] = ()
+
+
+def _ingest_error_prefixes() -> tuple[str, ...]:
+    global _INGEST_ERROR_STABLE_PREFIXES
+    if not _INGEST_ERROR_STABLE_PREFIXES:
+        try:
+            from app.services import document_processor as _dp
+
+            _INGEST_ERROR_STABLE_PREFIXES = tuple(
+                sorted(
+                    value
+                    for name, value in vars(_dp).items()
+                    if name.startswith("INGEST_ERROR_")
+                    and isinstance(value, str)
+                    and name != "INGEST_ERROR_MAX_CHARS"
+                )
+            )
+        except Exception:  # pragma: no cover - defensive, keeps the mask safe
+            _INGEST_ERROR_STABLE_PREFIXES = ()
+    return _INGEST_ERROR_STABLE_PREFIXES
+
 
 LEGACY_ERROR_REDACTED = (
     "REDACTED_LEGACY_ERROR: pre-redaction failure detail withheld; "
@@ -56,20 +91,154 @@ LEGACY_ERROR_REDACTED = (
 )
 
 
-def redact_legacy_error_text(error: Optional[str]) -> Optional[str]:
+def _is_stable_error_text(text: str, _depth: int = 0) -> bool:
+    """True when ``text`` is a known stable code (never raw exception text)."""
+    if not text:
+        return True
+    if text.startswith(_LEGACY_ERROR_STABLE_PREFIXES):
+        return True
+    if text.startswith(_ingest_error_prefixes()):
+        return True
+    if text.startswith(_ATTEMPT_CAP_PREFIX) and _depth < 8:
+        # Remainder-aware: only a nested stable code may follow the
+        # composition prefix (PRR-001). Bounded depth — a crafted
+        # deeply-nested column value must not raise out of the read path.
+        return _is_stable_error_text(
+            text[len(_ATTEMPT_CAP_PREFIX):].lstrip(), _depth + 1
+        )
+    return False
+
+
+def redact_legacy_error_text(error) -> Optional[str]:
     """Mask pre-redaction raw error text on the wiki/KMS job read paths.
 
-    Issue #953: values that already match the stable-code vocabulary pass
-    through byte-identically (operators keep the codes they can act on);
-    anything else is a pre-#951 ``str(exc)`` remnant and is replaced with
-    the marker. Read-side only — writers, retries, and the janitor are
-    untouched, and the raw detail remains in the server logs.
+    Issue #953: values that are stable codes pass through byte-identically
+    (operators keep the codes they can act on); anything else is a
+    pre-redaction ``str(exc)`` remnant and is replaced with the marker.
+    Read-side only — writers, retries, and the janitor are untouched, and
+    the raw detail remains in the server logs.
+
+    PRR-011 review fix: a non-string column value (SQLite is dynamically
+    typed; a blob or numeric written by any non-Python writer is
+    representable) is masked rather than raising — the read path must not
+    become a crash.
     """
+    if error is None:
+        return None
+    if not isinstance(error, str):
+        return LEGACY_ERROR_REDACTED
     if not error:
         return error
-    if error.startswith(_LEGACY_ERROR_STABLE_PREFIXES):
+    if _is_stable_error_text(error):
         return error
     return LEGACY_ERROR_REDACTED
+
+
+# PRR-002 review fix: the #958 fix narrowed the curator/compiler WRITERS to
+# class-only, but historical ``result_json`` payloads still carry the raw
+# ``<code>: <Class>: <message>`` strings. Those reach vault readers through
+# the verbatim ``result_json`` field, so the read path masks them too —
+# the same discipline the ``error`` column gets. Only the three #958 sink
+# codes are rewritten; every other payload key/value is preserved and the
+# original string is returned byte-identical when nothing needs masking.
+_DETAIL_ENTRY_SHAPE = re.compile(r"^(file_id=\d+: )(.*)$", re.DOTALL)
+
+_RESULT_JSON_LEGACY_ERROR_RE = re.compile(
+    r"^(transport_error|orchestration_error|persist_error|lint_persist_error"
+    r"|ssrf_blocked)"
+    r": [A-Za-z_][A-Za-z0-9_.]*: .+$"
+)
+
+
+def _mask_legacy_error_string(value: str) -> str:
+    """Drop the message tail from a legacy curator/compiler error string."""
+    code, sep, rest = value.partition(": ")
+    if not sep:
+        return value
+    cls, sep2, _msg = rest.partition(": ")
+    if not sep2:
+        return value
+    return f"{code}: {cls}"
+
+
+def redact_legacy_detail_entry(entry: object) -> str:
+    """Mask one ``result["details"]`` entry (the reindex legacy-persist shape).
+
+    PRR-005/PRR-007: the stable-code check runs on the message part AFTER the
+    ``file_id=<id>: `` prefix — a composed-clean entry
+    (``file_id=5: PARSE_FAILED: ...``) passes byte-identically; an entry
+    without that shape, or one whose message part carries no stable code,
+    maps to the ``file_id=<id>: <marker>`` form (or the bare marker for
+    shape-less entries). Entry count, ordering and result keys are unchanged.
+    """
+    text = entry if isinstance(entry, str) else str(entry)
+    match = _DETAIL_ENTRY_SHAPE.match(text)
+    if match is None:
+        return redact_legacy_error_text(text) or LEGACY_ERROR_REDACTED
+    prefix, message = match.group(1), match.group(2)
+    redacted = redact_legacy_error_text(message)
+    if not redacted:
+        redacted = LEGACY_ERROR_REDACTED
+    return f"{prefix}{redacted}"
+
+
+def redact_legacy_result_json(result_json) -> Optional[str]:
+    """Mask pre-redaction raw error strings inside a stored ``result_json``.
+
+    Issue #953/#958 review fix (PRR-002/PRR-007): parses the stored payload
+    and rewrites only the reader-visible error strings that still carry raw
+    text — the curator/compiler ``errors`` lists (``<code>: <Class>: <msg>``,
+    nested under ``curator`` or at the top level) and the reindex
+    legacy-persist ``details`` list (``file_id=<id>: <raw str(exc)>``). Rows
+    without such an entry are returned byte-identical so clean payloads never
+    change shape. Non-dict or unparseable payloads are returned unchanged
+    (nothing reader-sensitive to mask).
+    """
+    if not result_json or not isinstance(result_json, str):
+        return result_json
+    if "error" not in result_json:
+        return result_json
+    try:
+        payload = json.loads(result_json)
+    except (TypeError, ValueError, RecursionError):
+        return result_json
+    if not isinstance(payload, dict):
+        return result_json
+
+    changed = False
+    curator = payload.get("curator")
+    # (container, key, masker) — curator errors are nested; details and any
+    # top-level errors list are on the payload root.
+    targets = [(payload, "details", redact_legacy_detail_entry)]
+    if isinstance(curator, dict):
+        targets.append((curator, "errors", _mask_legacy_error_string))
+    targets.append((payload, "errors", _mask_legacy_error_string))
+
+    for container, key, masker in targets:
+        entries = container.get(key)
+        if not isinstance(entries, list):
+            continue
+        if masker is _mask_legacy_error_string:
+            masked = [
+                masker(entry)
+                if isinstance(entry, str)
+                and _RESULT_JSON_LEGACY_ERROR_RE.match(entry)
+                else entry
+                for entry in entries
+            ]
+        else:
+            masked = [
+                masker(entry) if isinstance(entry, str) else entry
+                for entry in entries
+            ]
+        if masked != entries:
+            container[key] = masked
+            changed = True
+
+    if not changed:
+        return result_json
+    return json.dumps(payload)
+
 
 _JOBS_TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -123,6 +292,7 @@ SET status = CASE
     worker_id = NULL,
     lease_generation = lease_generation + 1,
     {reclaim_started_at_set},
+    {reclaim_completed_at_set},
     heartbeat_at = NULL
 WHERE status = 'running'
   AND heartbeat_at IS NOT NULL
@@ -137,6 +307,7 @@ def _reclaim_sql(shape: _TableShape, table: str) -> str:
         queue_column=shape.queue_column,
         error_col="error_code" if shape.error_set.startswith("error_code") else "error",
         reclaim_started_at_set=shape.reclaim_started_at_set,
+        reclaim_completed_at_set=shape.reclaim_completed_at_set,
     )
 
 
@@ -185,12 +356,17 @@ class _TableShape:
         error_set: str,
         supports_enqueue: bool,
         reclaim_started_at_set: str = "started_at = NULL",
+        # PRR-010: the cap-failed settle stamps completed_at (the boot
+        # reconcile and every terminal reader key on it); the pending arm
+        # preserves the existing value. Tables without the column no-op.
+        reclaim_completed_at_set: str = "completed_at = completed_at",
     ) -> None:
         self.queue_column = queue_column
         self.has_run_after = has_run_after
         self.error_set = error_set
         self.supports_enqueue = supports_enqueue
         self.reclaim_started_at_set = reclaim_started_at_set
+        self.reclaim_completed_at_set = reclaim_completed_at_set
 
 
 # The table allowlist (issue #559 stage 4, plan-critic MAJOR-2: one primitive,
@@ -204,12 +380,25 @@ _TABLE_SHAPES: dict[str, _TableShape] = {
         has_run_after=True,
         error_set="error = ?,",
         supports_enqueue=True,
+        # PRR-010: cap-failed rows carry a completed_at stamp so the #955
+        # boot reconcile (completed_at IS NOT NULL) sees them.
+        reclaim_completed_at_set=(
+            "completed_at = CASE WHEN ? IS NOT NULL AND attempts >= ? "
+            "THEN CURRENT_TIMESTAMP ELSE completed_at END"
+        ),
     ),
     "draft_jobs": _TableShape(
         queue_column="job_type",
         has_run_after=False,
         error_set="error_code = ?,",
         supports_enqueue=False,
+        # draft_jobs carries completed_at too (database.py), so it takes the
+        # same CASE fragment — the reclaim statement's placeholder count must
+        # match its shape's fragments for EVERY allowlisted table.
+        reclaim_completed_at_set=(
+            "completed_at = CASE WHEN ? IS NOT NULL AND attempts >= ? "
+            "THEN CURRENT_TIMESTAMP ELSE completed_at END"
+        ),
         # Deadline continuation (issue #516 DRAFT-013): a reclaim must NOT
         # clear started_at — the resumed run keeps burning the original
         # wall-clock budget instead of being re-granted a full timeout.
@@ -552,7 +741,12 @@ class JobLease:
         with self._write_txn():
             cur = self._conn.execute(
                 _reclaim_sql(self._shape, self._table),
+                # Placeholder order follows the SQL TEXT: status CASE (2),
+                # error CASE (2), completed_at CASE (2) — all in the SET
+                # clause — then the WHERE heartbeat/queue operands.
                 (
+                    self._max_attempts,
+                    self._max_attempts,
                     self._max_attempts,
                     self._max_attempts,
                     self._max_attempts,
