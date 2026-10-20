@@ -476,7 +476,12 @@ class WikiCurator:
                         ]
                     )
                 except CuratorURLBlocked as e:
-                    return None, f"ssrf_blocked: {e}"
+                    # PRR-008: class-only, matching the #958 sibling
+                    # sinks — the SSRF message embeds the configured
+                    # curator host, which settings.py classifies as
+                    # admin-only infra (INFRA_REDACTED_FIELDS), so it must
+                    # not reach vault readers through result_json.
+                    return None, f"ssrf_blocked: {type(e).__name__}"
                 except Exception as e:  # broad — never propagate
                     # Issue #958: this string reaches vault readers through
                     # the job's result_json — exception CLASS only; the

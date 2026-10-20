@@ -1034,8 +1034,15 @@ async def cancel_wiki_job(
                 "trigger_type": (settled.trigger_type if settled else "manual"),
             },
         )
-    except Exception:  # noqa: BLE001 — fan-out must never fail the route
-        logger.warning("wiki cancel event publish failed for job %s", job_id)
+    except Exception as exc:  # noqa: BLE001 — fan-out must never fail the route
+        # PRR-015: keep the cause diagnosable (the sibling fan-out guards
+        # in the processor and the bus all log exc_info=True).
+        logger.warning(
+            "wiki cancel event publish failed for job %s: %s",
+            job_id,
+            exc,
+            exc_info=True,
+        )
     return {"job_id": job_id, "status": "cancelled"}
 
 

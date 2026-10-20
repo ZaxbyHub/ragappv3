@@ -56,17 +56,18 @@ raises `OperationalError: malformed JSON` before any Python guard runs.
 ## Migration
 
 No schema or settings changes. `jobs.error` content changes from raw text
-to stable codes for failures written after this deploy; rows written
-before it keep their stored error text until the historical scrub lands
-(tracked in #953).
+to stable codes for failures written after this deploy. Rows written
+before it are MASKED AT READ TIME for vault readers by #953's PR
+(read-time mapping, not a scrub migration) — see that PR's release
+fragment for the at-rest posture and the `REDACTED_LEGACY_ERROR` marker.
 
 ## Known caveats
 
 - Operators lose the raw message in the jobs API and must consult server
   logs for failure detail (the issue's stated trade).
 - Exception class names are not part of the stable code.
-- Rows written before this deploy still expose their stored error text to
-  vault readers; the scrub is tracked in #953.
+- Rows written before this deploy no longer expose their stored error text
+  to vault readers: #953's PR masks it at read time (no scrub migration).
 - The panel and KMS toast render the stable code verbatim (no
   code-to-prose mapping); the previous raw text went through the same
   sinks.

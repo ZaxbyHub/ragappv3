@@ -49,6 +49,9 @@ COMPILER_SOURCE = (SERVICES_DIR / "wiki_compiler.py").read_text(encoding="utf-8"
 # The ssrf_blocked arm is the single named exemption (short blocker
 # detail, by design — see the #958 release fragment).
 _SSRF_EXEMPTION = "ssrf_blocked"
+# PRR-012: the exemption applies to a line that BUILDS an ssrf_blocked
+# error string, not to any line that merely mentions it.
+_SSRF_SINK_RE = re.compile(r"f.ssrf_blocked:")
 
 
 def _mkdb(prefix: str) -> str:
@@ -182,6 +185,7 @@ class TestLegacyReindexDetailsBoundary(unittest.IsolatedAsyncioTestCase):
             "ReindexOperatorGuidance returned as an exception object must"
             " persist verbatim through the returned-error arm (#957/#702)",
         )
+
 
     async def test_details_arm_passes_composed_ingest_codes_through(self):
         """Review-round pin: a detail entry the composition layer already
@@ -378,7 +382,17 @@ class TestReconcileWindowIsoformat(unittest.IsolatedAsyncioTestCase):
                 "app.services.wiki_events.get_wiki_event_bus", return_value=_Bus()
             ):
                 await proc.start()
-                await asyncio.sleep(1.0)
+                # PRR-004: the fan-out is deferred past startup so
+                # reconnected SSE clients receive it — wait out the delay
+                # (plus margin) instead of a fixed 1s.
+                deadline = asyncio.get_event_loop().time() + 12.0
+                while (
+                    asyncio.get_event_loop().time() < deadline
+                    and not any(
+                        e.get("job_id") == recent_job.id for e in events
+                    )
+                ):
+                    await asyncio.sleep(0.2)
         finally:
             await proc.stop()
             pool.close_all()
@@ -404,24 +418,32 @@ class TestWidenedRawInterpolationCensus(unittest.TestCase):
 
     Wider than the frozen C15 census (which pins the exact
     ``{type(e).__name__}: {e}`` shape): this predicate catches ``{e}``,
-    ``{e!r}``, ``{exc}``, and ``{exc!r}`` variants, with exactly one named
-    exemption (the by-design ``ssrf_blocked:`` arm). RED at base (three
-    defect sites), GREEN after the fix.
+    ``{e!r}``, ``{exc}``, and ``{exc!r}`` variants.
+
+    PRR-012 review fix: the predicate is QUOTE-AGNOSTIC (``f"`` and
+    ``f'``) — the previous ``f"`` gate let a single-quoted reintroduction
+    through, which the frozen census catches and this one missed — and the
+    exemption is by SINK (the ``ssrf_blocked:`` code prefix), not a line
+    substring, so a trailing comment cannot exempt a whole line. A positive
+    control proves the detector fires.
     """
 
     _PATTERN = re.compile(r"\{(?:e|exc)(?:!r)?\}")
+    _FSTRING = re.compile("f" + chr(34) + "|f" + chr(39))
 
     def _violations(self, source: str, filename: str) -> dict:
         hits = []
         for lineno, line in enumerate(source.splitlines(), start=1):
-            # Both f-string quote styles gate the scan: a future regression
-            # written as f'...{e}...' must not escape the census (Copilot
-            # review round on the widened predicate).
-            if not line.lstrip().startswith("#") and (
-                'f"' in line or "f'" in line
-            ):
-                if self._PATTERN.search(line) and _SSRF_EXEMPTION not in line:
-                    hits.append(lineno)
+            stripped = line.lstrip()
+            if stripped.startswith("#") or not self._FSTRING.search(line):
+                continue
+            if not self._PATTERN.search(line):
+                continue
+            # Exempt by SINK: the line must actually build an ssrf_blocked
+            # error string (a trailing comment mention is not a sink).
+            if _SSRF_EXEMPTION in line and _SSRF_SINK_RE.search(line):
+                continue
+            hits.append(lineno)
         return {filename: hits}
 
     def test_no_raw_exception_message_interpolation(self):
@@ -433,9 +455,385 @@ class TestWidenedRawInterpolationCensus(unittest.TestCase):
             {"wiki_curator.py": [], "wiki_compiler.py": []},
             "raw exception-message interpolation in error strings reaches"
             " vault readers through result_json; use the exception class"
-            " name only (#958). The only permitted raw arm is the"
-            " ssrf_blocked: short blocker detail.",
+            " name only (#958).",
         )
+
+    def test_census_detects_its_own_target_class(self):
+        """Positive control: the predicate must fire on known-bad shapes.
+
+        PRR-012: without this, a census that can never fire is
+        indistinguishable from a clean tree.
+        """
+        bad_shapes = [
+            'return None, f"transport_error: {type(e).__name__}: {e}"',
+            "return None, f'transport_error: {type(e).__name__}: {e}'",
+            'raise_error(f"orchestration_error: {exc}")',
+            'raise_error(f"persist_error: {exc!r}")',
+        ]
+        for shape in bad_shapes:
+            self.assertEqual(
+                self._violations(shape, "synthetic.py"),
+                {"synthetic.py": [1]},
+                f"the census must flag {shape!r}",
+            )
+
+    def test_exemption_is_by_sink_not_by_comment(self):
+        """A trailing comment naming ssrf_blocked must not exempt a line."""
+        sneaky = (
+            'return None, f"transport_error: {type(e).__name__}: {e}"'
+            "  # note: unlike ssrf_blocked, this carries the message"
+        )
+        self.assertEqual(
+            self._violations(sneaky, "synthetic.py"),
+            {"synthetic.py": [1]},
+            "a comment mentioning ssrf_blocked must not exempt a defect line",
+        )
+        genuine = 'return None, f"ssrf_blocked: {type(e).__name__}"'
+        self.assertEqual(
+            self._violations(genuine, "synthetic.py"),
+            {"synthetic.py": []},
+            "the class-only ssrf_blocked sink is the permitted arm",
+        )
+
+
+class TestReadSideMaskContracts(unittest.TestCase):
+    """PRR-001/002/005/011/013: the shipped read-side redaction contracts."""
+
+    def test_attempt_cap_prefix_is_remainder_aware(self):
+        """PRR-001: the composition prefix must not smuggle raw text."""
+        from app.services.job_lease import (
+            LEGACY_ERROR_REDACTED,
+            redact_legacy_error_text,
+        )
+
+        self.assertEqual(
+            redact_legacy_error_text(
+                "attempt_cap_exceeded: RuntimeError: conn refused"
+                " db.internal:5432 pw=hunter2"
+            ),
+            LEGACY_ERROR_REDACTED,
+            "a pre-#792 cap row wrapping raw str(exc) must be masked",
+        )
+        self.assertEqual(
+            redact_legacy_error_text(
+                "attempt_cap_exceeded: COMPILE_FAILED: wiki compile dispatch"
+                " failed; see server logs"
+            ),
+            "attempt_cap_exceeded: COMPILE_FAILED: wiki compile dispatch"
+            " failed; see server logs",
+            "a nested stable code still passes through byte-identically",
+        )
+
+    def test_ingest_codes_are_stable_codes(self):
+        """PRR-005: the #562 vocabulary is part of the stable-code family."""
+        from app.services.job_lease import redact_legacy_error_text
+
+        for code in (
+            "PARSE_FAILED: document could not be parsed",
+            "FILE_MISSING: the document file is gone",
+            "EMBEDDING_FAILED: the embedding service refused the batch",
+            "VECTOR_STORE_FAILED: the vector store rejected the write",
+        ):
+            self.assertEqual(
+                redact_legacy_error_text(code),
+                code,
+                f"{code.split(':')[0]} is a stable code and must pass through",
+            )
+
+    def test_non_string_column_values_are_masked_not_raised(self):
+        """PRR-011: the read path must not crash on a non-str column value."""
+        from app.services.job_lease import (
+            LEGACY_ERROR_REDACTED,
+            redact_legacy_error_text,
+        )
+
+        for value in (b"raw bytes here", 123, 4.5, True):
+            self.assertEqual(
+                redact_legacy_error_text(value),
+                LEGACY_ERROR_REDACTED,
+                f"{value!r} must be masked, not raise",
+            )
+        self.assertIsNone(redact_legacy_error_text(None))
+        self.assertEqual(redact_legacy_error_text(""), "")
+
+    def test_marker_value_is_pinned(self):
+        """PRR-013: operators see exactly this string; pin it."""
+        from app.services.job_lease import (
+            LEGACY_ERROR_REDACTED,
+            redact_legacy_error_text,
+        )
+
+        self.assertEqual(
+            LEGACY_ERROR_REDACTED,
+            "REDACTED_LEGACY_ERROR: pre-redaction failure detail withheld; "
+            "see server logs",
+        )
+        self.assertEqual(
+            redact_legacy_error_text("RuntimeError: raw"),
+            LEGACY_ERROR_REDACTED,
+        )
+
+    def test_result_json_masks_legacy_error_strings(self):
+        """PRR-002: historical curator errors lose their message tail."""
+        import json
+
+        from app.services.job_lease import redact_legacy_result_json
+
+        legacy = json.dumps(
+            {
+                "curator": {
+                    "errors": [
+                        "transport_error: RuntimeError: Curator returned"
+                        " HTTP 401: {\"message\": \"bad key\"}"
+                    ],
+                    "accepted": 2,
+                }
+            }
+        )
+        out = json.loads(redact_legacy_result_json(legacy))
+        self.assertEqual(
+            out["curator"]["errors"],
+            ["transport_error: RuntimeError"],
+            "the raw message tail must be dropped",
+        )
+        self.assertEqual(
+            out["curator"]["accepted"],
+            2,
+            "non-error payload keys must survive",
+        )
+        clean = json.dumps({"curator": {"errors": ["transport_error: X"]}})
+        self.assertEqual(
+            redact_legacy_result_json(clean),
+            clean,
+            "a clean payload must pass through byte-identically",
+        )
+
+    def test_result_json_masks_legacy_detail_entries(self):
+        """PRR-007: the reindex legacy-persist details list is masked."""
+        import json
+
+        from app.services.job_lease import redact_legacy_result_json
+
+        legacy = json.dumps(
+            {
+                "processed": 3,
+                "failed": 1,
+                "details": [
+                    "file_id=5: PARSE_FAILED: document could not be parsed",
+                    "file_id=6: RuntimeError: disk I/O error on /srv/x",
+                ],
+            }
+        )
+        out = json.loads(redact_legacy_result_json(legacy))
+        self.assertEqual(
+            out["details"][0],
+            "file_id=5: PARSE_FAILED: document could not be parsed",
+            "a composed-clean ingest code must survive byte-identically",
+        )
+        self.assertNotIn("disk I/O", out["details"][1])
+        self.assertTrue(out["details"][1].startswith("file_id=6: "))
+
+
+class TestMapperWiring(unittest.IsolatedAsyncioTestCase):
+    """PRR-002 wiring proof: the mask must be applied AT the mappers, not
+    only exist as a helper — reverting either call site must fail here."""
+
+    def setUp(self):
+        db_path = _mkdb("o02h-wiring-")
+        self.addCleanup(shutil.rmtree, os.path.dirname(db_path), True)
+        self.db_path = db_path
+
+    async def test_mappers_mask_legacy_result_json(self):
+        import json
+        from unittest.mock import patch
+
+        from app.models.database import run_migrations  # noqa: F401
+        from app.services.kms_store import KMSStore
+        from app.services.wiki_store import WikiStore
+
+        legacy_result = json.dumps(
+            {
+                "curator": {
+                    "errors": [
+                        "transport_error: RuntimeError: Curator returned HTTP"
+                        " 401: {\"message\": \"bad key\"}"
+                    ],
+                    "accepted": 1,
+                }
+            }
+        )
+        conn = sqlite3.connect(self.db_path, timeout=10)
+        conn.row_factory = sqlite3.Row
+        try:
+            with patch.object(settings, "wiki_kms_job_lease_enabled", True):
+                wjob = WikiStore(conn).create_job(vault_id=1, trigger_type="manual")
+                kjob = KMSStore(conn).create_job(1, "manual")
+                conn.execute(
+                    "UPDATE jobs SET status = 'failed', error = ?, "
+                    "result_json = ? WHERE id = ?",
+                    (
+                        "attempt_cap_exceeded: RuntimeError: raw token=sk-live-1",
+                        legacy_result,
+                        wjob.id,
+                    ),
+                )
+                conn.execute(
+                    "UPDATE jobs SET status = 'failed', error = ?, "
+                    "result_json = ? WHERE id = ?",
+                    (
+                        "attempt_cap_exceeded: RuntimeError: raw token=sk-live-2",
+                        legacy_result,
+                        kjob.id,
+                    ),
+                )
+                conn.commit()
+
+                wjobs = WikiStore(conn).list_jobs(1)
+                wrow = next(j for j in wjobs if j.id == wjob.id)
+                kjobs = KMSStore(conn).list_jobs(1)
+                krow = next(j for j in kjobs if j.id == kjob.id)
+        finally:
+            conn.close()
+
+        for label, row in (("wiki", wrow), ("kms", krow)):
+            self.assertNotIn(
+                "sk-live",
+                row.error or "",
+                f"{label}: the cap-prefixed raw error must be masked (PRR-001)",
+            )
+            curator_errors = json.loads(row.result_json)["curator"]["errors"]
+            self.assertEqual(
+                curator_errors,
+                ["transport_error: RuntimeError"],
+                f"{label}: legacy result_json error strings must lose their"
+                " message tail at the mapper (PRR-002)",
+            )
+
+
+class TestRealBusDelivery(unittest.IsolatedAsyncioTestCase):
+    """PRR-003/PRR-004: the threaded publish arm and the deferred reconcile
+    fan-out must deliver through the REAL event bus (not a recording spy),
+    and deleting the publish arm must turn these red."""
+
+    def setUp(self):
+        db_path = _mkdb("o02h-bus-")
+        self.addCleanup(shutil.rmtree, os.path.dirname(db_path), True)
+        self.db_path = db_path
+
+    async def test_threaded_publish_reaches_a_real_subscriber(self):
+        import asyncio
+        from unittest.mock import patch
+
+        from app.models.database import SQLiteConnectionPool
+        from app.services.wiki_compile_processor import WikiCompileProcessor
+        from app.services.wiki_events import WikiEventBus
+        from app.services.wiki_store import WikiStore
+
+        bus = WikiEventBus()
+        queue = bus.subscribe(1)
+        pool = SQLiteConnectionPool(self.db_path, max_size=2)
+        proc = WikiCompileProcessor(pool)
+        with pool.connection() as conn:
+            job = WikiStore(conn).create_job(vault_id=1, trigger_type="manual")
+            job_id = job.id
+
+        def boom(_job):
+            raise RuntimeError("dispatch exploded: O02H-BUS-SENTINEL")
+
+        proc._dispatch = boom
+        with patch.object(settings, "wiki_kms_job_lease_enabled", True), \
+                patch.object(settings, "jobs_max_attempts", 1), \
+                patch(
+                    "app.services.wiki_events.get_wiki_event_bus",
+                    return_value=bus,
+                ):
+            await proc.start()
+            try:
+                deadline = asyncio.get_event_loop().time() + 15.0
+                while asyncio.get_event_loop().time() < deadline:
+                    conn = sqlite3.connect(self.db_path, timeout=10)
+                    conn.row_factory = sqlite3.Row
+                    row = conn.execute(
+                        "SELECT status FROM jobs WHERE id = ?", (job_id,)
+                    ).fetchone()
+                    conn.close()
+                    if row["status"] in ("failed", "completed", "cancelled"):
+                        break
+                    await asyncio.sleep(0.1)
+                # The threaded unit's publish is marshalled onto the loop;
+                # drain the loop so the callback runs.
+                for _ in range(20):
+                    await asyncio.sleep(0.1)
+                    if not queue.empty():
+                        break
+            finally:
+                await proc.stop()
+                pool.close_all()
+
+        self.assertFalse(
+            queue.empty(),
+            "the terminal job_failed event must reach a REAL subscriber"
+            " through the threaded publish arm (PRR-003: deleting the"
+            " _marshal_publish calls must fail here)",
+        )
+        delivered = queue.get_nowait()
+        self.assertEqual(delivered.get("type"), "job_failed")
+        self.assertEqual(delivered.get("job_id"), job_id)
+
+    async def test_reconcile_fanout_is_deferred_and_delivered(self):
+        """PRR-004: the reconcile fans out AFTER startup (subscribers exist)."""
+        import asyncio
+        from datetime import datetime, timedelta
+        from unittest.mock import patch
+
+        from app.models.database import SQLiteConnectionPool
+        from app.services.wiki_compile_processor import WikiCompileProcessor
+        from app.services.wiki_events import WikiEventBus
+        from app.services.wiki_store import WikiStore
+
+        bus = WikiEventBus()
+        pool = SQLiteConnectionPool(self.db_path, max_size=2)
+        with pool.connection() as conn:
+            job = WikiStore(conn).create_job(vault_id=1, trigger_type="manual")
+            job_id = job.id
+            conn.execute(
+                "UPDATE jobs SET status = 'failed', completed_at = ?, "
+                "error = ? WHERE id = ?",
+                (
+                    datetime.utcnow().isoformat(),
+                    "COMPILE_FAILED: wiki compile dispatch failed; see server logs",
+                    job_id,
+                ),
+            )
+            conn.commit()
+
+        proc = WikiCompileProcessor(pool)
+        with patch.object(settings, "wiki_kms_job_lease_enabled", True), \
+                patch(
+                    "app.services.wiki_events.get_wiki_event_bus",
+                    return_value=bus,
+                ):
+            await proc.start()
+            try:
+                # The fan-out is deferred past startup: a subscriber that
+                # attaches after start() must still receive the event.
+                queue = bus.subscribe(1)
+                deadline = asyncio.get_event_loop().time() + 15.0
+                while asyncio.get_event_loop().time() < deadline:
+                    if not queue.empty():
+                        break
+                    await asyncio.sleep(0.1)
+            finally:
+                await proc.stop()
+                pool.close_all()
+
+        self.assertFalse(
+            queue.empty(),
+            "the deferred reconcile fan-out must reach a subscriber that"
+            " attached after startup (PRR-004)",
+        )
+        self.assertEqual(queue.get_nowait().get("job_id"), job_id)
+
 
 
 if __name__ == "__main__":  # pragma: no cover

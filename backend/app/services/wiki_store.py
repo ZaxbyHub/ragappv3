@@ -20,6 +20,7 @@ from app.services.job_lease import (
     JobLease,
     ensure_jobs_schema,
     redact_legacy_error_text,
+    redact_legacy_result_json,
 )
 
 WIKI_QUEUE = "wiki"
@@ -379,7 +380,9 @@ def _to_compile_job(row: sqlite3.Row) -> WikiCompileJob:
         # Issue #953: pre-redaction rows pass through the legacy-error mask
         # so the lease-rollback read path never surfaces raw str(exc) text.
         error=redact_legacy_error_text(d.get("error")),
-        result_json=d.get("result_json") or "{}",
+        # PRR-002: result_json gets the same read-time treatment for
+        # pre-#958 curator error strings (clean payloads unchanged).
+        result_json=redact_legacy_result_json(d.get("result_json") or "{}"),
         created_at=d["created_at"],
         started_at=d.get("started_at"),
         completed_at=d.get("completed_at"),
@@ -415,7 +418,9 @@ def _compile_job_from_jobs_row(row: sqlite3.Row) -> WikiCompileJob:
         # (and legacy rows the boot sync copies forward) still hold raw
         # str(exc) text; mask it at read time, codes pass through.
         error=redact_legacy_error_text(d.get("error")),
-        result_json=d.get("result_json") or "{}",
+        # PRR-002: result_json gets the same read-time treatment for
+        # pre-#958 curator error strings (clean payloads unchanged).
+        result_json=redact_legacy_result_json(d.get("result_json") or "{}"),
         created_at=d["created_at"],
         started_at=d.get("started_at"),
         completed_at=d.get("completed_at"),

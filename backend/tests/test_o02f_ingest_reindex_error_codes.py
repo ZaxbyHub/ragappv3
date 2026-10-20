@@ -195,6 +195,13 @@ class TestIngestionErrorRedaction(unittest.IsolatedAsyncioTestCase):
             "the attempt-cap settle must persist a redacted stable code"
             " (attempt_cap_exceeded is allowed; the raw text is not) (#957)",
         )
+        # PRR-019: the cap CODE is load-bearing behaviour — pin it, not just
+        # the absence of the raw text.
+        self.assertTrue(
+            error.startswith("attempt_cap_exceeded:"),
+            f"the attempt-cap settle must carry the attempt_cap_exceeded"
+            f" code, got {error!r}",
+        )
         self.assertTrue(
             error.strip(),
             "the terminally failed row must still carry a non-empty redacted"
@@ -342,31 +349,44 @@ class TestLeasePathRedactionShape(unittest.TestCase):
             func, "_run_reindex_job_row must exist in background_tasks.py"
         )
 
-        has_guidance_carveout = any(
-            isinstance(n, ast.Call)
-            and isinstance(n.func, ast.Name)
-            and n.func.id == "isinstance"
-            and len(n.args) == 2
-            and isinstance(n.args[1], ast.Name)
-            and n.args[1].id == "ReindexOperatorGuidance"
-            for n in ast.walk(func)
+        # PRR-019: the tokens must appear in a LIVE conditional that guards
+        # the persisted error_text — a token-only scan passes even when the
+        # carve-out is dead code (e.g. `if False: isinstance(...)`).
+        carveout_if = None
+        for node in ast.walk(func):
+            if not isinstance(node, ast.If):
+                continue
+            test_names = {
+                n.id for n in ast.walk(node.test) if isinstance(n, ast.Name)
+            } | {
+                n.attr for n in ast.walk(node.test) if isinstance(n, ast.Attribute)
+            }
+            has_isinstance = any(
+                isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Name)
+                and n.func.id == "isinstance"
+                for n in ast.walk(node.test)
+            )
+            if has_isinstance and "ReindexOperatorGuidance" in test_names:
+                carveout_if = node
+                break
+        self.assertIsNotNone(
+            carveout_if,
+            "_run_reindex_job_row must keep a live isinstance(exc,"
+            " ReindexOperatorGuidance) conditional (issue #702/#562"
+            " contract) — dead tokens do not count",
         )
-        self.assertTrue(
-            has_guidance_carveout,
-            "_run_reindex_job_row must keep the isinstance(exc,"
-            " ReindexOperatorGuidance) carve-out (issue #702/#562 contract)",
+        body_text = ast.unparse(carveout_if)
+        self.assertIn(
+            "redact_ingest_error",
+            body_text,
+            "the carve-out conditional must be the one routing BaseException"
+            " payloads through redact_ingest_error (issue #562 contract)",
         )
-
-        has_redact_call = any(
-            isinstance(n, ast.Call)
-            and isinstance(n.func, ast.Name)
-            and n.func.id == "redact_ingest_error"
-            for n in ast.walk(func)
-        )
-        self.assertTrue(
-            has_redact_call,
-            "_run_reindex_job_row must keep redacting BaseException payloads"
-            " through redact_ingest_error (issue #562 contract)",
+        self.assertIn(
+            "error_text",
+            body_text,
+            "the carve-out conditional must assign the persisted error_text",
         )
 
 

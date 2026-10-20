@@ -68,6 +68,7 @@ from app.services.document_processor import (
 )
 from app.services.embeddings import EmbeddingService
 from app.services.fts_query import build_fts_match_query
+from app.services.job_lease import redact_legacy_result_json
 from app.services.near_duplicates import (
     clear_file_centroid,
     get_near_duplicate_group,
@@ -2973,6 +2974,26 @@ async def reindex_documents(
     return ReindexResponse(job_id=job_id, status="pending", vault_id=vault_id)
 
 
+def _mask_reindex_row(row: dict) -> dict:
+    """Mask pre-redaction raw exception text on a reindex job row.
+
+    Issue #953/#957 review fix (PRR-007): the #957 write-side fix stops NEW
+    raw ``str(exc)`` reaching the legacy ``details`` list, but rows written
+    before it (and rows the boot sync copied forward) still carry raw text
+    there. The ``details`` payload is therefore masked at read time — the
+    same discipline the wiki/KMS job readers get.
+
+    The ``error`` column is deliberately NOT masked on this surface: it
+    carries operator constants ("Interrupted by process restart",
+    ``ReindexOperatorGuidance`` texts with dynamic counts) that no
+    stable-code vocabulary can enumerate without drift, and these routes
+    are admin-gated. The wiki/KMS job readers mask their ``error`` column
+    because that vocabulary IS closed.
+    """
+    row["result_json"] = redact_legacy_result_json(row.get("result_json"))
+    return row
+
+
 @router.get("/reindex/jobs/{job_id}", response_model=ReindexJobStatusResponse)
 @limiter.limit(settings.admin_rate_limit)
 async def get_reindex_job_status(
@@ -3022,7 +3043,7 @@ async def get_reindex_job_status(
     if row is None:
         raise HTTPException(status_code=404, detail="Reindex job not found")
 
-    row_dict = dict(row)
+    row_dict = _mask_reindex_row(dict(row))
     return ReindexJobStatusResponse(**row_dict)
 
 
@@ -3067,7 +3088,7 @@ async def list_reindex_jobs(
             ).fetchall()
             out = []
             for row in rows:
-                row_dict = dict(row)
+                row_dict = _mask_reindex_row(dict(row))
                 row_dict["input_json"] = row_dict.get("input_json") or "{}"
                 out.append(row_dict)
             return out
@@ -3083,7 +3104,7 @@ async def list_reindex_jobs(
             LIMIT 20
             """
         ).fetchall()
-        return [dict(row) for row in rows]
+        return [_mask_reindex_row(dict(row)) for row in rows]
 
     jobs = await asyncio.to_thread(_fetch_jobs)
     return ReindexJobListResponse(
