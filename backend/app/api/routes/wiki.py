@@ -1016,6 +1016,26 @@ async def cancel_wiki_job(
             status_code=404,
             detail=f"Job {job_id} not found or not cancellable",
         )
+    # Issue #955: announce the cancellation on the wiki event bus so SSE
+    # consumers refetch — the row settled above is otherwise invisible to
+    # the event-driven UI. Call-time import (the processor's
+    # _publish_event pattern) and best-effort: a fan-out failure must
+    # never fail a settle that already committed.
+    try:
+        from app.services.wiki_events import get_wiki_event_bus
+
+        settled = store.get_job(job_id, vault_id)
+        get_wiki_event_bus().publish(
+            vault_id,
+            {
+                "type": "job_cancelled",
+                "job_id": job_id,
+                "vault_id": vault_id,
+                "trigger_type": (settled.trigger_type if settled else "manual"),
+            },
+        )
+    except Exception:  # noqa: BLE001 — fan-out must never fail the route
+        logger.warning("wiki cancel event publish failed for job %s", job_id)
     return {"job_id": job_id, "status": "cancelled"}
 
 

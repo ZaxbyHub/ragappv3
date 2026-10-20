@@ -10,6 +10,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -24,6 +25,7 @@ from app.services.admission import (
 
 from ..models.database import SQLiteConnectionPool
 from .document_processor import (
+    _INGEST_ERROR_REASONS,
     DocumentProcessingError,
     DocumentProcessor,
     IngestCancelledError,
@@ -32,7 +34,12 @@ from .document_processor import (
     redact_ingest_error,
 )
 from .embeddings import EmbeddingService
-from .job_lease import JobLease, ensure_jobs_schema
+from .job_lease import (
+    LEGACY_ERROR_REDACTED,
+    JobLease,
+    ensure_jobs_schema,
+    redact_legacy_error_text,
+)
 from .llm_client import LLMClient
 from .maintenance import MaintenanceService
 from .multimodal_enrichment import ArtifactEnrichmentService
@@ -52,6 +59,75 @@ class ReindexOperatorGuidance(VectorStoreError):
     :meth:`BackgroundProcessor._run_reindex_job_row` persists ``str()`` of
     this type verbatim and redacts every other ``BaseException``.
     """
+
+
+_REINDEX_DETAIL_SHAPE = re.compile(r"^(file_id=\d+: )(.*)$", re.DOTALL)
+
+# The #562 ingest codes the composition layer (``_reindex_embed_all``)
+# writes into detail entries via ``redact_ingest_error`` — trusted at
+# the details boundary so a composed-clean entry survives
+# byte-identically instead of being flattened by the wiki/KMS-scoped
+# vocabulary in ``redact_legacy_error_text``. Derived from the closed
+# ``_INGEST_ERROR_REASONS`` set — exactly the outputs
+# ``format_ingest_error`` can produce, including ``PARSE_TIMEOUT``
+# (``ParseDeadlineError.ingest_error_code``) and
+# ``ENRICHMENT_FAILED`` — so the invariant cannot drift from the
+# vocabulary it protects.
+_REINDEX_DETAIL_STABLE_PREFIXES = tuple(
+    f"{code}:" for code in _INGEST_ERROR_REASONS
+)
+
+
+def _redact_reindex_message_part(message: str) -> str:
+    """Map one detail message part to its persisted form (#957 review).
+
+    A message part that already carries a stable code — a #562 ingest
+    code composed by ``_reindex_embed_all``'s own redaction layer, or a
+    wiki/KMS compile code admitted by ``redact_legacy_error_text`` —
+    passes through unchanged; anything else is a raw remnant and takes
+    the legacy-error marker.
+    """
+    if message.startswith(_REINDEX_DETAIL_STABLE_PREFIXES):
+        return message
+    return redact_legacy_error_text(message) or LEGACY_ERROR_REDACTED
+
+
+def _redact_reindex_detail_entry(entry: object) -> str:
+    """Redact one ``result["details"]`` entry at the legacy persist boundary.
+
+    Issue #957: the stable-code check runs on the message part AFTER the
+    ``file_id=<id>: `` prefix — a composed-clean entry
+    (``file_id=5: PARSE_FAILED: ...``) passes byte-identically; an entry
+    without that shape, or one whose message part carries no stable code,
+    maps to the ``file_id=<id>: <REDACTED_LEGACY_ERROR marker>`` form (or
+    the bare marker for shape-less entries).
+    """
+    text = entry if isinstance(entry, str) else str(entry)
+    match = _REINDEX_DETAIL_SHAPE.match(text)
+    if match is None:
+        return _redact_reindex_message_part(text)
+    prefix, message = match.group(1), match.group(2)
+    return f"{prefix}{_redact_reindex_message_part(message)}"
+
+
+def _redact_reindex_error(error: "BaseException | str | None") -> Optional[str]:
+    """Redact a reindex failure for persistence on the legacy table.
+
+    Issue #957: the same three-way branch the lease boundary
+    (``_run_reindex_job_row``) applies — ``ReindexOperatorGuidance`` is a
+    hand-written operator constant and persists verbatim (issue #702);
+    any other ``BaseException`` goes through the #562
+    ``redact_ingest_error`` contract; a plain string is a trusted
+    operator-constant composition (per ``_reindex_embed_all``'s
+    docstring) and also persists verbatim. NOT adopted inside
+    ``_run_reindex_job_row`` itself — the o02 census pins that boundary's
+    inline isinstance + redact_ingest_error calls.
+    """
+    if isinstance(error, ReindexOperatorGuidance):
+        return str(error)
+    if isinstance(error, BaseException):
+        return redact_ingest_error(error)
+    return str(error) if error else None
 
 
 # Queue name for the shared jobs-lease table's ingestion rows (issue #559).
@@ -949,12 +1025,21 @@ class BackgroundProcessor:
                             j.created_at, j.started_at, j.completed_at
                         FROM {table} j
                         WHERE j.id NOT IN (
-                            SELECT CAST(json_extract(j2.payload_json,
-                                    '$.legacy_job_id') AS INTEGER)
+                            -- Issue #954: json_valid guard, same pattern as
+                            -- the #792/#951 store filters — a malformed
+                            -- payload_json row can never carry a
+                            -- legacy_job_id, so it is simply never excluded
+                            -- from copying instead of raising
+                            -- OperationalError inside the sync.
+                            SELECT CAST(
+                                CASE WHEN json_valid(j2.payload_json)
+                                THEN json_extract(j2.payload_json,
+                                    '$.legacy_job_id') END AS INTEGER)
                             FROM jobs j2
                             WHERE j2.queue = ?
-                              AND json_extract(j2.payload_json,
-                                  '$.legacy_job_id') IS NOT NULL
+                              AND CASE WHEN json_valid(j2.payload_json)
+                                  THEN json_extract(j2.payload_json,
+                                      '$.legacy_job_id') END IS NOT NULL
                           )
                         """,  # nosec B608 - table names are module constants
                         (queue, queue),
@@ -1568,7 +1653,11 @@ class BackgroundProcessor:
                 outcome_exc = None
                 return
             except Exception as exc:  # noqa: BLE001 — outcome drives settle
-                outcome_error = str(exc)
+                # Issue #957: jobs.error gets the #562 stable code, not the
+                # raw str(exc) — the requeue and attempt-cap compositions
+                # below inherit the redacted value (raw text stays in the
+                # logger.exception above and files.error_message handling).
+                outcome_error = redact_ingest_error(exc)
                 # Retained so the terminal branch hands the exception object
                 # (redacted at the persist boundary) to the permanent-failure
                 # path instead of its raw str(): the jobs-table error field is
@@ -4166,14 +4255,31 @@ class BackgroundProcessor:
                 )
             else:
                 if error is not None and result == {}:
-                    # Metadata/identity failure path: error is the raw string.
+                    # Metadata/identity failure path. Issue #957: the raw
+                    # vector here is the ("failed", {}, exc) returns from
+                    # _reindex_embed_all — redact exception objects
+                    # (guidance carve-out included); trusted operator-
+                    # constant strings persist verbatim as before.
                     async with self.processor.pool.connection_async() as conn:
                         conn.execute(
                             "UPDATE document_reindex_jobs SET status = 'failed', completed_at = ?, error = ? WHERE id = ?",
-                            (datetime.now(UTC).isoformat(), str(error), job_id),
+                            (datetime.now(UTC).isoformat(), _redact_reindex_error(error), job_id),
                         )
                         conn.commit()
                 else:
+                    # Issue #957: the details list is redacted AT THE PERSIST
+                    # BOUNDARY (unconditional, so any composer's output is
+                    # clean) — the message part after "file_id=<id>: " must
+                    # already carry a stable code (the composition layer in
+                    # _reindex_embed_all redacts as hygiene); entries without
+                    # that shape, or without a code in the message part, map
+                    # to the legacy-error marker. Result KEYS are unchanged.
+                    details = result.get("details")
+                    if isinstance(details, list):
+                        result["details"] = [
+                            _redact_reindex_detail_entry(entry)
+                            for entry in details
+                        ]
                     async with self.processor.pool.connection_async() as conn:
                         conn.execute(
                             "UPDATE document_reindex_jobs SET status = 'failed', error = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -4191,7 +4297,11 @@ class BackgroundProcessor:
                 async with self.processor.pool.connection_async() as conn:
                     conn.execute(
                         "UPDATE document_reindex_jobs SET status = 'failed', completed_at = ?, error = ? WHERE id = ?",
-                        (datetime.now(UTC).isoformat(), str(exc), job_id),
+                        (
+                            datetime.now(UTC).isoformat(),
+                            _redact_reindex_error(exc),
+                            job_id,
+                        ),
                     )
                     conn.commit()
             except Exception:
@@ -4561,7 +4671,12 @@ class BackgroundProcessor:
                                 exc,
                             )
                             failed_files += 1
-                            failed_details.append(f"file_id={file_id}: {exc}")
+                            # Issue #957 hygiene: compose the detail
+                            # from the redacted code (the persist
+                            # boundary maps any remnant anyway).
+                            failed_details.append(
+                                f"file_id={file_id}: {_redact_reindex_error(exc)}"
+                            )
                             failed_ids.append(file_id)
                             if first_failure is None:
                                 first_failure = exc
