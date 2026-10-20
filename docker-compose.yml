@@ -39,7 +39,10 @@ services:
     image: ghcr.io/huggingface/text-embeddings-inference:cuda-latest@sha256:1bf10562b37c8b835693084e1bab4d80232188cb258da886eaf1e6eaf6770353
     container_name: reranker
     restart: unless-stopped
-    command: --model-id BAAI/bge-reranker-v2-m3 --port 8081 --max-batch-tokens 8192
+    # --max-client-batch-size declares TEI's per-request client batch cap
+    # (issue #719): the backend splits /rerank candidate sets at
+    # RERANKER_MAX_BATCH (default 32) to match it.
+    command: --model-id BAAI/bge-reranker-v2-m3 --port 8081 --max-batch-tokens 8192 --max-client-batch-size 32
     ports:
       - "8081:8081"
     volumes:
@@ -196,6 +199,7 @@ services:
       - RERANKER_MODEL=${RERANKER_MODEL:-BAAI/bge-reranker-v2-m3}
       - RERANKING_ENABLED=${RERANKING_ENABLED:-true}
       - RERANKER_TOP_N=${RERANKER_TOP_N:-7}
+      - RERANKER_MAX_BATCH=${RERANKER_MAX_BATCH:-32}
       - INITIAL_RETRIEVAL_TOP_K=${INITIAL_RETRIEVAL_TOP_K:-20}
       - HYBRID_SEARCH_ENABLED=${HYBRID_SEARCH_ENABLED:-true}
       - HYBRID_ALPHA=${HYBRID_ALPHA:-0.6}

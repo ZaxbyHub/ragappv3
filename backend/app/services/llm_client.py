@@ -31,6 +31,14 @@ logger = logging.getLogger(__name__)
 
 _MAX_THINKING_BUFFER = 1024 * 1024  # 1MB max thinking buffer
 
+# Seconds allowed for the post-``[DONE]`` tail drain (issue #719 / R2-L5-C01).
+# The generation is already complete when the drain runs, so the tail is pure
+# connection-reuse housekeeping: it must be bounded and must never be able to
+# charge the breaker or fail a delivered answer. Short by design — a server
+# that trickles keep-alive comments after ``[DONE]`` must not pin the request
+# past the read timeout (review PRR-001 / F-1).
+_STREAM_TAIL_DRAIN_TIMEOUT = 5.0
+
 # Matches a complete <think> open tag case-insensitively, with optional attributes.
 # Examples: <think>, <THINK>, <think type="reasoning">, <Think foo="bar">
 _THINK_OPEN_RE = re.compile(r"<think(?:\s[^>]*)?>", re.IGNORECASE)
@@ -323,6 +331,41 @@ class LLMClient:
         if changed:
             self._circuit_breaker.reset()
 
+    async def _drain_stream_tail(self, events: AsyncGenerator[str, None]) -> None:
+        """Consume the SSE tail after ``[DONE]`` so httpx can pool the connection.
+
+        Called only once the generation has completed: everything after the
+        marker is legal trailer (blank line, SSE comment, usage frame) that is
+        never parsed. A tail that ends badly — a chunked body truncated before
+        its terminator, a peer reset, a server that never closes, or a
+        keep-alive trickle that resets the per-read timeout — must NOT be
+        charged to the circuit breaker nor surfaced to the caller as a failed
+        generation, because the answer was already delivered in full
+        (issue #719 review PRR-001 / F-1). The drain is bounded by
+        ``_STREAM_TAIL_DRAIN_TIMEOUT`` for the same reason.
+        """
+        while True:
+            try:
+                await asyncio.wait_for(
+                    events.__anext__(), timeout=_STREAM_TAIL_DRAIN_TIMEOUT
+                )
+            except StopAsyncIteration:
+                return
+            except asyncio.TimeoutError:
+                logger.debug(
+                    "Stream tail not drained within %.1fs after [DONE]; the "
+                    "generation itself completed (issue #719)",
+                    _STREAM_TAIL_DRAIN_TIMEOUT,
+                )
+                return
+            except (httpx.HTTPError, OSError) as exc:
+                logger.debug(
+                    "Stream tail ended with %s after [DONE]; the generation "
+                    "itself completed and is reported as successful (issue #719)",
+                    type(exc).__name__,
+                )
+                return
+
     async def prime_residency(self) -> bool:
         """One-shot native model-load call pinning residency/context (issue #571).
 
@@ -333,8 +376,8 @@ class LLMClient:
         ``options.num_ctx`` sizes the loaded instance's context window (the
         OpenAI-compatible surface cannot express either). LM Studio clients
         (``context_length`` set) request the context length from the native
-        model-load endpoint, trying the current v1 API first and the legacy
-        v0 path on 404 for pre-0.4.0 servers; residency for LM Studio comes
+        v1 model-load endpoint (the never-existed ``/api/v0`` fallback was
+        removed in issue #719); residency for LM Studio comes
         from the per-payload ``ttl`` every chat request already carries.
 
         Best-effort by contract: any transport/HTTP failure is logged and
@@ -346,16 +389,27 @@ class LLMClient:
         client = await self._ensure_started()
         try:
             if self.context_length is not None:
-                # LM Studio native load (v1, with a v0 fallback for older
-                # servers). `ttl` is intentionally not part of the load
-                # request: it rides every chat payload instead.
+                # LM Studio native load via the v1 REST API. The pre-0.4.0
+                # `/api/v0/models/load` retry was removed (issue #719): that
+                # endpoint never existed in LM Studio's v0 reference, so the
+                # fallback 404'd on exactly the old servers it existed for.
+                # `ttl` is intentionally not part of the load request: it
+                # rides every chat payload instead.
                 body = {"model": self.model, "context_length": self.context_length}
                 url = f"{self.base_url}/api/v1/models/load"
                 response = await client.post(url, json=body)
                 if response.status_code == 404:
-                    response = await client.post(
-                        f"{self.base_url}/api/v0/models/load", json=body
+                    logger.warning(
+                        "LM Studio context-length priming returned 404 for %s "
+                        "(model %r) - LM_STUDIO_CONTEXT_LENGTH=%s was not "
+                        "applied; either this server predates the v1 REST load "
+                        "API or it does not know the model id. The model will "
+                        "load on demand with provider defaults instead",
+                        url,
+                        self.model,
+                        self.context_length,
                     )
+                    return False
                 response.raise_for_status()
                 logger.info(
                     "Model residency primed via LM Studio load API (%s, ctx=%d)",
@@ -857,8 +911,14 @@ class LLMClient:
         _reasoning_chars = 0
         _reasoning_started_at: Optional[float] = None
         _reasoning_last_at: Optional[float] = None
+        # Issue #719: one-shot-per-stream flag for the no-think leak warning.
+        _no_think_leak_warned = False
 
         stream_succeeded = False
+        # Set once the provider sent the [DONE] marker: the generation is then
+        # complete, so any tail outcome is connection-reuse housekeeping and
+        # must not be charged to the breaker or reported as a failure.
+        done_seen = False
         # E3 closure (#518): gen_ai client span for the streaming chat call.
         # Entered manually (not via ``with``) so the large stream-consumption
         # block keeps its existing indentation; exited in the finally below
@@ -971,21 +1031,76 @@ class LLMClient:
                             value = value[1:]
                         if field == "data":
                             data_lines.append(value)
+                        elif line.startswith("{"):
+                            # Issue #719 (review PRR-012): some servers report a
+                            # mid-stream failure as a BARE JSON object on a
+                            # non-``data`` line. Framing alone must not decide
+                            # whether a failure is visible, so dispatch it as a
+                            # one-line event and let the parser classify it.
+                            if data_lines:
+                                yield "\n".join(data_lines)
+                                data_lines.clear()
+                            yield line
                     # Stream ended mid-event: dispatch any remaining data.
                     if data_lines:
                         yield "\n".join(data_lines)
                         data_lines.clear()
 
                 try:
-                    async for data_str in _sse_events():
+                    _events = _sse_events()
+                    async for data_str in _events:
                         # Check for stream end marker
                         if data_str == "[DONE]":
+                            done_seen = True
+                            # The generation is complete; the remaining tail
+                            # exists only so httpx can pool the connection.
+                            await self._drain_stream_tail(_events)
                             break
 
                         try:
                             data = json.loads(data_str)
                         except json.JSONDecodeError:
                             continue
+                        if not isinstance(data, dict):
+                            # Bare array/scalar payloads carry no choices and
+                            # no error; skip instead of crashing on .get
+                            # (issue #719).
+                            continue
+
+                        # In-band mid-stream failure (issue #719): vLLM and
+                        # other OpenAI-compatible servers can report an error
+                        # AFTER the 200 inside the SSE body. Treating it as
+                        # ignorable would record a breaker success and
+                        # last_metrics.status='ok' for a failed generation.
+                        error_obj = data.get("error")
+                        if error_obj is not None:
+                            if isinstance(error_obj, dict):
+                                error_msg = str(
+                                    error_obj.get("message")
+                                    or error_obj.get("code")
+                                    or error_obj
+                                )
+                                error_code = error_obj.get("code")
+                            else:
+                                error_msg = str(error_obj)
+                                error_code = None
+                            # OPS-002 (issue #494): charge the breaker for
+                            # outage-class failures only. A 400-class in-band
+                            # error is an input/config error that would recur
+                            # on every retry and must not open the circuit —
+                            # the same rule the HTTP status path follows
+                            # (review PRR-002).
+                            if is_outage_status(error_code):
+                                async with self._circuit_breaker._lock:
+                                    self._circuit_breaker.record_failure()
+                            self.last_metrics = {
+                                "provider_url": self.base_url,
+                                "model": self.model,
+                                "status": "inband_error",
+                            }
+                            raise LLMError(
+                                f"In-band stream error from provider: {error_msg}"
+                            )
 
                         # Extract content delta from choices
                         choices = data.get("choices", [])
@@ -1027,6 +1142,29 @@ class LLMClient:
                             if not isinstance(reasoning_text, str) or not reasoning_text:
                                 reasoning_text = None
                         if reasoning_text is not None:
+                            # Issue #719: a no-think control was requested for
+                            # this client, so a reasoning delta means the host
+                            # ignored it (reported for recent Qwen GGUF builds
+                            # on LM Studio). Surface that once per stream —
+                            # None-safe because reconfigure() stores None when
+                            # thinking is (re-)enabled.
+                            if (
+                                (self.chat_template_kwargs or {}).get(
+                                    "enable_thinking"
+                                )
+                                is False
+                                and not _no_think_leak_warned
+                            ):
+                                _no_think_leak_warned = True
+                                logger.warning(
+                                    "Model %s produced reasoning content despite "
+                                    "the instant-mode no-think control "
+                                    "(chat_template_kwargs enable_thinking=false); "
+                                    "the host ignored the control - reasoning is "
+                                    "being routed to the reasoning channel. Check "
+                                    "the model build/host capability.",
+                                    self.model,
+                                )
                             _now = time.perf_counter()
                             if _reasoning_started_at is None:
                                 _reasoning_started_at = _now
@@ -1195,12 +1333,35 @@ class LLMClient:
                     # Generator was closed by consumer - clean exit
                     stream_succeeded = True
                     raise
+                except asyncio.CancelledError:
+                    # Consumer (or a shutdown) cancelled mid-stream. If the
+                    # generation already completed at [DONE] the answer was
+                    # delivered in full, so record it as the success it was
+                    # rather than leaving status='error' for a turn that
+                    # actually finished (issue #719 review PRR-023).
+                    if done_seen:
+                        stream_succeeded = True
+                    raise
         except LLMError:
             # Don't record LLMError as transport failure — it represents an
             # app-level error (malformed body, admission refusal), not a
             # service-unavailability signal.
             raise
         except httpx.TimeoutException as e:
+            if done_seen:
+                # Defense in depth: _drain_stream_tail already swallows tail
+                # transport errors, so this arm is unreachable today. It stays
+                # because a future refactor that drains outside that helper
+                # must not turn a delivered answer into a charged failure
+                # (issue #719 review PRR-001 / F-1).
+                # The answer was fully delivered before the tail stalled; the
+                # stall is a pooling artifact, not a failed generation.
+                logger.debug(
+                    "Streaming tail timed out after [DONE]; the completed "
+                    "generation is unaffected: %s", e
+                )
+                stream_succeeded = True
+                return
             async with self._circuit_breaker._lock:
                 self._circuit_breaker.record_failure()
             self.last_metrics = {"provider_url": self.base_url, "model": self.model, "status": "timeout"}
@@ -1229,6 +1390,19 @@ class LLMClient:
                 f"HTTP error {e.response.status_code}: {response_text}"
             ) from e
         except httpx.RequestError as e:
+            if done_seen:
+                # Defense in depth — unreachable while the drain helper owns
+                # tail errors; see the TimeoutException arm above
+                # (issue #719 review PRR-001 / F-1).
+                # The answer was fully delivered before the tail failed; a
+                # truncated/reset tail is a pooling artifact, not a failed
+                # generation.
+                logger.debug(
+                    "Streaming tail ended with a transport error after "
+                    "[DONE]; the completed generation is unaffected: %s", e
+                )
+                stream_succeeded = True
+                return
             async with self._circuit_breaker._lock:
                 self._circuit_breaker.record_failure()
             self.last_metrics = {"provider_url": self.base_url, "model": self.model, "status": "request_error"}

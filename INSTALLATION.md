@@ -420,7 +420,7 @@ services:
   # Reranker Server (bge-reranker-v2-m3 via TEI)
   reranker:
     image: ghcr.io/huggingface/text-embeddings-inference:cuda-latest@sha256:1bf10562b37c8b835693084e1bab4d80232188cb258da886eaf1e6eaf6770353
-    command: --model-id BAAI/bge-reranker-v2-m3 --port 8081 --max-batch-tokens 8192
+    command: --model-id BAAI/bge-reranker-v2-m3 --port 8081 --max-batch-tokens 8192 --max-client-batch-size 32
     ports:
       - "8081:8081"
     volumes:
@@ -557,6 +557,22 @@ EMBEDDING_MODEL=microsoft/harrier-oss-v1-0.6b
 # Optional second, faster endpoint (e.g. LM Studio / llama-server):
 # INSTANT_CHAT_URL=http://localhost:1234
 # INSTANT_CHAT_MODEL=minicpm5-2b
+#
+# Ollama residency note (issue #719): OLLAMA_NUM_CTX is applied on the
+# native preload call only — the OpenAI-compatible chat surface cannot
+# carry a per-request context size. Ollama's scheduler keeps the
+# preloaded runner only when OLLAMA_NUM_CTX equals the server's
+# automatic context length (the OLLAMA_CONTEXT_LENGTH env var on the
+# Ollama host). On a mismatch, the first chat turn reloads the model at
+# the host's own context and keep_alive reverts to Ollama's default
+# (5 minutes), discarding the configured residency. Keep
+# OLLAMA_NUM_CTX == the host's OLLAMA_CONTEXT_LENGTH.
+# OLLAMA_KEEP_ALIVE: residency duration sent on that preload call (-1 = keep
+#   the model loaded; duration strings like 30m also work).
+OLLAMA_KEEP_ALIVE=-1
+# OLLAMA_NUM_CTX: context window the preloaded model is loaded with
+#   (default 4096 = Ollama's documented default).
+OLLAMA_NUM_CTX=4096
 
 # Embedding Configuration
 # Batch size for embedding requests (default: 32)
@@ -564,6 +580,18 @@ EMBEDDING_MODEL=microsoft/harrier-oss-v1-0.6b
 # Set based on your embedding service capacity. For TEI (Text Embeddings Inference),
 # the default of 32 is safe for most deployments.
 EMBEDDING_BATCH_SIZE=32
+
+# Reranking Configuration
+# Max texts per /rerank request (default: 32, must be >= 1). TEI enforces
+# a per-request client batch cap (bundled default 32; the bundled compose
+# file declares it via --max-client-batch-size). Candidate sets larger
+# than this are split into batched requests, so an over-cap set still
+# reranks instead of silently degrading to vector order. Match this to
+# your TEI's --max-client-batch-size when you change it there; a mismatch
+# is not detected at runtime — client > host cap silently degrades back
+# to vector order (the behavior this setting exists to remove), and
+# client < host cap costs extra round-trips.
+RERANKER_MAX_BATCH=32
 
 # Optional Features
 USERS_ENABLED=true

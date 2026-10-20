@@ -298,22 +298,16 @@ class RerankingService:
           Body: {"query": str, "texts": [str], "top_n": int, "truncate": true,
                  "raw_scores": true}
           Response: [{"index": int, "score": float}, ...]
+
+        Issue #719 (TQ-differential-b-02): TEI enforces a per-request client
+        batch cap (bundled default 32; ``--max-client-batch-size``). A larger
+        candidate set is split into ``settings.reranker_max_batch``-sized
+        requests; each batch is scored in full, so the union of per-batch
+        results contains the global top-n and the merged ordering is
+        equivalent to a single un-split request. At or below the cap the
+        request is byte-identical to the historical single-shot call.
         """
         url = f"{self.reranker_url}/rerank"
-        payload = {
-            "query": query,
-            "texts": texts,
-            "top_n": top_n,
-            "truncate": True,
-            # Score protocol (RERANK-004, issue #511): TEI's default config
-            # returns sigmoid-normalized 0..1 scores, but servers can be
-            # configured to return raw logits. Requesting raw_scores=true
-            # makes the response explicit logits, so the single client-side
-            # _safe_sigmoid below converts exactly once regardless of the
-            # server's default normalization — the same single-conversion
-            # semantics as the local CrossEncoder path.
-            "raw_scores": True,
-        }
         await asyncio.to_thread(assert_url_safe, self.reranker_url)
         if self._http_client is None:
             # SSRFSafeTransport re-validates the resolved IP at request time to
@@ -325,64 +319,106 @@ class RerankingService:
                 follow_redirects=False,
                 transport=SSRFSafeTransport(),
             )
+
+        max_batch = settings.reranker_max_batch
+        if len(texts) <= max_batch:
+            batches = [(0, texts, top_n)]
+        else:
+            batches = [
+                (offset, texts[offset : offset + max_batch], len(texts[offset : offset + max_batch]))
+                for offset in range(0, len(texts), max_batch)
+            ]
+
+        merged: List[Tuple[int, float]] = []
+        for offset, batch_texts, request_top_n in batches:
+            payload = {
+                "query": query,
+                "texts": batch_texts,
+                "top_n": request_top_n,
+                "truncate": True,
+                # Score protocol (RERANK-004, issue #511): TEI's default config
+                # returns sigmoid-normalized 0..1 scores, but servers can be
+                # configured to return raw logits. Requesting raw_scores=true
+                # makes the response explicit logits, so the single client-side
+                # _safe_sigmoid below converts exactly once regardless of the
+                # server's default normalization — the same single-conversion
+                # semantics as the local CrossEncoder path.
+                "raw_scores": True,
+            }
+            data = await self._post_rerank_batch(url, payload)
+
+            # data is list of {"index": int, "score": float}
+            # Sort by score descending before slicing to ensure correct results
+            sorted_data = sorted(data, key=lambda x: x.get("score", 0), reverse=True)
+            # #716 T1-35-K-09: a malformed response may carry indices outside
+            # [0, len(batch_texts)) — validate here (this method runs inside
+            # the caller's guarded region) so the documented (chunks[:n],
+            # False) fallback absorbs it, instead of an IndexError escaping
+            # rerank() or a negative index silently mis-attaching a score.
+            for item in sorted_data[:request_top_n]:
+                idx = item["index"]
+                if not isinstance(idx, int) or not 0 <= idx < len(batch_texts):
+                    raise ValueError(
+                        f"rerank response index out of range [0, {len(batch_texts)}): {idx!r}"
+                    )
+            # Map per-batch indices to global candidate indices; scores stay
+            # raw logits until the single sigmoid below (monotonic, so
+            # selecting on raw scores equals selecting on normalized scores).
+            merged.extend(
+                (offset + item["index"], item["score"])
+                for item in sorted_data[:request_top_n]
+            )
+
+        # Global ordering across batches, then the SAME single-conversion
+        # sigmoid semantics as the historical single-request path.
+        merged.sort(key=lambda pair: pair[1], reverse=True)
+        selected = merged[:top_n]
+        return [
+            (global_idx, _safe_sigmoid(raw)) for global_idx, raw in selected
+        ]
+
+    async def _post_rerank_batch(self, url: str, payload: Dict[str, Any]) -> Any:
+        """POST one /rerank payload and return the parsed JSON body.
+
         # OPS-002 (issue #494): run the POST and the HTTP status check as
         # ONE breaker-wrapped operation so HTTPStatusError trips the
         # reranking breaker. Previously raise_for_status() ran outside the
         # wrap, so error statuses recorded a SUCCESS on the breaker.
         # JSON decoding stays outside — a malformed body is not an outage.
-        async def _checked_post() -> httpx.Response:
-            # E3 telemetry (issue #518): correlation headers only when bound;
-            # kwarg omitted when empty (strict test fakes keep working).
-            _corr = _correlation_headers()
-            if _corr:
-                response = await self._http_client.post(
-                    url, json=payload, headers=_corr
-                )
-            else:
-                response = await self._http_client.post(url, json=payload)
-            # Outage statuses only inside the wrap (review RP-002, PR #576):
-            # ordinary 4xx are input errors, not provider outages.
-            if is_outage_status(response.status_code):
-                response.raise_for_status()
-            return response
+        """
+        # E3 closure (#518): gen_ai client span for the rerank call.
+        with start_span(
+            "gen_ai rerank",
+            attributes={
+                "gen_ai.operation.name": "rerank",
+                # #716 T1-35-K-10: the TEI payload never carries a
+                # "model" key — advertise the CONFIGURED reranker.
+                "gen_ai.request.model": str(self.reranker_model),
+            },
+        ):
 
-        try:
-            # E3 closure (#518): gen_ai client span for the rerank call.
-            with start_span(
-                "gen_ai rerank",
-                attributes={
-                    "gen_ai.operation.name": "rerank",
-                    # #716 T1-35-K-10: the TEI payload never carries a
-                    # "model" key — advertise the CONFIGURED reranker.
-                    "gen_ai.request.model": str(self.reranker_model),
-                },
-            ):
+            async def _checked_post() -> httpx.Response:
+                # E3 telemetry (issue #518): correlation headers only when bound;
+                # kwarg omitted when empty (strict test fakes keep working).
+                _corr = _correlation_headers()
+                if _corr:
+                    response = await self._http_client.post(
+                        url, json=payload, headers=_corr
+                    )
+                else:
+                    response = await self._http_client.post(url, json=payload)
+                # Outage statuses only inside the wrap (review RP-002, PR #576):
+                # ordinary 4xx are input errors, not provider outages.
+                if is_outage_status(response.status_code):
+                    response.raise_for_status()
+                return response
+
+            try:
                 response = await reranking_cb(_checked_post)()
-        except CircuitBreakerError:
-            raise
+            except CircuitBreakerError:
+                raise
         response.raise_for_status()
-        data = response.json()
-
-        # data is list of {"index": int, "score": float}
-        # Sort by score descending before slicing to ensure correct results
-        sorted_data = sorted(data, key=lambda x: x.get("score", 0), reverse=True)
-        # #716 T1-35-K-09: a malformed response may carry indices outside
-        # [0, len(texts)) — validate here (this method runs inside the
-        # caller's guarded region) so the documented (chunks[:n], False)
-        # fallback absorbs it, instead of an IndexError escaping rerank()
-        # or a negative index silently mis-attaching a score.
-        for item in sorted_data[:top_n]:
-            idx = item["index"]
-            if not isinstance(idx, int) or not 0 <= idx < len(texts):
-                raise ValueError(
-                    f"rerank response index out of range [0, {len(texts)}): {idx!r}"
-                )
-        raw_scores = [item["score"] for item in sorted_data[:top_n]]
-
-        # Unconditional sigmoid with overflow protection for BGE-M3 logits
-        normalized_scores = [_safe_sigmoid(score) for score in raw_scores]
-
-        return [(item["index"], score) for item, score in zip(sorted_data[:top_n], normalized_scores)]
+        return response.json()
 
     async def close(self):
         """Close the persistent HTTP client."""

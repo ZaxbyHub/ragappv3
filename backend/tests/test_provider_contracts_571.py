@@ -478,27 +478,23 @@ class TestPrimeResidency(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["options"], {"num_ctx": 8192})
         self.assertNotIn("prompt", body)
 
-    async def test_lm_studio_load_v1_then_v0_fallback(self):
+    async def test_lm_studio_load_v1_404_no_v0_fallback(self):
+        """#719 (TQ-host-all-05): on 404 from /api/v1/models/load priming must
+        NOT retry /api/v0/models/load (that endpoint never existed in LM
+        Studio's v0 reference), and prime_residency() returns False."""
         requests: list = []
-        state = {"calls": 0}
 
         def handler(request: httpx.Request) -> httpx.Response:
             requests.append((request.url.path, json.loads(request.content.decode())))
-            state["calls"] += 1
-            if state["calls"] == 1:
-                # v1 endpoint missing on a pre-0.4.0 server
-                return httpx.Response(404, json={"error": "not found"}, request=request)
-            return httpx.Response(
-                200, json={"status": "loaded", "type": "llm"}, request=request
-            )
+            return httpx.Response(404, json={"error": "not found"}, request=request)
 
         llm = self._contract_llm(handler, context_length=4096)
         ok = await llm.prime_residency()
-        self.assertTrue(ok)
+        self.assertFalse(ok)
+        self.assertEqual(len(requests), 1)
         self.assertEqual(requests[0][0], "/api/v1/models/load")
-        self.assertEqual(requests[1][0], "/api/v0/models/load")
         self.assertEqual(
-            requests[1][1], {"model": "m", "context_length": 4096}
+            requests[0][1], {"model": "m", "context_length": 4096}
         )
 
     async def test_failure_is_swallowed_and_reported(self):
