@@ -549,6 +549,13 @@ class Settings(BaseSettings):
     query_transform_cache_ttl_sec: int = 86400
     """Time-to-live in seconds for cached query transformation results. Default 24 hours."""
 
+    chat_message_max_chars: int = 20000
+    """Maximum length in characters of a LIVE chat message accepted by the chat
+    endpoints (POST /api/chat message and POST /api/chat/stream final message).
+    Bounds raw-user-input regex work on the query-transformer hot path (#922)
+    and prompt cost. Prior-turn history is intentionally NOT bounded by this
+    setting (legitimate assistant answers can be long)."""
+
     active_user_cache_ttl_seconds: int = 30
     """Time-to-live in seconds for cached active-user lookups in get_current_active_user.
     0 disables the in-memory cache entirely. Positive values must be between 5 and 300
@@ -1562,6 +1569,12 @@ class Settings(BaseSettings):
     def validate_per_doc_chunk_cap(cls, v: int) -> int:
         """Validate per_doc_chunk_cap is >= 1."""
         return cls._validate_int_range(v, 1, None, "per_doc_chunk_cap")
+
+    @field_validator("chat_message_max_chars", mode="after")
+    @classmethod
+    def validate_chat_message_max_chars(cls, v: int) -> int:
+        """Validate chat_message_max_chars is >= 1."""
+        return cls._validate_int_range(v, 1, None, "chat_message_max_chars")
 
     @field_validator("unique_docs_in_top_k", mode="after")
     @classmethod
