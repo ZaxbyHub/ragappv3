@@ -11,10 +11,11 @@
 - The same class is fixed at the admin audit surface: `/admin/toggles` and
   `/admin/maintenance` now write the fingerprint into
   `audit_toggle_log.user_id` (and its HMAC input) instead of the raw token.
-  Historical audit rows still hold the token and are deliberately NOT
-  rewritten — the row's `hmac_sha256` covers `user_id`, so rewriting them
-  would break audit-integrity verification. Backups created before this
-  change also retain old rows; treat historical backups as secret-bearing.
+  Historical audit rows are redacted at startup by issue #894's
+  `audit_redaction` service (see `894-audit-historical-redaction.md`):
+  digests are recomputed under the runtime key, so integrity verification
+  is preserved rather than traded away. Backups created before that change
+  retain old rows until the app boots once against the restored database.
 - New idempotent startup migration `migrate_redact_prompt_created_by`
   (`backend/app/models/database.py`) rewrites legacy
   `prompt_versions.created_by` rows and journals start/succeeded outcomes so
@@ -117,12 +118,13 @@
   GETs or the reindex job-status GET can drop it. Required-mode enforcement
   is stricter: answers citing labels that were never offered now report
   `missing_citations` naming them. The admin audit trail now records the
-  scope fingerprint instead of the token; historical audit rows (and
-  pre-change backups) still contain token material.
+  scope fingerprint instead of the token; historical rows are redacted at
+  startup by issue #894's service.
 
 ## Known limitations
-- Historical `audit_toggle_log` rows retain the raw token (HMAC integrity
-  prevents in-place redaction); pre-change backups do too.
+- Historical `audit_toggle_log` rows are redacted at startup (#894) with
+  recomputed digests; pre-#894 backups contain token material until the app
+  boots once against the restored database.
 - A 16-hex-shaped legacy admin token would evade the format-based
   `created_by` redaction (generator tokens are 64-char urlsafe).
 - "Offered" citation labels are the full retrieval lists (see above).

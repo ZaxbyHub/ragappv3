@@ -19,6 +19,7 @@ from app.middleware.logging import SensitiveFieldFilter
 from app.models.database import SQLiteConnectionPool, get_pool, run_migrations
 from app.models.migration_journal import MIGRATION_CONNECT_TIMEOUT_SECONDS
 from app.security import CSRFManager
+from app.services.audit_redaction import run_startup_audit_redaction
 from app.services.background_tasks import get_background_processor
 from app.services.document_extraction import DocumentExtractionService
 from app.services.draft_input_storage import DraftInputStorage
@@ -840,6 +841,10 @@ async def lifespan(app: FastAPI):
         app.state.db_pool, embedding_service=app.state.embedding_service
     )
     app.state.secret_manager = SecretManager()
+    # Issue #894: scrub raw admin-token material from historical
+    # audit_toggle_log rows now that the HMAC key exists; fail-soft with an
+    # app-state flag (audit_redaction_ok), mirroring migrations_ok above.
+    await asyncio.to_thread(run_startup_audit_redaction, app)
     app.state.toggle_manager = ToggleManager(app.state.db_pool)
     try:
         app.state.csrf_manager = CSRFManager(

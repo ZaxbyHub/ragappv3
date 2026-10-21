@@ -27,6 +27,7 @@ BACKEND = Path(__file__).resolve().parent.parent / "app"
 TARGETS = [
     BACKEND / "models" / "database.py",
     BACKEND / "models" / "migration_journal.py",
+    BACKEND / "services" / "audit_redaction.py",
     BACKEND / "lifespan.py",
 ]
 BUSY_OK = re.compile(r"busy_timeout\s*[=:]\s*\"?(\d+)")
