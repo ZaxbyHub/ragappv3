@@ -154,8 +154,11 @@ def test_redaction_exact_values_and_verifying_digests():
         # key_version updated truthfully to the passed value.
         assert rows["w_cur"][5] == TEST_KEY_VERSION
         assert rows["w_rot"][5] == TEST_KEY_VERSION
-        # Timestamps preserved verbatim (audit event time stays true).
-        assert rows["w_cur"][4] == rows["w_cur"][4]
+        # Timestamps preserved verbatim: the digest verification above is the
+        # load-bearing pin (it recomputes over the row's STORED timestamp, so
+        # a timestamp-regeneration mutation breaks it — proven by the
+        # reviewer's hand-probe 3); asserting the timestamp against itself
+        # would be a tautology, so no separate line here.
 
 
 def test_untouched_classes_byte_identical_and_journal_silent_on_clean():
@@ -317,4 +320,9 @@ def test_frozen_contract_bites_under_mutation(mutation):
             "fingerprint glob must match exactly-16 lowercase hex and nothing else"
         )
     else:
-        assert TEST_KEY_VERSION  # key_version propagation asserted in exact-values test
+        # key_version propagation is pinned behaviorally in
+        # test_redaction_exact_values_and_verifying_digests (asserts the
+        # stored key_version equals TEST_KEY_VERSION after redaction) and is
+        # killed by mutation probe M4; a constant assertion here would be a
+        # truthy tautology (reviewer round-1 nit), so this arm is doc-only.
+        pass
