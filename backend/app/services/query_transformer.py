@@ -483,6 +483,12 @@ class QueryTransformer:
             if not isinstance(content, str):
                 continue
             if role == "assistant" and prior_assistant is None:
+                # An empty newest assistant turn (a streaming turn that
+                # errored after opening the message, or a client-side empty
+                # placeholder) carries no context — keep scanning so older
+                # non-empty assistant turns stay reachable (issue #928).
+                if not content.strip():
+                    continue
                 prior_assistant = content
             elif role == "user" and prior_user is None:
                 # Skip follow-up phrases so we anchor on the original question.
@@ -536,7 +542,7 @@ class QueryTransformer:
             logger.warning("Follow-up rewrite failed: %s", exc)
             return None
 
-        if not response:
+        if not response or not response.strip():
             return None
         rewritten = response.strip().splitlines()[0].strip()
         # Strip surrounding quotes/brackets if the model added them.
