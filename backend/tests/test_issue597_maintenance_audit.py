@@ -82,9 +82,19 @@ def _audit_payload() -> SimpleNamespace:
     The pre-fix tree has no MaintenanceAudit symbol (importing it here would
     break every check on the base leg); the service reads only these five
     fields, and a foreign HMAC value is fine for the AC3 row-gate assertions.
+    ``user_id`` carries the non-secret scoped fingerprint of the acting
+    token — the identity value the production routes pass since the #709
+    class-(a) fix (issue #942 AC4) — computed under the same patched
+    settings the routes run under, because ``admin_scope_fingerprint`` reads
+    the scope map from settings.
     """
+    with patch.object(settings, "admin_secret_token", ADMIN_TOKEN):
+        with patch.object(
+            settings, "admin_token_scopes", {ADMIN_TOKEN: ["admin:config"]}
+        ):
+            identity = admin_scope_fingerprint(ADMIN_TOKEN)
     return SimpleNamespace(
-        user_id=ADMIN_TOKEN,
+        user_id=identity,
         ip=TESTCLIENT_HOST,
         key_version=TEST_KEY_VERSION,
         hmac_sha256=hashlib.sha256(b"issue597-ac3-payload").hexdigest(),

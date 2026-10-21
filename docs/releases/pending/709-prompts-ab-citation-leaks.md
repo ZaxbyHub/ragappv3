@@ -11,10 +11,14 @@
 - The same class is fixed at the admin audit surface: `/admin/toggles` and
   `/admin/maintenance` now write the fingerprint into
   `audit_toggle_log.user_id` (and its HMAC input) instead of the raw token.
-  Historical audit rows still hold the token and are deliberately NOT
-  rewritten — the row's `hmac_sha256` covers `user_id`, so rewriting them
-  would break audit-integrity verification. Backups created before this
-  change also retain old rows; treat historical backups as secret-bearing.
+  Historical audit rows are redacted at startup by issue #894's
+  `audit_redaction` service (see `894-audit-historical-redaction.md`): a row
+  that still verifies under its recorded key version is re-attributed and
+  re-signed under the runtime key, so it keeps verifying; a row that does
+  NOT verify (tampered, or signed under a key version that is gone) becomes
+  a tombstone without a valid digest, so a forged row is never laundered
+  into a validly-signed entry. Backup FILES are never rewritten and stay
+  secret-bearing; the restored live copy is scrubbed on the first boot.
 - New idempotent startup migration `migrate_redact_prompt_created_by`
   (`backend/app/models/database.py`) rewrites legacy
   `prompt_versions.created_by` rows and journals start/succeeded outcomes so
@@ -107,7 +111,7 @@
   directories that vanish mid-scan (a pytest-xdist race with the frontend
   coverage gate's `npm run` could previously crash the scan with
   `FileNotFoundError`). `backend/security/bandit-baseline.json` is
-  re-anchored for pure line drift from this change (131 findings, identity
+  re-anchored for pure line drift from this change (128 findings, identity
   multiset unchanged; only `line_number` moved).
 
 ## Operator impact
@@ -117,12 +121,15 @@
   GETs or the reindex job-status GET can drop it. Required-mode enforcement
   is stricter: answers citing labels that were never offered now report
   `missing_citations` naming them. The admin audit trail now records the
-  scope fingerprint instead of the token; historical audit rows (and
-  pre-change backups) still contain token material.
+  scope fingerprint instead of the token; historical rows are redacted at
+  startup by issue #894's service.
 
 ## Known limitations
-- Historical `audit_toggle_log` rows retain the raw token (HMAC integrity
-  prevents in-place redaction); pre-change backups do too.
+- Historical `audit_toggle_log` rows are redacted at startup (#894): rows
+  that still verify are re-signed, rows that do not verify become
+  tombstones without a valid digest. Pre-#894 BACKUP FILES keep token
+  material indefinitely (only the restored live copy is scrubbed) — rotate
+  `ADMIN_SECRET_TOKEN` and delete or re-encrypt old backups.
 - A 16-hex-shaped legacy admin token would evade the format-based
   `created_by` redaction (generator tokens are 64-char urlsafe).
 - "Offered" citation labels are the full retrieval lists (see above).
