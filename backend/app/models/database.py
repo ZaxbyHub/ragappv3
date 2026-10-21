@@ -7513,8 +7513,11 @@ def migrate_redact_prompt_created_by(sqlite_path: str) -> None:
     ``hmac_sha256`` covers ``user_id``, so rewriting rows inside a plain
     migration would break audit integrity verification. It is rewritten by the
     startup service ``app.services.audit_redaction`` (issue #894), which has
-    the runtime key and recomputes each digest over the redacted identity, so
-    verification is preserved. New audit rows carry the fingerprint.
+    the runtime key: a row that still verifies under its recorded key version
+    is re-attributed and re-signed over the redacted identity, so it keeps
+    verifying; a row it CANNOT verify (tampered, or signed under a key
+    version that is gone) becomes a tombstone that keeps its stored digest,
+    so it carries no valid digest. New audit rows carry the fingerprint.
 
     Idempotent: re-runs match nothing (rewritten values are fingerprints).
     Journals start/succeeded outcomes (issue #699 pattern) so an operator can

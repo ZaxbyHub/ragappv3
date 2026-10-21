@@ -307,13 +307,8 @@ def run_startup_audit_redaction(app) -> None:
             # dedicated audit key is configured).
             return
         key, key_version = app.state.secret_manager.get_hmac_key()
-        redacted = redact_historical_audit_rows(sqlite_path, key, key_version)
-        if redacted:
-            logger.info(
-                "Redacted %d historical audit_toggle_log row(s) that held "
-                "admin token material (issue #894).",
-                redacted,
-            )
+        # The routine logs the redaction count itself; do not log it twice.
+        redact_historical_audit_rows(sqlite_path, key, key_version)
     except Exception:
         app.state.audit_redaction_ok = False
         logger.exception(
