@@ -20,7 +20,7 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Set, Tuple, Uni
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from fastapi.sse import format_sse_event
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.api.deps import (
     _evaluate_policy,
@@ -106,6 +106,23 @@ class ChatRequest(BaseModel):
     # the same 100-id bound as the batched status route
     # (BATCHED_STATUS_MAX_IDS) so the resolved IN (...) filter stays bounded.
     document_ids: Optional[List[int]] = Field(default=None, max_length=100)
+
+    @field_validator("message")
+    @classmethod
+    def _cap_message_length(cls, value: str) -> str:
+        """Reject over-length live messages before any generation work (#922).
+
+        The cap bounds raw-user-input regex work on the query-transformer
+        hot path and prompt cost. Prior-turn history is intentionally
+        uncapped (legitimate assistant answers can be long); only the live
+        message is bounded.
+        """
+        cap = settings.chat_message_max_chars
+        if len(value) > cap:
+            raise ValueError(
+                f"message exceeds chat_message_max_chars ({cap} characters)"
+            )
+        return value
 
 
 class UsedMemory(BaseModel):
@@ -217,6 +234,12 @@ class ChatStreamRequest(BaseModel):
     # the pre-#553 behavior).
     session_id: Optional[int] = None
     turn_id: Optional[str] = Field(default=None, max_length=64)
+    # NOTE (#922, review F-001): the FINAL message's chat_message_max_chars
+    # cap is enforced inside the chat_stream route body AFTER
+    # get_stream_auth and the last-message role check — not as a pydantic
+    # validator — so the check is authenticated, does not echo the message
+    # list in a validation envelope, and preserves the route's own
+    # error-code ordering (400 empty / 400 role / 422 over-cap).
 
 
 class CreateSessionRequest(BaseModel):
@@ -2090,6 +2113,20 @@ async def chat_stream(
     if last_message.role.lower() != "user":
         raise HTTPException(
             status_code=400, detail="The last message must be from the user"
+        )
+
+    # Live-message cap (#922, review F-001): enforced here in the route
+    # body — after get_stream_auth and the role check — rather than as a
+    # pydantic validator, so the check is authenticated, the error detail
+    # does not echo the message list, and the route's own error-code
+    # ordering (400 empty / 400 role / 422 over-cap) is preserved.
+    cap = settings.chat_message_max_chars
+    if len(last_message.content) > cap:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"the final message exceeds chat_message_max_chars ({cap} characters)"
+            ),
         )
 
     require_vault = user.get("role") not in ("superadmin", "admin")

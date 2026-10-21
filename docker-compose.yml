@@ -310,6 +310,7 @@ services:
       - SEARCH_SEMAPHORE_TIMEOUT_SECONDS
       - WRITE_LOCK_TIMEOUT_SECONDS
       - ACTIVE_USER_CACHE_TTL_SECONDS
+      - CHAT_MESSAGE_MAX_CHARS
       - MEMORY_STORE_POOL_SIZE
       - DB_POOL_MAX_SIZE
       # Legacy/deprecated aliases (still honored for backward compatibility)
