@@ -7509,10 +7509,12 @@ def migrate_redact_prompt_created_by(sqlite_path: str) -> None:
     fingerprint; the configured generator emits 64-char urlsafe tokens.
 
     Scope note: ``audit_toggle_log.user_id`` (the other class-(a) writer, fixed
-    at the route in the same change) is deliberately NOT rewritten here — its
-    ``hmac_sha256`` covers ``user_id``, so rewriting rows would break audit
-    integrity verification. Historical audit rows are disclosed in the release
-    note; new audit rows carry the fingerprint.
+    at the route in the same change) is deliberately NOT rewritten HERE — its
+    ``hmac_sha256`` covers ``user_id``, so rewriting rows inside a plain
+    migration would break audit integrity verification. It is rewritten by the
+    startup service ``app.services.audit_redaction`` (issue #894), which has
+    the runtime key and recomputes each digest over the redacted identity, so
+    verification is preserved. New audit rows carry the fingerprint.
 
     Idempotent: re-runs match nothing (rewritten values are fingerprints).
     Journals start/succeeded outcomes (issue #699 pattern) so an operator can

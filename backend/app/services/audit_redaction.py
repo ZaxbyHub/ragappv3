@@ -6,14 +6,24 @@ readable ``user_id`` column forever: the fingerprint fix only changed what
 NEW rows carry, and the ``migrate_redact_prompt_created_by`` migration
 deliberately excluded this table because each row's ``hmac_sha256`` covers
 ``user_id`` (rewriting it in place invalidates the digest) and the HMAC key
-is only reachable in production through the secret manager, which plain
-schema migrations do not have. This module runs at lifespan time, after the
-secret manager exists, and rewrites every legacy token row with an integrity
-story: rows under the CURRENT configured token are re-attributed to the
-non-secret scoped fingerprint with a recomputed verifying digest; rows under
-rotated or otherwise unattributable tokens become an explicit tombstone
-identity, also with a recomputed digest. Because detection runs on every
-startup, a backup restored from a pre-fix era is scrubbed on the next boot.
+is resolved from the environment rather than from settings. This module runs
+at lifespan time, once the secret manager exists, and rewrites every legacy
+token row with an integrity story:
+
+* a row that still verifies under its recorded ``key_version`` is
+  re-attributed (current token -> the scoped fingerprint; anything else ->
+  the ``redacted:legacy-admin-token`` tombstone) and re-signed under the
+  runtime key, so it keeps verifying;
+* a row that does NOT verify (its digest was tampered with, or it was
+  signed under a key version that is no longer available) becomes a
+  tombstone WITHOUT a valid digest — the secret is still scrubbed, and the
+  tombstone marker states that the row's provenance can no longer be
+  established.
+
+Because detection runs on every startup, a backup restored from a pre-fix
+era is scrubbed on the next boot. The routine is fail-soft: a failure is
+logged and the boot continues, because blocking a deployment over
+historical-row hygiene is worse than deferring the scrub to the next boot.
 """
 
 import hashlib
@@ -31,20 +41,51 @@ from app.security import admin_scope_fingerprint
 logger = logging.getLogger(__name__)
 
 # Explicit tombstone for rows whose actor token cannot be attributed (a
-# rotated or otherwise unknown legacy token). The marker "redact" is what
-# integrity checks recognize as an honest redaction rather than a
-# silently-unverifiable row; the value is deliberately NOT a fingerprint so
-# it can never be mistaken for an actor identity.
+# rotated or otherwise unknown legacy token) and for rows whose stored
+# digest no longer verifies. The "redact" marker is what lets a reader
+# recognize an honest redaction rather than a silently unverifiable row
+# (no production reader consumes the table today, so the marker is a
+# convention for operators and future verifiers); the value is deliberately
+# NOT a fingerprint so it can never be mistaken for an actor identity.
 REDACTED_LEGACY_IDENTITY = "redacted:legacy-admin-token"
 
 # A fingerprint is exactly 16 lowercase hex chars (sha256 hexdigest[:16]).
 # EXACT shape of migrate_redact_prompt_created_by's ``fingerprint_glob``
-# (backend/app/models/database.py:7536) — anything else non-empty in
-# ``user_id`` is legacy token material by elimination, including rows
-# written under previously rotated tokens.
+# (backend/app/models/database.py:7536) — anything else non-empty is
+# legacy token material by elimination.
 _FINGERPRINT_GLOB = "[0-9a-f]" * 16
 
 _MIGRATION_NAME = "redact_historical_audit_rows"
+
+# The detection predicate mirrors the sibling migration's dual predicate:
+# the EXACT current token is always selected (it is known at runtime, so it
+# can never be "indistinguishable from a fingerprint"), and everything
+# else that is neither empty nor a 16-hex fingerprint nor a tombstone is
+# selected by elimination (a rotated or unknown legacy token).
+# Two literal statements instead of a composed one: the shape is fixed, and
+# no SQL text is ever built from data.
+_DETECT_SQL_WITH_TOKEN = (  # nosec B105 - SQL predicate constant; the name says which column it inspects, it holds no credential
+    "SELECT 1 FROM audit_toggle_log WHERE "
+    "(user_id IS NOT NULL AND user_id != '' AND user_id NOT GLOB ? "
+    "AND user_id != ?) OR user_id = ? LIMIT 1"
+)
+_DETECT_SQL_NO_TOKEN = (  # nosec B105 - SQL predicate constant; the name says which column it inspects, it holds no credential
+    "SELECT 1 FROM audit_toggle_log WHERE "
+    "user_id IS NOT NULL AND user_id != '' AND user_id NOT GLOB ? "
+    "AND user_id != ? LIMIT 1"
+)
+_ROWS_SQL_WITH_TOKEN = (  # nosec B105 - SQL predicate constant; the name says which column it inspects, it holds no credential
+    "SELECT id, feature, enabled, user_id, ip, timestamp, hmac_sha256, "
+    "key_version FROM audit_toggle_log WHERE "
+    "(user_id IS NOT NULL AND user_id != '' AND user_id NOT GLOB ? "
+    "AND user_id != ?) OR user_id = ?"
+)
+_ROWS_SQL_NO_TOKEN = (  # nosec B105 - SQL predicate constant; the name says which column it inspects, it holds no credential
+    "SELECT id, feature, enabled, user_id, ip, timestamp, hmac_sha256, "
+    "key_version FROM audit_toggle_log WHERE "
+    "user_id IS NOT NULL AND user_id != '' AND user_id NOT GLOB ? "
+    "AND user_id != ?"
+)
 
 
 def _audit_message(
@@ -59,29 +100,71 @@ def _audit_message(
     return f"{feature}|{int(enabled)}|{user_id or ''}|{ip or ''}|{timestamp}"
 
 
+def _digest(key: bytes, message: str) -> str:
+    return hmac.new(key, message.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _configured_token() -> str:
+    return getattr(settings, "admin_secret_token", "") or ""
+
+
+def historical_audit_rows_pending(sqlite_path: str) -> bool:
+    """True when at least one row still carries legacy token material.
+
+    Used by the lifespan wrapper to resolve the HMAC key ONLY when there is
+    work to do: resolving the key on every clean boot emits a
+    warn-and-fallback log line when no dedicated audit key is configured.
+    """
+    token = _configured_token()
+    conn = sqlite3.connect(
+        sqlite_path,
+        timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS,
+        isolation_level=None,
+    )
+    try:
+        conn.execute("PRAGMA foreign_keys = ON;")
+        if token:
+            found = conn.execute(
+                _DETECT_SQL_WITH_TOKEN,
+                (_FINGERPRINT_GLOB, REDACTED_LEGACY_IDENTITY, token),
+            ).fetchone()
+        else:
+            found = conn.execute(
+                _DETECT_SQL_NO_TOKEN,
+                (_FINGERPRINT_GLOB, REDACTED_LEGACY_IDENTITY),
+            ).fetchone()
+        return found is not None
+    finally:
+        conn.close()
+
+
 def redact_historical_audit_rows(
     sqlite_path: str, hmac_key: bytes, key_version: str
 ) -> int:
     """Rewrite legacy token-material ``audit_toggle_log`` rows; return count.
 
-    Rows needing redaction: ``user_id`` non-NULL, non-empty, not a 16-hex
-    fingerprint, and not already the tombstone literal (exact-literal
-    exclusion keeps re-runs no-ops; a marker-substring exclusion would let a
-    rotated token containing "redact" survive un-redacted). Known edge,
-    mirroring the #944 migration's documented limitation: a hand-configured
-    legacy token that is itself exactly 16 lowercase hex chars is
-    indistinguishable from a fingerprint and passes through (the configured
-    generator emits 64-char urlsafe tokens).
+    Rows needing redaction: ``user_id`` equal to the configured token, or
+    non-empty and neither a 16-hex fingerprint nor the tombstone literal
+    (a rotated or otherwise unknown legacy token). The tombstone exclusion
+    is an EXACT literal — a marker-substring exclusion would let a rotated
+    token containing "redact" survive un-redacted. Known edge, mirroring the
+    #944 migration's documented limitation: a hand-configured legacy token
+    that is itself exactly 16 lowercase hex chars is indistinguishable
+    from a fingerprint when it is UNKNOWN (rotated); the CURRENT token is
+    always matched exactly, so it is never skipped.
 
-    Every rewritten row gets a digest recomputed with ``hmac_key`` over the
-    production message layout with its ORIGINAL timestamp preserved, and
-    ``key_version`` is set to the passed value (truthful: the digest is now
-    computed under the current key). Idempotent; journal-silent on clean
-    databases (issue #699 pattern); journals start/succeeded/failed outcomes
-    on autocommit, outside the data transaction, so a failed attempt still
-    records its failure.
+    Every rewritten row gets a digest recomputed with the passed
+    ``hmac_key`` over the production message layout with its ORIGINAL
+    timestamp preserved, and ``key_version`` set to the passed value. A row
+    whose stored digest does not verify under its recorded ``key_version``
+    is tombstoned WITHOUT a valid digest (its provenance can no longer be
+    established) rather than re-attributed.
+
+    Idempotent; journal-silent on clean databases (issue #699 pattern); the
+    whole data work sits inside ONE try whose handler writes the ``failed``
+    journal row (issue #699 AC1) and re-raises.
     """
-    token = getattr(settings, "admin_secret_token", "") or ""
+    token = _configured_token()
     fingerprint = admin_scope_fingerprint(token) if token else None
     conn = sqlite3.connect(
         sqlite_path,
@@ -90,12 +173,16 @@ def redact_historical_audit_rows(
     )
     try:
         conn.execute("PRAGMA foreign_keys = ON;")
-        work_remains = conn.execute(
-            "SELECT 1 FROM audit_toggle_log "
-            "WHERE user_id IS NOT NULL AND user_id != '' "
-            "AND user_id NOT GLOB ? AND user_id != ? LIMIT 1",
-            (_FINGERPRINT_GLOB, REDACTED_LEGACY_IDENTITY),
-        ).fetchone()
+        if token:
+            work_remains = conn.execute(
+                _DETECT_SQL_WITH_TOKEN,
+                (_FINGERPRINT_GLOB, REDACTED_LEGACY_IDENTITY, token),
+            ).fetchone()
+        else:
+            work_remains = conn.execute(
+                _DETECT_SQL_NO_TOKEN,
+                (_FINGERPRINT_GLOB, REDACTED_LEGACY_IDENTITY),
+            ).fetchone()
         if work_remains is None:
             # Journal-silent no-op path (issue #699 AC2): clean boots and
             # already-redacted databases write no rows.
@@ -106,46 +193,71 @@ def redact_historical_audit_rows(
             phase="start",
             outcome="ok",
         )
-        rows = conn.execute(
-            "SELECT id, feature, enabled, user_id, ip, timestamp "
-            "FROM audit_toggle_log "
-            "WHERE user_id IS NOT NULL AND user_id != '' "
-            "AND user_id NOT GLOB ? AND user_id != ?",
-            (_FINGERPRINT_GLOB, REDACTED_LEGACY_IDENTITY),
-        ).fetchall()
-        redacted = 0
         conn.execute("BEGIN IMMEDIATE")
-        try:
-            for row_id, feature, enabled, user_id, ip, timestamp in rows:
+        if token:
+            rows = conn.execute(
+                _ROWS_SQL_WITH_TOKEN,
+                (_FINGERPRINT_GLOB, REDACTED_LEGACY_IDENTITY, token),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                _ROWS_SQL_NO_TOKEN,
+                (_FINGERPRINT_GLOB, REDACTED_LEGACY_IDENTITY),
+            ).fetchall()
+        redacted = 0
+        for (
+            row_id,
+            feature,
+            enabled,
+            user_id,
+            ip,
+            timestamp,
+            stored_digest,
+            stored_key_version,
+        ) in rows:
+            # A row is only re-attributed when it still verifies under the
+            # key version it was signed with. A row signed under a rotated
+            # key cannot be verified at all, and a tampered row fails its
+            # digest: both become tombstones (the secret is still scrubbed)
+            # rather than a re-attributed, now-verifying row.
+            verified = False
+            if stored_key_version == key_version:
+                expected = _digest(
+                    hmac_key,
+                    _audit_message(feature, bool(enabled), user_id, ip, timestamp),
+                )
+                verified = hmac.compare_digest(expected, stored_digest or "")
+            if verified:
                 if token and user_id == token and fingerprint is not None:
-                    new_identity: str = fingerprint
+                    new_identity = fingerprint
                 else:
                     new_identity = REDACTED_LEGACY_IDENTITY
-                digest = hmac.new(
+                new_digest = _digest(
                     hmac_key,
-                    _audit_message(feature, bool(enabled), new_identity, ip, timestamp).encode(
-                        "utf-8"
+                    _audit_message(
+                        feature, bool(enabled), new_identity, ip, timestamp
                     ),
-                    hashlib.sha256,
-                ).hexdigest()
-                conn.execute(
-                    "UPDATE audit_toggle_log "
-                    "SET user_id = ?, hmac_sha256 = ?, key_version = ? "
-                    "WHERE id = ?",
-                    (new_identity, digest, key_version, row_id),
                 )
-                redacted += 1
-            conn.execute("COMMIT")
-        except Exception as exc:
-            conn.execute("ROLLBACK")
-            record_migration_outcome(
-                conn,
-                migration_name=_MIGRATION_NAME,
-                phase="failed",
-                outcome="error",
-                detail=f"{type(exc).__name__}: {exc}",
+                new_key_version = key_version
+            else:
+                new_identity = REDACTED_LEGACY_IDENTITY
+                new_digest = stored_digest
+                new_key_version = stored_key_version
+            cur = conn.execute(
+                "UPDATE audit_toggle_log "
+                "SET user_id = ?, hmac_sha256 = ?, key_version = ? "
+                "WHERE id = ? AND user_id = ?",
+                (new_identity, new_digest, new_key_version, row_id, user_id),
             )
-            raise
+            if cur.rowcount:
+                redacted += 1
+        conn.execute("COMMIT")
+        if redacted:
+            logger.info(
+                "Redacted %d historical audit_toggle_log row(s) that held "
+                "admin token material (issue #894).",
+                redacted,
+            )
         record_migration_outcome(
             conn,
             migration_name=_MIGRATION_NAME,
@@ -154,6 +266,22 @@ def redact_historical_audit_rows(
             detail=f"redacted_rows={redacted}",
         )
         return redacted
+    except Exception as exc:
+        if conn.in_transaction:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error as rollback_exc:  # pragma: no cover
+                logger.warning(
+                    "audit_redaction: ROLLBACK failed: %s", rollback_exc
+                )
+        record_migration_outcome(
+            conn,
+            migration_name=_MIGRATION_NAME,
+            phase="failed",
+            outcome="error",
+            detail=f"{type(exc).__name__}: {exc}",
+        )
+        raise
     finally:
         conn.close()
 
@@ -162,21 +290,24 @@ def run_startup_audit_redaction(app) -> None:
     """Lifespan wiring: scrub historical audit rows once the key exists.
 
     Called from ``app/lifespan.py`` after ``app.state.secret_manager`` is
-    created, on a worker thread. Fail-soft by decision (plan Decision, issue
-    #894): a failed redaction must not block boot — it flags
+    created, on a worker thread. Fail-soft by decision (issue #894): a
+    failed redaction must not block boot — it flags
     ``app.state.audit_redaction_ok`` False and logs with full traceback;
     detection re-runs on every startup so the next boot retries. The flag
-    mirrors ``app.state.migrations_ok`` at the app-state level; the health
-    payload is deliberately not extended (API surface out of scope), so the
-    observable signals are this flag, the ERROR log line, and the journal
-    ``failed`` row.
+    is an in-process diagnostic (no production reader reads it, and the
+    health payload is deliberately unchanged); the operator-visible signals
+    are the ERROR log line and the journal ``failed`` row.
     """
     app.state.audit_redaction_ok = True
     try:
+        sqlite_path = str(settings.sqlite_path)
+        if not historical_audit_rows_pending(sqlite_path):
+            # No work: do NOT resolve the HMAC key (resolving it on every
+            # clean boot emits a warn-and-fallback log line when no
+            # dedicated audit key is configured).
+            return
         key, key_version = app.state.secret_manager.get_hmac_key()
-        redacted = redact_historical_audit_rows(
-            str(settings.sqlite_path), key, key_version
-        )
+        redacted = redact_historical_audit_rows(sqlite_path, key, key_version)
         if redacted:
             logger.info(
                 "Redacted %d historical audit_toggle_log row(s) that held "

@@ -43,8 +43,8 @@ from app.models.database import run_migrations
 from app.security import admin_scope_fingerprint
 from app.services.audit_redaction import redact_historical_audit_rows
 
-CURRENT_TOKEN = "audit-redaction-current-token"
-ROTATED_TOKEN = "audit-redaction-rotated-token-7c3d9e"
+CURRENT_TOKEN = "issue894-current-admin-token"
+ROTATED_TOKEN = "issue894-rotated-admin-token-7c3d9e"
 TEST_KEY = b"audit-redaction-test-key"
 TEST_KEY_VERSION = "v-audit-redaction"
 SEED_IP = "10.9.8.7"

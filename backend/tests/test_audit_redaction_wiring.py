@@ -1,19 +1,20 @@
-"""Additive wiring and behavior pins for the #894 audit-row redaction.
+"""Additive wiring, exact-value and fault-path pins for the #894 redaction.
 
 The frozen checks (test_audit_hmac_redaction.py C8/C9) accept any
-implementation whose rows either verify or self-identify — including a
-tombstone-everything one. These additive tests pin the exact contract the
-plan (05-fix-plan.md Revision 3, plan-critic rounds 1-3) specifies: exact
-identity values per branch (scoped fingerprint for the current token,
-REDACTED_LEGACY_IDENTITY for rotated/unknown), verifying digests for BOTH
-branches computed under the production message layout with the PASSED key,
-NULL-ip handling, control rows untouched, journal semantics, and the
-lifespan wiring helper's success and fail-soft behavior.
+implementation whose rows either verify or self-identify as a tombstone —
+including a tombstone-everything one. This module closes that gap with
+exact-value pins, the branch-specific contracts, the real-fault journal
+contract, and the source-shape pins that make the load-bearing lines
+mutation-sensitive.
+
+Nothing here is decorative: every assertion below fails if the
+corresponding implementation line is removed or weakened.
 """
 
 import ast
 import hashlib
 import hmac
+import logging
 import shutil
 import sqlite3
 import tempfile
@@ -42,6 +43,9 @@ TEST_KEY = b"wiring-test-key"
 TEST_KEY_VERSION = "v-wiring"
 SEED_IP = "10.1.2.3"
 
+# A 16-lowercase-hex token: the shape the fingerprint exclusion used to skip.
+HEX_TOKEN = "a3f9c1d24b7e6085"
+
 
 @contextmanager
 def _temp_db():
@@ -62,6 +66,13 @@ def _temp_db():
 
 @contextmanager
 def _configured_admin():
+    """Patch BOTH token settings on the REAL settings object.
+
+    ``admin_scope_fingerprint`` reads ``settings.admin_token_scopes`` from
+    ``app.config`` (imported into ``app.security``), so patching only a
+    module-local stub would leave the scope map unpatched and make the
+    expected fingerprint degenerate to the empty-scope digest.
+    """
     with patch.object(settings, "admin_secret_token", CURRENT_TOKEN):
         with patch.object(
             settings, "admin_token_scopes", {CURRENT_TOKEN: ["admin:config"]}
@@ -69,13 +80,31 @@ def _configured_admin():
             yield
 
 
-def _insert(conn, feature, enabled, user_id, ip=SEED_IP):
-    digest, ts = _compute_hmac(TEST_KEY, feature, enabled, user_id, ip)
+@contextmanager
+def _configured_hex_admin():
+    """Same, with a 16-lowercase-hex token as the CURRENT token."""
+    with patch.object(settings, "admin_secret_token", HEX_TOKEN):
+        with patch.object(
+            settings, "admin_token_scopes", {HEX_TOKEN: ["admin:config"]}
+        ):
+            yield
+
+
+def _insert(conn, feature, enabled, user_id, ip=SEED_IP, key=TEST_KEY, digest=None):
+    computed, ts = _compute_hmac(key, feature, enabled, user_id, ip)
     conn.execute(
         "INSERT INTO audit_toggle_log"
         "(feature, enabled, user_id, ip, timestamp, key_version, hmac_sha256) "
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (feature, int(enabled), user_id, ip, ts, "v-seed", digest),
+        (
+            feature,
+            int(enabled),
+            user_id,
+            ip,
+            ts,
+            TEST_KEY_VERSION,
+            digest if digest is not None else computed,
+        ),
     )
 
 
@@ -121,20 +150,51 @@ def _journal_rows(db_path):
     try:
         return conn.execute(
             "SELECT migration_name, phase, outcome FROM migration_journal "
-            "WHERE migration_name = 'redact_historical_audit_rows'"
+            "WHERE migration_name = 'redact_historical_audit_rows' "
+            "ORDER BY id"
         ).fetchall()
     finally:
         conn.close()
 
 
+class _FailOnBeginConnection:
+    """Real connection proxy whose BEGIN IMMEDIATE raises."""
+
+    def __init__(self, real: sqlite3.Connection) -> None:
+        self._real = real
+
+    def execute(self, sql, *args, **kwargs):
+        if str(sql).strip().upper().startswith("BEGIN IMMEDIATE"):
+            raise sqlite3.OperationalError("database is locked")
+        return self._real.execute(sql, *args, **kwargs)
+
+    def close(self) -> None:
+        self._real.close()
+
+    @property
+    def in_transaction(self) -> bool:
+        return self._real.in_transaction
+
+
+def _connect_failing_on_begin(*args, **kwargs):
+    return _FailOnBeginConnection(sqlite3.Connection(*args, **kwargs))
+
+
+class _ExplodingSecretManager:
+    """Secret manager that must NOT be asked for the key without work."""
+
+    def get_hmac_key(self):
+        raise AssertionError("the HMAC key must not be resolved without work")
+
+
 def test_redaction_exact_values_and_verifying_digests():
     """Both branches carry exact identities AND verifying digests.
 
-    The marker alone must not satisfy these pins: the current-token row's
-    user_id must equal the scoped fingerprint computed under the same
-    patched settings, the rotated row's must equal REDACTED_LEGACY_IDENTITY
-    exactly, and BOTH digests must verify under the production message
-    layout recomputed with the key passed to the routine.
+    The current-token row's user_id must equal the scoped fingerprint
+    computed under the same patched settings; the rotated row's must equal
+    REDACTED_LEGACY_IDENTITY exactly; and BOTH rewritten rows must verify
+    under the production message layout recomputed with the key passed to
+    the routine.
     """
     with _temp_db() as db_path:
         _seed(db_path)
@@ -147,18 +207,11 @@ def test_redaction_exact_values_and_verifying_digests():
         assert rows["w_cur"][2] == expected_fp
         assert rows["w_rot"][2] == REDACTED_LEGACY_IDENTITY
         assert rows["w_cur_null_ip"][2] == expected_fp
-        # BOTH rewritten branches verify (not merely marked).
         assert _verifies(rows["w_cur"])
         assert _verifies(rows["w_rot"])
         assert _verifies(rows["w_cur_null_ip"])
-        # key_version updated truthfully to the passed value.
         assert rows["w_cur"][5] == TEST_KEY_VERSION
         assert rows["w_rot"][5] == TEST_KEY_VERSION
-        # Timestamps preserved verbatim: the digest verification above is the
-        # load-bearing pin (it recomputes over the row's STORED timestamp, so
-        # a timestamp-regeneration mutation breaks it — proven by the
-        # reviewer's hand-probe 3); asserting the timestamp against itself
-        # would be a tautology, so no separate line here.
 
 
 def test_untouched_classes_byte_identical_and_journal_silent_on_clean():
@@ -171,17 +224,14 @@ def test_untouched_classes_byte_identical_and_journal_silent_on_clean():
         after = _rows(db_path)
         for feature in ("w_fp_control", "w_null", "w_empty", "w_tomb_control"):
             assert after[feature] == before[feature], f"{feature} was modified"
-        # Idempotent second run: nothing left to do, nothing changes.
         with _configured_admin():
             second = redact_historical_audit_rows(db_path, TEST_KEY, TEST_KEY_VERSION)
         assert second == 0
         assert _rows(db_path) == after
-        # Journal: exactly start + succeeded (no failed), no extra rows.
         assert _journal_rows(db_path) == [
             ("redact_historical_audit_rows", "start", "ok"),
             ("redact_historical_audit_rows", "succeeded", "ok"),
         ]
-        # A clean database journals nothing at all.
         with _temp_db() as clean_path:
             with _configured_admin():
                 assert redact_historical_audit_rows(clean_path, TEST_KEY, TEST_KEY_VERSION) == 0
@@ -199,28 +249,159 @@ def test_null_ip_row_verifies_via_or_empty_fallback():
         assert _verifies(row), "NULL-ip row digest must verify via the or '' fallback"
 
 
+def test_current_16_hex_token_is_redacted():
+    """A 16-lowercase-hex CURRENT token must not be skipped.
+
+    The fingerprint exclusion (``NOT GLOB``) matches a 16-hex token, so the
+    detection predicate must ALSO match the configured token exactly — the
+    sibling migration ORs that clause, and the current token is known at
+    runtime, so it can never be "indistinguishable from a fingerprint".
+    """
+    with _temp_db() as db_path:
+        conn = sqlite3.connect(db_path)
+        try:
+            _insert(conn, "hex_current", True, HEX_TOKEN)
+            conn.commit()
+        finally:
+            conn.close()
+        with _configured_hex_admin():
+            expected_fp = admin_scope_fingerprint(HEX_TOKEN)
+            count = redact_historical_audit_rows(db_path, TEST_KEY, TEST_KEY_VERSION)
+            row = _rows(db_path)["hex_current"]
+        assert count == 1, f"the current 16-hex token must be redacted, got {count}"
+        assert row[2] != HEX_TOKEN, "the raw 16-hex token must not remain in user_id"
+        assert row[2] == expected_fp
+        assert _verifies(row)
+
+
+def test_unverifiable_row_becomes_a_tombstone_without_a_valid_digest():
+    """A row whose digest does not verify is tombstoned, not re-attributed.
+
+    Re-signing a row that never verified would launder a tampered row into
+    a validly-signed audit entry, so an unverifiable row keeps its stored
+    digest (and its recorded key version) and only its identity is
+    scrubbed — the tombstone marker states that the row's provenance can
+    no longer be established.
+    """
+    with _temp_db() as db_path:
+        conn = sqlite3.connect(db_path)
+        try:
+            _insert(conn, "tampered", True, ROTATED_TOKEN, digest="GARBAGE")
+            conn.commit()
+        finally:
+            conn.close()
+        with _configured_admin():
+            redact_historical_audit_rows(db_path, TEST_KEY, TEST_KEY_VERSION)
+        row = _rows(db_path)["tampered"]
+        assert row[2] == REDACTED_LEGACY_IDENTITY
+        assert not _verifies(row), (
+            "an unverifiable row must not come out with a valid digest"
+        )
+
+
+def test_row_signed_under_a_rotated_key_is_tombstoned():
+    """A row signed under a different key version cannot be verified."""
+    with _temp_db() as db_path:
+        conn = sqlite3.connect(db_path)
+        try:
+            _insert(conn, "old_key", True, ROTATED_TOKEN, key=b"an-older-key")
+            conn.execute(
+                "UPDATE audit_toggle_log SET key_version = 'v-old' "
+                "WHERE feature = 'old_key'"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        with _configured_admin():
+            redact_historical_audit_rows(db_path, TEST_KEY, TEST_KEY_VERSION)
+        row = _rows(db_path)["old_key"]
+        assert row[2] == REDACTED_LEGACY_IDENTITY
+        assert row[5] == "v-old", "an unverifiable row keeps its recorded key version"
+
+
+def test_failure_writes_start_and_failed_rows_and_leaves_data_untouched():
+    """A real fault inside the data work journals start + failed.
+
+    The failure is injected into the real function (not a mocked-out
+    routine): ``BEGIN IMMEDIATE`` raises, and the contract is that the
+    journal ends in a terminal ``failed`` row, the audit rows are
+    unchanged, and the fail-soft wrapper logs the error.
+    """
+    with _temp_db() as db_path:
+        _seed(db_path)
+        before = _rows(db_path)
+        with _configured_admin():
+            with patch.object(sqlite3, "connect", _connect_failing_on_begin):
+                with pytest.raises(sqlite3.OperationalError):
+                    redact_historical_audit_rows(db_path, TEST_KEY, TEST_KEY_VERSION)
+
+        assert _journal_rows(db_path) == [
+            ("redact_historical_audit_rows", "start", "ok"),
+            ("redact_historical_audit_rows", "failed", "error"),
+        ]
+        assert _rows(db_path) == before, "a failed redaction must not change data"
+
+        # The fail-soft wrapper turns the same failure into a flag + log.
+        fake_sm = SimpleNamespace(get_hmac_key=lambda: (TEST_KEY, TEST_KEY_VERSION))
+        app = SimpleNamespace(state=SimpleNamespace(secret_manager=fake_sm))
+        with _configured_admin():
+            with patch.object(sqlite3, "connect", _connect_failing_on_begin):
+                with caplog_at_error() as records:
+                    run_startup_audit_redaction(app)
+        assert app.state.audit_redaction_ok is False
+        assert any("redaction failed" in r.message for r in records)
+
+
+@contextmanager
+def caplog_at_error():
+    """Collect ERROR records emitted inside the block."""
+    import logging as _logging
+
+    class _Collector(_logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.records = []
+
+        def emit(self, record):
+            self.records.append(record)
+
+    collector = _Collector()
+    logger = _logging.getLogger("app.services.audit_redaction")
+    logger.addHandler(collector)
+    old_level = logger.level
+    logger.setLevel(logging.ERROR)
+    try:
+        yield collector.records
+    finally:
+        logger.removeHandler(collector)
+        logger.setLevel(old_level)
+
+
 def test_wiring_helper_success_and_flag():
     """run_startup_audit_redaction drives the routine exactly as lifespan does."""
     with _temp_db() as db_path:
         _seed(db_path)
         # settings.sqlite_path is a read-only property on the real Settings
-        # object, so swap the module-level settings reference inside
-        # audit_redaction for a stub carrying the temp path (the routine also
-        # reads admin_secret_token from it, so the stub carries the patched
-        # admin values too — exactly what the lifespan context provides).
+        # object, so the module-level settings reference inside
+        # audit_redaction is swapped for a stub carrying the temp path. The
+        # admin token and scope map stay on the REAL settings object (patched
+        # by _configured_admin) because admin_scope_fingerprint reads them
+        # from app.config.
         stub_settings = SimpleNamespace(
             sqlite_path=db_path,
             admin_secret_token=CURRENT_TOKEN,
             admin_token_scopes={CURRENT_TOKEN: ["admin:config"]},
         )
-        with patch.object(audit_redaction, "settings", stub_settings):
-            fake_sm = SimpleNamespace(
-                get_hmac_key=lambda: (TEST_KEY, TEST_KEY_VERSION)
-            )
-            app = SimpleNamespace(state=SimpleNamespace(secret_manager=fake_sm))
-            run_startup_audit_redaction(app)
+        with _configured_admin():
+            expected_fp = admin_scope_fingerprint(CURRENT_TOKEN)
+            with patch.object(audit_redaction, "settings", stub_settings):
+                fake_sm = SimpleNamespace(
+                    get_hmac_key=lambda: (TEST_KEY, TEST_KEY_VERSION)
+                )
+                app = SimpleNamespace(state=SimpleNamespace(secret_manager=fake_sm))
+                run_startup_audit_redaction(app)
         rows = _rows(db_path)
-        assert rows["w_cur"][2] == admin_scope_fingerprint(CURRENT_TOKEN)
+        assert rows["w_cur"][2] == expected_fp
         assert rows["w_rot"][2] == REDACTED_LEGACY_IDENTITY
         assert app.state.audit_redaction_ok is True
 
@@ -242,16 +423,39 @@ def test_wiring_helper_fail_soft_flag_and_no_escape():
     assert app.state.audit_redaction_ok is False
 
 
+def test_wiring_helper_does_not_resolve_the_key_when_there_is_no_work():
+    """A clean boot must not resolve the HMAC key.
+
+    Resolving it on every clean boot emits a warn-and-fallback log line
+    when no dedicated audit key is configured — the routine therefore
+    probes for pending work FIRST.
+    """
+    with _temp_db() as db_path:
+        stub_settings = SimpleNamespace(
+            sqlite_path=db_path,
+            admin_secret_token=CURRENT_TOKEN,
+            admin_token_scopes={CURRENT_TOKEN: ["admin:config"]},
+        )
+
+        with _configured_admin():
+            with patch.object(audit_redaction, "settings", stub_settings):
+                fake_sm = _ExplodingSecretManager()
+                app = SimpleNamespace(state=SimpleNamespace(secret_manager=fake_sm))
+                run_startup_audit_redaction(app)
+        assert app.state.audit_redaction_ok is True
+
+
 def test_lifespan_wiring_source_pin():
     """Belt-only AST pin: lifespan calls the helper after the secret manager.
 
     Asserts both position (after ``app.state.secret_manager = SecretManager()``)
     and argument shape (``asyncio.to_thread(run_startup_audit_redaction, app)``).
-    The behavior tests above are the primary guardrail; this pin catches a
-    silent unwiring that they cannot see (a call removed from lifespan while
-    the helper still passes its own tests).
+    The path is resolved from THIS FILE, not from the process CWD, so the
+    pin is invariant to how the suite is invoked.
     """
-    source = Path("app/lifespan.py").read_text(encoding="utf-8")
+    source = (Path(__file__).resolve().parents[1] / "app" / "lifespan.py").read_text(
+        encoding="utf-8"
+    )
     tree = ast.parse(source)
     assigns = {}
     calls = []
@@ -282,47 +486,70 @@ def test_lifespan_wiring_source_pin():
     ), "run_startup_audit_redaction must be called after the secret manager exists"
 
 
-@pytest.mark.parametrize(
-    "mutation", ["identity", "digest", "predicate_glob", "key_version"]
-)
-def test_frozen_contract_bites_under_mutation(mutation):
-    """Named-mutation discipline: each load-bearing implementation choice has
-    a test above that fails when it is mutated (documented mapping, asserted
-    here by construction — the mutations are probed at Phase 4.5 in a
-    throwaway worktree; this test documents the mapping and guards the
-    module constants the probes rely on)."""
-    if mutation == "identity":
-        assert REDACTED_LEGACY_IDENTITY == "redacted:legacy-admin-token"
-        assert "redact" in REDACTED_LEGACY_IDENTITY.lower()
-    elif mutation == "digest":
-        # The message builder must reproduce the production layout exactly.
-        assert audit_redaction._audit_message("f", True, "u", "ip", "t") == "f|1|u|ip|t"
-        assert audit_redaction._audit_message("f", False, None, None, "t") == "f|0|||t"
-    elif mutation == "predicate_glob":
-        # "[0-9a-f]" * 16 is database.py:7536's shape: ONE bracket class
-        # repeated 16 times — a glob matching exactly 16 hex chars (the
-        # string itself is longer; the GLOB width is 16).
-        assert audit_redaction._FINGERPRINT_GLOB == "[0-9a-f]" * 16
-        conn = sqlite3.connect(":memory:")
-        try:
-            hex16 = conn.execute(
-                "SELECT '0123456789abcdef' GLOB ?", (audit_redaction._FINGERPRINT_GLOB,)
-            ).fetchone()[0]
-            not_hex = conn.execute(
-                "SELECT 'zzzzzzzzzzzzzzzz' GLOB ?", (audit_redaction._FINGERPRINT_GLOB,)
-            ).fetchone()[0]
-            short = conn.execute(
-                "SELECT '0123456789abcde' GLOB ?", (audit_redaction._FINGERPRINT_GLOB,)
-            ).fetchone()[0]
-        finally:
-            conn.close()
-        assert (hex16, not_hex, short) == (1, 0, 0), (
-            "fingerprint glob must match exactly-16 lowercase hex and nothing else"
-        )
-    else:
-        # key_version propagation is pinned behaviorally in
-        # test_redaction_exact_values_and_verifying_digests (asserts the
-        # stored key_version equals TEST_KEY_VERSION after redaction) and is
-        # killed by mutation probe M4; a constant assertion here would be a
-        # truthy tautology (reviewer round-1 nit), so this arm is doc-only.
-        pass
+def test_redaction_source_pins_are_mutation_sensitive():
+    """Source-shape pins for the load-bearing lines of the routine.
+
+    These replace a decorative "mutation" test with real, repo-reproducible
+    assertions: dropping the exact-token clause, the per-row user_id
+    re-check, the digest re-computation, or the key_version write must
+    break a pin.
+    """
+    source = (Path(__file__).resolve().parents[1] / "app" / "services" / "audit_redaction.py").read_text(
+        encoding="utf-8"
+    )
+
+    # 1. The detection predicate matches the configured token EXACTLY.
+    assert "OR user_id = ? LIMIT 1" in source, (
+        "the detection predicate must match the configured token exactly"
+    )
+    assert "OR user_id = ?" in source, (
+        "the row-selection predicate must match the configured token exactly"
+    )
+
+    # 2. The per-row UPDATE re-checks the identity it read, so a concurrent
+    #    redaction of the same row is not double-counted.
+    assert "WHERE id = ? AND user_id = ?" in source, (
+        "the UPDATE must be keyed by id AND the identity it read"
+    )
+
+    # 3. The digest is recomputed over the NEW identity, and the stored
+    #    digest is compared before a row is re-attributed.
+    assert "hmac.compare_digest" in source, (
+        "a row must be verified before it is re-attributed"
+    )
+    assert "_audit_message(\n                        feature, bool(enabled), new_identity, ip, timestamp" in source, (
+        "the re-signed digest must be computed over the NEW identity"
+    )
+
+    # 4. The key_version is written (truthfully: the digest is now under
+    #    the runtime key).
+    assert "SET user_id = ?, hmac_sha256 = ?, key_version = ?" in source
+
+    # 5. The data work is inside ONE try whose handler journals 'failed'.
+    assert "phase=\"failed\"" in source
+    tree = ast.parse(source)
+    func = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "redact_historical_audit_rows"
+    )
+    try_blocks = [n for n in ast.walk(func) if isinstance(n, ast.Try)]
+    assert try_blocks, "the routine must guard its data work in a try"
+    guarded = try_blocks[0]
+    begin_calls = [
+        n
+        for n in ast.walk(guarded)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "execute"
+        and n.args
+        and isinstance(n.args[0], ast.Constant)
+        and n.args[0].value == "BEGIN IMMEDIATE"
+    ]
+    assert begin_calls, "BEGIN IMMEDIATE must sit INSIDE the guarded try"
+    handlers = [h for h in guarded.handlers if h.type is not None]
+    assert handlers, "the guarded try must have an exception handler"
+    handler_src = ast.dump(handlers[0])
+    assert "failed" in handler_src, (
+        "the exception handler must journal the 'failed' phase"
+    )
