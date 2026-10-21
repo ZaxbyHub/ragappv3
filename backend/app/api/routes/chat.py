@@ -234,24 +234,12 @@ class ChatStreamRequest(BaseModel):
     # the pre-#553 behavior).
     session_id: Optional[int] = None
     turn_id: Optional[str] = Field(default=None, max_length=64)
-
-    @field_validator("messages")
-    @classmethod
-    def _cap_last_message_length(cls, value: List["ChatMessage"]) -> List["ChatMessage"]:
-        """Cap the FINAL message on the streaming route (#922).
-
-        The route feeds ``body.messages[-1]`` to the engine as the live
-        user turn, so it gets the same ``chat_message_max_chars`` bound as
-        ``ChatRequest.message``. Prior messages (history) stay uncapped.
-        Guarded for the empty list so ``{"messages": []}`` keeps hitting
-        the route's own clean 400, never an IndexError-driven 500.
-        """
-        cap = settings.chat_message_max_chars
-        if value and len(value[-1].content) > cap:
-            raise ValueError(
-                f"the final message exceeds chat_message_max_chars ({cap} characters)"
-            )
-        return value
+    # NOTE (#922, review F-001): the FINAL message's chat_message_max_chars
+    # cap is enforced inside the chat_stream route body AFTER
+    # get_stream_auth and the last-message role check — not as a pydantic
+    # validator — so the check is authenticated, does not echo the message
+    # list in a validation envelope, and preserves the route's own
+    # error-code ordering (400 empty / 400 role / 422 over-cap).
 
 
 class CreateSessionRequest(BaseModel):
@@ -2125,6 +2113,20 @@ async def chat_stream(
     if last_message.role.lower() != "user":
         raise HTTPException(
             status_code=400, detail="The last message must be from the user"
+        )
+
+    # Live-message cap (#922, review F-001): enforced here in the route
+    # body — after get_stream_auth and the role check — rather than as a
+    # pydantic validator, so the check is authenticated, the error detail
+    # does not echo the message list, and the route's own error-code
+    # ordering (400 empty / 400 role / 422 over-cap) is preserved.
+    cap = settings.chat_message_max_chars
+    if len(last_message.content) > cap:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"the final message exceeds chat_message_max_chars ({cap} characters)"
+            ),
         )
 
     require_vault = user.get("role") not in ("superadmin", "admin")

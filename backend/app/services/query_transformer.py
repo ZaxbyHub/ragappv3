@@ -207,8 +207,18 @@ _FILENAME_EXT_RE = re.compile(
     r'\.(pdf|docx?|xlsx?|csv|txt|md|yaml|yml|json|html?|pptx?)\b',
     re.IGNORECASE,
 )
-_RUN_CHARS_RE = re.compile(r'[\w\-]')
-_WORD_CHARS_RE = re.compile(r'\w')
+
+
+def _is_run_char(ch: str) -> bool:
+    """Membership predicate for the ``[\\w\\-]`` character class (unicode-aware:
+    ``str.isalnum`` covers exactly the unicode word characters plus ASCII
+    digits, and ``_`` is added explicitly, matching ``re``'s ``\\w``)."""
+    return ch == "_" or ch == "-" or ch.isalnum()
+
+
+def _is_word_char(ch: str) -> bool:
+    """Membership predicate for the ``\\w`` character class."""
+    return ch == "_" or ch.isalnum()
 
 
 def _contains_filename_reference(query: str) -> bool:
@@ -216,8 +226,8 @@ def _contains_filename_reference(query: str) -> bool:
     for ext_match in _FILENAME_EXT_RE.finditer(query):
         j = ext_match.start() - 1
         has_word = False
-        while j >= 0 and _RUN_CHARS_RE.match(query[j]):
-            if _WORD_CHARS_RE.match(query[j]):
+        while j >= 0 and _is_run_char(query[j]):
+            if _is_word_char(query[j]):
                 has_word = True
             j -= 1
         if has_word:
@@ -225,14 +235,17 @@ def _contains_filename_reference(query: str) -> bool:
     return False
 
 
-def _valid_step_back_variants(value: object) -> bool:
-    """Shape guard for cached step-back variant lists (#918 AC3).
+def _valid_step_back_variants(value: object, query: str) -> bool:
+    """Servability guard for cached step-back variant lists (#918 AC3).
 
     A cache payload is servable only when it is a non-empty list of
-    (kind, text) two-string entries. Anything else — including the corrupt
-    raw ``"[]"`` that parses to an empty list — must be treated as a bad
-    entry, never served, because the ``transform()`` contract guarantees
-    the original variant is always present.
+    (kind, text) two-string entries whose FIRST entry is the caller's own
+    original variant — ``("original", query)`` — with a non-empty step-back
+    text when present. Anything else — including the corrupt raw ``"[]"``
+    that parses to an empty list, and shape-valid payloads that dropped the
+    original arm — must be treated as a bad entry, never served, because
+    the ``transform()`` contract guarantees the original variant is always
+    present.
     """
     if not isinstance(value, list) or not value:
         return False
@@ -244,19 +257,41 @@ def _valid_step_back_variants(value: object) -> bool:
             or not isinstance(item[1], str)
         ):
             return False
+    first = value[0]
+    if first[0] != "original" or first[1] != query:
+        return False
+    if len(value) > 1 and not value[1][1].strip():
+        return False
     return True
 
 
-def _valid_cached_plan(value: object) -> bool:
-    """Shape guard for cached query plans (#924, sibling of #918's guard).
+def _valid_cached_plan(value: object, query: str) -> bool:
+    """Servability guard for cached query plans (#924, sibling of #918's
+    guard).
 
-    A plan payload is servable only when it is a non-empty list of strings.
+    A plan payload is servable only when it is a non-empty list of strings
+    that starts with the caller's own original query — the shape
+    ``QueryPlanner.plan`` itself always writes (it prepends the original).
     """
     return (
         isinstance(value, list)
         and bool(value)
         and all(isinstance(item, str) for item in value)
+        and value[0] == query
     )
+
+
+async def _cache_delete_corrupt(redis_client, key: str, warn_label: str) -> None:
+    """Best-effort delete of a corrupt cache entry (shared, never a setex —
+    the #711 hit-no-TTL-refresh pin is about refreshing live entries; a
+    corrupt entry is dead and its removal makes the next call a clean
+    miss). ``warn_label`` keeps the per-site degradation-warning prefixes
+    stable, mirroring ``_cache_write_success``."""
+    if redis_client:
+        try:
+            await redis_call(redis_client.delete, key)
+        except Exception as e:
+            logger.warning("%s delete failed: %s", warn_label, e)
 
 
 async def _cache_write_success(redis_client, lru_set, key: str, ttl: int, value, warn_label: str) -> None:
@@ -327,12 +362,16 @@ class QueryTransformer:
         """Generate cache key for query transformation result.
 
         DECISION(content-addressed-keys): the key is deliberately NOT scoped
-        to a user/vault/org. The cached payload (transformed query text)
-        contains no tenant-private data, Redis keys are never disclosed to
-        clients, and a chosen-prefix collision is structurally infeasible
-        through the ASCII-escaped JSON input (#924 addendum 1, critic-
-        assessed). Tenant-scoping would fragment the cache for no security
-        gain; re-evaluate if a payload ever embeds tenant-private content.
+        to a user/vault/org, and the CACHED VALUE embeds the query text it
+        was derived from (the original variant is stored verbatim), so the
+        entry is only as private as Redis itself. Sharing is accepted
+        because reading an entry requires knowing the exact query text, the
+        value reaches only embedding/search (never a generation prompt), a
+        chosen-prefix collision is structurally infeasible through the
+        ASCII-escaped JSON input (#924 addendum 1, critic-assessed), and
+        Redis keys/values are never disclosed to clients. Re-evaluate the
+        scoping if query text ever becomes disclosable through a cached
+        value surface, or if Redis is shared with untrusted tenants.
         """
         key_data = json.dumps({
             "model": chat_model,
@@ -344,6 +383,34 @@ class QueryTransformer:
         # primitive (same convention as rag_trace._text_hash). It also keeps
         # the call valid on FIPS-enabled interpreters.
         return f"query_transform:{hashlib.md5(key_data.encode(), usedforsecurity=False).hexdigest()}"
+
+    async def _decode_cached_variants(
+        self, cached: str, cache_key: str, query: str
+    ) -> Optional[List[Tuple[str, str]]]:
+        """Decode and validate a cached step-back payload (#918 AC3).
+
+        Returns the servable variant list (entries normalized to immutable
+        tuples so a caller cannot mutate the warmed LRU copy through the
+        parsed lists), or None — after a best-effort delete of the dead
+        entry — when the payload is unparseable, wrongly shaped, or missing
+        the caller's ('original', query) arm. The delete is never a setex,
+        so the #711 hit-no-TTL-refresh pin is untouched.
+        """
+        try:
+            parsed = json.loads(cached)
+        except (json.JSONDecodeError, ValueError):
+            logger.warning(
+                "Discarding corrupt step-back cache entry (unparseable payload)"
+            )
+            await _cache_delete_corrupt(self._redis_client, cache_key, "Redis cache")
+            return None
+        if not _valid_step_back_variants(parsed, query):
+            logger.warning(
+                "Discarding corrupt step-back cache entry (bad payload shape)"
+            )
+            await _cache_delete_corrupt(self._redis_client, cache_key, "Redis cache")
+            return None
+        return [(kind, text) for kind, text in parsed]
 
     def _lru_get(self, key: str) -> Optional[List[Tuple[str, str]]]:
         if key in self._lru_cache:
@@ -415,6 +482,12 @@ class QueryTransformer:
         # behave identically to a cold call with the same settings, and the
         # cached step-back value is never mutated by HyDE enable/disable.
         cached_variants: Optional[List[Tuple[str, str]]] = None
+        # Set when a corrupt/unservable Redis entry was discarded (and
+        # best-effort deleted): the request must NOT spend an LLM call
+        # re-deriving a step-back for a poisoned key, but it still falls
+        # through to the LRU arm and the HyDE block so it behaves like the
+        # step-back-failure arm (PRR-002/F-002).
+        corrupt_hit = False
 
         # Try Redis cache first (bounded, off-loop — see redis_call; a
         # timeout or error degrades to the LRU/LLM path below).
@@ -423,29 +496,23 @@ class QueryTransformer:
                 cached = await redis_call(self._redis_client.get, cache_key)
                 if cached:
                     logger.debug("Cache HIT (Redis) for query transformation")
-                    cached_variants = json.loads(cached)
+                    cached_variants = await self._decode_cached_variants(
+                        cached, cache_key, query
+                    )
+                    if cached_variants is None:
+                        corrupt_hit = True
             except Exception as e:
                 logger.warning("Redis cache get failed: %s", e)
 
-        # Unvalidated cached-data shape guard (#918 AC3): a parsed-but-empty
-        # or wrong-shape payload (e.g. the corrupt raw "[]") must never be
-        # served as the variants list — the caller contract guarantees the
-        # original variant is always present. Best-effort delete (not a
-        # setex, so the #711 hit-no-TTL-refresh pin is untouched) so the
-        # next call is a clean miss instead of TTL-long degradation, then
-        # return the original-only arm without spending an LLM call.
-        if cached_variants is not None and not _valid_step_back_variants(cached_variants):
-            logger.warning(
-                "Discarding corrupt step-back cache entry (bad payload shape)"
-            )
-            if self._redis_client:
-                try:
-                    await redis_call(self._redis_client.delete, cache_key)
-                except Exception as e:
-                    logger.warning("Redis cache delete failed: %s", e)
-            return [('original', query)]
+        # Servability guard (#918 AC3, hardened per review PRR-005/006/F-003):
+        # _decode_cached_variants returns None — after a best-effort delete —
+        # for ANY unservable payload: unparseable JSON, a wrong shape, or a
+        # payload that dropped the ('original', query) arm. A corrupt hit
+        # never re-runs the LLM here; it falls through to the LRU arm and
+        # the HyDE block below like the step-back-failure arm does.
 
-        # Try LRU cache
+        # Try LRU cache (also the corrupt-hit fallback: this worker's own
+        # valid entry outranks the poisoned remote value)
         if cached_variants is None:
             lru_cached = self._lru_get(cache_key)
             if lru_cached:
@@ -463,6 +530,12 @@ class QueryTransformer:
             # never mutate the object the LRU cache holds.
             variants: List[Tuple[str, str]] = list(cached_variants)
             self._lru_set(cache_key, list(variants))
+        elif corrupt_hit:
+            # Corrupt Redis entry, no valid LRU fallback: answer with the
+            # documented original-only arm WITHOUT spending an LLM call on a
+            # poisoned key (the deleted entry ages out; the next call starts
+            # clean). Falls through to the HyDE block below.
+            variants = [('original', query)]
         else:
             # Cache miss - proceed with transformation
             step_back_succeeded = False
@@ -552,24 +625,25 @@ class QueryTransformer:
                         self._redis_client.get, hyde_cache_key
                     )
                     if cached_hyde:
-                        parsed_hyde = json.loads(cached_hyde)
-                        # Shape guard (#918 class, HyDE arm): only a
-                        # non-empty string is a servable passage; a corrupt
-                        # payload (e.g. "[]" or an object) misses —
-                        # best-effort deleted — instead of being served or
-                        # appended as the passage.
-                        if isinstance(parsed_hyde, str) and parsed_hyde:
+                        # Servability guard (#918 class, HyDE arm): only a
+                        # non-blank string is a servable passage — a corrupt
+                        # or whitespace-only payload misses (best-effort
+                        # deleted) instead of being served or suppressing
+                        # regeneration. Parse failures are corrupt entries
+                        # too, not Redis infrastructure failures.
+                        try:
+                            parsed_hyde = json.loads(cached_hyde)
+                        except (json.JSONDecodeError, ValueError):
+                            parsed_hyde = None
+                        if isinstance(parsed_hyde, str) and parsed_hyde.strip():
                             hyde_passage = parsed_hyde
                         else:
                             logger.warning(
                                 "Discarding corrupt HyDE cache entry (bad payload shape)"
                             )
-                            try:
-                                await redis_call(
-                                    self._redis_client.delete, hyde_cache_key
-                                )
-                            except Exception as e:
-                                logger.warning("Redis cache delete failed: %s", e)
+                            await _cache_delete_corrupt(
+                                self._redis_client, hyde_cache_key, "Redis HyDE cache"
+                            )
                 except Exception as e:
                     logger.warning("Redis HyDE cache get failed: %s", e)
 
@@ -797,7 +871,10 @@ class QueryPlanner:
         """Generate cache key for a query plan.
 
         DECISION(content-addressed-keys): same rationale as
-        QueryTransformer._make_cache_key — no tenant scope by design.
+        QueryTransformer._make_cache_key — no tenant scope by design, and
+        the cached plan embeds the query text it was derived from (the
+        prepended original), so the entry is only as private as Redis
+        itself.
         """
         key_data = json.dumps(
             {
@@ -943,20 +1020,25 @@ class QueryPlanner:
                 cached = await redis_call(self._redis_client.get, cache_key)
                 if cached:
                     logger.debug("QueryPlanner cache HIT (Redis) for query '%s'", query[:40])
-                    plan = json.loads(cached)
-                    # Shape guard (#924, same class as the transformer's
-                    # #918 guard): only a non-empty list of strings is a
-                    # servable plan — a corrupt/legacy payload misses (and
-                    # is best-effort deleted) instead of being served.
-                    if _valid_cached_plan(plan):
+                    # Servability guard (#924, same class as the transformer's
+                    # #918 guard): only a non-empty list of strings that
+                    # starts with the caller's own original query is a
+                    # servable plan — a corrupt, legacy, or original-less
+                    # payload misses (best-effort deleted) instead of being
+                    # served. A parse failure is a corrupt entry too, not a
+                    # Redis infrastructure failure.
+                    try:
+                        plan = json.loads(cached)
+                    except (json.JSONDecodeError, ValueError):
+                        plan = None
+                    if _valid_cached_plan(plan, query):
                         return list(plan)
                     logger.warning(
                         "Discarding corrupt query-plan cache entry (bad payload shape)"
                     )
-                    try:
-                        await redis_call(self._redis_client.delete, cache_key)
-                    except Exception as e:
-                        logger.warning("Redis cache delete failed: %s", e)
+                    await _cache_delete_corrupt(
+                        self._redis_client, cache_key, "QueryPlanner Redis cache"
+                    )
             except Exception as e:
                 logger.warning("QueryPlanner Redis cache get failed: %s", e)
 

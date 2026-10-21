@@ -279,10 +279,12 @@ async def test_cache_hit_warms_lru_without_refreshing_ttl(
     setex_calls = [c for c in fake.calls if c[0] == "setex"]
     assert len(setex_calls) == 0
     # But the in-process LRU is warmed from the hit, so a later Redis outage
-    # still serves this worker from memory. (Redis JSON round-trips to lists.)
+    # still serves this worker from memory. Entries are normalized to the
+    # LRU's native tuple shape on decode (PR #988 feedback round), matching
+    # what the LLM-path writer stores.
     assert transformer._lru_get(cache_key) == [
-        ["original", TRANSFORM_QUERY],
-        ["step_back", "broader"],
+        ("original", TRANSFORM_QUERY),
+        ("step_back", "broader"),
     ]
 
 

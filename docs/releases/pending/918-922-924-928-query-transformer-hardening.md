@@ -21,18 +21,19 @@ invalidation of existing query-transform/plan cache entries at deploy).
   original variant at all; it now returns the original-only arm.
 - **#922 — the filename heuristic is worst-case linear and live messages
   are capped.** `_is_exact_or_document_query`'s filename regex was
-  quadratic on hyphen-joined runs (~160 s synchronous on the event loop
-  for a 200k-char message; reviewer/critic measured 7.2 s @ 40k, 214 s @
-  200k). It is replaced by an extension-anchored scan (literal `.<ext>`
-  finditer + backward `[\w\-]`-run walk accepting iff the run contains a
-  word character) that is provably equivalent and linear. Both chat
-  entry routes now reject over-cap LIVE messages with a 422 before any
-  generation work: `POST /api/chat` `message` and the FINAL message of
-  `POST /api/chat/stream` (`CHAT_MESSAGE_MAX_CHARS`, default 20000;
-  `{"messages": []}` keeps the route's own 400). Prior-turn history is
-  deliberately NOT bounded — legitimate assistant answers can be long;
-  a pathological paste now surfaces an error instead of blocking every
-  user's requests for minutes.
+  quadratic on hyphen-joined runs (a 200k-char message took 151-214 s
+  synchronous on the event loop, depending on machine — reviewer/critic
+  measured 7.2 s @ 40k and 214 s @ 200k on their hosts; the frozen check's
+  base leg measured 151.88 s locally). It is replaced by an
+  extension-anchored scan (literal `.<ext>` finditer + backward `[\w\-]`
+  run walk accepting iff the run contains a word character) that is
+  provably equivalent and linear. Both chat entry routes now reject
+  over-cap LIVE messages with a 422 before any generation work: `POST
+  /api/chat` `message` and the FINAL message of `POST /api/chat/stream`
+  (`CHAT_MESSAGE_MAX_CHARS`, default 20000; `{"messages": []}` keeps the
+  route's own 400). Prior-turn history is deliberately NOT bounded —
+  legitimate assistant answers can be long; a pathological paste now
+  surfaces an error instead of blocking every user's requests for minutes.
 - **#924 — planner copy discipline, one shared cache-write helper, and
   the three accepted-cost decisions recorded in code.** `QueryPlanner.
   plan` returns copies on both the cache-hit and fresh paths, so caller

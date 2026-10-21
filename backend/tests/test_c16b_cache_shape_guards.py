@@ -28,15 +28,19 @@ class FakeRedis:
     def __init__(self, store):
         self.store = store
         self.deleted = []
+        self.calls = []
 
     def get(self, key):
+        self.calls.append(("get", key))
         return self.store.get(key)
 
     def setex(self, key, ttl, value):
+        self.calls.append(("setex", key, ttl))
         self.store[key] = value
         return True
 
     def delete(self, key):
+        self.calls.append(("delete", key))
         self.deleted.append(key)
         self.store.pop(key, None)
         return 1
@@ -170,22 +174,234 @@ async def test_hyde_cache_discards_wrong_shape_entries(
 
 
 @pytest.mark.asyncio
-async def test_planner_valid_hit_is_served_as_a_copy(planner_settings):
-    """A VALID cached plan is served (no LLM call) and as a copy."""
+async def test_planner_redis_hit_serves_without_llm(planner_settings):
+    """A VALID cached plan is served with zero LLM calls (renamed per review
+    F-010: the Redis-hit path returns a fresh json.loads object, so this
+    test never exercised copy semantics — the LRU-hit copy pin lives in
+    test_planner_lru_hit_path_returns_a_copy). The seed starts with the
+    caller's own query because that is the only shape plan() writes."""
     llm = MagicMock()
     llm.model = "check-model"
     llm.chat_completion = AsyncMock(return_value=PLAN_JSON)
     fake = FakeRedis({})
     planner = _planner(fake, llm)
     key = planner._make_cache_key(PLAN_QUERY)
-    fake.store[key] = json.dumps(["alpha facet", "beta facet"])
+    fake.store[key] = json.dumps([PLAN_QUERY, "alpha facet", "beta facet"])
 
     plan1 = await planner.plan(PLAN_QUERY)
     assert llm.chat_completion.call_count == 0, "a valid hit must not call the LLM"
-    plan1.append("POISONED")
-    plan2 = await planner.plan(PLAN_QUERY)
-    assert "POISONED" not in plan2
-    assert plan2 == ["alpha facet", "beta facet"]
+    assert plan1 == [PLAN_QUERY, "alpha facet", "beta facet"]
+
+
+@pytest.mark.asyncio
+async def test_planner_discards_original_less_plan(planner_settings):
+    """A shape-valid plan whose first element is not the caller's query is
+    corrupt (review PRR-006/F-003): plan() always prepends the original, so
+    such a payload can only be a poisoned or foreign write."""
+    llm = MagicMock()
+    llm.model = "check-model"
+    llm.chat_completion = AsyncMock(return_value=PLAN_JSON)
+    fake = FakeRedis({})
+    planner = _planner(fake, llm)
+    key = planner._make_cache_key(PLAN_QUERY)
+    fake.store[key] = json.dumps(["sub-query A", "sub-query B"])
+
+    plan = await planner.plan(PLAN_QUERY)
+
+    assert llm.chat_completion.call_count == 1, "an original-less plan must miss"
+    assert key in fake.deleted
+    assert plan[0] == PLAN_QUERY
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '[["step_back", "broader question"]]',  # dropped the original arm
+        '[["original", "a different query entirely"], ["step_back", "s"]]',
+        'not json at all {',  # unparseable (review PRR-008)
+    ],
+)
+async def test_transformer_discards_payloads_missing_the_original_arm(
+    transformer_settings, payload
+):
+    """The servability guard requires the caller's ('original', query) arm
+    first — a shape-valid-but-original-less (or unparseable) payload is
+    discarded, best-effort deleted, and answered with the original-only arm
+    without an LLM spend."""
+    llm = MagicMock()
+    llm.model = "check-model"
+    llm.chat_completion = AsyncMock(return_value=STEP_BACK)
+    fake = FakeRedis({})
+    transformer = _transformer(fake, llm)
+    key = transformer._make_cache_key(transformer._cache_model, "step_back", QUERY)
+    fake.store[key] = payload
+
+    variants = await transformer.transform(QUERY)
+
+    kinds = [kind for kind, _ in variants]
+    assert kinds == ["original"]
+    assert llm.chat_completion.call_count == 0, (
+        "no LLM spend on a poisoned key: the corrupt arm degrades to the "
+        "original-only arm"
+    )
+    assert key in fake.deleted
+
+
+@pytest.mark.asyncio
+async def test_corrupt_step_back_entry_still_appends_hyde(transformer_settings,
+                                                            monkeypatch):
+    """A corrupt step-back entry falls through to the HyDE block like the
+    step-back-FAILURE arm does (review PRR-002/F-002): with hyde_enabled a
+    corrupt hit returns [original, hyde], not [original] alone."""
+    monkeypatch.setattr(settings, "hyde_enabled", True)
+    llm = MagicMock()
+    llm.model = "check-model"
+    llm.chat_completion = AsyncMock(
+        side_effect=[
+            "A short factual passage about the concept.",  # HyDE call only
+        ]
+    )
+    fake = FakeRedis({})
+    transformer = _transformer(fake, llm)
+    key = transformer._make_cache_key(transformer._cache_model, "step_back", QUERY)
+    fake.store[key] = "[]"
+
+    variants = await transformer.transform(QUERY)
+
+    kinds = [kind for kind, _ in variants]
+    assert kinds == ["original", "hyde"], (
+        "the corrupt arm must still run the HyDE block (fall-through, like "
+        f"the failure arm); got {kinds!r}"
+    )
+    assert llm.chat_completion.call_count == 1, "only the HyDE call, no step-back"
+    assert key in fake.deleted
+
+
+@pytest.mark.asyncio
+async def test_corrupt_discard_performs_no_cache_write(transformer_settings):
+    """The discard arm must never write a negative entry (the
+    DECISION(no-negative-cache) contract on the NEW path, review PRR-018):
+    after the corrupt transform, the key is absent from Redis AND the LRU,
+    so the next call retries cleanly."""
+    llm = MagicMock()
+    llm.model = "check-model"
+    llm.chat_completion = AsyncMock(return_value=STEP_BACK)
+    fake = FakeRedis({})
+    transformer = _transformer(fake, llm)
+    key = transformer._make_cache_key(transformer._cache_model, "step_back", QUERY)
+    fake.store[key] = "[]"
+
+    await transformer.transform(QUERY)
+
+    assert key not in fake.store, "no cache write may follow a corrupt discard"
+    assert all(call[0] != "setex" for call in fake.calls), (
+        "the discard arm must not issue setex (no-negative-cache)"
+    )
+    assert key not in transformer._lru_cache, "the LRU must not be poisoned either"
+
+
+@pytest.mark.asyncio
+async def test_corrupt_entry_self_heals_on_next_call(transformer_settings):
+    """After the corrupt discard (delete, original-only), the NEXT transform
+    regenerates via the LLM and rewrites a valid entry (review PRR-027l)."""
+    llm = MagicMock()
+    llm.model = "check-model"
+    llm.chat_completion = AsyncMock(return_value=STEP_BACK)
+    fake = FakeRedis({})
+    transformer = _transformer(fake, llm)
+    key = transformer._make_cache_key(transformer._cache_model, "step_back", QUERY)
+    fake.store[key] = "[]"
+
+    first = await transformer.transform(QUERY)
+    assert [k for k, _ in first] == ["original"]
+    assert llm.chat_completion.call_count == 0
+
+    second = await transformer.transform(QUERY)
+    assert [k for k, _ in second] == ["original", "step_back"]
+    assert llm.chat_completion.call_count == 1
+    assert key in fake.store, "the next call must rewrite a valid entry (self-heal)"
+
+
+@pytest.mark.asyncio
+async def test_delete_failure_degrades_gracefully(transformer_settings):
+    """A raising best-effort delete must not break the request (review
+    PRR-027m): the corrupt arm still answers original-only, and the
+    per-site label appears in the warning."""
+    import logging
+
+    llm = MagicMock()
+    llm.model = "check-model"
+    llm.chat_completion = AsyncMock(return_value=STEP_BACK)
+
+    class NoDeleteRedis(FakeRedis):
+        def delete(self, key):
+            raise RuntimeError("delete boom")
+
+    fake = NoDeleteRedis({})
+    transformer = _transformer(fake, llm)
+    key = transformer._make_cache_key(transformer._cache_model, "step_back", QUERY)
+    fake.store[key] = "[]"
+
+    with caplog_context() as records:
+        variants = await transformer.transform(QUERY)
+
+    assert [k for k, _ in variants] == ["original"]
+    assert llm.chat_completion.call_count == 0
+    assert any(
+        "Redis cache delete failed" in r.getMessage()
+        for r in records
+        if r.levelno >= logging.WARNING
+    )
+
+
+def caplog_context():
+    """Minimal caplog shim: capture warning records from the module logger."""
+    import logging
+
+    records = []
+    collector = logging.Handler()
+    collector.emit = lambda record: records.append(record)
+
+    class _Ctx:
+        def __enter__(self):
+            logging.getLogger("app.services.query_transformer").addHandler(collector)
+            return records
+
+        def __exit__(self, *exc):
+            logging.getLogger("app.services.query_transformer").removeHandler(collector)
+            return False
+
+    return _Ctx()
+
+
+@pytest.mark.asyncio
+async def test_hyde_cache_discards_whitespace_passage(transformer_settings,
+                                                       monkeypatch):
+    """A whitespace-only cached HyDE passage is corrupt (review PRR-007):
+    generate_hyde can never write one (min 20 chars after strip), so it
+    must be discarded and regenerated, not served verbatim."""
+    monkeypatch.setattr(settings, "hyde_enabled", True)
+    llm = MagicMock()
+    llm.model = "check-model"
+    llm.chat_completion = AsyncMock(
+        side_effect=[
+            "What are the general concepts?",
+            "A short factual passage about the concept.",
+        ]
+    )
+    fake = FakeRedis({})
+    transformer = _transformer(fake, llm)
+    hyde_key = transformer._make_cache_key(transformer._cache_model, "hyde", QUERY)
+    fake.store[hyde_key] = '"   "'
+
+    variants = await transformer.transform(QUERY)
+
+    hyde_texts = [text for kind, text in variants if kind == "hyde"]
+    assert hyde_texts == ["A short factual passage about the concept."], (
+        "a whitespace-only cached passage must be regenerated, never served"
+    )
+    assert hyde_key in fake.deleted
 
 
 @pytest.mark.asyncio

@@ -6,13 +6,13 @@ cap-sized message is ACCEPTED on both routes), the streaming-route cap
 ({"messages": []} must keep hitting the route's own 400, never a 500).
 """
 
-import os
+import shutil
 import sys
+import tempfile
 import types
 import unittest
-from dataclasses import dataclass, field
-from typing import Any, Dict, List
-from unittest.mock import MagicMock, patch
+from pathlib import Path
+from unittest.mock import MagicMock
 
 # Stub optional dependencies (same pattern as other chat tests)
 _stubs = [
@@ -40,28 +40,23 @@ from fastapi.testclient import TestClient
 pytestmark = pytest.mark.usefixtures("ready_vector_store")
 
 TEST_DB_PATH = None
+_TEST_DATA_DIR = None
 
 
 def setUpModule():
     """Create and initialize the shared test database before any test runs."""
-    global TEST_DB_PATH
-    import tempfile
-    from pathlib import Path
+    global TEST_DB_PATH, _TEST_DATA_DIR
 
     from app.models.database import init_db
 
-    test_data_dir = tempfile.mkdtemp(prefix="c16c-message-cap-")
-    TEST_DB_PATH = Path(test_data_dir) / "test.db"
+    _TEST_DATA_DIR = tempfile.mkdtemp(prefix="c16c-message-cap-")
+    TEST_DB_PATH = Path(_TEST_DATA_DIR) / "test.db"
     init_db(str(TEST_DB_PATH))
 
 
-@dataclass
-class MockRAGSource:
-    text: str
-    file_id: str
-    score: float
-    metadata: Dict[str, Any] = field(default_factory=dict)
-    parent_window_text: Any = None
+def tearDownModule():
+    """Remove the module's temp dir (review PRR-027b: no leaked mkdtemp)."""
+    shutil.rmtree(_TEST_DATA_DIR, ignore_errors=True)
 
 
 class TestChatMessageCapGuardrails(unittest.TestCase):
@@ -122,7 +117,10 @@ class TestChatMessageCapGuardrails(unittest.TestCase):
         self.app.dependency_overrides.pop(self._get_stream_auth, None)
 
     def test_cap_sized_message_accepted_on_chat_route(self):
-        """Positive control: exactly-at-cap is accepted (non-stream)."""
+        """Positive control: exactly-at-cap is ACCEPTED (200, generation runs).
+
+        Strengthened per review PRR-019/F-006: assertNotEqual(422) passed on
+        500/401/404/413 — assert the real success and that generation ran."""
         from app.config import settings
 
         cap = settings.chat_message_max_chars
@@ -130,14 +128,23 @@ class TestChatMessageCapGuardrails(unittest.TestCase):
             "/api/chat",
             json={"message": "x" * cap, "stream": False},
         )
-        self.assertNotEqual(
+        self.assertEqual(
             response.status_code,
-            422,
-            f"an exactly-{cap}-char message must not be rejected: {response.text[:200]}",
+            200,
+            f"an exactly-{cap}-char message must be accepted: {response.text[:200]}",
+        )
+        self.assertEqual(
+            len(self.query_calls),
+            1,
+            "the accepted path must reach the engine exactly once",
         )
 
     def test_oversized_final_message_rejected_on_stream_route(self):
-        """The streaming route caps the FINAL message (4xx, no generation)."""
+        """The streaming route caps the FINAL message (422, no generation).
+
+        The cap lives in the route body after get_stream_auth and the role
+        check (review F-001), so the rejection is authenticated, carries the
+        named detail, and does not echo the message list."""
         from app.config import settings
 
         cap = settings.chat_message_max_chars
@@ -150,17 +157,64 @@ class TestChatMessageCapGuardrails(unittest.TestCase):
                 ]
             },
         )
-        self.assertIn(
+        self.assertEqual(
             response.status_code,
-            (413, 422),
-            f"stream route must reject an over-cap final message, got "
+            422,
+            f"stream route must reject an over-cap final message with 422, got "
             f"{response.status_code}: {response.text[:200]}",
         )
+        self.assertIn("chat_message_max_chars", response.text)
+        self.assertNotIn("x" * 100, response.text, "the payload must not be echoed")
         self.assertEqual(
             self.query_calls,
             [],
             "the engine generation entry point must never run for a rejected payload",
         )
+
+    def test_exact_cap_final_message_accepted_on_stream_route(self):
+        """Exactly-at-cap final message is accepted on the stream route —
+        kills the `>` → `>=` boundary mutant (review F-006)."""
+        from app.config import settings
+
+        cap = settings.chat_message_max_chars
+        response = self.client.post(
+            "/api/chat/stream",
+            json={
+                "messages": [
+                    {"role": "user", "content": "x" * cap},
+                ]
+            },
+        )
+        self.assertEqual(
+            response.status_code,
+            200,
+            f"an exactly-{cap}-char final message must be accepted: "
+            f"{response.text[:200]}",
+        )
+        self.assertEqual(len(self.query_calls), 1)
+
+    def test_oversized_non_user_final_message_keeps_role_400(self):
+        """An oversized final message with a non-user role gets the route's
+        role 400 (error-code ordering preserved by the route-body cap,
+        review PRR-026/F-001)."""
+        from app.config import settings
+
+        cap = settings.chat_message_max_chars
+        response = self.client.post(
+            "/api/chat/stream",
+            json={
+                "messages": [
+                    {"role": "assistant", "content": "x" * (cap + 1)},
+                ]
+            },
+        )
+        self.assertEqual(
+            response.status_code,
+            400,
+            f"the role check must precede the cap check, got {response.status_code}: "
+            f"{response.text[:200]}",
+        )
+        self.assertIn("must be from the user", response.text)
 
     def test_cap_sized_history_not_rejected_on_stream_route(self):
         """Long PRIOR history stays accepted; only the final message is capped."""
@@ -176,12 +230,13 @@ class TestChatMessageCapGuardrails(unittest.TestCase):
                 ]
             },
         )
-        self.assertNotEqual(
+        self.assertEqual(
             response.status_code,
-            422,
+            200,
             f"long prior history must stay accepted, got {response.status_code}: "
             f"{response.text[:200]}",
         )
+        self.assertEqual(len(self.query_calls), 1)
 
     def test_empty_messages_list_keeps_the_route_400(self):
         """{"messages": []} hits the route's own 400, never a 500."""

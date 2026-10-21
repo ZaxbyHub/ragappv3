@@ -252,6 +252,7 @@ On first launch, you'll be redirected to the **Setup Wizard** (`/setup`) to crea
 | `MEMORY_RRF_MIN_SCORE` | `0.005` | Minimum fused RRF score for hybrid memory retrieval. Candidates below this are discarded. |
 | `MEMORY_CONTEXT_TOP_K` | `3` | Maximum number of memories injected into each prompt after relevance filtering. |
 | `CHAT_RATE_LIMIT` | `30` | Maximum chat requests per minute per user (0 = unlimited) |
+| `CHAT_MESSAGE_MAX_CHARS` | `20000` | Maximum length in characters of a live chat message (POST /api/chat and the final message of POST /api/chat/stream). Prior-turn history is not bounded. |
 | `SEARCH_RATE_LIMIT` | `30` | Maximum search requests per minute per user (0 = unlimited) |
 | `VAULT_CREATE_RATE_LIMIT` | `30` | Maximum vault creation requests per minute per user (0 = unlimited) |
 | `MEMORY_MUTATION_RATE_LIMIT` | `30` | Maximum memory create/update/delete requests per minute per user (0 = unlimited) |
