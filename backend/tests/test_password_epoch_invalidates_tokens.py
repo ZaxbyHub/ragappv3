@@ -345,7 +345,12 @@ class TestPasswordEpochInvalidatesTokens(unittest.TestCase):
                 f"Precondition: password_changed_at should be 0, got {epoch_before}"
             )
 
-        # (b) Create an admin user directly in DB and generate admin token
+        # (b) Create a superadmin actor directly in DB and generate its token.
+        # NOTE (issue #722): the reset must now be performed by a SUPERADMIN —
+        # assert_can_modify_target makes admin-on-superadmin password resets
+        # 403 (the issue's AC4 contract). The token-epoch mechanism under test
+        # is actor-independent, and get_current_active_user re-derives the
+        # role from the DB row, so the row itself must be superadmin.
         admin_username = f"admin_for_reset_{uuid.uuid4().hex[:8]}"
         admin_conn = self.test_pool.get_connection()
         try:
@@ -354,7 +359,7 @@ class TestPasswordEpochInvalidatesTokens(unittest.TestCase):
             admin_conn.execute(
                 """INSERT INTO users (username, hashed_password, full_name, role, is_active, must_change_password)
                    VALUES (?, ?, ?, ?, ?, ?)""",
-                (admin_username, hashed_admin_pw, "Admin User", "admin", 1, 0),
+                (admin_username, hashed_admin_pw, "Admin User", "superadmin", 1, 0),
             )
             admin_conn.commit()
             cursor = admin_conn.execute(
@@ -367,11 +372,15 @@ class TestPasswordEpochInvalidatesTokens(unittest.TestCase):
         finally:
             self.test_pool.release_connection(admin_conn)
 
-        # Generate admin token directly (matching test_admin_reset_unlocks_account.py pattern)
+        # Generate admin token directly (matching test_admin_reset_unlocks_account.py pattern).
+        # NOTE (issue #722): the reset must now be performed by a SUPERADMIN —
+        # assert_can_modify_target makes admin-on-superadmin password resets 403
+        # (the issue's AC4 contract). The token-epoch mechanism under test is
+        # actor-independent, so mint a superadmin principal for the reset.
         admin_token = create_access_token(
             admin_user_id,
             admin_username,
-            "admin",
+            "superadmin",
             client_fingerprint=compute_client_fingerprint(""),
         )
 

@@ -1045,8 +1045,17 @@ Indexes exist on `event_type`, `actor_user_id`, `target_user_id`, and `created_a
 | `user.password_reset` | `PATCH /users/{id}/password` | An admin reset a user's password |
 | `user.role_updated` | `PATCH /users/{id}/role` | A superadmin changed a user's role |
 | `user.active_updated` | `PATCH /users/{id}/active` | An admin enabled/disabled a user |
+| `user.deleted` | `DELETE /users/{id}` | A superadmin deleted a user (metadata snapshots the pre-delete role/username) |
 | `membership.organizations_replaced` | `PUT /users/{id}/organizations` | A user's org membership set was replaced |
 | `membership.groups_replaced` | `PUT /users/{id}/groups` | A user's group membership set was replaced |
+| `vault.visibility_updated` | `PUT /vaults/{id}` (visibility field) | A vault's visibility was updated (metadata carries old and new values) |
+| `vault.deleted` | `DELETE /vaults/{id}` | A vault admin deleted the vault (recorded after the durable delete) |
+| `vault.group_access_replaced` | `PUT /vaults/{id}/groups` | A vault's group-access list was replaced or cleared (metadata carries the resulting group ids; an empty list is a full revoke) |
+
+**Deactivation revokes sessions:** disabling a user (`PATCH /users/{id}/active`
+with `is_active: false`) deletes all of that user's refresh sessions in the same
+transaction — a refresh cookie issued before deactivation can never mint new
+access tokens, including after the account is reactivated.
 
 **Querying** (example — find all reuse-detection events for a user):
 

@@ -998,6 +998,7 @@ async def test_vault_deletion_clears_document_near_dups_rows(
                 return 2
 
         result = await delete_vault(
+            http_request=None,  # audit-event param (issue #722 AC1); None is safe for safe_record_security_event
             vault_id=1,
             conn=db,
             vector_store=_NullVectorStore(),

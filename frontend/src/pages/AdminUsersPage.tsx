@@ -406,7 +406,11 @@ function AdminUsersPageContent({ authOwner, principalGeneration }: { authOwner: 
   const formatDate = (dateStr: string) => new Date(dateStr).toLocaleDateString();
   const isSuperAdmin = currentUser?.role === "superadmin";
   const canDeleteUser = (user: User) => isSuperAdmin && user.id !== currentUser?.id;
-  const canManageUser = (user: User) => user.id !== currentUser?.id;
+  // UI mirror of the backend actor/target policy (issue #722): a
+  // non-superadmin can never modify a superadmin target — the backend 403s
+  // these calls; the UI does not offer them in the first place.
+  const canManageUser = (user: User) =>
+    user.id !== currentUser?.id && (isSuperAdmin || user.role !== "superadmin");
 
   return (
     <div className="space-y-6 animate-in fade-in duration-300 pb-12">
@@ -522,7 +526,7 @@ function AdminUsersPageContent({ authOwner, principalGeneration }: { authOwner: 
                           aria-checked={user.is_active}
                           aria-label={`${user.is_active ? "Deactivate" : "Activate"} user ${user.username}`}
                           onClick={() => handleActiveToggle(user.id, !user.is_active)}
-                          disabled={pendingUserIds.has(user.id) || user.id === currentUser?.id}
+                          disabled={pendingUserIds.has(user.id) || user.id === currentUser?.id || (!isSuperAdmin && user.role === "superadmin")}
                           className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 ${
                             user.is_active ? "bg-primary" : "bg-input"
                           }`}

@@ -125,6 +125,7 @@ class TestPRR004VaultPurgeInvalidatesDependentEvidence(FreshnessTestBase):
 
         response = asyncio.run(
             delete_vault(
+                http_request=None,  # audit-event param (issue #722 AC1); None is safe for safe_record_security_event
                 vault_id=PURGED_VAULT_ID,
                 conn=self.conn,
                 vector_store=_VectorStoreStub(),

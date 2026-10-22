@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS organizations (
     name TEXT NOT NULL UNIQUE,
     description TEXT DEFAULT '',
     slug TEXT UNIQUE,
+    created_by INTEGER,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 """

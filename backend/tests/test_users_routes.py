@@ -379,7 +379,12 @@ class TestUpdateUserActive(TestUserRoutes):
         assert "Cannot deactivate your own account" in response.json()["detail"]
 
     def test_update_user_active_admin_cannot_deactivate(self):
-        """Admin cannot be deactivated by regular admin (only superadmin)."""
+        """Admin cannot deactivate a superadmin target (#722 AC5).
+
+        RED at base (400 — the last-superadmin guard fires because the target
+        is the sole superadmin), GREEN after the fix (403 — the
+        superadmin-target check runs before the last-superadmin count guard
+        for non-superadmin actors)."""
         token = get_token(self.admin_id, "admin", "admin")
         response = self.client.patch(
             f"/users/{self.superadmin_id}/active",
@@ -387,8 +392,8 @@ class TestUpdateUserActive(TestUserRoutes):
             headers={"Authorization": f"Bearer {token}"},
         )
 
-        assert response.status_code == 400
-        assert "last superadmin" in response.json()["detail"]
+        assert response.status_code == 403
+        assert "Only superadmin" in response.json()["detail"]
 
     def test_update_user_active_not_found(self):
         """Updating non-existent user returns 404."""

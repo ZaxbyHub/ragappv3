@@ -30,6 +30,7 @@ from app.security import csrf_protect
 from app.services.draft_deletion import DraftDeletionService
 from app.services.draft_input_storage import DraftInputStorage, DraftInputStorageError
 from app.services.draft_store import DraftStore
+from app.services.security_audit import safe_record_security_event
 from app.services.vector_store import VectorStore
 
 logger = logging.getLogger(__name__)
@@ -510,6 +511,7 @@ async def create_vault(
 async def update_vault(
     vault_id: int,
     request: VaultUpdateRequest,
+    http_request: Request,
     conn: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(require_vault_permission("admin")),
     _csrf_token: str = Depends(csrf_protect),
@@ -523,7 +525,7 @@ async def update_vault(
     """
     # Check if vault exists
     row = await asyncio.to_thread(
-        lambda: conn.execute("SELECT id, name FROM vaults WHERE id = ?", (vault_id,)).fetchone()
+        lambda: conn.execute("SELECT id, name, visibility FROM vaults WHERE id = ?", (vault_id,)).fetchone()
     )
 
     if row is None:
@@ -572,6 +574,23 @@ async def update_vault(
             status_code=409, detail=f"Vault with name '{request.name}' already exists"
         )
 
+    if request.visibility is not None:
+        # Visibility-carrying updates are security-relevant events (issue
+        # #722 AC1): visibility widens or narrows who can read the vault.
+        # Recorded after the commit via the standard tamper-evident helper;
+        # the metadata carries old and new values even when equal.
+        await safe_record_security_event(
+            conn,
+            event_type="vault.visibility_updated",
+            actor=user,
+            request=http_request,
+            metadata={
+                "vault_id": vault_id,
+                "old_visibility": row[2],
+                "new_visibility": request.visibility,
+            },
+        )
+
     # Rename vault folder if name changed
     if request.name is not None:
         try:
@@ -614,6 +633,7 @@ def _log_vault_dir_rmtree_error(func, path, exc_info):  # noqa: ANN001
 @router.delete("/vaults/{vault_id}")
 async def delete_vault(
     vault_id: int,
+    http_request: Request,
     conn: sqlite3.Connection = Depends(get_db),
     vector_store: VectorStore = Depends(get_vector_store),
     user: dict = Depends(require_vault_permission("admin")),
@@ -807,6 +827,18 @@ async def delete_vault(
                 )
         logger.exception("Error deleting vault %d", vault_id)
         raise HTTPException(status_code=500, detail="Failed to delete vault")
+
+    # Security-relevant event recorded after the relational delete committed
+    # (issue #722 AC1) — the same record-after-real-mutation ordering the
+    # Draft Room deletions use, so the row only ever reflects a durable
+    # deletion.
+    await safe_record_security_event(
+        conn,
+        event_type="vault.deleted",
+        actor=user,
+        request=http_request,
+        metadata={"vault_id": vault_id, "name": vault_name},
+    )
 
     # -- Post-commit vector reconciliation (W21 / C19). -------------------
     # The relational delete is durable now; destroy the vault's vectors. On
@@ -1098,6 +1130,7 @@ async def get_vault_groups(
 async def update_vault_groups(
     vault_id: int,
     request: VaultGroupsUpdateRequest,
+    http_request: Request,
     user: dict = Depends(require_vault_permission("admin")),
     conn: sqlite3.Connection = Depends(get_db),
     _csrf_token: str = Depends(csrf_protect),
@@ -1137,6 +1170,16 @@ async def update_vault_groups(
             (vault_id,),
         )
         await asyncio.to_thread(conn.commit)
+        # Clearing all group access is the most security-relevant form of
+        # this mutation — it is audited exactly like a replace (issue #722
+        # AC1, both return paths).
+        await safe_record_security_event(
+            conn,
+            event_type="vault.group_access_replaced",
+            actor=user,
+            request=http_request,
+            metadata={"vault_id": vault_id, "group_ids": []},
+        )
         return VaultGroupsListResponse(groups=[])
 
     group_ids = [item.group_id for item in access_items]
@@ -1196,6 +1239,19 @@ async def update_vault_groups(
     except Exception:
         await asyncio.to_thread(lambda: conn.rollback())
         raise
+
+    # Security-relevant event on the replace path, recorded after the commit
+    # (issue #722 AC1 — the clear-all early return above records its own).
+    await safe_record_security_event(
+        conn,
+        event_type="vault.group_access_replaced",
+        actor=user,
+        request=http_request,
+        metadata={
+            "vault_id": vault_id,
+            "group_ids": [item.group_id for item in access_items],
+        },
+    )
 
     # Fetch and return updated groups
     rows = await asyncio.to_thread(
