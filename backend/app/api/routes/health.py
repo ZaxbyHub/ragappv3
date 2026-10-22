@@ -113,6 +113,91 @@ def _spawn_refresh_task(request, llm_checker, model_checker) -> None:
     task.add_done_callback(_refresh_tasks.discard)
 
 
+# Non-identifying replacements for deep-health detail text below admin
+# (issue #672): the ok/available/status signal fields are preserved for every
+# principal; only the identifying detail is swapped out.
+_DEEP_MODEL_DETAIL_HIDDEN = "model not configured or unavailable"
+_DEEP_SERVICE_DETAIL_HIDDEN = "service unavailable or not configured"
+# Dimension-neutral wording for the stale-index case: the sibling
+# ``stale_embeddings`` boolean stays true and the index is healthy
+# (``ok: true``), so a generic "unavailable" message would contradict it.
+_DEEP_STALE_DETAIL_HIDDEN = "embedding index needs re-indexing"
+
+# The marker role ``require_health_probe_auth`` mints for the X-API-Key
+# monitoring credential (app/api/deps.py) — the ONLY mint site; no real user
+# row can carry it (``users.role`` has a DB CHECK constraint on the four
+# UserRole names, enforced since the initial schema, and the writer path
+# validates against VALID_ROLES). Named here so the consumer side of the
+# contract is greppable to its producer.
+_MONITOR_ROLE = "monitor"
+
+
+def _redact_deep_detail_for_non_admin(deep_state: dict, role: str) -> dict:
+    """Replace identifying deep-health error text for below-admin principals.
+
+    The #672 disclosure class: the ModelChecker/LLMHealthChecker/vector-probe
+    error strings embed configured model names, provider URLs and store
+    paths, while ``GET /settings`` blanks exactly those values for the same
+    principal via ``_redact_infra_for_non_admin`` (issue #660). This applies
+    the same role-aware boundary to the deep-health response: a shallow
+    copy is returned with the ``models``/``llm``/``vector_store`` error
+    detail replaced by fixed non-identifying messages; ``available``/``ok``/
+    ``status``/``stale_embeddings`` signal fields are untouched, and the
+    HTTP-error ``status_code`` each model probe attaches is nulled (it
+    distinguishes 401-vs-404-vs-5xx on admin-only endpoints — provider-key
+    validity the settings sibling also suppresses). Retained non-identifying
+    fields: ``vector_store.rows``, ``llm_modes`` booleans, and the
+    ``not_configured`` status markers — all disclosed in the release
+    fragment.
+
+    Admins and superadmins are returned unchanged. The X-API-Key monitoring
+    principal is exempt too: ``require_health_probe_auth`` mints it with
+    ``role == _MONITOR_ROLE`` only from the server-side operator key, no real
+    user row can hold that role (see the CHECK-constraint note above), and
+    issue #551's C12 contract exists so monitoring systems configured with
+    only that key keep full diagnostics.
+    """
+    from app.api.deps import UserRole
+
+    if role == _MONITOR_ROLE or UserRole.level(role) >= UserRole.level("admin"):
+        return deep_state
+
+    redacted = dict(deep_state)
+
+    models = redacted.get("models")
+    if isinstance(models, dict):
+        entries = {}
+        for key, entry in models.items():
+            if isinstance(entry, dict) and entry.get("error"):
+                entry = {**entry, "error": _DEEP_MODEL_DETAIL_HIDDEN}
+            if isinstance(entry, dict) and "status_code" in entry:
+                entry = {**entry, "status_code": None}
+            entries[key] = entry
+        redacted["models"] = entries
+
+    llm = redacted.get("llm")
+    if isinstance(llm, dict):
+        scrubbed = dict(llm)
+        for section in ("embeddings", "chat"):
+            sub = scrubbed.get(section)
+            if isinstance(sub, dict) and sub.get("error"):
+                scrubbed[section] = {**sub, "error": _DEEP_SERVICE_DETAIL_HIDDEN}
+        if scrubbed.get("error"):
+            scrubbed["error"] = _DEEP_SERVICE_DETAIL_HIDDEN
+        redacted["llm"] = scrubbed
+
+    vector = redacted.get("vector_store")
+    if isinstance(vector, dict):
+        scrubbed = dict(vector)
+        if scrubbed.get("error"):
+            scrubbed["error"] = _DEEP_SERVICE_DETAIL_HIDDEN
+        if scrubbed.get("stale_embeddings_detail"):
+            scrubbed["stale_embeddings_detail"] = _DEEP_STALE_DETAIL_HIDDEN
+        redacted["vector_store"] = scrubbed
+
+    return redacted
+
+
 async def _collect_deep_state(app_state, llm_checker, model_checker) -> dict:
     """Run all deep checks; returns the deep-only portion of the response."""
     llm_status = await llm_checker.check_all()
@@ -275,7 +360,13 @@ async def health_check(
     if deep:
         deep_state = await _collect_deep_state(request.app.state, llm_checker, model_checker)
         _update_deep_cache(deep_state)
-        result.update(deep_state)
+        # The deep cache stores only the services booleans, so the redacted
+        # view below affects just this response (issue #672): identifying
+        # model/provider/store detail is hidden from below-admin USER
+        # principals while admins and the X-API-Key monitor keep it.
+        result.update(
+            _redact_deep_detail_for_non_admin(deep_state, (user or {}).get("role", ""))
+        )
     else:
         cached = _deep_cache["services"]
         if cached is not None:
