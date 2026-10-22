@@ -734,6 +734,9 @@ class TestAccessibleVaultsEndpoint(unittest.TestCase):
             vault_id = self._insert_vault(conn, "GroupVault")
             org_id = self._insert_org(conn, "TestOrg")
             group_id = self._insert_group(conn, "TestGroup", org_id)
+            # A valid chain: the group member is also an org member (issue
+            # #721 — group membership implies organization membership).
+            self._insert_org_member(conn, org_id, 2)
             self._insert_group_member(conn, group_id, 2)  # User 2 in group
             self._insert_vault_group_access(conn, vault_id, group_id, "write")
         finally:

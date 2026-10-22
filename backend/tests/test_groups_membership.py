@@ -471,9 +471,13 @@ class TestUpdateUserGroups(TestUserGroupMembershipSetup):
         assert response.status_code == 400
         assert "not a member of organization" in response.json()["detail"]
 
-    def test_superadmin_bypasses_org_membership_check(self):
-        """Superadmin can add user to any group's org without being a member themselves."""
-        # group3 is in org2, superadmin is not a member of org2
+    def test_superadmin_group_assignment_requires_target_org_membership(self):
+        """Target-org membership is enforced for superadmin callers too (#721 AC1).
+
+        RED at base (200 — the org-membership validation is skipped when the
+        caller is a superadmin), GREEN after the fix (400: the target user is
+        not a member of the group's organization)."""
+        # group3 is in org2, member_org1 is only in org1
         token = get_token(self.superadmin_id, "superadmin", "superadmin")
         response = self.client.put(
             f"/users/{self.member_org1_id}/groups",
@@ -481,10 +485,8 @@ class TestUpdateUserGroups(TestUserGroupMembershipSetup):
             headers={"Authorization": f"Bearer {token}"},
         )
 
-        assert response.status_code == 200
-        data = response.json()
-        assert len(data["groups"]) == 1
-        assert data["groups"][0]["id"] == self.group3_id
+        assert response.status_code == 400
+        assert "not a member of organization" in response.json()["detail"]
 
     def test_user_not_found_returns_404(self):
         """Updating groups for non-existent user returns 404."""
@@ -897,6 +899,33 @@ class TestUpdateVaultGroups(TestVaultGroupMembershipSetup):
 
         assert response.status_code == 400
         assert "different organization" in response.json()["detail"]
+
+    def test_allows_null_org_vault_to_accept_any_org_group_on_replace(self):
+        """Org-less vault policy: PUT accepts groups from any org (#721 AC9 pin).
+
+        This pins the explicitly-decided policy for a vault whose org_id is
+        NULL: it accepts groups from any organization. GREEN at base and after
+        the fix — the defect being closed is the undocumented/contradictory
+        docstring, not this behavior; the update_vault_groups docstring must
+        match this pin."""
+        # vault3 is org-less (org_id NULL); group1 is in org1
+        cursor = self.conn.execute(
+            "INSERT INTO vaults (name, org_id, visibility) VALUES ('Orgless Vault', NULL, 'private')"
+        )
+        orgless_vault_id = cursor.lastrowid
+        self.conn.commit()
+
+        token = get_token(self.superadmin_id, "superadmin", "superadmin")
+        response = self.client.put(
+            f"/vaults/{orgless_vault_id}/groups",
+            json={"group_ids": [self.group1_id]},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data["groups"]) == 1
+        assert data["groups"][0]["id"] == self.group1_id
 
     def test_validates_multiple_groups_cross_org_returns_400(self):
         """Multiple groups with one from different org returns 400."""

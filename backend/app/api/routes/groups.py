@@ -708,40 +708,40 @@ async def update_group_members(
                 detail="You must be a member of the organization to modify this group",
             )
 
-    # Verify all user_ids exist and are members of the group's organization
-    if request.user_ids:
-        placeholders = ",".join(["?"] * len(request.user_ids))
-        cursor = await asyncio.to_thread(
-            db.execute,
-            f"SELECT id FROM users WHERE id IN ({placeholders})",
-            tuple(request.user_ids),
-        )
-        found_users = await asyncio.to_thread(cursor.fetchall)
-        found_ids = {row[0] for row in found_users}
-        missing_ids = set(request.user_ids) - found_ids
-        if missing_ids:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Users not found: {sorted(missing_ids)}",
-            )
-        # Check that all users are members of the group's organization
-        cursor = await asyncio.to_thread(
-            db.execute,
-            f"SELECT user_id FROM org_members WHERE org_id = ? AND user_id IN ({placeholders})",
-            (group_org_id,) + tuple(request.user_ids),
-        )
-        org_members = await asyncio.to_thread(cursor.fetchall)
-        org_member_ids = {row[0] for row in org_members}
-        non_member_ids = set(request.user_ids) - org_member_ids
-        if non_member_ids:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Users are not members of this organization: {sorted(non_member_ids)}",
-            )
-
-    # Atomic update: delete existing and insert new in transaction
+    # Atomic update: delete existing and insert new in transaction. The
+    # user-existence and org-membership preconditions run INSIDE the
+    # transaction so a concurrent org removal cannot commit between the
+    # check and the INSERT and leave an orphaned group_members row
+    # (issue #721 claim 7); with the removal-side cleanups (organizations.py
+    # remove_org_member, users.py update_user_organizations) SQLite's
+    # one-writer serialization makes every interleaving converge.
     def _update_members():
         with transaction_context(db):
+            if request.user_ids:
+                placeholders = ",".join(["?"] * len(request.user_ids))
+                found_users = db.execute(
+                    f"SELECT id FROM users WHERE id IN ({placeholders})",
+                    tuple(request.user_ids),
+                ).fetchall()
+                found_ids = {row[0] for row in found_users}
+                missing_ids = set(request.user_ids) - found_ids
+                if missing_ids:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Users not found: {sorted(missing_ids)}",
+                    )
+                # All users must be members of the group's organization
+                org_members = db.execute(
+                    f"SELECT user_id FROM org_members WHERE org_id = ? AND user_id IN ({placeholders})",
+                    (group_org_id,) + tuple(request.user_ids),
+                ).fetchall()
+                org_member_ids = {row[0] for row in org_members}
+                non_member_ids = set(request.user_ids) - org_member_ids
+                if non_member_ids:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Users are not members of this organization: {sorted(non_member_ids)}",
+                    )
             # Delete existing memberships
             db.execute(
                 "DELETE FROM group_members WHERE group_id = ?",
@@ -918,12 +918,15 @@ async def update_group_vaults(
                 (group_id,),
             )
             seen: set[int] = set()
+            # Insert new memberships (deduplicated). granted_by records the
+            # acting caller, identical to the vault-side grant writers
+            # (vaults.py, vault_members.py) — issue #721 AC6.
             for item in access_list:
                 if item.vault_id not in seen:
                     seen.add(item.vault_id)
                     db.execute(
-                        "INSERT INTO vault_group_access (vault_id, group_id, permission) VALUES (?, ?, ?)",
-                        (item.vault_id, group_id, item.permission),
+                        "INSERT INTO vault_group_access (vault_id, group_id, permission, granted_by) VALUES (?, ?, ?, ?)",
+                        (item.vault_id, group_id, item.permission, user["id"]),
                     )
 
     await asyncio.to_thread(_update_vaults)

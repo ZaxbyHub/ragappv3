@@ -421,7 +421,7 @@ class TestResendInvite:
         """Resend returns a new raw token once (201)."""
         org_id = _create_org("Test Org", 2)
         conn = _get_db_conn()
-        invite_id, old_raw = _make_invite(conn, org_id, "user1@x.com", "member")
+        invite_id, old_raw = _make_invite(conn, org_id, "member1@x.com", "member")
         conn.close()
 
         response = client.post(
@@ -437,7 +437,7 @@ class TestResendInvite:
         """Old token cannot be used after resend."""
         org_id = _create_org("Test Org", 2)
         conn = _get_db_conn()
-        invite_id, old_raw = _make_invite(conn, org_id, "user1@x.com", "member")
+        invite_id, old_raw = _make_invite(conn, org_id, "member1@x.com", "member")
         conn.close()
 
         # Resend

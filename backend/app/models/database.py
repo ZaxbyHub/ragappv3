@@ -2021,6 +2021,10 @@ def run_migrations(sqlite_path: str) -> None:
     migrate_add_wiki_supporting_tables(sqlite_path)
     migrate_add_wiki_claims_normalized_text(sqlite_path)
     migrate_add_wiki_claims_unique_claim_text(sqlite_path)
+    # Issue #721: purge orphaned group_members rows BEFORE the Default-vault
+    # orphan backfill below, so the backfill's has-access predicate never
+    # counts an orphaned group grant as access.
+    migrate_purge_orphaned_group_members(sqlite_path)
     migrate_assign_orphan_users_to_default_vault(sqlite_path)
     migrate_add_wiki_lint_findings_json_check(sqlite_path)
     migrate_add_access_token_denylist(sqlite_path)
@@ -6823,6 +6827,83 @@ def set_migration_flag(conn: sqlite3.Connection, name: str) -> None:
         " VALUES (?, 1, 'migration milestone')",
         (name,),
     )
+
+
+def migrate_purge_orphaned_group_members(sqlite_path: str) -> None:
+    """
+    Migration: purge orphaned group_members rows (issue #721).
+
+    A group_members row is orphaned when its user is no longer a member of
+    the group's organization. The runtime fixes in this issue stop producing
+    such rows (removal-side cleanups in organizations.py/users.py plus the
+    reader-side org predicate in authz_policy.py); this one-off removes the
+    rows legacy databases already hold so group-membership listings stop
+    showing them. Runs BEFORE migrate_assign_orphan_users_to_default_vault so
+    the Default-vault backfill never counts an orphaned group grant as access.
+
+    Destructive and journaled (#699 AC5 precedent): purged rows are NOT
+    recoverable from the journal — the count + detail recorded in the journal
+    row are the only trace. Journal-gated on a prior succeeded run; a
+    converged boot is a no-op that journals nothing.
+    """
+    journal_name = "migrate_purge_orphaned_group_members"
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
+    try:
+        already = conn.execute(
+            "SELECT COUNT(*) FROM migration_journal WHERE migration_name = ? AND outcome = 'ok'",
+            (journal_name,),
+        ).fetchone()[0]
+        if already:
+            return
+
+        _doomed = conn.execute(
+            """SELECT COUNT(*) FROM group_members gm
+                JOIN groups g ON g.id = gm.group_id
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM org_members om
+                    WHERE om.org_id = g.org_id AND om.user_id = gm.user_id
+                )"""
+        ).fetchone()[0]
+        if _doomed:
+            logger.info(
+                "run_migrations: deleting %d orphaned group_members row(s) "
+                "(unrecoverable; user no longer in the group's organization)",
+                _doomed,
+            )
+            conn.execute(
+                """DELETE FROM group_members WHERE id IN (
+                    SELECT gm.id FROM group_members gm
+                    JOIN groups g ON g.id = gm.group_id
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM org_members om
+                        WHERE om.org_id = g.org_id AND om.user_id = gm.user_id
+                    ))"""
+            )
+        record_migration_outcome(
+            conn,
+            migration_name=journal_name,
+            phase="succeeded",
+            outcome="ok",
+            detail=f"orphaned group_members rows deleted: {_doomed}",
+        )
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        # Terminal journal outcome even on failure (#699 PRR-001 precedent):
+        # the rollback discarded the in-transaction row, so record on its own
+        # committed transaction. The journal gate above only matches outcome
+        # 'ok', so a failed attempt retries on the next boot.
+        record_migration_outcome(
+            conn,
+            migration_name=journal_name,
+            phase="failed",
+            outcome="error",
+            detail=f"{type(exc).__name__}: {exc}",
+        )
+        conn.commit()
+        raise
+    finally:
+        conn.close()
 
 
 def migrate_assign_orphan_users_to_default_vault(sqlite_path: str) -> None:

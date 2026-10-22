@@ -47,6 +47,8 @@ def org_visibility_db():
         "CREATE TABLE vault_members (vault_id INTEGER, user_id INTEGER, permission TEXT)"
     )
     conn.execute("CREATE TABLE group_members (group_id INTEGER, user_id INTEGER)")
+    # groups table required by the reader-side group/org predicate (#721 AC4)
+    conn.execute("CREATE TABLE groups (id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL)")
     conn.execute(
         "CREATE TABLE vault_group_access (vault_id INTEGER, group_id INTEGER, permission TEXT)"
     )

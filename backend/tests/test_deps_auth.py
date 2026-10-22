@@ -1066,6 +1066,10 @@ class TestEvaluatePolicy:
             "CREATE TABLE vault_members (vault_id INTEGER, user_id INTEGER, permission TEXT)"
         )
         conn.execute("CREATE TABLE group_members (group_id INTEGER, user_id INTEGER)")
+        # groups.org_id is NOT NULL in production; org 200 owns no vaults, so
+        # membership in it satisfies the reader-side group/org predicate
+        # (#721 AC4) without granting anything else.
+        conn.execute("CREATE TABLE groups (id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL)")
         conn.execute(
             "CREATE TABLE vault_group_access (vault_id INTEGER, group_id INTEGER, permission TEXT)"
         )
@@ -1075,6 +1079,8 @@ class TestEvaluatePolicy:
             [(1, "private", None), (2, "private", None), (3, "public", None), (4, "public", 10)],
         )
         conn.execute("INSERT INTO org_members (org_id, user_id) VALUES (10, 5)")
+        conn.execute("INSERT INTO groups (id, org_id) VALUES (10, 200)")
+        conn.execute("INSERT INTO org_members (org_id, user_id) VALUES (200, 4)")
         conn.commit()
         return conn
 

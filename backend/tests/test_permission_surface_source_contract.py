@@ -130,13 +130,22 @@ def test_create_org_invite_resolves_invitee_and_raises_not_found_400():
     docstring)."""
     source = _source(ORGANIZATIONS_ROUTE)
     body = _handler_body(source, "create_org_invite")
-    assert "FROM users WHERE username" in body, (
-        "create_org_invite must fetch the invitee user row via a "
+    assert "_assert_invite_redeemable" in body, (
+        "create_org_invite must delegate the redeemability precondition to "
+        "the shared _assert_invite_redeemable helper (issue #721 AC8)"
+    )
+    # _assert_invite_redeemable is a sync module-level helper, so slice it
+    # directly (the _handler_body helper anchors on "async def").
+    helper_start = source.index("def _assert_invite_redeemable(")
+    helper_end = source.find("\nasync def ", helper_start)
+    helper = source[helper_start : helper_end if helper_end != -1 else len(source)]
+    assert "FROM users WHERE username" in helper, (
+        "_assert_invite_redeemable must fetch the invitee user row via a "
         "FROM users WHERE username lookup"
     )
-    match = NOT_FOUND_400.search(body)
+    match = NOT_FOUND_400.search(helper)
     assert match, (
-        "create_org_invite must raise HTTPException(status_code=400, ...) "
+        "_assert_invite_redeemable must raise HTTPException(status_code=400, ...) "
         "with not-found wording (e.g. 'no user found for identifier ...') "
         "when the identifier resolves to no user"
     )
