@@ -52,6 +52,9 @@ class KMSEntry:
     created_at: str
     updated_at: str
     last_compiled_at: Optional[str]
+    # Issue #1002: populated (true body length) by the bounded list projection;
+    # None on detail reads, which intentionally return the full body.
+    body_chars: Optional[int] = None
 
     @property
     def tags(self) -> list:
@@ -99,6 +102,7 @@ def _to_entry(row: sqlite3.Row) -> KMSEntry:
         created_at=d["created_at"],
         updated_at=d["updated_at"],
         last_compiled_at=d.get("last_compiled_at"),
+        body_chars=d.get("body_chars"),
     )
 
 
@@ -236,13 +240,19 @@ class KMSStore:
 
     def get_entry_by_file(
         self, vault_id: int, file_id: int, source_type: str = "document"
-    ) -> Optional[KMSEntry]:
-        """Return the document-sourced entry for a file, or None."""
+    ) -> Optional[int]:
+        """Return the id of the file's entry, or None.
+
+        Issue #1002: id-only. The sole caller (``upsert_document_entry``)
+        consumes just ``existing.id`` — a full-row SELECT here materialized the
+        whole (potentially multi-megabyte) body for nothing. Full-body reads
+        belong to ``get_entry`` (explicit single-entry detail path).
+        """
         row = self._db.execute(
-            "SELECT * FROM kms_entries WHERE vault_id = ? AND file_id = ? AND source_type = ? LIMIT 1",
+            "SELECT id FROM kms_entries WHERE vault_id = ? AND file_id = ? AND source_type = ? LIMIT 1",
             (vault_id, file_id, source_type),
         ).fetchone()
-        return _to_entry(row) if row else None
+        return int(row["id"]) if row else None
 
     def list_entries(
         self,
@@ -255,16 +265,28 @@ class KMSStore:
     ) -> list[KMSEntry]:
         offset = (page - 1) * per_page
         params: list[Any] = []
+        # Issue #1002: the list path never materializes a full body — a
+        # multi-megabyte compiled spreadsheet body would otherwise ship in
+        # every row of every page. The projection bounds ``body`` to a head
+        # window and reports the true length via ``body_chars``; the
+        # single-entry detail path (``get_entry``) still returns the full body.
+        columns = (
+            "id, vault_id, file_id, slug, title, "
+            "substr(body, 1, 2048) AS body, length(body) AS body_chars, "
+            "summary, tags_json, source_type, status, created_by, "
+            "created_at, updated_at, last_compiled_at"
+        )
         if search:
             ids = self._fts_entry_ids(search)
             if not ids:
                 return []
             placeholders = ",".join("?" * len(ids))
-            sql = f"SELECT * FROM kms_entries WHERE id IN ({placeholders}) AND vault_id = ?"
+            where = f"id IN ({placeholders}) AND vault_id = ?"
             params = [*ids, vault_id]
         else:
-            sql = "SELECT * FROM kms_entries WHERE vault_id = ?"
+            where = "vault_id = ?"
             params = [vault_id]
+        sql = f"SELECT {columns} FROM kms_entries WHERE {where}"
         if status:
             sql += " AND status = ?"
             params.append(status)
@@ -368,13 +390,13 @@ class KMSStore:
         last_compiled_at.
         """
         now = datetime.utcnow().isoformat()
-        existing = self.get_entry_by_file(vault_id, file_id, source_type="document")
-        if existing:
+        existing_id = self.get_entry_by_file(vault_id, file_id, source_type="document")
+        if existing_id is not None:
             self._db.execute(
                 """UPDATE kms_entries
                    SET title = ?, body = ?, summary = ?, updated_at = ?, last_compiled_at = ?
                    WHERE id = ?""",
-                (title, body, summary, now, now, existing.id),
+                (title, body, summary, now, now, existing_id),
             )
             # SPEC section 12.6 (issue #516 DRAFT-025): a recompiled entry body
             # invalidates Draft Room evidence rows carrying this kms_entry_id.
@@ -382,9 +404,9 @@ class KMSStore:
             # hook's own hash guard (mirrors update_entry).
             from app.services.draft_evidence_freshness import on_kms_entry_changed
 
-            on_kms_entry_changed(self._db, entry_id=existing.id, new_body=body)
+            on_kms_entry_changed(self._db, entry_id=existing_id, new_body=body)
             self._db.commit()
-            return self.get_entry(existing.id)  # type: ignore[return-value]
+            return self.get_entry(existing_id)  # type: ignore[return-value]
         slug = self._unique_slug(vault_id, title)
         cur = self._db.execute(
             """INSERT INTO kms_entries

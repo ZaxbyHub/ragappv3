@@ -67,7 +67,7 @@ from app.services.document_processor import (
     DuplicateFileError,
 )
 from app.services.embeddings import EmbeddingService
-from app.services.fts_query import build_fts_match_query
+from app.services.fts_query import FTS_SNIPPET_MAX_COLUMN_BYTES, build_fts_match_query
 from app.services.job_lease import redact_legacy_result_json
 from app.services.near_duplicates import (
     clear_file_centroid,
@@ -1965,6 +1965,15 @@ async def search_documents(
     # which returns the whole column), so a term late in a long body or in a
     # low-priority metadata column still appears — with its ``<mark>``
     # highlight — inside the excerpt.
+    #
+    # Issue #1002: snippet() over an unbounded parsed_text is a worker-thread
+    # wedge (super-linear in column size AND match density), so the content-arm
+    # call sits behind a lazily-evaluated CASE guard over BYTE length —
+    # length(CAST(col AS BLOB)) — since plain length() stops at the first NUL
+    # and would let a NUL-prefixed body bypass the guard (review F-001).
+    # Over-ceiling files fall back to the bounded parsed_text window below.
+    # The CTE also never materializes more than the 600-char head of
+    # parsed_text — the downstream fallback reads only ``[:200]``.
     _SNIPPET_TOKENS = 24
 
     def _meta_snippet(col: int) -> str:
@@ -1991,17 +2000,21 @@ async def search_documents(
 
     ranked_sql = f"""
     WITH raw_matches AS (
-        SELECT f.id, f.file_name, f.vault_id, f.status, f.parsed_text,
+        SELECT f.id, f.file_name, f.vault_id, f.status,
+               substr(f.parsed_text, 1, 600) AS parsed_text,
                bm25(files_content_fts) AS rank,
-               snippet(files_content_fts, 0, '<mark>', '</mark>', '…',
-                       {_SNIPPET_TOKENS}) AS excerpt_raw,
+               CASE WHEN length(CAST(f.parsed_text AS BLOB)) <= {int(FTS_SNIPPET_MAX_COLUMN_BYTES)}
+                    THEN snippet(files_content_fts, 0, '<mark>', '</mark>', '…',
+                                 {_SNIPPET_TOKENS})
+               END AS excerpt_raw,
                1 AS type_priority
         FROM files_content_fts
         JOIN files f ON f.id = files_content_fts.rowid
         WHERE files_content_fts MATCH ?
           AND {vault_clause_body}
         UNION ALL
-        SELECT f.id, f.file_name, f.vault_id, f.status, f.parsed_text,
+        SELECT f.id, f.file_name, f.vault_id, f.status,
+               substr(f.parsed_text, 1, 600) AS parsed_text,
                bm25(files_search_fts) AS rank,
                {_meta_excerpt_expr} AS excerpt_raw,
                2 AS type_priority
@@ -2010,7 +2023,8 @@ async def search_documents(
         WHERE files_search_fts MATCH ?
           AND {vault_clause_meta}
         UNION ALL
-        SELECT f.id, f.file_name, f.vault_id, f.status, f.parsed_text,
+        SELECT f.id, f.file_name, f.vault_id, f.status,
+               substr(f.parsed_text, 1, 600) AS parsed_text,
                0.0 AS rank, NULL AS excerpt_raw,
                3 AS type_priority
         FROM files f
