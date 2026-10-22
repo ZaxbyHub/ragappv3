@@ -163,6 +163,12 @@ def redact_historical_audit_rows(
     Idempotent; journal-silent on clean databases (issue #699 pattern); the
     whole data work sits inside ONE try whose handler writes the ``failed``
     journal row (issue #699 AC1) and re-raises.
+
+    Lock budget (issue #995): the write lock is acquired exactly once —
+    ``BEGIN IMMEDIATE`` before any journal write, the ``start`` row inside
+    that transaction, the data work inside a ``SAVEPOINT`` — so a held write
+    lock costs one connect timeout plus one bounded best-effort
+    failure-journal write instead of three full timeouts.
     """
     token = _configured_token()
     fingerprint = admin_scope_fingerprint(token) if token else None
@@ -187,13 +193,18 @@ def redact_historical_audit_rows(
             # Journal-silent no-op path (issue #699 AC2): clean boots and
             # already-redacted databases write no rows.
             return 0
+        # One write-lock acquisition (issue #995): BEGIN IMMEDIATE first,
+        # journal `start` INSIDE the transaction (the helper's documented
+        # in-txn shape), and hold a SAVEPOINT around the data work so a
+        # failure reverts the data while the journal rows still commit.
+        conn.execute("BEGIN IMMEDIATE")
         record_migration_outcome(
             conn,
             migration_name=_MIGRATION_NAME,
             phase="start",
             outcome="ok",
         )
-        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("SAVEPOINT data")
         if token:
             rows = conn.execute(
                 _ROWS_SQL_WITH_TOKEN,
@@ -226,7 +237,9 @@ def redact_historical_audit_rows(
                     hmac_key,
                     _audit_message(feature, bool(enabled), user_id, ip, timestamp),
                 )
-                verified = hmac.compare_digest(expected, stored_digest or "")
+                verified = hmac.compare_digest(
+                    expected.encode("utf-8"), (stored_digest or "").encode("utf-8")
+                )
             if verified:
                 if token and user_id == token and fingerprint is not None:
                     new_identity = fingerprint
@@ -251,13 +264,10 @@ def redact_historical_audit_rows(
             )
             if cur.rowcount:
                 redacted += 1
-        conn.execute("COMMIT")
-        if redacted:
-            logger.info(
-                "Redacted %d historical audit_toggle_log row(s) that held "
-                "admin token material (issue #894).",
-                redacted,
-            )
+        conn.execute("RELEASE SAVEPOINT data")
+        # `succeeded` is journaled INSIDE the writer transaction: a COMMIT
+        # failure then converts to the terminal `failed` row via the handler
+        # below instead of claiming success for work that never landed.
         record_migration_outcome(
             conn,
             migration_name=_MIGRATION_NAME,
@@ -265,15 +275,37 @@ def redact_historical_audit_rows(
             outcome="ok",
             detail=f"redacted_rows={redacted}",
         )
+        conn.execute("COMMIT")
+        if redacted:
+            logger.info(
+                "Redacted %d historical audit_toggle_log row(s) that held "
+                "admin token material (issue #894).",
+                redacted,
+            )
         return redacted
     except Exception as exc:
+        # Sole `failed`-row writer (issues #699 AC1 and #995 single-write
+        # invariant): every failure path funnels here and journals exactly
+        # one terminal row.
         if conn.in_transaction:
             try:
-                conn.execute("ROLLBACK")
-            except sqlite3.Error as rollback_exc:  # pragma: no cover
-                logger.warning(
-                    "audit_redaction: ROLLBACK failed: %s", rollback_exc
-                )
+                conn.execute("ROLLBACK TO SAVEPOINT data")
+            except sqlite3.Error:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error as rollback_exc:  # pragma: no cover
+                    logger.warning(
+                        "audit_redaction: ROLLBACK failed: %s", rollback_exc
+                    )
+        # Bound the failure-journal write (issue #995): when the lock was
+        # never acquired this INSERT would otherwise wait a full second
+        # connect timeout. One tenth of the module timeout, floored at
+        # 50 ms, read at CALL time so the budget scales with tests that
+        # patch the module constant.
+        conn.execute(
+            f"PRAGMA busy_timeout = "
+            f"{max(50, int(MIGRATION_CONNECT_TIMEOUT_SECONDS * 1000 / 10))}"
+        )
         record_migration_outcome(
             conn,
             migration_name=_MIGRATION_NAME,
@@ -281,6 +313,17 @@ def redact_historical_audit_rows(
             outcome="error",
             detail=f"{type(exc).__name__}: {exc}",
         )
+        if conn.in_transaction:
+            # Persist the journal rows (data already reverted above); if
+            # this COMMIT itself fails the terminal row is lost — accepted:
+            # the routine is fail-soft and the next boot retries.
+            try:
+                conn.execute("COMMIT")
+            except sqlite3.Error as commit_exc:  # pragma: no cover
+                logger.warning(
+                    "audit_redaction: failure-journal COMMIT failed: %s",
+                    commit_exc,
+                )
         raise
     finally:
         conn.close()

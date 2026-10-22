@@ -1056,7 +1056,7 @@ WHERE event_type = 'auth.refresh_reuse_detected'
 ORDER BY created_at DESC;
 ```
 
-**HMAC verification** (optional, for forensic integrity): recompute the digest using the message format in `security_audit._build_digest` (`event_type|actor_user_id|actor_username|target_user_id|target_username|ip_address|user_agent|metadata_json|key_version`) and the key returned by `_audit_key()` (derived from `JWT_SECRET_KEY`, falling back to `ADMIN_SECRET_TOKEN`), then compare against the stored `hmac_sha256`.
+**HMAC verification** (optional, for forensic integrity): recompute the digest using the message format in `security_audit._build_digest` (`event_type|actor_user_id|actor_username|target_user_id|target_username|ip_address|user_agent|metadata_json|key_version`) and the key returned by `_audit_key()` (derived from `JWT_SECRET_KEY` when changed from the insecure default, falling back to `ADMIN_SECRET_TOKEN` — an unchanged-default JWT secret is treated as unset, see the #987-993-995 release note), then compare against the stored `hmac_sha256`.
 
 ### Service Accounts
 

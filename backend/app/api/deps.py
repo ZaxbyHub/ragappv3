@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import hmac
 import inspect
 import logging
-import secrets
 import sqlite3
 import time
 from collections.abc import Callable
@@ -19,7 +17,7 @@ from fastapi import Cookie, Depends, Header, HTTPException, Query, Request
 
 from app.config import Settings, settings
 from app.models.database import SQLiteConnectionPool, get_pool
-from app.security import get_csrf_manager  # noqa: F401
+from app.security import constant_time_equals, get_csrf_manager  # noqa: F401
 from app.services.auth_service import (
     TokenExpiredError,
     TokenInvalidError,
@@ -336,7 +334,7 @@ async def _resolve_active_user(
     if not settings.users_enabled:
         DEFAULT_TOKEN = "admin-secret-token"
 
-        if not settings.admin_secret_token and secrets.compare_digest(
+        if not settings.admin_secret_token and constant_time_equals(
             token, DEFAULT_TOKEN
         ):
             raise HTTPException(
@@ -344,7 +342,7 @@ async def _resolve_active_user(
                 detail="Invalid credentials - change default admin token",
             )
 
-        if not secrets.compare_digest(token, settings.admin_secret_token):
+        if not constant_time_equals(token, settings.admin_secret_token):
             raise HTTPException(status_code=403, detail="Invalid credentials")
 
         return {
@@ -394,7 +392,7 @@ async def _resolve_active_user(
     if token_fpt is not None:
         current_ua = request.headers.get("user-agent", "")
         current_fpt = compute_client_fingerprint(current_ua)
-        if not secrets.compare_digest(token_fpt, current_fpt):
+        if not constant_time_equals(token_fpt, current_fpt):
             raise HTTPException(
                 status_code=401,
                 detail="token_invalid",
@@ -666,7 +664,7 @@ async def require_health_probe_auth(
     if (
         key
         and settings.health_check_api_key
-        and hmac.compare_digest(key, settings.health_check_api_key)
+        and constant_time_equals(key, settings.health_check_api_key)
     ):
         # id stays an int to match the codebase-wide user-dict invariant;
         # the principal is never passed to authz checks (role is a marker).

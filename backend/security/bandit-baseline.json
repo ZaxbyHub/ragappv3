@@ -36,9 +36,9 @@
       "SEVERITY.LOW": 62,
       "SEVERITY.MEDIUM": 60,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 91073,
+      "loc": 91432,
       "nosec": 0,
-      "skipped_tests": 66
+      "skipped_tests": 70
     },
     "backend/app/__init__.py": {
       "CONFIDENCE.HIGH": 0,
@@ -62,7 +62,7 @@
       "SEVERITY.LOW": 2,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 701,
+      "loc": 699,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -114,7 +114,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 3052,
+      "loc": 3075,
       "nosec": 0,
       "skipped_tests": 7
     },
@@ -400,7 +400,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1532,
+      "loc": 1543,
       "nosec": 0,
       "skipped_tests": 1
     },
@@ -530,7 +530,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 6752,
+      "loc": 6757,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -543,7 +543,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 199,
+      "loc": 205,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -556,7 +556,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 473,
+      "loc": 486,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -660,7 +660,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 31,
+      "loc": 43,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -673,9 +673,9 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 162,
+      "loc": 284,
       "nosec": 0,
-      "skipped_tests": 0
+      "skipped_tests": 4
     },
     "backend/app/services/auth_service.py": {
       "CONFIDENCE.HIGH": 0,
@@ -1440,7 +1440,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 669,
+      "loc": 838,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1941,7 +1941,7 @@
   },
   "results": [
     {
-      "code": "336     if not settings.users_enabled:\n337         DEFAULT_TOKEN = \"admin-secret-token\"\n338 \n",
+      "code": "334     if not settings.users_enabled:\n335         DEFAULT_TOKEN = \"admin-secret-token\"\n336 \n",
       "col_offset": 24,
       "end_col_offset": 44,
       "filename": "backend/app/api/deps.py",
@@ -1952,16 +1952,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'admin-secret-token'",
-      "line_number": 337,
+      "line_number": 335,
       "line_range": [
-        337
+        335
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "355             \"is_active\": True,\n356             \"must_change_password\": False,\n357         }\n358 \n359     # User authentication enabled - validate JWT token\n360     try:\n361         payload = decode_access_token(token)\n362     except TokenExpiredError:\n363         raise HTTPException(\n364             status_code=401,\n",
+      "code": "353             \"is_active\": True,\n354             \"must_change_password\": False,\n355         }\n356 \n357     # User authentication enabled - validate JWT token\n358     try:\n359         payload = decode_access_token(token)\n360     except TokenExpiredError:\n361         raise HTTPException(\n362             status_code=401,\n",
       "col_offset": 12,
       "end_col_offset": 34,
       "filename": "backend/app/api/deps.py",
@@ -1972,16 +1972,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'False'",
-      "line_number": 356,
+      "line_number": 354,
       "line_range": [
+        348,
+        349,
         350,
         351,
         352,
         353,
         354,
-        355,
-        356,
-        357
+        355
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
