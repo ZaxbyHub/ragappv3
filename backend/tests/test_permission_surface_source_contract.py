@@ -135,10 +135,20 @@ def test_create_org_invite_resolves_invitee_and_raises_not_found_400():
         "the shared _assert_invite_redeemable helper (issue #721 AC8)"
     )
     # _assert_invite_redeemable is a sync module-level helper, so slice it
-    # directly (the _handler_body helper anchors on "async def").
+    # directly (the _handler_body helper anchors on "async def"). Bound at
+    # the next top-level def/async def so a later sync helper's body can
+    # never bleed into the match window.
     helper_start = source.index("def _assert_invite_redeemable(")
-    helper_end = source.find("\nasync def ", helper_start)
-    helper = source[helper_start : helper_end if helper_end != -1 else len(source)]
+    candidates = [
+        pos
+        for pos in (
+            source.find("\nasync def ", helper_start),
+            source.find("\ndef ", helper_start),
+        )
+        if pos != -1
+    ]
+    helper_end = min(candidates) if candidates else len(source)
+    helper = source[helper_start:helper_end]
     assert "FROM users WHERE username" in helper, (
         "_assert_invite_redeemable must fetch the invitee user row via a "
         "FROM users WHERE username lookup"

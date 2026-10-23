@@ -22,6 +22,30 @@ logger = logging.getLogger("security")
 CSRF_COOKIE_NAME = "X-CSRF-Token"
 
 
+def constant_time_equals(left: object, right: object) -> bool:
+    """Constant-time equality for credential-shaped strings.
+
+    ``secrets.compare_digest`` raises ``TypeError`` when comparing ``str``
+    values and either side contains non-ASCII characters, and callers pass
+    user-controlled header strings here (a bearer value or API key can carry
+    arbitrary bytes, latin-1-decoded server-side) — turning a 401/403 into
+    an unhandled 500 (issue #993). Compare utf-8 bytes instead, which the
+    same primitive accepts totally, and fail closed on non-``str`` input
+    (e.g. a forged non-string ``fpt`` JWT claim) instead of raising. Lone
+    surrogates (e.g. a JWT claim JSON-decoded from ``"\\ud800"``) cannot
+    encode to utf-8; they fail closed too rather than raising
+    ``UnicodeEncodeError`` (PR #996 review round).
+    """
+    if not isinstance(left, str) or not isinstance(right, str):
+        return False
+    try:
+        return secrets.compare_digest(
+            left.encode("utf-8"), right.encode("utf-8")
+        )
+    except UnicodeEncodeError:
+        return False
+
+
 class _InMemoryCSRFStore:
     """Thread-safe in-memory fallback for CSRF tokens when Redis is unavailable.
 
@@ -323,7 +347,7 @@ def require_scope(scope: str) -> Callable:
         # Authentication FIRST: verify token identity with constant-time comparison.
         # This must happen before any authz decision to avoid timing side-channels
         # and to ensure the scope lookup is only performed for authenticated callers.
-        if not secrets.compare_digest(token, settings.admin_secret_token):
+        if not constant_time_equals(token, settings.admin_secret_token):
             raise HTTPException(status_code=403, detail="Unauthorized token")
         # Authorization: derive scopes from server-side mapping (NOT from any
         # client-supplied header). The X-Scopes header is intentionally ignored.
@@ -582,7 +606,7 @@ def require_auth(
     if len(parts) < 2 or not parts[1].strip():
         raise HTTPException(status_code=401, detail="Invalid authorization header")
     token = parts[1].strip()
-    if not secrets.compare_digest(token, settings.admin_secret_token):
+    if not constant_time_equals(token, settings.admin_secret_token):
         raise HTTPException(status_code=403, detail="Invalid API key")
     return {"authenticated": True}
 

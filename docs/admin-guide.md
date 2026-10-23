@@ -1046,7 +1046,7 @@ Indexes exist on `event_type`, `actor_user_id`, `target_user_id`, and `created_a
 | `user.role_updated` | `PATCH /users/{id}/role` | A superadmin changed a user's role |
 | `user.active_updated` | `PATCH /users/{id}/active` | An admin enabled/disabled a user |
 | `user.deleted` | `DELETE /users/{id}` | A superadmin deleted a user (metadata snapshots the pre-delete role/username) |
-| `membership.organizations_replaced` | `PUT /users/{id}/organizations` | A user's org membership set was replaced |
+| `membership.organizations_replaced` | `PUT /users/{id}/organizations` | A user's org membership set was replaced (the payload lists the requested memberships; a caller who is not a superadmin only replaces memberships in their own organizations, and group memberships in dropped orgs are revoked with them) |
 | `membership.groups_replaced` | `PUT /users/{id}/groups` | A user's group membership set was replaced |
 | `vault.visibility_updated` | `PUT /vaults/{id}` (visibility field) | A vault's visibility was updated (metadata carries old and new values) |
 | `vault.deleted` | `DELETE /vaults/{id}` | A vault admin deleted the vault (recorded after the durable delete) |
@@ -1067,7 +1067,7 @@ WHERE event_type = 'auth.refresh_reuse_detected'
 ORDER BY created_at DESC;
 ```
 
-**HMAC verification** (optional, for forensic integrity): recompute the digest using the message format in `security_audit._build_digest` (`event_type|actor_user_id|actor_username|target_user_id|target_username|ip_address|user_agent|metadata_json|key_version`) and the key returned by `_audit_key()` (derived from `JWT_SECRET_KEY`, falling back to `ADMIN_SECRET_TOKEN`), then compare against the stored `hmac_sha256`.
+**HMAC verification** (optional, for forensic integrity): recompute the digest using the message format in `security_audit._build_digest` (`event_type|actor_user_id|actor_username|target_user_id|target_username|ip_address|user_agent|metadata_json|key_version`) and the key returned by `_audit_key()` (derived from `JWT_SECRET_KEY` when changed from the insecure default, falling back to `ADMIN_SECRET_TOKEN` — an unchanged-default JWT secret is treated as unset, see the #987-993-995 release note), then compare against the stored `hmac_sha256`.
 
 ### Service Accounts
 
@@ -1111,6 +1111,7 @@ Organization invites allow admins to invite users via a token-based flow with ex
 - Invites can be **resent** (new expiry) or **revoked** (immediate invalidation)
 - Each invite is tied to the inviting organization
 - The invite identifier must be the invitee's **username** — acceptance matches it against the invitee's username (user accounts have no email column). Email-form identifiers are rejected at creation unless they match an existing username, so a token that nobody can ever redeem is never minted. A username that does not exist yet may still be invited (the future user registers with that exact username to redeem)
+- **Renaming a user keeps their invites consistent**: the rename re-binds the user's own pending invites to the new username (they stay redeemable by the renamed user) and revokes any pending invite already addressed to the new name. This lookup is **cross-organization by design** — an invite for another org addressed to the new username is revoked too, because leaving it alone would silently re-bind someone else's token to the renamed user
 
 **Managing Invites:**
 
@@ -1118,7 +1119,7 @@ Organization invites allow admins to invite users via a token-based flow with ex
 |--------|-----|
 | Create | `POST /api/organizations/{id}/invites` — returns the raw `inv_` token to share |
 | List | `GET /api/organizations/{id}/invites` — shows all invites and their status |
-| Resend | `POST /api/organizations/{id}/invites/{invite_id}/resend` — resets expiry |
+| Resend | `POST /api/organizations/{id}/invites/{invite_id}/resend` — resets expiry; applies the same redeemability checks as create and returns **400** when the invite can no longer be redeemed (email-shaped identifier with no matching username, or the invitee's role has dropped below member) |
 | Revoke | `POST /api/organizations/{id}/invites/{invite_id}/revoke` — invalidates token |
 | Accept | `POST /api/organizations/invites/accept` — redeems the `inv_` token (no `{id}`) |
 

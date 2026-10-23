@@ -286,8 +286,11 @@ async def test_admin_user_with_group_read_still_gets_write_floor(db_conn):
     Admin with only group-based 'read' access still gets write floor
     because max(baseline=2, group_read=1) = write.
     """
-    # Create group and add admin user to it
-    db_conn.execute("INSERT INTO groups (id, name, org_id) VALUES (50, 'readers', NULL)")
+    # Create group and add admin user to it.
+    # org 200 owns no vaults: the membership satisfies the group/org
+    # predicate (#721 AC4) without granting anything else.
+    db_conn.execute("INSERT INTO groups (id, name, org_id) VALUES (50, 'readers', 200)")
+    db_conn.execute("INSERT INTO org_members (org_id, user_id) VALUES (200, 10)")
     db_conn.execute("INSERT INTO group_members (group_id, user_id) VALUES (50, 10)")
     # Give group read access to vault 1
     db_conn.execute(

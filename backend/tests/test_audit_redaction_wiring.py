@@ -319,13 +319,23 @@ def test_row_signed_under_a_rotated_key_is_tombstoned():
         assert row[5] == "v-old", "an unverifiable row keeps its recorded key version"
 
 
-def test_failure_writes_start_and_failed_rows_and_leaves_data_untouched():
-    """A real fault inside the data work journals start + failed.
+def test_begin_failure_journals_only_failed_row_and_leaves_data_untouched():
+    """A failing ``BEGIN IMMEDIATE`` journals exactly the terminal failed row.
 
     The failure is injected into the real function (not a mocked-out
     routine): ``BEGIN IMMEDIATE`` raises, and the contract is that the
     journal ends in a terminal ``failed`` row, the audit rows are
     unchanged, and the fail-soft wrapper logs the error.
+
+    Issue #995 realignment: the write lock is now acquired BEFORE any
+    journal write, so ``start`` is journaled in-transaction — only once the
+    lock is actually held. A BEGIN failure therefore journals exactly
+    ``[("redact_historical_audit_rows", "failed", "error")]``: the #699
+    contract needs the terminal ``failed`` row and unchanged data, not a
+    durable pre-``BEGIN`` ``start`` row (re-adding one would put a second
+    full connect-timeout wait on the boot path this change removes). The
+    data-failure path still journals ``[start, failed]`` — pinned in
+    ``test_audit_followups_extra_guards.py``.
     """
     with _temp_db() as db_path:
         _seed(db_path)
@@ -336,7 +346,6 @@ def test_failure_writes_start_and_failed_rows_and_leaves_data_untouched():
                     redact_historical_audit_rows(db_path, TEST_KEY, TEST_KEY_VERSION)
 
         assert _journal_rows(db_path) == [
-            ("redact_historical_audit_rows", "start", "ok"),
             ("redact_historical_audit_rows", "failed", "error"),
         ]
         assert _rows(db_path) == before, "a failed redaction must not change data"

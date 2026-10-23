@@ -751,6 +751,36 @@ class TestAccessibleVaultsEndpoint(unittest.TestCase):
         self.assertEqual(data["vaults"][0]["name"], "GroupVault")
         self.assertEqual(data["vaults"][0]["current_user_permission"], "write")
 
+    def test_accessible_vaults_orphaned_group_member_excluded(self):
+        """Group access without org membership grants nothing (#721 AC4).
+
+        Negative pin for the composed reader-side invariant: an orphaned
+        group_members row must surface neither in the accessible-vaults
+        listing nor in permission resolution — the EXISTS org predicates in
+        the listing union (vaults.py) and the effective-permission reader
+        (authz_policy.py) each enforce it, and removing both must fail this
+        test (review F-019a — previously only the effective-permission
+        reader had any negative pin, never this listing path)."""
+        conn = self._get_db_conn()
+        try:
+            vault_id = self._insert_vault(conn, "OrphanVault")
+            org_id = self._insert_org(conn, "OrphanOrg")
+            group_id = self._insert_group(conn, "OrphanGroup", org_id)
+            # User 2 is in the group but NOT in the group's organization:
+            # the orphaned state the org-removal paths now clean up.
+            self._insert_group_member(conn, group_id, 2)
+            self._insert_vault_group_access(conn, vault_id, group_id, "write")
+        finally:
+            self._connection_pool.release_connection(conn)
+
+        self._mock_user(2, "user2", role="user")
+        resp = self.client.get("/api/vaults/accessible")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertIn("vaults", data)
+        names = [v["name"] for v in data["vaults"]]
+        self.assertNotIn("OrphanVault", names)
+
     def test_accessible_vaults_public_sees_public_vault(self):
         """User can see public vaults without explicit membership."""
         conn = self._get_db_conn()

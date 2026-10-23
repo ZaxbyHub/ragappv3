@@ -731,6 +731,7 @@ class TestWikiCurator(unittest.TestCase):
                 "wiki_llm_curator_require_quote_match",
                 "wiki_llm_curator_require_chunk_id",
                 "wiki_llm_curator_max_input_chars",
+                "wiki_llm_curator_concurrency",
             )
         }
         settings.wiki_llm_curator_enabled = True
