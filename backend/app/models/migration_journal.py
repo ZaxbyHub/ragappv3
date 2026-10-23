@@ -77,6 +77,15 @@ def record_migration_outcome(
     count rows) commit atomically with it — the record exists iff the
     destructive work committed, and a failed attempt must journal its
     ``failed`` row on a fresh committed transaction after the rollback.
+    Issue #995 adds a sanctioned variant of that in-transaction shape: a
+    writer holding one ``BEGIN IMMEDIATE`` may journal ``start`` inside the
+    transaction, wrap the data work in a ``SAVEPOINT``, and — on failure —
+    ``ROLLBACK TO SAVEPOINT``, journal ``failed`` inside the SAME writer
+    transaction, then commit, so the terminal row lands while the data is
+    reverted and the write lock is taken exactly once. That terminal row is
+    best-effort: if its commit itself fails under contention the row is
+    lost — the caller stays fail-soft and retries on the next boot (see
+    ``audit_redaction``'s failure handler).
     """
     try:
         _ensure_table(conn)

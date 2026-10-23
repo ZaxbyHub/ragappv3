@@ -61,7 +61,11 @@ therefore need two separate actions:
    durable remedy is to rotate `ADMIN_SECRET_TOKEN` (in single-admin mode
    the token is the sole credential, so rotating it neutralizes the token
    material in every backup) and to delete or re-encrypt old backups under
-   your retention policy.
+   your retention policy. Note for shared-derivation deployments (single
+   admin with the default `JWT_SECRET_KEY`): rotating the admin token also
+   re-keys the audit HMAC for rows signed under that derivation, while the
+   stored `key_version` label stays unchanged — see the #987-993-995
+   fragment's rotation-scope disclosure before rotating.
 
 Note also that the redaction rewrites ROWS; SQLite does not compact the
 database, so the previous cell contents can linger in the database file's
@@ -81,7 +85,9 @@ rebuilt.
 - Redaction is irreversible by design (the token material is removed from
   the rows), matching the `created_by` migration; rollback of this change
   restores the behavior but not the rewritten rows.
-- Under a concurrent writer the boot-time redaction can wait for the
-  database write lock (up to the 30-second migration connect timeout per
-  waiting statement) and can then fail softly; the scrub is retried on the
-  next boot.
+- Under a concurrent writer the boot-time redaction takes the database
+  write lock exactly once and is bounded by one connect-timeout wait (30 s)
+  plus one bounded best-effort failure-journal write (≤ ~3 s) — a measured
+  worst case of ~36 s when the lock is never released, after which it fails
+  softly and the scrub is retried on the next boot (issue #995; before that
+  fix three sequential lock waits could stall boot for ~87 s).
