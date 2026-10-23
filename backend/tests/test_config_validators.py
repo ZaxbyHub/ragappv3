@@ -45,6 +45,38 @@ class TestRejectInsecureDefaults:
         assert settings.users_enabled is False
         assert settings.admin_secret_token == "some-token"
 
+    # --- well-known default admin token (issue #1001, Item A) ---
+
+    def test_users_disabled_with_default_admin_token_raises(self):
+        """users_enabled=False, admin_secret_token='admin-secret-token' (the
+        well-known literal) should raise — in single-admin mode the literal is
+        a public sole credential AND public audit-HMAC key material (#1001 AC1)."""
+        with pytest.raises(ValueError, match="ADMIN_SECRET_TOKEN") as exc_info:
+            Settings(users_enabled=False, admin_secret_token="admin-secret-token")
+        message = str(exc_info.value)
+        # Message shape mirrors the empty-token refusal: field name,
+        # single-admin rationale, and the generation one-liner.
+        assert "well-known default" in message
+        assert "single-admin" in message
+        assert "secrets.token_urlsafe(48)" in message
+
+    def test_users_disabled_with_case_variant_admin_token_boots(self):
+        """users_enabled=False, case variants of the literal (e.g.
+        'ADMIN-SECRET-TOKEN') still boot — the refusal is EXACT-match only,
+        mirroring main.py's startup warning (#1001 AC2 decision)."""
+        for variant in ("ADMIN-SECRET-TOKEN", "Admin-Secret-Token"):
+            settings = Settings(users_enabled=False, admin_secret_token=variant)
+            assert settings.admin_secret_token == variant
+
+    def test_users_enabled_with_default_admin_token_boots(self):
+        """users_enabled=True, admin_secret_token='admin-secret-token' still
+        boots — under multi-user auth the token is the required
+        bootstrap/first-admin credential and seeds admin_token_scopes, so only
+        the empty-token refusal applies (#1001 AC3 decision: UNCHANGED)."""
+        settings = Settings(users_enabled=True, admin_secret_token="admin-secret-token")
+        assert settings.admin_secret_token == "admin-secret-token"
+        assert settings.admin_token_scopes == {"admin-secret-token": ["admin:config"]}
+
     # --- JWT_SECRET_KEY validators ---
 
     def test_users_enabled_with_empty_jwt_secret_key_raises(self):
