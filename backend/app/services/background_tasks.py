@@ -4352,6 +4352,31 @@ class BackgroundProcessor:
                 str(settings.embedding_query_prefix or ""),
             )
 
+        # Issue #723 (T1-21-S-07): a vault-scoped reindex whose vault was
+        # deleted settles as a clean skip instead of embedding (its files
+        # are gone, so this would otherwise be a 0-file "completed" with the
+        # job row surviving forever). vault_id NULL means a GLOBAL all-vaults
+        # reindex and is never gated — `WHERE id = NULL` matches nothing.
+        if vault_id is not None:
+            async with self.processor.pool.connection_async() as conn:
+                vault_exists = conn.execute(
+                    "SELECT 1 FROM vaults WHERE id = ?", (vault_id,)
+                ).fetchone()
+            if vault_exists is None:
+                logger.info(
+                    "Reindex job %d skipped: vault %s was deleted", job_id, vault_id
+                )
+                return (
+                    "completed",
+                    {
+                        "processed": 0,
+                        "failed": 0,
+                        "skipped": True,
+                        "reason": "vault_deleted",
+                    },
+                    None,
+                )
+
         try:
             # Select files to reindex. Issue #702 (P02-SK2-04): a retry
             # attempt narrows the scope to the files that failed the

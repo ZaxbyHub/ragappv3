@@ -6,9 +6,11 @@ Vaults are containers for documents, memories, and chat sessions.
 """
 
 import asyncio
+import json
 import logging
 import shutil
 import sqlite3
+from datetime import datetime, timezone
 from typing import Callable, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -192,19 +194,43 @@ def _row_to_vault_response(row, current_user_permission: Optional[str] = None) -
     )
 
 
+# Vault-scoped tables that carry vault_id with no FK to vaults(id) and no
+# other cleanup path (issue #723 / T1-21-S-03): delete_vault's transaction
+# removes their rows explicitly. artifact_delete_pending and
+# vector_delete_pending are deliberately-durable cleanup queues and are NOT
+# listed; memories are reassigned to global scope, not deleted;
+# wiki_claim_sources / wiki_page_files / wiki_page_versions /
+# wiki_page_links cascade from the wiki_claims / wiki_pages / files rows
+# deleted here and in the files delete below. Statements are prebuilt
+# literals (no formatting at the call site) so static analysis can vouch
+# for them; the table names come only from this module.
+_VAULT_SCOPED_CLEANUP_SQL = {
+    "wiki_pages": "DELETE FROM wiki_pages WHERE vault_id = ?",
+    "wiki_entities": "DELETE FROM wiki_entities WHERE vault_id = ?",
+    "wiki_claims": "DELETE FROM wiki_claims WHERE vault_id = ?",
+    "wiki_relations": "DELETE FROM wiki_relations WHERE vault_id = ?",
+    "wiki_lint_findings": "DELETE FROM wiki_lint_findings WHERE vault_id = ?",
+    "wiki_page_versions": "DELETE FROM wiki_page_versions WHERE vault_id = ?",
+    "wiki_page_links": "DELETE FROM wiki_page_links WHERE vault_id = ?",
+    "wiki_activity_log": "DELETE FROM wiki_activity_log WHERE vault_id = ?",
+    "wiki_compile_jobs": "DELETE FROM wiki_compile_jobs WHERE vault_id = ?",
+    "kms_entries": "DELETE FROM kms_entries WHERE vault_id = ?",
+    "kms_compile_jobs": "DELETE FROM kms_compile_jobs WHERE vault_id = ?",
+    "document_reindex_jobs": "DELETE FROM document_reindex_jobs WHERE vault_id = ?",
+    "canvas_artifacts": "DELETE FROM canvas_artifacts WHERE vault_id = ?",
+}
+_VAULT_SCOPED_CLEANUP_TABLES = tuple(_VAULT_SCOPED_CLEANUP_SQL)
+
 _VAULT_WITH_COUNTS_SQL = """
     SELECT v.id, v.name, v.description, v.created_at, v.updated_at,
-           COUNT(DISTINCT f.id) as file_count,
-           COUNT(DISTINCT m.id) as memory_count,
-           COUNT(DISTINCT cs.id) as session_count,
+           (SELECT COUNT(*) FROM files f WHERE f.vault_id = v.id) as file_count,
+           (SELECT COUNT(*) FROM memories m WHERE m.vault_id = v.id) as memory_count,
+           (SELECT COUNT(*) FROM chat_sessions cs WHERE cs.vault_id = v.id) as session_count,
            v.org_id,
            v.visibility,
            v.enrichment_enabled,
            v.multimodal_provider_enabled
     FROM vaults v
-    LEFT JOIN files f ON f.vault_id = v.id
-    LEFT JOIN memories m ON m.vault_id = v.id
-    LEFT JOIN chat_sessions cs ON cs.vault_id = v.id
 """
 
 
@@ -645,7 +671,12 @@ async def delete_vault(
     Deletes the vault and all associated data:
     - All files in the vault (and their chunks in vector store)
     - All chat sessions and messages (via cascade)
-    - Vector chunks for this vault
+    - All wiki and KMS content and job rows scoped to the vault (the
+      vault-scoped tables without an FK to vaults; see
+      _VAULT_SCOPED_CLEANUP_TABLES), and pending unified lease jobs
+    - Vector chunks for this vault (with durable vector_delete_pending
+      tombstones written in the same transaction, before COMMIT, so a
+      post-commit crash or cancellation can always re-drive the cleanup)
     - Memories: reassign to global (SET vault_id = NULL)
 
     Returns 404 if not found.
@@ -724,6 +755,23 @@ async def delete_vault(
         vault_file_ids = [int(row[0]) for row in file_id_rows]
         vault_file_paths = [str(row[1]) for row in file_id_rows if row[1]]
 
+        # Issue #723 (T1-21-S2-02): record one durable vector_delete_pending
+        # tombstone per file INSIDE this transaction, before COMMIT — the
+        # documents.py single-delete pattern extended to vault deletion. The
+        # tombstones make the post-commit vector reconciliation re-driveable
+        # across a crash or a BaseException (asyncio.CancelledError escapes
+        # `except Exception`); they roll back with everything else if the
+        # transaction fails, and are removed again once delete_by_vault
+        # succeeds below.
+        if vault_file_ids:
+            await asyncio.to_thread(
+                lambda: conn.executemany(
+                    "INSERT INTO vector_delete_pending (file_id, vault_id) "
+                    "VALUES (?, ?)",
+                    [(fid, vault_id) for fid in vault_file_ids],
+                )
+            )
+
         # W21 (C19): vector chunks are NOT deleted here. The relational
         # deletion is committed first (durable intent) and the vector store
         # is reconciled AFTER the commit — a pre-commit SQL failure rolls
@@ -770,6 +818,41 @@ async def delete_vault(
             "DELETE FROM document_near_dups WHERE vault_id = ?",
             (vault_id,),
         )
+
+        # Issue #723 (T1-21-S-03 / T1-21-S-07): every vault-scoped table with
+        # no FK to vaults keeps rows past the vault delete unless they are
+        # removed here, in the same transaction. The NULL-vault rows some of
+        # them carry (e.g. global reindex jobs) are never matched by this
+        # predicate and survive by design.
+        for cleanup_sql in _VAULT_SCOPED_CLEANUP_SQL.values():
+            await asyncio.to_thread(conn.execute, cleanup_sql, (vault_id,))
+
+        # Issue #723 (T1-21-S-07): cancel the vault's pending/running jobs on
+        # the shared unified lease table. The legacy job tables were fully
+        # deleted above; the unified `jobs` table is shared across queues and
+        # vaults, so its rows are cancelled instead — the same
+        # status/completed_at pair and json_valid-guarded vault match the
+        # KmsStore lease cancel uses. A fenced worker write on a cancelled
+        # row then fails on status by design (issue #559). Skipped when the
+        # lease table was never created (lease mode never used).
+        has_jobs_table = await asyncio.to_thread(
+            lambda: conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'jobs'"
+            ).fetchone()
+        )
+        if has_jobs_table:
+            await asyncio.to_thread(
+                conn.execute,
+                """
+                UPDATE jobs SET status = 'cancelled', completed_at = ?
+                WHERE queue IN ('wiki', 'kms', 'reindex')
+                  AND CASE WHEN json_valid(payload_json)
+                       THEN CAST(json_extract(payload_json, '$.vault_id') AS INTEGER)
+                       ELSE NULL END = ?
+                  AND status IN ('pending', 'running')
+                """,
+                (datetime.now(timezone.utc).isoformat(), vault_id),
+            )
 
         # Delete files
         await asyncio.to_thread(
@@ -832,6 +915,29 @@ async def delete_vault(
                 )
         logger.exception("Error deleting vault %d", vault_id)
         raise HTTPException(status_code=500, detail="Failed to delete vault")
+    except BaseException:
+        # Issue #723 (T1-21-S2-04): a BaseException (asyncio.CancelledError,
+        # KeyboardInterrupt, an exception type outside the two handlers above)
+        # must never strand the tombstoned Draft Room bytes while the rows
+        # survive. Gating on conn.in_transaction is race-free: before COMMIT
+        # the transaction is open (rollback + restore); after COMMIT it is
+        # closed, and restoring bytes that belong to already-deleted drafts
+        # would be wrong — those tombstones stay in .trash and are discarded
+        # by the startup reconcile.
+        if conn.in_transaction:
+            await asyncio.to_thread(lambda: conn.rollback())
+            if draft_purge_plan is not None:
+                try:
+                    await asyncio.to_thread(
+                        draft_deletion.restore_purge, draft_purge_plan
+                    )
+                except Exception as restore_exc:
+                    logger.error(
+                        "draft_room_vault_purge_restore_failed vault_id=%s reason=%s",
+                        vault_id,
+                        type(restore_exc).__name__,
+                    )
+        raise
 
     # Security-relevant event recorded after the relational delete committed
     # (issue #722 AC1) — the same record-after-real-mutation ordering the
@@ -860,37 +966,34 @@ async def delete_vault(
             deleted_chunks,
             vault_id,
         )
+        # Issue #723 (T1-21-S2-02): the intent recorded before COMMIT is now
+        # fulfilled — drop those tombstone rows again so the pending table
+        # only ever holds unfulfilled intents for the sweep. A crash between
+        # the vector delete and this cleanup leaves a stale row the sweep
+        # re-drives as a no-op.
+        if vault_file_ids:
+
+            def _clear_vector_delete_tombstones() -> None:
+                conn.execute(
+                    "DELETE FROM vector_delete_pending WHERE vault_id = ? "
+                    "AND file_id IN (SELECT value FROM json_each(?))",
+                    (vault_id, json.dumps(vault_file_ids)),
+                )
+                conn.commit()
+
+            await asyncio.to_thread(_clear_vector_delete_tombstones)
     except Exception as e:  # noqa: BLE001 — reconcile, never fail the response
+        # The in-transaction tombstones written before COMMIT stay in place:
+        # the hourly sweep and startup retry_pending_vector_deletes reconcile
+        # the orphaned chunks from them.
         logger.warning(
-            "Error deleting chunks from vector store for vault %s; recording "
-            "%d vector_delete_pending tombstone(s): %s",
+            "Error deleting chunks from vector store for vault %s; leaving "
+            "%d in-transaction vector_delete_pending tombstone(s) for the "
+            "sweep: %s",
             vault_id,
             len(vault_file_ids),
             e,
         )
-
-        def _record_vector_delete_tombstones() -> None:
-            for pending_file_id in vault_file_ids:
-                conn.execute(
-                    "INSERT INTO vector_delete_pending (file_id, vault_id) "
-                    "VALUES (?, ?)",
-                    (pending_file_id, vault_id),
-                )
-            conn.commit()
-
-        try:
-            await asyncio.to_thread(_record_vector_delete_tombstones)
-        except sqlite3.Error as tombstone_exc:
-            # Last resort: the tombstones themselves failed. The rows are
-            # committed and the chunks remain searchable until an operator
-            # intervenes — log loudly rather than 500 a finished delete.
-            logger.error(
-                "Failed to record vector_delete_pending tombstones for vault "
-                "%s (%d file(s)); orphaned chunks remain searchable: %s",
-                vault_id,
-                len(vault_file_ids),
-                tombstone_exc,
-            )
 
     if draft_purge_plan is not None:
         try:
