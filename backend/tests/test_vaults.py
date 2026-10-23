@@ -754,10 +754,13 @@ class TestAccessibleVaultsEndpoint(unittest.TestCase):
     def test_accessible_vaults_orphaned_group_member_excluded(self):
         """Group access without org membership grants nothing (#721 AC4).
 
-        Negative pin for the listing endpoint's org predicate: reverting the
-        EXISTS clause in the accessible-vaults union must fail this test
-        (review F-019a — previously only the effective-permission reader was
-        pinned, never this listing path)."""
+        Negative pin for the composed reader-side invariant: an orphaned
+        group_members row must surface neither in the accessible-vaults
+        listing nor in permission resolution — the EXISTS org predicates in
+        the listing union (vaults.py) and the effective-permission reader
+        (authz_policy.py) each enforce it, and removing both must fail this
+        test (review F-019a — previously only the effective-permission
+        reader had any negative pin, never this listing path)."""
         conn = self._get_db_conn()
         try:
             vault_id = self._insert_vault(conn, "OrphanVault")

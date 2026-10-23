@@ -878,11 +878,12 @@ async def update_user_organizations(
                 )
 
         try:
-            # Take the write lock BEFORE the before-snapshot: a DEFERRED
-            # transaction would read before_orgs in autocommit and after_orgs
-            # inside the write txn — two different snapshots — so a concurrent
-            # grant committed between them could be deleted by this request
-            # while its group_members rows survived the dropped-set derivation
+            # Take the write lock BEFORE the before-snapshot: without an
+            # explicit transaction, before_orgs is read in autocommit and
+            # after_orgs lands inside the write txn the first DELETE opens —
+            # two different snapshots — so a concurrent grant committed
+            # between them could be deleted by this request while its
+            # group_members rows survived the dropped-set derivation
             # (issue #721 review F-001). BEGIN IMMEDIATE pins the write lock
             # and both reads into one snapshot.
             conn.execute("BEGIN IMMEDIATE")
