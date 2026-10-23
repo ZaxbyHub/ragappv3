@@ -16,7 +16,11 @@ from typing import TYPE_CHECKING, Optional
 from fastapi import Cookie, Depends, Header, HTTPException, Query, Request
 
 from app.config import Settings, settings
-from app.models.database import SQLiteConnectionPool, get_pool
+from app.models.database import (
+    SQLiteConnectionPool,
+    get_pool,
+    lookup_service_account,
+)
 from app.security import constant_time_equals, get_csrf_manager  # noqa: F401
 from app.services.auth_service import (
     TokenExpiredError,
@@ -598,16 +602,13 @@ async def get_current_user_or_service_account(
     # Hash the raw key and look up service_accounts
     key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
 
-    def _fetch_sa_row():
-        cursor = db.execute(
-            "SELECT id, name, scopes, revoked_at FROM service_accounts WHERE key_hash = ?",
-            (key_hash,),
-        )
-        return cursor.fetchone()
-
     # F-3: run the synchronous DB read off the event loop, mirroring
     # _resolve_active_user's _fetch_user_row_with_pwc + asyncio.to_thread pattern.
-    row = await asyncio.to_thread(_fetch_sa_row)
+    # Issue #724 (T1-01-S-09): the shared lookup carries the rotation grace —
+    # the previous key stays valid here exactly as on require_service_account.
+    row, _via_previous = await asyncio.to_thread(
+        lookup_service_account, db, key_hash
+    )
     if not row:
         raise HTTPException(status_code=401, detail="Not authenticated")
     sa_id, sa_name, sa_scopes_str, revoked_at = row
