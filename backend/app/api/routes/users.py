@@ -81,7 +81,7 @@ class UpdateActiveRequest(BaseModel):
 
 
 class UpdateUserRequest(BaseModel):
-    username: Optional[str] = Field(default=None, max_length=255)
+    username: Optional[str] = Field(default=None, min_length=3, max_length=255)
     full_name: Optional[str] = Field(default=None, max_length=255)
     role: Optional[str] = Field(default=None)
 
@@ -369,6 +369,37 @@ async def update_user(
     # Execute update
     update_values.append(user_id)
     await asyncio.to_thread(db.execute, f"UPDATE users SET {', '.join(update_fields)} WHERE id = ?", tuple(update_values))
+
+    if body.username is not None and body.username != target_row[1]:
+        # Org invites bind to the invitee's username at creation time and
+        # acceptance compares that stored identifier against the CURRENT
+        # username (organizations.py), so a rename must re-bind the user's own
+        # pending invites or they become unacceptably orphaned (issue #721
+        # AC7). Both statements run in the same transaction as the rename.
+        now_iso = datetime.now(timezone.utc).isoformat()
+        # Step 1: revoke PRE-EXISTING pending invites addressed to the NEW
+        # username (username-form invites may target not-yet-provisioned
+        # users, #300) — after the rename they would re-bind to the renaming
+        # user. Runs BEFORE the rewrite and excludes the old-name rows so it
+        # can never touch the user's own invites; revoked_at format matches
+        # revoke_org_invite.
+        await asyncio.to_thread(
+            db.execute,
+            """UPDATE org_invites SET revoked_at = ?
+                WHERE email = ? COLLATE NOCASE
+                  AND accepted_at IS NULL AND revoked_at IS NULL
+                  AND email != ? COLLATE NOCASE""",
+            (now_iso, body.username.lower(), target_row[1].lower()),
+        )
+        # Step 2: re-bind the user's own pending invites to the new username
+        # so the renamed user can still accept them.
+        await asyncio.to_thread(
+            db.execute,
+            """UPDATE org_invites SET email = ?
+                WHERE email = ? COLLATE NOCASE
+                  AND accepted_at IS NULL AND revoked_at IS NULL""",
+            (body.username.lower(), target_row[1].lower()),
+        )
     await asyncio.to_thread(db.commit)
 
     invalidate_active_user_cache(user_id)
@@ -780,7 +811,13 @@ async def update_user_organizations(
     user: dict = Depends(require_role("admin")),
     _csrf_token: str = Depends(csrf_protect),
 ):
-    """Replace user's organization memberships (admin/superadmin only)."""
+    """Replace a user's organization memberships (admin/superadmin only).
+
+    Superadmin callers replace the full membership set; other admins replace
+    only memberships in organizations they themselves belong to (issue #721
+    AC5). Dropped organizations' group memberships are revoked in the same
+    transaction.
+    """
     pool = get_pool(str(settings.sqlite_path))
     conn = await pool.get_connection_async()
 
@@ -841,11 +878,44 @@ async def update_user_organizations(
                 )
 
         try:
-            # Delete existing memberships (except owner roles to protect org ownership)
-            conn.execute(
-                "DELETE FROM org_members WHERE user_id = ? AND role != 'owner'",
+            # Take the write lock BEFORE the before-snapshot: without an
+            # explicit transaction, before_orgs is read in autocommit and
+            # after_orgs lands inside the write txn the first DELETE opens —
+            # two different snapshots — so a concurrent grant committed
+            # between them could be deleted by this request while its
+            # group_members rows survived the dropped-set derivation
+            # (issue #721 review F-001). BEGIN IMMEDIATE pins the write lock
+            # and both reads into one snapshot.
+            conn.execute("BEGIN IMMEDIATE")
+
+            # Snapshot the target's current non-owner orgs before the replace so
+            # group memberships can be cleaned up for orgs this call actually
+            # drops (issue #721 AC3). Owner rows are excluded by the same
+            # role != 'owner' filter the DELETE below uses.
+            cursor = conn.execute(
+                "SELECT org_id FROM org_members WHERE user_id = ? AND role != 'owner'",
                 (user_id,),
             )
+            before_orgs = {row[0] for row in cursor.fetchall()}
+
+            # Delete existing memberships (except owner roles to protect org
+            # ownership). Scoped to the caller's own orgs for non-superadmins —
+            # an org admin replaces only the memberships they can see (issue
+            # #721 AC5), mirroring update_user_groups' scoped delete below.
+            # The caller's scope is expressed as a subquery (their org_members
+            # rows) rather than dynamically interpolated placeholders.
+            if caller_orgs is None:
+                conn.execute(
+                    "DELETE FROM org_members WHERE user_id = ? AND role != 'owner'",
+                    (user_id,),
+                )
+            else:
+                conn.execute(
+                    """DELETE FROM org_members
+                        WHERE user_id = ? AND role != 'owner'
+                          AND org_id IN (SELECT org_id FROM org_members WHERE user_id = ?)""",
+                    (user_id, user.get("id")),
+                )
 
             # Insert new memberships
             for m in memberships:
@@ -858,6 +928,31 @@ async def update_user_organizations(
                         "INSERT INTO org_members (org_id, user_id, role) VALUES (?, ?, ?)",
                         (m.org_id, user_id, m.role),
                     )
+
+            # Group membership implies organization membership: drop the
+            # target's group_members rows for orgs this call actually removed.
+            # The dropped set is derived purely from the target's own row
+            # state (present in the before-snapshot, absent after the
+            # replace): whatever the scoped or unscoped DELETE above actually
+            # removed is exactly before − after — owner-protected rows never
+            # entered the snapshot, re-inserted orgs are in after, and orgs
+            # outside the DELETE's scope survive into after. Deriving the set
+            # from a second caller-orgs read instead would race the DELETE's
+            # own subquery (implementation-review finding: a caller-orgs
+            # addition committed between two reads could orphan rows).
+            cursor = conn.execute(
+                "SELECT org_id FROM org_members WHERE user_id = ?",
+                (user_id,),
+            )
+            after_orgs = {row[0] for row in cursor.fetchall()}
+            dropped_orgs = before_orgs - after_orgs
+            for org_id in dropped_orgs:
+                conn.execute(
+                    """DELETE FROM group_members
+                        WHERE user_id = ?
+                          AND group_id IN (SELECT id FROM groups WHERE org_id = ?)""",
+                    (user_id, org_id),
+                )
             conn.commit()
         except Exception:
             conn.rollback()
@@ -1050,18 +1145,22 @@ async def update_user_groups(
                     detail=f"Cannot assign groups from organizations you are not a member of: {sorted(unauthorized)}",
                 )
 
-        # Check user is a member of each group's organization (skip for superadmins)
-        if user.get("role") != "superadmin":
-            for group_id, org_id in found_groups.items():
-                cursor.execute(
-                    "SELECT 1 FROM org_members WHERE user_id = ? AND org_id = ?",
-                    (user_id, org_id),
+        # Check the TARGET user is a member of each group's organization. This
+        # is a data-integrity precondition of group membership (groups.py
+        # enforces the same one), so it must run for every caller including
+        # superadmins; the caller-authorization bypass above (caller_orgs is
+        # None for superadmins) is what superadmin privilege waives, not this
+        # check (issue #721 AC1).
+        for group_id, org_id in found_groups.items():
+            cursor.execute(
+                "SELECT 1 FROM org_members WHERE user_id = ? AND org_id = ?",
+                (user_id, org_id),
+            )
+            if not cursor.fetchone():
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"User is not a member of organization for group {group_id}",
                 )
-                if not cursor.fetchone():
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"User is not a member of organization for group {group_id}",
-                    )
 
         # Replace only memberships in the caller-managed org scope.
         if caller_orgs is None:

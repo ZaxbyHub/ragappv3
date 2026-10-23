@@ -963,9 +963,11 @@ KnowledgeVault has built-in JWT-based authentication with role-based access cont
 
 **Role assignment rule (one rule, all surfaces):** Only a `superadmin` can create `admin` or `superadmin` accounts, and only a `superadmin` can change any existing user's role (via `PATCH /api/users/{id}/role` or `PATCH /api/users/{id}`). Admins can create `member` and `viewer` accounts and edit user details; re-saving a user with their current role is a no-op, not a role change. A non-superadmin cannot modify a superadmin target at all — even a no-op role field on a superadmin account is rejected. This rule is enforced identically by every role-mutating route and by the admin UI's role dropdowns.
 
+**Group membership implies organization membership (one invariant, all surfaces):** a user can only be a member of a group whose organization they belong to. Every membership writer enforces this — including superadmin callers assigning a user's groups — and removing a user from an organization (directly or via an org-membership replace) always revokes their group memberships in that organization's groups and the vault access derived from them. Effective vault permission resolves a group grant only while the org membership holds.
+
 ### Vault permission matrix
 
-Vault access is granted per-vault as one of three permission levels with a strict numeric hierarchy: `read` (1) < `write` (2) < `admin` (3). An operation succeeds when the caller's effective permission level is greater than or equal to the operation's required level, so `admin` implies `write`, and `write` implies `read`. Effective permission resolves from (strongest wins): the `superadmin` app role (admin everywhere) → the app-role `admin` baseline (write everywhere) → an explicit `vault_members` row → `vault_group_access` via group membership → vault visibility (`public`/`org` grants read). See `docs/engineering/conventions.md` for the resolution-order contract.
+Vault access is granted per-vault as one of three permission levels with a strict numeric hierarchy: `read` (1) < `write` (2) < `admin` (3). An operation succeeds when the caller's effective permission level is greater than or equal to the operation's required level, so `admin` implies `write`, and `write` implies `read`. Effective permission resolves from (strongest wins): the `superadmin` app role (admin everywhere) → the app-role `admin` baseline (write everywhere) → an explicit `vault_members` row → `vault_group_access` via group membership (only while the user is a member of the group's organization) → vault visibility (`public`/`org` grants read). Org-less vaults (`org_id` NULL) are global: they accept groups from any organization, and org-visible vaults require org membership as usual. See `docs/engineering/conventions.md` for the resolution-order contract.
 
 | Operation | Minimum vault permission |
 |---|---|
@@ -1043,7 +1045,7 @@ Indexes exist on `event_type`, `actor_user_id`, `target_user_id`, and `created_a
 | `user.password_reset` | `PATCH /users/{id}/password` | An admin reset a user's password |
 | `user.role_updated` | `PATCH /users/{id}/role` | A superadmin changed a user's role |
 | `user.active_updated` | `PATCH /users/{id}/active` | An admin enabled/disabled a user |
-| `membership.organizations_replaced` | `PUT /users/{id}/organizations` | A user's org membership set was replaced |
+| `membership.organizations_replaced` | `PUT /users/{id}/organizations` | A user's org membership set was replaced (the payload lists the requested memberships; a caller who is not a superadmin only replaces memberships in their own organizations, and group memberships in dropped orgs are revoked with them) |
 | `membership.groups_replaced` | `PUT /users/{id}/groups` | A user's group membership set was replaced |
 
 **Querying** (example — find all reuse-detection events for a user):
@@ -1100,6 +1102,7 @@ Organization invites allow admins to invite users via a token-based flow with ex
 - Invites can be **resent** (new expiry) or **revoked** (immediate invalidation)
 - Each invite is tied to the inviting organization
 - The invite identifier must be the invitee's **username** — acceptance matches it against the invitee's username (user accounts have no email column). Email-form identifiers are rejected at creation unless they match an existing username, so a token that nobody can ever redeem is never minted. A username that does not exist yet may still be invited (the future user registers with that exact username to redeem)
+- **Renaming a user keeps their invites consistent**: the rename re-binds the user's own pending invites to the new username (they stay redeemable by the renamed user) and revokes any pending invite already addressed to the new name. This lookup is **cross-organization by design** — an invite for another org addressed to the new username is revoked too, because leaving it alone would silently re-bind someone else's token to the renamed user
 
 **Managing Invites:**
 
@@ -1107,7 +1110,7 @@ Organization invites allow admins to invite users via a token-based flow with ex
 |--------|-----|
 | Create | `POST /api/organizations/{id}/invites` — returns the raw `inv_` token to share |
 | List | `GET /api/organizations/{id}/invites` — shows all invites and their status |
-| Resend | `POST /api/organizations/{id}/invites/{invite_id}/resend` — resets expiry |
+| Resend | `POST /api/organizations/{id}/invites/{invite_id}/resend` — resets expiry; applies the same redeemability checks as create and returns **400** when the invite can no longer be redeemed (email-shaped identifier with no matching username, or the invitee's role has dropped below member) |
 | Revoke | `POST /api/organizations/{id}/invites/{invite_id}/revoke` — invalidates token |
 | Accept | `POST /api/organizations/invites/accept` — redeems the `inv_` token (no `{id}`) |
 

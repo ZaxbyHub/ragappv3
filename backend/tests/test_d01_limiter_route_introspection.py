@@ -192,7 +192,18 @@ class TestLimiterRouteIntrospection(unittest.TestCase):
     """AC8: every route the limiter knows about stores the wrapped endpoint."""
 
     def test_every_limited_route_endpoint_is_limiter_wrapped(self):
-        route_limits = limiter._route_limits
+        # The census protects PRODUCTION routes: co-run test fixtures
+        # decorate locally-defined functions with the shared limiter (e.g.
+        # test_chat_fork_rate_limit_compat's dummy_route), registering keys
+        # like "test_chat_fork_rate_limit_compat.dummy_route" that can never
+        # be mounted on the app — noise here, not lost enforcement. Every
+        # production route lives in the app package, so scope the census to
+        # app.* registrations.
+        route_limits = {
+            key: value
+            for key, value in limiter._route_limits.items()
+            if key.startswith("app.")
+        }
         self.assertTrue(
             route_limits,
             "limiter._route_limits is empty — no @limiter.limit registrations "
@@ -274,9 +285,11 @@ class TestLimiterRouteIntrospection(unittest.TestCase):
         # exactly like a wrong order); a registration whose handler is never
         # mounted fails too. Today both dynamic keys and unmatched keys are
         # empty; this assertion keeps them that way.
-        registered_keys = set(route_limits) | set(
-            getattr(limiter, "_dynamic_route_limits", {}) or {}
-        )
+        registered_keys = set(route_limits) | {
+            key
+            for key in (getattr(limiter, "_dynamic_route_limits", {}) or {})
+            if key.startswith("app.")
+        }
         self.assertEqual(
             registered_keys,
             matched_keys,

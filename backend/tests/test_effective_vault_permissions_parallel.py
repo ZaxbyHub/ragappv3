@@ -183,7 +183,10 @@ class TestResultMerging:
     @pytest.mark.asyncio
     async def test_group_access_contributes(self, db_conn):
         """Group access via vault_group_access + group_members contributes its permission."""
-        db_conn.execute("INSERT INTO groups (id, name, org_id) VALUES (7, 'editors', NULL)")
+        db_conn.execute("INSERT INTO groups (id, name, org_id) VALUES (7, 'editors', 200)")
+        # org 200 owns no vaults: membership satisfies the group/org
+        # predicate (#721 AC4) without granting anything else.
+        db_conn.execute("INSERT INTO org_members (org_id, user_id) VALUES (200, 11)")
         db_conn.execute("INSERT INTO group_members (group_id, user_id) VALUES (7, 11)")
         db_conn.execute("INSERT INTO vault_group_access (vault_id, group_id, permission) VALUES (1, 7, 'write')")
         db_conn.commit()
@@ -218,7 +221,8 @@ class TestResultMerging:
     async def test_max_merging_direct_and_group(self, db_conn):
         """When both direct membership and group access exist, max() wins."""
         db_conn.execute("INSERT INTO vault_members (vault_id, user_id, permission) VALUES (1, 12, 'read')")
-        db_conn.execute("INSERT INTO groups (id, name, org_id) VALUES (8, 'admins', NULL)")
+        db_conn.execute("INSERT INTO groups (id, name, org_id) VALUES (8, 'admins', 200)")
+        db_conn.execute("INSERT INTO org_members (org_id, user_id) VALUES (200, 12)")
         db_conn.execute("INSERT INTO group_members (group_id, user_id) VALUES (8, 12)")
         db_conn.execute("INSERT INTO vault_group_access (vault_id, group_id, permission) VALUES (1, 8, 'admin')")
         db_conn.commit()
@@ -450,7 +454,8 @@ class TestMixedVisibilityModes:
     @pytest.mark.asyncio
     async def test_member_with_multiple_access_paths_gets_max(self, db_conn):
         """Member with direct write + group admin + org read → gets admin (max of all)."""
-        db_conn.execute("INSERT INTO groups (id, name, org_id) VALUES (9, 'super_editors', NULL)")
+        db_conn.execute("INSERT INTO groups (id, name, org_id) VALUES (9, 'super_editors', 200)")
+        db_conn.execute("INSERT INTO org_members (org_id, user_id) VALUES (200, 60)")
         db_conn.execute("INSERT INTO group_members (group_id, user_id) VALUES (9, 60)")
         db_conn.execute("INSERT INTO vault_group_access (vault_id, group_id, permission) VALUES (1, 9, 'admin')")
         db_conn.execute("INSERT INTO vault_members (vault_id, user_id, permission) VALUES (1, 60, 'write')")

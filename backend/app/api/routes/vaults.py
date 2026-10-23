@@ -286,7 +286,12 @@ async def _fetch_accessible_vaults(
             UNION
             SELECT vga.vault_id FROM vault_group_access vga
             JOIN group_members gm ON vga.group_id = gm.group_id
+            JOIN groups g ON g.id = gm.group_id
             WHERE gm.user_id = ?
+              AND EXISTS (
+                  SELECT 1 FROM org_members om
+                  WHERE om.org_id = g.org_id AND om.user_id = ?
+              )
             UNION
             SELECT v.id FROM vaults v WHERE v.visibility = 'public' AND v.org_id IS NULL
             UNION
@@ -301,7 +306,7 @@ async def _fetch_accessible_vaults(
     """
 
     rows = await asyncio.to_thread(
-        lambda: conn.execute(union_query, (user_id, user_id, user_id, user_id)).fetchall()
+        lambda: conn.execute(union_query, (user_id, user_id, user_id, user_id, user_id)).fetchall()
     )
 
     # Extract vault IDs from rows
@@ -479,8 +484,11 @@ async def create_vault(
     try:
         await asyncio.to_thread(
             conn.execute,
-            "INSERT INTO vault_members (vault_id, user_id, permission) VALUES (?, ?, ?)",
-            (vault_id, user["id"], "admin"),
+            # granted_by records the creating caller, identical to the
+            # grant route in vault_members.py — the vault-creation writer is
+            # the same provenance class (issue #721 sweep, C14 sibling).
+            "INSERT INTO vault_members (vault_id, user_id, permission, granted_by) VALUES (?, ?, ?, ?)",
+            (vault_id, user["id"], "admin", user["id"]),
         )
         await asyncio.to_thread(conn.commit)
     except Exception as e:
@@ -1098,7 +1106,13 @@ async def update_vault_groups(
     Update which groups have access to this vault.
 
     Replaces the current group access list with the provided group_ids.
-    Validates all group_ids exist and belong to the same org as the vault.
+    Validates all group_ids exist and, when the vault belongs to an
+    organization, that each group belongs to the same organization. POLICY
+    (issue #721 AC9): a vault whose org_id is NULL is org-less/global and
+    accepts groups from ANY organization — the pinned, explicitly-decided
+    behavior (test_allows_null_org_vault_to_accept_any_org_group_on_replace
+    and the sibling POST route's test_allows_null_org_id_vault_accepts_any_
+    org_group); a vault WITH an org rejects groups from a different one.
     Returns the updated list of groups with vault access.
     Returns 400 if any group_ids are invalid or belong to a different org.
     Returns 404 if vault doesn't exist.
