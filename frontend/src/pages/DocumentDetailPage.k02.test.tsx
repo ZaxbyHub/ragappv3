@@ -11,10 +11,12 @@
 //        screen (the old code did exactly that).
 //   (ii) AC6 state-corruption direction — the same late save must not touch
 //        the current document's tag checkboxes or its tagsDirty bookkeeping:
-//        doc 2's "Tag alpha" stays unchecked and Save stays disabled. This
-//        also kills the drop-updater-guard mutant (setDoc without the
-//        prev-id check): with the guard removed the stale tags land on doc 2,
-//        tagsDirty flips true, and Save re-enables.
+//        doc 2's "Tag alpha" stays unchecked and Save stays disabled. The
+//        OUTCOME is pinned jointly by the loadGen gate and this assertion:
+//        removing only the updater's prev-id check does NOT fail this test
+//        (the outer gate returns before setDoc in every late-save scenario —
+//        probe R2-P5), so that check is a redundant backstop; what these
+//        pins kill is removal of the outer gate itself (probe R2-P2).
 //
 // Harness mirrors DocumentDetailPage.save-toast.test.tsx (proven in this
 // repo): deferred getDocument/setDocumentTags mocks, the useUploadMonitoring

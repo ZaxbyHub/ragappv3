@@ -241,6 +241,10 @@ describe("useDocumentPolling K02 feedback-round pins", () => {
     expect(fixture.listDocuments).toHaveBeenCalledTimes(3);
 
     expect(view.result.current.documents.length).toBe(0);
+    // F-003 pin: the NO-KEEP wipe inside the keep-rows branch arms the AC12
+    // retry affordance exactly like the foreground path (listError=true).
+    // Reverting that block (listError left false on the wipe) fails here.
+    expect(view.result.current.listError).toBe(true);
 
     // Settle the held q2 foreground load (its token is no longer latest, so
     // it commits nothing) so no flight outlives the test.
@@ -347,6 +351,10 @@ describe("useDocumentPolling K02 feedback-round pins", () => {
     // Sentinel: the initial load settled with the processing row visible.
     expect(view.result.current.documents).toHaveLength(1);
 
+    // The next stats fetch fails (once) — pin that the stats failure toast
+    // carries the same stable-id discipline as the list toast.
+    fixture.getDocumentStats.mockRejectedValueOnce(new Error("stats down"));
+
     // Two consecutive poll rejections: the first at the base 2000ms; the
     // kept-rows failure re-arms itself (no state changed for the effect to
     // observe), so the second fires at the ramped +3000ms.
@@ -359,9 +367,14 @@ describe("useDocumentPolling K02 feedback-round pins", () => {
       await flush();
     });
     expect(fixture.listDocuments).toHaveBeenCalledTimes(3);
-    expect(fixture.toastError).toHaveBeenCalledTimes(2);
+    // Two list-failure toasts + one stats-failure toast (the rejected tick-1
+    // stats fetch above).
+    expect(fixture.toastError).toHaveBeenCalledTimes(3);
+    expect(fixture.toastError).toHaveBeenCalledWith(expect.any(String), {
+      id: "documents-stats-failure",
+    });
 
-    // Both failures surface through the SAME toast id so sonner dedupes them.
+    // Both failures surface through the SAME list toast id so sonner dedupes them.
     expect(fixture.toastError).toHaveBeenLastCalledWith(expect.any(String), {
       id: "documents-list-failure",
     });

@@ -323,6 +323,11 @@ export function useDocumentPolling({
       setDocumentsState((previous) => {
         if (!isReadCurrent(token)) return previous;
         documentsScopeRef.current = token.scope;
+        // Paired with documentsScopeRef inside the SAME updater: the keep-rows
+        // predicate reads both together, so they must be written together —
+        // a sync write here vs an updater write there could skew if React
+        // defers the updater (review question on the feedback round).
+        documentsContextRef.current = token.readContext;
         return response.documents;
       });
       setTotalState((previous) => {
@@ -335,8 +340,6 @@ export function useDocumentPolling({
         listErrorScopeRef.current = token.scope;
         return false;
       });
-      // Successful commits own the rows for THIS read context (query).
-      documentsContextRef.current = token.readContext;
       return true;
     } catch (error) {
       if (!isReadCurrent(token)) return;
