@@ -6768,6 +6768,12 @@ def transaction_context(conn: sqlite3.Connection):
             conn.execute("UPDATE ...")
         # Automatically commits on success, rolls back on exception
 
+    Takes the write lock upfront (BEGIN IMMEDIATE): a DEFERRED begin here
+    turned read-then-write sequences (validate preconditions, then write)
+    into snapshot upgrades that fail with SQLITE_BUSY_SNAPSHOT — which
+    busy_timeout does not retry — whenever another connection committed
+    between the in-transaction read and the first write (issue #721 review).
+
     Args:
         conn: SQLite database connection
 
@@ -6777,7 +6783,7 @@ def transaction_context(conn: sqlite3.Connection):
     Raises:
         Any exception that occurs during the transaction (after rollback)
     """
-    conn.execute("BEGIN")
+    conn.execute("BEGIN IMMEDIATE")
     try:
         yield conn
         conn.commit()
@@ -6843,17 +6849,27 @@ def migrate_purge_orphaned_group_members(sqlite_path: str) -> None:
 
     Destructive and journaled (#699 AC5 precedent): purged rows are NOT
     recoverable from the journal — the count + detail recorded in the journal
-    row are the only trace. Journal-gated on a prior succeeded run; a
-    converged boot is a no-op that journals nothing.
+    row are the only trace. The gate, the count, the DELETE, and the journal
+    row all run inside one BEGIN IMMEDIATE transaction: concurrent worker
+    startups serialize (the second sees the first's 'ok' row and exits), the
+    journaled count is the DELETE's own rowcount from the same snapshot, and
+    a failed journal INSERT rolls the DELETE back so the count is never lost
+    (issue #721 review F-007/F-023/F-030). Journal-gated on a prior succeeded
+    run; a converged boot is a no-op that journals nothing.
     """
     journal_name = "migrate_purge_orphaned_group_members"
     conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
+        # BEGIN IMMEDIATE: gate + count + DELETE + journal row commit as one
+        # unit and concurrent startups serialize behind the write lock
+        # (issue #721 review F-030).
+        conn.execute("BEGIN IMMEDIATE")
         already = conn.execute(
             "SELECT COUNT(*) FROM migration_journal WHERE migration_name = ? AND outcome = 'ok'",
             (journal_name,),
         ).fetchone()[0]
         if already:
+            conn.rollback()
             return
 
         _doomed = conn.execute(
@@ -6870,7 +6886,7 @@ def migrate_purge_orphaned_group_members(sqlite_path: str) -> None:
                 "(unrecoverable; user no longer in the group's organization)",
                 _doomed,
             )
-            conn.execute(
+            deleted = conn.execute(
                 """DELETE FROM group_members WHERE id IN (
                     SELECT gm.id FROM group_members gm
                     JOIN groups g ON g.id = gm.group_id
@@ -6878,13 +6894,18 @@ def migrate_purge_orphaned_group_members(sqlite_path: str) -> None:
                         SELECT 1 FROM org_members om
                         WHERE om.org_id = g.org_id AND om.user_id = gm.user_id
                     ))"""
-            )
-        record_migration_outcome(
-            conn,
-            migration_name=journal_name,
-            phase="succeeded",
-            outcome="ok",
-            detail=f"orphaned group_members rows deleted: {_doomed}",
+            ).rowcount
+        else:
+            deleted = 0
+        # Direct INSERT rather than record_migration_outcome: that helper
+        # never raises, so a failed journal INSERT would commit the DELETE
+        # while losing the only trace of it. Here a journal failure rolls the
+        # DELETE back too and the whole purge retries on the next boot with
+        # its count intact (issue #721 review F-007/F-023).
+        conn.execute(
+            "INSERT INTO migration_journal (migration_name, phase, outcome, detail)"
+            " VALUES (?, ?, ?, ?)",
+            (journal_name, "succeeded", "ok", f"orphaned group_members rows deleted: {deleted}"),
         )
         conn.commit()
     except Exception as exc:

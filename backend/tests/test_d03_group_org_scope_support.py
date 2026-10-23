@@ -442,3 +442,22 @@ def test_vault_creation_records_granted_by(env):
         (vault_id,),
     ).fetchone()
     assert row == (env.member_id, "admin", env.member_id)
+
+
+def test_run_migrations_purges_orphans_before_default_vault_backfill():
+    """Ordering pin (review F-019b): the orphan purge must run BEFORE
+    migrate_assign_orphan_users_to_default_vault inside run_migrations.
+
+    The backfill's has-access predicate counts any group_members x
+    vault_group_access row as access; if the purge ran after it, a user whose
+    only access was an orphaned group grant would be skipped by the backfill
+    on the first boot. Swapping the two call lines in run_migrations must
+    fail this test."""
+    import inspect
+
+    from app.models import database
+
+    source = inspect.getsource(database.run_migrations)
+    purge_pos = source.index("migrate_purge_orphaned_group_members(sqlite_path)")
+    backfill_pos = source.index("migrate_assign_orphan_users_to_default_vault(sqlite_path)")
+    assert purge_pos < backfill_pos

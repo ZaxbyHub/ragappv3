@@ -14,8 +14,12 @@
   and the member-role vault listing resolve a group grant only while the user is a member
   of the group's organization — orphaned rows (from any legacy path or a raced write) no
   longer grant anything.
-- **Group-member writes are race-free**: the org-membership check in
-  `PUT /groups/{id}/members` moved inside the write transaction.
+- **Group-member validation moved inside its write transaction**: the
+  org-membership check in `PUT /groups/{id}/members` now runs in the same
+  transaction as the membership write, closing the validate-then-write race on
+  that path. (`PUT /users/{id}/groups` still validates before its transaction;
+  the org-replace write in `PUT /users/{id}/organizations` takes its write lock
+  at the head of the transaction so its before-snapshot cannot race a commit.)
 - **Grant provenance parity**: the group-side vault grant route
   (`PUT /groups/{id}/vaults`) and vault creation both record `granted_by`
   (the acting/creating user), identical to the other grant writers.
@@ -24,7 +28,10 @@
   invites already addressed to the new name (which would otherwise re-bind to the
   renaming user); `resend` now applies the exact redeemability checks `create` applies
   (email-form to nobody → 400; role dropped below member → 400; #300-style
-  not-yet-provisioned username invites stay allowed).
+  not-yet-provisioned username invites stay allowed). The rename rebind/revocation
+  is cross-organization by design: an invite for another org addressed to the new
+  username is revoked too, because leaving it would re-bind someone else's token
+  to the renamed user.
 - **One-off migration**: journaled startup purge of existing orphaned
   `group_members` rows (a user not in the group's organization), placed before the
   Default-vault orphan backfill. **Destructive**: purged rows are not recoverable from
@@ -47,9 +54,10 @@ grant provenance and invite identity drifted on sibling paths.
 - API behavior changes are the issue's required semantics (superadmin cross-org
   assignment 400; scoped org replace keeps out-of-scope memberships; resend 400 for
   unredeemable invites; hijack-style renames revoke the stolen invite).
-- Two test fixtures were corrected to seed valid chains (an org-less group member and
-  an invite addressed to a nonexistent email-shaped username — states the API itself
-  could never produce).
+- Test fixtures were corrected for states the API itself can never produce:
+  groups seeded without an organization while users held membership in them
+  (now seeded with the group's organization plus matching organization
+  membership), and an invite addressed to a nonexistent email-shaped username.
 
 ## Known limitations
 

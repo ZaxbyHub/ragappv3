@@ -81,7 +81,7 @@ class UpdateActiveRequest(BaseModel):
 
 
 class UpdateUserRequest(BaseModel):
-    username: Optional[str] = Field(default=None, max_length=255)
+    username: Optional[str] = Field(default=None, min_length=3, max_length=255)
     full_name: Optional[str] = Field(default=None, max_length=255)
     role: Optional[str] = Field(default=None)
 
@@ -811,7 +811,13 @@ async def update_user_organizations(
     user: dict = Depends(require_role("admin")),
     _csrf_token: str = Depends(csrf_protect),
 ):
-    """Replace user's organization memberships (admin/superadmin only)."""
+    """Replace a user's organization memberships (admin/superadmin only).
+
+    Superadmin callers replace the full membership set; other admins replace
+    only memberships in organizations they themselves belong to (issue #721
+    AC5). Dropped organizations' group memberships are revoked in the same
+    transaction.
+    """
     pool = get_pool(str(settings.sqlite_path))
     conn = await pool.get_connection_async()
 
@@ -872,6 +878,15 @@ async def update_user_organizations(
                 )
 
         try:
+            # Take the write lock BEFORE the before-snapshot: a DEFERRED
+            # transaction would read before_orgs in autocommit and after_orgs
+            # inside the write txn — two different snapshots — so a concurrent
+            # grant committed between them could be deleted by this request
+            # while its group_members rows survived the dropped-set derivation
+            # (issue #721 review F-001). BEGIN IMMEDIATE pins the write lock
+            # and both reads into one snapshot.
+            conn.execute("BEGIN IMMEDIATE")
+
             # Snapshot the target's current non-owner orgs before the replace so
             # group memberships can be cleaned up for orgs this call actually
             # drops (issue #721 AC3). Owner rows are excluded by the same
