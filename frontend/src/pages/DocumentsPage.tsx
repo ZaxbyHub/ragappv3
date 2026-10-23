@@ -273,9 +273,10 @@ export default function DocumentsPage() {
   const activeVaultIdRef = useRef<number | null>(activeVaultId);
   activeVaultIdRef.current = activeVaultId;
   // The vault the currently open confirm dialog was opened for; written by
-  // every setConfirmDialog call site so confirms can detect a switch that
-  // happened while the modal was open (the modal captures its onConfirm with
-  // pre-switch closures).
+  // every setConfirmDialog call site (all four) and READ by the two bulk
+  // executors' execute-time guards — the folder and single-document confirms
+  // are per-resource actions backed by per-vault server authorization and are
+  // deliberately unguarded (recorded residual).
   const confirmVaultRef = useRef<number | null>(null);
 
   useEffect(() => {
@@ -556,11 +557,12 @@ export default function DocumentsPage() {
 
   const executeDeleteAllInVault = useCallback(async () => {
     if (!activeVaultId || !canMutateDocuments) return;
-    // Same execute-time guard as executeBulkDelete (issue #764 fix 7): the
-    // dialog captured the open-time activeVaultId in this closure, so a stale
-    // confirm would wipe the PREVIOUS vault. Delete-all is a bulk mutation.
+    // Same execute-time guard as executeBulkDelete (per the bulk-mutation
+    // scope decision): the dialog captured the open-time activeVaultId in
+    // this closure, so a stale confirm would wipe the PREVIOUS vault.
+    // Delete-all is a bulk mutation.
     if (confirmVaultRef.current !== activeVaultIdRef.current) {
-      toast.error("Vault changed — reload the page and try again");
+      toast.error("Vault changed — reopen the confirmation and try again");
       return;
     }
     setIsBulkDeletingAll(true);
@@ -571,13 +573,18 @@ export default function DocumentsPage() {
         setDocuments([]);
         setStats((prev) => (prev ? { ...prev, total_documents: 0 } : prev));
         fetchFolders();
+        // Refetch the authoritative list: the optimistic empty above does not
+        // touch the polling hook's `total`, which would otherwise leave
+        // "Showing 0 of N" and a Load-more control pointing at rows that no
+        // longer exist.
+        await fetchDocuments();
       }
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to delete documents");
     } finally {
       setIsBulkDeletingAll(false);
     }
-  }, [activeVaultId, canMutateDocuments, setDocuments, setStats, fetchFolders]);
+  }, [activeVaultId, canMutateDocuments, setDocuments, setStats, fetchFolders, fetchDocuments]);
 
   const handleDeleteAllInVault = useCallback(() => {
     if (!documents || documents.length === 0) return;

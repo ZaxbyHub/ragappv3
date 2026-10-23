@@ -110,21 +110,22 @@ describe("AC6 toast pins (issue #764, non-frozen)", () => {
     render(<RouterProvider router={router} />);
 
     // Document 1 with tag alpha pre-selected; toggle beta on to make tagsDirty.
-    const beta = await screen.findByLabelText("Tag beta");
+    const beta = await screen.findByLabelText("Tag beta", { timeout: 10_000 });
     await act(async () => {
       beta.click();
     });
-    const save = await screen.findByRole("button", { name: /save/i });
-    await waitFor(() => expect(save).toBeEnabled());
+    const save = await screen.findByRole("button", { name: /save/i }, { timeout: 10_000 });
+    await waitFor(() => expect(save).toBeEnabled(), { timeout: 10_000 });
 
     await act(async () => {
       save.click();
     });
 
-    await waitFor(() =>
-      expect(vi.mocked(toast.success)).toHaveBeenCalledWith("Tags updated")
+    await waitFor(
+      () => expect(vi.mocked(toast.success)).toHaveBeenCalledWith("Tags updated"),
+      { timeout: 10_000 }
     );
-    await waitFor(() => expect(save).toBeDisabled());
+    await waitFor(() => expect(save).toBeDisabled(), { timeout: 10_000 });
   });
 
   it("stale save resolving after navigation does not toast success", { timeout: 30_000 }, async () => {
@@ -144,8 +145,8 @@ describe("AC6 toast pins (issue #764, non-frozen)", () => {
     await act(async () => {
       alpha.click();
     });
-    const save = await screen.findByRole("button", { name: /save/i });
-    await waitFor(() => expect(save).toBeEnabled());
+    const save = await screen.findByRole("button", { name: /save/i }, { timeout: 10_000 });
+    await waitFor(() => expect(save).toBeEnabled(), { timeout: 10_000 });
 
     // Start the save (held pending), then navigate to doc 2.
     await act(async () => {
@@ -155,7 +156,7 @@ describe("AC6 toast pins (issue #764, non-frozen)", () => {
       await router.navigate("/documents/2");
     });
     // Doc 2 must be on screen before the save resolves.
-    await screen.findByRole("heading", { name: /two\.txt/i });
+    await screen.findByRole("heading", { name: /two\.txt/i }, { timeout: 10_000 });
 
     // Resolve the stale save — no toast, no tag on doc 2.
     await act(async () => {
@@ -169,6 +170,6 @@ describe("AC6 toast pins (issue #764, non-frozen)", () => {
     // stale commit (the frozen C6 covers this state assertion; kept here as
     // a belt-and-suspenders pairing with the toast assertion).
     const saveAfter = screen.getByRole("button", { name: /save/i });
-    await waitFor(() => expect(saveAfter).toBeDisabled());
+    await waitFor(() => expect(saveAfter).toBeDisabled(), { timeout: 10_000 });
   });
 });

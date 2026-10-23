@@ -43,10 +43,11 @@ export default function DocumentDetailPage() {
   const [error, setError] = useState<string | null>(null);
 
   // Live mirror of the doc slot, written SYNCHRONOUSLY at every setDoc call
-  // site (issue #764 AC6): a per-render mirror would miss a queued-but-
-  // unrendered setDoc under batched async renders, letting a same-tick stale
-  // save read the old id. handleSaveTags uses it to decide whether its late
-  // result (and its success toast) belongs to the document still on screen.
+  // site (issue #764 AC6) — never inside an updater (React may defer or re-run
+  // updaters in the render phase). handleSaveTags combines it with the load
+  // generation (loadGenRef) to decide whether its late result and success
+  // toast belong to the document still on screen: the id mirror alone cannot
+  // see a navigation whose next document is still loading.
   const docRef = useRef<Document | null>(null);
   // Save-generation token (issue #764 AC6): bumped per save so a stale save's
   // finally cannot clear a NEWER save's saving flag (which would re-enable
@@ -227,30 +228,36 @@ export default function DocumentDetailPage() {
   const handleSaveTags = async () => {
     if (!doc || doc.vault_id == null) return;
     const savedDocId = String(doc.id);
+    const savedLoadGen = loadGenRef.current;
     const saveGen = ++savingTagGenRef.current;
     setSavingTags(true);
     try {
       const updated = await setDocumentTags(Number(doc.id), doc.vault_id, Array.from(selectedTagIds));
-      // Issue #764 AC6: commit only if the doc slot still holds THIS document.
-      // The guard runs against the updater's live `prev` (a closed-over `doc`
-      // compare would be a tautology), so a save that resolves after
-      // navigation can never re-tag the navigated-to document.
+      // Issue #764 AC6: commit/toast only if THIS document is still the one on
+      // screen. Two still-current signals, both needed: the live docRef must
+      // still hold the saved id (a closed-over `doc` compare would be a
+      // tautology), AND the load generation must be unchanged — a navigation
+      // bumps loadGenRef before the next document's getDocument resolves, and
+      // in that window docRef still names the previous document, so the id
+      // check alone would let a stale save toast over the loading screen.
+      const liveDoc = docRef.current;
+      const stillCurrent =
+        loadGenRef.current === savedLoadGen &&
+        liveDoc !== null &&
+        String(liveDoc.id) === savedDocId;
+      if (!stillCurrent) return;
+      // docRef is written at this call site, never inside the updater below:
+      // React may defer or re-run updaters in the render phase, so the mirror
+      // must not depend on them (the updater keeps its own live-prev guard as
+      // a backstop against any other writer racing the slot).
+      const nextDoc = { ...liveDoc, tags: updated };
+      docRef.current = nextDoc;
       setDoc((prev) => {
         if (prev === null || String(prev.id) !== savedDocId) return prev;
-        const next = { ...prev, tags: updated };
-        docRef.current = next;
-        return next;
+        return { ...prev, tags: updated };
       });
-      // Toast from the LIVE ref (docRef, written synchronously at every setDoc
-      // site), not the closure: under batched renders a queued-but-unrendered
-      // setDoc is invisible to a per-render mirror but not to docRef, and a
-      // closed-over `doc` would always match (tautology). Suppressing the
-      // success toast when the user has navigated away keeps it truthful —
-      // it announces the document still on screen.
-      const liveDoc = docRef.current;
-      if (liveDoc !== null && String(liveDoc.id) === savedDocId) {
-        toast.success("Tags updated");
-      }
+      // Truthful success toast: it announces the document still on screen.
+      toast.success("Tags updated");
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to update tags");
     } finally {

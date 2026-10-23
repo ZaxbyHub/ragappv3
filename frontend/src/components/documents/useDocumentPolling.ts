@@ -173,6 +173,15 @@ export function useDocumentPolling({
   const wikiScopeRef = useRef<Scope | null>(null);
   const compilingScopeRef = useRef<Scope | null>(null);
   const totalScopeRef = useRef<Scope | null>(null);
+  // Read-context (query) ownership of the committed list rows (issue #764
+  // keep-rows hardening): written on every successful list commit so a later
+  // keep-rows failure only preserves rows that belong to the SAME query
+  // context the failing fetch was issued under — a poll that rejects after a
+  // search/sort/filter change must not keep the previous query's rows.
+  const documentsContextRef = useRef<object | null>(null);
+  // Render mirror of the visible rows, declared before fetchDocuments reads it
+  // in the keep-rows decision (assigned in the render body below).
+  const documentsRef = useRef<Document[]>([]);
 
   const queryBaseKey = JSON.stringify([
     activeVaultId,
@@ -326,46 +335,56 @@ export function useDocumentPolling({
         listErrorScopeRef.current = token.scope;
         return false;
       });
+      // Successful commits own the rows for THIS read context (query).
+      documentsContextRef.current = token.readContext;
       return true;
     } catch (error) {
       if (!isReadCurrent(token)) return;
       console.error("Failed to fetch documents:", error);
-      toast.error(error instanceof Error ? error.message : "Failed to load documents");
+      toast.error(error instanceof Error ? error.message : "Failed to load documents", {
+        id: "documents-list-failure",
+      });
       if (options?.keepRowsOnFailure) {
-        // Issue #764 AC8/AC9 — background-poll failure over an ALREADY-LOADED
-        // list must not replace rendered rows with empty state. "Loaded for
-        // the current scope" is exactly: this scope owns the committed rows
-        // (documentsScopeRef) and the updater's live previous is non-empty.
-        // listError is NOT flipped here: the rows are valid last-known-good
-        // data and the toast already surfaced the transient error; flipping it
-        // would arm the ErrorState branch for an empty future refetch with a
-        // stale failure. A rejection during the scope's INITIAL load (no rows
-        // committed yet) keeps the historical behavior below, so the AC12
-        // retry affordance is unchanged.
+        // Issue #764 AC8/AC9 — a background-poll failure over an ALREADY-LOADED
+        // list must not replace rendered rows with empty state. Kept rows must
+        // belong to the CURRENT scope (documentsScopeRef) AND the CURRENT read
+        // context (documentsContextRef): a poll that rejects after a
+        // search/sort/filter change must not keep the previous query's rows
+        // under the new query. On a keep, listError is NOT flipped — the rows
+        // are valid last-known-good data and the toast already surfaced the
+        // transient error. When the rows are NOT kept (nothing committed for
+        // this scope+context yet), the historical wipe + listError arms the
+        // AC12 retry affordance exactly as the foreground path does.
+        const keepRows =
+          documentsScopeRef.current === token.scope &&
+          documentsContextRef.current === token.readContext &&
+          documentsRef.current.length > 0;
         setDocumentsState((previous) => {
           if (!isReadCurrent(token)) return previous;
-          if (documentsScopeRef.current === token.scope && previous.length > 0) {
-            return previous;
-          }
+          if (keepRows) return previous;
           documentsScopeRef.current = token.scope;
           return [];
         });
         setTotalState((previous) => {
           if (!isReadCurrent(token)) return previous;
-          if (totalScopeRef.current === token.scope && previous > 0) {
-            return previous;
-          }
+          if (keepRows) return previous;
           totalScopeRef.current = token.scope;
           return 0;
         });
-        // Failure verdict for the poll owner: rows were kept, so no state
-        // visible to the poll effect changed — the caller (runPollFetch) must
-        // schedule the next poll itself. A state-driven re-arm (effect dep)
-        // cannot be observed by the frozen C9 check's single-block fake-time
-        // advance (sinon drains only MICROTASKS between fake timers; React's
-        // effect flush is a macrotask and lands after the advance), and the
-        // promise-chain re-arm works identically in production where state
-        // flushes are near-immediate.
+        if (!keepRows) {
+          setListErrorState((previous) => {
+            if (!isReadCurrent(token)) return previous;
+            listErrorScopeRef.current = token.scope;
+            return true;
+          });
+        }
+        // Failure verdict for the poll owner: on a keep, no state visible to
+        // the poll effect changed, so the caller (runPollFetch) schedules the
+        // next poll itself (a state-driven re-arm cannot be observed by the
+        // C9 poll-re-arm acceptance check's single-block fake-time advance,
+        // which drains only microtasks between fake timers; this behaves
+        // identically in production where state flushes are near-immediate).
+        // On a wipe the effect re-runs from the commit and owns re-arming.
         return false;
       }
       setDocumentsState((previous) => {
@@ -424,7 +443,9 @@ export function useDocumentPolling({
     } catch (error) {
       if (!isReadCurrent(token)) return;
       console.error("Failed to fetch stats:", error);
-      toast.error(error instanceof Error ? error.message : "Failed to load document stats");
+      toast.error(error instanceof Error ? error.message : "Failed to load document stats", {
+        id: "documents-stats-failure",
+      });
     } finally {
       finishRead(token);
     }
@@ -446,7 +467,6 @@ export function useDocumentPolling({
     listErrorScopeRef.current === scope ? listError : false;
   const loadingVisible = loadingScopeRef.current === scope ? loading : true;
 
-  const documentsRef = useRef<Document[]>([]);
   documentsRef.current = documentsVisible;
 
   // Issue #764 AC9 — the adaptive poll's fire/retry scheduler. The effect
@@ -454,9 +474,10 @@ export function useDocumentPolling({
   // are kept (fetchDocuments returns false), no state visible to that effect
   // changes, so nothing would re-arm it — runPollFetch schedules the next
   // timer itself in the failure's own microtask domain (a state-driven
-  // re-arm cannot be observed by the frozen C9 check's single-block fake-time
-  // advance, which drains only microtasks between fake timers; this behaves
-  // identically in production where state flushes are near-immediate). The
+  // re-arm cannot be observed by the C9 poll-rearm acceptance check's
+  // single-block fake-time advance, which drains only microtasks between fake
+  // timers; this behaves identically in production where state flushes are
+  // near-immediate). The
   // handle lives in pollTimerRef so the poll effect's cleanup cancels a
   // pending retry on any dep change (incl. scope), and arming is skipped
   // whenever a timer is already pending — at most one poll timer exists.
