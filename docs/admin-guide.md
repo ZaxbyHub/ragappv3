@@ -998,6 +998,7 @@ Note the deliberate asymmetry: **viewing** chat sessions requires only `read`, b
 - Access tokens are **short-lived (15 minutes)** and can be **denylisted before expiry** (e.g., on logout)
 - All active sessions for a user can be revoked at once via `POST /api/auth/revoke-all`
 - **Password-change token invalidation (FR-007):** Changing a user's password via `change_password` or `admin_reset_password` updates the `password_changed_at` epoch. Any access token issued before that epoch is rejected — users must re-authenticate after a password change. This is by design and ensures compromised credentials cannot be used with old tokens.
+- **Deactivation revokes sessions:** deactivating a user (`PATCH /api/users/{id}/active` with `is_active: false`) deletes their `user_sessions` rows in the same transaction as the flag flip, so a refresh cookie issued before deactivation can never mint access tokens again — including after reactivation. A password reset revokes sessions the same way.
 
 **Client Fingerprint Binding:**
 - Access tokens are bound to the client fingerprint (User-Agent + other signals)
@@ -1045,14 +1046,14 @@ Indexes exist on `event_type`, `actor_user_id`, `target_user_id`, and `created_a
 | `user.password_reset` | `PATCH /users/{id}/password` | An admin reset a user's password |
 | `user.role_updated` | `PATCH /users/{id}/role` | A superadmin changed a user's role |
 | `user.active_updated` | `PATCH /users/{id}/active` | An admin enabled/disabled a user |
-| `user.deleted` | `DELETE /users/{id}` | A superadmin deleted a user (metadata snapshots the pre-delete role/username) |
+| `user.deleted` | `DELETE /api/users/{id}` | A superadmin deleted a user (metadata snapshots the pre-delete role/username) |
 | `membership.organizations_replaced` | `PUT /users/{id}/organizations` | A user's org membership set was replaced (the payload lists the requested memberships; a caller who is not a superadmin only replaces memberships in their own organizations, and group memberships in dropped orgs are revoked with them) |
 | `membership.groups_replaced` | `PUT /users/{id}/groups` | A user's group membership set was replaced |
-| `vault.visibility_updated` | `PUT /vaults/{id}` (visibility field) | A vault's visibility was updated (metadata carries old and new values) |
-| `vault.deleted` | `DELETE /vaults/{id}` | A vault admin deleted the vault (recorded after the durable delete) |
-| `vault.group_access_replaced` | `PUT /vaults/{id}/groups` | A vault's group-access list was replaced or cleared (metadata carries the resulting group ids; an empty list is a full revoke) |
+| `vault.visibility_updated` | `PUT /api/vaults/{id}` (visibility field) | A vault's visibility was updated (metadata carries old and new values) |
+| `vault.deleted` | `DELETE /api/vaults/{id}` | A vault admin deleted the vault (recorded after the durable delete) |
+| `vault.group_access_replaced` | `PUT /api/vaults/{id}/groups` | A vault's group-access list was replaced or cleared (metadata carries the resulting group ids; an empty list is a full revoke) |
 
-**Deactivation revokes sessions:** disabling a user (`PATCH /users/{id}/active`
+**Deactivation revokes sessions:** disabling a user (`PATCH /api/users/{id}/active`
 with `is_active: false`) deletes all of that user's refresh sessions in the same
 transaction — a refresh cookie issued before deactivation can never mint new
 access tokens, including after the account is reactivated.

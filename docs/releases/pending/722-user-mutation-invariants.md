@@ -62,12 +62,16 @@ combinations, plus a schema FK gap that 500'd historical-creator deletes.
   assertions unchanged).
 - API changes are the issue's required semantics; the admin-guide rule ("a
   non-superadmin cannot modify a superadmin target at all") is now enforced by
-  every writer.
+  all five users.py writers listed above. (The org-side membership writers in
+  organizations.py / groups.py are org-scoped surfaces without a superadmin
+  target concept and are out of this rule's scope.)
 
 ## Known limitations
 
 - The structural fix (rebuild `organizations` with `ON DELETE SET NULL`) is
   sequenced to the Workstream B schema lane per the issue's Dependencies; the
   same-transaction NULL-ing closes the reachable 500 now.
-- Rows for users who never log in again are reclaimed only at account deletion
-  (login purge is per-user); recorded as a sweep observation.
+- A user's expired session rows are purged at that user's next login,
+  deactivation, or password reset; for a user who is never mutated again they
+  persist until account deletion (the login purge is per-user). Recorded as a
+  sweep observation.

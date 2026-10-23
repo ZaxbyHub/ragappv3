@@ -796,9 +796,14 @@ async def delete_vault(
         # draft_inputs/draft_jobs/draft_revisions/draft_events all cascade
         # from drafts in turn — so this one statement also removes every
         # draft row purged above with no separate DELETE FROM drafts needed.
-        await asyncio.to_thread(
-            conn.execute, "DELETE FROM vaults WHERE id = ?", (vault_id,)
-        )
+        # The rowcount gates the audit event below: a concurrent delete that
+        # won the race must not double-record vault.deleted (review F-031a).
+        def _delete_vault_row() -> int:
+            return conn.execute(
+                "DELETE FROM vaults WHERE id = ?", (vault_id,)
+            ).rowcount
+
+        deleted_vault_rows = await asyncio.to_thread(_delete_vault_row)
 
         # Commit transaction (durable deletion intent)
         await asyncio.to_thread(conn.commit)
@@ -831,14 +836,16 @@ async def delete_vault(
     # Security-relevant event recorded after the relational delete committed
     # (issue #722 AC1) — the same record-after-real-mutation ordering the
     # Draft Room deletions use, so the row only ever reflects a durable
-    # deletion.
-    await safe_record_security_event(
-        conn,
-        event_type="vault.deleted",
-        actor=user,
-        request=http_request,
-        metadata={"vault_id": vault_id, "name": vault_name},
-    )
+    # deletion. Gated on the DELETE's own rowcount so a concurrent delete
+    # that already removed the row records nothing (review F-031a).
+    if deleted_vault_rows > 0:
+        await safe_record_security_event(
+            conn,
+            event_type="vault.deleted",
+            actor=user,
+            request=http_request,
+            metadata={"vault_id": vault_id, "name": vault_name},
+        )
 
     # -- Post-commit vector reconciliation (W21 / C19). -------------------
     # The relational delete is durable now; destroy the vault's vectors. On

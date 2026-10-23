@@ -36,7 +36,7 @@
       "SEVERITY.LOW": 62,
       "SEVERITY.MEDIUM": 60,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 91804,
+      "loc": 91807,
       "nosec": 0,
       "skipped_tests": 70
     },
@@ -374,7 +374,7 @@
       "SEVERITY.LOW": 4,
       "SEVERITY.MEDIUM": 2,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 962,
+      "loc": 965,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -3251,7 +3251,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1190         lambda: conn.execute(\n1191             f\"\"\"\n1192             SELECT id, org_id FROM groups\n1193             WHERE id IN ({placeholders})\n1194             \"\"\",\n1195             tuple(group_ids),\n",
+      "code": "1197         lambda: conn.execute(\n1198             f\"\"\"\n1199             SELECT id, org_id FROM groups\n1200             WHERE id IN ({placeholders})\n1201             \"\"\",\n1202             tuple(group_ids),\n",
       "col_offset": 12,
       "end_col_offset": 15,
       "filename": "backend/app/api/routes/vaults.py",
@@ -3262,12 +3262,12 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 1191,
+      "line_number": 1198,
       "line_range": [
-        1191,
-        1192,
-        1193,
-        1194
+        1198,
+        1199,
+        1200,
+        1201
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",

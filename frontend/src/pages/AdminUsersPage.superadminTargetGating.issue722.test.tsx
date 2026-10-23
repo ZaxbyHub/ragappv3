@@ -102,6 +102,16 @@ describe('AdminUsersPage superadmin-target gating (issue #722)', () => {
     // The active toggle on the superadmin row is disabled for the admin.
     const toggle = screen.getByRole('switch', { name: /deactivate user root/i });
     expect(toggle).toBeDisabled();
+
+    // The rendered role Select options (not just the helper): rows render in
+    // list order — root (superadmin target) first — and the admin is offered
+    // only the target's current role there (issue #722 review F-014: pins the
+    // wiring through roleOptionsFor into the rendered options).
+    const renderedRoleSelects = screen.getAllByTestId('role-options');
+    const rootRowOptions = Array.from(
+      renderedRoleSelects[0].querySelectorAll('option'),
+    ).map((o) => o.value);
+    expect(rootRowOptions).toEqual(['superadmin']);
   });
 
   it('roleOptionsFor keeps the role Select inert for an admin on a superadmin target', () => {

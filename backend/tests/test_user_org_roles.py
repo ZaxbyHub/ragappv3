@@ -27,7 +27,8 @@ from app.services.auth_service import (
 )
 
 # Local supplements for this file's schema variations:
-# 1. Simplified organizations table (no created_by/updated_at)
+# 1. Simplified organizations table (created_by column kept for the #722
+#    delete_user FK fix; no updated_at)
 # 2. Extra csrf_tokens table (not in shared schema)
 _ORGANIZATIONS_SIMPLIFIED = """
 DROP TABLE IF EXISTS organizations;
