@@ -19,6 +19,14 @@ the maintainer's investigation comment on #1001):
   literal, mirroring `main.py`'s exact-match startup warning: case
   variants (e.g. `ADMIN-SECRET-TOKEN`) are not the published literal and
   keep booting exactly as before.
+- **Whitespace-trimmed comparison (closing the padded-literal gap).** The
+  comparison runs on `admin_secret_token.strip()`, matching what
+  `derive_audit_key()` actually feeds the HMAC: it strips the token, so a
+  whitespace-padded literal (`" admin-secret-token "`) would otherwise
+  boot AND still derive the public key `b"admin-secret-token"`. Pinned by
+  `test_users_disabled_with_whitespace_padded_default_token_raises`.
+  Case variants are unaffected — trimming does not change case
+  sensitivity.
 - **`USERS_ENABLED=true` unchanged (AC3).** Under multi-user auth the
   token is the required bootstrap/first-admin credential and seeds
   `admin_token_scopes`, so only the existing empty-token refusal applies;
@@ -70,8 +78,30 @@ are unaffected.
 - Case variants of the literal still boot with no warning at all
   (exact-match decision, consistent with `main.py`'s warning trigger set
   and `backend/tests/test_admin_token_warning.py`'s case-variant pins).
+  Case variants do NOT derive the public key — `derive_audit_key()`
+  preserves case, so `ADMIN-SECRET-TOKEN` derives `b"ADMIN-SECRET-TOKEN"`,
+  a different (operator-specific) key.
 - Existing audit rows signed under the literal are not rotated or
   re-tombstoned by this change.
 - Item B (issue #1001 AC5: the #993 AC2 literal-401 wording decision and
   its cross-post) requires the maintainer's decision comment; the
   contingent literal-401 / RFC 6750 work (AC6) remains out of scope.
+
+## Item B — drafted decision record (AC5, awaiting maintainer posting)
+
+The critic's advisory recommendation (confidence 92/100), consistent with
+the frozen check `backend/tests/test_nonascii_credential_rejection.py`
+(non-ASCII legs accept any 4xx-never-5xx; wrong-ASCII control legs pin
+403/401 per route) and the frontend 401 interceptor
+(`frontend/src/lib/api/core.ts` clears `_jwtAccessToken` and calls
+`redirectToLogin()` on any unrefreshed 401 — a literal-401 change would
+log users out on every wrong admin credential):
+
+> **Decision:** #993 AC2 is confirmed satisfied-as-written: a non-ASCII
+> credential receives the route's existing invalid-credential 4xx (403 on
+> `require_auth`/`require_scope`/`_resolve_active_user`, 401 on the
+> service-account/health paths) and never a 500. No code change; the
+> literal-401 / RFC 6750 alignment is declined for this issue and would
+> need its own issue/PR (frozen-C2 checkpoint amendment, 403-assertion
+> audit across `backend/tests/`, frontend interceptor decision) if ever
+> revisited. Cross-posted to #993.

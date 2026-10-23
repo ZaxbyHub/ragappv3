@@ -1913,15 +1913,21 @@ class Settings(BaseSettings):
         # Single-admin mode: refuse the well-known literal token (issue #1001,
         # Item A). The exact string is published in this repository, so it is a
         # public sole credential AND public audit-HMAC key material via
-        # derive_audit_key's admin-token fallback. EXACT match only, mirroring
-        # main.py's startup warning: case variants are not the published
-        # literal and keep booting (AC2 decision). NOT refused under
+        # derive_audit_key's admin-token fallback. EXACT match on the trimmed
+        # value, mirroring main.py's startup warning: case variants are not the
+        # published literal and keep booting (AC2 decision). NOT refused under
         # USERS_ENABLED=True (AC3 decision: UNCHANGED) — there the token is
         # the required bootstrap/first-admin credential and seeds
         # admin_token_scopes, so only the empty-token arm above applies.
+        #
+        # The trim matters: derive_audit_key() strips the token before using it
+        # as HMAC key material, so a whitespace-padded literal (' admin-secret-
+        # token ') would otherwise boot and still derive the public key
+        # b'admin-secret-token'. Trimming here matches what the derivation
+        # actually does; the empty-token arm above trims for the same reason.
         if (
             not self.users_enabled
-            and self.admin_secret_token == _INSECURE_DEFAULT_ADMIN_TOKEN
+            and self.admin_secret_token.strip() == _INSECURE_DEFAULT_ADMIN_TOKEN
         ):
             raise ValueError(
                 "ADMIN_SECRET_TOKEN must be changed from the well-known default "

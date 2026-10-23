@@ -68,6 +68,17 @@ class TestRejectInsecureDefaults:
             settings = Settings(users_enabled=False, admin_secret_token=variant)
             assert settings.admin_secret_token == variant
 
+    @pytest.mark.parametrize(
+        "padded", [" admin-secret-token ", "\tadmin-secret-token\n"]
+    )
+    def test_users_disabled_with_whitespace_padded_default_token_raises(self, padded):
+        """users_enabled=False with the literal wrapped in whitespace must also
+        be refused: derive_audit_key() strips the token before using it as HMAC
+        key material, so a padded literal boots but still derives the PUBLIC
+        key b'admin-secret-token' (#1001 — the hole has to actually close)."""
+        with pytest.raises(ValueError, match="well-known default"):
+            Settings(users_enabled=False, admin_secret_token=padded)
+
     def test_users_enabled_with_default_admin_token_boots(self):
         """users_enabled=True, admin_secret_token='admin-secret-token' still
         boots — under multi-user auth the token is the required
