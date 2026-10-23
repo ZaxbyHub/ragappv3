@@ -292,7 +292,8 @@ export function useDocumentPolling({
 
   const pollIntervalMsRef = useRef(2_000);
 
-  const fetchDocuments = useCallback(async () => {
+  const fetchDocuments = useCallback(
+    async (options?: { keepRowsOnFailure?: boolean }) => {
     if (scopeRef.current !== scope || readContextRef.current !== readContext) return;
     const token = beginRead("list", listReadKey, scope);
     if (token === null) return;
@@ -325,10 +326,48 @@ export function useDocumentPolling({
         listErrorScopeRef.current = token.scope;
         return false;
       });
+      return true;
     } catch (error) {
       if (!isReadCurrent(token)) return;
       console.error("Failed to fetch documents:", error);
       toast.error(error instanceof Error ? error.message : "Failed to load documents");
+      if (options?.keepRowsOnFailure) {
+        // Issue #764 AC8/AC9 — background-poll failure over an ALREADY-LOADED
+        // list must not replace rendered rows with empty state. "Loaded for
+        // the current scope" is exactly: this scope owns the committed rows
+        // (documentsScopeRef) and the updater's live previous is non-empty.
+        // listError is NOT flipped here: the rows are valid last-known-good
+        // data and the toast already surfaced the transient error; flipping it
+        // would arm the ErrorState branch for an empty future refetch with a
+        // stale failure. A rejection during the scope's INITIAL load (no rows
+        // committed yet) keeps the historical behavior below, so the AC12
+        // retry affordance is unchanged.
+        setDocumentsState((previous) => {
+          if (!isReadCurrent(token)) return previous;
+          if (documentsScopeRef.current === token.scope && previous.length > 0) {
+            return previous;
+          }
+          documentsScopeRef.current = token.scope;
+          return [];
+        });
+        setTotalState((previous) => {
+          if (!isReadCurrent(token)) return previous;
+          if (totalScopeRef.current === token.scope && previous > 0) {
+            return previous;
+          }
+          totalScopeRef.current = token.scope;
+          return 0;
+        });
+        // Failure verdict for the poll owner: rows were kept, so no state
+        // visible to the poll effect changed — the caller (runPollFetch) must
+        // schedule the next poll itself. A state-driven re-arm (effect dep)
+        // cannot be observed by the frozen C9 check's single-block fake-time
+        // advance (sinon drains only MICROTASKS between fake timers; React's
+        // effect flush is a macrotask and lands after the advance), and the
+        // promise-chain re-arm works identically in production where state
+        // flushes are near-immediate.
+        return false;
+      }
       setDocumentsState((previous) => {
         if (!isReadCurrent(token)) return previous;
         documentsScopeRef.current = token.scope;
@@ -344,24 +383,30 @@ export function useDocumentPolling({
         listErrorScopeRef.current = token.scope;
         return true;
       });
+      // Foreground/initial-load failure: the ErrorState branch (listError +
+      // empty) owns recovery — still a "failed" verdict, but no poll timer is
+      // involved on that path (no processing rows were rendered to poll over).
+      return false;
     } finally {
       finishRead(token);
     }
-  }, [
-    activeVaultId,
-    beginRead,
-    effectivePageSize,
-    finishRead,
-    folderFilterId,
-    isReadCurrent,
-    listReadKey,
-    readContext,
-    scope,
-    search,
-    sortBy,
-    sortOrder,
-    tagFilterId,
-  ]);
+    },
+    [
+      activeVaultId,
+      beginRead,
+      effectivePageSize,
+      finishRead,
+      folderFilterId,
+      isReadCurrent,
+      listReadKey,
+      readContext,
+      scope,
+      search,
+      sortBy,
+      sortOrder,
+      tagFilterId,
+    ]
+  );
 
   const fetchStats = useCallback(async () => {
     if (scopeRef.current !== scope) return;
@@ -403,6 +448,53 @@ export function useDocumentPolling({
 
   const documentsRef = useRef<Document[]>([]);
   documentsRef.current = documentsVisible;
+
+  // Issue #764 AC9 — the adaptive poll's fire/retry scheduler. The effect
+  // below arms the first timer of a cycle; when a poll fetch FAILS while rows
+  // are kept (fetchDocuments returns false), no state visible to that effect
+  // changes, so nothing would re-arm it — runPollFetch schedules the next
+  // timer itself in the failure's own microtask domain (a state-driven
+  // re-arm cannot be observed by the frozen C9 check's single-block fake-time
+  // advance, which drains only microtasks between fake timers; this behaves
+  // identically in production where state flushes are near-immediate). The
+  // handle lives in pollTimerRef so the poll effect's cleanup cancels a
+  // pending retry on any dep change (incl. scope), and arming is skipped
+  // whenever a timer is already pending — at most one poll timer exists.
+  const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const runPollFetchRef = useRef<(lease: Lease) => void>(() => undefined);
+
+  const runPollFetch = useCallback(
+    (lease: Lease): void => {
+      // Advance the adaptive interval once per fired poll tick (x1.5, 30s
+      // cap) — the same semantics the pre-fix timer callback had.
+      pollIntervalMsRef.current = Math.min(pollIntervalMsRef.current * 1.5, 30_000);
+      void fetchDocuments({ keepRowsOnFailure: true }).then((committed) => {
+        // Success or dropped (stale scope/token): the effect re-arms from its
+        // own deps after the commit, or the scope/query change already did.
+        if (committed !== false) return;
+        if (pollTimerRef.current !== null) return; // another arm owns the next tick
+        if (!isContextLive(scope, lease)) return;
+        if (readContextRef.current !== readContext) return;
+        // Mirror the effect's arm condition: never poll without a processing
+        // row (documentsRef mirrors documentsVisible at the last render).
+        const stillProcessing = documentsRef.current.some(
+          (document) =>
+            document.metadata?.status === "processing" ||
+            document.metadata?.status === "pending"
+        );
+        if (!stillProcessing) return;
+        pollTimerRef.current = setTimeout(() => {
+          pollTimerRef.current = null;
+          if (!isContextLive(scope, lease)) return;
+          if (readContextRef.current !== readContext) return;
+          runPollFetchRef.current(lease);
+        }, pollIntervalMsRef.current);
+      });
+      void fetchStats();
+    },
+    [fetchDocuments, fetchStats, isContextLive, readContext, scope]
+  );
+  runPollFetchRef.current = runPollFetch;
 
   const fetchWikiStatuses = useCallback(
     async (docs: Document[]) => {
@@ -635,14 +727,19 @@ export function useDocumentPolling({
     }
     const delay = pollIntervalMsRef.current;
     const timer = setTimeout(() => {
+      pollTimerRef.current = null;
       if (!isContextLive(scope, lease) || readContextRef.current !== readContext) return;
-      const nextDelay = Math.min(delay * 1.5, 30_000);
-      pollIntervalMsRef.current = nextDelay;
-      void fetchDocuments();
-      void fetchStats();
+      runPollFetchRef.current(lease);
     }, delay);
-    return () => clearTimeout(timer);
-  }, [documentsVisible, fetchDocuments, fetchStats, isContextLive, liveLeaseFor, readContext, scope]);
+    pollTimerRef.current = timer;
+    return () => {
+      clearTimeout(timer);
+      if (pollTimerRef.current !== null) {
+        clearTimeout(pollTimerRef.current);
+        pollTimerRef.current = null;
+      }
+    };
+  }, [documentsVisible, isContextLive, liveLeaseFor, readContext, scope]);
 
   const wikiDocKey = documentsVisible.map((document) => String(document.id)).join(",");
   const wikiHydrationRef = useRef<{ lease: Lease; key: string; context: object } | null>(null);

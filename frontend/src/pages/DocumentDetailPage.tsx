@@ -42,6 +42,17 @@ export default function DocumentDetailPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
+  // Live mirror of the doc slot, written SYNCHRONOUSLY at every setDoc call
+  // site (issue #764 AC6): a per-render mirror would miss a queued-but-
+  // unrendered setDoc under batched async renders, letting a same-tick stale
+  // save read the old id. handleSaveTags uses it to decide whether its late
+  // result (and its success toast) belongs to the document still on screen.
+  const docRef = useRef<Document | null>(null);
+  // Save-generation token (issue #764 AC6): bumped per save so a stale save's
+  // finally cannot clear a NEWER save's saving flag (which would re-enable
+  // Save mid-save on the current document).
+  const savingTagGenRef = useRef(0);
+
   const [allTags, setAllTags] = useState<Tag[]>([]);
   const [selectedTagIds, setSelectedTagIds] = useState<Set<number>>(new Set());
   const [savingTags, setSavingTags] = useState(false);
@@ -88,7 +99,12 @@ export default function DocumentDetailPage() {
       // tags, or the vault tag list.
       if (loadGenRef.current === gen) {
         setDoc(d);
+        docRef.current = d;
         setSelectedTagIds(new Set((d.tags ?? []).map((t) => t.id)));
+        // Issue #764 AC7: drop the PREVIOUS document's tag vocabulary before
+        // this document's listTags resolves — a rejected listTags must render
+        // as "no tags" (empty), never the prior document's checkboxes.
+        setAllTags([]);
         // UI-011: the preview follows only the CURRENT load's payload. A
         // stale load must not re-trigger the preview effect: the effect's
         // cleanup would tear down the preview the user is looking at even
@@ -102,7 +118,9 @@ export default function DocumentDetailPage() {
             setAllTags(tags);
           }
         } catch {
-          // Tag editing is best-effort; ignore load failures.
+          // Tag editing is best-effort; the empty reset above already hid the
+          // previous document's vocabulary, so failure leaves an honest empty
+          // state rather than stale checkboxes (issue #764 AC7).
         }
       }
     } catch (err) {
@@ -208,15 +226,40 @@ export default function DocumentDetailPage() {
 
   const handleSaveTags = async () => {
     if (!doc || doc.vault_id == null) return;
+    const savedDocId = String(doc.id);
+    const saveGen = ++savingTagGenRef.current;
     setSavingTags(true);
     try {
       const updated = await setDocumentTags(Number(doc.id), doc.vault_id, Array.from(selectedTagIds));
-      setDoc((prev) => (prev ? { ...prev, tags: updated } : prev));
-      toast.success("Tags updated");
+      // Issue #764 AC6: commit only if the doc slot still holds THIS document.
+      // The guard runs against the updater's live `prev` (a closed-over `doc`
+      // compare would be a tautology), so a save that resolves after
+      // navigation can never re-tag the navigated-to document.
+      setDoc((prev) => {
+        if (prev === null || String(prev.id) !== savedDocId) return prev;
+        const next = { ...prev, tags: updated };
+        docRef.current = next;
+        return next;
+      });
+      // Toast from the LIVE ref (docRef, written synchronously at every setDoc
+      // site), not the closure: under batched renders a queued-but-unrendered
+      // setDoc is invisible to a per-render mirror but not to docRef, and a
+      // closed-over `doc` would always match (tautology). Suppressing the
+      // success toast when the user has navigated away keeps it truthful —
+      // it announces the document still on screen.
+      const liveDoc = docRef.current;
+      if (liveDoc !== null && String(liveDoc.id) === savedDocId) {
+        toast.success("Tags updated");
+      }
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to update tags");
     } finally {
-      setSavingTags(false);
+      // Clear only if no NEWER save started meanwhile (issue #764 AC6): a
+      // stale save's finally must not re-enable Save mid-save on the current
+      // document.
+      if (savingTagGenRef.current === saveGen) {
+        setSavingTags(false);
+      }
     }
   };
 
