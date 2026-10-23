@@ -546,6 +546,14 @@ async def login(
                         user_agent,
                     ),
                 )
+                # Opportunistic expiry purge, mirroring the access-token
+                # denylist's purge-on-use: remove THIS user's already-expired
+                # session rows without their cookies ever being presented
+                # (issue #722 AC10). Strict '<' never touches unexpired rows.
+                db.execute(
+                    "DELETE FROM user_sessions WHERE user_id = ? AND expires_at < ?",
+                    (user_id, datetime.now(timezone.utc).isoformat()),
+                )
                 if new_hashed_password:
                     db.execute(
                         "UPDATE users SET failed_attempts = 0, locked_until = NULL, last_login_at = ?, hashed_password = ? WHERE id = ?",
@@ -999,13 +1007,20 @@ async def list_sessions(
     current_token_hash = (
         hashlib.sha256(refresh_token.encode()).hexdigest() if refresh_token else None
     )
+    # expires_at is stored as aware-UTC ISO-8601 (every writer uses
+    # datetime.now(timezone.utc).isoformat()), so comparing against a bound
+    # ISO parameter of the same shape is order-correct across dates AND
+    # within a day — SQLite's datetime('now') renders a space separator that
+    # a same-day ISO 'T' value sorts above ('T' > ' '), which used to keep
+    # earlier-today expiries listed as active (issue #722 AC9).
+    now_iso = datetime.now(timezone.utc).isoformat()
     rows = await asyncio.to_thread(
         lambda: db.execute(
             """SELECT id, user_id, refresh_token_hash, ip_address, user_agent, created_at, expires_at
                FROM user_sessions
-               WHERE user_id = ? AND expires_at > datetime('now')
+               WHERE user_id = ? AND expires_at > ?
                ORDER BY created_at DESC""",
-            (user["id"],),
+            (user["id"], now_iso),
         ).fetchall()
     )
 
