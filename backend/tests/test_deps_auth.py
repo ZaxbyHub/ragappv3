@@ -133,35 +133,17 @@ class TestGetCurrentUserAdminToken:
         assert exc_info.value.status_code == 403
         assert "change default admin token" in exc_info.value.detail.lower()
 
-    @pytest.mark.asyncio
-    async def test_get_current_user_accepts_explicit_default_token(self, mock_db, tmp_path):
-        """users_enabled=False, admin_secret_token='admin-secret-token', token='admin-secret-token' → 200."""
-        from app.api.deps import get_current_active_user
+    def test_get_current_user_explicit_default_token_refused_at_config(self):
+        """users_enabled=False, admin_secret_token='admin-secret-token' can no
+        longer reach this dependency: Settings refuses the well-known literal
+        at construction (#1001 AC1/AC4). This replaces the pre-#1001 pin that
+        blessed an explicit-default deployment with a 200; the deps-layer
+        guard itself stays defense in depth (see
+        test_get_current_user_rejects_default_token for the unconfigured arm)."""
+        from app.config import Settings
 
-        mock = MagicMock()
-        mock.users_enabled = False
-        mock.admin_secret_token = "admin-secret-token"  # Explicit default token
-        # Hermetic per-test DB (tmp_path): the shared relative "./test.db"
-        # collided across xdist workers/orderings on CI Linux (PR #577).
-        mock.sqlite_path = str(tmp_path / "deps_auth_test.db")
-
-        mock_conn, mock_cursor = mock_db
-
-        with patch("app.api.deps.settings", mock, create=True):
-            result = await get_current_active_user(request=mock_request,
-                authorization="Bearer admin-secret-token",
-                access_token=None,
-                db=mock_conn,
-            )
-
-            assert result == {
-                "id": 0,
-                "username": "admin",
-                "full_name": "Admin",
-                "role": "superadmin",
-                "is_active": True,
-                "must_change_password": False,
-            }
+        with pytest.raises(ValueError, match="well-known default"):
+            Settings(users_enabled=False, admin_secret_token="admin-secret-token")
 
     @pytest.mark.asyncio
     async def test_get_current_user_missing_header(self, mock_settings_admin_mode):

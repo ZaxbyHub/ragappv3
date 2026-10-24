@@ -20,6 +20,15 @@ logger = logging.getLogger(__name__)
 # security guard, so B105 is suppressed at this single definition site.
 _INSECURE_DEFAULT_JWT_SECRET = "change-me-to-a-random-64-char-string"  # nosec B105 — intentional placeholder constant used only to detect unchanged defaults
 
+# The well-known insecure default admin token (issue #1001, Item A). The exact
+# literal is published in this repository (docs/tests), so in single-admin mode
+# it is both a public sole credential and public audit-HMAC key material via
+# derive_audit_key's fallback. Compared against in reject_insecure_defaults to
+# REFUSE the unchanged literal: the comparison IS the security guard, so B105
+# is suppressed at this single definition site (twin inline literals live in
+# main.py's startup warning and deps.py's defense-in-depth guard).
+_INSECURE_DEFAULT_ADMIN_TOKEN = "admin-secret-token"  # nosec B105 — intentional placeholder constant used only to detect unchanged defaults
+
 
 # Legacy → new settings-field migration table (issue #494 CONFIG-004).
 #
@@ -1799,6 +1808,33 @@ class Settings(BaseSettings):
             raise ValueError(
                 "ADMIN_SECRET_TOKEN must be set when USERS_ENABLED=False (single-admin mode). "
                 "In single-admin mode this token is the sole authentication mechanism. "
+                'Generate one with: python -c "import secrets; print(secrets.token_urlsafe(48))"'
+            )
+        # Single-admin mode: refuse the well-known literal token (issue #1001,
+        # Item A). The exact string is published in this repository, so it is a
+        # public sole credential AND public audit-HMAC key material via
+        # derive_audit_key's admin-token fallback. EXACT match on the trimmed
+        # value, mirroring main.py's startup warning: case variants are not the
+        # published literal and keep booting (AC2 decision). NOT refused under
+        # USERS_ENABLED=True (AC3 decision: UNCHANGED) — there the token is
+        # the required bootstrap/first-admin credential and seeds
+        # admin_token_scopes, so only the empty-token arm above applies.
+        #
+        # The trim matters: derive_audit_key() strips the token before using it
+        # as HMAC key material, so a whitespace-padded literal (' admin-secret-
+        # token ') would otherwise boot and still derive the public key
+        # b'admin-secret-token'. Trimming here matches what the derivation
+        # actually does; the empty-token arm above trims for the same reason.
+        if (
+            not self.users_enabled
+            and self.admin_secret_token.strip() == _INSECURE_DEFAULT_ADMIN_TOKEN
+        ):
+            raise ValueError(
+                "ADMIN_SECRET_TOKEN must be changed from the well-known default "
+                "'admin-secret-token' when USERS_ENABLED=False (single-admin mode). "
+                "In single-admin mode this token is the sole authentication mechanism "
+                "and the audit-key derivation fallback, so the published default "
+                "leaves both the API and audit digests computable by anyone. "
                 'Generate one with: python -c "import secrets; print(secrets.token_urlsafe(48))"'
             )
         return self
