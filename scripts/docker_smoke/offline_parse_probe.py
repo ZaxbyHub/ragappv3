@@ -26,9 +26,13 @@ def main() -> int:
         print("OFFLINE_PARSE_FAIL usage: parse_probe.py <pdf-path>")
         return 1
     target = Path(sys.argv[1])
-    # Fallback import root: the mounted fixture's parent directory.
-    if str(target.parent) not in sys.path:
-        sys.path.insert(0, str(target.parent))
+    # The image's WORKDIR is /app and the backend package lives at /app/app,
+    # but running a script by absolute path puts the SCRIPT's directory (not
+    # the cwd) on sys.path — put both the image WORKDIR and the fixture's
+    # parent there so `app.services...` resolves inside the container.
+    for root in ("/app", str(target.parent)):
+        if root and root not in sys.path:
+            sys.path.insert(0, root)
 
     try:
         from app.services.document_processor import DocumentParser
