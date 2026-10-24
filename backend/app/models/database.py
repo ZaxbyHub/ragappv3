@@ -8423,6 +8423,69 @@ def migrate_add_vault_count_indexes(sqlite_path: str) -> None:
         conn.close()
 
 
+def lookup_service_account(conn, key_hash: str):
+    """Shared service-account key lookup with rotation grace (issue #724).
+
+    Single round trip over the primary and the previous (rotation-grace)
+    hash: ``WHERE key_hash = ? OR previous_key_hash = ?``. Returns
+    ``(row, via_previous)`` where row is ``(id, name, scopes, revoked_at)``
+    and via_previous is True when the match was the previous key inside its
+    grace window (an expired grace reads as no match). A NEW-key match
+    retires the grace columns conditionally (``previous_key_hash IS NOT
+    NULL`` guard: no write on the steady-state hot path). Both live
+    validators (security.require_service_account and
+    deps.get_current_user_or_service_account) resolve through this helper.
+    """
+    from datetime import datetime as _dt
+    from datetime import timezone as _tz
+
+    # Issue #724 review (F-4): under a degraded boot (migrations_ok=False)
+    # the rotation-grace columns may not exist; fall back to the pre-grace
+    # 4-column shape (treated as no grace) instead of OperationalError-500ing
+    # every service-account authentication, mirroring the
+    # _fetch_user_row_with_pwc no-such-column convention.
+    try:
+        row = conn.execute(
+            "SELECT id, name, scopes, revoked_at, key_hash, previous_key_hash, "
+            "previous_key_expires_at FROM service_accounts "
+            "WHERE key_hash = ? OR previous_key_hash = ?",
+            (key_hash, key_hash),
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such column" not in str(exc).lower():
+            raise
+        row = conn.execute(
+            "SELECT id, name, scopes, revoked_at, key_hash, "
+            "NULL AS previous_key_hash, NULL AS previous_key_expires_at "
+            "FROM service_accounts WHERE key_hash = ?",
+            (key_hash,),
+        ).fetchone()
+    if row is None:
+        return None, False
+    sa_id, name, scopes, revoked_at, current_hash, prev_hash, prev_expires = row
+    if prev_hash is not None and prev_hash == key_hash:
+        if prev_expires is None:
+            return (sa_id, name, scopes, revoked_at), True
+        try:
+            grace_end = _dt.fromisoformat(prev_expires)
+        except ValueError:
+            return None, False
+        if grace_end.tzinfo is None:
+            grace_end = grace_end.replace(tzinfo=_tz.utc)
+        if _dt.now(_tz.utc) > grace_end:
+            return None, False
+        return (sa_id, name, scopes, revoked_at), True
+    if prev_hash is not None:
+        conn.execute(
+            "UPDATE service_accounts SET previous_key_hash = NULL, "
+            "previous_key_expires_at = NULL "
+            "WHERE id = ? AND previous_key_hash IS NOT NULL",
+            (sa_id,),
+        )
+        conn.commit()
+    return (sa_id, name, scopes, revoked_at), False
+
+
 def migrate_add_canvas_tables(sqlite_path: str) -> None:
     conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
