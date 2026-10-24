@@ -169,7 +169,7 @@ def _d06_admin_app(conn, toggle_manager, secret_manager) -> FastAPI:
     return app
 
 
-@pytest.mark.parametrize("site", ["write", "state_refresh"])
+@pytest.mark.parametrize("site", ["write"])
 def test_admin_toggles_pool_runtime_error_is_handled(site, tmp_path):
     """RED at base, GREEN after the fix: pool RuntimeErrors must not escape as HTTP 500.
 

@@ -251,6 +251,7 @@ class CSRFManager:
                     redis_url,
                     decode_responses=True,
                     socket_connect_timeout=_REDIS_CONNECT_TIMEOUT_SECONDS,
+                    socket_timeout=_REDIS_CONNECT_TIMEOUT_SECONDS,
                 )
                 self._redis.ping()
                 logger.info("CSRFManager connected to Redis successfully")
@@ -371,7 +372,10 @@ class CSRFManager:
                 )
         if exists:
             try:
-                store.expire(key, self.ttl)
+                # Issue #724 review (Copilot): after a mid-run failover the
+                # fresh fallback store holds the token - extend on the store
+                # that answered the read, not the stale capture.
+                self._get_store().expire(key, self.ttl)
             except (redis.RedisError, ConnectionError, TimeoutError, RuntimeError):
                 logger.warning("Failed to extend CSRF token TTL")
             return True

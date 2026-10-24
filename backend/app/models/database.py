@@ -8395,12 +8395,27 @@ def lookup_service_account(conn, key_hash: str):
     from datetime import datetime as _dt
     from datetime import timezone as _tz
 
-    row = conn.execute(
-        "SELECT id, name, scopes, revoked_at, key_hash, previous_key_hash, "
-        "previous_key_expires_at FROM service_accounts "
-        "WHERE key_hash = ? OR previous_key_hash = ?",
-        (key_hash, key_hash),
-    ).fetchone()
+    # Issue #724 review (F-4): under a degraded boot (migrations_ok=False)
+    # the rotation-grace columns may not exist; fall back to the pre-grace
+    # 4-column shape (treated as no grace) instead of OperationalError-500ing
+    # every service-account authentication, mirroring the
+    # _fetch_user_row_with_pwc no-such-column convention.
+    try:
+        row = conn.execute(
+            "SELECT id, name, scopes, revoked_at, key_hash, previous_key_hash, "
+            "previous_key_expires_at FROM service_accounts "
+            "WHERE key_hash = ? OR previous_key_hash = ?",
+            (key_hash, key_hash),
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such column" not in str(exc).lower():
+            raise
+        row = conn.execute(
+            "SELECT id, name, scopes, revoked_at, key_hash, "
+            "NULL AS previous_key_hash, NULL AS previous_key_expires_at "
+            "FROM service_accounts WHERE key_hash = ?",
+            (key_hash,),
+        ).fetchone()
     if row is None:
         return None, False
     sa_id, name, scopes, revoked_at, current_hash, prev_hash, prev_expires = row
