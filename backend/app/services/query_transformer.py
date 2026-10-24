@@ -703,6 +703,13 @@ class QueryTransformer:
                     continue
                 prior_assistant = content
             elif role == "user" and prior_user is None:
+                # An empty/whitespace user turn (e.g. a streaming client
+                # that opened the turn before content arrived, or a bot
+                # placeholder) carries no anchor content: skip it like the
+                # blank assistant arm above so it neither shadows an older
+                # real question (#992) nor anchors the rewrite on nothing.
+                if not content.strip():
+                    continue
                 # Skip follow-up phrases so we anchor on the original question.
                 if is_followup_query(content):
                     continue
