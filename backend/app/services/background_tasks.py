@@ -26,11 +26,13 @@ from app.services.admission import (
 from ..models.database import SQLiteConnectionPool
 from .document_processor import (
     _INGEST_ERROR_REASONS,
+    INGEST_ERROR_VECTOR_STORE_LOCK_TIMEOUT,
     DocumentProcessingError,
     DocumentProcessor,
     IngestCancelledError,
     ParseDeadlineError,
     ParseInFlightError,
+    classify_ingest_error,
     redact_ingest_error,
 )
 from .embeddings import EmbeddingService
@@ -235,6 +237,58 @@ def reset_background_processor() -> None:
 
         asyncio.create_task(_processor_instance.stop())
     _processor_instance = None
+
+
+# Issue #1010: the stall watchdog's cancel-conversion contract — when the
+# watchdog cancels a wedged run task, the worker loop's except arm converts
+# the delivered CancelledError into the stall-settle path via the one-shot
+# `_stall_cancel_flag` (plus the `cancelling()` discriminator), so the
+# shutdown `except asyncio.CancelledError: raise` branch stays reserved for
+# shutdown and the loop CONTINUES to re-claim the released row.
+class _LeaseProgressLost(Exception):
+    """The run lost its lease fence mid-attempt (issue #1010).
+
+    Raised by the progress-watermark refresh when the fenced UPDATE matches
+    zero rows: a stale attempt must STOP (no further vector writes a
+    successor may re-do) instead of continuing silently.
+    """
+
+
+# Issue #1010: the stable server-side reason the stall watchdog settles a
+# no-progress release with (registered in job_lease's stable-prefix
+# vocabulary; never raw exception text).
+LEASE_STALL_REASON = (
+    "lease_stall_reclaimed: no per-file progress within "
+    "jobs_stall_timeout_seconds"
+)
+
+
+def _stall_watermark_age_seconds(value: str) -> Optional[float]:
+    """Wall-clock age in seconds of a SQLite/ISO timestamp string.
+
+    Accepts both ``YYYY-MM-DD HH:MM:SS`` (SQLite CURRENT_TIMESTAMP) and the
+    ISO ``T``-separated form; unparseable input returns None (the watchdog
+    treats it as no-signal rather than guessing).
+    """
+    from datetime import datetime, timezone
+
+    parsed = None
+    # Millisecond stamps carry a fractional suffix (%f); legacy
+    # second-granularity rows parse without it.
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S.%f",
+        "%Y-%m-%dT%H:%M:%S.%f",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+    ):
+        try:
+            parsed = datetime.strptime(value, fmt)
+            break
+        except ValueError:
+            continue
+    if parsed is None:
+        return None
+    return (datetime.now(timezone.utc) - parsed.replace(tzinfo=timezone.utc)).total_seconds()
 
 
 @dataclass
@@ -547,6 +601,17 @@ class BackgroundProcessor:
         self._jobs_barrier = asyncio.Event()
         self._jobs_migration_task: Optional[asyncio.Task] = None
         self._ingest_janitor_task: Optional[asyncio.Task] = None
+        # Issue #1010: per-attempt stall-watchdog state. _stall_cancel_flag
+        # is the ONE-SHOT marker of the job whose run task the watchdog just
+        # cancelled (consumed by the worker loop's conversion arm so a later
+        # task-level cancel can never be mistaken for a stall cancel);
+        # _active_progress carries the (job_id, worker_id) fence for the
+        # progress-watermark writes; _stall_retry_file_ids carries the
+        # interrupted + remaining file ids from a cancelled per-file loop to
+        # the stall settle's $.retry_file_ids transaction.
+        self._stall_cancel_flag: Optional[int] = None
+        self._active_progress: Optional[tuple[int, str]] = None
+        self._stall_retry_file_ids: list[int] = []
 
     def set_llm_client(self, llm_client: Optional[LLMClient]) -> None:
         """Rebind the owned DocumentProcessor to a different ingestion LLM client."""
@@ -1465,6 +1530,11 @@ class BackgroundProcessor:
                     conn,
                     reclaim_timeout_seconds=settings.jobs_lease_reclaim_timeout_seconds,
                     max_attempts=settings.jobs_max_attempts,
+                    # Issue #1010: the janitor is the stall BACKSTOP — its
+                    # reclaims also release live-but-stalled rows whose
+                    # progress watermark went stale while the heartbeat
+                    # stayed fresh.
+                    stall_timeout_seconds=self._reindex_stall_budget(),
                 )
                 for queue in queues:
                     settled[queue] = lease.reclaim_expired(queue=queue)
@@ -1678,13 +1748,29 @@ class BackgroundProcessor:
             # back — and at the cap it fails terminally. (The pre-feedback
             # code settled shutdown failures as `release`, whose refund
             # handed the consumed attempt back.)
-            delay = self.retry_delay * (2 ** (task.attempt - 1))
+            delay = self.retry_delay * (2 ** min(task.attempt - 1, 6))
             if isinstance(outcome_exc, (ParseDeadlineError, ParseInFlightError)):
                 # The abandoned parse worker still holds the file's
                 # parse slot for at least the timeout window; retrying
                 # sooner is guaranteed to be refused (issue #703).
                 delay = max(delay, settings.document_parse_timeout)
-            if task.attempt < max_attempts:
+            contention_retryable = (
+                outcome_exc is not None
+                and classify_ingest_error(outcome_exc)
+                == INGEST_ERROR_VECTOR_STORE_LOCK_TIMEOUT
+            )
+            if contention_retryable:
+                # Issue #1011: maintenance (or peer-write) contention on the
+                # store write lock is never terminal while this worker
+                # lives — a routine index build must not burn the attempt
+                # cap. Backoff is exponent-safe, floored at the lock window
+                # (each retry is a bounded lock wait) and capped at
+                # max(60s, lock window) so the cap can never undercut the
+                # floor.
+                lock_window = float(settings.write_lock_timeout_seconds)
+                delay = min(delay, max(60.0, lock_window))
+                delay = max(delay, lock_window)
+            if task.attempt < max_attempts or contention_retryable:
                 await self._settle_ingest_job(
                     job_id,
                     worker_id,
@@ -4010,7 +4096,19 @@ class BackgroundProcessor:
                 self._reindex_job_ids.discard(item.job_id)
 
     async def _reindex_lease_worker_loop(self) -> None:
-        """Claim-and-run reindex jobs through the shared lease."""
+        """Claim-and-run reindex jobs through the shared lease.
+
+        Issue #1010: the run is a TASK with a deadline-driven stall watchdog
+        alongside the heartbeat. The watchdog cancels the run when EITHER the
+        progress deadline passes while the row is still ours (watchdog-first,
+        the primary release mechanism — budget-exact) OR the row no longer
+        belongs to this attempt (janitor-first, the backstop that exists for
+        a watchdog that itself died). Both orderings cancel AND drain the old
+        attempt: this loop awaits the run task to completion before its next
+        claim iteration, so old and new attempts never coexist on one worker
+        and a late settle from a foreign claimant is fenced by the janitor's
+        generation bump.
+        """
         worker_id = f"reindex-{id(self)}"
         while True:
             if self.shutdown_event.is_set():
@@ -4019,15 +4117,41 @@ class BackgroundProcessor:
             if row is None:
                 await asyncio.sleep(0.25)
                 continue
+            job_id = int(row["id"])
             heartbeat_task = asyncio.create_task(
-                self._heartbeat_loop(int(row["id"]), worker_id),
-                name=f"reindex-heartbeat-{row['id']}",
+                self._heartbeat_loop(job_id, worker_id),
+                name=f"reindex-heartbeat-{job_id}",
             )
+            run_task = asyncio.create_task(
+                self._run_reindex_job_row(row, worker_id),
+                name=f"reindex-run-{job_id}",
+            )
+            watchdog_task = asyncio.create_task(
+                self._stall_watchdog(job_id, worker_id, run_task, heartbeat_task),
+                name=f"reindex-stall-watchdog-{job_id}",
+            )
+            stall_cancelled = False
             try:
-                await self._run_reindex_job_row(row, worker_id)
+                await run_task
             except asyncio.CancelledError:
-                # shutdown cancellation must reach the loop's exit path
-                raise
+                me = asyncio.current_task()
+                if (
+                    self._stall_cancel_flag == job_id
+                    and not self.shutdown_event.is_set()
+                    and (me is None or me.cancelling() == 0)
+                ):
+                    # Watchdog stall-cancel of the run TASK (issue #1010):
+                    # convert to a normal exception so this coroutine does
+                    # not end. The flag is one-shot (consumed here) and the
+                    # cancelling() count proves THIS task was not itself
+                    # cancelled, so a task-level cancel (shutdown, test
+                    # teardown) can never be swallowed as a stall.
+                    self._stall_cancel_flag = None
+                    stall_cancelled = True
+                else:
+                    # shutdown/task-level cancellation must reach the loop's
+                    # exit path
+                    raise
             except Exception:  # noqa: BLE001 — settle failures are janitor food
                 # Issue #702 / P02-SK2-01: one job-level exception must never
                 # end this loop — the ingestion transport's _settle_ingest_job
@@ -4037,11 +4161,244 @@ class BackgroundProcessor:
                 logger.exception(
                     "Reindex lease worker: job %s failed to settle; leaving "
                     "the lease for janitor reclaim and claiming the next job",
-                    row["id"],
+                    job_id,
                 )
             finally:
-                heartbeat_task.cancel()
-                await asyncio.gather(heartbeat_task, return_exceptions=True)
+                # Drain the old attempt completely before the next claim:
+                # the run task has resolved (normal, stall-cancelled, or
+                # fenced failure) and the heartbeat/watchdog are gathered.
+                for task in (heartbeat_task, watchdog_task):
+                    task.cancel()
+                await asyncio.gather(
+                    heartbeat_task, watchdog_task, return_exceptions=True
+                )
+            if stall_cancelled:
+                # The watchdog cancelled a no-progress run (issue #1010):
+                # settle it ourselves — cap-aware, with the interrupted +
+                # remaining file ids as the retry scope — then CONTINUE; the
+                # released row is re-claimable and the next iteration of
+                # THIS loop re-claims it (same worker, no restart).
+                await self._settle_stalled_reindex(job_id, worker_id)
+
+    def _reindex_stall_budget(self) -> Optional[float]:
+        """The configured stall budget, None when the knob is absent.
+
+        Read defensively (``getattr`` with a None default) so the frozen
+        b13/f3 harnesses that pre-date the knob keep working on mocked
+        settings objects.
+        """
+        value = getattr(settings, "jobs_stall_timeout_seconds", None)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return float(value)
+
+    async def _stall_watchdog(
+        self,
+        job_id: int,
+        worker_id: str,
+        run_task: "asyncio.Task",
+        heartbeat_task: "asyncio.Task",
+    ) -> None:
+        """Stall watchdog for one claimed reindex job (progress-polling).
+
+        Polls the row at ``max(0.25, min(budget/4, 5.0))`` second intervals
+        (NOT a sleep-until-deadline: the watermark is durable state that can
+        advance between polls) and cancels the run + heartbeat when the
+        watermark age passes the stall budget while the row is still ours,
+        OR when the row no longer belongs to this attempt. Release is
+        therefore budget-bounded from above, but poll latency and the
+        bounded per-file granularity (the watermark advances on file
+        COMPLETION — one very large file on a slow embedder can legitimately
+        exceed the budget; raise ``jobs_stall_timeout_seconds`` for such
+        workloads, or see the per-batch refresh follow-up) mean the release
+        can land after the nominal budget: the janitor's heartbeat-age arm
+        stays the crash backstop either way.
+        """
+        budget = self._reindex_stall_budget()
+        if budget is None:
+            return
+        try:
+            while not run_task.done():
+                await asyncio.sleep(
+                    max(0.25, min(budget / 4.0, 5.0))
+                )
+                if run_task.done():
+                    return
+                # Refresh the deadline from the durable watermark and check
+                # ownership in one read.
+                def _probe():
+                    with self.processor.pool.connection() as conn:
+                        return conn.execute(
+                            "SELECT status, worker_id, progress_at,"
+                            " started_at, created_at FROM jobs WHERE id = ?",
+                            (job_id,),
+                        ).fetchone()
+
+                try:
+                    probe = await asyncio.to_thread(_probe)
+                except Exception:  # noqa: BLE001 — a dropped probe retries
+                    logger.debug(
+                        "Stall watchdog probe failed for job %d",
+                        job_id,
+                        exc_info=True,
+                    )
+                    continue
+                if probe is None:
+                    continue
+                if probe["status"] != "running" or probe["worker_id"] != worker_id:
+                    # Ownership lost (janitor-first backstop): cancel the
+                    # wedged run so THIS loop can continue.
+                    logger.info(
+                        "Stall watchdog: reindex job %d no longer owned by "
+                        "this worker (status=%r) — cancelling the stale run "
+                        "(issue #1010)",
+                        job_id,
+                        probe["status"],
+                    )
+                    self._stall_cancel_flag = job_id
+                    run_task.cancel()
+                    heartbeat_task.cancel()
+                    return
+                watermark = (
+                    probe["progress_at"]
+                    or probe["started_at"]
+                    or probe["created_at"]
+                )
+                if watermark is None:
+                    continue
+                age = _stall_watermark_age_seconds(str(watermark))
+                if age is None:
+                    continue
+                if age >= budget:
+                    logger.warning(
+                        "Stall watchdog: reindex job %d made no per-file "
+                        "progress for over %.1fs (heartbeat fresh) — "
+                        "cancelling the wedged run and releasing the lease "
+                        "(issue #1010)",
+                        job_id,
+                        budget,
+                    )
+                    self._stall_cancel_flag = job_id
+                    run_task.cancel()
+                    heartbeat_task.cancel()
+                    return
+        except asyncio.CancelledError:
+            raise
+
+    async def _settle_stalled_reindex(self, job_id: int, worker_id: str) -> None:
+        """Cap-aware stall settle for a watchdog-cancelled run (issue #1010).
+
+        Below the attempts cap: fenced requeue with the stable stall reason
+        and the interrupted + remaining file ids as ``$.retry_file_ids``.
+        At/over the cap: fenced fail with the existing cap composition
+        wrapped around the stall reason (fail() stamps completed_at) — a
+        repeatedly re-wedging job terminates instead of requeueing forever.
+        A fenced-off settle (the janitor won the race) only logs.
+        """
+        retry_ids = list(getattr(self, "_stall_retry_file_ids", None) or [])
+
+        def _settle():
+            with self.processor.pool.connection() as conn:
+                lease = JobLease(
+                    conn,
+                    reclaim_timeout_seconds=settings.jobs_lease_reclaim_timeout_seconds,
+                    max_attempts=settings.jobs_max_attempts,
+                    stall_timeout_seconds=self._reindex_stall_budget(),
+                )
+                row = conn.execute(
+                    "SELECT attempts FROM jobs WHERE id = ?", (job_id,)
+                ).fetchone()
+                attempts = int(row["attempts"]) if row is not None else 0
+                if retry_ids:
+                    conn.execute(
+                        "UPDATE jobs SET payload_json = json_set(payload_json,"
+                        " '$.retry_file_ids', json(?)) "
+                        "WHERE id = ? AND worker_id = ? AND status = 'running'",
+                        (json.dumps([int(i) for i in retry_ids]), job_id, worker_id),
+                    )
+                if attempts >= int(settings.jobs_max_attempts):
+                    settled = bool(
+                        lease.fail(
+                            job_id,
+                            worker_id,
+                            f"attempt_cap_exceeded: {LEASE_STALL_REASON}"[:500],
+                        )
+                    )
+                else:
+                    settled = bool(
+                        lease.requeue(job_id, worker_id, error=LEASE_STALL_REASON)
+                    )
+                conn.commit()
+                return settled
+
+        try:
+            settled = await asyncio.to_thread(_settle)
+        except Exception:  # noqa: BLE001 — the janitor still owns the row
+            logger.exception(
+                "Stall settle for reindex job %d raised; the janitor owns "
+                "the row (issue #1010)",
+                job_id,
+            )
+            return
+        if settled:
+            logger.warning(
+                "Reindex job %d released by the stall watchdog (%s); "
+                "retry scope: %d file(s) (issue #1010)",
+                job_id,
+                LEASE_STALL_REASON,
+                len(retry_ids),
+            )
+        else:
+            logger.info(
+                "Stall settle for reindex job %d fenced off — the janitor "
+                "already released the row (issue #1010)",
+                job_id,
+            )
+
+    async def _stamp_progress_watermark(self) -> bool:
+        """Write the fenced progress watermark for the armed attempt.
+
+        No-op (True) when no attempt is armed. A zero-row match means the
+        lease fence was lost: callers decide what that means (the entry
+        stamp refuses to run; the per-file refresh raises
+        ``_LeaseProgressLost`` so a stale attempt stops).
+        """
+        context = self._active_progress
+        if context is None:
+            return True
+        job_id, worker_id = context
+
+        def _stamp():
+            with self.processor.pool.connection() as conn:
+                cur = conn.execute(
+                    # Millisecond precision: a second-granular
+                    # CURRENT_TIMESTAMP can read as up to 1s old the moment
+                    # it is written, which a sub-second stall budget would
+                    # misread as an immediate stall (issue #1010).
+                    "UPDATE jobs SET progress_at = "
+                    "strftime('%Y-%m-%d %H:%M:%f', 'now') "
+                    "WHERE id = ? AND worker_id = ? AND status = 'running'",
+                    (job_id, worker_id),
+                )
+                conn.commit()
+                return cur.rowcount > 0
+
+        return bool(await asyncio.to_thread(_stamp))
+
+    async def _refresh_progress_watermark(self) -> None:
+        """Refresh the watermark after a completed file (issue #1010).
+
+        Raises ``_LeaseProgressLost`` when the fenced write matched zero
+        rows: the stale attempt must stop rather than keep writing vectors a
+        successor may re-do.
+        """
+        if self._active_progress is None:
+            return
+        if not await self._stamp_progress_watermark():
+            raise _LeaseProgressLost(
+                f"reindex job {self._active_progress[0]} lost its lease "
+                "fence mid-attempt (issue #1010)"
+            )
 
     async def _run_reindex_job_row(self, row, worker_id: str) -> None:
         """Run one claimed reindex ``jobs`` row and settle it on the lease.
@@ -4065,6 +4422,23 @@ class BackgroundProcessor:
         vault_id = payload.get("vault_id")
         retry_file_ids = payload.get("retry_file_ids") or []
         logger.info("Starting lease-claimed reindex job %d", job_id)
+        # Issue #1010: stamp the progress watermark BEFORE the first per-file
+        # await (rowcount-checked — a lost fence means the janitor owns the
+        # row and this attempt must not run) and arm the per-attempt
+        # watermark context the per-file loop refreshes. The context is
+        # re-armed at every entry, so a stale value left by an exceptional
+        # exit is inert (watermark writes are fenced by id+worker+status).
+        self._active_progress = (job_id, worker_id)
+        self._stall_retry_file_ids = []
+        if not await self._stamp_progress_watermark():
+            self._active_progress = None
+            logger.warning(
+                "Lease reindex job %d progress stamp fenced off — lease "
+                "lost before the run started; leaving the row to its "
+                "owner (issue #1010)",
+                job_id,
+            )
+            return
         # Two-argument call unless a retry scope is recorded (issue #702):
         # the marker-less first attempt needs no narrowing, and test doubles
         # of this coroutine bind exactly (job_id, vault_id).
@@ -4592,6 +4966,14 @@ class BackgroundProcessor:
             failed_files = 0
             cancelled_files = 0
             failed_details: list[str] = []
+            # Issue #1010: the per-file iteration order, precomputed so a
+            # watchdog cancellation can record the interrupted + remaining
+            # scope as the settle's $.retry_file_ids without re-walking.
+            ordered_file_ids: list[int] = [
+                int(entry[0])
+                for _vault in sorted(vaults_files.keys())
+                for entry in vaults_files[_vault]
+            ]
             # Issue #702 (P02-SK2-04): the structured failure ledger the lease
             # caller narrows the next retry attempt with, plus the first
             # failing exception object so the persisted cap error carries a
@@ -4641,9 +5023,51 @@ class BackgroundProcessor:
                         )
                         try:
                             await self.processor.process_existing_file(
-                                file_id, file_path, vault_id_file, **reprocess_kwargs
+                                file_id,
+                                file_path,
+                                vault_id_file,
+                                retry_context="reindex",
+                                **reprocess_kwargs,
                             )
                             processed_files += 1
+                            # Issue #1010: refresh the per-file progress
+                            # watermark (a lost fence stops this attempt).
+                            await self._refresh_progress_watermark()
+                        except _LeaseProgressLost:
+                            # Issue #1010: this attempt lost the lease fence —
+                            # STOP (no failed_ids accumulation, no successor
+                            # scope mutation); the successor owns the row.
+                            raise
+                        except asyncio.CancelledError:
+                            # Issue #1010: the stall watchdog cancelled a
+                            # wedged per-file await. Record the interrupted +
+                            # remaining file ids (the settle's
+                            # $.retry_file_ids scope) and re-raise so the
+                            # worker wrapper converts and settles; the file
+                            # row itself was restored by
+                            # process_existing_file's cancellation handler.
+                            # Files that already FAILED earlier in THIS
+                            # attempt (failed_ids) must ride the retry scope
+                            # too — otherwise the narrowed retry re-runs only
+                            # the interrupted+remaining files, the failed
+                            # ones keep their error rows, and the job
+                            # completes reporting false success (PR #1018
+                            # review B2: file1 raises, file2 hangs → scope
+                            # [2, 3], file 1 never retried). Order-stable
+                            # dedupe: failed first (oldest failure first),
+                            # then the interrupted + remaining tail.
+                            self._stall_retry_file_ids = list(
+                                dict.fromkeys(
+                                    [int(fid) for fid in failed_ids]
+                                    + [
+                                        int(fid)
+                                        for fid in ordered_file_ids[
+                                            max(total_files - 1, 0):
+                                        ]
+                                    ]
+                                )
+                            )
+                            raise
                         except IngestCancelledError:
                             # issue #783 review PRR-011/F-001: a user
                             # cancellation during a staged rebuild skips the
@@ -5126,13 +5550,29 @@ class BackgroundProcessor:
             )
             return
 
-        if task.attempt < self.max_retries:
-            # Calculate exponential backoff delay
-            delay = self.retry_delay * (2 ** (task.attempt - 1))
+        if task.attempt < self.max_retries or (
+            isinstance(error, BaseException)
+            and classify_ingest_error(error)
+            == INGEST_ERROR_VECTOR_STORE_LOCK_TIMEOUT
+        ):
+            # Calculate exponential backoff delay (exponent bounded so a
+            # long contention sequence cannot overflow).
+            delay = self.retry_delay * (2 ** min(task.attempt - 1, 6))
             if isinstance(error, (ParseDeadlineError, ParseInFlightError)):
                 # Same floor as the lease transport (issue #703): wait
                 # out the parse-timeout window before retrying.
                 delay = max(delay, settings.document_parse_timeout)
+            if (
+                isinstance(error, BaseException)
+                and classify_ingest_error(error)
+                == INGEST_ERROR_VECTOR_STORE_LOCK_TIMEOUT
+            ):
+                # Issue #1011: contention is never terminal on this
+                # transport either — same floored/capped backoff as the
+                # lease settlement.
+                lock_window = float(settings.write_lock_timeout_seconds)
+                delay = min(delay, max(60.0, lock_window))
+                delay = max(delay, lock_window)
             logger.warning(
                 f"Task failed for {task.file_path}, "
                 f"retrying in {delay}s (attempt {task.attempt + 1}/{self.max_retries})"
@@ -5154,15 +5594,52 @@ class BackgroundProcessor:
                 queue=self.queue, item=new_task, delay=delay
             )
             if not retry_scheduled:
-                # Retry backlog full (or shutdown began between the checks):
-                # escalate to the permanent-failure path instead of blocking.
-                logger.error(
-                    "Task retry for %s could not be scheduled (retry backlog "
-                    "full); treating as permanent failure: %s",
-                    task.file_path,
-                    error,
-                )
-                self._mark_task_permanently_failed(task, error)
+                if (
+                    isinstance(error, BaseException)
+                    and classify_ingest_error(error)
+                    == INGEST_ERROR_VECTOR_STORE_LOCK_TIMEOUT
+                ):
+                    # Issue #1011: contention is never terminal even when
+                    # the retry backlog is full. Hand the file to the real
+                    # stranded-upload recovery sweep instead of the
+                    # permanent-failure path: persist the exact eligibility
+                    # predicate that sweep selects on (status='pending' AND
+                    # phase='queued', fenced to in-flight states). NO
+                    # in-memory queued reservation is created — without a
+                    # retry ticket it would block _claim_recovery_file
+                    # while creating no consumer — and no recovery_claim
+                    # transfer happens; the wrapper's settle cleanup
+                    # releases the active-file reservation.
+                    if task.file_id is not None:
+                        def _mark_sweep_eligible():
+                            with self.processor.pool.connection() as conn:
+                                conn.execute(
+                                    "UPDATE files SET status = 'pending', "
+                                    "phase = 'queued' WHERE id = ? "
+                                    "AND status IN ('pending', 'processing')",
+                                    (task.file_id,),
+                                )
+                                conn.commit()
+
+                        await asyncio.to_thread(_mark_sweep_eligible)
+                    logger.warning(
+                        "Task retry for %s could not be scheduled (retry "
+                        "backlog full) during write-lock contention; file "
+                        "left pending/queued for the recovery sweep "
+                        "(issue #1011)",
+                        task.file_path,
+                    )
+                else:
+                    # Retry backlog full (or shutdown began between the
+                    # checks): escalate to the permanent-failure path
+                    # instead of blocking.
+                    logger.error(
+                        "Task retry for %s could not be scheduled (retry "
+                        "backlog full); treating as permanent failure: %s",
+                        task.file_path,
+                        error,
+                    )
+                    self._mark_task_permanently_failed(task, error)
             elif task.file_id is not None:
                 # The retry ticket owns a queue slot even while it waits in the
                 # deferred scheduler. This prevents recovery from claiming the

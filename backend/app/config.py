@@ -3,6 +3,7 @@ Application configuration using Pydantic Settings.
 """
 
 import logging
+import math
 import warnings
 from pathlib import Path
 from typing import Annotated, Mapping, Optional
@@ -290,6 +291,21 @@ class Settings(BaseSettings):
     budget; an oversized single text ships alone (per-text validation still
     applies). Bounds the token cost of each request alongside
     ``embedding_batch_size``. Range 4096-1048576."""
+    embedding_probe_batch_count: int = 4
+    """Number of synthetic inputs in the deep-health embedding probe's batch
+    payload (issue #1009). The probe must exercise the LIST input shape
+    ingest traffic uses, so a provider that only has capacity for single
+    short texts reports unhealthy during a live outage. Defaults are a
+    deliberately light capacity-shape smoke (count x chars completes well
+    inside the health checker's timeout); raise toward ``embedding_batch_size``
+    to approximate the full production ingest batch. Same 1-128 ceiling as
+    ``embedding_batch_size``; count*chars must stay within
+    ``embedding_batch_max_chars``."""
+    embedding_probe_batch_chars: int = 512
+    """Character size of each synthetic input in the deep-health embedding
+    probe's batch payload (issue #1009); bounded by the documented
+    chunk-scale ceiling (2000 chars) so the probe payload is chunk-shaped.
+    See ``embedding_probe_batch_count`` for the probe contract."""
     embedding_cache_max_entries: int = 50000
     """Capacity bound for the persistent embedding cache (issue #513 W24),
     stored in its own sqlite file under ``data_dir`` by
@@ -314,6 +330,16 @@ class Settings(BaseSettings):
     'running' job whose heartbeat is older than this is requeued (or failed at
     the attempts cap). Must exceed 4x jobs_heartbeat_interval_seconds.
     Range 15.0-3600.0."""
+    jobs_stall_timeout_seconds: float = 900.0
+    """Per-file progress stall budget for lease-mode reindex jobs (issue
+    #1010): a 'running' job whose progress watermark (progress_at, falling
+    back to started_at/created_at) is older than this while its worker is
+    live is released by the deadline-driven stall watchdog and re-claimed by
+    the same worker — the heartbeat proves liveness, not progress, so a
+    wedged-but-heartbeating job otherwise stays 'running' forever. The
+    janitor's heartbeat-age reclaim remains the crash backstop. Must exceed
+    jobs_lease_reclaim_timeout_seconds AND document_parse_timeout (a single
+    slow first file must never look stalled). Range 60.0-7200.0."""
     jobs_max_attempts: int = 3
     """Durable attempt cap per ingestion job row (issue #559): the janitor
     settles a row at/over this many attempts terminally instead of requeuing
@@ -365,7 +391,17 @@ class Settings(BaseSettings):
     search_semaphore_timeout_seconds: float = 30.0
     """Timeout in seconds for search semaphore acquisitions. Prevents indefinite blocking if search concurrency is saturated."""
     write_lock_timeout_seconds: float = 30.0
-    """Timeout in seconds for write lock acquisitions. Prevents indefinite deadlock if a write operation hangs."""
+    """Timeout in seconds for write lock acquisitions. Prevents indefinite
+    deadlock if a write operation hangs. The 1.0-300.0 range is deliberately
+    RETAINED even though a full vector-index build can hold the lock for
+    longer (a 204K-row IVF-PQ build measured ~706 s in the 2026-10-22
+    incident): a waiter that times out on maintenance contention raises
+    WriteLockTimeoutError, which classifies to its own stable code and
+    requeues with backoff floored at this window (capped at
+    max(60, this value)) WITHOUT consuming the terminal attempt cap, so an
+    ingest survives any build length without a bigger wait (issue #1011).
+    The janitor still cap-settles a contention-marked row whose WORKER DIED
+    (the crash path); the never-terminal guarantee is for a live worker."""
 
     # ── Shared inference admission (issue #518, Workstream E3) ──────────────
     # Per-endpoint/per-device admission budgets shared by chat, Instant,
@@ -1053,7 +1089,17 @@ class Settings(BaseSettings):
     def _validate_float_range(
         v: float, min_val: float | None, max_val: float | None, field_name: str
     ) -> float:
-        """Validate a float is within a specified range."""
+        """Validate a float is within a specified range (and finite).
+
+        NaN slips past both ``<`` and ``>`` comparisons, and a non-finite
+        value reaching a SQLite ``datetime('now', ?)`` modifier or budget
+        computation silently disables the guarded behavior (issue #1011
+        review: ``'-nan seconds'`` evaluates to NULL). Every knob this
+        helper validates is finite-bounded, so non-finite values are
+        rejected outright.
+        """
+        if not math.isfinite(v):
+            raise ValueError(f"{field_name} must be a finite number")
         if min_val is not None and v < min_val:
             raise ValueError(f"{field_name} must be >= {min_val}")
         if max_val is not None and v > max_val:
@@ -1483,6 +1529,26 @@ class Settings(BaseSettings):
         """Validate the durable per-job attempt cap is in range 1-20."""
         return cls._validate_int_range(v, 1, 20, "jobs_max_attempts")
 
+    @field_validator("jobs_stall_timeout_seconds", mode="after")
+    @classmethod
+    def validate_jobs_stall_timeout_seconds(cls, v: float) -> float:
+        """Validate the per-file progress stall budget is in range 60-7200 s."""
+        return cls._validate_float_range(
+            v, 60.0, 7200.0, "jobs_stall_timeout_seconds"
+        )
+
+    @field_validator("embedding_probe_batch_count", mode="after")
+    @classmethod
+    def validate_embedding_probe_batch_count(cls, v: int) -> int:
+        """Probe batch count shares embedding_batch_size's 1-128 ceiling."""
+        return cls._validate_int_range(v, 1, 128, "embedding_probe_batch_count")
+
+    @field_validator("embedding_probe_batch_chars", mode="after")
+    @classmethod
+    def validate_embedding_probe_batch_chars(cls, v: int) -> int:
+        """Probe input size is bounded by the chunk-scale ceiling (2000)."""
+        return cls._validate_int_range(v, 64, 2000, "embedding_probe_batch_chars")
+
     @model_validator(mode="after")
     def validate_jobs_lease_coherence(self) -> "Settings":
         """The janitor reclaim timeout must exceed 4x the heartbeat interval.
@@ -1498,6 +1564,40 @@ class Settings(BaseSettings):
             raise ValueError(
                 "jobs_lease_reclaim_timeout_seconds must be > 4x "
                 "jobs_heartbeat_interval_seconds"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_jobs_stall_coherence(self) -> "Settings":
+        """The stall budget must exceed the reclaim timeout AND the parse
+        deadline (issue #1010).
+
+        Below the reclaim timeout a stall release could race the crash
+        backstop; below ``document_parse_timeout`` one legitimately slow
+        first file would look stalled — the exact false positive the
+        "slow-but-alive worker" promise forbids.
+        """
+        if self.jobs_stall_timeout_seconds <= self.jobs_lease_reclaim_timeout_seconds:
+            raise ValueError(
+                "jobs_stall_timeout_seconds must be > "
+                "jobs_lease_reclaim_timeout_seconds"
+            )
+        if self.jobs_stall_timeout_seconds <= self.document_parse_timeout:
+            raise ValueError(
+                "jobs_stall_timeout_seconds must be > document_parse_timeout"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_embedding_probe_shape_budget(self) -> "Settings":
+        """The probe batch must fit the per-request character budget."""
+        if (
+            self.embedding_probe_batch_count * self.embedding_probe_batch_chars
+            > self.embedding_batch_max_chars
+        ):
+            raise ValueError(
+                "embedding_probe_batch_count * embedding_probe_batch_chars must "
+                "be <= embedding_batch_max_chars"
             )
         return self
 

@@ -90,6 +90,25 @@ RUN pip install --no-cache-dir --require-hashes -r requirements-lock.txt
 # image stays buildable (BUILD-002 docker smoke, #258).
 RUN python -c "import spacy" 2>/dev/null     && python -m spacy download en_core_web_sm     || echo "spacy not installed - skipping en_core_web_sm download"
 
+# Bake the NLTK data packages unstructured's partitioners load lazily at
+# first parse. nltk ships as a locked library (via unstructured in
+# requirements-lock.txt) but pip has no artifact for the tokenizer corpora,
+# so an offline `--no-index` install can never provide them — without this
+# bake a fresh container either hangs on the lazy download or silently
+# returns zero elements per document (issue #1008). Unlike the optional
+# spaCy model above there is NO skip fallback: nltk is a locked dependency,
+# so a missing corpus is a build defect and the pre-flight nltk.data.find
+# assertions below fail the build when the downloader could not reach a
+# mirror. Like the apt/pip steps above this needs network access at build
+# time; restricted/airgapped builds pass a proxy via Docker's standard
+# build args or pre-seed a mirror. /usr/local/nltk_data persists into the
+# runtime image and is world-readable, so the non-root appuser resolves it
+# via NLTK_DATA on first parse.
+ENV NLTK_DATA=/usr/local/nltk_data
+RUN python -m nltk.downloader -d /usr/local/nltk_data punkt punkt_tab \
+        averaged_perceptron_tagger averaged_perceptron_tagger_eng \
+    && python -c "import nltk.data; nltk.data.find('tokenizers/punkt'); nltk.data.find('tokenizers/punkt_tab'); nltk.data.find('taggers/averaged_perceptron_tagger'); nltk.data.find('taggers/averaged_perceptron_tagger_eng')"
+
 # Copy backend code
 COPY backend/app ./app
 

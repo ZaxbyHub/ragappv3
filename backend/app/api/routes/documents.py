@@ -662,6 +662,13 @@ class ReindexJobStatusResponse(BaseModel):
     created_at: Optional[str] = None
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
+    # issue #1010: True for a RUNNING row whose progress watermark
+    # (progress_at, falling back to started_at/created_at) is older than
+    # jobs_stall_timeout_seconds — a machine-readable no-progress signal.
+    # A dead worker's row ALSO reads stalled=1 until the janitor's
+    # heartbeat-age arm flips it out of 'running'; the watchdog (not the
+    # reader) is what distinguishes live-stalled from dead.
+    stalled: bool = False
 
 
 class ReindexJobListResponse(BaseModel):
@@ -1976,10 +1983,34 @@ async def search_documents(
     # parsed_text — the downstream fallback reads only ``[:200]``.
     _SNIPPET_TOKENS = 24
 
+    # Issue #1005: FTS columns 4/5 (email_subject/email_sender) are stored
+    # uncapped from mail headers, so only their snippets carry the
+    # length(CAST(col AS BLOB)) NUL-proof guard; the remaining metadata
+    # columns are bounded at write/validation time. The guard expressions
+    # are kept as literals (not f-string placeholders) so the k7 snippet
+    # census can bind each guard to its column.
+    _META_SNIPPET_LENGTH_GUARDS: dict[int, str] = {
+        4: "length(CAST(f.email_subject AS BLOB))",
+        5: "length(CAST(f.email_sender AS BLOB))",
+    }
+
     def _meta_snippet(col: int) -> str:
-        return (
+        call = (
             f"snippet(files_search_fts, {col}, '<mark>', '</mark>', '…', "
             f"{_SNIPPET_TOKENS})"
+        )
+        # Issue #1005: email_subject/email_sender are stored uncapped from
+        # mail headers, so their metadata snippets sit behind the same
+        # NUL-proof length guard as the content arm (issue #1002) — an
+        # oversized column skips snippet() entirely instead of costing
+        # seconds per matched row. The guard strings are literals so the
+        # k7 census can bind them to these columns.
+        guard = _META_SNIPPET_LENGTH_GUARDS.get(col)
+        if guard is None:
+            return call
+        return (
+            f"CASE WHEN {guard} <= {int(FTS_SNIPPET_MAX_COLUMN_BYTES)} "
+            f"THEN {call} END"
         )
 
     # files_search_fts columns in excerpt-priority order:
@@ -3008,6 +3039,18 @@ def _mask_reindex_row(row: dict) -> dict:
     return row
 
 
+def _reindex_stall_cutoff() -> str:
+    """SQLite modifier for the stalled-signal cutoff (issue #1010).
+
+    MagicMock-safe numeric read (the frozen #494-style harness patches
+    Mock objects over settings); falls back to the shipped default.
+    """
+    value = getattr(settings, "jobs_stall_timeout_seconds", 900.0)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        value = 900.0
+    return f"-{float(value)} seconds"
+
+
 @router.get("/reindex/jobs/{job_id}", response_model=ReindexJobStatusResponse)
 @limiter.limit(settings.admin_rate_limit)
 async def get_reindex_job_status(
@@ -3038,17 +3081,27 @@ async def get_reindex_job_status(
                        error, result_json,
                        json_extract(payload_json, '$.input_json') AS input_json,
                        attempts AS retry_count,
-                       created_at, started_at, completed_at
+                       created_at, started_at, completed_at,
+                       CASE WHEN status = 'running'
+                                 AND COALESCE(progress_at, started_at, created_at)
+                                     < strftime('%Y-%m-%d %H:%M:%f', 'now', ?)
+                            THEN 1 ELSE 0 END AS stalled
                 FROM jobs WHERE id = ? AND queue = 'reindex'
                 """,
-                (job_id,),
+                (
+                    _reindex_stall_cutoff(),
+                    job_id,
+                ),
             ).fetchone()
             if row is not None:
                 row = dict(row)
                 row["input_json"] = row.get("input_json") or "{}"
             return row
         row = conn.execute(
-            "SELECT id, vault_id, trigger_type, trigger_id, status, error, result_json, input_json, retry_count, created_at, started_at, completed_at FROM document_reindex_jobs WHERE id = ?",
+            "SELECT id, vault_id, trigger_type, trigger_id, status, error, "
+            "result_json, input_json, retry_count, created_at, started_at, "
+            "completed_at, 0 AS stalled "
+            "FROM document_reindex_jobs WHERE id = ?",
             (job_id,),
         ).fetchone()
         return row
@@ -3094,11 +3147,16 @@ async def list_reindex_jobs(
                        error, result_json,
                        json_extract(payload_json, '$.input_json') AS input_json,
                        attempts AS retry_count,
-                       created_at, started_at, completed_at
+                       created_at, started_at, completed_at,
+                       CASE WHEN status = 'running'
+                                 AND COALESCE(progress_at, started_at, created_at)
+                                     < strftime('%Y-%m-%d %H:%M:%f', 'now', ?)
+                            THEN 1 ELSE 0 END AS stalled
                 FROM jobs WHERE queue = 'reindex'
                 ORDER BY created_at DESC, id DESC
                 LIMIT 20
-                """
+                """,
+                (_reindex_stall_cutoff(),),
             ).fetchall()
             out = []
             for row in rows:
@@ -3112,7 +3170,8 @@ async def list_reindex_jobs(
                    CASE WHEN status = 'interrupted' THEN 'failed' ELSE status END AS status,
                    error, result_json, input_json,
                    COALESCE(retry_count, 0) AS retry_count,
-                   created_at, started_at, completed_at
+                   created_at, started_at, completed_at,
+                   0 AS stalled
             FROM document_reindex_jobs
             ORDER BY created_at DESC, id DESC
             LIMIT 20
