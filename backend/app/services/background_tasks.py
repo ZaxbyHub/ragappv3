@@ -239,14 +239,12 @@ def reset_background_processor() -> None:
     _processor_instance = None
 
 
-# Issue #1010: the stall watchdog converts its cancellation of a wedged
-# reindex run into THIS exception (an Exception, not BaseException) so the
-# worker loop's shutdown `except asyncio.CancelledError: raise` branch stays
-# reserved for shutdown and the loop CONTINUES to re-claim the released row.
-class _LeaseStallCancelled(Exception):
-    """A reindex run was cancelled by the stall watchdog (issue #1010)."""
-
-
+# Issue #1010: the stall watchdog's cancel-conversion contract — when the
+# watchdog cancels a wedged run task, the worker loop's except arm converts
+# the delivered CancelledError into the stall-settle path via the one-shot
+# `_stall_cancel_flag` (plus the `cancelling()` discriminator), so the
+# shutdown `except asyncio.CancelledError: raise` branch stays reserved for
+# shutdown and the loop CONTINUES to re-claim the released row.
 class _LeaseProgressLost(Exception):
     """The run lost its lease fence mid-attempt (issue #1010).
 
