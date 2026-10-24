@@ -215,6 +215,22 @@ class WikiCompiler:
         self._db = db
         self._store = store or WikiStore(db)
 
+    def _vault_row_exists(self, vault_id: Optional[int]) -> bool:
+        """True when vault_id names a live vault row (None is never checked).
+
+        Issue #723 (T1-21-S-07): compile entry points refuse to write wiki
+        rows for a vault that was deleted while the job sat pending or was
+        already running — the entry-point re-check narrows the write race to
+        inside a single compile (an irreducible residual disclosed in the
+        issue's PR).
+        """
+        if vault_id is None:
+            return True
+        row = self._db.execute(
+            "SELECT 1 FROM vaults WHERE id = ?", (vault_id,)
+        ).fetchone()
+        return row is not None
+
     def _find_or_create_claim(
         self,
         vault_id: int,
@@ -341,6 +357,9 @@ class WikiCompiler:
         role-derived value; trusted system callers (e.g. the background
         WikiCompileProcessor) pass ``True`` explicitly.
         """
+        if not self._vault_row_exists(vault_id):
+            return {"skipped": True, "reason": f"vault {vault_id} no longer exists"}
+
         # Load memory — FK verify vault scope
         self._db.row_factory = sqlite3.Row
         row = self._db.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
@@ -535,6 +554,9 @@ class WikiCompiler:
 
         source_type is derived per-claim from the kinds of sources actually cited.
         """
+        if not self._vault_row_exists(vault_id):
+            return {"skipped": True, "reason": f"vault {vault_id} no longer exists"}
+
         assistant_answer: str = input_json.get("assistant_answer") or ""
         # Per-claim source mapping: {"sentence text": [source_dicts]}
         per_claim_sources: dict = input_json.get("per_claim_sources") or {}
@@ -809,6 +831,16 @@ class WikiCompiler:
         directly; otherwise the method reads from the file path recorded in
         the files table.
         """
+        if not self._vault_row_exists(vault_id):
+            return {
+                "page": None,
+                "claims": [],
+                "entities": [],
+                "relations_count": 0,
+                "skipped": True,
+                "reason": f"vault {vault_id} no longer exists",
+            }
+
         file_id: Optional[int] = input_json.get("file_id")
         if not file_id:
             return {"page": None, "claims": [], "entities": [], "relations_count": 0, "skipped": True}

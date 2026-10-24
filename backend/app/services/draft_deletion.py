@@ -123,6 +123,25 @@ class DraftDeletionService:
                         type(restore_exc).__name__,
                     )
             raise
+        except BaseException:
+            # Issue #723 (T1-21-S2-04): a BaseException must not strand the
+            # tombstoned bytes while the row survives. Gated on the store
+            # transaction — the store commits internally, so a BaseException
+            # delivered after that commit must NOT restore bytes whose row
+            # is already gone (the startup reconcile/age purge owns them).
+            if store._db.in_transaction:
+                store._db.rollback()
+                if token is not None:
+                    try:
+                        self._storage.restore_tombstone(token, relpath)
+                    except (OSError, DraftInputStorageError):
+                        logger.error(
+                            "draft_input_restore_failed draft_id=%s input_id=%s "
+                            "exception_class=BaseException",
+                            draft_id,
+                            input_id,
+                        )
+            raise
         if token is not None:
             self._storage.commit_tombstone(token)
         logger.info("draft_input_deleted draft_id=%s input_id=%s", draft_id, input_id)
@@ -152,11 +171,24 @@ class DraftDeletionService:
         except Exception:
             self._restore_all(tokens)
             raise
+        except BaseException:
+            # Issue #723 (T1-21-S2-04): no row deletes have happened yet, so
+            # the draft's rows certainly survive — restore unconditionally.
+            self._restore_all(tokens)
+            raise
 
         try:
             store.delete_draft_row(draft_id=draft_id, owner_id=owner_id)
         except Exception:
             self._restore_all(tokens)
+            raise
+        except BaseException:
+            # Gated on the store transaction: delete_draft_row commits
+            # internally, so a BaseException delivered after that commit must
+            # not resurrect an already-deleted draft's bytes.
+            if store._db.in_transaction:
+                store._db.rollback()
+                self._restore_all(tokens)
             raise
 
         for token, _relpath in tokens:
@@ -208,6 +240,13 @@ class DraftDeletionService:
                     token = self._storage.tombstone(relpath)
                     tokens.append((token, relpath))
         except Exception:
+            self._restore_all(tokens)
+            raise
+        except BaseException:
+            # Issue #723 (T1-21-S2-04): pure filesystem staging — no row
+            # deletes have happened yet, so restore unconditionally (a
+            # CancelledError at the caller's await cannot reach this thread,
+            # but a KeyboardInterrupt inside it can).
             self._restore_all(tokens)
             raise
         return PurgePlan(tokens=tokens, draft_owner_pairs=list(pairs))

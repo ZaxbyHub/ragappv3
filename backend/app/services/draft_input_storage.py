@@ -15,6 +15,7 @@ and stable codes.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import time
@@ -219,6 +220,13 @@ class DraftInputStorage:
     def tombstone(self, relpath: str) -> str:
         """Atomically rename the resolved path into ``.trash`` and return its token.
 
+        Issue #723 (T1-21-S2-03): the tombstone's mtime is refreshed to NOW
+        (``os.replace`` preserves the upload's old mtime, which made the
+        startup reconcile delete a surviving draft's tombstoned bytes purely
+        on upload age), and a ``<token>.json`` sidecar records the owning
+        relpath so a restart can restore tombstones whose drafts still
+        exist.
+
         Raises:
             DraftInputPathError: The storage root itself is missing. Creating
                 it here would relocate the user's bytes into a fresh tree while
@@ -238,7 +246,22 @@ class DraftInputStorage:
         trash_dir.mkdir(parents=True, exist_ok=True)
         token = uuid.uuid4().hex
         trash_path = trash_dir / token
-        os.replace(source, trash_path)
+        # Issue #723 review (F-1): write the sidecar BEFORE the rename so a
+        # failure in the metadata write cannot strand a sidecar-less entry
+        # (the restore pass skips those and the age purge would destroy the
+        # only copy of a surviving draft's bytes). If the rename itself
+        # fails, unlink the sidecar and re-raise with the bytes untouched at
+        # their original path; an orphan sidecar without an entry is cleaned
+        # by the reconcile's restore pass.
+        self._sidecar_path(token).write_text(
+            json.dumps({"relpath": relpath}), encoding="utf-8"
+        )
+        try:
+            os.replace(source, trash_path)
+        except OSError:
+            self._sidecar_path(token).unlink(missing_ok=True)
+            raise
+        os.utime(trash_path, None)
         return token
 
     def restore_tombstone(self, token: str, relpath: str) -> None:
@@ -247,15 +270,23 @@ class DraftInputStorage:
         final_path = self.resolve(relpath)
         final_path.parent.mkdir(parents=True, exist_ok=True)
         os.replace(trash_path, final_path)
+        self._sidecar_path(token).unlink(missing_ok=True)
 
     def commit_tombstone(self, token: str) -> None:
         """Permanently discard a tombstoned file."""
         self._trash_path(token).unlink(missing_ok=True)
+        self._sidecar_path(token).unlink(missing_ok=True)
 
     def _trash_path(self, token: str) -> Path:
         if not token or any(c in token for c in ("/", "\\", "..")):
             raise DraftInputPathError("invalid tombstone token")
         return (self._root / _TRASH_DIR / token).resolve()
+
+    def _sidecar_path(self, token: str) -> Path:
+        # Same validation as _trash_path; the sidecar rides beside the entry.
+        if not token or any(c in token for c in ("/", "\\", "..")):
+            raise DraftInputPathError("invalid tombstone token")
+        return (self._root / _TRASH_DIR / f"{token}.json").resolve()
 
     # ── startup reconciliation ──────────────────────────────────────────
 
@@ -264,6 +295,7 @@ class DraftInputStorage:
         valid_owner_draft_pairs: set[tuple[int, int]],
         *,
         max_age_seconds: float,
+        valid_input_relpaths: Optional[set[str]] = None,
     ) -> dict[str, int]:
         """Remove stale ``.incoming``/``.trash`` entries and orphan project dirs.
 
@@ -271,29 +303,93 @@ class DraftInputStorage:
         only to ``.incoming``/``.trash``; ``<user_id>/<draft_id>`` directories
         whose pair is not in ``valid_owner_draft_pairs`` are removed immediately
         regardless of age.
+
+        Issue #723 (T1-21-S2-03): before the age purge, every sidecar-bearing
+        ``.trash`` entry whose bytes are still owed to a live row is restored.
+        When ``valid_input_relpaths`` is provided (the exact rule — the
+        production startup passes the DB-derived set of ``draft_inputs``.storage_relpath
+        values), only relpaths still backed by a row are restored; with the
+        legacy pairs-only call shape, entries whose relpath's ``(owner, draft)``
+        pair is valid are restored (a coarser fallback that can also restore a
+        concurrently-deleted input's bytes — the shipped startup path never
+        uses it). Entries whose target relpath already exists are never
+        restored and age-purge as redundant bytes.
         """
         counts = {
             "incoming_removed": 0,
             "trash_removed": 0,
+            "trash_restored": 0,
             "orphan_dirs_removed": 0,
         }
         if not self._root.is_dir():
             return counts
 
+        counts["trash_restored"] = self._reconcile_restore_trash(
+            valid_owner_draft_pairs, valid_input_relpaths
+        )
         now = time.time()
         counts["incoming_removed"] = self._reconcile_age_dir(
             self._root / _INCOMING_DIR, now=now, max_age_seconds=max_age_seconds
         )
         counts["trash_removed"] = self._reconcile_age_dir(
-            self._root / _TRASH_DIR, now=now, max_age_seconds=max_age_seconds
+            self._root / _TRASH_DIR,
+            now=now,
+            max_age_seconds=max_age_seconds,
+            sidecar_suffix=".json",
         )
         counts["orphan_dirs_removed"] = self._reconcile_orphan_projects(
             valid_owner_draft_pairs
         )
         return counts
 
+    def _reconcile_restore_trash(
+        self,
+        valid_owner_draft_pairs: set[tuple[int, int]],
+        valid_input_relpaths: Optional[set[str]],
+    ) -> int:
+        """Restore tombstoned bytes still owed to a live draft-input row.
+
+        Sidecars without an entry are orphaned metadata and removed; entries
+        without a sidecar (pre-fix tombstones) are left to the age purge.
+        """
+        trash_dir = self._root / _TRASH_DIR
+        if not trash_dir.is_dir():
+            return 0
+        restored = 0
+        for sidecar in list(trash_dir.glob("*.json")):
+            token = sidecar.name[: -len(".json")]
+            entry = trash_dir / token
+            if not entry.exists():
+                sidecar.unlink(missing_ok=True)
+                continue
+            try:
+                relpath = json.loads(sidecar.read_text(encoding="utf-8"))["relpath"]
+            except (OSError, ValueError, KeyError):
+                continue
+            if valid_input_relpaths is not None:
+                owed = relpath in valid_input_relpaths
+            else:
+                pair = _owner_draft_pair_from_relpath(relpath)
+                owed = pair is not None and pair in valid_owner_draft_pairs
+            if not owed or self.exists(relpath):
+                continue
+            try:
+                os.replace(entry, self.resolve(relpath))
+                sidecar.unlink(missing_ok=True)
+                restored += 1
+            except (OSError, DraftInputPathError):
+                logger.warning(
+                    "draft_room_reconcile: failed to restore tombstoned input"
+                )
+        return restored
+
     def _reconcile_age_dir(
-        self, directory: Path, *, now: float, max_age_seconds: float
+        self,
+        directory: Path,
+        *,
+        now: float,
+        max_age_seconds: float,
+        sidecar_suffix: Optional[str] = None,
     ) -> int:
         if not directory.is_dir():
             return 0
@@ -304,6 +400,11 @@ class DraftInputStorage:
         except (OSError, ValueError):
             return 0
         for entry in directory.iterdir():
+            if sidecar_suffix and entry.name.endswith(sidecar_suffix):
+                # Sidecar metadata is paired with its entry — never counted
+                # or purged as an independent entry; it is unlinked alongside
+                # its entry below (or as an orphan by the restore pass).
+                continue
             try:
                 age = now - entry.stat().st_mtime
             except OSError:
@@ -317,6 +418,10 @@ class DraftInputStorage:
                     shutil.rmtree(entry, ignore_errors=True)
                 else:
                     entry.unlink(missing_ok=True)
+                if sidecar_suffix:
+                    entry.with_name(entry.name + sidecar_suffix).unlink(
+                        missing_ok=True
+                    )
                 removed += 1
             except OSError:
                 logger.warning("draft_room_reconcile: failed to remove stale entry")
@@ -351,6 +456,18 @@ class DraftInputStorage:
                 shutil.rmtree(resolved_entry, ignore_errors=True)
                 removed += 1
         return removed
+
+
+def _owner_draft_pair_from_relpath(relpath: str) -> Optional[tuple[int, int]]:
+    """Best-effort ``(owner_id, draft_id)`` from a storage relpath.
+
+    Layout is ``<owner_id>/<draft_id>/inputs/<input_id>/<name>``; returns None
+    when the leading segments are not both numeric.
+    """
+    parts = relpath.split("/")
+    if len(parts) >= 3 and parts[0].isdigit() and parts[1].isdigit():
+        return (int(parts[0]), int(parts[1]))
+    return None
 
 
 def _guess_media_type(extension: str) -> Optional[str]:
