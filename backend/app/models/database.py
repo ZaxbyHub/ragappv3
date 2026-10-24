@@ -890,6 +890,7 @@ CREATE TABLE IF NOT EXISTS chat_messages (
 CREATE INDEX IF NOT EXISTS idx_chat_messages_session_id ON chat_messages(session_id);
 CREATE INDEX IF NOT EXISTS idx_files_status ON files(status);
 CREATE INDEX IF NOT EXISTS idx_files_hash_vault_status ON files(file_hash, vault_id, status);
+CREATE INDEX IF NOT EXISTS idx_files_vault_id ON files(vault_id);
 
 -- Document actions for auditing admin operations
 CREATE TABLE IF NOT EXISTS document_actions (
@@ -1132,6 +1133,7 @@ CREATE INDEX IF NOT EXISTS idx_vault_group_access_group_id ON vault_group_access
 CREATE INDEX IF NOT EXISTS idx_users_locked_until ON users(locked_until);
 CREATE INDEX IF NOT EXISTS idx_user_sessions_expires ON user_sessions(expires_at);
 CREATE INDEX IF NOT EXISTS idx_chat_sessions_user_id ON chat_sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_chat_sessions_vault_id ON chat_sessions(vault_id);
 CREATE INDEX IF NOT EXISTS idx_memories_vault_id ON memories(vault_id);
 CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at);
 
@@ -2083,6 +2085,7 @@ def run_migrations(sqlite_path: str) -> None:
     # Per-user onboarding milestone state (issue #782) — purely additive.
     migrate_add_user_onboarding_state(sqlite_path)
     migrate_add_service_account_rotation_grace(sqlite_path)
+    migrate_add_vault_count_indexes(sqlite_path)
     # Producer provenance + auto_resolved status for wiki lint findings
     # (issue #791): table rebuild, so it runs after every other migration
     # that may create or rebuild wiki_lint_findings.
@@ -8355,10 +8358,6 @@ def migrate_add_service_account_rotation_grace(sqlite_path: str) -> None:
         }
         if "previous_key_hash" in cols and "previous_key_expires_at" in cols:
             return
-        record_migration_outcome(
-            conn, migration_name=_journal, phase="start", outcome="ok"
-        )
-        conn.execute("PRAGMA foreign_keys = ON;")
         if "previous_key_hash" not in cols:
             conn.execute(
                 "ALTER TABLE service_accounts ADD COLUMN previous_key_hash TEXT"
@@ -8379,84 +8378,54 @@ def migrate_add_service_account_rotation_grace(sqlite_path: str) -> None:
         conn.close()
 
 
-def lookup_service_account(conn, key_hash: str):
-    """Shared service-account key lookup with rotation grace (issue #724).
+def migrate_add_vault_count_indexes(sqlite_path: str) -> None:
+    """Migration: vault_id indexes for the vault counts query (issue #723).
 
-    Single round trip over the primary and the previous (rotation-grace)
-    hash: ``WHERE key_hash = ? OR previous_key_hash = ?``. Returns
-    ``(row, via_previous)`` where row is ``(id, name, scopes, revoked_at)``
-    and via_previous is True when the match was the previous key inside its
-    grace window (an expired grace reads as no match). A NEW-key match
-    retires the grace columns conditionally (``previous_key_hash IS NOT
-    NULL`` guard: no write on the steady-state hot path). Both live
-    validators (security.require_service_account and
-    deps.get_current_user_or_service_account) resolve through this helper.
+    The counts rewrite in ``_VAULT_WITH_COUNTS_SQL`` uses three correlated
+    scalar subqueries on ``files.vault_id`` and ``chat_sessions.vault_id``;
+    SQLite auto-indexed the old LEFT JOIN form but never auto-indexes
+    correlated subqueries, and fresh installs get no vault_id-leading index
+    on those two tables from the base DDL. Purely additive
+    ``CREATE INDEX IF NOT EXISTS`` — journal-silent no-op when present,
+    matching the migrate_add_user_onboarding_state peer.
     """
-    from datetime import datetime as _dt
-    from datetime import timezone as _tz
-
-    # Issue #724 review (F-4): under a degraded boot (migrations_ok=False)
-    # the rotation-grace columns may not exist; fall back to the pre-grace
-    # 4-column shape (treated as no grace) instead of OperationalError-500ing
-    # every service-account authentication, mirroring the
-    # _fetch_user_row_with_pwc no-such-column convention.
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
+    conn.isolation_level = None
+    _journal = "migrate_add_vault_count_indexes"
     try:
-        row = conn.execute(
-            "SELECT id, name, scopes, revoked_at, key_hash, previous_key_hash, "
-            "previous_key_expires_at FROM service_accounts "
-            "WHERE key_hash = ? OR previous_key_hash = ?",
-            (key_hash, key_hash),
-        ).fetchone()
-    except sqlite3.OperationalError as exc:
-        if "no such column" not in str(exc).lower():
-            raise
-        row = conn.execute(
-            "SELECT id, name, scopes, revoked_at, key_hash, "
-            "NULL AS previous_key_hash, NULL AS previous_key_expires_at "
-            "FROM service_accounts WHERE key_hash = ?",
-            (key_hash,),
-        ).fetchone()
-    if row is None:
-        return None, False
-    sa_id, name, scopes, revoked_at, current_hash, prev_hash, prev_expires = row
-    if prev_hash is not None and prev_hash == key_hash:
-        if prev_expires is None:
-            return (sa_id, name, scopes, revoked_at), True
-        try:
-            grace_end = _dt.fromisoformat(prev_expires)
-        except ValueError:
-            return None, False
-        if grace_end.tzinfo is None:
-            grace_end = grace_end.replace(tzinfo=_tz.utc)
-        if _dt.now(_tz.utc) > grace_end:
-            return None, False
-        return (sa_id, name, scopes, revoked_at), True
-    if prev_hash is not None:
-        conn.execute(
-            "UPDATE service_accounts SET previous_key_hash = NULL, "
-            "previous_key_expires_at = NULL "
-            "WHERE id = ? AND previous_key_hash IS NOT NULL",
-            (sa_id,),
+        have = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name IN "
+                "('idx_files_vault_id', 'idx_chat_sessions_vault_id')"
+            ).fetchall()
+        }
+        if have == {"idx_files_vault_id", "idx_chat_sessions_vault_id"}:
+            return
+        if "idx_files_vault_id" not in have:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_files_vault_id ON files(vault_id)"
+            )
+        if "idx_chat_sessions_vault_id" not in have:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_chat_sessions_vault_id "
+                "ON chat_sessions(vault_id)"
+            )
+        record_migration_outcome(
+            conn, migration_name=_journal, phase="succeeded", outcome="ok"
         )
-        conn.commit()
-    return (sa_id, name, scopes, revoked_at), False
+    except Exception:
+        record_migration_outcome(
+            conn, migration_name=_journal, phase="failed", outcome="error"
+        )
+        raise
+    finally:
+        conn.close()
 
 
 def migrate_add_canvas_tables(sqlite_path: str) -> None:
-    """Migration: add the canvas artifact/version tables (issue #509).
-
-    Creates ``canvas_artifacts`` (stable artifact identity + lineage + sources
-    snapshot) and ``canvas_versions`` (append-only version history).
-
-    Executes ``_CANVAS_DDL`` — the exact same constant appended to ``SCHEMA`` —
-    so a database created by ``init_db`` and a legacy database upgraded by this
-    migration converge on an identical schema (double-definition convention).
-    Every statement is ``CREATE ... IF NOT EXISTS``, so repeat execution is a
-    no-op and existing data is preserved.
-    """
     conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
-        conn.execute("PRAGMA foreign_keys = ON;")
         conn.executescript(_CANVAS_DDL)
         conn.commit()
     finally:

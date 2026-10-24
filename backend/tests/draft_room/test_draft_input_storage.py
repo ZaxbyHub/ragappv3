@@ -58,10 +58,12 @@ def _incoming_entries(root: Path) -> list[Path]:
 
 
 def _trash_entries(root: Path) -> list[Path]:
+    """Tombstone entries only - the <token>.json sidecars (issue #723) ride
+    beside their entries and are never counted as entries themselves."""
     trash = root / ".trash"
     if not trash.is_dir():
         return []
-    return list(trash.iterdir())
+    return [e for e in trash.iterdir() if not e.name.endswith(".json")]
 
 
 class DraftInputStorageTestBase(unittest.TestCase):
