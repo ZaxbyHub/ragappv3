@@ -583,4 +583,93 @@ describe('DocumentsPage k03 — feedback-round pins (delete-all guard/refetch, f
     });
     expect(screen.queryAllByText((content: string) => content.includes('v1-only-tag')).length).toBe(0);
   });
+  // --- ABA (vault 1 -> 2 -> 1) round-trip pins (fifth-review finding) -----------
+
+  it('ABA vault round trip leaves a stale bulk-delete confirm refused', { timeout: 30_000 }, async () => {
+    // Vault-aware rows so every ABA leg renders its own vault's row.
+    vi.mocked(listDocuments).mockImplementation((request?: { vaultId?: number }) =>
+      Promise.resolve({
+        documents: [makeDoc(`v${request?.vaultId ?? 1}-a`, `v${request?.vaultId ?? 1}-a.pdf`)],
+        total: 1,
+      })
+    );
+    vi.mocked(deleteDocuments).mockResolvedValue({ deleted_count: 1, failed_ids: [] });
+
+    let utils!: RenderResult;
+    await act(async () => {
+      utils = render(<DocumentsPage />);
+    });
+
+    // Select a vault-1 row and open the confirm dialog there.
+    const rowCheckbox = await screen.findByLabelText('Select v1-a.pdf', {}, { timeout: 10_000 });
+    await act(async () => {
+      fireEvent.click(rowCheckbox);
+    });
+    await waitFor(() => expect(screen.getByText('1 selected')).toBeInTheDocument(), { timeout: 5_000 });
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Delete Selected' }));
+    });
+    expect(screen.getByText('Delete Selected Documents')).toBeInTheDocument();
+
+    // ABA: switch away and BACK to the same numeric vault while the dialog
+    // stays open. The numeric-id compare (confirmVaultRef vs activeVaultIdRef)
+    // sees 1 === 1 after the round trip and would pass; only the monotone
+    // confirmation generation (bumped by each switch effect) still refuses.
+    setStoreVault(2);
+    await act(async () => {
+      utils.rerender(<DocumentsPage />);
+    });
+    await waitForVaultRows('v2-a.pdf');
+    setStoreVault(1);
+    await act(async () => {
+      utils.rerender(<DocumentsPage />);
+    });
+    await waitForVaultRows('v1-a.pdf');
+    expect(screen.getByText('Delete Selected Documents')).toBeInTheDocument();
+
+    // Confirm through the ABA-stale dialog: the guard must refuse.
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Confirm' }));
+      await flushMicrotasks();
+    });
+
+    expect(vi.mocked(deleteDocuments)).not.toHaveBeenCalled();
+    expect(vi.mocked(toast.error)).toHaveBeenCalledWith(expect.stringContaining('Selection changed'));
+  });
+
+  it('ABA vault round trip leaves a stale delete-all confirm refused', { timeout: 30_000 }, async () => {
+    listByVault();
+
+    let utils!: RenderResult;
+    await act(async () => {
+      utils = render(<DocumentsPage />);
+    });
+
+    const deleteAllButton = await screen.findByRole('button', { name: 'Delete All in Vault' }, { timeout: 10_000 });
+    await act(async () => {
+      fireEvent.click(deleteAllButton);
+    });
+    expect(await screen.findByText('Delete All Documents in Vault')).toBeInTheDocument();
+
+    // ABA round trip with the dialog open.
+    setStoreVault(2);
+    await act(async () => {
+      utils.rerender(<DocumentsPage />);
+    });
+    await waitForVaultRows('v2-a.pdf');
+    setStoreVault(1);
+    await act(async () => {
+      utils.rerender(<DocumentsPage />);
+    });
+    await waitForVaultRows('v1-a.pdf');
+    expect(screen.getByText('Delete All Documents in Vault')).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Confirm' }));
+      await flushMicrotasks();
+    });
+
+    expect(vi.mocked(deleteAllDocumentsInVault)).not.toHaveBeenCalled();
+    expect(vi.mocked(toast.error)).toHaveBeenCalledWith(expect.stringContaining('Vault changed'));
+  });
 });

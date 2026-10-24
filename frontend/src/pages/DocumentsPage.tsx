@@ -278,6 +278,15 @@ export default function DocumentsPage() {
   // are per-resource actions backed by per-vault server authorization and are
   // deliberately unguarded (recorded residual).
   const confirmVaultRef = useRef<number | null>(null);
+  // Vault-context GENERATION for confirmations (complements confirmVaultRef):
+  // a monotone counter bumped on every vault transition, so a round trip
+  // (vault 1 -> 2 -> 1) — which the numeric-id compare cannot see — still
+  // invalidates a dialog opened in the earlier incarnation. The numeric id
+  // and the generation cover each other's windows: the id read is live from
+  // render (catches a switch before the bump effect runs); the generation is
+  // bumped in the switch effect (catches round trips back to the same id).
+  const vaultSwitchGenRef = useRef(0);
+  const confirmVaultGenRef = useRef(0);
 
   useEffect(() => {
     if (!canMutateDocuments) {
@@ -288,9 +297,13 @@ export default function DocumentsPage() {
   // Bulk selection is per-vault display state: an admin->admin vault switch
   // never flips canMutateDocuments, so the permission-keyed effect above never
   // fires for it — clear the selection on the switch itself (issue #764 AC1;
-  // the confirm-dialog path is covered by the execute-time guard instead).
+  // the confirm-dialog path is covered by the execute-time guards instead).
+  // Every transition also bumps the confirmation generation, so dialogs
+  // opened before any later transition (including ABA round trips) refuse at
+  // execute time.
   useEffect(() => {
     setSelectedIds(new Set());
+    vaultSwitchGenRef.current += 1;
   }, [activeVaultId, setSelectedIds]);
 
   // Load the vault's tags for the filter + bulk-assign dialog.
@@ -390,6 +403,7 @@ export default function DocumentsPage() {
   const handleDeleteFolder = useCallback(
     (folder: Folder) => {
       confirmVaultRef.current = activeVaultId;
+      confirmVaultGenRef.current = vaultSwitchGenRef.current;
       setConfirmDialog({
         open: true,
         title: "Delete Folder",
@@ -493,7 +507,10 @@ export default function DocumentsPage() {
     // background fetchVaults correction), the captured ids belong to another
     // vault — refuse instead of sending them. A live-ref read, not a closed
     // value, sees the switch.
-    if (confirmVaultRef.current !== activeVaultIdRef.current) {
+    if (
+      confirmVaultRef.current !== activeVaultIdRef.current ||
+      confirmVaultGenRef.current !== vaultSwitchGenRef.current
+    ) {
       toast.error("Selection changed — select documents again");
       clearSelection();
       return;
@@ -546,6 +563,7 @@ export default function DocumentsPage() {
   const handleBulkDelete = useCallback(() => {
     if (selectedIds.size === 0) return;
     confirmVaultRef.current = activeVaultId;
+    confirmVaultGenRef.current = vaultSwitchGenRef.current;
     setConfirmDialog({
       open: true,
       title: "Delete Selected Documents",
@@ -561,7 +579,10 @@ export default function DocumentsPage() {
     // scope decision): the dialog captured the open-time activeVaultId in
     // this closure, so a stale confirm would wipe the PREVIOUS vault.
     // Delete-all is a bulk mutation.
-    if (confirmVaultRef.current !== activeVaultIdRef.current) {
+    if (
+      confirmVaultRef.current !== activeVaultIdRef.current ||
+      confirmVaultGenRef.current !== vaultSwitchGenRef.current
+    ) {
       toast.error("Vault changed — reopen the confirmation and try again");
       return;
     }
@@ -593,6 +614,7 @@ export default function DocumentsPage() {
       return;
     }
     confirmVaultRef.current = activeVaultId;
+    confirmVaultGenRef.current = vaultSwitchGenRef.current;
     setConfirmDialog({
       open: true,
       title: "Delete All Documents in Vault",
@@ -678,6 +700,7 @@ export default function DocumentsPage() {
       return;
     }
     confirmVaultRef.current = activeVaultId;
+    confirmVaultGenRef.current = vaultSwitchGenRef.current;
     setConfirmDialog({
       open: true,
       title: "Delete Document",
