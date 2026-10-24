@@ -1044,6 +1044,21 @@ def _build_files_fts_query(raw_search: str) -> str:
     return build_fts_match_query(normalized)
 
 
+def _escape_like_term(term: str) -> str:
+    """Escape SQL LIKE wildcards in a user-supplied search term (issue #975).
+
+    ``\\``, ``%`` and ``_`` become literal characters instead of wildcards.
+    Every LIKE clause that binds the returned value must carry
+    ``ESCAPE '\\\\'`` — the same recipe as the unified-search chat-title arm
+    (issue #718 AC6) and the existing users/groups/search routes.
+    """
+    return (
+        term.replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+    )
+
+
 @router.get("", response_model=DocumentListResponse, include_in_schema=False)
 @router.get("/", response_model=DocumentListResponse)
 async def list_documents(
@@ -1095,7 +1110,7 @@ async def list_documents(
                 # build — must use the full virtual-table name in MATCH.
                 extra_where.append(
                     """(
-                        LOWER(file_name) LIKE ?
+                        LOWER(file_name) LIKE ? ESCAPE '\\'
                         OR id IN (
                             SELECT rowid FROM files_search_fts
                             WHERE files_search_fts MATCH ?
@@ -1108,14 +1123,14 @@ async def list_documents(
                         )
                     )"""
                 )
-                extra_params.append(f"%{search.strip().lower()}%")
+                extra_params.append(f"%{_escape_like_term(search.strip().lower())}%")
                 extra_params.append(fts_query)
                 extra_params.append(fts_query)
                 extra_params.append(vault_id)
             else:
                 extra_where.append(
                     """(
-                        LOWER(file_name) LIKE ?
+                        LOWER(file_name) LIKE ? ESCAPE '\\'
                         OR id IN (
                             SELECT rowid FROM files_search_fts
                             WHERE files_search_fts MATCH ?
@@ -1126,12 +1141,12 @@ async def list_documents(
                         )
                     )"""
                 )
-                extra_params.append(f"%{search.strip().lower()}%")
+                extra_params.append(f"%{_escape_like_term(search.strip().lower())}%")
                 extra_params.append(fts_query)
                 extra_params.append(fts_query)
         else:
-            extra_where.append("LOWER(file_name) LIKE ?")
-            extra_params.append(f"%{search.strip().lower()}%")
+            extra_where.append("LOWER(file_name) LIKE ? ESCAPE '\\'")
+            extra_params.append(f"%{_escape_like_term(search.strip().lower())}%")
     if status and status.strip():
         extra_where.append("status = ?")
         extra_params.append(status.strip())
@@ -1925,7 +1940,7 @@ async def search_documents(
     fts_query = _build_files_fts_query(query_text)
     if not fts_query:
         raise HTTPException(status_code=400, detail="Query has no searchable tokens")
-    like_query = f"%{query_text.lower()}%"
+    like_query = f"%{_escape_like_term(query_text.lower())}%"
 
     # Resolve the vault scope (mirrors list_documents).
     accessible_vaults: Optional[List[int]] = None
@@ -2028,7 +2043,7 @@ async def search_documents(
                0.0 AS rank, NULL AS excerpt_raw,
                3 AS type_priority
         FROM files f
-        WHERE LOWER(f.file_name) LIKE ?
+        WHERE LOWER(f.file_name) LIKE ? ESCAPE '\\'
           AND {vault_clause_name}
     ),
     ranked AS (
@@ -2077,7 +2092,7 @@ async def search_documents(
             WHERE files_search_fts MATCH ? AND {vault_clause_meta}
             UNION
             SELECT f.id FROM files f
-            WHERE LOWER(f.file_name) LIKE ? AND {vault_clause_name}
+            WHERE LOWER(f.file_name) LIKE ? ESCAPE '\\' AND {vault_clause_name}
         )
         SELECT COUNT(*) FROM raw_matches
         """
