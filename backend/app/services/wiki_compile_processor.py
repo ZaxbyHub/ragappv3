@@ -820,6 +820,29 @@ class WikiCompileProcessor:
                 WikiStore(conn).cancel_job(job.id, job.vault_id, result_json=result)
             return result
 
+        # Issue #723 (T1-21-S-07): a job whose vault was deleted must never
+        # re-persist wiki rows for a vault_id that no longer exists. Checked
+        # at dispatch (not enqueue) because a vault delete can land between
+        # enqueue and claim; the compiler entry points re-check for jobs that
+        # were already running when the vault delete committed.
+        with self._pool.connection() as conn:
+            vault_row = conn.execute(
+                "SELECT 1 FROM vaults WHERE id = ?", (job.vault_id,)
+            ).fetchone()
+            if vault_row is None:
+                result = {
+                    "cancelled": "vault_deleted",
+                    "skipped": True,
+                    "reason": f"vault {job.vault_id} no longer exists",
+                }
+                logger.info(
+                    "WikiCompileProcessor: cancelling job id=%d type=%s — vault deleted",
+                    job.id,
+                    job.trigger_type,
+                )
+                WikiStore(conn).cancel_job(job.id, job.vault_id, result_json=result)
+                return result
+
         input_json: dict = {}
         if job.input_json:
             try:
