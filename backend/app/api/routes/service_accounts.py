@@ -12,16 +12,25 @@ import asyncio
 import hashlib
 import logging
 import secrets
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from app.config import settings
 from app.models.database import get_pool
-from app.security import admin_scope_fingerprint, require_scope
+from app.security import (
+    admin_scope_fingerprint,
+    csrf_protect,
+    require_scope,
+)
 
 logger = logging.getLogger(__name__)
+
+# Issue #724 (T1-01-S-09): the previous key stays valid for a bounded grace
+# after a rotation, so an undelivered rotation response is recoverable
+# without a second rotation.
+_ROTATION_GRACE_SECONDS = 24 * 60 * 60
 router = APIRouter(prefix="/service-accounts", tags=["service-accounts"])
 
 
@@ -92,6 +101,7 @@ def _generate_service_key() -> tuple[str, str]:
 async def create_service_account(
     payload: ServiceAccountCreate,
     _auth: dict = Depends(require_scope("admin:config")),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Issue a new service-account API key.
 
@@ -183,13 +193,20 @@ async def list_service_accounts(
 async def rotate_service_account_key(
     sa_id: int,
     _auth: dict = Depends(require_scope("admin:config")),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Rotate a service account's API key.
 
-    Supersedes the current key with a new one. The old key stops working
-    immediately; the new raw key is returned once.
+    Supersedes the current key with a new one. The previous key stays valid
+    until the NEW key is first used or the rotation grace TTL expires
+    (issue #724 T1-01-S-09): an undelivered rotation response must be
+    recoverable without a second rotation. The new raw key is returned once.
     """
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc)
+    grace_expires = (
+        now + timedelta(seconds=_ROTATION_GRACE_SECONDS)
+    ).isoformat()
+    now = now.isoformat()
 
     pool = get_pool(str(settings.sqlite_path))
     conn = await pool.get_connection_async()
@@ -204,10 +221,13 @@ async def rotate_service_account_key(
             conn.execute,
             """
             UPDATE service_accounts
-            SET key_hash = ?, last_rotated_at = ?
+            SET previous_key_hash = key_hash,
+                previous_key_expires_at = ?,
+                key_hash = ?,
+                last_rotated_at = ?
             WHERE id = ? AND revoked_at IS NULL
             """,
-            (new_hash, now, sa_id),
+            (grace_expires, new_hash, now, sa_id),
         )
         await asyncio.to_thread(conn.commit)
 
@@ -247,6 +267,7 @@ async def rotate_service_account_key(
 async def revoke_service_account(
     sa_id: int,
     _auth: dict = Depends(require_scope("admin:config")),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Revoke a service account immediately.
 

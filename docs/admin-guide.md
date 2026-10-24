@@ -1077,7 +1077,10 @@ Service accounts provide scoped, rotatable API keys for programmatic access (CI/
 **Key Properties:**
 - API keys are prefixed `sak_` and stored as SHA-256 hashes (keys themselves are shown only once at creation)
 - Keys are scoped to specific permissions and can be rotated without disrupting other keys
-- Rotation immediately invalidates the old key — there is no grace period
+- Rotation keeps the old key valid until the new key is first used or 24 hours
+  elapse, whichever comes first — so a lost rotation response is recoverable.
+  Rotation is NOT a revoke: to invalidate a suspected-leaked key immediately,
+  use Revoke
 
 **Managing Service Accounts:**
 
@@ -1085,7 +1088,7 @@ Service accounts provide scoped, rotatable API keys for programmatic access (CI/
 |--------|-----|
 | Create | `POST /api/service-accounts` — returns the raw key once; store it securely |
 | List | `GET /api/service-accounts` — shows metadata only, not keys |
-| Rotate | `POST /api/service-accounts/{id}/rotate` — issues a new key, invalidates old |
+| Rotate | `POST /api/service-accounts/{id}/rotate` — issues a new key; the old key stays valid until first use of the new key or 24h (see grace note above) |
 | Revoke | `POST /api/service-accounts/{id}/revoke` — permanently invalidates the key |
 
 **Route Authorization (sak_ key acceptance):**
