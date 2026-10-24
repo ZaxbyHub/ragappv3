@@ -32,12 +32,19 @@ on the documents ranked-search path).
   (`0 < value <= 200000`) keeps any future drift inside the measured budget
   envelope.
 - The `files_search_fts` metadata snippets (file_name, file_type, status,
-  source, email_subject, email_sender, document_date) are NOT length-guarded;
-  they are exempted by the census as bounded-metadata columns. That exemption's
-  premise is wrong for `email_subject`/`email_sender`, which are stored
-  uncapped from mail headers (follow-up filed; gated behind `imap_enabled`,
-  default off). The `documents.py` code comments describe the content-arm guard
-  precisely.
+  source, document_date) remain exempted by the census as bounded-metadata
+  columns — bounded at write/validation time. That exemption's premise was
+  wrong for `email_subject`/`email_sender`, which are stored uncapped from
+  mail headers; the email-metadata residual is closed by #1005: both columns
+  are bounded behind the same NUL-proof
+  `length(CAST(<col> AS BLOB))` length guard as the content arm (an
+  oversized header skips `snippet()` entirely and the excerpt falls through
+  the existing COALESCE fallbacks), and the census exemption is now an
+  explicit bounded-column allowlist with the dynamic `{col}` helper as the
+  only placeholder-compatibility case — an unguarded `files_search_fts`
+  snippet for the email columns (or any future unbounded metadata column, or
+  an invalid/out-of-range literal column index) fails the census. The
+  `documents.py` code comments describe both guards precisely.
 - Read paths stop materializing unbounded bodies into their results where only
   a bounded window is consumed: the KMS retrieval SELECT carries
   `substr(body, 1, 600)`; the documents-search CTE carries

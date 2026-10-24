@@ -58,6 +58,24 @@ _BLOB_GUARD_RE = re.compile(
 
 _BOUNDED_META_TABLE = "files_search_fts"
 
+# Issue #1005: the files_search_fts columns that are bounded at
+# write/validation time and therefore exempt from the length guard. The two
+# email columns are stored uncapped from mail headers and are deliberately
+# NOT in this allowlist — their snippets must carry the
+# length(CAST(col AS BLOB)) guard. A future metadata column is not exempt
+# until it is added here WITH a bounded-writer justification.
+_BOUNDED_META_COLUMNS = {
+    "file_name",
+    "file_type",
+    "status",
+    "source",
+    "document_date",
+}
+
+# Sentinel: the call's column index is an f-string {placeholder} token —
+# the recognized dynamic-helper shape whose guards ship as literals.
+_DYNAMIC_TARGET = object()
+
 _META_LOOKAHEAD_CHARS = 40
 
 # FTS5 column order per table — used to bind a guard to the column the
@@ -124,18 +142,25 @@ class SnippetSite:
         return f"{self.rel_path}:{self.line} {self.kind}( -> {self.verdict}"
 
 
-def _target_column(token_text: str, match: re.Match) -> Optional[str]:
-    """Resolve the column a snippet()/highlight() call reads, or None.
+def _target_column(token_text: str, match: re.Match):
+    """Resolve the column a snippet()/highlight() call reads.
 
-    Parses ``<table>, <int-index>`` right after the open paren and maps it
-    through _TABLE_COLUMNS. Unparsable (f-string placeholders, unknown
-    tables/out-of-range indices) returns None, which the classifier treats as
-    UNGUARDED — a site the scanner cannot bind must fail loud, not silent.
+    Returns the column name, the sentinel ``_DYNAMIC_TARGET`` when the
+    call's index position is an f-string ``{placeholder}`` token (the
+    recognized dynamic-helper shape — the live metadata arm builds its
+    calls through ``_meta_snippet(col)``), or ``None`` when the target is
+    invalid (unknown table, out-of-range or unparseable literal index).
+    ``None`` is treated by the classifier as UNGUARDED — a site the scanner
+    cannot bind must fail loud, not silent. An invalid literal index (e.g.
+    column 99) is NOT exempt: only the dynamic helper keeps the
+    bounded-metadata compatibility exemption (issue #1005).
     """
     after = token_text[match.end() :]
-    m = re.match(r"\s*([A-Za-z_]\w*)\s*,\s*(\d+)", after)
+    m = re.match(r"\s*([A-Za-z_]\w*)\s*,\s*(\{[^}]*\}|\d+)", after)
     if not m:
         return None
+    if not m.group(2).isdigit():
+        return _DYNAMIC_TARGET
     columns = _TABLE_COLUMNS.get(m.group(1))
     if columns is None:
         return None
@@ -149,10 +174,17 @@ def _classify_site(token_text: str, match: re.Match) -> str:
     """Classify one snippet(/highlight( occurrence inside a string literal."""
     start = match.start()
     tail = token_text[start : start + _META_LOOKAHEAD_CHARS]
-    if _BOUNDED_META_TABLE in tail:
-        return "bounded-metadata"
     target = _target_column(token_text, match)
-    if target is None:
+    if _BOUNDED_META_TABLE in tail and (
+        target is _DYNAMIC_TARGET or target in _BOUNDED_META_COLUMNS
+    ):
+        # Bounded metadata: either the column is write-bounded by contract
+        # (the allowlist below — NOT the uncapped email columns, issue
+        # #1005), or the site is the recognized dynamic helper whose column
+        # index is an f-string placeholder (its guards ship as literals in
+        # the same module and are pinned by the k7c/k7e suites).
+        return "bounded-metadata"
+    if target is None or target is _DYNAMIC_TARGET:
         return "unguarded"
     # Nearest preceding NUL-proof guard whose column matches THIS call and
     # which has no other snippet(/highlight( between it and this site
