@@ -189,7 +189,9 @@ CREATE TABLE IF NOT EXISTS service_accounts (
     created_at TEXT NOT NULL,
     last_rotated_at TEXT,
     revoked_at TEXT,
-    created_by TEXT
+    created_by TEXT,
+    previous_key_hash TEXT,
+    previous_key_expires_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_service_accounts_key_hash ON service_accounts(key_hash);
 

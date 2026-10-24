@@ -185,11 +185,16 @@ class TestCompileIngestJob(unittest.TestCase):
         result = self.compiler.compile_ingest_job(vault_id=1, input_json={})
         self.assertTrue(result.get("skipped"))
 
-    def test_raises_when_file_not_in_vault(self):
-        with self.assertRaises(ValueError):
-            self.compiler.compile_ingest_job(
-                vault_id=999, input_json={"file_id": 1}
-            )
+    def test_skips_when_vault_does_not_exist(self):
+        # Issue #723 (T1-21-S-07): a compile for a vault that no longer
+        # exists settles as a clean skip (no writes, no loud failure) instead
+        # of the old file-lookup ValueError; the file row is gone with the
+        # vault, so the entry-point vault guard fires first.
+        result = self.compiler.compile_ingest_job(
+            vault_id=999, input_json={"file_id": 1}
+        )
+        self.assertTrue(result.get("skipped"))
+        self.assertIn("no longer exists", result.get("reason", ""))
 
     def test_creates_page_for_document(self):
         result = self.compiler.compile_ingest_job(

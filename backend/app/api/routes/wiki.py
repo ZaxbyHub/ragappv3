@@ -841,6 +841,15 @@ async def promote_memory_to_wiki(
         logger.exception("Error promoting memory to wiki")
         raise HTTPException(status_code=500, detail="Failed to promote memory to wiki")
 
+    # Issue #723 review (F-8): the compile worker's vault-existence guard
+    # returns a skip shape without page/claims keys when the vault was
+    # deleted mid-flight; the interactive route must answer 404 instead of
+    # KeyErroring on the missing keys.
+    if result.get("skipped"):
+        raise HTTPException(
+            status_code=404, detail=result.get("reason", "vault no longer exists")
+        )
+
     return {
         "page": _page_dict(result["page"]),
         "claims": [_as_dict(c) for c in result["claims"]],

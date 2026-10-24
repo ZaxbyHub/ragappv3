@@ -28,15 +28,15 @@
       "skipped_tests": 1
     },
     "_totals": {
-      "CONFIDENCE.HIGH": 37,
+      "CONFIDENCE.HIGH": 34,
       "CONFIDENCE.LOW": 26,
       "CONFIDENCE.MEDIUM": 65,
       "CONFIDENCE.UNDEFINED": 0,
       "SEVERITY.HIGH": 6,
-      "SEVERITY.LOW": 62,
+      "SEVERITY.LOW": 59,
       "SEVERITY.MEDIUM": 60,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 92650,
+      "loc": 93146,
       "nosec": 0,
       "skipped_tests": 70
     },
@@ -80,12 +80,12 @@
       "skipped_tests": 0
     },
     "backend/app/api/routes/auth.py": {
-      "CONFIDENCE.HIGH": 12,
+      "CONFIDENCE.HIGH": 9,
       "CONFIDENCE.LOW": 0,
       "CONFIDENCE.MEDIUM": 6,
       "CONFIDENCE.UNDEFINED": 0,
       "SEVERITY.HIGH": 0,
-      "SEVERITY.LOW": 18,
+      "SEVERITY.LOW": 15,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
       "loc": 946,
@@ -309,7 +309,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 213,
+      "loc": 230,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -374,7 +374,7 @@
       "SEVERITY.LOW": 4,
       "SEVERITY.MEDIUM": 2,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 965,
+      "loc": 1028,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -387,7 +387,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1098,
+      "loc": 1102,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -413,7 +413,7 @@
       "SEVERITY.LOW": 7,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 899,
+      "loc": 893,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -530,7 +530,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 6838,
+      "loc": 6970,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -556,7 +556,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 494,
+      "loc": 555,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -712,7 +712,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 4503,
+      "loc": 4522,
       "nosec": 0,
       "skipped_tests": 6
     },
@@ -894,7 +894,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 218,
+      "loc": 243,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -933,7 +933,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 295,
+      "loc": 393,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -946,7 +946,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 949,
+      "loc": 956,
       "nosec": 0,
       "skipped_tests": 1
     },
@@ -1245,7 +1245,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 371,
+      "loc": 403,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1726,7 +1726,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 664,
+      "loc": 681,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1739,7 +1739,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1072,
+      "loc": 1099,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1941,7 +1941,7 @@
   },
   "results": [
     {
-      "code": "334     if not settings.users_enabled:\n335         DEFAULT_TOKEN = \"admin-secret-token\"\n336 \n",
+      "code": "338     if not settings.users_enabled:\n339         DEFAULT_TOKEN = \"admin-secret-token\"\n340 \n",
       "col_offset": 24,
       "end_col_offset": 44,
       "filename": "backend/app/api/deps.py",
@@ -1952,16 +1952,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'admin-secret-token'",
-      "line_number": 335,
+      "line_number": 339,
       "line_range": [
-        335
+        339
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "353             \"is_active\": True,\n354             \"must_change_password\": False,\n355         }\n356 \n357     # User authentication enabled - validate JWT token\n358     try:\n359         payload = decode_access_token(token)\n360     except TokenExpiredError:\n361         raise HTTPException(\n362             status_code=401,\n",
+      "code": "357             \"is_active\": True,\n358             \"must_change_password\": False,\n359         }\n360 \n361     # User authentication enabled - validate JWT token\n362     try:\n363         payload = decode_access_token(token)\n364     except TokenExpiredError:\n365         raise HTTPException(\n366             status_code=401,\n",
       "col_offset": 12,
       "end_col_offset": 34,
       "filename": "backend/app/api/deps.py",
@@ -1972,16 +1972,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'False'",
-      "line_number": 354,
+      "line_number": 358,
       "line_range": [
-        348,
-        349,
-        350,
-        351,
         352,
         353,
         354,
-        355
+        355,
+        356,
+        357,
+        358,
+        359
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
@@ -2050,28 +2050,7 @@
       "test_name": "try_except_pass"
     },
     {
-      "code": "398         issue_csrf_token(response, csrf_manager)\n399     except Exception:\n400         pass\n401 \n",
-      "col_offset": 4,
-      "end_col_offset": 12,
-      "filename": "backend/app/api/routes/auth.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 703,
-        "link": "https://cwe.mitre.org/data/definitions/703.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "Try, Except, Pass detected.",
-      "line_number": 399,
-      "line_range": [
-        399,
-        400
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
-      "test_id": "B110",
-      "test_name": "try_except_pass"
-    },
-    {
-      "code": "403         \"access_token\": access_token,\n404         \"token_type\": \"bearer\",\n405         \"expires_in\": 900,\n406         \"user\": {\n407             \"id\": user_id,\n408             \"username\": body.username,\n409             \"full_name\": body.full_name or \"\",\n410             \"role\": role,\n411             \"is_active\": True,\n412         },\n413         \"message\": \"Registration successful\",\n414     }\n415 \n416 \n417 @router.post(\"/login\")\n",
+      "code": "405         \"access_token\": access_token,\n406         \"token_type\": \"bearer\",\n407         \"expires_in\": 900,\n408         \"user\": {\n409             \"id\": user_id,\n410             \"username\": body.username,\n411             \"full_name\": body.full_name or \"\",\n412             \"role\": role,\n413             \"is_active\": True,\n414         },\n415         \"message\": \"Registration successful\",\n416     }\n417 \n418 \n419 @router.post(\"/login\")\n",
       "col_offset": 8,
       "end_col_offset": 20,
       "filename": "backend/app/api/routes/auth.py",
@@ -2082,10 +2061,8 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'bearer'",
-      "line_number": 404,
+      "line_number": 406,
       "line_range": [
-        402,
-        403,
         404,
         405,
         406,
@@ -2096,14 +2073,16 @@
         411,
         412,
         413,
-        414
+        414,
+        415,
+        416
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "570                     db.rollback()\n571                 except Exception:\n572                     pass\n573                 raise\n",
+      "code": "572                     db.rollback()\n573                 except Exception:\n574                     pass\n575                 raise\n",
       "col_offset": 16,
       "end_col_offset": 24,
       "filename": "backend/app/api/routes/auth.py",
@@ -2114,38 +2093,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 571,
+      "line_number": 573,
       "line_range": [
-        571,
-        572
+        573,
+        574
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "593         issue_csrf_token(response, csrf_manager)\n594     except Exception:\n595         pass\n596     await safe_record_security_event(\n",
-      "col_offset": 4,
-      "end_col_offset": 12,
-      "filename": "backend/app/api/routes/auth.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 703,
-        "link": "https://cwe.mitre.org/data/definitions/703.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "Try, Except, Pass detected.",
-      "line_number": 594,
-      "line_range": [
-        594,
-        595
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
-      "test_id": "B110",
-      "test_name": "try_except_pass"
-    },
-    {
-      "code": "607         \"access_token\": access_token,\n608         \"token_type\": \"bearer\",\n609         \"expires_in\": 15 * 60,\n610         \"user\": {\n611             \"id\": user_id,\n612             \"username\": db_username,\n613             \"full_name\": full_name,\n614             \"role\": role,\n615             \"is_active\": bool(is_active),\n616             \"must_change_password\": bool(must_change_password),\n617         },\n618     }\n619 \n620 \n621 @router.post(\"/refresh\")\n",
+      "code": "611         \"access_token\": access_token,\n612         \"token_type\": \"bearer\",\n613         \"expires_in\": 15 * 60,\n614         \"user\": {\n615             \"id\": user_id,\n616             \"username\": db_username,\n617             \"full_name\": full_name,\n618             \"role\": role,\n619             \"is_active\": bool(is_active),\n620             \"must_change_password\": bool(must_change_password),\n621         },\n622     }\n623 \n624 \n625 @router.post(\"/refresh\")\n",
       "col_offset": 8,
       "end_col_offset": 20,
       "filename": "backend/app/api/routes/auth.py",
@@ -2156,12 +2114,8 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'bearer'",
-      "line_number": 608,
+      "line_number": 612,
       "line_range": [
-        606,
-        607,
-        608,
-        609,
         610,
         611,
         612,
@@ -2170,35 +2124,18 @@
         615,
         616,
         617,
-        618
+        618,
+        619,
+        620,
+        621,
+        622
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "695         issue_csrf_token(response, csrf_manager)\n696     except Exception:\n697         pass\n698 \n",
-      "col_offset": 4,
-      "end_col_offset": 12,
-      "filename": "backend/app/api/routes/auth.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 703,
-        "link": "https://cwe.mitre.org/data/definitions/703.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "Try, Except, Pass detected.",
-      "line_number": 696,
-      "line_range": [
-        696,
-        697
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
-      "test_id": "B110",
-      "test_name": "try_except_pass"
-    },
-    {
-      "code": "700         \"access_token\": access_token,\n701         \"token_type\": \"bearer\",\n702         \"expires_in\": 15 * 60,\n703     }\n704 \n705 \n706 @router.post(\"/logout\")\n",
+      "code": "706         \"access_token\": access_token,\n707         \"token_type\": \"bearer\",\n708         \"expires_in\": 15 * 60,\n709     }\n710 \n711 \n712 @router.post(\"/logout\")\n",
       "col_offset": 8,
       "end_col_offset": 20,
       "filename": "backend/app/api/routes/auth.py",
@@ -2209,20 +2146,20 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'bearer'",
-      "line_number": 701,
+      "line_number": 707,
       "line_range": [
-        699,
-        700,
-        701,
-        702,
-        703
+        705,
+        706,
+        707,
+        708,
+        709
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "735                         purge_expired_denied_tokens(db)\n736             except Exception:\n737                 # Best-effort: deny only \u2014 do not fail logout if token decode fails\n738                 pass\n739     if refresh_token:\n",
+      "code": "741                         purge_expired_denied_tokens(db)\n742             except Exception:\n743                 # Best-effort: deny only \u2014 do not fail logout if token decode fails\n744                 pass\n745     if refresh_token:\n",
       "col_offset": 12,
       "end_col_offset": 20,
       "filename": "backend/app/api/routes/auth.py",
@@ -2233,18 +2170,18 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 736,
+      "line_number": 742,
       "line_range": [
-        736,
-        737,
-        738
+        742,
+        743,
+        744
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "760                         db_ref.rollback()\n761                     except Exception:\n762                         pass\n763                     raise\n",
+      "code": "766                         db_ref.rollback()\n767                     except Exception:\n768                         pass\n769                     raise\n",
       "col_offset": 20,
       "end_col_offset": 28,
       "filename": "backend/app/api/routes/auth.py",
@@ -2255,17 +2192,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 761,
+      "line_number": 767,
       "line_range": [
-        761,
-        762
+        767,
+        768
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "838                     db.rollback()\n839                 except Exception:\n840                     pass\n841                 raise\n",
+      "code": "844                     db.rollback()\n845                 except Exception:\n846                     pass\n847                 raise\n",
       "col_offset": 16,
       "end_col_offset": 24,
       "filename": "backend/app/api/routes/auth.py",
@@ -2276,17 +2213,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 839,
+      "line_number": 845,
       "line_range": [
-        839,
-        840
+        845,
+        846
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "945                     db.rollback()\n946                 except Exception:\n947                     pass\n948                 raise\n",
+      "code": "951                     db.rollback()\n952                 except Exception:\n953                     pass\n954                 raise\n",
       "col_offset": 16,
       "end_col_offset": 24,
       "filename": "backend/app/api/routes/auth.py",
@@ -2297,17 +2234,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 946,
+      "line_number": 952,
       "line_range": [
-        946,
-        947
+        952,
+        953
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "989         \"access_token\": access_token,\n990         \"token_type\": \"bearer\",\n991         \"expires_in\": 15 * 60,\n992     }\n993 \n994 \n995 @router.get(\"/sessions\")\n",
+      "code": "995         \"access_token\": access_token,\n996         \"token_type\": \"bearer\",\n997         \"expires_in\": 15 * 60,\n998     }\n999 \n1000 \n1001 @router.get(\"/sessions\")\n",
       "col_offset": 8,
       "end_col_offset": 20,
       "filename": "backend/app/api/routes/auth.py",
@@ -2318,20 +2255,20 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'bearer'",
-      "line_number": 990,
+      "line_number": 996,
       "line_range": [
-        988,
-        989,
-        990,
-        991,
-        992
+        994,
+        995,
+        996,
+        997,
+        998
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "1079                     db.rollback()\n1080                 except Exception:\n1081                     pass\n1082                 raise\n",
+      "code": "1085                     db.rollback()\n1086                 except Exception:\n1087                     pass\n1088                 raise\n",
       "col_offset": 16,
       "end_col_offset": 24,
       "filename": "backend/app/api/routes/auth.py",
@@ -2342,17 +2279,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1080,
+      "line_number": 1086,
       "line_range": [
-        1080,
-        1081
+        1086,
+        1087
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "1153                     db.rollback()\n1154                 except Exception:\n1155                     pass\n1156                 raise\n",
+      "code": "1159                     db.rollback()\n1160                 except Exception:\n1161                     pass\n1162                 raise\n",
       "col_offset": 16,
       "end_col_offset": 24,
       "filename": "backend/app/api/routes/auth.py",
@@ -2363,17 +2300,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1154,
+      "line_number": 1160,
       "line_range": [
-        1154,
-        1155
+        1160,
+        1161
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "1191         \"access_token\": access_token,\n1192         \"token_type\": \"bearer\",\n1193         \"expires_in\": 15 * 60,\n1194     }\n",
+      "code": "1197         \"access_token\": access_token,\n1198         \"token_type\": \"bearer\",\n1199         \"expires_in\": 15 * 60,\n1200     }\n",
       "col_offset": 8,
       "end_col_offset": 20,
       "filename": "backend/app/api/routes/auth.py",
@@ -2384,13 +2321,13 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'bearer'",
-      "line_number": 1192,
+      "line_number": 1198,
       "line_range": [
-        1190,
-        1191,
-        1192,
-        1193,
-        1194
+        1196,
+        1197,
+        1198,
+        1199,
+        1200
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
@@ -3143,7 +3080,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "465             await asyncio.to_thread(conn.rollback)\n466         except Exception:\n467             pass\n468         raise HTTPException(\n",
+      "code": "494             await asyncio.to_thread(conn.rollback)\n495         except Exception:\n496             pass\n497         raise HTTPException(\n",
       "col_offset": 8,
       "end_col_offset": 16,
       "filename": "backend/app/api/routes/vaults.py",
@@ -3154,17 +3091,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 466,
+      "line_number": 495,
       "line_range": [
-        466,
-        467
+        495,
+        496
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "473             await asyncio.to_thread(conn.rollback)\n474         except Exception:\n475             pass\n476         raise HTTPException(status_code=500, detail=\"Failed to create vault\")\n",
+      "code": "502             await asyncio.to_thread(conn.rollback)\n503         except Exception:\n504             pass\n505         raise HTTPException(status_code=500, detail=\"Failed to create vault\")\n",
       "col_offset": 8,
       "end_col_offset": 16,
       "filename": "backend/app/api/routes/vaults.py",
@@ -3175,17 +3112,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 474,
+      "line_number": 503,
       "line_range": [
-        474,
-        475
+        503,
+        504
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "480             await asyncio.to_thread(conn.rollback)\n481         except Exception:\n482             pass\n483         raise HTTPException(status_code=500, detail=\"Failed to create vault\")\n",
+      "code": "509             await asyncio.to_thread(conn.rollback)\n510         except Exception:\n511             pass\n512         raise HTTPException(status_code=500, detail=\"Failed to create vault\")\n",
       "col_offset": 8,
       "end_col_offset": 16,
       "filename": "backend/app/api/routes/vaults.py",
@@ -3196,17 +3133,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 481,
+      "line_number": 510,
       "line_range": [
-        481,
-        482
+        510,
+        511
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "497             await asyncio.to_thread(conn.rollback)\n498         except Exception:\n499             pass\n500         logger.error(\n",
+      "code": "526             await asyncio.to_thread(conn.rollback)\n527         except Exception:\n528             pass\n529         logger.error(\n",
       "col_offset": 8,
       "end_col_offset": 16,
       "filename": "backend/app/api/routes/vaults.py",
@@ -3217,17 +3154,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 498,
+      "line_number": 527,
       "line_range": [
-        498,
-        499
+        527,
+        528
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "563     try:\n564         sql = f\"\"\"\n565             UPDATE vaults\n566             SET {\", \".join(update_fields)}, updated_at = CURRENT_TIMESTAMP\n567             WHERE id = ?\n568         \"\"\"\n569         await asyncio.to_thread(conn.execute, sql, params)\n",
+      "code": "592     try:\n593         sql = f\"\"\"\n594             UPDATE vaults\n595             SET {\", \".join(update_fields)}, updated_at = CURRENT_TIMESTAMP\n596             WHERE id = ?\n597         \"\"\"\n598         await asyncio.to_thread(conn.execute, sql, params)\n",
       "col_offset": 14,
       "end_col_offset": 11,
       "filename": "backend/app/api/routes/vaults.py",
@@ -3238,20 +3175,20 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 564,
+      "line_number": 593,
       "line_range": [
-        564,
-        565,
-        566,
-        567,
-        568
+        593,
+        594,
+        595,
+        596,
+        597
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1197         lambda: conn.execute(\n1198             f\"\"\"\n1199             SELECT id, org_id FROM groups\n1200             WHERE id IN ({placeholders})\n1201             \"\"\",\n1202             tuple(group_ids),\n",
+      "code": "1316         lambda: conn.execute(\n1317             f\"\"\"\n1318             SELECT id, org_id FROM groups\n1319             WHERE id IN ({placeholders})\n1320             \"\"\",\n1321             tuple(group_ids),\n",
       "col_offset": 12,
       "end_col_offset": 15,
       "filename": "backend/app/api/routes/vaults.py",
@@ -3262,19 +3199,19 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 1198,
+      "line_number": 1317,
       "line_range": [
-        1198,
-        1199,
-        1200,
-        1201
+        1317,
+        1318,
+        1319,
+        1320
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1172         await app.state.thinking_llm_client.close()\n1173     except Exception:\n1174         pass\n1175     try:\n",
+      "code": "1166         await app.state.thinking_llm_client.close()\n1167     except Exception:\n1168         pass\n1169     try:\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3285,17 +3222,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1173,
+      "line_number": 1167,
       "line_range": [
-        1173,
-        1174
+        1167,
+        1168
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "1176         await app.state.instant_llm_client.close()\n1177     except Exception:\n1178         pass\n1179     try:\n",
+      "code": "1170         await app.state.instant_llm_client.close()\n1171     except Exception:\n1172         pass\n1173     try:\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3306,17 +3243,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1177,
+      "line_number": 1171,
       "line_range": [
-        1177,
-        1178
+        1171,
+        1172
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "1180         await app.state.embedding_service.close()\n1181     except Exception:\n1182         pass\n1183     try:\n",
+      "code": "1174         await app.state.embedding_service.close()\n1175     except Exception:\n1176         pass\n1177     try:\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3327,17 +3264,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1181,
+      "line_number": 1175,
       "line_range": [
-        1181,
-        1182
+        1175,
+        1176
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "1184         await app.state.reranking_service.close()\n1185     except Exception:\n1186         pass\n1187     try:\n",
+      "code": "1178         await app.state.reranking_service.close()\n1179     except Exception:\n1180         pass\n1181     try:\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3348,17 +3285,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1185,
+      "line_number": 1179,
       "line_range": [
-        1185,
-        1186
+        1179,
+        1180
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "1188         app.state.vector_store.close()\n1189     except Exception:\n1190         pass\n1191     try:\n",
+      "code": "1182         app.state.vector_store.close()\n1183     except Exception:\n1184         pass\n1185     try:\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3369,17 +3306,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1189,
+      "line_number": 1183,
       "line_range": [
-        1189,
-        1190
+        1183,
+        1184
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "1192         app.state.db_pool.close_all()\n1193     except Exception:\n1194         pass\n1195     try:\n",
+      "code": "1186         app.state.db_pool.close_all()\n1187     except Exception:\n1188         pass\n1189     try:\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3390,17 +3327,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1193,
+      "line_number": 1187,
       "line_range": [
-        1193,
-        1194
+        1187,
+        1188
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "1197         _auth_executor.shutdown(wait=False)\n1198     except Exception:\n1199         pass\n1200     with contextlib_suppress(Exception):\n",
+      "code": "1191         _auth_executor.shutdown(wait=False)\n1192     except Exception:\n1193         pass\n1194     with contextlib_suppress(Exception):\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3411,10 +3348,10 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1198,
+      "line_number": 1192,
       "line_range": [
-        1198,
-        1199
+        1192,
+        1193
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
