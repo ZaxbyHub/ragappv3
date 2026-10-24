@@ -138,6 +138,21 @@ class VectorStoreConnectionError(VectorStoreError):
     pass
 
 
+class WriteLockTimeoutError(VectorStoreError):
+    """The store write lock could not be acquired within the timeout.
+
+    Issue #1011: maintenance (a vector-index build or churn rebuild) or a
+    peer write holds the lock longer than
+    ``settings.write_lock_timeout_seconds``. This is CONTENTION, not a
+    store rejection: the subclass lets ``classify_ingest_error`` map it to
+    its own stable code and the ingest retry ladder treat it as
+    never-terminal, so a routine rebuild window can no longer permanently
+    fail concurrent ingests.
+    """
+
+    pass
+
+
 class VectorStoreValidationError(VectorStoreError):
     """Exception raised when record validation fails."""
 
@@ -666,7 +681,7 @@ class VectorStore:
                 timeout=settings.write_lock_timeout_seconds,
             )
         except asyncio.TimeoutError:
-            raise VectorStoreError(
+            raise WriteLockTimeoutError(
                 f"Write lock acquisition timed out after {settings.write_lock_timeout_seconds}s"
             )
         try:

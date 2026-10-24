@@ -76,7 +76,7 @@ from .image_processor import ImageProcessingResult, _process_image_sync
 from .image_search import build_searchable_text
 from .llm_client import LLMClient
 from .schema_parser import SchemaParser
-from .vector_store import VectorStore, VectorStoreError
+from .vector_store import VectorStore, VectorStoreError, WriteLockTimeoutError
 
 logger = logging.getLogger(__name__)
 
@@ -366,6 +366,16 @@ INGEST_ERROR_DIMENSION_CHANGED = "DIMENSION_CHANGED"
 # codes).
 INGEST_ERROR_EMBEDDING_FAILED = "EMBEDDING_FAILED"
 INGEST_ERROR_VECTOR_STORE_FAILED = "VECTOR_STORE_FAILED"
+# issue #1011: write-lock CONTENTION (a vector-index build or churn rebuild
+# holding the store write lock past write_lock_timeout_seconds) is not a
+# store rejection — the ingest is intact and must retry until the lock
+# frees instead of terminally failing at the attempt cap.
+INGEST_ERROR_VECTOR_STORE_LOCK_TIMEOUT = "VECTOR_STORE_LOCK_TIMEOUT"
+# issue #1010: a reindex attempt interrupted mid-file by the stall watchdog
+# after disturbing the prior generation settles to a truthful, selectable
+# 'error' so the next reindex pass re-selects it (the retry scope normally
+# carries it, but a janitor-first settle re-selects by status).
+INGEST_ERROR_REINDEX_INTERRUPTED = "REINDEX_INTERRUPTED"
 
 _INGEST_ERROR_REASONS = {
     INGEST_ERROR_PARSER_UNAVAILABLE: "document parser is unavailable",
@@ -384,6 +394,15 @@ _INGEST_ERROR_REASONS = {
     ),
     INGEST_ERROR_VECTOR_STORE_FAILED: (
         "the vector store rejected the write; the document itself parsed correctly"
+    ),
+    INGEST_ERROR_VECTOR_STORE_LOCK_TIMEOUT: (
+        "the vector store's write lock was unavailable (held by index "
+        "maintenance or a peer write); the document itself is intact and "
+        "the ingest retries until the lock frees"
+    ),
+    INGEST_ERROR_REINDEX_INTERRUPTED: (
+        "the reindex attempt was interrupted mid-file; the next reindex "
+        "pass re-processes this file"
     ),
 }
 
@@ -421,6 +440,10 @@ def classify_ingest_error(exc: BaseException) -> str:
         # persisted code alone. Dimension changes stay first (more specific).
         if isinstance(current, EmbeddingError):
             return INGEST_ERROR_EMBEDDING_FAILED
+        if isinstance(current, WriteLockTimeoutError):
+            # issue #1011: contention is retryable and must stay
+            # distinguishable from a genuine store rejection below.
+            return INGEST_ERROR_VECTOR_STORE_LOCK_TIMEOUT
         if isinstance(current, VectorStoreError):
             return INGEST_ERROR_VECTOR_STORE_FAILED
         if isinstance(current, ImportError):
@@ -481,6 +504,27 @@ class DocumentParser:
             elements = partition(
                 filename=str(path), strategy=settings.document_parsing_strategy
             )
+            if not elements:
+                # Issue #1008: on offline deployments a missing NLTK
+                # tokenizer-data download makes unstructured return zero
+                # elements for healthy documents; downstream errors then
+                # blame the content. Name the likely cause so an operator
+                # can tell a missing-corpus container from an empty file.
+                try:
+                    non_empty_bytes = os.path.getsize(path)
+                except OSError:
+                    non_empty_bytes = 0
+                if non_empty_bytes > 0:
+                    logger.warning(
+                        "DocumentParser.parse: unstructured returned 0 "
+                        "elements for a non-empty file (%d bytes). On "
+                        "offline deployments a missing NLTK tokenizer-data "
+                        "download (e.g. punkt) is a likely cause — the "
+                        "image bakes it at build time; check the NLTK_DATA "
+                        "location if parsing was working before "
+                        "(issue #1008).",
+                        non_empty_bytes,
+                    )
             return elements
         except Exception as e:
             # Wrap exceptions with clear, actionable message
@@ -4626,6 +4670,23 @@ class DocumentProcessor:
                 ) from e
             safe_error = redact_ingest_error(e)
             restored = False
+            if classify_ingest_error(e) == INGEST_ERROR_VECTOR_STORE_LOCK_TIMEOUT and (
+                prior_generation_disturbed
+                or pre_ingest_status not in ("indexed", "partial")
+            ):
+                # Issue #1011 (upload twin): disturbed contention never
+                # writes the terminal error state — this path has no reindex
+                # re-selection, so the row stays in its retryable state for
+                # the transport's retry (undisturbed contention falls
+                # through to the #704 restore below).
+                logger.warning(
+                    "Ingestion hit write-lock contention for file_id=%s "
+                    "(disturbed=%s); leaving the row retryable for the "
+                    "transport-level retry (issue #1011)",
+                    file_id,
+                    prior_generation_disturbed,
+                )
+                raise
             if not prior_generation_disturbed and pre_ingest_status in (
                 "indexed",
                 "partial",
@@ -4758,8 +4819,16 @@ class DocumentProcessor:
         *,
         file_hash: Optional[str] = None,
         vector_target: object | None = None,
+        retry_context: str = "upload",
     ) -> ProcessedDocument:
         """Process a file whose `files` row already exists.
+
+        ``retry_context`` distinguishes the two callers for issue #1011's
+        contention/cancellation restore rule: "upload" (the async upload
+        path and reprocessing, where a disturbed attempt must stay
+        retryable and never write status='error') vs "reindex" (the reindex
+        job path, where a disturbed attempt may truthfully settle to a
+        selectable 'error' the next reindex pass re-selects).
 
         Used by the async upload path: the route inserts the `files` row
         with status='pending' / phase='queued' and a duplicate-hash check
@@ -5331,6 +5400,48 @@ class DocumentProcessor:
             # status='error' over the terminal 'cancelled'; the transport's
             # cancellation handler unwinds the generation.
             raise
+        except asyncio.CancelledError:
+            # Issue #1010: the stall watchdog cancelled a wedged per-file
+            # await. Mutation-aware restore, decided where the flag is
+            # owned: undisturbed restores the prior indexed/partial status
+            # (selectable by any later pass); disturbed keeps a truthful
+            # retry-context state — the upload path stays 'processing' (the
+            # durable job owns the row and re-adopts it), the reindex path
+            # settles to a selectable 'error' with the stable interrupted
+            # code so a status-selected (janitor-first) next pass still
+            # finds it. The retry scope usually carries the file explicitly
+            # ($.retry_file_ids), which re-selects by id regardless.
+            if not prior_generation_disturbed and pre_ingest_status in (
+                "indexed",
+                "partial",
+            ):
+                async with self._write_session() as conn:
+                    conn.execute(
+                        "UPDATE files SET status = ? WHERE id = ? "
+                        "AND status = 'processing'",
+                        (pre_ingest_status, file_id),
+                    )
+                    conn.commit()
+            elif prior_generation_disturbed and retry_context == "reindex":
+                async with self._write_session() as conn:
+                    self._update_status(
+                        file_id,
+                        "error",
+                        conn,
+                        error_message=format_ingest_error(
+                            INGEST_ERROR_REINDEX_INTERRUPTED
+                        ),
+                    )
+                    conn.commit()
+            logger.info(
+                "Existing-file ingestion cancelled for file_id=%s "
+                "(retry_context=%s, disturbed=%s); row left in a "
+                "retryable/selectable state (issue #1010)",
+                file_id,
+                retry_context,
+                prior_generation_disturbed,
+            )
+            raise
         except Exception as e:
             # Raw exception stays in the server log; persisted fields are
             # user-facing (issue #562).
@@ -5347,6 +5458,34 @@ class DocumentProcessor:
                 ) from e
             safe_error = redact_ingest_error(e)
             restored = False
+            if classify_ingest_error(e) == INGEST_ERROR_VECTOR_STORE_LOCK_TIMEOUT and (
+                prior_generation_disturbed
+                or pre_ingest_status not in ("indexed", "partial")
+            ):
+                # Issue #1011: write-lock contention with a disturbed (or
+                # absent) prior generation must not terminally mark the row.
+                # Undisturbed contention falls through to the #704 restore
+                # below. Disturbed: the upload path (retry_context="upload")
+                # stays in its current retryable state — the durable job owns
+                # this file id and is actively retrying, and AC11 forbids
+                # 'error' on this path; the reindex path settles to a
+                # truthful, selectable 'error' with the stable contention
+                # code that the next reindex pass re-selects.
+                if retry_context == "reindex":
+                    async with self._write_session() as conn:
+                        self._update_status(
+                            file_id, "error", conn, error_message=safe_error
+                        )
+                        conn.commit()
+                logger.warning(
+                    "Existing-file ingestion hit write-lock contention for "
+                    "file_id=%s (retry_context=%s, disturbed=%s); leaving "
+                    "the row retryable for the job-level retry (issue #1011)",
+                    file_id,
+                    retry_context,
+                    prior_generation_disturbed,
+                )
+                raise
             if not prior_generation_disturbed and pre_ingest_status in (
                 "indexed",
                 "partial",

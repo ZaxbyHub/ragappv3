@@ -279,6 +279,18 @@ jobs:
       - name: Build frontend image (no push)
         run: docker build -f frontend/Dockerfile --tag ragappv3-frontend:ci-smoke frontend/
 
+      # Issue #1008: prove the baked NLTK data actually serves the FIRST
+      # document parse in a fresh container with no network — a missing
+      # tokenizer corpus is exactly what --network none reproduces.
+      - name: Offline first-parse runtime smoke (issue #1008)
+        run: >
+          docker run --rm --network none
+          -e ADMIN_SECRET_TOKEN=offline-smoke-test-only-token-0123456789
+          -e JWT_SECRET_KEY=offline-smoke-test-only-key-0123456789abcdef
+          -v ${{ github.workspace }}/scripts/docker_smoke/offline_parse_probe.py:/smoke/parse_probe.py:ro
+          -v ${{ github.workspace }}/backend/tests/fixtures/real_docs/sample_table.pdf:/smoke/fixture.pdf:ro
+          --entrypoint python ragappv3:ci-smoke /smoke/parse_probe.py /smoke/fixture.pdf
+
   sast:
     name: SAST (bandit)
     runs-on: ubuntu-latest

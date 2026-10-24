@@ -996,10 +996,96 @@ class EmbeddingService:
         # place (embed_passage_with_label); the label is discarded here.
         return (await self.embed_passage_with_label(text))[0]
 
-    async def embed_probe(self, timeout: float) -> None:
-        """Issue a cache-bypassing ping embedding for deep-health checks.
+    def _build_batch_payload(
+        self, texts: List[str], config: Optional[_EmbeddingRequestConfig] = None
+    ) -> dict:
+        """Build a LIST-input payload per provider dialect (issue #1009).
 
-        Runs the ping through the breaker-wrapped checked POST with a
+        The legacy ``prompt``-only Ollama dialect has no list form and is NOT
+        handled here — callers must fall back to a single large text for it
+        (``embed_probe`` documents that fallback in its error text).
+        """
+        if config is None:
+            config = self._request_config()
+        if config.mode == "openai":
+            return {"model": config.model, "input": texts}
+        if config.mode == "tei":
+            return {"inputs": texts}
+        if config.ollama_style == "modern":
+            return {"model": config.model, "input": texts}
+        raise ValueError(
+            "legacy ollama dialect does not support list payloads"
+        )
+
+    @staticmethod
+    def _int_probe_setting(name: str, default: int) -> int:
+        """Read an int setting with a MagicMock-safe numeric fallback.
+
+        The frozen #494 harness patches a MagicMock over this module's
+        ``settings``; a plain ``getattr`` would return a Mock (MagicMock
+        synthesizes unknown attributes), so only a real non-bool int counts.
+        """
+        value = getattr(settings, name, default)
+        if isinstance(value, bool) or not isinstance(value, int):
+            return default
+        return value
+
+    def _build_probe_inputs(self) -> List[str]:
+        """Deterministic synthetic probe inputs (issue #1009).
+
+        Never document text: a fixed filler pattern of the configured
+        chunk-sized length, repeated for the configured batch count — the
+        LIST input shape ingest traffic uses, so capacity-class provider
+        failures surface in deep health.
+        """
+        count = max(1, self._int_probe_setting("embedding_probe_batch_count", 4))
+        chars = max(
+            8, self._int_probe_setting("embedding_probe_batch_chars", 512)
+        )
+        unit = "probe "
+        filler = (unit * (chars // len(unit) + 1))[:chars]
+        return [filler for _ in range(count)]
+
+    def _validate_probe_response(self, data, config) -> None:
+        """Validate a probe response in EVERY dialect (issue #1009).
+
+        Count parity is deliberately NOT required — a provider may answer a
+        batch with a single representative embedding; the probe's contract
+        is that the payload SHAPE was accepted and something embedding-like
+        came back.
+        """
+        if config.mode == "tei":
+            if not (
+                isinstance(data, list)
+                and data
+                and all(isinstance(row, list) for row in data)
+            ):
+                raise EmbeddingError(
+                    "Invalid response from embedding service"
+                )
+            return
+        if config.mode == "openai":
+            if not isinstance(data, dict) or not isinstance(
+                data.get("data"), list
+            ):
+                raise EmbeddingError(
+                    "Invalid response from embedding service"
+                )
+            return
+        # Modern ollama {"embeddings": [[...]]} plus the compatibility
+        # {"embedding": [...]} shape; legacy prompt dialect answers the
+        # scalar shape too.
+        if isinstance(data, dict) and (
+            isinstance(data.get("embeddings"), list)
+            or isinstance(data.get("embedding"), list)
+        ):
+            return
+        raise EmbeddingError("Invalid response from embedding service")
+
+    async def embed_probe(self, timeout: float) -> None:
+        """Issue a cache-bypassing capacity-shaped probe for deep-health checks.
+
+        Runs the probe through the breaker-wrapped checked POST with a
         per-request ``timeout`` — httpx per-request timeouts override the
         persistent client's default without mutating the shared client or
         any service state (OPS-004, issue #494) — and skips both cache
@@ -1007,6 +1093,15 @@ class EmbeddingService:
         nor populated, so the probe observes the live provider instead of a
         stale healthy past (OPS-003, issue #494). ``last_metrics`` is left
         untouched so health probes do not pollute operational metrics.
+
+        Issue #1009: the payload is INGEST-SHAPED — a list of
+        ``embedding_probe_batch_count`` synthetic chunk-sized inputs — so a
+        provider with capacity for one short text but not an ingest batch
+        answers the probe with a capacity-class failure instead of a 200
+        that vouches for throughput it cannot deliver. The legacy
+        scalar-only ``prompt`` Ollama dialect cannot carry a list: the probe
+        falls back to ONE text of the configured size and, when that leg
+        fails, names the fallback in the error.
 
         Args:
             timeout: Per-request timeout in seconds for the probe POST.
@@ -1018,20 +1113,39 @@ class EmbeddingService:
                 unchanged for the caller to classify.
         """
         config = self._request_config()
+        legacy_dialect = (
+            config.mode != "openai"
+            and config.mode != "tei"
+            and config.ollama_style != "modern"
+        )
+        if legacy_dialect:
+            probe_inputs = self._build_probe_inputs()
+            fallback_note = (
+                "legacy ollama dialect supports scalar inputs only; probe "
+                f"sent a single {len(probe_inputs[0])}-char text"
+            )
+        else:
+            probe_inputs = self._build_probe_inputs()
+            fallback_note = ""
+
+        def _probe_payload() -> dict:
+            if legacy_dialect:
+                return self._build_payload(probe_inputs[0], config)
+            return self._build_batch_payload(probe_inputs, config)
 
         async def _checked_probe_post() -> httpx.Response:
             _corr = _correlation_headers()
             if _corr:
                 response = await self._client.post(
                     config.url,
-                    json=self._build_payload("ping", config),
+                    json=_probe_payload(),
                     timeout=timeout,
                     headers=_corr,
                 )
             else:
                 response = await self._client.post(
                     config.url,
-                    json=self._build_payload("ping", config),
+                    json=_probe_payload(),
                     timeout=timeout,
                 )
             if response.status_code != 200 and _is_outage_status(
@@ -1063,8 +1177,11 @@ class EmbeddingService:
                 f"Embedding API returned status {response.status_code} for {config.mode} mode (body_len={len(response.text)})"
             )
             logger.debug(f"Embedding API error body: {response.text[:2000]}")
+            detail = (
+                f" ({fallback_note})" if fallback_note else ""
+            )
             raise EmbeddingError(
-                f"Embedding API returned status {response.status_code}"
+                f"Embedding API returned status {response.status_code}{detail}"
             )
 
         try:
@@ -1076,8 +1193,9 @@ class EmbeddingService:
             logger.debug(f"Embedding API error body: {response.text[:2000]}")
             raise EmbeddingError("Invalid response from embedding service")
 
-        # Validate the response shape (raises EmbeddingError when malformed).
-        self._extract_embedding(data, config)
+        # Validate the response shape in every dialect (raises
+        # EmbeddingError when malformed); count parity is not required.
+        self._validate_probe_response(data, config)
 
     async def validate_embedding_dimension(self, expected_dim: int) -> bool:
         """

@@ -42,6 +42,15 @@ SHIPPED_INGEST_ERROR_CODES = frozenset(
         # from parse failures.
         "EMBEDDING_FAILED",
         "VECTOR_STORE_FAILED",
+        # issue #1011: write-lock contention (maintenance or peer write
+        # holding the store lock past write_lock_timeout_seconds) is
+        # retryable and classifies to its own stable code, distinct from a
+        # genuine store rejection.
+        "VECTOR_STORE_LOCK_TIMEOUT",
+        # issue #1010: a reindex attempt interrupted mid-file by the stall
+        # watchdog settles to this stable code so a status-selected next
+        # pass re-selects the file.
+        "REINDEX_INTERRUPTED",
     }
 )
 
