@@ -199,9 +199,12 @@ def _row_to_vault_response(row, current_user_permission: Optional[str] = None) -
 # removes their rows explicitly. artifact_delete_pending and
 # vector_delete_pending are deliberately-durable cleanup queues and are NOT
 # listed; memories are reassigned to global scope, not deleted;
-# wiki_claim_sources / wiki_page_files / wiki_page_versions /
-# wiki_page_links cascade from the wiki_claims / wiki_pages / files rows
-# deleted here and in the files delete below. Statements are prebuilt
+# wiki_claim_sources cascade from the wiki_claims rows deleted here;
+# wiki_page_files cascade from the files rows deleted below (wiki_page_versions
+# and wiki_page_links are ALSO deleted explicitly above — belt and braces,
+# since their parent wiki_pages rows are removed here too). Statements are
+# prebuilt literals (no formatting at the call site) so static analysis can
+# vouch for them; the table names come only from this module. Statements are prebuilt
 # literals (no formatting at the call site) so static analysis can vouch
 # for them; the table names come only from this module.
 _VAULT_SCOPED_CLEANUP_SQL = {
@@ -981,7 +984,20 @@ async def delete_vault(
                 )
                 conn.commit()
 
-            await asyncio.to_thread(_clear_vector_delete_tombstones)
+            try:
+                await asyncio.to_thread(_clear_vector_delete_tombstones)
+            except sqlite3.Error as clear_exc:
+                # Issue #723 review: a failed intent-cleanup is a different
+                # event from a failed chunk delete — the chunks are already
+                # gone and the stale rows are swept as no-ops. Log it as its
+                # own warning so operators are not sent chasing orphaned
+                # chunks that do not exist.
+                logger.warning(
+                    "Vault %s chunks deleted but vector_delete_pending cleanup "
+                    "failed; stale rows remain until the sweep: %s",
+                    vault_id,
+                    clear_exc,
+                )
     except Exception as e:  # noqa: BLE001 — reconcile, never fail the response
         # The in-transaction tombstones written before COMMIT stay in place:
         # the hourly sweep and startup retry_pending_vector_deletes reconcile

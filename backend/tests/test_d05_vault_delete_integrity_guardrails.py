@@ -19,6 +19,7 @@ checks do not reach:
 """
 
 import asyncio
+import json
 import os
 import sqlite3
 import sys
@@ -905,6 +906,106 @@ class TestStartupReconcileExactRuleKillsFallback(unittest.TestCase):
             "a tombstone whose draft_inputs row is gone must NOT be restored "
             "(exact rule; the pair alone is insufficient)",
         )
+
+
+class TestUnifiedJobsCancelExecutes(unittest.TestCase):
+    """The unified-lease cancel UPDATE executes for real: a pending jobs row
+    for the vault settles to cancelled on vault delete. The frozen route
+    harnesses use init_db-only databases (no jobs table), so without this
+    test the whole cancel block is skipped and a mutation deleting it ships
+    green (issue #723 review F-6).
+    """
+
+    def test_pending_wiki_lease_job_cancelled_on_vault_delete(self):
+        td = tempfile.mkdtemp()
+        try:
+            db_path = str(Path(td) / "lease.db")
+            init_db(db_path)
+            run_migrations(db_path)  # creates the unified jobs table
+            pool = SQLiteConnectionPool(db_path, max_size=3)
+            self.addCleanup(pool.close_all)
+
+            conn = pool.get_connection()
+            try:
+                conn.execute(
+                    "INSERT INTO users (id, username, hashed_password, role, is_active) "
+                    "VALUES (1, 'admin', 'abc123', 'superadmin', 1)"
+                )
+                conn.execute(
+                    "INSERT INTO vaults (id, name) VALUES (700, 'LeaseVault')"
+                )
+                cursor = conn.execute(
+                    "INSERT INTO jobs (queue, payload_json, status) "
+                    "VALUES ('wiki', ?, 'pending')",
+                    (json.dumps({"vault_id": 700, "trigger_type": "manual"}),),
+                )
+                job_id = cursor.lastrowid
+                conn.commit()
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM jobs WHERE id = ?", (job_id,)
+                    ).fetchone()[0],
+                    1,
+                    "precondition: the unified jobs row must exist",
+                )
+            finally:
+                pool.release_connection(conn)
+
+            client = TestClient(app)
+            original_data_dir = settings.data_dir
+            settings.data_dir = Path(td)
+
+            def override_get_db():
+                conn = pool.get_connection()
+                try:
+                    yield conn
+                finally:
+                    pool.release_connection(conn)
+
+            # The delete transaction (and the jobs cancel UPDATE) must run
+            # against THIS test's database, which has the jobs table.
+            app.dependency_overrides[get_db] = override_get_db
+            app.dependency_overrides[get_current_active_user] = lambda: {
+                "id": 1,
+                "username": "admin",
+                "full_name": "Admin",
+                "role": "superadmin",
+                "is_active": True,
+                "must_change_password": False,
+            }
+            app.dependency_overrides[csrf_protect] = lambda: "test-csrf"
+            try:
+                from unittest.mock import AsyncMock, MagicMock
+
+                mock_vs = MagicMock()
+                mock_vs.delete_by_vault = AsyncMock(return_value=0)
+                app.dependency_overrides[get_vector_store] = lambda: mock_vs
+                resp = client.delete("/api/vaults/700")
+                self.assertEqual(resp.status_code, 200, resp.text)
+            finally:
+                app.dependency_overrides.pop(get_db, None)
+                app.dependency_overrides.pop(get_current_active_user, None)
+                app.dependency_overrides.pop(csrf_protect, None)
+                app.dependency_overrides.pop(get_vector_store, None)
+                settings.data_dir = original_data_dir
+
+            conn = pool.get_connection()
+            try:
+                status = conn.execute(
+                    "SELECT status FROM jobs WHERE id = ?", (job_id,)
+                ).fetchone()[0]
+                self.assertEqual(
+                    status,
+                    "cancelled",
+                    "the pending unified lease job must be cancelled by the "
+                    "vault delete",
+                )
+            finally:
+                pool.release_connection(conn)
+        finally:
+            import shutil
+
+            shutil.rmtree(td, ignore_errors=True)
 
 
 class TestTombstoneSidecarSemantics(unittest.TestCase):

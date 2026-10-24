@@ -61,7 +61,7 @@ Issue: #723 ([Workstream D] PR 5 of 8 — audit findings T1-21-S-03, T1-21-S-07,
 - The vault-existence checks narrow the dead-vault write race to inside a
   single compile; a compile already past its entry check when the vault
   delete commits can still land rows for the dead vault until the next
-  delete or sweep (irreducible without write-path fencing).
+  delete or manual cleanup (irreducible without write-path fencing).
 - `users.py::delete_user` mirrors the old two-handler restore shape; it is
   out of this issue's scope and disclosed for a maintainer decision (see the
   PR body).

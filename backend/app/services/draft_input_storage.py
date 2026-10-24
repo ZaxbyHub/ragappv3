@@ -246,11 +246,22 @@ class DraftInputStorage:
         trash_dir.mkdir(parents=True, exist_ok=True)
         token = uuid.uuid4().hex
         trash_path = trash_dir / token
-        os.replace(source, trash_path)
-        os.utime(trash_path, None)
+        # Issue #723 review (F-1): write the sidecar BEFORE the rename so a
+        # failure in the metadata write cannot strand a sidecar-less entry
+        # (the restore pass skips those and the age purge would destroy the
+        # only copy of a surviving draft's bytes). If the rename itself
+        # fails, unlink the sidecar and re-raise with the bytes untouched at
+        # their original path; an orphan sidecar without an entry is cleaned
+        # by the reconcile's restore pass.
         self._sidecar_path(token).write_text(
             json.dumps({"relpath": relpath}), encoding="utf-8"
         )
+        try:
+            os.replace(source, trash_path)
+        except OSError:
+            self._sidecar_path(token).unlink(missing_ok=True)
+            raise
+        os.utime(trash_path, None)
         return token
 
     def restore_tombstone(self, token: str, relpath: str) -> None:
