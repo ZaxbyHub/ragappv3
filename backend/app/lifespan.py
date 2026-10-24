@@ -862,12 +862,6 @@ async def lifespan(app: FastAPI):
         instant_client=app.state.instant_llm_client,
     )
     app.state.model_checker = ModelChecker()
-    app.state.model_validation = (
-        settings.enable_model_validation
-        or app.state.toggle_manager.get_toggle(
-            "model_validation", settings.enable_model_validation
-        )
-    )
     ingestion_llm_client = select_ingestion_llm_client(
         app, settings.ingestion_llm_mode
     )

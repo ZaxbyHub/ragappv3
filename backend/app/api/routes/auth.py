@@ -397,7 +397,9 @@ async def register(
         csrf_manager = get_csrf_manager(request)
         issue_csrf_token(response, csrf_manager)
     except Exception:
-        pass
+        # Issue #724 (S02-SK2-11): a client getting 200 with no CSRF cookie
+        # was previously indistinguishable from success in the logs.
+        logger.warning("csrf_token_issuance_failed", exc_info=True)
 
     return {
         "access_token": access_token,
@@ -592,7 +594,9 @@ async def login(
         csrf_manager = get_csrf_manager(request)
         issue_csrf_token(response, csrf_manager)
     except Exception:
-        pass
+        # Issue #724 (S02-SK2-11): a client getting 200 with no CSRF cookie
+        # was previously indistinguishable from success in the logs.
+        logger.warning("csrf_token_issuance_failed", exc_info=True)
     await safe_record_security_event(
         db,
         event_type="auth.login_success",
@@ -694,7 +698,9 @@ async def refresh(
         csrf_manager = get_csrf_manager(request)
         issue_csrf_token(response, csrf_manager)
     except Exception:
-        pass
+        # Issue #724 (S02-SK2-11): a client getting 200 with no CSRF cookie
+        # was previously indistinguishable from success in the logs.
+        logger.warning("csrf_token_issuance_failed", exc_info=True)
 
     return {
         "access_token": access_token,

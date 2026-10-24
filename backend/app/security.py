@@ -110,12 +110,24 @@ class _SQLiteCSRFStore:
 
     def __init__(self, db_path: str, ttl: int = 900) -> None:
         self.ttl = ttl
-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        # Issue #724 (T1-21-S2-05): keyword timeout >= the app pool's 30s
+        # busy_timeout, so a long writer on the shared app DB no longer
+        # starves CSRF validation into the 5s default.
+        self._conn = sqlite3.connect(
+            db_path, timeout=30, check_same_thread=False
+        )
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS csrf_tokens (token_hash TEXT PRIMARY KEY, created_at REAL NOT NULL, expires_at REAL NOT NULL)"
         )
         self._conn.commit()
         self._lock = threading.Lock()
+
+    @staticmethod
+    def _hashed(key: str) -> str:
+        # Issue #724 (T1-21-K-11): the token_hash column finally holds a
+        # hash — the raw bearer token never rests in the DB file. Unsalted
+        # SHA-256 is adequate: the keys are 128-bit urlsafe randoms.
+        return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
     def _cleanup_expired(self) -> None:
         try:
@@ -134,7 +146,7 @@ class _SQLiteCSRFStore:
             try:
                 self._conn.execute(
                     "INSERT OR REPLACE INTO csrf_tokens (token_hash, created_at, expires_at) VALUES (?, ?, ?)",
-                    (key, time.time(), expires_at),
+                    (self._hashed(key), time.time(), expires_at),
                 )
                 self._conn.commit()
             except sqlite3.Error as exc:
@@ -143,12 +155,34 @@ class _SQLiteCSRFStore:
 
     def get(self, key: str) -> str | None:
         with self._lock:
+            now = time.time()
             try:
                 cursor = self._conn.execute(
                     "SELECT 1 FROM csrf_tokens WHERE token_hash = ? AND expires_at > ?",
-                    (key, time.time()),
+                    (self._hashed(key), now),
                 )
-                return "1" if cursor.fetchone() else None
+                if cursor.fetchone():
+                    return "1"
+                # Issue #724 (T1-21-K-11): a row written by pre-fix code
+                # stores the raw key. Same expiry predicate, and on hit the
+                # row is upgraded in place — hashed copy preserving the
+                # original expires_at, raw copy deleted in the same step.
+                cursor = self._conn.execute(
+                    "SELECT expires_at FROM csrf_tokens WHERE token_hash = ? AND expires_at > ?",
+                    (key, now),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO csrf_tokens (token_hash, created_at, expires_at) VALUES (?, ?, ?)",
+                    (self._hashed(key), now, float(row[0])),
+                )
+                self._conn.execute(
+                    "DELETE FROM csrf_tokens WHERE token_hash = ?", (key,)
+                )
+                self._conn.commit()
+                return "1"
             except sqlite3.Error as exc:
                 logger.error("SQLite CSRF store error during get: %s", exc)
                 raise RuntimeError("CSRF storage unavailable") from exc
@@ -158,8 +192,8 @@ class _SQLiteCSRFStore:
             expires_at = time.time() + ttl
             try:
                 self._conn.execute(
-                    "UPDATE csrf_tokens SET expires_at = ? WHERE token_hash = ?",
-                    (expires_at, key),
+                    "UPDATE csrf_tokens SET expires_at = ? WHERE token_hash = ? OR token_hash = ?",
+                    (expires_at, self._hashed(key), key),
                 )
                 self._conn.commit()
             except sqlite3.Error as exc:
@@ -169,8 +203,10 @@ class _SQLiteCSRFStore:
     def delete(self, key: str) -> None:
         with self._lock:
             try:
+                # Hashed first, raw legacy arm second (issue #724 T1-21-K-11).
                 self._conn.execute(
-                    "DELETE FROM csrf_tokens WHERE token_hash = ?", (key,)
+                    "DELETE FROM csrf_tokens WHERE token_hash = ? OR token_hash = ?",
+                    (self._hashed(key), key),
                 )
                 self._conn.commit()
             except sqlite3.Error as exc:
@@ -186,17 +222,36 @@ class _SQLiteCSRFStore:
                 return False
 
 
+# Issue #724 (RT-S2-03): a refused localhost connect must not stall the
+# request path when the recovery ping actually fires.
+_REDIS_CONNECT_TIMEOUT_SECONDS = 2.0
+
+
 class CSRFManager:
+    # Issue #724 (RT-S2-03): the recovery ping is rate-limited so a dead
+    # Redis cannot add a ~2s refused-connect to every token operation, and
+    # the client gets a bounded connect timeout for the rare real ping.
+    _RECOVERY_PING_INTERVAL_SECONDS = 30.0
+
     def __init__(self, redis_url: str, ttl: int = 900, db_path: str = "") -> None:
         self.ttl = ttl
         self._redis: redis.Redis | None = None
         self._fallback_store: _InMemoryCSRFStore | _SQLiteCSRFStore | None = None
         self._use_fallback = False
         self._lock = threading.Lock()
+        self._next_recovery_ping_at = 0.0
+        # Issue #724 (T1-21-S-02): db_path is retained (not just forwarded)
+        # so the after-boot failover edge can lazily build the same durable
+        # fallback store instead of silently downgrading to in-memory.
+        self._db_path = db_path
 
         if redis_url:
             try:
-                self._redis = redis.from_url(redis_url, decode_responses=True)
+                self._redis = redis.from_url(
+                    redis_url,
+                    decode_responses=True,
+                    socket_connect_timeout=_REDIS_CONNECT_TIMEOUT_SECONDS,
+                )
                 self._redis.ping()
                 logger.info("CSRFManager connected to Redis successfully")
             except Exception as exc:
@@ -238,10 +293,27 @@ class CSRFManager:
             return self._redis
         raise HTTPException(status_code=503, detail="CSRF storage unavailable")
 
+    def _engage_fallback(self) -> None:
+        """Issue #724 (T1-21-S-02): the missing after-boot edge — Redis died
+        mid-run, so switch to the (lazily built) durable fallback store."""
+        with self._lock:
+            if not self._use_fallback:
+                if self._fallback_store is None:
+                    self._init_fallback_store(ttl=self.ttl, db_path=self._db_path)
+                # Publish the store before the flag: _get_store reads both
+                # lock-free and must never see the flag without a store.
+                self._use_fallback = True
+                logger.warning(
+                    "Redis failed mid-run; CSRF manager failing over to the "
+                    "fallback store"
+                )
+
     def _check_redis_available(self) -> bool:
         """Check if Redis is available, switch back from fallback if recovered."""
         with self._lock:
             if self._use_fallback and self._redis:
+                if time.monotonic() < self._next_recovery_ping_at:
+                    return False
                 try:
                     self._redis.ping()
                     logger.info(
@@ -249,9 +321,12 @@ class CSRFManager:
                     )
                     self._use_fallback = False
                     self._fallback_store = None
+                    self._next_recovery_ping_at = 0.0
                     return True
                 except redis.RedisError:
-                    pass
+                    self._next_recovery_ping_at = (
+                        time.monotonic() + self._RECOVERY_PING_INTERVAL_SECONDS
+                    )
             return not self._use_fallback
 
     def generate_token(self) -> str:
@@ -263,7 +338,17 @@ class CSRFManager:
             store.setex(key, self.ttl, "1")
         except (redis.RedisError, ConnectionError, TimeoutError, RuntimeError) as exc:
             logger.error("Storage error during token generation: %s", exc)
-            raise HTTPException(status_code=503, detail="CSRF storage unavailable")
+            # Issue #724 (T1-21-S-02): fail over after a healthy boot instead
+            # of 503-ing every subsequent call. A failed retry keeps today's
+            # 503 mapping (never a raw RuntimeError 500).
+            self._engage_fallback()
+            try:
+                self._get_store().setex(key, self.ttl, "1")
+            except (redis.RedisError, ConnectionError, TimeoutError, RuntimeError):
+                logger.error("Fallback store also failed during token generation")
+                raise HTTPException(
+                    status_code=503, detail="CSRF storage unavailable"
+                )
         return token
 
     def validate_token(self, token: str) -> bool:
@@ -276,7 +361,14 @@ class CSRFManager:
             exists = store.get(key)
         except (redis.RedisError, ConnectionError, TimeoutError, RuntimeError) as exc:
             logger.error("Storage error during token validation: %s", exc)
-            raise HTTPException(status_code=503, detail="CSRF storage unavailable")
+            self._engage_fallback()
+            try:
+                exists = self._get_store().get(key)
+            except (redis.RedisError, ConnectionError, TimeoutError, RuntimeError):
+                logger.error("Fallback store also failed during token validation")
+                raise HTTPException(
+                    status_code=503, detail="CSRF storage unavailable"
+                )
         if exists:
             try:
                 store.expire(key, self.ttl)
@@ -376,7 +468,7 @@ def require_service_account(required_scopes: list[str]):
     """
     # Import here to avoid circular import at module load time.
     from app.config import settings
-    from app.models.database import get_pool
+    from app.models.database import get_pool, lookup_service_account
 
     async def dependency(
         authorization: str | None = Header(None),
@@ -397,11 +489,8 @@ def require_service_account(required_scopes: list[str]):
         pool = get_pool(str(settings.sqlite_path))
         conn = await pool.get_connection_async()
         try:
-            row = await asyncio.to_thread(
-                lambda: conn.execute(
-                    "SELECT id, name, scopes, revoked_at FROM service_accounts WHERE key_hash = ?",
-                    (key_hash,),
-                ).fetchone()
+            row, _via_previous = await asyncio.to_thread(
+                lookup_service_account, conn, key_hash
             )
         finally:
             pool.release_connection(conn)
