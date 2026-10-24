@@ -662,11 +662,12 @@ class ReindexJobStatusResponse(BaseModel):
     created_at: Optional[str] = None
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
-    # issue #1010: True only for a RUNNING row whose progress watermark
+    # issue #1010: True for a RUNNING row whose progress watermark
     # (progress_at, falling back to started_at/created_at) is older than
-    # jobs_stall_timeout_seconds — a machine-readable live-but-stalled
-    # signal, distinguishable from a healthy running job and from a dead
-    # worker's age-reclaimable row.
+    # jobs_stall_timeout_seconds — a machine-readable no-progress signal.
+    # A dead worker's row ALSO reads stalled=1 until the janitor's
+    # heartbeat-age arm flips it out of 'running'; the watchdog (not the
+    # reader) is what distinguishes live-stalled from dead.
     stalled: bool = False
 
 

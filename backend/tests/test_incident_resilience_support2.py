@@ -21,6 +21,7 @@ Coverage:
 """
 
 import contextlib
+import json
 import logging
 import shutil
 import sqlite3
@@ -443,3 +444,230 @@ def test_census_sibling_classifications():
     assert classify(
         "snippet(files_search_fts, {col}, '<mark>', '</mark>', '…', 24)"
     ) == {"bounded-metadata"}
+
+
+# ---------------------------------------------------------------------------
+# PR #1018 feedback-round pins — probe response oracle (F-005/C-26),
+# settings-derived payload (C-51), legacy fallback naming (C-27)
+# ---------------------------------------------------------------------------
+
+
+def _namespace(**overrides):
+    ns = _tei_settings_namespace()
+    for key, value in overrides.items():
+        setattr(ns, key, value)
+    return ns
+
+
+class TestProbeResponseOracleStrength:
+    """F-005: EMPTY containers must be rejected in every dialect (the
+    replaced _extract_embedding oracle rejected them); C-26: the native-TEI
+    {"embeddings": [[...]]} wrapper is accepted."""
+
+    async def test_openai_empty_data_rejected(self):
+        def handler(request):
+            return httpx.Response(200, json={"data": []}, request=request)
+
+        async with _tei_embed_service(handler) as service:
+            with pytest.raises(EmbeddingError):
+                await service.embed_probe(2.0)
+
+    async def test_openai_url_variant_empty_data_rejected(self):
+        def handler(request):
+            return httpx.Response(200, json={"data": []}, request=request)
+
+        with patch("app.services.embeddings.settings",
+                   _namespace(ollama_embedding_url="http://localhost:8080/v1/embeddings")):
+            with patch("app.services.embeddings.assert_url_safe"):
+                with patch(
+                    "app.services.embeddings.embeddings_cb",
+                    AsyncCircuitBreaker(fail_max=50, reset_timeout=30,
+                                        name="sup2-openai"),
+                ):
+                    service = EmbeddingService()
+                    service._client = httpx.AsyncClient(
+                        transport=httpx.MockTransport(handler)
+                    )
+                    try:
+                        with pytest.raises(EmbeddingError):
+                            await service.embed_probe(2.0)
+                    finally:
+                        await service._client.aclose()
+
+    async def test_tei_empty_rows_rejected(self):
+        def handler(request):
+            return httpx.Response(200, json=[[]], request=request)
+
+        async with _tei_embed_service(handler) as service:
+            with pytest.raises(EmbeddingError):
+                await service.embed_probe(2.0)
+
+    async def test_tei_embeddings_wrapper_accepted(self):
+        def handler(request):
+            return httpx.Response(
+                200, json={"embeddings": [[0.5, 0.6]]}, request=request
+            )
+
+        async with _tei_embed_service(handler) as service:
+            await service.embed_probe(2.0)
+
+    async def test_modern_ollama_empty_embeddings_rejected(self):
+        # Modern-ollama mode (URL path /api/embed): the fallback dict arm
+        # of _validate_probe_response is what must reject the empty
+        # container (delta re-gate Finding 1: the original test ran in TEI
+        # mode and never reached this arm).
+        def handler(request):
+            return httpx.Response(
+                200, json={"embeddings": []}, request=request
+            )
+
+        with patch(
+            "app.services.embeddings.settings",
+            _namespace(
+                ollama_embedding_url="http://localhost:8080/api/embed"
+            ),
+        ):
+            with patch("app.services.embeddings.assert_url_safe"):
+                with patch(
+                    "app.services.embeddings.embeddings_cb",
+                    AsyncCircuitBreaker(fail_max=50, reset_timeout=30,
+                                        name="sup2-ollama"),
+                ):
+                    service = EmbeddingService()
+                    service._client = httpx.AsyncClient(
+                        transport=httpx.MockTransport(handler)
+                    )
+                    try:
+                        with pytest.raises(EmbeddingError):
+                            await service.embed_probe(2.0)
+                    finally:
+                        await service._client.aclose()
+
+    async def test_ollama_empty_inner_row_rejected(self):
+        def handler(request):
+            return httpx.Response(
+                200, json={"embeddings": [[]]}, request=request
+            )
+
+        with patch(
+            "app.services.embeddings.settings",
+            _namespace(
+                ollama_embedding_url="http://localhost:8080/api/embed"
+            ),
+        ):
+            with patch("app.services.embeddings.assert_url_safe"):
+                with patch(
+                    "app.services.embeddings.embeddings_cb",
+                    AsyncCircuitBreaker(fail_max=50, reset_timeout=30,
+                                        name="sup2-ollama-row"),
+                ):
+                    service = EmbeddingService()
+                    service._client = httpx.AsyncClient(
+                        transport=httpx.MockTransport(handler)
+                    )
+                    try:
+                        with pytest.raises(EmbeddingError):
+                            await service.embed_probe(2.0)
+                    finally:
+                        await service._client.aclose()
+
+    async def test_ollama_populated_embeddings_accepted(self):
+        def handler(request):
+            return httpx.Response(
+                200, json={"embeddings": [[0.5, 0.6]]}, request=request
+            )
+
+        with patch(
+            "app.services.embeddings.settings",
+            _namespace(
+                ollama_embedding_url="http://localhost:8080/api/embed"
+            ),
+        ):
+            with patch("app.services.embeddings.assert_url_safe"):
+                with patch(
+                    "app.services.embeddings.embeddings_cb",
+                    AsyncCircuitBreaker(fail_max=50, reset_timeout=30,
+                                        name="sup2-ollama-ok"),
+                ):
+                    service = EmbeddingService()
+                    service._client = httpx.AsyncClient(
+                        transport=httpx.MockTransport(handler)
+                    )
+                    try:
+                        await service.embed_probe(2.0)
+                    finally:
+                        await service._client.aclose()
+
+
+class TestProbePayloadDerivesFromSettings:
+    """C-51: the payload must follow the settings knobs, not a hard-coded
+    4x32 shape (the frozen C5 passes even against a hard-coded probe)."""
+
+    async def test_payload_shape_follows_settings_knobs(self):
+        payloads = []
+
+        def handler(request):
+            payloads.append(json.loads(request.content))
+            return httpx.Response(200, json=[[0.5, 0.6]], request=request)
+
+        async with _tei_embed_service(handler) as service:
+            # The module-level settings name is read live at embed_probe
+            # time, so a nested patch re-points the payload knobs while the
+            # MockTransport client stays shared.
+            with patch(
+                "app.services.embeddings.settings",
+                _namespace(embedding_probe_batch_count=5,
+                           embedding_probe_batch_chars=40),
+            ):
+                await service.embed_probe(2.0)
+
+        assert payloads, "harness: the probe must have issued a request"
+        value = payloads[0].get(
+            "inputs", payloads[0].get("input", payloads[0].get("prompt"))
+        )
+        assert isinstance(value, list) and len(value) == 5, (
+            f"probe must send exactly embedding_probe_batch_count=5 "
+            f"inputs, got {len(value) if isinstance(value, list) else value!r}"
+        )
+        assert all(isinstance(t, str) and len(t) == 40 for t in value), (
+            "every probe input must be exactly embedding_probe_batch_chars=40 "
+            f"chars, got {[len(t) for t in value]}"
+        )
+
+
+class TestLegacyOllamaFallbackNaming:
+    """C-27: the legacy scalar-only fallback names itself in the error
+    text on BOTH raise paths (breaker-wrapped outage and post-response)."""
+
+    def _legacy_namespace(self):
+        # Legacy Ollama derives from the /api/embeddings URL path.
+        return _namespace(
+            ollama_embedding_url="http://localhost:11434/api/embeddings",
+            embedding_probe_batch_chars=48,
+        )
+
+    async def test_legacy_outage_error_names_fallback(self):
+        def handler(request):
+            body = json.loads(request.content)
+            # Legacy dialect: {"model": ..., "prompt": <scalar>}
+            assert isinstance(body.get("prompt"), str), (
+                f"legacy dialect must send a scalar prompt, got {body!r}"
+            )
+            return httpx.Response(500, text="boom", request=request)
+
+        with patch("app.services.embeddings.settings", self._legacy_namespace()):
+            with patch("app.services.embeddings.assert_url_safe"):
+                with patch(
+                    "app.services.embeddings.embeddings_cb",
+                    AsyncCircuitBreaker(fail_max=50, reset_timeout=30,
+                                        name="sup2-legacy"),
+                ):
+                    service = EmbeddingService()
+                    service._client = httpx.AsyncClient(
+                        transport=httpx.MockTransport(handler)
+                    )
+                    try:
+                        with pytest.raises(EmbeddingError, match="legacy"):
+                            await service.embed_probe(2.0)
+                    finally:
+                        await service._client.aclose()

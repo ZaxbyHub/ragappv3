@@ -1051,22 +1051,38 @@ class EmbeddingService:
 
         Count parity is deliberately NOT required — a provider may answer a
         batch with a single representative embedding; the probe's contract
-        is that the payload SHAPE was accepted and something embedding-like
-        came back.
+        is that the payload SHAPE was accepted and at least one usable
+        embedding row came back (an empty container is NOT embedding-like:
+        the replaced ``_extract_embedding`` oracle rejected empties, and a
+        200-with-empty-payload must not vouch for capacity — PR #1018
+        review F-005).
         """
         if config.mode == "tei":
+            # Native TEI answers a bare list-of-lists; some TEI deployments
+            # wrap the same matrix as {"embeddings": [[...]]} — the ingest
+            # path accepts that wrapper, so the probe must too (PR #1018
+            # review C-26: rejecting it produces a false unhealthy).
+            tei_matrix = data
+            if isinstance(data, dict) and isinstance(
+                data.get("embeddings"), list
+            ):
+                tei_matrix = data["embeddings"]
             if not (
-                isinstance(data, list)
-                and data
-                and all(isinstance(row, list) for row in data)
+                isinstance(tei_matrix, list)
+                and tei_matrix
+                and all(
+                    isinstance(row, list) and row for row in tei_matrix
+                )
             ):
                 raise EmbeddingError(
                     "Invalid response from embedding service"
                 )
             return
         if config.mode == "openai":
-            if not isinstance(data, dict) or not isinstance(
-                data.get("data"), list
+            if (
+                not isinstance(data, dict)
+                or not isinstance(data.get("data"), list)
+                or not data["data"]
             ):
                 raise EmbeddingError(
                     "Invalid response from embedding service"
@@ -1074,11 +1090,38 @@ class EmbeddingService:
             return
         # Modern ollama {"embeddings": [[...]]} plus the compatibility
         # {"embedding": [...]} shape; legacy prompt dialect answers the
-        # scalar shape too.
-        if isinstance(data, dict) and (
-            isinstance(data.get("embeddings"), list)
-            or isinstance(data.get("embedding"), list)
-        ):
+        # scalar shape too. Native TEI deployments may also wrap the matrix
+        # as {"embeddings": [[...]]} (the ingest path accepts the same
+        # wrapper), so it is honored here as well. Empty containers are
+        # rejected in every arm (F-005): a 200-with-empty-payload must not
+        # vouch for capacity.
+        if isinstance(data, dict):
+            # "embeddings" is a matrix (list of vectors); "embedding" is a
+            # single flat compatibility vector. Both must be non-empty.
+            matrix = data.get("embeddings")
+            if isinstance(matrix, list):
+                if not matrix or not all(
+                    isinstance(row, list) and row for row in matrix
+                ):
+                    raise EmbeddingError(
+                        "Invalid response from embedding service"
+                    )
+                return
+            vector = data.get("embedding")
+            if isinstance(vector, list):
+                if not vector:
+                    raise EmbeddingError(
+                        "Invalid response from embedding service"
+                    )
+                return
+            raise EmbeddingError("Invalid response from embedding service")
+        if isinstance(data, list):
+            if not data or not all(
+                isinstance(row, list) and row for row in data
+            ):
+                raise EmbeddingError(
+                    "Invalid response from embedding service"
+                )
             return
         raise EmbeddingError("Invalid response from embedding service")
 
@@ -1155,8 +1198,12 @@ class EmbeddingService:
                     f"Embedding API returned status {response.status_code} for {config.mode} mode (body_len={len(response.text)})"
                 )
                 logger.debug(f"Embedding API error body: {response.text[:2000]}")
+                detail = (
+                    f" ({fallback_note})" if fallback_note else ""
+                )
                 raise EmbeddingError(
-                    f"Embedding API returned status {response.status_code}"
+                    f"Embedding API returned status "
+                    f"{response.status_code}{detail}"
                 )
             return response
 

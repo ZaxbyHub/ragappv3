@@ -40,10 +40,14 @@ on the documents ranked-search path).
   `length(CAST(<col> AS BLOB))` length guard as the content arm (an
   oversized header skips `snippet()` entirely and the excerpt falls through
   the existing COALESCE fallbacks), and the census exemption is now an
-  explicit bounded-column allowlist with the dynamic `{col}` helper as the
-  only placeholder-compatibility case — an unguarded `files_search_fts`
-  snippet for the email columns (or any future unbounded metadata column, or
-  an invalid/out-of-range literal column index) fails the census. The
+  explicit bounded-column allowlist: an unguarded `files_search_fts`
+  snippet bound to a LITERAL column index (the email columns, any future
+  unbounded metadata column, or an invalid/out-of-range index) fails the
+  census. The live metadata arm builds its calls through the dynamic
+  `{col}` helper, which the census intentionally classifies
+  bounded-metadata as a compatibility case — the runtime guard for that
+  site is pinned functionally by the k7c/k7e suites and the #1005 timing
+  bounds, not by the census. The
   `documents.py` code comments describe both guards precisely.
 - Read paths stop materializing unbounded bodies into their results where only
   a bounded window is consumed: the KMS retrieval SELECT carries

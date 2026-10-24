@@ -562,30 +562,34 @@ class SettingsUpdate(BaseModel):
 
         setattr persistence onto the settings singleton bypasses the
         Settings model validators, so the PUT path enforces the same rules
-        here against effective (body-value-else-current) values when the
-        body sets the stall knob itself: the stall budget must exceed the
-        reclaim timeout AND document_parse_timeout (a stall arm below the
-        reclaim timeout would fire on healthy slow parses; below the parse
-        timeout one legitimately slow file would read as stalled). Bodies
-        that only move the sibling knobs keep their pre-#1010 acceptance
-        contract (the #559 pair check above still governs them)."""
+        here against effective (body-value-else-current) values on EVERY
+        body: the stall budget must exceed the reclaim timeout AND
+        document_parse_timeout. A reclaim-only PUT that raises the reclaim
+        timeout above the live stall budget would otherwise persist a pair
+        the boot validator rejects — accepted live, then silently reverted
+        by the startup replay (PR #1018 review F-001). This deliberately
+        supersedes the pre-#1010 sibling-only acceptance contract; the #559
+        heartbeat/reclaim pair check above still governs independently."""
         from app.config import settings as _settings
 
-        if self.jobs_stall_timeout_seconds is None:
-            return self
-        stall = float(self.jobs_stall_timeout_seconds)
+        stall = (
+            float(self.jobs_stall_timeout_seconds)
+            if self.jobs_stall_timeout_seconds is not None
+            else float(_settings.jobs_stall_timeout_seconds)
+        )
         reclaim = (
-            self.jobs_lease_reclaim_timeout_seconds
+            float(self.jobs_lease_reclaim_timeout_seconds)
             if self.jobs_lease_reclaim_timeout_seconds is not None
-            else _settings.jobs_lease_reclaim_timeout_seconds
+            else float(_settings.jobs_lease_reclaim_timeout_seconds)
         )
         if stall <= reclaim:
             raise ValueError(
                 "jobs_stall_timeout_seconds must be > "
-                "jobs_lease_reclaim_timeout_seconds"
+                "jobs_lease_reclaim_timeout_seconds "
+                f"(effective stall={stall:g}, reclaim={reclaim:g})"
             )
-        parse_timeout = getattr(
-            _settings, "document_parse_timeout", 0.0
+        parse_timeout = float(
+            getattr(_settings, "document_parse_timeout", 0.0)
         )
         if stall <= parse_timeout:
             raise ValueError(

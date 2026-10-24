@@ -4199,15 +4199,20 @@ class BackgroundProcessor:
         run_task: "asyncio.Task",
         heartbeat_task: "asyncio.Task",
     ) -> None:
-        """Deadline-driven stall watchdog for one claimed reindex job.
+        """Stall watchdog for one claimed reindex job (progress-polling).
 
-        Computes ``deadline = max(progress_at-or-claim-time) + stall_budget``
-        and sleeps until it (refreshing the deadline whenever the watermark
-        advances), so the worker-side release happens AT the configured
-        budget — the janitor's heartbeat-age arm stays a backstop. On wake it
-        re-checks ownership and cancels the run + heartbeat when EITHER the
-        deadline passed while the row is still ours OR the row no longer
-        belongs to this attempt (the janitor requeued it first).
+        Polls the row at ``max(0.25, min(budget/4, 5.0))`` second intervals
+        (NOT a sleep-until-deadline: the watermark is durable state that can
+        advance between polls) and cancels the run + heartbeat when the
+        watermark age passes the stall budget while the row is still ours,
+        OR when the row no longer belongs to this attempt. Release is
+        therefore budget-bounded from above, but poll latency and the
+        bounded per-file granularity (the watermark advances on file
+        COMPLETION — one very large file on a slow embedder can legitimately
+        exceed the budget; raise ``jobs_stall_timeout_seconds`` for such
+        workloads, or see the per-batch refresh follow-up) mean the release
+        can land after the nominal budget: the janitor's heartbeat-age arm
+        stays the crash backstop either way.
         """
         budget = self._reindex_stall_budget()
         if budget is None:
@@ -5016,12 +5021,27 @@ class BackgroundProcessor:
                             # worker wrapper converts and settles; the file
                             # row itself was restored by
                             # process_existing_file's cancellation handler.
-                            self._stall_retry_file_ids = [
-                                int(fid)
-                                for fid in ordered_file_ids[
-                                    max(total_files - 1, 0):
-                                ]
-                            ]
+                            # Files that already FAILED earlier in THIS
+                            # attempt (failed_ids) must ride the retry scope
+                            # too — otherwise the narrowed retry re-runs only
+                            # the interrupted+remaining files, the failed
+                            # ones keep their error rows, and the job
+                            # completes reporting false success (PR #1018
+                            # review B2: file1 raises, file2 hangs → scope
+                            # [2, 3], file 1 never retried). Order-stable
+                            # dedupe: failed first (oldest failure first),
+                            # then the interrupted + remaining tail.
+                            self._stall_retry_file_ids = list(
+                                dict.fromkeys(
+                                    [int(fid) for fid in failed_ids]
+                                    + [
+                                        int(fid)
+                                        for fid in ordered_file_ids[
+                                            max(total_files - 1, 0):
+                                        ]
+                                    ]
+                                )
+                            )
                             raise
                         except IngestCancelledError:
                             # issue #783 review PRR-011/F-001: a user

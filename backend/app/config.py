@@ -3,6 +3,7 @@ Application configuration using Pydantic Settings.
 """
 
 import logging
+import math
 import warnings
 from pathlib import Path
 from typing import Annotated, Mapping, Optional
@@ -1088,7 +1089,17 @@ class Settings(BaseSettings):
     def _validate_float_range(
         v: float, min_val: float | None, max_val: float | None, field_name: str
     ) -> float:
-        """Validate a float is within a specified range."""
+        """Validate a float is within a specified range (and finite).
+
+        NaN slips past both ``<`` and ``>`` comparisons, and a non-finite
+        value reaching a SQLite ``datetime('now', ?)`` modifier or budget
+        computation silently disables the guarded behavior (issue #1011
+        review: ``'-nan seconds'`` evaluates to NULL). Every knob this
+        helper validates is finite-bounded, so non-finite values are
+        rejected outright.
+        """
+        if not math.isfinite(v):
+            raise ValueError(f"{field_name} must be a finite number")
         if min_val is not None and v < min_val:
             raise ValueError(f"{field_name} must be >= {min_val}")
         if max_val is not None and v > max_val:

@@ -258,6 +258,11 @@ jobs:
               - frontend/Dockerfile
               - frontend/.dockerignore
               - docker-compose.yml
+              # The offline first-parse smoke mounts these two files; a
+              # probe/fixture-only edit must still run the smoke (PR #1018
+              # review F-006).
+              - scripts/docker_smoke/**
+              - backend/tests/fixtures/real_docs/sample_table.pdf
 
   # BUILD-002: smoke-build the root image (no push) whenever the docker surface
   # changes, so a green CI run proves the shipped image still builds under the

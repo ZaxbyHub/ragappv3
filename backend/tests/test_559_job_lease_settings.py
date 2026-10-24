@@ -100,9 +100,29 @@ class TestSettingsUpdateLayerValidation:
             SettingsUpdate(jobs_heartbeat_interval_seconds=100)
 
     def test_reclaim_update_measured_against_current_heartbeat_accepted(self):
-        # Effective pair (current 30, 1000): 1000 > 120 — coherent.
-        update = SettingsUpdate(jobs_lease_reclaim_timeout_seconds=1000)
-        assert update.jobs_lease_reclaim_timeout_seconds == 1000
+        # Effective pair (current 30, 800): 800 > 120 — heartbeat-coherent.
+        # Deliberate #1010-review contract change: sibling-only PUTs are now
+        # ALSO measured against the live stall budget (the stall validator
+        # runs on every body), so 1000 (above the 900 default stall) is no
+        # longer acceptable — 800 is the highest coherent reclaim.
+        update = SettingsUpdate(jobs_lease_reclaim_timeout_seconds=800)
+        assert update.jobs_lease_reclaim_timeout_seconds == 800
+
+    def test_reclaim_update_above_current_stall_rejected(self):
+        # Issue #1010 review F-001: a reclaim-only PUT that raises reclaim
+        # above the live stall budget persists a pair the boot validator
+        # rejects (accepted live, silently reverted by the startup replay).
+        with pytest.raises(ValidationError, match="stall"):
+            SettingsUpdate(jobs_lease_reclaim_timeout_seconds=1200)
+
+    def test_reclaim_only_put_persisted_pair_cannot_boot(self):
+        # Restart-replay regression for F-001: the state a reclaim-only PUT
+        # used to persist must be unbootable, which is why the PUT path has
+        # to reject it up front.
+        candidate = settings.model_dump()
+        candidate["jobs_lease_reclaim_timeout_seconds"] = 1200
+        with pytest.raises(ValidationError, match="stall"):
+            Settings(**candidate)
 
     def test_omitted_fields_fall_back_to_current_singleton(self):
         # Sanity for the body-value-else-current semantics the coherence

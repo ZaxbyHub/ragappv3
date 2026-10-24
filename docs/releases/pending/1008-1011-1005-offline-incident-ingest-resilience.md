@@ -26,10 +26,17 @@ wedge onto the documents metadata arm).
   below the attempts cap with the stable reason
   `lease_stall_reclaimed: no per-file progress within
   jobs_stall_timeout_seconds` (registered in job_lease's stable-prefix
-  vocabulary) and narrows `$.retry_file_ids` to the interrupted +
-  remaining files; at/over the cap it settles terminally as
+  vocabulary) and narrows `$.retry_file_ids` to the files that already
+  failed this attempt plus the interrupted + remaining files (the cancel
+  lands via a new keyword-only `retry_context="reindex"` parameter on
+  `process_existing_file`, which selects the mutation-aware restore
+  semantics); at/over the cap it settles terminally as
   `attempt_cap_exceeded: lease_stall_reclaimed: ...` with `completed_at`
-  stamped. The lease janitor (`job_lease.reclaim_expired`) gained a stall
+  stamped. A JANITOR-first release (watchdog dead) requeues the FULL
+  original scope with no stall reason — the narrowed scope is a
+  watchdog-first property only. Each `claim` resets `progress_at` to claim-time (a re-claimed row's
+  stall baseline is the fresh claim, never a dead attempt's watermark).
+  The lease janitor (`job_lease.reclaim_expired`) gained a stall
   arm — a parenthesized expiry group with the queue filter outside it — so
   a live-heartbeat no-progress row is also reclaimed by the backstop
   (below cap: pending with no error rewrite; at cap: the
@@ -100,14 +107,19 @@ wedge onto the documents metadata arm).
   invalid/out-of-range/unknown-table targets (unguarded — fail loud), and
   the dynamic `{col}` helper form as the only bounded-metadata
   compatibility case.
-- **Settings.** `jobs_stall_timeout_seconds` (60..7200s, default 900; must
-  exceed `jobs_lease_reclaim_timeout_seconds` AND
-  `document_parse_timeout`) and the probe knobs are declared in
-  `backend/app/config.py`; the stall budget is wired through the admin
-  settings surface (`backend/app/api/routes/settings.py`:
-  SettingsUpdate/ALLOWED_FIELDS/SettingsResponse/_build_settings_dict)
-  and the startup replay list (`backend/app/lifespan.py`
-  NEW_DIRECT_KEYS), mirroring the sibling job-lease knobs.
+- **Settings (upgrade note).** `jobs_stall_timeout_seconds` (60..7200s,
+  default 900) must exceed `jobs_lease_reclaim_timeout_seconds` AND
+  `document_parse_timeout` — enforced at boot AND on every admin PUT
+  (effective-pair semantics), so a deployment whose reclaim knob sits
+  above 900 must now raise `JOBS_STALL_TIMEOUT_SECONDS` in tandem;
+  previously-documented reclaim values up to 3600 are no longer
+  boot-legal without it. The stall budget is admin-writable
+  (settings.py five-point pipeline) AND forwarded by docker-compose /
+  `.env.example` (`JOBS_STALL_TIMEOUT_SECONDS`, tandem-raise warning
+  included); the probe knobs are env-only (not admin-writable). Sibling-
+  only PUT contract change:
+  `SettingsUpdate(jobs_lease_reclaim_timeout_seconds=1000)` is now
+  rejected (the #559 pin was updated in the same commit).
 - Supporting (non-frozen) tests ship alongside the frozen acceptance
   checks: `backend/tests/test_incident_resilience_support.py` (#1010/#1011)
   and `backend/tests/test_incident_resilience_support2.py`
@@ -115,18 +127,27 @@ wedge onto the documents metadata arm).
 
 ## Disclosed limitations
 
-- The `write_lock_timeout_seconds` 300s ceiling is RETAINED: contention is
-  handled by the contention-aware never-terminal requeue (floored/capped
-  backoff, attempt-cap bypass) rather than by raising the wait — a
-  maintainer decision is requested on #1011 (AC14) on whether the ceiling
-  should move.
+- The `write_lock_timeout_seconds` 300s ceiling is RETAINED by recorded
+  decision (#1011 comment 6384635491, maintainer-delegated): contention
+  is handled by the contention-aware never-terminal requeue
+  (floored/capped backoff, attempt-cap bypass) rather than by raising the
+  wait; the ceiling stays 300 s unless a future build-duration regime
+  justifies moving it.
 - A contention-marked row whose worker DIED (process crash mid-contention)
   still cap-settles at the janitor's `lease_attempt_cap_exceeded` arm —
-  the crash path has no live worker to keep requeueing; same #1011
-  decision comment applies.
-- The probe defaults (4 inputs x 512 chars) are a light capacity smoke,
-  not the full ingest shape; operators can raise them toward the real
-  batch shape (`embedding_probe_batch_count` /
+  the crash path has no live worker to keep requeueing. Accepted as
+  designed in the same recorded decision (the alternative would make a
+  crashed mid-contention job immortal).
+- The watermark advances on file COMPLETION: one very large file whose
+  parse + embed waves legitimately exceed `jobs_stall_timeout_seconds`
+  will be stall-released and retried each attempt until the cap — raise
+  the budget for such workloads (a per-embedding-batch watermark refresh
+  is the deeper fix and was deferred).
+- The probe defaults (4 inputs x 512 chars — a quarter of the documented
+  2000-char chunk scale, deliberately light so the probe completes well
+  inside the health checker's timeout) are a capacity-SHAPE smoke, not
+  the full ingest shape; operators can raise them toward the real batch
+  shape via env (`embedding_probe_batch_count` /
   `embedding_probe_batch_chars`, cross-validated against
   `embedding_batch_max_chars`).
 - Wiki/KMS/ingestion queues do not yet publish progress watermarks — the

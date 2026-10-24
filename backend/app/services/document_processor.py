@@ -398,7 +398,10 @@ _INGEST_ERROR_REASONS = {
     INGEST_ERROR_VECTOR_STORE_LOCK_TIMEOUT: (
         "the vector store's write lock was unavailable (held by index "
         "maintenance or a peer write); the document itself is intact and "
-        "the ingest retries until the lock frees"
+        "the upload-path ingest retries until the lock frees — on the "
+        "reindex path a contention-marked file is re-selected by the next "
+        "reindex pass, and a job whose worker died still settles terminally "
+        "at the durable attempt cap"
     ),
     INGEST_ERROR_REINDEX_INTERRUPTED: (
         "the reindex attempt was interrupted mid-file; the next reindex "
@@ -1104,6 +1107,15 @@ async def _parse_with_deadline(
             fut,
             timeout=settings.document_parse_timeout,
         )
+    except asyncio.CancelledError:
+        # Issue #1010 review C-22: an EXTERNAL cancellation (e.g. the
+        # reindex stall watchdog) tears down wait_for the same way the
+        # deadline does. If the parse was still queued, its work item is
+        # dropped and _tracked's finally never runs — release the slot
+        # here; a running worker releases its own slot in its finally.
+        if concurrent.cancel():
+            _release_parse_slot(key)
+        raise
     except asyncio.TimeoutError:
         # cancel() returns True only when the queued work item was
         # dropped (or is dropped now): _tracked never runs, so its

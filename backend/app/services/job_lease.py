@@ -403,6 +403,12 @@ class _TableShape:
         # shapes whose table carries the progress_at watermark column; the
         # default empty string collapses the expiry group to the age arm.
         stall_arm: str = "",
+        # Issue #1010 review: the claim-time progress reset, interpolated
+        # only for shapes whose table carries progress_at. Without it a
+        # re-claimed row carries its OLD stale watermark until the run's
+        # entry stamp lands, so a janitor sweep or watchdog probe in that
+        # claim→stamp window can burn an attempt on a freshly claimed job.
+        claim_progress_reset: str = "",
     ) -> None:
         self.queue_column = queue_column
         self.has_run_after = has_run_after
@@ -411,6 +417,7 @@ class _TableShape:
         self.reclaim_started_at_set = reclaim_started_at_set
         self.reclaim_completed_at_set = reclaim_completed_at_set
         self.stall_arm = stall_arm
+        self.claim_progress_reset = claim_progress_reset
 
 
 # The table allowlist (issue #559 stage 4, plan-critic MAJOR-2: one primitive,
@@ -431,8 +438,13 @@ _TABLE_SHAPES: dict[str, _TableShape] = {
             "THEN CURRENT_TIMESTAMP ELSE completed_at END"
         ),
         # Issue #1010: jobs carries the progress_at watermark, so its
-        # reclaim carries the stall arm.
+        # reclaim carries the stall arm and its claim resets the watermark
+        # (each attempt's stall baseline is claim-time, never a prior
+        # attempt's stale watermark).
         stall_arm=_STALL_ARM_FRAGMENT,
+        claim_progress_reset=(
+            ", progress_at = strftime('%Y-%m-%d %H:%M:%f', 'now')"
+        ),
     ),
     "draft_jobs": _TableShape(
         queue_column="job_type",
@@ -636,7 +648,7 @@ class JobLease:
                     lease_generation = lease_generation + 1,
                     attempts = attempts + 1,
                     started_at = {self._claim_started_at},
-                    heartbeat_at = CURRENT_TIMESTAMP
+                    heartbeat_at = CURRENT_TIMESTAMP{self._shape.claim_progress_reset}
                 WHERE id = (
                     SELECT id FROM {self._table}
                     WHERE {self._shape.queue_column} = ?

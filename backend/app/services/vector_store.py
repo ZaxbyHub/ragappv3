@@ -673,7 +673,9 @@ class VectorStore:
             None
 
         Raises:
-            VectorStoreError: If the lock acquisition times out.
+            WriteLockTimeoutError: If the lock acquisition times out (a
+                subclass of ``VectorStoreError``, issue #1011).
+            VectorStoreError: For other acquisition failures.
         """
         try:
             await asyncio.wait_for(
