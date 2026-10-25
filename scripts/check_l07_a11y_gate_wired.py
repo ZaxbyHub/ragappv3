@@ -19,10 +19,11 @@ review feedback round) wires the gate:
      width: 640 / height: 360 — a comment mentioning the numbers does not
      count) and carries a roster of at least 20 routes (>= 20 `path: "`
      entries).
-  4. The axe waiver cannot silently widen: the spec names exactly the four
-     tracked-out rule families (#865 aria-valid-attr-value, #866
-     nested-interactive, #867 button-name, #868 aria-required-children) and
-     disables exactly four rules (`enabled: false` x 4).
+  4. The axe waiver cannot silently widen: the spec names exactly the three
+     still-waived rule families (#865 aria-valid-attr-value, #866
+     nested-interactive, #867 button-name) and disables exactly three rules
+     (`enabled: false` x 3). #868's aria-required-children was re-armed
+     (amendment 6) — any fourth disable, including that rule, fails here.
   5. The `e2e` job's Playwright run lines name their own specs and never
      reference a11y-matrix.spec.ts; NO job may run playwright without naming
      at least one *.spec.ts, and the a11y-matrix literal may appear in only
@@ -49,7 +50,7 @@ CI_REL = Path(".github") / "workflows" / "ci.yml"
 E2E_JOB = "e2e"
 SPEC_LITERAL = "a11y-matrix.spec.ts"
 VIEWPORT_STRUCTURAL = (("320", "width"), ("568", "height"), ("640", "width"), ("360", "height"))
-DISABLED_RULES = ("aria-valid-attr-value", "nested-interactive", "button-name", "aria-required-children")
+DISABLED_RULES = ("aria-valid-attr-value", "nested-interactive", "button-name")
 MIN_ROUTES = 20
 
 # A job key inside the GitHub Actions `jobs:` map: exactly two-space indent,
@@ -209,7 +210,9 @@ def main() -> int:
         if disables != len(DISABLED_RULES):
             misses.append(
                 f"the spec disables {disables} axe rules; exactly "
-                f"{len(DISABLED_RULES)} are sanctioned (the #865-#868 set)"
+                f"{len(DISABLED_RULES)} are sanctioned (the #865-#867 set; "
+                "#868 aria-required-children was re-armed and may not be "
+                "waived again)"
             )
 
     # 5. Run-line hygiene across ALL jobs (issue #778 review PRR-016):

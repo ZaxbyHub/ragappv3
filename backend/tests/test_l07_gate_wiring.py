@@ -154,7 +154,6 @@ FULL_SPEC = (
     + '  "aria-valid-attr-value": { enabled: false },' + _NL
     + '  "nested-interactive": { enabled: false },' + _NL
     + '  "button-name": { enabled: false },' + _NL
-    + '  "aria-required-children": { enabled: false },' + _NL
     + "} });" + _NL
 )
 
@@ -213,7 +212,7 @@ def test_roster_below_minimum_rejected(tmp_path: Path) -> None:
     assert "route roster has 2 entries" in result.stdout
 
 
-def test_fifth_waiver_rejected(tmp_path: Path) -> None:
+def test_fourth_waiver_rejected(tmp_path: Path) -> None:
     widened = FULL_SPEC.replace(
         "} });",
         '  "region": { enabled: false },\n} });',
@@ -221,7 +220,22 @@ def test_fifth_waiver_rejected(tmp_path: Path) -> None:
     _plant_full(tmp_path, spec_text=widened)
     result = _run_guard(tmp_path)
     assert result.returncode == 1
-    assert "disables 5 axe rules" in result.stdout
+    assert "disables 4 axe rules" in result.stdout
+
+
+def test_rewaived_aria_required_children_rejected(tmp_path: Path) -> None:
+    # Issue #868 regression pin: aria-required-children was re-armed
+    # (amendment 6, native ul/li suggested prompts). Re-waiving it — the
+    # exact row amendment 5 shipped — must fail the count check, so the
+    # #868 fix cannot be silently reverted in the frozen gate.
+    rewidened = FULL_SPEC.replace(
+        "} });",
+        '  "aria-required-children": { enabled: false },\n} });',
+    )
+    _plant_full(tmp_path, spec_text=rewidened)
+    result = _run_guard(tmp_path)
+    assert result.returncode == 1
+    assert "disables 4 axe rules" in result.stdout
 
 
 def test_missing_disabled_rule_rejected(tmp_path: Path) -> None:

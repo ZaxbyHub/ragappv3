@@ -552,6 +552,14 @@ async function runAxe(page: Page): Promise<AxeViolation[]> {
     // color-contrast and every other serious/critical rule stay enforced —
     // at full matrix run 2 those other rules found only the four tracked-out
     // classes after the body base-coat fix.
+    // Amendment 6 (issue #868 AC1/AC2, 2026-10-25): the #868-owned waiver is
+    // RE-ARMED — aria-required-children runs again. Its only matrix violation
+    // (chat empty-state suggested prompts, div role="list" with button
+    // children) is fixed at the source (native <ul>/<li> in
+    // TranscriptPane.tsx). The three remaining waivers below are owned by the
+    // still-open #865/#866/#867; check_l07_a11y_gate_wired.py pins the
+    // disabled set at exactly these three so this waiver can never silently
+    // re-widen (re-adding a fourth disable — including this rule — fails CI).
     const results = await win.axe.run({
       rules: {
         // Each disabled family is owned by an open follow-up issue whose AC1
@@ -560,7 +568,6 @@ async function runAxe(page: Page): Promise<AxeViolation[]> {
         "aria-valid-attr-value": { enabled: false }, // #865
         "nested-interactive": { enabled: false }, // #866
         "button-name": { enabled: false }, // #867
-        "aria-required-children": { enabled: false }, // #868
       },
     });
     return results.violations
