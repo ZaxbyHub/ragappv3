@@ -36,7 +36,7 @@
       "SEVERITY.LOW": 60,
       "SEVERITY.MEDIUM": 60,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 93413,
+      "loc": 93423,
       "nosec": 0,
       "skipped_tests": 71
     },
@@ -374,7 +374,7 @@
       "SEVERITY.LOW": 5,
       "SEVERITY.MEDIUM": 2,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1105,
+      "loc": 1115,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -3080,7 +3080,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "523             await asyncio.to_thread(conn.rollback)\n524         except Exception:\n525             pass\n526         raise HTTPException(\n",
+      "code": "537             await asyncio.to_thread(conn.rollback)\n538         except Exception:\n539             pass\n540         raise HTTPException(\n",
       "col_offset": 8,
       "end_col_offset": 16,
       "filename": "backend/app/api/routes/vaults.py",
@@ -3091,17 +3091,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 524,
+      "line_number": 538,
       "line_range": [
-        524,
-        525
+        538,
+        539
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "531             await asyncio.to_thread(conn.rollback)\n532         except Exception:\n533             pass\n534         # Server-side cause must survive: attach it at ERROR before the fixed\n",
+      "code": "545             await asyncio.to_thread(conn.rollback)\n546         except Exception:\n547             pass\n548         # Server-side cause must survive: attach it at ERROR before the fixed\n",
       "col_offset": 8,
       "end_col_offset": 16,
       "filename": "backend/app/api/routes/vaults.py",
@@ -3112,17 +3112,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 532,
+      "line_number": 546,
       "line_range": [
-        532,
-        533
+        546,
+        547
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "542             await asyncio.to_thread(conn.rollback)\n543         except Exception:\n544             pass\n545         raise HTTPException(status_code=500, detail=\"Failed to create vault\")\n",
+      "code": "556             await asyncio.to_thread(conn.rollback)\n557         except Exception:\n558             pass\n559         raise HTTPException(status_code=500, detail=\"Failed to create vault\")\n",
       "col_offset": 8,
       "end_col_offset": 16,
       "filename": "backend/app/api/routes/vaults.py",
@@ -3133,17 +3133,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 543,
+      "line_number": 557,
       "line_range": [
-        543,
-        544
+        557,
+        558
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "564                 await asyncio.to_thread(conn.rollback)\n565             except Exception:\n566                 pass\n567             logger.error(\n",
+      "code": "578                 await asyncio.to_thread(conn.rollback)\n579             except Exception:\n580                 pass\n581             logger.error(\n",
       "col_offset": 12,
       "end_col_offset": 20,
       "filename": "backend/app/api/routes/vaults.py",
@@ -3154,17 +3154,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 565,
+      "line_number": 579,
       "line_range": [
-        565,
-        566
+        579,
+        580
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "580             await asyncio.to_thread(conn.rollback)\n581         except Exception:\n582             pass\n583         logger.exception(\"Failed to commit vault creation\")\n",
+      "code": "594             await asyncio.to_thread(conn.rollback)\n595         except Exception:\n596             pass\n597         logger.exception(\"Failed to commit vault creation\")\n",
       "col_offset": 8,
       "end_col_offset": 16,
       "filename": "backend/app/api/routes/vaults.py",
@@ -3175,17 +3175,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 581,
+      "line_number": 595,
       "line_range": [
-        581,
-        582
+        595,
+        596
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "668     try:\n669         sql = f\"\"\"\n670             UPDATE vaults\n671             SET {\", \".join(update_fields)}, updated_at = CURRENT_TIMESTAMP\n672             WHERE id = ?\n673         \"\"\"\n674         await asyncio.to_thread(conn.execute, sql, params)\n",
+      "code": "682     try:\n683         sql = f\"\"\"\n684             UPDATE vaults\n685             SET {\", \".join(update_fields)}, updated_at = CURRENT_TIMESTAMP\n686             WHERE id = ?\n687         \"\"\"\n688         await asyncio.to_thread(conn.execute, sql, params)\n",
       "col_offset": 14,
       "end_col_offset": 11,
       "filename": "backend/app/api/routes/vaults.py",
@@ -3196,20 +3196,20 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 669,
+      "line_number": 683,
       "line_range": [
-        669,
-        670,
-        671,
-        672,
-        673
+        683,
+        684,
+        685,
+        686,
+        687
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1426         lambda: conn.execute(\n1427             f\"\"\"\n1428             SELECT id, org_id FROM groups\n1429             WHERE id IN ({placeholders})\n1430             \"\"\",\n1431             tuple(group_ids),\n",
+      "code": "1440         lambda: conn.execute(\n1441             f\"\"\"\n1442             SELECT id, org_id FROM groups\n1443             WHERE id IN ({placeholders})\n1444             \"\"\",\n1445             tuple(group_ids),\n",
       "col_offset": 12,
       "end_col_offset": 15,
       "filename": "backend/app/api/routes/vaults.py",
@@ -3220,12 +3220,12 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 1427,
+      "line_number": 1441,
       "line_range": [
-        1427,
-        1428,
-        1429,
-        1430
+        1441,
+        1442,
+        1443,
+        1444
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",

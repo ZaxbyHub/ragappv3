@@ -264,25 +264,25 @@ async def _fetch_vault_with_counts(
     return _row_to_vault_response(row, permission)
 
 
+async def _count_all_vaults(conn: sqlite3.Connection) -> int:
+    """Exact vault count for the admin list endpoint's truncation signal."""
+    row = (
+        await asyncio.to_thread(
+            lambda: conn.execute("SELECT COUNT(*) FROM vaults").fetchone()
+        )
+    )
+    return row[0]
+
+
 async def _fetch_all_vaults(
     conn: sqlite3.Connection, user: Optional[dict] = None
-) -> tuple[List[VaultResponse], int, bool]:
-    """Fetch vaults with counts, ordered by creation date.
-
-    Returns ``(vaults, total, truncated)``: the SQL cap stays as a response-size
-    guard, but the count is exact and ``truncated`` signals the cap so the list
-    endpoints never drop rows silently (issue #725, T1-21-KR-17).
-    """
+) -> List[VaultResponse]:
+    """Fetch vaults with counts, ordered by creation date (capped at 1000 rows)."""
     rows = await asyncio.to_thread(
         lambda: conn.execute(
             _VAULT_WITH_COUNTS_SQL + " GROUP BY v.id ORDER BY v.created_at ASC LIMIT 1000"
         ).fetchall()
     )
-    total = (
-        await asyncio.to_thread(
-            lambda: conn.execute("SELECT COUNT(*) FROM vaults").fetchone()
-        )
-    )[0]
     permissions = (
         await get_effective_vault_permissions(conn, user, [row[0] for row in rows])
         if user
@@ -291,13 +291,13 @@ async def _fetch_all_vaults(
     vaults = []
     for row in rows:
         vaults.append(_row_to_vault_response(row, permissions.get(row[0])))
-    return vaults, total, len(vaults) < total
+    return vaults
 
 
-async def _fetch_accessible_vaults(
+async def _accessible_vaults_with_total(
     conn: sqlite3.Connection, user: Optional[dict] = None
 ) -> tuple[List[VaultResponse], int, bool]:
-    """Fetch only vaults the current user can act on, using SQL prefiltering.
+    """Fetch only vaults the current user can act on, with an exact count.
 
     Builds a UNION query to get candidate vault IDs:
     - (a) vaults where user is directly a member
@@ -323,9 +323,12 @@ async def _fetch_accessible_vaults(
     if user_id is None:
         return [], 0, False
 
-    # For admin/superadmin, fetch all vaults (no filtering needed)
+    # For admin/superadmin, fetch all vaults (no filtering needed); total is
+    # the exact vault count for the truncation signal.
     if user_role in ("admin", "superadmin"):
-        return await _fetch_all_vaults(conn, user)
+        vaults = await _fetch_all_vaults(conn, user)
+        total = await _count_all_vaults(conn)
+        return vaults, total, len(vaults) < total
 
     # Build UNION query for candidate vault IDs
     # (a) vaults where user is directly a member
@@ -401,6 +404,14 @@ async def _fetch_accessible_vaults(
     return vaults, total, len(full_rows) < total
 
 
+async def _fetch_accessible_vaults(
+    conn: sqlite3.Connection, user: Optional[dict] = None
+) -> List[VaultResponse]:
+    """List-only view of _accessible_vaults_with_total (existing callers/tests)."""
+    vaults, _total, _truncated = await _accessible_vaults_with_total(conn, user)
+    return vaults
+
+
 @router.get("/vaults/", response_model=VaultListResponse, include_in_schema=False)
 @router.get("/vaults", response_model=VaultListResponse)
 async def list_vaults(
@@ -408,9 +419,12 @@ async def list_vaults(
     conn: sqlite3.Connection = Depends(get_db),
 ):
     """List all vaults with document/memory/session counts and permission info. Admin/superadmin only. Regular users should use the /vaults/accessible endpoint."""
-    vaults, total, truncated = await _fetch_all_vaults(conn, user)
+    vaults = await _fetch_all_vaults(conn, user)
+    total = await _count_all_vaults(conn)
 
-    return VaultListResponse(vaults=vaults, total=total, truncated=truncated)
+    return VaultListResponse(
+        vaults=vaults, total=total, truncated=len(vaults) < total
+    )
 
 
 @router.get("/vaults/accessible", response_model=VaultListResponse)
@@ -423,7 +437,7 @@ async def list_accessible_vaults(
     Results are capped at 1000 vaults; ``total``/``truncated`` in the response
     body signal the cap instead of dropping rows silently.
     """
-    vaults, total, truncated = await _fetch_accessible_vaults(conn, user)
+    vaults, total, truncated = await _accessible_vaults_with_total(conn, user)
     return VaultListResponse(vaults=vaults, total=total, truncated=truncated)
 
 
