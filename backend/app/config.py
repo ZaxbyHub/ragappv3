@@ -133,7 +133,11 @@ class Settings(BaseSettings):
     _configured_env_file: object = PrivateAttr(default=None)
 
     model_config = SettingsConfigDict(
-        env_file=".env", env_file_encoding="utf-8", extra="ignore"
+        # hide_input_in_errors: boot validation errors must not echo
+        # co-located env values (the ValidationError input repr) into
+        # startup logs (pydantic >= 2.6; #1001 feedback V-1007-4).
+        hide_input_in_errors=True,
+        env_file=".env", env_file_encoding="utf-8", extra="ignore",
     )
     # NOTE (PR #576 review F2): empty-string values are MEANINGFUL here —
     # OLLAMA_EMBEDDING_URL="" disables embeddings, RERANKER_URL="" selects
@@ -1914,7 +1918,8 @@ class Settings(BaseSettings):
         # Item A). The exact string is published in this repository, so it is a
         # public sole credential AND public audit-HMAC key material via
         # derive_audit_key's admin-token fallback. EXACT match on the trimmed
-        # value, mirroring main.py's startup warning: case variants are not the
+        # value (predicate intentionally DIFFERS from main.py's untrimmed-exact
+        # startup warning): case variants are not the
         # published literal and keep booting (AC2 decision). NOT refused under
         # USERS_ENABLED=True (AC3 decision: UNCHANGED) — there the token is
         # the required bootstrap/first-admin credential and seeds
