@@ -155,15 +155,28 @@ describe("#866 structural no-nesting pins (matrix-unreached surfaces)", () => {
     const outerOpen = src.slice(outerStart, src.indexOf(">", outerStart));
     expect(outerOpen).not.toContain('role="list"');
     // Every role="list" the component declares sits on a row-path container
-    // (the sizing div, the fallback container, or the grouped list).
-    const listRoleLines = src
-      .split(String.fromCharCode(10))
-      .filter((ln) => ln.includes('role="list"'));
-    expect(listRoleLines.length).toBeGreaterThanOrEqual(3);
-    for (const ln of listRoleLines) {
-      expect(ln).toMatch(/Chat sessions|aria-label=.Chat sessions.|role="list"/);
+    // (the sizing div, the fallback container, or the grouped list) — count
+    // CODE lines only (comments excluded) and require each to label the list
+    // "Chat sessions", so a role dropped from a row path or added elsewhere
+    // both fail.
+    const lines = src.split(String.fromCharCode(10));
+    const listRoleIdx = lines
+      .map((ln, i) => ({ ln, i }))
+      .filter(({ ln }) => !ln.trimStart().startsWith("//") && ln.includes('role="list"'))
+      .map(({ i }) => i);
+    expect(listRoleIdx.length).toBe(3);
+    for (const i of listRoleIdx) {
+      // JSX attributes may sit on adjacent lines — require the labelled
+      // container within a +-3-line window of the role attribute (the
+      // grouped path labels dynamically: `${label} sessions`).
+      const window = lines.slice(Math.max(0, i - 3), i + 4).join(" ");
+      expect(window).toMatch(/Chat sessions|\$\{label\} sessions/);
     }
-    // And each row path has listitem children in the source.
-    expect(src.match(/role="listitem"/g)?.length ?? 0).toBeGreaterThanOrEqual(3);
+    // And each row path has listitem children in the source (code lines
+    // only — the asListItem doc comment does not count).
+    const listitemCodeLines = lines.filter(
+      (ln) => !ln.trimStart().startsWith("//") && ln.includes('role="listitem"')
+    );
+    expect(listitemCodeLines.length).toBeGreaterThanOrEqual(2);
   });
 });
