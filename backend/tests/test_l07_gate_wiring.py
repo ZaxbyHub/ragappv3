@@ -123,10 +123,11 @@ def test_guard_flags_missing_viewport_literals(tmp_path: Path) -> None:
     assert "viewport literal height: 360 missing" in result.stdout
 
 
-# ---- issue #778 feedback round: failing-tree pins for the strengthened
-# checker legs (comment-skip, if:/continue-on-error, roster, waiver set,
-# census, single-job literal). FULL_CI/FULL_SPEC satisfy every check; each
-# mutant below flips exactly one leg and must go red.
+# ---- issue #778 feedback round + #865-#868 re-arm: failing-tree pins for
+# the strengthened checker legs (comment-skip, if:/continue-on-error,
+# roster, zero-waiver, census, single-job literal). FULL_CI/FULL_SPEC
+# satisfy every check; each mutant below flips exactly one leg and must
+# go red.
 
 FULL_CI = """name: CI
 on: [push]
@@ -145,17 +146,14 @@ _NL = chr(10)
 
 _FULL_ROUTES = "".join(f'  {{ path: "r{i}" }},{_NL}' for i in range(1, 21))
 
+# Re-armed shape (#865-#868 closed): the spec carries NO rule-disable
+# rows; the checker requires zero waivers.
 FULL_SPEC = (
     "const VIEWPORTS = [{ width: 320, height: 568 }, { width: 640, height: 360 }];" + _NL
     + "const ROUTES = [" + _NL
     + _FULL_ROUTES
     + "];" + _NL
-    + "axe.run({ rules: {" + _NL
-    + '  "aria-valid-attr-value": { enabled: false },' + _NL
-    + '  "nested-interactive": { enabled: false },' + _NL
-    + '  "button-name": { enabled: false },' + _NL
-    + '  "aria-required-children": { enabled: false },' + _NL
-    + "} });" + _NL
+    + "axe.run();" + _NL
 )
 
 
@@ -213,23 +211,45 @@ def test_roster_below_minimum_rejected(tmp_path: Path) -> None:
     assert "route roster has 2 entries" in result.stdout
 
 
-def test_fifth_waiver_rejected(tmp_path: Path) -> None:
+def test_any_waiver_rejected(tmp_path: Path) -> None:
+    # Re-arm invariant (#865-#868 closed): ANY disabled axe rule is a
+    # regression of the gate's blindness -- zero waivers are sanctioned.
     widened = FULL_SPEC.replace(
-        "} });",
-        '  "region": { enabled: false },\n} });',
+        "axe.run();",
+        'axe.run({ rules: { "region": { enabled: false } } });',
     )
     _plant_full(tmp_path, spec_text=widened)
     result = _run_guard(tmp_path)
     assert result.returncode == 1
-    assert "disables 5 axe rules" in result.stdout
+    assert "disables 1 axe rule" in result.stdout
 
 
-def test_missing_disabled_rule_rejected(tmp_path: Path) -> None:
-    dropped = FULL_SPEC.replace('  "button-name": { enabled: false },\n', "")
-    _plant_full(tmp_path, spec_text=dropped)
+def test_waiver_spacing_variant_rejected(tmp_path: Path) -> None:
+    # The zero-waiver count is whitespace-tolerant: an enabled:false
+    # spelling (no spaces) must not slip past the matcher.
+    widened = FULL_SPEC.replace(
+        "axe.run();",
+        'axe.run({ rules: { "region": { enabled:false } } });',
+    )
+    _plant_full(tmp_path, spec_text=widened)
     result = _run_guard(tmp_path)
     assert result.returncode == 1
-    assert "disabled rule 'button-name' missing" in result.stdout
+    assert "disables 1 axe rule" in result.stdout
+
+
+def test_waiver_comment_not_counted(tmp_path: Path) -> None:
+    # Comments are skipped by the waiver scan: prose mentioning the
+    # disable shape stays legal (the re-arm note in the spec does this).
+    # The fixture's roster shape is intentionally minimal, so the guard may
+    # still fail OTHER legs — the pin is that the WAIVER leg contributes no
+    # miss line to stdout.
+    commented = FULL_SPEC.replace(
+        "axe.run();",
+        "// historical: rules were once { enabled: false } here" + _NL + "axe.run();",
+    )
+    _plant_full(tmp_path, spec_text=commented)
+    result = _run_guard(tmp_path)
+    assert "disables" not in result.stdout, result.stdout
 
 
 def test_census_unnamed_spec_rejected(tmp_path: Path) -> None:

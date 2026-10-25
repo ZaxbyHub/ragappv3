@@ -19,10 +19,10 @@ review feedback round) wires the gate:
      width: 640 / height: 360 — a comment mentioning the numbers does not
      count) and carries a roster of at least 20 routes (>= 20 `path: "`
      entries).
-  4. The axe waiver cannot silently widen: the spec names exactly the four
-     tracked-out rule families (#865 aria-valid-attr-value, #866
-     nested-interactive, #867 button-name, #868 aria-required-children) and
-     disables exactly four rules (`enabled: false` x 4).
+  4. No axe rule may be waived (re-arm of issues #865-#868): the spec must
+     contain ZERO rule-disable rows, matched whitespace-tolerantly
+     (`enabled[ws]:[ws]false`) on non-comment lines so formatting variants
+     cannot slip a waiver past the count.
   5. The `e2e` job's Playwright run lines name their own specs and never
      reference a11y-matrix.spec.ts; NO job may run playwright without naming
      at least one *.spec.ts, and the a11y-matrix literal may appear in only
@@ -49,7 +49,6 @@ CI_REL = Path(".github") / "workflows" / "ci.yml"
 E2E_JOB = "e2e"
 SPEC_LITERAL = "a11y-matrix.spec.ts"
 VIEWPORT_STRUCTURAL = (("320", "width"), ("568", "height"), ("640", "width"), ("360", "height"))
-DISABLED_RULES = ("aria-valid-attr-value", "nested-interactive", "button-name", "aria-required-children")
 MIN_ROUTES = 20
 
 # A job key inside the GitHub Actions `jobs:` map: exactly two-space indent,
@@ -200,16 +199,22 @@ def main() -> int:
                 f"{MIN_ROUTES} (>= 20 gated routes)"
             )
 
-        # 4. The axe waiver cannot silently widen: exactly the four tracked
-        #    rule ids, exactly four disables (issue #778 review PRR-006).
-        for rule in DISABLED_RULES:
-            if f'"{rule}"' not in spec_text:
-                misses.append(f"disabled rule '{rule}' missing from the spec")
-        disables = spec_text.count("enabled: false")
-        if disables != len(DISABLED_RULES):
+        # 4. Re-arm invariant (issues #865-#868 closed): NO axe rule may be
+        #    disabled in the spec. Whitespace-tolerant on non-comment lines
+        #    so an `enabled:false` (or `enabled :  false`) spelling cannot
+        #    slip a waiver past the count.
+        spec_code_lines = [
+            ln for ln in spec_lines if not ln.lstrip().startswith("//")
+        ]
+        disables = sum(
+            1
+            for ln in spec_code_lines
+            if re.search(r"enabled\s*:\s*false", ln)
+        )
+        if disables != 0:
             misses.append(
-                f"the spec disables {disables} axe rules; exactly "
-                f"{len(DISABLED_RULES)} are sanctioned (the #865-#868 set)"
+                f"the spec disables {disables} axe rule(s); the re-armed "
+                "gate waives nothing (zero enabled-false rows sanctioned)"
             )
 
     # 5. Run-line hygiene across ALL jobs (issue #778 review PRR-016):

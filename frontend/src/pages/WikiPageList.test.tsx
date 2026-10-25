@@ -8,29 +8,6 @@ vi.mock("@/lib/api", () => ({
   bulkWikiPageAction: vi.fn().mockResolvedValue({}),
 }));
 
-// Radix Tabs cannot be activated via fireEvent.click in jsdom (pointer-capture /
-// activation semantics). Mock the primitive so TabsTrigger is a plain button that
-// invokes onValueChange — same approach the repo uses for ui/tabs and ui/select
-// (see frontend-testing-gotchas + RightPane.test.tsx). WikiPageList is the sole
-// ui/tabs consumer in this file, so reshaping the module here is safe.
-vi.mock("@/components/ui/tabs", async () => {
-  const React = await import("react");
-  const Ctx = React.createContext<(v: string) => void>(() => {});
-  return {
-    Tabs: ({ onValueChange, children }: any) =>
-      React.createElement(Ctx.Provider, { value: onValueChange }, children),
-    TabsList: ({ children }: any) => React.createElement("div", null, children),
-    TabsTrigger: ({ value, children }: any) => {
-      const onValueChange = React.useContext(Ctx);
-      return React.createElement(
-        "button",
-        { role: "tab", onClick: () => onValueChange(value) },
-        children
-      );
-    },
-  };
-});
-
 import { WikiPageList } from "./WikiPageList";
 import { bulkWikiPageAction } from "@/lib/api";
 import type { WikiPage } from "@/lib/api";

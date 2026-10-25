@@ -629,7 +629,11 @@ describe("DraftWorkspace", () => {
       detail: makeDetail({ active_compile_job: makeJob({ id: 77, status: "running" }) }),
     });
 
-    expect(await screen.findByText(READY_BLOCKER_LABELS.vault_access_revoked)).toBeInTheDocument();
+    // #865 forceMount: the revoked-access reason renders in every mounted
+    // (hidden) panel that gates content actions — pin presence, not count.
+    expect(
+      (await screen.findAllByText(READY_BLOCKER_LABELS.vault_access_revoked)).length
+    ).toBeGreaterThan(0);
     expect(screen.queryByRole("button", { name: "Export" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Promote to vault" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Cancel run" })).toBeInTheDocument();

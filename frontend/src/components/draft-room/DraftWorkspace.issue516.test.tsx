@@ -610,7 +610,12 @@ describe("DraftWorkspace (issue #516)", () => {
 
       renderWorkspace();
 
-      await screen.findByTestId("stage-artifact");
+      // #865 forceMount: sibling tab panels stay mounted, so wait for the
+      // artifact to exist somewhere and scope the single-match query to the
+      // ACTIVE panel.
+      await waitFor(() =>
+        expect(screen.getAllByTestId("stage-artifact").length).toBeGreaterThan(0)
+      );
       await waitFor(() => expect(mockGetDraftStages).toHaveBeenCalled());
 
       // REQUIRED: stages are queried for the FAILED job's id (12)…
@@ -618,7 +623,10 @@ describe("DraftWorkspace (issue #516)", () => {
 
       // …and the artifact rendered for the research stage is the FAILED
       // job's stage (job 12 with its error), not the old job's.
-      const artifact = screen.getByTestId("stage-artifact");
+      const activePanel = document.querySelector(
+        '[role="tabpanel"][data-state="active"]'
+      ) as HTMLElement;
+      const artifact = within(activePanel).getByTestId("stage-artifact");
       expect(artifact).toHaveTextContent("stage:research");
       expect(artifact).toHaveTextContent("job:12");
       expect(artifact).toHaveTextContent("error:model_timeout");

@@ -16,7 +16,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { FilterToggle, FilterToggleGroup } from "@/components/ui/filter-toggle-group";
 
 import { DraftCreateDialog } from "@/components/draft-room/DraftCreateDialog";
 import {
@@ -237,15 +237,23 @@ export default function DraftRoomPage() {
                 </SelectContent>
               </Select>
             </div>
-            <Tabs value={statusFilterKey} onValueChange={setStatusFilterKey}>
-              <TabsList className="h-auto flex-wrap justify-start">
-                {DRAFT_LIST_FILTERS.map((filter) => (
-                  <TabsTrigger key={filter.id} value={filter.id}>
-                    {filter.label}
-                  </TabsTrigger>
-                ))}
-              </TabsList>
-            </Tabs>
+            {/* Status filter (#865): toggle group, not a trigger-only Tabs
+                bar — Tabs triggers carry aria-controls for panels that were
+                never rendered, which axe flags as aria-valid-attr-value. */}
+            <FilterToggleGroup
+              aria-label="Filter drafts by status"
+              className="h-auto flex-wrap justify-start"
+            >
+              {DRAFT_LIST_FILTERS.map((filter) => (
+                <FilterToggle
+                  key={filter.id}
+                  pressed={statusFilterKey === filter.id}
+                  onClick={() => setStatusFilterKey(filter.id)}
+                >
+                  {filter.label}
+                </FilterToggle>
+              ))}
+            </FilterToggleGroup>
           </div>
 
           {draftsQuery.isError ? (

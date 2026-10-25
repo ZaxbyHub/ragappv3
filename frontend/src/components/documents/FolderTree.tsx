@@ -185,21 +185,25 @@ function FolderNode({
         }`}
         style={{ paddingLeft: depth * 16 }}
       >
-        <button
-          type="button"
-          className="flex h-6 w-6 shrink-0 items-center justify-center text-muted-foreground"
-          onClick={() => hasChildren && toggleExpanded(node.id)}
-          aria-label={hasChildren ? (isOpen ? "Collapse folder" : "Expand folder") : undefined}
-          tabIndex={hasChildren ? 0 : -1}
-        >
-          {hasChildren ? (
-            isOpen ? (
-              <ChevronDown className="h-4 w-4" />
+        {/* #867: leaf folders render a non-interactive spacer — the previous
+            empty, unlabeled chevron <button> (no icon, no aria-label) was a
+            critical axe button-name violation on /documents. */}
+        {hasChildren ? (
+          <button
+            type="button"
+            className="flex h-6 w-6 shrink-0 items-center justify-center text-muted-foreground"
+            onClick={() => toggleExpanded(node.id)}
+            aria-label={isOpen ? "Collapse folder" : "Expand folder"}
+          >
+            {isOpen ? (
+              <ChevronDown className="h-4 w-4" aria-hidden="true" />
             ) : (
-              <ChevronRight className="h-4 w-4" />
-            )
-          ) : null}
-        </button>
+              <ChevronRight className="h-4 w-4" aria-hidden="true" />
+            )}
+          </button>
+        ) : (
+          <span className="flex h-6 w-6 shrink-0" aria-hidden="true" />
+        )}
         <button
           type="button"
           className="flex min-w-0 flex-1 items-center gap-2 py-1.5 text-left text-sm"

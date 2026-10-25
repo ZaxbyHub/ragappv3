@@ -226,7 +226,10 @@ jobs:
         # --retries=1 rides out single-row flakes (config-level retries is 0);
         # --max-failures=20 stops a wholesale break early so failure artifacts
         # still upload inside the job budget (issue #778 review F-13).
-        run: npx playwright test --reporter=line a11y-matrix.spec.ts --retries=1 --max-failures=20
+        # a11y-rearm-865-868.spec.ts is the focused re-arm probe suite for the
+        # #865-#868 rule families (dangling aria-controls, nested interactive
+        # cards, unnamed controls, native list semantics).
+        run: npx playwright test --reporter=line a11y-matrix.spec.ts a11y-rearm-865-868.spec.ts --retries=1 --max-failures=20
 
       - name: Upload a11y failure artifacts
         if: failure()

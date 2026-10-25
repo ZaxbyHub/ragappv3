@@ -311,7 +311,7 @@ describe("SessionRail ADVERSARIAL TESTS", () => {
       const sessionItem = await screen.findByRole("button", { name: /chat session/i });
       fireEvent.mouseEnter(sessionItem);
       // Pin/rename/delete now live in a dropdown opened by the "More options" button.
-      fireEvent.click(within(sessionItem).getByLabelText("More options"));
+      fireEvent.click(within(sessionItem.closest('[role="listitem"]') as HTMLElement).getByLabelText("More options"));
       fireEvent.click(await screen.findByLabelText("Delete session"));
 
       // With the toast-undo flow, clicking delete immediately removes the session (optimistic removal)
@@ -356,7 +356,7 @@ describe("SessionRail ADVERSARIAL TESTS", () => {
       // Pin now lives in the "More options" dropdown, which closes on select.
       // Reopen the menu and click "Pin session" 10 times to exercise rapid toggling.
       for (let i = 0; i < 10; i++) {
-        fireEvent.click(within(sessionItem).getByLabelText("More options"));
+        fireEvent.click(within(sessionItem.closest('[role="listitem"]') as HTMLElement).getByLabelText("More options"));
         const pinItem = await screen.findByLabelText("Pin session");
         fireEvent.click(pinItem);
       }
@@ -398,7 +398,7 @@ describe("SessionRail ADVERSARIAL TESTS", () => {
       const sessionElement = screen.getByRole("button", { name: /chat session/i });
       fireEvent.mouseEnter(sessionElement);
       // Rename now lives in the "More options" dropdown.
-      fireEvent.click(within(sessionElement).getByLabelText("More options"));
+      fireEvent.click(within(sessionElement.closest('[role="listitem"]') as HTMLElement).getByLabelText("More options"));
       fireEvent.click(await screen.findByLabelText("Rename session"));
 
       // useDebounce is mocked to return immediately, so no timer is needed
@@ -443,7 +443,7 @@ describe("SessionRail ADVERSARIAL TESTS", () => {
 
       const sessionElement = screen.getByRole("button", { name: /chat session/i });
       fireEvent.mouseEnter(sessionElement);
-      fireEvent.click(within(sessionElement).getByLabelText("More options"));
+      fireEvent.click(within(sessionElement.closest('[role="listitem"]') as HTMLElement).getByLabelText("More options"));
       fireEvent.click(await screen.findByLabelText("Rename session"));
 
       const input = screen.getByLabelText("Edit session title");
@@ -553,7 +553,7 @@ describe("SessionRail ADVERSARIAL TESTS", () => {
       const sessionElement = screen.getByRole("button", { name: /chat session/i });
       fireEvent.mouseEnter(sessionElement);
       // Rename now lives in the "More options" dropdown.
-      fireEvent.click(within(sessionElement).getByLabelText("More options"));
+      fireEvent.click(within(sessionElement.closest('[role="listitem"]') as HTMLElement).getByLabelText("More options"));
       fireEvent.click(await screen.findByLabelText("Rename session"));
 
       // useDebounce is mocked to return immediately, so no timer advancement needed
@@ -783,7 +783,7 @@ describe("SessionRail ADVERSARIAL TESTS", () => {
 
       // Delete session 1 - with the toast-undo flow, clicking delete immediately
       // removes the session optimistically (no confirmation dialog).
-      const session1 = screen.getByText("Session 1").closest('[role="button"]');
+      const session1 = screen.getByText("Session 1").closest('[role="listitem"]');
       fireEvent.mouseEnter(session1!);
       // Delete now lives in the "More options" dropdown. Scope to session1's row
       // since every session renders its own (inline-mocked) delete item.
@@ -795,9 +795,10 @@ describe("SessionRail ADVERSARIAL TESTS", () => {
         expect(screen.queryByText("Session 1")).not.toBeInTheDocument();
       });
 
-      // Click session 2 while delete API call is still pending
-      const session2 = screen.getByText("Session 2").closest('[role="button"]');
-      fireEvent.click(session2!);
+      // Click session 2 while delete API call is still pending. #866: the
+      // row's activation lives on its title button, not the listitem row.
+      const session2 = screen.getByText("Session 2").closest('[role="listitem"]');
+      fireEvent.click(within(session2! as HTMLElement).getByRole("button", { name: /chat session: session 2/i }));
 
       expect(mockSetActiveSessionId).toHaveBeenCalledWith("2");
     });
@@ -908,7 +909,7 @@ describe("SessionRail ADVERSARIAL TESTS", () => {
       const sessionElement = screen.getByRole("button", { name: /chat session/i });
       fireEvent.mouseEnter(sessionElement);
       // Rename now lives in the "More options" dropdown.
-      fireEvent.click(within(sessionElement).getByLabelText("More options"));
+      fireEvent.click(within(sessionElement.closest('[role="listitem"]') as HTMLElement).getByLabelText("More options"));
       fireEvent.click(await screen.findByLabelText("Rename session"));
 
       // useDebounce is mocked to return immediately, so no timer advancement needed
@@ -1004,7 +1005,7 @@ describe("SessionRail ADVERSARIAL TESTS", () => {
         expect(screen.getByText("Active Session")).toBeInTheDocument();
       });
 
-      const row = screen.getByText("Active Session").closest('[role="button"]');
+      const row = screen.getByText("Active Session").closest('[role="listitem"]');
       fireEvent.mouseEnter(row!);
       fireEvent.click(within(row! as HTMLElement).getByLabelText("More options"));
       fireEvent.click(within(row! as HTMLElement).getByLabelText("Delete session"));
@@ -1048,7 +1049,7 @@ describe("SessionRail ADVERSARIAL TESTS", () => {
 
       // Initial roving index is 0 — the first row is the tabbable one.
       const tabbable = Array.from(rows).filter(
-        (r) => (r.firstElementChild as HTMLElement)?.tabIndex === 0
+        (r) => (r.querySelector('button') as HTMLElement)?.tabIndex === 0
       );
       expect(tabbable).toHaveLength(1);
       expect(tabbable[0]).toBe(rows[0]);

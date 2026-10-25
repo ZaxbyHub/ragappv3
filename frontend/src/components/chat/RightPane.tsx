@@ -929,19 +929,25 @@ export function RightPane() {
             <div className="flex h-full flex-col min-h-0 gap-4">
               <div className="flex-1 min-h-0">
                 {shouldVirtualizeSources ? (
+                  // #868: the sizing div carries the list role — its DIRECT
+                  // children are the per-item wrappers, so the ownership
+                  // chain stays intact (each wrapper is a listitem).
                   <div
                     ref={sourcesScrollRef}
                     className="h-full overflow-y-auto w-full min-w-[320px]"
-                    aria-label="Sources list"
-                    role="list"
                   >
-                    <div style={{ height: sourcesVirtualizer.getTotalSize(), position: 'relative' }}>
+                    <div
+                      style={{ height: sourcesVirtualizer.getTotalSize(), position: 'relative' }}
+                      role="list"
+                      aria-label="Sources list"
+                    >
                       {sourcesVirtualizer.getVirtualItems().map((virtualItem) => {
                         const source = sources[virtualItem.index];
                         return (
                           <div
                             key={source.id}
                             data-index={virtualItem.index}
+                            role="listitem"
                             ref={sourcesVirtualizer.measureElement}
                             style={{
                               position: 'absolute',
@@ -965,16 +971,20 @@ export function RightPane() {
                   </div>
                 ) : (
                   <ScrollArea className="h-full min-w-[320px]">
-                    <div className="space-y-2">
+                    {/* #868: explicit list semantics on the non-virtualized
+                        Sources variant — each SourceListItem (a native
+                        button) sits in a listitem wrapper. */}
+                    <div className="space-y-2" role="list" aria-label="Sources list">
                       {sources.map((source, index) => (
-                        <SourceListItem
-                          key={source.id}
-                          source={source}
-                          index={index}
-                          isSelected={selectedSource?.id === source.id || selectedEvidenceSource?.id === source.id}
-                          scoreType={source.score_type}
-                          onClick={() => handleSourceClick(source)}
-                        />
+                        <div role="listitem" key={source.id}>
+                          <SourceListItem
+                            source={source}
+                            index={index}
+                            isSelected={selectedSource?.id === source.id || selectedEvidenceSource?.id === source.id}
+                            scoreType={source.score_type}
+                            onClick={() => handleSourceClick(source)}
+                          />
+                        </div>
                       ))}
                     </div>
                   </ScrollArea>
@@ -985,16 +995,18 @@ export function RightPane() {
                   <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">
                     Retrieved — not yet cited
                   </h3>
-                  <div className="space-y-2">
+                  {/* #868: same list semantics for the candidates block. */}
+                  <div className="space-y-2" role="list" aria-label="Retrieved — not yet cited">
                     {candidateSources!.map((source, index) => (
-                      <SourceListItem
-                        key={source.id}
-                        source={source}
-                        index={index}
-                        isSelected={selectedSource?.id === source.id || selectedEvidenceSource?.id === source.id}
-                        scoreType={source.score_type}
-                        onClick={() => handleSourceClick(source)}
-                      />
+                      <div role="listitem" key={source.id}>
+                        <SourceListItem
+                          source={source}
+                          index={index}
+                          isSelected={selectedSource?.id === source.id || selectedEvidenceSource?.id === source.id}
+                          scoreType={source.score_type}
+                          onClick={() => handleSourceClick(source)}
+                        />
+                      </div>
                     ))}
                   </div>
                 </div>

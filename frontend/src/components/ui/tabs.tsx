@@ -55,8 +55,18 @@ const TabsContent = React.forwardRef<
 >(({ className, ...props }, ref) => (
   <TabsPrimitive.Content
     ref={ref}
+    // #865: Radix unmounts inactive panels by default, which leaves every
+    // inactive trigger's aria-controls pointing at a non-existent id (axe
+    // aria-valid-attr-value, critical). forceMount keeps all panels in the
+    // DOM so the ids resolve; the data-[state=inactive]:hidden class below
+    // keeps inactive panels out of layout, the tab order, and the
+    // accessibility tree (display: none) — the a11y gate's offender probe
+    // skips display: none elements too. Note: force-mounted panels mount
+    // their children eagerly, so tab-panel effects (data fetches) run at
+    // page load rather than on first activation.
+    forceMount
     className={cn(
-      "mt-2 ring-offset-background focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
+      "mt-2 ring-offset-background focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 data-[state=inactive]:hidden",
       className
     )}
     {...props}

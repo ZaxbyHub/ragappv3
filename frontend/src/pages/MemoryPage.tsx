@@ -207,7 +207,7 @@ function MemoryPageContent({ activeVaultId }: { activeVaultId: number }) {
             onKeyDown={(e) => e.key === "Enter" && handleSearch()}
           />
         </div>
-        <Button variant="outline" size="icon" onClick={handleSearch} disabled={loading}>
+        <Button variant="outline" size="icon" onClick={handleSearch} disabled={loading} aria-label="Search memories">
           {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />}
         </Button>
         <Badge variant="secondary">{memories?.length || 0} {searchQuery ? "results" : "memories"}</Badge>

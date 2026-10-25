@@ -544,25 +544,16 @@ async function runAxe(page: Page): Promise<AxeViolation[]> {
     if (!win.axe) {
       throw new Error("window.axe is missing — axe.min.js injection failed");
     }
-    // Amendment 5 (AC_CHANGED_BY_USER, user-sanctioned 2026-10-09): the axe
-    // gate enforces the full default rule set EXCEPT four rule families the
-    // user moved to numbered follow-up issues (Radix Tabs dangling
-    // aria-controls on unmounted panels; clickable-card nested interactive
-    // content; remaining unnamed controls; chat empty-state list semantics).
-    // color-contrast and every other serious/critical rule stay enforced —
-    // at full matrix run 2 those other rules found only the four tracked-out
-    // classes after the body base-coat fix.
-    const results = await win.axe.run({
-      rules: {
-        // Each disabled family is owned by an open follow-up issue whose AC1
-        // re-enables it (issue #778 review F-05 — keep the refs beside the
-        // rules so the waiver never outlives its issues).
-        "aria-valid-attr-value": { enabled: false }, // #865
-        "nested-interactive": { enabled: false }, // #866
-        "button-name": { enabled: false }, // #867
-        "aria-required-children": { enabled: false }, // #868
-      },
-    });
+    // Re-arm (issues #865/#866/#867/#868, closed by the rearm PR): the axe
+    // gate enforces the FULL default rule set again. The amendment-5 waiver
+    // (aria-valid-attr-value, nested-interactive, button-name,
+    // aria-required-children disabled 2026-10-09 pending those four issues)
+    // is gone — the underlying violations were fixed at their sources
+    // (filter bars converted to toggle groups; tab panels force-mounted;
+    // clickable cards de-buttoned; unnamed controls labeled; list semantics
+    // made native). scripts/check_l07_a11y_gate_wired.py now enforces that
+    // NO axe rule is disabled here.
+    const results = await win.axe.run();
     return results.violations
       .filter((v) => v.impact === "serious" || v.impact === "critical")
       .map((v) => ({

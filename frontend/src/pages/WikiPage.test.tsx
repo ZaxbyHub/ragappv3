@@ -42,28 +42,6 @@ vi.mock("sonner", () => ({
   toast: { success: vi.fn(), error: vi.fn(), info: vi.fn() },
 }));
 
-// Radix Tabs cannot be activated via fireEvent.click in jsdom (pointer-capture /
-// activation semantics). Mock the primitive so TabsTrigger is a plain button that
-// invokes onValueChange — same approach the repo uses for ui/tabs and ui/select.
-// This lets us drive the page-type tabs that live in WikiPage's toolbar.
-vi.mock("@/components/ui/tabs", async () => {
-  const ReactMod = await import("react");
-  const Ctx = ReactMod.createContext<(v: string) => void>(() => {});
-  return {
-    Tabs: ({ onValueChange, children }: any) =>
-      ReactMod.createElement(Ctx.Provider, { value: onValueChange }, children),
-    TabsList: ({ children }: any) => ReactMod.createElement("div", null, children),
-    TabsTrigger: ({ value, children }: any) => {
-      const onValueChange = ReactMod.useContext(Ctx);
-      return ReactMod.createElement(
-        "button",
-        { role: "tab", onClick: () => onValueChange(value) },
-        children
-      );
-    },
-  };
-});
-
 // Mock child wiki page components to isolate the parent
 vi.mock("@/pages/WikiPageList", () => ({
   WikiPageList: ({ onSelect }: { onSelect?: (pageId: number) => void }) => (
@@ -366,7 +344,9 @@ describe("WikiPage", () => {
     it("changing the page-type tab calls listWikiPages with the page_type", async () => {
       render(<WikiPage />);
       (listWikiPages as ReturnType<typeof vi.fn>).mockClear();
-      fireEvent.click(screen.getByRole("tab", { name: "Entities" }));
+      // #865: the page-type filter is a plain aria-pressed toggle button now —
+// no Radix Tabs mock needed to drive it.
+    fireEvent.click(screen.getByRole("button", { name: "Entities" }));
       await waitFor(() => {
         expect(listWikiPages).toHaveBeenCalledWith({
           vault_id: 1,
