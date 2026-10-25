@@ -303,6 +303,33 @@ class GroupsPerPageBounds(_SiblingBase):
         self.assertLessEqual(body["per_page"], 1000)
 
 
+class VaultListTruncationSignal(_SiblingBase):
+    """Above the 1000-row cap, `truncated` must be True and `total` exact.
+
+    Closes the C6 partial-fix hole found in implementation review (4.5 R1):
+    the frozen C6 check's OR-chain and the hardening file's below-cap pin
+    both stay green under a constant-``truncated=False`` implementation;
+    this leg is the pin that goes RED for it.
+    """
+
+    def test_above_cap_truncated_is_true_and_total_exact(self):
+        conn = self._conn()
+        conn.executemany(
+            "INSERT INTO vaults (name, description) VALUES (?, 'd')",
+            [("bulk-vault-%04d" % i,) for i in range(1001)],
+        )
+        conn.commit()
+        self._release(conn)
+        r = self.client.get("/api/vaults")
+        self.assertEqual(r.status_code, 200, r.text[:200])
+        body = r.json()
+        self.assertEqual(body["total"], 1001)
+        self.assertTrue(body["truncated"] is True, body.get("truncated"))
+        self.assertEqual(len(body["vaults"]), 1000)
+        # Consistency invariant in both directions.
+        self.assertEqual(body["truncated"], body["total"] > len(body["vaults"]))
+
+
 class AllowLocalServicesPrecedence(_SiblingBase):
     def _opt_in(self):
         from app.services.ssrf import _local_services_opt_in_enabled

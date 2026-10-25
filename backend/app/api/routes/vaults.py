@@ -590,11 +590,16 @@ async def create_vault(
     try:
         await asyncio.to_thread(conn.commit)
     except Exception:
+        logger.exception("Failed to commit vault creation")
         try:
             await asyncio.to_thread(conn.rollback)
-        except Exception:
-            pass
-        logger.exception("Failed to commit vault creation")
+        except Exception as rollback_error:
+            # Logged, never swallowed silently (a bare except-pass here would
+            # add a new B110 to the SAST baseline — review finding, 4.5 R1).
+            logger.warning(
+                "Rollback after failed vault-creation commit also failed: %s",
+                rollback_error,
+            )
         raise HTTPException(status_code=500, detail="Failed to create vault")
 
     vault = await _fetch_vault_with_counts(conn, vault_id, user)
