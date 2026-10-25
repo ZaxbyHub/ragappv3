@@ -6,7 +6,7 @@ import logging
 import math
 import warnings
 from pathlib import Path
-from typing import Annotated, Mapping, Optional, Literal, Union
+from typing import Annotated, Literal, Mapping, Optional, Union
 
 from pydantic import Field, PrivateAttr, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict

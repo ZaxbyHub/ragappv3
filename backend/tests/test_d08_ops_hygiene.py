@@ -27,6 +27,8 @@ from app.api.routes.auth import router as auth_router
 from app.api.routes.groups import router as groups_router
 from app.api.routes.vault_members import (
     group_access_router,
+)
+from app.api.routes.vault_members import (
     router as vault_members_router,
 )
 from app.security import csrf_protect

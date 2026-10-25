@@ -29,10 +29,10 @@ if _TESTS_DIR not in sys.path:
 
 from test_d07_absent_vs_empty import _D07Harness, _FailingExecuteProxy
 from test_d08_ops_hygiene import (
-    _RaceConnection,
     _build_db_fixture,
     _exec,
     _patch_settings,
+    _RaceConnection,
     _seed_users,
     _superadmin_token,
     _teardown_db,
@@ -42,6 +42,8 @@ from app.api.routes.auth import router as auth_router
 from app.api.routes.groups import router as groups_router
 from app.api.routes.vault_members import (
     group_access_router,
+)
+from app.api.routes.vault_members import (
     router as vault_members_router,
 )
 from app.main import app

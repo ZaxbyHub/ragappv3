@@ -16,10 +16,10 @@ import unittest
 
 from fastapi.testclient import TestClient
 
+from app.api.deps import get_current_active_user, get_db
 from app.config import settings
 from app.main import app
-from app.api.deps import get_db, get_current_active_user
-from app.models.database import init_db, _pool_cache, SQLiteConnectionPool
+from app.models.database import SQLiteConnectionPool, _pool_cache, init_db
 from app.security import csrf_protect
 
 
