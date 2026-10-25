@@ -18,11 +18,18 @@ sibling of the assistant-arm blank guard shipped by #928 (PR #988):
   whitespace passed the ``if not prior_user`` guard, so the LLM was
   called anchored on blank content.
 
-AC3 (PRESERVING) — real user turns keep the current scan semantics
-(follow-up-phrase skipping, ``is_followup_query`` gating, assistant-turn
-emptiness skipping, whitespace-only-response ``None``) — is pinned by the
-existing suites: ``test_c16_followup_prior_turns.py``,
-``test_sibling_service_xml_escape.py``, ``test_c16b_cache_shape_guards.py``.
+The exact-empty-string (``""``) newest user turn is pinned alongside
+AC1: it takes the same ``not content.strip()`` skip branch, and the
+pre-fix base differed there too — ``""`` bound ``prior_user`` falsy, so
+the ``if not prior_user`` rescue returned ``None`` with zero LLM calls
+instead of anchoring the older question.
+
+AC3 (PRESERVING) — real user turns keep the current scan semantics — is
+pinned by the existing suite ``test_c16_followup_prior_turns.py``: C12
+(empty newest assistant turn skipped in favor of the older real answer),
+C13 (whitespace-only LLM rewrite response returns ``None``), and C14
+(follow-up-phrase skipping so the scan anchors on the prior-user
+question even with an empty assistant turn).
 """
 
 from unittest.mock import AsyncMock, MagicMock
@@ -110,3 +117,36 @@ async def test_blank_only_user_history_returns_none_without_llm_call(
         "no LLM call may be issued when there is no non-blank user turn "
         "to anchor the rewrite on"
     )
+
+
+@pytest.mark.asyncio
+async def test_exact_empty_string_newest_user_turn_falls_back_to_older_question(
+    followup_settings,
+):
+    """AC1 edge: an exactly-empty (``""``) newest user turn takes the same
+    blank-skip branch — the rewrite anchors on the older question. The
+    pre-fix base returned ``None`` with zero LLM calls here (falsy
+    ``prior_user`` tripped the ``if not prior_user`` rescue)."""
+    history = [
+        {"role": "user", "content": Q1},
+        {"role": "assistant", "content": A1},
+        {"role": "user", "content": ""},
+    ]
+    llm = _make_llm(REWRITE)
+    transformer = QueryTransformer(llm)
+
+    result = await transformer.rewrite_followup(query=FOLLOWUP, chat_history=history)
+
+    assert llm.chat_completion.call_count == 1, (
+        "an exact-empty-string newest user turn must be skipped so the "
+        "rewrite LLM call still happens anchored on the older question "
+        "(the pre-fix base returned None with zero LLM calls)"
+    )
+    messages = llm.chat_completion.call_args.kwargs["messages"]
+    user_prompt = messages[1]["content"]
+
+    assert "enterprise pricing tier" in user_prompt, (
+        "the sent user prompt must anchor on the older non-blank user "
+        "question; an exact-empty-string newest user turn must not shadow it"
+    )
+    assert result is not None, "the rewrite itself must succeed"
