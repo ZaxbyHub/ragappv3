@@ -730,11 +730,17 @@ class TestOversizedParameters:
             headers={"Authorization": f"Bearer {token}"},
         )
 
-        # Should return 200 with empty list, not crash
-        assert response.status_code == 200, f"Expected 200, got {response.status_code}"
-        data = response.json()
-        assert data["users"] == []
-        assert data["total"] == 52  # 2 initial + 50 created
+        # list_users caps limit at 1000 (issue #725 AC5): an over-max limit is
+        # rejected 422 rather than honored (the finite cap matches the vault
+        # list cap and keeps client requests bounded).
+        assert response.status_code == 422, f"Expected 422, got {response.status_code}"
+        # skip stays unbounded above (an empty page is harmless); a sane
+        # in-range call still works and returns an empty page past the end.
+        response2 = self.client.get(
+            "/users/?skip=999999&limit=50", headers={"Authorization": f"Bearer {token}"}
+        )
+        assert response2.status_code == 200
+        assert response2.json()["users"] == []
 
     def test_negative_skip_limit(self):
         """Negative skip/limit - behavior depends on implementation (returns results)."""
@@ -742,13 +748,13 @@ class TestOversizedParameters:
         response = self.client.get(
             "/users/?skip=-1&limit=-1", headers={"Authorization": f"Bearer {token}"}
         )
-        # FastAPI doesn't validate min values by default - negative values pass through
-        # SQLite handles negative OFFSET by interpreting it as 0 (effectively)
-        assert response.status_code == 200, f"Expected 200, got {response.status_code}"
-        data = response.json()
-        # With negative values, SQLite may return all results (depends on implementation)
-        assert "users" in data
-        assert "total" in data
+        # list_users validates skip/limit with Query bounds (issue #725 AC5):
+        # negative values are rejected 422 and never reach SQLite's
+        # negative-LIMIT-as-unbounded / negative-OFFSET-as-0 sentinels.
+        assert response.status_code == 422, f"Expected 422, got {response.status_code}"
+        detail = response.json()["detail"]
+        rejected = {item["loc"][1] for item in detail}
+        assert rejected == {"skip", "limit"}, detail
 
     def test_zero_limit(self):
         """Zero limit should return empty list, not crash."""

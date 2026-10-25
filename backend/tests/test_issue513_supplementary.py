@@ -974,23 +974,30 @@ async def test_vault_deletion_clears_document_near_dups_rows(
     db = sqlite3.connect(db_path, check_same_thread=False)
     db.row_factory = sqlite3.Row
     try:
-        # Vault id=1 ("Default") is seeded by the migrations themselves, and
-        # _new_db already inserted a files row (id=1, vault_id=1) for it.
+        # Vault id=1 is the migrations-seeded "Default" vault, which delete_
+        # vault now refuses by design (issue #725: the name-keyed default
+        # vault must not be deletable). Seed a second, deletable vault and
+        # target THAT — the near-dups purge is the behavior under test.
+        target_vault_id = db.execute(
+            "INSERT INTO vaults (name, description) VALUES ('near-dups-probe', 'd')"
+        ).lastrowid
         db.execute(
             "INSERT INTO files (vault_id, file_path, file_name, file_hash, file_size, status) "
-            "VALUES (1, '/tmp/y.txt', 'y.txt', 'hy', 1, 'indexed')"
+            "VALUES (?, '/tmp/y.txt', 'y.txt', 'hy', 1, 'indexed')",
+            (target_vault_id,),
         )
         for file_id in (1, 2):
             db.execute(
                 "INSERT INTO document_near_dups "
                 "(vault_id, file_id, centroid, dim, group_id, similarity) "
-                "VALUES (1, ?, ?, 4, 'shared-group', 0.99)",
-                (file_id, bytes([file_id]) * 16),
+                "VALUES (?, ?, ?, 4, 'shared-group', 0.99)",
+                (target_vault_id, file_id, bytes([file_id]) * 16),
             )
         db.commit()
 
         assert db.execute(
-            "SELECT COUNT(*) FROM document_near_dups WHERE vault_id = 1"
+            "SELECT COUNT(*) FROM document_near_dups WHERE vault_id = ?",
+            (target_vault_id,),
         ).fetchone()[0] == 2
 
         class _NullVectorStore:
@@ -999,7 +1006,7 @@ async def test_vault_deletion_clears_document_near_dups_rows(
 
         result = await delete_vault(
             http_request=None,  # audit-event param (issue #722 AC1); None is safe for safe_record_security_event
-            vault_id=1,
+            vault_id=target_vault_id,
             conn=db,
             vector_store=_NullVectorStore(),
             user={"id": 1, "role": "admin"},
@@ -1010,14 +1017,19 @@ async def test_vault_deletion_clears_document_near_dups_rows(
         # The purge: 2 rows before, 0 after — in the same transaction as
         # the files/vault cascade, which completed too.
         assert db.execute(
-            "SELECT COUNT(*) FROM document_near_dups WHERE vault_id = 1"
+            "SELECT COUNT(*) FROM document_near_dups WHERE vault_id = ?",
+            (target_vault_id,),
         ).fetchone()[0] == 0
         assert db.execute(
-            "SELECT COUNT(*) FROM files WHERE vault_id = 1"
+            "SELECT COUNT(*) FROM files WHERE vault_id = ?", (target_vault_id,)
         ).fetchone()[0] == 0
+        assert db.execute(
+            "SELECT COUNT(*) FROM vaults WHERE id = ?", (target_vault_id,)
+        ).fetchone()[0] == 0
+        # The seeded default vault survives (issue #725: undeletable by design).
         assert db.execute(
             "SELECT COUNT(*) FROM vaults WHERE id = 1"
-        ).fetchone()[0] == 0
+        ).fetchone()[0] == 1
     finally:
         db.close()
 
