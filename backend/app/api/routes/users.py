@@ -6,8 +6,8 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, HTTPException, Request, Query
+from pydantic import BaseModel, Field, field_validator
 
 from app.api.deps import (
     assign_user_to_default_vault,
@@ -98,10 +98,27 @@ class UpdateActiveRequest(BaseModel):
     is_active: bool = Field(...)
 
 
+def _validate_username_after_strip(v: Optional[str]) -> Optional[str]:
+    """Reject usernames shorter than 3 characters AFTER stripping.
+
+    Validation-only: the stored value is never rewritten (issue #725,
+    T1-21-KR-12 — the raw min_length=3 floor left whitespace-padded short
+    names accepted). Shared by admin create and update so both ends of the
+    contract are identical.
+    """
+    if v is None:
+        return v
+    if len(v.strip()) < 3:
+        raise ValueError("username must be at least 3 characters (after trimming whitespace)")
+    return v
+
+
 class UpdateUserRequest(BaseModel):
     username: Optional[str] = Field(default=None, min_length=3, max_length=255)
     full_name: Optional[str] = Field(default=None, max_length=255)
     role: Optional[str] = Field(default=None)
+
+    _strip_check = field_validator("username")(_validate_username_after_strip)
 
 
 class AdminResetPasswordRequest(BaseModel):
@@ -117,6 +134,8 @@ class CreateUserRequest(BaseModel):
     password: str = Field(..., min_length=8, max_length=128)
     full_name: str = Field(default="", max_length=255)
     role: str = Field(default="member")
+
+    _strip_check = field_validator("username")(_validate_username_after_strip)
 
 
 class OrgMembershipItem(BaseModel):
@@ -134,6 +153,14 @@ class UserOrgsUpdateRequest(BaseModel):
     memberships: Optional[List[OrgMembershipItem]] = None
     org_ids: Optional[List[int]] = None
     role: str = Field(default="member")
+
+    def any_field_set(self) -> bool:
+        """True when at least one replace-set field was explicitly provided.
+
+        Omitted/null fields are rejected upstream (422) so an empty-body PUT
+        can never clear all memberships (issue #725, T1-21-KR-11).
+        """
+        return self.memberships is not None or self.org_ids is not None
 
     def resolved_memberships(self) -> List[OrgMembershipItem]:
         """Return canonical per-org membership list."""
@@ -243,8 +270,10 @@ async def create_user(
 @router.get("", include_in_schema=False)
 @router.get("/")
 async def list_users(
-    skip: int = 0,
-    limit: int = 100,
+    skip: int = Query(0, ge=0, description="Rows to skip (non-negative)"),
+    limit: int = Query(
+        100, ge=1, le=1000, description="Rows to return (1-1000; matches the vault-list cap)"
+    ),
     q: str | None = None,
     user: dict = Depends(require_role("admin")),
 ):
@@ -456,6 +485,10 @@ async def update_user(
     # Fetch updated user
     cursor = await asyncio.to_thread(db.execute, "SELECT id, username, full_name, role, is_active, created_at FROM users WHERE id = ?", (user_id,))
     row = await asyncio.to_thread(cursor.fetchone)
+    if row is None:
+        # Post-commit re-read guard: a concurrent delete must answer 404, not
+        # an untyped TypeError 500 (issue #726 census, T1-01-S2-08 class).
+        raise HTTPException(status_code=404, detail=f"User with id {user_id} not found")
 
     return {
         "id": row[0],
@@ -915,6 +948,18 @@ async def update_user_organizations(
     AC5). Dropped organizations' group memberships are revoked in the same
     transaction.
     """
+    # Omitted (or null) list fields are NOT an explicit clear: reject with 422
+    # before any DELETE runs (issue #725, T1-21-KR-11). An explicit empty list
+    # is the only way to clear all memberships.
+    if not body.any_field_set():
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Provide at least one of 'memberships' or 'org_ids' "
+                "(an explicit empty list clears all organization memberships)"
+            ),
+        )
+
     pool = get_pool(str(settings.sqlite_path))
     conn = await pool.get_connection_async()
 
@@ -1283,8 +1328,15 @@ async def update_user_groups(
                 (user_id, *caller_orgs),
             )
 
-        # Insert new memberships
+        # Insert new memberships; dedupe by group id first: group_members has
+        # UNIQUE(group_id, user_id) and a duplicate id in one body would 500
+        # on the second insert (issue #725, S02-SK-03; groups.py dedupes the
+        # same way).
+        seen_group_ids = set()
         for group_id in body.group_ids:
+            if group_id in seen_group_ids:
+                continue
+            seen_group_ids.add(group_id)
             cursor.execute(
                 "INSERT INTO group_members (group_id, user_id) VALUES (?, ?)",
                 (group_id, user_id),
