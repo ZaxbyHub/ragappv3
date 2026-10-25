@@ -10,11 +10,12 @@ set, so the matrix (23 routes × 320×568/640×360 × light/dark) now enforces:
   trigger-only **filter bars** (Wiki page-type filter, Draft Room status
   filter) that rendered no panels at all; they are now `role="group"`
   toggle-button groups (`aria-pressed`, each filter its own tab stop — filters
-  that re-filter one list are not tabs per the ARIA Practices). The shared
-  `TabsContent` wrapper now `forceMount`s panels with
-  `data-[state=inactive]:hidden`, so every real tab set (Settings, Canvas,
-  RightPane, DraftWorkspace, DraftInspector) keeps its inactive panels in the
-  DOM — every trigger's `aria-controls` resolves.
+  that re-filter one list are not tabs per the ARIA Practices). For real tab
+  sets, Radix keeps an empty panel shell mounted but unmounts the panel's
+  CONTENT on inactive tabs; the shared `TabsContent` wrapper now `forceMount`s
+  panels with `data-[state=inactive]:hidden`, keeping every panel's content in
+  the DOM (Settings, Canvas, RightPane, DraftWorkspace, DraftInspector) —
+  every trigger's `aria-controls` resolves to a mounted, populated panel.
 - **#866 — `nested-interactive` (serious)**: clickable-card containers that
   nested interactive controls are gone. Wiki page cards: the open action
   moved to the title button, the per-row checkbox keeps its own control.

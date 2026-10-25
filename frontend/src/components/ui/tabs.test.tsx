@@ -5,7 +5,7 @@
 // layout, the tab order, and the accessibility tree in a real browser.
 
 import { describe, it, expect } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "./tabs";
 
 describe("ui/tabs forceMount wrapper (#865)", () => {
@@ -40,5 +40,10 @@ describe("ui/tabs forceMount wrapper (#865)", () => {
     expect(betaPanel.getAttribute("data-state")).toBe("inactive");
     expect(betaPanel.className).toContain("data-[state=inactive]:hidden");
     expect(betaPanel.getAttribute("role")).toBe("tabpanel");
+    // Content presence is the forceMount discriminator: Radix Presence keeps
+    // an empty shell mounted for render-prop children, so id/class/role
+    // assertions alone survive deletion of the forceMount prop — the panel's
+    // CHILDREN are what forceMount keeps alive.
+    expect(within(betaPanel).getByText("beta panel")).toBeInTheDocument();
   });
 });

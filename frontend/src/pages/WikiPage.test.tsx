@@ -344,8 +344,8 @@ describe("WikiPage", () => {
     it("changing the page-type tab calls listWikiPages with the page_type", async () => {
       render(<WikiPage />);
       (listWikiPages as ReturnType<typeof vi.fn>).mockClear();
-      // #865: the page-type filter is a plain aria-pressed toggle button now —
-// no Radix Tabs mock needed to drive it.
+          // #865: the page-type filter is a plain aria-pressed toggle button now —
+    // no Radix Tabs mock needed to drive it.
     fireEvent.click(screen.getByRole("button", { name: "Entities" }));
       await waitFor(() => {
         expect(listWikiPages).toHaveBeenCalledWith({
