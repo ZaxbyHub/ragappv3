@@ -1056,7 +1056,7 @@ def _escape_like_term(term: str) -> str:
 
     ``\\``, ``%`` and ``_`` become literal characters instead of wildcards.
     Every LIKE clause that binds the returned value must carry
-    ``ESCAPE '\\\\'`` — the same recipe as the unified-search chat-title arm
+    ``ESCAPE '\\'`` — the same recipe as the unified-search chat-title arm
     (issue #718 AC6) and the existing users/groups/search routes.
     """
     return (
@@ -1072,8 +1072,12 @@ async def list_documents(
     vault_id: Optional[int] = Query(None, description="Filter by vault ID"),
     page: int = Query(1, ge=1, description="Page number (1-indexed)"),
     per_page: int = Query(50, ge=1, le=1000, description="Items per page"),
+    # Cap mirrors /search's q: the escaped LIKE pattern roughly doubles
+    # special-dense terms, and past ~50k pattern chars SQLite raises
+    # "LIKE or GLOB pattern too complex" → uncaught 500.
     search: Optional[str] = Query(
         None,
+        max_length=200,
         description="Filter by document name or metadata fields (case-insensitive substring)",
     ),
     status: Optional[str] = Query(None, description="Filter by processing status"),

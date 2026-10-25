@@ -20,6 +20,14 @@
   (`backend/app/api/routes/search.py`) and the pre-existing escaped LIKEs in
   `backend/app/api/routes/users.py` and `backend/app/api/routes/groups.py`,
   so every user-search LIKE in the repo now uses the same pattern.
+- The unified search route's document arm (`GET /api/search/unified`,
+  `types=document`) inherits the same wildcard→literal behavior: it reuses
+  `search_documents` verbatim, so its filename matching changes with it.
+- `list_documents`' `search` query param is now capped at 200 characters
+  (`max_length=200`, mirroring `q` on `/documents/search`), because the
+  escaped pattern roughly doubles special-dense terms and SQLite raises
+  "LIKE or GLOB pattern too complex" past ~50k pattern chars (an uncaught
+  500 otherwise).
 
 ### Tests
 
@@ -32,6 +40,14 @@
   plain terms, substring matches, and searches for names that literally
   contain `%`/`_` keep working, and that a bare `q=%` is still rejected
   with 400 (no FTS tokens) on the ranked search.
+- Mutation-verified positive controls (`test_control_*`): a literal
+  underscore/backslash probe must still FIND the literal-named file via
+  each LIKE arm — the global list arm, the ranked filename arm, the
+  count-only re-derive, the helper's backslash-doubling step (a\b.pdf vs
+  the ab.pdf confusable), and the unified route's document arm — so
+  dropping any arm's `ESCAPE` clause (or the doubling step) flips a test
+  to failure instead of silently keeping the suite green. The list
+  route's 200-char `search` cap is pinned by a 422 test.
 
 ## Why
 
@@ -45,11 +61,13 @@ AC6, left out of #718's declared route scope.
 
 ## Migration steps
 
-None. No schema, config, API-shape or dependency changes; responses are
-byte-compatible for every query that does not contain `%`, `_` or `\`.
-Searches that previously over-matched by accident (e.g. `q=%` returning
-everything) now return only literal matches, which is the intended
-behavior.
+- `GET /api/documents` search terms are now capped at 200 characters;
+  longer values return 422, mirroring `/api/documents/search`'s `q` cap.
+  Otherwise: no schema, config, or dependency changes, and responses are
+  byte-compatible for every query that does not contain `%`, `_` or `\`.
+  Searches that previously over-matched by accident (e.g. `q=%` returning
+  everything) now return only literal matches, which is the intended
+  behavior.
 
 ## Known caveats
 
@@ -61,6 +79,8 @@ behavior.
 - A bare `%` on `GET /documents/search` keeps returning 400 ("Query has no
   searchable tokens") because the FTS tokenizer drops punctuation-only
   input; it never reached the LIKE arm before or after this change.
-- The escape character is `\`, matching the rest of the repo; a search term
-  containing a literal backslash is now matched literally instead of
-  erroring/escaping into the following character.
+- The escape character is `\`, matching the rest of the repo. At base
+  (no `ESCAPE` clause) a literal backslash in a search term already
+  matched literally — no error, no escape-into-next-character — and the
+  fix preserves exactly that literal matching now that the clauses
+  declare `ESCAPE '\'`.

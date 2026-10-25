@@ -36,7 +36,7 @@
       "SEVERITY.LOW": 59,
       "SEVERITY.MEDIUM": 60,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 93146,
+      "loc": 93159,
       "nosec": 0,
       "skipped_tests": 70
     },
@@ -127,7 +127,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 14,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 2960,
+      "loc": 2973,
       "nosec": 0,
       "skipped_tests": 4
     },
@@ -2334,7 +2334,7 @@
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "1165             conn.execute,\n1166             f\"SELECT COUNT(*) FROM files WHERE vault_id = ?{_extra_clause()}\",\n1167             (vault_id, *extra_params),\n",
+      "code": "1184             conn.execute,\n1185             f\"SELECT COUNT(*) FROM files WHERE vault_id = ?{_extra_clause()}\",\n1186             (vault_id, *extra_params),\n",
       "col_offset": 12,
       "end_col_offset": 77,
       "filename": "backend/app/api/routes/documents.py",
@@ -2345,16 +2345,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 1166,
+      "line_number": 1185,
       "line_range": [
-        1166
+        1185
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1172             conn.execute,\n1173             f\"\"\"\n1174             SELECT id, file_name, file_path, status, chunk_count, chunks_failed, file_size,\n1175                    created_at, processed_at, error_message, phase, phase_message,\n1176                    progress_percent, processed_units, total_units, unit_label,\n1177                    phase_started_at, processing_started_at, enrichment_status,\n1178                    enrichment_error, enrichment_enabled, vault_id, folder_id,\n1179                    partial_embeddings, extraction_diagnostics,\n1180                    (SELECT COUNT(*) FROM failed_chunks WHERE file_id = files.id) AS failed_chunks,\n1181                    (SELECT COALESCE(json_group_array(chunk_index), '[]')\n1182                     FROM failed_chunks WHERE file_id = files.id) AS failed_chunk_ids\n1183             FROM files\n1184             WHERE vault_id = ?{_extra_clause()}\n1185             {order_clause}\n1186             LIMIT ? OFFSET ?\n1187             \"\"\",\n1188             (vault_id, *extra_params, per_page, offset),\n",
+      "code": "1191             conn.execute,\n1192             f\"\"\"\n1193             SELECT id, file_name, file_path, status, chunk_count, chunks_failed, file_size,\n1194                    created_at, processed_at, error_message, phase, phase_message,\n1195                    progress_percent, processed_units, total_units, unit_label,\n1196                    phase_started_at, processing_started_at, enrichment_status,\n1197                    enrichment_error, enrichment_enabled, vault_id, folder_id,\n1198                    partial_embeddings, extraction_diagnostics,\n1199                    (SELECT COUNT(*) FROM failed_chunks WHERE file_id = files.id) AS failed_chunks,\n1200                    (SELECT COALESCE(json_group_array(chunk_index), '[]')\n1201                     FROM failed_chunks WHERE file_id = files.id) AS failed_chunk_ids\n1202             FROM files\n1203             WHERE vault_id = ?{_extra_clause()}\n1204             {order_clause}\n1205             LIMIT ? OFFSET ?\n1206             \"\"\",\n1207             (vault_id, *extra_params, per_page, offset),\n",
       "col_offset": 12,
       "end_col_offset": 15,
       "filename": "backend/app/api/routes/documents.py",
@@ -2365,30 +2365,30 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 1173,
+      "line_number": 1192,
       "line_range": [
-        1173,
-        1174,
-        1175,
-        1176,
-        1177,
-        1178,
-        1179,
-        1180,
-        1181,
-        1182,
-        1183,
-        1184,
-        1185,
-        1186,
-        1187
+        1192,
+        1193,
+        1194,
+        1195,
+        1196,
+        1197,
+        1198,
+        1199,
+        1200,
+        1201,
+        1202,
+        1203,
+        1204,
+        1205,
+        1206
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1199                 conn.execute,\n1200                 f\"SELECT COUNT(*) FROM files WHERE vault_id IN ({placeholders}){_extra_clause()}\",\n1201                 (*accessible_vaults, *extra_params),\n",
+      "code": "1218                 conn.execute,\n1219                 f\"SELECT COUNT(*) FROM files WHERE vault_id IN ({placeholders}){_extra_clause()}\",\n1220                 (*accessible_vaults, *extra_params),\n",
       "col_offset": 16,
       "end_col_offset": 97,
       "filename": "backend/app/api/routes/documents.py",
@@ -2399,16 +2399,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 1200,
+      "line_number": 1219,
       "line_range": [
-        1200
+        1219
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1206                 conn.execute,\n1207                 f\"\"\"\n1208                 SELECT id, file_name, file_path, status, chunk_count, chunks_failed, file_size,\n1209                        created_at, processed_at, error_message, phase, phase_message,\n1210                        progress_percent, processed_units, total_units, unit_label,\n1211                        phase_started_at, processing_started_at, enrichment_status,\n1212                        enrichment_error, enrichment_enabled, vault_id, folder_id,\n1213                    partial_embeddings, extraction_diagnostics,\n1214                        (SELECT COUNT(*) FROM failed_chunks WHERE file_id = files.id) AS failed_chunks,\n1215                        (SELECT COALESCE(json_group_array(chunk_index), '[]')\n1216                         FROM failed_chunks WHERE file_id = files.id) AS failed_chunk_ids\n1217                 FROM files\n1218                 WHERE vault_id IN ({placeholders}){_extra_clause()}\n1219                 {order_clause}\n1220                 LIMIT ? OFFSET ?\n1221                 \"\"\",\n1222                 (*accessible_vaults, *extra_params, per_page, offset),\n",
+      "code": "1225                 conn.execute,\n1226                 f\"\"\"\n1227                 SELECT id, file_name, file_path, status, chunk_count, chunks_failed, file_size,\n1228                        created_at, processed_at, error_message, phase, phase_message,\n1229                        progress_percent, processed_units, total_units, unit_label,\n1230                        phase_started_at, processing_started_at, enrichment_status,\n1231                        enrichment_error, enrichment_enabled, vault_id, folder_id,\n1232                    partial_embeddings, extraction_diagnostics,\n1233                        (SELECT COUNT(*) FROM failed_chunks WHERE file_id = files.id) AS failed_chunks,\n1234                        (SELECT COALESCE(json_group_array(chunk_index), '[]')\n1235                         FROM failed_chunks WHERE file_id = files.id) AS failed_chunk_ids\n1236                 FROM files\n1237                 WHERE vault_id IN ({placeholders}){_extra_clause()}\n1238                 {order_clause}\n1239                 LIMIT ? OFFSET ?\n1240                 \"\"\",\n1241                 (*accessible_vaults, *extra_params, per_page, offset),\n",
       "col_offset": 16,
       "end_col_offset": 19,
       "filename": "backend/app/api/routes/documents.py",
@@ -2419,30 +2419,30 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 1207,
+      "line_number": 1226,
       "line_range": [
-        1207,
-        1208,
-        1209,
-        1210,
-        1211,
-        1212,
-        1213,
-        1214,
-        1215,
-        1216,
-        1217,
-        1218,
-        1219,
-        1220,
-        1221
+        1226,
+        1227,
+        1228,
+        1229,
+        1230,
+        1231,
+        1232,
+        1233,
+        1234,
+        1235,
+        1236,
+        1237,
+        1238,
+        1239,
+        1240
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1228                 conn.execute,\n1229                 f\"SELECT COUNT(*) FROM files{base_where}\",\n1230                 extra_params,\n",
+      "code": "1247                 conn.execute,\n1248                 f\"SELECT COUNT(*) FROM files{base_where}\",\n1249                 extra_params,\n",
       "col_offset": 16,
       "end_col_offset": 57,
       "filename": "backend/app/api/routes/documents.py",
@@ -2453,16 +2453,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 1229,
+      "line_number": 1248,
       "line_range": [
-        1229
+        1248
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1234                 conn.execute,\n1235                 f\"\"\"\n1236                 SELECT id, file_name, file_path, status, chunk_count, chunks_failed, file_size,\n1237                        created_at, processed_at, error_message, phase, phase_message,\n1238                        progress_percent, processed_units, total_units, unit_label,\n1239                        phase_started_at, processing_started_at, enrichment_status,\n1240                        enrichment_error, enrichment_enabled, vault_id, folder_id,\n1241                    partial_embeddings, extraction_diagnostics,\n1242                        (SELECT COUNT(*) FROM failed_chunks WHERE file_id = files.id) AS failed_chunks,\n1243                        (SELECT COALESCE(json_group_array(chunk_index), '[]')\n1244                         FROM failed_chunks WHERE file_id = files.id) AS failed_chunk_ids\n1245                 FROM files{base_where}\n1246                 {order_clause}\n1247                 LIMIT ? OFFSET ?\n1248                 \"\"\",\n1249                 (*extra_params, per_page, offset),\n",
+      "code": "1253                 conn.execute,\n1254                 f\"\"\"\n1255                 SELECT id, file_name, file_path, status, chunk_count, chunks_failed, file_size,\n1256                        created_at, processed_at, error_message, phase, phase_message,\n1257                        progress_percent, processed_units, total_units, unit_label,\n1258                        phase_started_at, processing_started_at, enrichment_status,\n1259                        enrichment_error, enrichment_enabled, vault_id, folder_id,\n1260                    partial_embeddings, extraction_diagnostics,\n1261                        (SELECT COUNT(*) FROM failed_chunks WHERE file_id = files.id) AS failed_chunks,\n1262                        (SELECT COALESCE(json_group_array(chunk_index), '[]')\n1263                         FROM failed_chunks WHERE file_id = files.id) AS failed_chunk_ids\n1264                 FROM files{base_where}\n1265                 {order_clause}\n1266                 LIMIT ? OFFSET ?\n1267                 \"\"\",\n1268                 (*extra_params, per_page, offset),\n",
       "col_offset": 16,
       "end_col_offset": 19,
       "filename": "backend/app/api/routes/documents.py",
@@ -2473,29 +2473,29 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 1235,
+      "line_number": 1254,
       "line_range": [
-        1235,
-        1236,
-        1237,
-        1238,
-        1239,
-        1240,
-        1241,
-        1242,
-        1243,
-        1244,
-        1245,
-        1246,
-        1247,
-        1248
+        1254,
+        1255,
+        1256,
+        1257,
+        1258,
+        1259,
+        1260,
+        1261,
+        1262,
+        1263,
+        1264,
+        1265,
+        1266,
+        1267
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1392             lease_status_sql = (\n1393                 \"SELECT json_extract(payload_json, '$.trigger_id') AS trigger_id,\"\n1394                 \" status FROM jobs WHERE queue = ? AND\"\n1395                 \" json_extract(payload_json, '$.trigger_id') IN (\"\n1396                 + placeholders\n1397                 + \") ORDER BY id ASC\"\n",
+      "code": "1411             lease_status_sql = (\n1412                 \"SELECT json_extract(payload_json, '$.trigger_id') AS trigger_id,\"\n1413                 \" status FROM jobs WHERE queue = ? AND\"\n1414                 \" json_extract(payload_json, '$.trigger_id') IN (\"\n1415                 + placeholders\n1416                 + \") ORDER BY id ASC\"\n",
       "col_offset": 16,
       "end_col_offset": 66,
       "filename": "backend/app/api/routes/documents.py",
@@ -2506,19 +2506,19 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 1393,
+      "line_number": 1412,
       "line_range": [
-        1393,
-        1394,
-        1395,
-        1396
+        1412,
+        1413,
+        1414,
+        1415
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1477         conn.execute,\n1478         f\"\"\"\n1479         SELECT id, file_name AS filename, vault_id, status, chunk_count, phase,\n1480                progress_percent, wiki_pending, error_message,\n1481                partial_embeddings, extraction_diagnostics\n1482         FROM files WHERE id IN ({placeholders})\n1483         \"\"\",\n1484         tuple(deduped),\n",
+      "code": "1496         conn.execute,\n1497         f\"\"\"\n1498         SELECT id, file_name AS filename, vault_id, status, chunk_count, phase,\n1499                progress_percent, wiki_pending, error_message,\n1500                partial_embeddings, extraction_diagnostics\n1501         FROM files WHERE id IN ({placeholders})\n1502         \"\"\",\n1503         tuple(deduped),\n",
       "col_offset": 8,
       "end_col_offset": 11,
       "filename": "backend/app/api/routes/documents.py",
@@ -2529,21 +2529,21 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 1478,
+      "line_number": 1497,
       "line_range": [
-        1478,
-        1479,
-        1480,
-        1481,
-        1482,
-        1483
+        1497,
+        1498,
+        1499,
+        1500,
+        1501,
+        1502
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "2031 \n2032     ranked_sql = f\"\"\"\n2033     WITH raw_matches AS (\n2034         SELECT f.id, f.file_name, f.vault_id, f.status,\n2035                substr(f.parsed_text, 1, 600) AS parsed_text,\n2036                bm25(files_content_fts) AS rank,\n2037                CASE WHEN length(CAST(f.parsed_text AS BLOB)) <= {int(FTS_SNIPPET_MAX_COLUMN_BYTES)}\n2038                     THEN snippet(files_content_fts, 0, '<mark>', '</mark>', '\u2026',\n2039                                  {_SNIPPET_TOKENS})\n2040                END AS excerpt_raw,\n2041                1 AS type_priority\n2042         FROM files_content_fts\n2043         JOIN files f ON f.id = files_content_fts.rowid\n2044         WHERE files_content_fts MATCH ?\n2045           AND {vault_clause_body}\n2046         UNION ALL\n2047         SELECT f.id, f.file_name, f.vault_id, f.status,\n2048                substr(f.parsed_text, 1, 600) AS parsed_text,\n2049                bm25(files_search_fts) AS rank,\n2050                {_meta_excerpt_expr} AS excerpt_raw,\n2051                2 AS type_priority\n2052         FROM files_search_fts\n2053         JOIN files f ON f.id = files_search_fts.rowid\n2054         WHERE files_search_fts MATCH ?\n2055           AND {vault_clause_meta}\n2056         UNION ALL\n2057         SELECT f.id, f.file_name, f.vault_id, f.status,\n2058                substr(f.parsed_text, 1, 600) AS parsed_text,\n2059                0.0 AS rank, NULL AS excerpt_raw,\n2060                3 AS type_priority\n2061         FROM files f\n2062         WHERE LOWER(f.file_name) LIKE ?\n2063           AND {vault_clause_name}\n2064     ),\n2065     ranked AS (\n2066         SELECT id, file_name, vault_id, status, rank, excerpt_raw, parsed_text, type_priority,\n2067                ROW_NUMBER() OVER (PARTITION BY id ORDER BY type_priority ASC, rank ASC) AS rn\n2068         FROM raw_matches\n2069     ),\n2070     deduped AS (\n2071         SELECT id, file_name, vault_id, status, rank, excerpt_raw, parsed_text, type_priority\n2072         FROM ranked WHERE rn = 1\n2073     ),\n2074     full_count AS (\n2075         SELECT COUNT(*) AS n FROM deduped\n2076     )\n2077     SELECT d.id, d.file_name, d.vault_id, d.status, d.rank, d.excerpt_raw,\n2078            d.parsed_text, d.type_priority, fc.n AS total_count\n2079     FROM deduped d, full_count fc\n2080     ORDER BY d.type_priority ASC, d.rank ASC\n2081     LIMIT ? OFFSET ?\n2082     \"\"\"\n2083 \n",
+      "code": "2050 \n2051     ranked_sql = f\"\"\"\n2052     WITH raw_matches AS (\n2053         SELECT f.id, f.file_name, f.vault_id, f.status,\n2054                substr(f.parsed_text, 1, 600) AS parsed_text,\n2055                bm25(files_content_fts) AS rank,\n2056                CASE WHEN length(CAST(f.parsed_text AS BLOB)) <= {int(FTS_SNIPPET_MAX_COLUMN_BYTES)}\n2057                     THEN snippet(files_content_fts, 0, '<mark>', '</mark>', '\u2026',\n2058                                  {_SNIPPET_TOKENS})\n2059                END AS excerpt_raw,\n2060                1 AS type_priority\n2061         FROM files_content_fts\n2062         JOIN files f ON f.id = files_content_fts.rowid\n2063         WHERE files_content_fts MATCH ?\n2064           AND {vault_clause_body}\n2065         UNION ALL\n2066         SELECT f.id, f.file_name, f.vault_id, f.status,\n2067                substr(f.parsed_text, 1, 600) AS parsed_text,\n2068                bm25(files_search_fts) AS rank,\n2069                {_meta_excerpt_expr} AS excerpt_raw,\n2070                2 AS type_priority\n2071         FROM files_search_fts\n2072         JOIN files f ON f.id = files_search_fts.rowid\n2073         WHERE files_search_fts MATCH ?\n2074           AND {vault_clause_meta}\n2075         UNION ALL\n2076         SELECT f.id, f.file_name, f.vault_id, f.status,\n2077                substr(f.parsed_text, 1, 600) AS parsed_text,\n2078                0.0 AS rank, NULL AS excerpt_raw,\n2079                3 AS type_priority\n2080         FROM files f\n2081         WHERE LOWER(f.file_name) LIKE ? ESCAPE '\\\\'\n2082           AND {vault_clause_name}\n2083     ),\n2084     ranked AS (\n2085         SELECT id, file_name, vault_id, status, rank, excerpt_raw, parsed_text, type_priority,\n2086                ROW_NUMBER() OVER (PARTITION BY id ORDER BY type_priority ASC, rank ASC) AS rn\n2087         FROM raw_matches\n2088     ),\n2089     deduped AS (\n2090         SELECT id, file_name, vault_id, status, rank, excerpt_raw, parsed_text, type_priority\n2091         FROM ranked WHERE rn = 1\n2092     ),\n2093     full_count AS (\n2094         SELECT COUNT(*) AS n FROM deduped\n2095     )\n2096     SELECT d.id, d.file_name, d.vault_id, d.status, d.rank, d.excerpt_raw,\n2097            d.parsed_text, d.type_priority, fc.n AS total_count\n2098     FROM deduped d, full_count fc\n2099     ORDER BY d.type_priority ASC, d.rank ASC\n2100     LIMIT ? OFFSET ?\n2101     \"\"\"\n2102 \n",
       "col_offset": 17,
       "end_col_offset": 7,
       "filename": "backend/app/api/routes/documents.py",
@@ -2554,27 +2554,8 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 2032,
+      "line_number": 2051,
       "line_range": [
-        2032,
-        2033,
-        2034,
-        2035,
-        2036,
-        2037,
-        2038,
-        2039,
-        2040,
-        2041,
-        2042,
-        2043,
-        2044,
-        2045,
-        2046,
-        2047,
-        2048,
-        2049,
-        2050,
         2051,
         2052,
         2053,
@@ -2606,14 +2587,33 @@
         2079,
         2080,
         2081,
-        2082
+        2082,
+        2083,
+        2084,
+        2085,
+        2086,
+        2087,
+        2088,
+        2089,
+        2090,
+        2091,
+        2092,
+        2093,
+        2094,
+        2095,
+        2096,
+        2097,
+        2098,
+        2099,
+        2100,
+        2101
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "2099         # matches exist). Single cheap count over the deduped CTE.\n2100         count_only_sql = f\"\"\"\n2101         WITH raw_matches AS (\n2102             SELECT f.id FROM files_content_fts\n2103             JOIN files f ON f.id = files_content_fts.rowid\n2104             WHERE files_content_fts MATCH ? AND {vault_clause_body}\n2105             UNION\n2106             SELECT f.id FROM files_search_fts\n2107             JOIN files f ON f.id = files_search_fts.rowid\n2108             WHERE files_search_fts MATCH ? AND {vault_clause_meta}\n2109             UNION\n2110             SELECT f.id FROM files f\n2111             WHERE LOWER(f.file_name) LIKE ? AND {vault_clause_name}\n2112         )\n2113         SELECT COUNT(*) FROM raw_matches\n2114         \"\"\"\n2115         count_cursor = await asyncio.to_thread(\n",
+      "code": "2118         # matches exist). Single cheap count over the deduped CTE.\n2119         count_only_sql = f\"\"\"\n2120         WITH raw_matches AS (\n2121             SELECT f.id FROM files_content_fts\n2122             JOIN files f ON f.id = files_content_fts.rowid\n2123             WHERE files_content_fts MATCH ? AND {vault_clause_body}\n2124             UNION\n2125             SELECT f.id FROM files_search_fts\n2126             JOIN files f ON f.id = files_search_fts.rowid\n2127             WHERE files_search_fts MATCH ? AND {vault_clause_meta}\n2128             UNION\n2129             SELECT f.id FROM files f\n2130             WHERE LOWER(f.file_name) LIKE ? ESCAPE '\\\\' AND {vault_clause_name}\n2131         )\n2132         SELECT COUNT(*) FROM raw_matches\n2133         \"\"\"\n2134         count_cursor = await asyncio.to_thread(\n",
       "col_offset": 25,
       "end_col_offset": 11,
       "filename": "backend/app/api/routes/documents.py",
@@ -2624,72 +2624,32 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 2100,
+      "line_number": 2119,
       "line_range": [
-        2100,
-        2101,
-        2102,
-        2103,
-        2104,
-        2105,
-        2106,
-        2107,
-        2108,
-        2109,
-        2110,
-        2111,
-        2112,
-        2113,
-        2114
+        2119,
+        2120,
+        2121,
+        2122,
+        2123,
+        2124,
+        2125,
+        2126,
+        2127,
+        2128,
+        2129,
+        2130,
+        2131,
+        2132,
+        2133
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "2195         conn.execute,\n2196         f\"SELECT COUNT(*) as total_files FROM files {vault_filter_sql}\".strip(),\n2197         vault_filter_params,\n",
+      "code": "2214         conn.execute,\n2215         f\"SELECT COUNT(*) as total_files FROM files {vault_filter_sql}\".strip(),\n2216         vault_filter_params,\n",
       "col_offset": 8,
       "end_col_offset": 71,
-      "filename": "backend/app/api/routes/documents.py",
-      "issue_confidence": "LOW",
-      "issue_cwe": {
-        "id": 89,
-        "link": "https://cwe.mitre.org/data/definitions/89.html"
-      },
-      "issue_severity": "MEDIUM",
-      "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 2196,
-      "line_range": [
-        2196
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
-      "test_id": "B608",
-      "test_name": "hardcoded_sql_expressions"
-    },
-    {
-      "code": "2204         conn.execute,\n2205         f\"SELECT COALESCE(SUM(chunk_count), 0) as total_chunks FROM files {vault_filter_sql}\".strip(),\n2206         vault_filter_params,\n",
-      "col_offset": 8,
-      "end_col_offset": 93,
-      "filename": "backend/app/api/routes/documents.py",
-      "issue_confidence": "LOW",
-      "issue_cwe": {
-        "id": 89,
-        "link": "https://cwe.mitre.org/data/definitions/89.html"
-      },
-      "issue_severity": "MEDIUM",
-      "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 2205,
-      "line_range": [
-        2205
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
-      "test_id": "B608",
-      "test_name": "hardcoded_sql_expressions"
-    },
-    {
-      "code": "2214             conn.execute,\n2215             f\"SELECT COALESCE(SUM(file_size), 0) as total_size FROM files {vault_filter_sql}\".strip(),\n2216             vault_filter_params,\n",
-      "col_offset": 12,
-      "end_col_offset": 93,
       "filename": "backend/app/api/routes/documents.py",
       "issue_confidence": "LOW",
       "issue_cwe": {
@@ -2707,7 +2667,47 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "2225         conn.execute,\n2226         f\"SELECT status, COUNT(*) as count FROM files {vault_filter_sql} GROUP BY status\".strip(),\n2227         vault_filter_params,\n",
+      "code": "2223         conn.execute,\n2224         f\"SELECT COALESCE(SUM(chunk_count), 0) as total_chunks FROM files {vault_filter_sql}\".strip(),\n2225         vault_filter_params,\n",
+      "col_offset": 8,
+      "end_col_offset": 93,
+      "filename": "backend/app/api/routes/documents.py",
+      "issue_confidence": "LOW",
+      "issue_cwe": {
+        "id": 89,
+        "link": "https://cwe.mitre.org/data/definitions/89.html"
+      },
+      "issue_severity": "MEDIUM",
+      "issue_text": "Possible SQL injection vector through string-based query construction.",
+      "line_number": 2224,
+      "line_range": [
+        2224
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
+      "test_id": "B608",
+      "test_name": "hardcoded_sql_expressions"
+    },
+    {
+      "code": "2233             conn.execute,\n2234             f\"SELECT COALESCE(SUM(file_size), 0) as total_size FROM files {vault_filter_sql}\".strip(),\n2235             vault_filter_params,\n",
+      "col_offset": 12,
+      "end_col_offset": 93,
+      "filename": "backend/app/api/routes/documents.py",
+      "issue_confidence": "LOW",
+      "issue_cwe": {
+        "id": 89,
+        "link": "https://cwe.mitre.org/data/definitions/89.html"
+      },
+      "issue_severity": "MEDIUM",
+      "issue_text": "Possible SQL injection vector through string-based query construction.",
+      "line_number": 2234,
+      "line_range": [
+        2234
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
+      "test_id": "B608",
+      "test_name": "hardcoded_sql_expressions"
+    },
+    {
+      "code": "2244         conn.execute,\n2245         f\"SELECT status, COUNT(*) as count FROM files {vault_filter_sql} GROUP BY status\".strip(),\n2246         vault_filter_params,\n",
       "col_offset": 8,
       "end_col_offset": 89,
       "filename": "backend/app/api/routes/documents.py",
@@ -2718,9 +2718,9 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 2226,
+      "line_number": 2245,
       "line_range": [
-        2226
+        2245
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
