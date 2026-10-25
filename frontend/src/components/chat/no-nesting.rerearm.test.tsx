@@ -10,7 +10,22 @@ import { describe, it, expect, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
 import { SourceCards } from "./SourceCards";
 import { SessionItem } from "./SessionRail";
+import { UploadIndicator } from "@/components/shared/UploadIndicator";
 import type { Source } from "@/lib/api";
+import type { UploadFile } from "@/stores/useUploadStore";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+
+// UploadIndicator reads the upload store; pin the #866 header shape with a
+// one-active-upload state (header row + labeled collapse + Clear sibling).
+const uploadMocks = vi.hoisted(() => ({
+  uploads: [] as UploadFile[],
+  clearCompleted: vi.fn(),
+}));
+vi.mock("@/stores/useUploadStore", () => ({
+  useUploadStore: () => uploadMocks,
+}));
+
 
 const source: Source = {
   id: "src-1",
@@ -103,5 +118,52 @@ describe("#866 structural no-nesting pins (matrix-unreached surfaces)", () => {
     expect(
       screen.getByRole("button", { name: "Chat session: Nesting probe session" })
     ).toBeInTheDocument();
+  });
+
+  it("UploadIndicator header: no interactive control inside another; labeled collapse carries aria-expanded (#866)", () => {
+    uploadMocks.uploads = [
+      {
+        id: "u1",
+        file: new File(["probe"], "probe.pdf", { type: "application/pdf" }),
+        status: "uploading",
+        uploadProgress: 40,
+      } as unknown as UploadFile,
+    ];
+    const { container } = render(<UploadIndicator />);
+    const offenders = nestedInteractives(container);
+    expect(offenders, offenderDetails(offenders)).toHaveLength(0);
+    const collapse = screen.getByRole("button", {
+      name: /collapse upload details|expand upload details/i,
+    });
+    expect(collapse.getAttribute("aria-expanded")).toBe("false");
+    uploadMocks.uploads = [];
+  });
+
+  it("SessionRail containers: list roles live ONLY on the row paths, never on the no-results outer container (#868)", () => {
+    // Structural pin (source-reading guard pattern): the outer scroll
+    // container also renders the no-results state, which has no listitems —
+    // a role="list" there would raise aria-required-children. The three row
+    // paths (grouped/virtualized/fallback) must each carry one.
+    const src = readFileSync(
+      resolve(__dirname, "SessionRail.tsx"),
+      "utf-8"
+    );
+    // The outer scroll container is the scrollbar-thin div that opens the
+    // sessions-list region; the no-results branch renders directly under it.
+    const outerStart = src.indexOf('className="flex-1 overflow-y-auto scrollbar-thin');
+    expect(outerStart).toBeGreaterThan(-1);
+    const outerOpen = src.slice(outerStart, src.indexOf(">", outerStart));
+    expect(outerOpen).not.toContain('role="list"');
+    // Every role="list" the component declares sits on a row-path container
+    // (the sizing div, the fallback container, or the grouped list).
+    const listRoleLines = src
+      .split(String.fromCharCode(10))
+      .filter((ln) => ln.includes('role="list"'));
+    expect(listRoleLines.length).toBeGreaterThanOrEqual(3);
+    for (const ln of listRoleLines) {
+      expect(ln).toMatch(/Chat sessions|aria-label=.Chat sessions.|role="list"/);
+    }
+    // And each row path has listitem children in the source.
+    expect(src.match(/role="listitem"/g)?.length ?? 0).toBeGreaterThanOrEqual(3);
   });
 });
