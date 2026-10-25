@@ -2,7 +2,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor, within, act } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { TranscriptPane, Composer, EmptyTranscript } from "./TranscriptPane";
+import { TranscriptPane, Composer, EmptyTranscript, SUGGESTED_PROMPTS } from "./TranscriptPane";
 import { useChatStore } from "@/stores/useChatStore";
 import { useVaultStore } from "@/stores/useVaultStore";
 
@@ -919,6 +919,33 @@ describe("TranscriptPane", () => {
       );
 
       expect(screen.getByRole("list", { name: "Suggested prompts" })).toBeInTheDocument();
+    });
+
+    it("suggested-prompts list is native ul/li so axe aria-required-children passes (#868)", () => {
+      // Regression for issue #868: a div role="list" whose direct children are
+      // plain buttons is a critical aria-required-children violation. The
+      // container must be a real <ul> and every direct child a <li> item.
+      const { container } = render(
+        <EmptyTranscript
+          onPromptClick={mockSetInput}
+          hasIndexedDocs={true}
+          onNavigateToDocuments={mockNavigate}
+        />
+      );
+
+      const list = screen.getByRole("list", { name: "Suggested prompts" });
+      expect(list.tagName).toBe("UL");
+      const items = screen.getAllByRole("listitem");
+      expect(items).toHaveLength(SUGGESTED_PROMPTS.length);
+      expect(items.every((item) => item.tagName === "LI")).toBe(true);
+      // Every prompt button is a DIRECT child of a listitem (no intermediate
+      // wrappers that would break the list->listitem ownership chain).
+      for (const item of items) {
+        expect(item.querySelector("button")).toBeInTheDocument();
+      }
+      expect(container.querySelectorAll("ul[aria-label='Suggested prompts'] > li > button")).toHaveLength(
+        SUGGESTED_PROMPTS.length
+      );
     });
   });
 
