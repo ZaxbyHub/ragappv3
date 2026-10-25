@@ -72,6 +72,24 @@ def assert_can_assign_role(
         )
 
 
+def assert_can_modify_target(actor_role: Optional[str], target_role: Optional[str]) -> None:
+    """The single rule for who may modify a superadmin target (issue #722).
+
+    Every route that edits a target user's state (``update_user``,
+    ``admin_reset_password``, ``update_user_active``,
+    ``update_user_organizations``, ``update_user_groups``) must invoke this
+    helper after reading the target row so the routes cannot drift apart
+    (same pattern as ``assert_can_assign_role``, issue #560): a
+    non-superadmin actor can never modify any field of a superadmin target —
+    not even a no-op field on the account (admin-guide role-assignment rule).
+    """
+    if target_role == "superadmin" and actor_role != "superadmin":
+        raise HTTPException(
+            status_code=403,
+            detail="Only superadmin can modify superadmin users",
+        )
+
+
 class UpdateRoleRequest(BaseModel):
     role: str = Field(...)
 
@@ -81,7 +99,7 @@ class UpdateActiveRequest(BaseModel):
 
 
 class UpdateUserRequest(BaseModel):
-    username: Optional[str] = Field(default=None, max_length=255)
+    username: Optional[str] = Field(default=None, min_length=3, max_length=255)
     full_name: Optional[str] = Field(default=None, max_length=255)
     role: Optional[str] = Field(default=None)
 
@@ -317,6 +335,11 @@ async def update_user(
     if not target_row:
         raise HTTPException(status_code=404, detail="User not found")
 
+    # Superadmin targets are modifiable by superadmins only, across every
+    # field combination (issue #722 AC3) — runs before any field application,
+    # including for bodies that omit the role field entirely.
+    assert_can_modify_target(user.get("role"), target_row[3])
+
     # Build update fields based on whitelist
     update_fields = []
     update_values = []
@@ -340,16 +363,11 @@ async def update_user(
         if user_id == user.get("id"):
             raise HTTPException(status_code=400, detail="Cannot change your own role")
 
-        if target_row[3] == "superadmin" and user.get("role") != "superadmin":
-            raise HTTPException(
-                status_code=403,
-                detail="Only superadmin can change role of superadmin users",
-            )
-
         # One rule for who may assign which role (issue #560 C22), shared
         # with create_user and update_user_role. Re-asserting the target's
         # current role is a no-op so the Edit dialog's always-sent role
-        # field does not 403 unrelated saves.
+        # field does not 403 unrelated saves. The superadmin-target half of
+        # the rule is assert_can_modify_target above.
         assert_can_assign_role(user.get("role"), target_row[3], body.role)
 
         update_fields.append("role = ?")
@@ -366,9 +384,59 @@ async def update_user(
             "created_at": target_row[5],
         }
 
-    # Execute update
+    # Execute update. Demoting an active superadmin carries the same atomic
+    # at-least-one-active-superadmin guard update_user_role uses (issue #722
+    # AC6): the count predicate rides the WHERE clause of this single
+    # statement, so on guard rejection NONE of the co-submitted fields apply
+    # (all-or-nothing, stated intentionally). The is_active-aware trigger is
+    # deliberately stricter than update_user_role's (which ignores is_active)
+    # — demoting an already-inactive superadmin cannot lock out actives.
+    demotes_last_superadmin = (
+        body.role is not None
+        and target_row[3] == "superadmin"
+        and body.role != "superadmin"
+        and bool(target_row[4])
+    )
     update_values.append(user_id)
-    await asyncio.to_thread(db.execute, f"UPDATE users SET {', '.join(update_fields)} WHERE id = ?", tuple(update_values))
+    sql = f"UPDATE users SET {', '.join(update_fields)} WHERE id = ?"
+    if demotes_last_superadmin:
+        sql += " AND (SELECT COUNT(*) FROM users WHERE role = 'superadmin' AND is_active = 1) > 1"
+    update_cursor = await asyncio.to_thread(db.execute, sql, tuple(update_values))
+    if demotes_last_superadmin and await asyncio.to_thread(lambda: update_cursor.rowcount) == 0:
+        raise HTTPException(
+            status_code=400, detail="Cannot demote the last superadmin"
+        )
+
+    if body.username is not None and body.username != target_row[1]:
+        # Org invites bind to the invitee's username at creation time and
+        # acceptance compares that stored identifier against the CURRENT
+        # username (organizations.py), so a rename must re-bind the user's own
+        # pending invites or they become unacceptably orphaned (issue #721
+        # AC7). Both statements run in the same transaction as the rename.
+        now_iso = datetime.now(timezone.utc).isoformat()
+        # Step 1: revoke PRE-EXISTING pending invites addressed to the NEW
+        # username (username-form invites may target not-yet-provisioned
+        # users, #300) — after the rename they would re-bind to the renaming
+        # user. Runs BEFORE the rewrite and excludes the old-name rows so it
+        # can never touch the user's own invites; revoked_at format matches
+        # revoke_org_invite.
+        await asyncio.to_thread(
+            db.execute,
+            """UPDATE org_invites SET revoked_at = ?
+                WHERE email = ? COLLATE NOCASE
+                  AND accepted_at IS NULL AND revoked_at IS NULL
+                  AND email != ? COLLATE NOCASE""",
+            (now_iso, body.username.lower(), target_row[1].lower()),
+        )
+        # Step 2: re-bind the user's own pending invites to the new username
+        # so the renamed user can still accept them.
+        await asyncio.to_thread(
+            db.execute,
+            """UPDATE org_invites SET email = ?
+                WHERE email = ? COLLATE NOCASE
+                  AND accepted_at IS NULL AND revoked_at IS NULL""",
+            (body.username.lower(), target_row[1].lower()),
+        )
     await asyncio.to_thread(db.commit)
 
     invalidate_active_user_cache(user_id)
@@ -413,9 +481,13 @@ async def admin_reset_password(
     Forces must_change_password=1 for the target user.
     """
     # Verify target user exists
-    cursor = await asyncio.to_thread(db.execute, "SELECT id FROM users WHERE id = ?", (user_id,))
-    if not await asyncio.to_thread(cursor.fetchone):
+    cursor = await asyncio.to_thread(db.execute, "SELECT id, role FROM users WHERE id = ?", (user_id,))
+    target_row = await asyncio.to_thread(cursor.fetchone)
+    if not target_row:
         raise HTTPException(status_code=404, detail="User not found")
+
+    # Superadmin targets are modifiable by superadmins only (issue #722 AC4).
+    assert_can_modify_target(user.get("role"), target_row[1])
 
     # Validate password strength
     try:
@@ -426,7 +498,10 @@ async def admin_reset_password(
     # Hash the new password
     hashed_password = await async_hash_password(body.new_password)
 
+    sessions_revoked = False
+
     def _admin_reset_password_db():
+        nonlocal sessions_revoked
         try:
             db.execute("BEGIN EXCLUSIVE")
         except sqlite3.OperationalError:
@@ -440,6 +515,7 @@ async def admin_reset_password(
             )
             try:
                 db.execute("DELETE FROM user_sessions WHERE user_id = ?", (user_id,))
+                sessions_revoked = True
             except sqlite3.OperationalError as e:
                 err_str = str(e)
                 if "no such table" in err_str:
@@ -464,7 +540,7 @@ async def admin_reset_password(
         actor=user,
         target_user_id=user_id,
         request=request,
-        metadata={"must_change_password": True, "sessions_revoked": True},
+        metadata={"must_change_password": True, "sessions_revoked": sessions_revoked},
     )
 
     return {
@@ -564,6 +640,12 @@ async def update_user_active(
         target_role = target_row[0]
         currently_active = bool(target_row[1])
 
+        # Superadmin targets are modifiable by superadmins only, before any
+        # guard below can answer (issue #722 AC5: with a second active
+        # superadmin the last-superadmin guard cannot fire, so without this
+        # check a plain admin could deactivate a superadmin).
+        assert_can_modify_target(user.get("role"), target_role)
+
         if target_role == "superadmin" and not body.is_active and currently_active:
             # Atomic guard: only deactivate if there are other active superadmins
             await asyncio.to_thread(cursor.execute, """UPDATE users SET is_active = ?
@@ -574,6 +656,27 @@ async def update_user_active(
                 )
         else:
             await asyncio.to_thread(cursor.execute, "UPDATE users SET is_active = ? WHERE id = ?", (1 if body.is_active else 0, user_id))
+
+        if not body.is_active:
+            # Deactivation revokes the user's sessions in the same transaction
+            # as the is_active flip (issue #722 AC2), so a refresh cookie
+            # issued before deactivation can never mint tokens again after
+            # reactivation. Missing-table tolerance mirrors
+            # admin_reset_password (pre-migration DBs / test fixtures).
+            try:
+                await asyncio.to_thread(
+                    conn.execute,
+                    "DELETE FROM user_sessions WHERE user_id = ?",
+                    (user_id,),
+                )
+            except sqlite3.OperationalError as e:
+                if "no such table" in str(e):
+                    logger.warning(
+                        "Could not delete user_sessions for user %d (table may not exist)",
+                        user_id,
+                    )
+                else:
+                    raise
         await asyncio.to_thread(conn.commit)
 
         invalidate_active_user_cache(user_id)
@@ -599,6 +702,7 @@ async def update_user_active(
 @router.delete("/{user_id}")
 async def delete_user(
     user_id: int,
+    request: Request,
     user: dict = Depends(require_role("superadmin")),
     _csrf_token: str = Depends(csrf_protect),
 ):
@@ -607,13 +711,14 @@ async def delete_user(
     conn = await pool.get_connection_async()
 
     try:
-        cursor = await asyncio.to_thread(conn.execute, "SELECT role FROM users WHERE id = ?", (user_id,))
+        cursor = await asyncio.to_thread(conn.execute, "SELECT role, username FROM users WHERE id = ?", (user_id,))
         target_row = await asyncio.to_thread(cursor.fetchone)
 
         if not target_row:
             raise HTTPException(status_code=404, detail="User not found")
 
         target_role = target_row[0]
+        target_username = target_row[1]
 
         if user_id == user.get("id"):
             raise HTTPException(
@@ -667,6 +772,15 @@ async def delete_user(
             )
 
         try:
+            # Detach historical org authorship first: organizations.created_by
+            # has no ON DELETE action, so a user who created an org they no
+            # longer own would otherwise trip the FK and 500 the delete
+            # (issue #722 AC8). Same transaction as the DELETE below.
+            await asyncio.to_thread(
+                conn.execute,
+                "UPDATE organizations SET created_by = NULL WHERE created_by = ?",
+                (user_id,),
+            )
             if target_role == "superadmin":
                 # Atomic guard: only delete if there are other active superadmins
                 await asyncio.to_thread(cursor.execute, """DELETE FROM users
@@ -720,6 +834,20 @@ async def delete_user(
                 )
 
         invalidate_active_user_cache(user_id)
+
+        # Security-relevant event, same helper/tamper-evident contract as
+        # every other users.py mutation (issue #722 AC1). security_audit_log
+        # carries no FK on user ids, so recording after the delete commits
+        # cannot violate constraints; metadata snapshots the pre-delete row.
+        await safe_record_security_event(
+            conn,
+            event_type="user.deleted",
+            actor=user,
+            target_user_id=user_id,
+            target_username=target_username,
+            request=request,
+            metadata={"role": target_role, "username": target_username},
+        )
 
         return {"message": "User deleted", "user_id": user_id}
     finally:
@@ -780,15 +908,26 @@ async def update_user_organizations(
     user: dict = Depends(require_role("admin")),
     _csrf_token: str = Depends(csrf_protect),
 ):
-    """Replace user's organization memberships (admin/superadmin only)."""
+    """Replace a user's organization memberships (admin/superadmin only).
+
+    Superadmin callers replace the full membership set; other admins replace
+    only memberships in organizations they themselves belong to (issue #721
+    AC5). Dropped organizations' group memberships are revoked in the same
+    transaction.
+    """
     pool = get_pool(str(settings.sqlite_path))
     conn = await pool.get_connection_async()
 
     def _update_orgs():
         # Verify user exists
-        cursor = conn.execute("SELECT id FROM users WHERE id = ?", (user_id,))
-        if not cursor.fetchone():
+        cursor = conn.execute("SELECT id, role FROM users WHERE id = ?", (user_id,))
+        target_row = cursor.fetchone()
+        if not target_row:
             raise HTTPException(status_code=404, detail="User not found")
+
+        # Superadmin targets are modifiable by superadmins only (issue #722,
+        # five-writer parity for assert_can_modify_target).
+        assert_can_modify_target(user.get("role"), target_row[1])
 
         # For non-superadmins, verify caller shares an org with target user
         # and can only assign orgs they belong to (parity + scope restriction).
@@ -841,11 +980,44 @@ async def update_user_organizations(
                 )
 
         try:
-            # Delete existing memberships (except owner roles to protect org ownership)
-            conn.execute(
-                "DELETE FROM org_members WHERE user_id = ? AND role != 'owner'",
+            # Take the write lock BEFORE the before-snapshot: without an
+            # explicit transaction, before_orgs is read in autocommit and
+            # after_orgs lands inside the write txn the first DELETE opens —
+            # two different snapshots — so a concurrent grant committed
+            # between them could be deleted by this request while its
+            # group_members rows survived the dropped-set derivation
+            # (issue #721 review F-001). BEGIN IMMEDIATE pins the write lock
+            # and both reads into one snapshot.
+            conn.execute("BEGIN IMMEDIATE")
+
+            # Snapshot the target's current non-owner orgs before the replace so
+            # group memberships can be cleaned up for orgs this call actually
+            # drops (issue #721 AC3). Owner rows are excluded by the same
+            # role != 'owner' filter the DELETE below uses.
+            cursor = conn.execute(
+                "SELECT org_id FROM org_members WHERE user_id = ? AND role != 'owner'",
                 (user_id,),
             )
+            before_orgs = {row[0] for row in cursor.fetchall()}
+
+            # Delete existing memberships (except owner roles to protect org
+            # ownership). Scoped to the caller's own orgs for non-superadmins —
+            # an org admin replaces only the memberships they can see (issue
+            # #721 AC5), mirroring update_user_groups' scoped delete below.
+            # The caller's scope is expressed as a subquery (their org_members
+            # rows) rather than dynamically interpolated placeholders.
+            if caller_orgs is None:
+                conn.execute(
+                    "DELETE FROM org_members WHERE user_id = ? AND role != 'owner'",
+                    (user_id,),
+                )
+            else:
+                conn.execute(
+                    """DELETE FROM org_members
+                        WHERE user_id = ? AND role != 'owner'
+                          AND org_id IN (SELECT org_id FROM org_members WHERE user_id = ?)""",
+                    (user_id, user.get("id")),
+                )
 
             # Insert new memberships
             for m in memberships:
@@ -858,6 +1030,31 @@ async def update_user_organizations(
                         "INSERT INTO org_members (org_id, user_id, role) VALUES (?, ?, ?)",
                         (m.org_id, user_id, m.role),
                     )
+
+            # Group membership implies organization membership: drop the
+            # target's group_members rows for orgs this call actually removed.
+            # The dropped set is derived purely from the target's own row
+            # state (present in the before-snapshot, absent after the
+            # replace): whatever the scoped or unscoped DELETE above actually
+            # removed is exactly before − after — owner-protected rows never
+            # entered the snapshot, re-inserted orgs are in after, and orgs
+            # outside the DELETE's scope survive into after. Deriving the set
+            # from a second caller-orgs read instead would race the DELETE's
+            # own subquery (implementation-review finding: a caller-orgs
+            # addition committed between two reads could orphan rows).
+            cursor = conn.execute(
+                "SELECT org_id FROM org_members WHERE user_id = ?",
+                (user_id,),
+            )
+            after_orgs = {row[0] for row in cursor.fetchall()}
+            dropped_orgs = before_orgs - after_orgs
+            for org_id in dropped_orgs:
+                conn.execute(
+                    """DELETE FROM group_members
+                        WHERE user_id = ?
+                          AND group_id IN (SELECT id FROM groups WHERE org_id = ?)""",
+                    (user_id, org_id),
+                )
             conn.commit()
         except Exception:
             conn.rollback()
@@ -972,9 +1169,14 @@ async def update_user_groups(
 
     def _update_groups():
         # Verify user exists
-        cursor = conn.execute("SELECT id FROM users WHERE id = ?", (user_id,))
-        if not cursor.fetchone():
+        cursor = conn.execute("SELECT id, role FROM users WHERE id = ?", (user_id,))
+        target_row = cursor.fetchone()
+        if not target_row:
             raise HTTPException(status_code=404, detail="User not found")
+
+        # Superadmin targets are modifiable by superadmins only (issue #722,
+        # five-writer parity for assert_can_modify_target).
+        assert_can_modify_target(user.get("role"), target_row[1])
 
         # For non-superadmins, verify caller shares an org with target user
         # (parity with get_user_groups and update_user_organizations).
@@ -1050,18 +1252,22 @@ async def update_user_groups(
                     detail=f"Cannot assign groups from organizations you are not a member of: {sorted(unauthorized)}",
                 )
 
-        # Check user is a member of each group's organization (skip for superadmins)
-        if user.get("role") != "superadmin":
-            for group_id, org_id in found_groups.items():
-                cursor.execute(
-                    "SELECT 1 FROM org_members WHERE user_id = ? AND org_id = ?",
-                    (user_id, org_id),
+        # Check the TARGET user is a member of each group's organization. This
+        # is a data-integrity precondition of group membership (groups.py
+        # enforces the same one), so it must run for every caller including
+        # superadmins; the caller-authorization bypass above (caller_orgs is
+        # None for superadmins) is what superadmin privilege waives, not this
+        # check (issue #721 AC1).
+        for group_id, org_id in found_groups.items():
+            cursor.execute(
+                "SELECT 1 FROM org_members WHERE user_id = ? AND org_id = ?",
+                (user_id, org_id),
+            )
+            if not cursor.fetchone():
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"User is not a member of organization for group {group_id}",
                 )
-                if not cursor.fetchone():
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"User is not a member of organization for group {group_id}",
-                    )
 
         # Replace only memberships in the caller-managed org scope.
         if caller_orgs is None:

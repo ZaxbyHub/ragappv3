@@ -86,8 +86,15 @@ Workstream B PR 13 of 16 (frontier audit 20260923T174456Z, findings P02-SK2-01/-
 
 ## Operator notes
 
-- Regenerate-on-crash guidance is unchanged: a job stuck `running` still
-  settles after `JOBS_LEASE_RECLAIM_TIMEOUT_SECONDS`; the metric
+- Regenerate-on-crash guidance is unchanged for a DEAD worker: a job stuck
+  `running` whose worker is gone still settles after
+  `JOBS_LEASE_RECLAIM_TIMEOUT_SECONDS`. A LIVE-but-stalled worker
+  (heartbeat fresh, no per-file progress) now settles within the
+  `jobs_stall_timeout_seconds` budget (default 900 s; admin-settable and
+  forwarded by docker-compose/`.env.example`, so it survives restart)
+  instead (issue #1010: the stall watchdog releases the lease and the
+  same worker re-claims it; the reclaim timeout remains the crash
+  backstop); the metric
   `ingestion_queue_size` now reflects real durable backlog under the default
   transport.
 - `jobs.error='lease_disabled_rollback'` marks rows settled when their

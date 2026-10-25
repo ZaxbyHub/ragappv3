@@ -415,7 +415,7 @@ export default function VaultsPage() {
         <DialogHeader>
           <DialogTitle id="delete-vault-title">Delete Vault</DialogTitle>
           <DialogDescription id="delete-vault-desc">
-            Are you sure you want to delete "{selectedVault?.name}"? This will permanently delete all documents, memories, and chat sessions in this vault. This action cannot be undone.
+            Are you sure you want to delete "{selectedVault?.name}"? This will permanently delete all documents and chat sessions in this vault. Memories will be kept and moved to global memories. This action cannot be undone.
           </DialogDescription>
         </DialogHeader>
           <DialogFooter>

@@ -265,6 +265,8 @@ def _load_persisted_settings(sqlite_path: str) -> None:
             "jobs_heartbeat_interval_seconds",
             "jobs_lease_reclaim_timeout_seconds",
             "jobs_max_attempts",
+            # Reindex stall watchdog budget (issue #1010)
+            "jobs_stall_timeout_seconds",
             "reranking_enabled",
             "reranker_top_n",
             "initial_retrieval_top_k",
@@ -862,12 +864,6 @@ async def lifespan(app: FastAPI):
         instant_client=app.state.instant_llm_client,
     )
     app.state.model_checker = ModelChecker()
-    app.state.model_validation = (
-        settings.enable_model_validation
-        or app.state.toggle_manager.get_toggle(
-            "model_validation", settings.enable_model_validation
-        )
-    )
     ingestion_llm_client = select_ingestion_llm_client(
         app, settings.ingestion_llm_mode
     )

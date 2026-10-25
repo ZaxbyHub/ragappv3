@@ -267,11 +267,44 @@ export default function DocumentsPage() {
   const { selectedIds, setSelectedIds, clear: clearSelection, selectMany, selectOne } =
     useBulkSelection(canMutateDocuments);
 
+  // Live mirror of the active vault for still-current checks inside async
+  // continuations (fetch commits, dialog confirms): a ref read at commit time
+  // sees switches the closure that started the work did not.
+  const activeVaultIdRef = useRef<number | null>(activeVaultId);
+  activeVaultIdRef.current = activeVaultId;
+  // The vault the currently open confirm dialog was opened for; written by
+  // every setConfirmDialog call site (all four) and READ by the two bulk
+  // executors' execute-time guards — the folder and single-document confirms
+  // are per-resource actions backed by per-vault server authorization and are
+  // deliberately unguarded (recorded residual).
+  const confirmVaultRef = useRef<number | null>(null);
+  // Vault-context GENERATION for confirmations (complements confirmVaultRef):
+  // a monotone counter bumped on every vault transition, so a round trip
+  // (vault 1 -> 2 -> 1) — which the numeric-id compare cannot see — still
+  // invalidates a dialog opened in the earlier incarnation. The numeric id
+  // and the generation cover each other's windows: the id read is live from
+  // render (catches a switch before the bump effect runs); the generation is
+  // bumped in the switch effect (catches round trips back to the same id).
+  const vaultSwitchGenRef = useRef(0);
+  const confirmVaultGenRef = useRef(0);
+
   useEffect(() => {
     if (!canMutateDocuments) {
       setSelectedIds(new Set());
     }
   }, [canMutateDocuments, setSelectedIds]);
+
+  // Bulk selection is per-vault display state: an admin->admin vault switch
+  // never flips canMutateDocuments, so the permission-keyed effect above never
+  // fires for it — clear the selection on the switch itself (issue #764 AC1;
+  // the confirm-dialog path is covered by the execute-time guards instead).
+  // Every transition also bumps the confirmation generation, so dialogs
+  // opened before any later transition (including ABA round trips) refuse at
+  // execute time.
+  useEffect(() => {
+    setSelectedIds(new Set());
+    vaultSwitchGenRef.current += 1;
+  }, [activeVaultId, setSelectedIds]);
 
   // Load the vault's tags for the filter + bulk-assign dialog.
   const fetchTags = useCallback(async () => {
@@ -279,8 +312,15 @@ export default function DocumentsPage() {
       setTags([]);
       return;
     }
+    // Issue #764 AC13: bind the commit to the ISSUED vault id (the argument
+    // this call fetches for), not a live read — a stale-closure re-invocation
+    // issues the old vault's request and must not commit over the current
+    // vault's state when it resolves late.
+    const issuedVaultId = activeVaultId;
     try {
-      setTags(await listTags(activeVaultId));
+      const next = await listTags(issuedVaultId);
+      if (activeVaultIdRef.current !== issuedVaultId) return;
+      setTags(next);
     } catch (err) {
       console.error("Failed to load tags:", err);
     }
@@ -290,9 +330,12 @@ export default function DocumentsPage() {
     fetchTags();
   }, [fetchTags]);
 
-  // Reset the tag filter when switching vaults (tag ids are vault-scoped).
+  // Reset the tag filter when switching vaults (tag ids are vault-scoped),
+  // and drop the previous vault's tag vocabulary immediately so a failed or
+  // slow refetch can never render it (issue #764 AC4/AC5/AC13).
   useEffect(() => {
     setTagFilterId(null);
+    setTags([]);
   }, [activeVaultId]);
 
   // Load the vault's folders for the sidebar tree + move dialog. Returns the
@@ -303,8 +346,11 @@ export default function DocumentsPage() {
       setFolders([]);
       return [];
     }
+    // Same issued-vault guard as fetchTags (issue #764 AC13).
+    const issuedVaultId = activeVaultId;
     try {
-      const refreshed = await listFolders(activeVaultId);
+      const refreshed = await listFolders(issuedVaultId);
+      if (activeVaultIdRef.current !== issuedVaultId) return [];
       setFolders(refreshed);
       return refreshed;
     } catch (err) {
@@ -317,9 +363,12 @@ export default function DocumentsPage() {
     fetchFolders();
   }, [fetchFolders]);
 
-  // Reset the folder filter when switching vaults (folder ids are vault-scoped).
+  // Reset the folder filter when switching vaults (folder ids are vault-
+  // scoped), and drop the previous vault's folders immediately (issue #764
+  // AC4/AC5/AC13).
   useEffect(() => {
     setFolderFilterId(null);
+    setFolders([]);
   }, [activeVaultId]);
 
   const handleCreateFolder = useCallback(
@@ -353,6 +402,8 @@ export default function DocumentsPage() {
 
   const handleDeleteFolder = useCallback(
     (folder: Folder) => {
+      confirmVaultRef.current = activeVaultId;
+      confirmVaultGenRef.current = vaultSwitchGenRef.current;
       setConfirmDialog({
         open: true,
         title: "Delete Folder",
@@ -381,7 +432,7 @@ export default function DocumentsPage() {
         },
       });
     },
-    [folderFilterId, fetchFolders, fetchDocuments]
+    [folderFilterId, fetchFolders, fetchDocuments, activeVaultId]
   );
 
   const handleMoveFolderTrigger = useCallback((folder: Folder) => {
@@ -450,6 +501,20 @@ export default function DocumentsPage() {
       toast.error("Select a vault you administer before deleting documents");
       return;
     }
+    // Execute-time still-current guard (issue #764 AC1/AC14): the dialog
+    // captured this closure with the selection from the vault it was opened
+    // for; if the active vault changed while the modal was open (e.g. a
+    // background fetchVaults correction), the captured ids belong to another
+    // vault — refuse instead of sending them. A live-ref read, not a closed
+    // value, sees the switch.
+    if (
+      confirmVaultRef.current !== activeVaultIdRef.current ||
+      confirmVaultGenRef.current !== vaultSwitchGenRef.current
+    ) {
+      toast.error("Selection changed — select documents again");
+      clearSelection();
+      return;
+    }
     setIsBulkDeleting(true);
     try {
       const result = await deleteDocuments(Array.from(selectedIds));
@@ -497,6 +562,8 @@ export default function DocumentsPage() {
 
   const handleBulkDelete = useCallback(() => {
     if (selectedIds.size === 0) return;
+    confirmVaultRef.current = activeVaultId;
+    confirmVaultGenRef.current = vaultSwitchGenRef.current;
     setConfirmDialog({
       open: true,
       title: "Delete Selected Documents",
@@ -504,10 +571,21 @@ export default function DocumentsPage() {
       onConfirm: executeBulkDelete,
       variant: "destructive",
     });
-  }, [selectedIds, executeBulkDelete]);
+  }, [selectedIds, executeBulkDelete, activeVaultId]);
 
   const executeDeleteAllInVault = useCallback(async () => {
     if (!activeVaultId || !canMutateDocuments) return;
+    // Same execute-time guard as executeBulkDelete (per the bulk-mutation
+    // scope decision): the dialog captured the open-time activeVaultId in
+    // this closure, so a stale confirm would wipe the PREVIOUS vault.
+    // Delete-all is a bulk mutation.
+    if (
+      confirmVaultRef.current !== activeVaultIdRef.current ||
+      confirmVaultGenRef.current !== vaultSwitchGenRef.current
+    ) {
+      toast.error("Vault changed — reopen the confirmation and try again");
+      return;
+    }
     setIsBulkDeletingAll(true);
     try {
       const result = await deleteAllDocumentsInVault(activeVaultId);
@@ -516,13 +594,18 @@ export default function DocumentsPage() {
         setDocuments([]);
         setStats((prev) => (prev ? { ...prev, total_documents: 0 } : prev));
         fetchFolders();
+        // Refetch the authoritative list: the optimistic empty above does not
+        // touch the polling hook's `total`, which would otherwise leave
+        // "Showing 0 of N" and a Load-more control pointing at rows that no
+        // longer exist.
+        await fetchDocuments();
       }
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to delete documents");
     } finally {
       setIsBulkDeletingAll(false);
     }
-  }, [activeVaultId, canMutateDocuments, setDocuments, setStats, fetchFolders]);
+  }, [activeVaultId, canMutateDocuments, setDocuments, setStats, fetchFolders, fetchDocuments]);
 
   const handleDeleteAllInVault = useCallback(() => {
     if (!documents || documents.length === 0) return;
@@ -530,6 +613,8 @@ export default function DocumentsPage() {
       toast.error("Select a vault you administer before deleting documents");
       return;
     }
+    confirmVaultRef.current = activeVaultId;
+    confirmVaultGenRef.current = vaultSwitchGenRef.current;
     setConfirmDialog({
       open: true,
       title: "Delete All Documents in Vault",
@@ -537,7 +622,7 @@ export default function DocumentsPage() {
       onConfirm: executeDeleteAllInVault,
       variant: "destructive",
     });
-  }, [documents, canMutateDocuments, executeDeleteAllInVault]);
+  }, [documents, canMutateDocuments, executeDeleteAllInVault, activeVaultId]);
 
   // Effective client-side upload limit: the server-configured
   // max_file_size_mb from the settings store is the source of truth; the
@@ -614,6 +699,8 @@ export default function DocumentsPage() {
       toast.error("Select a vault you administer before deleting documents");
       return;
     }
+    confirmVaultRef.current = activeVaultId;
+    confirmVaultGenRef.current = vaultSwitchGenRef.current;
     setConfirmDialog({
       open: true,
       title: "Delete Document",
@@ -702,7 +789,11 @@ export default function DocumentsPage() {
   const hasActiveSearch = searchQuery.trim().length > 0;
   const hasStats = stats !== null;
   const totalVaultDocuments = stats?.total_documents ?? 0;
-  const isResolvingSearchEmptyState = hasSelectedVault && hasActiveSearch && !hasStats;
+  // Issue #764 AC10: the resolving placeholder must also require that no rows
+  // are visible — after a stats failure `!hasStats` stays true forever, and
+  // without the row check the skeleton hides real search results permanently.
+  const isResolvingSearchEmptyState =
+    hasSelectedVault && hasActiveSearch && !hasStats && filteredDocuments.length === 0;
   const emptyState =
     vaults.length === 0
       ? {

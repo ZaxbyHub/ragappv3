@@ -432,6 +432,27 @@ class KMSCompileProcessor:
         with self._pool.connection() as conn:
             store = KMSStore(conn)
 
+            # Issue #723 (T1-21-S-07): a job whose vault was deleted must
+            # never re-persist KMS rows for a vault_id that no longer exists
+            # (checked at dispatch; the _compile_* entry points re-check for
+            # jobs already running when the vault delete committed).
+            vault_row = conn.execute(
+                "SELECT 1 FROM vaults WHERE id = ?", (job.vault_id,)
+            ).fetchone()
+            if vault_row is None:
+                result = {
+                    "cancelled": "vault_deleted",
+                    "skipped": True,
+                    "reason": f"vault {job.vault_id} no longer exists",
+                }
+                logger.info(
+                    "KMSCompileProcessor: cancelling job id=%d type=%s — vault deleted",
+                    job.id,
+                    job.trigger_type,
+                )
+                store.cancel_job(job.id, job.vault_id)
+                return result
+
             if job.trigger_type == "ingest":
                 file_id = input_json.get("file_id")
                 if not file_id:
@@ -457,6 +478,13 @@ class KMSCompileProcessor:
     @staticmethod
     def _compile_file(conn, store, vault_id: int, file_id: int) -> dict:
         """Create/refresh the document-sourced KMS entry for one file."""
+        if not conn.execute(
+            "SELECT 1 FROM vaults WHERE id = ?", (vault_id,)
+        ).fetchone():
+            return {
+                "skipped": True,
+                "reason": f"vault {vault_id} no longer exists",
+            }
         row = conn.execute(
             "SELECT file_name, parsed_text FROM files WHERE id = ? AND vault_id = ?",
             (file_id, vault_id),
@@ -486,6 +514,15 @@ class KMSCompileProcessor:
         per-file path applies no status filter — this selection is a strict
         subset of it.)
         """
+        if not conn.execute(
+            "SELECT 1 FROM vaults WHERE id = ?", (vault_id,)
+        ).fetchone():
+            return {
+                "compiled": 0,
+                "skipped": 0,
+                "total": 0,
+                "skipped_reason": f"vault {vault_id} no longer exists",
+            }
         rows = conn.execute(
             "SELECT id FROM files WHERE vault_id = ? AND status IN ('indexed', 'partial')",
             (vault_id,),

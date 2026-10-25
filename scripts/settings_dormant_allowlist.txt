@@ -1,0 +1,2 @@
+embedding_probe_batch_count :: consumed via getattr(settings, NAME, default) with NAME passed as a method argument (_int_probe_setting) — the census cannot see variable-name reads; a direct attribute read would return a Mock under the frozen #494 harness (issue #1009)
+embedding_probe_batch_chars :: consumed via getattr(settings, NAME, default) with NAME passed as a method argument (_int_probe_setting) — the census cannot see variable-name reads (issue #1009)

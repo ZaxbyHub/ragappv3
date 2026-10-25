@@ -55,6 +55,9 @@ class SettingsUpdate(BaseModel):
     jobs_heartbeat_interval_seconds: Optional[float] = None
     jobs_lease_reclaim_timeout_seconds: Optional[float] = None
     jobs_max_attempts: Optional[int] = None
+    # Reindex stall watchdog budget (issue #1010); same five-point wiring
+    # as the sibling job-lease knobs above.
+    jobs_stall_timeout_seconds: Optional[float] = None
 
     # Reranker config
     reranker_url: Optional[str] = None
@@ -368,6 +371,16 @@ class SettingsUpdate(BaseModel):
             raise ValueError("jobs_max_attempts must be between 1 and 20")
         return v
 
+    @field_validator("jobs_stall_timeout_seconds")
+    @classmethod
+    def validate_jobs_stall_timeout_seconds(cls, v):
+        # Same envelope as the Settings model (issue #1010).
+        if v is not None and not (60.0 <= v <= 7200.0):
+            raise ValueError(
+                "jobs_stall_timeout_seconds must be between 60.0 and 7200.0"
+            )
+        return v
+
     @field_validator("reranker_top_n")
     @classmethod
     def validate_reranker_top_n(cls, v):
@@ -543,6 +556,47 @@ class SettingsUpdate(BaseModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def _enforce_jobs_stall_coherence(self):
+        """Reject an update leaving the stall budget incoherent (issue #1010).
+
+        setattr persistence onto the settings singleton bypasses the
+        Settings model validators, so the PUT path enforces the same rules
+        here against effective (body-value-else-current) values on EVERY
+        body: the stall budget must exceed the reclaim timeout AND
+        document_parse_timeout. A reclaim-only PUT that raises the reclaim
+        timeout above the live stall budget would otherwise persist a pair
+        the boot validator rejects — accepted live, then silently reverted
+        by the startup replay (PR #1018 review F-001). This deliberately
+        supersedes the pre-#1010 sibling-only acceptance contract; the #559
+        heartbeat/reclaim pair check above still governs independently."""
+        from app.config import settings as _settings
+
+        stall = (
+            float(self.jobs_stall_timeout_seconds)
+            if self.jobs_stall_timeout_seconds is not None
+            else float(_settings.jobs_stall_timeout_seconds)
+        )
+        reclaim = (
+            float(self.jobs_lease_reclaim_timeout_seconds)
+            if self.jobs_lease_reclaim_timeout_seconds is not None
+            else float(_settings.jobs_lease_reclaim_timeout_seconds)
+        )
+        if stall <= reclaim:
+            raise ValueError(
+                "jobs_stall_timeout_seconds must be > "
+                "jobs_lease_reclaim_timeout_seconds "
+                f"(effective stall={stall:g}, reclaim={reclaim:g})"
+            )
+        parse_timeout = float(
+            getattr(_settings, "document_parse_timeout", 0.0)
+        )
+        if stall <= parse_timeout:
+            raise ValueError(
+                "jobs_stall_timeout_seconds must be > document_parse_timeout"
+            )
+        return self
+
     # ── Curator validators ────────────────────────────────────────────────
     @field_validator("wiki_llm_curator_temperature")
     @classmethod
@@ -647,6 +701,8 @@ ALLOWED_FIELDS = [
     "jobs_heartbeat_interval_seconds",
     "jobs_lease_reclaim_timeout_seconds",
     "jobs_max_attempts",
+    # Reindex stall watchdog budget (issue #1010)
+    "jobs_stall_timeout_seconds",
     "reranker_url",
     "reranker_model",
     "reranking_enabled",
@@ -1007,6 +1063,7 @@ class SettingsResponse(BaseModel):
     jobs_heartbeat_interval_seconds: float = 30.0
     jobs_lease_reclaim_timeout_seconds: float = 300.0
     jobs_max_attempts: int = 3
+    jobs_stall_timeout_seconds: float = 900.0
 
     # Reranker config
     reranker_url: str = ""
@@ -1161,6 +1218,7 @@ def _build_settings_dict() -> dict:
         "jobs_heartbeat_interval_seconds": settings.jobs_heartbeat_interval_seconds,
         "jobs_lease_reclaim_timeout_seconds": settings.jobs_lease_reclaim_timeout_seconds,
         "jobs_max_attempts": settings.jobs_max_attempts,
+        "jobs_stall_timeout_seconds": settings.jobs_stall_timeout_seconds,
         "maintenance_mode": settings.maintenance_mode,
         "auto_scan_enabled": settings.auto_scan_enabled,
         "auto_scan_interval_minutes": settings.auto_scan_interval_minutes,

@@ -47,6 +47,10 @@ _LEGACY_ERROR_STABLE_PREFIXES = (
     "PAYLOAD_MALFORMED:",
     "lease_attempt_cap_exceeded",
     "lease_disabled_rollback",
+    # issue #1010: the reindex stall watchdog's settle code — a
+    # no-progress release is a stable server-side reason, never a raw
+    # exception text.
+    "lease_stall_reclaimed",
     "admission rejected:",
 )
 
@@ -256,7 +260,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     started_at TIMESTAMP,
     heartbeat_at TIMESTAMP,
-    completed_at TIMESTAMP
+    completed_at TIMESTAMP,
+    progress_at TIMESTAMP
 )
 """
 
@@ -278,6 +283,12 @@ ON jobs(status, heartbeat_at) WHERE status = 'running'
 # reclaim. Only allowlisted table/column fragments are interpolated. The
 # {error_col} fragment is the table's single error column ("error" on jobs;
 # "error_code" on draft_jobs, which splits error into code+message).
+# Issue #1010: the expiry predicate is a PARENTHESIZED group with the queue
+# filter OUTSIDE it — the age arm (dead heartbeat) ORs with the stall arm
+# (live-but-no-progress watermark, present only on shapes that carry a
+# progress_at column), so the stall arm can never bypass the queue filter.
+# A wedged-but-heartbeating worker matches the stall arm; a dead worker
+# matches the age arm; both settle identically (requeue, or cap-fail).
 _RECLAIM_SQL_TEMPLATE = """
 UPDATE {table}
 SET status = CASE
@@ -294,28 +305,54 @@ SET status = CASE
     {reclaim_started_at_set},
     {reclaim_completed_at_set},
     heartbeat_at = NULL
-WHERE status = 'running'
-  AND heartbeat_at IS NOT NULL
-  AND heartbeat_at < datetime('now', ?)
-  AND {queue_column} = COALESCE(?, {queue_column})
+WHERE {queue_column} = COALESCE(?, {queue_column})
+  AND status = 'running'
+  AND (
+        (heartbeat_at IS NOT NULL AND heartbeat_at < datetime('now', ?))
+        {stall_arm}
+      )
 """
 
+# The stall arm fragment (issue #1010): interpolated only for shapes whose
+# table carries the progress watermark column. The leading OR is part of
+# the fragment so shapes without it collapse to today's single predicate.
+# Both sides carry millisecond precision: a second-granular datetime('now')
+# next to a %f stamp would fire the arm up to a second early (issue #1010).
+_STALL_ARM_FRAGMENT = (
+    " OR (progress_at IS NOT NULL AND progress_at < "
+    "strftime('%Y-%m-%d %H:%M:%f', 'now', ?))"
+)
 
-def _reclaim_sql(shape: _TableShape, table: str) -> str:
+
+def _reclaim_sql(
+    shape: _TableShape,
+    table: str,
+    stall_arm: str = "",
+) -> str:
     return _RECLAIM_SQL_TEMPLATE.format(
         table=table,
         queue_column=shape.queue_column,
         error_col="error_code" if shape.error_set.startswith("error_code") else "error",
         reclaim_started_at_set=shape.reclaim_started_at_set,
         reclaim_completed_at_set=shape.reclaim_completed_at_set,
+        stall_arm=stall_arm,
     )
+
+
+def _jobs_column_names(conn: sqlite3.Connection) -> set[str]:
+    """The ``jobs`` table's current column names (pragma table_info)."""
+    return {str(row[1]) for row in conn.execute("PRAGMA table_info(jobs)")}
 
 
 def ensure_jobs_schema(conn: sqlite3.Connection) -> None:
     """Create the shared ``jobs`` table and its indexes if absent.
 
     Idempotent (``IF NOT EXISTS``) and safe to run on every boot; commits only
-    when it opened the transaction itself.
+    when it opened the transaction itself. Issue #1010: pre-existing
+    deployments gain the ``progress_at`` watermark column through a guarded
+    ``ALTER TABLE`` (idempotent via pragma table_info — the database.py
+    guarded-ALTER precedent); NULL watermark rows simply never match the
+    stall arm.
     """
     statements = (
         _JOBS_TABLE_DDL,
@@ -328,6 +365,8 @@ def ensure_jobs_schema(conn: sqlite3.Connection) -> None:
     try:
         for statement in statements:
             conn.execute(statement)
+        if "progress_at" not in _jobs_column_names(conn):
+            conn.execute("ALTER TABLE jobs ADD COLUMN progress_at TIMESTAMP")
     except BaseException:
         if owned:
             conn.rollback()
@@ -360,6 +399,16 @@ class _TableShape:
         # reconcile and every terminal reader key on it); the pending arm
         # preserves the existing value. Tables without the column no-op.
         reclaim_completed_at_set: str = "completed_at = completed_at",
+        # Issue #1010: the stall-arm WHERE fragment, interpolated only for
+        # shapes whose table carries the progress_at watermark column; the
+        # default empty string collapses the expiry group to the age arm.
+        stall_arm: str = "",
+        # Issue #1010 review: the claim-time progress reset, interpolated
+        # only for shapes whose table carries progress_at. Without it a
+        # re-claimed row carries its OLD stale watermark until the run's
+        # entry stamp lands, so a janitor sweep or watchdog probe in that
+        # claim→stamp window can burn an attempt on a freshly claimed job.
+        claim_progress_reset: str = "",
     ) -> None:
         self.queue_column = queue_column
         self.has_run_after = has_run_after
@@ -367,6 +416,8 @@ class _TableShape:
         self.supports_enqueue = supports_enqueue
         self.reclaim_started_at_set = reclaim_started_at_set
         self.reclaim_completed_at_set = reclaim_completed_at_set
+        self.stall_arm = stall_arm
+        self.claim_progress_reset = claim_progress_reset
 
 
 # The table allowlist (issue #559 stage 4, plan-critic MAJOR-2: one primitive,
@@ -385,6 +436,14 @@ _TABLE_SHAPES: dict[str, _TableShape] = {
         reclaim_completed_at_set=(
             "completed_at = CASE WHEN ? IS NOT NULL AND attempts >= ? "
             "THEN CURRENT_TIMESTAMP ELSE completed_at END"
+        ),
+        # Issue #1010: jobs carries the progress_at watermark, so its
+        # reclaim carries the stall arm and its claim resets the watermark
+        # (each attempt's stall baseline is claim-time, never a prior
+        # attempt's stale watermark).
+        stall_arm=_STALL_ARM_FRAGMENT,
+        claim_progress_reset=(
+            ", progress_at = strftime('%Y-%m-%d %H:%M:%f', 'now')"
         ),
     ),
     "draft_jobs": _TableShape(
@@ -444,6 +503,7 @@ class JobLease:
         table: str = "jobs",
         claim_order: str = "id ASC",
         claim_started_at: str = "CURRENT_TIMESTAMP",
+        stall_timeout_seconds: Optional[float] = None,
     ) -> None:
         shape = _TABLE_SHAPES.get(table)
         if shape is None:
@@ -463,6 +523,11 @@ class JobLease:
         self._conn = conn
         self._reclaim_timeout_seconds = float(reclaim_timeout_seconds)
         self._max_attempts = max_attempts
+        self._stall_timeout_seconds = (
+            None
+            if stall_timeout_seconds is None
+            else float(stall_timeout_seconds)
+        )
         self._table = table
         self._shape = shape
         self._claim_order = claim_order
@@ -583,7 +648,7 @@ class JobLease:
                     lease_generation = lease_generation + 1,
                     attempts = attempts + 1,
                     started_at = {self._claim_started_at},
-                    heartbeat_at = CURRENT_TIMESTAMP
+                    heartbeat_at = CURRENT_TIMESTAMP{self._shape.claim_progress_reset}
                 WHERE id = (
                     SELECT id FROM {self._table}
                     WHERE {self._shape.queue_column} = ?
@@ -736,25 +801,39 @@ class JobLease:
         to ``pending`` (generation bumped, worker cleared) — or terminally to
         ``failed`` when this lease was constructed with ``max_attempts`` and
         the row is at/over the cap. Returns the number of rows settled.
+
+        Issue #1010: when constructed with ``stall_timeout_seconds`` on a
+        shape carrying the progress watermark, a ``running`` row whose
+        ``progress_at`` is older than the stall budget is ALSO settled —
+        a live-but-wedged worker (fresh heartbeat, zero per-file progress)
+        can no longer hold its lease forever.
         """
         cutoff = f"-{self._reclaim_timeout_seconds} seconds"
+        stall_armed = (
+            self._stall_timeout_seconds is not None and self._shape.stall_arm
+        )
+        stall_cutoff = (
+            f"-{self._stall_timeout_seconds} seconds" if stall_armed else None
+        )
+        params = [
+            self._max_attempts,
+            self._max_attempts,
+            self._max_attempts,
+            self._max_attempts,
+            self._max_attempts,
+            self._max_attempts,
+            queue,
+            cutoff,
+        ]
+        if stall_cutoff is not None:
+            params.append(stall_cutoff)
+        sql = _reclaim_sql(
+            self._shape,
+            self._table,
+            stall_arm=_STALL_ARM_FRAGMENT if stall_armed else "",
+        )
         with self._write_txn():
-            cur = self._conn.execute(
-                _reclaim_sql(self._shape, self._table),
-                # Placeholder order follows the SQL TEXT: status CASE (2),
-                # error CASE (2), completed_at CASE (2) — all in the SET
-                # clause — then the WHERE heartbeat/queue operands.
-                (
-                    self._max_attempts,
-                    self._max_attempts,
-                    self._max_attempts,
-                    self._max_attempts,
-                    self._max_attempts,
-                    self._max_attempts,
-                    cutoff,
-                    queue,
-                ),
-            )
+            cur = self._conn.execute(sql, params)
             settled = cur.rowcount
         if settled:
             logger.debug(

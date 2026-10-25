@@ -890,6 +890,7 @@ CREATE TABLE IF NOT EXISTS chat_messages (
 CREATE INDEX IF NOT EXISTS idx_chat_messages_session_id ON chat_messages(session_id);
 CREATE INDEX IF NOT EXISTS idx_files_status ON files(status);
 CREATE INDEX IF NOT EXISTS idx_files_hash_vault_status ON files(file_hash, vault_id, status);
+CREATE INDEX IF NOT EXISTS idx_files_vault_id ON files(vault_id);
 
 -- Document actions for auditing admin operations
 CREATE TABLE IF NOT EXISTS document_actions (
@@ -1079,7 +1080,9 @@ CREATE TABLE IF NOT EXISTS service_accounts (
     created_at TEXT NOT NULL,
     last_rotated_at TEXT,
     revoked_at TEXT,
-    created_by TEXT
+    created_by TEXT,
+    previous_key_hash TEXT,
+    previous_key_expires_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_service_accounts_key_hash ON service_accounts(key_hash);
 
@@ -1130,6 +1133,7 @@ CREATE INDEX IF NOT EXISTS idx_vault_group_access_group_id ON vault_group_access
 CREATE INDEX IF NOT EXISTS idx_users_locked_until ON users(locked_until);
 CREATE INDEX IF NOT EXISTS idx_user_sessions_expires ON user_sessions(expires_at);
 CREATE INDEX IF NOT EXISTS idx_chat_sessions_user_id ON chat_sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_chat_sessions_vault_id ON chat_sessions(vault_id);
 CREATE INDEX IF NOT EXISTS idx_memories_vault_id ON memories(vault_id);
 CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at);
 
@@ -2021,6 +2025,10 @@ def run_migrations(sqlite_path: str) -> None:
     migrate_add_wiki_supporting_tables(sqlite_path)
     migrate_add_wiki_claims_normalized_text(sqlite_path)
     migrate_add_wiki_claims_unique_claim_text(sqlite_path)
+    # Issue #721: purge orphaned group_members rows BEFORE the Default-vault
+    # orphan backfill below, so the backfill's has-access predicate never
+    # counts an orphaned group grant as access.
+    migrate_purge_orphaned_group_members(sqlite_path)
     migrate_assign_orphan_users_to_default_vault(sqlite_path)
     migrate_add_wiki_lint_findings_json_check(sqlite_path)
     migrate_add_access_token_denylist(sqlite_path)
@@ -2076,6 +2084,8 @@ def run_migrations(sqlite_path: str) -> None:
     migrate_add_chat_stream_events(sqlite_path)
     # Per-user onboarding milestone state (issue #782) — purely additive.
     migrate_add_user_onboarding_state(sqlite_path)
+    migrate_add_service_account_rotation_grace(sqlite_path)
+    migrate_add_vault_count_indexes(sqlite_path)
     # Producer provenance + auto_resolved status for wiki lint findings
     # (issue #791): table rebuild, so it runs after every other migration
     # that may create or rebuild wiki_lint_findings.
@@ -4128,7 +4138,9 @@ def migrate_add_service_accounts(sqlite_path: str) -> None:
                 created_at TEXT NOT NULL,
                 last_rotated_at TEXT,
                 revoked_at TEXT,
-                created_by TEXT
+                created_by TEXT,
+                previous_key_hash TEXT,
+                previous_key_expires_at TEXT
             )
         """)
         conn.execute("""
@@ -6764,6 +6776,12 @@ def transaction_context(conn: sqlite3.Connection):
             conn.execute("UPDATE ...")
         # Automatically commits on success, rolls back on exception
 
+    Takes the write lock upfront (BEGIN IMMEDIATE): a DEFERRED begin here
+    turned read-then-write sequences (validate preconditions, then write)
+    into snapshot upgrades that fail with SQLITE_BUSY_SNAPSHOT — which
+    busy_timeout does not retry — whenever another connection committed
+    between the in-transaction read and the first write (issue #721 review).
+
     Args:
         conn: SQLite database connection
 
@@ -6773,7 +6791,7 @@ def transaction_context(conn: sqlite3.Connection):
     Raises:
         Any exception that occurs during the transaction (after rollback)
     """
-    conn.execute("BEGIN")
+    conn.execute("BEGIN IMMEDIATE")
     try:
         yield conn
         conn.commit()
@@ -6823,6 +6841,98 @@ def set_migration_flag(conn: sqlite3.Connection, name: str) -> None:
         " VALUES (?, 1, 'migration milestone')",
         (name,),
     )
+
+
+def migrate_purge_orphaned_group_members(sqlite_path: str) -> None:
+    """
+    Migration: purge orphaned group_members rows (issue #721).
+
+    A group_members row is orphaned when its user is no longer a member of
+    the group's organization. The runtime fixes in this issue stop producing
+    such rows (removal-side cleanups in organizations.py/users.py plus the
+    reader-side org predicate in authz_policy.py); this one-off removes the
+    rows legacy databases already hold so group-membership listings stop
+    showing them. Runs BEFORE migrate_assign_orphan_users_to_default_vault so
+    the Default-vault backfill never counts an orphaned group grant as access.
+
+    Destructive and journaled (#699 AC5 precedent): purged rows are NOT
+    recoverable from the journal — the count + detail recorded in the journal
+    row are the only trace. The gate, the count, the DELETE, and the journal
+    row all run inside one BEGIN IMMEDIATE transaction: concurrent worker
+    startups serialize (the second sees the first's 'ok' row and exits), the
+    journaled count is the DELETE's own rowcount from the same snapshot, and
+    a failed journal INSERT rolls the DELETE back so the count is never lost
+    (issue #721 review F-007/F-023/F-030). Journal-gated on a prior succeeded
+    run; a converged boot is a no-op that journals nothing.
+    """
+    journal_name = "migrate_purge_orphaned_group_members"
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
+    try:
+        # BEGIN IMMEDIATE: gate + count + DELETE + journal row commit as one
+        # unit and concurrent startups serialize behind the write lock
+        # (issue #721 review F-030).
+        conn.execute("BEGIN IMMEDIATE")
+        already = conn.execute(
+            "SELECT COUNT(*) FROM migration_journal WHERE migration_name = ? AND outcome = 'ok'",
+            (journal_name,),
+        ).fetchone()[0]
+        if already:
+            conn.rollback()
+            return
+
+        _doomed = conn.execute(
+            """SELECT COUNT(*) FROM group_members gm
+                JOIN groups g ON g.id = gm.group_id
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM org_members om
+                    WHERE om.org_id = g.org_id AND om.user_id = gm.user_id
+                )"""
+        ).fetchone()[0]
+        if _doomed:
+            logger.info(
+                "run_migrations: deleting %d orphaned group_members row(s) "
+                "(unrecoverable; user no longer in the group's organization)",
+                _doomed,
+            )
+            deleted = conn.execute(
+                """DELETE FROM group_members WHERE id IN (
+                    SELECT gm.id FROM group_members gm
+                    JOIN groups g ON g.id = gm.group_id
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM org_members om
+                        WHERE om.org_id = g.org_id AND om.user_id = gm.user_id
+                    ))"""
+            ).rowcount
+        else:
+            deleted = 0
+        # Direct INSERT rather than record_migration_outcome: that helper
+        # never raises, so a failed journal INSERT would commit the DELETE
+        # while losing the only trace of it. Here a journal failure rolls the
+        # DELETE back too and the whole purge retries on the next boot with
+        # its count intact (issue #721 review F-007/F-023).
+        conn.execute(
+            "INSERT INTO migration_journal (migration_name, phase, outcome, detail)"
+            " VALUES (?, ?, ?, ?)",
+            (journal_name, "succeeded", "ok", f"orphaned group_members rows deleted: {deleted}"),
+        )
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        # Terminal journal outcome even on failure (#699 PRR-001 precedent):
+        # the rollback discarded the in-transaction row, so record on its own
+        # committed transaction. The journal gate above only matches outcome
+        # 'ok', so a failed attempt retries on the next boot.
+        record_migration_outcome(
+            conn,
+            migration_name=journal_name,
+            phase="failed",
+            outcome="error",
+            detail=f"{type(exc).__name__}: {exc}",
+        )
+        conn.commit()
+        raise
+    finally:
+        conn.close()
 
 
 def migrate_assign_orphan_users_to_default_vault(sqlite_path: str) -> None:
@@ -8227,21 +8337,158 @@ def migrate_add_user_onboarding_state(sqlite_path: str) -> None:
         conn.close()
 
 
-def migrate_add_canvas_tables(sqlite_path: str) -> None:
-    """Migration: add the canvas artifact/version tables (issue #509).
+def migrate_add_service_account_rotation_grace(sqlite_path: str) -> None:
+    """Migration: service-account rotation grace columns (issue #724).
 
-    Creates ``canvas_artifacts`` (stable artifact identity + lineage + sources
-    snapshot) and ``canvas_versions`` (append-only version history).
-
-    Executes ``_CANVAS_DDL`` — the exact same constant appended to ``SCHEMA`` —
-    so a database created by ``init_db`` and a legacy database upgraded by this
-    migration converge on an identical schema (double-definition convention).
-    Every statement is ``CREATE ... IF NOT EXISTS``, so repeat execution is a
-    no-op and existing data is preserved.
+    Adds ``previous_key_hash`` / ``previous_key_expires_at`` (nullable) so a
+    rotation whose response was never delivered stays recoverable: the
+    previous key remains valid until the new key is first used or the grace
+    TTL expires. Purely additive ``ALTER TABLE ADD COLUMN`` for legacy
+    databases; fresh databases get the columns from ``SCHEMA`` already
+    (double-definition convention). Journal-silent no-op when the columns
+    already exist, matching the migrate_add_user_onboarding_state peer.
     """
     conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
+    conn.isolation_level = None
+    _journal = "migrate_add_service_account_rotation_grace"
     try:
-        conn.execute("PRAGMA foreign_keys = ON;")
+        cols = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(service_accounts)").fetchall()
+        }
+        if "previous_key_hash" in cols and "previous_key_expires_at" in cols:
+            return
+        if "previous_key_hash" not in cols:
+            conn.execute(
+                "ALTER TABLE service_accounts ADD COLUMN previous_key_hash TEXT"
+            )
+        if "previous_key_expires_at" not in cols:
+            conn.execute(
+                "ALTER TABLE service_accounts ADD COLUMN previous_key_expires_at TEXT"
+            )
+        record_migration_outcome(
+            conn, migration_name=_journal, phase="succeeded", outcome="ok"
+        )
+    except Exception:
+        record_migration_outcome(
+            conn, migration_name=_journal, phase="failed", outcome="error"
+        )
+        raise
+    finally:
+        conn.close()
+
+
+def migrate_add_vault_count_indexes(sqlite_path: str) -> None:
+    """Migration: vault_id indexes for the vault counts query (issue #723).
+
+    The counts rewrite in ``_VAULT_WITH_COUNTS_SQL`` uses three correlated
+    scalar subqueries on ``files.vault_id`` and ``chat_sessions.vault_id``;
+    SQLite auto-indexed the old LEFT JOIN form but never auto-indexes
+    correlated subqueries, and fresh installs get no vault_id-leading index
+    on those two tables from the base DDL. Purely additive
+    ``CREATE INDEX IF NOT EXISTS`` — journal-silent no-op when present,
+    matching the migrate_add_user_onboarding_state peer.
+    """
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
+    conn.isolation_level = None
+    _journal = "migrate_add_vault_count_indexes"
+    try:
+        have = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name IN "
+                "('idx_files_vault_id', 'idx_chat_sessions_vault_id')"
+            ).fetchall()
+        }
+        if have == {"idx_files_vault_id", "idx_chat_sessions_vault_id"}:
+            return
+        if "idx_files_vault_id" not in have:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_files_vault_id ON files(vault_id)"
+            )
+        if "idx_chat_sessions_vault_id" not in have:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_chat_sessions_vault_id "
+                "ON chat_sessions(vault_id)"
+            )
+        record_migration_outcome(
+            conn, migration_name=_journal, phase="succeeded", outcome="ok"
+        )
+    except Exception:
+        record_migration_outcome(
+            conn, migration_name=_journal, phase="failed", outcome="error"
+        )
+        raise
+    finally:
+        conn.close()
+
+
+def lookup_service_account(conn, key_hash: str):
+    """Shared service-account key lookup with rotation grace (issue #724).
+
+    Single round trip over the primary and the previous (rotation-grace)
+    hash: ``WHERE key_hash = ? OR previous_key_hash = ?``. Returns
+    ``(row, via_previous)`` where row is ``(id, name, scopes, revoked_at)``
+    and via_previous is True when the match was the previous key inside its
+    grace window (an expired grace reads as no match). A NEW-key match
+    retires the grace columns conditionally (``previous_key_hash IS NOT
+    NULL`` guard: no write on the steady-state hot path). Both live
+    validators (security.require_service_account and
+    deps.get_current_user_or_service_account) resolve through this helper.
+    """
+    from datetime import datetime as _dt
+    from datetime import timezone as _tz
+
+    # Issue #724 review (F-4): under a degraded boot (migrations_ok=False)
+    # the rotation-grace columns may not exist; fall back to the pre-grace
+    # 4-column shape (treated as no grace) instead of OperationalError-500ing
+    # every service-account authentication, mirroring the
+    # _fetch_user_row_with_pwc no-such-column convention.
+    try:
+        row = conn.execute(
+            "SELECT id, name, scopes, revoked_at, key_hash, previous_key_hash, "
+            "previous_key_expires_at FROM service_accounts "
+            "WHERE key_hash = ? OR previous_key_hash = ?",
+            (key_hash, key_hash),
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such column" not in str(exc).lower():
+            raise
+        row = conn.execute(
+            "SELECT id, name, scopes, revoked_at, key_hash, "
+            "NULL AS previous_key_hash, NULL AS previous_key_expires_at "
+            "FROM service_accounts WHERE key_hash = ?",
+            (key_hash,),
+        ).fetchone()
+    if row is None:
+        return None, False
+    sa_id, name, scopes, revoked_at, current_hash, prev_hash, prev_expires = row
+    if prev_hash is not None and prev_hash == key_hash:
+        if prev_expires is None:
+            return (sa_id, name, scopes, revoked_at), True
+        try:
+            grace_end = _dt.fromisoformat(prev_expires)
+        except ValueError:
+            return None, False
+        if grace_end.tzinfo is None:
+            grace_end = grace_end.replace(tzinfo=_tz.utc)
+        if _dt.now(_tz.utc) > grace_end:
+            return None, False
+        return (sa_id, name, scopes, revoked_at), True
+    if prev_hash is not None:
+        conn.execute(
+            "UPDATE service_accounts SET previous_key_hash = NULL, "
+            "previous_key_expires_at = NULL "
+            "WHERE id = ? AND previous_key_hash IS NOT NULL",
+            (sa_id,),
+        )
+        conn.commit()
+    return (sa_id, name, scopes, revoked_at), False
+
+
+def migrate_add_canvas_tables(sqlite_path: str) -> None:
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
+    try:
         conn.executescript(_CANVAS_DDL)
         conn.commit()
     finally:

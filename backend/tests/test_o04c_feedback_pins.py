@@ -79,13 +79,29 @@ def _make_env(vaults=(1,)):
 
 
 class _O04cBase(unittest.TestCase):
+    # Every curator attribute any test in this file assigns on the
+    # process-wide settings singleton (issue #987: the url/model leak alone
+    # flipped test_settings_curator's 422 to 200 under xdist co-scheduling).
+    _CURATOR_FIELDS = (
+        "wiki_llm_curator_enabled",
+        "wiki_llm_curator_run_on_ingest",
+        "wiki_llm_curator_url",
+        "wiki_llm_curator_model",
+        "wiki_llm_curator_mode",
+        "wiki_llm_curator_require_quote_match",
+        "wiki_llm_curator_require_chunk_id",
+    )
+
     def setUp(self):
         self.conn, self.store, self.compiler, self._td = _make_env()
-        self._snap = getattr(settings, "wiki_llm_curator_enabled")
+        self._snap = {
+            f: getattr(settings, f) for f in self._CURATOR_FIELDS
+        }
         settings.wiki_llm_curator_enabled = False
 
     def tearDown(self):
-        settings.wiki_llm_curator_enabled = self._snap
+        for f, v in self._snap.items():
+            setattr(settings, f, v)
         self.conn.close()
         shutil.rmtree(self._td, ignore_errors=True)
 

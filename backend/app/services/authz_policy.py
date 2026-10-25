@@ -93,8 +93,13 @@ async def get_effective_vault_permissions(
         return db.execute(
             f"""SELECT vga.vault_id, vga.permission FROM vault_group_access vga
                JOIN group_members gm ON vga.group_id = gm.group_id
-               WHERE gm.user_id = ? AND vga.vault_id IN ({placeholders})""",
-            (user_id, *normalized_ids),
+               JOIN groups g ON g.id = gm.group_id
+               WHERE gm.user_id = ? AND vga.vault_id IN ({placeholders})
+                 AND EXISTS (
+                     SELECT 1 FROM org_members om
+                     WHERE om.org_id = g.org_id AND om.user_id = ?
+                 )""",
+            (user_id, *normalized_ids, user_id),
         ).fetchall()
 
     def _query_public_vaults():

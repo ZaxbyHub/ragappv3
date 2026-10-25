@@ -286,8 +286,11 @@ async def test_admin_user_with_group_read_still_gets_write_floor(db_conn):
     Admin with only group-based 'read' access still gets write floor
     because max(baseline=2, group_read=1) = write.
     """
-    # Create group and add admin user to it
-    db_conn.execute("INSERT INTO groups (id, name, org_id) VALUES (50, 'readers', NULL)")
+    # Create group and add admin user to it.
+    # org 200 owns no vaults: the membership satisfies the group/org
+    # predicate (#721 AC4) without granting anything else.
+    db_conn.execute("INSERT INTO groups (id, name, org_id) VALUES (50, 'readers', 200)")
+    db_conn.execute("INSERT INTO org_members (org_id, user_id) VALUES (200, 10)")
     db_conn.execute("INSERT INTO group_members (group_id, user_id) VALUES (50, 10)")
     # Give group read access to vault 1
     db_conn.execute(
@@ -371,7 +374,10 @@ async def test_member_user_via_group_write_gets_write(db_conn):
     No baseline floor for member, so group_write=2 is the result.
     """
     # Create group and add user to it
-    db_conn.execute("INSERT INTO groups (id, name, org_id) VALUES (60, 'editors', NULL)")
+    # org 200 owns no vaults: membership satisfies the group/org
+    # predicate (#721 AC4) without granting anything else.
+    db_conn.execute("INSERT INTO groups (id, name, org_id) VALUES (60, 'editors', 200)")
+    db_conn.execute("INSERT INTO org_members (org_id, user_id) VALUES (200, 30)")
     db_conn.execute("INSERT INTO group_members (group_id, user_id) VALUES (60, 30)")
     # Give group write access to vault 1
     db_conn.execute(
@@ -396,7 +402,8 @@ async def test_explicit_vault_permission_beats_group_permission(db_conn):
     the higher of the two should win.
     """
     # User 40: explicit 'read' on vault 1, but group gives 'write'
-    db_conn.execute("INSERT INTO groups (id, name, org_id) VALUES (70, 'writers', NULL)")
+    db_conn.execute("INSERT INTO groups (id, name, org_id) VALUES (70, 'writers', 200)")
+    db_conn.execute("INSERT INTO org_members (org_id, user_id) VALUES (200, 40)")
     db_conn.execute("INSERT INTO group_members (group_id, user_id) VALUES (70, 40)")
     db_conn.execute(
         "INSERT INTO vault_group_access (vault_id, group_id, permission) VALUES (1, 70, 'write')"

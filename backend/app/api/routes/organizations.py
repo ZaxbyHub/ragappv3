@@ -106,6 +106,35 @@ def _generate_slug(name: str) -> str:
     return generate_org_slug(name)
 
 
+def _assert_invite_redeemable(conn: sqlite3.Connection, email: str) -> None:
+    """Redeemability precondition shared by create_org_invite and resend_org_invite.
+
+    Fails closed at mint time for identifiers that could never be redeemed:
+    acceptance matches the stored identifier against the invitee's USERNAME
+    (#300's delivered design) and requires a global role of member or above.
+    Username-form identifiers may address not-yet-provisioned users and stay
+    allowed; email-form identifiers that are nobody's username are rejected
+    (issue #560 C24). Resend re-asserts the same checks so an invite whose
+    invitee has since become unredeemable is not re-minted (issue #721 AC8).
+    """
+    invitee_row = conn.execute(
+        "SELECT role FROM users WHERE username = ? COLLATE NOCASE",
+        (email.lower(),),
+    ).fetchone()
+    if invitee_row is None and "@" in email:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No user found with username '{email.lower()}'; email-form invites must match an existing username",
+        )
+    if invitee_row:
+        invitee_level = UserRole.level(invitee_row[0])
+        if invitee_level < UserRole.MEMBER.value:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot invite a user with a global role below member",
+            )
+
+
 def _is_org_admin_or_owner(conn: sqlite3.Connection, org_id: int, user_id: int) -> bool:
     """Check if user has admin or owner role in the organization."""
     cursor = conn.execute(
@@ -660,31 +689,9 @@ async def create_org_invite(
             )
 
         # Fail closed at creation time for identifiers that could never be
-        # redeemed: acceptance matches the stored identifier against the
-        # invitee's USERNAME (#300's delivered design) and requires a global
-        # role of member or above.
-        invitee_cursor = await asyncio.to_thread(
-            conn.execute,
-            "SELECT role FROM users WHERE username = ? COLLATE NOCASE",
-            (req.email.lower(),),
-        )
-        invitee_row = await asyncio.to_thread(invitee_cursor.fetchone)
-        if invitee_row is None and "@" in req.email:
-            # An email-form identifier that is nobody's username mints a
-            # token nobody can ever redeem (issue #560 C24). Username-form
-            # identifiers may address not-yet-provisioned users (see #300)
-            # and stay allowed.
-            raise HTTPException(
-                status_code=400,
-                detail=f"No user found with username '{req.email.lower()}'; email-form invites must match an existing username",
-            )
-        if invitee_row:
-            invitee_level = UserRole.level(invitee_row[0])
-            if invitee_level < UserRole.MEMBER.value:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Cannot invite a user with a global role below member",
-                )
+        # redeemed (issue #560 C24, #721 AC8): the shared helper applies the
+        # exact checks resend re-asserts.
+        await asyncio.to_thread(_assert_invite_redeemable, conn, req.email)
 
         # Generate token
         raw_token, token_hash = _generate_invite_token()
@@ -764,6 +771,11 @@ async def resend_org_invite(
             raise HTTPException(status_code=400, detail="Invite has been revoked")
         if invite[4]:  # accepted_at
             raise HTTPException(status_code=400, detail="Invite has already been accepted")
+
+        # Re-assert the same redeemability checks creation applies (issue #721
+        # AC8): an invite whose invitee has since become unable to redeem it
+        # (e.g. global role dropped below member) must not be re-minted.
+        await asyncio.to_thread(_assert_invite_redeemable, conn, invite[1])
 
         # Generate new token
         raw_token, token_hash = _generate_invite_token()
@@ -1155,6 +1167,17 @@ async def remove_org_member(
                 conn.execute,
                 "DELETE FROM org_members WHERE org_id = ? AND user_id = ?",
                 (org_id, member_user_id),
+            )
+            # Group membership implies organization membership: also drop the
+            # member's group_members rows for this org's groups in the same
+            # transaction, so the removal revokes their derived vault grants
+            # (issue #721 AC2).
+            await asyncio.to_thread(
+                conn.execute,
+                """DELETE FROM group_members
+                    WHERE user_id = ?
+                      AND group_id IN (SELECT id FROM groups WHERE org_id = ?)""",
+                (member_user_id, org_id),
             )
             await asyncio.to_thread(conn.commit)
         except Exception:
