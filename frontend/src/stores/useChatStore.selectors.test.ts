@@ -3,10 +3,11 @@
  * re-rendering on streaming token growth (P1.6).
  */
 import { describe, it, expect, beforeEach } from "vitest";
-import { renderHook } from "@testing-library/react";
+import { act, renderHook } from "@testing-library/react";
 import {
   useChatStore,
   useLastCompletedAssistantSources,
+  useLastCompletedAssistantCitationConfidence,
   useLastUserContent,
   useSourcesForSourceId,
   useCompletedAssistantMessageIdsKey,
@@ -134,5 +135,150 @@ describe("granular RightPane selectors", () => {
     s.setStreamingMessageId(null);
     rerender();
     expect(parseCompletedAssistantIds(result.current)).toEqual(["a"]);
+  });
+});
+
+describe("useLastCompletedAssistantCitationConfidence (#965)", () => {
+  it("returns the most recent completed assistant message's score record", () => {
+    const s = useChatStore.getState();
+    s.addMessage({ id: "u", role: "user", content: "q" });
+    s.addMessage({
+      id: "a-old",
+      role: "assistant",
+      content: "old",
+      citationConfidence: { W1: 0.25 },
+    });
+    s.addMessage({
+      id: "a-new",
+      role: "assistant",
+      content: "new",
+      citationConfidence: { W1: 0.5, K1: 0 },
+    });
+
+    const { result } = renderHook(() =>
+      useLastCompletedAssistantCitationConfidence()
+    );
+    expect(result.current).toEqual({ W1: 0.5, K1: 0 });
+  });
+
+  it("skips the actively streaming message", () => {
+    const s = useChatStore.getState();
+    s.addMessage({ id: "u", role: "user", content: "q" });
+    s.addMessage({
+      id: "a-live",
+      role: "assistant",
+      content: "streaming",
+      citationConfidence: { W9: 0.9 },
+    });
+    s.setStreamingMessageId("a-live");
+
+    const { result } = renderHook(() =>
+      useLastCompletedAssistantCitationConfidence()
+    );
+    expect(result.current).toBeUndefined();
+  });
+
+  it("stops the scan at an explicitly empty record so older scores never leak", () => {
+    const s = useChatStore.getState();
+    s.addMessage({ id: "u", role: "user", content: "q" });
+    s.addMessage({
+      id: "a-old",
+      role: "assistant",
+      content: "old",
+      citationConfidence: { W1: 0.25 },
+    });
+    s.addMessage({ id: "a-new", role: "assistant", content: "new", citationConfidence: {} });
+
+    const { result } = renderHook(() =>
+      useLastCompletedAssistantCitationConfidence()
+    );
+    expect(result.current).toEqual({});
+  });
+
+  it("pairs refs and scores only within the same message (mixed history)", () => {
+    // The disclosed caveat (#965): the refs selectors stop at the newest
+    // message with non-empty refs while this selector stops at the newest
+    // message carrying any record. When a newer completed message has refs
+    // but NO confidence field, the two scans disagree — pin the actual
+    // behavior so any hardening that derives both slices from one message id
+    // updates this test deliberately.
+    const s = useChatStore.getState();
+    s.addMessage({
+      id: "a-scored",
+      role: "assistant",
+      content: "scored turn",
+      citationConfidence: { W1: 0.4 },
+    });
+    s.addMessage({
+      id: "a-refsonly",
+      role: "assistant",
+      content: "newer turn with refs but no score field",
+      wikiRefs: [{ id: "chunk-x", filename: "x-title" }],
+    });
+
+    const { result } = renderHook(() =>
+      useLastCompletedAssistantCitationConfidence()
+    );
+    // The selector falls through the refs-only message (no confidence field)
+    // to the older scored one — the refs surface would show the newer card
+    // with this older score. Documented, not hidden.
+    expect(result.current).toEqual({ W1: 0.4 });
+  });
+
+  it("returns a reference-stable record across streaming token growth", () => {
+    const s = useChatStore.getState();
+    s.addMessage({ id: "u", role: "user", content: "q" });
+    s.addMessage({
+      id: "a1",
+      role: "assistant",
+      content: "answer",
+      citationConfidence: { W1: 0.5 },
+    });
+
+    const { result, rerender } = renderHook(() =>
+      useLastCompletedAssistantCitationConfidence()
+    );
+    const before = result.current;
+    expect(before).toEqual({ W1: 0.5 });
+
+    // Streaming token growth on the SAME message must not change the
+    // record's identity (useShallow + stored-reference contract — mirrors
+    // the sibling useCompletedAssistantMessageIdsKey pin above).
+    act(() => {
+      useChatStore.setState((state) => ({
+        messagesById: {
+          ...state.messagesById,
+          a1: { ...state.messagesById.a1, content: "answer with more tokens" },
+        },
+      }));
+    });
+    rerender();
+    expect(result.current).toBe(before);
+  });
+
+  it("ignores non-assistant messages that carry a confidence record", () => {
+    const s = useChatStore.getState();
+    s.addMessage({
+      id: "u",
+      role: "user",
+      content: "hostile or misplaced record",
+      citationConfidence: { W1: 0.99 },
+    } as never);
+
+    const { result } = renderHook(() =>
+      useLastCompletedAssistantCitationConfidence()
+    );
+    expect(result.current).toBeUndefined();
+  });
+
+  it("is undefined when no completed assistant message carries scores", () => {
+    const s = useChatStore.getState();
+    s.addMessage({ id: "u", role: "user", content: "q" });
+    s.addMessage({ id: "a", role: "assistant", content: "no scores" });
+
+    const { result } = renderHook(() =>
+      useLastCompletedAssistantCitationConfidence()
+    );
+    expect(result.current).toBeUndefined();
   });
 });

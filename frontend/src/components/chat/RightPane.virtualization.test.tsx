@@ -76,6 +76,10 @@ vi.mock("@/stores/useChatStore", () => {
   });
   const useLastCompletedAssistantWikiRefsMock = vi.fn(() => undefined);
   const useLastCompletedAssistantKmsRefsMock = vi.fn(() => undefined);
+  // Issue #965: one-line stub (sibling pattern) — the real selector's
+  // scan-back is pinned in useChatStore.selectors.test.ts and the dedicated
+  // c09 pane suite; no assertion in this file observes its output.
+  const useLastCompletedAssistantCitationConfidenceMock = vi.fn(() => undefined);
   const useStreamingCandidateSourcesMock = vi.fn(() => {
     const state = chatStoreMock() ?? {};
     const id = (state as { streamingMessageId?: string }).streamingMessageId;
@@ -89,6 +93,7 @@ vi.mock("@/stores/useChatStore", () => {
     useLastCompletedAssistantSources: useLastCompletedAssistantSourcesMock,
     useLastCompletedAssistantWikiRefs: useLastCompletedAssistantWikiRefsMock,
     useLastCompletedAssistantKmsRefs: useLastCompletedAssistantKmsRefsMock,
+    useLastCompletedAssistantCitationConfidence: useLastCompletedAssistantCitationConfidenceMock,
     useLastUserContent: useLastUserContentMock,
     useSourcesForSourceId: useSourcesForSourceIdMock,
     useCompletedAssistantMessageIdsKey: useCompletedAssistantMessageIdsKeyMock,
