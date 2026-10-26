@@ -135,7 +135,9 @@ describe("RightPane support chips on side-pane evidence cards (#965)", () => {
 
     renderPane();
 
-    const chips = screen.getAllByText(/support/i);
+    // queryAllByText-length form matches the issue's declared RED signature
+    // (0 found at base).
+    const chips = screen.queryAllByText(/support/i);
     expect(chips).toHaveLength(1);
     expect(chips[0]).toHaveTextContent("Support 50%");
     // #714 chip contract reused verbatim: the lexical-measure disclaimer lives
@@ -144,6 +146,8 @@ describe("RightPane support chips on side-pane evidence cards (#965)", () => {
     expect(chips[0].getAttribute("title")).toContain("lexical measure");
     expect(chips[0].getAttribute("title")?.toLowerCase()).not.toContain("verified");
     expect(screen.queryByText(/verified/i)).not.toBeInTheDocument();
+    // The disclaimer is title-ONLY: it never leaks into a visible text node.
+    expect(screen.queryByText(/lexical measure/i)).not.toBeInTheDocument();
   });
 
   it("renders a support score for a cited KMS ref in the pane", () => {
@@ -151,11 +155,16 @@ describe("RightPane support chips on side-pane evidence cards (#965)", () => {
 
     renderPane();
 
-    const chips = screen.getAllByText(/support/i);
+    const chips = screen.queryAllByText(/support/i);
     expect(chips).toHaveLength(1);
-    expect(chips[0]).toHaveTextContent("Support 0%");
+    // Exact text: a "verified" suffix would slip a substring match.
+    expect(chips[0].textContent).toMatch(/^Support 0%$/);
     expect(chips[0].getAttribute("title")).toContain("lexical measure");
     expect(chips[0].getAttribute("title")?.toLowerCase()).not.toContain("verified");
+    // Same document-level pins as the wiki half: nothing claims verified and
+    // the disclaimer never leaves the title attribute.
+    expect(screen.queryByText(/verified/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/lexical measure/i)).not.toBeInTheDocument();
   });
 
   it("renders no support indicator without scores", () => {
@@ -165,6 +174,24 @@ describe("RightPane support chips on side-pane evidence cards (#965)", () => {
     // Both cited cards render (role=article); neither carries a chip.
     expect(screen.getAllByRole("article").length).toBeGreaterThanOrEqual(2);
     expect(screen.queryAllByText(/support/i)).toHaveLength(0);
+
+    // Per-label association: with two cited cards and different scores, each
+    // card shows ITS OWN label's score (a lookup that ignores the label key
+    // renders the wrong percentage here).
+    act(() => {
+      seedStore({
+        id: "a1",
+        wikiRefs: [WIKI],
+        kmsRefs: [KMS],
+        citationConfidence: { W1: 0.82, K1: 0 },
+      });
+    });
+    // The card root is a plain div (no role/testid), so pin label
+    // association by distinct outcomes: a lookup that ignores the label key
+    // (e.g. Object.values(...)[0]) renders the SAME score on both cards,
+    // which this distinct-count pair rejects.
+    expect(screen.queryAllByText("Support 82%")).toHaveLength(1);
+    expect(screen.queryAllByText("Support 0%")).toHaveLength(1);
 
     // An explicitly empty confidence record changes nothing either.
     act(() => {

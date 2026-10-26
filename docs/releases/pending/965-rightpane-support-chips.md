@@ -10,9 +10,10 @@ The RightPane's Wiki and Knowledge (KMS) evidence tabs now render the same
   the existing `useLastCompletedAssistantSources` / `…WikiRefs` / `…KmsRefs`
   scan-back pattern (skip the streaming message id, `useShallow`): it returns
   the `citationConfidence` record of the most recent *completed* assistant
-  message, or undefined when no completed message carries scores. An
-  explicitly empty record stops the scan, so an older message's scores are
-  never paired with a newer message's refs.
+  message whenever it carries the field at all (an explicitly empty record
+  counts and stops the scan, so an older message's scores are never paired
+  with a newer message's refs), and undefined only when no completed message
+  carries the field.
 - `frontend/src/components/chat/RightPane.tsx` passes that record as the
   optional `citationConfidence` prop to its two card call sites
   (`<WikiCards wikiRefs={…}>` in the wiki tab and `<KMSCards kmsRefs={…}>` in

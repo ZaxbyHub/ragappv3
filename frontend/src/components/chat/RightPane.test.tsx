@@ -62,17 +62,10 @@ vi.mock("@/stores/useChatStore", () => {
   });
   const useLastCompletedAssistantWikiRefsMock = vi.fn(() => undefined);
   const useLastCompletedAssistantKmsRefsMock = vi.fn(() => undefined);
-  // Issue #965: mirror the real scan-back selector so the pane's support-chip
-  // prop keeps working under the module-level mock.
-  const useLastCompletedAssistantCitationConfidenceMock = vi.fn(() => {
-    const messages = messagesFromMock();
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const msg = messages[i];
-      if (msg?.role === "assistant" && msg?.citationConfidence)
-        return msg.citationConfidence;
-    }
-    return undefined;
-  });
+  // Issue #965: one-line stub (sibling pattern) — the real selector's
+  // scan-back is pinned in useChatStore.selectors.test.ts and the dedicated
+  // c09 pane suite; no assertion in this file observes its output.
+  const useLastCompletedAssistantCitationConfidenceMock = vi.fn(() => undefined);
   const useStreamingCandidateSourcesMock = vi.fn(() => {
     const state = chatStoreMock() ?? {};
     const id = (state as { streamingMessageId?: string }).streamingMessageId;
