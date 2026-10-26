@@ -18,9 +18,13 @@ from app.api.deps import (
 )
 from app.api.routes.auth import async_hash_password
 from app.config import settings
-from app.models.database import get_pool
+from app.models.database import get_pool, transaction_context
 from app.security import csrf_protect
 from app.services.auth_service import password_strength_check
+from app.services.authz_policy import (
+    direct_vault_admin_ids,
+    group_derived_vault_admin_ids,
+)
 from app.services.draft_deletion import DraftDeletionService
 from app.services.draft_input_storage import DraftInputStorage, DraftInputStorageError
 from app.services.draft_store import DraftStore
@@ -732,6 +736,66 @@ async def update_user_active(
         pool.release_connection(conn)
 
 
+def _vaults_orphaned_by_user_delete(
+    conn: sqlite3.Connection, user_id: int
+) -> List[int]:
+    """Vaults that deleting ``user_id`` would leave without any effective admin.
+
+    Shared effective-admin inventory over both coverage layers (issue #1025,
+    PRR-010): the candidate set is every vault where the target holds admin
+    DIRECTLY (``vault_members``) or group-derived (``vault_group_access`` via
+    ``group_members``/``groups`` with the org-membership EXISTS, the exact
+    join the policy evaluator honors). A vault is orphaned when, with the
+    target excluded from BOTH layers, no effective admin remains.
+    """
+    admin_vault_ids = {
+        row[0]
+        for row in conn.execute(
+            "SELECT DISTINCT vault_id FROM vault_members"
+            " WHERE user_id = ? AND permission = 'admin'",
+            (user_id,),
+        )
+    }
+    admin_vault_ids |= {
+        row[0]
+        for row in conn.execute(
+            """SELECT DISTINCT vga.vault_id FROM vault_group_access vga
+               JOIN group_members gm ON vga.group_id = gm.group_id
+               JOIN groups g ON g.id = gm.group_id
+               WHERE gm.user_id = ? AND vga.permission = 'admin'
+                 AND EXISTS (
+                     SELECT 1 FROM org_members om
+                     WHERE om.org_id = g.org_id AND om.user_id = ?
+                 )""",
+            (user_id, user_id),
+        )
+    }
+    return [
+        vault_id
+        for vault_id in sorted(admin_vault_ids)
+        if not (
+            direct_vault_admin_ids(conn, vault_id, exclude_user_id=user_id)
+            | group_derived_vault_admin_ids(conn, vault_id, exclude_user_id=user_id)
+        )
+    ]
+
+
+def _refuse_user_delete_orphaning_vaults(orphaned_vaults: List[int]) -> None:
+    """Refuse a user deletion that would strand vaults with zero admins.
+
+    Mirrors the existing last-superadmin/org-owner guards' shape: a 400 naming
+    the affected vault ids (issue #1025, AC5).
+    """
+    if orphaned_vaults:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"User is the last effective admin of vault(s) {orphaned_vaults}."
+                " Grant another admin before deleting."
+            ),
+        )
+
+
 @router.delete("/{user_id}")
 async def delete_user(
     user_id: int,
@@ -739,7 +803,8 @@ async def delete_user(
     user: dict = Depends(require_role("superadmin")),
     _csrf_token: str = Depends(csrf_protect),
 ):
-    """Delete user (superadmin only). Cannot delete last superadmin or self."""
+    """Delete user (superadmin only). Cannot delete last superadmin or self.
+    Refuses 400 naming vaults where the user is the last effective admin."""
     pool = get_pool(str(settings.sqlite_path))
     conn = await pool.get_connection_async()
 
@@ -766,6 +831,16 @@ async def delete_user(
                 status_code=400,
                 detail=f"User owns organization(s) {owned_orgs}. Transfer ownership before deleting.",
             )
+
+        # Fast-path effective-admin refusal BEFORE the purge preparation below
+        # (no side effects have run yet, issue #1025 AC5): deleting the user
+        # cascades away their vault_members rows and org/group memberships,
+        # which must not strand any vault with zero effective admins. The
+        # authoritative recheck runs inside the deletion transaction.
+        orphaned_vaults = await asyncio.to_thread(
+            _vaults_orphaned_by_user_delete, conn, user_id
+        )
+        _refuse_user_delete_orphaning_vaults(orphaned_vaults)
 
         # Prepare the Draft Room purge before the DELETE below: drafts.created_by
         # cascades on user delete (ON DELETE CASCADE), losing the rows that
@@ -804,29 +879,44 @@ async def delete_user(
                 type(e).__name__,
             )
 
-        try:
-            # Detach historical org authorship first: organizations.created_by
-            # has no ON DELETE action, so a user who created an org they no
-            # longer own would otherwise trip the FK and 500 the delete
-            # (issue #722 AC8). Same transaction as the DELETE below.
-            await asyncio.to_thread(
-                conn.execute,
-                "UPDATE organizations SET created_by = NULL WHERE created_by = ?",
-                (user_id,),
-            )
-            if target_role == "superadmin":
-                # Atomic guard: only delete if there are other active superadmins
-                await asyncio.to_thread(cursor.execute, """DELETE FROM users
-                       WHERE id = ? AND (SELECT COUNT(*) FROM users WHERE role = 'superadmin' AND is_active = 1) > 1""", (user_id,))
-                if await asyncio.to_thread(lambda: cursor.rowcount) == 0:
-                    raise HTTPException(
-                        status_code=400, detail="Cannot delete the last superadmin"
+        def _delete_user_row() -> None:
+            # One BEGIN IMMEDIATE over the org-detach, the authoritative
+            # effective-admin recheck, and the DELETE (issue #1025): a grant
+            # written between the fast-path check and here still refuses the
+            # delete, and transaction_context rolls any refusal (or the
+            # last-superadmin guard's) back atomically with the org-detach.
+            with transaction_context(conn):
+                # Detach historical org authorship first: organizations.created_by
+                # has no ON DELETE action, so a user who created an org they no
+                # longer own would otherwise trip the FK and 500 the delete
+                # (issue #722 AC8). Same transaction as the DELETE below.
+                conn.execute(
+                    "UPDATE organizations SET created_by = NULL WHERE created_by = ?",
+                    (user_id,),
+                )
+                _refuse_user_delete_orphaning_vaults(
+                    _vaults_orphaned_by_user_delete(conn, user_id)
+                )
+                if target_role == "superadmin":
+                    # Atomic guard: only delete if there are other active superadmins
+                    guard_cursor = conn.execute(
+                        """DELETE FROM users
+                           WHERE id = ? AND (SELECT COUNT(*) FROM users WHERE role = 'superadmin' AND is_active = 1) > 1""",
+                        (user_id,),
                     )
-            else:
-                await asyncio.to_thread(cursor.execute, "DELETE FROM users WHERE id = ?", (user_id,))
-            await asyncio.to_thread(conn.commit)
+                    if guard_cursor.rowcount == 0:
+                        raise HTTPException(
+                            status_code=400, detail="Cannot delete the last superadmin"
+                        )
+                else:
+                    conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+
+        try:
+            await asyncio.to_thread(_delete_user_row)
         except HTTPException:
-            await asyncio.to_thread(conn.rollback)
+            # transaction_context already rolled the transaction back; a late
+            # refusal restores the tombstoned Draft Room bytes (see the purge
+            # preparation above for the ordering contract).
             if draft_purge_plan is not None:
                 try:
                     await asyncio.to_thread(draft_deletion.restore_purge, draft_purge_plan)
@@ -838,7 +928,6 @@ async def delete_user(
                     )
             raise
         except (sqlite3.Error, OSError, RuntimeError) as e:
-            await asyncio.to_thread(conn.rollback)
             if draft_purge_plan is not None:
                 try:
                     await asyncio.to_thread(draft_deletion.restore_purge, draft_purge_plan)

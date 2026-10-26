@@ -50,6 +50,82 @@ VAULT_PERMISSION_NAMES = {0: None, 1: "read", 2: "write", 3: "admin"}
 VAULT_ACTION_LEVELS = {"read": 1, "write": 2, "delete": 3, "admin": 3}
 
 
+def direct_vault_admin_ids(
+    conn: sqlite3.Connection,
+    vault_id: int,
+    exclude_user_id: int | None = None,
+) -> set[int]:
+    """Return the user ids holding DIRECT admin permission on a vault.
+
+    One layer of the shared effective-admin inventory (issue #1025, PRR-010):
+    the last-admin guards on the member and group-access routes must count the
+    same admins the policy evaluator grants, so the direct layer is exactly the
+    ``vault_members`` admin rows ``get_effective_vault_permissions`` merges.
+    ``exclude_user_id`` models a member's removal/demotion (their direct row is
+    going away); group-derived coverage is NOT excluded here — a demoted member
+    keeps any group grant.
+
+    The inventory counts GRANT ROWS ONLY (F-006): it does not model the
+    superadmin role baseline (``evaluate`` grants superadmins admin on every
+    vault) nor ``users.is_active``. A vault whose sole counted coverage is a
+    superadmin or a deactivated account therefore has an EMPTY inventory here,
+    and the guards built on it can refuse conservatively (fail-closed).
+    Adding a vault member (or reactivating the account) remains the repair
+    path; no behavior change rides on this docstring.
+    """
+    sql = (
+        "SELECT user_id FROM vault_members"
+        " WHERE vault_id = ? AND permission = 'admin'"
+    )
+    params: list = [vault_id]
+    if exclude_user_id is not None:
+        sql += " AND user_id != ?"
+        params.append(exclude_user_id)
+    return {row[0] for row in conn.execute(sql, params).fetchall()}
+
+
+def group_derived_vault_admin_ids(
+    conn: sqlite3.Connection,
+    vault_id: int,
+    exclude_user_id: int | None = None,
+    exclude_group_id: int | None = None,
+) -> set[int]:
+    """Return the user ids holding GROUP-DERIVED admin permission on a vault.
+
+    The other inventory layer, mirroring ``_query_group_access``'s join exactly
+    (``vault_group_access`` x ``group_members`` x ``groups`` with the
+    ``org_members`` EXISTS that gates derived access on org membership) so a
+    grant counted here is a grant the policy evaluator honors, and vice versa.
+    ``exclude_group_id`` models one group's grant being revoked or demoted
+    (that grant no longer confers admin); ``exclude_user_id`` models a user's
+    disappearance from every group (user deletion).
+
+    The inventory counts GRANT ROWS ONLY (F-006): it does not model the
+    superadmin role baseline (``evaluate`` grants superadmins admin on every
+    vault) nor ``users.is_active``. When a vault's sole counted coverage is a
+    superadmin or a deactivated account this layer reports nothing, and the
+    guards built on it can refuse conservatively (fail-closed). Adding a
+    vault member (or reactivating the account) remains the repair path; no
+    behavior change rides on this docstring.
+    """
+    sql = """SELECT DISTINCT gm.user_id FROM vault_group_access vga
+        JOIN group_members gm ON vga.group_id = gm.group_id
+        JOIN groups g ON g.id = gm.group_id
+        WHERE vga.vault_id = ? AND vga.permission = 'admin'"""
+    params: list = [vault_id]
+    if exclude_group_id is not None:
+        sql += " AND vga.group_id != ?"
+        params.append(exclude_group_id)
+    sql += """ AND EXISTS (
+            SELECT 1 FROM org_members om
+            WHERE om.org_id = g.org_id AND om.user_id = gm.user_id
+        )"""
+    if exclude_user_id is not None:
+        sql += " AND gm.user_id != ?"
+        params.append(exclude_user_id)
+    return {row[0] for row in conn.execute(sql, params).fetchall()}
+
+
 async def get_effective_vault_permission(
     db: sqlite3.Connection,
     principal: dict,

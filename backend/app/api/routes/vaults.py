@@ -25,10 +25,16 @@ from app.api.deps import (
     get_vector_store,
     require_role,
     require_vault_permission,
+    resolve_granted_by,
 )
 from app.config import settings
 from app.limiter import limiter
+from app.models.database import transaction_context
 from app.security import csrf_protect
+from app.services.authz_policy import (
+    direct_vault_admin_ids,
+    group_derived_vault_admin_ids,
+)
 from app.services.draft_deletion import DraftDeletionService
 from app.services.draft_input_storage import DraftInputStorage, DraftInputStorageError
 from app.services.draft_store import DraftStore
@@ -46,7 +52,11 @@ class VaultCreateRequest(BaseModel):
 
     name: str = Field(..., min_length=1, max_length=255, description="Vault name")
     description: str = Field("", max_length=1000, description="Vault description")
-    org_id: Optional[int] = Field(None, description="Organization to assign this vault to")
+    org_id: Optional[int] = Field(
+        None,
+        gt=0,
+        description="Organization to assign this vault to",
+    )
     visibility: str = Field("private", description="Vault visibility: private, org, or public")
 
     @field_validator("name", mode="before")
@@ -76,6 +86,14 @@ class VaultUpdateRequest(BaseModel):
     visibility: Optional[str] = Field(
         None, description="Vault visibility: private, org, or public"
     )
+    org_id: Optional[int] = Field(
+        None,
+        gt=0,
+        description=(
+            "Organization to adopt this vault into (NULL->org only; org-to-org"
+            " reassignment is not supported)"
+        ),
+    )
 
     @field_validator("name", mode="before")
     @classmethod
@@ -90,6 +108,25 @@ class VaultUpdateRequest(BaseModel):
         if v is not None and v not in ("private", "org", "public"):
             raise ValueError("visibility must be 'private', 'org', or 'public'")
         return v
+
+
+def _ensure_org_visibility_coherence(
+    visibility: Optional[str], effective_org_id: Optional[int]
+) -> None:
+    """Reject visibility 'org' when the vault's effective organization is NULL.
+
+    Shared by create and update (issue #1003): the row state
+    ``visibility='org' AND org_id IS NULL`` matches NO branch of the
+    vault-listing UNION nor of the policy evaluator's org-vault query, so a
+    write that would produce it silently locks every non-member out of the
+    vault. ``effective_org_id`` is the organization the vault WILL have after
+    the write (on update: the adopted org when the same request adopts one).
+    """
+    if visibility == "org" and effective_org_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="visibility 'org' requires an organization",
+        )
 
 
 class VaultEnrichmentToggleRequest(BaseModel):
@@ -477,6 +514,7 @@ async def create_vault(
     Creates a new vault with the given name, description, and organization.
     org_id is required unless the caller belongs to exactly one organization
     (in which case it is inferred). Superadmins may pass any org_id.
+    Returns 400 if visibility is 'org' without an organization.
     Returns 409 if a vault with the same name already exists.
     """
     # Resolve org_id: explicit > inferred > error
@@ -522,6 +560,11 @@ async def create_vault(
                     status_code=403,
                     detail="You are not a member of that organization",
                 )
+
+    # Org-visibility coherence (issue #1003): a caller with no organization
+    # must not mint an org-less org-visible vault — no access-query branch
+    # can ever match that row, so the vault would be silently unreadable.
+    _ensure_org_visibility_coherence(body.visibility, target_org_id)
 
     # The name "Default" is reserved: the startup migration and the orphan
     # backfill resolve the system default vault BY NAME (issue #725,
@@ -639,16 +682,28 @@ async def update_vault(
     Updates the name and/or description of the vault with the given id.
     Returns 404 if not found.
     Returns 409 if new name conflicts with an existing vault.
+    Returns 400 on org-adoption refusals: visibility 'org' without an
+    organization (coherence), target org not found, org-to-org reassignment,
+    or a foreign-org group-grant conflict.
+    Returns 403 if a non-superadmin caller adopts an organization they are
+    not a member of.
     """
-    # Check if vault exists
+    # Check if vault exists. Row order: id, name, visibility, org_id — org_id
+    # is appended last so the name/visibility indices the guards below use
+    # are unchanged.
     row = await asyncio.to_thread(
-        lambda: conn.execute("SELECT id, name, visibility FROM vaults WHERE id = ?", (vault_id,)).fetchone()
+        lambda: conn.execute(
+            "SELECT id, name, visibility, org_id FROM vaults WHERE id = ?", (vault_id,)
+        ).fetchone()
     )
 
     if row is None:
         raise HTTPException(
             status_code=404, detail=f"Vault with id {vault_id} not found"
         )
+
+    current_visibility = row[2]
+    current_org_id = row[3]
 
     # The system default vault is resolved BY NAME across the startup
     # migration and new-user/orphan assignment (deps.
@@ -699,7 +754,9 @@ async def update_vault(
         update_fields.append("visibility = ?")
         params.append(request.visibility)
 
-    if not update_fields:
+    adoption_requested = request.org_id is not None
+
+    if not update_fields and not adoption_requested:
         # No fields to update, just fetch and return current record
         vault = await _fetch_vault_with_counts(conn, vault_id, user)
         if vault is None:
@@ -708,29 +765,165 @@ async def update_vault(
             )
         return vault
 
-    # Add vault_id to params
-    params.append(vault_id)
+    adoption_applied = False
+    # In-transaction snapshot of the vault's live (visibility, org_id),
+    # captured inside _apply_vault_update (F-005): the outer read above is
+    # advisory only (404 check, Default-name guards, old-name rename), so a
+    # write committed by another connection between that read and this
+    # transaction must not feed the coherence check or the audit metadata a
+    # stale snapshot. Pre-initialized from the outer read purely for typing;
+    # the txn re-read below always overwrites both on every executed path.
+    txn_current_org_id = current_org_id
+    txn_current_visibility = current_visibility
 
-    # Execute update with error handling for duplicate name
+    def _apply_vault_update() -> None:
+        nonlocal adoption_applied, txn_current_org_id, txn_current_visibility
+        # One BEGIN IMMEDIATE over adoption validation and the UPDATE: the
+        # adoption branch re-reads the current org inside the transaction so a
+        # concurrent grant write (or racing adoption) cannot interleave between
+        # the validation and the write (issue #1003). HTTPExceptions roll back
+        # through transaction_context; only the duplicate-name IntegrityError
+        # translation stays outside.
+        with transaction_context(conn):
+            fields = list(update_fields)
+            bind = list(params)
+
+            # Unconditional in-transaction re-read (F-005): both the
+            # org-visibility coherence check and the post-commit audit
+            # metadata below must describe the row THIS transaction sees, not
+            # the possibly stale outer read.
+            txn_row = conn.execute(
+                "SELECT visibility, org_id FROM vaults WHERE id = ?", (vault_id,)
+            ).fetchone()
+            if txn_row is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Vault with id {vault_id} not found",
+                )
+            txn_current_visibility = txn_row[0]
+            txn_current_org_id = txn_row[1]
+
+            if adoption_requested:
+                # Organization adoption (issue #1003): permission composed
+                # with the create flow — the target org must exist and a
+                # non-superadmin caller must belong to it. NULL -> org only;
+                # an already-adopted vault cannot be reassigned.
+                if not conn.execute(
+                    "SELECT 1 FROM organizations WHERE id = ?", (request.org_id,)
+                ).fetchone():
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Organization {request.org_id} not found",
+                    )
+                if user.get("role") != "superadmin":
+                    if not conn.execute(
+                        "SELECT 1 FROM org_members WHERE org_id = ? AND user_id = ?",
+                        (request.org_id, user["id"]),
+                    ).fetchone():
+                        raise HTTPException(
+                            status_code=403,
+                            detail="You are not a member of that organization",
+                        )
+                if txn_current_org_id == request.org_id:
+                    # Same value: no-op, nothing to adopt.
+                    pass
+                else:
+                    if txn_current_org_id is not None:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="reassigning an organization is not supported",
+                        )
+                    # Foreign-grant conflict: a grant whose group sits in a
+                    # different org than the adoption target is unreproducible
+                    # through the grant writers (they enforce the same-org
+                    # invariant on org'd vaults); silently preserving it would
+                    # violate that invariant, so adoption leaves the vault
+                    # unchanged and names the offending groups.
+                    conflict_rows = conn.execute(
+                        """
+                        SELECT vga.group_id FROM vault_group_access vga
+                        JOIN groups g ON g.id = vga.group_id
+                        WHERE vga.vault_id = ? AND g.org_id != ?
+                        """,
+                        (vault_id, request.org_id),
+                    ).fetchall()
+                    if conflict_rows:
+                        conflict_group_ids = sorted({r[0] for r in conflict_rows})
+                        raise HTTPException(
+                            status_code=400,
+                            detail=(
+                                "Vault has group access grants from another"
+                                f" organization (group ids {conflict_group_ids});"
+                                " revoke them before adopting an organization"
+                            ),
+                        )
+                    fields.append("org_id = ?")
+                    bind.append(request.org_id)
+                    adoption_applied = True
+
+            if not fields:
+                # Same-org adoption with no other fields: nothing to write.
+                return
+
+            # Org-visibility coherence (issue #1003): the effective org is
+            # the adopted org when this request adopts one (post-validation),
+            # else the vault's in-transaction current org — visibility 'org'
+            # on an org-less vault matches no access-query branch and would
+            # silently lock the vault (F-005: never the stale outer read).
+            effective_org_id = (
+                request.org_id if adoption_requested else txn_current_org_id
+            )
+            _ensure_org_visibility_coherence(request.visibility, effective_org_id)
+
+            sql = f"""
+                UPDATE vaults
+                SET {", ".join(fields)}, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """
+            conn.execute(sql, [*bind, vault_id])
+
     try:
-        sql = f"""
-            UPDATE vaults
-            SET {", ".join(update_fields)}, updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-        """
-        await asyncio.to_thread(conn.execute, sql, params)
-        await asyncio.to_thread(conn.commit)
+        await asyncio.to_thread(_apply_vault_update)
     except sqlite3.IntegrityError:
-        await asyncio.to_thread(conn.rollback)
         raise HTTPException(
             status_code=409, detail=f"Vault with name '{request.name}' already exists"
+        )
+
+    if adoption_applied:
+        # Access-CHANGE event, recorded after the adoption transaction commits
+        # (the helper commits itself). Not labeled widening: for a public
+        # org-less vault, adoption NARROWS global reads to the org's members.
+        # old_org_id/old_visibility carry the pre-change values from the
+        # IN-TRANSACTION re-read (F-005), and new_visibility records the
+        # visibility this same request persisted (request.visibility when
+        # set, else the in-txn pre-adoption value) — the same metadata
+        # convention as vault.visibility_updated (issue #1003, ML-P-1).
+        await safe_record_security_event(
+            conn,
+            event_type="vault.org_id_updated",
+            actor=user,
+            request=http_request,
+            metadata={
+                "vault_id": vault_id,
+                "old_org_id": txn_current_org_id,
+                "new_org_id": request.org_id,
+                "old_visibility": txn_current_visibility,
+                "new_visibility": (
+                    request.visibility
+                    if request.visibility is not None
+                    else txn_current_visibility
+                ),
+            },
         )
 
     if request.visibility is not None:
         # Visibility-carrying updates are security-relevant events (issue
         # #722 AC1): visibility widens or narrows who can read the vault.
         # Recorded after the commit via the standard tamper-evident helper;
-        # the metadata carries old and new values even when equal.
+        # the metadata carries old and new values even when equal. The old
+        # value is the in-transaction re-read (F-005) — identical to the
+        # outer read except under a concurrent visibility flip, where the
+        # transactional value is the authoritative pre-image of THIS update.
         await safe_record_security_event(
             conn,
             event_type="vault.visibility_updated",
@@ -738,7 +931,7 @@ async def update_vault(
             request=http_request,
             metadata={
                 "vault_id": vault_id,
-                "old_visibility": row[2],
+                "old_visibility": txn_current_visibility,
                 "new_visibility": request.visibility,
             },
         )
@@ -1420,16 +1613,18 @@ async def update_vault_groups(
     Returns the updated list of groups with vault access.
     Returns 400 if any group_ids are invalid or belong to a different org.
     Returns 404 if vault doesn't exist.
+    Returns 409 if the replacement would leave the vault with zero effective
+    admins.
     """
-    # Check if vault exists and get its org_id
+    # Check if vault exists (existence only — the org is re-read inside the
+    # transaction below so the same-org validation cannot race an adoption).
     vault_row = await asyncio.to_thread(
-        lambda: conn.execute("SELECT id, org_id FROM vaults WHERE id = ?", (vault_id,)).fetchone()
+        lambda: conn.execute("SELECT id FROM vaults WHERE id = ?", (vault_id,)).fetchone()
     )
     if vault_row is None:
         raise HTTPException(
             status_code=404, detail=f"Vault with id {vault_id} not found"
         )
-    vault_org_id = vault_row[1]
 
     # Omitted (or null) list fields are NOT an explicit clear: reject before
     # any DELETE or audit event runs (issue #725, T1-21-KR-11). An explicit
@@ -1445,96 +1640,133 @@ async def update_vault_groups(
 
     access_items = request.resolved_access()
 
-    # If no access items provided, just clear all access and return empty list
-    if not access_items:
-        await asyncio.to_thread(
-            conn.execute,
-            "DELETE FROM vault_group_access WHERE vault_id = ?",
-            (vault_id,),
-        )
-        await asyncio.to_thread(conn.commit)
-        # Clearing all group access is the most security-relevant form of
-        # this mutation — it is audited exactly like a replace (issue #722
-        # AC1, both return paths).
-        await safe_record_security_event(
-            conn,
-            event_type="vault.group_access_replaced",
-            actor=user,
-            request=http_request,
-            metadata={"vault_id": vault_id, "group_ids": []},
-        )
-        return VaultGroupsListResponse(groups=[])
+    # granted_by is FK-safe: the single-admin sentinel (id 0, no users row)
+    # records NULL provenance instead of tripping the granted_by FK (issue
+    # #1025, PRR-001; at base commit this INSERT loop answered 500 in
+    # single-admin mode).
+    granted_by = resolve_granted_by(user)
 
-    group_ids = [item.group_id for item in access_items]
+    # Deduplicated items that will actually be PERSISTED, recorded for the
+    # post-commit audit event: the metadata must name the persisted rows, not
+    # the raw request list — duplicates are dropped before the insert loop
+    # (L1-6; on the empty-clear path this stays [], matching the no-rows
+    # outcome).
+    deduped_items: List[GroupAccessItem] = []
 
-    # Validate all group_ids exist and belong to the same org as the vault
-    placeholders = ",".join("?" * len(group_ids))
-    group_rows = await asyncio.to_thread(
-        lambda: conn.execute(
-            f"""
-            SELECT id, org_id FROM groups
-            WHERE id IN ({placeholders})
-            """,
-            tuple(group_ids),
-        ).fetchall()
-    )
+    def _replace_access() -> None:
+        nonlocal deduped_items
+        # One BEGIN IMMEDIATE (transaction_context) over validation, the
+        # pre-state read, DELETE, INSERTs, and the ACTUAL post-state re-read:
+        # the last-effective-admin guard must observe persisted rows, not a
+        # hypothetical view of the incoming list (issue #1025, PRR-010), and
+        # the vault-org validation must not race an adoption (issue #1003).
+        # A 409 raised inside rolls the whole replacement back.
+        with transaction_context(conn):
+            org_row = conn.execute(
+                "SELECT org_id FROM vaults WHERE id = ?", (vault_id,)
+            ).fetchone()
+            if org_row is None:
+                raise HTTPException(
+                    status_code=404, detail=f"Vault with id {vault_id} not found"
+                )
+            vault_org_id = org_row[0]
 
-    found_group_ids = {row[0] for row in group_rows}
-    missing_group_ids = set(group_ids) - found_group_ids
-    if missing_group_ids:
-        raise HTTPException(
-            status_code=400, detail=f"Group(s) not found: {sorted(missing_group_ids)}"
-        )
-
-    # Validate all groups belong to the same org as the vault
-    # Safe NULL comparison: only reject if both have non-NULL org_ids that differ
-    invalid_org_groups = [
-        row[0]
-        for row in group_rows
-        if (row[1] is not None and vault_org_id is not None and row[1] != vault_org_id)
-    ]
-    if invalid_org_groups:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Group(s) belong to a different organization: {sorted(invalid_org_groups)}",
-        )
-
-    # Delete existing vault_group_access for this vault and insert new records atomically
-    await asyncio.to_thread(conn.execute, "BEGIN TRANSACTION")
-    try:
-        await asyncio.to_thread(
-            conn.execute,
-            "DELETE FROM vault_group_access WHERE vault_id = ?",
-            (vault_id,),
-        )
-
-        granted_by = user.get("id")
-        # Deduplicate by group id before the insert loop: vault_group_access
-        # has a UNIQUE(vault_id, group_id) constraint and a duplicate id in
-        # one body would 500 on the second insert (issue #725, S02-SK-03; the
-        # groups.py writers dedupe the same way).
-        seen_group_ids: set = set()
-        deduped_items: List[GroupAccessItem] = []
-        for item in access_items:
-            if item.group_id not in seen_group_ids:
-                seen_group_ids.add(item.group_id)
-                deduped_items.append(item)
-        for item in deduped_items:
-            await asyncio.to_thread(
-                conn.execute,
-                """
-                    INSERT INTO vault_group_access (vault_id, group_id, permission, granted_by)
-                    VALUES (?, ?, ?, ?)
-                """,
-                (vault_id, item.group_id, item.permission, granted_by),
+            # Pre-state: does this vault have ANY effective admin today?
+            pre_nonempty = bool(
+                direct_vault_admin_ids(conn, vault_id)
+                | group_derived_vault_admin_ids(conn, vault_id)
             )
-        await asyncio.to_thread(conn.commit)
-    except Exception:
-        await asyncio.to_thread(lambda: conn.rollback())
-        raise
 
-    # Security-relevant event on the replace path, recorded after the commit
-    # (issue #722 AC1 — the clear-all early return above records its own).
+            if access_items:
+                group_ids = [item.group_id for item in access_items]
+                placeholders = ",".join("?" * len(group_ids))
+                group_rows = conn.execute(
+                    f"""
+                    SELECT id, org_id FROM groups
+                    WHERE id IN ({placeholders})
+                    """,
+                    tuple(group_ids),
+                ).fetchall()
+
+                found_group_ids = {row[0] for row in group_rows}
+                missing_group_ids = set(group_ids) - found_group_ids
+                if missing_group_ids:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Group(s) not found: {sorted(missing_group_ids)}",
+                    )
+
+                # Validate all groups belong to the same org as the vault.
+                # Safe NULL comparison: only reject if both have non-NULL org
+                # ids that differ — an org-less vault accepts any org's
+                # groups (pinned policy, issue #721 AC9).
+                invalid_org_groups = [
+                    row[0]
+                    for row in group_rows
+                    if (
+                        row[1] is not None
+                        and vault_org_id is not None
+                        and row[1] != vault_org_id
+                    )
+                ]
+                if invalid_org_groups:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "Group(s) belong to a different organization:"
+                            f" {sorted(invalid_org_groups)}"
+                        ),
+                    )
+
+            conn.execute(
+                "DELETE FROM vault_group_access WHERE vault_id = ?",
+                (vault_id,),
+            )
+
+            # Deduplicate by group id before the insert loop:
+            # vault_group_access has a UNIQUE(vault_id, group_id) constraint
+            # and a duplicate id in one body would 500 on the second insert
+            # (issue #725, S02-SK-03; the groups.py writers dedupe the same
+            # way).
+            seen_group_ids: set = set()
+            for item in access_items:
+                if item.group_id not in seen_group_ids:
+                    seen_group_ids.add(item.group_id)
+                    deduped_items.append(item)
+            for item in deduped_items:
+                conn.execute(
+                    """
+                        INSERT INTO vault_group_access (vault_id, group_id, permission, granted_by)
+                        VALUES (?, ?, ?, ?)
+                    """,
+                    (vault_id, item.group_id, item.permission, granted_by),
+                )
+
+            # ACTUAL post-state re-read over the persisted rows: the union of
+            # direct admins and the group-derived admins the new grant set
+            # confers. Refusing only when the vault HAD effective admins keeps
+            # an already-broken vault repairable.
+            post_admins = direct_vault_admin_ids(
+                conn, vault_id
+            ) | group_derived_vault_admin_ids(conn, vault_id)
+            if pre_nonempty and not post_admins:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Cannot clear/replace the last effective admin for"
+                        f" vault {vault_id}: a vault must keep at least one"
+                        " effective admin"
+                    ),
+                )
+
+    await asyncio.to_thread(_replace_access)
+
+    # Security-relevant event on every replace path, recorded after the commit
+    # (issue #722 AC1) — clearing all group access is the most
+    # security-relevant form of this mutation. group_ids names the DEDUPED
+    # persisted rows (L1-6): a duplicated id in the request body is inserted
+    # once, and the event must not claim a grant that was never persisted
+    # ([] on the empty-clear path, where no rows survive).
     await safe_record_security_event(
         conn,
         event_type="vault.group_access_replaced",
@@ -1542,9 +1774,13 @@ async def update_vault_groups(
         request=http_request,
         metadata={
             "vault_id": vault_id,
-            "group_ids": [item.group_id for item in access_items],
+            "group_ids": [item.group_id for item in deduped_items],
         },
     )
+
+    # If no access items were provided, all access is now cleared.
+    if not access_items:
+        return VaultGroupsListResponse(groups=[])
 
     # Fetch and return updated groups
     rows = await asyncio.to_thread(

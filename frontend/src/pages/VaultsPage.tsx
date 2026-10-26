@@ -25,7 +25,7 @@ import { Database, Plus, Pencil, Trash2, FileText, Brain, MessageSquare, Loader2
 import { EmptyState } from "@/components/EmptyState";
 import { useVaultStore } from "@/stores/useVaultStore";
 import { listOrganizations } from "@/lib/api";
-import type { Vault, Organization } from "@/lib/api";
+import type { Vault, Organization, VaultUpdateRequest } from "@/lib/api";
 import { useTestMode } from "@/fixtures/TestModeContext";
 import { mockVaults, mockOrganizations } from "@/fixtures/vaults";
 import { PageTitleHeader } from "@/components/layout/PageTitleHeader";
@@ -40,6 +40,7 @@ export default function VaultsPage() {
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [orgId, setOrgId] = useState<number | null>(null);
+  const [editOrgId, setEditOrgId] = useState<number | null>(null);
   const [orgs, setOrgs] = useState<Organization[]>([]);
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -77,6 +78,10 @@ export default function VaultsPage() {
     setSelectedVault(vault);
     setName(vault.name);
     setDescription(vault.description);
+    // Organization adoption is offered once per vault: the selection resets
+    // every time the dialog opens so a previous vault's pick never leaks
+    // into this edit (issue #1003).
+    setEditOrgId(null);
     setEditDialogOpen(true);
   }
 
@@ -116,7 +121,15 @@ export default function VaultsPage() {
     if (!selectedVault) return;
     setSaving(true);
     try {
-      await editVault(selectedVault.id, { name: name.trim(), description: description.trim() });
+      // org_id joins the PUT payload ONLY when an organization was actually
+      // selected in the edit dialog: name/description-only edits keep the
+      // exact legacy payload shape (pinned by VaultsPage.test.tsx; org
+      // adoption is offered for org-less vaults only, #1003).
+      const payload: VaultUpdateRequest = { name: name.trim(), description: description.trim() };
+      if (selectedVault.org_id == null && editOrgId !== null) {
+        payload.org_id = editOrgId;
+      }
+      await editVault(selectedVault.id, payload);
       toast.success("Vault updated successfully");
       setEditDialogOpen(false);
       setSelectedVault(null);
@@ -390,6 +403,32 @@ export default function VaultsPage() {
                 onChange={(e) => setDescription(e.target.value)}
               />
             </div>
+            {/* Organization adoption for org-less vaults only (#1003); a
+                vault that already has an organization shows no control —
+                org-to-org reassignment is out of scope. */}
+            {orgs.length > 0 && selectedVault?.org_id == null && (
+              <div>
+                <Label htmlFor="edit-vault-org">Organization</Label>
+                <Select
+                  value={editOrgId !== null ? String(editOrgId) : ""}
+                  onValueChange={(v) => setEditOrgId(v ? Number(v) : null)}
+                >
+                  <SelectTrigger id="edit-vault-org">
+                    <SelectValue placeholder="Select organization…" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {orgs.map((org) => (
+                      <SelectItem key={org.id} value={String(org.id)}>
+                        {org.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-muted-foreground mt-1">
+                  Optional: join this vault to an organization. This cannot be changed later.
+                </p>
+              </div>
+            )}
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setEditDialogOpen(false)}>
                 Cancel

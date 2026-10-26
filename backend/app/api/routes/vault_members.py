@@ -9,9 +9,14 @@ from app.api.deps import (
     get_db,
     get_evaluate_policy,
     require_vault_permission,
+    resolve_granted_by,
 )
 from app.models.database import set_migration_flag, transaction_context
 from app.security import csrf_protect
+from app.services.authz_policy import (
+    direct_vault_admin_ids,
+    group_derived_vault_admin_ids,
+)
 
 router = APIRouter(prefix="/vaults/{vault_id}/members", tags=["vault-members"])
 group_access_router = APIRouter(
@@ -19,6 +24,56 @@ group_access_router = APIRouter(
 )
 
 VALID_PERMISSIONS = ("read", "write", "admin")
+
+
+def _effective_admin_post_state(
+    conn: sqlite3.Connection,
+    vault_id: int,
+    *,
+    exclude_direct_user_id: int | None = None,
+    exclude_group_id: int | None = None,
+) -> set[int]:
+    """Compute the post-mutation effective-admin set for a vault (issue #1025).
+
+    The shared inventory union (direct admins plus group-derived admins) with
+    the mutation's exclusions applied: a demoted/removed member drops out of
+    the direct layer only (their group grant survives), a demoted/revoked group
+    grant drops out via ``exclude_group_id``.
+    """
+    return (
+        direct_vault_admin_ids(conn, vault_id, exclude_user_id=exclude_direct_user_id)
+        | group_derived_vault_admin_ids(
+            conn, vault_id, exclude_group_id=exclude_group_id
+        )
+    )
+
+
+def _refuse_if_last_effective_admin(
+    conn: sqlite3.Connection,
+    vault_id: int,
+    post_admins: set[int],
+    action: str,
+) -> None:
+    """Refuse a mutation whose post-state has zero effective admins.
+
+    Only refused when the vault HAD effective admins before the mutation
+    (pre-state non-empty): an already-broken vault stays repairable — every
+    guard-raising mutation on it is one that does not further reduce the set.
+    """
+    if post_admins:
+        return
+    pre_admins = direct_vault_admin_ids(conn, vault_id) | group_derived_vault_admin_ids(
+        conn, vault_id
+    )
+    if not pre_admins:
+        return
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            f"Cannot {action} the last effective admin: a vault must keep at"
+            " least one effective admin"
+        ),
+    )
 
 
 class VaultMemberCreateRequest(BaseModel):
@@ -155,8 +210,10 @@ def add_vault_member(
     if cursor.fetchone():
         raise HTTPException(status_code=409, detail="User is already a member")
 
-    # Insert new member
-    granted_by = current_user.get("id")
+    # Insert new member. granted_by is FK-safe: the single-admin sentinel (id
+    # 0, no users row) records NULL provenance instead of tripping the FK and
+    # surfacing as a misleading duplicate-member 409 (issue #1025, PRR-001).
+    granted_by = resolve_granted_by(current_user)
     try:
         cursor.execute(
             "INSERT INTO vault_members (vault_id, user_id, permission, granted_by) VALUES (?, ?, ?, ?)",
@@ -212,7 +269,7 @@ def update_vault_member(
     if not cursor.fetchone():
         raise HTTPException(status_code=404, detail="Vault not found")
 
-    granted_by = current_user.get("id")
+    granted_by = resolve_granted_by(current_user)
     # BEGIN IMMEDIATE from the existence read through the UPDATE: a deferred
     # read-then-write let two connections both observe the last admin before
     # either demoted them, leaving the vault with zero admins (issue #726,
@@ -227,22 +284,16 @@ def update_vault_member(
         if row is None:
             raise HTTPException(status_code=404, detail="Member not found")
 
-        # Last-admin guard: demoting the only admin-permission member would
-        # leave the vault unmanageable by anyone but a superadmin.
+        # Last-effective-admin guard: demoting this member's direct admin row
+        # leaves the vault manageable when any OTHER effective admin remains —
+        # another direct admin, or a group grant conferring admin on anyone
+        # (issue #1025, PRR-010; the demoted member's own group grant also
+        # keeps them admin, so a same-user dual-admin demote is allowed).
         if row[0] == "admin" and request.permission != "admin":
-            cursor.execute(
-                "SELECT COUNT(*) FROM vault_members"
-                " WHERE vault_id = ? AND permission = 'admin'",
-                (vault_id,),
+            post_admins = _effective_admin_post_state(
+                conn, vault_id, exclude_direct_user_id=member_user_id
             )
-            if cursor.fetchone()[0] <= 1:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "Cannot demote the last admin member: a vault must keep"
-                        " at least one admin member"
-                    ),
-                )
+            _refuse_if_last_effective_admin(conn, vault_id, post_admins, "demote")
 
         cursor.execute(
             "UPDATE vault_members SET permission = ?, granted_by = ? WHERE vault_id = ? AND user_id = ?",
@@ -314,19 +365,15 @@ def remove_vault_member(
                 raise HTTPException(status_code=404, detail="Member not found")
 
             if row[0] == "admin":
-                cursor.execute(
-                    "SELECT COUNT(*) FROM vault_members"
-                    " WHERE vault_id = ? AND permission = 'admin'",
-                    (vault_id,),
+                # Last-effective-admin guard over the shared inventory: the
+                # removed member drops out of the DIRECT layer only — their
+                # group-derived admin (if any) survives the removal, and any
+                # other direct or group-derived admin keeps the vault
+                # manageable (issue #1025, PRR-010).
+                post_admins = _effective_admin_post_state(
+                    conn, vault_id, exclude_direct_user_id=member_user_id
                 )
-                if cursor.fetchone()[0] <= 1:
-                    raise HTTPException(
-                        status_code=409,
-                        detail=(
-                            "Cannot remove the last admin member: a vault must"
-                            " keep at least one admin member"
-                        ),
-                    )
+                _refuse_if_last_effective_admin(conn, vault_id, post_admins, "remove")
 
             cursor.execute(
                 "DELETE FROM vault_members WHERE vault_id = ? AND user_id = ?",
@@ -423,51 +470,63 @@ def grant_vault_group_access(
     """Grant a group access to a vault."""
     cursor = conn.cursor()
 
-    # Verify vault exists and get org_id
-    cursor.execute("SELECT id, org_id FROM vaults WHERE id = ?", (vault_id,))
-    vault_row = cursor.fetchone()
-    if not vault_row:
-        raise HTTPException(status_code=404, detail="Vault not found")
-    vault_org_id = vault_row[1]
-
-    # Verify target group exists and get org_id
-    cursor.execute("SELECT id, org_id FROM groups WHERE id = ?", (request.group_id,))
-    group_row = cursor.fetchone()
-    if not group_row:
-        raise HTTPException(status_code=404, detail="Group not found")
-    group_org_id = group_row[1]
-
-    # Check not already granted
-    cursor.execute(
-        "SELECT group_id FROM vault_group_access WHERE vault_id = ? AND group_id = ?",
-        (vault_id, request.group_id),
-    )
-    if cursor.fetchone():
-        raise HTTPException(
-            status_code=409, detail="Group already has access to this vault"
-        )
-
-    # Validate group and vault belong to the same org (NULL-safe comparison)
-    # Only reject if both have non-NULL org_ids that differ
-    if (group_org_id is not None and vault_org_id is not None and group_org_id != vault_org_id):
-        raise HTTPException(
-            status_code=400,
-            detail="Group belongs to a different organization than this vault",
-        )
-
-    # Insert new group access
-    granted_by = current_user.get("id")
+    # granted_by is FK-safe: the single-admin sentinel (id 0, no users row)
+    # records NULL provenance instead of tripping the granted_by FK and
+    # surfacing as a misleading duplicate-grant 409 (issue #1025, PRR-001).
+    granted_by = resolve_granted_by(current_user)
+    # One BEGIN IMMEDIATE over the whole read-validate-write: the vault-org
+    # read, duplicate check, and INSERT are atomic against a concurrent
+    # adoption of this vault into an organization (#1003) and against a racing
+    # duplicate grant. HTTPExceptions roll back through transaction_context;
+    # only the IntegrityError -> 409 translation stays outside.
     try:
-        cursor.execute(
-            "INSERT INTO vault_group_access (vault_id, group_id, permission, granted_by) VALUES (?, ?, ?, ?)",
-            (vault_id, request.group_id, request.permission, granted_by),
-        )
-        conn.commit()
-    except HTTPException:
-        conn.rollback()
-        raise
+        with transaction_context(conn):
+            # Verify vault exists and get org_id
+            cursor.execute("SELECT id, org_id FROM vaults WHERE id = ?", (vault_id,))
+            vault_row = cursor.fetchone()
+            if not vault_row:
+                raise HTTPException(status_code=404, detail="Vault not found")
+            vault_org_id = vault_row[1]
+
+            # Verify target group exists and get org_id
+            cursor.execute(
+                "SELECT id, org_id FROM groups WHERE id = ?", (request.group_id,)
+            )
+            group_row = cursor.fetchone()
+            if not group_row:
+                raise HTTPException(status_code=404, detail="Group not found")
+            group_org_id = group_row[1]
+
+            # Check not already granted
+            cursor.execute(
+                "SELECT group_id FROM vault_group_access"
+                " WHERE vault_id = ? AND group_id = ?",
+                (vault_id, request.group_id),
+            )
+            if cursor.fetchone():
+                raise HTTPException(
+                    status_code=409, detail="Group already has access to this vault"
+                )
+
+            # Validate group and vault belong to the same org (NULL-safe
+            # comparison): only reject if both have non-NULL org_ids that
+            # differ — an org-less (global) vault accepts groups from any
+            # organization (pinned policy, issue #721 AC9).
+            if (
+                group_org_id is not None
+                and vault_org_id is not None
+                and group_org_id != vault_org_id
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Group belongs to a different organization than this vault",
+                )
+
+            cursor.execute(
+                "INSERT INTO vault_group_access (vault_id, group_id, permission, granted_by) VALUES (?, ?, ?, ?)",
+                (vault_id, request.group_id, request.permission, granted_by),
+            )
     except sqlite3.IntegrityError:
-        conn.rollback()
         raise HTTPException(
             status_code=409, detail="Group already has access to this vault"
         )
@@ -511,38 +570,50 @@ def update_vault_group_access(
     """Update a group's permission for a vault."""
     cursor = conn.cursor()
 
-    # Verify vault exists
-    cursor.execute("SELECT id FROM vaults WHERE id = ?", (vault_id,))
-    if not cursor.fetchone():
-        raise HTTPException(status_code=404, detail="Vault not found")
+    # granted_by is FK-safe for the single-admin sentinel (issue #1025,
+    # PRR-001). One BEGIN IMMEDIATE over the existence read, the guard, and
+    # the UPDATE: this route previously had no transaction at all, so a
+    # concurrent revoke (or member demote) could interleave between the read
+    # and the write and strand the vault with zero effective admins.
+    granted_by = resolve_granted_by(current_user)
+    with transaction_context(conn):
+        # Verify vault exists
+        cursor.execute("SELECT id FROM vaults WHERE id = ?", (vault_id,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Vault not found")
 
-    # Check group access exists
-    cursor.execute(
-        "SELECT group_id FROM vault_group_access WHERE vault_id = ? AND group_id = ?",
-        (vault_id, group_id),
-    )
-    if not cursor.fetchone():
-        raise HTTPException(status_code=404, detail="Group access not found")
-
-    # Update group permission
-    granted_by = current_user.get("id")
-    try:
+        # Check group access exists (capture its permission for the guard)
         cursor.execute(
-            "UPDATE vault_group_access SET permission = ?, granted_by = ? WHERE vault_id = ? AND group_id = ?",
+            "SELECT permission FROM vault_group_access"
+            " WHERE vault_id = ? AND group_id = ?",
+            (vault_id, group_id),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Group access not found")
+
+        # Last-effective-admin guard: demoting this grant's admin
+        # permission leaves the vault manageable when any other effective
+        # admin remains — a direct admin, or another group's admin grant
+        # (issue #1025, PRR-010). This grant's contribution is excluded
+        # from the post-state; refusal only fires when the pre-state was
+        # non-empty, so an already-broken vault stays repairable.
+        if row[0] == "admin" and request.permission != "admin":
+            post_admins = _effective_admin_post_state(
+                conn, vault_id, exclude_group_id=group_id
+            )
+            _refuse_if_last_effective_admin(conn, vault_id, post_admins, "demote")
+
+        cursor.execute(
+            "UPDATE vault_group_access SET permission = ?, granted_by = ?"
+            " WHERE vault_id = ? AND group_id = ?",
             (request.permission, granted_by, vault_id, group_id),
         )
         if cursor.rowcount == 0:
-            # The row vanished between the existence check and the UPDATE
-            # (concurrent revoke): 404, never success-for-nothing (issue #726,
-            # T1-01-S2-08).
+            # The row vanished between the guarded read and the UPDATE
+            # (concurrent revoke): 404, never success-for-nothing (issue
+            # #726, T1-01-S2-08).
             raise HTTPException(status_code=404, detail="Group access not found")
-        conn.commit()
-    except HTTPException:
-        conn.rollback()
-        raise
-    except Exception:
-        conn.rollback()
-        raise
 
     # Fetch and return updated group access
     cursor.execute(
@@ -581,21 +652,35 @@ def revoke_vault_group_access(
     """Remove a group's access from a vault."""
     cursor = conn.cursor()
 
-    # Verify vault exists
-    cursor.execute("SELECT id FROM vaults WHERE id = ?", (vault_id,))
-    if not cursor.fetchone():
-        raise HTTPException(status_code=404, detail="Vault not found")
+    # One BEGIN IMMEDIATE over the existence read, the guard, and the DELETE:
+    # like update_vault_group_access, this route previously had no
+    # transaction, so the revocation could strand a vault with zero effective
+    # admins when it removed the last one (issue #1025, PRR-010).
+    with transaction_context(conn):
+        # Verify vault exists
+        cursor.execute("SELECT id FROM vaults WHERE id = ?", (vault_id,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Vault not found")
 
-    # Check group access exists
-    cursor.execute(
-        "SELECT group_id FROM vault_group_access WHERE vault_id = ? AND group_id = ?",
-        (vault_id, group_id),
-    )
-    if not cursor.fetchone():
-        raise HTTPException(status_code=404, detail="Group access not found")
+        # Check group access exists (capture its permission for the guard)
+        cursor.execute(
+            "SELECT permission FROM vault_group_access"
+            " WHERE vault_id = ? AND group_id = ?",
+            (vault_id, group_id),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Group access not found")
 
-    # Delete group access
-    try:
+        # Last-effective-admin guard: this grant's contribution is excluded
+        # from the post-state entirely; refusal only fires when the vault had
+        # effective admins (direct or via another group) beforehand.
+        if row[0] == "admin":
+            post_admins = _effective_admin_post_state(
+                conn, vault_id, exclude_group_id=group_id
+            )
+            _refuse_if_last_effective_admin(conn, vault_id, post_admins, "revoke")
+
         cursor.execute(
             "DELETE FROM vault_group_access WHERE vault_id = ? AND group_id = ?",
             (vault_id, group_id),
@@ -603,13 +688,6 @@ def revoke_vault_group_access(
         if cursor.rowcount == 0:
             # Racing revoke already removed the row: 404, not success.
             raise HTTPException(status_code=404, detail="Group access not found")
-        conn.commit()
-    except HTTPException:
-        conn.rollback()
-        raise
-    except Exception:
-        conn.rollback()
-        raise
 
     return {
         "message": "Group access revoked",
