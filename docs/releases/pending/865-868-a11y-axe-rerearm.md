@@ -10,12 +10,12 @@ set, so the matrix (23 routes × 320×568/640×360 × light/dark) now enforces:
   trigger-only **filter bars** (Wiki page-type filter, Draft Room status
   filter) that rendered no panels at all; they are now `role="group"`
   toggle-button groups (`aria-pressed`, each filter its own tab stop — filters
-  that re-filter one list are not tabs per the ARIA Practices). For real tab
-  sets, Radix keeps an empty panel shell mounted but unmounts the panel's
-  CONTENT on inactive tabs; the shared `TabsContent` wrapper now `forceMount`s
-  panels with `data-[state=inactive]:hidden`, keeping every panel's content in
-  the DOM (Settings, Canvas, RightPane, DraftWorkspace, DraftInspector) —
-  every trigger's `aria-controls` resolves to a mounted, populated panel.
+  that re-filter one list are not tabs per the ARIA Practices). Real tab sets
+  needed no component change: Radix keeps every inactive panel in the DOM as a
+  hidden shell, so each trigger's `aria-controls` already resolved to a
+  mounted element once the filter bars stopped emitting dangling ids. The
+  shared `TabsContent` wrapper is unchanged, and a new jsdom pin
+  (`ui/tabs.test.tsx`) locks that shell-resolution contract in.
 - **#866 — `nested-interactive` (serious)**: clickable-card containers that
   nested interactive controls are gone. Wiki page cards: the open action
   moved to the title button, the per-row checkbox keeps its own control.
@@ -35,33 +35,49 @@ set, so the matrix (23 routes × 320×568/640×360 × light/dark) now enforces:
   grid is a native `<ul>`/`<li>`; the RightPane Sources lists (virtualized
   and plain) and the evidence-candidates block declare `role="list"` with
   `listitem` item wrappers; every SessionRail row path that renders listitems
-  renders a labelled list parent (the no-results state stays roleless).
+  renders a labelled list parent (the no-results state stays roleless, and
+  the inner list is labelled "Session list" so it does not duplicate the
+  surrounding landmark's name).
 
 ## Gate and CI changes
 
 - `frontend/e2e/a11y-matrix.spec.ts` runs axe with the full default rule set
   (the amendment-5 waiver rows are removed).
+- `scripts/check_l07_a11y_gate_wired.py` enforces that invariant structurally:
+  **every `axe.run(` call in every `frontend/e2e/*.spec.ts` must be
+  argument-less**. Any option object — `rules`/`enabled: false` under any
+  quoting or line split, `runOnly`, `exclude` — fails CI, as do job-neutering
+  spellings (`if:` conditions evaluating false by any common spelling;
+  `continue-on-error: "true"/True`). Its pytest mutants pin each shape
+  (`backend/tests/test_l07_gate_wiring.py`).
 - New focused probe suite `frontend/e2e/a11y-rearm-865-868.spec.ts` runs in
-  the same CI job: aria-controls resolution, no interactive-inside-interactive
-  on /wiki cards, native list semantics on /chat.
-- `scripts/check_l07_a11y_gate_wired.py` now enforces **zero** disabled rules
-  (whitespace-tolerant scan, comments ignored) instead of the exactly-four
-  waiver roster; its pytest mutants pin any-waiver, spacing-variant, and
-  comment-tolerance behavior (`backend/tests/test_l07_gate_wiring.py`).
+  the same CI job: the /wiki card no-nesting contract and the /chat native
+  list contract, plus the historical dangling-aria-controls probe over
+  /wiki and /draft-room (the routes whose filter bars produced the base
+  violations — those routes now render no tabs, and the axe matrix itself
+  enforces `aria-valid-attr-value` on all 23 routes every run).
 - New source-census guardrail `frontend/src/a11y.unnamed-controls-census.test.ts`
-  fails on any new unnamed icon-only button, placeholder-only Select trigger
-  (absent an associated label or pinned value), or FolderTree-style empty
+  fails on any new unnamed icon-only shadcn `<Button>` (inline `<svg>` counts
+  as an icon; JSX comments do not count as a name; `aria-label={undefined}`,
+  `aria-hidden="false"`, and empty-`title` exemptions require live values),
+  any genuinely unnamed placeholder-only Select trigger (absent an
+  associated label or a pinned value), and the FolderTree-style empty
   unlabeled plain button.
 
 ## Known limitations
 
-- `TabsContent forceMount` mounts every panel eagerly: tab-panel effects and
-  queries (e.g. Canvas compare's version queries, Maintenance jobs fetch) now
-  run at page load instead of on first activation. Hidden panels are
-  `display: none`, so they stay out of the tab order, accessibility tree, and
-  the gate's offender probe.
 - The keyboard model of the two converted filter bars changes from Radix
   roving-arrow focus to plain buttons (each filter is its own tab stop).
-- The upload indicator's whole-header click no longer toggles the panel; the
-  labeled collapse/expand button (which also carries `aria-expanded`) owns
-  the toggle.
+- Three interactive containers lost their whole-surface click targets, with
+  the action preserved on a named inner control: wiki page cards (title
+  button), chat source cards (filename button), and session-rail rows (title
+  button; the row's cursor-pointer affordance went with the role). The
+  upload indicator's whole-header click similarly moved to its labeled
+  collapse button, and filename hover tooltips (title attr) were dropped
+  where the filename became the button.
+- The census is a source-scanning guard, not a compiler: member-expression
+  tags (`<UI.Button>`), props-spread wrappers, cross-component label
+  association, spread-supplied placeholders, and value-pinned Selects
+  without a matching item are documented exemption classes, and its native
+  `<button>` leg targets the conditional-`aria-label` FolderTree shape
+  specifically.

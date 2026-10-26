@@ -170,7 +170,7 @@ describe("#866 structural no-nesting pins (matrix-unreached surfaces)", () => {
       // container within a +-3-line window of the role attribute (the
       // grouped path labels dynamically: `${label} sessions`).
       const window = lines.slice(Math.max(0, i - 3), i + 4).join(" ");
-      expect(window).toMatch(/Chat sessions|\$\{label\} sessions/);
+      expect(window).toMatch(/Session list|Chat sessions|\$\{label\} sessions/);
     }
     // And each row path has listitem children in the source (code lines
     // only — the asListItem doc comment does not count).

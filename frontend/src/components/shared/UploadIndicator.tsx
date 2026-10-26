@@ -58,10 +58,7 @@ export function UploadIndicator() {
                 variant="ghost"
                 size="sm"
                 className="h-6 px-2 text-xs"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  clearCompleted();
-                }}
+                onClick={() => clearCompleted()}
               >
                 Clear
               </Button>

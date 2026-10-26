@@ -232,7 +232,14 @@ describe("DraftRoomPage", () => {
     mockListAccessibleVaults.mockResolvedValue({
       vaults: [{ id: 7, name: "Drafts vault" }],
     });
-    mockListDrafts.mockResolvedValue({ items: [makeDraft()], total: 1, page: 1, per_page: 20 });
+    // Two pages: the test first navigates OFF page 1 so the reset assertion
+    // can actually fail if the filter change stopped resetting the page.
+    mockListDrafts.mockResolvedValue({
+      items: [makeDraft()],
+      total: 25,
+      page: 1,
+      per_page: 20,
+    });
     renderPage();
 
     // The filter bar is a toggle group, not a trigger-only Tabs bar: each
@@ -240,6 +247,14 @@ describe("DraftRoomPage", () => {
     const allFilter = await screen.findByRole("button", { name: "All" });
     expect(allFilter.getAttribute("aria-pressed")).toBe("true");
 
+    // Navigate to page 2 first.
+    await user.click(await screen.findByRole("button", { name: "Go to page 2" }));
+    await waitFor(() => {
+      const lastCall = mockListDrafts.mock.calls.at(-1)?.[0] as Record<string, unknown>;
+      expect(lastCall?.page).toBe(2);
+    });
+
+    // Changing the status filter must reset the page to 1.
     await user.click(screen.getByRole("button", { name: "In progress" }));
 
     expect(screen.getByRole("button", { name: "In progress" }).getAttribute("aria-pressed")).toBe("true");

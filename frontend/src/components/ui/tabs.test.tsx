@@ -1,15 +1,16 @@
 // frontend/src/components/ui/tabs.test.tsx
-// #865 wrapper pin: TabsContent force-mounts every panel so each tab
-// trigger's aria-controls resolves to an element in the DOM, while inactive
-// panels are hidden (data-[state=inactive]:hidden base class) — out of
-// layout, the tab order, and the accessibility tree in a real browser.
+// #865 contract pin: Radix keeps every inactive TabsContent panel in the DOM
+// as a hidden shell, so EVERY tab trigger's aria-controls resolves to an
+// element in the document without any forceMount — and the hidden shell's
+// content stays unmounted (out of layout, tab order, and the accessibility
+// tree), which keeps the a11y matrix measuring exactly what renders.
 
 import { describe, it, expect } from "vitest";
-import { render, screen, within } from "@testing-library/react";
+import { render, screen } from "@testing-library/react";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "./tabs";
 
-describe("ui/tabs forceMount wrapper (#865)", () => {
-  it("keeps inactive panels mounted so aria-controls always resolves", () => {
+describe("ui/tabs aria-controls resolution (#865)", () => {
+  it("resolves every trigger's aria-controls via the hidden inactive panel", () => {
     render(
       <Tabs defaultValue="a">
         <TabsList>
@@ -24,26 +25,31 @@ describe("ui/tabs forceMount wrapper (#865)", () => {
     const alpha = screen.getByRole("tab", { name: "Alpha" });
     const beta = screen.getByRole("tab", { name: "Beta" });
 
-    // Every trigger's aria-controls must resolve to a mounted element —
-    // the dangling-id defect this wrapper eliminates.
+    // The #865 invariant: no trigger may reference a panel id that is absent
+    // from the document.
     for (const trigger of [alpha, beta]) {
       const id = trigger.getAttribute("aria-controls");
       expect(id).toBeTruthy();
       expect(document.getElementById(id as string)).not.toBeNull();
     }
 
-    // The inactive panel stays mounted, marked inactive, and carries the
-    // display:none base class that keeps it out of layout and the a11y tree.
+    // The active panel renders its content.
+    const alphaPanel = document.getElementById(
+      alpha.getAttribute("aria-controls") as string
+    ) as HTMLElement;
+    expect(alphaPanel.getAttribute("data-state")).toBe("active");
+    expect(alphaPanel).toHaveTextContent("alpha panel");
+    expect(alphaPanel.hasAttribute("hidden")).toBe(false);
+
+    // The inactive panel is the hidden shell: present (so the id resolves),
+    // marked inactive, but its CONTENT is unmounted — the same contract the
+    // a11y matrix measures on every tabbed route.
     const betaPanel = document.getElementById(
       beta.getAttribute("aria-controls") as string
     ) as HTMLElement;
     expect(betaPanel.getAttribute("data-state")).toBe("inactive");
-    expect(betaPanel.className).toContain("data-[state=inactive]:hidden");
     expect(betaPanel.getAttribute("role")).toBe("tabpanel");
-    // Content presence is the forceMount discriminator: Radix Presence keeps
-    // an empty shell mounted for render-prop children, so id/class/role
-    // assertions alone survive deletion of the forceMount prop — the panel's
-    // CHILDREN are what forceMount keeps alive.
-    expect(within(betaPanel).getByText("beta panel")).toBeInTheDocument();
+    expect(betaPanel.hasAttribute("hidden")).toBe(true);
+    expect(betaPanel).not.toHaveTextContent("beta panel");
   });
 });

@@ -165,9 +165,9 @@ def main() -> int:
     else:
         for name in wired_jobs:
             joined = "\n".join(jobs[name])
-            if re.search(r"^\s*if:.*\bfalse\b", joined, re.MULTILINE):
+            if re.search(r"^\s*if:.*(false|False|!\s*true|!\s*1\b)", joined, re.MULTILINE):
                 misses.append(f"the '{name}' job carries an if:-false condition")
-            if re.search(r"^\s*continue-on-error:\s*true", joined, re.MULTILINE):
+            if re.search(r"^\s*continue-on-error:\s*[\"']?(true|True|TRUE)[\"']?\s*$", joined, re.MULTILINE):
                 misses.append(f"the '{name}' job sets continue-on-error: true")
 
     # Structural spec checks (only meaningful when the spec exists).
@@ -199,23 +199,30 @@ def main() -> int:
                 f"{MIN_ROUTES} (>= 20 gated routes)"
             )
 
-        # 4. Re-arm invariant (issues #865-#868 closed): NO axe rule may be
-        #    disabled in the spec. Whitespace-tolerant on non-comment lines
-        #    so an `enabled:false` (or `enabled :  false`) spelling cannot
-        #    slip a waiver past the count.
-        spec_code_lines = [
-            ln for ln in spec_lines if not ln.lstrip().startswith("//")
-        ]
-        disables = sum(
-            1
-            for ln in spec_code_lines
-            if re.search(r"enabled\s*:\s*false", ln)
-        )
-        if disables != 0:
-            misses.append(
-                f"the spec disables {disables} axe rule(s); the re-armed "
-                "gate waives nothing (zero enabled-false rows sanctioned)"
-            )
+        # 4. Re-arm invariant (issues #865-#868 closed): the gate runs axe
+        #    with its FULL default rule set -- every axe.run( call in every
+        #    a11y-gate spec must be argument-less. This subsumes every
+        #    waiver spelling (rules/enabled:false in any quoting or line
+        #    split, runOnly, exclude): any option object restricts what the
+        #    gate measures.
+        for spec_path in sorted((root / E2E_DIR_REL).glob("*.spec.ts")):
+            try:
+                spec_code = spec_path.read_text(encoding="utf-8")
+            except OSError as exc:
+                misses.append(f"a11y-gate spec unreadable: {exc}")
+                continue
+            code = re.sub(r"/\*.*?\*/", " ", spec_code, flags=re.S)
+            code = re.sub(r"^\s*//.*$", " ", code, flags=re.M)
+            for m in re.finditer(r"axe\.run\s*\(", code):
+                tail = code[m.end():].lstrip()
+                if not tail.startswith(")"):
+                    rel = spec_path.relative_to(root).as_posix()
+                    line_no = code[: m.start()].count("\n") + 1
+                    misses.append(
+                        f"{rel}:{line_no} calls axe.run with options; the "
+                        "re-armed gate runs the full default rule set "
+                        "(axe.run() takes no arguments)"
+                    )
 
     # 5. Run-line hygiene across ALL jobs (issue #778 review PRR-016):
     #    every playwright invocation names at least one *.spec.ts; the e2e

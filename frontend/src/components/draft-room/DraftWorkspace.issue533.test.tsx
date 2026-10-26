@@ -460,14 +460,9 @@ describe("DraftWorkspace (issue #533)", () => {
       expect(useDraftRoomUiStore.getState().compareToRevisionId).toBe(100);
     });
     expect(screen.getByRole("tab", { name: "Compare" })).toHaveAttribute("aria-selected", "true");
-    // #865 forceMount: the editor panel stays MOUNTED (display:none in a
-    // real browser) while Compare is active — pin that the editor sits in
-    // the INACTIVE panel rather than asserting DOM absence.
-    const editor = screen.queryByLabelText("Draft content");
-    expect(editor).not.toBeNull();
-    expect(
-      editor?.closest("[data-state]")?.getAttribute("data-state")
-    ).toBe("inactive");
+    // The editor panel unmounts while Compare is active — the editor is
+    // unreachable in the DOM, not merely hidden.
+    expect(screen.queryByLabelText("Draft content")).not.toBeInTheDocument();
 
     // The real DraftRevisionDiff renders the two served revisions as a diff.
     const rows = await screen.findAllByTestId("draft-diff-row");

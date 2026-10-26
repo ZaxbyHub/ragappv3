@@ -1630,7 +1630,7 @@ function SessionRailContent({
             <div
               style={{ height: sessionVirtualizer.getTotalSize(), position: 'relative' }}
               role="list"
-              aria-label="Chat sessions"
+              aria-label="Session list"
               onKeyDown={handleSessionListKeyDown}
             >
               {virtualItems.map((virtualItem) => {
@@ -1680,7 +1680,7 @@ function SessionRailContent({
             // Fallback: render all items directly (used in JSDOM/test env where
             // scroll container has 0 height and getVirtualItems() returns [])
             // eslint-disable-next-line jsx-a11y-x/no-noninteractive-element-interactions -- list container uses event delegation for roving-tabindex arrow-key navigation (UI-045). APG listbox pattern.
-            <div role="list" aria-label="Chat sessions" onKeyDown={handleSessionListKeyDown}>
+            <div role="list" aria-label="Session list" onKeyDown={handleSessionListKeyDown}>
               {filteredSessions.map((session, index) => (
                 // eslint-disable-next-line jsx-a11y-x/no-noninteractive-element-interactions -- focusable listitem row wrapper (UI-045); Enter/Space activate the session when the wrapper holds focus.
                 <div

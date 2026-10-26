@@ -45,10 +45,6 @@ const sourceZ: Source = { id: "chunk-z", filename: "z-title" };
 describe("RightPane citation anchor (A07 AC4)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    // #865 forceMount: the context panel mounts eagerly with the Sources
-    // tab, so its selection effect calls getChunkContext before any test
-    // override — default it to a settled no-context response.
-    apiMocks.getChunkContext.mockResolvedValue(undefined);
     useChatStore.setState({
       messageIds: ["msg1", "msg2"],
       messagesById: {
@@ -94,16 +90,8 @@ describe("RightPane citation anchor (A07 AC4)", () => {
     render(<RightPane />);
 
     // The pane lists msg2's sources: x and z present, y (msg1-only) absent.
-    // #865 forceMount: the Preview panel is mounted (hidden) alongside the
-    // Sources list, so the selected source's title can appear twice in the
-    // DOM — scope the count pins to the Sources list itself.
-    const sourcesList = screen
-      .getAllByText("z-title")[0]
-      .closest('[aria-label="Sources list"]') as HTMLElement | null;
-    expect(sourcesList).not.toBeNull();
-    const withinSources = sourcesList as HTMLElement;
-    expect(within(sourcesList).queryAllByText("z-title").length).toBe(1);
-    expect(within(withinSources).queryAllByText("x-title").length).toBe(1);
-    expect(within(withinSources).queryAllByText("y-title").length).toBe(0);
+    expect(screen.queryAllByText("z-title").length).toBe(1);
+    expect(screen.queryAllByText("x-title").length).toBe(1);
+    expect(screen.queryAllByText("y-title").length).toBe(0);
   });
 });
