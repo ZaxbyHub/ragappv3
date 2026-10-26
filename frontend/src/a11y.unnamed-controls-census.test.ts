@@ -200,7 +200,7 @@ function findElementBlocks(source: string, blanked: string, tag: string): Elemen
       line: lineOf(source, start),
       start,
       openTag: source.slice(start, openEnd),
-      inner: source.slice(openEnd, closeIdx),
+      inner: blanked.slice(openEnd, closeIdx),
       selfClosing: false,
     });
     openRe.lastIndex = openEnd;
@@ -263,6 +263,18 @@ function parseAttrValueAt(text: string, i: number): string | null {
  * (`<Label htmlFor={X}>` / `<SelectTrigger id={X}>`) carry the identical
  * source token.
  */
+/**
+ * True when openTag carries `name` with a LIVE value: the attribute exists
+ * and its value is neither the empty string nor the literal `{undefined}`
+ * (React drops both, so the attribute names nothing at runtime).
+ */
+function hasLiveAttribute(openTag: string, name: string): boolean {
+  const value = attrValueText(openTag, name);
+  if (value === null) return false;
+  const v = value.trim();
+  return v !== "" && v !== "undefined";
+}
+
 function attrValueText(openTag: string, name: string): string | null {
   const re = new RegExp(`(?:^|[\\s"])${name}\\s*=`, "g");
   const m = re.exec(openTag);
@@ -489,7 +501,9 @@ function rendersVisibleText(inner: string): boolean {
 }
 
 function hasIconComponent(inner: string): boolean {
-  return analyzeInner(inner).hasIconTag;
+  // Inline `<svg>` (lowercase, not a component tag) is still an icon — an
+  // icon-only shape by the same rule the capitalised-component check covers.
+  return analyzeInner(inner).hasIconTag || /<svg[\s>/]/.test(inner);
 }
 
 interface Offender {
@@ -513,8 +527,11 @@ describe("unnamed-controls source census (issue #867 AC8)", () => {
         // could render unnamed — but only when NO other name source exists.
         if (!whole.includes("placeholder=")) continue;
         // Exemption 1 — named directly: aria-label / aria-labelledby on the
-        // trigger block.
-        if (whole.includes("aria-label")) continue;
+        // trigger's OWN open tag (a descendant's aria-label does not name
+        // the combobox role), and only when the value is live (non-empty,
+        // not literally {undefined}).
+        if (hasLiveAttribute(block.openTag, "aria-label")) continue;
+        if (hasLiveAttribute(block.openTag, "aria-labelledby")) continue;
         // Exemption 2 — named by an associated label (accname step 2D; the
         // plan critic's runtime computeAccessibleName replay confirmed the
         // label wins over the placeholder): a <Label htmlFor>/<label for> in
@@ -546,11 +563,19 @@ describe("unnamed-controls source census (issue #867 AC8)", () => {
       for (const block of findElementBlocks(source, blanked, "Button")) {
         // ui/pagination.tsx's disabled ellipsis button carries aria-hidden on
         // the opening tag and is excluded by that same leg (no denylist).
-        if (block.openTag.includes("aria-label")) continue;
-        if (block.openTag.includes("aria-hidden")) continue;
+        if (hasLiveAttribute(block.openTag, "aria-label")) continue;
+        if (hasLiveAttribute(block.openTag, "aria-labelledby")) continue;
+        // ui/pagination.tsx's disabled ellipsis button carries aria-hidden on
+        // the opening tag and is excluded by that same leg (no denylist).
+        // aria-hidden only exempts when literally "true" — "false" leaves
+        // the control in the accessibility tree.
+        if (attrValueText(block.openTag, "aria-hidden") === "true") continue;
         // A title attribute is an accessible-name source (accname step 2F),
-        // so a title-bearing control is not a button-name offender.
-        if (block.openTag.includes("title=")) continue;
+        // so a title-bearing control is not a button-name offender — but
+        // only a non-empty literal title names anything; title="" or
+        // title={undefined} does not.
+        const title = attrValueText(block.openTag, "title");
+        if (title !== null && title.trim() !== "" && title !== "undefined") continue;
         // Generic wrappers (LoadingButton, EmptyState-style components) spread
         // props or render caller-provided children — their accessible name is
         // supplied at the call site, so this static census cannot classify
@@ -569,6 +594,39 @@ describe("unnamed-controls source census (issue #867 AC8)", () => {
       `icon-only Button blocks without a name ` +
         `(add aria-label, or aria-hidden when decorative): ${render(offenders)}`
     ).toEqual([]);
+  });
+
+  it("predicate hardening fixtures (#1022 review): comments are not names, svg is an icon, presence exemptions require live values", () => {
+    const cases: Array<{ name: string; src: string; offender: boolean }> = [
+      { name: "JSX comment is not an accessible name", offender: true,
+        src: '<Button onClick={x}>{/* TODO: label me */}<Trash2 size={16} /></Button>' },
+      { name: "inline svg counts as an icon", offender: true,
+        src: '<Button onClick={x}><svg viewBox="0 0 2 2" /></Button>' },
+      { name: "aria-hidden=false does not exempt", offender: true,
+        src: '<Button onClick={x} aria-hidden="false"><Trash2 size={16} /></Button>' },
+      { name: "empty title does not exempt", offender: true,
+        src: '<Button onClick={x} title=""><Trash2 size={16} /></Button>' },
+      { name: "aria-label={undefined} does not exempt", offender: true,
+        src: '<Button onClick={x} aria-label={undefined}><Trash2 size={16} /></Button>' },
+      { name: "live title still exempts", offender: false,
+        src: '<Button onClick={x} title="Delete row"><Trash2 size={16} /></Button>' },
+      { name: "live aria-label still exempts", offender: false,
+        src: '<Button onClick={x} aria-label="Delete row"><Trash2 size={16} /></Button>' },
+    ];
+    for (const c of cases) {
+      const blanked = blankComments(c.src);
+      const blocks = findElementBlocks(c.src, blanked, "Button");
+      expect(blocks.length, c.name).toBe(1);
+      const block = blocks[0];
+      if (hasLiveAttribute(block.openTag, "aria-label")) continue;
+      if (hasLiveAttribute(block.openTag, "aria-labelledby")) continue;
+      if (attrValueText(block.openTag, "aria-hidden") === "true") continue;
+      const title = attrValueText(block.openTag, "title");
+      if (title !== null && title.trim() !== "" && title !== "undefined") continue;
+      const isOffender =
+        rendersVisibleText(block.inner) === false && hasIconComponent(block.inner);
+      expect(isOffender, c.name).toBe(c.offender);
+    }
   });
 
   it("plain buttons cannot render as unnamed empty controls", () => {

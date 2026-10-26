@@ -144,7 +144,7 @@ jobs:
 
 _NL = chr(10)
 
-_FULL_ROUTES = "".join(f'  {{ path: "r{i}" }},{_NL}' for i in range(1, 21))
+_FULL_ROUTES = "".join(f'    path: "r{i}",{_NL}' for i in range(1, 21))
 
 # Re-armed shape (#865-#868 closed): the spec carries NO rule-disable
 # rows; the checker requires zero waivers.
@@ -164,6 +164,15 @@ def _plant_full(tmp_path: Path, ci_text: str = FULL_CI, spec_text: str = FULL_SP
     (tmp_path / SPEC_REL).write_text(spec_text, encoding="utf-8")
 
 
+def test_planted_full_is_green(tmp_path: Path) -> None:
+    # Green baseline: the planted FULL fixture satisfies EVERY checker leg
+    # (roster included — the fixture routes use the production line shape),
+    # so each mutant below isolates exactly one leg.
+    _plant_full(tmp_path)
+    result = _run_guard(tmp_path)
+    assert result.returncode == 0, result.stdout
+
+
 def test_comment_only_wiring_rejected(tmp_path: Path) -> None:
     # A comment naming the spec satisfies nothing (PRR-017/F-01): the run
     # step is gone, so the gate is unwired even though the literal appears.
@@ -179,31 +188,33 @@ def test_comment_only_wiring_rejected(tmp_path: Path) -> None:
 
 def test_if_false_job_rejected(tmp_path: Path) -> None:
     # GitHub reports an if:-false job as success - the gate would be a no-op.
-    neutered = FULL_CI.replace(
-        "  a11y-matrix:\n",
-        "  a11y-matrix:\n    if: false\n",
-    )
-    _plant_full(tmp_path, neutered)
-    result = _run_guard(tmp_path)
-    assert result.returncode == 1
-    assert "if:-false" in result.stdout
+    for condition in ("false", "False", '${{ !true }}', "!1"):
+        neutered = FULL_CI.replace(
+            "  a11y-matrix:\n",
+            f"  a11y-matrix:\n    if: {condition}\n",
+        )
+        _plant_full(tmp_path, neutered)
+        result = _run_guard(tmp_path)
+        assert result.returncode == 1, condition
+        assert "if:-false" in result.stdout, condition
 
 
 def test_continue_on_error_job_rejected(tmp_path: Path) -> None:
-    neutered = FULL_CI.replace(
-        "  a11y-matrix:\n",
-        "  a11y-matrix:\n    continue-on-error: true\n",
-    )
-    _plant_full(tmp_path, neutered)
-    result = _run_guard(tmp_path)
-    assert result.returncode == 1
-    assert "continue-on-error: true" in result.stdout
+    for value in ("true", '"true"', "True", "true # neutered"):
+        neutered = FULL_CI.replace(
+            "  a11y-matrix:\n",
+            f"  a11y-matrix:\n    continue-on-error: {value}\n",
+        )
+        _plant_full(tmp_path, neutered)
+        result = _run_guard(tmp_path)
+        assert result.returncode == 1, value
+        assert "continue-on-error: true" in result.stdout, value
 
 
 def test_roster_below_minimum_rejected(tmp_path: Path) -> None:
     shrunken = FULL_SPEC.replace(
         _FULL_ROUTES,
-        "  {" + _NL + '    path: "r1" },' + _NL + "  {" + _NL + '    path: "r2" },' + _NL,
+        '    path: "r1",' + _NL + '    path: "r2",' + _NL,
     )
     _plant_full(tmp_path, spec_text=shrunken)
     result = _run_guard(tmp_path)

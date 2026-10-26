@@ -167,7 +167,7 @@ def main() -> int:
             joined = "\n".join(jobs[name])
             if re.search(r"^\s*if:.*(false|False|!\s*true|!\s*1\b)", joined, re.MULTILINE):
                 misses.append(f"the '{name}' job carries an if:-false condition")
-            if re.search(r"^\s*continue-on-error:\s*[\"']?(true|True|TRUE)[\"']?\s*$", joined, re.MULTILINE):
+            if re.search(r"^\s*continue-on-error:\s*[\"']?(true|True|TRUE)[\"']?(?:\s*#.*)?$", joined, re.MULTILINE):
                 misses.append(f"the '{name}' job sets continue-on-error: true")
 
     # Structural spec checks (only meaningful when the spec exists).
