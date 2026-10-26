@@ -88,8 +88,10 @@ swaps the destination in one rename. Behavior changes:
   replaced.
 - **WAL-safe**: stale `app.db-wal`/`-shm`/`-journal` sidecars are never
   carried into the restored tree (they leave with the pre-restore
-  directory), so a fresh SQLite open never replays the pre-restore
-  database over the restored one.
+  directory when the set replaces the database), so a fresh SQLite open
+  never replays the pre-restore database over the restored one; a set
+  that does not cover `app.db` preserves the database together with its
+  live sidecars (the journal of surviving bytes).
 - **Tagged generations persist**: after the swap each manifest table is
   `checkout(tag)` + `restore()`-ed, so a FRESH LanceDB connection serves
   the tagged generation (previously the checkout ran on a discarded handle

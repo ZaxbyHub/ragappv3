@@ -658,8 +658,9 @@ def test_sqliteless_manifest_preserves_uncheckpointed_rows(
 
     # Fixture sanity is byte-level inside _make_wal_dest (opening the
     # database here would replay the wal and destroy the crash state).
-    # The 2 seeded rows are in app.db alone; the 50 committed rows live
-    # only in the wal.
+    # Nothing is checkpointed into app.db at all (WAL mode with
+    # wal_autocheckpoint=0 from the very first statement): the whole
+    # table lives in the wal until something opens the database.
     pre_rows = _rows_with_wal()
     assert pre_rows == 52, (
         f"E-03b FIXTURE: expected 52 rows with the wal, got {pre_rows}"

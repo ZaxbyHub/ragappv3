@@ -190,7 +190,9 @@ roles, not capacity claims.
   logged; insufficient space refuses up front), preserves content the set
   does not cover (`documents/`, `uploads/`, uncovered vaults, ...) by
   copying it through the swap, and never replays a stale `app.db-wal` —
-  sidecars are dropped with the pre-restore directory. See Scheduled
+  sidecars are dropped with the pre-restore directory when the set
+  replaces the database (a set that does not cover `app.db` preserves
+  the database together with its live sidecars). See Scheduled
   backups (crash recovery below) for the rare interrupted-restore journal.
 - Corrupt/missing metrics: telemetry shards are rebuildable caches — delete
   the registry dir contents and restart; no user data is involved.
