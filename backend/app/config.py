@@ -807,7 +807,9 @@ class Settings(BaseSettings):
     # an empty default, which plain bool parsing would reject at startup):
     # empty and unset both mean disabled.
     allow_local_curator: Union[bool, Literal[""]] = False
-    """Allow loopback/private curator endpoints when ALLOW_LOCAL_CURATOR=1/true.
+    """Allow loopback/private curator endpoints when ALLOW_LOCAL_CURATOR=1/true
+    (case-sensitive, after trimming — the same grammar as the process
+    environment; any other value is disabled, never a boot error).
 
     Read at call time with process-environment precedence (see
     services/curator_ssrf.py): a key present in os.environ wins verbatim so
@@ -815,7 +817,8 @@ class Settings(BaseSettings):
     """
 
     allow_local_services: Union[bool, Literal[""]] = False
-    """Allow loopback service endpoints when ALLOW_LOCAL_SERVICES=1/true.
+    """Allow loopback service endpoints when ALLOW_LOCAL_SERVICES=1/true
+    (same grammar and precedence notes as allow_local_curator).
 
     Same precedence and empty-tolerance as allow_local_curator (read at call
     time in services/ssrf.py).
@@ -823,11 +826,20 @@ class Settings(BaseSettings):
 
     @field_validator("allow_local_curator", "allow_local_services", mode="before")
     @classmethod
-    def _empty_optin_means_false(cls, v):
-        # ``ALLOW_LOCAL_CURATOR=`` (empty) must boot as disabled, not crash
-        # pydantic's bool parser (issue #726 review probe).
-        if v == "":
+    def _normalize_optin_bool(cls, v):
+        # Normalize to the SAME grammar the call-time process-environment
+        # readers use (curator_ssrf.py / ssrf.py: only "1"/"true"/"True"
+        # enable, after trimming) so one operator value means one posture
+        # regardless of source (review round: grammar-split closure). Empty
+        # must boot as disabled, not crash pydantic's bool parser (issue
+        # #726 review probe); unknown values are disabled, never boot-fatal
+        # (base treated unknown keys as inert via extra="ignore").
+        if isinstance(v, bool):
+            return v
+        if v is None:
             return False
+        if isinstance(v, str):
+            return v.strip() in ("1", "true", "True")
         return v
 
 

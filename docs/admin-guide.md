@@ -993,7 +993,7 @@ Note the deliberate asymmetry: **viewing** chat sessions requires only `read`, b
 **Password Hashing:**
 - New passwords are hashed with **Argon2id** (memory-hard, CPU-intensive)
 - Existing **bcrypt** hashes are verified transparently and upgraded to Argon2id on next successful login — no forced password resets required
-- **This upgrade is one-way.** Argon2id hashes cannot be verified by older bcrypt-only releases (e.g. v1.1.0): after any user logs in on this version, rolling back to an older release locks that account out with 401s until their hash is restored. Rolling back therefore requires the pre-upgrade backup of the database
+- **This upgrade is one-way.** Argon2id hashes cannot be verified by older bcrypt-only releases (e.g. v1.1.0): after any user logs in on this version, rolling back to an older release locks that account out with 401s until their hash is restored. Recovery options: restore the pre-upgrade database backup, or (per account) have an admin set a new password from the older release, which re-hashes it with that release's algorithm.
 
 **Token Revocation:**
 - Access tokens are **short-lived (15 minutes)** and can be **denylisted before expiry** (e.g., on logout)

@@ -757,15 +757,27 @@ class TestOversizedParameters:
         assert rejected == {"skip", "limit"}, detail
 
     def test_zero_limit(self):
-        """Zero limit should return empty list, not crash."""
+        """Zero limit is rejected 422 (list_users enforces limit ge=1)."""
         token = get_token(self.admin_id, "admin", "admin")
         response = self.client.get(
             "/users/?limit=0", headers={"Authorization": f"Bearer {token}"}
         )
-        # FastAPI may reject 0 as invalid for limit >= 1
-        assert response.status_code in (200, 422), (
+        # list_users bounds limit at ge=1 (issue #725 AC5): 0 is rejected.
+        assert response.status_code == 422, (
             f"Unexpected status: {response.status_code}"
         )
+
+    def test_limit_upper_boundary(self):
+        """limit=1000 is accepted (exact cap); 1001 is rejected 422."""
+        token = get_token(self.admin_id, "admin", "admin")
+        response = self.client.get(
+            "/users/?limit=1000", headers={"Authorization": f"Bearer {token}"}
+        )
+        assert response.status_code == 200, f"Expected 200, got {response.status_code}"
+        response = self.client.get(
+            "/users/?limit=1001", headers={"Authorization": f"Bearer {token}"}
+        )
+        assert response.status_code == 422, f"Expected 422, got {response.status_code}"
 
 
 class TestEmptyAndMalformedBodies:

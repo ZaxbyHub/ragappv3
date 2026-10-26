@@ -523,6 +523,19 @@ async def create_vault(
                     detail="You are not a member of that organization",
                 )
 
+    # The name "Default" is reserved: the startup migration and the orphan
+    # backfill resolve the system default vault BY NAME (issue #725,
+    # S03-SK2-02), so a caller-created or renamed-in "Default" vault would be
+    # adopted for every new user and then become unrenamable/undeletable via
+    # the guards below (review round: sticky-squat closure).
+    if body.name == "Default":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "The name 'Default' is reserved for the system default vault"
+            ),
+        )
+
     # Begin explicit transaction for atomic vault + membership creation
     try:
         await asyncio.to_thread(conn.execute, "BEGIN")
@@ -654,6 +667,21 @@ async def update_vault(
                 "The default vault cannot be renamed: new users and the orphan "
                 "backfill are assigned to it by name. Rename another vault or "
                 "create a new vault instead."
+            ),
+        )
+
+    # Symmetric guard (review round, sticky-squat closure): renaming a second
+    # vault INTO the reserved name would hand the name-keyed resolver slot to
+    # a caller-chosen vault, which the delete/rename guards would then freeze.
+    if (
+        row[1] != "Default"
+        and request.name is not None
+        and request.name == "Default"
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "The name 'Default' is reserved for the system default vault"
             ),
         )
 

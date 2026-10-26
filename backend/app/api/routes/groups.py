@@ -47,8 +47,10 @@ def _validate_group_name(v: Optional[str]) -> Optional[str]:
     """Enforce the UI's exact name contract: trimmed length >= 2 AND raw
     length <= 100 (GroupFormDialog checks trim().length < 2 then
     .length > 100). Validation-only: the stored value is never rewritten
-    (issue #726, R1-G5b-02 — API and UI now reject and accept identical
-    inputs).
+    (issue #726, R1-G5b-02 — API and UI reject and accept identical inputs
+    for BMP text; lengths are Python code points vs the UI's UTF-16 units,
+    so names containing astral characters (e.g. emoji) can diverge by up to
+    1 UTF-16 unit per astral char).
     """
     if v is None:
         return v

@@ -36,7 +36,7 @@
       "SEVERITY.LOW": 59,
       "SEVERITY.MEDIUM": 60,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 93426,
+      "loc": 93453,
       "nosec": 0,
       "skipped_tests": 71
     },
@@ -192,7 +192,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 6,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 815,
+      "loc": 817,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -374,7 +374,7 @@
       "SEVERITY.LOW": 4,
       "SEVERITY.MEDIUM": 2,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1118,
+      "loc": 1136,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -400,7 +400,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1666,
+      "loc": 1673,
       "nosec": 0,
       "skipped_tests": 2
     },
@@ -2727,7 +2727,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "222     # Get total count with search filter\n223     total_query = f\"SELECT COUNT(*) FROM groups g {where_clause}\"\n224     total_cursor = await asyncio.to_thread(\n",
+      "code": "224     # Get total count with search filter\n225     total_query = f\"SELECT COUNT(*) FROM groups g {where_clause}\"\n226     total_cursor = await asyncio.to_thread(\n",
       "col_offset": 18,
       "end_col_offset": 65,
       "filename": "backend/app/api/routes/groups.py",
@@ -2738,16 +2738,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 223,
+      "line_number": 225,
       "line_range": [
-        223
+        225
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "235         db.execute,\n236         f\"\"\"\n237         SELECT\n238             g.id,\n239             g.org_id,\n240             g.name,\n241             g.description,\n242             g.created_at,\n243             o.name as organization_name\n244         FROM groups g\n245         JOIN organizations o ON g.org_id = o.id\n246         {where_clause}\n247         ORDER BY g.name\n248         LIMIT ? OFFSET ?\n249         \"\"\",\n250         tuple(query_params),\n",
+      "code": "237         db.execute,\n238         f\"\"\"\n239         SELECT\n240             g.id,\n241             g.org_id,\n242             g.name,\n243             g.description,\n244             g.created_at,\n245             o.name as organization_name\n246         FROM groups g\n247         JOIN organizations o ON g.org_id = o.id\n248         {where_clause}\n249         ORDER BY g.name\n250         LIMIT ? OFFSET ?\n251         \"\"\",\n252         tuple(query_params),\n",
       "col_offset": 8,
       "end_col_offset": 11,
       "filename": "backend/app/api/routes/groups.py",
@@ -2758,10 +2758,8 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 236,
+      "line_number": 238,
       "line_range": [
-        236,
-        237,
         238,
         239,
         240,
@@ -2773,14 +2771,16 @@
         246,
         247,
         248,
-        249
+        249,
+        250,
+        251
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "516         db.execute,\n517         f\"\"\"\n518         UPDATE groups\n519         SET {\", \".join(updates)}\n520         WHERE id = ?\n521         \"\"\",\n522         tuple(params),\n",
+      "code": "518         db.execute,\n519         f\"\"\"\n520         UPDATE groups\n521         SET {\", \".join(updates)}\n522         WHERE id = ?\n523         \"\"\",\n524         tuple(params),\n",
       "col_offset": 8,
       "end_col_offset": 11,
       "filename": "backend/app/api/routes/groups.py",
@@ -2791,20 +2791,20 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 517,
+      "line_number": 519,
       "line_range": [
-        517,
-        518,
         519,
         520,
-        521
+        521,
+        522,
+        523
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "766                 found_users = db.execute(\n767                     f\"SELECT id FROM users WHERE id IN ({placeholders})\",\n768                     tuple(request.user_ids),\n",
+      "code": "768                 found_users = db.execute(\n769                     f\"SELECT id FROM users WHERE id IN ({placeholders})\",\n770                     tuple(request.user_ids),\n",
       "col_offset": 20,
       "end_col_offset": 72,
       "filename": "backend/app/api/routes/groups.py",
@@ -2815,16 +2815,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 767,
+      "line_number": 769,
       "line_range": [
-        767
+        769
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "778                 org_members = db.execute(\n779                     f\"SELECT user_id FROM org_members WHERE org_id = ? AND user_id IN ({placeholders})\",\n780                     (group_org_id,) + tuple(request.user_ids),\n",
+      "code": "780                 org_members = db.execute(\n781                     f\"SELECT user_id FROM org_members WHERE org_id = ? AND user_id IN ({placeholders})\",\n782                     (group_org_id,) + tuple(request.user_ids),\n",
       "col_offset": 20,
       "end_col_offset": 103,
       "filename": "backend/app/api/routes/groups.py",
@@ -2835,16 +2835,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 779,
+      "line_number": 781,
       "line_range": [
-        779
+        781
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "944             db.execute,\n945             f\"SELECT id, org_id FROM vaults WHERE id IN ({placeholders})\",\n946             tuple(vault_ids),\n",
+      "code": "946             db.execute,\n947             f\"SELECT id, org_id FROM vaults WHERE id IN ({placeholders})\",\n948             tuple(vault_ids),\n",
       "col_offset": 12,
       "end_col_offset": 73,
       "filename": "backend/app/api/routes/groups.py",
@@ -2855,9 +2855,9 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 945,
+      "line_number": 947,
       "line_range": [
-        945
+        947
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
@@ -3080,7 +3080,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "537             await asyncio.to_thread(conn.rollback)\n538         except Exception:\n539             pass\n540         raise HTTPException(\n",
+      "code": "550             await asyncio.to_thread(conn.rollback)\n551         except Exception:\n552             pass\n553         raise HTTPException(\n",
       "col_offset": 8,
       "end_col_offset": 16,
       "filename": "backend/app/api/routes/vaults.py",
@@ -3091,17 +3091,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 538,
+      "line_number": 551,
       "line_range": [
-        538,
-        539
+        551,
+        552
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "545             await asyncio.to_thread(conn.rollback)\n546         except Exception:\n547             pass\n548         # Server-side cause must survive: attach it at ERROR before the fixed\n",
+      "code": "558             await asyncio.to_thread(conn.rollback)\n559         except Exception:\n560             pass\n561         # Server-side cause must survive: attach it at ERROR before the fixed\n",
       "col_offset": 8,
       "end_col_offset": 16,
       "filename": "backend/app/api/routes/vaults.py",
@@ -3112,17 +3112,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 546,
+      "line_number": 559,
       "line_range": [
-        546,
-        547
+        559,
+        560
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "556             await asyncio.to_thread(conn.rollback)\n557         except Exception:\n558             pass\n559         raise HTTPException(status_code=500, detail=\"Failed to create vault\")\n",
+      "code": "569             await asyncio.to_thread(conn.rollback)\n570         except Exception:\n571             pass\n572         raise HTTPException(status_code=500, detail=\"Failed to create vault\")\n",
       "col_offset": 8,
       "end_col_offset": 16,
       "filename": "backend/app/api/routes/vaults.py",
@@ -3133,17 +3133,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 557,
+      "line_number": 570,
       "line_range": [
-        557,
-        558
+        570,
+        571
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "578                 await asyncio.to_thread(conn.rollback)\n579             except Exception:\n580                 pass\n581             logger.error(\n",
+      "code": "591                 await asyncio.to_thread(conn.rollback)\n592             except Exception:\n593                 pass\n594             logger.error(\n",
       "col_offset": 12,
       "end_col_offset": 20,
       "filename": "backend/app/api/routes/vaults.py",
@@ -3154,17 +3154,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 579,
+      "line_number": 592,
       "line_range": [
-        579,
-        580
+        592,
+        593
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "687     try:\n688         sql = f\"\"\"\n689             UPDATE vaults\n690             SET {\", \".join(update_fields)}, updated_at = CURRENT_TIMESTAMP\n691             WHERE id = ?\n692         \"\"\"\n693         await asyncio.to_thread(conn.execute, sql, params)\n",
+      "code": "715     try:\n716         sql = f\"\"\"\n717             UPDATE vaults\n718             SET {\", \".join(update_fields)}, updated_at = CURRENT_TIMESTAMP\n719             WHERE id = ?\n720         \"\"\"\n721         await asyncio.to_thread(conn.execute, sql, params)\n",
       "col_offset": 14,
       "end_col_offset": 11,
       "filename": "backend/app/api/routes/vaults.py",
@@ -3175,20 +3175,20 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 688,
+      "line_number": 716,
       "line_range": [
-        688,
-        689,
-        690,
-        691,
-        692
+        716,
+        717,
+        718,
+        719,
+        720
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1445         lambda: conn.execute(\n1446             f\"\"\"\n1447             SELECT id, org_id FROM groups\n1448             WHERE id IN ({placeholders})\n1449             \"\"\",\n1450             tuple(group_ids),\n",
+      "code": "1473         lambda: conn.execute(\n1474             f\"\"\"\n1475             SELECT id, org_id FROM groups\n1476             WHERE id IN ({placeholders})\n1477             \"\"\",\n1478             tuple(group_ids),\n",
       "col_offset": 12,
       "end_col_offset": 15,
       "filename": "backend/app/api/routes/vaults.py",
@@ -3199,12 +3199,12 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 1446,
+      "line_number": 1474,
       "line_range": [
-        1446,
-        1447,
-        1448,
-        1449
+        1474,
+        1475,
+        1476,
+        1477
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
