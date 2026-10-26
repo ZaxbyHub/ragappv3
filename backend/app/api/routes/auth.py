@@ -278,7 +278,10 @@ async def register(
         )
     # 3-char username floor — see RegisterRequest for the rationale (issue #395
     # LOW-4). Kept here (not as Pydantic min_length) to preserve the 400 response.
-    if not body.username or len(body.username) < 3:
+    # Length is measured AFTER stripping, matching the admin create/update
+    # contract (issue #725, T1-21-KR-12 sibling): a whitespace-padded
+    # 2-character handle must not slip through a raw-length check.
+    if not body.username or len(body.username.strip()) < 3:
         raise HTTPException(
             status_code=400, detail="Username must be at least 3 characters"
         )

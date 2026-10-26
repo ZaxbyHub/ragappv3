@@ -19,6 +19,10 @@ export interface Vault {
 
 export interface VaultListResponse {
   vaults: Vault[];
+  /** Exact count of vaults the caller is authorized to see (issue #725). */
+  total?: number;
+  /** True when the 1000-row response cap dropped authorized rows (#725). */
+  truncated?: boolean;
 }
 
 export interface VaultCreateRequest {

@@ -5,7 +5,7 @@ import sqlite3
 from collections.abc import Callable
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.api.deps import (
@@ -43,19 +43,56 @@ class GroupListResponse(BaseModel):
     per_page: int
 
 
+def _validate_group_name(v: Optional[str]) -> Optional[str]:
+    """Enforce the UI's exact name contract: trimmed length >= 2 AND raw
+    length <= 100 (GroupFormDialog checks trim().length < 2 then
+    .length > 100). Validation-only: the stored value is never rewritten
+    (issue #726, R1-G5b-02 — API and UI reject and accept identical inputs
+    for BMP text; lengths are Python code points vs the UI's UTF-16 units,
+    so names containing astral characters (e.g. emoji) can diverge by up to
+    1 UTF-16 unit per astral char).
+    """
+    if v is None:
+        return v
+    if len(v.strip()) < 2:
+        raise ValueError("Group name must be at least 2 characters (after trimming whitespace)")
+    if len(v) > 100:
+        raise ValueError("Group name must be at most 100 characters")
+    return v
+
+
+def _validate_group_description(v: Optional[str]) -> Optional[str]:
+    """UI parity: description capped at 500 raw characters."""
+    if v is None:
+        return v
+    if len(v) > 500:
+        raise ValueError("Group description must be at most 500 characters")
+    return v
+
+
 class GroupCreateRequest(BaseModel):
     """Request model for creating a group."""
 
-    name: str = Field(..., min_length=1)
-    description: Optional[str] = None
+    name: str = Field(..., min_length=1, max_length=255)
+    description: Optional[str] = Field(default=None, max_length=2000)
     org_id: Optional[int] = None
+
+    _name_check = field_validator("name")(_validate_group_name)
+    _description_check = field_validator("description")(_validate_group_description)
 
 
 class GroupUpdateRequest(BaseModel):
-    """Request model for updating a group."""
+    """Request model for updating a group.
 
-    name: Optional[str] = None
-    description: Optional[str] = None
+    None means "leave unchanged"; a provided name/description is validated
+    with the same bounds as creation (an empty-after-trim rename is rejected).
+    """
+
+    name: Optional[str] = Field(default=None, max_length=255)
+    description: Optional[str] = Field(default=None, max_length=2000)
+
+    _name_check = field_validator("name")(_validate_group_name)
+    _description_check = field_validator("description")(_validate_group_description)
 
 
 class GroupMemberResponse(BaseModel):
@@ -105,6 +142,15 @@ class GroupVaultsUpdateRequest(BaseModel):
     vault_access: Optional[List[VaultAccessItem]] = None
     vault_ids: Optional[List[int]] = None  # legacy; maps to read permission
 
+    def any_field_set(self) -> bool:
+        """True when at least one replace-set field was explicitly provided.
+
+        Omitted/null fields are rejected upstream (422) so an empty-body PUT
+        can never clear every vault grant for the group (issue #725 census,
+        same family as the vault-groups and user-organizations routes).
+        """
+        return self.vault_access is not None or self.vault_ids is not None
+
     def resolved_access(self) -> List[VaultAccessItem]:
         """Return the canonical list of vault+permission pairs."""
         if self.vault_access is not None:
@@ -119,7 +165,7 @@ class GroupVaultsUpdateRequest(BaseModel):
 @router.get("/", response_model=GroupListResponse)
 async def list_groups(
     page: int = 1,
-    per_page: int = 100,
+    per_page: int = Query(100, ge=1),
     search: Optional[str] = None,
     user: dict = Depends(require_role("admin")),
     db: sqlite3.Connection = Depends(get_db),
@@ -876,6 +922,18 @@ async def update_group_vaults(
                 status_code=403,
                 detail="You must be a member of the organization to modify this group",
             )
+
+    # Omitted (or null) list fields are NOT an explicit clear: reject with 422
+    # before any DELETE or audit event runs (issue #725 census — same family
+    # as the vault-groups and user-organizations replace routes).
+    if not request.any_field_set():
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Provide at least one of 'vault_access' or 'vault_ids' "
+                "(an explicit empty list clears all vault access for this group)"
+            ),
+        )
 
     # Resolve canonical access list (handles both vault_access and legacy vault_ids)
     access_list = request.resolved_access()

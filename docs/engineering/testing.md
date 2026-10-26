@@ -44,7 +44,7 @@ Tests for `get_current_active_user` caching live in `backend/tests/test_active_u
 ### Parallel vault permission tests (`test_effective_vault_permissions_parallel.py`)
 Tests for concurrent permission queries live in `backend/tests/test_effective_vault_permissions_parallel.py`. Key patterns:
 - Uses `IsolatedAsyncioTestCase` to test the `asyncio.gather` path in `get_effective_vault_permissions`.
-- The `_SQLITE_SERIALIZED` flag in `deps.py` controls whether the concurrent or sequential branch runs; tests may monkey-patch `deps._SQLITE_SERIALIZED` to force either path.
+- The `_SQLITE_SERIALIZED` flag in `authz_policy.py` controls whether the concurrent or sequential branch of `get_effective_vault_permissions` runs; tests may monkey-patch `authz_policy._SQLITE_SERIALIZED` to force either path (patch the module attribute — `deps.py` imports only a copy of the value, so patching `deps` does not select the branch). `backend/tests/test_d08_sequential_branch_parity.py` is the reference forcing test.
 - Seeds multiple vaults, groups, and memberships; asserts each vault returns the correct effective permission string.
 
 ### Auth override async-path tests (`test_auth_override_async_path.py`)

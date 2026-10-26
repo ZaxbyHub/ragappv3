@@ -6,7 +6,7 @@ import logging
 import math
 import warnings
 from pathlib import Path
-from typing import Annotated, Mapping, Optional
+from typing import Annotated, Literal, Mapping, Optional, Union
 
 from pydantic import Field, PrivateAttr, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -800,6 +800,48 @@ class Settings(BaseSettings):
     """Run the curator in query compile jobs. Default OFF to protect chat latency."""
     wiki_llm_curator_run_on_manual: bool = True
     """Run the curator in manual / recompile jobs when curator is enabled."""
+    # SSRF-guard local-endpoint opt-ins (issue #726, T1-02-K-12). These are
+    # ENV-ONLY keys (documented in .env.example; deliberately NOT part of the
+    # admin-writable SettingsUpdate surface). Tolerant of the shipped EMPTY
+    # value (`.env.example` ships `ALLOW_LOCAL_CURATOR=` and compose forwards
+    # an empty default, which plain bool parsing would reject at startup):
+    # empty and unset both mean disabled.
+    allow_local_curator: Union[bool, Literal[""]] = False
+    """Allow loopback/private curator endpoints when ALLOW_LOCAL_CURATOR=1/true
+    (case-sensitive, after trimming — the same grammar as the process
+    environment; any other value is disabled, never a boot error).
+
+    Read at call time with process-environment precedence (see
+    services/curator_ssrf.py): a key present in os.environ wins verbatim so
+    dynamic flipping keeps working; otherwise this .env-backed field applies.
+    """
+
+    allow_local_services: Union[bool, Literal[""]] = False
+    """Allow loopback service endpoints when ALLOW_LOCAL_SERVICES=1/true
+    (same grammar and precedence notes as allow_local_curator).
+
+    Same precedence and empty-tolerance as allow_local_curator (read at call
+    time in services/ssrf.py).
+    """
+
+    @field_validator("allow_local_curator", "allow_local_services", mode="before")
+    @classmethod
+    def _normalize_optin_bool(cls, v):
+        # Normalize to the SAME grammar the call-time process-environment
+        # readers use (curator_ssrf.py / ssrf.py: only "1"/"true"/"True"
+        # enable, after trimming) so one operator value means one posture
+        # regardless of source (review round: grammar-split closure). Empty
+        # must boot as disabled, not crash pydantic's bool parser (issue
+        # #726 review probe); unknown values are disabled, never boot-fatal
+        # (base treated unknown keys as inert via extra="ignore").
+        if isinstance(v, bool):
+            return v
+        if v is None:
+            return False
+        if isinstance(v, str):
+            return v.strip() in ("1", "true", "True")
+        return v
+
 
     # ── KMS / Knowledge Management configuration ─────────────────────────
     kms_enabled: bool = True

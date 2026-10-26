@@ -143,9 +143,16 @@ class VaultResponse(BaseModel):
 
 
 class VaultListResponse(BaseModel):
-    """Response model for listing vaults."""
+    """Response model for listing vaults.
+
+    ``total`` is the exact authorized count and ``truncated`` is True when the
+    1000-row response cap dropped rows, so callers can always detect a capped
+    result (issue #725, T1-21-KR-17).
+    """
 
     vaults: List[VaultResponse]
+    total: int = 0
+    truncated: bool = False
 
 
 def _row_to_vault_response(row, current_user_permission: Optional[str] = None) -> VaultResponse:
@@ -257,10 +264,20 @@ async def _fetch_vault_with_counts(
     return _row_to_vault_response(row, permission)
 
 
+async def _count_all_vaults(conn: sqlite3.Connection) -> int:
+    """Exact vault count for the admin list endpoint's truncation signal."""
+    row = (
+        await asyncio.to_thread(
+            lambda: conn.execute("SELECT COUNT(*) FROM vaults").fetchone()
+        )
+    )
+    return row[0]
+
+
 async def _fetch_all_vaults(
     conn: sqlite3.Connection, user: Optional[dict] = None
 ) -> List[VaultResponse]:
-    """Fetch all vaults with counts, ordered by creation date."""
+    """Fetch vaults with counts, ordered by creation date (capped at 1000 rows)."""
     rows = await asyncio.to_thread(
         lambda: conn.execute(
             _VAULT_WITH_COUNTS_SQL + " GROUP BY v.id ORDER BY v.created_at ASC LIMIT 1000"
@@ -277,10 +294,10 @@ async def _fetch_all_vaults(
     return vaults
 
 
-async def _fetch_accessible_vaults(
+async def _accessible_vaults_with_total(
     conn: sqlite3.Connection, user: Optional[dict] = None
-) -> List[VaultResponse]:
-    """Fetch only vaults the user might have access to, using SQL prefiltering.
+) -> tuple[List[VaultResponse], int, bool]:
+    """Fetch only vaults the current user can act on, with an exact count.
 
     Builds a UNION query to get candidate vault IDs:
     - (a) vaults where user is directly a member
@@ -288,20 +305,30 @@ async def _fetch_accessible_vaults(
     - (c) public/org-visible vaults user belongs to
     - (d) all vaults for admin/superadmin users
 
-    Then applies get_effective_vault_permissions on the reduced set.
+    Then applies get_effective_vault_permissions on the reduced set; the
+    authorized IDs drive BOTH the count and the fetched rows so ``total`` is
+    the exact authorized count, never a pre-permission candidate count
+    (issue #725 review). Returns ``(vaults, total, truncated)``.
     """
     if user is None:
-        return []
+        return [], 0, False
 
     user_id = user.get("id")
     user_role = user.get("role", "")
 
-    if not user_id:
-        return []
+    # Only a missing id means "no principal on this connection": the
+    # single-admin sentinel principal carries id 0 and must NOT be treated as
+    # absent (issue #725, T1-21-K-03). A role without an id still gets no
+    # membership-derived vaults, matching authz_policy's missing-id deny.
+    if user_id is None:
+        return [], 0, False
 
-    # For admin/superadmin, fetch all vaults (no filtering needed)
+    # For admin/superadmin, fetch all vaults (no filtering needed); total is
+    # the exact vault count for the truncation signal.
     if user_role in ("admin", "superadmin"):
-        return await _fetch_all_vaults(conn, user)
+        vaults = await _fetch_all_vaults(conn, user)
+        total = await _count_all_vaults(conn)
+        return vaults, total, len(vaults) < total
 
     # Build UNION query for candidate vault IDs
     # (a) vaults where user is directly a member
@@ -343,13 +370,18 @@ async def _fetch_accessible_vaults(
     vault_ids = [row[0] for row in rows]
 
     if not vault_ids:
-        return []
+        return [], 0, False
 
-    # Get permissions for the filtered vault set
+    # Resolve permissions for the candidate set, then keep ONLY the authorized
+    # IDs: the same authorized set drives the count and the fetched rows.
     permissions = await get_effective_vault_permissions(conn, user, vault_ids)
+    authorized_ids = [vid for vid in vault_ids if permissions.get(vid) is not None]
+    if not authorized_ids:
+        return [], 0, False
+    total = len(authorized_ids)
 
     # Fetch full vault records with counts
-    placeholders = ",".join("?" for _ in vault_ids)
+    placeholders = ",".join("?" for _ in authorized_ids)
     full_query = _VAULT_WITH_COUNTS_SQL + f"""
         WHERE v.id IN ({placeholders})
         GROUP BY v.id
@@ -358,17 +390,25 @@ async def _fetch_accessible_vaults(
     """
 
     full_rows = await asyncio.to_thread(
-        lambda: conn.execute(full_query, tuple(vault_ids)).fetchall()
+        lambda: conn.execute(full_query, tuple(authorized_ids)).fetchall()
     )
 
     # Build vault responses, filtering out any that resolved to None permission
-    # (safety net against TOCTOU between UNION and permission check)
+    # (safety net against TOCTOU between resolution and fetch)
     vaults = []
     for row in full_rows:
         v = _row_to_vault_response(row, permissions.get(row[0]))
         if v.current_user_permission is not None:
             vaults.append(v)
 
+    return vaults, total, len(full_rows) < total
+
+
+async def _fetch_accessible_vaults(
+    conn: sqlite3.Connection, user: Optional[dict] = None
+) -> List[VaultResponse]:
+    """List-only view of _accessible_vaults_with_total (existing callers/tests)."""
+    vaults, _total, _truncated = await _accessible_vaults_with_total(conn, user)
     return vaults
 
 
@@ -380,8 +420,11 @@ async def list_vaults(
 ):
     """List all vaults with document/memory/session counts and permission info. Admin/superadmin only. Regular users should use the /vaults/accessible endpoint."""
     vaults = await _fetch_all_vaults(conn, user)
+    total = await _count_all_vaults(conn)
 
-    return VaultListResponse(vaults=vaults)
+    return VaultListResponse(
+        vaults=vaults, total=total, truncated=len(vaults) < total
+    )
 
 
 @router.get("/vaults/accessible", response_model=VaultListResponse)
@@ -391,11 +434,11 @@ async def list_accessible_vaults(
 ):
     """Return vaults the current user has access to.
 
-    Note: results are capped at 1000 vaults (SQL LIMIT in _fetch_accessible_vaults).
-    Pagination is not yet implemented.
+    Results are capped at 1000 vaults; ``total``/``truncated`` in the response
+    body signal the cap instead of dropping rows silently.
     """
-    vaults = await _fetch_accessible_vaults(conn, user)
-    return VaultListResponse(vaults=vaults)
+    vaults, total, truncated = await _accessible_vaults_with_total(conn, user)
+    return VaultListResponse(vaults=vaults, total=total, truncated=truncated)
 
 
 @router.get("/vaults/{vault_id}", response_model=VaultResponse)
@@ -480,6 +523,19 @@ async def create_vault(
                     detail="You are not a member of that organization",
                 )
 
+    # The name "Default" is reserved: the startup migration and the orphan
+    # backfill resolve the system default vault BY NAME (issue #725,
+    # S03-SK2-02), so a caller-created or renamed-in "Default" vault would be
+    # adopted for every new user and then become unrenamable/undeletable via
+    # the guards below (review round: sticky-squat closure).
+    if body.name == "Default":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "The name 'Default' is reserved for the system default vault"
+            ),
+        )
+
     # Begin explicit transaction for atomic vault + membership creation
     try:
         await asyncio.to_thread(conn.execute, "BEGIN")
@@ -502,6 +558,10 @@ async def create_vault(
             await asyncio.to_thread(conn.rollback)
         except Exception:
             pass
+        # Server-side cause must survive: attach it at ERROR before the fixed
+        # 500 (issue #725, T1-21-K-13). Static message only — no vault names at
+        # default level (C15 family, #982).
+        logger.exception("Failed to create vault")
         raise HTTPException(status_code=500, detail="Failed to create vault")
 
     if vault_id is None or vault_id <= 0:
@@ -511,28 +571,56 @@ async def create_vault(
             pass
         raise HTTPException(status_code=500, detail="Failed to create vault")
 
+    # The single-admin sentinel principal has id 0 and no users row: the FK on
+    # vault_members.user_id would reject its membership insert. Skip ONLY the
+    # membership insert — the vault INSERT itself is always committed below
+    # (issue #725, T1-21-K-04); the sentinel's full access flows from its
+    # superadmin role, not from a membership row.
+    if user.get("id") != 0:
+        try:
+            await asyncio.to_thread(
+                conn.execute,
+                # granted_by records the creating caller, identical to the
+                # grant route in vault_members.py — the vault-creation writer is
+                # the same provenance class (issue #721 sweep, C14 sibling).
+                "INSERT INTO vault_members (vault_id, user_id, permission, granted_by) VALUES (?, ?, ?, ?)",
+                (vault_id, user["id"], "admin", user["id"]),
+            )
+        except Exception as e:
+            try:
+                await asyncio.to_thread(conn.rollback)
+            except Exception:
+                pass
+            logger.error(
+                "Error creating vault or assigning membership: %s",
+                e,
+            )
+            raise HTTPException(status_code=500, detail="Failed to create vault or assign membership")
+
+    # Success path: always commit the vault transaction (issue #725 review —
+    # skipping this commit would leave the vault invisible to other
+    # connections).
     try:
-        await asyncio.to_thread(
-            conn.execute,
-            # granted_by records the creating caller, identical to the
-            # grant route in vault_members.py — the vault-creation writer is
-            # the same provenance class (issue #721 sweep, C14 sibling).
-            "INSERT INTO vault_members (vault_id, user_id, permission, granted_by) VALUES (?, ?, ?, ?)",
-            (vault_id, user["id"], "admin", user["id"]),
-        )
         await asyncio.to_thread(conn.commit)
-    except Exception as e:
+    except Exception:
+        logger.exception("Failed to commit vault creation")
         try:
             await asyncio.to_thread(conn.rollback)
-        except Exception:
-            pass
-        logger.error(
-            "Error creating vault or assigning membership: %s",
-            e,
-        )
-        raise HTTPException(status_code=500, detail="Failed to create vault or assign membership")
+        except Exception as rollback_error:
+            # Logged, never swallowed silently (a bare except-pass here would
+            # add a new B110 to the SAST baseline — review finding, 4.5 R1).
+            logger.warning(
+                "Rollback after failed vault-creation commit also failed: %s",
+                rollback_error,
+            )
+        raise HTTPException(status_code=500, detail="Failed to create vault")
 
     vault = await _fetch_vault_with_counts(conn, vault_id, user)
+    if vault is None:
+        # Post-commit re-read guard: a vault row that just committed but cannot
+        # be re-read must not leak an untyped 500 (issue #725 census, C14 class).
+        logger.error("Created vault %s could not be re-read", vault_id)
+        raise HTTPException(status_code=500, detail="Failed to create vault")
     return vault
 
 
@@ -560,6 +648,41 @@ async def update_vault(
     if row is None:
         raise HTTPException(
             status_code=404, detail=f"Vault with id {vault_id} not found"
+        )
+
+    # The system default vault is resolved BY NAME across the startup
+    # migration and new-user/orphan assignment (deps.
+    # assign_user_to_default_vault). Renaming it away would leave that
+    # resolver minting a second "Default" vault, so the rename is refused
+    # (issue #725, S03-SK2-02). Same-name PUTs and description/visibility-only
+    # edits stay allowed.
+    if (
+        row[1] == "Default"
+        and request.name is not None
+        and request.name != "Default"
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "The default vault cannot be renamed: new users and the orphan "
+                "backfill are assigned to it by name. Rename another vault or "
+                "create a new vault instead."
+            ),
+        )
+
+    # Symmetric guard (review round, sticky-squat closure): renaming a second
+    # vault INTO the reserved name would hand the name-keyed resolver slot to
+    # a caller-chosen vault, which the delete/rename guards would then freeze.
+    if (
+        row[1] != "Default"
+        and request.name is not None
+        and request.name == "Default"
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "The name 'Default' is reserved for the system default vault"
+            ),
         )
 
     # Build update query dynamically based on provided fields
@@ -695,6 +818,20 @@ async def delete_vault(
         )
 
     vault_name = row[1]
+
+    # Deleting the name-keyed default vault would make the very next resolver
+    # call (registration, user creation, orphan backfill) mint a fresh
+    # "Default" vault. Refused before ANY cleanup side effects run (issue
+    # #725, S03-SK2-02 — same identity protection as the rename guard).
+    if vault_name == "Default":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "The default vault cannot be deleted: new users and the orphan "
+                "backfill are assigned to it by name. Remove its contents or "
+                "archive it instead."
+            ),
+        )
 
     # Prepare the Draft Room purge before the row deletion below: drafts.vault_id
     # cascades on vault delete (ON DELETE CASCADE), losing the rows that name
@@ -1175,10 +1312,18 @@ class VaultGroupsUpdateRequest(BaseModel):
 
     Preferred: ``vault_access: [{group_id, permission}]``
     Legacy: ``group_ids: [int]`` (all get 'read' permission)
+
+    At least one field must be EXPLICITLY present (an empty list counts):
+    omitting both is rejected with 422 so an empty-body PUT can never be
+    confused with "clear all access" (issue #725, T1-21-KR-11).
     """
 
     vault_access: Optional[List[GroupAccessItem]] = None
     group_ids: Optional[List[int]] = None
+
+    def any_field_set(self) -> bool:
+        """True when at least one replace-set field was explicitly provided."""
+        return self.vault_access is not None or self.group_ids is not None
 
     def resolved_access(self) -> List[GroupAccessItem]:
         """Return the canonical list of group+permission pairs."""
@@ -1286,6 +1431,18 @@ async def update_vault_groups(
         )
     vault_org_id = vault_row[1]
 
+    # Omitted (or null) list fields are NOT an explicit clear: reject before
+    # any DELETE or audit event runs (issue #725, T1-21-KR-11). An explicit
+    # empty list is the only way to clear.
+    if not request.any_field_set():
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Provide at least one of 'vault_access' or 'group_ids' "
+                "(an explicit empty list clears all group access)"
+            ),
+        )
+
     access_items = request.resolved_access()
 
     # If no access items provided, just clear all access and return empty list
@@ -1352,7 +1509,17 @@ async def update_vault_groups(
         )
 
         granted_by = user.get("id")
+        # Deduplicate by group id before the insert loop: vault_group_access
+        # has a UNIQUE(vault_id, group_id) constraint and a duplicate id in
+        # one body would 500 on the second insert (issue #725, S02-SK-03; the
+        # groups.py writers dedupe the same way).
+        seen_group_ids: set = set()
+        deduped_items: List[GroupAccessItem] = []
         for item in access_items:
+            if item.group_id not in seen_group_ids:
+                seen_group_ids.add(item.group_id)
+                deduped_items.append(item)
+        for item in deduped_items:
             await asyncio.to_thread(
                 conn.execute,
                 """

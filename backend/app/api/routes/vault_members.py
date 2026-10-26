@@ -10,7 +10,7 @@ from app.api.deps import (
     get_evaluate_policy,
     require_vault_permission,
 )
-from app.models.database import set_migration_flag
+from app.models.database import set_migration_flag, transaction_context
 from app.security import csrf_protect
 
 router = APIRouter(prefix="/vaults/{vault_id}/members", tags=["vault-members"])
@@ -179,6 +179,11 @@ def add_vault_member(
         (vault_id, request.member_user_id),
     )
     row = cursor.fetchone()
+    if row is None:
+        # Post-commit re-read guard: a concurrent removal of the just-inserted
+        # row must answer 404, never an untyped TypeError 500 (issue #726,
+        # T1-01-S2-08).
+        raise HTTPException(status_code=404, detail="Member not found")
 
     return {
         "user_id": row[0],
@@ -207,25 +212,47 @@ def update_vault_member(
     if not cursor.fetchone():
         raise HTTPException(status_code=404, detail="Vault not found")
 
-    # Check member exists
-    cursor.execute(
-        "SELECT user_id FROM vault_members WHERE vault_id = ? AND user_id = ?",
-        (vault_id, member_user_id),
-    )
-    if not cursor.fetchone():
-        raise HTTPException(status_code=404, detail="Member not found")
-
-    # Update member permission
     granted_by = current_user.get("id")
-    try:
+    # BEGIN IMMEDIATE from the existence read through the UPDATE: a deferred
+    # read-then-write let two connections both observe the last admin before
+    # either demoted them, leaving the vault with zero admins (issue #726,
+    # T1-01-S-06; same atomicity the users.py last-superadmin guard uses).
+    with transaction_context(conn):
+        # Check member exists (and capture its permission for the guard)
+        cursor.execute(
+            "SELECT permission FROM vault_members WHERE vault_id = ? AND user_id = ?",
+            (vault_id, member_user_id),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Member not found")
+
+        # Last-admin guard: demoting the only admin-permission member would
+        # leave the vault unmanageable by anyone but a superadmin.
+        if row[0] == "admin" and request.permission != "admin":
+            cursor.execute(
+                "SELECT COUNT(*) FROM vault_members"
+                " WHERE vault_id = ? AND permission = 'admin'",
+                (vault_id,),
+            )
+            if cursor.fetchone()[0] <= 1:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Cannot demote the last admin member: a vault must keep"
+                        " at least one admin member"
+                    ),
+                )
+
         cursor.execute(
             "UPDATE vault_members SET permission = ?, granted_by = ? WHERE vault_id = ? AND user_id = ?",
             (request.permission, granted_by, vault_id, member_user_id),
         )
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
+        if cursor.rowcount == 0:
+            # The member vanished between the guarded read and the UPDATE
+            # (concurrent removal): answer 404, never report success for an
+            # unapplied mutation (issue #726, T1-01-S2-08).
+            raise HTTPException(status_code=404, detail="Member not found")
 
     # Fetch and return updated member
     cursor.execute(
@@ -237,6 +264,8 @@ def update_vault_member(
         (vault_id, member_user_id),
     )
     row = cursor.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Member not found")
 
     return {
         "user_id": row[0],
@@ -264,35 +293,56 @@ def remove_vault_member(
     if not cursor.fetchone():
         raise HTTPException(status_code=404, detail="Vault not found")
 
-    # Check member exists
-    cursor.execute(
-        "SELECT user_id FROM vault_members WHERE vault_id = ? AND user_id = ?",
-        (vault_id, member_user_id),
-    )
-    if not cursor.fetchone():
-        raise HTTPException(status_code=404, detail="Member not found")
-
     # Guard against self-removal
     if member_user_id == current_user.get("id"):
         raise HTTPException(
             status_code=400, detail="Cannot remove yourself from a vault"
         )
 
-    # Delete member
+    # BEGIN IMMEDIATE through the DELETE, mirroring update_vault_member: the
+    # last-admin check and the removal must be one atomic step (issue #726,
+    # T1-01-S-06 constraint — no combination of update/remove calls may leave
+    # a vault with zero admin members).
     try:
-        cursor.execute(
-            "DELETE FROM vault_members WHERE vault_id = ? AND user_id = ?",
-            (vault_id, member_user_id),
-        )
-        # Durable-removal marker (issue #690 / S03-SK-01): written in the same
-        # transaction as the DELETE so the startup orphan backfill can never
-        # re-grant a membership an admin explicitly removed. User-scoped: any
-        # removed membership blocks the Default-vault backfill for that user.
-        set_migration_flag(conn, f"vault_members.removed.user.{member_user_id}")
-        conn.commit()
-    except Exception:
+        with transaction_context(conn):
+            cursor.execute(
+                "SELECT permission FROM vault_members WHERE vault_id = ? AND user_id = ?",
+                (vault_id, member_user_id),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="Member not found")
+
+            if row[0] == "admin":
+                cursor.execute(
+                    "SELECT COUNT(*) FROM vault_members"
+                    " WHERE vault_id = ? AND permission = 'admin'",
+                    (vault_id,),
+                )
+                if cursor.fetchone()[0] <= 1:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Cannot remove the last admin member: a vault must"
+                            " keep at least one admin member"
+                        ),
+                    )
+
+            cursor.execute(
+                "DELETE FROM vault_members WHERE vault_id = ? AND user_id = ?",
+                (vault_id, member_user_id),
+            )
+            if cursor.rowcount == 0:
+                # Racing removal already deleted the row: 404, not success.
+                raise HTTPException(status_code=404, detail="Member not found")
+            # Durable-removal marker (issue #690 / S03-SK-01): written in the same
+            # transaction as the DELETE so the startup orphan backfill can never
+            # re-grant a membership an admin explicitly removed. User-scoped: any
+            # removed membership blocks the Default-vault backfill for that user.
+            set_migration_flag(conn, f"vault_members.removed.user.{member_user_id}")
+    except sqlite3.IntegrityError:
         conn.rollback()
-        raise
+        raise HTTPException(status_code=409, detail="Member is referenced elsewhere")
 
     return {
         "message": "Member removed",
@@ -434,6 +484,10 @@ def grant_vault_group_access(
         (vault_id, request.group_id),
     )
     row = cursor.fetchone()
+    if row is None:
+        # Post-commit re-read guard (issue #726, T1-01-S2-08): a racing revoke
+        # of the just-granted row answers 404, never a TypeError 500.
+        raise HTTPException(status_code=404, detail="Group access not found")
 
     return {
         "group_id": row[0],
@@ -477,7 +531,15 @@ def update_vault_group_access(
             "UPDATE vault_group_access SET permission = ?, granted_by = ? WHERE vault_id = ? AND group_id = ?",
             (request.permission, granted_by, vault_id, group_id),
         )
+        if cursor.rowcount == 0:
+            # The row vanished between the existence check and the UPDATE
+            # (concurrent revoke): 404, never success-for-nothing (issue #726,
+            # T1-01-S2-08).
+            raise HTTPException(status_code=404, detail="Group access not found")
         conn.commit()
+    except HTTPException:
+        conn.rollback()
+        raise
     except Exception:
         conn.rollback()
         raise
@@ -494,6 +556,9 @@ def update_vault_group_access(
         (vault_id, group_id),
     )
     row = cursor.fetchone()
+    if row is None:
+        # Post-commit re-read guard (issue #726, T1-01-S2-08).
+        raise HTTPException(status_code=404, detail="Group access not found")
 
     return {
         "group_id": row[0],
@@ -535,7 +600,13 @@ def revoke_vault_group_access(
             "DELETE FROM vault_group_access WHERE vault_id = ? AND group_id = ?",
             (vault_id, group_id),
         )
+        if cursor.rowcount == 0:
+            # Racing revoke already removed the row: 404, not success.
+            raise HTTPException(status_code=404, detail="Group access not found")
         conn.commit()
+    except HTTPException:
+        conn.rollback()
+        raise
     except Exception:
         conn.rollback()
         raise
