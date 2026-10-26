@@ -189,6 +189,7 @@ def cleanup_backups(
     # finished when the manifest landed), tags released before removal.
     candidates = sorted(directory.iterdir())
     set_dirs = []
+    skipped_links: list = []
     for cand in candidates:
         if _is_backup_set_dir(cand):
             set_dirs.append(cand)
@@ -197,6 +198,7 @@ def cleanup_backups(
             # a symlink or junction. Skip it with a logged error BEFORE
             # any manifest load or tag release (#728 review finding) —
             # never prune through a link.
+            skipped_links.append(cand)
             logger.error(
                 "skipping backup-set candidate %s: it is a symlink or "
                 "junction; pruning never follows links — remove or "
@@ -251,9 +253,22 @@ def cleanup_backups(
         removed.append(set_dir)
 
     if release_orphan_tags:
-        _release_unreferenced_tags(
-            set_dirs=[p for p in set_dirs if p not in removed]
-        )
+        if skipped_links:
+            # A skipped linked set's manifest never entered the census,
+            # so tags it references would read as orphans — abort the
+            # whole reconciliation phase rather than risk deleting live
+            # tags (implementation-review round 2 question).
+            logger.error(
+                "orphan-tag reconciliation SKIPPED: %d candidate(s) are "
+                "symlinks/junctions whose manifests cannot be counted "
+                "(%s); remove or replace the links, then retry",
+                len(skipped_links),
+                ", ".join(str(p) for p in skipped_links),
+            )
+        else:
+            _release_unreferenced_tags(
+                set_dirs=[p for p in set_dirs if p not in removed]
+            )
     return removed
 
 

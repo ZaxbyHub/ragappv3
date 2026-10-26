@@ -323,14 +323,24 @@ def _write_journal(dest_root: Path, payload: dict) -> Path:
     journal = dest_root.parent / (
         f"{dest_root.name}.restore-journal-{secrets.token_hex(4)}.json"
     )
-    journal.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    try:
+        journal.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except OSError as exc:
+        raise RestoreError(
+            f"could not write the restore crash journal {journal}: {exc}"
+        ) from exc
     return journal
 
 
 def _update_journal_phase(journal: Path, phase: str) -> None:
     payload = json.loads(journal.read_text(encoding="utf-8"))
     payload["phase"] = phase
-    journal.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    try:
+        journal.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except OSError as exc:
+        raise RestoreError(
+            f"could not update the restore crash journal {journal}: {exc}"
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -392,11 +402,17 @@ def _copy_unmanaged_into_staging(
 
     Runs while the destination is still untouched, so any fault here
     leaves the destination byte-identical. SQLite sidecars are skipped
-    ONLY at the destination root (a same-named file inside an uncovered
-    subtree is ordinary unmanaged content). Symlinks are preserved AS
-    LINKS (never followed); a junction/reparse-point directory inside an
-    unmanaged tree refuses the whole restore before any rename — it is
-    neither portably preservable nor safe to traverse.
+    ONLY at the destination root AND only when this restore REPLACES the
+    database (``app.db`` is a managed root, i.e. the manifest carries a
+    sqlite item): a set that does not cover the database preserves it,
+    and then its live ``-wal``/``-shm`` are the journal of SURVIVING
+    bytes, not stale sidecars — they are copied through the swap with
+    the database (implementation-review round 2). A same-named file
+    inside an uncovered subtree is ordinary unmanaged content. Symlinks
+    are preserved AS LINKS (never followed); a junction/reparse-point
+    directory inside an unmanaged tree refuses the whole restore before
+    any rename — it is neither portably preservable nor safe to
+    traverse.
     """
     def refuse_junction(path: Path) -> None:
         try:
@@ -439,10 +455,12 @@ def _copy_unmanaged_into_staging(
                         "replace the link, then retry"
                     )
 
+    drop_sidecars = "app.db" in roots
+
     def walk(directory: Path, rel_prefix: str) -> None:
         for entry in sorted(directory.iterdir()):
             rel = f"{rel_prefix}{entry.name}"
-            if not rel_prefix and entry.name in SQLITE_SIDECARS:
+            if drop_sidecars and not rel_prefix and entry.name in SQLITE_SIDECARS:
                 continue
             if _is_covered(rel, roots):
                 continue
@@ -477,11 +495,13 @@ def _unmanaged_bytes(dest_root: Path, roots: List[str]) -> int:
     if not dest_root.exists():
         return 0
 
+    drop_sidecars = "app.db" in roots
+
     def walk(directory: Path, rel_prefix: str) -> None:
         nonlocal total
         for entry in sorted(directory.iterdir()):
             rel = f"{rel_prefix}{entry.name}"
-            if not rel_prefix and entry.name in SQLITE_SIDECARS:
+            if drop_sidecars and not rel_prefix and entry.name in SQLITE_SIDECARS:
                 continue
             if _is_covered(rel, roots):
                 continue

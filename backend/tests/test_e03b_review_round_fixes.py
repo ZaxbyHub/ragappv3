@@ -82,10 +82,16 @@ def _make_set(tmp_path: Path, monkeypatch) -> Path:
 
 
 def _make_wal_dest(dest: Path, *, uncheckpointed: bool = False) -> None:
-    """A WAL-mode destination; with ``uncheckpointed`` the committed rows
-    live ONLY in the -wal (a true-crash state: a read connection pins the
-    WAL while the writer commits, then both close with the sidecars put
-    back un-checkpointed)."""
+    """A WAL-mode destination; with ``uncheckpointed`` the last 50
+    committed rows live ONLY in the -wal (a true-crash state).
+
+    The byte-level true-crash state is built by SNAPSHOTTING app.db,
+    -wal and -shm while the connections are still open (the -wal then
+    holds the committed frames), letting the closes checkpoint, and
+    restoring the snapshotted bytes — so rows-in-app.db-alone is
+    strictly fewer than rows-with-wal (implementation-review round 2:
+    the earlier fixture checkpointed everything at close and its
+    byte-identity pin passed at the defective commit)."""
     dest.mkdir(parents=True, exist_ok=True)
     db = dest / "app.db"
     aside = dest.parent / "wal-aside"
@@ -96,17 +102,21 @@ def _make_wal_dest(dest: Path, *, uncheckpointed: bool = False) -> None:
         writer.execute("PRAGMA journal_mode=WAL")
         writer.execute("PRAGMA wal_autocheckpoint=0")
         writer.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        for i in range(1, 3):
+            writer.execute("INSERT INTO t VALUES (?, 'seeded')", (i,))
         writer.commit()
-        if uncheckpointed:
-            pin.execute("BEGIN")
-            pin.execute("SELECT COUNT(*) FROM t").fetchone()
-        for i in range(1, 51):
+        writer.execute("BEGIN IMMEDIATE")
+        for i in range(101, 151):
             writer.execute(
                 "INSERT INTO t VALUES (?, 'post-backup-live')", (i,)
             )
         writer.commit()
         if uncheckpointed:
-            for name in ("app.db-wal", "app.db-shm"):
+            # Snapshot the exact on-disk bytes WHILE the wal still holds
+            # the last 50 committed frames.
+            pin.execute("BEGIN")
+            pin.execute("SELECT COUNT(*) FROM t").fetchone()
+            for name in ("app.db", "app.db-wal", "app.db-shm"):
                 side = dest / name
                 if side.exists():
                     shutil.copy2(side, aside / name)
@@ -114,10 +124,20 @@ def _make_wal_dest(dest: Path, *, uncheckpointed: bool = False) -> None:
         writer.close()
         pin.close()
     if uncheckpointed:
-        for name in ("app.db-wal", "app.db-shm"):
+        # Close checkpointed the wal into app.db; restore the crash
+        # state byte-for-byte. The sanity check is BYTE-LEVEL: opening
+        # the database at all would replay the wal and destroy the very
+        # state under test.
+        for name in ("app.db", "app.db-wal", "app.db-shm"):
             saved = aside / name
             if saved.exists():
                 shutil.copy2(saved, dest / name)
+        assert (dest / "app.db").read_bytes() == (aside / "app.db").read_bytes(), (
+            "fixture failed to restore the pre-checkpoint app.db bytes"
+        )
+        assert (dest / "app.db-wal").stat().st_size > 0, (
+            "fixture failed to restore a non-empty wal"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -430,13 +450,34 @@ def test_pruner_skips_junction_candidate_and_continues(tmp_path):
         outside / "backup_manifest.json", (aged, aged)
     )
 
-    removed = cleanup_backups(backups, retention_days=0)
+    import logging as _logging
+
+    root_logger = _logging.getLogger("scripts.cleanup_backups")
+    captured = []
+
+    class _Capture(_logging.Handler):
+        def emit(self, record):
+            captured.append(record.getMessage())
+
+    handler = _Capture()
+    root_logger.addHandler(handler)
+    try:
+        removed = cleanup_backups(backups, retention_days=0)
+    finally:
+        root_logger.removeHandler(handler)
     assert real_set in removed, (
         "E-03b JUNCTION SWEEP: the real expired set was not pruned after "
         "the junction candidate"
     )
     assert link.exists(), "the junction itself must never be removed"
     assert outside.exists(), "the junction target must never be touched"
+    assert any(
+        "symlink or junction" in message and str(link) in message
+        for message in captured
+    ), (
+        "E-03b JUNCTION SWEEP: the plan-mandated logged skip was not "
+        f"emitted (captured: {captured})"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -523,7 +564,7 @@ def test_journal_creation_failure_is_typed(tmp_path, monkeypatch):
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(Path, "write_text", failing_write_text)
-        with pytest.raises(OSError, match="journal-creation"):
+        with pytest.raises(RestoreError, match="crash journal"):
             restore_backup_set(out, dest, key_provider=_key_provider)
     # The lock must be released on this failure path.
     assert not (dest.parent / f"{dest.name}.restore.lock").exists()
@@ -531,3 +572,169 @@ def test_journal_creation_failure_is_typed(tmp_path, monkeypatch):
     # A journal write failure happens after staging was built but before
     # any rename: the destination is untouched.
     assert dest.exists() and not any(dest.iterdir())
+
+
+# ---------------------------------------------------------------------------
+# Round 2, finding 3: the remaining plan-listed link tests.
+# ---------------------------------------------------------------------------
+
+
+def test_symlink_in_uncovered_tree_preserved_as_link(tmp_path, monkeypatch):
+    out = _make_set(tmp_path, monkeypatch)
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    (dest / "documents").mkdir()
+    (dest / "documents" / "keep.txt").write_bytes(b"keep")
+    target = tmp_path / "link-target.txt"
+    target.write_bytes(b"target content")
+    link = dest / "documents" / "a-symlink"
+    try:
+        link.symlink_to(target)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlinks need privileges on this host: {exc}")
+
+    restore_backup_set(out, dest, key_provider=_key_provider)
+    staged_link = dest / "documents" / "a-symlink"
+    assert staged_link.is_symlink(), (
+        "E-03b SYMLINK-AS-LINK: the unmanaged symlink was not preserved "
+        "as a link"
+    )
+    assert os.readlink(staged_link) == os.readlink(link), (
+        "E-03b SYMLINK-AS-LINK: the preserved link points somewhere else"
+    )
+    assert target.read_bytes() == b"target content", (
+        "E-03b SYMLINK-AS-LINK: the link target was read or mutated"
+    )
+    assert (dest / "documents" / "keep.txt").read_bytes() == b"keep"
+
+
+def test_nested_sidecar_named_file_in_uncovered_tree_preserved(
+    tmp_path, monkeypatch
+):
+    out = _make_set(tmp_path, monkeypatch)
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    (dest / "documents").mkdir()
+    nested_wal = dest / "documents" / "app.db-wal"
+    nested_wal.write_bytes(b"ordinary unmanaged content, not a sidecar")
+    pre_hash = _sha256_file(nested_wal)
+
+    restore_backup_set(out, dest, key_provider=_key_provider)
+    assert nested_wal.exists(), (
+        "E-03b NESTED SIDECAR NAME: a file named app.db-wal inside an "
+        "uncovered subtree was dropped"
+    )
+    assert _sha256_file(nested_wal) == pre_hash, (
+        "E-03b NESTED SIDECAR NAME: the uncovered-subtree file changed"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Round 2, finding 2 pin: a sqlite-less manifest preserves the destination
+# database TOGETHER WITH its live -wal (no silent row loss).
+# ---------------------------------------------------------------------------
+
+
+def test_sqliteless_manifest_preserves_uncheckpointed_rows(
+    tmp_path, monkeypatch
+):
+    out = _make_set(tmp_path, monkeypatch)
+    manifest_path = out / "backup_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["items"] = [
+        i for i in manifest["items"] if i.get("kind") != "sqlite"
+    ]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    dest = tmp_path / "dest"
+    _make_wal_dest(dest, uncheckpointed=True)
+
+    def _rows_with_wal():
+        conn = sqlite3.connect(str(dest / "app.db"))
+        try:
+            return conn.execute("SELECT COUNT(*) FROM t").fetchone()[0]
+        finally:
+            conn.close()
+
+    # Fixture sanity is byte-level inside _make_wal_dest (opening the
+    # database here would replay the wal and destroy the crash state).
+    # The 2 seeded rows are in app.db alone; the 50 committed rows live
+    # only in the wal.
+    pre_rows = _rows_with_wal()
+    assert pre_rows == 52, (
+        f"E-03b FIXTURE: expected 52 rows with the wal, got {pre_rows}"
+    )
+    # Rebuild once more: the count check above absorbed the wal.
+    shutil.rmtree(dest)
+    _make_wal_dest(dest, uncheckpointed=True)
+    pre_db_bytes = (dest / "app.db").read_bytes()
+
+    report = restore_backup_set(out, dest, key_provider=_key_provider)
+    assert report["verified"] is True
+    # The wal assertion must run BEFORE any sqlite open on the restored
+    # tree: opening (and closing) the database checkpoints and deletes
+    # the wal — the preservation oracle would destroy its own subject.
+    assert (dest / "app.db-wal").exists(), (
+        "E-03b SQLITELESS WAL LOSS: the live -wal was dropped although "
+        "the database it journals was preserved"
+    )
+    assert (dest / "app.db").read_bytes() == pre_db_bytes, (
+        "E-03b SQLITELESS WAL LOSS: app.db bytes changed although the "
+        "set does not cover the database"
+    )
+    post_rows = _rows_with_wal()
+    assert post_rows == pre_rows, (
+        f"E-03b SQLITELESS WAL LOSS: {pre_rows - post_rows} committed "
+        "rows vanished although the set does not cover the database"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Round 2 question: orphan reconciliation aborts when a linked candidate
+# was skipped (its manifest cannot be counted).
+# ---------------------------------------------------------------------------
+
+
+def test_orphan_reconciliation_aborts_when_link_skipped(tmp_path):
+    import lancedb
+    from scripts.cleanup_backups import cleanup_backups
+
+    from scripts import cleanup_backups as cleanup_module
+
+    outside = tmp_path / "outside-set"
+    outside.mkdir()
+    (outside / "backup_manifest.json").write_text(
+        '{"schema": "ragapp-backup-set/1", "items": []}'
+    )
+    backups = tmp_path / "backups"
+    backups.mkdir()
+    link = backups / "linked-set"
+    if not _make_junction(link, outside):
+        pytest.skip("mklink /J unavailable on this host")
+
+    lancedb_dir = tmp_path / "lancedb"
+    table = lancedb.connect(str(lancedb_dir)).create_table(
+        "chunks", [{"chunk_id": 1, "text": "row-1"}]
+    )
+    table.tags.create("backup-orphan-candidate", int(table.version))
+
+    import unittest.mock as _mock
+
+    with _mock.patch.object(
+        cleanup_module, "_live_lancedb_dir", return_value=lancedb_dir
+    ), _mock.patch.object(
+        cleanup_module,
+        "_release_unreferenced_tags",
+        wraps=cleanup_module._release_unreferenced_tags,
+    ) as spy:
+        cleanup_backups(backups, retention_days=0, release_orphan_tags=True)
+
+    assert spy.call_count == 0, (
+        "E-03b CENSUS LINK: orphan reconciliation ran although a linked "
+        "candidate's manifest could not be counted"
+    )
+    names = list(table.tags.list())
+    assert "backup-orphan-candidate" in names, (
+        "E-03b CENSUS LINK: a tag was released (or attempted) although "
+        "reconciliation should have aborted"
+    )
