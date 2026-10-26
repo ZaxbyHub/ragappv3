@@ -14,9 +14,14 @@ from app.api.deps import (
     get_evaluate_policy,
     get_user_primary_org,
     require_role,
+    resolve_granted_by,
 )
 from app.models.database import transaction_context
 from app.security import csrf_protect
+from app.services.authz_policy import (
+    direct_vault_admin_ids,
+    group_derived_vault_admin_ids,
+)
 
 router = APIRouter(prefix="/groups", tags=["groups"])
 
@@ -938,39 +943,67 @@ async def update_group_vaults(
     # Resolve canonical access list (handles both vault_access and legacy vault_ids)
     access_list = request.resolved_access()
 
-    # Verify all vaults exist and belong to the same organization as the group
-    if access_list:
-        vault_ids = [item.vault_id for item in access_list]
-        placeholders = ",".join(["?"] * len(vault_ids))
-        cursor = await asyncio.to_thread(
-            db.execute,
-            f"SELECT id, org_id FROM vaults WHERE id IN ({placeholders})",
-            tuple(vault_ids),
-        )
-        found_vaults = await asyncio.to_thread(cursor.fetchall)
-        found_ids = {row[0] for row in found_vaults}
-        missing_ids = set(vault_ids) - found_ids
-        if missing_ids:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Vaults not found: {sorted(missing_ids)}",
-            )
-        # A vault with org_id IS NULL is treated as global (unscoped) and allowed.
-        # Only reject vaults that explicitly belong to a *different* organization.
-        cross_org_vaults = [
-            row[0]
-            for row in found_vaults
-            if row[1] is not None and row[1] != group_org_id
-        ]
-        if cross_org_vaults:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Vaults do not belong to this organization: {sorted(cross_org_vaults)}",
-            )
+    # granted_by is FK-safe: the single-admin sentinel (id 0, no users row)
+    # records NULL provenance instead of tripping the granted_by FK (issue
+    # #1025, PRR-001; at base commit this INSERT loop answered 500 in
+    # single-admin mode).
+    granted_by = resolve_granted_by(user)
 
-    # Atomic update: delete existing and insert new in transaction
+    # Atomic update: the existing transaction wrapper, expanded to cover
+    # validation and the per-vault effective-admin guard
     def _update_vaults():
+        # One BEGIN IMMEDIATE over validation, the per-vault pre-state reads,
+        # DELETE, INSERTs, and the per-vault ACTUAL post-state re-reads. The
+        # vault-org validation must not race a vault adoption (#1003), and
+        # the last-effective-admin guard must observe persisted rows for
+        # EVERY vault in the old-union-new grant set — one vault's preserved
+        # admin must never mask another vault's zeroing, so ANY refused vault
+        # rolls the whole replacement back (issue #1025, PRR-010).
         with transaction_context(db):
+            if access_list:
+                vault_ids = [item.vault_id for item in access_list]
+                placeholders = ",".join(["?"] * len(vault_ids))
+                found_vaults = db.execute(
+                    f"SELECT id, org_id FROM vaults WHERE id IN ({placeholders})",
+                    tuple(vault_ids),
+                ).fetchall()
+                found_ids = {row[0] for row in found_vaults}
+                missing_ids = set(vault_ids) - found_ids
+                if missing_ids:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Vaults not found: {sorted(missing_ids)}",
+                    )
+                # A vault with org_id IS NULL is treated as global (unscoped)
+                # and allowed. Only reject vaults that explicitly belong to a
+                # *different* organization.
+                cross_org_vaults = [
+                    row[0]
+                    for row in found_vaults
+                    if row[1] is not None and row[1] != group_org_id
+                ]
+                if cross_org_vaults:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Vaults do not belong to this organization: {sorted(cross_org_vaults)}",
+                    )
+
+            # Every vault whose group-derived coverage this replacement can
+            # change: the old grant set union the incoming one.
+            affected_vault_ids = {
+                row[0]
+                for row in db.execute(
+                    "SELECT vault_id FROM vault_group_access WHERE group_id = ?",
+                    (group_id,),
+                )
+            } | {item.vault_id for item in access_list}
+            pre_nonempty_vault_ids = {
+                vid
+                for vid in affected_vault_ids
+                if direct_vault_admin_ids(db, vid)
+                | group_derived_vault_admin_ids(db, vid)
+            }
+
             db.execute(
                 "DELETE FROM vault_group_access WHERE group_id = ?",
                 (group_id,),
@@ -984,8 +1017,29 @@ async def update_group_vaults(
                     seen.add(item.vault_id)
                     db.execute(
                         "INSERT INTO vault_group_access (vault_id, group_id, permission, granted_by) VALUES (?, ?, ?, ?)",
-                        (item.vault_id, group_id, item.permission, user["id"]),
+                        (item.vault_id, group_id, item.permission, granted_by),
                     )
+
+            # ACTUAL per-vault post-state re-read over the persisted rows,
+            # before commit. Refusal only fires for vaults that HAD effective
+            # admins, so an already-broken vault stays repairable.
+            refused_vault_ids = sorted(
+                vid
+                for vid in pre_nonempty_vault_ids
+                if not (
+                    direct_vault_admin_ids(db, vid)
+                    | group_derived_vault_admin_ids(db, vid)
+                )
+            )
+            if refused_vault_ids:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Replacing vault access would leave vault(s)"
+                        f" {refused_vault_ids} without an effective admin: each"
+                        " vault must keep at least one effective admin"
+                    ),
+                )
 
     await asyncio.to_thread(_update_vaults)
 

@@ -262,7 +262,25 @@ def test_mutation_writes_security_audit_event(route_case):
             vault_id = _insert_vault(env, "D04 Vault")
             method, path = "DELETE", f"/vaults/{vault_id}"
         elif route_case == "update_vault_visibility":
-            vault_id = _insert_vault(env, "D04 Visibility Vault")
+            # The fixture vault needs an organization: the visibility-'org'-
+            # requires-org coherence is enforced on update as of #1003, and
+            # this fixture's premise — a SUCCESSFUL visibility mutation as an
+            # audit-event source — is legitimately changed by that fix. The
+            # org-less rejection is pinned separately by the frozen
+            # test_1003_vault_org_adoption.py checks.
+            cur = env.conn.execute(
+                "INSERT INTO organizations (name) VALUES (?)", ("D04 Visibility Org",)
+            )
+            vis_org_id = cur.lastrowid
+            env.conn.execute(
+                "INSERT INTO org_members (org_id, user_id, role)"
+                " VALUES (?, ?, 'member')",
+                (vis_org_id, superadmin_id),
+            )
+            env.conn.commit()
+            vault_id = _insert_vault(
+                env, "D04 Visibility Vault", org_id=vis_org_id
+            )
             method, path = "PUT", f"/vaults/{vault_id}"
             body = {"visibility": "org"}
         else:  # update_vault_groups

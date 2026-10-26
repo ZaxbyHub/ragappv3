@@ -34,6 +34,8 @@ export interface VaultCreateRequest {
 export interface VaultUpdateRequest {
   name?: string;
   description?: string;
+  /** Organization adoption (org-less vaults only); sent only when the user picked one. */
+  org_id?: number;
 }
 
 export interface VaultEnrichmentToggleRequest {

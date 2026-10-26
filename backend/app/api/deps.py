@@ -267,6 +267,29 @@ def get_email_service(request: Request) -> EmailIngestionService:
     return request.app.state.email_service
 
 
+def resolve_granted_by(user: dict) -> int | None:
+    """Map a principal to an FK-safe ``granted_by`` value.
+
+    The single-admin sentinel principal minted by ``_resolve_active_user``
+    (``users_enabled=False``) carries ``id: 0`` and has no ``users`` row,
+    while every ``granted_by`` column is an ``INTEGER ... REFERENCES users(id)``
+    foreign key enforced on pooled connections (``PRAGMA foreign_keys = ON``).
+    Binding the raw id would raise IntegrityError, so sharing writers bind
+    ``resolve_granted_by(current_user)`` instead: the sentinel records NULL
+    provenance, every real user records their id (issue #1025, PRR-001).
+
+    The guard is a strict int type check (F-008): only a genuine non-zero int
+    id is returned as-is. Every other shape — ``None``, the id-0 sentinel, or
+    a NON-INT id such as a service-account principal's ``"sa:<id>"`` string —
+    maps to NULL, so a truthy-but-non-int principal can never be bound into
+    the users(id) FK.
+    """
+    uid = user.get("id")
+    if isinstance(uid, int) and uid != 0:
+        return uid
+    return None
+
+
 def _fetch_user_row_with_pwc(db: sqlite3.Connection, user_id: int) -> tuple | None:
     """Fetch a user row, tolerating the absence of the password_changed_at column.
 
