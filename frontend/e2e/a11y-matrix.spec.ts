@@ -549,10 +549,11 @@ async function runAxe(page: Page): Promise<AxeViolation[]> {
     // (aria-valid-attr-value, nested-interactive, button-name,
     // aria-required-children disabled 2026-10-09 pending those four issues)
     // is gone — the underlying violations were fixed at their sources
-    // (filter bars converted to toggle groups; tab panels force-mounted;
-    // clickable cards de-buttoned; unnamed controls labeled; list semantics
-    // made native). scripts/check_l07_a11y_gate_wired.py now enforces that
-    // NO axe rule is disabled here.
+    // (trigger-only filter bars converted to toggle groups; clickable cards
+    // de-buttoned; unnamed controls labeled; list semantics made native;
+    // Radix's hidden inactive panel shells already resolve aria-controls).
+    // scripts/check_l07_a11y_gate_wired.py now enforces that NO axe rule
+    // is disabled here (any axe.run options object fails CI).
     const results = await win.axe.run();
     return results.violations
       .filter((v) => v.impact === "serious" || v.impact === "critical")

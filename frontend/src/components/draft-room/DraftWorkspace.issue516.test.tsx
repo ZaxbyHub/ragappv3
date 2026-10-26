@@ -610,9 +610,8 @@ describe("DraftWorkspace (issue #516)", () => {
 
       renderWorkspace();
 
-      // #865 forceMount: sibling tab panels stay mounted, so wait for the
-      // artifact to exist somewhere and scope the single-match query to the
-      // ACTIVE panel.
+      // Only the ACTIVE tab panel is mounted, so wait for the artifact to
+      // exist and scope the single-match query to that panel.
       await waitFor(() =>
         expect(screen.getAllByTestId("stage-artifact").length).toBeGreaterThan(0)
       );

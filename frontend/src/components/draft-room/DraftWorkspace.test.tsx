@@ -629,8 +629,9 @@ describe("DraftWorkspace", () => {
       detail: makeDetail({ active_compile_job: makeJob({ id: 77, status: "running" }) }),
     });
 
-    // #865 forceMount: the revoked-access reason renders in every mounted
-    // (hidden) panel that gates content actions — pin presence, not count.
+    // The revoked-access reason gates content actions across surfaces —
+    // pin presence, not count (the exact panel set is an implementation
+    // detail).
     expect(
       (await screen.findAllByText(READY_BLOCKER_LABELS.vault_access_revoked)).length
     ).toBeGreaterThan(0);
