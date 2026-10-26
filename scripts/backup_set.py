@@ -387,6 +387,22 @@ def create_backup_set(
     if staging.exists():
         shutil.rmtree(staging)
     created_tags: List[tuple] = []
+
+    def _fail_after_created_tags() -> None:
+        """Roll back the tags this run created; keep staging as evidence
+        when that rollback itself fails (#728 review finding: the commit
+        seam must not silently orphan tags)."""
+        remaining = _rollback_tags(created_tags)
+        if remaining:
+            logger.error(
+                "backup failed and tag rollback also failed: staging "
+                "evidence KEPT at %s; remove the live tags manually: %s",
+                staging,
+                sorted(remaining),
+            )
+        else:
+            shutil.rmtree(staging, ignore_errors=True)
+
     try:
         _write_set(
             staging,
@@ -398,22 +414,20 @@ def create_backup_set(
             created_tags=created_tags,
         )
     except BaseException:
-        remaining = _rollback_tags(created_tags)
-        if remaining:
-            logger.error(
-                "backup failed and tag rollback also failed: staging "
-                "evidence KEPT at %s; remove the live tags manually: %s",
-                staging,
-                sorted(remaining),
-            )
-        else:
-            shutil.rmtree(staging, ignore_errors=True)
+        _fail_after_created_tags()
         raise
     # Commit: replace an existing (checked-empty) output directory, then
-    # rename the completed staging tree into place.
-    if output_dir.exists():
-        output_dir.rmdir()
-    os.replace(staging, output_dir)
+    # rename the completed staging tree into place. This seam is inside
+    # the rollback envelope too: a commit-phase failure (rmdir/replace
+    # error — an open handle on the pre-created output dir, an AV lock)
+    # must release the created tags rather than orphan them.
+    try:
+        if output_dir.exists():
+            output_dir.rmdir()
+        os.replace(staging, output_dir)
+    except BaseException:
+        _fail_after_created_tags()
+        raise
     return output_dir / MANIFEST_NAME
 
 

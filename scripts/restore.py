@@ -61,8 +61,6 @@ MANIFEST_NAME = "backup_manifest.json"
 _IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 SQLITE_SIDECARS = ("app.db-wal", "app.db-shm", "app.db-journal")
-LOCK_NAME = "{dest}.restore.lock"
-JOURNAL_GLOB = "{dest}.restore-journal-*.json"
 
 
 class RestoreError(Exception):
@@ -184,14 +182,16 @@ def _refuse_on_leftover_journal(dest_root: Path) -> None:
     raise RestoreError(
         f"an interrupted restore left a crash journal ({journal}); the "
         "destination's state is uncertain. Complete the recovery manually "
-        "per docs/operations.md (Restore crash recovery): either roll "
-        "forward (finish the recorded phase's renames, then checkout(tag) "
-        "+ restore() every manifest table and verify a fresh connection, "
-        "then delete the .pre-restore-* aside, the journal and the lock) "
-        "or roll back (restore the .pre-restore-* directory over the "
-        "destination — or delete the restored directory when the journal "
-        "says dest_existed is false — then delete the journal and the "
-        "lock), then retry."
+        "per docs/operations.md (Restore crash recovery). The DISK, not "
+        "the journal's phase field, is authoritative: if the aside path "
+        "recorded in the journal exists, the original destination sits "
+        "there (roll forward = aside is dispensable after rename staging "
+        "-> dest + checkout(tag)/restore() per manifest table; roll back "
+        "= rename the aside back over the destination); otherwise no "
+        "rename happened (roll forward = rename dest aside then staging "
+        "-> dest; roll back = leave the destination alone). Then delete "
+        "the aside (when one remains), the journal and the lock, and "
+        "retry."
     )
 
 
@@ -212,22 +212,60 @@ def _probe_destination_db_held(dest_db: Path) -> None:
     destination database in a write transaction (#728 AC6; the documented
     stop-the-app precondition, enforced).
 
-    Closing the LAST connection to a WAL database checkpoints it and
-    deletes the ``-wal``/``-shm`` sidecars, which would silently mutate
-    the pre-restore state this module promises to preserve on rollback —
-    so the sidecars are snapshotted aside and restored byte-identically
-    around the probe."""
+    The probe must leave the destination byte-identical in EVERY outcome.
+    Closing the LAST connection to a WAL database checkpoints it —
+    mutating ``app.db`` and deleting the ``-wal``/``-shm`` sidecars — so
+    ``app.db`` and any sidecars are snapshotted to KEEPS OUTSIDE the
+    destination (never inside it) and restored byte-identically around
+    the probe. A sidecar that cannot be read while a writer holds it
+    (Windows locks ``-shm`` exclusively) is simply not snapshotted: in
+    that held case the probe is never the last connection, so no
+    checkpoint occurs and there is nothing to restore. A destination
+    database that is not readable SQLite (a corrupt file — the canonical
+    disaster-recovery input) cannot be held in any meaningful sense, so
+    the probe is skipped and the restore proceeds to overwrite it, the
+    pre-change behavior."""
     if not dest_db.exists():
         return
+    keep_dir = dest_db.parent.parent
+    token = secrets.token_hex(4)
     saved: List[Tuple[Path, Path]] = []
+
+    def _snapshot(path: Path) -> Optional[Path]:
+        keep = keep_dir / f"{path.name}.probe-keep-{token}"
+        try:
+            shutil.copy2(path, keep, follow_symlinks=False)
+        except OSError:
+            # Locked by a live writer (e.g. -shm under an active hold) or
+            # unreadable: nothing to preserve — see docstring.
+            try:
+                keep.unlink()
+            except OSError:
+                pass
+            return None
+        return keep
+
     try:
+        keep = _snapshot(dest_db)
+        if keep is not None:
+            saved.append((keep, dest_db))
         for suffix in ("-wal", "-shm", "-journal"):
             side = dest_db.with_name(dest_db.name + suffix)
             if side.exists():
-                keep = side.with_name(side.name + ".probe-keep")
-                shutil.copy2(side, keep, follow_symlinks=False)
-                saved.append((keep, side))
-        conn = sqlite3.connect(str(dest_db), timeout=0.0)
+                keep = _snapshot(side)
+                if keep is not None:
+                    saved.append((keep, side))
+        try:
+            conn = sqlite3.connect(str(dest_db), timeout=0.0)
+        except sqlite3.DatabaseError as exc:
+            logger.info(
+                "destination database %s is not readable SQLite (%s); "
+                "skipping the held-database probe — the restore will "
+                "overwrite it",
+                dest_db,
+                exc,
+            )
+            return
         try:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute("ROLLBACK")
@@ -237,21 +275,48 @@ def _probe_destination_db_held(dest_db: Path) -> None:
                 f"({dest_db}): stop the application before restoring "
                 f"({exc})"
             ) from exc
+        except sqlite3.DatabaseError as exc:
+            # connect() is lazy; a corrupt header surfaces here.
+            logger.info(
+                "destination database %s is not readable SQLite (%s); "
+                "skipping the held-database probe — the restore will "
+                "overwrite it",
+                dest_db,
+                exc,
+            )
+            return
         finally:
             conn.close()
     finally:
-        for keep, side in saved:
+        for keep, original in saved:
             try:
-                if side.exists():
+                if not original.exists():
+                    # The probe's close deleted the file (checkpointed WAL
+                    # sidecar): restore the exact pre-probe bytes.
+                    os.replace(keep, original)
+                    continue
+                same = original.stat().st_size == keep.stat().st_size and (
+                    _sha256_file(original) == _sha256_file(keep)
+                )
+                if same:
                     keep.unlink()
                 else:
-                    os.replace(keep, side)
+                    # The probe's close CHECKPOINTED the WAL into the main
+                    # file: restore the pre-probe bytes so the destination
+                    # stays byte-identical.
+                    os.replace(keep, original)
             except OSError:
                 logger.warning(
-                    "could not restore the destination sidecar %s after "
-                    "the held-database probe",
-                    side,
+                    "could not restore the destination file %s after the "
+                    "held-database probe (a live writer holds it; the "
+                    "probe was not the last connection, so it made no "
+                    "changes)",
+                    original,
                 )
+                try:
+                    keep.unlink()
+                except OSError:
+                    pass
 
 
 def _write_journal(dest_root: Path, payload: dict) -> Path:
@@ -277,11 +342,16 @@ def _managed_roots(manifest: dict) -> List[str]:
     """Destination-relative paths this restore owns (posix form).
 
     The sqlite item's artifact is ``app.db.enc`` but its DESTINATION name
-    is ``app.db``; every tree item restores to its manifest path.
+    is ``app.db`` — bound ONLY when the manifest actually carries a
+    sqlite item, so a (degenerate) sqlite-less manifest leaves an
+    existing destination database as unmanaged content that is copied
+    through the swap instead of silently dropped (#728 review finding);
+    every tree item restores to its manifest path.
     """
-    roots: List[str] = ["app.db"]
+    roots: List[str] = []
     for item in manifest.get("items", []):
         if item.get("kind") == "sqlite":
+            roots.append("app.db")
             continue
         path = str(item.get("path", "")).replace("\\", "/")
         if path:
@@ -343,6 +413,32 @@ def _copy_unmanaged_into_staging(
                 "dereference it — remove or replace the link, then retry"
             )
 
+    def scan_for_junctions(root: Path) -> None:
+        """Refuse junctions at ANY depth of an unmanaged subtree BEFORE
+        copytree traverses it: shutil.copytree(symlinks=True) preserves
+        symlinks but recurses INTO junctions (DirEntry.is_symlink() is
+        false for MOUNT_POINT reparse points), silently dereferencing
+        them (#728 review finding)."""
+        stack = [root]
+        while stack:
+            current = stack.pop()
+            for entry in os.scandir(current):
+                if entry.is_symlink():
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    try:
+                        os.readlink(entry.path)
+                    except OSError:
+                        stack.append(entry.path)
+                        continue
+                    # readlink succeeded on a non-symlink dir: a junction.
+                    raise RestoreError(
+                        f"unmanaged destination entry {entry.path} is a "
+                        "junction/reparse point; restore refuses to "
+                        "traverse or silently dereference it — remove or "
+                        "replace the link, then retry"
+                    )
+
     def walk(directory: Path, rel_prefix: str) -> None:
         for entry in sorted(directory.iterdir()):
             rel = f"{rel_prefix}{entry.name}"
@@ -364,6 +460,7 @@ def _copy_unmanaged_into_staging(
                 if _is_partial(rel, roots):
                     walk(entry, f"{rel}/")
                 else:
+                    scan_for_junctions(entry)
                     shutil.copytree(
                         entry,
                         staging / Path(rel),
@@ -446,6 +543,11 @@ def restore_backup_set(
             "destination"
         )
     _refuse_on_leftover_journal(dest_root)
+    # The lock/journal/staging siblings live in dest_root.parent — create
+    # it BEFORE acquiring the lock so a fresh nested destination (one whose
+    # parent does not exist yet, the base-restore behavior) works instead
+    # of failing at lock creation (#728 review finding).
+    dest_root.parent.mkdir(parents=True, exist_ok=True)
     lock = _RestoreLock(dest_root)
     lock.acquire()
     journal: Optional[Path] = None
@@ -461,7 +563,6 @@ def restore_backup_set(
             f.stat().st_size for f in backup_dir.rglob("*") if f.is_file()
         )
         extra_bytes = _unmanaged_bytes(dest_root, roots) if dest_existed else 0
-        dest_root.parent.mkdir(parents=True, exist_ok=True)
         try:
             free_bytes = shutil.disk_usage(dest_root.parent).free
         except OSError:
@@ -628,6 +729,11 @@ def restore_backup_set(
             if dest_existed:
                 os.rename(dest_root, aside)
                 aside_created = True
+                # Record the phase AFTER the rename (the disk, not the
+                # flag, is the truth a crash leaves behind) so the
+                # documented `aside-created` recovery steps match what
+                # actually happened (#728 review finding).
+                _update_journal_phase(journal, "aside-created")
             try:
                 os.rename(staging, dest_root)
             except BaseException:
@@ -638,13 +744,17 @@ def restore_backup_set(
                     aside_created = False
                 raise
         except BaseException as exc:
-            if aside_created:
-                # The recovery rename itself failed: the outcome is
-                # UNCERTAIN — keep the journal AND the lock, and name
-                # every directory plus the manual completion steps.
+            # Filesystem truth, not the flag: an async exception can land
+            # between the rename and the flag store, so consult the aside
+            # directory itself before deciding the outcome is confirmed.
+            if aside.exists():
+                # The original destination sits at the aside path and the
+                # destination path does not hold the pre-state: the
+                # outcome is UNCERTAIN — keep the journal AND the lock,
+                # and name every directory plus the manual steps.
                 raise RestoreError(
-                    "restore failed and the rollback rename could not "
-                    "complete; recovery is UNCERTAIN. Journal kept at "
+                    "restore failed and the destination was left moved "
+                    "aside; recovery is UNCERTAIN. Journal kept at "
                     f"{journal}. Original state: {aside}. Staged state: "
                     f"{staging}. Complete the recovery manually per "
                     "docs/operations.md (Restore crash recovery). "

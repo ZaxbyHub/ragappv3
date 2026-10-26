@@ -247,7 +247,11 @@ A restore writes a `<dest>.restore-journal-*.json` beside the destination
 before its first rename and removes it once the outcome is confirmed. If
 the process dies mid-restore the journal survives, and the NEXT restore
 into that destination REFUSES until you complete the recovery manually.
-Read the journal's `phase` (and `dest_existed`):
+The DISK is authoritative, not the journal's `phase` field (an async
+exception can land between a rename and the phase write): if the `aside`
+path recorded in the journal exists, the original destination sits there
+regardless of the recorded phase. With that rule applied, the `phase`
+(and `dest_existed`) map to the steps below:
 
 - `journal-written` (no rename happened yet): roll FORWARD by renaming
   the original destination to the journal's `aside` path, then `staging`

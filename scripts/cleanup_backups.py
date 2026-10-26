@@ -28,6 +28,7 @@ single directory's view cannot safely infer orphanhood automatically.
 import argparse
 import json
 import logging
+import os
 import shutil
 import sys
 from datetime import datetime, timedelta, timezone
@@ -51,7 +52,17 @@ class _SetSkipped(Exception):
 
 
 def _is_backup_set_dir(path: Path) -> bool:
-    return path.is_dir() and not path.is_symlink() and (path / MANIFEST_NAME).is_file()
+    if path.is_symlink():
+        return False
+    try:
+        os.readlink(path)
+        # readlink succeeded but is_symlink() is false: a Windows
+        # junction/reparse point — never a candidate (the sweep loop
+        # skips it with a logged error before any tag release).
+        return False
+    except (OSError, ValueError):
+        pass
+    return path.is_dir() and (path / MANIFEST_NAME).is_file()
 
 
 def _load_manifest(set_dir: Path) -> dict:
@@ -176,7 +187,22 @@ def cleanup_backups(
 
     # Backup-set directories: aged by the MANIFEST's mtime (the set was
     # finished when the manifest landed), tags released before removal.
-    set_dirs = [p for p in sorted(directory.iterdir()) if _is_backup_set_dir(p)]
+    candidates = sorted(directory.iterdir())
+    set_dirs = []
+    for cand in candidates:
+        if _is_backup_set_dir(cand):
+            set_dirs.append(cand)
+        elif (cand / MANIFEST_NAME).is_file() and not cand.is_file():
+            # A manifest-bearing entry that failed the candidate check:
+            # a symlink or junction. Skip it with a logged error BEFORE
+            # any manifest load or tag release (#728 review finding) —
+            # never prune through a link.
+            logger.error(
+                "skipping backup-set candidate %s: it is a symlink or "
+                "junction; pruning never follows links — remove or "
+                "replace it manually",
+                cand,
+            )
     expired = []
     for set_dir in set_dirs:
         manifest_path = set_dir / MANIFEST_NAME
@@ -210,7 +236,18 @@ def cleanup_backups(
                 exc,
             )
             continue
-        shutil.rmtree(set_dir)
+        try:
+            shutil.rmtree(set_dir)
+        except OSError as exc:
+            # One candidate's removal failing must not abort the sweep
+            # (#728 review finding); the set stays for a retry.
+            logger.error(
+                "keeping expired backup set %s: removal failed (%s); "
+                "retry after resolving",
+                set_dir,
+                exc,
+            )
+            continue
         removed.append(set_dir)
 
     if release_orphan_tags:
