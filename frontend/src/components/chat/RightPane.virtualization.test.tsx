@@ -260,10 +260,13 @@ describe("RightPane virtualization", () => {
 
       render(<RightPane />);
 
-      // Should show the virtualized container (overflow-y-auto div with aria-label)
-      const virtualizedContainer = screen.getByLabelText("Sources list");
-      expect(virtualizedContainer).toBeInTheDocument();
-      expect(virtualizedContainer).toHaveClass("overflow-y-auto");
+      // #868: the aria-label now sits on the role="list" sizing div; the
+      // scrollable wrapper is its parent (the overflow-y-auto container).
+      const virtualizedList = screen.getByLabelText("Sources list");
+      expect(virtualizedList).toBeInTheDocument();
+      expect(virtualizedList.getAttribute("role")).toBe("list");
+      const scrollWrapper = virtualizedList.parentElement as HTMLElement;
+      expect(scrollWrapper).toHaveClass("overflow-y-auto");
     });
   });
 
@@ -405,9 +408,11 @@ describe("RightPane virtualization", () => {
 
       render(<RightPane />);
 
+      // #868: label sits on the role="list" sizing div; the scroll wrapper
+      // is its parent (the overflow-y-auto container).
       const container = screen.getByLabelText("Sources list");
       expect(container).toBeInTheDocument();
-      expect(container).toHaveClass("overflow-y-auto");
+      expect((container.parentElement as HTMLElement).className).toContain("overflow-y-auto");
     });
 
     it("should render virtualized container for 50 sources", () => {

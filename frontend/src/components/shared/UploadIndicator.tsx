@@ -37,16 +37,11 @@ export function UploadIndicator() {
           isExpanded ? "max-h-96" : "max-h-14"
         )}
       >
-        {/* Header - always visible */}
-        <div
-          role="button"
-          tabIndex={0}
-          className="w-full flex items-center justify-between p-3 cursor-pointer hover:bg-muted/50"
-          onClick={() => setIsExpanded(!isExpanded)}
-          onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setIsExpanded(!isExpanded); } }}
-          aria-expanded={isExpanded}
-          aria-label="Toggle upload details"
-        >
+        {/* Header - always visible. #866: the header row is a layout surface,
+            not a button — the labeled collapse control below owns the toggle
+            so the row never nests the Clear action inside an interactive
+            container (axe nested-interactive). */}
+        <div className="w-full flex items-center justify-between p-3">
           <div className="flex items-center gap-2" aria-live="polite">
             <Upload className="w-4 h-4 text-primary" />
             <span className="text-sm font-medium">
@@ -63,10 +58,7 @@ export function UploadIndicator() {
                 variant="ghost"
                 size="sm"
                 className="h-6 px-2 text-xs"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  clearCompleted();
-                }}
+                onClick={() => clearCompleted()}
               >
                 Clear
               </Button>
@@ -75,10 +67,8 @@ export function UploadIndicator() {
               variant="ghost"
               size="icon"
               className="h-6 w-6"
-              onClick={(e) => {
-                e.stopPropagation();
-                setIsExpanded(!isExpanded);
-              }}
+              onClick={() => setIsExpanded(!isExpanded)}
+              aria-expanded={isExpanded}
               aria-label={isExpanded ? "Collapse upload details" : "Expand upload details"}
             >
               <X className="w-3 h-3" aria-hidden="true" />

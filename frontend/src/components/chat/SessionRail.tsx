@@ -115,6 +115,10 @@ interface SessionItemProps {
   onDelete: () => void;
   tabIndex?: number;
   onKeyDown?: (e: React.KeyboardEvent) => void;
+  /** #866/#868: the root renders role="listitem" by default; paths that wrap
+   * the item in their own listitem wrapper (virtualized/fallback rows) pass
+   * false so the role is not nested. */
+  asListItem?: boolean;
 }
 
 // Time-based group keys
@@ -290,7 +294,7 @@ export function ChatSearchInput({
 // COMPONENT: SessionItem
 // =============================================================================
 
-export const SessionItem = forwardRef<HTMLDivElement, SessionItemProps>(
+export const SessionItem = forwardRef<HTMLButtonElement, SessionItemProps>(
   function SessionItem(
     {
       session,
@@ -302,8 +306,9 @@ export const SessionItem = forwardRef<HTMLDivElement, SessionItemProps>(
       onDelete,
       tabIndex,
       onKeyDown,
+      asListItem = true,
     }: SessionItemProps,
-    ref: React.Ref<HTMLDivElement>
+    ref: React.Ref<HTMLButtonElement>
   ) {
   const [isEditing, setIsEditing] = useState(false);
   const [editTitle, setEditTitle] = useState(session.title || "");
@@ -361,28 +366,21 @@ export const SessionItem = forwardRef<HTMLDivElement, SessionItemProps>(
 
   return (
     <>
+      {/* #866/#868: the row is a listitem layout surface, not a button — the
+          activation, roving tabIndex, and keyboard handling moved onto the
+          title <button> below so the row never nests the More-options menu
+          trigger (an interactive control) inside an interactive container
+          (axe nested-interactive), and list rows carry their required
+          listitem role. */}
       <div
-        ref={ref}
         className={`
           group relative flex flex-col justify-start items-start rounded-sm px-3 py-2.5 text-sm mb-2
-          cursor-pointer transition-all duration-150 ease-in-out
+          transition-all duration-150 ease-in-out
           border border-transparent
           ${isActive ? "bg-primary/10 border-ring" : "hover:bg-muted hover:border-border/50"}
           focus-within:border focus-within:border-ring
         `}
-        onClick={() => !isEditing && onClick()}
-        role={isEditing ? "listitem" : "button"}
-        tabIndex={isEditing ? undefined : (tabIndex ?? -1)}
-        aria-label={isEditing ? undefined : `Chat session: ${displayTitle}`}
-        onKeyDown={isEditing ? undefined : (e) => {
-          // First handle the parent's roving tabindex navigation
-          onKeyDown?.(e);
-          // Then handle activation with Enter or Space
-          if (e.key === "Enter" || e.key === " ") {
-            e.preventDefault();
-            onClick();
-          }
-        }}
+        role={asListItem ? "listitem" : undefined}
       >
         <div className="flex flex-col items-start gap-2">
           <div className="flex items-center justify-between gap-2">
@@ -428,13 +426,34 @@ export const SessionItem = forwardRef<HTMLDivElement, SessionItemProps>(
                 </div>
               ) : (
                 <div className="flex items-center justify-between gap-2">
-                  <span className={`truncate font-medium${isActive ? " text-foreground" : ""}`}>{truncatedTitle}</span>
-                  {session.forked_from_session_id != null && (
-                    <span title="Branched conversation"><GitBranch className="h-3 w-3 text-muted-foreground shrink-0" aria-hidden="true" /></span>
-                  )}
-                  {isPinned && (
-                    <Pin className="h-3 w-3 text-muted-foreground shrink-0" aria-hidden="true" />
-                  )}
+                  {/* #866: the title carries the row's activation, roving
+                      tabIndex, and keyboard contract (arrows delegate to the
+                      container's handler; Enter/Space activate). */}
+                  <button
+                    ref={ref}
+                    type="button"
+                    onClick={() => onClick()}
+                    aria-label={`Chat session: ${displayTitle}`}
+                    tabIndex={tabIndex ?? -1}
+                    onKeyDown={(e) => {
+                      // First handle the parent's roving tabindex navigation
+                      onKeyDown?.(e);
+                      // Then handle activation with Enter or Space
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        onClick();
+                      }
+                    }}
+                    className="flex items-center justify-between gap-2 w-full text-left rounded-sm focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                  >
+                    <span className={`truncate font-medium${isActive ? " text-foreground" : ""}`}>{truncatedTitle}</span>
+                    {session.forked_from_session_id != null && (
+                      <span title="Branched conversation"><GitBranch className="h-3 w-3 text-muted-foreground shrink-0" aria-hidden="true" /></span>
+                    )}
+                    {isPinned && (
+                      <Pin className="h-3 w-3 text-muted-foreground shrink-0" aria-hidden="true" />
+                    )}
+                  </button>
                   {!isEditing && (
                     <div className="justify-items-end">
                     <DropdownMenu>
@@ -537,7 +556,7 @@ export function SessionGroup({
 }: SessionGroupProps) {
   const [internalIsOpen, setInternalIsOpen] = useState(true);
   const isOpen = controlledIsOpen ?? internalIsOpen;
-  const itemRefs = useRef<(HTMLDivElement | null)[]>([]);
+  const itemRefs = useRef<(HTMLButtonElement | null)[]>([]);
 
   const handleToggle = useCallback(() => {
     if (onToggle) {
@@ -630,7 +649,7 @@ export function SessionGroup({
               onPinToggle={() => onSessionPinToggle(session.id)}
               onDelete={() => onSessionDelete(session)}
               tabIndex={index + indexOffset === focusedIndex ? 0 : -1}
-              ref={(el: HTMLDivElement | null) => {
+              ref={(el: HTMLButtonElement | null) => {
                 itemRefs.current[index] = el;
               }}
               onKeyDown={(e: React.KeyboardEvent) => {
@@ -1607,20 +1626,23 @@ function SessionRailContent({
           const virtualItems = sessionVirtualizer.getVirtualItems();
           const shouldUseVirtualizer = virtualItems.length > 0;
           return shouldUseVirtualizer ? (
-            // eslint-disable-next-line jsx-a11y-x/no-static-element-interactions -- container uses event delegation for roving-tabindex arrow-key navigation (UI-045); rows carry data-session-index and receive programmatic focus. APG listbox pattern.
+            // eslint-disable-next-line jsx-a11y-x/no-noninteractive-element-interactions -- list container uses event delegation for roving-tabindex arrow-key navigation (UI-045); rows carry data-session-index and receive programmatic focus. APG listbox pattern.
             <div
               style={{ height: sessionVirtualizer.getTotalSize(), position: 'relative' }}
+              role="list"
+              aria-label="Session list"
               onKeyDown={handleSessionListKeyDown}
             >
               {virtualItems.map((virtualItem) => {
                 const session = filteredSessions[virtualItem.index];
                 return (
-                  // eslint-disable-next-line jsx-a11y-x/no-static-element-interactions -- focusable row wrapper (SessionItem forwards no unknown props to its root); Enter/Space activate the session when the wrapper holds focus.
+                  // eslint-disable-next-line jsx-a11y-x/no-noninteractive-element-interactions -- focusable listitem row wrapper (UI-045); Enter/Space activate the session when the wrapper holds focus.
                   <div
                     key={virtualItem.key}
                     data-index={virtualItem.index}
                     data-session-index={virtualItem.index}
                     tabIndex={-1}
+                    role="listitem"
                     ref={sessionVirtualizer.measureElement}
                     style={{ position: 'absolute', top: virtualItem.start, left: 0, right: 0 }}
                     onKeyDown={(e) => {
@@ -1648,6 +1670,7 @@ function SessionRailContent({
                       onPinToggle={() => togglePinSession(session.id)}
                       onDelete={() => handleSessionDelete(session)}
                       tabIndex={virtualItem.index === focusedSessionIndex ? 0 : -1}
+                      asListItem={false}
                     />
                   </div>
                 );
@@ -1656,14 +1679,15 @@ function SessionRailContent({
           ) : (
             // Fallback: render all items directly (used in JSDOM/test env where
             // scroll container has 0 height and getVirtualItems() returns [])
-            // eslint-disable-next-line jsx-a11y-x/no-static-element-interactions -- container uses event delegation for roving-tabindex arrow-key navigation (UI-045). APG listbox pattern.
-            <div onKeyDown={handleSessionListKeyDown}>
+            // eslint-disable-next-line jsx-a11y-x/no-noninteractive-element-interactions -- list container uses event delegation for roving-tabindex arrow-key navigation (UI-045). APG listbox pattern.
+            <div role="list" aria-label="Session list" onKeyDown={handleSessionListKeyDown}>
               {filteredSessions.map((session, index) => (
-                // eslint-disable-next-line jsx-a11y-x/no-static-element-interactions -- focusable row wrapper (SessionItem forwards no unknown props to its root); Enter/Space activate the session when the wrapper holds focus.
+                // eslint-disable-next-line jsx-a11y-x/no-noninteractive-element-interactions -- focusable listitem row wrapper (UI-045); Enter/Space activate the session when the wrapper holds focus.
                 <div
                   key={session.id}
                   data-session-index={index}
                   tabIndex={-1}
+                  role="listitem"
                   onKeyDown={(e) => {
                     if (e.target !== e.currentTarget) return;
                     if (e.key === "Enter" || e.key === " ") {
@@ -1687,6 +1711,7 @@ function SessionRailContent({
                     onPinToggle={() => togglePinSession(session.id)}
                     onDelete={() => handleSessionDelete(session)}
                     tabIndex={index === focusedSessionIndex ? 0 : -1}
+                    asListItem={false}
                   />
                 </div>
               ))}
