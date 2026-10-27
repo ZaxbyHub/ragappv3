@@ -437,6 +437,23 @@ export function useSendMessage(
               const [userSaveResult, assistantSaveResult] = saved;
               if (userSaveResult) migrateId(userMessage.id, userSaveResult);
               if (assistantMsg && assistantSaveResult) {
+                // Issue #815 CI round (issue552 suite): a canceled unload can
+                // fire pagehide while the stream is STILL LIVE — the stream's
+                // appends and the terminal path keep referencing the temp
+                // assistant id, so renaming it mid-stream orphans them. The
+                // durable SEQ is the payload the Retry/Edit anchor needs;
+                // stamp it immediately, and only run the full id migration
+                // once this row is no longer the live streaming row (the
+                // true page-death/bfcache case — where nothing else ever
+                // will).
+                const state = useChatStore.getState();
+                if (state.streamingMessageId === assistantMessageId) {
+                  state.updateMessage(assistantMessageId, {
+                    saveState: "saved",
+                    seq: assistantSaveResult.seq,
+                  });
+                  return;
+                }
                 migrateId(assistantMessageId, assistantSaveResult);
               }
             })

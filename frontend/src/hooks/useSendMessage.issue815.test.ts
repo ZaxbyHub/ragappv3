@@ -214,30 +214,73 @@ describe("useSendMessage migrates keepalive save results into store rows (issue 
     cleanup();
   });
 
-  it("carries the keepalive-saved durable ids and seqs into the store (RED at base)", async () => {
+  it("stamps seq on the live streaming row without renaming it (canceled-unload case; RED at base)", async () => {
+    // AMEND (CHECK_WRONG, CI round 1): a canceled unload can fire pagehide
+    // while the stream is STILL LIVE — the stream's appends and the terminal
+    // path keep referencing the temp assistant id, so the migration stamps
+    // seq/saveState immediately but must NOT rename the live streaming row
+    // (renaming orphans the appends; caught by the issue552 suite in CI).
+    // RED at base: no seq is stamped at all.
     const refreshHistory = vi.fn().mockResolvedValue(undefined);
+    let resolveKeepalive: (rows: unknown[]) => void = () => {};
+    apiMocks.addChatMessagesBatchKeepalive.mockImplementationOnce(
+      () => new Promise((res) => { resolveKeepalive = res as typeof resolveKeepalive; })
+    );
     await startSend(refreshHistory);
-
+    const idsBefore = [...useChatStore.getState().messageIds];
     await emitPartialAnswer();
     await act(async () => {
       window.dispatchEvent(new Event("pagehide"));
     });
-    await flushPersistence();
-
-    expect(apiMocks.addChatMessagesBatchKeepalive).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      resolveKeepalive(keepaliveSaveResults as unknown[]);
+      await useChatStore.getState().pendingTurnPersist;
+    });
 
     const state = useChatStore.getState();
-    // The store rows must be the SERVER rows now: migrateId forwarded the
-    // durable ids onto the turn's user and assistant messages.
-    expect(state.messageIds).toEqual(["100", "101"]);
-    expect(state.messagesById["100"]).toMatchObject({
-      saveState: "saved",
-      seq: 1,
+    // The USER row renames safely (nothing references it mid-stream); the
+    // LIVE STREAMING row keeps its id — the stream still appends to it.
+    expect(state.messageIds[0]).toBe("100");
+    expect(state.messageIds[1]).toBe(idsBefore[1]);
+    for (const id of state.messageIds) {
+      expect(state.messagesById[id]).toMatchObject({ saveState: "saved" });
+      expect(typeof state.messagesById[id].seq).toBe("number");
+    }
+    expect(state.streamingMessageId).toBe(idsBefore[1]);
+  });
+
+  it("fully migrates ids once the stream ended before the response settled (bfcache case; RED at base)", async () => {
+    // The response settles only AFTER the stream ended (true page-death or
+    // bfcache survival — nothing else ever will migrate): the full
+    // migrateId rename applies. RED at base: no migration runs at all.
+    const refreshHistory = vi.fn().mockResolvedValue(undefined);
+    let resolveKeepalive: (rows: unknown[]) => void = () => {};
+    apiMocks.addChatMessagesBatchKeepalive.mockImplementationOnce(
+      () => new Promise((res) => { resolveKeepalive = res as typeof resolveKeepalive; })
+    );
+    await startSend(refreshHistory);
+    await emitPartialAnswer();
+    await act(async () => {
+      window.dispatchEvent(new Event("pagehide"));
     });
-    expect(state.messagesById["101"]).toMatchObject({
-      saveState: "saved",
-      seq: 2,
+    // End the stream: after the pagehide claim, onComplete cleans up the
+    // active UI without re-persisting (issue #552 contract).
+    await act(async () => {
+      const handlers = activeHandlers;
+      if (!handlers) throw new Error("chatStream handlers were not captured");
+      await handlers.onComplete();
     });
+    expect(useChatStore.getState().streamingMessageId).toBeNull();
+
+    await act(async () => {
+      resolveKeepalive(keepaliveSaveResults as unknown[]);
+      await useChatStore.getState().pendingTurnPersist;
+    });
+
+    const settled = useChatStore.getState();
+    expect(settled.messageIds).toEqual(["100", "101"]);
+    expect(settled.messagesById["100"]).toMatchObject({ saveState: "saved", seq: 1 });
+    expect(settled.messagesById["101"]).toMatchObject({ saveState: "saved", seq: 2 });
   });
 
   it("gives the keepalive-saved rows a numeric seq so durableKeepSeq counts them (RED at base)", async () => {
