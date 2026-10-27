@@ -13,11 +13,66 @@ from pydantic import BaseModel, Field, field_validator
 
 from app.api.deps import UserRole, require_role
 from app.config import settings
-from app.models.database import get_pool
+from app.models.database import get_pool, transaction_context
 from app.security import csrf_protect
+from app.services.authz_policy import (
+    direct_vault_admin_ids,
+    group_derived_vault_admin_ids,
+)
 from app.utils.slug import generate_org_slug
 
 router = APIRouter(prefix="/organizations", tags=["organizations"])
+
+
+def _covered_vault_ids(conn: sqlite3.Connection, vault_ids) -> set:
+    """Return the candidate vaults that still have an effective admin (#1028).
+
+    Route-layer composition of the shared effective-admin inventory
+    (``authz_policy.direct_vault_admin_ids`` /
+    ``authz_policy.group_derived_vault_admin_ids``); the inventory functions
+    themselves stay untouched per #1028's scope. Callers run this inside the
+    same BEGIN IMMEDIATE transaction as the mutation (both the pre-state and
+    the ACTUAL post-state read).
+    """
+    return {
+        vault_id
+        for vault_id in vault_ids
+        if direct_vault_admin_ids(conn, vault_id)
+        | group_derived_vault_admin_ids(conn, vault_id)
+    }
+
+
+def _user_derived_admin_vault_ids(conn: sqlite3.Connection, user_id: int) -> set:
+    """Vaults where ``user_id`` currently holds GROUP-DERIVED admin (#1028).
+
+    Conservative superset for the member-removal route: candidacy only decides
+    which vaults get the pre/post inventory reads, so a superset is safe while
+    remaining complete for every row the route can remove. Stale memberships
+    (grant without the org premise) surface here but contribute no effective
+    admin, so a pre-broken vault among them is never refused (AC7).
+    """
+    return {
+        row[0]
+        for row in conn.execute(
+            """SELECT DISTINCT vga.vault_id FROM vault_group_access vga
+               JOIN group_members gm ON vga.group_id = gm.group_id
+               WHERE gm.user_id = ? AND vga.permission = 'admin'""",
+            (user_id,),
+        )
+    }
+
+
+def _org_group_admin_grant_vault_ids(conn: sqlite3.Connection, org_id: int) -> set:
+    """Vaults whose group-derived admin coverage runs through this org's groups (#1028)."""
+    return {
+        row[0]
+        for row in conn.execute(
+            """SELECT DISTINCT vga.vault_id FROM vault_group_access vga
+               JOIN groups g ON g.id = vga.group_id
+               WHERE g.org_id = ? AND vga.permission = 'admin'""",
+            (org_id,),
+        )
+    }
 
 
 class OrganizationCreateRequest(BaseModel):
@@ -1161,28 +1216,48 @@ async def remove_org_member(
                 status_code=400, detail="Cannot remove yourself from an organization"
             )
 
-        # Delete member
-        try:
-            await asyncio.to_thread(
-                conn.execute,
-                "DELETE FROM org_members WHERE org_id = ? AND user_id = ?",
-                (org_id, member_user_id),
-            )
-            # Group membership implies organization membership: also drop the
-            # member's group_members rows for this org's groups in the same
-            # transaction, so the removal revokes their derived vault grants
-            # (issue #721 AC2).
-            await asyncio.to_thread(
-                conn.execute,
-                """DELETE FROM group_members
-                    WHERE user_id = ?
-                      AND group_id IN (SELECT id FROM groups WHERE org_id = ?)""",
-                (member_user_id, org_id),
-            )
-            await asyncio.to_thread(conn.commit)
-        except Exception:
-            await asyncio.to_thread(conn.rollback)
-            raise
+        # Delete member. Issue #1028: one BEGIN IMMEDIATE over candidate
+        # discovery, the pre-state read, both DELETEs, and the ACTUAL
+        # post-state re-read — removing the org row (or the group rows its
+        # cleanup removes) can strip the member's only group-derived admin
+        # coverage. Refusal fires only for vaults that HAD effective admins
+        # (AC7), and rolls both DELETEs back.
+        def _remove_member():
+            with transaction_context(conn):
+                candidate_vault_ids = _user_derived_admin_vault_ids(
+                    conn, member_user_id
+                )
+                covered_before = _covered_vault_ids(conn, candidate_vault_ids)
+                conn.execute(
+                    "DELETE FROM org_members WHERE org_id = ? AND user_id = ?",
+                    (org_id, member_user_id),
+                )
+                # Group membership implies organization membership: also drop the
+                # member's group_members rows for this org's groups in the same
+                # transaction, so the removal revokes their derived vault grants
+                # (issue #721 AC2).
+                conn.execute(
+                    """DELETE FROM group_members
+                        WHERE user_id = ?
+                          AND group_id IN (SELECT id FROM groups WHERE org_id = ?)""",
+                    (member_user_id, org_id),
+                )
+                refused_vault_ids = sorted(
+                    covered_before
+                    - _covered_vault_ids(conn, candidate_vault_ids)
+                )
+                if refused_vault_ids:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Removing this organization member would leave"
+                            f" vault(s) {refused_vault_ids} without an"
+                            " effective admin: each vault must keep at least"
+                            " one effective admin"
+                        ),
+                    )
+
+        await asyncio.to_thread(_remove_member)
 
         return {
             "message": "Member removed",
@@ -1290,13 +1365,36 @@ async def delete_organization(
         if not await asyncio.to_thread(cursor.fetchone):
             raise HTTPException(status_code=404, detail="Organization not found")
 
-        # Delete organization (FK cascades handle org_members, groups, group_members)
-        await asyncio.to_thread(
-            conn.execute,
-            "DELETE FROM organizations WHERE id = ?",
-            (org_id,),
-        )
-        await asyncio.to_thread(conn.commit)
+        # Delete organization (FK cascades handle org_members, groups, group_members,
+        # and vault_group_access). Issue #1028: one BEGIN IMMEDIATE over candidate
+        # discovery, the pre-state read, the cascade DELETE, and the ACTUAL
+        # post-state re-read — the cascade can strip every org group's admin
+        # grants at once, orphaning vaults whose only coverage ran through them
+        # (vaults.org_id carries no FK, so vault rows survive with a dangling
+        # org_id). Refusal fires only for vaults that HAD effective admins (AC7).
+        def _delete_organization():
+            with transaction_context(conn):
+                candidate_vault_ids = _org_group_admin_grant_vault_ids(conn, org_id)
+                covered_before = _covered_vault_ids(conn, candidate_vault_ids)
+                conn.execute(
+                    "DELETE FROM organizations WHERE id = ?",
+                    (org_id,),
+                )
+                refused_vault_ids = sorted(
+                    covered_before
+                    - _covered_vault_ids(conn, candidate_vault_ids)
+                )
+                if refused_vault_ids:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Deleting this organization would leave vault(s)"
+                            f" {refused_vault_ids} without an effective admin:"
+                            " each vault must keep at least one effective admin"
+                        ),
+                    )
+
+        await asyncio.to_thread(_delete_organization)
 
         return {
             "message": "Organization deleted",

@@ -738,6 +738,45 @@ async def update_user_active(
         pool.release_connection(conn)
 
 
+def _covered_vault_ids(conn: sqlite3.Connection, vault_ids) -> set:
+    """Return the candidate vaults that still have an effective admin (#1028).
+
+    Route-layer composition of the shared effective-admin inventory
+    (``authz_policy.direct_vault_admin_ids`` /
+    ``authz_policy.group_derived_vault_admin_ids``); the inventory functions
+    themselves stay untouched per #1028's scope. Callers run this inside the
+    same BEGIN IMMEDIATE transaction as the mutation (both the pre-state and
+    the ACTUAL post-state read).
+    """
+    return {
+        vault_id
+        for vault_id in vault_ids
+        if direct_vault_admin_ids(conn, vault_id)
+        | group_derived_vault_admin_ids(conn, vault_id)
+    }
+
+
+def _user_derived_admin_vault_ids(conn: sqlite3.Connection, user_id: int) -> set:
+    """Vaults where ``user_id`` currently holds GROUP-DERIVED admin (#1028).
+
+    Conservative superset for the membership/org replacement routes: it omits
+    the inventory join's ``org_members`` EXISTS on purpose — candidacy only
+    decides which vaults get the pre/post inventory reads, so a superset is
+    safe while remaining complete for every row the routes can remove. Stale
+    memberships (grant without the org premise) surface here but contribute no
+    effective admin, so a pre-broken vault among them is never refused (AC7).
+    """
+    return {
+        row[0]
+        for row in conn.execute(
+            """SELECT DISTINCT vga.vault_id FROM vault_group_access vga
+               JOIN group_members gm ON vga.group_id = gm.group_id
+               WHERE gm.user_id = ? AND vga.permission = 'admin'""",
+            (user_id,),
+        )
+    }
+
+
 def _vaults_orphaned_by_user_delete(
     conn: sqlite3.Connection, user_id: int
 ) -> List[int]:
@@ -1208,6 +1247,14 @@ async def update_user_organizations(
             # and both reads into one snapshot.
             conn.execute("BEGIN IMMEDIATE")
 
+            # Issue #1028: candidate discovery and the pre-state read inside
+            # the same write transaction — dropping an org membership (or the
+            # group rows its cleanup removes) can strip the target's only
+            # group-derived admin coverage. The refusal at the bottom fires
+            # only for vaults that HAD effective admins (AC7).
+            candidate_vault_ids = _user_derived_admin_vault_ids(conn, user_id)
+            covered_before = _covered_vault_ids(conn, candidate_vault_ids)
+
             # Snapshot the target's current non-owner orgs before the replace so
             # group memberships can be cleaned up for orgs this call actually
             # drops (issue #721 AC3). Owner rows are excluded by the same
@@ -1272,6 +1319,22 @@ async def update_user_organizations(
                         WHERE user_id = ?
                           AND group_id IN (SELECT id FROM groups WHERE org_id = ?)""",
                     (user_id, org_id),
+                )
+            # ACTUAL post-state re-read over the persisted rows, before commit
+            # (issue #1028). Any refused vault rolls back the whole
+            # replacement through the handler below.
+            refused_vault_ids = sorted(
+                covered_before - _covered_vault_ids(conn, candidate_vault_ids)
+            )
+            if refused_vault_ids:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Replacing this user's organization memberships would"
+                        f" leave vault(s) {refused_vault_ids} without an"
+                        " effective admin: each vault must keep at least one"
+                        " effective admin"
+                    ),
                 )
             conn.commit()
         except Exception:
@@ -1417,19 +1480,41 @@ async def update_user_groups(
 
         # If group_ids is empty, clear only the caller-managed org scope.
         if not body.group_ids:
-            if caller_orgs is None:
-                conn.execute("DELETE FROM group_members WHERE user_id = ?", (user_id,))
-            else:
-                placeholders = ",".join("?" * len(caller_orgs))
-                conn.execute(
-                    f"""DELETE FROM group_members
-                        WHERE user_id = ?
-                          AND group_id IN (
-                              SELECT id FROM groups WHERE org_id IN ({placeholders})
-                          )""",
-                    (user_id, *caller_orgs),
+            # Issue #1028: one BEGIN IMMEDIATE over candidate discovery, the
+            # pre-state read, the scoped/unscoped clear, and the ACTUAL
+            # post-state re-read. Removing the target's group memberships can
+            # strip their only group-derived admin coverage; refusal fires
+            # only for vaults that HAD effective admins (AC7).
+            with transaction_context(conn):
+                candidate_vault_ids = _user_derived_admin_vault_ids(conn, user_id)
+                covered_before = _covered_vault_ids(conn, candidate_vault_ids)
+                if caller_orgs is None:
+                    conn.execute(
+                        "DELETE FROM group_members WHERE user_id = ?", (user_id,)
+                    )
+                else:
+                    placeholders = ",".join("?" * len(caller_orgs))
+                    conn.execute(
+                        f"""DELETE FROM group_members
+                            WHERE user_id = ?
+                              AND group_id IN (
+                                  SELECT id FROM groups WHERE org_id IN ({placeholders})
+                              )""",
+                        (user_id, *caller_orgs),
+                    )
+                refused_vault_ids = sorted(
+                    covered_before - _covered_vault_ids(conn, candidate_vault_ids)
                 )
-            conn.commit()
+                if refused_vault_ids:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Replacing this user's group memberships would"
+                            f" leave vault(s) {refused_vault_ids} without an"
+                            " effective admin: each vault must keep at least"
+                            " one effective admin"
+                        ),
+                    )
             cursor = conn.execute(
                 """SELECT g.id, g.name, g.description, g.org_id
                    FROM groups g
@@ -1487,35 +1572,55 @@ async def update_user_groups(
                     detail=f"User is not a member of organization for group {group_id}",
                 )
 
-        # Replace only memberships in the caller-managed org scope.
-        if caller_orgs is None:
-            cursor.execute("DELETE FROM group_members WHERE user_id = ?", (user_id,))
-        else:
-            placeholders = ",".join("?" * len(caller_orgs))
-            cursor.execute(
-                f"""DELETE FROM group_members
-                    WHERE user_id = ?
-                      AND group_id IN (
-                          SELECT id FROM groups WHERE org_id IN ({placeholders})
-                      )""",
-                (user_id, *caller_orgs),
-            )
+        # Replace only memberships in the caller-managed org scope, inside one
+        # BEGIN IMMEDIATE with the #1028 effective-admin guard (same shape as
+        # the clear branch above; the refusal rolls back the whole
+        # replacement).
+        with transaction_context(conn):
+            candidate_vault_ids = _user_derived_admin_vault_ids(conn, user_id)
+            covered_before = _covered_vault_ids(conn, candidate_vault_ids)
+            if caller_orgs is None:
+                cursor.execute(
+                    "DELETE FROM group_members WHERE user_id = ?", (user_id,)
+                )
+            else:
+                placeholders = ",".join("?" * len(caller_orgs))
+                cursor.execute(
+                    f"""DELETE FROM group_members
+                        WHERE user_id = ?
+                          AND group_id IN (
+                              SELECT id FROM groups WHERE org_id IN ({placeholders})
+                              )""",
+                    (user_id, *caller_orgs),
+                )
 
-        # Insert new memberships; dedupe by group id first: group_members has
-        # UNIQUE(group_id, user_id) and a duplicate id in one body would 500
-        # on the second insert (issue #725, S02-SK-03; groups.py dedupes the
-        # same way).
-        seen_group_ids = set()
-        for group_id in body.group_ids:
-            if group_id in seen_group_ids:
-                continue
-            seen_group_ids.add(group_id)
-            cursor.execute(
-                "INSERT INTO group_members (group_id, user_id) VALUES (?, ?)",
-                (group_id, user_id),
-            )
+            # Insert new memberships; dedupe by group id first: group_members has
+            # UNIQUE(group_id, user_id) and a duplicate id in one body would 500
+            # on the second insert (issue #725, S02-SK-03; groups.py dedupes the
+            # same way).
+            seen_group_ids = set()
+            for group_id in body.group_ids:
+                if group_id in seen_group_ids:
+                    continue
+                seen_group_ids.add(group_id)
+                cursor.execute(
+                    "INSERT INTO group_members (group_id, user_id) VALUES (?, ?)",
+                    (group_id, user_id),
+                )
 
-        conn.commit()
+            refused_vault_ids = sorted(
+                covered_before - _covered_vault_ids(conn, candidate_vault_ids)
+            )
+            if refused_vault_ids:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Replacing this user's group memberships would leave"
+                        f" vault(s) {refused_vault_ids} without an effective"
+                        " admin: each vault must keep at least one effective"
+                        " admin"
+                    ),
+                )
 
         # Return updated list of groups
         cursor.execute(
