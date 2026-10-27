@@ -26,6 +26,40 @@ from app.services.authz_policy import (
 router = APIRouter(prefix="/groups", tags=["groups"])
 
 
+def _covered_vault_ids(db: sqlite3.Connection, vault_ids: set) -> set:
+    """Return the candidate vaults that still have an effective admin (#1028).
+
+    Route-layer composition of the shared effective-admin inventory
+    (``authz_policy.direct_vault_admin_ids`` /
+    ``authz_policy.group_derived_vault_admin_ids``); the inventory functions
+    themselves stay untouched per #1028's scope. Callers run this inside the
+    same BEGIN IMMEDIATE transaction as the mutation (both the pre-state and
+    the ACTUAL post-state read).
+    """
+    return {
+        vault_id
+        for vault_id in vault_ids
+        if direct_vault_admin_ids(db, vault_id)
+        | group_derived_vault_admin_ids(db, vault_id)
+    }
+
+
+def _group_admin_grant_vault_ids(db: sqlite3.Connection, group_id: int) -> set:
+    """Vaults whose group-derived admin coverage runs through this group (#1028).
+
+    Only admin ``vault_group_access`` rows can contribute effective admins, so
+    read/write grants are not candidates.
+    """
+    return {
+        row[0]
+        for row in db.execute(
+            "SELECT DISTINCT vault_id FROM vault_group_access"
+            " WHERE group_id = ? AND permission = 'admin'",
+            (group_id,),
+        )
+    }
+
+
 class GroupResponse(BaseModel):
     """Response model for a group."""
 
@@ -612,16 +646,38 @@ async def delete_group(
             )
 
     # ON DELETE CASCADE handles group_members and vault_group_access cleanup
-    cursor = await asyncio.to_thread(
-        db.execute,
-        "DELETE FROM groups WHERE id = ?",
-        (group_id,),
-    )
+    def _delete_group():
+        # Issue #1028: one BEGIN IMMEDIATE over candidate discovery, the
+        # pre-state read, the cascade DELETE, and the ACTUAL post-state
+        # re-read. The FK cascade deletes the group's admin grants WITH the
+        # row, so a vault whose only effective admin was group-derived through
+        # this group would otherwise be silently orphaned. The refusal fires
+        # only for vaults that HAD effective admins (pre-state-non-empty), so
+        # an already-broken vault stays repairable (issue AC7).
+        with transaction_context(db):
+            candidate_vault_ids = _group_admin_grant_vault_ids(db, group_id)
+            covered_before = _covered_vault_ids(db, candidate_vault_ids)
+            delete_cursor = db.execute(
+                "DELETE FROM groups WHERE id = ?",
+                (group_id,),
+            )
+            if delete_cursor.rowcount == 0:
+                raise HTTPException(status_code=404, detail="Group not found")
+            # ACTUAL post-state re-read over the persisted rows, before commit.
+            refused_vault_ids = sorted(
+                covered_before - _covered_vault_ids(db, candidate_vault_ids)
+            )
+            if refused_vault_ids:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Deleting this group would leave vault(s)"
+                        f" {refused_vault_ids} without an effective admin: each"
+                        " vault must keep at least one effective admin"
+                    ),
+                )
 
-    if cursor.rowcount == 0:
-        raise HTTPException(status_code=404, detail="Group not found")
-
-    await asyncio.to_thread(db.commit)
+    await asyncio.to_thread(_delete_group)
 
 
 @router.get("/{group_id}/members", response_model=List[GroupMemberResponse])
@@ -793,6 +849,11 @@ async def update_group_members(
                         status_code=400,
                         detail=f"Users are not members of this organization: {sorted(non_member_ids)}",
                     )
+            # Issue #1028: candidate discovery and the pre-state read inside
+            # the same BEGIN IMMEDIATE as the replacement — removing a member
+            # deletes the rows that realize this group's admin grants.
+            candidate_vault_ids = _group_admin_grant_vault_ids(db, group_id)
+            covered_before = _covered_vault_ids(db, candidate_vault_ids)
             # Delete existing memberships
             db.execute(
                 "DELETE FROM group_members WHERE group_id = ?",
@@ -803,6 +864,22 @@ async def update_group_members(
                 db.execute(
                     "INSERT INTO group_members (group_id, user_id) VALUES (?, ?)",
                     (group_id, user_id),
+                )
+            # ACTUAL post-state re-read before commit; refusal only for vaults
+            # that HAD effective admins (AC7 keeps pre-broken vaults
+            # repairable), and any refused vault rolls back the whole
+            # replacement.
+            refused_vault_ids = sorted(
+                covered_before - _covered_vault_ids(db, candidate_vault_ids)
+            )
+            if refused_vault_ids:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Replacing this group's members would leave vault(s)"
+                        f" {refused_vault_ids} without an effective admin: each"
+                        " vault must keep at least one effective admin"
+                    ),
                 )
 
     await asyncio.to_thread(_update_members)
