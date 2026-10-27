@@ -36,6 +36,12 @@ interface ChatShellState {
   setSessionSearchQuery: (query: string) => void;
   togglePinSession: (sessionId: number) => void;
   isSessionPinned: (sessionId: number) => boolean;
+  /**
+   * Identity-boundary reset (issue #823): the rail's search query is
+   * user-typed text and the pin list is user-scoped metadata persisted to
+   * localStorage — neither may survive a logout / different-principal login.
+   */
+  clearIdentityScopedState: () => void;
   // Evidence pane actions
   setSelectedEvidenceSource: (source: Source | null) => void;
   setSelectedEvidenceMessageId: (id: string | null) => void;
@@ -143,6 +149,12 @@ export const useChatShellStore = create<ChatShellState>((set, get) => ({
   },
   isSessionPinned: (sessionId) => {
     return get().pinnedSessionIds.includes(sessionId);
+  },
+  clearIdentityScopedState: () => {
+    // Keep the memory==storage invariant from F-005: clear through the
+    // same persistence helper togglePinSession uses.
+    persistPinnedSessions([]);
+    set({ pinnedSessionIds: [], sessionSearchQuery: "" });
   },
   // Evidence pane actions
   setSelectedEvidenceSource: (source) => set({ selectedEvidenceSource: source }),

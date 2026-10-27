@@ -420,16 +420,37 @@ export function useSendMessage(
 
         if (options.keepalive) {
           const persistPromise = addChatMessagesBatchKeepalive(sessionId, prepared.messages);
+          // Issue #815: the keepalive save is durable server-side the moment
+          // the request lands; when the page outlives it (bfcache restore,
+          // canceled unload) the resolved save results must migrate into the
+          // store rows — same migrateId forwarding as the normal path — so
+          // durableKeepSeq/observedTail cover these rows and a later
+          // Retry/Edit truncate cannot delete the turn. The migration lives
+          // INSIDE the registered pending-save chain (revision operations
+          // await it before computing the truncate boundary) and never
+          // throws into the pagehide caller; no refreshHistory here (the
+          // sidebar heals on the next interaction).
+          const { assistantMsg } = prepared;
+          const tracked = persistPromise
+            .then((saved) => {
+              if (!saved) return;
+              const [userSaveResult, assistantSaveResult] = saved;
+              if (userSaveResult) migrateId(userMessage.id, userSaveResult);
+              if (assistantMsg && assistantSaveResult) {
+                migrateId(assistantMessageId, assistantSaveResult);
+              }
+            })
+            .catch(() => undefined);
           const { setPendingTurnPersist, registerPendingTurnPersist } = useChatStore.getState();
-          setPendingTurnPersist(persistPromise);
-          registerPendingTurnPersist?.(persistPromise);
-          void persistPromise.finally(() => {
-            if (useChatStore.getState().pendingTurnPersist === persistPromise) {
+          setPendingTurnPersist(tracked);
+          registerPendingTurnPersist?.(tracked);
+          void tracked.finally(() => {
+            if (useChatStore.getState().pendingTurnPersist === tracked) {
               useChatStore.getState().setPendingTurnPersist(null);
             }
-            useChatStore.getState().unregisterPendingTurnPersist?.(persistPromise);
+            useChatStore.getState().unregisterPendingTurnPersist?.(tracked);
           });
-          return persistPromise;
+          return tracked;
         }
 
         const persistPromise = (async () => {

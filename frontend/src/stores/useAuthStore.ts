@@ -14,6 +14,13 @@ import {
   ensureCsrfTokenPhysical,
 } from "@/lib/api";
 import { useVaultStore } from "@/stores/useVaultStore";
+import { useChatStore } from "@/stores/useChatStore";
+import { useChatShellStore } from "@/stores/useChatShellStore";
+import { useUploadStore } from "@/stores/useUploadStore";
+import {
+  clearAllChatDrafts,
+  invalidatePendingDraftWrites,
+} from "@/lib/chatDrafts";
 import { resetCitationReport } from "@/lib/api/onboarding";
 import { AuthTransportTimeoutError, type AuthOwner, captureAuthOwner, captureAuthPrincipalGeneration, enqueueAuthTransport, isCurrentAuthOwner, publishAuthPrincipal, reserveReplacementAuthOwner, StaleAuthOwnerError, subscribeAuthPrincipal } from "@/lib/api/auth-lifecycle";
 import { onJwtAccessTokenPublished } from "@/lib/api/core";
@@ -191,6 +198,37 @@ async function initializeVaultsForScope(scope: InitScope): Promise<void> {
 }
 
 // Reset init guard state (exported for testing)
+/**
+ * Issue #823: no per-user chat state may survive an identity boundary.
+ * ChatShell's session-load fast path renders whatever `activeChatId` holds
+ * without a server re-fetch, so a different user logging in within the same
+ * tab could otherwise see the previous user's transcript; the composer's
+ * unsent input, its persisted localStorage drafts, the shell's session
+ * title/evidence selection, and the upload store's attachment registrations
+ * and in-flight transfers are the same content class. Called ONLY at real
+ * credential boundaries: `logout` (after the auth resets) and a
+ * different-principal `login` at its credential-publication instant.
+ */
+const resetChatStateForIdentitySwitch = () => {
+  // Kill delayed writers FIRST so they cannot re-create cleared state:
+  // pending draft debounce timers / unmount flushes, and async upload
+  // completions / queue continuations of the outgoing identity.
+  invalidatePendingDraftWrites();
+  useChatStore.getState().newChat();
+  useChatStore.getState().setInput("");
+  useChatStore.getState().setInputError(null);
+  clearAllChatDrafts();
+  const shell = useChatShellStore.getState();
+  shell.setActiveSessionId(null);
+  shell.setActiveSessionTitle(null);
+  shell.resetEvidenceSelection();
+  // Review round 1 (implementation review): the rail's search box holds
+  // user-typed text and the pin list is user-scoped persisted metadata —
+  // the same content class as the fields above.
+  shell.clearIdentityScopedState();
+  useUploadStore.getState().resetForIdentitySwitch();
+};
+
 export const resetInitState = () => {
   initAttemptedScope = null;
   initPromiseScope = null;
@@ -386,6 +424,12 @@ export const useAuthStore = create<AuthState>()(
 
       login: async (username: string, password: string) => {
         const owner = reserveReplacementAuthOwner();
+        // Issue #823: the identity this tab's chat surface currently belongs
+        // to. A login that publishes a DIFFERENT principal (including a
+        // user-less response while another user was signed in — the eventual
+        // principal is unknown until fetchMe) must reset the chat surface at
+        // the publication instant, before the new credentials can be used.
+        const prevUserId = get().user?.id ?? null;
         if (isCurrentAuthOwner(owner)) resetInitState();
         if (isCurrentAuthOwner(owner)) set({ isLoading: true, initializationFailed: false });
         if (!isCurrentAuthOwner(owner)) return;
@@ -403,6 +447,17 @@ export const useAuthStore = create<AuthState>()(
           setJwtAccessToken(access_token);
           if (!isCurrentAuthOwner(owner)) return;
           set({ accessToken: access_token, user: user || null, isAuthenticated: true, authMode: "jwt" });
+          // Issue #823 identity boundary: the instant new credentials are
+          // published, the chat surface either provably still belongs to the
+          // same principal (response user id equals the entry-captured id ->
+          // no reset; a failed login never reaches here at all) or it must be
+          // reset synchronously — a user-less response cannot prove sameness
+          // and is treated as a boundary so the fetchMe await below can never
+          // leave the previous user's writers or queued uploads live under
+          // the new token.
+          if ((user?.id ?? null) !== prevUserId) {
+            resetChatStateForIdentitySwitch();
+          }
           resetSubpathRefreshDiagnostic();
           if (!user) await get().fetchMe();
           if (!isCurrentAuthOwner(owner)) return;
@@ -546,6 +601,9 @@ export const useAuthStore = create<AuthState>()(
           resetSubpathRefreshDiagnostic();
           resetCitationReport();
           resetInitState();
+          // Issue #823: this tab's chat surface belongs to the identity that
+          // just ended — clear it before any other user can log in here.
+          resetChatStateForIdentitySwitch();
           if (timeoutFailure) throw timeoutFailure;
           // Preserve the longstanding best-effort server logout for ordinary
           // request failures while keeping lifecycle cancellation rejecting.

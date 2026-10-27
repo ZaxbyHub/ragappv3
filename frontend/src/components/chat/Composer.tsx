@@ -46,6 +46,7 @@ import { computeEffectiveChatMode } from "@/lib/chatMode";
 import { MAX_INPUT_LENGTH } from "@/hooks/useSendMessage";
 import { useEscapeToStop } from "@/hooks/useEscapeToStop";
 import { toast } from "sonner";
+import { currentDraftGeneration, getDraftKey } from "@/lib/chatDrafts";
 
 // =============================================================================
 // Types
@@ -119,8 +120,8 @@ const SLASH_COMMANDS: SlashCommand[] = [
   { id: "actions",   label: "/actions",   description: "List action items",        icon: <ListChecks className="h-4 w-4" /> },
 ];
 
-const DRAFT_PREFIX = "ragapp_chat_draft_";
-const getDraftKey = (sessionId: string | null) => `${DRAFT_PREFIX}${sessionId ?? "new"}`;
+// Draft key scheme + identity-boundary invalidation live in
+// @/lib/chatDrafts (issue #823: the auth identity-switch reset shares them).
 
 // Draft persistence bounds (issue #616): a leading+trailing debounce keeps
 // rapid input bursts from rewriting the FULL draft string to localStorage
@@ -297,7 +298,11 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
   // key is captured when the write is scheduled, so a session switch
   // mid-debounce can never bleed a draft across sessions.
   const draftTimerRef = useRef<number | null>(null);
-  const pendingDraftRef = useRef<{ key: string; value: string } | null>(null);
+  const pendingDraftRef = useRef<{
+    key: string;
+    value: string;
+    gen: number;
+  } | null>(null);
   const lastWrittenRef = useRef<{ key: string; value: string } | null>(null);
 
   const writeDraftNow = useCallback((key: string, value: string) => {
@@ -314,6 +319,11 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
     }
     const pending = pendingDraftRef.current;
     pendingDraftRef.current = null;
+    // Issue #823: an identity switch (logout / different-principal login)
+    // both cleared every stored draft and bumped the generation this write
+    // was scheduled under. Executing it would resurrect the previous user's
+    // unsent text; drop it instead.
+    if (pending && pending.gen !== currentDraftGeneration()) return;
     const last = lastWrittenRef.current;
     if (pending && (last?.key !== pending.key || last?.value !== pending.value)) {
       writeDraftNow(pending.key, pending.value);
@@ -331,7 +341,7 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
     if (draftTimerRef.current !== null && pendingDraftRef.current?.key !== key) {
       flushPendingDraft();
     }
-    pendingDraftRef.current = { key, value };
+    pendingDraftRef.current = { key, value, gen: currentDraftGeneration() };
     if (draftTimerRef.current !== null) return;
     // Leading edge: write immediately, then hold the trailing window open
     // for the burst that often follows (paste, IME, fast typing).
