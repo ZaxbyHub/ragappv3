@@ -3,20 +3,28 @@
  * issue #823 so the identity-switch reset and the composer share one source
  * of truth for the storage keys).
  *
- * Drafts are unsent, potentially private text keyed per chat session (or
- * "new"). They must never survive an identity boundary: `logout` and a
- * different-principal `login` clear every stored draft AND invalidate every
- * in-flight writer through the generation counter, so a pending debounce
- * timer or an unmount flush scheduled before the switch can never re-create
- * a cleared key afterwards (issue #823, plan-critic round 3).
+ * Drafts are unsent, potentially private text keyed per PRINCIPAL and chat
+ * session (or "new"). They must never survive an identity boundary: `logout`
+ * and a different-principal `login`/`register` clear every stored draft AND
+ * invalidate every in-flight writer through the generation counter, so a
+ * pending debounce timer or an unmount flush scheduled before the switch can
+ * never re-create a cleared key afterwards (issue #823, plan-critic round 3).
+ *
+ * The principal segment is load-bearing, not cosmetic: a best-effort
+ * `removeItem` can fail (storage surface), and a key that survives removal
+ * must still be unreadable by the NEXT principal — the hermes review at the
+ * final head rated that cross-principal draft exposure HIGH. Keying by
+ * principal makes the namespace itself the boundary.
  */
 
 export const DRAFT_PREFIX = "ragapp_chat_draft_";
 
 let draftGeneration = 0;
 
-export const getDraftKey = (sessionId: string | null) =>
-  `${DRAFT_PREFIX}${sessionId ?? "new"}`;
+export const getDraftKey = (
+  sessionId: string | null,
+  principalId: number | string | null,
+) => `${DRAFT_PREFIX}${principalId ?? "anon"}:${sessionId ?? "new"}`;
 
 /** Generation captured when a (possibly delayed) draft write is scheduled. */
 export const currentDraftGeneration = (): number => draftGeneration;
@@ -31,15 +39,18 @@ export const invalidatePendingDraftWrites = (): void => {
 };
 
 /**
- * Remove every persisted chat draft (all sessions + the "new" key).
+ * Remove every persisted chat draft (all principals, all sessions + the
+ * "new" key). Each removal is attempted independently: one throwing
+ * `removeItem` (a storage-surface failure) must not abort the remaining keys
+ * (review PRR-008).
  *
- * Each removal is attempted independently: one throwing `removeItem` (a
- * storage-surface failure) must not abort the remaining keys and leave the
- * previous identity's draft text behind while the caller proceeds as if the
- * wipe succeeded (review PRR-008).
+ * Returns the number of keys that could NOT be removed, so the caller can
+ * record the residual instead of proceeding as though the wipe succeeded
+ * (hermes review, final head). Those keys stay unreadable to the next
+ * principal because the key namespace is principal-scoped.
  */
-export const clearAllChatDrafts = (): void => {
-  if (typeof window === "undefined") return;
+export const clearAllChatDrafts = (): number => {
+  if (typeof window === "undefined") return 0;
   const doomed: string[] = [];
   try {
     for (let i = 0; i < localStorage.length; i += 1) {
@@ -48,13 +59,16 @@ export const clearAllChatDrafts = (): void => {
     }
   } catch {
     /* storage unavailable — nothing to enumerate */
-    return;
+    return 0;
   }
+  let failed = 0;
   for (const key of doomed) {
     try {
       localStorage.removeItem(key);
     } catch {
       /* this key could not be removed; keep clearing the rest */
+      failed += 1;
     }
   }
+  return failed;
 };

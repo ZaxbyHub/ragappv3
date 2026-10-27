@@ -501,7 +501,12 @@ export function useSendMessage(
                 migrateId(assistantMessageId, assistantSaveResult);
               }
             })
-            .catch(() => undefined);
+            .catch((err) => {
+              // The keepalive save already succeeded server-side; a failure
+              // here is only the local mirror. Log it rather than swallowing
+              // it silently (out-of-band review M-19).
+              console.error("Failed to mirror the keepalive save into the store:", err);
+            });
           const { setPendingTurnPersist, registerPendingTurnPersist } = useChatStore.getState();
           setPendingTurnPersist(tracked);
           registerPendingTurnPersist?.(tracked);

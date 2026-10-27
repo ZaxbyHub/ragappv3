@@ -1,4 +1,12 @@
 // Issue #815 retry-boundary pin (unfrozen, plan-critic rounds 1-2):
+// NOTE (out-of-band review C-04/M-26): this suite drives the REAL
+// TranscriptPane Retry path and the REAL truncate-request builder, but the
+// keepalive migration itself is simulated at the store level
+// (replaceMessageId with the server ids/seqs) because the pagehide +
+// deferred-response interleaving cannot be produced in jsdom. The
+// end-to-end keepalive migration is pinned by
+// useSendMessage.issue815.test.ts; this file pins what the Retry path does
+// with rows that HAVE been migrated.
 // the REAL truncate inputs must cover the keepalive turn's server seqs.
 //
 // Scenario (#815's interleaving): turn 1 was persisted through the keepalive

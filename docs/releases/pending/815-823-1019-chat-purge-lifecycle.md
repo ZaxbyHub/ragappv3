@@ -33,13 +33,23 @@ snapshots (`newChat`), the composer's unsent input, every persisted
 `ragapp_chat_draft_*` localStorage key (with the pending debounce timer and
 the unmount flush generation-gated so they cannot re-create a cleared key),
 the shell's session id/title, evidence selection, search query and pinned
-sessions, and the upload store's chat attachments, upload rows, and vault
-pointer (in-flight transfer completions and queue continuations of the
+sessions (pins are now wiped on every identity switch — a behavior change
+from the session-scoped pin list), the `chat_feedback_*` vote mirror, and
+the upload store's chat attachments, upload rows, and vault pointer
+(in-flight transfer completions and queue continuations of the
 previous identity are suppressed; already-dispatched requests keep the token
 they were sent with and cannot touch the new user's data). A failed login
 never crosses the boundary; a same-principal re-login (with the user in the
 response) leaves the surface untouched; a user-less login response is
 unconditionally treated as a boundary.
+
+Composer drafts are keyed per principal (`ragapp_chat_draft_<userId>:<session|new>`),
+so a key the storage surface refuses to delete cannot be read by the next
+principal; the number of failed removals is logged rather than swallowed.
+Drafts written by earlier versions (without the principal segment) are simply
+never read again. Identity-scoped surfaces outside this change's scope — the
+global react-query cache, canvas drafts, the Draft Room UI store — are tracked
+as follow-ups.
 
 ## #1019 — delete_user can no longer strand purged Draft Room bytes
 

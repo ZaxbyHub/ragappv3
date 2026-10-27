@@ -110,6 +110,7 @@ import { useUploadStore } from "@/stores/useUploadStore";
 import { DRAFT_PREFIX } from "@/lib/chatDrafts";
 import { AuthTransportTimeoutError } from "@/lib/api/auth-lifecycle";
 import { toast } from "sonner";
+import { writeFeedbackVote } from "@/lib/chatFeedbackStorage";
 
 const USER_A = { id: 11, username: "usera", full_name: "User A", role: "admin" as const, is_active: true };
 const USER_B = { id: 22, username: "userb", full_name: "User B", role: "admin" as const, is_active: true };
@@ -147,7 +148,8 @@ function seedUserAChatState(store: Map<string, string>) {
   useChatShellStore.getState().setActiveSessionTitle("A's private session");
   useChatShellStore.getState().setSessionSearchQuery("A's private search");
   useChatShellStore.setState({ pinnedSessionIds: [7] });
-  store.set(`${DRAFT_PREFIX}7`, "user A's persisted draft");
+  writeFeedbackVote("500", "up");
+  store.set(`${DRAFT_PREFIX}11:7`, "user A's persisted draft");
   store.set(`${DRAFT_PREFIX}new`, "user A's new-chat draft");
   useUploadStore.setState({
     uploads: [
@@ -244,6 +246,9 @@ describe("useAuthStore identity-boundary reset (issue #823 hardening)", () => {
     expect(useUploadStore.getState().uploads).toEqual([]);
     expect(useUploadStore.getState().chatAttachmentIds).toEqual([]);
     expect(useUploadStore.getState().activeVaultId).toBeNull();
+    // Issue #823 / out-of-band review R3: feedback votes are keyed by server
+    // message id, so they are per-principal state exactly like the transcript.
+    expect(localStorage.getItem("chat_feedback_500")).toBeNull();
   });
 
   it("user-less login response is treated as a boundary at publication", async () => {

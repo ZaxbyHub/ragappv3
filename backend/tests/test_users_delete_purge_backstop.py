@@ -125,6 +125,13 @@ class _PoolFacade:
     a connection holding an open transaction is rolled back first — at base
     this release-time rollback is exactly what keeps the surviving rows
     intact when the escaping CancelledError skipped every handler.
+
+    Note: the CancelledError is raised on the WORKER side (inside the
+    connection wrapper, after the user DELETE executes inside the open
+    transaction) — it models the exception CLASS escaping the delete window,
+    not a cancellation delivered at the route's await. The await-cancellation
+    interleavings are covered by
+    tests/test_users_delete_purge_recovery_outcomes.py.
     """
 
     def __init__(self, real_pool: SQLiteConnectionPool, conn: _CancelAfterUserDeleteConn):

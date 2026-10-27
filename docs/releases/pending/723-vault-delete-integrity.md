@@ -62,9 +62,7 @@ Issue: #723 ([Workstream D] PR 5 of 8 — audit findings T1-21-S-03, T1-21-S-07,
   single compile; a compile already past its entry check when the vault
   delete commits can still land rows for the dead vault until the next
   delete or manual cleanup (irreducible without write-path fencing).
-- `users.py::delete_user` mirrors the old two-handler restore shape; it is
-  out of this issue's scope and disclosed for a maintainer decision (see the
-  PR body).
+- `users.py::delete_user` kept the old two-handler restore shape when this shipped; it gained the same recovery contract in #1019 / PR #1030 (see `815-823-1019-chat-purge-lifecycle.md`).
 
 ## Verification
 

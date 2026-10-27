@@ -21,6 +21,7 @@ import {
   clearAllChatDrafts,
   invalidatePendingDraftWrites,
 } from "@/lib/chatDrafts";
+import { clearAllFeedbackVotes } from "@/lib/chatFeedbackStorage";
 import { resetCitationReport } from "@/lib/api/onboarding";
 import { AuthTransportTimeoutError, type AuthOwner, captureAuthOwner, captureAuthPrincipalGeneration, enqueueAuthTransport, isCurrentAuthOwner, publishAuthPrincipal, reserveReplacementAuthOwner, StaleAuthOwnerError, subscribeAuthPrincipal } from "@/lib/api/auth-lifecycle";
 import { onJwtAccessTokenPublished } from "@/lib/api/core";
@@ -197,16 +198,26 @@ async function initializeVaultsForScope(scope: InitScope): Promise<void> {
   await useVaultStore.getState().fetchVaults();
 }
 
-// Reset init guard state (exported for testing)
+/**
+ * Reset init guard state (exported for testing).
+ */
+export const resetInitState = () => {
+  initAttemptedScope = null;
+  initPromiseScope = null;
+  initPromise = null;
+  vaultsInitializedScope = null;
+};
+
 /**
  * Issue #823: no per-user chat state may survive an identity boundary.
  * ChatShell's session-load fast path renders whatever `activeChatId` holds
  * without a server re-fetch, so a different user logging in within the same
  * tab could otherwise see the previous user's transcript; the composer's
  * unsent input, its persisted localStorage drafts, the shell's session
- * title/evidence selection, and the upload store's attachment registrations
- * and in-flight transfers are the same content class. Called ONLY at real
- * credential boundaries: `logout` (after the auth resets) and a
+ * title/evidence/search/pins, the feedback-vote mirror, and the upload
+ * store's attachment registrations and in-flight transfers are the same
+ * content class. Called ONLY at real credential boundaries: `logout` (after
+ * the auth resets), a different-principal `register`, and a
  * different-principal `login` at its credential-publication instant.
  */
 const resetChatStateForIdentitySwitch = () => {
@@ -217,7 +228,24 @@ const resetChatStateForIdentitySwitch = () => {
   useChatStore.getState().newChat();
   useChatStore.getState().setInput("");
   useChatStore.getState().setInputError(null);
-  clearAllChatDrafts();
+  // Best-effort wipes can partially fail on a degraded storage surface; the
+  // principal-scoped key namespaces keep the residue unreadable to the next
+  // principal, and the counts are logged so the residual is observable
+  // rather than silent (hermes review, final head).
+  const draftRemovalFailures = clearAllChatDrafts();
+  if (draftRemovalFailures > 0) {
+    console.warn(
+      "identity_switch_draft_wipe_incomplete failed_keys=%d",
+      draftRemovalFailures
+    );
+  }
+  const feedbackRemovalFailures = clearAllFeedbackVotes();
+  if (feedbackRemovalFailures > 0) {
+    console.warn(
+      "identity_switch_feedback_wipe_incomplete failed_keys=%d",
+      feedbackRemovalFailures
+    );
+  }
   const shell = useChatShellStore.getState();
   shell.setActiveSessionId(null);
   shell.setActiveSessionTitle(null);
@@ -229,12 +257,6 @@ const resetChatStateForIdentitySwitch = () => {
   useUploadStore.getState().resetForIdentitySwitch();
 };
 
-export const resetInitState = () => {
-  initAttemptedScope = null;
-  initPromiseScope = null;
-  initPromise = null;
-  vaultsInitializedScope = null;
-};
 
 // Wire up CSRF via centralized api.ts utilities
 attachCsrfInterceptor(authClient);

@@ -58,18 +58,18 @@ describe("addChatMessagesBatchKeepalive failure contract (issue #815)", () => {
     vi.unstubAllGlobals();
   });
 
-  it("resolves null on a non-2xx response (no retry, no throw)", async () => {
+  it("resolves undefined on a non-2xx response (no retry, no throw)", async () => {
     fetchMock.mockResolvedValueOnce({ ok: false, status: 503 });
     await expect(addChatMessagesBatchKeepalive(42, wrapperMessages)).resolves.toBeUndefined();
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("resolves null when the body is not valid JSON", async () => {
+  it("resolves undefined when the body is not valid JSON", async () => {
     fetchMock.mockResolvedValueOnce({ ok: true, json: async () => Promise.reject(new Error("bad body")) });
     await expect(addChatMessagesBatchKeepalive(42, wrapperMessages)).resolves.toBeUndefined();
   });
 
-  it("resolves null on a 2xx response whose envelope has no messages array", async () => {
+  it("resolves undefined on a 2xx response whose envelope has no messages array", async () => {
     fetchMock.mockResolvedValueOnce({ ok: true, json: async () => ({ unexpected: true }) });
     await expect(addChatMessagesBatchKeepalive(42, wrapperMessages)).resolves.toBeUndefined();
   });
@@ -81,7 +81,7 @@ describe("addChatMessagesBatchKeepalive failure contract (issue #815)", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("resolves null when fetch itself rejects (transport death)", async () => {
+  it("resolves undefined when fetch itself rejects (transport death)", async () => {
     fetchMock.mockRejectedValueOnce(new TypeError("network down"));
     await expect(addChatMessagesBatchKeepalive(42, wrapperMessages)).resolves.toBeUndefined();
   });
