@@ -86,9 +86,10 @@ class _ScriptedConn:
     Hooks (all optional):
     - raise_after_user_delete: exception raised right after the user DELETE
       executes inside the open transaction (worker-side failure).
-    - block_after_user_delete: (blocked_flag, release_gate) — after the
-      DELETE the WORKER THREAD parks on ``release_gate`` (models a worker
-      mid-transaction while the route await is cancelled).
+    - block_after_user_delete: release_gate — after the DELETE the WORKER
+      THREAD parks on ``release_gate`` (models a worker mid-transaction while
+      the route await is cancelled). The test owns the gate, so it decides
+      exactly when the worker's terminal outcome becomes observable.
     - fail_rollback: ``rollback()`` raises (backstop cleanup-failure probe;
       only reachable for worker BaseExceptions that skip
       transaction_context's own rollback).
@@ -101,23 +102,25 @@ class _ScriptedConn:
         self,
         inner: sqlite3.Connection,
         raise_after_user_delete: BaseException | None = None,
-        block_after_user_delete: tuple[threading.Event, threading.Event] | None = None,
+        block_after_user_delete: threading.Event | None = None,
         fail_rollback: bool = False,
     ) -> None:
         self._inner = inner
         self._raise_after = raise_after_user_delete
-        self._block_pair = block_after_user_delete
+        self._block_release = block_after_user_delete
         self._fail_rollback = fail_rollback
         self.after_delete_ran = threading.Event()
         self.hook_done = threading.Event()
+        # True when the block gate (not its 10s fallback) let the worker go.
+        self.block_released_by_gate: bool | None = None
 
     def execute(self, sql, params=()):  # noqa: ANN001
         result = self._inner.execute(sql, params)
         if sql.strip().upper().startswith("DELETE FROM USERS"):
             self.after_delete_ran.set()
             try:
-                if self._block_pair is not None:
-                    self._block_pair[1].wait(timeout=10)
+                if self._block_release is not None:
+                    self.block_released_by_gate = self._block_release.wait(timeout=10)
                 if self._raise_after is not None:
                     raise self._raise_after
             finally:
@@ -307,11 +310,10 @@ def test_cancel_at_await_waits_for_worker_then_restores(tmp_path: Path) -> None:
     """Release ordering + composite interleaving: cancel, worker unblocks to
     raise inside the still-open transaction (BaseException -> no
     transaction_context rollback), backstop rolls back and restores."""
-    blocked = threading.Event()
     release = threading.Event()
     env = _OutcomesEnv(
         tmp_path,
-        block_after_user_delete=(blocked, release),
+        block_after_user_delete=release,
         raise_after_user_delete=asyncio.CancelledError(),
     )
     try:
@@ -349,9 +351,8 @@ def test_cancel_at_await_waits_for_worker_then_restores(tmp_path: Path) -> None:
 
 def test_cancel_at_await_worker_commits_keeps_tombstones(tmp_path: Path) -> None:
     """Interleaving (d): commit after cancellation keeps tombstones discarded."""
-    blocked = threading.Event()
     release = threading.Event()
-    env = _OutcomesEnv(tmp_path, block_after_user_delete=(blocked, release))
+    env = _OutcomesEnv(tmp_path, block_after_user_delete=release)
     try:
 
         async def drive() -> None:
@@ -473,10 +474,10 @@ def test_second_cancel_during_settle_wait_is_disclosed_and_contained(tmp_path: P
     on — the worker still reaches its terminal outcome, the connection is
     released exactly once, and the route's own finally completes (no leak of
     the executor handle)."""
-    blocked = threading.Event()
     release = threading.Event()
-    env = _OutcomesEnv(tmp_path, block_after_user_delete=(blocked, release))
+    env = _OutcomesEnv(tmp_path, block_after_user_delete=release)
     release_calls: list[bool] = []
+    hook_done_at_second_cancel: list[bool] = []
     orig_release = env.facade.release_connection
 
     def _release_probe(c) -> None:  # noqa: ANN001
@@ -496,15 +497,37 @@ def test_second_cancel_during_settle_wait_is_disclosed_and_contained(tmp_path: P
             task.cancel()  # first cancellation
             await asyncio.sleep(0.05)
             task.cancel()  # second: aborts the wait (the disclosed residual)
+            # Sample BEFORE the worker is released: the containment assertions
+            # below are only meaningful if the route was abandoned while the
+            # worker was still parked in its hook. A worker that had already
+            # finished would make them vacuously true.
+            hook_done_at_second_cancel.append(env.conn.hook_done.is_set())
             with pytest.raises(asyncio.CancelledError):
                 await task
+            # The route has unwound. Release the worker here — not in this
+            # test's finally — so its terminal outcome is observed promptly
+            # instead of waiting out the scripted hook's 10s fallback.
+            release.set()
 
         asyncio.run(drive())
-        # The worker always reaches its terminal outcome; the pool release is
-        # bounded to one call and happens after the worker's hook completed
-        # (the settle-wait is what orders them on the first-cancel path).
-        assert env.conn.hook_done.is_set(), "the detached worker finished its item"
+        assert hook_done_at_second_cancel == [False], (
+            "the second cancellation must land while the worker is still "
+            "parked, otherwise the containment assertions below are vacuous"
+        )
+        assert env.conn.block_released_by_gate is True, (
+            "the worker was released by the gate this test owns, not by the "
+            "scripted hook's 10s fallback — a timeout-released worker is what "
+            "made the pre-fix ordering pass"
+        )
+        # The worker always reaches its terminal outcome even though the
+        # route abandoned it, and the connection is still released exactly
+        # once — the containment the disclosed residual rests on.
+        assert env.conn.hook_done.wait(timeout=5), "the detached worker finished its item"
         assert len(release_calls) == 1, "connection released exactly once"
+        assert release_calls == [False], (
+            "the disclosed residual: the route released the connection while "
+            "the worker was still parked, and the worker settled anyway"
+        )
     finally:
         release.set()
         env.close()

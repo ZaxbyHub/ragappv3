@@ -286,11 +286,13 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
   const lastLoadedRef = useRef<string | null>(null);
   useEffect(() => {
     if (typeof window === "undefined") return;
-    const key = activeChatId ?? "new";
+    // The dedup key IS the storage key: a principal switch on the same
+    // session id must re-restore from the new principal's key (issue #823).
+    const key = getDraftKey(activeChatId, draftPrincipalId);
     if (lastLoadedRef.current === key) return;
     lastLoadedRef.current = key;
     try {
-      setInput(localStorage.getItem(getDraftKey(activeChatId, draftPrincipalId)) ?? "");
+      setInput(localStorage.getItem(key) ?? "");
     } catch { /* private mode */ }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeChatId, draftPrincipalId]);

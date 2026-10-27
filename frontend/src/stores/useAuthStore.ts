@@ -257,7 +257,6 @@ const resetChatStateForIdentitySwitch = () => {
   useUploadStore.getState().resetForIdentitySwitch();
 };
 
-
 // Wire up CSRF via centralized api.ts utilities
 attachCsrfInterceptor(authClient);
 
