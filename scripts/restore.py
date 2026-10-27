@@ -26,6 +26,7 @@ all-or-nothing and WAL drill is backend/tests/test_e02_*.
 
 import argparse
 import gc
+import glob
 import hashlib
 import json
 import logging
@@ -170,7 +171,8 @@ class _RestoreLock:
 
 
 def _find_leftover_journal(dest_root: Path) -> Optional[Path]:
-    for path in sorted(dest_root.parent.glob(f"{dest_root.name}.restore-journal-*.json")):
+    pattern = f"{glob.escape(dest_root.name)}.restore-journal-*.json"
+    for path in sorted(dest_root.parent.glob(pattern)):
         return path
     return None
 
@@ -235,6 +237,7 @@ def _probe_destination_db_held(dest_db: Path) -> None:
         keep = keep_dir / f"{path.name}.probe-keep-{token}"
         try:
             shutil.copy2(path, keep, follow_symlinks=False)
+            os.chmod(keep, 0o600)
         except OSError:
             # Locked by a live writer (e.g. -shm under an active hold) or
             # unreadable: nothing to preserve — see docstring.
@@ -288,11 +291,23 @@ def _probe_destination_db_held(dest_db: Path) -> None:
         finally:
             conn.close()
     finally:
+        # Classify BEFORE restoring: a sidecar that vanished during the
+        # probe is proof our close checkpointed the WAL away (we were
+        # the last connection). A file that still exists but differs
+        # from the snapshot was mutated by a concurrent writer -
+        # restoring the snapshot would erase their committed frames
+        # (review round 3, CS-1), so the snapshot is discarded and the
+        # writer's bytes stand. The C15 true-crash fixture (no holder:
+        # our close deletes the sidecars) and the C18/e03b holders
+        # (uncommitted txn: bytes unchanged) are unaffected.
+        sidecar_vanished = any(
+            not original.exists()
+            for keep, original in saved
+            if original.name != dest_db.name
+        )
         for keep, original in saved:
             try:
                 if not original.exists():
-                    # The probe's close deleted the file (checkpointed WAL
-                    # sidecar): restore the exact pre-probe bytes.
                     os.replace(keep, original)
                     continue
                 same = original.stat().st_size == keep.stat().st_size and (
@@ -300,11 +315,17 @@ def _probe_destination_db_held(dest_db: Path) -> None:
                 )
                 if same:
                     keep.unlink()
-                else:
-                    # The probe's close CHECKPOINTED the WAL into the main
-                    # file: restore the pre-probe bytes so the destination
-                    # stays byte-identical.
+                elif original.name == dest_db.name and sidecar_vanished:
                     os.replace(keep, original)
+                else:
+                    keep.unlink()
+                    logger.warning(
+                        "the destination file %s changed during the "
+                        "held-database probe (a concurrent writer "
+                        "committed); keeping the writer's bytes instead "
+                        "of the probe's snapshot",
+                        original,
+                    )
             except OSError:
                 logger.warning(
                     "could not restore the destination file %s after the "
@@ -319,12 +340,28 @@ def _probe_destination_db_held(dest_db: Path) -> None:
                     pass
 
 
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    """Write JSON crash-safe: temp file + os.replace, so a crash or
+    disk-full mid-write can never leave a truncated journal (the journal
+    is the only record of the aside/staging paths recovery needs)."""
+    tmp = path.with_name(path.name + f".tmp-{secrets.token_hex(4)}")
+    try:
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def _write_journal(dest_root: Path, payload: dict) -> Path:
     journal = dest_root.parent / (
         f"{dest_root.name}.restore-journal-{secrets.token_hex(4)}.json"
     )
     try:
-        journal.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        _atomic_write_json(journal, payload)
     except OSError as exc:
         raise RestoreError(
             f"could not write the restore crash journal {journal}: {exc}"
@@ -333,10 +370,16 @@ def _write_journal(dest_root: Path, payload: dict) -> Path:
 
 
 def _update_journal_phase(journal: Path, phase: str) -> None:
-    payload = json.loads(journal.read_text(encoding="utf-8"))
+    try:
+        payload = json.loads(journal.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        raise RestoreError(
+            f"the restore crash journal {journal} is unreadable ({exc}); "
+            "complete the recovery manually per docs/operations.md"
+        ) from exc
     payload["phase"] = phase
     try:
-        journal.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        _atomic_write_json(journal, payload)
     except OSError as exc:
         raise RestoreError(
             f"could not update the restore crash journal {journal}: {exc}"
@@ -346,6 +389,29 @@ def _update_journal_phase(journal: Path, phase: str) -> None:
 # ---------------------------------------------------------------------------
 # Managed-path semantics for unmanaged-content preservation
 # ---------------------------------------------------------------------------
+
+
+def _refuse_junctions_in_tree(root: Path) -> None:
+    """Refuse junction/reparse-point directories at ANY depth of a tree
+    BEFORE it is copied (shutil.copytree recurses into junctions on
+    Windows — is_symlink() is False for MOUNT_POINT reparse points)."""
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        for entry in os.scandir(current):
+            if entry.is_symlink():
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                try:
+                    os.readlink(entry.path)
+                except OSError:
+                    stack.append(entry.path)
+                    continue
+                raise RestoreError(
+                    f"backup-set entry {entry.path} is a junction/reparse "
+                    "point; restore refuses to traverse or silently "
+                    "dereference it — rebuild the set without the link"
+                )
 
 
 def _managed_roots(manifest: dict) -> List[str]:
@@ -562,7 +628,6 @@ def restore_backup_set(
             f"{dest_root}; restore from a set stored outside the "
             "destination"
         )
-    _refuse_on_leftover_journal(dest_root)
     # The lock/journal/staging siblings live in dest_root.parent — create
     # it BEFORE acquiring the lock so a fresh nested destination (one whose
     # parent does not exist yet, the base-restore behavior) works instead
@@ -572,6 +637,10 @@ def restore_backup_set(
     lock.acquire()
     journal: Optional[Path] = None
     try:
+        # Journal check AFTER the lock: a concurrent live restore holds the
+        # lock, so this restore fails with "another restore in progress"
+        # instead of misreading the live restore's journal as a crashed one.
+        _refuse_on_leftover_journal(dest_root)
         _probe_destination_db_held(dest_root / "app.db")
 
         provider = key_provider or _default_key_provider
@@ -617,6 +686,7 @@ def restore_backup_set(
 
         try:
             staging.mkdir(parents=True)
+            os.chmod(staging, 0o700)
             for item in manifest.get("items", []):
                 kind = item.get("kind")
                 name = item.get("name", "?")
@@ -636,6 +706,27 @@ def restore_backup_set(
                 if not _contained(dest_root, dest_root / item_path):
                     raise RestoreError(
                         f"manifest path escapes the destination root: {item_path!r}"
+                    )
+                if "\\" in item_path:
+                    # Containment passed, so on this filesystem the path
+                    # is inside both roots — but the managed-roots model
+                    # normalizes backslashes to separators while the write
+                    # side uses the raw string. On POSIX that divergence
+                    # lets a crafted set mark live content covered
+                    # (skipped) while staging a different literal name;
+                    # refuse rather than diverge. (The #518 absolute/
+                    # escape pins above fire first for paths that leave
+                    # either root.)
+                    raise RestoreError(
+                        f"manifest item {name!r} path contains a backslash:"
+                        f" {item_path!r}"
+                    )
+                if kind != "sqlite" and Path(item_path).as_posix() in (
+                    SQLITE_SIDECARS + ("app.db",)
+                ):
+                    raise RestoreError(
+                        f"manifest tree item {name!r} reserves the "
+                        f"destination name {item_path!r}"
                     )
 
                 if kind == "sqlite":
@@ -683,7 +774,22 @@ def restore_backup_set(
                         # which restores as an empty directory (#727,
                         # T1-28-K-02).
                         if item.get("empty") is True:
-                            (staging / Path(item_path)).mkdir(parents=True, exist_ok=True)
+                            root = staging / Path(item_path)
+                            root.mkdir(parents=True, exist_ok=True)
+                            # The producer records the tree's directory
+                            # skeleton for fileless trees; recreate it so a
+                            # vault like uploads/empty/ round-trips.
+                            for rel_dir in item.get("dirs") or []:
+                                if not _contained(
+                                    src_dir, src_dir / rel_dir
+                                ):
+                                    raise RestoreError(
+                                        f"manifest directory escapes the "
+                                        f"artifact tree: {rel_dir!r}"
+                                    )
+                                (staging / Path(item_path) / Path(rel_dir)).mkdir(
+                                    parents=True, exist_ok=True
+                                )
                             items_out.append({"name": name, "ok": ok})
                             continue
                         raise RestoreError(
@@ -706,7 +812,8 @@ def restore_backup_set(
                             )
                     staged_dir = staging / Path(item_path)
                     staged_dir.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copytree(src_dir, staged_dir)
+                    _refuse_junctions_in_tree(src_dir)
+                    shutil.copytree(src_dir, staged_dir, symlinks=True)
                     _restrict_permissions(staged_dir)
 
                 else:
@@ -718,8 +825,16 @@ def restore_backup_set(
                 raise RestoreError("manifest binds no items")
 
             # Generation binding against the STAGED database, before any
-            # destination mutation.
-            _verify_generation_binding(manifest, staging)
+            # destination mutation. Skipped when the manifest carries no
+            # sqlite item: the binding compares the restored database's
+            # journal against the lancedb generation, and a sqlite-less
+            # set has no database to check (the docstring's sqlite-less
+            # support is real only here).
+            if any(
+                item.get("kind") == "sqlite"
+                for item in manifest.get("items", [])
+            ):
+                _verify_generation_binding(manifest, staging)
 
             # Unmanaged destination content is copied into staging while
             # the destination is still untouched; stale SQLite sidecars
@@ -747,13 +862,49 @@ def restore_backup_set(
         aside_created = False
         try:
             if dest_existed:
-                os.rename(dest_root, aside)
+                try:
+                    os.rename(dest_root, aside)
+                except OSError as exc:
+                    # Typically the app still holds the destination open
+                    # (Windows sharing violation). Typed, with the
+                    # documented precondition named; destination and
+                    # staging are both still intact.
+                    shutil.rmtree(staging, ignore_errors=True)
+                    raise RestoreError(
+                        "could not move the destination aside — the "
+                        "application is still holding it open: stop the "
+                        "application before restoring "
+                        f"({dest_root} -> {aside}: {exc})"
+                    ) from exc
                 aside_created = True
                 # Record the phase AFTER the rename (the disk, not the
                 # flag, is the truth a crash leaves behind) so the
                 # documented `aside-created` recovery steps match what
-                # actually happened (#728 review finding).
-                _update_journal_phase(journal, "aside-created")
+                # actually happened (#728 review finding). Bookkeeping
+                # failure here is ROLLED BACK, not UNCERTAIN: the rename
+                # already succeeded and is trivially reversible, so a
+                # journal-write fault must not strand the destination at
+                # the aside path (the C14 fault matrix counts the
+                # journal's replace step).
+                try:
+                    _update_journal_phase(journal, "aside-created")
+                except BaseException as exc:
+                    try:
+                        os.rename(aside, dest_root)
+                        aside_created = False
+                    except OSError:
+                        pass  # rollback failed -> UNCERTAIN via aside.exists()
+                    if aside_created:
+                        raise
+                    shutil.rmtree(staging, ignore_errors=True)
+                    if journal is not None:
+                        journal.unlink(missing_ok=True)
+                        journal = None
+                    raise RestoreError(
+                        "restore rolled back: the crash journal could not "
+                        f"be updated after moving the destination aside "
+                        f"({exc})"
+                    ) from exc
             try:
                 os.rename(staging, dest_root)
             except BaseException:
@@ -781,11 +932,22 @@ def restore_backup_set(
                     f"Original error: {exc}"
                 ) from exc
             # Destination is back to (or never left) its pre-restore
-            # state: the outcome is confirmed, so the journal goes.
+            # state: the outcome is confirmed. Clear the journal AND the
+            # staged copy (which holds the decrypted database) — a
+            # confirmed-rollback swap failure previously leaked the full
+            # staging tree with no pointer to it — and raise the typed
+            # error (a raw OSError here escaped every RestoreError-
+            # catching caller, swarm review pr1026 WD-03/RB-04).
             if journal is not None:
                 journal.unlink(missing_ok=True)
                 journal = None
-            raise
+            shutil.rmtree(staging, ignore_errors=True)
+            if isinstance(exc, RestoreError):
+                raise
+            raise RestoreError(
+                f"restore failed during the destination swap; the "
+                f"destination is unchanged ({exc})"
+            ) from exc
         try:
             _update_journal_phase(journal, "commit")
 
@@ -867,7 +1029,7 @@ def restore_backup_set(
                 ) from persistence_error
 
             # --- Committed ---
-            journal.unlink()
+            journal.unlink(missing_ok=True)
             journal = None
             if dest_existed:
                 try:
@@ -1010,6 +1172,9 @@ def _cli_lancedb_factory(
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO, format="%(levelname)s %(name)s %(message)s"
+    )
     parser = argparse.ArgumentParser(
         description="Restore and verify a backup set (see scripts/backup_set.py)"
     )

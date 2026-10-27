@@ -222,12 +222,35 @@ def _crash_before_first_rename(out: Path, dest: Path):
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(restore_module, "_write_journal", spy_write_journal)
         mp.setattr(os, "rename", crash_rename)
-        with pytest.raises(OSError):
+        # rename#1 failure is a TYPED RestoreError as of the feedback
+        # round (it names the stop-the-application precondition); the
+        # crash simulation then re-stages the journal + lock a killed
+        # process would have left behind.
+        with pytest.raises((OSError, RestoreError)):
             restore_backup_set(out, dest, key_provider=_key_provider)
 
     journal = captured["journal"]
     payload = captured["payload"]
-    assert Path(payload["staging"]).exists(), "E-03 CRASH HARNESS: staged tree missing after the injected crash"
+    # The in-process fault handler clears the staged tree (a confirmed
+    # rollback: it holds the decrypted database); a KILLED process would
+    # have left it. Re-stage it faithfully from the backup set: the staged
+    # tree at crash time holds the decrypted app.db plus verbatim tree
+    # copies.
+    staging = Path(payload["staging"])
+    staging.mkdir(parents=True)
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    blob = (out / "app.db.enc").read_bytes()
+    plain = AESGCM(TEST_KEY).decrypt(blob[:12], blob[12:], None)
+    (staging / "app.db").write_bytes(plain)
+    for item in json.loads(
+        (out / "backup_manifest.json").read_text(encoding="utf-8")
+    )["items"]:
+        if item.get("kind") == "sqlite":
+            continue
+        rel = Path(item["path"])
+        if (out / rel).exists():
+            shutil.copytree(out / rel, staging / rel)
     # The in-process fault handler deletes the journal (a confirmed rollback
     # for an OS error); a KILLED process would not have run that cleanup.
     journal.write_text(json.dumps(payload, indent=2), encoding="utf-8")

@@ -97,7 +97,8 @@ swaps the destination in one rename. Behavior changes:
   the tagged generation (previously the checkout ran on a discarded handle
   and fresh connections served newer, post-tag data).
 - **Refusals**: restore refuses while another connection holds the
-  destination `app.db` (the documented stop-the-app step is enforced),
+  destination `app.db` in an ACTIVE WRITE TRANSACTION (an idle open
+  connection is not detected — still stop the application first),
   refuses a symlinked destination, refuses a backup set stored inside the
   destination, and refuses while a leftover `<dest>.restore-journal-*.json`
   from an interrupted restore exists (the journal's phase maps to the
@@ -112,12 +113,18 @@ swaps the destination in one rename. Behavior changes:
 - The two-rename swap has a crash window between the renames; it is
   covered by the crash journal + the documented manual recovery (no
   portable filesystem transaction exists). Single-fault failures roll
-  back automatically.
+  back automatically and clear the staged copy.
+- The held-database probe's byte-restore assumes it is the only mutator
+  of the destination: if another process opens the database, commits,
+  and closes entirely within the probe's few-millisecond window, that
+  commit is treated as pre-probe state and restored over. Stop the
+  stack; the window does not exist against a stopped application.
 - A two-fault outcome (the rollback ladder itself fails) retains the
   journal and lock and names every directory in the raised error; it is
   NOT claimed as a clean rollback.
 - Old (pre-fix) restore cannot consume sets the fixed producer writes
   with `"empty": true` items — the old reader rejects any empty files
   map. Rolling this change back therefore requires re-taking backups.
-- Restore now needs roughly 2x the set size plus the unmanaged content's
-  size free on the destination's drive.
+- Restore enforces free space of the set size plus the unmanaged
+  content's size on the destination's drive (the swap itself peaks near
+  twice that once the pre-restore copy is counted).

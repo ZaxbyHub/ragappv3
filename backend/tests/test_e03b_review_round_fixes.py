@@ -226,7 +226,8 @@ def test_corrupt_destination_db_restored_over(tmp_path, monkeypatch):
     (dest / "app.db").write_bytes(b"definitely not a sqlite database" * 8)
 
     report = restore_backup_set(out, dest, key_provider=_key_provider)
-    assert report["verified"] is True
+    assert report["verified"] is True  # failures raise; sqlite_rows pins the restore
+    assert report["sqlite_rows"] > 0
     header = (dest / "app.db").read_bytes()[:16]
     assert header == b"SQLite format 3\x00", (
         "E-03b CORRUPT DEST: the restored destination database is not a "
@@ -500,7 +501,10 @@ def test_sqliteless_manifest_preserves_dest_app_db(tmp_path, monkeypatch):
     pre_hash = _sha256_file(dest / "app.db")
 
     report = restore_backup_set(out, dest, key_provider=_key_provider)
-    assert report["verified"] is True
+    assert report["verified"] is True  # failures raise
+    assert report["sqlite_rows"] == 0, (
+        "a sqlite-less manifest restores no sqlite rows"
+    )
     assert (dest / "app.db").exists(), (
         "E-03b SQLITELESS MANIFEST: dest/app.db was silently dropped"
     )
@@ -520,7 +524,10 @@ def test_restore_into_fresh_nested_destination(tmp_path, monkeypatch):
     dest = tmp_path / "brand-new-parent" / "data"
 
     report = restore_backup_set(out, dest, key_provider=_key_provider)
-    assert report["verified"] is True
+    assert report["verified"] is True  # failures raise
+    assert report["sqlite_rows"] > 0, (
+        "the restored destination database must carry the seeded rows"
+    )
     assert (dest / "app.db").exists(), (
         "E-03b NESTED DEST: the restore into a destination whose parent "
         "did not exist failed to land"
@@ -671,7 +678,10 @@ def test_sqliteless_manifest_preserves_uncheckpointed_rows(
     pre_db_bytes = (dest / "app.db").read_bytes()
 
     report = restore_backup_set(out, dest, key_provider=_key_provider)
-    assert report["verified"] is True
+    assert report["verified"] is True  # failures raise
+    assert report["sqlite_rows"] == 0, (
+        "a sqlite-less manifest restores no sqlite rows"
+    )
     # The wal assertion must run BEFORE any sqlite open on the restored
     # tree: opening (and closing) the database checkpoints and deletes
     # the wal — the preservation oracle would destroy its own subject.

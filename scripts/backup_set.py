@@ -196,10 +196,13 @@ def _snapshot_generation_binding(snapshot_bytes: bytes) -> Optional[dict]:
     return {"id": int(row[0]), "name": str(row[1]), "detail": str(row[2] or "")}
 
 
-def _tree_item(name: str, kind: str, rel_path: str, files: dict) -> dict:
+def _tree_item(
+    name: str, kind: str, rel_path: str, files: dict, source: Path
+) -> dict:
     """A tree manifest item; an existing-but-fileless source is recorded
-    with an explicit ``empty`` marker so restore recreates the directory
-    instead of rejecting the set (#727, T1-28-K-02)."""
+    with an explicit ``empty`` marker plus its directory skeleton, so
+    restore recreates the tree's nested empty directories instead of only
+    the root (#727, T1-28-K-02; swarm review pr1026 PRR-001)."""
     item = {
         "name": name,
         "kind": kind,
@@ -208,6 +211,11 @@ def _tree_item(name: str, kind: str, rel_path: str, files: dict) -> dict:
     }
     if not files:
         item["empty"] = True
+        item["dirs"] = sorted(
+            path.relative_to(source).as_posix()
+            for path in source.rglob("*")
+            if path.is_dir()
+        )
     return item
 
 
@@ -316,7 +324,9 @@ def _write_set(
         target = staging / vault_rel
         _copy_tree(vault_dir, target)
         items.append(
-            _tree_item(name, "vault", vault_rel, _digest_tree(target))
+            _tree_item(
+                name, "vault", vault_rel, _digest_tree(target), vault_dir
+            )
         )
 
     # --- Draft room ---
@@ -328,7 +338,11 @@ def _write_set(
         _copy_tree(draft_room_dir, target)
         items.append(
             _tree_item(
-                "draft-room", "draft_room", "draft-room", _digest_tree(target)
+                "draft-room",
+                "draft_room",
+                "draft-room",
+                _digest_tree(target),
+                draft_room_dir,
             )
         )
     elif draft_room_dir is not None:
@@ -432,6 +446,9 @@ def create_backup_set(
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO, format="%(levelname)s %(name)s %(message)s"
+    )
     parser = argparse.ArgumentParser(
         description="Create a consistent backup set (SQLite + LanceDB + files)"
     )

@@ -140,7 +140,13 @@ def _release_tags(pairs) -> None:
                 f"could not open live table {table_name!r} to release tag "
                 f"{tag!r}: {exc}"
             ) from exc
-        if tag not in _tag_names(table):
+        try:
+            names = _tag_names(table)
+        except Exception as exc:  # noqa: BLE001 — unknown errors abort the set
+            raise _SetSkipped(
+                f"could not list tags on live table {table_name!r}: {exc}"
+            ) from exc
+        if tag not in names:
             logger.info("tag %r already absent from live table %r", tag, table_name)
             continue
         try:
@@ -192,6 +198,16 @@ def cleanup_backups(
     skipped_links: list = []
     for cand in candidates:
         if _is_backup_set_dir(cand):
+            if ".partial-" in cand.name:
+                # The producer's in-flight staging directory carries its
+                # manifest before the commit rename; pruning it here would
+                # release the in-flight run's tags and delete the tree the
+                # producer is still writing (swarm review pr1026 PRR-009).
+                logger.info(
+                    "skipping in-flight backup staging directory %s",
+                    cand,
+                )
+                continue
             set_dirs.append(cand)
         elif (cand / MANIFEST_NAME).is_file() and not cand.is_file():
             # A manifest-bearing entry that failed the candidate check:
@@ -244,8 +260,10 @@ def cleanup_backups(
             # One candidate's removal failing must not abort the sweep
             # (#728 review finding); the set stays for a retry.
             logger.error(
-                "keeping expired backup set %s: removal failed (%s); "
-                "retry after resolving",
+                "keeping expired backup set %s: removal failed (%s); its "
+                "live tags were ALREADY RELEASED, so the retained copy is "
+                "no longer pinned — retry the removal or delete it "
+                "manually",
                 set_dir,
                 exc,
             )
@@ -323,6 +341,9 @@ def _release_unreferenced_tags(*, set_dirs) -> None:
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO, format="%(levelname)s %(name)s %(message)s"
+    )
     parser = argparse.ArgumentParser(description="Cleanup old encrypted backups")
     parser.add_argument("--directory", type=Path, default=Path("backups"))
     parser.add_argument("--retention", type=int, default=30)

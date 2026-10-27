@@ -455,8 +455,11 @@ def test_migrate_fallback_names_unique_same_second(tmp_path, monkeypatch):
     src.mkdir()
     _seed_db(src / "app.db")
     out = tmp_path / "backups"
-    # Import under a controlled DATA_DIR so the module's import-time
-    # os.environ.setdefault cannot leak the repo data path into this process.
+    # NOTE: migrate_memories is typically already imported at collection
+    # time (test_migrate_memories imports it module-level), so its
+    # import-time DATA_DIR setdefault has already run with the repo path;
+    # this test does NOT rely on that import being controlled — it
+    # monkeypatches settings.data_dir explicitly below.
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv("DATA_DIR", str(tmp_path))
         from scripts import migrate_memories as migrate_module  # noqa: F401

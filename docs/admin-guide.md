@@ -86,8 +86,9 @@ echo "Backup complete: ${BACKUP_NAME}.tar.gz"
 > directories as well as legacy `db_*_k*.enc` files and releases the
 > pruned sets' live `backup-*` LanceDB tags first. Restore is
 > all-or-nothing and refuses to run while the application holds the
-> destination database; see docs/operations.md (Scheduled backups / Restore
-> crash recovery).
+> destination database in an active write transaction (stop the stack
+> first — an idle open connection is not detected); see
+> docs/operations.md (Scheduled backups / Restore crash recovery).
 
 **backup.ps1 (Windows):**
 ```powershell
