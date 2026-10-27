@@ -30,17 +30,31 @@ export const invalidatePendingDraftWrites = (): void => {
   draftGeneration += 1;
 };
 
-/** Remove every persisted chat draft (all sessions + the "new" key). */
+/**
+ * Remove every persisted chat draft (all sessions + the "new" key).
+ *
+ * Each removal is attempted independently: one throwing `removeItem` (a
+ * storage-surface failure) must not abort the remaining keys and leave the
+ * previous identity's draft text behind while the caller proceeds as if the
+ * wipe succeeded (review PRR-008).
+ */
 export const clearAllChatDrafts = (): void => {
   if (typeof window === "undefined") return;
+  const doomed: string[] = [];
   try {
-    const doomed: string[] = [];
     for (let i = 0; i < localStorage.length; i += 1) {
       const key = localStorage.key(i);
       if (key && key.startsWith(DRAFT_PREFIX)) doomed.push(key);
     }
-    for (const key of doomed) localStorage.removeItem(key);
   } catch {
-    /* private mode or storage unavailable — nothing to clear */
+    /* storage unavailable — nothing to enumerate */
+    return;
+  }
+  for (const key of doomed) {
+    try {
+      localStorage.removeItem(key);
+    } catch {
+      /* this key could not be removed; keep clearing the rest */
+    }
   }
 };

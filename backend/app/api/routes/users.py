@@ -934,11 +934,21 @@ async def delete_user(
         # cancelled before entry from a still-running one). Only a queued
         # work item can ever transition to cancelled, so
         # delete_future.cancelled() is the race-free "never entered" signal.
-        delete_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="user_delete"
-        )
-        delete_future = delete_executor.submit(_delete_user_row)
+        #
+        # Construction and submission live INSIDE the recovery boundary: a
+        # thread-start/submission failure (RuntimeError "can't start new
+        # thread" under resource exhaustion) must take the same
+        # rollback-plus-restore path as every other failure in the delete
+        # window — at base the dispatch was wrapped by the same except
+        # tuples, so leaving it outside would have been a regression (issue
+        # #1019, review PRR-003).
+        delete_executor: concurrent.futures.ThreadPoolExecutor | None = None
+        delete_future: concurrent.futures.Future | None = None
         try:
+            delete_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="user_delete"
+            )
+            delete_future = delete_executor.submit(_delete_user_row)
             await asyncio.wrap_future(delete_future)
         except HTTPException:
             # transaction_context already rolled the transaction back; a late
@@ -977,8 +987,10 @@ async def delete_user(
             # re-awaiting the future, which would re-raise the worker's own
             # exception and replace this one before the restore could run.
             # A cancelled (never-entered) work item has no event to wait
-            # for: nothing ran, so the rows trivially survived.
-            if not delete_future.cancelled():
+            # for: nothing ran, so the rows trivially survived. A submission
+            # failure means the item never existed at all — the same
+            # disposition, and the wait below is skipped for it too.
+            if delete_future is not None and not delete_future.cancelled():
                 await asyncio.shield(asyncio.to_thread(delete_settled.wait))
             if not delete_outcome["committed"]:
                 # Restore whenever a commit was never proven. The rollback
@@ -1009,8 +1021,10 @@ async def delete_user(
         finally:
             # After any observed settlement the worker thread is already
             # done, so no join is needed; in the disclosed second-cancellation
-            # residual the thread finishes its single item on its own.
-            delete_executor.shutdown(wait=False)
+            # residual the thread finishes its single item on its own. A
+            # construction failure leaves nothing to shut down.
+            if delete_executor is not None:
+                delete_executor.shutdown(wait=False)
 
         if draft_purge_plan is not None:
             try:

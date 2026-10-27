@@ -174,6 +174,12 @@ describe("useAuthStore identity-boundary reset (issue #823 hardening)", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    // mockReset (not just clearAllMocks): a leftover mockResolvedValueOnce
+    // from a previous test otherwise queues ahead of this test's own GET
+    // stub and the held-fetchMe pattern deadlocks (feedback-round hygiene).
+    mockGetFn.mockReset();
+    mockPostFn.mockReset();
+    mockUploadDocument.mockReset();
     mockEnsureCsrfToken.mockResolvedValue("mock-csrf-token");
     mockJwtTokenHolder.value = null;
     resetInitState();
@@ -283,6 +289,64 @@ describe("useAuthStore identity-boundary reset (issue #823 hardening)", () => {
     expect(useChatStore.getState().activeChatId).toBe("7");
     expect(useChatStore.getState().messageIds).toHaveLength(2);
     expect(useUploadStore.getState().uploads).toHaveLength(1);
+  });
+
+  it("user-less login response with no previous user still clears (conservative boundary, both-null arm)", async () => {
+    // Review PRR-009: the boundary must not depend on prevUserId being
+    // non-null — chat state can be live while the principal is null (the
+    // auth-clearing arms null it without clearing chat), and a user-less
+    // response cannot prove sameness. Holding fetchMe pending proves the
+    // reset runs BEFORE the eventual principal is known.
+    useAuthStore.setState({ user: null, accessToken: null, isAuthenticated: false });
+    useChatStore.getState().loadChat("5", [
+      { id: "a-user", role: "user", content: "user A private question" },
+    ]);
+    useChatShellStore.getState().setActiveSessionId("5");
+
+    mockPostFn.mockResolvedValueOnce({ data: { access_token: "jwt-b" } }); // no user
+    let resolveFetchMe: (v: { data: typeof USER_B }) => void = () => {};
+    mockGetFn.mockImplementationOnce(
+      () => new Promise((res) => { resolveFetchMe = res; })
+    );
+
+    const loginPromise = useAuthStore.getState().login("userb", "pw");
+    // The boundary fired at publication, before fetchMe resolved.
+    await vi.waitFor(() => {
+      expect(useChatStore.getState().activeChatId).toBeNull();
+      expect(useChatStore.getState().messageIds).toEqual([]);
+      expect(useChatShellStore.getState().activeSessionId).toBeNull();
+    });
+    resolveFetchMe({ data: USER_B });
+    await loginPromise;
+    expect(useAuthStore.getState().user?.id).toBe(22);
+  });
+
+  it("register publishing a different principal clears the chat surface", async () => {
+    // Review PRR-002: register is a principal publication like login. The
+    // auth-clearing arms leave chat state live while isAuthenticated is
+    // false, which disables RegisterPage's authenticated redirect — so the
+    // surface must be cleared here too.
+    useAuthStore.setState({ user: null, accessToken: null, isAuthenticated: false });
+    useChatStore.getState().loadChat("8", [
+      { id: "r-user", role: "user", content: "user A private question" },
+    ]);
+    useChatShellStore.getState().setActiveSessionId("8");
+    useChatStore.getState().setInput("user A unsent");
+
+    mockPostFn.mockResolvedValueOnce({
+      data: {
+        access_token: "jwt-new",
+        user: { id: 33, username: "newbie", full_name: "New Bie", role: "member", is_active: true },
+      },
+    });
+
+    await useAuthStore.getState().register("newbie", "SuperSecret1!", "New Bie");
+
+    expect(useAuthStore.getState().isAuthenticated).toBe(true);
+    expect(useChatStore.getState().activeChatId).toBeNull();
+    expect(useChatStore.getState().messageIds).toEqual([]);
+    expect(useChatStore.getState().input).toBe("");
+    expect(useChatShellStore.getState().activeSessionId).toBeNull();
   });
 
   it("in-flight A-owned uploads completing after the switch are fully suppressed", async () => {

@@ -283,6 +283,52 @@ describe("useSendMessage migrates keepalive save results into store rows (issue 
     expect(settled.messagesById["101"]).toMatchObject({ saveState: "saved", seq: 2 });
   });
 
+  it("heals the deferred id once the stream ends (review PRR-001)", async () => {
+    // A keepalive result that settles while the stream is live stamps the
+    // durable seq on the temp-id row (the stream still appends to that id —
+    // renaming mid-stream orphans the appends, the #552 CI-round contract).
+    // Once the stream ENDS, the deferred rename must apply: otherwise the
+    // tail row keeps a numeric temp id and the next Retry/Edit ships a
+    // bogus expected_tail_id, a false 409 stale-view refusal (PRR-001).
+    const refreshHistory = vi.fn().mockResolvedValue(undefined);
+    let resolveKeepalive: (rows: unknown[]) => void = () => {};
+    apiMocks.addChatMessagesBatchKeepalive.mockImplementationOnce(
+      () => new Promise((res) => { resolveKeepalive = res as typeof resolveKeepalive; })
+    );
+    await startSend(refreshHistory);
+    const liveIds = [...useChatStore.getState().messageIds];
+    await emitPartialAnswer();
+    await act(async () => {
+      window.dispatchEvent(new Event("pagehide"));
+    });
+    await act(async () => {
+      resolveKeepalive(keepaliveSaveResults as unknown[]);
+      await useChatStore.getState().pendingTurnPersist;
+    });
+
+    // While streaming: the user row renames immediately (nothing references
+    // it mid-stream), the LIVE STREAMING row keeps its id — the stream still
+    // appends to it — but carries the durable seq.
+    const live = useChatStore.getState();
+    expect(live.messageIds[0]).toBe("100");
+    expect(live.messageIds[1]).toBe(liveIds[1]);
+    expect(typeof live.messagesById[liveIds[1]].seq).toBe("number");
+    expect(live.streamingMessageId).toBe(liveIds[1]);
+
+    // Stream ends: the deferred rename applies (the full migration).
+    await act(async () => {
+      const handlers = activeHandlers;
+      if (!handlers) throw new Error("chatStream handlers were not captured");
+      await handlers.onComplete();
+    });
+
+    const healed = useChatStore.getState();
+    expect(healed.streamingMessageId).toBeNull();
+    expect(healed.messageIds).toEqual(["100", "101"]);
+    expect(healed.messagesById["100"]).toMatchObject({ saveState: "saved", seq: 1 });
+    expect(healed.messagesById["101"]).toMatchObject({ saveState: "saved", seq: 2 });
+  });
+
   it("gives the keepalive-saved rows a numeric seq so durableKeepSeq counts them (RED at base)", async () => {
     const refreshHistory = vi.fn().mockResolvedValue(undefined);
     await startSend(refreshHistory);

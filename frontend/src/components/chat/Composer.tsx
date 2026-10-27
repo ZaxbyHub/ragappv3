@@ -303,7 +303,11 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
     value: string;
     gen: number;
   } | null>(null);
-  const lastWrittenRef = useRef<{ key: string; value: string } | null>(null);
+  const lastWrittenRef = useRef<{
+    key: string;
+    value: string;
+    gen: number;
+  } | null>(null);
 
   const writeDraftNow = useCallback((key: string, value: string) => {
     try {
@@ -325,7 +329,16 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
     // unsent text; drop it instead.
     if (pending && pending.gen !== currentDraftGeneration()) return;
     const last = lastWrittenRef.current;
-    if (pending && (last?.key !== pending.key || last?.value !== pending.value)) {
+    // The generation is part of the "already persisted" comparison: an
+    // identity switch deletes the stored key AND bumps the generation, so a
+    // byte-identical draft typed by the NEXT identity must be written again
+    // rather than skipped as already-persisted (review PRR-007).
+    if (
+      pending &&
+      (last?.key !== pending.key ||
+        last?.value !== pending.value ||
+        last?.gen !== pending.gen)
+    ) {
       writeDraftNow(pending.key, pending.value);
       lastWrittenRef.current = pending;
     }
@@ -346,7 +359,7 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
     // Leading edge: write immediately, then hold the trailing window open
     // for the burst that often follows (paste, IME, fast typing).
     writeDraftNow(key, value);
-    lastWrittenRef.current = { key, value };
+    lastWrittenRef.current = { key, value, gen: currentDraftGeneration() };
     draftTimerRef.current = window.setTimeout(() => {
       draftTimerRef.current = null;
       flushPendingDraft();

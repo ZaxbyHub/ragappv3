@@ -425,10 +425,12 @@ export const useAuthStore = create<AuthState>()(
       login: async (username: string, password: string) => {
         const owner = reserveReplacementAuthOwner();
         // Issue #823: the identity this tab's chat surface currently belongs
-        // to. A login that publishes a DIFFERENT principal (including a
-        // user-less response while another user was signed in — the eventual
-        // principal is unknown until fetchMe) must reset the chat surface at
-        // the publication instant, before the new credentials can be used.
+        // to. A login that publishes a DIFFERENT principal — including a
+        // user-less response, whose eventual principal is unknown until
+        // fetchMe — must reset the chat surface BEFORE the new credentials
+        // are published, so no bridge subscriber or request issued on the
+        // new token can ever observe the previous user's state (reviews
+        // PRR-009/PRR-015).
         const prevUserId = get().user?.id ?? null;
         if (isCurrentAuthOwner(owner)) resetInitState();
         if (isCurrentAuthOwner(owner)) set({ isLoading: true, initializationFailed: false });
@@ -442,22 +444,19 @@ export const useAuthStore = create<AuthState>()(
           });
           if (!isCurrentAuthOwner(owner)) return;
           const { access_token, user } = response.data;
-          // Publish the holder first: bridge subscribers may issue a request
+          // Identity boundary first: same principal -> provably the same
+          // surface, no reset (a fresh boot has prevUserId null and no
+          // state to clear, so the unconditional user-less arm costs
+          // nothing there). Everything else — different id, or an unknown
+          // principal — clears before the credentials become usable.
+          if (!user || user.id !== prevUserId) {
+            resetChatStateForIdentitySwitch();
+          }
+          // Publish the holder: bridge subscribers may issue a request
           // synchronously when the store state changes.
           setJwtAccessToken(access_token);
           if (!isCurrentAuthOwner(owner)) return;
           set({ accessToken: access_token, user: user || null, isAuthenticated: true, authMode: "jwt" });
-          // Issue #823 identity boundary: the instant new credentials are
-          // published, the chat surface either provably still belongs to the
-          // same principal (response user id equals the entry-captured id ->
-          // no reset; a failed login never reaches here at all) or it must be
-          // reset synchronously — a user-less response cannot prove sameness
-          // and is treated as a boundary so the fetchMe await below can never
-          // leave the previous user's writers or queued uploads live under
-          // the new token.
-          if ((user?.id ?? null) !== prevUserId) {
-            resetChatStateForIdentitySwitch();
-          }
           resetSubpathRefreshDiagnostic();
           if (!user) await get().fetchMe();
           if (!isCurrentAuthOwner(owner)) return;
@@ -528,6 +527,17 @@ export const useAuthStore = create<AuthState>()(
             is_active: userData.is_active ?? true,
           };
 
+          // Issue #823 identity boundary (review PRR-002): register is a
+          // principal publication like login. When the registered account is
+          // a DIFFERENT principal than the one this tab's chat surface
+          // belongs to — reachable because the auth-clearing arms
+          // (refreshToken failure, init 401/403) null the principal without
+          // clearing chat, which also disables RegisterPage's authenticated
+          // redirect — clear the surface BEFORE publishing the new
+          // credentials.
+          if (!isSamePrincipal(admissionUser, user)) {
+            resetChatStateForIdentitySwitch();
+          }
           setJwtAccessToken(access_token);
           if (!isPrePublicationCurrent()) return;
           resetInitState();

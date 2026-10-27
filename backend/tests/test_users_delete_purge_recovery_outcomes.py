@@ -42,6 +42,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from fastapi import HTTPException
 from starlette.requests import Request
 
 from app.api.routes import users as users_mod
@@ -415,4 +416,95 @@ def test_rollback_failure_does_not_replace_primary_exception(
         assert env.rows_survive()
         assert env.input_live(), "restore still runs after a failed rollback"
     finally:
+        env.close()
+
+
+def test_executor_submit_failure_restores_purge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review PRR-003: executor construction/submission lives INSIDE the
+    recovery boundary, so a thread-start failure (RuntimeError "can't start
+    new thread" under resource exhaustion) takes the same
+    rollback-plus-restore path as every other failure in the delete window.
+    At base the dispatch was wrapped by the except tuples; leaving it
+    outside would have been a regression."""
+    env = _OutcomesEnv(tmp_path)
+
+    real_tpe = concurrent.futures.ThreadPoolExecutor
+
+    class _SubmitFailsExecutor(real_tpe):
+        """Fails ONLY the delete route's dedicated executor.
+
+        The patch is narrowed to `thread_name_prefix="user_delete"` because
+        asyncio's default executor (which `asyncio.to_thread` uses for the
+        route's own statements) is also a ThreadPoolExecutor: an unfiltered
+        patch would kill the route at its FIRST to_thread — before the purge
+        is even prepared — and the test would then assert against a case it
+        never exercised (reviewer round-4 catch)."""
+
+        def __init__(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            self._fails = kwargs.get("thread_name_prefix") == "user_delete"
+            super().__init__(*args, **kwargs)
+
+        def submit(self, fn, *args, **kwargs):  # noqa: ANN001, ANN003
+            if self._fails:
+                raise RuntimeError("can't start new thread")
+            return super().submit(fn, *args, **kwargs)
+
+    monkeypatch.setattr(
+        users_mod.concurrent.futures, "ThreadPoolExecutor", _SubmitFailsExecutor
+    )
+    try:
+        # With the fix the submit failure is caught by the recovery arms and
+        # surfaces as a 500; with construction/submit outside the boundary
+        # (the reverted shape) the RuntimeError propagates instead — either
+        # way the tombstones must be restored, which is the discriminator.
+        with pytest.raises((HTTPException, RuntimeError)):
+            asyncio.run(delete_user(2, _request_for(2), user=_ADMIN_USER, _csrf_token="t"))
+        assert env.rows_survive(), "the delete did not commit"
+        assert env.input_live(), "a submit failure must still restore the tombstones"
+    finally:
+        env.close()
+        # monkeypatch's own teardown restores the module attribute.
+
+
+def test_second_cancel_during_settle_wait_is_disclosed_and_contained(tmp_path: Path) -> None:
+    """Review PRR-005: a SECOND cancellation delivered while the backstop
+    waits for the detached worker aborts the restore. The protocol discloses
+    this residual; this test pins the CONTAINMENT that the disclosure rests
+    on — the worker still reaches its terminal outcome, the connection is
+    released exactly once, and the route's own finally completes (no leak of
+    the executor handle)."""
+    blocked = threading.Event()
+    release = threading.Event()
+    env = _OutcomesEnv(tmp_path, block_after_user_delete=(blocked, release))
+    release_calls: list[bool] = []
+    orig_release = env.facade.release_connection
+
+    def _release_probe(c) -> None:  # noqa: ANN001
+        release_calls.append(env.conn.hook_done.is_set())
+        orig_release(c)
+
+    env.facade.release_connection = _release_probe
+    try:
+
+        async def drive() -> None:
+            task = asyncio.create_task(
+                delete_user(2, _request_for(2), user=_ADMIN_USER, _csrf_token="t")
+            )
+            while not env.conn.after_delete_ran.is_set():
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.05)  # backstop parks on the settle-wait
+            task.cancel()  # first cancellation
+            await asyncio.sleep(0.05)
+            task.cancel()  # second: aborts the wait (the disclosed residual)
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(drive())
+        # The worker always reaches its terminal outcome; the pool release is
+        # bounded to one call and happens after the worker's hook completed
+        # (the settle-wait is what orders them on the first-cancel path).
+        assert env.conn.hook_done.is_set(), "the detached worker finished its item"
+        assert len(release_calls) == 1, "connection released exactly once"
+    finally:
+        release.set()
         env.close()

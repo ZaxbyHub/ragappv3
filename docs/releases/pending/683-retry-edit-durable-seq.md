@@ -16,10 +16,13 @@
   counts `typeof seq === "number"`, and a `null`/absent `seq` (legacy rows
   saved before the column existed) is ignored exactly as before (PRR-020).
   A non-numeric `seq` cannot occur: the column is a SQLite INTEGER assigned as
-  `MAX(seq)+1` on insert. Known residual (tracked in issue #815): turns saved
-  only through the page-unload keepalive path do not yet carry `seq` in the
-  current page's store; after a bfcache restore, a Retry in that page can
-  still anchor below such a turn.
+  `MAX(seq)+1` on insert. Former residual (tracked in issue #815): turns saved
+  only through the page-unload keepalive path did not yet carry `seq` in the
+  current page's store, so after a bfcache restore a Retry in that page could
+  still anchor below such a turn — **closed** by the #815 fix (the keepalive
+  wrapper now parses the batch-save response and the hook migrates the
+  durable ids/seqs inside the pending-save chain; see
+  `815-823-1019-chat-purge-lifecycle.md`).
 - Send-path test fixtures now mirror the `add_messages_batch` response
   contract (every mocked saved row carries a numeric `seq`): the three
   batch-result sites in `useSendMessage.test.ts`, the mapped rows in

@@ -290,21 +290,24 @@ export function effectiveUploadLimitMb(): number {
 
 // Issue #823: identity-boundary invalidation for asynchronous upload work.
 // Transfers capture the generation at dispatch; when an identity switch
-// (logout / different-principal login) bumps it, every stale completion is
-// suppressed — no filename-bearing toasts, no state writes for removed
+// (logout / different-principal login/register) bumps it, every stale
+// completion is suppressed — no filename-bearing toasts, no state writes for removed
 // rows, no processQueue() continuation, and no queued item of the previous
 // user can ever start under the new credentials (the token is bound at
 // request time, so an already-dispatched request cannot touch the new
 // user's data; only its UI side effects needed killing).
+//
+// The live suppression is entirely in runTransfer's captured-generation
+// checks plus the synchronous row wipe in resetForIdentitySwitch: the
+// previous identity's pending rows are gone before any loop can dispatch
+// them. (An earlier revision carried a second "queue generation" marker
+// and a processQueue guard comparing the two; review PRR-006 found it
+// unreachable — the only bump re-synced the marker on the next line — so
+// the dead guard and marker were removed rather than left to imply a
+// protection they never provided.)
 let uploadGeneration = 0;
 
-// The identity the CURRENT queue (rows in the store) belongs to. A dispatch
-// loop only starts items while the queue still belongs to the live
-// identity; resetForIdentitySwitch retires the old queue by advancing
-// uploadGeneration ahead of this marker.
-let queueGeneration = 0;
-
-export const bumpUploadGeneration = (): void => {
+const bumpUploadGeneration = (): void => {
   uploadGeneration += 1;
 };
 
@@ -564,10 +567,6 @@ export const useUploadStore = create<UploadState>((set, get) => {
       // keep starting pending transfers until the pool is full. No awaits in
       // this loop — re-entrant calls simply observe the already-marked rows.
       while (true) {
-        // Issue #823: an identity switch retired the queue with its owner —
-        // never dispatch the previous user's pending files, not even under
-        // freshly published credentials.
-        if (uploadGeneration !== queueGeneration) return;
         const { uploads, activeVaultId } = get();
         const inFlight = uploads.filter((u) => u.status === "uploading").length;
         if (inFlight >= UPLOAD_CONCURRENCY) {
@@ -586,12 +585,12 @@ export const useUploadStore = create<UploadState>((set, get) => {
 
     resetForIdentitySwitch: () => {
       // Issue #823: called ONLY at a real credential boundary (logout, or a
-      // different-principal login at its publication instant). Bump first so
-      // in-flight completions and queue continuations of the previous
-      // identity die, then drop every row — no path clears rows while their
-      // writers stay live, and none leaves stranded live rows.
+      // different-principal login/register at its publication instant). Bump
+      // first so in-flight completions and queue continuations of the
+      // previous identity die, then drop every row synchronously — the queue
+      // the next identity inherits is empty, so nothing of the old owner can
+      // ever dispatch.
       bumpUploadGeneration();
-      queueGeneration = uploadGeneration;
       set({
         uploads: [],
         chatAttachmentIds: [],
