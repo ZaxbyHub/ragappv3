@@ -91,6 +91,15 @@ export function useSendMessage(
   const [currentStage, setCurrentStage] = useState<string | null>(null);
 
   // Atomic guard — prevents double-send from rapid clicks / Enter
+  // Issue #815 (review PRR-001): a keepalive save result that settles while
+  // the stream is still live stamps the durable seq immediately but defers the
+  // id rename to the stream-end choke point (endStreamingRow), so the row
+  // heals to its server id once nothing references the temp id anymore.
+  const deferredKeepaliveIdRef = useRef<{
+    assistantId: string;
+    save: ChatSessionMessage;
+  } | null>(null);
+
   const sendingRef = useRef(false);
 
   // Generation token (issue #507 / UI-003): captured per send, bumped on Stop.
@@ -134,6 +143,20 @@ export function useSendMessage(
       activeStreamToken = streamToken;
       stoppingStreamToken = null;
 
+      // Issue #815 (review PRR-001): a keepalive save result that settles
+      // while the stream is still live stamps the durable seq immediately
+      // but defers the id rename to the stream-end choke point, so the row
+      // heals to its server id once nothing references the temp id anymore.
+      // Declared before the abort-handle closure below because that closure
+      // can run during session creation (UI-003), before the rest of the
+      // hook body has executed.
+      const healDeferredKeepaliveId = () => {
+        const deferred = deferredKeepaliveIdRef.current;
+        deferredKeepaliveIdRef.current = null;
+        if (deferred && useChatStore.getState().streamingMessageId !== deferred.assistantId) {
+          migrateId(deferred.assistantId, deferred.save);
+        }
+      };
       // UI-003: install the abort handle BEFORE the first await. A Stop
       // pressed during session creation (while no stream exists to abort)
       // invalidates this send's generation so generation can never start
@@ -146,6 +169,10 @@ export function useSendMessage(
         stoppingStreamToken = null;
         sendGenRef.current += 1;
         useChatStore.setState({ isStreaming: false, abortFn: null, streamingMessageId: null });
+        // A keepalive result can only be pending once a stream existed, but keeping
+        // this stream-end path on the same heal as the others makes the enumeration
+        // exhaustive (reviewer round-4 note).
+        healDeferredKeepaliveId();
         sendingRef.current = false;
       });
 
@@ -402,6 +429,19 @@ export function useSendMessage(
       };
 
       let turnPersistenceClaimed = false;
+      // Issue #815 (review PRR-001): a keepalive save result that settles
+      // while the stream is still live stamps the durable seq immediately but
+      // must NOT rename the row (the stream's appends still address the temp
+      // id). The rename is deferred to here — the single choke point every
+      // stream-end path funnels through — so the row heals to its server id
+      // once nothing references the temp id anymore. Without it the tail row
+      // would keep a numeric temp id and the next Retry/Edit would ship a
+      // bogus expected_tail_id (a false 409).
+      const endStreamingRow = () => {
+        setStreamingMessageId(null);
+        healDeferredKeepaliveId();
+      };
+
       const claimTurnPersistence = (): boolean => {
         if (turnPersistenceClaimed) return false;
         turnPersistenceClaimed = true;
@@ -420,16 +460,63 @@ export function useSendMessage(
 
         if (options.keepalive) {
           const persistPromise = addChatMessagesBatchKeepalive(sessionId, prepared.messages);
+          // Issue #815: the keepalive save is durable server-side the moment
+          // the request lands; when the page outlives it (bfcache restore,
+          // canceled unload) the resolved save results must migrate into the
+          // store rows — same migrateId forwarding as the normal path — so
+          // durableKeepSeq/observedTail cover these rows and a later
+          // Retry/Edit truncate cannot delete the turn. The migration lives
+          // INSIDE the registered pending-save chain (revision operations
+          // await it before computing the truncate boundary) and never
+          // throws into the pagehide caller; no refreshHistory here (the
+          // sidebar heals on the next interaction).
+          const { assistantMsg } = prepared;
+          const tracked = persistPromise
+            .then((saved) => {
+              if (!saved) return;
+              const [userSaveResult, assistantSaveResult] = saved;
+              if (userSaveResult) migrateId(userMessage.id, userSaveResult);
+              if (assistantMsg && assistantSaveResult) {
+                // Issue #815 CI round (issue552 suite): a canceled unload can
+                // fire pagehide while the stream is STILL LIVE — the stream's
+                // appends and the terminal path keep referencing the temp
+                // assistant id, so renaming it mid-stream orphans them. The
+                // durable SEQ is the payload the Retry/Edit anchor needs;
+                // stamp it immediately, and only run the full id migration
+                // once this row is no longer the live streaming row (the
+                // true page-death/bfcache case — where nothing else ever
+                // will).
+                const state = useChatStore.getState();
+                if (state.streamingMessageId === assistantMessageId) {
+                  state.updateMessage(assistantMessageId, {
+                    saveState: "saved",
+                    seq: assistantSaveResult.seq,
+                  });
+                  deferredKeepaliveIdRef.current = {
+                    assistantId: assistantMessageId,
+                    save: assistantSaveResult,
+                  };
+                  return;
+                }
+                migrateId(assistantMessageId, assistantSaveResult);
+              }
+            })
+            .catch((err) => {
+              // The keepalive save already succeeded server-side; a failure
+              // here is only the local mirror. Log it rather than swallowing
+              // it silently (out-of-band review M-19).
+              console.error("Failed to mirror the keepalive save into the store:", err);
+            });
           const { setPendingTurnPersist, registerPendingTurnPersist } = useChatStore.getState();
-          setPendingTurnPersist(persistPromise);
-          registerPendingTurnPersist?.(persistPromise);
-          void persistPromise.finally(() => {
-            if (useChatStore.getState().pendingTurnPersist === persistPromise) {
+          setPendingTurnPersist(tracked);
+          registerPendingTurnPersist?.(tracked);
+          void tracked.finally(() => {
+            if (useChatStore.getState().pendingTurnPersist === tracked) {
               useChatStore.getState().setPendingTurnPersist(null);
             }
-            useChatStore.getState().unregisterPendingTurnPersist?.(persistPromise);
+            useChatStore.getState().unregisterPendingTurnPersist?.(tracked);
           });
-          return persistPromise;
+          return tracked;
         }
 
         const persistPromise = (async () => {
@@ -581,6 +668,7 @@ export function useSendMessage(
             sendingRef.current = false;
             setCurrentStage(null);
             useChatStore.setState({ isStreaming: false, abortFn: null, streamingMessageId: null });
+            healDeferredKeepaliveId();
           },
           onMessage: (chunk) => {
             setCurrentStage(null);
@@ -711,7 +799,7 @@ export function useSendMessage(
               clearTurnPersistence();
               setIsStreaming(false);
               setAbortFn(null);
-              setStreamingMessageId(null);
+              endStreamingRow();
               sendingRef.current = false;
               return;
             }
@@ -729,7 +817,7 @@ export function useSendMessage(
               setCurrentStage(null);
               setIsStreaming(false);
               setAbortFn(null);
-              setStreamingMessageId(null);
+              endStreamingRow();
               sendingRef.current = false;
               if (ownsPersistence) void persistTurn("interrupted");
               return;
@@ -755,7 +843,7 @@ export function useSendMessage(
             setCurrentStage(null);
             setIsStreaming(false);
             setAbortFn(null);
-            setStreamingMessageId(null);
+            endStreamingRow();
             sendingRef.current = false;
             if (ownsPersistence) void persistTurn("failed");
             // Issue #684 (T1-13-S-08): ADMISSION_REJECTED is emitted by the
@@ -826,7 +914,7 @@ export function useSendMessage(
             setCurrentStage(null);
             setIsStreaming(false);
             setAbortFn(null);
-            setStreamingMessageId(null);
+            endStreamingRow();
             sendingRef.current = false;
             if (ownsPersistence) await persistTurn("complete");
           },

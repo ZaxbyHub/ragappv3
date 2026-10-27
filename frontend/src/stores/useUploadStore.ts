@@ -146,6 +146,13 @@ interface UploadState {
   attachToChat: (id: string) => void;
   /** Remove an upload's chat attachment registration. */
   detachFromChat: (id: string) => void;
+  /**
+   * Identity-boundary reset (issue #823): retire every asynchronous upload
+   * writer of the previous identity (generation bump), drop all rows and
+   * chat attachment registrations, and clear the vault pointer. Called only
+   * by the auth store's logout / different-principal-login reset.
+   */
+  resetForIdentitySwitch: () => void;
   processQueue: () => Promise<void>;
 }
 
@@ -281,6 +288,29 @@ export function effectiveUploadLimitMb(): number {
   return useSettingsStore.getState().settings?.max_file_size_mb ?? MAX_UPLOAD_FILE_SIZE_MB;
 }
 
+// Issue #823: identity-boundary invalidation for asynchronous upload work.
+// Transfers capture the generation at dispatch; when an identity switch
+// (logout / different-principal login/register) bumps it, every stale
+// completion is suppressed — no filename-bearing toasts, no state writes for removed
+// rows, no processQueue() continuation, and no queued item of the previous
+// user can ever start under the new credentials (the token is bound at
+// request time, so an already-dispatched request cannot touch the new
+// user's data; only its UI side effects needed killing).
+//
+// The live suppression is entirely in runTransfer's captured-generation
+// checks plus the synchronous row wipe in resetForIdentitySwitch: the
+// previous identity's pending rows are gone before any loop can dispatch
+// them. (An earlier revision carried a second "queue generation" marker
+// and a processQueue guard comparing the two; review PRR-006 found it
+// unreachable — the only bump re-synced the marker on the next line — so
+// the dead guard and marker were removed rather than left to imply a
+// protection they never provided.)
+let uploadGeneration = 0;
+
+const bumpUploadGeneration = (): void => {
+  uploadGeneration += 1;
+};
+
 export const useUploadStore = create<UploadState>((set, get) => {
   /**
    * Run one byte-transfer. A pool slot corresponds to the `uploadDocument`
@@ -293,6 +323,7 @@ export const useUploadStore = create<UploadState>((set, get) => {
     file: File,
     vaultId: number | null
   ): Promise<void> => {
+    const generation = uploadGeneration;
     try {
       const uploadResult = await uploadDocument(
         file,
@@ -302,6 +333,7 @@ export const useUploadStore = create<UploadState>((set, get) => {
         vaultId ?? undefined
       );
 
+      if (generation !== uploadGeneration) return;
       // Network upload finished. Don't claim "indexed" — the backend
       // is now the source of truth for processing/wiki state.
       const docId = String(uploadResult.id);
@@ -324,12 +356,16 @@ export const useUploadStore = create<UploadState>((set, get) => {
       }));
       toast.success(`${file.name} uploaded`);
     } catch (err) {
+      if (generation !== uploadGeneration) return;
       const errorMsg = normalizeUploadErrorMessage(err);
       get().setStatus(uploadId, "error", errorMsg);
       toast.error(`Failed to upload ${file.name}: ${errorMsg}`);
     } finally {
-      // Free the slot and immediately admit the next pending transfer.
-      void get().processQueue();
+      // Free the slot and immediately admit the next pending transfer —
+      // unless an identity switch retired this transfer's queue with it.
+      if (generation === uploadGeneration) {
+        void get().processQueue();
+      }
     }
   };
 
@@ -545,6 +581,22 @@ export const useUploadStore = create<UploadState>((set, get) => {
         get().setStatus(next.id, "uploading");
         void runTransfer(next.id, next.file, activeVaultId);
       }
+    },
+
+    resetForIdentitySwitch: () => {
+      // Issue #823: called ONLY at a real credential boundary (logout, or a
+      // different-principal login/register at its publication instant). Bump
+      // first so in-flight completions and queue continuations of the
+      // previous identity die, then drop every row synchronously — the queue
+      // the next identity inherits is empty, so nothing of the old owner can
+      // ever dispatch.
+      bumpUploadGeneration();
+      set({
+        uploads: [],
+        chatAttachmentIds: [],
+        activeVaultId: null,
+        isProcessing: false,
+      });
     },
   };
 });

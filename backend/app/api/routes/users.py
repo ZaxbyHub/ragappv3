@@ -1,8 +1,10 @@
 """User management routes (admin/superadmin only)."""
 
 import asyncio
+import concurrent.futures
 import logging
 import sqlite3
+import threading
 from datetime import datetime, timezone
 from typing import List, Optional
 
@@ -918,40 +920,75 @@ async def delete_user(
                 type(e).__name__,
             )
 
+        # Issue #1019: worker-outcome-aware recovery for the delete window.
+        # The purge tombstones must be restored whenever the rows survived,
+        # and stay discarded only after a PROVEN commit. Enumerated except
+        # tuples cannot express that: an exception class outside the two
+        # handlers below (transaction_context has already rolled ordinary
+        # Exceptions back, so conn.in_transaction is False by then), or
+        # cancellation of the await while the worker runs detached, both
+        # previously escaped with the tombstones stranded in .trash.
+        delete_outcome: dict = {"committed": False}
+        delete_settled = threading.Event()
+
         def _delete_user_row() -> None:
             # One BEGIN IMMEDIATE over the org-detach, the authoritative
             # effective-admin recheck, and the DELETE (issue #1025): a grant
             # written between the fast-path check and here still refuses the
             # delete, and transaction_context rolls any refusal (or the
             # last-superadmin guard's) back atomically with the org-detach.
-            with transaction_context(conn):
-                # Detach historical org authorship first: organizations.created_by
-                # has no ON DELETE action, so a user who created an org they no
-                # longer own would otherwise trip the FK and 500 the delete
-                # (issue #722 AC8). Same transaction as the DELETE below.
-                conn.execute(
-                    "UPDATE organizations SET created_by = NULL WHERE created_by = ?",
-                    (user_id,),
-                )
-                _refuse_user_delete_orphaning_vaults(
-                    _vaults_orphaned_by_user_delete(conn, user_id)
-                )
-                if target_role == "superadmin":
-                    # Atomic guard: only delete if there are other active superadmins
-                    guard_cursor = conn.execute(
-                        """DELETE FROM users
-                           WHERE id = ? AND (SELECT COUNT(*) FROM users WHERE role = 'superadmin' AND is_active = 1) > 1""",
+            try:
+                with transaction_context(conn):
+                    # Detach historical org authorship first: organizations.created_by
+                    # has no ON DELETE action, so a user who created an org they no
+                    # longer own would otherwise trip the FK and 500 the delete
+                    # (issue #722 AC8). Same transaction as the DELETE below.
+                    conn.execute(
+                        "UPDATE organizations SET created_by = NULL WHERE created_by = ?",
                         (user_id,),
                     )
-                    if guard_cursor.rowcount == 0:
-                        raise HTTPException(
-                            status_code=400, detail="Cannot delete the last superadmin"
+                    _refuse_user_delete_orphaning_vaults(
+                        _vaults_orphaned_by_user_delete(conn, user_id)
+                    )
+                    if target_role == "superadmin":
+                        # Atomic guard: only delete if there are other active superadmins
+                        guard_cursor = conn.execute(
+                            """DELETE FROM users
+                               WHERE id = ? AND (SELECT COUNT(*) FROM users WHERE role = 'superadmin' AND is_active = 1) > 1""",
+                            (user_id,),
                         )
-                else:
-                    conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+                        if guard_cursor.rowcount == 0:
+                            raise HTTPException(
+                                status_code=400, detail="Cannot delete the last superadmin"
+                            )
+                    else:
+                        conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+                delete_outcome["committed"] = True
+            finally:
+                delete_settled.set()
 
+        # A dedicated single-worker executor so the route holds a REAL
+        # concurrent.futures.Future (loop.run_in_executor returns an asyncio
+        # future whose cancelled() state cannot distinguish a queued item
+        # cancelled before entry from a still-running one). Only a queued
+        # work item can ever transition to cancelled, so
+        # delete_future.cancelled() is the race-free "never entered" signal.
+        #
+        # Construction and submission live INSIDE the recovery boundary: a
+        # thread-start/submission failure (RuntimeError "can't start new
+        # thread" under resource exhaustion) must take the same
+        # rollback-plus-restore path as every other failure in the delete
+        # window — at base the dispatch was wrapped by the same except
+        # tuples, so leaving it outside would have been a regression (issue
+        # #1019, review PRR-003).
+        delete_executor: concurrent.futures.ThreadPoolExecutor | None = None
+        delete_future: concurrent.futures.Future | None = None
         try:
-            await asyncio.to_thread(_delete_user_row)
+            delete_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="user_delete"
+            )
+            delete_future = delete_executor.submit(_delete_user_row)
+            await asyncio.wrap_future(delete_future)
         except HTTPException:
             # transaction_context already rolled the transaction back; a late
             # refusal restores the tombstoned Draft Room bytes (see the purge
@@ -980,6 +1017,53 @@ async def delete_user(
             raise HTTPException(
                 status_code=500, detail="Failed to delete user"
             ) from e
+        except BaseException:
+            # Issue #1019 backstop: every exception class the two handlers
+            # above do not name (asyncio.CancelledError on client
+            # disconnect, KeyboardInterrupt, any other exception type), plus
+            # cancellation of the await while the worker runs detached.
+            # Settlement is observed through the worker-side event — never by
+            # re-awaiting the future, which would re-raise the worker's own
+            # exception and replace this one before the restore could run.
+            # A cancelled (never-entered) work item has no event to wait
+            # for: nothing ran, so the rows trivially survived. A submission
+            # failure means the item never existed at all — the same
+            # disposition, and the wait below is skipped for it too.
+            if delete_future is not None and not delete_future.cancelled():
+                await asyncio.shield(asyncio.to_thread(delete_settled.wait))
+            if not delete_outcome["committed"]:
+                # Restore whenever a commit was never proven. The rollback
+                # covers a BaseException raised inside the worker that
+                # skipped transaction_context's `except Exception` rollback;
+                # it is guarded so a cleanup failure cannot replace the
+                # primary exception.
+                try:
+                    if conn.in_transaction:
+                        await asyncio.to_thread(lambda: conn.rollback())
+                except Exception:
+                    logger.warning(
+                        "draft_room_user_delete_rollback_failed user_id=%s",
+                        user_id,
+                    )
+                if draft_purge_plan is not None:
+                    try:
+                        await asyncio.to_thread(
+                            draft_deletion.restore_purge, draft_purge_plan
+                        )
+                    except Exception as restore_exc:
+                        logger.error(
+                            "draft_room_user_purge_restore_failed user_id=%s reason=%s",
+                            user_id,
+                            type(restore_exc).__name__,
+                        )
+            raise
+        finally:
+            # After any observed settlement the worker thread is already
+            # done, so no join is needed; in the disclosed second-cancellation
+            # residual the thread finishes its single item on its own. A
+            # construction failure leaves nothing to shut down.
+            if delete_executor is not None:
+                delete_executor.shutdown(wait=False)
 
         if draft_purge_plan is not None:
             try:

@@ -17,6 +17,12 @@ vi.mock("@/stores/useChatStore", () => ({
   ),
 }));
 
+vi.mock("@/stores/useAuthStore", () => ({
+  useAuthStore: vi.fn((selector?: (s: unknown) => unknown) => {
+    const state = { user: { id: 11 } };
+    return typeof selector === "function" ? selector(state) : state;
+  }),
+}));
 vi.mock("@/stores/useChatModeStore", () => ({
   useChatModeStore: vi.fn((selector?: (s: any) => unknown) => {
     const state = { chatMode: "thinking", setChatMode: vi.fn() };
@@ -98,7 +104,7 @@ describe("Composer draft persistence", () => {
   });
 
   it("loads the new-chat draft on mount", () => {
-    storage.set("ragapp_chat_draft_new", "unsent new-chat draft");
+    storage.set("ragapp_chat_draft_11:new", "unsent new-chat draft");
 
     render(<Composer onSend={vi.fn()} onStop={vi.fn()} isStreaming={false} />);
 
@@ -114,17 +120,17 @@ describe("Composer draft persistence", () => {
     const textarea = screen.getByLabelText("Message input");
 
     fireEvent.change(textarea, { target: { value: "persist me" } });
-    expect(storage.get("ragapp_chat_draft_42")).toBe("persist me");
+    expect(storage.get("ragapp_chat_draft_11:42")).toBe("persist me");
 
     rerender(<Composer onSend={onSend} onStop={vi.fn()} isStreaming={false} />);
     fireEvent.click(screen.getByLabelText("Send message"));
-    expect(storage.has("ragapp_chat_draft_42")).toBe(false);
+    expect(storage.has("ragapp_chat_draft_11:42")).toBe(false);
     expect(onSend).toHaveBeenCalledTimes(1);
   });
 
   it("does not reload the same session draft on rerender after the user edits", () => {
     mockChatState.activeChatId = "7";
-    storage.set("ragapp_chat_draft_7", "stored draft");
+    storage.set("ragapp_chat_draft_11:7", "stored draft");
     const { rerender } = render(<Composer onSend={vi.fn()} onStop={vi.fn()} isStreaming={false} />);
     expect(mockChatState.setInput).toHaveBeenCalledWith("stored draft");
     mockChatState.setInput.mockClear();
@@ -138,7 +144,7 @@ describe("Composer draft persistence", () => {
 
   it("does not reload when the active chat id changes but still resolves to the new-chat draft key", () => {
     mockChatState.activeChatId = null;
-    storage.set("ragapp_chat_draft_new", "new-chat draft");
+    storage.set("ragapp_chat_draft_11:new", "new-chat draft");
     const { rerender } = render(<Composer onSend={vi.fn()} onStop={vi.fn()} isStreaming={false} />);
     expect(mockChatState.setInput).toHaveBeenCalledWith("new-chat draft");
     mockChatState.setInput.mockClear();
@@ -153,8 +159,8 @@ describe("Composer draft persistence", () => {
 
   it("loads the next session draft when activeChatId changes", () => {
     mockChatState.activeChatId = "1";
-    storage.set("ragapp_chat_draft_1", "first session");
-    storage.set("ragapp_chat_draft_2", "second session");
+    storage.set("ragapp_chat_draft_11:1", "first session");
+    storage.set("ragapp_chat_draft_11:2", "second session");
     const { rerender } = render(<Composer onSend={vi.fn()} onStop={vi.fn()} isStreaming={false} />);
 
     mockChatState.activeChatId = "2";

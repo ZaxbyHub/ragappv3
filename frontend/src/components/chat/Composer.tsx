@@ -37,6 +37,7 @@ import { cn } from "@/lib/utils";
 import { useChatStore } from "@/stores/useChatStore";
 import { useChatModeStore } from "@/stores/useChatModeStore";
 import { useLlmHealthStore } from "@/stores/useLlmHealthStore";
+import { useAuthStore } from "@/stores/useAuthStore";
 import { useSettingsStore } from "@/stores/useSettingsStore";
 import { useVaultStore } from "@/stores/useVaultStore";
 import { useUploadStore } from "@/stores/useUploadStore";
@@ -46,6 +47,7 @@ import { computeEffectiveChatMode } from "@/lib/chatMode";
 import { MAX_INPUT_LENGTH } from "@/hooks/useSendMessage";
 import { useEscapeToStop } from "@/hooks/useEscapeToStop";
 import { toast } from "sonner";
+import { currentDraftGeneration, getDraftKey } from "@/lib/chatDrafts";
 
 // =============================================================================
 // Types
@@ -119,8 +121,8 @@ const SLASH_COMMANDS: SlashCommand[] = [
   { id: "actions",   label: "/actions",   description: "List action items",        icon: <ListChecks className="h-4 w-4" /> },
 ];
 
-const DRAFT_PREFIX = "ragapp_chat_draft_";
-const getDraftKey = (sessionId: string | null) => `${DRAFT_PREFIX}${sessionId ?? "new"}`;
+// Draft key scheme + identity-boundary invalidation live in
+// @/lib/chatDrafts (issue #823: the auth identity-switch reset shares them).
 
 // Draft persistence bounds (issue #616): a leading+trailing debounce keeps
 // rapid input bursts from rewriting the FULL draft string to localStorage
@@ -195,6 +197,9 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
   // individual selectors keep the #616 render budget.
   const input = useChatStore((s) => s.input);
   const setInput = useChatStore((s) => s.setInput);
+  // Issue #823: composer drafts are keyed per principal so a failed removal
+  // can never leak the previous user's unsent text to the next one.
+  const draftPrincipalId = useAuthStore((s) => s.user?.id ?? null);
   const inputError = useChatStore((s) => s.inputError);
   const setInputError = useChatStore((s) => s.setInputError);
   const activeChatId = useChatStore((s) => s.activeChatId);
@@ -281,14 +286,16 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
   const lastLoadedRef = useRef<string | null>(null);
   useEffect(() => {
     if (typeof window === "undefined") return;
-    const key = activeChatId ?? "new";
+    // The dedup key IS the storage key: a principal switch on the same
+    // session id must re-restore from the new principal's key (issue #823).
+    const key = getDraftKey(activeChatId, draftPrincipalId);
     if (lastLoadedRef.current === key) return;
     lastLoadedRef.current = key;
     try {
-      setInput(localStorage.getItem(getDraftKey(activeChatId)) ?? "");
+      setInput(localStorage.getItem(key) ?? "");
     } catch { /* private mode */ }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeChatId]);
+  }, [activeChatId, draftPrincipalId]);
 
   // Debounced draft persistence (issue #616). Leading+trailing: the first
   // change after an idle window writes synchronously (preserving the
@@ -297,8 +304,16 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
   // key is captured when the write is scheduled, so a session switch
   // mid-debounce can never bleed a draft across sessions.
   const draftTimerRef = useRef<number | null>(null);
-  const pendingDraftRef = useRef<{ key: string; value: string } | null>(null);
-  const lastWrittenRef = useRef<{ key: string; value: string } | null>(null);
+  const pendingDraftRef = useRef<{
+    key: string;
+    value: string;
+    gen: number;
+  } | null>(null);
+  const lastWrittenRef = useRef<{
+    key: string;
+    value: string;
+    gen: number;
+  } | null>(null);
 
   const writeDraftNow = useCallback((key: string, value: string) => {
     try {
@@ -314,8 +329,22 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
     }
     const pending = pendingDraftRef.current;
     pendingDraftRef.current = null;
+    // Issue #823: an identity switch (logout / different-principal login)
+    // both cleared every stored draft and bumped the generation this write
+    // was scheduled under. Executing it would resurrect the previous user's
+    // unsent text; drop it instead.
+    if (pending && pending.gen !== currentDraftGeneration()) return;
     const last = lastWrittenRef.current;
-    if (pending && (last?.key !== pending.key || last?.value !== pending.value)) {
+    // The generation is part of the "already persisted" comparison: an
+    // identity switch deletes the stored key AND bumps the generation, so a
+    // byte-identical draft typed by the NEXT identity must be written again
+    // rather than skipped as already-persisted (review PRR-007).
+    if (
+      pending &&
+      (last?.key !== pending.key ||
+        last?.value !== pending.value ||
+        last?.gen !== pending.gen)
+    ) {
       writeDraftNow(pending.key, pending.value);
       lastWrittenRef.current = pending;
     }
@@ -323,7 +352,7 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
 
   const persistDraft = useCallback((value: string) => {
     if (typeof window === "undefined") return;
-    const key = getDraftKey(activeChatId);
+    const key = getDraftKey(activeChatId, draftPrincipalId);
     // Session switched mid-debounce: the pending timer belongs to the OLD
     // session's key. Flush the old session's final value first, then take a
     // fresh leading edge so the new session's first write is synchronous
@@ -331,17 +360,17 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
     if (draftTimerRef.current !== null && pendingDraftRef.current?.key !== key) {
       flushPendingDraft();
     }
-    pendingDraftRef.current = { key, value };
+    pendingDraftRef.current = { key, value, gen: currentDraftGeneration() };
     if (draftTimerRef.current !== null) return;
     // Leading edge: write immediately, then hold the trailing window open
     // for the burst that often follows (paste, IME, fast typing).
     writeDraftNow(key, value);
-    lastWrittenRef.current = { key, value };
+    lastWrittenRef.current = { key, value, gen: currentDraftGeneration() };
     draftTimerRef.current = window.setTimeout(() => {
       draftTimerRef.current = null;
       flushPendingDraft();
     }, DRAFT_DEBOUNCE_MS);
-  }, [activeChatId, writeDraftNow, flushPendingDraft]);
+  }, [activeChatId, draftPrincipalId, writeDraftNow, flushPendingDraft]);
 
   // Synchronous clear used by the send path: the draft must be gone from
   // localStorage before onSend() runs, not 400ms later.
@@ -353,10 +382,10 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
     }
     pendingDraftRef.current = null;
     try {
-      localStorage.removeItem(getDraftKey(activeChatId));
+      localStorage.removeItem(getDraftKey(activeChatId, draftPrincipalId));
       lastWrittenRef.current = null;
     } catch { /* ignore */ }
-  }, [activeChatId]);
+  }, [activeChatId, draftPrincipalId]);
 
   // Unmount: never lose the tail of a burst that had not hit the trailing
   // edge yet.

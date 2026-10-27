@@ -155,6 +155,11 @@ describe("Composer large-input handling (issue #616)", () => {
   const storage = new Map<string, string>();
   let draftWrites: number;
 
+  // Issue #823: drafts are principal-scoped. This harness runs the real
+  // useAuthStore with nobody signed in, so the composer's principal is the
+  // "anon" fallback and every key carries it.
+  const draftKey = (sessionId: string) => `ragapp_chat_draft_anon:${sessionId}`;
+
   beforeEach(() => {
     vi.clearAllMocks();
     vi.useFakeTimers();
@@ -253,7 +258,7 @@ describe("Composer large-input handling (issue #616)", () => {
 
     // The first change after idle writes synchronously (leading edge).
     fireEvent.change(textarea, { target: { value: "first" } });
-    expect(storage.get("ragapp_chat_draft_42")).toBe("first");
+    expect(storage.get(draftKey("42"))).toBe("first");
 
     let value = "first";
     for (let i = 1; i <= 30; i += 1) {
@@ -265,7 +270,7 @@ describe("Composer large-input handling (issue #616)", () => {
     act(() => {
       vi.advanceTimersByTime(2_000);
     });
-    expect(storage.get("ragapp_chat_draft_42")).toBe(value);
+    expect(storage.get(draftKey("42"))).toBe(value);
     expect(draftWrites).toBeLessThanOrEqual(4);
   });
 
@@ -277,13 +282,13 @@ describe("Composer large-input handling (issue #616)", () => {
     act(() => {
       vi.advanceTimersByTime(10_000);
     });
-    expect(storage.get("ragapp_chat_draft_42")).toHaveLength(99_999);
+    expect(storage.get(draftKey("42"))).toHaveLength(99_999);
 
     fireEvent.change(textarea, { target: { value: "v".repeat(100_001) } });
     act(() => {
       vi.advanceTimersByTime(10_000);
     });
-    expect(storage.has("ragapp_chat_draft_42")).toBe(false);
+    expect(storage.has(draftKey("42"))).toBe(false);
   });
 
   it("accepts 20,000-char input for send and visibly rejects 100,001", () => {
@@ -324,7 +329,7 @@ describe("Composer large-input handling (issue #616)", () => {
     fireEvent.change(textarea, { target: { value: "old-session-1" } });
     fireEvent.change(textarea, { target: { value: "old-session-2" } });
     // Only the leading write has happened so far.
-    expect(storage.get("ragapp_chat_draft_42")).toBe("old-session-1");
+    expect(storage.get(draftKey("42"))).toBe("old-session-1");
 
     // Switch session mid-debounce.
     mockChatState.activeChatId = "7";
@@ -334,8 +339,8 @@ describe("Composer large-input handling (issue #616)", () => {
     // flushed synchronously, and the NEW session gets a synchronous
     // leading-edge write (no 400 ms loss window after a switch).
     fireEvent.change(textarea, { target: { value: "new-session-1" } });
-    expect(storage.get("ragapp_chat_draft_42")).toBe("old-session-2");
-    expect(storage.get("ragapp_chat_draft_7")).toBe("new-session-1");
+    expect(storage.get(draftKey("42"))).toBe("old-session-2");
+    expect(storage.get(draftKey("7"))).toBe("new-session-1");
   });
 
   it("sending clears the persisted draft synchronously", () => {
@@ -348,13 +353,13 @@ describe("Composer large-input handling (issue #616)", () => {
     const textarea = screen.getByLabelText("Message input");
 
     fireEvent.change(textarea, { target: { value: "send me" } });
-    expect(storage.get("ragapp_chat_draft_42")).toBe("send me");
+    expect(storage.get(draftKey("42"))).toBe("send me");
 
     // The mocked store does not subscribe: re-render so the submit
     // handler's closure sees the changed input.
     rerender(<Composer onSend={onSend} onStop={vi.fn()} isStreaming={false} />);
     fireEvent.click(screen.getByLabelText("Send message"));
-    expect(storage.has("ragapp_chat_draft_42")).toBe(false);
+    expect(storage.has(draftKey("42"))).toBe(false);
     expect(onSend).toHaveBeenCalledTimes(1);
   });
 });
