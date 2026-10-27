@@ -178,8 +178,26 @@ roles, not capacity claims.
   TTL expiry only happens for a process that died). Restarting the backend
   also releases all local slots on shutdown.
 - Restore from backup: stop the stack, run `python scripts/restore.py
-  <backup-set-dir> --dest <data-dir>` (verifies every digest and checks out
-  the tagged LanceDB generations), then restart. See Scheduled backups.
+  <backup-set-dir> --dest <data-dir>` (verifies every digest IN A PRIVATE
+  STAGING DIRECTORY before anything is written, then swaps the destination
+  with two renames (the window between them is journaled and recoverable —
+  see Restore crash recovery) and persists the tagged LanceDB generations
+  so a FRESH connection serves them), then restart. Restore is all-or-nothing:
+  a failure at any step leaves the destination byte-identical to its
+  pre-restore state or fully restored. It refuses to run while another
+  connection holds the destination `app.db` in an ACTIVE WRITE
+  transaction — an idle open connection is not detected, so stop the
+  stack first (the stop-the-stack step is enforced for writers, not
+  assumed, but an idle open connection must still be avoided by
+  stopping the stack). The staged copy needs the set size plus your
+  unmanaged content free on the destination's drive (the estimate is
+  logged; insufficient space refuses up front), preserves content the set
+  does not cover (`documents/`, `uploads/`, uncovered vaults, ...) by
+  copying it through the swap, and never replays a stale `app.db-wal` —
+  sidecars are dropped with the pre-restore directory when the set
+  replaces the database (a set that does not cover `app.db` preserves
+  the database together with its live sidecars). See Scheduled
+  backups (crash recovery below) for the rare interrupted-restore journal.
 - Corrupt/missing metrics: telemetry shards are rebuildable caches — delete
   the registry dir contents and restart; no user data is involved.
 
@@ -204,13 +222,76 @@ roles, not capacity claims.
   the tagged LanceDB generations (restores vaults under `<dest>/vaults/`,
   matching live layout). The CI restore drill is
   `backend/tests/test_518_restore.py` (runs in the backend job).
+- The set is BUILT under a sibling `.partial-*` staging directory and
+  renamed into place only when complete; a re-run into a NON-EMPTY output
+  directory is refused before anything is snapshotted or tagged (never
+  merges stale files), and an existing EMPTY output directory (e.g. a
+  wrapper script's pre-created folder) is replaced. Tag names carry a
+  per-run token (`backup-<timestamp>-<token>-<table>`), so same-second
+  runs cannot collide.
 - Schedule under the existing deployment support (no new scheduler
   service): Linux cron `0 2 * * * cd /path/to/ragappv3 && python
   scripts/backup_set.py --output /backup-host/ragappv3/set-$(date
-  +\%Y\%m\%d)` ; Windows Task Scheduler runs the same command. Prune with
-  `scripts/cleanup_backups.py` (retention). The legacy single-file
-  `scripts/backup_sqlite.py` remains for the memories migration path and is
-  now WAL-safe too.
+  +\%Y\%m\%d-\%H\%M\%S)` (the `%` signs MUST be backslash-escaped in a
+  crontab — an unescaped `%` truncates the command); Windows Task
+  Scheduler runs the same command unescaped. Both schedulers need the
+  backend environment (the repo `.env` or the `AES_KEY` /
+  `ADMIN_SECRET_TOKEN` / `JWT_SECRET_KEY` variables) exactly like the
+  app — see the release notes for this change. Prune
+  with `python scripts/cleanup_backups.py --directory <backups-dir>
+  --retention <days>` — it removes both the legacy single-file
+  `db_*_k*.enc` backups AND backup-set directories past retention, and
+  RELEASES each pruned set's live `backup-*` LanceDB tags first, so the
+  store's periodic `optimize()` keeps working past the retention window.
+  A set whose tags cannot be released (or whose manifest is unreadable)
+  is KEPT for retry, with the reason logged.
+  `--release-unreferenced-tags` (opt-in) additionally deletes live
+  `backup-*` tags no remaining set manifest in that directory references
+  — opt-in because sets may live in several directories and one
+  directory's view cannot infer orphanhood. The legacy single-file
+  `scripts/backup_sqlite.py` remains for the memories migration path and
+  is WAL-safe; its filenames now carry a uniqueness token too.
+
+### Restore crash recovery
+
+A restore writes a `<dest>.restore-journal-*.json` beside the destination
+before its first rename and removes it once the outcome is confirmed. If
+the process dies mid-restore the journal survives, and the NEXT restore
+into that destination REFUSES until you complete the recovery manually.
+The DISK is authoritative, not the journal's `phase` field (an async
+exception can land between a rename and the phase write). Check TWO
+things before following the phase table: does the `aside` path recorded
+in the journal exist (the original destination sits there), and does the
+`staging` path still exist (the swap has not completed — `staging` is
+consumed by the swap). With that rule applied, the `phase` (and
+`dest_existed`) map to the steps below:
+
+- `journal-written` (no rename happened yet): roll FORWARD by renaming
+  the original destination to the journal's `aside` path, then `staging`
+  to the destination; roll BACK by leaving the untouched original
+  destination alone and deleting the staging directory, the journal and
+  the lock.
+- `aside-created` (the original is at the `aside` path): roll FORWARD by
+  renaming `staging` to the destination; roll BACK by renaming `aside`
+  back to the destination and deleting staging/journal/lock.
+- `commit` (the swap is done): finish persistence by running, for every
+  manifest table, `lancedb.connect(<dest>/lancedb).open_table(name).
+  checkout(tag)` followed by `restore()`, and verify a fresh connection
+  reports the tagged generation; roll BACK by moving any
+  `<dest>.failed-*`/current destination aside and renaming the
+  `.pre-restore-*` directory back (or, when `dest_existed` is false,
+  simply deleting the restored directory).
+- Finally delete the `<dest>.pre-restore-*` directory (when one remains),
+  any leftover `<dest>.staging-*` directory, the journal, and the stale
+  `<dest>.restore.lock` if present.
+
+After an ordinary (non-crash) failure no journal remains: single-fault
+failures roll back automatically to the byte-identical pre-restore state
+and the staged copy is cleared; the only residues are a discarded
+restored copy kept as `<dest>.failed-*` (safe to delete once you have
+verified the destination) and, on Windows, a refused restore that could
+not move the destination aside (the error says so; the staged copy is
+cleared automatically).
 
 ## Telemetry surface
 
