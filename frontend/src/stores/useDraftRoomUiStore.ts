@@ -49,6 +49,12 @@ interface DraftRoomUiState {
   setFindingStatusFilter(v: string | null): void;
   setClaimStatusFilter(v: string | null): void;
   resetForDraft(draftId: number): void;
+  /**
+   * Identity-boundary reset (issue #1032): `draftText` is user-authored
+   * content and must never survive an identity switch. View selections
+   * carry no cross-user content and are deliberately kept.
+   */
+  resetForIdentitySwitch(): void;
 }
 
 /**
@@ -94,4 +100,5 @@ export const useDraftRoomUiStore = create<DraftRoomUiState>((set) => ({
   setFindingStatusFilter: (v) => set({ findingStatusFilter: v }),
   setClaimStatusFilter: (v) => set({ claimStatusFilter: v }),
   resetForDraft: () => set({ ...DEFAULT_SELECTION_STATE }),
+  resetForIdentitySwitch: () => set({ draftText: {} }),
 }));

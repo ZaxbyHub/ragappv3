@@ -1,14 +1,15 @@
 import React from 'react'
 import ReactDOM from 'react-dom/client'
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { QueryClientProvider } from '@tanstack/react-query'
 import { Toaster } from 'sonner'
 import App from './App.tsx'
 import './index.css'
 // Initialize theme from persisted preference before first paint
 import { useThemeStore } from '@/stores/useThemeStore'
 import { logSubpathConfig } from './lib/paths'
-
-const queryClient = new QueryClient()
+// The app-wide React Query client lives in lib so the auth store's
+// identity-boundary reset can clear it at logout / identity switches (#1032).
+import { queryClient } from '@/lib/queryClient'
 
 logSubpathConfig();
 

@@ -1,4 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { canvasDraftKey } from "@/lib/canvasDrafts";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
@@ -176,7 +177,7 @@ test("unmount after a save discarded the draft must not resurrect it", async () 
     fireEvent.click(saveButton);
   });
   await act(async () => {});
-  expect(localStorage.getItem("canvas-draft:cav_discard")).toBeNull();
+  expect(localStorage.getItem(canvasDraftKey("cav_discard", null))).toBeNull();
 
   // Unmount inside the original debounce window: the discarded pending write
   // must NOT re-persist the draft (issue #688 constraint).
@@ -184,7 +185,7 @@ test("unmount after a save discarded the draft must not resurrect it", async () 
     vi.advanceTimersByTime(100);
   });
   cleanup();
-  expect(localStorage.getItem("canvas-draft:cav_discard")).toBeNull();
+  expect(localStorage.getItem(canvasDraftKey("cav_discard", null))).toBeNull();
 });
 
 test("unmount after an equality revert must not resurrect the cleared draft", async () => {
@@ -202,13 +203,13 @@ test("unmount after an equality revert must not resurrect the cleared draft", as
   // Re-type the original text: the equality branch clears the draft.
   fireEvent.change(editor, { target: { value: SAVED_CONTENT } });
   await act(async () => {});
-  expect(localStorage.getItem("canvas-draft:cav_discard")).toBeNull();
+  expect(localStorage.getItem(canvasDraftKey("cav_discard", null))).toBeNull();
 
   act(() => {
     vi.advanceTimersByTime(100);
   });
   cleanup();
-  expect(localStorage.getItem("canvas-draft:cav_discard")).toBeNull();
+  expect(localStorage.getItem(canvasDraftKey("cav_discard", null))).toBeNull();
 });
 
 test("applied save content is not re-persisted as a draft before the refetch lands", async () => {
@@ -251,5 +252,32 @@ test("applied save content is not re-persisted as a draft before the refetch lan
   cleanup();
 
   // Neither the pre-save draft nor the applied v2 content may be persisted.
-  expect(localStorage.getItem("canvas-draft:cav_discard")).toBeNull();
+  expect(localStorage.getItem(canvasDraftKey("cav_discard", null))).toBeNull();
+});
+
+test("a persisted draft is physically cleared when the editor returns to the saved content (issue #688 discard-clear)", async () => {
+  getCanvasArtifactMock.mockResolvedValue({
+    artifact: ARTIFACT_TEST,
+    version: makeVersion(2, SAVED_CONTENT, "user_edit"),
+  });
+  renderCanvasPage();
+
+  const editor = await screen.findByLabelText("Canvas content editor");
+  expect(editor).toHaveValue(SAVED_CONTENT);
+
+  vi.useFakeTimers();
+  fireEvent.change(editor, { target: { value: "draft to be discarded" } });
+  act(() => {
+    vi.advanceTimersByTime(600); // past the debounce: the key IS persisted
+  });
+  expect(localStorage.getItem(canvasDraftKey("cav_discard", null))).toBe(
+    "draft to be discarded",
+  );
+
+  // The equality discard path must CLEAR the persisted key, not merely stop
+  // future writes (removing the clearCanvasDraft call leaves the stale key).
+  fireEvent.change(editor, { target: { value: SAVED_CONTENT } });
+  await act(async () => {});
+
+  expect(localStorage.getItem(canvasDraftKey("cav_discard", null))).toBeNull();
 });
