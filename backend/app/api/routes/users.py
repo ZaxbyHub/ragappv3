@@ -31,6 +31,7 @@ from app.services.draft_deletion import DraftDeletionService
 from app.services.draft_input_storage import DraftInputStorage, DraftInputStorageError
 from app.services.draft_store import DraftStore
 from app.services.security_audit import safe_record_security_event
+from app.services.task_drain import drain_audit, drain_await
 
 router = APIRouter(prefix="/users", tags=["users"])
 logger = logging.getLogger(__name__)
@@ -249,7 +250,7 @@ async def create_user(
             "is_active": bool(row[4]),
             "created_at": row[5],
         }
-        await safe_record_security_event(
+        await drain_audit(safe_record_security_event(
             conn,
             event_type="user.created",
             actor=user,
@@ -257,7 +258,7 @@ async def create_user(
             target_username=row[1],
             request=request,
             metadata={"role": row[3]},
-        )
+        ))
         return response
     except HTTPException:
         await asyncio.to_thread(conn.rollback)
@@ -475,7 +476,7 @@ async def update_user(
     await asyncio.to_thread(db.commit)
 
     invalidate_active_user_cache(user_id)
-    await safe_record_security_event(
+    await drain_audit(safe_record_security_event(
         db,
         event_type="user.updated",
         actor=user,
@@ -486,7 +487,7 @@ async def update_user(
             "fields": [field.split(" = ")[0] for field in update_fields],
             "role": body.role,
         },
-    )
+    ))
 
     # Fetch updated user
     cursor = await asyncio.to_thread(db.execute, "SELECT id, username, full_name, role, is_active, created_at FROM users WHERE id = ?", (user_id,))
@@ -573,14 +574,14 @@ async def admin_reset_password(
     await asyncio.to_thread(_admin_reset_password_db)
 
     invalidate_active_user_cache(user_id)
-    await safe_record_security_event(
+    await drain_audit(safe_record_security_event(
         db,
         event_type="user.password_reset",
         actor=user,
         target_user_id=user_id,
         request=request,
         metadata={"must_change_password": True, "sessions_revoked": sessions_revoked},
-    )
+    ))
 
     return {
         "message": "Password reset successfully",
@@ -628,14 +629,14 @@ async def update_user_role(
         await asyncio.to_thread(conn.commit)
 
         invalidate_active_user_cache(user_id)
-        await safe_record_security_event(
+        await drain_audit(safe_record_security_event(
             conn,
             event_type="user.role_updated",
             actor=user,
             target_user_id=user_id,
             request=request,
             metadata={"old_role": current_role, "new_role": body.role},
-        )
+        ))
 
         return {
             "message": f"User role updated to {body.role}",
@@ -721,14 +722,14 @@ async def update_user_active(
         invalidate_active_user_cache(user_id)
 
         status_str = "activated" if body.is_active else "deactivated"
-        await safe_record_security_event(
+        await drain_audit(safe_record_security_event(
             conn,
             event_type="user.active_updated",
             actor=user,
             target_user_id=user_id,
             request=request,
             metadata={"is_active": body.is_active, "old_is_active": currently_active},
-        )
+        ))
         return {
             "message": f"User {status_str}",
             "user_id": user_id,
@@ -947,6 +948,24 @@ async def delete_user(
                         "UPDATE organizations SET created_by = NULL WHERE created_by = ?",
                         (user_id,),
                     )
+                    # Issue #1037 item 1: the owner refusal above read the
+                    # target's owned organizations BEFORE this transaction
+                    # opened, so a transfer_ownership committing in that gap
+                    # promoted the delete-target to owner and the cascading
+                    # DELETE below removed their membership — leaving the
+                    # organization with zero owners. BEGIN IMMEDIATE holds
+                    # the write lock, so this in-transaction re-read is
+                    # definitive (mirrors #1033's remove_org_member fix).
+                    owner_cursor = conn.execute(
+                        "SELECT org_id FROM org_members WHERE user_id = ? AND role = 'owner'",
+                        (user_id,),
+                    )
+                    owned_now = [row[0] for row in owner_cursor.fetchall()]
+                    if owned_now:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"User owns organization(s) {owned_now}. Transfer ownership before deleting.",
+                        )
                     _refuse_user_delete_orphaning_vaults(
                         _vaults_orphaned_by_user_delete(conn, user_id)
                     )
@@ -997,20 +1016,11 @@ async def delete_user(
         async def _drain(
             task: asyncio.Future,
         ) -> tuple[bool, BaseException | None]:
-            cancelled = False
-            while True:
-                try:
-                    await asyncio.shield(task)
-                    return cancelled, None
-                except asyncio.CancelledError as exc:
-                    if task.cancelled():
-                        # The drained task itself was cancelled (e.g. loop
-                        # shutdown) — return rather than loop forever.
-                        return cancelled, exc
-                    cancelled = True
-                    continue
-                except Exception as exc:
-                    return cancelled, exc
+            # Thin alias over the shared drain (task_drain.drain_await) so the
+            # delete path reads as one pattern with the 31 sibling audit
+            # sites (issue #1036 AC1); semantics are byte-for-byte the
+            # shield/absorb/report loop PR #1035 shipped.
+            return await drain_await(task)
 
         async def _finalize_committed_delete() -> None:
             # Best-effort purge discard, then the cache invalidation and the
@@ -1070,27 +1080,48 @@ async def delete_user(
         except HTTPException:
             # transaction_context already rolled the transaction back; a late
             # refusal restores the tombstoned Draft Room bytes (see the purge
-            # preparation above for the ordering contract).
+            # preparation above for the ordering contract). Issue #1036 AC4:
+            # the restore is DRAINED — a cancellation delivered at this await
+            # must not strand the tombstones; it propagates only after the
+            # restore completes.
             if draft_purge_plan is not None:
-                try:
-                    await asyncio.to_thread(draft_deletion.restore_purge, draft_purge_plan)
-                except Exception as restore_exc:
+                restore_cancelled, restore_error = await _drain(
+                    asyncio.ensure_future(
+                        asyncio.to_thread(
+                            draft_deletion.restore_purge, draft_purge_plan
+                        )
+                    )
+                )
+                if restore_error is not None and not isinstance(
+                    restore_error, asyncio.CancelledError
+                ):
                     logger.error(
                         "draft_room_user_purge_restore_failed user_id=%s reason=%s",
                         user_id,
-                        type(restore_exc).__name__,
+                        type(restore_error).__name__,
                     )
+                if restore_cancelled:
+                    raise asyncio.CancelledError
             raise
         except (sqlite3.Error, OSError, RuntimeError) as e:
             if draft_purge_plan is not None:
-                try:
-                    await asyncio.to_thread(draft_deletion.restore_purge, draft_purge_plan)
-                except Exception as restore_exc:
+                restore_cancelled, restore_error = await _drain(
+                    asyncio.ensure_future(
+                        asyncio.to_thread(
+                            draft_deletion.restore_purge, draft_purge_plan
+                        )
+                    )
+                )
+                if restore_error is not None and not isinstance(
+                    restore_error, asyncio.CancelledError
+                ):
                     logger.error(
                         "draft_room_user_purge_restore_failed user_id=%s reason=%s",
                         user_id,
-                        type(restore_exc).__name__,
+                        type(restore_error).__name__,
                     )
+                if restore_cancelled:
+                    raise asyncio.CancelledError
             logger.exception("Error deleting user %d", user_id)
             raise HTTPException(
                 status_code=500, detail="Failed to delete user"
@@ -1128,26 +1159,55 @@ async def delete_user(
                 # covers a BaseException raised inside the worker that
                 # skipped transaction_context's `except Exception` rollback;
                 # it is guarded so a cleanup failure cannot replace the
-                # primary exception.
+                # primary exception. Issue #1036 AC4: the WHOLE recovery
+                # sequence (rollback + restore_purge) is DRAINED with
+                # cancellation deferred until the sequence completes — a
+                # second cancellation delivered at either await is absorbed
+                # and re-raised only AFTER the restore, never between the
+                # two steps (plan-critic round 2, finding 5).
+                recovery_cancelled = False
                 try:
                     if conn.in_transaction:
-                        await asyncio.to_thread(lambda: conn.rollback())
+                        rollback_cancelled, rollback_error = await _drain(
+                            asyncio.ensure_future(
+                                asyncio.to_thread(lambda: conn.rollback())
+                            )
+                        )
+                        recovery_cancelled = recovery_cancelled or rollback_cancelled
+                        if rollback_error is not None and not isinstance(
+                            rollback_error, asyncio.CancelledError
+                        ):
+                            logger.warning(
+                                "draft_room_user_delete_rollback_failed user_id=%s",
+                                user_id,
+                            )
                 except Exception:
                     logger.warning(
                         "draft_room_user_delete_rollback_failed user_id=%s",
                         user_id,
                     )
                 if draft_purge_plan is not None:
-                    try:
-                        await asyncio.to_thread(
-                            draft_deletion.restore_purge, draft_purge_plan
+                    restore_cancelled, restore_error = await _drain(
+                        asyncio.ensure_future(
+                            asyncio.to_thread(
+                                draft_deletion.restore_purge, draft_purge_plan
+                            )
                         )
-                    except Exception as restore_exc:
+                    )
+                    recovery_cancelled = recovery_cancelled or restore_cancelled
+                    if restore_error is not None and not isinstance(
+                        restore_error, asyncio.CancelledError
+                    ):
                         logger.error(
                             "draft_room_user_purge_restore_failed user_id=%s reason=%s",
                             user_id,
-                            type(restore_exc).__name__,
+                            type(restore_error).__name__,
                         )
+                if recovery_cancelled:
+                    # The recovery completed; now the absorbed cancellation
+                    # propagates (never swallowed — same contract as the
+                    # committed-path finalization).
+                    raise asyncio.CancelledError
             else:
                 # Issue #1031: the delete COMMITTED even though this request
                 # is being cancelled — the audit event, cache invalidation
@@ -1475,7 +1535,7 @@ async def update_user_organizations(
 
     try:
         result = await asyncio.to_thread(_update_orgs)
-        await safe_record_security_event(
+        await drain_audit(safe_record_security_event(
             conn,
             event_type="membership.organizations_replaced",
             actor=user,
@@ -1487,7 +1547,7 @@ async def update_user_organizations(
                     for m in body.resolved_memberships()
                 ]
             },
-        )
+        ))
         return result
     finally:
         pool.release_connection(conn)
@@ -1761,14 +1821,14 @@ async def update_user_groups(
 
     try:
         groups = await asyncio.to_thread(_update_groups)
-        await safe_record_security_event(
+        await drain_audit(safe_record_security_event(
             conn,
             event_type="membership.groups_replaced",
             actor=user,
             target_user_id=user_id,
             request=request,
             metadata={"group_ids": list(body.group_ids)},
-        )
+        ))
         return {"groups": groups}
     finally:
         pool.release_connection(conn)

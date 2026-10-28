@@ -156,6 +156,7 @@ from app.services.draft_store import (
 from app.services.folder_store import FolderStore
 from app.services.security_audit import safe_record_security_event
 from app.services.tag_store import TagStore
+from app.services.task_drain import drain_audit
 from app.services.upload_validation import secure_filename
 
 logger = logging.getLogger(__name__)
@@ -2842,13 +2843,13 @@ async def delete_draft(
     # still existing — recording after the cascade loses no information
     # while guaranteeing the record only ever reflects a real deletion
     # (SPEC section 9.3).
-    await safe_record_security_event(
+    await drain_audit(safe_record_security_event(
         db,
         event_type="draft_deleted",
         actor=user,
         request=request,
         metadata={"draft_id": draft_id},
-    )
+    ))
 
 
 # ── inputs ───────────────────────────────────────────────────────────────────
@@ -3238,7 +3239,7 @@ async def cancel_draft_job(
             draft_id=draft_id, owner_id=owner_id, job_id=job_id
         )
     )
-    await safe_record_security_event(
+    await drain_audit(safe_record_security_event(
         db,
         event_type="draft_job_cancelled",
         actor=user,
@@ -3249,7 +3250,7 @@ async def cancel_draft_job(
             "job_type": job.job_type,
             "status": job.status,
         },
-    )
+    ))
     return _to_job(job)
 
 
@@ -3360,7 +3361,7 @@ async def retry_draft_job(
         lambda: store.get_job(draft_id=draft_id, owner_id=owner_id, job_id=new_job_id)
     )
     if created:
-        await safe_record_security_event(
+        await drain_audit(safe_record_security_event(
             db,
             event_type="draft_job_retried",
             actor=user,
@@ -3374,7 +3375,7 @@ async def retry_draft_job(
                 "compile_input_sha256": prepared["compile_fingerprint"],
                 "prompt_bundle_version": PROMPT_BUNDLE_VERSION,
             },
-        )
+        ))
     return _to_job(job)
 
 
@@ -3458,7 +3459,7 @@ async def compile_draft(
         lambda: store.get_job(draft_id=draft_id, owner_id=owner_id, job_id=job_id)
     )
     if created:
-        await safe_record_security_event(
+        await drain_audit(safe_record_security_event(
             db,
             event_type="draft_compile_requested",
             actor=user,
@@ -3474,7 +3475,7 @@ async def compile_draft(
                 "tier": draft.tier,
                 "idempotent_replay": False,
             },
-        )
+        ))
     else:
         # Idempotent replay. The job's request snapshot is a large body, so it
         # is fetched explicitly through the store's dedicated accessor rather
@@ -3482,7 +3483,7 @@ async def compile_draft(
         stored = await _run_store(
             lambda: store.get_job_json_field(job_id=job_id, field="input_json")
         )
-        await safe_record_security_event(
+        await drain_audit(safe_record_security_event(
             db,
             event_type="draft_compile_requested",
             actor=user,
@@ -3493,7 +3494,7 @@ async def compile_draft(
                 "start_stage": stored.get("normalized_start_stage"),
                 "idempotent_replay": True,
             },
-        )
+        ))
     return _to_job(job)
 
 
@@ -3692,13 +3693,13 @@ async def mark_revision_ready(
             acknowledge_source_only=body.acknowledge_source_only,
         )
     )
-    await safe_record_security_event(
+    await drain_audit(safe_record_security_event(
         db,
         event_type="draft_ready_marked",
         actor=user,
         request=request,
         metadata={"draft_id": draft_id, **audit},
-    )
+    ))
     updated = await _run_store(lambda: store.get_draft(draft_id, owner_id))
     return await _build_summary(db, store, updated, evaluate, user)
 
@@ -3797,7 +3798,7 @@ async def export_draft_revision(
             },
         )
     )
-    await safe_record_security_event(
+    await drain_audit(safe_record_security_event(
         db,
         event_type="draft_exported",
         actor=user,
@@ -3810,7 +3811,7 @@ async def export_draft_revision(
             "approval_status": approval_status,
             "content_sha256": revision.content_sha256,
         },
-    )
+    ))
     # RFC 6266: the ASCII-safe ``filename`` parameter stays for legacy
     # clients, and the additive ``filename*`` parameter carries the raw title
     # (percent-encoded, ``safe=""`` so a title's own ``/`` never passes
@@ -3954,13 +3955,13 @@ async def _record_promotion_cleanup_failure(
     ``draft_promotions`` row, or on-disk file may still exist. Distinct
     ``event_type`` from ``draft_promoted`` so operators can search for it
     specifically."""
-    await safe_record_security_event(
+    await drain_audit(safe_record_security_event(
         db,
         event_type="draft_promotion_cleanup_failed",
         actor=user,
         request=request,
         metadata={"draft_id": draft_id, "detail": str(exc)},
-    )
+    ))
 
 
 def _apply_promotion_organization(
@@ -4174,7 +4175,7 @@ async def promote_draft_source(
     # is deliberately the final opportunity to record provenance for a
     # promotion that has already, irreversibly, happened.
     try:
-        await safe_record_security_event(
+        await drain_audit(safe_record_security_event(
             db,
             event_type="draft_promoted",
             actor=user,
@@ -4192,7 +4193,7 @@ async def promote_draft_source(
                 "organization_error": organization_error,
                 "draft_event_error": draft_event_error,
             },
-        )
+        ))
     except BaseException as exc:  # noqa: BLE001 — the promotion already succeeded; this must not prevent the response either
         logger.warning(
             "draft_room: failed to record draft_promoted security audit "
@@ -4537,7 +4538,7 @@ async def dispose_draft_finding(
     # dismiss/waive moved theirs into DraftStore with the same guards (issue
     # #788 / T1-08-K-02). The note text stays in
     # ``draft_findings.resolution_note``; payloads carry IDs and codes only.
-    await safe_record_security_event(
+    await drain_audit(safe_record_security_event(
         db,
         event_type=f"draft_finding_{body.action}",
         actor=user,
@@ -4552,7 +4553,7 @@ async def dispose_draft_finding(
             "span_text_sha256": finding.span_text_sha256,
             "revision_id": new_revision.id if new_revision else finding.revision_id,
         },
-    )
+    ))
     updated = await _run_store(
         lambda: _sync_get_finding(
             db, draft_id=draft_id, owner_id=owner_id, finding_id=finding_id

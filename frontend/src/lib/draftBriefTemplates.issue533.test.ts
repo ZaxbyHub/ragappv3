@@ -34,19 +34,21 @@ describe("draftBriefTemplates (issue #533)", () => {
   it("resetDraftBriefTemplatesCacheForTests clears the session cache so the next list re-reads storage", () => {
     // Baseline: no cached state may survive from an earlier test in this file.
     resetDraftBriefTemplatesCacheForTests();
+    // Issue #1036 AC2: templates are principal-scoped — every call names one.
+    const principalId = 533;
 
-    const saved = saveDraftBriefTemplate("Quarterly template", brief);
+    const saved = saveDraftBriefTemplate("Quarterly template", brief, principalId);
     expect(saved).toHaveLength(1);
     expect(saved[0]).toMatchObject({ name: "Quarterly template", brief });
 
     // Before the reset the session cache still serves the save — the stubbed
     // storage write alone could not have produced this.
-    expect(listDraftBriefTemplates()).toEqual(saved);
+    expect(listDraftBriefTemplates(principalId)).toEqual(saved);
 
     resetDraftBriefTemplatesCacheForTests();
 
     // After the reset the next list must re-read storage (stubbed empty)
     // rather than serving the stale in-memory copy.
-    expect(listDraftBriefTemplates()).toEqual([]);
+    expect(listDraftBriefTemplates(principalId)).toEqual([]);
   });
 });
