@@ -467,15 +467,20 @@ def test_executor_submit_failure_restores_purge(tmp_path: Path, monkeypatch: pyt
         # monkeypatch's own teardown restores the module attribute.
 
 
-def test_second_cancel_during_settle_wait_is_disclosed_and_contained(tmp_path: Path) -> None:
-    """Review PRR-005: a SECOND cancellation delivered while the backstop
-    waits for the detached worker aborts the restore. The protocol discloses
-    this residual; this test pins the CONTAINMENT that the disclosure rests
-    on — the worker still reaches its terminal outcome, the connection is
-    released exactly once, and the route's own finally completes (no leak of
-    the executor handle)."""
+def test_second_cancel_during_settle_wait_is_drained_not_abandoning(tmp_path: Path) -> None:
+    """Issue #1031 hardening of the former PRR-005 disclosed residual: a
+    SECOND cancellation delivered while the backstop waits for the detached
+    worker no longer aborts the wait — the settle-wait is DRAINED, so
+    settlement is observed, the (non-committed) restore runs, and only then
+    does the original CancelledError propagate. Containment still holds: the
+    worker reaches its terminal outcome, the connection is released exactly
+    once, and only AFTER settlement."""
     release = threading.Event()
-    env = _OutcomesEnv(tmp_path, block_after_user_delete=release)
+    env = _OutcomesEnv(
+        tmp_path,
+        block_after_user_delete=release,
+        raise_after_user_delete=asyncio.CancelledError(),
+    )
     release_calls: list[bool] = []
     hook_done_at_second_cancel: list[bool] = []
     orig_release = env.facade.release_connection
@@ -496,37 +501,39 @@ def test_second_cancel_during_settle_wait_is_disclosed_and_contained(tmp_path: P
             await asyncio.sleep(0.05)  # backstop parks on the settle-wait
             task.cancel()  # first cancellation
             await asyncio.sleep(0.05)
-            task.cancel()  # second: aborts the wait (the disclosed residual)
-            # Sample BEFORE the worker is released: the containment assertions
-            # below are only meaningful if the route was abandoned while the
-            # worker was still parked in its hook. A worker that had already
-            # finished would make them vacuously true.
+            task.cancel()  # second: absorbed by the drained settle-wait
+            # Sample BEFORE the worker is released: the assertions below are
+            # only meaningful if both cancellations landed while the worker
+            # was still parked in its hook.
             hook_done_at_second_cancel.append(env.conn.hook_done.is_set())
+            # Release the worker NOW: it raises CancelledError inside the
+            # still-open transaction (non-commit outcome), the drain
+            # observes settlement, the restore runs, and the route's
+            # original cancellation propagates only afterwards.
+            release.set()
             with pytest.raises(asyncio.CancelledError):
                 await task
-            # The route has unwound. Release the worker here — not in this
-            # test's finally — so its terminal outcome is observed promptly
-            # instead of waiting out the scripted hook's 10s fallback.
-            release.set()
 
         asyncio.run(drive())
         assert hook_done_at_second_cancel == [False], (
-            "the second cancellation must land while the worker is still "
-            "parked, otherwise the containment assertions below are vacuous"
+            "both cancellations must land while the worker is still parked, "
+            "otherwise the assertions below are vacuous"
         )
         assert env.conn.block_released_by_gate is True, (
             "the worker was released by the gate this test owns, not by the "
-            "scripted hook's 10s fallback — a timeout-released worker is what "
-            "made the pre-fix ordering pass"
+            "scripted hook's 10s fallback"
         )
-        # The worker always reaches its terminal outcome even though the
-        # route abandoned it, and the connection is still released exactly
-        # once — the containment the disclosed residual rests on.
         assert env.conn.hook_done.wait(timeout=5), "the detached worker finished its item"
         assert len(release_calls) == 1, "connection released exactly once"
-        assert release_calls == [False], (
-            "the disclosed residual: the route released the connection while "
-            "the worker was still parked, and the worker settled anyway"
+        assert release_calls == [True], (
+            "post-#1031 contract: the drained backstop releases the "
+            "connection only AFTER the worker settled — the restore is no "
+            "longer abandoned by a second cancellation"
+        )
+        assert env.rows_survive(), "the rolled-back delete kept the user row"
+        assert env.input_live(), (
+            "the restore ran even after the second cancellation — the "
+            "disclosed residual is closed"
         )
     finally:
         release.set()

@@ -983,6 +983,84 @@ async def delete_user(
         # #1019, review PRR-003).
         delete_executor: concurrent.futures.ThreadPoolExecutor | None = None
         delete_future: concurrent.futures.Future | None = None
+
+        # Issue #1031: the post-commit bookkeeping (purge discard, cache
+        # invalidation, the user.deleted audit event) must run on EVERY
+        # committed path — including a cancellation delivered at the delete
+        # await while the detached worker commits, or during the
+        # bookkeeping awaits themselves. `_drain` awaits a shielded task
+        # through repeated cancellations and reports BOTH whether a
+        # cancellation was absorbed and the task's own failure, so the
+        # absorption state survives a finalization exception (plan-critic
+        # round 2/3) and the caller re-raises cancellation AFTER the
+        # bookkeeping completes (plan-critic round 2 finding 6).
+        async def _drain(
+            task: asyncio.Future,
+        ) -> tuple[bool, BaseException | None]:
+            cancelled = False
+            while True:
+                try:
+                    await asyncio.shield(task)
+                    return cancelled, None
+                except asyncio.CancelledError as exc:
+                    if task.cancelled():
+                        # The drained task itself was cancelled (e.g. loop
+                        # shutdown) — return rather than loop forever.
+                        return cancelled, exc
+                    cancelled = True
+                    continue
+                except Exception as exc:
+                    return cancelled, exc
+
+        async def _finalize_committed_delete() -> None:
+            # Best-effort purge discard, then the cache invalidation and the
+            # security-audit event — the exact sequence the normal path has
+            # always run, now reachable from the cancelled-committed path
+            # too. Scheduled at most once per request via finalize_task.
+            if draft_purge_plan is not None:
+                try:
+                    await asyncio.to_thread(
+                        draft_deletion.commit_purge, draft_purge_plan
+                    )
+                except Exception as e:
+                    # Bytes are already tombstoned in `.trash`; failing to
+                    # finish discarding them must not turn a successful
+                    # user delete into an error response.
+                    logger.warning(
+                        "draft_room_user_purge_commit_failed user_id=%s reason=%s",
+                        user_id,
+                        type(e).__name__,
+                    )
+
+            # Multi-stage review: the audit event is the mandatory step — a
+            # cache-invalidation failure must be logged and NEVER prevent the
+            # user.deleted record from being attempted (same best-effort
+            # contract as commit_purge above).
+            try:
+                invalidate_active_user_cache(user_id)
+            except Exception as e:
+                logger.warning(
+                    "user_delete_cache_invalidate_failed user_id=%s reason=%s",
+                    user_id,
+                    type(e).__name__,
+                )
+
+            # Security-relevant event, same helper/tamper-evident contract
+            # as every other users.py mutation (issue #722 AC1).
+            # security_audit_log carries no FK on user ids, so recording
+            # after the delete commits cannot violate constraints; metadata
+            # snapshots the pre-delete row.
+            await safe_record_security_event(
+                conn,
+                event_type="user.deleted",
+                actor=user,
+                target_user_id=user_id,
+                target_username=target_username,
+                request=request,
+                metadata={"role": target_role, "username": target_username},
+            )
+
+        finalize_task: asyncio.Future | None = None
         try:
             delete_executor = concurrent.futures.ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="user_delete"
@@ -1029,8 +1107,22 @@ async def delete_user(
             # for: nothing ran, so the rows trivially survived. A submission
             # failure means the item never existed at all — the same
             # disposition, and the wait below is skipped for it too.
+            # Issue #1031: the settlement wait itself is DRAINED — a second
+            # cancellation delivered while it is pending must not exit this
+            # arm before the committed check below (plan-critic round 1
+            # finding 3). The EVENT is the truth, never any single wait
+            # task: a settle-wait task that fails or is cancelled (loop
+            # shutdown) is re-created until the worker actually settles, so
+            # a failed wait can never be mistaken for an observed
+            # non-commit (review lane finding: the discarded drain tuple
+            # previously let the arm roll back and release the connection
+            # while the worker was still inside its transaction).
             if delete_future is not None and not delete_future.cancelled():
-                await asyncio.shield(asyncio.to_thread(delete_settled.wait))
+                while not delete_settled.is_set():
+                    settle_wait_task: asyncio.Future = asyncio.ensure_future(
+                        asyncio.to_thread(delete_settled.wait)
+                    )
+                    await _drain(settle_wait_task)
             if not delete_outcome["committed"]:
                 # Restore whenever a commit was never proven. The rollback
                 # covers a BaseException raised inside the worker that
@@ -1056,6 +1148,32 @@ async def delete_user(
                             user_id,
                             type(restore_exc).__name__,
                         )
+            else:
+                # Issue #1031: the delete COMMITTED even though this request
+                # is being cancelled — the audit event, cache invalidation
+                # and purge finalization must still run before the original
+                # exception propagates. Drained so a second cancellation
+                # cannot skip it; a finalization failure is logged, never a
+                # replacement for the propagating exception.
+                if finalize_task is None:
+                    finalize_task = asyncio.ensure_future(
+                        _finalize_committed_delete()
+                    )
+                finalize_cancelled, finalize_error = await _drain(finalize_task)
+                if finalize_error is not None:
+                    logger.warning(
+                        "user_delete_finalize_failed user_id=%s reason=%s",
+                        user_id,
+                        type(finalize_error).__name__,
+                    )
+                elif finalize_cancelled:
+                    # The original cancellation below already propagates;
+                    # this records that the drain absorbed additional
+                    # cancellations during the bookkeeping itself.
+                    logger.info(
+                        "user_delete_finalize_absorbed_cancellation user_id=%s",
+                        user_id,
+                    )
             raise
         finally:
             # After any observed settlement the worker thread is already
@@ -1065,34 +1183,30 @@ async def delete_user(
             if delete_executor is not None:
                 delete_executor.shutdown(wait=False)
 
-        if draft_purge_plan is not None:
-            try:
-                await asyncio.to_thread(draft_deletion.commit_purge, draft_purge_plan)
-            except Exception as e:
-                # Bytes are already tombstoned in `.trash`; failing to finish
-                # discarding them must not turn a successful user delete into
-                # an error response.
-                logger.warning(
-                    "draft_room_user_purge_commit_failed user_id=%s reason=%s",
-                    user_id,
-                    type(e).__name__,
-                )
-
-        invalidate_active_user_cache(user_id)
-
-        # Security-relevant event, same helper/tamper-evident contract as
-        # every other users.py mutation (issue #722 AC1). security_audit_log
-        # carries no FK on user ids, so recording after the delete commits
-        # cannot violate constraints; metadata snapshots the pre-delete row.
-        await safe_record_security_event(
-            conn,
-            event_type="user.deleted",
-            actor=user,
-            target_user_id=user_id,
-            target_username=target_username,
-            request=request,
-            metadata={"role": target_role, "username": target_username},
-        )
+        # Issue #1031: the post-commit bookkeeping runs as one at-most-once
+        # DRAINED task on the normal path too — a cancellation delivered
+        # during the commit_purge or audit awaits previously skipped the
+        # remaining steps. `_drain` reports whether a cancellation was
+        # absorbed; the delete succeeded, so cancellation propagates only
+        # AFTER the bookkeeping completes (never swallowed — plan-critic
+        # round 2 findings 4 and 6).
+        if finalize_task is None:
+            finalize_task = asyncio.ensure_future(_finalize_committed_delete())
+        finalize_cancelled, finalize_error = await _drain(finalize_task)
+        if finalize_error is not None:
+            logger.warning(
+                "user_delete_finalize_failed user_id=%s reason=%s",
+                user_id,
+                type(finalize_error).__name__,
+            )
+            if isinstance(finalize_error, asyncio.CancelledError):
+                # A cancellation raised INSIDE the finalization (e.g. a
+                # scripted commit_purge cancel) is a cancellation-class
+                # event: propagate it after logging, never convert the
+                # request into a silent 200.
+                finalize_cancelled = True
+        if finalize_cancelled:
+            raise asyncio.CancelledError
 
         return {"message": "User deleted", "user_id": user_id}
     finally:

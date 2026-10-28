@@ -1224,6 +1224,28 @@ async def remove_org_member(
         # (AC7), and rolls both DELETEs back.
         def _remove_member():
             with transaction_context(conn):
+                # Issue #1033: the owner refusal above read the target's
+                # role BEFORE this write transaction opened, so a
+                # transfer_ownership committing in that window promoted the
+                # target to owner and the un-predicated DELETE below would
+                # remove them — leaving the organization with zero owners.
+                # BEGIN IMMEDIATE holds the write lock for the transaction's
+                # duration, so this in-transaction re-read is definitive.
+                role_cursor = conn.execute(
+                    "SELECT role FROM org_members WHERE org_id = ? AND user_id = ?",
+                    (org_id, member_user_id),
+                )
+                target_role_now = role_cursor.fetchone()
+                if target_role_now is None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Member not found in organization",
+                    )
+                if target_role_now[0] == "owner":
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Cannot remove the organization owner. Transfer ownership first.",
+                    )
                 candidate_vault_ids = _user_derived_admin_vault_ids(
                     conn, member_user_id
                 )

@@ -22,6 +22,12 @@ import {
   invalidatePendingDraftWrites,
 } from "@/lib/chatDrafts";
 import { clearAllFeedbackVotes } from "@/lib/chatFeedbackStorage";
+import {
+  clearAllCanvasDrafts,
+  invalidatePendingCanvasDraftWrites,
+} from "@/lib/canvasDrafts";
+import { queryClient } from "@/lib/queryClient";
+import { useDraftRoomUiStore } from "@/stores/useDraftRoomUiStore";
 import { resetCitationReport } from "@/lib/api/onboarding";
 import { AuthTransportTimeoutError, type AuthOwner, captureAuthOwner, captureAuthPrincipalGeneration, enqueueAuthTransport, isCurrentAuthOwner, publishAuthPrincipal, reserveReplacementAuthOwner, StaleAuthOwnerError, subscribeAuthPrincipal } from "@/lib/api/auth-lifecycle";
 import { onJwtAccessTokenPublished } from "@/lib/api/core";
@@ -223,20 +229,38 @@ export const resetInitState = () => {
 const resetChatStateForIdentitySwitch = () => {
   // Kill delayed writers FIRST so they cannot re-create cleared state:
   // pending draft debounce timers / unmount flushes, and async upload
-  // completions / queue continuations of the outgoing identity.
+  // completions / queue continuations of the outgoing identity. Issue
+  // #1032: the canvas draft writers are the same delayed-writer class
+  // (debounce timer + unmount/artifact-switch flushes in CanvasPage).
   invalidatePendingDraftWrites();
+  invalidatePendingCanvasDraftWrites();
   useChatStore.getState().newChat();
   useChatStore.getState().setInput("");
   useChatStore.getState().setInputError(null);
   // Best-effort wipes can partially fail on a degraded storage surface; the
   // principal-scoped key namespaces keep the residue unreadable to the next
   // principal, and the counts are logged so the residual is observable
-  // rather than silent (hermes review, final head).
+  // rather than silent (hermes review, final head). Issue #1032 extends the
+  // same contract to the canvas draft namespace.
   const draftRemovalFailures = clearAllChatDrafts();
   if (draftRemovalFailures > 0) {
     console.warn(
       "identity_switch_draft_wipe_incomplete failed_keys=%d",
       draftRemovalFailures
+    );
+  }
+  const canvasDraftRemovalFailures = clearAllCanvasDrafts();
+  if (canvasDraftRemovalFailures < 0) {
+    // Enumeration itself failed: the wipe completeness is unknown, so the
+    // residual is unobservable (multi-stage review). Principal-scoped keys
+    // keep any residue unreadable to the next principal either way.
+    console.warn(
+      "identity_switch_canvas_draft_wipe_unknown storage_enumeration_failed"
+    );
+  } else if (canvasDraftRemovalFailures > 0) {
+    console.warn(
+      "identity_switch_canvas_draft_wipe_incomplete failed_keys=%d",
+      canvasDraftRemovalFailures
     );
   }
   const feedbackRemovalFailures = clearAllFeedbackVotes();
@@ -255,6 +279,19 @@ const resetChatStateForIdentitySwitch = () => {
   // the same content class as the fields above.
   shell.clearIdentityScopedState();
   useUploadStore.getState().resetForIdentitySwitch();
+  // Issue #1032: the remaining per-user surfaces outside the chat store's
+  // namespace — the app-wide React Query cache (no query key carries a
+  // principal segment) and the Draft Room UI store's unsent editor text.
+  // resetQueries() FIRST: a mounted QueryObserver keeps rendering its own
+  // #currentQuery state after clear() empties the cache map, so clear()
+  // alone leaves the previous principal's payload on screen until the next
+  // refetch; resetQueries() resets every observer to its initial state
+  // (cancelling in-flight fetches), and the subsequent clear() removes the
+  // entries outright (blind-lane probe: clear() alone -> observer still
+  // renders user A's payload; resetQueries() -> data undefined, pending).
+  queryClient.resetQueries();
+  queryClient.clear();
+  useDraftRoomUiStore.getState().resetForIdentitySwitch();
 };
 
 // Wire up CSRF via centralized api.ts utilities

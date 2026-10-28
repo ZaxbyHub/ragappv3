@@ -1,7 +1,12 @@
 import { useEffect } from "react";
+import {
+  canvasDraftKey,
+  invalidatePendingCanvasDraftWrites,
+} from "@/lib/canvasDrafts";
+import { useAuthStore } from "@/stores/useAuthStore";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, Route, Routes, useNavigate } from "react-router-dom";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 
 // The shared highlighter's loader is mocked to reject so the preview fallback
@@ -202,7 +207,95 @@ test("unmount inside the debounce window flushes the draft", async () => {
   });
   unmount();
 
-  expect(localStorage.getItem("canvas-draft:cav_test1")).toBe("edited draft");
+  expect(localStorage.getItem(canvasDraftKey("cav_test1", null))).toBe("edited draft");
+});
+
+test("a flush scheduled before an identity-switch generation bump writes nothing (issue #1032)", async () => {
+  getCanvasArtifactMock.mockResolvedValue({
+    artifact: ARTIFACT_TEST,
+    version: makeVersion(2, SAVED_CONTENT, "user_edit"),
+  });
+  const { unmount } = renderCanvasPage();
+
+  const editor = await screen.findByLabelText("Canvas content editor");
+  expect(editor).toHaveValue(SAVED_CONTENT);
+
+  vi.useFakeTimers();
+  fireEvent.change(editor, { target: { value: "user A's unsent canvas text" } });
+  act(() => {
+    vi.advanceTimersByTime(100); // inside the debounce window: scheduled at gen G
+  });
+  // The identity boundary kills delayed writers: the generation bumps to
+  // G+1. The pending write captured G at SCHEDULE time — the eventual flush
+  // (timer, unmount, or artifact switch) must drop it, not re-capture the
+  // current generation at flush time.
+  invalidatePendingCanvasDraftWrites();
+  act(() => {
+    vi.advanceTimersByTime(500 + 50); // DRAFT_PERSIST_DEBOUNCE_MS window
+  });
+  unmount(); // unmount flush must also drop the stale pending
+
+  expect(localStorage.getItem(canvasDraftKey("cav_test1", null))).toBeNull();
+});
+
+test("artifact switch after a generation bump drops the stale pending draft", async () => {
+  getCanvasArtifactMock.mockImplementation(async (uid: string) =>
+    uid === "cav_b"
+      ? { artifact: ARTIFACT_B, version: makeVersion(2, B_CONTENT, "user_edit") }
+      : { artifact: ARTIFACT_A, version: makeVersion(2, A_CONTENT, "user_edit") }
+  );
+  renderCanvasPage("/chat/7/canvas/cav_a");
+
+  const editor = await screen.findByLabelText("Canvas content editor");
+  expect(editor).toHaveValue(A_CONTENT);
+
+  vi.useFakeTimers();
+  fireEvent.change(editor, { target: { value: "edited draft" } });
+  act(() => {
+    vi.advanceTimersByTime(100);
+  });
+  invalidatePendingCanvasDraftWrites();
+  act(() => {
+    navigateRef.current?.("/chat/7/canvas/cav_b");
+  });
+  await act(async () => {});
+
+  expect(localStorage.getItem(canvasDraftKey("cav_a", null))).toBeNull();
+});
+
+// Behavioral pin (multi-stage review HIGH — disclosed non-discriminating):
+// after the principal switch the editor shows the SAVED content, never the
+// previous principal's unsent text. The invariant holds through the
+// artifact-reset effect's editorBaseVersionNo reset (flushPendingDraft dep
+// chain); CanvasPage's explicit principalChanged bypass removes the reliance
+// on that implicit coupling, so this leg stays green with OR without it.
+test("same-artifact principal switch resets stale editor text (multi-stage review HIGH)", async () => {
+  getCanvasArtifactMock.mockResolvedValue({
+    artifact: ARTIFACT_TEST,
+    version: makeVersion(2, SAVED_CONTENT, "user_edit"),
+  });
+  useAuthStore.setState({ user: { id: 11, username: "usera", full_name: "A", role: "admin", is_active: true } });
+  renderCanvasPage();
+
+  const editor = await screen.findByLabelText("Canvas content editor");
+  expect(editor).toHaveValue(SAVED_CONTENT);
+
+  // User A types an unsent edit (in-memory only — nothing flushed).
+  fireEvent.change(editor, { target: { value: "user A's private unsent text" } });
+  expect(editor).toHaveValue("user A's private unsent text");
+
+  // A different principal logs in on the SAME artifact. The rehydrate
+  // effect must take its full path despite the version guard — otherwise
+  // A's unsent text survives in component state for B.
+  useAuthStore.setState({ user: { id: 22, username: "userb", full_name: "B", role: "admin", is_active: true } });
+
+  await waitFor(() => {
+    expect(screen.getByLabelText("Canvas content editor")).toHaveValue(SAVED_CONTENT);
+  });
+
+  // Reset the principal so the leak does not poison later suites in this
+  // file (draftFlush has no auth-store afterEach).
+  useAuthStore.setState({ user: null });
 });
 
 test("artifact switch inside the debounce window flushes the previous draft", async () => {
@@ -229,5 +322,5 @@ test("artifact switch inside the debounce window flushes the previous draft", as
   });
   await act(async () => {});
 
-  expect(localStorage.getItem("canvas-draft:cav_a")).toBe("edited draft");
+  expect(localStorage.getItem(canvasDraftKey("cav_a", null))).toBe("edited draft");
 });
