@@ -75,18 +75,47 @@ def test_ac11_coverage_thresholds_configured():
 
 @pytest.mark.skipif(
     _NPM is None or not (FRONTEND / "node_modules").is_dir(),
-    reason="npm or frontend/node_modules unavailable (backend CI runner); "
-    "the Frontend CI job runs the coverage gate",
+    reason="npm or frontend/node_modules unavailable — the Backend job "
+    "installs a full frontend/node_modules, so this node runs there; the "
+    "Frontend CI job runs the same coverage gate natively",
 )
-def test_ac11_coverage_command_passes():
+def test_ac11_coverage_command_passes(tmp_path):
+    # Issue #943: the coverage command's artifacts (including vitest's
+    # transient reports-directory lifecycle) must stay OUTSIDE the
+    # repository root — the default ``coverage/`` directory under
+    # ``frontend/`` appears and disappears mid-run, racing any concurrent
+    # repo-wide walk under pytest-xdist (observed crashing the secretscan
+    # contract test). The redirect confines the whole lifecycle to a
+    # per-test pytest tmp dir.
+    reports_dir = tmp_path / "coverage-reports"
+    frontend_coverage = FRONTEND / "coverage"
     try:
+        assert not frontend_coverage.exists(), (
+            "frontend/coverage exists before the run — previous artifact "
+            "left in place; the confinement assertion below needs a clean slate"
+        )
         package = json.loads((FRONTEND / "package.json").read_text(encoding="utf-8"))
         scripts = package.get("scripts", {})
+        # The json reporter makes the redirect OBSERVABLE: vitest must write
+        # coverage-report.json into reports_dir, proving the artifacts really
+        # landed outside the repository root (issue #943).
+        redirect_flags = [
+            f"--coverage.reportsDirectory={reports_dir.as_posix()}",
+            "--coverage.reporter=json",
+        ]
         if "test:coverage" in scripts:
-            argv = [_NPM, "run", "test:coverage"]
+            argv = [_NPM, "run", "test:coverage", "--", *redirect_flags]
             command = "npm run test:coverage"
         else:
-            argv = [_NPM, "exec", "--", "vitest", "run", "--coverage"]
+            argv = [
+                _NPM,
+                "exec",
+                "--",
+                "vitest",
+                "run",
+                "--coverage",
+                *redirect_flags,
+            ]
             command = "npm exec -- vitest run --coverage"
         print(f"argv: {argv}")
         result = subprocess.run(
@@ -103,6 +132,18 @@ def test_ac11_coverage_command_passes():
         assert result.returncode == 0, (
             f"the frontend coverage command ({command}) must pass against the "
             "configured thresholds"
+        )
+        # Confinement oracle (issue #943): the redirect took effect (the
+        # json report landed OUTSIDE the repo) and no coverage directory
+        # exists under the repository root.
+        assert any(reports_dir.iterdir()), (
+            f"{command} wrote no coverage report into {reports_dir} — the "
+            "reportsDirectory redirect did not take effect, so vitest may "
+            "have written artifacts under the repository root"
+        )
+        assert not frontend_coverage.exists(), (
+            "frontend/coverage exists after the run — coverage artifacts "
+            "were written under the repository root (issue #943 race)"
         )
     except Exception:
         print("AC11 CHECK: FAIL")
