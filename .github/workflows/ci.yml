@@ -380,6 +380,84 @@ jobs:
 
       - name: Test
         # -rs: itemize skips (live-marker skips must be visible, not silent — issue #563)
-        run: pytest --tb=short -v --timeout=300 -rs -n auto --cov --cov-report=term-missing tests/
+        # --timeout-method=thread: the POSIX-default signal method fires only
+        # when the main thread returns to the interpreter loop, so on the
+        # demonstrated hang classes it behaves differently — late/never on a
+        # GIL-releasing C-block call (the wedge class behind #1021's silent
+        # 60-minute stalls), per-test failures on starved-pool joins. The
+        # thread method aborts a wedged worker fast and xdist names the hung
+        # test. This flag line itself is pinned by
+        # backend/tests/test_1021_timeout_wiring.py.
+        run: pytest --tb=short -v --timeout=300 --timeout-method=thread -rs -n auto --cov --cov-report=term-missing tests/
         env:
           REDIS_URL: ""
+
+      - name: Hang-class timeout canary (#1021)
+        # Exercises the timeout mechanism on every non-cancelled run, on
+        # Linux, in four shapes (each leg selects exactly one nodeid; the
+        # whole file is never collected here): both wedge members abort
+        # under the thread method with the full Timeout banner + thread-stack
+        # dump; the xdist arm produces the named crashed-worker signature the
+        # Test step itself will show on a real wedge; and the contrast leg
+        # shows the OLD signal method still interrupts starved-pool joins
+        # (its coverage boundary: late/never on the C-block class). A GIL-
+        # held hang starves both methods — that residual is disclosed in the
+        # #1021 PR, not covered here. The presence of this step and of the
+        # Test step's flag is pinned by test_1021_timeout_wiring.py.
+        if: ${{ !cancelled() }}
+        working-directory: backend
+        env:
+          REDIS_URL: ""
+          RUN_CI_HANG_CANARY: "1"
+        run: |
+          # Every leg below MUST capture rc and end in an explicit contract
+          # check that exits 1 — set +e keeps this step fail-open otherwise.
+          set +e
+          canary="tests/test_ci_hang_canary.py"
+          cblock="${canary}::test_wedge_c_block_aborted_by_configured_timeout"
+          pooljoin="${canary}::test_wedge_starved_pool_join_aborted_by_configured_timeout"
+          logs="${RUNNER_TEMP:-/tmp}"
+
+          timeout 300 pytest "$cblock" -q -p no:cacheprovider -p no:randomly \
+            --timeout-method=thread --timeout=30 > "$logs/canary-cblock.log" 2>&1
+          rc=$?
+          cat "$logs/canary-cblock.log"
+          if [ "$rc" -ne 1 ] || ! grep -q 'Timeout' "$logs/canary-cblock.log" \
+            || ! grep -q 'Stack of' "$logs/canary-cblock.log" \
+            || ! grep -q 'pbkdf2' "$logs/canary-cblock.log"; then
+            echo "::error::C-block canary did not abort as configured (rc=$rc)"
+            exit 1
+          fi
+
+          timeout 300 pytest "$pooljoin" -q -p no:cacheprovider -p no:randomly \
+            --timeout-method=thread --timeout=30 > "$logs/canary-pooljoin.log" 2>&1
+          rc=$?
+          cat "$logs/canary-pooljoin.log"
+          if [ "$rc" -ne 1 ] || ! grep -q 'Timeout' "$logs/canary-pooljoin.log" \
+            || ! grep -q 'Stack of' "$logs/canary-pooljoin.log" \
+            || ! grep -qE 'concurrent\.futures|Future\.result|future\.result|shutdown' "$logs/canary-pooljoin.log"; then
+            echo "::error::starved-pool-join canary did not abort as configured (rc=$rc)"
+            exit 1
+          fi
+
+          # The crashed-worker line is xdist 3.x's crash-report format
+          # (dsession.py); a future xdist rewording fails this leg closed.
+          timeout 300 pytest "$pooljoin" -q -p no:cacheprovider -p no:randomly \
+            -n 2 --timeout-method=thread --timeout=30 > "$logs/canary-xdist.log" 2>&1
+          rc=$?
+          cat "$logs/canary-xdist.log"
+          if [ "$rc" -ne 1 ] || ! grep -q 'crashed while running' "$logs/canary-xdist.log" \
+            || ! grep -q 'test_wedge_starved_pool_join' "$logs/canary-xdist.log"; then
+            echo "::error::xdist canary arm did not produce the named crashed-worker signature (rc=$rc)"
+            exit 1
+          fi
+
+          timeout 300 pytest "$pooljoin" -q -p no:cacheprovider -p no:randomly \
+            --timeout-method=signal --timeout=30 > "$logs/canary-signal.log" 2>&1
+          rc=$?
+          cat "$logs/canary-signal.log"
+          if [ "$rc" -ne 1 ] || ! grep -q 'Timeout' "$logs/canary-signal.log"; then
+            echo "::error::signal-contrast leg did not abort the interruptible pool join (rc=$rc)"
+            exit 1
+          fi
+          echo "hang canaries: thread method aborts both wedges with stack dumps; xdist names the hung test; signal method interrupts pool joins (per-test failure)"

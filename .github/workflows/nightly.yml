@@ -52,10 +52,16 @@ jobs:
           python -c "import unstructured; from unstructured.partition.auto import partition; print('unstructured', unstructured.__version__)"
 
       - name: Real-parser fixture tests (real_docs + lifespan FTS validation)
-        run: pytest --tb=short -v -s tests/test_real_docs_parsing.py tests/test_lifespan_fts_validation.py
+        # Same hang-class coverage as the full-suite step (#1021): these
+        # real-parser paths are exactly the C-extension-heavy code the wedge
+        # class lives in, and nothing else bounds this step.
+        run: pytest --tb=short -v -s --timeout=300 --timeout-method=thread tests/test_real_docs_parsing.py tests/test_lifespan_fts_validation.py
 
       - name: Full backend suite (plain full run = cross-file isolation check)
-        run: pytest --tb=short -q --timeout=300 -n auto tests/
+        # --timeout-method=thread: same hang-class coverage as the CI Backend
+        # job's Test step (#1021) — the signal method cannot fire on a
+        # GIL-releasing C-block wedge.
+        run: pytest --tb=short -q --timeout=300 --timeout-method=thread -n auto tests/
         env:
           REDIS_URL: ""
 

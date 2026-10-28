@@ -42,9 +42,15 @@ Backend job:
 - `pip install -r requirements-dev.txt`
 - `pip install pytest-xdist`
 - `ruff check .`
-- `pytest --tb=short -v --timeout=300 -rs -n auto --cov --cov-report=term-missing tests/` — **full backend suite (3918 tests since PR #215 / FR-4)**.
+- `pytest --tb=short -v --timeout=300 --timeout-method=thread -rs -n auto --cov --cov-report=term-missing tests/` — **full backend suite (9,866 tests in the recorded 2026-10-28 Backend run; FR-4 made it the full suite)**.
   Job timeout is **60m** (raised from 30m in PR #215 to accommodate the 3918-test full suite + coverage step on slow CI Linux runners; local baseline is ~3-5m, CI is ~18m, plus coverage runs another ~18m).
-  `--timeout=300` caps per-test hangs at 5 min. The conftest.py has 4 fixtures (CSRF bypass, rate-limiter reset, SQLite pool reset, bcrypt cache for 'pass123' test password) that the test suite relies on.
+  `--timeout=300` caps per-test hangs at 5 min. `--timeout-method=thread`
+  (issue #1021) makes that cap actually fire on the demonstrated hang classes:
+  the thread method covers both committed canary wedges — the old POSIX-default
+  signal method cannot fire during a GIL-releasing C-block call, while it DOES
+  interrupt starved-pool joins; a GIL-held hang starves both methods and is the
+  disclosed residual class. The dedicated canary step re-proves this every CI
+  run. The conftest.py has 4 fixtures (CSRF bypass, rate-limiter reset, SQLite pool reset, bcrypt cache for 'pass123' test password) that the test suite relies on.
 
 Repository contract job:
 
@@ -115,7 +121,7 @@ cd frontend && VITE_APP_BASENAME=/knowledgevault VITE_API_URL=/knowledgevault/ap
 #   "Base path contains unsafe characters: <the rewritten value>" (issue #567).
 #   On PowerShell and on Linux no prefix is needed. The repo justfile handles
 #   this automatically via `just frontend-build-subpath`.
-cd backend && ruff check . && pytest --tb=short -v --timeout=300 tests/
+cd backend && ruff check . && pytest --tb=short -v --timeout=300 --timeout-method=thread tests/
 python scripts/check_runtime_contract.py
 python scripts/check_config_contract.py
 python scripts/check_pr_scope_drift.py

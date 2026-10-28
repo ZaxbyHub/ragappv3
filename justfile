@@ -61,7 +61,7 @@ backend-lint:
 
 # Backend tests (CI invocation; REDIS_URL empty like the workflow env)
 backend-test:
-    cd backend && REDIS_URL="" python -m pytest --tb=short -v --timeout=300 -rs -n auto --cov --cov-report=term-missing tests/
+    cd backend && REDIS_URL="" python -m pytest --tb=short -v --timeout=300 --timeout-method=thread -rs -n auto --cov --cov-report=term-missing tests/
 
 # Frontend type checks (CI: npm run typecheck / typecheck:contracts)
 frontend-typecheck:

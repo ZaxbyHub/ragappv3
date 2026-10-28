@@ -294,6 +294,45 @@ def on_disk_files() -> list[str]:
     return out
 
 
+def on_disk_dirs() -> list[str]:
+    """Return on-disk directory paths (relative, posix) under ROOT, excluding
+    .git.
+
+    Same os.scandir discipline as on_disk_files (issue #943): Path.rglob
+    raises FileNotFoundError when a directory vanishes between listing and
+    stat mid-walk — this scan's stale-glob advisory previously had exactly
+    that exposure against the coverage gate's transient artifacts under
+    pytest-xdist, so the directory census uses the same tolerant walk.
+
+    Deliberate semantic change vs the replaced ``ROOT.rglob`` comprehension:
+    symlinked directories are listed but not followed here
+    (``follow_symlinks=False``), matching on_disk_files' directory
+    handling, whereas rglob recursed into them. A ``<dir>/**`` ignore
+    pattern whose target is only reachable through a symlinked directory
+    will now be reported by the stale-glob advisory; the repo carries no
+    symlinked directories today.
+    """
+    out: list[str] = []
+    stack = [ROOT]
+    while stack:
+        current = stack.pop()
+        try:
+            entries = list(os.scandir(current))
+        except OSError:
+            # Vanished, replaced, or unreadable between listing and walking.
+            continue
+        for entry in entries:
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    path = Path(entry.path)
+                    if ".git" not in path.parts:
+                        out.append(path.relative_to(ROOT).as_posix())
+                        stack.append(path)
+            except OSError:
+                continue
+    return out
+
+
 def main() -> int:
     patterns = parse_patterns()
     if not patterns:
@@ -350,12 +389,12 @@ def main() -> int:
         # whether a `<dir>/**` pattern targets a directory that exists at any
         # depth. We match the pattern itself against these paths via the same
         # glob_to_regex the validator uses elsewhere — no ad-hoc last-segment
-        # heuristics.
-        on_disk_dirs = [
-            p.relative_to(ROOT).as_posix()
-            for p in ROOT.rglob("*")
-            if p.is_dir() and ".git" not in p.parts
-        ]
+        # heuristics. Issue #943: on_disk_dirs() walks with the same
+        # vanish-tolerant os.scandir discipline as on_disk_files() — the
+        # previous ROOT.rglob("*") comprehension crashed the whole scan with
+        # FileNotFoundError when a directory (e.g. the coverage gate's
+        # transient frontend/coverage) vanished mid-walk under pytest-xdist.
+        dirs_cache = on_disk_dirs()
         for line_no, _raw, glob, is_defensive in patterns:
             if is_defensive:
                 continue
@@ -376,7 +415,7 @@ def main() -> int:
                     self_regex = glob_to_regex(dir_glob)
                     anywhere = any(
                         dir_regex.match(d + "/") or self_regex.match(d)
-                        for d in on_disk_dirs
+                        for d in dirs_cache
                     )
                     if not anywhere:
                         _print(

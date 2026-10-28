@@ -129,7 +129,7 @@ CI (`.github/workflows/ci.yml`) runs the full suite across eight jobs:
 - **Detect docker scope job:** a paths-filter that arms the docker-smoke job only when the docker build surface changed (BUILD-002).
 - **Docker build smoke job:** builds the root and frontend images (no push) when the docker surface changed, proving a green run ships a buildable image.
 - **SAST (bandit) job:** `scripts/run_bandit.py` — fails on new bandit findings or unused `# nosec` suppressions against the committed baseline.
-- **Backend job:** uv universal-lockfile byte-diff verification, hash-pinned install (`requirements-lock-ci.txt` with `--require-hashes`), `ruff check .`, and the full pytest suite (`pytest --tb=short -v --timeout=300 -rs -n auto --cov --cov-report=term-missing tests/`).
+- **Backend job:** uv universal-lockfile byte-diff verification, hash-pinned install (`requirements-lock-ci.txt` with `--require-hashes`), `ruff check .`, and the full pytest suite (`pytest --tb=short -v --timeout=300 --timeout-method=thread -rs -n auto --cov --cov-report=term-missing tests/`; the thread method covers both demonstrated hang classes — the old signal method cannot fire during a GIL-releasing C-block call, while it DOES interrupt starved-pool joins; a GIL-held hang starves both methods and is the disclosed residual class, #1021). The job also runs the four-leg hang-class canary step proving the timeout mechanism on every run.
 
 The historical Draft Room capability contract guards (`scripts/check_l02_capability_fixture_keys.py`
 and `scripts/check_l02_capability_reader_keys.py`) remain owned by
