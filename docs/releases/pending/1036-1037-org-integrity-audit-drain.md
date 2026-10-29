@@ -51,8 +51,8 @@ Collated closure of the two PR #1035 follow-up issues:
 - Client disconnects no longer silently skip security-audit rows for
   committed mutations (users/auth/draft-room/vaults).
 - update_org_member_role no longer maps a raw sqlite busy/locked error to a
-  409 (the previous route-local wrapper); it now surfaces 500 via the shared
-  transaction convention used by its sibling routes, while the retryable
+  409 (the previous route-local wrapper); such errors now propagate to the
+  framework's server-error handler and surface as 500, while the retryable
   zero-row path still answers 409.
 
 ## Out of scope (disclosed)
@@ -79,4 +79,10 @@ Collated closure of the two PR #1035 follow-up issues:
   `test_transfer_ownership_caller_race.py`, `test_users_delete_restore_drain.py`,
   `test_users_delete_owner_race.py`, `test_update_org_member_role_race.py`.
 - Preserving suites green: the #1029/#1030/#1035 owner-race and
-  delete-recovery suites, users/organizations/auth/draft_room route suites.
+  delete-recovery suites, users/organizations/auth/draft_room route suites
+  (the draft_room batch carries the 2 documented Windows-only
+  `test_strips_traversal` failures — diff-foreign, reproduced in isolation);
+  frontend preserving suites: `draftBriefTemplates.issue533.test.ts` (adapted
+  to the principal arg) and the pre-existing Draft Room form suites (adapted
+  to the `@/lib/api` mock contract the form's new auth-store import
+  requires).
