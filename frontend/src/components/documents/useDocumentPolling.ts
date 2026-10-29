@@ -201,7 +201,8 @@ export function useDocumentPolling({
   // async worker paths.
   const [wikiFailedIds, setWikiFailedIdsState] = useState<Set<string>>(
     new Set()
-  );  const [compilingDocIds, setCompilingDocIdsState] = useState<Set<string>>(
+  );
+  const [compilingDocIds, setCompilingDocIdsState] = useState<Set<string>>(
     new Set()
   );
   const [total, setTotalState] = useState(0);

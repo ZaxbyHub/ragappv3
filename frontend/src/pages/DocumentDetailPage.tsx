@@ -155,11 +155,21 @@ export default function DocumentDetailPage() {
     const tick = () => {
       if (disposed) return;
       const docId = Number(id);
-      const currentStatus = docRef.current?.metadata?.status as string | undefined;
-      if (
-        !Number.isFinite(docId) ||
-        (currentStatus !== "pending" && currentStatus !== "processing")
-      ) {
+      if (!Number.isFinite(docId)) return;
+      const current = docRef.current;
+      // Only a LOADED document for THIS route id disarms the loop at a
+      // terminal status. While the foreground load has not committed yet
+      // (no doc, or the previous document still in the mirror) the tick has
+      // nothing to converge and MUST re-arm — returning here would kill the
+      // loop permanently and reintroduce the stuck-on-Processing symptom
+      // (#765 AC7; caught in implementation review).
+      const loadedForRoute = current != null && String(current.id) === String(id);
+      if (!loadedForRoute) {
+        statusRefreshTimerRef.current = setTimeout(tick, STATUS_REFRESH_INTERVAL_MS);
+        return;
+      }
+      const currentStatus = current.metadata?.status as string | undefined;
+      if (currentStatus !== "pending" && currentStatus !== "processing") {
         return;
       }
       if (statusRefreshInFlightRef.current) return;
