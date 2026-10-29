@@ -378,13 +378,16 @@ def _drive(drive_factory) -> dict:  # noqa: ANN001
     return outcome
 
 
-def _assert_refused(outcome: dict, defect: str) -> None:
+def _assert_refused(outcome: dict, defect: str, expected: int) -> None:
+    # Statuses pinned per leg to the documented contract (release note +
+    # Multi-Stage review): demoted-privilege refusals are 403, a removed
+    # new owner is 400, a zero-row write backstop is 409.
     assert "refused_status" in outcome, (
         f"{defect}: the handler returned success "
         f"({outcome.get('ok')}) instead of refusing"
     )
-    assert outcome["refused_status"] in (400, 403, 409), (
-        f"a refusal must be a 400/403/409 conflict, not {outcome['refused_status']}"
+    assert outcome["refused_status"] == expected, (
+        f"a refusal must be HTTP {expected}, not {outcome['refused_status']}"
     )
 
 
@@ -432,6 +435,7 @@ def test_window_a_caller_demoted_before_transaction_is_refused(tmp_path: Path) -
             "authorization window: the caller was demoted between the "
             "owner pre-check and the write transaction, but the stale "
             "transfer still executed",
+            expected=403,
         )
         assert env.owner_ids() != [], (
             "organization left with zero owners after the caller-demoted "
@@ -482,6 +486,7 @@ def test_window_b_new_owner_removed_before_transaction_is_refused(
             "row was removed between the pre-check and the transaction, the "
             "unconditional demote still ran and the unpredicated promote "
             "matched zero rows",
+            expected=400,
         )
         assert env.owner_ids() == [1], (
             "organization left with zero owners: the refused transfer must "
@@ -522,6 +527,7 @@ def test_zero_row_promote_refuses_and_retains_old_owner(tmp_path: Path) -> None:
             "zero-row promote: the promote UPDATE matched zero rows after "
             "validation, but the handler committed the unconditional demote "
             "anyway and returned success on a transfer that never landed",
+            expected=409,
         )
         assert env.owner_ids() == [1], (
             "the refused transfer must roll back and retain the old owner "
@@ -574,6 +580,7 @@ def test_same_family_remove_org_member_demoted_caller_is_refused(
             "authorization window: the caller was demoted between the "
             "_is_org_admin_or_owner check and the removal transaction, but "
             "the stale removal still executed",
+            expected=403,
         )
         assert env.member_role(3) is not None, (
             "the refused removal must leave the target's membership intact"

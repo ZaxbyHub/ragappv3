@@ -8,13 +8,15 @@ Collated closure of the two PR #1035 follow-up issues:
   `transfer_ownership`, `update_org_member_role`, `remove_org_member` and
   `delete_user`'s worker now re-validate authorization and role state INSIDE
   their `BEGIN IMMEDIATE` transactions (the #1028/#1033 house pattern):
-  a stale caller (demoted between the outer check and the write) is refused,
-  a concurrently removed new owner answers 400 and a vanished update target
-  answers 404, the promote/role
-  UPDATEs carry rowcount checks (zero rows refuses and rolls back), and
-  `update_org_member_role`'s UPDATE is predicated with `AND role != 'owner'`.
-  No interleaving with a concurrent `transfer_ownership` can leave an
-  organization with zero owners or execute a demoted caller's mutation.
+  a stale caller (demoted between the outer check and the write) is refused
+  403 (transfer, role-update, removal), a concurrently removed transfer
+  target answers 400, a vanished role-update target answers 404, and a
+  zero-row promote or role update answers 409 and rolls back; the promote
+  and role UPDATEs carry rowcount checks, and `update_org_member_role`'s
+  UPDATE is predicated with `AND role != 'owner'`. Under client-driven
+  operation, no interleaving with a concurrent `transfer_ownership` can
+  leave an organization with zero owners or execute a demoted caller's
+  mutation on these four routes.
 - **Audit-await cancellation skips (#1036 item 1).** The drained-completion
   pattern PR #1035 shipped for `delete_user` is extracted to
   `app.services.task_drain` and applied at all 31 sibling
@@ -44,10 +46,14 @@ Collated closure of the two PR #1035 follow-up issues:
   refusal answer 400; update_org_member_role's vanished-target refusal answers
   404). Recovery from any pre-existing zero-owner organization is unchanged
   (superadmin `transfer_ownership`).
-- Saved brief templates now live per account. Templates saved before this
-  release (the legacy un-scoped namespace) are dropped at the first identity
-  switch rather than migrated — the legacy payload has no owner information,
-  and copying it could hand one user's templates to another.
+- Saved brief templates now live per account. Signing out clears them (they
+  are local-only, and the app cannot assume the next sign-in is the same
+  principal), so templates do not survive a logout/re-login cycle; they DO
+  survive same-principal re-authentication without an intervening logout.
+  Templates saved before this release (the legacy un-scoped namespace) are
+  dropped at the first identity switch rather than migrated — the legacy
+  payload has no owner information, and copying it could hand one user's
+  templates to another.
 - Client disconnects no longer silently skip security-audit rows for
   committed mutations (users/auth/draft-room/vaults).
 - update_org_member_role no longer maps a raw sqlite busy/locked error to a

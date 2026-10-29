@@ -18,7 +18,7 @@ at the base tree:
 
   Vanished target — the target's ``org_members`` row is removed between the
   outer target read and the write: the UPDATE matches zero rows and the
-  response read subscriptes ``None`` — the base outcome is an unhandled
+  response read subscripts ``None`` — the base outcome is an unhandled
   TypeError, never a 404 (empirically confirmed at base).
 
   Zero-row UPDATE — the predicated UPDATE of the fixed shape must check its
@@ -386,7 +386,12 @@ def _drive(drive_factory) -> dict:  # noqa: ANN001
     return outcome
 
 
-def _assert_refused(outcome: dict, defect: str, statuses: tuple = (400, 403, 409)) -> None:
+def _assert_refused(outcome: dict, defect: str, statuses: tuple = ()) -> None:
+    # Statuses pinned per leg to the documented contract (release note +
+    # Multi-Stage review): demoted-privilege/owner refusals are 403, a
+    # vanished member is 404, a zero-row write backstop is 409. Callers must
+    # pass the expected set explicitly; the empty default fails any status so
+    # an unparametrized leg cannot silently widen the contract.
     assert "refused_status" in outcome, (
         f"{defect}: the handler returned success "
         f"({outcome.get('ok')}) instead of refusing"
@@ -447,6 +452,7 @@ def test_target_read_racing_ownership_transfer_is_refused(tmp_path: Path) -> Non
             "committed between update_org_member_role's target read and its "
             "unpredicated UPDATE, promoting the target to owner, but the "
             "stale update still executed",
+            statuses=(403,),
         )
         assert env.owner_ids() == [TARGET_USER_ID], (
             "organization left with zero owners: the refused update must "
@@ -517,7 +523,7 @@ def test_vanished_target_returns_404_not_an_unhandled_error(
     org_members row is removed between the outer target read and the write —
     the update must answer 404 'Member not found', never an unhandled
     TypeError/500. (Empirically at base the UPDATE matches zero rows, the
-    commit succeeds, and the response read subscriptes None -> TypeError.)"""
+    commit succeeds, and the response read subscripts None -> TypeError.)"""
     env = _RaceEnv(tmp_path)
     try:
         env.seed_org(user2_org_role="member")
@@ -587,7 +593,7 @@ def test_zero_row_update_refuses_and_leaves_role_unchanged(tmp_path: Path) -> No
             outcome,
             "zero-row UPDATE: the role UPDATE matched zero rows, but the "
             "handler returned success on a write that never landed",
-            statuses=(403, 409),
+            statuses=(409,),
         )
         assert env.member_role(TARGET_USER_ID) == "admin", (
             "the refused update must roll back and leave the target's role "
@@ -643,7 +649,7 @@ def test_owner_at_write_without_role_predicate_refuses_and_preserves_owner(
             "from the role refusals, and without the role != 'owner' "
             "predicate on the UPDATE the real owner row was demoted — the "
             "organization was left with zero owners",
-            statuses=(403, 409),
+            statuses=(409,),
         )
         assert env.member_role(1) == "owner", (
             "the refused update must preserve the target as the org's owner "

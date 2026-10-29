@@ -60,12 +60,21 @@ async def drain_audit(audit_coro: Coroutine) -> None:
     the route task while this awaits is absorbed until the audit coroutine
     finishes, then re-raised so the request still unwinds as cancelled; a
     failure of the audit itself is logged, never re-raised (the helper's
-    existing best-effort contract).
+    existing best-effort contract). A cancellation OF the audit task itself
+    (loop teardown — nothing else cancels it) writes no row and cannot be
+    retried, so it is logged loudly rather than returned silently
+    (swarm-pr-review F-06).
     """
     cancelled, error = await drain_await(asyncio.ensure_future(audit_coro))
-    if error is not None and not isinstance(error, asyncio.CancelledError):
-        logger.warning(
-            "security_audit_record_failed reason=%s", type(error).__name__
-        )
+    if error is not None:
+        if isinstance(error, asyncio.CancelledError):
+            logger.warning(
+                "security_audit_record_cancelled "
+                "task_cancelled_during_audit row_not_written"
+            )
+        else:
+            logger.warning(
+                "security_audit_record_failed reason=%s", type(error).__name__
+            )
     if cancelled:
         raise asyncio.CancelledError

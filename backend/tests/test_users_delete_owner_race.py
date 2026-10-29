@@ -240,8 +240,8 @@ def test_delete_user_racing_ownership_transfer_is_refused(tmp_path: Path) -> Non
         f"success ({outcome.get('ok')}) and cascaded the new owner's "
         "membership away"
     )
-    assert 400 <= outcome["refused_status"] < 500, (
-        "the refusal must be a 400-class conflict, not "
+    assert outcome["refused_status"] == 400, (
+        "the refusal must be the documented HTTP 400 owner conflict, not "
         f"{outcome['refused_status']}"
     )
     assert _owner_ids() == [VICTIM_USER_ID], (
