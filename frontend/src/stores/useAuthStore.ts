@@ -26,6 +26,7 @@ import {
   clearAllCanvasDrafts,
   invalidatePendingCanvasDraftWrites,
 } from "@/lib/canvasDrafts";
+import { clearAllDraftBriefTemplates } from "@/lib/draftBriefTemplates";
 import { queryClient } from "@/lib/queryClient";
 import { useDraftRoomUiStore } from "@/stores/useDraftRoomUiStore";
 import { resetCitationReport } from "@/lib/api/onboarding";
@@ -268,6 +269,21 @@ const resetChatStateForIdentitySwitch = () => {
     console.warn(
       "identity_switch_feedback_wipe_incomplete failed_keys=%d",
       feedbackRemovalFailures
+    );
+  }
+  // Issue #1036 AC2: saved brief templates are user-authored content in the
+  // same class as chat drafts and feedback votes. The keys are
+  // principal-scoped, so any residue a degraded storage surface leaves
+  // behind stays unreadable to the next principal.
+  const briefTemplateRemovalFailures = clearAllDraftBriefTemplates();
+  if (briefTemplateRemovalFailures < 0) {
+    console.warn(
+      "identity_switch_brief_template_wipe_unknown storage_enumeration_failed"
+    );
+  } else if (briefTemplateRemovalFailures > 0) {
+    console.warn(
+      "identity_switch_brief_template_wipe_incomplete failed_keys=%d",
+      briefTemplateRemovalFailures
     );
   }
   const shell = useChatShellStore.getState();

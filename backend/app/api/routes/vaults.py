@@ -39,6 +39,7 @@ from app.services.draft_deletion import DraftDeletionService
 from app.services.draft_input_storage import DraftInputStorage, DraftInputStorageError
 from app.services.draft_store import DraftStore
 from app.services.security_audit import safe_record_security_event
+from app.services.task_drain import drain_audit
 from app.services.vector_store import VectorStore
 
 logger = logging.getLogger(__name__)
@@ -898,7 +899,7 @@ async def update_vault(
         # visibility this same request persisted (request.visibility when
         # set, else the in-txn pre-adoption value) — the same metadata
         # convention as vault.visibility_updated (issue #1003, ML-P-1).
-        await safe_record_security_event(
+        await drain_audit(safe_record_security_event(
             conn,
             event_type="vault.org_id_updated",
             actor=user,
@@ -914,7 +915,7 @@ async def update_vault(
                     else txn_current_visibility
                 ),
             },
-        )
+        ))
 
     if request.visibility is not None:
         # Visibility-carrying updates are security-relevant events (issue
@@ -924,7 +925,7 @@ async def update_vault(
         # value is the in-transaction re-read (F-005) — identical to the
         # outer read except under a concurrent visibility flip, where the
         # transactional value is the authoritative pre-image of THIS update.
-        await safe_record_security_event(
+        await drain_audit(safe_record_security_event(
             conn,
             event_type="vault.visibility_updated",
             actor=user,
@@ -934,7 +935,7 @@ async def update_vault(
                 "old_visibility": txn_current_visibility,
                 "new_visibility": request.visibility,
             },
-        )
+        ))
 
     # Rename vault folder if name changed
     if request.name is not None:
@@ -1278,13 +1279,13 @@ async def delete_vault(
     # deletion. Gated on the DELETE's own rowcount so a concurrent delete
     # that already removed the row records nothing (review F-031a).
     if deleted_vault_rows > 0:
-        await safe_record_security_event(
+        await drain_audit(safe_record_security_event(
             conn,
             event_type="vault.deleted",
             actor=user,
             request=http_request,
             metadata={"vault_id": vault_id, "name": vault_name},
-        )
+        ))
 
     # -- Post-commit vector reconciliation (W21 / C19). -------------------
     # The relational delete is durable now; destroy the vault's vectors. On
@@ -1767,7 +1768,7 @@ async def update_vault_groups(
     # persisted rows (L1-6): a duplicated id in the request body is inserted
     # once, and the event must not claim a grant that was never persisted
     # ([] on the empty-clear path, where no rows survive).
-    await safe_record_security_event(
+    await drain_audit(safe_record_security_event(
         conn,
         event_type="vault.group_access_replaced",
         actor=user,
@@ -1776,7 +1777,7 @@ async def update_vault_groups(
             "vault_id": vault_id,
             "group_ids": [item.group_id for item in deduped_items],
         },
-    )
+    ))
 
     # If no access items were provided, all access is now cleared.
     if not access_items:

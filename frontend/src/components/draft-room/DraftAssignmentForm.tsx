@@ -2,6 +2,7 @@ import { useEffect, useId, useMemo, useRef, useState } from "react";
 import type { JSX } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { listAccessibleVaults } from "@/lib/api";
+import { useAuthStore } from "@/stores/useAuthStore";
 import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
@@ -278,17 +279,46 @@ export function DraftAssignmentForm(props: DraftAssignmentFormProps): JSX.Elemen
   });
   const vaults = vaultsQuery.data?.vaults ?? [];
 
-  // ---- Brief templates (issue #517 AC14) ----------------------------------
-  // Read once per mount: templates are a local browser convenience stored
-  // under a namespaced localStorage key. Saves refresh this state from the
-  // helper's return value so the apply affordance appears without a remount.
-  const [briefTemplates, setBriefTemplates] = useState<DraftBriefTemplate[]>(() =>
-    listDraftBriefTemplates()
-  );
+  // ---- Brief templates (issue #517 AC14; #1036 AC2 identity scoping) -----
+  // Templates are a local browser convenience stored under PRINCIPAL-SCOPED
+  // localStorage keys. The state records which principal it was loaded
+  // under; while the session principal differs (an identity switch with the
+  // form still mounted) the list renders EMPTY and apply is gated — the
+  // previous principal's templates are never shown or applied, and the
+  // effect reloads under the new principal. Saves refresh this state from
+  // the helper's return value so the apply affordance appears without a
+  // remount.
+  const principalId = useAuthStore((s) => s.user?.id ?? null);
+  const [templateState, setTemplateState] = useState<{
+    owner: string | number | null;
+    templates: DraftBriefTemplate[];
+  }>(() => ({
+    owner: useAuthStore.getState().user?.id ?? null,
+    templates:
+      useAuthStore.getState().user != null
+        ? listDraftBriefTemplates(useAuthStore.getState().user!.id)
+        : [],
+  }));
+  useEffect(() => {
+    if (principalId == null) return;
+    if (templateState.owner === principalId) return;
+    setTemplateState({
+      owner: principalId,
+      templates: listDraftBriefTemplates(principalId),
+    });
+  }, [principalId, templateState.owner]);
+  const briefTemplates =
+    principalId != null && templateState.owner === principalId
+      ? templateState.templates
+      : [];
   const latestBriefTemplate = briefTemplates.length > 0 ? briefTemplates[briefTemplates.length - 1] : null;
 
   function handleSaveBriefTemplate(): void {
-    setBriefTemplates(saveDraftBriefTemplate(value.title, value.brief));
+    if (principalId == null) return;
+    setTemplateState({
+      owner: principalId,
+      templates: saveDraftBriefTemplate(value.title, value.brief, principalId),
+    });
   }
 
   function handleApplyBriefTemplate(): void {

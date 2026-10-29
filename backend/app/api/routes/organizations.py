@@ -1130,30 +1130,65 @@ async def update_org_member_role(
                 detail="Use the ownership transfer endpoint to assign the owner role",
             )
 
-        # Update role
-        try:
-            await asyncio.to_thread(
-                conn.execute,
-                "UPDATE org_members SET role = ? WHERE org_id = ? AND user_id = ?",
-                (req.role, org_id, member_user_id),
-            )
-            await asyncio.to_thread(conn.commit)
-        except sqlite3.Error:
-            await asyncio.to_thread(conn.rollback)
-            raise HTTPException(
-                status_code=409,
-                detail="Could not update member role. Please try again.",
-            )
+        # Issue #1037 item 2 (plus #1036 AC3's caller family): the target-role
+        # read above ran OUTSIDE any transaction and the UPDATE below was
+        # un-predicated, so a transfer_ownership committing in that gap made
+        # the target owner and this UPDATE silently demoted them — leaving
+        # the organization with zero owners. One BEGIN IMMEDIATE now covers
+        # caller-privilege and target-role re-reads, a predicated UPDATE with
+        # a rowcount check, and the response read; every refusal rolls back
+        # atomically (mirrors #1033's fix). This route has no superadmin
+        # bypass, so the caller re-read is unconditional like its outer check.
+        def _update_member_role() -> tuple:
+            with transaction_context(conn):
+                if not _is_org_admin_or_owner(conn, org_id, user["id"]):
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Insufficient privileges. Organization admin or owner required",
+                    )
+                role_cursor = conn.execute(
+                    "SELECT role FROM org_members WHERE org_id = ? AND user_id = ?",
+                    (org_id, member_user_id),
+                )
+                target_role_now = role_cursor.fetchone()
+                if target_role_now is None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Member not found",
+                    )
+                if target_role_now[0] == "owner":
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Cannot change the role of the organization owner",
+                    )
+                update_cursor = conn.execute(
+                    "UPDATE org_members SET role = ? WHERE org_id = ? AND user_id = ? AND role != 'owner'",
+                    (req.role, org_id, member_user_id),
+                )
+                if update_cursor.rowcount == 0:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Could not update member role. Please try again.",
+                    )
+                # Response read inside the transaction: a concurrent removal
+                # cannot make this row vanish mid-flight, and a vanished
+                # member answers 404 instead of an unhandled error.
+                resp_cursor = conn.execute(
+                    """SELECT u.id, u.username, u.full_name, om.role, om.joined_at
+                       FROM org_members om JOIN users u ON om.user_id = u.id
+                       WHERE om.org_id = ? AND om.user_id = ?""",
+                    (org_id, member_user_id),
+                )
+                row = resp_cursor.fetchone()
+                if row is None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Member not found",
+                    )
+                return row
 
-        # Fetch updated member details
-        cursor = await asyncio.to_thread(
-            conn.execute,
-            """SELECT u.id, u.username, u.full_name, om.role, om.joined_at
-               FROM org_members om JOIN users u ON om.user_id = u.id
-               WHERE om.org_id = ? AND om.user_id = ?""",
-            (org_id, member_user_id),
-        )
-        row = await asyncio.to_thread(cursor.fetchone)
+        row = await asyncio.to_thread(_update_member_role)
+
         return {
             "user_id": row[0],
             "username": row[1],
@@ -1224,6 +1259,17 @@ async def remove_org_member(
         # (AC7), and rolls both DELETEs back.
         def _remove_member():
             with transaction_context(conn):
+                # Issue #1036 item 3 (same family as the transfer windows):
+                # the caller-privilege check above ran OUTSIDE this
+                # transaction, so a concurrent role change demoting the
+                # caller between check and BEGIN still executed their
+                # removal. This route has no superadmin bypass — its outer
+                # check applies to every caller — so the re-read does too.
+                if not _is_org_admin_or_owner(conn, org_id, user["id"]):
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Insufficient privileges. Organization admin or owner required",
+                    )
                 # Issue #1033: the owner refusal above read the target's
                 # role BEFORE this write transaction opened, so a
                 # transfer_ownership committing in that window promoted the
@@ -1342,21 +1388,57 @@ async def transfer_ownership(
                 detail="New owner must be an active member of the organization",
             )
 
+        # Issue #1036 AC3: the authorization reads above ran OUTSIDE the
+        # write transaction, so a concurrent transfer could demote the caller
+        # (authorization window) or a concurrent remove_org_member could
+        # delete the new owner's member row — the unconditional demote plus
+        # the un-predicated promote (matching zero rows) then left the
+        # organization with ZERO owners while returning 200. Everything is
+        # re-validated under BEGIN IMMEDIATE, where the write lock makes the
+        # reads definitive (mirrors #1033's fix), and the promote rowcount is
+        # checked so a zero-row transfer refuses and transaction_context
+        # rolls the demote back.
+        def _transfer_ownership() -> None:
+            with transaction_context(conn):
+                if user.get("role") != "superadmin":
+                    caller_cursor = conn.execute(
+                        "SELECT role FROM org_members WHERE org_id = ? AND user_id = ?",
+                        (org_id, user["id"]),
+                    )
+                    caller_row = caller_cursor.fetchone()
+                    if not caller_row or caller_row[0] != "owner":
+                        raise HTTPException(
+                            status_code=403,
+                            detail="Only the organization owner or a superadmin can transfer ownership",
+                        )
+                member_cursor = conn.execute(
+                    """SELECT u.id FROM users u
+                       JOIN org_members om ON u.id = om.user_id
+                       WHERE u.id = ? AND om.org_id = ? AND u.is_active = 1""",
+                    (req.new_owner_user_id, org_id),
+                )
+                if not member_cursor.fetchone():
+                    raise HTTPException(
+                        status_code=400,
+                        detail="New owner must be an active member of the organization",
+                    )
+                conn.execute(
+                    "UPDATE org_members SET role = 'admin' WHERE org_id = ? AND role = 'owner'",
+                    (org_id,),
+                )
+                promote_cursor = conn.execute(
+                    "UPDATE org_members SET role = 'owner' WHERE org_id = ? AND user_id = ?",
+                    (org_id, req.new_owner_user_id),
+                )
+                if promote_cursor.rowcount == 0:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Could not transfer ownership. Please try again.",
+                    )
+
         try:
-            await asyncio.to_thread(conn.execute, "BEGIN IMMEDIATE")
-            await asyncio.to_thread(
-                conn.execute,
-                "UPDATE org_members SET role = 'admin' WHERE org_id = ? AND role = 'owner'",
-                (org_id,),
-            )
-            await asyncio.to_thread(
-                conn.execute,
-                "UPDATE org_members SET role = 'owner' WHERE org_id = ? AND user_id = ?",
-                (org_id, req.new_owner_user_id),
-            )
-            await asyncio.to_thread(conn.commit)
+            await asyncio.to_thread(_transfer_ownership)
         except sqlite3.Error:
-            await asyncio.to_thread(conn.rollback)
             raise HTTPException(status_code=500, detail="Failed to transfer ownership")
 
         return {

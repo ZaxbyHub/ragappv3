@@ -40,6 +40,7 @@ from app.services.security_audit import (
     _request_ip,
     safe_record_security_event,
 )
+from app.services.task_drain import drain_audit
 from app.utils.paths import csrf_cookie_path, refresh_cookie_path
 
 logger = logging.getLogger(__name__)
@@ -387,14 +388,14 @@ async def register(
         max_age=REFRESH_TOKEN_MAX_AGE_DAYS * 24 * 60 * 60,
         path=refresh_cookie_path(),
     )
-    await safe_record_security_event(
+    await drain_audit(safe_record_security_event(
         db,
         event_type="user.register",
         target_user_id=user_id,
         target_username=body.username,
         request=request,
         metadata={"role": role},
-    )
+    ))
 
     try:
         csrf_manager = get_csrf_manager(request)
@@ -437,13 +438,13 @@ async def login(
     )
 
     if not row:
-        await safe_record_security_event(
+        await drain_audit(safe_record_security_event(
             db,
             event_type="auth.login_failed",
             target_username=body.username,
             request=request,
             metadata={"reason": "unknown_user"},
-        )
+        ))
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
     (
@@ -459,14 +460,14 @@ async def login(
     ) = row
 
     if not is_active:
-        await safe_record_security_event(
+        await drain_audit(safe_record_security_event(
             db,
             event_type="auth.login_failed",
             target_user_id=user_id,
             target_username=db_username,
             request=request,
             metadata={"reason": "inactive"},
-        )
+        ))
         raise HTTPException(status_code=403, detail="User account is inactive")
 
     # Lockout check (before password verify)
@@ -476,14 +477,14 @@ async def login(
             retry_after = int(
                 (locked_until_dt - datetime.now(timezone.utc)).total_seconds()
             )
-            await safe_record_security_event(
+            await drain_audit(safe_record_security_event(
                 db,
                 event_type="auth.login_failed",
                 target_user_id=user_id,
                 target_username=db_username,
                 request=request,
                 metadata={"reason": "locked", "retry_after": retry_after},
-            )
+            ))
             raise HTTPException(
                 status_code=423,
                 detail=f"Account locked. Try again in {retry_after // 60} minutes.",
@@ -500,7 +501,7 @@ async def login(
         fresh_failed_attempts = await asyncio.to_thread(
             _record_failed_attempt_db, db, user_id
         )
-        await safe_record_security_event(
+        await drain_audit(safe_record_security_event(
             db,
             event_type="auth.login_failed",
             target_user_id=user_id,
@@ -510,7 +511,7 @@ async def login(
                 "reason": "bad_password",
                 "failed_attempts": fresh_failed_attempts,
             },
-        )
+        ))
         if fresh_failed_attempts >= 5:
             raise HTTPException(
                 status_code=423,
@@ -600,7 +601,7 @@ async def login(
         # Issue #724 (S02-SK2-11): a client getting 200 with no CSRF cookie
         # was previously indistinguishable from success in the logs.
         logger.warning("csrf_token_issuance_failed", exc_info=True)
-    await safe_record_security_event(
+    await drain_audit(safe_record_security_event(
         db,
         event_type="auth.login_success",
         actor={"id": user_id, "username": db_username},
@@ -608,7 +609,7 @@ async def login(
         target_username=db_username,
         request=request,
         metadata={"role": role},
-    )
+    ))
 
     return {
         "access_token": access_token,
@@ -774,14 +775,14 @@ async def logout(
             await asyncio.to_thread(_logout_db, db, token_hash)
         except Exception:
             logger.error("Failed to delete session during logout", exc_info=True)
-    await safe_record_security_event(
+    await drain_audit(safe_record_security_event(
         db,
         event_type="auth.logout",
         actor=audit_user,
         target_user_id=audit_user.get("id") if audit_user else None,
         target_username=audit_user.get("username") if audit_user else None,
         request=request,
-    )
+    ))
 
     response.delete_cookie(key=REFRESH_TOKEN_COOKIE_NAME, path=refresh_cookie_path())
     response.delete_cookie(key=CSRF_COOKIE_NAME, path=csrf_cookie_path())
@@ -968,7 +969,7 @@ async def change_password(
         raise HTTPException(status_code=500, detail="An internal error occurred. Please try again later.")
 
     invalidate_active_user_cache(user_id)
-    await safe_record_security_event(
+    await drain_audit(safe_record_security_event(
         db,
         event_type="auth.password_changed",
         actor=user,
@@ -976,7 +977,7 @@ async def change_password(
         target_username=username,
         request=request,
         metadata={"sessions_revoked": True},
-    )
+    ))
 
     # Generate new access token (username/role/user_id already in scope).
     access_token = create_access_token(
@@ -1094,7 +1095,7 @@ async def revoke_session(
     except Exception:
         logger.error("Failed to revoke session", exc_info=True)
         raise HTTPException(status_code=500, detail="An internal error occurred. Please try again later.")
-    await safe_record_security_event(
+    await drain_audit(safe_record_security_event(
         db,
         event_type="auth.session_revoked",
         actor=user,
@@ -1102,7 +1103,7 @@ async def revoke_session(
         target_username=user.get("username"),
         request=request,
         metadata={"session_id": session_id},
-    )
+    ))
 
     return Response(status_code=204)
 
@@ -1175,7 +1176,7 @@ async def revoke_all_sessions(
         user["id"], user["username"], user["role"],
         client_fingerprint=compute_client_fingerprint(user_agent),
     )
-    await safe_record_security_event(
+    await drain_audit(safe_record_security_event(
         db,
         event_type="auth.sessions_revoked",
         actor=user,
@@ -1183,7 +1184,7 @@ async def revoke_all_sessions(
         target_username=user.get("username"),
         request=request,
         metadata={"kept_session_id": current_session_id},
-    )
+    ))
 
     # Set new refresh cookie
     response.set_cookie(
