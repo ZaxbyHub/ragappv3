@@ -93,7 +93,12 @@ const WIKI_POLL_INTERVAL_MS = 5_000;
 // schedule is exhausted the id stays marked failed (the cell keeps its
 // "unavailable" render) but is never re-requested — no sustained request
 // storm from permanently failing rows.
-const WIKI_RETRY_SKIP_TICKS = [0, 1, 3, 7, 15];
+const WIKI_RETRY_SKIP_TICKS = [0, 1, 3, 7];
+// Five total attempts per document (initial + four retries, review round 1
+// B-4/R02: the previous eligibility gate admitted a sixth fetch). Exhausted
+// ids stay marked failed for rendering but are never fetched again by either
+// the retry interval or the hydration pass.
+const WIKI_RETRY_MAX_ATTEMPTS = WIKI_RETRY_SKIP_TICKS.length + 1;
 
 /**
  * Signature of a committed document-list response, used by the adaptive poll
@@ -652,7 +657,13 @@ export function useDocumentPolling({
       let cursor = 0;
       const worker = async () => {
         while (true) {
-          if (!isReadCurrent(token)) return;
+          // No whole-batch currency gate here (review round 1 PRR-009/R20):
+          // a newer wiki read invalidating this batch's token used to stop
+          // the workers mid-batch, leaving the remaining documents with no
+          // cached status and no retry path. The per-document commit
+          // watermark below keeps every result correct, so the batch always
+          // runs to completion; scope death still stops it.
+          if (!isContextLive(token.scope, token.lease)) return;
           const index = cursor;
           if (index >= indexed.length) return;
           cursor += 1;
@@ -682,6 +693,10 @@ export function useDocumentPolling({
             });
           } catch {
             if (!isContextLive(token.scope, token.lease)) return;
+            // Failure path carries the same attempt-recency guard as the
+            // success path (review round 1 PRR-035): a stale failure must
+            // not advance retry state a newer success already settled.
+            if (attempt <= (wikiDocCommittedRef.current.get(docId) ?? 0)) return;
             markWikiFetchFailed(docId, token.scope, token.lease);
           }
         }
@@ -706,6 +721,11 @@ export function useDocumentPolling({
   // and cleared only on fire or lease retirement (see the scope effect).
   const uploadRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const knownIndexedUploadIdsRef = useRef<Set<string>>(new Set());
+  // Every upload id ever seen (any status) — drives the acceptance refetch
+  // trigger (review round 1 PRR-013). Persists across vault switches like
+  // the indexed set: upload rows themselves survive switches, and a switch
+  // must not make surviving rows look newly accepted.
+  const knownUploadIdsRef = useRef<Set<string>>(new Set());
   const wikiPollFlightRef = useRef<WikiPollFlight | null>(null);
   const wikiPollSerialRef = useRef(0);
 
@@ -848,6 +868,16 @@ export function useDocumentPolling({
         clearTimeout(uploadRefreshTimerRef.current);
         uploadRefreshTimerRef.current = null;
       }
+      // Per-document wiki bookkeeping is scope-owned (review round 1
+      // PRR-005/M2-03/B-3/R04): attempts, commit watermarks, retry
+      // schedules, and the failed mirror are released with the scope so a
+      // new vault/identity starts fresh and the collections cannot grow
+      // without bound across a session.
+      wikiDocAttemptRef.current.clear();
+      wikiDocCommittedRef.current.clear();
+      wikiRetryAttemptsRef.current.clear();
+      wikiRetrySkipTicksRef.current.clear();
+      wikiFailedRef.current.clear();
       if (wikiPollFlightRef.current?.lease === mountedLease) {
         wikiPollFlightRef.current = null;
       }
@@ -929,6 +959,11 @@ export function useDocumentPolling({
     wikiHydrationRef.current = { lease, key: wikiDocKey, context: readContext };
     const need = documentsVisible.filter((document) => {
       if (document.metadata?.status !== "indexed") return false;
+      // A failed document is owned exclusively by the retry interval
+      // (review round 1 PRR-004): re-including it here re-requested it on
+      // every unrelated key change, bypassing the capped schedule and —
+      // once exhausted — re-requesting it forever.
+      if (wikiFailedRef.current.has(String(document.id))) return false;
       const cached = wikiStatusVisible[String(document.id)];
       return !cached || isTransientWikiStatus(cached.wiki_status);
     });
@@ -956,8 +991,8 @@ export function useDocumentPolling({
       (document) =>
         document.metadata?.status === "indexed" &&
         wikiFailedRefLive.current.has(String(document.id)) &&
-        (wikiRetryAttemptsRef.current.get(String(document.id)) ?? 0) <=
-          WIKI_RETRY_SKIP_TICKS.length
+        (wikiRetryAttemptsRef.current.get(String(document.id)) ?? 0) <
+          WIKI_RETRY_MAX_ATTEMPTS
     )
     .map((document) => String(document.id))
     .join(",");
@@ -1007,14 +1042,18 @@ export function useDocumentPolling({
   useEffect(() => {
     const lease = liveLeaseFor(scope);
     if (lease === null || !isContextLive(scope, lease)) return;
-    // Upload-transition refetch (#766 AC4/AC5): the seen-set is RECONCILED to
-    // the currently-indexed ids on every uploads change (an id that left
-    // `indexed` — e.g. retryUpload returning it to pending — or disappeared
-    // is forgotten, so a genuine later transition re-arms), and exactly ONE
-    // 1 s timer is armed per new transition. The timer is deliberately NOT
-    // cleared here: this effect's cleanup runs on every uploads-array
-    // identity change (every progress tick), which is what starved the old
-    // implementation; it is cleared on fire or lease retirement instead.
+    // Upload-transition refetch (#766 AC4/AC5, plus review round 1
+    // PRR-013): the seen-set is RECONCILED to the currently-indexed ids on
+    // every uploads change (an id that left `indexed` — e.g. retryUpload
+    // returning it to pending — or disappeared is forgotten, so a genuine
+    // later transition re-arms), and a NEW upload id (any status) arms the
+    // refetch too: #766's constraint requires an accepted upload to appear
+    // in the list within a bounded delay, not only once it reaches
+    // `indexed`. Exactly ONE 1 s timer is armed per trigger round. The
+    // timer is deliberately NOT cleared here: this effect's cleanup runs on
+    // every uploads-array identity change (every progress tick), which is
+    // what starved the old implementation; it is cleared on fire or lease
+    // retirement instead.
     const currentlyIndexed = new Set(
       uploads
         .filter((upload) => upload.status === "indexed")
@@ -1028,15 +1067,32 @@ export function useDocumentPolling({
         upload.status === "indexed" &&
         !knownIndexedUploadIdsRef.current.has(String(upload.id))
     );
-    if (newlyIndexed.length === 0) return;
     newlyIndexed.forEach((upload) =>
       knownIndexedUploadIdsRef.current.add(String(upload.id))
     );
+    let shouldRefetch = newlyIndexed.length > 0;
+    if (!shouldRefetch) {
+      // Acceptance trigger (PRR-013): an upload id we have never seen
+      // appeared in the queue (pending/uploading) — refetch once so the new
+      // document shows up promptly; monitor-tick re-creations of the same
+      // ids arm nothing.
+      for (const upload of uploads) {
+        if (!knownUploadIdsRef.current.has(String(upload.id))) {
+          shouldRefetch = true;
+          break;
+        }
+      }
+    }
+    uploads.forEach((upload) => knownUploadIdsRef.current.add(String(upload.id)));
+    if (!shouldRefetch) return;
     if (uploadRefreshTimerRef.current !== null) return;
     uploadRefreshTimerRef.current = setTimeout(() => {
       uploadRefreshTimerRef.current = null;
       if (!isContextLive(scope, lease) || readContextRef.current !== readContext) return;
-      void fetchDocuments();
+      // keepRowsOnFailure (review round 1 PRR-011): a transient failure of
+      // this background refetch must not wipe a loaded list to the error
+      // state — the transition was consumed, so nothing would self-heal.
+      void fetchDocuments({ keepRowsOnFailure: true });
       void fetchStats();
     }, 1_000);
     // uploads stays a dependency (transition detection), but its cleanup no

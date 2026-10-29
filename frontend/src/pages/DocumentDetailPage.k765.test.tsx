@@ -141,12 +141,23 @@ describe("DocumentDetailPage K765 acceptance checks", () => {
       name: /ask about this document/i,
     }) as HTMLButtonElement;
     expect(ask.disabled).toBe(false);
+
+    // Terminal-disarm pin (review round 1): once converged to a TERMINAL
+    // status the refresh loop must STOP — 20s more of ticks issue no further
+    // getDocument calls (an unarmed loop would keep polling forever).
+    const callsAtConvergence = apiMock.getDocument.mock.calls.length;
+    for (let step = 0; step < 10; step += 1) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2_000);
+      });
+    }
+    expect(apiMock.getDocument).toHaveBeenCalledTimes(callsAtConvergence);
   });
 
   it("failed document Ask tooltip does not say waiting until indexed", { timeout: 30_000 }, async () => {
     apiMock.getDocument.mockResolvedValue({
       ...DOC_BASE,
-      metadata: { status: "error", chunk_count: 0 },
+      metadata: { status: "error", chunk_count: 0, error_message: "extraction crashed" },
     });
 
     await act(async () => {
@@ -166,5 +177,40 @@ describe("DocumentDetailPage K765 acceptance checks", () => {
     // shared non-searchable tooltip reads "Waiting until indexed — ...".
     // RED at base, GREEN after the fix.
     expect(ask.title).not.toContain("Waiting until indexed");
+    // Positive pins (review round 1): the tooltip states the FAILURE, and
+    // the same description renders as VISIBLE text in the Details card —
+    // not only an unreachable title on a pointer-events-none button.
+    expect(ask.title.startsWith("Indexing failed")).toBe(true);
+    expect(
+      screen.getByText("Indexing failed — extraction crashed. Re-upload the document to index it again."),
+    ).toBeInTheDocument();
+  });
+
+  it("cancelled document Ask tooltip says indexing was cancelled", { timeout: 30_000 }, async () => {
+    apiMock.getDocument.mockResolvedValue({
+      ...DOC_BASE,
+      metadata: { status: "cancelled", chunk_count: 0 },
+    });
+
+    await act(async () => {
+      render(<Harness />);
+      await flushMicrotasks();
+    });
+
+    const ask = screen.getByRole("button", {
+      name: /ask about this document/i,
+    }) as HTMLButtonElement;
+    // Sentinel: a cancelled document is not searchable either.
+    expect(ask.disabled).toBe(true);
+
+    // Discriminating assertion (cancelled branch): the tooltip names the
+    // cancellation — it is not "waiting", and not the error copy either.
+    expect(ask.title).toContain("Indexing was cancelled");
+    expect(ask.title).not.toContain("Waiting until indexed");
+    expect(ask.title).not.toContain("Indexing failed");
+    // The visible description renders (no failureMessage on this fixture).
+    expect(
+      screen.getByText("Indexing was cancelled. Re-upload the document to index it again."),
+    ).toBeInTheDocument();
   });
 });

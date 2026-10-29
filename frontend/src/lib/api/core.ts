@@ -1328,14 +1328,28 @@ export function deleteDocumentKeepalive(fileId: string): boolean {
     "X-CSRF-Token": csrfToken,
   };
   if (_jwtAccessToken) headers.Authorization = "Bearer " + _jwtAccessToken;
-  void fetch(API_BASE_URL + "/documents/" + fileId, {
+  const url = API_BASE_URL + "/documents/" + fileId;
+  void fetch(url, {
     method: "DELETE",
     credentials: "include",
     headers,
     keepalive: true,
-  }).catch(() => {
-    // pagehide is best effort: there is no safe opportunity to retry.
-  });
+  })
+    .then((response) => {
+      // Outcome is logged, never silently dropped (review round 1 PRR-006):
+      // a non-2xx means the confirmed delete did not land; DocumentsPage's
+      // bfcache pageshow replay completes the intent when the page returns.
+      if (!response.ok) {
+        logApiFailure(
+          "Keepalive document delete did not succeed:",
+          new Error(`keepalive DELETE returned HTTP ${response.status}`),
+          `${response.status} /documents/${fileId}`
+        );
+      }
+    })
+    .catch((error: unknown) => {
+      logApiFailure("Keepalive document delete did not reach the server:", error);
+    });
   return true;
 }
 
@@ -1343,14 +1357,29 @@ export function deleteDocumentKeepalive(fileId: string): boolean {
  * Sanitized API-failure logging for the documents surfaces (#766): logs the
  * error's message plus response status and request URL — never the raw error
  * object or its config, whose toJSON() serialization would carry the
- * Authorization header to the browser console.
+ * Authorization header to the browser console. Reads BOTH error shapes this
+ * repo produces (review round 1 PRR-014/M3-01): the apiClient response
+ * interceptor's normalized Error (top-level `status`, original error under
+ * `originalError`) and a raw AxiosError (`.response`/`.config`).
  */
-export function logApiFailure(prefix: string, err: unknown): void {
+export function logApiFailure(prefix: string, err: unknown, where?: string): void {
   const message = err instanceof Error ? err.message : String(err);
-  const status = (err as { response?: { status?: number } } | null)?.response?.status;
-  const url = (err as { config?: { url?: string } } | null)?.config?.url;
-  const where = status != null ? `${status} ${url ?? ""}`.trim() : (url ?? "");
-  console.error(prefix, message, where);
+  const candidate = err as {
+    status?: unknown;
+    response?: { status?: unknown };
+    config?: { url?: string };
+    originalError?: { response?: { status?: unknown }; config?: { url?: string } };
+  };
+  let status: unknown;
+  if (candidate.status != null) status = candidate.status;
+  else if (candidate.response?.status != null) status = candidate.response.status;
+  else if (candidate.originalError?.response?.status != null) {
+    status = candidate.originalError.response.status;
+  }
+  const url = candidate.config?.url ?? candidate.originalError?.config?.url;
+  const whereResolved =
+    where ?? (url ? (status != null ? `${String(status)} ${url}` : url) : status != null ? String(status) : "");
+  console.error(prefix, message, whereResolved);
 }
 
 export async function deleteDocuments(fileIds: string[]): Promise<{ deleted_count: number, failed_ids: string[] }> {

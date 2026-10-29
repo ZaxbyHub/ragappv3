@@ -53,6 +53,11 @@ vi.mock('@/lib/api', () => ({
     claims_count: 0,
     lint_count: 0,
   }),
+  // useUploadMonitoring imports these two-hops via this barrel; explicit
+  // mocks keep them dead in this suite (latent today: the hook stays
+  // disarmed with no uploads).
+  getDocumentStatus: vi.fn(),
+  getDocumentStatuses: vi.fn(),
   compileDocumentWiki: vi.fn().mockResolvedValue({ job_id: 1, status: 'queued' }),
   getDocumentStats: vi.fn().mockResolvedValue({
     total_documents: 0,
@@ -243,6 +248,15 @@ describe('DocumentsPage K765 acceptance check — failed wiki status fetch is no
     await act(async () => {
       for (let i = 0; i < 10; i += 1) await Promise.resolve();
     });
+
+    // Positive control (review round 1): the failed fetch state actually
+    // RENDERED — DocumentTable shows the "Wiki status unavailable" cell for
+    // failed ids and the row (filename) is still visible. Without this the
+    // zero-Compile assertion below could pass on a page that never rendered
+    // the row's wiki cell at all.
+    expect(await screen.findByText('Wiki status unavailable', {}, { timeout: 10_000 })).toBeInTheDocument();
+    // The row's filename is still visible (table link and/or mobile card).
+    expect(screen.getAllByText('probe.pdf').length).toBeGreaterThan(0);
 
     // Discriminating assertion: an UNKNOWN wiki status (the fetch failed)
     // must not render the Compile affordance — that invites a compile we

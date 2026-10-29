@@ -16,6 +16,14 @@
 //        results for documents the newer attempt FAILED to fetch; at base
 //        the whole older batch is dropped when its token goes stale.
 //
+// Amended after review round 1 (falsifiability gaps):
+//   C4-BOUND — the retry path is capped at five total attempts per document
+//        (initial + four retries at skip ticks 0,1,3,7); a permanently
+//        failing document must not be re-requested forever.
+//   VAULT-SWITCH — per-document wiki failure bookkeeping is scope-owned: a
+//        vault switch clears it, so the old vault's failing document earns
+//        no further fetches and the new vault hydrates fresh.
+//
 // Harness copied from useDocumentPolling.k01.test.ts (proven in this repo):
 // the vi.importActual-spread "@/lib/api" mock, the sonner mock, the
 // useAuthStore owner setup, the options() helper, and the deferred/flush
@@ -290,6 +298,125 @@ describe("useDocumentPolling K765 acceptance checks", () => {
     // retried until it resolves; the resolved status must be committed.
     // At base nothing retries and wikiStatusMap["5"] stays undefined.
     expect(view.result.current.wikiStatusMap["5"]?.wiki_status).toBe("compiled");
+  });
+
+  it("permanently failing wiki fetch is retried at most five times in total", { timeout: 30_000 }, async () => {
+    vi.useFakeTimers({
+      toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"],
+    });
+    fixture.listDocuments.mockImplementation(() =>
+      Promise.resolve({ documents: [documentRow("5", "indexed")], total: 1 }),
+    );
+    // ALWAYS reject: the document can never succeed, so the only observable
+    // bound is the attempt cap (review round 1 B-4/R02).
+    fixture.getDocumentWikiStatus.mockRejectedValue(
+      new Error("wiki status unavailable"),
+    );
+
+    renderHook(
+      (props: { vault: number }) => useDocumentPolling(options(props.vault)),
+      { initialProps: { vault: 1 } },
+    );
+    await act(async () => {
+      await flush();
+    });
+
+    // The bounded schedule is measured in retry-interval ticks with skip
+    // credits [0, 1, 3, 7]: the retries ride the ticks at 5s, 15s, 35s and
+    // 75s after the initial hydration failure — the schedule is exhausted
+    // only at t=75s, so advance well past it (16 ticks = 80s).
+    for (let index = 0; index < 16; index += 1) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5_000);
+      });
+    }
+    await act(async () => {
+      await flush();
+    });
+
+    // Bounded-retry assertion: FIVE attempts total (initial + four retries).
+    // An uncapped implementation keeps fetching every eligible tick past
+    // this point. (Six ticks alone cannot exhaust the [0,1,3,7] skip
+    // schedule — the cap is only observable after 15 ticks.)
+    expect(fixture.getDocumentWikiStatus).toHaveBeenCalledTimes(5);
+    expect(
+      fixture.getDocumentWikiStatus.mock.calls.filter(([fileId]) => fileId === 5),
+    ).toHaveLength(5);
+  });
+
+  it("failed document state resets on a vault switch", { timeout: 30_000 }, async () => {
+    vi.useFakeTimers({
+      toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"],
+    });
+    // Vault 1 lists the failing document; vault 2 lists a fresh one.
+    fixture.listDocuments.mockImplementation(({ vaultId }: { vaultId?: number }) =>
+      vaultId === 2
+        ? Promise.resolve({ documents: [documentRow("9", "indexed")], total: 1 })
+        : Promise.resolve({ documents: [documentRow("5", "indexed")], total: 1 }),
+    );
+    fixture.getDocumentWikiStatus.mockImplementation((fileId: number) =>
+      fileId === 5
+        ? Promise.reject(new Error("wiki status unavailable"))
+        : Promise.resolve(wikiStatus("compiled", fileId)),
+    );
+
+    const view = renderHook(
+      (props: { vault: number }) => useDocumentPolling(options(props.vault)),
+      { initialProps: { vault: 1 } },
+    );
+    await act(async () => {
+      await flush();
+    });
+    // Sentinel: the initial hydration for 5 ran and failed...
+    expect(
+      fixture.getDocumentWikiStatus.mock.calls.filter(([fileId]) => fileId === 5),
+    ).toHaveLength(1);
+    // ...and one retry tick fired for it (skip credit 0 rides the next tick).
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5_000);
+    });
+    expect(
+      fixture.getDocumentWikiStatus.mock.calls.filter(([fileId]) => fileId === 5),
+    ).toHaveLength(2);
+
+    // Switch to vault 2: the scope (and with it every per-document wiki
+    // bookkeeping map) is retired.
+    await act(async () => {
+      view.rerender({ vault: 2 });
+    });
+    await act(async () => {
+      await flush();
+    });
+    // The old document would now resolve — if its retry schedule had leaked
+    // across the switch, later ticks would still fetch it.
+    fixture.getDocumentWikiStatus.mockImplementation((fileId: number) =>
+      Promise.resolve(wikiStatus("compiled", fileId)),
+    );
+    const callsForFiveAtSwitch = fixture.getDocumentWikiStatus.mock.calls.filter(
+      ([fileId]) => fileId === 5,
+    ).length;
+
+    for (let index = 0; index < 6; index += 1) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5_000);
+      });
+    }
+    await act(async () => {
+      await flush();
+    });
+
+    // Discriminating assertions: no further fetch for the old vault's doc...
+    expect(
+      fixture.getDocumentWikiStatus.mock.calls.filter(([fileId]) => fileId === 5),
+    ).toHaveLength(callsForFiveAtSwitch);
+    // ...the new vault's document hydrated fresh...
+    expect(
+      fixture.getDocumentWikiStatus.mock.calls.filter(([fileId]) => fileId === 9),
+    ).toHaveLength(1);
+    expect(view.result.current.wikiStatusMap["9"]?.wiki_status).toBe("compiled");
+    // ...and the old failure is not rendered into the new vault's view.
+    expect(view.result.current.wikiFetchFailedIds.has("5")).toBe(false);
+    expect(view.result.current.wikiStatusMap["5"]).toBeUndefined();
   });
 
   it("superseded wiki batch still commits its per document results", { timeout: 30_000 }, async () => {

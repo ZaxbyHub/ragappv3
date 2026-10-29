@@ -343,7 +343,7 @@ export function DocumentTable({
                           return (
                             <span
                               className="text-xs text-muted-foreground italic"
-                              title="Wiki status unavailable — the status fetch failed and will be retried."
+                              title="Wiki status unavailable — the status fetch failed."
                             >
                               Wiki status unavailable
                             </span>

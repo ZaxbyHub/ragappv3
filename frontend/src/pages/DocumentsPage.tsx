@@ -35,6 +35,7 @@ import {
 // from the api core module — the page's test suites replace the "@/lib/api"
 // barrel with a manual mock object that does not re-export new helpers.
 import { deleteDocumentKeepalive, logApiFailure } from "@/lib/api/core";
+import { captureAuthOwner, type AuthOwner } from "@/lib/api/auth-lifecycle";
 import { useDebounce } from "@/hooks/useDebounce";
 import { useUploadMonitoring } from "@/hooks/useUploadMonitoring";
 import { useVaultStore } from "@/stores/useVaultStore";
@@ -200,6 +201,15 @@ export default function DocumentsPage() {
   // Optimistic delete state
   const [optimisticallyDeletedIds, setOptimisticallyDeletedIds] = useState<Set<string>>(new Set());
   const pendingDeleteTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  // Owner captured when the delete was confirmed (review round 1 PRR-015):
+  // a pending delete confirmed by one principal must never be dispatched
+  // under another principal's bearer after an identity switch.
+  const pendingDeleteOwnersRef = useRef<Map<string, AuthOwner>>(new Map());
+  // Doc ids whose pagehide keepalive DELETE was dispatched but whose outcome
+  // is unconfirmed (review round 1 PRR-006/PRR-008): a bfcache restore
+  // replays them through the normal path so an Undo click can never re-show
+  // a document whose delete already survived teardown.
+  const dispatchedPagehideDeletesRef = useRef<Set<string>>(new Set());
 
   useEffect(
     () => () => {
@@ -208,35 +218,101 @@ export default function DocumentsPage() {
     []
   );
 
-  // Flush pending deletes (#766 AC1/AC2). The user already confirmed each
-  // delete (the 3s undo window simply hadn't elapsed); cancelling the timers
-  // would silently discard a confirmed destructive action. The SPA-unmount
-  // flush and a pagehide flush share one exactly-once helper: each timer
-  // entry is removed from the map BEFORE its channel fires, so pagehide
-  // followed by unmount (or logout) can never double-delete. On pagehide the
-  // keepalive channel is preferred (it survives page teardown); when no CSRF
-  // credential is cached nothing was sent and the normal deleteDocument path
-  // runs. The unmount flush surfaces failures (toast) instead of discarding
-  // them; on pagehide there is nothing left to toast to.
+  // Flush pending deletes (#766 AC1/AC2, hardened per review round 1). The
+  // user already confirmed each delete (the 3s undo window simply hadn't
+  // elapsed); cancelling the timers would silently discard a confirmed
+  // destructive action. The SPA-unmount flush and a pagehide flush share one
+  // exactly-once helper: each timer entry is removed from the map BEFORE its
+  // channel fires, so pagehide followed by unmount (or logout) can never
+  // double-delete. Channel rules:
+  // - pagehide: the keepalive channel when a CSRF credential is cached;
+  //   when none is cached, NO request is attempted — the axios fallback
+  //   would need a CSRF-discovery round trip the browser aborts during
+  //   teardown (PRR-028), so the entry is dropped to the replay registry
+  //   and, if the page returns (bfcache), replayed on pageshow.
+  // - unmount (SPA navigation / logout): the normal deleteDocument path,
+  //   whose failures now surface as a toast (AC13); a delete confirmed by a
+  //   DIFFERENT principal than the current one is skipped and its row
+  //   un-hidden — a principal never executes another principal's intent
+  //   (PRR-015), and a 403 would lie about the outcome anyway.
   const flushPendingDeletes = useCallback((pagehide: boolean) => {
     const timers = pendingDeleteTimersRef.current;
+    let failed = 0;
+    const ownerNow = captureAuthOwner();
     timers.forEach((timer, docId) => {
       timers.delete(docId);
       clearTimeout(timer);
-      if (pagehide && deleteDocumentKeepalive(docId)) return;
+      const confirmedOwner = pendingDeleteOwnersRef.current.get(docId);
+      pendingDeleteOwnersRef.current.delete(docId);
+      if (confirmedOwner && ownerNow !== confirmedOwner) {
+        // The confirming principal is gone; the intent dies with it.
+        setOptimisticallyDeletedIds((previous) => {
+          const next = new Set(previous);
+          next.delete(docId);
+          return next;
+        });
+        return;
+      }
+      if (pagehide) {
+        dispatchedPagehideDeletesRef.current.add(docId);
+        if (deleteDocumentKeepalive(docId)) return;
+        // No CSRF credential: the keepalive channel never fired. Leave the
+        // id in the replay registry — pageshow (bfcache return) replays it.
+        return;
+      }
       void deleteDocument(docId).catch(() => {
+        failed += 1;
         toast.error("Failed to delete document", { id: "delete-flush-failure" });
       });
     });
+    if (failed > 1) {
+      // Aggregate count (review round 1 L1-05/M5-01): N independently failed
+      // deletes must not read as one.
+      toast.error(`Failed to delete ${failed} documents`, {
+        id: "delete-flush-failure-many",
+      });
+    }
   }, []);
 
   useEffect(() => {
     const handlePageHide = () => flushPendingDeletes(true);
+    // Bfcache restore (review round 1 PRR-006/PRR-008): the page is alive
+    // again — replay any pagehide delete whose keepalive dispatch could not
+    // be confirmed (no credential at teardown) through the normal path so
+    // the confirmed intent completes and Undo can never resurrect a deleted
+    // document.
+    const handlePageShow = (event: PageTransitionEvent) => {
+      if (!event.persisted) return;
+      const replay = Array.from(dispatchedPagehideDeletesRef.current);
+      dispatchedPagehideDeletesRef.current.clear();
+      replay.forEach((docId) => {
+        void deleteDocument(docId)
+          .then(() => {
+            toast.success("Deleted document");
+          })
+          .catch(() => {
+            toast.error("Failed to delete document", { id: "delete-flush-failure" });
+          });
+      });
+    };
     window.addEventListener("pagehide", handlePageHide);
+    window.addEventListener("pageshow", handlePageShow);
     return () => {
       window.removeEventListener("pagehide", handlePageHide);
+      window.removeEventListener("pageshow", handlePageShow);
       flushPendingDeletes(false);
     };
+  }, [flushPendingDeletes]);
+
+  // Before-logout flush (review round 1 PRR-007): logout clears the bearer
+  // and CSRF token before the router unmounts this page, so the SPA-unmount
+  // flush previously ran with no credentials and lost the confirmed delete
+  // (401 + a spurious toast on the login screen). The auth store dispatches
+  // this event FIRST, while the credentials are still valid.
+  useEffect(() => {
+    const handleBeforeLogout = () => flushPendingDeletes(true);
+    window.addEventListener("ragapp:before-logout", handleBeforeLogout);
+    return () => window.removeEventListener("ragapp:before-logout", handleBeforeLogout);
   }, [flushPendingDeletes]);
 
   const { uploads, addUploads, cancelUpload, removeUpload, clearCompleted, retryUpload } =
@@ -724,6 +800,9 @@ export default function DocumentsPage() {
       description: "Are you sure you want to delete this document? This will also remove all associated chunks.",
       onConfirm: () => {
         if (pendingDeleteTimersRef.current.has(docId)) return;
+        // Owner at confirm time (review round 1 PRR-015): the flush never
+        // dispatches another principal's confirmed intent.
+        pendingDeleteOwnersRef.current.set(docId, captureAuthOwner());
 
         setOptimisticallyDeletedIds((prev) => new Set(prev).add(docId));
 
@@ -738,6 +817,15 @@ export default function DocumentsPage() {
                 clearTimeout(timer);
                 pendingDeleteTimersRef.current.delete(docId);
               }
+              // If a teardown flush already dispatched this delete
+              // (review round 1 PRR-008), Undo must not resurrect the
+              // row: the destructive intent is already in flight and the
+              // pageshow replay (bfcache) completes it.
+              if (dispatchedPagehideDeletesRef.current.has(docId)) {
+                toast.dismiss(toastId);
+                toast.info("Delete already sent — the document will be removed");
+                return;
+              }
               setOptimisticallyDeletedIds((prev) => {
                 const next = new Set(prev);
                 next.delete(docId);
@@ -750,6 +838,7 @@ export default function DocumentsPage() {
 
         const timer = setTimeout(async () => {
           pendingDeleteTimersRef.current.delete(docId);
+          pendingDeleteOwnersRef.current.delete(docId);
           toast.dismiss(toastId);
           try {
             await deleteDocument(docId);

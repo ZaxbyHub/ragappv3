@@ -149,8 +149,18 @@ export default function DocumentDetailPage() {
   // (pending/processing are the only non-terminal states the backend emits).
   const statusRefreshInFlightRef = useRef(false);
   const statusRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Consecutive failed refreshes (review round 1 PRR-010): the loop must
+  // terminate when the document is gone or the request keeps failing —
+  // previously a 404ing/deleted document was polled every 2 s forever.
+  const statusRefreshFailuresRef = useRef(0);
   useEffect(() => {
     const STATUS_REFRESH_INTERVAL_MS = 2_000;
+    const STATUS_REFRESH_MAX_FAILURES = 5;
+    // A fresh route id must not inherit the previous document's in-flight
+    // flag (review round 1 PRR-001 — Copilot, shard A and the critic all
+    // independently reproduced the wedge): reset it on every effect run.
+    statusRefreshInFlightRef.current = false;
+    statusRefreshFailuresRef.current = 0;
     let disposed = false;
     const tick = () => {
       if (disposed) return;
@@ -172,31 +182,50 @@ export default function DocumentDetailPage() {
       if (currentStatus !== "pending" && currentStatus !== "processing") {
         return;
       }
-      if (statusRefreshInFlightRef.current) return;
+      if (statusRefreshInFlightRef.current) {
+        // A request is already in flight: leave ONE successor armed rather
+        // than returning bare-handed (review round 1 PRR-001 — the bare
+        // return let a cross-document navigation wedge the new document's
+        // loop permanently).
+        statusRefreshTimerRef.current = setTimeout(tick, STATUS_REFRESH_INTERVAL_MS);
+        return;
+      }
+      if (statusRefreshFailuresRef.current >= STATUS_REFRESH_MAX_FAILURES) {
+        // The document has been deleted or the endpoint keeps failing
+        // (PRR-010): stop instead of polling forever.
+        return;
+      }
       statusRefreshInFlightRef.current = true;
       const gen = loadGenRef.current;
       void getDocument(docId)
         .then((d) => {
           statusRefreshInFlightRef.current = false;
+          statusRefreshFailuresRef.current = 0;
           if (disposed || loadGenRef.current !== gen) return;
           const previous = docRef.current;
           if (previous == null || String(previous.id) !== String(d.id)) return;
+          // Refresh the FULL live metadata plus the top-level progress
+          // fields (review round 1 B-5/R05: dropping production progress
+          // surfaces and leaving stale chunks_failed/extraction_diagnostics
+          // kept partial-status and failure copy wrong until reload). The
+          // merge never touches loading/error/tags/preview state.
           const merged: Document = {
             ...previous,
             metadata: {
               ...previous.metadata,
-              status: d.metadata?.status ?? previous.metadata?.status,
-              chunk_count: d.metadata?.chunk_count ?? previous.metadata?.chunk_count,
-              progress:
-                (d.metadata as { progress?: number } | undefined)?.progress ??
-                (previous.metadata as { progress?: number } | undefined)?.progress,
+              ...d.metadata,
             },
-          };
+            progress_percent: d.progress_percent ?? previous.progress_percent,
+            processed_units: d.processed_units ?? previous.processed_units,
+            total_units: d.total_units ?? previous.total_units,
+            phase: d.phase ?? previous.phase,
+          } as Document;
           docRef.current = merged;
           setDoc(merged);
         })
         .catch(() => {
           statusRefreshInFlightRef.current = false;
+          statusRefreshFailuresRef.current += 1;
         })
         .finally(() => {
           if (disposed) return;
@@ -382,6 +411,21 @@ export default function DocumentDetailPage() {
     (chunksFailed > 0 ? `${chunksFailed} chunks failed to embed` : null);
   const partialDescription =
     status === "partial" ? (failureMessage ?? "Completed with failures") : null;
+  // Truthful failure/cancelled copy (review round 1 PRR-027/R14): there is
+  // no one-click reindex affordance to point at, so the copy states the
+  // outcome and the real remediation instead of a nonexistent "retry from
+  // Documents" action; and the message renders VISIBLE text in the Details
+  // card, not only a title attribute on a disabled button
+  // (disabled:pointer-events-none makes a title there unreachable).
+  const failedCopy =
+    status === "error" || status === "failed"
+      ? "Indexing failed"
+      : status === "cancelled"
+        ? "Indexing was cancelled"
+        : null;
+  const failedDescription = failedCopy
+    ? `${failedCopy}${failureMessage ? ` — ${failureMessage}` : ""}. Re-upload the document to index it again.`
+    : null;
 
   const handleAskAboutDocument = () => {
     if (!doc || !isSearchable) return;
@@ -425,11 +469,9 @@ export default function DocumentDetailPage() {
                 title={
                   isSearchable
                     ? "Ask questions scoped to this document"
-                    : status === "error" || status === "failed"
-                      ? "Indexing failed — retry from Documents"
-                      : status === "cancelled"
-                        ? "Indexing was cancelled — retry from Documents"
-                        : "Waiting until indexed — available once the document is searchable"
+                    : failedCopy
+                      ? failedDescription ?? failedCopy
+                      : "Waiting until indexed — available once the document is searchable"
                 }
               >
                 <MessageSquare className="w-4 h-4 mr-1" />
@@ -457,6 +499,9 @@ export default function DocumentDetailPage() {
               <StatusBadge status={status} chunksFailed={Number(doc.metadata?.chunks_failed ?? 0)} />
               {partialDescription && (
                 <p className="text-xs text-warning mt-1">{partialDescription}</p>
+              )}
+              {failedDescription && (
+                <p className="text-xs text-destructive mt-1">{failedDescription}</p>
               )}
             </div>
             <div>

@@ -2,26 +2,12 @@
 // timers: compile follow-up refresh vs unmount (C14, PRESERVING), the
 // indexed-upload refetch vs monitor churn (C15/C16), the adaptive status-poll
 // interval vs progress changes (C17), and Authorization-header leakage in
-// failure logs (C18).
+// failure logs (C18). C14 GREEN at base/after the fix; C15-C18 DISCRIMINATING.
 //
-//   C14 (PRESERVING) — the 2s compile follow-up refresh must not fire after
-//        the hook unmounts (the current code clears compile timers in the
-//        lease cleanup). GREEN at base and after the fix.
-//   C15 (DISCRIMINATING) — an indexed upload must still trigger a refetch
-//        while the upload monitor keeps churning progress updates. At base
-//        every churn rerender restarts the 1s refetch timer, so it never
-//        fires. RED at base, GREEN after the fix.
-//   C16 (DISCRIMINATING) — a single indexed upload refetches exactly once
-//        across repeated monitor ticks with the SAME indexed set. At base
-//        each fresh uploads array restarts the timer and refetches again.
-//        RED at base, GREEN after the fix.
-//   C17 (DISCRIMINATING) — the adaptive status-poll interval resets when the
-//        processing document's progress changes. At base the interval only
-//        grows (x1.5, 30s cap). RED at base, GREEN after the fix.
-//   C18 (DISCRIMINATING) — documents/stats failure logs must not serialize
-//        the request config (and its Authorization header). At base the raw
-//        AxiosError is logged, whose toJSON includes config.headers.
-//        RED at base, GREEN after the fix.
+// Amended after review round 1: C14 also pins the timer-clear mechanism via
+// vi.getTimerCount; new PRR-013/PRR-023 checks (acceptance refetch fires once
+// per NEW upload id; the seen-indexed set reconciles); C17 drives production
+// top-level progress_percent; C18 uses the NORMALIZED error shape.
 //
 // Harness copied from useDocumentPolling.k01.test.ts (proven in this repo):
 // the vi.importActual-spread "@/lib/api" mock, the sonner mock, the
@@ -31,11 +17,7 @@ import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AxiosError, type InternalAxiosRequestConfig } from "axios";
 
-import type {
-  Document,
-  DocumentStatsResponse,
-  DocumentWikiStatus,
-} from "@/lib/api";
+import type { Document, DocumentStatsResponse, DocumentWikiStatus } from "@/lib/api";
 import type { UploadFile } from "@/stores/useUploadStore";
 import { useAuthStore } from "@/stores/useAuthStore";
 
@@ -98,10 +80,7 @@ function restorePublicAuthState(): void {
   act(() => useAuthStore.setState(publicAuthSnapshot, true));
 }
 
-function documentRow(
-  id: string,
-  status: "indexed" | "processing" = "indexed",
-): Document {
+function documentRow(id: string, status: "indexed" | "processing" = "indexed"): Document {
   return {
     id,
     filename: `${id}.txt`,
@@ -162,18 +141,25 @@ function uploadRow(id: string, status: string, progress = 0): UploadFile {
   } as unknown as UploadFile;
 }
 
-/** A real AxiosError whose serialized config carries an Authorization header. */
-function authorizationBearerError(): AxiosError {
+/** The apiClient interceptor's NORMALIZED error (review round 1): top-level
+ * status, raw AxiosError under originalError whose serialized config still
+ * carries the Authorization header and the request URL (the leak shape). */
+function normalizedBearerError(): Error & { status?: number; originalError?: unknown } {
   const config = {
     headers: { Authorization: "Bearer probe-token" },
+    url: "/documents",
   } as unknown as InternalAxiosRequestConfig;
-  return new AxiosError("boom", "500", config, {}, null);
+  const err = new Error("Request failed with status code 500") as Error & {
+    status?: number;
+    originalError?: unknown;
+  };
+  err.status = 500;
+  err.originalError = new AxiosError("Request failed with status code 500", "500", config);
+  return err;
 }
 
 /** Serialize every logged argument; JSON.stringify failures become "". */
-function serializedLoggedArgs(
-  spies: Array<{ mock: { calls: unknown[][] } }>,
-): string[] {
+function serializedLoggedArgs(spies: Array<{ mock: { calls: unknown[][] } }>): string[] {
   return spies
     .flatMap((spy) => spy.mock.calls)
     .flatMap((args) =>
@@ -241,11 +227,23 @@ describe("useDocumentPolling K766 acceptance checks", () => {
     });
     // Sentinel: the compile succeeded and armed the 2s follow-up refresh.
     expect(fixture.compileDocumentWiki).toHaveBeenCalledWith(5, 1);
+    // Mechanism pin: a timer is genuinely armed, and drives the follow-up refresh.
+    expect(vi.getTimerCount()).toBeGreaterThanOrEqual(1);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    expect(fixture.getDocumentWikiStatus.mock.calls.length).toBeGreaterThan(0);
 
+    // Re-arm via a second compile; unmount must CLEAR it (getTimerCount → 0).
+    await act(async () => {
+      await view.result.current.handleCompileDocument("5");
+    });
+    expect(vi.getTimerCount()).toBeGreaterThanOrEqual(1);
     fixture.getDocumentWikiStatus.mockClear();
     act(() => {
       view.unmount();
     });
+    expect(vi.getTimerCount()).toBe(0);
     await act(async () => {
       await vi.advanceTimersByTimeAsync(3_000);
     });
@@ -254,6 +252,80 @@ describe("useDocumentPolling K766 acceptance checks", () => {
     // unmount — no wiki status fetch happens after the page is gone.
     // GREEN at base and after the fix.
     expect(fixture.getDocumentWikiStatus).toHaveBeenCalledTimes(0);
+  });
+
+  it("an accepted upload triggers a prompt refetch", { timeout: 30_000 }, async () => {
+    vi.useFakeTimers({
+      toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"],
+    });
+    fixture.listDocuments.mockImplementation(() =>
+      Promise.resolve({ documents: [documentRow("5", "indexed")], total: 1 }),
+    );
+
+    const view = renderHook(
+      (props: { uploads: UploadFile[] }) => useDocumentPolling(optionsWith(props.uploads, 1)),
+      { initialProps: { uploads: [] } },
+    );
+    await act(async () => {
+      await flush();
+    });
+    expect(view.result.current.documents.map((row) => row.id)).toEqual(["5"]);
+
+    fixture.listDocuments.mockClear();
+    // A NEW pending upload id — the acceptance trigger (PRR-013) refetches once.
+    view.rerender({ uploads: [uploadRow("a", "pending")] });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(fixture.listDocuments.mock.calls.length).toBeGreaterThanOrEqual(1);
+
+    // Five monitor ticks, FRESH arrays, same pending id: acceptance fires
+    // once per NEW id, never per array identity.
+    for (let tick = 1; tick <= 5; tick += 1) {
+      view.rerender({ uploads: [uploadRow("a", "pending")] });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1_000);
+      });
+    }
+    expect(fixture.listDocuments).toHaveBeenCalledTimes(1);
+  });
+
+  it("seen indexed set reconciles so a retry round trip re-fires", { timeout: 30_000 }, async () => {
+    vi.useFakeTimers({
+      toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"],
+    });
+    fixture.listDocuments.mockImplementation(() =>
+      Promise.resolve({ documents: [documentRow("5", "indexed")], total: 1 }),
+    );
+
+    const view = renderHook(
+      (props: { uploads: UploadFile[] }) => useDocumentPolling(optionsWith(props.uploads, 1)),
+      { initialProps: { uploads: [] } },
+    );
+    await act(async () => {
+      await flush();
+    });
+    expect(view.result.current.documents.map((row) => row.id)).toEqual(["5"]);
+
+    fixture.listDocuments.mockClear();
+    // A indexes → one refetch.
+    view.rerender({ uploads: [uploadRow("a", "indexed")] });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(fixture.listDocuments).toHaveBeenCalledTimes(1);
+
+    // A leaves indexed (retryUpload returns it to pending): the seen set must
+    // FORGET it, so the SECOND transition re-fires the refetch (one more call).
+    view.rerender({ uploads: [uploadRow("a", "pending")] });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    view.rerender({ uploads: [uploadRow("a", "indexed")] });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(fixture.listDocuments).toHaveBeenCalledTimes(2);
   });
 
   it("indexed upload triggers a refetch despite progress churn", { timeout: 30_000 }, async () => {
@@ -293,8 +365,7 @@ describe("useDocumentPolling K766 acceptance checks", () => {
     }
 
     // Discriminating assertion: the indexed upload must still trigger a
-    // document refetch. At base every churn rerender restarts the 1s refetch
-    // timer and it never elapses: zero calls.
+    // refetch. At base every churn rerender restarts the 1s timer: zero calls.
     expect(fixture.listDocuments.mock.calls.length).toBeGreaterThan(0);
   });
 
@@ -318,12 +389,12 @@ describe("useDocumentPolling K766 acceptance checks", () => {
     expect(view.result.current.documents.map((row) => row.id)).toEqual(["5"]);
 
     fixture.listDocuments.mockClear();
-    // The transition: uploads goes from [] to [A indexed]...
+    // The transition: uploads goes from [] to [A indexed]... then five more
+    // monitor ticks with FRESH arrays holding the same indexed A, 1500ms
+    // apart (each fresh array re-runs the uploads effect).
     await act(async () => {
       view.rerender({ uploads: [uploadRow("a", "indexed")] });
     });
-    // ...then five more monitor ticks with FRESH arrays holding the same
-    // indexed A, 1500ms apart (each fresh array re-runs the uploads effect).
     for (let tick = 1; tick <= 5; tick += 1) {
       await act(async () => {
         await vi.advanceTimersByTimeAsync(1_500);
@@ -353,10 +424,13 @@ describe("useDocumentPolling K766 acceptance checks", () => {
     let listCalls = 0;
     fixture.listDocuments.mockImplementation(() => {
       listCalls += 1;
-      // Same processing document every call, but a DIFFERENT progress value.
+      // metadata.progress CONSTANT; the PRODUCTION top-level surface
+      // (progress_percent — what the backend emits) advances; the adaptive
+      // poll's signature reads it, so the interval must reset on this alone.
       const row = {
         ...documentRow("p1", "processing"),
-        metadata: { status: "processing", progress: listCalls },
+        metadata: { status: "processing", progress: 7 },
+        progress_percent: listCalls,
       } as unknown as Document;
       return Promise.resolve({ documents: [row], total: 1 });
     });
@@ -378,18 +452,16 @@ describe("useDocumentPolling K766 acceptance checks", () => {
       });
     }
 
-    // Discriminating assertion: an advancing progress value means work is
-    // actively happening, so the adaptive interval must reset to the base
-    // cadence — 4 polls in 8s (2s/4s/6s/8s). At base the interval only grows
-    // (2s then 3s then 4.5s): 2 polls land inside the 8s window.
+    // Discriminating assertion: advancing progress means active work, so the
+    // interval resets to base cadence — 4 polls in 8s (2s/4s/6s/8s). At base
+    // it only grows (2s→3s→4.5s): 2 polls land inside the 8s window.
     expect(fixture.listDocuments).toHaveBeenCalledTimes(4);
   });
 
   it("documents and stats failure logs carry no Authorization header", { timeout: 30_000 }, async () => {
-    const authError = authorizationBearerError();
-    // Sentinel: the fixture error itself serializes the Authorization header
-    // (a real AxiosError whose toJSON carries config.headers) — this check
-    // would be vacuous otherwise.
+    const authError = normalizedBearerError();
+    // Sentinel: the fixture error serializes the Authorization header (via
+    // the raw AxiosError under originalError) — else this check is vacuous.
     expect(JSON.stringify(authError)).toContain("Authorization");
 
     fixture.listDocuments.mockRejectedValue(authError);
@@ -411,13 +483,18 @@ describe("useDocumentPolling K766 acceptance checks", () => {
     // Sentinel: both failure logs actually fired.
     expect(errorSpy.mock.calls.length).toBeGreaterThanOrEqual(2);
 
-    const leaking = serializedLoggedArgs([errorSpy, warnSpy]).filter(
-      (serialized) => serialized.includes("Authorization"),
+    const logged = serializedLoggedArgs([errorSpy, warnSpy]);
+    const leaking = logged.filter((serialized) =>
+      serialized.includes("Authorization"),
     );
 
     // Discriminating assertion: no logged argument may serialize the request
     // config's Authorization header. At base both console.error(err) calls
     // serialize the AxiosError with its config: 2 leaking arguments.
     expect(leaking).toHaveLength(0);
+    // Positive pin (review round 1): the sanitized log still DELIVERS the
+    // status and URL — stripping the header must not strip the diagnosis.
+    expect(logged.some((serialized) => serialized.includes("500"))).toBe(true);
+    expect(logged.some((serialized) => serialized.includes("/documents"))).toBe(true);
   });
 });

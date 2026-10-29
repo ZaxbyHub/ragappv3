@@ -4,9 +4,10 @@
 // tag/folder failure logs (C19).
 //
 //   C12 (DISCRIMINATING) — a pagehide fired INSIDE the 3s undo window must
-//   still issue the confirmed delete (the user already confirmed; leaving
-//   the page must not silently cancel it). At base only a full unmount
-//   flushes; pagehide does nothing. RED at base, GREEN after the fix.
+//   still dispatch the confirmed delete through the keepalive channel when
+//   a CSRF credential is cached, and — with no credential — dispatch
+//   NOTHING and register the id for the bfcache pageshow replay. At base
+//   pagehide does nothing. RED at base, GREEN after the fix.
 //
 //   C13 (DISCRIMINATING) — when that flush (unmount inside the undo window)
 //   FAILS, an error must surface. At base the unmount flush swallows the
@@ -15,6 +16,14 @@
 //   C19 (DISCRIMINATING) — tag/folder failure logs must not serialize the
 //   request config (and its Authorization header). At base the raw
 //   AxiosError is logged. RED at base, GREEN after the fix.
+//
+// Amended after review round 1: C12 follows the NEW design (the sendBeacon
+// fallback is gone — no production path uses it, so no stub here); the
+// keepalive channel is pinned through the stubbed global fetch with its
+// DELETE/keepalive/X-CSRF-Token shape, and the pageshow replay through
+// deleteDocument (the keepalive outcome is unconfirmed, so a bfcache return
+// completes the intent through the normal path). C13 pins the toast MESSAGE,
+// and C19 adds an emission sentinel (>= 2 failure logs).
 //
 // Mock structure mirrors DocumentsPage.k03.test.tsx (proven in this repo):
 // the full "@/lib/api" mock, the sonner callable toast mock, the
@@ -62,6 +71,11 @@ vi.mock('@/lib/api', () => ({
     claims_count: 0,
     lint_count: 0,
   }),
+  // useUploadMonitoring imports these two-hops via this barrel; explicit
+  // mocks keep them dead in this suite (latent today: the hook stays
+  // disarmed with no uploads).
+  getDocumentStatus: vi.fn(),
+  getDocumentStatuses: vi.fn(),
   compileDocumentWiki: vi.fn().mockResolvedValue({ job_id: 1, status: 'queued' }),
   getDocumentStats: vi.fn().mockResolvedValue({
     total_documents: 0,
@@ -279,10 +293,23 @@ function serializedLoggedArgs(spies: Array<{ mock: { calls: unknown[][] } }>): s
 }
 
 describe('DocumentsPage K766 acceptance checks', () => {
-  let sendBeaconSpy: ReturnType<typeof vi.fn>;
   let fetchSpy: ReturnType<typeof vi.fn>;
-  let hadSendBeacon: boolean;
-  let originalSendBeacon: (() => boolean) | undefined;
+
+  /** Count deleteDocument mock calls for doc "1". */
+  function apiDeleteCalls(): number {
+    return vi
+      .mocked(deleteDocument)
+      .mock.calls.filter(([docId]) => docId === '1').length;
+  }
+
+  /** Count keepalive fetch calls for doc "1" (any method — shape asserted
+   * separately in the credential test). */
+  function keepaliveCalls(): number {
+    return fetchSpy.mock.calls.filter(([input, init]) => {
+      const requestInit = (init ?? {}) as { keepalive?: boolean };
+      return requestInit.keepalive === true && String(input).endsWith('/documents/1');
+    }).length;
+  }
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -290,40 +317,27 @@ describe('DocumentsPage K766 acceptance checks', () => {
     vi.mocked(listDocuments).mockResolvedValue({ documents: [DOC_ONE], total: 1 });
     vi.mocked(getDocumentStats).mockResolvedValue(STATS);
     vi.mocked(deleteDocument).mockResolvedValue(undefined);
-    // Stub the two out-of-band delete channels a pagehide flush may use.
-    // jsdom ships no navigator.sendBeacon, and window.fetch must be prevented
-    // from issuing real requests.
-    originalSendBeacon = window.navigator.sendBeacon;
-    hadSendBeacon = typeof originalSendBeacon === 'function';
-    sendBeaconSpy = vi.fn(() => true);
-    Object.defineProperty(window.navigator, 'sendBeacon', {
-      value: sendBeaconSpy,
-      configurable: true,
-    });
+    // The keepalive channel rides the REAL core's global fetch; stub it so
+    // no real request leaves jsdom (sendBeacon is gone from the design —
+    // no production path uses it, so it is not stubbed here either).
     fetchSpy = vi.fn(() => Promise.resolve({ ok: true } as Response));
     vi.stubGlobal('fetch', fetchSpy);
   });
 
   afterEach(() => {
     vi.unstubAllGlobals();
-    if (hadSendBeacon) {
-      Object.defineProperty(window.navigator, 'sendBeacon', {
-        value: originalSendBeacon,
-        configurable: true,
-      });
-    } else {
-      delete (window.navigator as { sendBeacon?: unknown }).sendBeacon;
-    }
+    // Any CSRF cookie seeded by a test must not leak into the next one.
+    document.cookie = 'X-CSRF-Token=; path=/; max-age=0';
     vi.restoreAllMocks();
   });
 
-  it('pagehide inside the undo window still issues the confirmed delete', { timeout: 30_000 }, async () => {
+  it('pagehide without a credential defers the delete and pageshow replays it', { timeout: 30_000 }, async () => {
     await act(async () => {
       render(<DocumentsPage />);
     });
 
     // Confirm one delete (starts the 3s undo window; the real delete is
-    // deferred inside it).
+    // deferred inside it). No CSRF credential is cached in this test env.
     await confirmSingleDelete();
     expect(vi.mocked(deleteDocument)).not.toHaveBeenCalled();
 
@@ -332,24 +346,85 @@ describe('DocumentsPage K766 acceptance checks', () => {
       fireEvent(window, new Event('pagehide'));
     });
 
-    // Count delete requests for document "1" across all three channels: the
-    // deleteDocument mock, a keepalive fetch, and navigator.sendBeacon.
-    const apiCalls = vi
-      .mocked(deleteDocument)
-      .mock.calls.filter(([docId]) => docId === '1').length;
-    const beaconCalls = sendBeaconSpy.mock.calls.filter(([url]) =>
-      String(url).endsWith('/documents/1'),
-    ).length;
-    const keepaliveCalls = fetchSpy.mock.calls.filter(([input, init]) => {
-      const requestInit = (init ?? {}) as { keepalive?: boolean };
-      return requestInit.keepalive === true && String(input).endsWith('/documents/1');
-    }).length;
+    // Discriminating assertion (first half): with NO credential the pagehide
+    // dispatches NOTHING — neither the axios path (a CSRF-discovery round
+    // trip the browser would abort mid-teardown) nor a keepalive fetch. The
+    // id is registered for the bfcache replay instead. At base pagehide does
+    // nothing at all, so this alone would pass there — the replay below is
+    // what discriminates.
+    expect(apiDeleteCalls()).toBe(0);
+    expect(keepaliveCalls()).toBe(0);
 
-    // Discriminating assertion: the confirmed delete must survive the
-    // pagehide — issued EXACTLY once across the three channels. At base a
-    // pagehide flush does not exist: zero.
-    // RED at base, GREEN after the fix.
-    expect(apiCalls + beaconCalls + keepaliveCalls).toBe(1);
+    // The page returns from the bfcache (jsdom has no PageTransitionEvent —
+    // synthesize the persisted flag).
+    const pageshow = new Event('pageshow');
+    (pageshow as unknown as { persisted: boolean }).persisted = true;
+    await act(async () => {
+      fireEvent(window, pageshow);
+    });
+    await act(async () => {
+      await flushMicrotasks();
+    });
+
+    // Discriminating assertion (second half): the persisted pageshow REPLAYS
+    // the registered delete through the normal path — exactly once.
+    expect(apiDeleteCalls()).toBe(1);
+  });
+
+  it('pagehide with a cached CSRF credential issues the keepalive delete', { timeout: 30_000 }, async () => {
+    // Seed the readable CSRF cookie the keepalive channel reads
+    // (getCsrfCookie reads document.cookie; no sendBeacon involved).
+    document.cookie = 'X-CSRF-Token=test-token';
+
+    let utils!: ReturnType<typeof render>;
+    await act(async () => {
+      utils = render(<DocumentsPage />);
+    });
+    await confirmSingleDelete();
+    expect(vi.mocked(deleteDocument)).not.toHaveBeenCalled();
+
+    await act(async () => {
+      fireEvent(window, new Event('pagehide'));
+    });
+
+    // Discriminating assertion: the confirmed delete left via the keepalive
+    // fetch — exactly one request, with the destructive shape (DELETE,
+    // keepalive, the cached CSRF header) and no axios deleteDocument call.
+    expect(keepaliveCalls()).toBe(1);
+    expect(fetchSpy).toHaveBeenCalledWith(
+      expect.stringMatching(/\/documents\/1$/),
+      expect.objectContaining({
+        method: 'DELETE',
+        keepalive: true,
+        headers: expect.objectContaining({ 'X-CSRF-Token': 'test-token' }),
+      }),
+    );
+    expect(apiDeleteCalls()).toBe(0);
+
+    // Bfcache return: the keepalive outcome is UNCONFIRMED (its response is
+    // not observable), so the pageshow replay completes the intent through
+    // the normal path — one deleteDocument call, success toast and all.
+    const pageshow = new Event('pageshow');
+    (pageshow as unknown as { persisted: boolean }).persisted = true;
+    await act(async () => {
+      fireEvent(window, pageshow);
+    });
+    await act(async () => {
+      await flushMicrotasks();
+    });
+    expect(apiDeleteCalls()).toBe(1);
+
+    // Exactly-once pin: the pagehide flush already emptied the pending
+    // map, so the SPA-unmount flush finds nothing — no second call on
+    // either channel.
+    await act(async () => {
+      utils.unmount();
+    });
+    await act(async () => {
+      await flushMicrotasks();
+    });
+    expect(apiDeleteCalls()).toBe(1);
+    expect(keepaliveCalls()).toBe(1);
   });
 
   it('failed unmount flush of a confirmed delete surfaces an error', { timeout: 30_000 }, async () => {
@@ -377,6 +452,12 @@ describe('DocumentsPage K766 acceptance checks', () => {
     // know). At base the unmount flush swallows the rejection silently.
     // RED at base, GREEN after the fix.
     expect(vi.mocked(toast.error).mock.calls.length).toBeGreaterThan(0);
+    // Message oracle (review round 1): the toast names the failed action —
+    // not an unrelated or generic error that would pass vacuously.
+    expect(vi.mocked(toast.error)).toHaveBeenCalledWith(
+      'Failed to delete document',
+      expect.anything(),
+    );
   });
 
   it('tag and folder failure logs carry no Authorization header', { timeout: 30_000 }, async () => {
@@ -392,12 +473,15 @@ describe('DocumentsPage K766 acceptance checks', () => {
     await act(async () => {
       render(<DocumentsPage />);
     });
-    // Sentinel: both failure fetches fired and both failure logs landed.
+    // Sentinel: both failure fetches fired and both failure logs landed
+    // (one per failing surface — the leak assertion below is only
+    // meaningful if there IS a logged argument to leak).
     await waitFor(() => expect(vi.mocked(listTags)).toHaveBeenCalled(), { timeout: 10_000 });
     await waitFor(() => expect(vi.mocked(listFolders)).toHaveBeenCalled(), { timeout: 10_000 });
     await act(async () => {
       await flushMicrotasks();
     });
+    expect(errorSpy.mock.calls.length).toBeGreaterThanOrEqual(2);
 
     const leaking = serializedLoggedArgs([errorSpy, warnSpy]).filter((serialized) =>
       serialized.includes('Authorization'),

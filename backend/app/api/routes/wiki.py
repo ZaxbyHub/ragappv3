@@ -1080,25 +1080,44 @@ async def compile_document_wiki(
     store = WikiStore(db)
     # Idempotent re-click (#765): while an ingest job for this file is still
     # active (pending or running), a second Compile returns the existing job
-    # instead of enqueueing a duplicate. Status-filtered limit-1 queries are
-    # exact in both storage arms; newer terminal jobs cannot hide an older
-    # active one.
-    for active_status in ("pending", "running"):
-        active_jobs = store.list_jobs(
-            vault_id,
-            status=active_status,
+    # instead of enqueueing a duplicate. The lookup -> create sequence runs
+    # under BEGIN IMMEDIATE (review round 1, PRR-012: the check-then-act was
+    # not atomic across processes) so a concurrent request cannot observe
+    # "no active job" between this request's lookup and its insert; both
+    # storage arms tolerate the caller-owned transaction (job_lease._write_txn
+    # yields ownership when one is already open, and the legacy arm's commit
+    # releases the write lock after the insert).
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        for active_status in ("pending", "running"):
+            active_jobs = store.list_jobs(
+                vault_id,
+                status=active_status,
+                trigger_type="ingest",
+                trigger_id=f"file:{file_id}",
+                limit=1,
+            )
+            if active_jobs:
+                existing = active_jobs[0]
+                db.commit()
+                return {"job_id": existing.id, "status": existing.status}
+        job = store.create_job(
+            vault_id=vault_id,
             trigger_type="ingest",
             trigger_id=f"file:{file_id}",
-            limit=1,
+            input_json={"file_id": file_id, "vault_id": vault_id},
         )
-        if active_jobs:
-            return {"job_id": active_jobs[0].id, "status": active_jobs[0].status}
-    job = store.create_job(
-        vault_id=vault_id,
-        trigger_type="ingest",
-        trigger_id=f"file:{file_id}",
-        input_json={"file_id": file_id, "vault_id": vault_id},
-    )
+        # Commit before releasing the request connection: the unified-storage
+        # arm inserts under the caller-owned transaction (job_lease._write_txn
+        # yields ownership when one is open) and the production pool ROLLS
+        # BACK a dirty connection at release — without this commit the
+        # created job would be silently discarded (caught by the round-2
+        # check-amendment author; the C2 harness hit the same missing
+        # request-boundary commit).
+        db.commit()
+    except BaseException:
+        db.rollback()
+        raise
     return {"job_id": job.id, "status": job.status}
 
 
