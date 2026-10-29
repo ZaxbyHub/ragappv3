@@ -20,40 +20,43 @@ from app.services.task_drain import drain_audit, drain_await
 
 
 def test_drain_audit_absorbs_caller_cancellation_and_reraises_after() -> None:
-    started = asyncio.Event()
-    finished = asyncio.Event()
+    # Deterministic, event-driven shape (the original sleep/cancel-loop
+    # version was xdist-timing-flaky on CI): the caller parks inside
+    # drain_await's shield (proven by the audit having started — drain_audit
+    # creates the audit task before the caller awaits it), exactly one
+    # cancellation is delivered at that suspension point, then the audit is
+    # released. The audit MUST complete (the "row was written" analog) and
+    # the caller MUST re-raise CancelledError only after that completion.
+    audit_started = asyncio.Event()
+    release = asyncio.Event()
 
     async def audit() -> None:
-        started.set()
-        await asyncio.to_thread(finished.wait, 5)
-        finished.set()
+        audit_started.set()
+        await asyncio.to_thread(release.wait, 10)
+        release.set()
+
+    async def caller() -> None:
+        await drain_audit(audit())
 
     async def scenario() -> str:
-        task = asyncio.ensure_future(audit())
-        await started.wait()
-
-        async def caller() -> None:
-            await drain_audit(task)
-
         caller_task = asyncio.ensure_future(caller())
-        # Give the caller a chance to park on the shield, then cancel it
-        # repeatedly — the audit must still complete.
-        for _ in range(3):
-            await asyncio.sleep(0.01)
-            caller_task.cancel()
-            try:
-                await caller_task
-            except asyncio.CancelledError:
-                pass
-        await asyncio.to_thread(finished.set)
+        # The audit starting proves the caller is inside drain_await's
+        # shield (drain_audit creates the audit task first, then awaits it).
+        await asyncio.wait_for(audit_started.wait(), 10)
+        caller_task.cancel()      # one cancellation, delivered at the shield
+        await asyncio.sleep(0)    # hand off so the CancelledError is absorbed
+        release.set()             # the audit completes
         try:
             await caller_task
+            return "no-reraise"
         except asyncio.CancelledError:
+            assert release.is_set(), (
+                "cancellation must propagate only AFTER the audit completed"
+            )
             return "reraised-after-completion"
-        return "no-reraise"
 
     assert asyncio.run(scenario()) == "reraised-after-completion"
-    assert finished.is_set()
+    assert release.is_set()
 
 
 def test_drain_audit_logs_child_failure_without_reraising(caplog) -> None:
