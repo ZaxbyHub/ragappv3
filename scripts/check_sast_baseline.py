@@ -27,10 +27,10 @@ Exit non-zero on any violation. Run from the repository root.
 
 from __future__ import annotations
 
+import importlib.util as _ilu
 import json
 import os
 import re
-import subprocess
 import sys
 from pathlib import Path
 
@@ -38,6 +38,16 @@ ROOT = Path(__file__).resolve().parent.parent
 CI_FILE = ROOT / ".github" / "workflows" / "ci.yml"
 RUN_BANDIT = ROOT / "scripts" / "run_bandit.py"
 BASELINE = ROOT / "backend" / "security" / "bandit-baseline.json"
+
+# Shared hardened git plumbing (issue #740): NUL-delimited listings,
+# bounded timeouts, OSError tolerance. Loaded file-relative so the module
+# resolves identically under `python scripts/check_sast_baseline.py` and
+# under test loaders that spec-load this script without scripts/ on sys.path.
+_gate_git_spec = _ilu.spec_from_file_location(
+    "_gate_git", Path(__file__).resolve().parent / "_gate_git.py"
+)
+_gate_git = _ilu.module_from_spec(_gate_git_spec)
+_gate_git_spec.loader.exec_module(_gate_git)
 
 EXPECTED_TARGETS = (
     "backend/app",
@@ -55,19 +65,25 @@ def fail(message: str) -> None:
 
 
 def run_git(args: list[str]) -> str:
-    proc = subprocess.run(
-        ["git", *args],
-        cwd=ROOT,
-        check=False,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    return proc.stdout
+    """Bounded, OSError-tolerant git text call (content verbs).
+
+    Returns "" when git cannot answer (missing binary, hang past
+    GIT_TIMEOUT_SECONDS, non-zero exit) — the callers treat that as "no
+    answer", never as an empty list that would silently satisfy a check.
+    """
+    proc = _gate_git.run_git(ROOT, *args)
+    if proc is None:
+        return ""
+    return proc.stdout or ""
 
 
 def changed_files() -> list[str]:
-    """Changed files on this PR vs the merge-base with master (best-effort)."""
+    """Changed files on this PR vs the merge-base with master (best-effort).
+
+    Listings go through the shared NUL-delimited helper, so a non-ASCII or
+    whitespace-edged tracked path arrives raw instead of core.quotePath
+    C-quoted and can never silently evade a glob or prefix match.
+    """
     for base in (
         os.environ.get("PR_SCOPE_DRIFT_BASE"),
         f"origin/{os.environ['GITHUB_BASE_REF']}" if os.environ.get("GITHUB_BASE_REF") else None,
@@ -75,43 +91,70 @@ def changed_files() -> list[str]:
     ):
         if not base:
             continue
-        mb = run_git(["merge-base", base, "HEAD"]).strip()
-        if not mb:
+        mb_lines = _gate_git.git_lines(ROOT, "merge-base", base, "HEAD")
+        if not mb_lines:
             continue
-        diff = run_git(["diff", "--name-only", f"{mb}..HEAD"])
+        diff = _gate_git.git_lines(ROOT, "diff", "--name-only", f"{mb_lines[0]}..HEAD")
         if diff:
-            return [line.strip() for line in diff.splitlines() if line.strip()]
+            return diff
     # Local fallback.
-    diff = run_git(["diff", "--name-only", "HEAD~1..HEAD"])
-    return [line.strip() for line in diff.splitlines() if line.strip()]
+    return _gate_git.git_lines(ROOT, "diff", "--name-only", "HEAD~1..HEAD") or []
+
+
+def _sast_job_block(text: str) -> str | None:
+    """The `sast:` job's own text block (indentation-delimited), or None.
+
+    Stdlib indentation walk over the jobs mapping: the block starts at the
+    `  sast:` key and ends at the next key at the same indentation. This is
+    what binds C-005's run: search to the job it names (issue #740) —
+    scanning the whole file let any unrelated job's `run:` line satisfy the
+    check.
+    """
+    lines = text.splitlines()
+    start = None
+    for idx, line in enumerate(lines):
+        if re.match(r"^  sast:\s*(#.*)?$", line):
+            start = idx
+            break
+    if start is None:
+        return None
+    block: list[str] = [lines[start]]
+    for line in lines[start + 1:]:
+        if line.strip() and not line.startswith("  "):
+            break
+        if re.match(r"^  \S", line) and not line.startswith("   "):
+            break  # next job key at the same two-space indent
+        block.append(line)
+    return "\n".join(block)
 
 
 def check_workflow_integrity() -> bool:
-    """C-005: the ci.yml must contain a sast job running run_bandit.py."""
+    """C-005: the ci.yml `sast` job itself must run run_bandit.py (gated mode)."""
     if not CI_FILE.exists():
         fail(f"{CI_FILE.relative_to(ROOT)} not found")
         return False
     text = CI_FILE.read_text(encoding="utf-8")
-    has_sast_job = re.search(r"^  sast:\s*$", text, re.MULTILINE) is not None
-    # Require a `run:` step whose command actually invokes the gated scan
-    # (python ... run_bandit.py with NO --update-baseline). The token must appear
-    # before any trailing `#` comment, and the command must not be the
-    # always-exits-0 baseline-regeneration mode — otherwise a PR could swap the
-    # gated scan for `run_bandit.py --update-baseline` and the gate would never
-    # fail. Anchored to `run:` so a step name or prose reference cannot satisfy it.
+    block = _sast_job_block(text)
+    if block is None:
+        fail("C-005: .github/workflows/ci.yml has no `sast:` job — SAST gate is missing")
+        return False
+    # Require a `run:` step INSIDE the sast job whose command actually invokes
+    # the gated scan (python ... run_bandit.py with NO --update-baseline). The
+    # token must appear before any trailing `#` comment, and the command must
+    # not be the always-exits-0 baseline-regeneration mode — otherwise a PR
+    # could swap the gated scan for `run_bandit.py --update-baseline` or move
+    # the scan into an unrelated job and the gate would never fail.
     runs_run_bandit = False
-    for m in re.finditer(r"^\s*run:\s*([^#\n]*)", text, re.MULTILINE):
+    for m in re.finditer(r"^\s*run:\s*([^#\n]*)", block, re.MULTILINE):
         cmd = m.group(1)
         if "run_bandit.py" in cmd and "--update-baseline" not in cmd:
             runs_run_bandit = True
             break
-    if not has_sast_job:
-        fail("C-005: .github/workflows/ci.yml has no `sast:` job — SAST gate is missing")
-        return False
     if not runs_run_bandit:
         fail(
-            "C-005: ci.yml has no `run:` step invoking run_bandit.py — "
-            "the gate command may have been replaced"
+            "C-005: the `sast:` job in .github/workflows/ci.yml has no `run:` "
+            "step invoking run_bandit.py (gated mode) — the gate command may "
+            "have been replaced or moved out of the sast job"
         )
         return False
     return True
@@ -178,11 +221,9 @@ def check_baseline_expansion(paths: list[str]) -> bool:
     # Fail-closed: if the baseline is locally modified but changed_files() could
     # not determine the PR diff (e.g. base resolution failed), we cannot verify
     # expansion — refuse to pass silently.
+    status = _gate_git.run_git(ROOT, "status", "--porcelain", "--", baseline_rel)
     baseline_locally_modified = bool(
-        subprocess.run(
-            ["git", "status", "--porcelain", "--", baseline_rel],
-            cwd=ROOT, check=False, text=True, stdout=subprocess.PIPE,
-        ).stdout.strip()
+        status is not None and status.returncode == 0 and (status.stdout or "").strip()
     )
     if baseline_rel not in paths:
         if baseline_locally_modified:
@@ -210,15 +251,8 @@ def check_baseline_expansion(paths: list[str]) -> bool:
         mb = run_git(["merge-base", base, "HEAD"]).strip()
         if not mb:
             continue
-        show = subprocess.run(
-            ["git", "show", f"{mb}:{baseline_rel}"],
-            cwd=ROOT,
-            check=False,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        if show.returncode == 0:
+        show = _gate_git.run_git(ROOT, "show", f"{mb}:{baseline_rel}")
+        if show is not None and show.returncode == 0:
             prev_text = show.stdout
             break
 

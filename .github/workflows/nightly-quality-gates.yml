@@ -116,7 +116,10 @@ jobs:
 
           pyproject = pathlib.Path("pyproject.toml")
           text = pyproject.read_text(encoding="utf-8")
-          scoped = "source_paths = [\"$mpath\"]\n"
+          # The guard-module path is repo-root-relative, but this step's cwd is
+          # already backend/ — strip the prefix or mutmut looks for
+          # backend/backend/... and finds nothing (issue #739).
+          scoped = "source_paths = [\"${mpath#backend/}\"]\n"
           if "[tool.mutmut]" in text:
               text = re.sub(r"(?ms)^\[tool\.mutmut\]\nsource_paths = \[.*?\]\n", "[tool.mutmut]\n" + scoped, text)
           else:
@@ -124,22 +127,39 @@ jobs:
           pyproject.write_text(text, encoding="utf-8")
           PY
             rm -rf mutants
-            python -m mutmut run || true
+            # Record the mutmut run's own exit code per module (no || true on
+            # the capture): the score step hard-fails on a nonzero .rc so a
+            # crashed/hung run can never masquerade as a passing score, while
+            # export still runs so partial diagnostics reach the artifact.
+            rc=0
+            python -m mutmut run || rc=$?
+            echo "$rc" > "mutation-stats/${module}.rc"
             python -m mutmut export-cicd-stats > "mutation-stats/${module}.json" 2>&1 || true
           done < mutation_modules.txt
 
       - name: Report per-module mutation scores and enforce the survival budget
         run: |
-          ARGS=""
-          while IFS= read -r module; do
+          # mutation_modules.txt lines are "<module> <path>" pairs (written by
+          # the scope step) — read BOTH tokens so the path half can never
+          # word-split into extra positional argv (issue #739: this step
+          # exited 2 on an argparse usage error every night). No `IFS=`
+          # prefix here on purpose: an empty IFS disables read's field
+          # splitting, which would put the whole line back into $module.
+          ARGS=()
+          while read -r module _path; do
             [ -z "$module" ] && continue
-            ARGS="$ARGS --module $module:mutation-stats/${module}.json"
+            rc_file="mutation-stats/${module}.rc"
+            if [ -f "$rc_file" ] && [ "$(cat "$rc_file")" != "0" ]; then
+              echo "mutmut run failed for module $module (exit $(cat "$rc_file")); see the run step log"
+              exit 1
+            fi
+            ARGS+=(--module "$module:mutation-stats/${module}.json")
           done < mutation_modules.txt
-          if [ -z "$ARGS" ]; then
+          if [ "${#ARGS[@]}" -eq 0 ]; then
             echo "No guard modules selected; skipping score gate."
             exit 0
           fi
-          python ../scripts/mutation_score.py --floor "$MUTATION_SCORE_FLOOR" $ARGS
+          python ../scripts/mutation_score.py --floor "$MUTATION_SCORE_FLOOR" "${ARGS[@]}"
 
       - name: Upload mutation stats
         if: always()
@@ -212,15 +232,20 @@ jobs:
         # committed baseline at backend/schemathesis-baseline.json records
         # them, and the gate step below fails the job on any NEW signature —
         # the same baseline-diff discipline as the bandit SAST gate.
-        # `|| true` is deliberate: schemathesis exits non-zero whenever ANY
-        # check fails (known-baseline signatures included). GitHub Actions'
-        # default bash has pipefail on, so without it the run step would fail
-        # the job before the baseline-diff gate below could decide. The step
-        # records the schemathesis exit code as a SCHEMATHESIS_EXIT marker in
-        # the log; the gate script treats a missing marker (crash before
-        # completion) or an unexpected exit code as a failure — a crashed run
-        # can never pass the gate.
+        #
+        # Exit-code capture (issue #739): GitHub Actions' DEFAULT shell for a
+        # run: block is `bash -e {0}` — NO pipefail (pipefail only turns on
+        # with an explicit `shell: bash`). We therefore do not rely on either
+        # default: `set +e` disables -e around the pipeline, PIPESTATUS[0] is
+        # read immediately after the pipeline with NO `|| true` in between
+        # (under pipefail, `|| true` would RESET PIPESTATUS to 0 and erase the
+        # crash code — exactly the bug this rewrite fixes), and `set -e` is
+        # restored afterwards. The step records the schemathesis exit code as
+        # a SCHEMATHESIS_EXIT marker in the log; the gate script treats a
+        # missing marker (crash before completion) or an unexpected exit code
+        # as a failure — a crashed run can never pass the gate.
         run: |
+          set +e
           python -c "
           from schemathesis.cli import schemathesis
           schemathesis([
@@ -229,8 +254,9 @@ jobs:
               '-H', 'Authorization: Bearer nightly-schemathesis-admin-token-0123456789abcdef0123456789abcdef0123',
               '--max-examples', '20',
           ])
-          " 2>&1 | tee schemathesis-run.log || true
+          " 2>&1 | tee schemathesis-run.log
           rc=${PIPESTATUS[0]}
+          set -e
           echo "SCHEMATHESIS_EXIT=$rc" >> schemathesis-run.log
 
       - name: Gate on new contract violations (baseline diff)
@@ -252,7 +278,10 @@ jobs:
   stryker-frontend:
     name: StrykerJS (frontend mutation)
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    # 180 min: the observed real duration is 106-120 min, which equalled the
+    # old 120 budget — 4 of 6 scheduled runs were cancelled by their own
+    # timeout. 180 gives real headroom (issue #739).
+    timeout-minutes: 180
     defaults:
       run:
         working-directory: frontend

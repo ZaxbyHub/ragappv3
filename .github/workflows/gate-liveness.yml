@@ -1,0 +1,64 @@
+name: Gate liveness
+
+# Issue #739 (ENH-03 DoD 2): a scheduled workflow that silently stops
+# scheduling is invisible without a checker. This daily job asks the GitHub
+# API for recent scheduled runs and hands them to
+# scripts/check_gate_liveness.py, which FAILS the job naming every scheduled
+# workflow whose last successful scheduled run is older than 48h.
+#
+# The job's own red status IS the signal (an issue-commenting variant would
+# need `issues: write`, which the #739 constraint forbids: nothing beyond
+# `actions: read` on the default token). The checker excludes this workflow
+# itself — its current invocation is the execution evidence.
+
+on:
+  schedule:
+    - cron: "30 5 * * *" # daily, after both nightly tiers (03:00 / 03:30)
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  gate-liveness:
+    name: Scheduled-workflow liveness (48h)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Fetch scheduled run history (last 30 days)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          since=$(date -u -d '30 days ago' +%Y-%m-%d)
+          # --paginate emits one JSON body per page (concatenated, not merged);
+          # decode_incremental reassembles them into the single
+          # {"workflow_runs": [...]} fixture shape the checker consumes.
+          gh api --paginate "repos/${{ github.repository }}/actions/runs?event=schedule&per_page=100&created=>=${since}" \
+            > gate-liveness-runs.raw.json || true
+          python - <<'PY'
+          import json
+
+          decoder = json.JSONDecoder()
+          raw = open("gate-liveness-runs.raw.json", encoding="utf-8").read().strip()
+          runs = []
+          idx = 0
+          while idx < len(raw):
+              obj, end = decoder.raw_decode(raw, idx)
+              runs.extend(obj.get("workflow_runs", []))
+              idx = end
+              while idx < len(raw) and raw[idx] in " \t\r\n":
+                  idx += 1
+          with open("gate-liveness-runs.json", "w", encoding="utf-8") as fh:
+              json.dump({"workflow_runs": runs}, fh)
+          print("scheduled runs fetched:", len(runs))
+          PY
+
+      - name: Check scheduled-workflow liveness (fails naming stale workflows)
+        run: python scripts/check_gate_liveness.py --runs-json gate-liveness-runs.json

@@ -3,24 +3,28 @@
 
 from __future__ import annotations
 
+import importlib.util as _ilu
 import os
-import subprocess
 import sys
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
+# Shared hardened git plumbing (issue #740): bounded, OSError-tolerant,
+# NUL-delimited listings. Loaded file-relative so the module resolves
+# identically under `python scripts/check_pr_scope_drift.py` and under test
+# loaders that spec-load this script without scripts/ on sys.path.
+_gate_git_spec = _ilu.spec_from_file_location(
+    "_gate_git", Path(__file__).resolve().parent / "_gate_git.py"
+)
+_gate_git = _ilu.module_from_spec(_gate_git_spec)
+_gate_git_spec.loader.exec_module(_gate_git)
 
-def run_git(args: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", *args],
-        cwd=ROOT,
-        check=False,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+
+def run_git(args: list[str]):
+    """Bounded, OSError-tolerant git call (kept for parity/tests)."""
+    return _gate_git.run_git(ROOT, *args)
 
 
 def changed_files() -> list[str]:
@@ -34,16 +38,21 @@ def changed_files() -> list[str]:
     candidates.append("origin/master")
 
     for base in candidates:
-        merge_base = run_git(["merge-base", base, "HEAD"])
-        if merge_base.returncode != 0:
+        # NUL-delimited listings (issue #740): a non-ASCII tracked path
+        # arrives raw instead of core.quotePath C-quoted, so it can never
+        # silently evade the prefix checks below.
+        merge_base = _gate_git.git_lines(ROOT, "merge-base", base, "HEAD")
+        if not merge_base:
             continue
-        diff = run_git(["diff", "--name-only", f"{merge_base.stdout.strip()}..HEAD"])
-        if diff.returncode == 0:
-            return [line.strip() for line in diff.stdout.splitlines() if line.strip()]
+        diff = _gate_git.git_lines(
+            ROOT, "diff", "--name-only", f"{merge_base[0]}..HEAD"
+        )
+        if diff is not None:
+            return diff
 
-    fallback = run_git(["diff", "--name-only", "HEAD~1..HEAD"])
-    if fallback.returncode == 0:
-        return [line.strip() for line in fallback.stdout.splitlines() if line.strip()]
+    fallback = _gate_git.git_lines(ROOT, "diff", "--name-only", "HEAD~1..HEAD")
+    if fallback is not None:
+        return fallback
     print(
         "scope-drift: unable to determine changed files; skipping drift check",
         file=sys.stderr,
@@ -68,9 +77,12 @@ def main() -> int:
         (
             "backend/app/api/routes/auth.py",
             "backend/app/security.py",
+            # Prefix, not directory: also covers auth_service.py and
+            # authz_policy.py (issue #740 — the two dead entries below were
+            # removed because no repository path starts with them; the real
+            # dependency module joins the list).
             "backend/app/services/auth",
-            "backend/app/models/auth",
-            "backend/app/deps.py",
+            "backend/app/api/deps.py",
         ),
     )
     auth_docs_changed = has_path(paths, ("CHANGELOG.md", "docs/", "INSTALLATION.md"))
