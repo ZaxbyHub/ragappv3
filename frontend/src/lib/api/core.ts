@@ -1310,6 +1310,49 @@ export async function deleteDocument(fileId: string): Promise<void> {
   await apiClient.delete(`/documents/${fileId}`);
 }
 
+/**
+ * Best-effort keepalive DELETE for a pagehide flush of a confirmed document
+ * delete (#766). Mirrors addChatMessagesBatchKeepalive: keepalive requests
+ * cannot wait for CSRF-token discovery, so the cached token or the readable
+ * CSRF cookie is used; when neither exists NOTHING is sent and the caller
+ * must fall back to the normal deleteDocument path (never after a request
+ * was issued). Returns true when a keepalive fetch was attempted, false when
+ * no CSRF credential was available. Never throws; hard termination remains
+ * outside the guarantee.
+ */
+export function deleteDocumentKeepalive(fileId: string): boolean {
+  const csrfToken = getCsrfToken() ?? getCsrfCookie();
+  if (!csrfToken) return false;
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "X-CSRF-Token": csrfToken,
+  };
+  if (_jwtAccessToken) headers.Authorization = "Bearer " + _jwtAccessToken;
+  void fetch(API_BASE_URL + "/documents/" + fileId, {
+    method: "DELETE",
+    credentials: "include",
+    headers,
+    keepalive: true,
+  }).catch(() => {
+    // pagehide is best effort: there is no safe opportunity to retry.
+  });
+  return true;
+}
+
+/**
+ * Sanitized API-failure logging for the documents surfaces (#766): logs the
+ * error's message plus response status and request URL — never the raw error
+ * object or its config, whose toJSON() serialization would carry the
+ * Authorization header to the browser console.
+ */
+export function logApiFailure(prefix: string, err: unknown): void {
+  const message = err instanceof Error ? err.message : String(err);
+  const status = (err as { response?: { status?: number } } | null)?.response?.status;
+  const url = (err as { config?: { url?: string } } | null)?.config?.url;
+  const where = status != null ? `${status} ${url ?? ""}`.trim() : (url ?? "");
+  console.error(prefix, message, where);
+}
+
 export async function deleteDocuments(fileIds: string[]): Promise<{ deleted_count: number, failed_ids: string[] }> {
   const response = await apiClient.post<{ deleted_count: number, failed_ids: string[] }>("/documents/batch", { file_ids: fileIds });
   return response.data;

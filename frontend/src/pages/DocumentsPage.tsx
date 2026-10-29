@@ -31,6 +31,10 @@ import {
   type DocumentSortBy,
   type SortOrder,
 } from "@/lib/api";
+// #766: the keepalive helper and the sanitized logger are imported directly
+// from the api core module — the page's test suites replace the "@/lib/api"
+// barrel with a manual mock object that does not re-export new helpers.
+import { deleteDocumentKeepalive, logApiFailure } from "@/lib/api/core";
 import { useDebounce } from "@/hooks/useDebounce";
 import { useUploadMonitoring } from "@/hooks/useUploadMonitoring";
 import { useVaultStore } from "@/stores/useVaultStore";
@@ -204,24 +208,36 @@ export default function DocumentsPage() {
     []
   );
 
-  // Flush pending deletes on unmount. The user already confirmed each delete
-  // (the 3s undo window simply hadn't elapsed); cancelling the timers would
-  // silently discard a confirmed destructive action and the document would
-  // reappear. Instead, execute the deletes best-effort. Fire-and-forget — the
-  // component is unmounting, so there is no toast/refetch to perform.
-  useEffect(() => {
-    // Capture the stable ref'd Map instance so the cleanup reads the same one.
+  // Flush pending deletes (#766 AC1/AC2). The user already confirmed each
+  // delete (the 3s undo window simply hadn't elapsed); cancelling the timers
+  // would silently discard a confirmed destructive action. The SPA-unmount
+  // flush and a pagehide flush share one exactly-once helper: each timer
+  // entry is removed from the map BEFORE its channel fires, so pagehide
+  // followed by unmount (or logout) can never double-delete. On pagehide the
+  // keepalive channel is preferred (it survives page teardown); when no CSRF
+  // credential is cached nothing was sent and the normal deleteDocument path
+  // runs. The unmount flush surfaces failures (toast) instead of discarding
+  // them; on pagehide there is nothing left to toast to.
+  const flushPendingDeletes = useCallback((pagehide: boolean) => {
     const timers = pendingDeleteTimersRef.current;
-    return () => {
-      timers.forEach((timer, docId) => {
-        clearTimeout(timer);
-        void deleteDocument(docId).catch(() => {
-          /* best-effort on unmount; nothing to surface */
-        });
+    timers.forEach((timer, docId) => {
+      timers.delete(docId);
+      clearTimeout(timer);
+      if (pagehide && deleteDocumentKeepalive(docId)) return;
+      void deleteDocument(docId).catch(() => {
+        toast.error("Failed to delete document", { id: "delete-flush-failure" });
       });
-      timers.clear();
-    };
+    });
   }, []);
+
+  useEffect(() => {
+    const handlePageHide = () => flushPendingDeletes(true);
+    window.addEventListener("pagehide", handlePageHide);
+    return () => {
+      window.removeEventListener("pagehide", handlePageHide);
+      flushPendingDeletes(false);
+    };
+  }, [flushPendingDeletes]);
 
   const { uploads, addUploads, cancelUpload, removeUpload, clearCompleted, retryUpload } =
     useUploadStore();
@@ -249,6 +265,7 @@ export default function DocumentsPage() {
     fetchDocuments,
     fetchStats,
     wikiStatusMap,
+    wikiFetchFailedIds,
     compilingDocIds,
     handleCompileDocument,
     total,
@@ -322,7 +339,7 @@ export default function DocumentsPage() {
       if (activeVaultIdRef.current !== issuedVaultId) return;
       setTags(next);
     } catch (err) {
-      console.error("Failed to load tags:", err);
+      logApiFailure("Failed to load tags:", err);
     }
   }, [activeVaultId]);
 
@@ -354,7 +371,7 @@ export default function DocumentsPage() {
       setFolders(refreshed);
       return refreshed;
     } catch (err) {
-      console.error("Failed to load folders:", err);
+      logApiFailure("Failed to load folders:", err);
       return [];
     }
   }, [activeVaultId]);
@@ -989,6 +1006,7 @@ export default function DocumentsPage() {
             onSelectAll={handleSelectAll}
             onSelectOne={selectOne}
             wikiStatusMap={wikiStatusMap}
+            wikiFetchFailedIds={wikiFetchFailedIds}
             compilingDocIds={compilingDocIds}
             onCompileDocument={handleCompileDocument}
             onDownload={handleDownloadDocument}

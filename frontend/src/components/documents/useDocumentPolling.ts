@@ -26,6 +26,7 @@ import {
   type DocumentWikiStatus,
   type SortOrder,
 } from "@/lib/api";
+import { logApiFailure } from "@/lib/api/core";
 import type { UploadFile } from "@/stores/useUploadStore";
 import { useAuthOwner } from "@/hooks/useAuthOwner";
 
@@ -84,6 +85,43 @@ type CompileTimer = {
 const PAGE_SIZE = 50;
 const MAX_PAGE_SIZE = 1000;
 const WIKI_POLL_INTERVAL_MS = 5_000;
+// Capped per-document backoff for retrying a failed per-document wiki-status
+// fetch (#765 AC4), measured in TRANSIENT-INTERVAL TICKS rather than wall
+// time (the hook's tests fake the timers but not Date, and production gains
+// nothing from wall-clock math here): the first retry rides the very next
+// 5 s tick after the failure, later attempts space out, and once the
+// schedule is exhausted the id stays marked failed (the cell keeps its
+// "unavailable" render) but is never re-requested — no sustained request
+// storm from permanently failing rows.
+const WIKI_RETRY_SKIP_TICKS = [0, 1, 3, 7, 15];
+
+/**
+ * Signature of a committed document-list response, used by the adaptive poll
+ * to detect change (#766 AC6). Covers the status/progress metadata the tests
+ * drive AND the production top-level progress surface the backend actually
+ * emits (progress_percent/processed_units/total_units/phase).
+ */
+function listSignature(documents: Document[]): string {
+  return documents
+    .map((document) => {
+      const top = document as {
+        progress_percent?: number | null;
+        processed_units?: number | null;
+        total_units?: number | null;
+        phase?: string | null;
+      };
+      return [
+        document.id,
+        (document.metadata?.status as string | undefined) ?? "",
+        ((document.metadata as { progress?: number } | undefined)?.progress) ?? "",
+        top.progress_percent ?? "",
+        top.processed_units ?? "",
+        top.total_units ?? "",
+        top.phase ?? "",
+      ].join(":");
+    })
+    .join(",");
+}
 
 function isDocumentListResponse(
   value: unknown
@@ -157,7 +195,13 @@ export function useDocumentPolling({
   const [wikiStatusMap, setWikiStatusMapState] = useState<
     Record<string, DocumentWikiStatus>
   >({});
-  const [compilingDocIds, setCompilingDocIdsState] = useState<Set<string>>(
+  // Documents whose latest per-document wiki-status fetch FAILED (#765 AC4/
+  // AC6): immutable render state (the retry interval's arming key derives
+  // from it), scope-owned like wikiStatusMap, mirrored into a ref for the
+  // async worker paths.
+  const [wikiFailedIds, setWikiFailedIdsState] = useState<Set<string>>(
+    new Set()
+  );  const [compilingDocIds, setCompilingDocIdsState] = useState<Set<string>>(
     new Set()
   );
   const [total, setTotalState] = useState(0);
@@ -171,6 +215,7 @@ export function useDocumentPolling({
   const loadingScopeRef = useRef<Scope | null>(null);
   const listErrorScopeRef = useRef<Scope | null>(null);
   const wikiScopeRef = useRef<Scope | null>(null);
+  const wikiFailedScopeRef = useRef<Scope | null>(null);
   const compilingScopeRef = useRef<Scope | null>(null);
   const totalScopeRef = useRef<Scope | null>(null);
   // Read-context (query) ownership of the committed list rows (issue #764
@@ -300,6 +345,13 @@ export function useDocumentPolling({
   );
 
   const pollIntervalMsRef = useRef(2_000);
+  // Baseline for the adaptive poll's change detection (#766 AC6): written on
+  // every successfully committed list response (the first commit establishes
+  // the baseline); failed or stale reads never touch it. When a commit's
+  // signature differs from the previous committed one the poll interval is
+  // reset synchronously here — BEFORE the state commit re-arms the poll
+  // effect, so the next tick is scheduled at the reset interval.
+  const lastCommittedSignatureRef = useRef<string | null>(null);
 
   const fetchDocuments = useCallback(
     async (options?: { keepRowsOnFailure?: boolean }) => {
@@ -320,6 +372,14 @@ export function useDocumentPolling({
       if (!isDocumentListResponse(response)) {
         throw new Error("Invalid document list response");
       }
+      const signature = listSignature(response.documents);
+      if (
+        lastCommittedSignatureRef.current !== null &&
+        signature !== lastCommittedSignatureRef.current
+      ) {
+        pollIntervalMsRef.current = 2_000;
+      }
+      lastCommittedSignatureRef.current = signature;
       setDocumentsState((previous) => {
         if (!isReadCurrent(token)) return previous;
         documentsScopeRef.current = token.scope;
@@ -343,7 +403,7 @@ export function useDocumentPolling({
       return true;
     } catch (error) {
       if (!isReadCurrent(token)) return;
-      console.error("Failed to fetch documents:", error);
+      logApiFailure("Failed to fetch documents:", error);
       toast.error(error instanceof Error ? error.message : "Failed to load documents", {
         id: "documents-list-failure",
       });
@@ -445,7 +505,7 @@ export function useDocumentPolling({
       });
     } catch (error) {
       if (!isReadCurrent(token)) return;
-      console.error("Failed to fetch stats:", error);
+      logApiFailure("Failed to fetch stats:", error);
       toast.error(error instanceof Error ? error.message : "Failed to load document stats", {
         id: "documents-stats-failure",
       });
@@ -520,6 +580,66 @@ export function useDocumentPolling({
   );
   runPollFetchRef.current = runPollFetch;
 
+  // Per-document wiki fetch bookkeeping (#765 AC4/AC5):
+  // - wikiDocAttemptRef counts, per document, every fetch START for that
+  //   document (across batches).
+  // - wikiDocCommittedRef is the per-document successful-commit watermark: a
+  //   result commits when its attempt number exceeds it. A newer FAILURE
+  //   never raises the watermark (a held older success still commits), while
+  //   a newer SUCCESS blocks a subsequent older late success (no stale
+  //   clobber). The whole-batch currency check below still gates LAUNCHING
+  //   new per-document requests, but no longer discards in-flight results.
+  // - wikiRetryAttemptsRef/wikiRetrySkipTicksRef drive the capped
+  //   per-document retry backoff (tick-based; see WIKI_RETRY_SKIP_TICKS);
+  //   wikiFailedRef mirrors the render state for the workers.
+  const wikiDocAttemptRef = useRef(new Map<string, number>());
+  const wikiDocCommittedRef = useRef(new Map<string, number>());
+  const wikiRetryAttemptsRef = useRef(new Map<string, number>());
+  const wikiRetrySkipTicksRef = useRef(new Map<string, number>());
+  const wikiFailedRef = useRef<Set<string>>(new Set());
+
+  const markWikiFetchFailed = useCallback(
+    (docId: string, scope: Scope, lease: Lease): void => {
+      if (!isContextLive(scope, lease)) return;
+      const attempts = (wikiRetryAttemptsRef.current.get(docId) ?? 0) + 1;
+      wikiRetryAttemptsRef.current.set(docId, attempts);
+      wikiRetrySkipTicksRef.current.set(
+        docId,
+        WIKI_RETRY_SKIP_TICKS[
+          Math.min(attempts - 1, WIKI_RETRY_SKIP_TICKS.length - 1)
+        ]
+      );
+      wikiFailedRef.current.add(docId);
+      setWikiFailedIdsState((previous) => {
+        if (!isContextLive(scope, lease)) return previous;
+        const next = wikiFailedScopeRef.current === scope ? new Set(previous) : new Set<string>();
+        wikiFailedScopeRef.current = scope;
+        next.add(docId);
+        return next;
+      });
+    },
+    [isContextLive]
+  );
+
+  const clearWikiFetchFailure = useCallback(
+    (docId: string, scope: Scope, lease: Lease): void => {
+      if (!isContextLive(scope, lease)) return;
+      if (!wikiFailedRef.current.has(docId)) return;
+      wikiFailedRef.current.delete(docId);
+      wikiRetryAttemptsRef.current.delete(docId);
+      wikiRetrySkipTicksRef.current.delete(docId);
+      setWikiFailedIdsState((previous) => {
+        if (!isContextLive(scope, lease)) return previous;
+        if (wikiFailedScopeRef.current !== scope) return previous;
+        if (!previous.has(docId)) return previous;
+        const next = new Set(previous);
+        next.delete(docId);
+        return next;
+      });
+    },
+    [isContextLive]
+  );
+
   const fetchWikiStatuses = useCallback(
     async (docs: Document[]) => {
       if (scopeRef.current !== scope || activeVaultId === null) return;
@@ -528,7 +648,6 @@ export function useDocumentPolling({
       const key = JSON.stringify(indexed.map((document) => String(document.id)));
       const token = beginRead("wiki", key, scope);
       if (token === null) return;
-      const results: (DocumentWikiStatus | undefined)[] = new Array(indexed.length);
       let cursor = 0;
       const worker = async () => {
         while (true) {
@@ -536,15 +655,33 @@ export function useDocumentPolling({
           const index = cursor;
           if (index >= indexed.length) return;
           cursor += 1;
+          const document = indexed[index];
+          const docId = String(document.id);
+          const attempt = (wikiDocAttemptRef.current.get(docId) ?? 0) + 1;
+          wikiDocAttemptRef.current.set(docId, attempt);
           try {
-            if (!isReadCurrent(token)) return;
-            results[index] = await getDocumentWikiStatus(
-              Number(indexed[index].id),
+            const result = await getDocumentWikiStatus(
+              Number(document.id),
               activeVaultId
             );
-            if (!isReadCurrent(token)) return;
+            // Per-document commit watermark (#765 AC5): scope liveness plus
+            // attempt recency versus the last SUCCESSFUL commit for this
+            // document — a superseded batch no longer discards an in-flight
+            // result.
+            if (!isContextLive(token.scope, token.lease)) return;
+            if (attempt <= (wikiDocCommittedRef.current.get(docId) ?? 0)) return;
+            wikiDocCommittedRef.current.set(docId, attempt);
+            clearWikiFetchFailure(docId, token.scope, token.lease);
+            setWikiStatusMapState((previous) => {
+              if (!isContextLive(token.scope, token.lease)) return previous;
+              const next = wikiScopeRef.current === token.scope ? { ...previous } : {};
+              wikiScopeRef.current = token.scope;
+              next[docId] = result;
+              return next;
+            });
           } catch {
-            if (!isReadCurrent(token)) return;
+            if (!isContextLive(token.scope, token.lease)) return;
+            markWikiFetchFailed(docId, token.scope, token.lease);
           }
         }
       };
@@ -552,28 +689,22 @@ export function useDocumentPolling({
         await Promise.all(
           Array.from({ length: Math.min(6, indexed.length) }, () => worker())
         );
-        if (!isReadCurrent(token)) return;
-        setWikiStatusMapState((previous) => {
-          if (!isReadCurrent(token)) return previous;
-          const next = wikiScopeRef.current === token.scope ? { ...previous } : {};
-          wikiScopeRef.current = token.scope;
-          indexed.forEach((document, index) => {
-            const result = results[index];
-            if (result !== undefined) next[String(document.id)] = result;
-          });
-          return next;
-        });
       } finally {
         finishRead(token);
       }
     },
-    [activeVaultId, beginRead, finishRead, isReadCurrent, scope]
+    [activeVaultId, beginRead, clearWikiFetchFailure, finishRead, isContextLive, isReadCurrent, markWikiFetchFailed, scope]
   );
 
   const compileInFlightRef = useRef(new Map<string, CompileToken>());
   const compileLatestRef = useRef(new Map<string, CompileToken>());
   const compileSerialRef = useRef(0);
   const compileTimersRef = useRef(new Set<CompileTimer>());
+  // Upload-transition refetch timer + the seen-indexed reconciliation set
+  // (#766 AC4/AC5). The timer is armed once per NEW upload→indexed transition
+  // and cleared only on fire or lease retirement (see the scope effect).
+  const uploadRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const knownIndexedUploadIdsRef = useRef<Set<string>>(new Set());
   const wikiPollFlightRef = useRef<WikiPollFlight | null>(null);
   const wikiPollSerialRef = useRef(0);
 
@@ -631,9 +762,16 @@ export function useDocumentPolling({
         return next;
       });
       try {
-        await compileDocumentWiki(Number(docId), activeVaultId);
+        const result = await compileDocumentWiki(Number(docId), activeVaultId);
         if (!isMutationCurrent(token)) return;
-        toast.success("Wiki compile job queued");
+        // #765 F2: the route is idempotent — a returned `running` job means a
+        // compile is already in flight, so the toast must not claim a fresh
+        // queueing.
+        toast.success(
+          result.status === "running"
+            ? "Wiki compile already in progress"
+            : "Wiki compile job queued"
+        );
         scheduleCompileWikiRefresh(token);
       } catch (error) {
         if (!isMutationCurrent(token)) return;
@@ -701,6 +839,14 @@ export function useDocumentPolling({
           compileTimers.delete(entry);
         }
       }
+      // The upload-transition refetch timer is owned by the lease lifecycle
+      // (#766 AC4/AC5), NOT by the uploads effect — that effect's cleanup
+      // runs on every uploads-array identity change and would starve the
+      // timer under progress churn exactly as the pre-fix code did.
+      if (uploadRefreshTimerRef.current !== null) {
+        clearTimeout(uploadRefreshTimerRef.current);
+        uploadRefreshTimerRef.current = null;
+      }
       if (wikiPollFlightRef.current?.lease === mountedLease) {
         wikiPollFlightRef.current = null;
       }
@@ -765,7 +911,12 @@ export function useDocumentPolling({
     };
   }, [documentsVisible, isContextLive, liveLeaseFor, readContext, scope]);
 
-  const wikiDocKey = documentsVisible.map((document) => String(document.id)).join(",");
+  // Keyed on id AND status (#765 AC3): a processing→indexed transition with
+  // an unchanged id set must re-enter the hydration effect — the id-only join
+  // let the guard short-circuit it.
+  const wikiDocKey = documentsVisible
+    .map((document) => `${document.id}:${document.metadata?.status ?? ""}`)
+    .join(",");
   const wikiHydrationRef = useRef<{ lease: Lease; key: string; context: object } | null>(null);
   useEffect(() => {
     const lease = liveLeaseFor(scope);
@@ -792,9 +943,28 @@ export function useDocumentPolling({
     .map((document) => String(document.id))
     .join(",");
 
+  // Scope-owned view of the failed set for render (#765 AC6): a vault/auth
+  // switch can neither render another scope's failures nor retry them.
+  const wikiFailedVisible = wikiFailedScopeRef.current === scope ? wikiFailedIds : new Set<string>();
+  const wikiFailedRefLive = wikiFailedRef;
+  // Retry scheduling joins the transient interval (#765 AC4): failed ids that
+  // are visible, indexed, and inside their capped attempt schedule ride the
+  // same 5 s tick; ids past the schedule are never re-requested.
+  const wikiRetryKey = documentsVisible
+    .filter(
+      (document) =>
+        document.metadata?.status === "indexed" &&
+        wikiFailedRefLive.current.has(String(document.id)) &&
+        (wikiRetryAttemptsRef.current.get(String(document.id)) ?? 0) <=
+          WIKI_RETRY_SKIP_TICKS.length
+    )
+    .map((document) => String(document.id))
+    .join(",");
+
   useEffect(() => {
     const lease = liveLeaseFor(scope);
-    if (lease === null || !isContextLive(scope, lease) || !transientWikiKey) return;
+    if (lease === null || !isContextLive(scope, lease)) return;
+    if (!transientWikiKey && !wikiRetryKey) return;
     const timer = setInterval(() => {
       if (!isContextLive(scope, lease) || readContextRef.current !== readContext) return;
       const currentFlight = wikiPollFlightRef.current;
@@ -808,28 +978,68 @@ export function useDocumentPolling({
         serial: ++wikiPollSerialRef.current,
       };
       wikiPollFlightRef.current = flight;
-      const currentDocs = documentsRef.current.filter((document) =>
-        transientWikiKey.split(",").includes(String(document.id))
-      );
+      const wanted = new Set([
+        ...transientWikiKey.split(",").filter(Boolean),
+        ...wikiRetryKey.split(",").filter(Boolean),
+      ]);
+      const currentDocs = documentsRef.current.filter((document) => {
+        const docId = String(document.id);
+        if (!wanted.has(docId)) return false;
+        if (transientWikiKey.split(",").includes(docId)) return true;
+        // Retry-eligible only once its tick backoff has elapsed: each tick
+        // first spends one skip credit before the id becomes eligible.
+        const skip = wikiRetrySkipTicksRef.current.get(docId) ?? 0;
+        if (skip > 0) {
+          wikiRetrySkipTicksRef.current.set(docId, skip - 1);
+          return false;
+        }
+        return true;
+      });
       void fetchWikiStatuses(currentDocs).finally(() => {
         if (!isContextLive(flight.scope, flight.lease)) return;
         if (wikiPollFlightRef.current === flight) wikiPollFlightRef.current = null;
       });
     }, WIKI_POLL_INTERVAL_MS);
     return () => clearInterval(timer);
-  }, [fetchWikiStatuses, isContextLive, liveLeaseFor, readContext, scope, transientWikiKey]);
+  }, [fetchWikiStatuses, isContextLive, liveLeaseFor, readContext, scope, transientWikiKey, wikiRetryKey]);
 
   useEffect(() => {
     const lease = liveLeaseFor(scope);
     if (lease === null || !isContextLive(scope, lease)) return;
-    const completedCount = uploads.filter((upload) => upload.status === "indexed").length;
-    if (completedCount === 0) return;
-    const timeout = setTimeout(() => {
+    // Upload-transition refetch (#766 AC4/AC5): the seen-set is RECONCILED to
+    // the currently-indexed ids on every uploads change (an id that left
+    // `indexed` — e.g. retryUpload returning it to pending — or disappeared
+    // is forgotten, so a genuine later transition re-arms), and exactly ONE
+    // 1 s timer is armed per new transition. The timer is deliberately NOT
+    // cleared here: this effect's cleanup runs on every uploads-array
+    // identity change (every progress tick), which is what starved the old
+    // implementation; it is cleared on fire or lease retirement instead.
+    const currentlyIndexed = new Set(
+      uploads
+        .filter((upload) => upload.status === "indexed")
+        .map((upload) => String(upload.id))
+    );
+    for (const id of knownIndexedUploadIdsRef.current) {
+      if (!currentlyIndexed.has(id)) knownIndexedUploadIdsRef.current.delete(id);
+    }
+    const newlyIndexed = uploads.filter(
+      (upload) =>
+        upload.status === "indexed" &&
+        !knownIndexedUploadIdsRef.current.has(String(upload.id))
+    );
+    if (newlyIndexed.length === 0) return;
+    newlyIndexed.forEach((upload) =>
+      knownIndexedUploadIdsRef.current.add(String(upload.id))
+    );
+    if (uploadRefreshTimerRef.current !== null) return;
+    uploadRefreshTimerRef.current = setTimeout(() => {
+      uploadRefreshTimerRef.current = null;
       if (!isContextLive(scope, lease) || readContextRef.current !== readContext) return;
       void fetchDocuments();
       void fetchStats();
     }, 1_000);
-    return () => clearTimeout(timeout);
+    // uploads stays a dependency (transition detection), but its cleanup no
+    // longer owns the timer — see the scope effect for teardown.
   }, [fetchDocuments, fetchStats, isContextLive, liveLeaseFor, readContext, scope, uploads]);
 
   return {
@@ -842,6 +1052,7 @@ export function useDocumentPolling({
     fetchDocuments,
     fetchStats,
     wikiStatusMap: wikiStatusVisible,
+    wikiFetchFailedIds: wikiFailedVisible,
     compilingDocIds: compilingVisible,
     handleCompileDocument,
     total: totalVisible,

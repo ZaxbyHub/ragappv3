@@ -139,6 +139,70 @@ export default function DocumentDetailPage() {
     load();
   }, [load]);
 
+  // #765 AC7: converge the page's own status without a remount. This is a
+  // DEDICATED background refresh, not the foreground load() — load() toggles
+  // the skeleton, resets tag selection and vocabulary, replaces the preview,
+  // and bumps the foreground generation; none of that may run on a poll. The
+  // refresh merges ONLY the live status/progress fields into the current
+  // document, is invalidated by any foreground load (generation compare) or
+  // id change, never overlaps itself, and disarms on any terminal status
+  // (pending/processing are the only non-terminal states the backend emits).
+  const statusRefreshInFlightRef = useRef(false);
+  const statusRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    const STATUS_REFRESH_INTERVAL_MS = 2_000;
+    let disposed = false;
+    const tick = () => {
+      if (disposed) return;
+      const docId = Number(id);
+      const currentStatus = docRef.current?.metadata?.status as string | undefined;
+      if (
+        !Number.isFinite(docId) ||
+        (currentStatus !== "pending" && currentStatus !== "processing")
+      ) {
+        return;
+      }
+      if (statusRefreshInFlightRef.current) return;
+      statusRefreshInFlightRef.current = true;
+      const gen = loadGenRef.current;
+      void getDocument(docId)
+        .then((d) => {
+          statusRefreshInFlightRef.current = false;
+          if (disposed || loadGenRef.current !== gen) return;
+          const previous = docRef.current;
+          if (previous == null || String(previous.id) !== String(d.id)) return;
+          const merged: Document = {
+            ...previous,
+            metadata: {
+              ...previous.metadata,
+              status: d.metadata?.status ?? previous.metadata?.status,
+              chunk_count: d.metadata?.chunk_count ?? previous.metadata?.chunk_count,
+              progress:
+                (d.metadata as { progress?: number } | undefined)?.progress ??
+                (previous.metadata as { progress?: number } | undefined)?.progress,
+            },
+          };
+          docRef.current = merged;
+          setDoc(merged);
+        })
+        .catch(() => {
+          statusRefreshInFlightRef.current = false;
+        })
+        .finally(() => {
+          if (disposed) return;
+          statusRefreshTimerRef.current = setTimeout(tick, STATUS_REFRESH_INTERVAL_MS);
+        });
+    };
+    statusRefreshTimerRef.current = setTimeout(tick, STATUS_REFRESH_INTERVAL_MS);
+    return () => {
+      disposed = true;
+      if (statusRefreshTimerRef.current !== null) {
+        clearTimeout(statusRefreshTimerRef.current);
+        statusRefreshTimerRef.current = null;
+      }
+    };
+  }, [id]);
+
   // Inline preview for text-like and PDF documents.
   useEffect(() => {
     if (!previewSource) return;
@@ -351,7 +415,11 @@ export default function DocumentDetailPage() {
                 title={
                   isSearchable
                     ? "Ask questions scoped to this document"
-                    : "Waiting until indexed — available once the document is searchable"
+                    : status === "error" || status === "failed"
+                      ? "Indexing failed — retry from Documents"
+                      : status === "cancelled"
+                        ? "Indexing was cancelled — retry from Documents"
+                        : "Waiting until indexed — available once the document is searchable"
                 }
               >
                 <MessageSquare className="w-4 h-4 mr-1" />

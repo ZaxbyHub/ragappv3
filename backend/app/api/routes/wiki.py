@@ -1078,6 +1078,21 @@ async def compile_document_wiki(
     if not file_row:
         raise HTTPException(status_code=404, detail=f"File {file_id} not found in vault {vault_id}")
     store = WikiStore(db)
+    # Idempotent re-click (#765): while an ingest job for this file is still
+    # active (pending or running), a second Compile returns the existing job
+    # instead of enqueueing a duplicate. Status-filtered limit-1 queries are
+    # exact in both storage arms; newer terminal jobs cannot hide an older
+    # active one.
+    for active_status in ("pending", "running"):
+        active_jobs = store.list_jobs(
+            vault_id,
+            status=active_status,
+            trigger_type="ingest",
+            trigger_id=f"file:{file_id}",
+            limit=1,
+        )
+        if active_jobs:
+            return {"job_id": active_jobs[0].id, "status": active_jobs[0].status}
     job = store.create_job(
         vault_id=vault_id,
         trigger_type="ingest",
@@ -1113,6 +1128,11 @@ async def get_document_wiki_status(
     if latest_job is None:
         wiki_status = "not_compiled"
     elif latest_job.status == "running":
+        wiki_status = "compiling"
+    elif latest_job.status == "pending":
+        # Every job starts pending (wiki_store.create_job); a queued job is a
+        # transient state the frontend must poll to completion, not the
+        # terminal not_compiled it was previously collapsed into (#765).
         wiki_status = "compiling"
     elif latest_job.status == "failed":
         wiki_status = "failed"

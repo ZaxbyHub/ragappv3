@@ -18,6 +18,9 @@ import type {
   SortOrder,
 } from "@/lib/api";
 
+// Shared immutable default for the optional wikiFetchFailedIds prop.
+const EMPTY_WIKI_FETCH_FAILED_IDS: Set<string> = new Set();
+
 interface DocumentTableProps {
   documents: Document[];
   selectedIds: Set<string>;
@@ -29,6 +32,7 @@ interface DocumentTableProps {
   onSelectAll: (checked: boolean | "indeterminate") => void;
   onSelectOne: (docId: string, checked: boolean) => void;
   wikiStatusMap: Record<string, DocumentWikiStatus>;
+  wikiFetchFailedIds?: Set<string>;
   compilingDocIds: Set<string>;
   onCompileDocument: (docId: string) => void;
   onDownload: (doc: Document) => void;
@@ -85,6 +89,10 @@ export function DocumentTable({
   onSelectAll,
   onSelectOne,
   wikiStatusMap,
+  // Optional so existing renderers (and their test doubles) that do not
+  // track fetch failures keep compiling; absence simply means no document is
+  // rendered as "status unavailable".
+  wikiFetchFailedIds = EMPTY_WIKI_FETCH_FAILED_IDS,
   compilingDocIds,
   onCompileDocument,
   onDownload,
@@ -324,6 +332,20 @@ export function DocumentTable({
                               title="Wiki compile skipped — no extractable knowledge found in this document."
                             >
                               Skipped — no extractable knowledge
+                            </span>
+                          );
+                        }
+                        if (!ws && wikiFetchFailedIds.has(docId)) {
+                          // A FAILED wiki-status fetch is unknown, NOT
+                          // uncompiled (#765 AC6): it must not render the
+                          // Compile affordance that invites a pointless job —
+                          // only a server-confirmed not_compiled does.
+                          return (
+                            <span
+                              className="text-xs text-muted-foreground italic"
+                              title="Wiki status unavailable — the status fetch failed and will be retried."
+                            >
+                              Wiki status unavailable
                             </span>
                           );
                         }

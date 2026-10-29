@@ -1342,8 +1342,10 @@ class TestWikiDocumentStatusRoute(WikiNewRouteTestBase):
         self.assertEqual(data["job_count"], 1)
         self.assertIsNotNone(data["latest_job"])
         self.assertEqual(data["latest_job"]["trigger_id"], f"file:{file_id}")
-        # A pending job is not yet compiled.
-        self.assertEqual(data["wiki_status"], "not_compiled")
+        # A pending job is a transient state (#765): the semantic status is
+        # `compiling` until the job runs or terminates, so the frontend keeps
+        # polling instead of treating the cell as settled-not-compiled.
+        self.assertEqual(data["wiki_status"], "compiling")
 
 
 class TestWikiMemoryStatusRoute(WikiNewRouteTestBase):
