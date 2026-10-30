@@ -48,7 +48,7 @@
   server's `max_file_size_mb` and `allowed_extensions` reach upload surfaces without visiting
   Settings.
 - The dropzone advertises the server's extension allowlist and enforces it client-side with a
-  predicate that mirrors the server's filename pipeline exactly (secure_filename rules,
+  predicate that mirrors the server's filename pipeline step for step (secure_filename rules,
   Python-`Path.suffix` semantics, the missing-suffix `.txt` fallback, lowercase membership).
   The react-dropzone `accept` option is advisory UX only (a single valid MIME key carrying the
   extension list); acceptance truth is the predicate on both drop paths — a type-only
@@ -60,6 +60,11 @@
   (previously `opacity-60` on the whole card dropped them below WCAG AA).
 
 ## Caveats
+
+- The client acceptance predicate mirrors the server pipeline step for step with one known
+  edge: a filename that sanitizes to EMPTY (pure non-ASCII/punctuation) is refused
+  client-side, while the server renames such uploads to `unnamed_file.txt` and accepts them
+  when `.txt` is allowed. The server remains authoritative on the API path.
 
 - Before settings load (failed fetch or first paint), the dropzone keeps the pre-existing
   behavior: hardcoded copy, the 100 MB fallback limit, and no client-side extension filter —
