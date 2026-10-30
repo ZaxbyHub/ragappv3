@@ -24,6 +24,9 @@ const EMPTY_WIKI_FETCH_FAILED_IDS: Set<string> = new Set();
 interface DocumentTableProps {
   documents: Document[];
   selectedIds: Set<string>;
+  /** Organize-level capability (vault write): row selection + wiki compile (issue #767). */
+  canOrganizeDocuments: boolean;
+  /** Admin-level capability (vault admin): destructive actions only (issue #767). */
   canMutateDocuments: boolean;
   filenameColWidth: number;
   onResizeMouseDown: (e: React.MouseEvent<HTMLDivElement>) => void;
@@ -36,7 +39,7 @@ interface DocumentTableProps {
   compilingDocIds: Set<string>;
   onCompileDocument: (docId: string) => void;
   onDownload: (doc: Document) => void;
-  onDelete: (docId: string) => void;
+  onDelete: (docId: string, filename?: string) => void;
   sortBy: DocumentSortBy;
   sortOrder: SortOrder;
   onSort: (column: DocumentSortBy) => void;
@@ -81,6 +84,7 @@ function SortHeader({
 export function DocumentTable({
   documents,
   selectedIds,
+  canOrganizeDocuments,
   canMutateDocuments,
   filenameColWidth,
   onResizeMouseDown,
@@ -165,7 +169,7 @@ export function DocumentTable({
                   <Checkbox
                     checked={headerChecked}
                     onCheckedChange={onSelectAll}
-                    disabled={!canMutateDocuments}
+                    disabled={!canOrganizeDocuments}
                     aria-label="Select all documents"
                   />
                 </th>
@@ -261,7 +265,7 @@ export function DocumentTable({
                       <Checkbox
                         checked={isSelected}
                         onCheckedChange={(checked) => onSelectOne(docId, !!checked)}
-                        disabled={!canMutateDocuments}
+                        disabled={!canOrganizeDocuments}
                         aria-label={`Select ${doc.filename}`}
                       />
                     </td>
@@ -358,8 +362,8 @@ export function DocumentTable({
                               type="button"
                               className="text-xs text-muted-foreground hover:text-foreground underline"
                               onClick={() => onCompileDocument(docId)}
-                              disabled={isCompiling}
-                              title="Compile wiki for this document"
+                              disabled={!canOrganizeDocuments || isCompiling}
+                              title={canOrganizeDocuments ? "Compile wiki for this document" : "Write access to this vault is required to compile the wiki"}
                             >
                               {isCompiling ? "Queuing…" : "Compile"}
                             </button>
@@ -380,9 +384,10 @@ export function DocumentTable({
                         return (
                           <button
                             type="button"
-                            className={`text-xs font-mono cursor-pointer bg-transparent border-0 p-0 ${color}`}
+                            className={`text-xs font-mono bg-transparent border-0 p-0 ${color} ${canOrganizeDocuments ? "cursor-pointer" : "cursor-not-allowed"}`}
                             onClick={() => onCompileDocument(docId)}
-                            title={`Wiki: ${ws.wiki_status} — ${ws.pages_count} pages, ${ws.claims_count} claims, ${ws.lint_count} lint issues. Click to recompile.`}
+                            disabled={!canOrganizeDocuments}
+                            title={canOrganizeDocuments ? `Wiki: ${ws.wiki_status} — ${ws.pages_count} pages, ${ws.claims_count} claims, ${ws.lint_count} lint issues. Click to recompile.` : "Write access to this vault is required to recompile the wiki"}
                             aria-label={`Recompile wiki for ${doc.filename}. Status: ${ws.wiki_status}.`}
                           >
                             {label}
@@ -423,7 +428,7 @@ export function DocumentTable({
                           variant="ghost"
                           size="icon"
                           className="min-w-[44px] min-h-[44px]"
-                          onClick={() => onDelete(docId)}
+                          onClick={() => onDelete(docId, doc.filename)}
                           aria-label="Delete document"
                         >
                           <Trash2 className="w-4 h-4 text-destructive" aria-hidden="true" />

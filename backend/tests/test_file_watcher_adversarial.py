@@ -78,8 +78,8 @@ class TestVaultUploadsDirExceptions:
                 # Should not raise - should handle gracefully
                 result = await watcher.scan_once()
 
-                # Should return 0 since vault scan failed
-                assert result == 0
+                # Should enqueue nothing since vault scan failed
+                assert result.files_enqueued == 0
 
     @pytest.mark.asyncio
     async def test_vault_uploads_dir_raises_os_error(self, mock_processor, mock_pool):
@@ -104,7 +104,7 @@ class TestVaultUploadsDirExceptions:
 
                 # Should not raise
                 result = await watcher.scan_once()
-                assert result == 0
+                assert result.files_enqueued == 0
 
     @pytest.mark.asyncio
     async def test_vault_uploads_dir_raises_attribute_error(self, mock_processor, mock_pool):
@@ -133,7 +133,7 @@ class TestVaultUploadsDirExceptions:
                 try:
                     result = await watcher.scan_once()
                     # If it returns at all, verify reasonable behavior
-                    assert isinstance(result, int)
+                    assert isinstance(result.files_enqueued, int)
                 except AttributeError:
                     pytest.fail("scan_once did not handle missing vault_uploads_dir gracefully")
 
@@ -308,7 +308,7 @@ class TestSymlinkAndNonExistentPaths:
 
                 # Should not crash on symlink
                 result = await watcher.scan_once()
-                assert isinstance(result, int)
+                assert isinstance(result.files_enqueued, int)
 
     @pytest.mark.asyncio
     async def test_vault_uploads_dir_returns_nonexistent_path(self, mock_processor, mock_pool, tmp_path):
@@ -334,7 +334,7 @@ class TestSymlinkAndNonExistentPaths:
 
                 # Should handle nonexistent path gracefully
                 result = await watcher.scan_once()
-                assert result == 0  # No files found in nonexistent dir
+                assert result.files_enqueued == 0  # No files found in nonexistent dir
 
     @pytest.mark.asyncio
     async def test_vault_uploads_dir_returns_path_with_special_chars(self, mock_processor, mock_pool, tmp_path):
@@ -360,7 +360,7 @@ class TestSymlinkAndNonExistentPaths:
 
                 # Should handle special chars gracefully
                 result = await watcher.scan_once()
-                assert isinstance(result, int)
+                assert isinstance(result.files_enqueued, int)
 
 
 class TestRaceConditionVaultDeleted:
@@ -419,7 +419,7 @@ class TestRaceConditionVaultDeleted:
                 # Should handle race condition gracefully
                 result = await watcher.scan_once()
                 # Should not crash, returns some count (likely 0)
-                assert isinstance(result, int)
+                assert isinstance(result.files_enqueued, int)
 
     @pytest.mark.asyncio
     async def test_concurrent_vault_deletion(self, mock_processor, mock_pool, tmp_path):
@@ -457,7 +457,7 @@ class TestRaceConditionVaultDeleted:
 
                 # Should process vaults 1 and 3, skip vault 2 gracefully
                 result = await watcher.scan_once()
-                assert isinstance(result, int)
+                assert isinstance(result.files_enqueued, int)
 
 
 class TestSettingsObjectMissingMethod:
@@ -512,7 +512,7 @@ class TestSettingsObjectMissingMethod:
                 # Should NOT raise - code catches the error and logs warning
                 # Result is 0 because no vaults could be scanned
                 result = await watcher.scan_once()
-                assert result == 0
+                assert result.files_enqueued == 0
 
     @pytest.mark.asyncio
     async def test_settings_vault_uploads_dir_is_not_callable(self, mock_processor, mock_pool):
@@ -542,7 +542,7 @@ class TestSettingsObjectMissingMethod:
                 # Should NOT raise - code catches the error and logs warning
                 # Result is 0 because no vaults could be scanned
                 result = await watcher.scan_once()
-                assert result == 0
+                assert result.files_enqueued == 0
 
 
 class TestPathTraversalAndInjection:
@@ -692,7 +692,7 @@ class TestUnicodeAndEncoding:
 
                 # Should handle Unicode gracefully
                 result = await watcher.scan_once()
-                assert isinstance(result, int)
+                assert isinstance(result.files_enqueued, int)
                 assert 1 in captured_ids
 
     @pytest.mark.asyncio
@@ -723,5 +723,5 @@ class TestUnicodeAndEncoding:
 
                 # Should handle null bytes gracefully
                 result = await watcher.scan_once()
-                assert isinstance(result, int)
+                assert isinstance(result.files_enqueued, int)
                 assert 1 in captured_ids

@@ -85,7 +85,7 @@ async def test_relative_stored_row_not_reported_new(tmp_path: Path) -> None:
     finally:
         os.chdir(old_cwd)
 
-    assert len(new) == 0
+    assert len(new.new_files) == 0
 
 
 async def test_absolute_stored_row_not_reported_new(tmp_path: Path) -> None:
@@ -120,7 +120,7 @@ async def test_absolute_stored_row_not_reported_new(tmp_path: Path) -> None:
     finally:
         os.chdir(old_cwd)
 
-    assert len(new) == 0
+    assert len(new.new_files) == 0
 
 
 async def test_reconcile_enable_during_stop_drain_leaves_watcher_running() -> None:

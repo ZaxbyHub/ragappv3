@@ -181,8 +181,8 @@ class TestFileWatcherLibraryVaultIdMapping(unittest.TestCase):
         try:
             # Run scan_once - should complete without error (async method)
             result = asyncio.run(watcher.scan_once())
-            # Verify it returns an integer (count of enqueued files)
-            self.assertIsInstance(result, int)
+            # Verify it returns a scan result with an integer enqueued count
+            self.assertIsInstance(result.files_enqueued, int)
         finally:
             fw_module.settings = original_settings
 
@@ -222,7 +222,7 @@ class TestFileWatcherLibraryVaultIdMapping(unittest.TestCase):
         try:
             # Run scan_once - should include library_dir in mapping
             result = asyncio.run(watcher.scan_once())
-            self.assertIsInstance(result, int)
+            self.assertIsInstance(result.files_enqueued, int)
         finally:
             fw_module.settings = original_settings
 
@@ -258,7 +258,7 @@ class TestFileWatcherLibraryVaultIdMapping(unittest.TestCase):
         # by checking that scan_once completes without trying to map library_dir
         try:
             result = asyncio.run(watcher.scan_once())
-            self.assertIsInstance(result, int)
+            self.assertIsInstance(result.files_enqueued, int)
         finally:
             fw_module.settings = original_settings
 
@@ -277,7 +277,7 @@ class TestFileWatcherLibraryVaultIdMapping(unittest.TestCase):
 
         try:
             result = asyncio.run(watcher.scan_once())
-            self.assertIsInstance(result, int)
+            self.assertIsInstance(result.files_enqueued, int)
         finally:
             fw_module.settings = original_settings
 

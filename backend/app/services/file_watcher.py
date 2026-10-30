@@ -8,8 +8,9 @@ for new files and enqueues them for processing via BackgroundProcessor.
 import asyncio
 import concurrent.futures
 import logging
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Optional, Set
+from typing import Dict, List, NamedTuple, Optional, Set
 
 from ..config import settings
 from ..models.database import SQLiteConnectionPool
@@ -31,6 +32,35 @@ def _validate_scan_candidate(file_path: Path) -> tuple[bool, Optional[str]]:
     return validate_ingest_candidate(file_path)
 
 
+class DirectoryScan(NamedTuple):
+    """Per-directory discovery result (issue #767 AC6).
+
+    ``examined`` is the number of candidate files actually checked against the
+    database (the on-disk set after temp-artifact and zero-byte filtering) —
+    the count a truthful ``scanned`` reports. ``new_files`` are the candidates
+    not present in the database.
+    """
+
+    examined: int
+    new_files: Set[Path]
+
+
+@dataclass
+class ScanResult:
+    """What one ``scan_once`` pass actually did (issue #767 AC6).
+
+    ``files_examined`` counts every candidate checked against the database
+    across all scanned directories; ``files_enqueued`` counts real enqueues;
+    ``errors`` carries per-directory failure descriptions (a file failing the
+    structural screen is a per-file decision — examined, not enqueued, and NOT
+    an error).
+    """
+
+    files_examined: int = 0
+    files_enqueued: int = 0
+    errors: List[str] = field(default_factory=list)
+
+
 class FileWatcher:
     """
     File watcher for auto-scanning directories for new files.
@@ -50,7 +80,11 @@ class FileWatcher:
             saved cadence change applies on the next cycle
     """
 
-    def __init__(self, processor: BackgroundProcessor, pool: Optional[SQLiteConnectionPool] = None):
+    def __init__(
+        self,
+        processor: BackgroundProcessor,
+        pool: Optional[SQLiteConnectionPool] = None,
+    ):
         """
         Initialize the file watcher.
 
@@ -229,7 +263,7 @@ class FileWatcher:
             fut = asyncio.run_coroutine_threadsafe(self.stop(), loop)
             fut.add_done_callback(_log_lifecycle_failure)
 
-    async def scan_once(self) -> int:
+    async def scan_once(self) -> ScanResult:
         """
         Perform a single scan of all configured directories.
 
@@ -237,9 +271,11 @@ class FileWatcher:
         not present in the database, enqueuing new files.
 
         Returns:
-            int: Number of new files enqueued for processing
+            ScanResult: files_examined (candidates checked against the DB),
+            files_enqueued (new files queued for processing), and errors
+            (per-directory failures).
         """
-        enqueued_count = 0
+        result = ScanResult()
         # Scan vault-specific upload directories + library
         UploadPathProvider()
         dir_vault_map: Dict[Path, int] = {}
@@ -247,6 +283,7 @@ class FileWatcher:
         # Add each vault's upload directory
         try:
             from app.models.database import get_pool
+
             pool = get_pool(str(settings.sqlite_path))
             conn = await pool.get_connection_async()
             try:
@@ -259,15 +296,20 @@ class FileWatcher:
                 pool.release_connection(conn)
         except Exception as e:
             logger.warning(f"Failed to get vault directories: {e}")
+            result.errors.append(f"vault directories: {e}")
 
         # Add library_dir only if configured
         if settings.library_vault_id is not None:
             if settings.library_dir.exists():
                 dir_vault_map[settings.library_dir] = settings.library_vault_id
             else:
-                logger.info("library_vault_id is configured but library directory does not exist, skipping library directory scan")
+                logger.info(
+                    "library_vault_id is configured but library directory does not exist, skipping library directory scan"
+                )
         else:
-            logger.info("library_vault_id is not configured, skipping library directory scan")
+            logger.info(
+                "library_vault_id is not configured, skipping library directory scan"
+            )
 
         for directory, vault_id in dir_vault_map.items():
             if not directory.exists():
@@ -281,8 +323,9 @@ class FileWatcher:
                 # screen (issue #693 / RT-S5-02) is the same class of
                 # blocking IO (zip central-directory reads), so it runs in
                 # the same thread context.
-                new_files = await asyncio.to_thread(self._find_new_files, directory)
-                for file_path in new_files:
+                discovery = await asyncio.to_thread(self._find_new_files, directory)
+                result.files_examined += discovery.examined
+                for file_path in discovery.new_files:
                     ok, reason = await asyncio.to_thread(
                         _validate_scan_candidate, file_path
                     )
@@ -295,19 +338,26 @@ class FileWatcher:
                         )
                         continue
                     await self.processor.enqueue(str(file_path), vault_id=vault_id)
-                    enqueued_count += 1
+                    result.files_enqueued += 1
                     logger.info(f"Enqueued new file for processing: {file_path}")
             except Exception as e:
                 logger.error(f"Error scanning directory {directory}: {e}")
+                result.errors.append(f"{directory}: {e}")
 
-        if enqueued_count > 0:
-            logger.info(f"Scan complete: {enqueued_count} new files enqueued")
+        if result.files_enqueued > 0:
+            logger.info(
+                f"Scan complete: {result.files_enqueued} new files enqueued "
+                f"({result.files_examined} examined, {len(result.errors)} errors)"
+            )
         else:
-            logger.debug("Scan complete: no new files found")
+            logger.debug(
+                f"Scan complete: no new files found "
+                f"({result.files_examined} examined, {len(result.errors)} errors)"
+            )
 
-        return enqueued_count
+        return result
 
-    def _find_new_files(self, directory: Path) -> Set[Path]:
+    def _find_new_files(self, directory: Path) -> DirectoryScan:
         """
         Find files in directory that are not in the database.
 
@@ -315,7 +365,8 @@ class FileWatcher:
             directory: Path to scan for files
 
         Returns:
-            Set of Path objects for files not in the database
+            DirectoryScan with the number of examined candidates and the set
+            of files not in the database.
         """
         # Get all files in directory (recursively)
         files_on_disk: Set[Path] = set()
@@ -359,6 +410,7 @@ class FileWatcher:
         try:
             if self.pool is None:
                 from ..models.database import get_pool
+
                 self.pool = get_pool(str(settings.sqlite_path), max_size=2)
             conn = self.pool.get_connection()
             try:
@@ -393,7 +445,7 @@ class FileWatcher:
             if str(file_path) not in files_in_db:
                 new_files.add(file_path)
 
-        return new_files
+        return DirectoryScan(examined=len(files_on_disk), new_files=new_files)
 
     async def _watch_loop(self) -> None:
         """
