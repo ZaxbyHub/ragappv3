@@ -14,13 +14,19 @@ Issues: #739, #740 (Workstream H PRs 1-2 of 10, collated)
   variable, so the path word-split into extra positional argv and
   `scripts/mutation_score.py` exited 2 (argparse usage error) every night
   before computing any score. It now reads both tokens and passes a quoted
-  argv array.
+  argv array. `backend/pyproject.toml`'s `pytest_add_cli_args` is also a
+  LIST now — mutmut 3.7 concatenates it onto a list, so the old string form
+  crashed `mutmut run` with a TypeError before any mutant was tested.
 - The mutmut step wrote `backend/`-prefixed `source_paths` while its working
   directory was already `backend/`, so mutmut looked for
   `backend/backend/...` and found nothing. The prefix is stripped at use.
   The mutmut exit code is now recorded per module (`<module>.rc`) and the
   score step hard-fails on a nonzero rc — a crashed run can no longer
-  masquerade as a passing score through partial stats.
+  masquerade as a passing score through partial stats. The stats file is
+  now the file mutmut actually writes (`mutants/mutmut-cicd-stats.json`,
+  copied to `mutation-stats/<module>.json`): `export-cicd-stats` prints
+  only a status line to stdout, so the previous stdout redirect made the
+  stats file non-JSON and the score gate UNPARSEABLE forever.
 - `stryker-frontend`'s `timeout-minutes: 120` equalled its observed real
   duration (106-120 min; 4 of 6 scheduled runs were cancelled by their own
   timeout). Raised to 180.
@@ -35,22 +41,40 @@ Issues: #739, #740 (Workstream H PRs 1-2 of 10, collated)
 
 A daily workflow fetches the repository's scheduled run history (`gh api`,
 default token, `actions: read` + `contents: read` only) and runs a
-stdlib-only checker that fails naming every scheduled workflow whose last
-successful scheduled run is older than 48h. The checker excludes itself
-(its current invocation is the execution evidence) and fails closed on
-undecidable `on:` blocks. A scheduled tier that silently stops scheduling
-is no longer invisible — that is exactly how nightly.yml stayed dead for
-two weeks.
+stdlib-only checker that fails naming every scheduled workflow without a
+successful scheduled run in 48h — and names the FAILURE MODE per workflow:
+`DEAD` (no scheduled run in the history at all), `STALE` (last success
+older than 48h), or `FAILING` (scheduled runs within the window but none
+concluded success — the schedule is alive, the tier is red). The checker
+excludes itself (its current invocation is the execution evidence),
+discovers `.yml` AND `.yaml` workflows including quoted `"on":` keys and
+skips comment lines while walking `on:` blocks. **First run after merge
+will be red by construction**: the nightly tiers have had no successful
+scheduled run in the window (nightly.yml was invalid; the quality gates'
+mutation job failed nightly), so expect one red liveness run per tier
+until each produces its first green scheduled night. A scheduled tier
+that silently stops scheduling is no longer invisible — that is exactly
+how nightly.yml stayed dead for two weeks.
 
 ### Runtime contract (scripts/check_runtime_contract.py)
 
 - Runtime pins are now checked in EVERY `.github/workflows/*.yml`, not only
   `ci.yml` (nightly.yml, nightly-quality-gates.yml and closure-evidence.yml
-  each pin runtimes independently).
+  each pin runtimes independently). Literal pins only: `"22.x"`, matrix
+  expressions, and `node-version-file` indirection are outside the
+  contract's reach (none exist today).
 - Dockerfile `@sha256:` digests are now COMPARED against a recorded
   `ALLOWED_DIGESTS` table for tracked runtime images (node/python) — a
-  tag bump with a stale digest no longer passes. Non-runtime base images
-  (nginx, ollama) stay outside the contract, as before.
+  tag bump with a stale digest no longer passes. Digest-only pins pass
+  only when they match the recorded digest; registry-qualified names
+  (`docker.io/library/node:...`) are matched on their last path segment;
+  a FROM line the gate cannot parse (ARG interpolation, line continuation)
+  FAILS the surface closed instead of escaping both contracts.
+  **Dependabot digest bumps**: a digest bump goes red until
+  `ALLOWED_DIGESTS` in `scripts/check_runtime_contract.py` is updated in
+  the same change — that co-edit is the point (stale digests must be
+  deliberate). Non-runtime base images (nginx, ollama) stay outside the
+  contract, as before.
 - The dead `CONTRIBUTING_NODE_RE` module constant is gone:
   `check_contributing` now uses it (previously it compiled its own local
   copy and editing the constant changed nothing).
@@ -91,8 +115,15 @@ two weeks.
 
 ## Upgrade notes
 
-Nothing to do: all changes are CI/gate-side. Behavior visible to operators:
-the nightly tiers can now actually fail (that is the point), the new
-"Gate liveness" scheduled workflow goes red naming stale scheduled
-workflows, and the SAST gate fails instead of passing silently when bandit
-cannot parse a file.
+Nothing to do for operators: all changes are CI/gate-side. Behavior visible
+to operators: the nightly tiers can now actually fail (that is the point),
+the new "Gate liveness" scheduled workflow goes red naming the per-tier
+failure mode (DEAD / STALE / FAILING — expect FAILING/DEAD rows for the
+nightly tiers on the first post-merge run until each tier lands its first
+green scheduled night), and the SAST gate fails instead of passing
+silently when bandit cannot parse a file. Two deliberate co-edit rules:
+bumping a runtime-image digest requires updating `ALLOWED_DIGESTS` in
+`scripts/check_runtime_contract.py` in the same change, and a git-level
+fault (binary missing / timeout) now FAILS the scope-drift and
+baseline-expansion gates under GITHUB_ACTIONS instead of degrading to a
+pass (locally they keep the skip-with-note behavior).

@@ -5,7 +5,9 @@ a no-mock-at-all spec both fail (C-BATCHSEQ-1/2), plus the real-repo happy
 path through find_offenders.
 """
 
+import contextlib
 import importlib.util
+import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
@@ -54,10 +56,24 @@ it("saves", async () => {
 """
 
 
+
+
+@contextlib.contextmanager
+def _no_bytecode():
+    """Keep spec_from_file_location loads from writing scripts/__pycache__
+    into the repository working tree (the frozen siblings do the same)."""
+    old = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        yield
+    finally:
+        sys.dont_write_bytecode = old
+
 def _load():
     spec = importlib.util.spec_from_file_location("check_batch_mock_seq_t", SCRIPT)
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    with _no_bytecode():
+        spec.loader.exec_module(mod)
     return mod
 
 

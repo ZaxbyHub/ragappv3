@@ -33,10 +33,14 @@ network and no gh CLI:
 * A scheduled workflow is healthy when the fixture holds a run with
   ``path`` == the workflow file, ``event == "schedule"`` and
   ``conclusion == "success"`` whose ``created_at`` is younger than 48h
-  (relative to now). Missing, older, or only failed/cancelled runs are
-  stale.
-* Any stale scheduled workflow → exit 1 with one line naming it; all fresh
-  → exit 0.
+  (relative to now). Otherwise it FAILS the gate, and the output names the
+  failure mode so a red tier is never reported as a dead one (PR #1045
+  review, NEW-001): ``DEAD`` = no scheduled run in the fixture at all,
+  ``STALE`` = last success older than 48h, ``FAILING`` = scheduled runs
+  within the window but none concluded success (the schedule is alive;
+  the tier itself is red).
+* Any failing scheduled workflow → exit 1 with one line naming it; all
+  fresh → exit 0.
 
 Stdlib-only on purpose. Run from anywhere (paths resolve from this file).
 """
@@ -56,19 +60,36 @@ SELF_WORKFLOW = "gate-liveness.yml"
 STALENESS_LIMIT = timedelta(hours=48)
 
 # Bare `on:` key at column 0 opens the trigger block; the next column-0 key
-# closes it. Inside the block, an indented `schedule:` line is the trigger.
+# closes it. Quoted keys (`"on":` / `'on':`) are legal YAML that GitHub
+# Actions accepts, so they open the block too (PR #1045 review, PRR-003 —
+# an unquoted-only match silently excluded such workflows from monitoring).
+# Comment lines are transparent: they never open or close a block and never
+# end one (a column-0 comment between trigger keys would otherwise truncate
+# the walk — the out-of-band #1045 review's column-0-comment finding).
 _ON_BLOCK_RE = re.compile(r"(?m)^on:\s*(?:#.*)?$")
+_ON_BLOCK_QUOTED_RE = re.compile(r"(?m)^['\"]on['\"]:\s*(?:#.*)?$")
 _SCHEDULE_LINE_RE = re.compile(r"(?m)^\s+schedule:\s*(?:#.*)?$")
 # Flow-style single-line triggers (on: {schedule: ...}) or any other shape we
 # cannot decide: if the text mentions schedule near the on: line, treat as
 # scheduled (fail closed).
 _ON_FLOW_SCHEDULE_RE = re.compile(r"(?m)^on:.*\bschedule\b")
+_ON_FLOW_SCHEDULE_QUOTED_RE = re.compile(r"(?m)^['\"]on['\"].*\bschedule\b")
+
+
+def _strip_comment_lines(text: str) -> str:
+    """Drop full-line comments so they can't open/close/terminate a block."""
+    return re.sub(r"(?m)^\s*#.*$", "", text)
 
 
 def _scheduled_workflows() -> list[Path]:
-    """Workflow files under .github/workflows/ with a schedule trigger."""
+    """Workflow files under .github/workflows/ with a schedule trigger.
+
+    ``*.yml`` AND ``*.yaml`` are discovered (GitHub Actions accepts both; a
+    ``.yaml`` scheduled tier was silently unmonitored before — PRR-003).
+    """
     scheduled: list[Path] = []
-    for wf_path in sorted(WORKFLOWS_DIR.glob("*.yml")):
+    wf_paths = sorted({*WORKFLOWS_DIR.glob("*.yml"), *WORKFLOWS_DIR.glob("*.yaml")})
+    for wf_path in wf_paths:
         try:
             text = wf_path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
@@ -77,11 +98,12 @@ def _scheduled_workflows() -> list[Path]:
             # fail-closed direction.
             scheduled.append(wf_path)
             continue
-        open_match = _ON_BLOCK_RE.search(text)
+        cleaned = _strip_comment_lines(text)
+        open_match = _ON_BLOCK_RE.search(cleaned) or _ON_BLOCK_QUOTED_RE.search(cleaned)
         decided = False
         if open_match is not None:
             # The block ends at the next column-0 key after the on: line.
-            tail = text[open_match.end():]
+            tail = cleaned[open_match.end():]
             end = re.search(r"(?m)^\S", tail)
             block = tail if end is None else tail[: end.start()]
             if _SCHEDULE_LINE_RE.search(block):
@@ -93,7 +115,10 @@ def _scheduled_workflows() -> list[Path]:
                 if "schedule" in block:
                     scheduled.append(wf_path)
                     decided = True
-        if not decided and _ON_FLOW_SCHEDULE_RE.search(text):
+        if not decided and (
+            _ON_FLOW_SCHEDULE_RE.search(cleaned)
+            or _ON_FLOW_SCHEDULE_QUOTED_RE.search(cleaned)
+        ):
             scheduled.append(wf_path)
     return scheduled
 
@@ -138,16 +163,26 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     now = datetime.now(timezone.utc)
-    # Newest successful scheduled run per workflow path.
+    # Newest successful scheduled run and newest scheduled run AT ALL, per
+    # workflow path. The second map is what distinguishes a tier that is
+    # SCHEDULING but failing from one whose schedule went silent (the
+    # #1045 NEW-001 finding: both used to render as "no successful run",
+    # hiding which failure mode the operator is looking at).
     newest_success: dict[str, datetime] = {}
+    newest_any: dict[str, datetime] = {}
     for run in runs:
         if not isinstance(run, dict):
             continue
-        if run.get("event") != "schedule" or run.get("conclusion") != "success":
+        if run.get("event") != "schedule":
             continue
         path = run.get("path")
         created = _parse_created_at(run.get("created_at", ""))
         if not isinstance(path, str) or created is None:
+            continue
+        prior_any = newest_any.get(path)
+        if prior_any is None or created > prior_any:
+            newest_any[path] = created
+        if run.get("conclusion") != "success":
             continue
         prior = newest_success.get(path)
         if prior is None or created > prior:
@@ -158,29 +193,48 @@ def main(argv: list[str] | None = None) -> int:
         print("gate-liveness: no scheduled workflows found under .github/workflows/")
         return 0
 
+    # stale = last SUCCESS older than the window; failing = scheduled recently
+    # but with no success in the fixture. Both fail the gate, but the output
+    # names the failure mode so a red tier is never reported as a dead one.
     stale: list[tuple[Path, datetime | None]] = []
+    failing: list[Path] = []
     for wf_path in scheduled:
         rel = f".github/workflows/{wf_path.name}"
         last = newest_success.get(rel)
-        if last is None or (now - last) > STALENESS_LIMIT:
+        if last is not None and (now - last) <= STALENESS_LIMIT:
+            continue
+        if rel in newest_any and (now - newest_any[rel]) <= STALENESS_LIMIT:
+            failing.append(wf_path)
+        else:
             stale.append((wf_path, last))
 
-    if stale:
+    if stale or failing:
         print(
-            "gate-liveness: FAIL — scheduled workflow(s) with no successful "
+            "gate-liveness: FAIL — scheduled workflow(s) without a successful "
             f"scheduled run in the last {int(STALENESS_LIMIT.total_seconds() // 3600)}h:",
             file=sys.stderr,
         )
         for wf_path, last in stale:
             if last is None:
-                print(f"  {wf_path.name}: no successful scheduled run in the fixture", file=sys.stderr)
+                print(
+                    f"  {wf_path.name}: DEAD — no successful scheduled run in "
+                    "the fixture (schedule may be silent)",
+                    file=sys.stderr,
+                )
             else:
                 age_h = (now - last).total_seconds() / 3600
                 print(
-                    f"  {wf_path.name}: last successful scheduled run "
+                    f"  {wf_path.name}: STALE — last successful scheduled run "
                     f"{age_h:.1f}h ago ({last.isoformat()})",
                     file=sys.stderr,
                 )
+        for wf_path in failing:
+            print(
+                f"  {wf_path.name}: FAILING — scheduled runs exist within the "
+                "window but none concluded success (check the tier's own run "
+                "history; the schedule itself is alive)",
+                file=sys.stderr,
+            )
         return 1
 
     print(

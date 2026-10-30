@@ -76,9 +76,9 @@ def test_git_listing_returns_raw_unicode_path(tmp_path, monkeypatch, script_name
 )
 def test_missing_git_ends_with_gate_message(monkeypatch, capsys, script_name):
     """C20 supplement: under a missing git binary each main() must END with a
-    gate message (its own prefix) and an exit code in {0, 1} — not silence."""
-    import sys as _sys
-
+    gate message (its own prefix) and an exit code in {0, 1} — not silence.
+    (Under GITHUB_ACTIONS the sast gate now fails closed — the message leg
+    holds either way.)"""
     mod = _load(script_name, script_name + "_msg")
     real_run = subprocess.run
 
@@ -98,4 +98,45 @@ def test_missing_git_ends_with_gate_message(monkeypatch, capsys, script_name):
     assert re.search(
         r"(sast-baseline|secretscan):", combined
     ), f"{script_name} ended without a gate message: {combined!r}"
-    assert _sys.modules is not None  # keep import used
+
+
+def test_walk_prune_keeps_a_positive_control(tmp_path, monkeypatch):
+    """AC16 supplement (PRR-007c): the frozen C16 check asserts pruned trees
+    are ABSENT; an on_disk_files() that returned NOTHING at all would also
+    pass it. This control requires the non-pruned seeded file to be PRESENT."""
+    mod = _load("check_secretscan", "check_secretscan_ctrl")
+    (tmp_path / "frontend" / "node_modules" / "pkg").mkdir(parents=True)
+    (tmp_path / "frontend" / "node_modules" / "pkg" / "a.js").write_text("x", encoding="utf-8")
+    (tmp_path / "backend" / ".venv" / "lib").mkdir(parents=True)
+    (tmp_path / "backend" / ".venv" / "lib" / "b.py").write_text("x", encoding="utf-8")
+    (tmp_path / "notes.txt").write_text("keep", encoding="utf-8")
+    monkeypatch.setattr(mod, "ROOT", tmp_path)
+    files = mod.on_disk_files()
+    assert "notes.txt" in files, (
+        f"the non-pruned control file must survive the walk (an empty result "
+        f"would make the absence assertions vacuous); got {files!r}"
+    )
+    assert not any("node_modules" in f or ".venv" in f for f in files)
+
+
+def test_scope_drift_change_detection_makes_git_calls(tmp_path, monkeypatch):
+    """AC21 supplement (PRR-007f): the frozen timeout census passes when a
+    script makes NO git call at all. This control requires check_pr_scope_
+    drift's git path to actually run (its recorded calls must be non-empty)."""
+    calls: list[dict] = []
+    real_run = subprocess.run
+
+    def recording_run(cmd, *args, **kwargs):
+        if cmd and cmd[0] == "git":
+            calls.append({"timeout": kwargs.get("timeout")})
+        return real_run(cmd, *args, **kwargs)
+
+    mod = _load("check_pr_scope_drift", "check_pr_scope_drift_ctrl")
+    monkeypatch.setenv("PR_SCOPE_DRIFT_BASE", "origin/master")
+    monkeypatch.setattr(subprocess, "run", recording_run)
+    mod.changed_files()
+    monkeypatch.undo()
+    assert calls, "check_pr_scope_drift must issue at least one git call"
+    assert all(c["timeout"] is not None for c in calls), (
+        f"every recorded git call must carry a finite timeout: {calls!r}"
+    )

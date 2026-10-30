@@ -45,11 +45,14 @@ from pathlib import Path
 GIT_TIMEOUT_SECONDS = 60
 
 # Verbs whose stdout is a path listing (NUL-delimited with -z). Anything else
-# is treated as a content/status call and returned as text.
+# is treated as a content/status call and returned as text. `status` is
+# deliberately NOT a listing verb here: `git status --porcelain -z` records
+# carry the XY status prefix, not raw repo-relative paths, and the token
+# shape differs from listings (PR #1045 review, PRR-016) — status reads go
+# through run_git and parse their own record shape.
 _LISTING_VERBS = {
     "ls-files",
     "diff",
-    "status",
 }
 
 
@@ -103,11 +106,3 @@ def git_lines(root: Path, *args: str) -> list[str] | None:
     if proc is None or proc.returncode != 0 or proc.stdout is None:
         return None
     return [line for line in proc.stdout.splitlines() if line.strip()]
-
-
-def git_text(root: Path, *args: str) -> str | None:
-    """Run a CONTENT git command (e.g. ``show <rev>:<path>``); raw text or None."""
-    proc = run_git(root, *args)
-    if proc is None or proc.returncode != 0 or proc.stdout is None:
-        return None
-    return proc.stdout

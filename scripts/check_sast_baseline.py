@@ -64,6 +64,19 @@ def fail(message: str) -> None:
     print(f"sast-baseline: {message}", file=sys.stderr)
 
 
+def _git_fault(message: str) -> bool:
+    """Handle a git-cannot-answer fault (binary missing / timeout / OSError —
+    NOT a command that ran and exited non-zero). Under GITHUB_ACTIONS the
+    gate fails closed (a monitoring gate must not print "all checks passed"
+    on an instrument fault — PR #1045 review, PRR-008/F2-01); locally it
+    degrades with a note. Returns True when the caller should fail."""
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        fail(message)
+        return True
+    print(f"sast-baseline: note — {message}; continuing with local degrade", file=sys.stderr)
+    return False
+
+
 def run_git(args: list[str]) -> str:
     """Bounded, OSError-tolerant git text call (content verbs).
 
@@ -72,13 +85,17 @@ def run_git(args: list[str]) -> str:
     answer", never as an empty list that would silently satisfy a check.
     """
     proc = _gate_git.run_git(ROOT, *args)
-    if proc is None:
+    if proc is None or proc.returncode != 0:
         return ""
     return proc.stdout or ""
 
 
-def changed_files() -> list[str]:
+def changed_files() -> list[str] | None:
     """Changed files on this PR vs the merge-base with master (best-effort).
+
+    Returns None when git could not answer at all (binary missing, timed
+    out, OSError) — the caller decides skip-with-note locally vs fail-closed
+    in CI. A returned [] is a real, empty answer (no changed files).
 
     Listings go through the shared NUL-delimited helper, so a non-ASCII or
     whitespace-edged tracked path arrives raw instead of core.quotePath
@@ -92,27 +109,45 @@ def changed_files() -> list[str]:
         if not base:
             continue
         mb_lines = _gate_git.git_lines(ROOT, "merge-base", base, "HEAD")
+        if mb_lines is None:
+            return None
         if not mb_lines:
             continue
         diff = _gate_git.git_lines(ROOT, "diff", "--name-only", f"{mb_lines[0]}..HEAD")
+        if diff is None:
+            return None
         if diff:
             return diff
+        return []
     # Local fallback.
-    return _gate_git.git_lines(ROOT, "diff", "--name-only", "HEAD~1..HEAD") or []
+    diff = _gate_git.git_lines(ROOT, "diff", "--name-only", "HEAD~1..HEAD")
+    if diff is None:
+        return None
+    return diff
 
 
 def _sast_job_block(text: str) -> str | None:
     """The `sast:` job's own text block (indentation-delimited), or None.
 
-    Stdlib indentation walk over the jobs mapping: the block starts at the
-    `  sast:` key and ends at the next key at the same indentation. This is
-    what binds C-005's run: search to the job it names (issue #740) —
-    scanning the whole file let any unrelated job's `run:` line satisfy the
-    check.
+    Stdlib indentation walk scoped to the `jobs:` mapping (PR #1045 review,
+    PRR-005/ST-05: the previous first-match-anywhere walk let a decoy
+    2-space `sast:` key planted above `jobs:` hijack the extraction). The
+    block starts at the `  sast:` key INSIDE the top-level `jobs:` mapping
+    and ends at the next key at the same indentation.
     """
     lines = text.splitlines()
-    start = None
+    jobs_start = None
     for idx, line in enumerate(lines):
+        if re.match(r"^jobs:\s*(#.*)?$", line):
+            jobs_start = idx
+            break
+    if jobs_start is None:
+        return None
+    start = None
+    for idx in range(jobs_start + 1, len(lines)):
+        line = lines[idx]
+        if line.strip() and not line.startswith(" "):
+            break  # next top-level key — jobs: mapping ended, no sast job
         if re.match(r"^  sast:\s*(#.*)?$", line):
             start = idx
             break
@@ -128,6 +163,21 @@ def _sast_job_block(text: str) -> str | None:
     return "\n".join(block)
 
 
+def _invokes_run_bandit(cmd: str) -> bool:
+    """True when a `run:` command is a real python invocation of the gated
+    scan (PRR-005/ST-04: the substring test let `run: echo run_bandit.py`
+    satisfy C-005). The FIRST shell token must be the python interpreter and
+    the command must carry the script path without --update-baseline.
+    """
+    cmd = cmd.strip()
+    if "--update-baseline" in cmd:
+        return False
+    first = re.split(r"[\s|;&]+", cmd, maxsplit=1)[0] if cmd else ""
+    if first not in ("python", "python3"):
+        return False
+    return bool(re.search(r"(?:^|[\s\"'/\\])run_bandit\.py(?:[\s\"']|$)", cmd))
+
+
 def check_workflow_integrity() -> bool:
     """C-005: the ci.yml `sast` job itself must run run_bandit.py (gated mode)."""
     if not CI_FILE.exists():
@@ -139,15 +189,13 @@ def check_workflow_integrity() -> bool:
         fail("C-005: .github/workflows/ci.yml has no `sast:` job — SAST gate is missing")
         return False
     # Require a `run:` step INSIDE the sast job whose command actually invokes
-    # the gated scan (python ... run_bandit.py with NO --update-baseline). The
-    # token must appear before any trailing `#` comment, and the command must
-    # not be the always-exits-0 baseline-regeneration mode — otherwise a PR
-    # could swap the gated scan for `run_bandit.py --update-baseline` or move
-    # the scan into an unrelated job and the gate would never fail.
+    # the gated scan: a python-first command carrying run_bandit.py with NO
+    # --update-baseline (PRR-005). A PR could otherwise swap the gated scan
+    # for an echo/printf mentioning the script or move it out of the job and
+    # the gate would never fail.
     runs_run_bandit = False
     for m in re.finditer(r"^\s*run:\s*([^#\n]*)", block, re.MULTILINE):
-        cmd = m.group(1)
-        if "run_bandit.py" in cmd and "--update-baseline" not in cmd:
+        if _invokes_run_bandit(m.group(1)):
             runs_run_bandit = True
             break
     if not runs_run_bandit:
@@ -248,11 +296,22 @@ def check_baseline_expansion(paths: list[str]) -> bool:
     ):
         if not base:
             continue
-        mb = run_git(["merge-base", base, "HEAD"]).strip()
-        if not mb:
+        mb_lines = _gate_git.git_lines(ROOT, "merge-base", base, "HEAD")
+        if mb_lines is None:
+            # git itself could not answer (broken/timeout) — distinct from a
+            # legitimate non-answer; never treat as "initial seeding"
+            # (PR #1045 review, ST-06).
+            if _git_fault(f"git merge-base against {base} could not run; cannot verify baseline did not expand"):
+                return False
+            return True
+        if not mb_lines:
             continue
-        show = _gate_git.run_git(ROOT, "show", f"{mb}:{baseline_rel}")
-        if show is not None and show.returncode == 0:
+        show = _gate_git.run_git(ROOT, "show", f"{mb_lines[0]}:{baseline_rel}")
+        if show is None:
+            if _git_fault(f"git show {mb_lines[0]}:{baseline_rel} could not run; cannot verify baseline did not expand"):
+                return False
+            return True
+        if show.returncode == 0:
             prev_text = show.stdout
             break
 
@@ -324,6 +383,13 @@ def check_baseline_expansion(paths: list[str]) -> bool:
 
 def main() -> int:
     paths = changed_files()
+    if paths is None:
+        # git could not answer at all: fail closed in CI, degrade with a
+        # note locally (PR #1045 review, PRR-008 — this gate used to print
+        # "all checks passed" on exactly this fault).
+        if _git_fault("git could not determine the changed-file set; the C-002 baseline-expansion gate cannot run"):
+            return 1
+        return 0
     ok = True
     if not check_workflow_integrity():
         ok = False

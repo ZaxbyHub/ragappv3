@@ -37,16 +37,22 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           since=$(date -u -d '30 days ago' +%Y-%m-%d)
-          # --paginate emits one JSON body per page (concatenated, not merged);
-          # decode_incremental reassembles them into the single
-          # {"workflow_runs": [...]} fixture shape the checker consumes.
+          # NO `|| true` here (PR #1045 review, PRR-004): a fetch failure
+          # must fail the step with gh's real error, not degrade into an
+          # empty fixture the checker would render as "every workflow
+          # stale". The merge step below additionally refuses an empty
+          # response so an instrument fault can never masquerade as tier
+          # death.
           gh api --paginate "repos/${{ github.repository }}/actions/runs?event=schedule&per_page=100&created=>=${since}" \
-            > gate-liveness-runs.raw.json || true
+            > gate-liveness-runs.raw.json
           python - <<'PY'
           import json
+          import sys
 
           decoder = json.JSONDecoder()
           raw = open("gate-liveness-runs.raw.json", encoding="utf-8").read().strip()
+          if not raw:
+              sys.exit("gate-liveness: run-history fetch returned an empty body — instrument fault, refusing to evaluate")
           runs = []
           idx = 0
           while idx < len(raw):

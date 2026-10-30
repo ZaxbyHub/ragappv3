@@ -22,12 +22,12 @@ _gate_git = _ilu.module_from_spec(_gate_git_spec)
 _gate_git_spec.loader.exec_module(_gate_git)
 
 
-def run_git(args: list[str]):
-    """Bounded, OSError-tolerant git call (kept for parity/tests)."""
-    return _gate_git.run_git(ROOT, *args)
-
-
-def changed_files() -> list[str]:
+def changed_files() -> list[str] | None:
+    """Changed files vs the merge-base, or None when git cannot answer at
+    all (binary missing / timeout / OSError — distinct from a legitimate
+    empty answer). The caller fails closed under GITHUB_ACTIONS (PR #1045
+    review, PRR-008/F2-01: this gate used to print "all checks passed" on
+    exactly that fault)."""
     explicit_base = os.environ.get("PR_SCOPE_DRIFT_BASE")
     github_base = os.environ.get("GITHUB_BASE_REF")
     candidates = []
@@ -42,22 +42,23 @@ def changed_files() -> list[str]:
         # arrives raw instead of core.quotePath C-quoted, so it can never
         # silently evade the prefix checks below.
         merge_base = _gate_git.git_lines(ROOT, "merge-base", base, "HEAD")
+        if merge_base is None:
+            return None
         if not merge_base:
             continue
         diff = _gate_git.git_lines(
             ROOT, "diff", "--name-only", f"{merge_base[0]}..HEAD"
         )
-        if diff is not None:
+        if diff is None:
+            return None
+        if diff:
             return diff
+        return []
 
     fallback = _gate_git.git_lines(ROOT, "diff", "--name-only", "HEAD~1..HEAD")
-    if fallback is not None:
-        return fallback
-    print(
-        "scope-drift: unable to determine changed files; skipping drift check",
-        file=sys.stderr,
-    )
-    return []
+    if fallback is None:
+        return None
+    return fallback
 
 
 def has_path(paths: list[str], prefixes: tuple[str, ...]) -> bool:
@@ -66,6 +67,16 @@ def has_path(paths: list[str], prefixes: tuple[str, ...]) -> bool:
 
 def main() -> int:
     paths = changed_files()
+    if paths is None:
+        # git could not answer at all: fail closed in CI (a gate must not
+        # print "all checks passed" on an instrument fault — PR #1045
+        # review, PRR-008), degrade with the skip note locally.
+        message = "unable to determine changed files (git could not answer); drift check cannot run"
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            print(f"scope-drift: {message}", file=sys.stderr)
+            return 1
+        print(f"scope-drift: {message}", file=sys.stderr)
+        return 0
     failures: list[str] = []
 
     auth_test_changed = any(

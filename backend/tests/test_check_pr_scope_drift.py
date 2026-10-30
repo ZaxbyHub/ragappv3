@@ -6,17 +6,33 @@ live prefix covering auth_service.py and authz_policy.py — the fix keeps
 it and adds backend/app/api/deps.py).
 """
 
+import contextlib
 import importlib.util
+import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 SCRIPT = REPO / "scripts" / "check_pr_scope_drift.py"
 
 
+
+
+@contextlib.contextmanager
+def _no_bytecode():
+    """Keep spec_from_file_location loads from writing scripts/__pycache__
+    into the repository working tree (the frozen siblings do the same)."""
+    old = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        yield
+    finally:
+        sys.dont_write_bytecode = old
+
 def _load():
     spec = importlib.util.spec_from_file_location("check_pr_scope_drift_t", SCRIPT)
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    with _no_bytecode():
+        spec.loader.exec_module(mod)
     return mod
 
 
@@ -83,3 +99,17 @@ def test_scope_drift_removed_dead_prefixes(monkeypatch):
     source = SCRIPT.read_text(encoding="utf-8")
     assert '"backend/app/deps.py"' not in source
     assert '"backend/app/models/auth"' not in source
+
+
+def test_scope_drift_git_fault_fails_closed_in_ci(tmp_path, monkeypatch, capsys):
+    """PRR-008: under GITHUB_ACTIONS a git instrument fault must fail the
+    gate (main() -> 1) instead of printing 'all checks passed'."""
+    mod = _load()
+    monkeypatch.setattr(mod, "ROOT", tmp_path)
+    monkeypatch.setattr(mod._gate_git, "git_lines", lambda root, *args, **kw: None)
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    rc = mod.main()
+    captured = capsys.readouterr()
+    combined = captured.out + captured.err
+    assert rc == 1
+    assert "all checks passed" not in combined

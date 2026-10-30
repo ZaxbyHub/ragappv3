@@ -5,8 +5,10 @@ misplaced-step negative), C-003 (TARGETS scope), C-002 (baseline expansion
 gate). The gate had zero test references at the #740 base.
 """
 
+import contextlib
 import importlib.util
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -15,10 +17,24 @@ REPO = Path(__file__).resolve().parents[2]
 SCRIPT = REPO / "scripts" / "check_sast_baseline.py"
 
 
+
+
+@contextlib.contextmanager
+def _no_bytecode():
+    """Keep spec_from_file_location loads from writing scripts/__pycache__
+    into the repository working tree (the frozen siblings do the same)."""
+    old = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        yield
+    finally:
+        sys.dont_write_bytecode = old
+
 def _load():
     spec = importlib.util.spec_from_file_location("check_sast_baseline_t", SCRIPT)
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    with _no_bytecode():
+        spec.loader.exec_module(mod)
     return mod
 
 
@@ -127,3 +143,64 @@ def test_sast_c002_blocks_baseline_growth(tmp_path, monkeypatch):
     monkeypatch.setattr(mod._gate_git, "run_git", fake_gate_git_run_git)
 
     assert mod.check_baseline_expansion([baseline_rel]) is False
+
+
+def test_sast_c005_rejects_echo_shaped_run_line(tmp_path):
+    """PRR-005/ST-04: `run: echo run_bandit.py` inside the sast job must NOT
+    satisfy C-005 (the binding requires a python-first invocation)."""
+    mod = _load()
+    fake = tmp_path / "ci.yml"
+    fake.write_text(
+        "jobs:\n"
+        "  sast:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - name: scan\n"
+        "        run: echo run_bandit.py\n",
+        encoding="utf-8",
+    )
+    original = mod.CI_FILE
+    mod.CI_FILE = fake
+    try:
+        assert mod.check_workflow_integrity() is False
+    finally:
+        mod.CI_FILE = original
+
+
+def test_sast_c005_rejects_decoy_sast_key_above_jobs(tmp_path):
+    """PRR-005/ST-05: a decoy 2-space `sast:` key planted ABOVE the jobs:
+    mapping must not hijack the block extraction."""
+    mod = _load()
+    fake = tmp_path / "ci.yml"
+    fake.write_text(
+        "name: decoy\n"
+        "env:\n"
+        "  sast: python scripts/run_bandit.py\n"
+        "jobs:\n"
+        "  sast:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - name: scan\n"
+        "        run: echo pass\n",
+        encoding="utf-8",
+    )
+    original = mod.CI_FILE
+    mod.CI_FILE = fake
+    try:
+        assert mod.check_workflow_integrity() is False
+    finally:
+        mod.CI_FILE = original
+
+
+def test_sast_c002_git_fault_fails_closed_in_ci(tmp_path, monkeypatch, capsys):
+    """PRR-008: under GITHUB_ACTIONS a git instrument fault must fail the
+    gate (main() -> 1) instead of printing 'all checks passed'."""
+    mod = _load()
+    monkeypatch.setattr(mod, "ROOT", tmp_path)
+    monkeypatch.setattr(mod._gate_git, "git_lines", lambda root, *args, **kw: None)
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    rc = mod.main()
+    captured = capsys.readouterr()
+    combined = captured.out + captured.err
+    assert rc == 1
+    assert "all checks passed" not in combined

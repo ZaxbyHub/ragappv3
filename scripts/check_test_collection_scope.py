@@ -142,6 +142,14 @@ def _is_under_backend_tests(rel_posix: str) -> bool:
     return len(parts) >= 2 and parts[0] == "backend" and parts[1] == "tests"
 
 
+def _is_candidate(name: str, patterns: tuple[str, ...]) -> bool:
+    """A file this gate must examine: legacy test-shaped (so the gate keeps
+    working without a pyproject) OR matching a configured python_files
+    pattern (PR #1045 review, PRR-010: the legacy-only pre-filter hid files
+    collected under a custom pattern like ``spec_*.py``)."""
+    return _is_test_filename(name) or _is_collected_by_pytest(name, patterns)
+
+
 def _walk_violations(repo_root: Path, patterns: tuple[str, ...]) -> list[str]:
     """Degraded-mode candidate set: the original filesystem walk, with the
     same collected-by-pytest check as git mode (issue #740)."""
@@ -160,7 +168,7 @@ def _walk_violations(repo_root: Path, patterns: tuple[str, ...]) -> list[str]:
                 if entry.name.startswith(".") or entry.name in PRUNE_DIRS:
                     continue
                 stack.append(entry)
-            elif entry.is_file() and _is_test_filename(entry.name):
+            elif entry.is_file() and _is_candidate(entry.name, patterns):
                 if not _is_collected_by_pytest(entry.name, patterns):
                     violations.append(entry.relative_to(repo_root).as_posix())
                     continue
@@ -171,13 +179,14 @@ def _walk_violations(repo_root: Path, patterns: tuple[str, ...]) -> list[str]:
 
 
 def find_violations(repo_root: Path) -> list[str]:
-    """Return test files pytest never collects, as repo-relative POSIX paths.
+    """Return test files pytest never collects (or never reaches), as
+    repo-relative POSIX paths.
 
-    Two violation classes (issue #740): a test-shaped file OUTSIDE
-    backend/tests/ (never reached by ``pytest tests/``), and a test-shaped
-    file ANYWHERE — including under backend/tests/ — that matches no
-    ``python_files`` pattern in backend/pyproject.toml (pytest silently
-    skips it at collection).
+    Violation classes (issue #740 + PR #1045 review): a test-shaped or
+    configured-pattern file OUTSIDE backend/tests/ (never reached by
+    ``pytest tests/``), and such a file ANYWHERE — including under
+    backend/tests/ — that matches no ``python_files`` pattern in
+    backend/pyproject.toml (pytest silently skips it at collection).
     """
     tracked = _git_paths(repo_root, "ls-files", "-z")
     untracked = _git_paths(
@@ -194,7 +203,7 @@ def find_violations(repo_root: Path) -> list[str]:
     violations: list[str] = []
     for rel in sorted(set(tracked) | set(untracked)):
         name = Path(rel).name
-        if not _is_test_filename(name):
+        if not _is_candidate(name, patterns):
             continue
         if not (repo_root / rel).is_file():
             continue

@@ -150,9 +150,13 @@ def test_workflow_steps_use_only_schema_keys():
     """#739-AC1: every step in every workflow uses only Actions schema keys.
 
     A key dedented out of ``with:`` to step level (like nightly.yml's
-    ``if-no-files-found``) is silently ignored by Actions — the setting stops
-    applying and no error is raised. The frozen contract: the sorted list of
-    "<file>: <key>" offenders over all .github/workflows/*.yml is empty.
+    ``if-no-files-found``) is an INVALID step key: GitHub REJECTS the whole
+    workflow file — every push run failed at startup as a workflow-file
+    issue and zero schedule runs exist since the mis-indentation landed
+    (gh-API evidence: 708 failing runs, 0 scheduled; this is why the tier
+    was invisible for two weeks, not merely a silently-dropped setting).
+    The frozen contract: the sorted list of "<file>: <key>" offenders over
+    all .github/workflows/*.yml is empty.
     """
     offenders: list[str] = []
     for wf_path in sorted(WORKFLOWS.glob("*.yml")):
@@ -298,10 +302,13 @@ def test_stryker_job_has_timeout_headroom():
 def test_schemathesis_exit_code_survives_pipefail(tmp_path):
     """#739-AC5: SCHEMATHESIS_EXIT must record the tool's real exit code.
 
-    The step runs under GitHub Actions' default ``bash -eo pipefail``. The
-    ``|| true`` guard resets PIPESTATUS before ``rc=${PIPESTATUS[0]}`` runs,
-    so a crashed schemathesis run is recorded as SCHEMATHESIS_EXIT=0 and the
-    downstream gate can never see the crash. The step script is executed
+    Executed under ``bash -eo pipefail`` — the shell mode an explicit
+    ``shell: bash`` step selects (GitHub Actions' DEFAULT is ``bash -e``,
+    with NO pipefail). The pre-fix step captured the exit code only via a
+    ``|| true`` pipeline followed by ``rc=${PIPESTATUS[0]}``; under
+    pipefail the ``|| true`` reset PIPESTATUS to 0, so a crashed
+    schemathesis run was recorded as SCHEMATHESIS_EXIT=0 and the
+    downstream gate could never see the crash. The step script is executed
     verbatim with a ``python`` shim that exits 3 first on PATH; frozen
     contract: schemathesis-run.log records ``SCHEMATHESIS_EXIT=3``.
     """

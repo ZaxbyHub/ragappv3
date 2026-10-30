@@ -65,4 +65,4 @@ there is no consumer for a routing YAML, and adding one would be unwired
 **Detect docker scope** + **Docker build smoke** (the smoke builds the images when the docker surface changed),
 **SAST** (`scripts/run_bandit.py` — bandit baseline gate, fails on new findings or unused `# nosec` suppressions).
 **Closure evidence** (`.github/workflows/closure-evidence.yml` — PRs whose bodies `Closes #N` an issue must name verifiable closure evidence; `high`/`critical` issues need a cross-family approval; warn-mode rollout — see `docs/ci/closure-evidence-gate.md`).
-Scheduled: `nightly.yml` (full deps) and `nightly-quality-gates.yml` (mutmut / schemathesis / stryker).
+Scheduled: `nightly.yml` (full deps), `nightly-quality-gates.yml` (mutmut / schemathesis / stryker), and `gate-liveness.yml` (scheduled-workflow liveness, issue #739).

@@ -129,12 +129,18 @@ jobs:
             rm -rf mutants
             # Record the mutmut run's own exit code per module (no || true on
             # the capture): the score step hard-fails on a nonzero .rc so a
-            # crashed/hung run can never masquerade as a passing score, while
-            # export still runs so partial diagnostics reach the artifact.
+            # crashed/hung run can never masquerade as a passing score.
             rc=0
             python -m mutmut run || rc=$?
             echo "$rc" > "mutation-stats/${module}.rc"
-            python -m mutmut export-cicd-stats > "mutation-stats/${module}.json" 2>&1 || true
+            # mutmut 3.7's export-cicd-stats writes the JSON to the FILE
+            # mutants/mutmut-cicd-stats.json and prints only a status line to
+            # stdout — redirecting stdout would make the stats file non-JSON
+            # and the score step UNPARSEABLE forever (PR #1045 review,
+            # PRR-001/DBR-007). Copy the written file; the printed status line
+            # goes to the step log.
+            python -m mutmut export-cicd-stats
+            cp "mutants/mutmut-cicd-stats.json" "mutation-stats/${module}.json"
           done < mutation_modules.txt
 
       - name: Report per-module mutation scores and enforce the survival budget
