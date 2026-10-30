@@ -48,6 +48,17 @@ let principalGeneration = 0;
 const principalListeners = new Set<() => void>();
 
 export function captureAuthPrincipalGeneration(): number { return principalGeneration; }
+
+/**
+ * Current principal's role, or null when no principal is published (issue
+ * #1039). Poll-time consumers that must gate admin-only dispatches (the
+ * Activity tray's reindex family) read this instead of subscribing to the
+ * auth store: auth-lifecycle is dependency-free, so importing it cannot drag
+ * the store/api graphs into a polling module. The auth store publishes here
+ * at its module init and on every principal change, so any authenticated
+ * shell sees its role; null means "unknown — fall back to your own backoff".
+ */
+export function captureAuthPrincipalRole(): string | null { return principalRole; }
 export function subscribeAuthPrincipal(listener: () => void): () => void {
   principalListeners.add(listener);
   return () => { principalListeners.delete(listener); };
