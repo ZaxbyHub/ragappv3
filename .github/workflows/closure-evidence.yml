@@ -105,12 +105,12 @@ jobs:
           PREFLIGHT_RC=0
           PR_JSON="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")" || PREFLIGHT_RC=$?
           if [ "$PREFLIGHT_RC" -eq 0 ]; then
-            BASE_REF="$(printf '%s' "$PR_JSON" | python -I -c 'import json,sys; print(json.load(sys.stdin)["base"]["ref"])')" || PREFLIGHT_RC=$?
+            BASE_REF="$(printf '%s' "$PR_JSON" | python -I -c "import json,sys; print(json.load(sys.stdin)['base']['ref'])")" || PREFLIGHT_RC=$?
           fi
           if [ "$PREFLIGHT_RC" -eq 0 ] && [ "${GITHUB_EVENT_NAME:-}" = "workflow_dispatch" ]; then
             # A dispatch run checks out the dispatch ref, not the PR; artifact
             # evidence must resolve against the PR head instead.
-            HEAD_SHA="$(printf '%s' "$PR_JSON" | python -I -c 'import json,sys; print(json.load(sys.stdin)["head"]["sha"])')" || PREFLIGHT_RC=$?
+            HEAD_SHA="$(printf '%s' "$PR_JSON" | python -I -c "import json,sys; print(json.load(sys.stdin)['head']['sha'])")" || PREFLIGHT_RC=$?
             if [ "$PREFLIGHT_RC" -eq 0 ]; then
               git checkout "$HEAD_SHA" || PREFLIGHT_RC=$?
             fi
@@ -163,8 +163,8 @@ jobs:
           # dispatch checkout, not the PR — so fetch both from the API (works
           # identically for pull_request events).
           PR_JSON="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")"
-          BASE_REF="$(printf '%s' "$PR_JSON" | python -I -c 'import json,sys; print(json.load(sys.stdin)["base"]["ref"])')"
-          HEAD_SHA="$(printf '%s' "$PR_JSON" | python -I -c 'import json,sys; print(json.load(sys.stdin)["head"]["sha"])')"
+          BASE_REF="$(printf '%s' "$PR_JSON" | python -I -c "import json,sys; print(json.load(sys.stdin)['base']['ref'])")"
+          HEAD_SHA="$(printf '%s' "$PR_JSON" | python -I -c "import json,sys; print(json.load(sys.stdin)['head']['sha'])")"
           BASE_SHA="$(git merge-base "origin/$BASE_REF" "$HEAD_SHA")"
           echo "verify-test base=$BASE_SHA head=$HEAD_SHA test=$TEST_ID"
           # GitHub Actions runs run: blocks under bash -e: capture the

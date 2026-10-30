@@ -395,7 +395,9 @@ def test_closure_policy_preserves_review_modes_and_api_base_resolution() -> None
     assert 'if [ "$MODE" = "enforce" ]' in source
     assert "closure-evidence: WARN" in source
     assert "closure-evidence: FAIL" in source
-    assert "python scripts/check_closure_evidence.py evaluate" in source
+    # #741: the gate invokes the BASE copy of the checker under python -I
+    # (isolated mode — no script-dir/cwd stdlib shadowing).
+    assert "python -I scripts/check_closure_evidence.py evaluate" in source
     assert '--mode "$MODE"' in source
 
     assert 'PR_JSON="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")"' in verify
