@@ -317,10 +317,10 @@ def _cache_bcrypt_hash_for_test_passwords():
     try:
         from app.services import auth_service as _auth_module
     except ImportError:
-        # Not importable (e.g. the Frontend job's minimal pytest env for the
-        # #742 venue nodes, which installs only pytest+pyyaml): yield so the
-        # generator contract holds, with nothing cached. Tests that actually
-        # exercise auth import it themselves and fail loudly there.
+        # Not importable (e.g. any minimal pytest environment without the
+        # runtime lock installed): yield so the generator contract holds,
+        # with nothing cached. Tests that actually exercise auth import it
+        # themselves and fail loudly there.
         yield
         return
 
