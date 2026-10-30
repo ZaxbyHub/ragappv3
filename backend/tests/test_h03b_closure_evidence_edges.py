@@ -374,3 +374,13 @@ def test_frontend_toolchain_nodes_have_exactly_one_venue():
     assert "skipped" in venue_run and "exit 1" in venue_run.replace("::error::", ""), (
         "the venue step must fail the job when a node skips in its only venue"
     )
+    # Round-2 review findings: the venue modules import yaml at collection
+    # time AND the shared backend conftest's autouse fixtures import the app
+    # stack, so the venue needs the SAME provision the Backend job's pytest
+    # runs under (runtime lock + dev requirements) — exactly the environment
+    # these nodes ran green in before #742. A pytest-only provision fails at
+    # collection (ModuleNotFoundError) on every run.
+    assert "requirements-lock-ci.txt" in venue_run and "requirements-dev.txt" in venue_run, (
+        "the venue step must install the Backend job's pytest provision "
+        "(runtime lock + dev requirements) or it cannot collect its modules"
+    )
