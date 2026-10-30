@@ -18,6 +18,9 @@ import type {
   SortOrder,
 } from "@/lib/api";
 
+// Shared immutable default for the optional wikiFetchFailedIds prop.
+const EMPTY_WIKI_FETCH_FAILED_IDS: Set<string> = new Set();
+
 interface DocumentTableProps {
   documents: Document[];
   selectedIds: Set<string>;
@@ -29,6 +32,7 @@ interface DocumentTableProps {
   onSelectAll: (checked: boolean | "indeterminate") => void;
   onSelectOne: (docId: string, checked: boolean) => void;
   wikiStatusMap: Record<string, DocumentWikiStatus>;
+  wikiFetchFailedIds?: Set<string>;
   compilingDocIds: Set<string>;
   onCompileDocument: (docId: string) => void;
   onDownload: (doc: Document) => void;
@@ -85,6 +89,10 @@ export function DocumentTable({
   onSelectAll,
   onSelectOne,
   wikiStatusMap,
+  // Optional so existing renderers (and their test doubles) that do not
+  // track fetch failures keep compiling; absence simply means no document is
+  // rendered as "status unavailable".
+  wikiFetchFailedIds = EMPTY_WIKI_FETCH_FAILED_IDS,
   compilingDocIds,
   onCompileDocument,
   onDownload,
@@ -313,6 +321,23 @@ export function DocumentTable({
                         const ws = wikiStatusMap[docId];
                         const isCompiling =
                           compilingDocIds.has(docId) || ws?.wiki_status === "compiling";
+                        // A FAILED wiki-status fetch is unknown, NOT
+                        // uncompiled (#765 AC6), and a current failure takes
+                        // precedence over ANY cached value (review rounds
+                        // 2-3, PRR-037/B-2/R03 + critic round 3: the branch
+                        // sits ABOVE the skipped/Compile interpretations so
+                        // no stale cached value — not_compiled OR skipped —
+                        // can mask the failure).
+                        if (wikiFetchFailedIds.has(docId)) {
+                          return (
+                            <span
+                              className="text-xs text-muted-foreground italic"
+                              title="Wiki status unavailable — the status fetch failed."
+                            >
+                              Wiki status unavailable
+                            </span>
+                          );
+                        }
                         // AC29 (#515): a document the compiler SKIPPED (no
                         // extractable knowledge) gets a distinct label — it is
                         // NOT uncompiled, so it must not offer the generic

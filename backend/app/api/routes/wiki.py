@@ -1078,12 +1078,46 @@ async def compile_document_wiki(
     if not file_row:
         raise HTTPException(status_code=404, detail=f"File {file_id} not found in vault {vault_id}")
     store = WikiStore(db)
-    job = store.create_job(
-        vault_id=vault_id,
-        trigger_type="ingest",
-        trigger_id=f"file:{file_id}",
-        input_json={"file_id": file_id, "vault_id": vault_id},
-    )
+    # Idempotent re-click (#765): while an ingest job for this file is still
+    # active (pending or running), a second Compile returns the existing job
+    # instead of enqueueing a duplicate. The lookup -> create sequence runs
+    # under BEGIN IMMEDIATE (review round 1, PRR-012: the check-then-act was
+    # not atomic across processes) so a concurrent request cannot observe
+    # "no active job" between this request's lookup and its insert; both
+    # storage arms tolerate the caller-owned transaction (job_lease._write_txn
+    # yields ownership when one is already open, and the legacy arm's commit
+    # releases the write lock after the insert).
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        for active_status in ("pending", "running"):
+            active_jobs = store.list_jobs(
+                vault_id,
+                status=active_status,
+                trigger_type="ingest",
+                trigger_id=f"file:{file_id}",
+                limit=1,
+            )
+            if active_jobs:
+                existing = active_jobs[0]
+                db.commit()
+                return {"job_id": existing.id, "status": existing.status}
+        job = store.create_job(
+            vault_id=vault_id,
+            trigger_type="ingest",
+            trigger_id=f"file:{file_id}",
+            input_json={"file_id": file_id, "vault_id": vault_id},
+        )
+        # Commit before releasing the request connection: the unified-storage
+        # arm inserts under the caller-owned transaction (job_lease._write_txn
+        # yields ownership when one is open) and the production pool ROLLS
+        # BACK a dirty connection at release — without this commit the
+        # created job would be silently discarded (caught by the round-2
+        # check-amendment author; the C2 harness hit the same missing
+        # request-boundary commit).
+        db.commit()
+    except BaseException:
+        db.rollback()
+        raise
     return {"job_id": job.id, "status": job.status}
 
 
@@ -1113,6 +1147,11 @@ async def get_document_wiki_status(
     if latest_job is None:
         wiki_status = "not_compiled"
     elif latest_job.status == "running":
+        wiki_status = "compiling"
+    elif latest_job.status == "pending":
+        # Every job starts pending (wiki_store.create_job); a queued job is a
+        # transient state the frontend must poll to completion, not the
+        # terminal not_compiled it was previously collapsed into (#765).
         wiki_status = "compiling"
     elif latest_job.status == "failed":
         wiki_status = "failed"

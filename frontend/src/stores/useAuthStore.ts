@@ -658,6 +658,14 @@ export const useAuthStore = create<AuthState>()(
       },
 
       logout: (): Promise<void> => {
+        // Before-logout flush (review round 1 PRR-007): give mounted pages
+        // holding confirmed destructive intent (e.g. DocumentsPage's pending
+        // deletes) one synchronous dispatch while the bearer and CSRF
+        // credential are still valid — everything below replaces the owner,
+        // clears the token, and resets CSRF, after which any flushed delete
+        // would 401 and the intent would be lost with a spurious toast on
+        // the login screen.
+        window.dispatchEvent(new Event("ragapp:before-logout"));
         const owner = reserveReplacementAuthOwner();
         if (isCurrentAuthOwner(owner)) set({ isLoading: true });
         const operation = (async () => {
