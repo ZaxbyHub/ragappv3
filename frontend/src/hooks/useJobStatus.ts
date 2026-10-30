@@ -6,6 +6,10 @@ import { listKMSJobs } from "@/lib/api/kms";
 import { listDrafts, listDraftJobs } from "@/lib/api/draftRoom";
 import { documentProgress } from "@/components/documents/documentProgress";
 import { useVaultStore } from "@/stores/useVaultStore";
+import {
+  captureAuthPrincipalGeneration,
+  captureAuthPrincipalRole,
+} from "@/lib/api/auth-lifecycle";
 
 /**
  * Shared job-family contract for background-job polling (issue #783).
@@ -370,13 +374,90 @@ async function fetchReindexRows(): Promise<ActivityJobRow[]> {
   );
 }
 
+// --- Reindex family visibility (issue #1039) -------------------------------
+//
+// GET /documents/reindex/jobs sits behind require_admin_role
+// (backend/app/api/routes/documents.py): for a member/viewer session it can
+// ONLY ever 403. Polling it every tray tick is pure waste the browser still
+// logs as a failed network resource (100+ 403s measured in one member
+// session, 2026-10-28). Two layers keep the family visible exactly where it
+// belongs, without touching the other four families (#1039 AC3):
+//
+//   1. Role-aware skip: when the principal's role is known (the auth store
+//      publishes it to auth-lifecycle), a non-admin never dispatches the
+//      call — zero requests for the whole session.
+//   2. First-403 session backoff: when the role is NOT known (auth still
+//      hydrating, or a user-less session shape like single_admin), the
+//      family is fetched once; a 403 arms a backoff keyed to the principal
+//      generation and later ticks skip the dispatch. A principal change
+//      (login-as switch without a reload) or a later role publication
+//      overrides the backoff either way (an admin keeps the family; a
+//      member stays hidden), so the family can never wedge into the wrong
+//      visibility for a whole page session.
+//
+// Session-wide by design: the tray is remounted on route changes, and a
+// per-mount flag would re-issue the dead request after every navigation.
+const REINDEX_ADMIN_ROLES: ReadonlySet<string> = new Set(["admin", "superadmin"]);
+let reindexHiddenBy403Generation: number | null = null;
+
+function reindexFamilyVisible(): boolean {
+  const role = captureAuthPrincipalRole();
+  if (role !== null) return REINDEX_ADMIN_ROLES.has(role);
+  const generation = captureAuthPrincipalGeneration();
+  if (
+    reindexHiddenBy403Generation !== null &&
+    reindexHiddenBy403Generation !== generation
+  ) {
+    // The 403 belonged to a previous principal: the new one gets a fresh
+    // chance (its own first 403 re-arms the backoff).
+    reindexHiddenBy403Generation = null;
+  }
+  return reindexHiddenBy403Generation === null;
+}
+
+/**
+ * HTTP status of a family fetch failure, in either error shape this repo's
+ * API client produces: the response interceptor's normalized Error (top-level
+ * `status`) or a raw AxiosError (`.response.status`). Mirrors the
+ * shape-tolerance convention of `logApiFailure` (core.ts).
+ */
+function httpStatusOf(error: unknown): number | undefined {
+  const candidate = error as {
+    status?: number;
+    response?: { status?: number };
+    originalError?: { response?: { status?: number } };
+  } | null;
+  return (
+    candidate?.status ??
+    candidate?.response?.status ??
+    candidate?.originalError?.response?.status
+  );
+}
+
 async function fetchAllActivityRows(): Promise<ActivityJobRow[]> {
   const results = await Promise.allSettled([
     fetchIngestRows(),
     fetchWikiRows(),
     fetchKmsRows(),
     fetchDraftRoomRows(),
-    fetchReindexRows(),
+    // Adapter stays registered inline (issue #784 family census) but is
+    // dispatched only when the family can be visible to this principal
+    // (issue #1039): the spread keeps the census-visible `fetchReindexRows()`
+    // call while gating it before any network work happens.
+    ...(reindexFamilyVisible()
+      ? [
+          fetchReindexRows().catch((error: unknown) => {
+            // A 403 is the admin gate answering: hide the family for the
+            // rest of this principal's session so later ticks skip the
+            // dispatch. Any other failure (network, 5xx) stays an ordinary
+            // one-tick family miss and keeps polling.
+            if (httpStatusOf(error) === 403) {
+              reindexHiddenBy403Generation = captureAuthPrincipalGeneration();
+            }
+            return [];
+          }),
+        ]
+      : []),
   ]);
   return results.flatMap((r) => (r.status === "fulfilled" ? r.value : []));
 }
