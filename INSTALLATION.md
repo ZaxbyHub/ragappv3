@@ -73,7 +73,7 @@ pip --version
 
 ```powershell
 # Download from https://nodejs.org/en/download
-# Choose the Node.js 22 LTS line (>= 22.22.0)
+# Choose the Node.js 22 LTS line (>= 22.22.2)
 
 # Verify installation
 node --version

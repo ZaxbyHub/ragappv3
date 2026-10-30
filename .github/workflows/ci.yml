@@ -364,21 +364,25 @@ jobs:
           pip install pytest-xdist
 
       # test_issue566_config_loader_native.py parses the frontend config via
-      # the TypeScript compiler; the Backend checkout has no frontend install,
-      # so the guardrail's parser dependency is provided here (devDep version
-      # from frontend/package.json; --no-save leaves the lockfile untouched).
+      # the TypeScript compiler. Issue #742: the parser dependency installs
+      # OUTSIDE the repo tree ($RUNNER_TEMP) so the Backend checkout never
+      # gains a frontend/node_modules — the two issue-258 frontend-toolchain
+      # nodes stay scoped to the Frontend job, and the #566 walker resolves
+      # `typescript` through NODE_PATH on the Test step below.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
         with:
           node-version: "22.22.2"
 
-      - name: Install TypeScript for the #566 config guardrail
-        run: npm install --no-save typescript@6.0.3
-        working-directory: frontend
+      - name: Install TypeScript for the #566 config guardrail (outside the repo tree)
+        run: npm install --prefix "$RUNNER_TEMP/h03-gate-ts" typescript@6.0.3
 
       - name: Lint (ruff)
         run: ruff check .
 
       - name: Test
+        # Step-level timeout strictly inside the job's 60-minute budget
+        # (issue #742): a post-test wedge is cut off here and names THIS step
+        # instead of burning the whole job.
         # -rs: itemize skips (live-marker skips must be visible, not silent — issue #563)
         # --timeout-method=thread: the POSIX-default signal method fires only
         # when the main thread returns to the interpreter loop, so on the
@@ -388,9 +392,14 @@ jobs:
         # thread method aborts a wedged worker fast and xdist names the hung
         # test. This flag line itself is pinned by
         # backend/tests/test_1021_timeout_wiring.py.
+        timeout-minutes: 50
         run: pytest --tb=short -v --timeout=300 --timeout-method=thread -rs -n auto --cov --cov-report=term-missing tests/
         env:
           REDIS_URL: ""
+          # #742 / #566: makes the outside-tree TypeScript install resolvable
+          # by the walker's `require('typescript')` (cwd stays frontend/, so
+          # NODE_PATH carries the dependency instead of node_modules there).
+          NODE_PATH: ${{ runner.temp }}/h03-gate-ts/node_modules
 
       - name: Hang-class timeout canary (#1021)
         # Exercises the timeout mechanism on every non-cancelled run, on

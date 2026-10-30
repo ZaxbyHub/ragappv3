@@ -1,6 +1,6 @@
 # Stage 1: Build Frontend
 # Pinned to node 22.22 (current LTS line; node 20 is EOL since 2026-04-30) to match
-# CI (ci.yml node-version "22.22.0") so a green CI run proves the shipped image
+# CI (ci.yml node-version "22.22.2") so a green CI run proves the shipped image
 # builds. Parity across this FROM, frontend/Dockerfile, ci.yml, package.json
 # engines and CONTRIBUTING.md is enforced by scripts/check_runtime_contract.py
 # (Quality contracts job) — move majors through that gate, not by editing here.

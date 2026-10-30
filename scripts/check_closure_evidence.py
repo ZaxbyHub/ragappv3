@@ -21,6 +21,16 @@ reopen/comment-on-merge procedure in docs/ci/closure-evidence-gate.md.
 Rollout ships warn-only; the flip to enforce is the workflow's ``mode``
 input. Rollback is disabling or deleting .github/workflows/closure-evidence.yml.
 
+Evidence semantics (#741): URL-form artifacts are advisory-only (skipped at
+resolution, never a violation); artifact captures are Markdown-noise-stripped
+(backticks/emphasis deleted, not spaced) before path resolution; PR sub-lists
+(commits, files, reviews) are paginated to completeness and cross-checked
+against the pulls response's own totals so a truncated fetch fails closed;
+and cross-family approval counts only each reviewer's LATEST non-COMMENTED
+review (a superseded approval does not satisfy the rule). The workflow runs
+the BASE branch's copy of this script so a PR editing the gate cannot grade
+itself (see .github/workflows/closure-evidence.yml).
+
 Subcommands:
   evaluate      structural gate over a PR snapshot (offline --pr-data, or
                 live --pr N --repo-slug O/R via ``gh api``)
@@ -66,8 +76,12 @@ MARKDOWN_NOISE_RE = re.compile(r"[*`\u00a0]+")
 TEST_ID_RE = re.compile(r"backend/tests/[A-Za-z0-9_/.-]+\.py(?:::\w+)*")
 
 # Artifact evidence: ``artifact: <repo-relative-path>``. URL-form artifacts
-# are advisory only — the gate never makes network calls to validate them.
+# are advisory only — the gate never makes network calls to validate them
+# (skipped at resolution, below). The capture is Markdown-noise-stripped
+# before resolution so ``artifact: `docs/x.md` `` resolves to docs/x.md
+# (#741: the close-ref path already normalizes; the artifact path must too).
 ARTIFACT_RE = re.compile(r"\bartifact[:=]\s*([^\s,;]+)", re.IGNORECASE)
+URL_ARTIFACT_RE = re.compile(r"^https?://", re.IGNORECASE)
 
 HIGH_LABELS = {"high", "critical"}
 
@@ -87,7 +101,11 @@ FAMILY_PREFIXES: tuple[tuple[str, str], ...] = (
 
 RUN_TIMEOUT_SECONDS = 240
 GH_TRANSIENT_RETRIES = 1
-MAX_COMMITS_WITH_FILES = 100
+# GitHub page size for the PR sub-list endpoints. Page 1 is requested bare;
+# later pages append ``&page=N``. Completeness is separately proven against
+# the pulls response's own totals (``commits``/``changed_files``) because
+# some caps (250 commits) are not page multiples and end on a SHORT page.
+PAGE_SIZE = 100
 
 
 class FetchError(Exception):
@@ -125,9 +143,34 @@ def extract_evidence(body: str | None) -> tuple[str | None, str | None, list[str
         return None, None, []
     test_ids = TEST_ID_RE.findall(body)
     artifact_match = ARTIFACT_RE.search(body)
-    artifact = artifact_match.group(1).rstrip(".") if artifact_match else None
+    artifact = None
+    if artifact_match:
+        # Markdown emphasis/backticks around the value are presentation, not
+        # path characters — delete them (never substitute spaces: a path with
+        # an injected space must fail resolution, not silently "resolve").
+        artifact = MARKDOWN_NOISE_RE.sub("", artifact_match.group(1)).rstrip(".")
     first, extra = (test_ids[0], test_ids[1:]) if test_ids else (None, [])
     return first, artifact, list(extra)
+
+
+def latest_non_commented_state_by_login(reviews: list[dict]) -> dict[str, str]:
+    """Reduce chronological review history to each login's latest stance.
+
+    #741 (decided rule): only a reviewer's LATEST non-COMMENTED review counts
+    toward the cross-family approval requirement — an approval later
+    superseded by CHANGES_REQUESTED (or DISMISSED) does not satisfy the rule,
+    while CHANGES_REQUESTED later superseded by APPROVED does. COMMENTED
+    entries never change a stance and are skipped. The GitHub reviews
+    endpoint returns full chronological history in submission order.
+    """
+    latest: dict[str, str] = {}
+    for review in reviews:
+        state = str(review.get("state") or "").upper()
+        login = str(review.get("author") or "")
+        if state == "COMMENTED" or not login:
+            continue
+        latest[login] = state
+    return latest
 
 
 def evaluate_snapshot(snapshot: dict, mode: str, repo_root: Path) -> tuple[list[str], str | None]:
@@ -152,6 +195,12 @@ def evaluate_snapshot(snapshot: dict, mode: str, repo_root: Path) -> tuple[list[
                 "— name a backend pytest test id (backend/tests/...py::test) or an "
                 "existing captured artifact (artifact: <repo-relative-path>)"
             )
+        elif URL_ARTIFACT_RE.match(artifact):
+            # URL-form artifacts are advisory only (documented contract): the
+            # gate never makes network calls to validate them, so they neither
+            # block nor satisfy the evidence requirement on their own — they
+            # are recorded as advisory and produce no violation (#741).
+            pass
         else:
             resolved = (repo_root / artifact).resolve()
             if not resolved.is_relative_to(repo_root.resolve()) or not resolved.is_file():
@@ -169,19 +218,25 @@ def evaluate_snapshot(snapshot: dict, mode: str, repo_root: Path) -> tuple[list[
             author = str(commit.get("author") or "")
             files = list(commit.get("files") or [])
             if not files:
-                # Commit with no known files (live mode truncates per-commit
-                # file fetches beyond the first 100 commits): treat the author
-                # as same-family so an unfetched commit can never count as a
-                # cross-family approval (conservative).
+                # Commit with no known files (the per-commit detail fetch
+                # failed, or the commit's file list is empty/truncated at the
+                # API's per-commit cap): treat the author as same-family so
+                # an unfetched commit can never count as a cross-family
+                # approval (conservative).
                 same_family_logins.add(author)
             elif any(family_of(f) in pr_families for f in files):
                 same_family_logins.add(author)
+        # Decided rule (#741): reduce to each login's LATEST non-COMMENTED
+        # review before testing for APPROVED — a superseded approval does not
+        # satisfy the cross-family requirement. Empty logins and bots never
+        # count as cross-family approval.
+        latest_state = latest_non_commented_state_by_login(reviews)
         cross_family = [
-            review
-            for review in reviews
-            if str(review.get("state") or "").upper() == "APPROVED"
-            and str(review.get("author") or "") not in same_family_logins
-            and not str(review.get("author") or "").endswith("[bot]")
+            login
+            for login, state in latest_state.items()
+            if state == "APPROVED"
+            and login not in same_family_logins
+            and not login.endswith("[bot]")
         ]
         if not cross_family:
             violations.append(
@@ -231,15 +286,60 @@ def gh_api(endpoint: str) -> dict | list:
     raise FetchError(f"gh api {endpoint} failed: {last_error}")
 
 
+def _fetch_all_pages(endpoint: str) -> list:
+    """Paginate a GitHub list endpoint to completeness, failing closed.
+
+    Page 1 is requested bare (the endpoint's canonical URL shape, preserved
+    for consumers that pin exact first-page URLs); later pages append
+    ``&page=N``. A full page (``per_page`` results) means more may exist, so
+    the loop continues; a short page terminates it. Any transport failure
+    raises FetchError (never a silently shortened list).
+    """
+    items: list = []
+    page = 1
+    while True:
+        url = endpoint if page == 1 else f"{endpoint}&page={page}"
+        batch = gh_api(url)
+        if not isinstance(batch, list):
+            raise FetchError(f"expected a list response from {url}, got {type(batch).__name__}")
+        items.extend(batch)
+        if len(batch) < PAGE_SIZE:
+            return items
+        page += 1
+
+
+def _require_complete(fetched: int, expected: object, what: str) -> None:
+    """Fail closed when the fetched count contradicts the PR's own count.
+
+    GitHub caps some PR sub-lists at values that are NOT page multiples (the
+    commits endpoint returns at most 250 = 100+100+50, so the final page is
+    short and a page-size loop alone would accept it as complete). The pulls
+    response carries authoritative totals (``commits``, ``changed_files``);
+    a mismatch means the fetch was truncated and evaluation would silently
+    miss commits/authors — raise instead (#741).
+    """
+    if isinstance(expected, int) and fetched != expected:
+        raise FetchError(
+            f"fetched {fetched} {what} but the pull request reports {expected} — "
+            "refusing to evaluate a truncated snapshot"
+        )
+
+
 def fetch_snapshot(pr_number: int, repo_slug: str) -> dict:
     """Assemble the offline snapshot shape from the live GitHub API."""
     try:
         pull = gh_api(f"repos/{repo_slug}/pulls/{pr_number}")
-        files = gh_api(f"repos/{repo_slug}/pulls/{pr_number}/files?per_page=100")
-        commit_list = gh_api(f"repos/{repo_slug}/pulls/{pr_number}/commits?per_page={MAX_COMMITS_WITH_FILES}")
-        reviews = gh_api(f"repos/{repo_slug}/pulls/{pr_number}/reviews?per_page=100")
+        files = _fetch_all_pages(f"repos/{repo_slug}/pulls/{pr_number}/files?per_page={PAGE_SIZE}")
+        commit_list = _fetch_all_pages(
+            f"repos/{repo_slug}/pulls/{pr_number}/commits?per_page={PAGE_SIZE}"
+        )
+        reviews = _fetch_all_pages(f"repos/{repo_slug}/pulls/{pr_number}/reviews?per_page={PAGE_SIZE}")
     except LookupError:
         raise FetchError(f"pull request #{pr_number} not found in {repo_slug}") from None
+
+    # Completeness against the PR's own totals (fail-closed, never truncated).
+    _require_complete(len(files), pull.get("changed_files"), "changed files")
+    _require_complete(len(commit_list), pull.get("commits"), "commits")
 
     body_refs = extract_close_refs(pull.get("body") or "")
     issue_labels: dict[str, list[str]] = {}
