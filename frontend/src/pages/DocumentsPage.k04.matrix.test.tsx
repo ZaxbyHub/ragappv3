@@ -254,7 +254,7 @@ vi.mock('@/components/documents/UploadDropzone', () => ({
 // Import component after mocks
 import DocumentsPage from '@/pages/DocumentsPage';
 import { useVaultStore } from '@/stores/useVaultStore';
-import { listDocuments, listFolders } from '@/lib/api';
+import { listDocuments, listFolders, getDocumentStats, deleteDocuments } from '@/lib/api';
 
 interface ListDocumentsParams {
   folderId?: number;
@@ -488,5 +488,55 @@ describe('DocumentsPage K04 permission matrix (issue #767)', () => {
     expect(within(dialog).getByText('Delete Document')).toBeInTheDocument();
     expect(within(dialog).getByText(/"mobile\.pdf"/)).toBeInTheDocument();
     expect(within(dialog).getByRole('button', { name: 'Delete' })).toBeInTheDocument();
+  });
+
+
+  it('partial bulk delete ends with the SERVER total, not double-subtracted (impl-review R1 value pin)', async () => {
+    // Seeds 10 docs, deletes 3, server reports 7 afterwards. The final
+    // rendered Documents card must read 7 — an optimistic patch applied AFTER
+    // the stats refetch would show 4 (double-subtraction), which the frozen
+    // C13 call-count oracle cannot detect (implementation review Round 1).
+    const tenDocs = Array.from({ length: 10 }, (_, i) => ({
+      id: String(i + 1),
+      filename: `doc${i + 1}.pdf`,
+      size: 1024,
+      created_at: '2024-01-01',
+      metadata: { status: 'processed', chunk_count: 1 },
+    }));
+    vi.mocked(listDocuments).mockResolvedValue({ documents: tenDocs, total: 10 });
+    let serverTotal = 10;
+    vi.mocked(getDocumentStats).mockImplementation(async () => ({
+      total_documents: serverTotal,
+      total_chunks: serverTotal * 2,
+      total_size_bytes: serverTotal * 1000,
+      documents_by_status: { processed: serverTotal },
+    }));
+    vi.mocked(deleteDocuments).mockImplementation(async () => {
+      serverTotal = 7; // the server has now deleted 3 of 10
+      return { deleted_count: 3, failed_ids: [] };
+    });
+
+    selectVault('admin');
+    await renderPage();
+    // Select three rows, then Delete Selected -> confirm.
+    const checkboxes = await screen.findAllByRole('checkbox');
+    await act(async () => {
+      fireEvent.click(checkboxes[1]);
+      fireEvent.click(checkboxes[2]);
+      fireEvent.click(checkboxes[3]);
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Delete Selected' }));
+    });
+    const dialog = await screen.findByRole('dialog');
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole('button', { name: /^(Confirm|Delete)$/ }));
+    });
+    // The stats card renders the total; wait for the refetch to land, then
+    // the final value must be the server's 7.
+    await waitFor(() => {
+      expect(screen.getByText('7')).toBeInTheDocument();
+    });
+    expect(screen.queryByText('4')).toBeNull();
   });
 });

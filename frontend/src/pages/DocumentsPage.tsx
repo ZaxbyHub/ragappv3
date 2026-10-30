@@ -665,10 +665,11 @@ export default function DocumentsPage() {
       // server just deleted) while retaining the failed rows either way.
       await fetchDocuments();
       setDocuments((prev) => prev.filter((doc) => !deletedIds.has(String(doc.id))));
-      // Optimistic single-field patch above kept for the immediate render;
-      // refetch the authoritative stats so Chunks/Size/Indexed also agree
-      // with the server after the deletion (issue #768 AC2).
-      await fetchStats();
+      // Optimistic single-field patch FIRST for the immediate render, then
+      // refetch the authoritative stats LAST so the final committed value is
+      // the server's post-delete state — ordering matters: patching after the
+      // refetch would double-subtract deleted_count from the fresh server
+      // total (implementation-review Round 1; issue #768 AC2).
       setStats((prev) =>
         prev
           ? {
@@ -677,6 +678,7 @@ export default function DocumentsPage() {
             }
           : prev
       );
+      await fetchStats();
       fetchFolders();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to delete documents");
