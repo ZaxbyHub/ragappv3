@@ -340,3 +340,37 @@ def test_preflight_success_runs_checker(tmp_path):
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "eval_rc=0" in outputs
     assert "evaluate" in python_calls, "clean preflight must reach the checker"
+
+
+# ── #742 final-critic round 1: the positive "exactly one CI venue" leg ────────
+
+FRONTEND_TOOLCHAIN_NODES = (
+    "test_issue258_coverage_gate.py::test_ac11_coverage_command_passes",
+    "test_issue258_build_contracts.py::test_ac8_vite_node_config_project_typechecks",
+)
+
+
+def test_frontend_toolchain_nodes_have_exactly_one_venue():
+    # The negative leg (no in-repo frontend install in the Backend job) is
+    # the frozen C12 check; this pins the POSITIVE leg — each node is named
+    # by exactly one job's steps, that job is `frontend` (where the tree the
+    # nodes need actually exists), and the venue step fails on a skip.
+    import yaml as _yaml
+
+    ci = _yaml.safe_load((REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8"))
+    venues: dict[str, list[str]] = {}
+    for job_id, job in ci["jobs"].items():
+        steps_text = "\n".join(str(s.get("run") or "") for s in job.get("steps") or [])
+        for node in FRONTEND_TOOLCHAIN_NODES:
+            if node in steps_text:
+                venues.setdefault(node, []).append(job_id)
+    assert venues == {node: ["frontend"] for node in FRONTEND_TOOLCHAIN_NODES}, venues
+    venue_steps = [
+        s for s in ci["jobs"]["frontend"]["steps"]
+        if any(node in str(s.get("run") or "") for node in FRONTEND_TOOLCHAIN_NODES)
+    ]
+    assert len(venue_steps) == 1
+    venue_run = str(venue_steps[0].get("run") or "")
+    assert "skipped" in venue_run and "exit 1" in venue_run.replace("::error::", ""), (
+        "the venue step must fail the job when a node skips in its only venue"
+    )

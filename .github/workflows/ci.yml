@@ -44,6 +44,35 @@ jobs:
           npm exec vite -- --version
           npm exec vitest -- --version
 
+      # Issue #742 (AC5, "never in neither"): the two frontend-toolchain
+      # contract nodes are pytest tests that need the frontend install, so
+      # THIS job is their single CI venue. The Backend job no longer
+      # installs a frontend tree (its #566 walker uses an outside-tree
+      # TypeScript via NODE_PATH), so without this step the nodes would run
+      # in no CI job at all. A skip here fails the step: a skipped node in
+      # its only venue is "neither" again.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Frontend-toolchain contract nodes (#742 single-venue)
+        working-directory: backend
+        run: |
+          python -m pip install --quiet pytest
+          set +e
+          python -m pytest \
+            tests/test_issue258_coverage_gate.py::test_ac11_coverage_command_passes \
+            tests/test_issue258_build_contracts.py::test_ac8_vite_node_config_project_typechecks \
+            -q -p no:cacheprovider -rs > pytest-frontend-toolchain.log 2>&1
+          EXIT=$?
+          set -e
+          cat pytest-frontend-toolchain.log
+          if grep -q "skipped" pytest-frontend-toolchain.log; then
+            echo "::error::a frontend-toolchain contract node SKIPPED in its single CI venue (must run here)"
+            exit 1
+          fi
+          exit "$EXIT"
+
       - name: Type check
         run: npm run typecheck
 

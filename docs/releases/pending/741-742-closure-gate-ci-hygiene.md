@@ -51,14 +51,19 @@ Issues: #741 (Workstream H PR 3 of 10), #742 (Workstream H PR 4 of 10).
   inside the job's 60-minute budget: a post-test wedge is cut off and names
   the step instead of burning the job (the per-test `--timeout-method=thread`
   from #1021 is untouched and still pinned).
-- **No frontend tree in the Backend job.** The #566 guardrail's TypeScript
-  parser now installs outside the repo tree
+- **No frontend tree in the Backend job — and the frontend-toolchain nodes
+  keep exactly one CI venue.** The #566 guardrail's TypeScript parser now
+  installs outside the repo tree
   (`npm install --prefix "$RUNNER_TEMP/h03-gate-ts" typescript@6.0.3`) with
   `NODE_PATH` pointing the walker's `require('typescript')` at it, so
-  `frontend/node_modules` never appears in the Backend job and the two
-  issue-258 frontend-toolchain nodes (`test_ac11_coverage_command_passes`,
-  `test_ac8_vite_node_config_project_typechecks`) run in exactly one CI job
-  (the Frontend job), as their skip guards intend.
+  `frontend/node_modules` never appears in the Backend job. The two
+  issue-258 frontend-toolchain nodes are pytest tests that need the
+  frontend install, so their single CI venue is a scoped pytest step in the
+  Frontend job ("Frontend-toolchain contract nodes"); the step fails the
+  job if either node skips in its only venue ("never in neither"), and the
+  tsconfig.node.json typecheck they pin (no npm script invokes it —
+  `typecheck:contracts` covers the separate contracts surface) keeps live
+  CI coverage.
 
 ### Node floor aligned at one value (#742)
 

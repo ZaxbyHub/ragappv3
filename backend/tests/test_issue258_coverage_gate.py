@@ -76,9 +76,9 @@ def test_ac11_coverage_thresholds_configured():
 @pytest.mark.skipif(
     _NPM is None or not (FRONTEND / "node_modules").is_dir(),
     reason="npm or frontend/node_modules unavailable — since #742 the "
-    "Backend CI job no longer installs a frontend tree, so this node runs "
-    "in exactly one CI job: the Frontend job (dev boxes with a local "
-    "frontend install also run it)",
+    "Backend CI job no longer installs a frontend tree; this node's single "
+    "CI venue is the Frontend job's scoped pytest step (dev boxes with a "
+    "local frontend install also run it)",
 )
 def test_ac11_coverage_command_passes(tmp_path):
     # Issue #943: the coverage command's artifacts (including vitest's
