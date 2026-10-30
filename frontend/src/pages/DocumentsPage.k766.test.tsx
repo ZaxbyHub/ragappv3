@@ -430,6 +430,46 @@ describe('DocumentsPage K766 acceptance checks', () => {
     );
   });
 
+  // Review round 2 (reviewer F4): the backend DELETE is not idempotent — a
+  // replay 404 means the keepalive delete ALREADY landed, so the pageshow
+  // replay must treat it as completion (success toast), never as failure.
+  it('a pageshow replay 404 is completion, not failure', { timeout: 30_000 }, async () => {
+    // First replay call rejects with the production normalized 404 shape;
+    // (only one pagehide-dispatched id exists, so exactly one replay runs).
+    vi.mocked(deleteDocument).mockRejectedValue(
+      Object.assign(new Error('Request failed with status code 404'), { status: 404 }),
+    );
+
+    let utils!: ReturnType<typeof render>;
+    await act(async () => {
+      utils = render(<DocumentsPage />);
+    });
+    await confirmSingleDelete();
+    await act(async () => {
+      fireEvent(window, new Event('pagehide'));
+    });
+    // No credential in this suite: the keepalive channel deferred the id.
+    expect(keepaliveCalls()).toBe(0);
+
+    await act(async () => {
+      const pageshow = new Event('pageshow');
+      (pageshow as unknown as { persisted: boolean }).persisted = true;
+      fireEvent(window, pageshow);
+    });
+    await act(async () => {
+      await flushMicrotasks();
+    });
+
+    // Discriminating assertion: the 404 (delete already landed via the
+    // keepalive dispatch in production) surfaces SUCCESS, and no error toast
+    // fires — deleting this branch reintroduces the false failure toast.
+    expect(vi.mocked(toast.success)).toHaveBeenCalledWith('Deleted document');
+    expect(vi.mocked(toast.error)).not.toHaveBeenCalled();
+    await act(async () => {
+      utils.unmount();
+    });
+  });
+
   // Review round 2, PRR-007 — useAuthStore.logout dispatches
   // "ragapp:before-logout" as its FIRST line, while credentials are still
   // valid. The listener runs the SPA-unmount-semantics flush (round 2
