@@ -321,6 +321,23 @@ export function DocumentTable({
                         const ws = wikiStatusMap[docId];
                         const isCompiling =
                           compilingDocIds.has(docId) || ws?.wiki_status === "compiling";
+                        // A FAILED wiki-status fetch is unknown, NOT
+                        // uncompiled (#765 AC6), and a current failure takes
+                        // precedence over ANY cached value (review rounds
+                        // 2-3, PRR-037/B-2/R03 + critic round 3: the branch
+                        // sits ABOVE the skipped/Compile interpretations so
+                        // no stale cached value — not_compiled OR skipped —
+                        // can mask the failure).
+                        if (wikiFetchFailedIds.has(docId)) {
+                          return (
+                            <span
+                              className="text-xs text-muted-foreground italic"
+                              title="Wiki status unavailable — the status fetch failed."
+                            >
+                              Wiki status unavailable
+                            </span>
+                          );
+                        }
                         // AC29 (#515): a document the compiler SKIPPED (no
                         // extractable knowledge) gets a distinct label — it is
                         // NOT uncompiled, so it must not offer the generic
@@ -332,23 +349,6 @@ export function DocumentTable({
                               title="Wiki compile skipped — no extractable knowledge found in this document."
                             >
                               Skipped — no extractable knowledge
-                            </span>
-                          );
-                        }
-                        if (wikiFetchFailedIds.has(docId)) {
-                          // A FAILED wiki-status fetch is unknown, NOT
-                          // uncompiled (#765 AC6), and a current failure
-                          // takes precedence over ANY cached value
-                          // (review round 2, PRR-037/B-2/R03: a cached
-                          // not_compiled plus a later failed refresh must
-                          // not render the Compile affordance — the failure
-                          // must never be masked by the stale value).
-                          return (
-                            <span
-                              className="text-xs text-muted-foreground italic"
-                              title="Wiki status unavailable — the status fetch failed."
-                            >
-                              Wiki status unavailable
                             </span>
                           );
                         }

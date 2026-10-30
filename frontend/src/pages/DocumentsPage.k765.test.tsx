@@ -327,4 +327,100 @@ describe('DocumentsPage K765 acceptance check — failed wiki status fetch is no
     expect(screen.getByText('Wiki status unavailable')).toBeInTheDocument();
     expect(screen.queryAllByRole('button', { name: 'Compile' }).length).toBe(0);
   });
+
+  it('a cached skipped status plus a later failed refresh renders unavailable, not Skipped', { timeout: 30_000 }, async () => {
+    // Critic round 3: the failure branch must sit ABOVE the skipped
+    // interpretation too — a cached skipped value plus a later failed
+    // refresh must render the unavailable state, not the stale Skipped
+    // label. Killing mutation: moving the failure branch back below the
+    // skipped branch fails the final assertions. Driver: a Compile click on
+    // the SIBLING document — the compile follow-up re-fetches EVERY indexed
+    // row regardless of cache, which is the only cached-skipped-reachable
+    // refetch (hydration skips cached non-transient docs; the retry interval
+    // owns only failed ids).
+    const DOC5: Document = {
+      id: '5',
+      filename: 'skipped.pdf',
+      size: 1024,
+      created_at: '2024-01-01',
+      metadata: { status: 'indexed', chunk_count: 3 },
+    } as unknown as Document;
+    const DOC6: Document = {
+      id: '6',
+      filename: 'sibling.pdf',
+      size: 2048,
+      created_at: '2024-01-02',
+      metadata: { status: 'indexed', chunk_count: 4 },
+    } as unknown as Document;
+    vi.mocked(listDocuments).mockResolvedValue({
+      documents: [DOC5, DOC6],
+      total: 2,
+    });
+    let doc5Fetches = 0;
+    vi.mocked(getDocumentWikiStatus).mockImplementation((fileId: number) => {
+      if (Number(fileId) === 5) {
+        doc5Fetches += 1;
+        if (doc5Fetches > 1) {
+          return Promise.reject(new Error('status fetch failed'));
+        }
+        return Promise.resolve({
+          file_id: 5,
+          wiki_status: 'skipped',
+          pages_count: 0,
+          claims_count: 0,
+          active_claims: 0,
+          lint_count: 0,
+          pages: [],
+          latest_job: null,
+          job_count: 0,
+        });
+      }
+      return Promise.resolve({
+        file_id: 6,
+        wiki_status: 'not_compiled',
+        pages_count: 0,
+        claims_count: 0,
+        active_claims: 0,
+        lint_count: 0,
+        pages: [],
+        latest_job: null,
+        job_count: 0,
+      });
+    });
+
+    render(<DocumentsPage />);
+
+    // Sentinel: doc 5's cached skipped committed and its label IS on screen.
+    expect(
+      await screen.findByText('Skipped — no extractable knowledge', {}, { timeout: 10_000 }),
+    ).toBeInTheDocument();
+
+    // Drive the compile follow-up from doc 6: the 2 s follow-up re-fetches
+    // every indexed row — including cached-skipped doc 5 — and doc 5's
+    // fetch fails this wave.
+    const compileButton = await screen.findByRole(
+      'button',
+      { name: 'Compile' },
+      { timeout: 10_000 },
+    );
+    vi.useFakeTimers({
+      toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'],
+    });
+    await act(async () => {
+      fireEvent.click(compileButton);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    await act(async () => {
+      for (let i = 0; i < 10; i += 1) await Promise.resolve();
+    });
+
+    // Discriminating assertions: doc 5's later failure is rendered as
+    // Wiki status unavailable and the stale Skipped label no longer masks
+    // it. Under the killed ordering (failure branch below skipped) the
+    // Skipped label would still be on screen.
+    expect(screen.getByText('Wiki status unavailable')).toBeInTheDocument();
+    expect(screen.queryByText('Skipped — no extractable knowledge')).not.toBeInTheDocument();
+  });
 });
