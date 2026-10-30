@@ -59,7 +59,13 @@ Documented scope decisions (issue #655 follow-up review, PR #663):
   rejected: it reintroduces a loud false-positive class ("Node 22 LTS
   (22.22.0)" stops matching), which is worse than the rare misattribution.
 
-Digest pins (@sha256:...) are honored: the tag before the digest is compared.
+Digest pins (@sha256:...) are COMPARED for tracked runtime images: a digest
+must equal the recorded entry in ALLOWED_DIGESTS (stale digests fail); a
+digest-only pin passes only when it matches the recorded digest; registry-
+qualified names are matched on their last path segment; any FROM line this
+gate cannot parse (ARG interpolation, line continuation) fails the surface
+closed instead of escaping both contracts. Non-runtime base images (nginx,
+ollama, ...) stay outside the digest contract.
 Non-runtime base images (nginx, ollama, ...) are ignored.
 
 Stdlib-only on purpose: the CI Quality contracts job runs scripts/check_*.py
@@ -100,20 +106,40 @@ DOCKERFILE_SURFACES = (
     "backend/embedding_server/Dockerfile",
 )
 
+FROM_LINE_RE = re.compile(r"(?im)^\s*FROM\s+(.*)$")
+# A FROM line parses to (image, optional tag, optional digest). Both optional
+# groups absent (a bare image reference) is NOT accepted — the caller fails
+# the surface closed rather than silently skipping a runtime pin it cannot
+# read (PR #1045 review, PRR-002/E-1: digest-only, registry-qualified and
+# ARG-interpolated FROM shapes used to escape BOTH contracts).
 FROM_RE = re.compile(
     r"(?im)^\s*FROM\s+"
     r"(?:--[\w-]+=\S+\s+)?"  # optional --platform=... style flags
-    r"(?P<image>[a-z0-9][a-z0-9./_-]*):"
-    r"(?P<tag>[A-Za-z0-9._-]+)"
-    r"(?:@sha256:[0-9a-f]+)?"
+    r"(?P<image>[a-z0-9][a-z0-9./_-]*)"
+    r"(?::(?P<tag>[A-Za-z0-9._-]+))?"
+    r"(?P<digest>@sha256:[0-9a-f]+)?"
+    r"\s*(?:AS\s+\S+)?\s*$"
 )
+
+# Good digests for TRACKED RUNTIME images pinned by digest (issue #739: the
+# 113bfad0 incident shipped a stale digest because FROM_RE ignored it). Same
+# decision discipline as ALLOWED_RUNTIME: to move a runtime's digest, update
+# the Dockerfile AND this table in one change. Non-runtime base images
+# (nginx, ollama, ...) stay outside the digest contract exactly as they are
+# outside the tag contract. Keyed (surface, image); a runtime FROM carrying
+# a digest that does not match its recorded entry fails.
+ALLOWED_DIGESTS: dict[tuple[str, str], str] = {
+    ("Dockerfile", "node"): "sha256:e58326d0d441090181ac150dc2078d3e2cf6a0d42e809aebba3ef5880935ffdd",
+    ("Dockerfile", "python"): "sha256:9534e5a8e315485d4061ed659af0fd78a284c015f9b73661b41d6bab25604534",
+    ("frontend/Dockerfile", "node"): "sha256:e58326d0d441090181ac150dc2078d3e2cf6a0d42e809aebba3ef5880935ffdd",
+}
 
 CI_NODE_VERSION_RE = re.compile(r"(?im)^\s*node-version:\s*[\"']?(\d+(?:\.\d+)*)[\"']?\s*$")
 CI_PYTHON_VERSION_RE = re.compile(
     r"(?im)^\s*python-version:\s*[\"']?(\d+(?:\.\d+)*)[\"']?\s*$"
 )
 
-CONTRIBUTING_NODE_RE = re.compile(r"(?i)\bnode(?:\.js)?\b[^\n]{0,40}?\b(\d{1,2})\.\d+")
+CONTRIBUTING_NODE_RE = re.compile(r"(?i)\bnode(?:\.js)?\b[^\n]{0,40}?\b(\d{1,2})\.(\d+)")
 CONTRIBUTING_PYTHON_RE = re.compile(r"(?i)\bpython(?:3)?[ @:]\s*(\d+\.\d+)")
 
 # Docs surfaces (issue #655): the engineering docs assert runtime facts and a
@@ -178,18 +204,6 @@ def tag_version(tag: str) -> str:
     return tag.split("-")[0]
 
 
-def from_statements(dockerfile_text: str) -> list[tuple[str, str]]:
-    """Return (image, version) for every FROM line with a numeric tag."""
-    result: list[tuple[str, str]] = []
-    for match in FROM_RE.finditer(dockerfile_text):
-        tag = match.group("tag")
-        version = tag_version(tag)
-        if not re.fullmatch(r"\d+(\.\d+)*", version):
-            continue  # nginx:alpine / ollama:latest style — not a tracked runtime
-        result.append((match.group("image"), version))
-    return result
-
-
 def _expected_node() -> str:
     """Minor-exact node pin, e.g. '22.11'."""
     n_ = ALLOWED_RUNTIME["node"]
@@ -208,40 +222,119 @@ def _node_version_ok(version: str) -> tuple[bool, str]:
     return True, ""
 
 
+def _registry_stripped_image(image: str) -> str:
+    """`docker.io/library/node` / `ghcr.io/owner/node` -> last path segment.
+
+    A registry prefix must not hide a tracked runtime from the contract
+    (PRR-002: `FROM docker.io/library/node:22.22.0@sha256:...` used to
+    compare its image against "node" and silently skip).
+    """
+    return image.rsplit("/", 1)[-1]
+
+
 def check_dockerfiles(failures: list[str]) -> None:
     for surface in DOCKERFILE_SURFACES:
         path = ROOT / surface
         if not path.is_file():
             continue
-        for image, version in from_statements(path.read_text(encoding="utf-8")):
-            if image == "node":
+        text = path.read_text(encoding="utf-8")
+        from_lines = FROM_LINE_RE.findall(text)
+        matches = list(FROM_RE.finditer(text))
+        if len(from_lines) != len(matches):
+            # A FROM line FROM_RE cannot parse (ARG-interpolated image,
+            # line-continuation digest, exotic shape) must fail closed, not
+            # escape both contracts silently (PRR-002/E-1).
+            failures.append(
+                f"{surface}: {len(from_lines) - len(matches)} FROM line(s) this "
+                "gate cannot parse (ARG interpolation, line continuation, or "
+                "unrecognized shape) — write plain image[:tag][@sha256:digest] "
+                "FROM lines so the runtime contract can verify them"
+            )
+            continue
+        for match in matches:
+            image = _registry_stripped_image(match.group("image"))
+            tag = match.group("tag")
+            digest = match.group("digest")
+            if tag is None and digest is None:
+                failures.append(
+                    f"{surface}: FROM {match.group('image')} pins neither a tag "
+                    "nor a digest — the runtime cannot be verified"
+                )
+                continue
+            if tag is None:
+                # Digest-only pin: the digest IS the version commitment, so a
+                # digest matching the recorded good digest passes; anything
+                # else fails.
+                expected = ALLOWED_DIGESTS.get((surface, image))
+                if expected is None or f"@{expected}" != digest:
+                    failures.append(
+                        f"{surface}: digest-only FROM {match.group('image')}{digest} "
+                        f"does not match the recorded good digest for ({surface}, "
+                        f"{image}) — update ALLOWED_DIGESTS together with the "
+                        "Dockerfile"
+                    )
+                continue
+            version = tag_version(tag)
+            numeric_tag = bool(re.fullmatch(r"\d+(\.\d+)*", version))
+            if numeric_tag and image == "node":
                 ok, why = _node_version_ok(version)
                 if not ok:
                     failures.append(f"{surface}: FROM {image}:{version} is {why}")
-            elif image == "python":
+            elif numeric_tag and image == "python":
                 if version != ALLOWED_RUNTIME["python"]["version"]:
                     failures.append(
                         f"{surface}: FROM {image}:{version} is python {version}, "
                         f"contract requires {ALLOWED_RUNTIME['python']['version']}"
                     )
+            elif image not in ("node", "python"):
+                continue  # not a tracked runtime image (nginx, ollama, ...)
+            # Digest contract (tracked runtime images only): a digest pin must
+            # equal the recorded good digest — stale, unrecorded, and
+            # non-numeric-tag digests all fail here rather than escaping.
+            if image in ("node", "python") and digest is not None:
+                expected = ALLOWED_DIGESTS.get((surface, image))
+                if expected is None:
+                    failures.append(
+                        f"{surface}: FROM {image}:{tag}{digest} pins a digest but "
+                        f"({surface}, {image}) has no recorded good digest in "
+                        "ALLOWED_DIGESTS — record the verified digest or drop the "
+                        "pin"
+                    )
+                elif digest != f"@{expected}":
+                    failures.append(
+                        f"{surface}: FROM {image}:{tag}{digest} digest does not "
+                        f"match the recorded good digest {expected} — stale digest "
+                        "(update the Dockerfile and ALLOWED_DIGESTS together)"
+                    )
 
 
 def check_ci_versions(failures: list[str]) -> None:
-    ci_text = read(".github/workflows/ci.yml")
-    for match in CI_NODE_VERSION_RE.finditer(ci_text):
-        version = match.group(1)
-        ok, why = _node_version_ok(version)
-        if not ok:
-            failures.append(
-                f".github/workflows/ci.yml: setup-node node-version {version!r} is {why}"
-            )
-    for match in CI_PYTHON_VERSION_RE.finditer(ci_text):
-        version = match.group(1)
-        if version != ALLOWED_RUNTIME["python"]["version"]:
-            failures.append(
-                f".github/workflows/ci.yml: setup-python python-version {version!r} "
-                f"contract requires {ALLOWED_RUNTIME['python']['version']!r}"
-            )
+    """Runtime pins in EVERY workflow file are contract surfaces (issue #739:
+    nightly.yml, nightly-quality-gates.yml and closure-evidence.yml each pin
+    runtimes independently and drifted pins were invisible)."""
+    workflows_dir = ROOT / ".github" / "workflows"
+    ci_path = workflows_dir / "ci.yml"
+    if not ci_path.is_file():
+        failures.append(".github/workflows/ci.yml missing (required runtime-contract surface)")
+        return
+    surfaces = sorted(workflows_dir.glob("*.yml"))
+    if ci_path not in surfaces:
+        surfaces.append(ci_path)
+    for wf_path in surfaces:
+        rel = f".github/workflows/{wf_path.name}"
+        wf_text = wf_path.read_text(encoding="utf-8")
+        for match in CI_NODE_VERSION_RE.finditer(wf_text):
+            version = match.group(1)
+            ok, why = _node_version_ok(version)
+            if not ok:
+                failures.append(f"{rel}: setup-node node-version {version!r} is {why}")
+        for match in CI_PYTHON_VERSION_RE.finditer(wf_text):
+            version = match.group(1)
+            if version != ALLOWED_RUNTIME["python"]["version"]:
+                failures.append(
+                    f"{rel}: setup-python python-version {version!r} "
+                    f"contract requires {ALLOWED_RUNTIME['python']['version']!r}"
+                )
 
 
 def check_package_engines(failures: list[str]) -> None:
@@ -277,10 +370,10 @@ def check_package_engines(failures: list[str]) -> None:
 
 def check_contributing(failures: list[str]) -> None:
     text = read("CONTRIBUTING.md")
-    node_re = re.compile(
-        r"(?i)\bnode(?:\.js)?\b[^\n]{0,40}?\b(\d{1,2})\.(\d+)"
-    )
-    for match in node_re.finditer(text):
+    # The module-level CONTRIBUTING_NODE_RE is THE contributing-surface
+    # pattern (issue #740: this function used to compile its own local copy,
+    # leaving the module constant dead — editing it changed nothing).
+    for match in CONTRIBUTING_NODE_RE.finditer(text):
         ok, why = _node_version_ok(f"{match.group(1)}.{match.group(2)}")
         if not ok:
             failures.append(

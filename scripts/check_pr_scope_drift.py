@@ -3,27 +3,31 @@
 
 from __future__ import annotations
 
+import importlib.util as _ilu
 import os
-import subprocess
 import sys
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
+# Shared hardened git plumbing (issue #740): bounded, OSError-tolerant,
+# NUL-delimited listings. Loaded file-relative so the module resolves
+# identically under `python scripts/check_pr_scope_drift.py` and under test
+# loaders that spec-load this script without scripts/ on sys.path.
+_gate_git_spec = _ilu.spec_from_file_location(
+    "_gate_git", Path(__file__).resolve().parent / "_gate_git.py"
+)
+_gate_git = _ilu.module_from_spec(_gate_git_spec)
+_gate_git_spec.loader.exec_module(_gate_git)
 
-def run_git(args: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", *args],
-        cwd=ROOT,
-        check=False,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
 
-
-def changed_files() -> list[str]:
+def changed_files() -> list[str] | None:
+    """Changed files vs the merge-base, or None when git cannot answer at
+    all (binary missing / timeout / OSError — distinct from a legitimate
+    empty answer). The caller fails closed under GITHUB_ACTIONS (PR #1045
+    review, PRR-008/F2-01: this gate used to print "all checks passed" on
+    exactly that fault)."""
     explicit_base = os.environ.get("PR_SCOPE_DRIFT_BASE")
     github_base = os.environ.get("GITHUB_BASE_REF")
     candidates = []
@@ -34,21 +38,27 @@ def changed_files() -> list[str]:
     candidates.append("origin/master")
 
     for base in candidates:
-        merge_base = run_git(["merge-base", base, "HEAD"])
-        if merge_base.returncode != 0:
+        # NUL-delimited listings (issue #740): a non-ASCII tracked path
+        # arrives raw instead of core.quotePath C-quoted, so it can never
+        # silently evade the prefix checks below.
+        merge_base = _gate_git.git_lines(ROOT, "merge-base", base, "HEAD")
+        if merge_base is None:
+            return None
+        if not merge_base:
             continue
-        diff = run_git(["diff", "--name-only", f"{merge_base.stdout.strip()}..HEAD"])
-        if diff.returncode == 0:
-            return [line.strip() for line in diff.stdout.splitlines() if line.strip()]
+        diff = _gate_git.git_lines(
+            ROOT, "diff", "--name-only", f"{merge_base[0]}..HEAD"
+        )
+        if diff is None:
+            return None
+        if diff:
+            return diff
+        return []
 
-    fallback = run_git(["diff", "--name-only", "HEAD~1..HEAD"])
-    if fallback.returncode == 0:
-        return [line.strip() for line in fallback.stdout.splitlines() if line.strip()]
-    print(
-        "scope-drift: unable to determine changed files; skipping drift check",
-        file=sys.stderr,
-    )
-    return []
+    fallback = _gate_git.git_lines(ROOT, "diff", "--name-only", "HEAD~1..HEAD")
+    if fallback is None:
+        return None
+    return fallback
 
 
 def has_path(paths: list[str], prefixes: tuple[str, ...]) -> bool:
@@ -57,6 +67,16 @@ def has_path(paths: list[str], prefixes: tuple[str, ...]) -> bool:
 
 def main() -> int:
     paths = changed_files()
+    if paths is None:
+        # git could not answer at all: fail closed in CI (a gate must not
+        # print "all checks passed" on an instrument fault — PR #1045
+        # review, PRR-008), degrade with the skip note locally.
+        message = "unable to determine changed files (git could not answer); drift check cannot run"
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            print(f"scope-drift: {message}", file=sys.stderr)
+            return 1
+        print(f"scope-drift: {message}", file=sys.stderr)
+        return 0
     failures: list[str] = []
 
     auth_test_changed = any(
@@ -68,9 +88,12 @@ def main() -> int:
         (
             "backend/app/api/routes/auth.py",
             "backend/app/security.py",
+            # Prefix, not directory: also covers auth_service.py and
+            # authz_policy.py (issue #740 — the two dead entries below were
+            # removed because no repository path starts with them; the real
+            # dependency module joins the list).
             "backend/app/services/auth",
-            "backend/app/models/auth",
-            "backend/app/deps.py",
+            "backend/app/api/deps.py",
         ),
     )
     auth_docs_changed = has_path(paths, ("CHANGELOG.md", "docs/", "INSTALLATION.md"))

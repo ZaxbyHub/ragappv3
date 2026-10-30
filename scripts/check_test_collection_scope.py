@@ -44,8 +44,10 @@ Exit codes: 0 = clean, 1 = violations found (each offender printed).
 Run from any cwd (paths resolve from this file).
 """
 
+import fnmatch
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 PRUNE_DIRS = {"__pycache__", "node_modules", "venv", "env", "ENV"}
@@ -53,11 +55,47 @@ TEST_FILE_SUFFIXES = (".py",)
 GIT_TIMEOUT_SECONDS = 60
 DEGRADED_NOTE = "test-collection-scope: git unavailable; falling back to filesystem walk"
 
+# Legacy default when backend/pyproject.toml is missing or unparseable: both
+# test-shaped prefixes count as collected (exactly the pre-#740 behavior, so
+# synthetic repos without a pyproject keep their meaning).
+_LEGACY_PYTHON_FILES = ("test_*.py", "*_test.py")
+
 
 def _is_test_filename(name: str) -> bool:
     return (name.startswith("test_") or name.endswith("_test.py")) and name.endswith(
         TEST_FILE_SUFFIXES
     )
+
+
+def _python_files_patterns(repo_root: Path) -> tuple[str, ...]:
+    """The pytest collection patterns from backend/pyproject.toml, or the
+    legacy default.
+
+    Issue #740: ``backend/pyproject.toml`` pins ``python_files =
+    ["test_*.py"]``, so a ``*_test.py`` file is NEVER collected by pytest —
+    a test-shaped file that matches no pattern is dead weight exactly like a
+    test file outside backend/tests, and this gate now flags it wherever it
+    lives. A missing or unparseable pyproject falls back to the legacy
+    both-shapes-collected behavior rather than guessing.
+    """
+    pyproject = repo_root / "backend" / "pyproject.toml"
+    try:
+        with open(pyproject, "rb") as fh:
+            doc = tomllib.load(fh)
+    except (OSError, tomllib.TOMLDecodeError):
+        return _LEGACY_PYTHON_FILES
+    raw = doc.get("tool", {}).get("pytest", {}).get("ini_options", {}).get("python_files")
+    if isinstance(raw, str):
+        patterns = (raw,)
+    elif isinstance(raw, list) and raw and all(isinstance(item, str) for item in raw):
+        patterns = tuple(raw)
+    else:
+        return _LEGACY_PYTHON_FILES
+    return patterns
+
+
+def _is_collected_by_pytest(name: str, patterns: tuple[str, ...]) -> bool:
+    return any(fnmatch.fnmatch(name, pattern) for pattern in patterns)
 
 
 def _git_paths(repo_root: Path, *args: str) -> list[str] | None:
@@ -104,12 +142,21 @@ def _is_under_backend_tests(rel_posix: str) -> bool:
     return len(parts) >= 2 and parts[0] == "backend" and parts[1] == "tests"
 
 
-def _walk_violations(repo_root: Path) -> list[str]:
-    """Degraded-mode candidate set: the original filesystem walk, unchanged."""
+def _is_candidate(name: str, patterns: tuple[str, ...]) -> bool:
+    """A file this gate must examine: legacy test-shaped (so the gate keeps
+    working without a pyproject) OR matching a configured python_files
+    pattern (PR #1045 review, PRR-010: the legacy-only pre-filter hid files
+    collected under a custom pattern like ``spec_*.py``)."""
+    return _is_test_filename(name) or _is_collected_by_pytest(name, patterns)
+
+
+def _walk_violations(repo_root: Path, patterns: tuple[str, ...]) -> list[str]:
+    """Degraded-mode candidate set: the original filesystem walk, with the
+    same collected-by-pytest check as git mode (issue #740)."""
     if not repo_root.is_dir():
         # Unreachable via main() (ROOT is derived from this file's location) —
-        # a library caller with a nonexistent root gets "no violations", not a
-        # traceback from iterdir().
+        # a library caller with a nonexistent root gets "no violations", not
+        # a traceback from iterdir().
         return []
     tests_root = repo_root / "backend" / "tests"
     violations: list[str] = []
@@ -121,7 +168,10 @@ def _walk_violations(repo_root: Path) -> list[str]:
                 if entry.name.startswith(".") or entry.name in PRUNE_DIRS:
                     continue
                 stack.append(entry)
-            elif entry.is_file() and _is_test_filename(entry.name):
+            elif entry.is_file() and _is_candidate(entry.name, patterns):
+                if not _is_collected_by_pytest(entry.name, patterns):
+                    violations.append(entry.relative_to(repo_root).as_posix())
+                    continue
                 if tests_root == entry or tests_root in entry.parents:
                     continue
                 violations.append(entry.relative_to(repo_root).as_posix())
@@ -129,25 +179,40 @@ def _walk_violations(repo_root: Path) -> list[str]:
 
 
 def find_violations(repo_root: Path) -> list[str]:
-    """Return test files outside backend/tests/, as repo-relative POSIX paths."""
+    """Return test files pytest never collects (or never reaches), as
+    repo-relative POSIX paths.
+
+    Violation classes (issue #740 + PR #1045 review): a test-shaped or
+    configured-pattern file OUTSIDE backend/tests/ (never reached by
+    ``pytest tests/``), and such a file ANYWHERE — including under
+    backend/tests/ — that matches no ``python_files`` pattern in
+    backend/pyproject.toml (pytest silently skips it at collection).
+    """
     tracked = _git_paths(repo_root, "ls-files", "-z")
     untracked = _git_paths(
         repo_root, "ls-files", "--others", "--exclude-standard", "-z"
     )
+    patterns = _python_files_patterns(repo_root)
     if tracked is None or untracked is None:
         # Conservative on purpose: either call failing degrades the whole gate,
         # because a partial git view is not a safe candidate set. Each call is
         # bounded by GIT_TIMEOUT_SECONDS, so the degraded walk starts within
         # 2 x GIT_TIMEOUT_SECONDS of entry.
         print(DEGRADED_NOTE, file=sys.stderr)
-        return _walk_violations(repo_root)
+        return _walk_violations(repo_root, patterns)
     violations: list[str] = []
     for rel in sorted(set(tracked) | set(untracked)):
-        if not _is_test_filename(Path(rel).name):
+        name = Path(rel).name
+        if not _is_candidate(name, patterns):
             continue
         if not (repo_root / rel).is_file():
             continue
         if _has_hidden_parent(rel):
+            continue
+        if not _is_collected_by_pytest(name, patterns):
+            # Collected by no python_files pattern — pytest skips it silently
+            # even under backend/tests/.
+            violations.append(rel)
             continue
         if _is_under_backend_tests(rel):
             continue
@@ -160,15 +225,17 @@ def main() -> int:
     violations = find_violations(repo_root)
     if violations:
         print(
-            "test-collection-scope: pytest test files found outside "
-            "backend/tests/ (never collected by `pytest tests/`):",
+            "test-collection-scope: pytest test files that `pytest tests/` "
+            "never collects (outside backend/tests/, or matching no "
+            "python_files pattern):",
             file=sys.stderr,
         )
         for path in violations:
             print(f"  {path}", file=sys.stderr)
         print(
-            "Move them under backend/tests/ (as real, collectable tests) or "
-            "delete them — see issue #563 / C11.",
+            "Move them under backend/tests/ AND name them per pyproject's "
+            "python_files (test_*.py), or delete them — see issues #563 / "
+            "C11 and #740.",
             file=sys.stderr,
         )
         return 1

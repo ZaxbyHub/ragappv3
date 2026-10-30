@@ -255,6 +255,15 @@ def _load_baseline_keys(path: Path) -> set[str]:
         return set()
 
 
+def _report_bandit_errors(data: dict) -> list[dict]:
+    """Bandit's own ``errors`` array (issue #740): a file bandit cannot parse
+    is silently unscanned — the gate's docstring promises failure "when
+    bandit itself errors", so the errors array is verdict-bearing input, not
+    noise. Returns the error entries (empty when bandit reports none)."""
+    errors = data.get("errors")
+    return errors if isinstance(errors, list) else []
+
+
 def update_baseline() -> int:
     """Regenerate the committed baseline with normalized paths + no timestamp."""
     BASELINE.parent.mkdir(parents=True, exist_ok=True)
@@ -262,6 +271,15 @@ def update_baseline() -> int:
     _exit_code, data, stderr_text = _run_bandit_json(TARGETS, [])
     if data is None:
         sys.stderr.write("run_bandit: failed to generate baseline JSON\n")
+        return 1
+    bandit_errors = _report_bandit_errors(data)
+    if bandit_errors:
+        sys.stderr.write(
+            f"run_bandit: FAIL — bandit reported {len(bandit_errors)} "
+            "unparseable file(s); a baseline would silently skip them:\n"
+        )
+        for err in bandit_errors:
+            sys.stderr.write(f"  {err.get('filename', '?')}: {err.get('reason', '?')}\n")
         return 1
     data = _normalize_for_commit(data)
     with open(BASELINE, "w", encoding="utf-8", newline="\n") as fh:
@@ -344,6 +362,15 @@ def gated_scan() -> int:
     _exit_code, data, stderr_text = _run_bandit_json(TARGETS, [])
     if data is None:
         sys.stderr.write("run_bandit: failed to run bandit for the gated scan\n")
+        return 1
+    bandit_errors = _report_bandit_errors(data)
+    if bandit_errors:
+        sys.stderr.write(
+            f"run_bandit: FAIL — bandit reported {len(bandit_errors)} "
+            "unparseable file(s); they were silently unscanned:\n"
+        )
+        for err in bandit_errors:
+            sys.stderr.write(f"  {err.get('filename', '?')}: {err.get('reason', '?')}\n")
         return 1
     current_results = data.get("results", [])
     current_keys = {_finding_key(r) for r in current_results}
