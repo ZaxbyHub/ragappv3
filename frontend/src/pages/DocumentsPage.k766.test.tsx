@@ -1,34 +1,19 @@
 // frontend/src/pages/DocumentsPage.k766.test.tsx
-// K766 acceptance checks (issue #766, frozen) — confirmed-delete durability
-// across the undo window (C12/C13) and Authorization-header leakage in
-// tag/folder failure logs (C19).
-//
-//   C12 (DISCRIMINATING) — a pagehide fired INSIDE the 3s undo window must
-//   still dispatch the confirmed delete through the keepalive channel when
-//   a CSRF credential is cached, and — with no credential — dispatch
-//   NOTHING and register the id for the bfcache pageshow replay. At base
-//   pagehide does nothing. RED at base, GREEN after the fix.
-//
-//   C13 (DISCRIMINATING) — when that flush (unmount inside the undo window)
-//   FAILS, an error must surface. At base the unmount flush swallows the
-//   rejection silently. RED at base, GREEN after the fix.
-//
-//   C19 (DISCRIMINATING) — tag/folder failure logs must not serialize the
-//   request config (and its Authorization header). At base the raw
-//   AxiosError is logged. RED at base, GREEN after the fix.
-//
-// Amended after review round 1: C12 follows the NEW design (the sendBeacon
-// fallback is gone — no production path uses it, so no stub here); the
-// keepalive channel is pinned through the stubbed global fetch with its
-// DELETE/keepalive/X-CSRF-Token shape, and the pageshow replay through
-// deleteDocument (the keepalive outcome is unconfirmed, so a bfcache return
-// completes the intent through the normal path). C13 pins the toast MESSAGE,
-// and C19 adds an emission sentinel (>= 2 failure logs).
-//
-// Mock structure mirrors DocumentsPage.k03.test.tsx (proven in this repo):
-// the full "@/lib/api" mock, the sonner callable toast mock, the
-// useVaultStore/useUploadStore/useDebounce mocks, the UI-primitive stubs,
-// the react-virtual stub, and the real ConfirmDialog (Radix portal).
+// K766 acceptance checks (issue #766, frozen); all DISCRIMINATING (RED at
+// base, GREEN after the fix). C12 — pagehide inside the 3s undo window
+// dispatches the confirmed delete via the keepalive fetch when a CSRF
+// credential is cached; with none it dispatches NOTHING and registers the
+// id for the bfcache pageshow replay (which completes it via
+// deleteDocument). C13 — a FAILED unmount flush surfaces an error toast
+// (message pinned). C19 — tag/folder failure logs never serialize the
+// request config / Authorization header (round 2: production NORMALIZED
+// error fixture with positive pins for status 500 and the /documents URL).
+// Round 2 PRR-007 — "ragapp:before-logout" (dispatched FIRST by logout,
+// while credentials are valid) runs the SPA-unmount flush: the delete goes
+// out via the normal path; a later pageshow cannot re-send it.
+// Mocks mirror DocumentsPage.k03.test.tsx (proven in this repo): the full
+// "@/lib/api" mock, the sonner toast mock, the store/debounce mocks, the
+// UI-primitive stubs, the react-virtual stub, the real ConfirmDialog.
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render as rtlRender, fireEvent, act, waitFor, screen, within } from '@testing-library/react';
@@ -65,24 +50,13 @@ vi.mock('@/lib/api', () => ({
   deleteDocument: vi.fn().mockResolvedValue(undefined),
   deleteDocuments: vi.fn().mockResolvedValue({ deleted_count: 0, failed_ids: [] }),
   deleteAllDocumentsInVault: vi.fn().mockResolvedValue({ deleted_count: 0 }),
-  getDocumentWikiStatus: vi.fn().mockResolvedValue({
-    wiki_status: 'not_compiled',
-    pages_count: 0,
-    claims_count: 0,
-    lint_count: 0,
-  }),
+  getDocumentWikiStatus: vi.fn().mockResolvedValue({ wiki_status: 'not_compiled', pages_count: 0, claims_count: 0, lint_count: 0 }),
   // useUploadMonitoring imports these two-hops via this barrel; explicit
-  // mocks keep them dead in this suite (latent today: the hook stays
-  // disarmed with no uploads).
+  // mocks keep them dead in this suite.
   getDocumentStatus: vi.fn(),
   getDocumentStatuses: vi.fn(),
   compileDocumentWiki: vi.fn().mockResolvedValue({ job_id: 1, status: 'queued' }),
-  getDocumentStats: vi.fn().mockResolvedValue({
-    total_documents: 0,
-    total_chunks: 0,
-    total_size_bytes: 0,
-    documents_by_status: {},
-  }),
+  getDocumentStats: vi.fn().mockResolvedValue({ total_documents: 0, total_chunks: 0, total_size_bytes: 0, documents_by_status: {} }),
   listTags: vi.fn().mockResolvedValue([]),
   listFolders: vi.fn().mockResolvedValue([]),
   createFolder: vi.fn().mockResolvedValue({ id: 1, name: 'mock', vault_id: 1, parent_folder_id: null }),
@@ -214,8 +188,7 @@ vi.mock('@/components/documents/UploadDropzone', () => ({
 vi.mock('@/components/documents/RejectedFilesBanner', () => ({
   RejectedFilesBanner: () => null,
 }));
-
-// Import component after mocks
+// Import component after mocks.
 import DocumentsPage from '@/pages/DocumentsPage';
 import { useVaultStore } from '@/stores/useVaultStore';
 import { toast } from 'sonner';
@@ -257,7 +230,7 @@ async function confirmSingleDelete() {
     fireEvent.click(deleteButtons[0]);
   });
   // The real ConfirmDialog renders in a Radix portal; locate the destructive
-  // confirm BY ROLE inside the dialog (never by the literal button text).
+  // confirm BY ROLE inside the dialog.
   const dialog = await screen.findByRole('dialog', {}, { timeout: 10_000 });
   const confirmButton = within(dialog).getByRole('button', { name: /confirm|delete/i });
   expect(confirmButton).toBeEnabled();
@@ -268,12 +241,22 @@ async function confirmSingleDelete() {
   await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull(), { timeout: 5_000 });
 }
 
-/** A real AxiosError whose serialized config carries an Authorization header. */
-function authorizationBearerError(): AxiosError {
+/** The apiClient interceptor's NORMALIZED error (mirrors the K766 C18
+ * fixture in useDocumentPolling.k766.test.ts): top-level status, raw
+ * AxiosError under originalError whose serialized config carries the
+ * Authorization header and the request URL. */
+function normalizedBearerError(): Error & { status?: number; originalError?: unknown } {
   const config = {
     headers: { Authorization: 'Bearer probe-token' },
+    url: '/documents',
   } as unknown as InternalAxiosRequestConfig;
-  return new AxiosError('boom', '500', config, {}, null);
+  const err = new Error('Request failed with status code 500') as Error & {
+    status?: number;
+    originalError?: unknown;
+  };
+  err.status = 500;
+  err.originalError = new AxiosError('Request failed with status code 500', '500', config);
+  return err;
 }
 
 /** Serialize every logged argument; JSON.stringify failures become "". */
@@ -302,8 +285,7 @@ describe('DocumentsPage K766 acceptance checks', () => {
       .mock.calls.filter(([docId]) => docId === '1').length;
   }
 
-  /** Count keepalive fetch calls for doc "1" (any method — shape asserted
-   * separately in the credential test). */
+  /** Count keepalive fetch calls for doc "1" (shape asserted in the credential test). */
   function keepaliveCalls(): number {
     return fetchSpy.mock.calls.filter(([input, init]) => {
       const requestInit = (init ?? {}) as { keepalive?: boolean };
@@ -318,8 +300,7 @@ describe('DocumentsPage K766 acceptance checks', () => {
     vi.mocked(getDocumentStats).mockResolvedValue(STATS);
     vi.mocked(deleteDocument).mockResolvedValue(undefined);
     // The keepalive channel rides the REAL core's global fetch; stub it so
-    // no real request leaves jsdom (sendBeacon is gone from the design —
-    // no production path uses it, so it is not stubbed here either).
+    // no real request leaves jsdom (sendBeacon is gone from the design).
     fetchSpy = vi.fn(() => Promise.resolve({ ok: true } as Response));
     vi.stubGlobal('fetch', fetchSpy);
   });
@@ -336,8 +317,7 @@ describe('DocumentsPage K766 acceptance checks', () => {
       render(<DocumentsPage />);
     });
 
-    // Confirm one delete (starts the 3s undo window; the real delete is
-    // deferred inside it). No CSRF credential is cached in this test env.
+    // Confirm one delete (starts the 3s undo window; no CSRF credential cached).
     await confirmSingleDelete();
     expect(vi.mocked(deleteDocument)).not.toHaveBeenCalled();
 
@@ -347,11 +327,9 @@ describe('DocumentsPage K766 acceptance checks', () => {
     });
 
     // Discriminating assertion (first half): with NO credential the pagehide
-    // dispatches NOTHING — neither the axios path (a CSRF-discovery round
-    // trip the browser would abort mid-teardown) nor a keepalive fetch. The
-    // id is registered for the bfcache replay instead. At base pagehide does
-    // nothing at all, so this alone would pass there — the replay below is
-    // what discriminates.
+    // dispatches NOTHING — the id is registered for the bfcache replay
+    // instead (the replay below is what discriminates; at base pagehide
+    // does nothing at all).
     expect(apiDeleteCalls()).toBe(0);
     expect(keepaliveCalls()).toBe(0);
 
@@ -367,13 +345,12 @@ describe('DocumentsPage K766 acceptance checks', () => {
     });
 
     // Discriminating assertion (second half): the persisted pageshow REPLAYS
-    // the registered delete through the normal path — exactly once.
+    // the registered delete through the normal path, exactly once.
     expect(apiDeleteCalls()).toBe(1);
   });
 
   it('pagehide with a cached CSRF credential issues the keepalive delete', { timeout: 30_000 }, async () => {
-    // Seed the readable CSRF cookie the keepalive channel reads
-    // (getCsrfCookie reads document.cookie; no sendBeacon involved).
+    // Seed the readable CSRF cookie the keepalive channel reads.
     document.cookie = 'X-CSRF-Token=test-token';
 
     let utils!: ReturnType<typeof render>;
@@ -388,8 +365,7 @@ describe('DocumentsPage K766 acceptance checks', () => {
     });
 
     // Discriminating assertion: the confirmed delete left via the keepalive
-    // fetch — exactly one request, with the destructive shape (DELETE,
-    // keepalive, the cached CSRF header) and no axios deleteDocument call.
+    // fetch — exactly one request with the destructive shape.
     expect(keepaliveCalls()).toBe(1);
     expect(fetchSpy).toHaveBeenCalledWith(
       expect.stringMatching(/\/documents\/1$/),
@@ -401,9 +377,7 @@ describe('DocumentsPage K766 acceptance checks', () => {
     );
     expect(apiDeleteCalls()).toBe(0);
 
-    // Bfcache return: the keepalive outcome is UNCONFIRMED (its response is
-    // not observable), so the pageshow replay completes the intent through
-    // the normal path — one deleteDocument call, success toast and all.
+    // Bfcache return: the keepalive outcome is UNCONFIRMED, so the pageshow replay completes the intent.
     const pageshow = new Event('pageshow');
     (pageshow as unknown as { persisted: boolean }).persisted = true;
     await act(async () => {
@@ -414,9 +388,8 @@ describe('DocumentsPage K766 acceptance checks', () => {
     });
     expect(apiDeleteCalls()).toBe(1);
 
-    // Exactly-once pin: the pagehide flush already emptied the pending
-    // map, so the SPA-unmount flush finds nothing — no second call on
-    // either channel.
+    // Exactly-once pin: the pagehide flush emptied the pending map, so the
+    // SPA-unmount flush finds nothing.
     await act(async () => {
       utils.unmount();
     });
@@ -448,22 +421,49 @@ describe('DocumentsPage K766 acceptance checks', () => {
     });
 
     // Discriminating assertion: the flushed delete failed, so an error toast
-    // must surface (the destructive action did NOT happen — the user must
-    // know). At base the unmount flush swallows the rejection silently.
-    // RED at base, GREEN after the fix.
+    // must surface (at base the flush swallows the rejection silently).
     expect(vi.mocked(toast.error).mock.calls.length).toBeGreaterThan(0);
-    // Message oracle (review round 1): the toast names the failed action —
-    // not an unrelated or generic error that would pass vacuously.
+    // Message oracle (round 1): the toast names the failed action.
     expect(vi.mocked(toast.error)).toHaveBeenCalledWith(
       'Failed to delete document',
       expect.anything(),
     );
   });
 
+  // Review round 2, PRR-007 — useAuthStore.logout dispatches
+  // "ragapp:before-logout" as its FIRST line, while credentials are still
+  // valid. The listener runs the SPA-unmount-semantics flush (round 2
+  // channel fix: a pagehide-style deferral could never replay — an SPA
+  // logout fires no pageshow): the confirmed delete goes out via the normal
+  // deleteDocument path; a later pageshow cannot re-send it.
+  it('logout event flushes a pending delete before credentials clear', { timeout: 30_000 }, async () => {
+    await act(async () => {
+      render(<DocumentsPage />);
+    });
+    await confirmSingleDelete();
+    expect(apiDeleteCalls()).toBe(0);
+
+    await act(async () => {
+      fireEvent(window, new Event('ragapp:before-logout'));
+      await flushMicrotasks();
+    });
+    // Discriminating assertion: the delete went out via the NORMAL path.
+    expect(apiDeleteCalls()).toBe(1);
+    expect(keepaliveCalls()).toBe(0);
+
+    // A persisted pageshow must not replay it (nothing was registered).
+    const pageshow = new Event('pageshow');
+    (pageshow as unknown as { persisted: boolean }).persisted = true;
+    await act(async () => {
+      fireEvent(window, pageshow);
+      await flushMicrotasks();
+    });
+    expect(apiDeleteCalls()).toBe(1);
+  });
+
   it('tag and folder failure logs carry no Authorization header', { timeout: 30_000 }, async () => {
-    const authError = authorizationBearerError();
-    // Sentinel: the fixture error itself serializes the Authorization header
-    // (a real AxiosError whose toJSON carries config.headers).
+    const authError = normalizedBearerError();
+    // Sentinel: the fixture error serializes the Authorization header (via the AxiosError under originalError).
     expect(JSON.stringify(authError)).toContain('Authorization');
     vi.mocked(listTags).mockRejectedValue(authError);
     vi.mocked(listFolders).mockRejectedValue(authError);
@@ -483,14 +483,17 @@ describe('DocumentsPage K766 acceptance checks', () => {
     });
     expect(errorSpy.mock.calls.length).toBeGreaterThanOrEqual(2);
 
-    const leaking = serializedLoggedArgs([errorSpy, warnSpy]).filter((serialized) =>
-      serialized.includes('Authorization'),
-    );
+    const logged = serializedLoggedArgs([errorSpy, warnSpy]);
+    const leaking = logged.filter((serialized) => serialized.includes('Authorization'));
 
     // Discriminating assertion: no logged argument may serialize the request
     // config's Authorization header. At base both console.error(err) calls
     // serialize the AxiosError with its config: 2 leaking arguments.
     // RED at base, GREEN after the fix.
     expect(leaking).toHaveLength(0);
+    // Positive pins (mirroring C18): the sanitized log still DELIVERS the
+    // status and URL — stripping the header must not strip the diagnosis.
+    expect(logged.some((serialized) => serialized.includes('500'))).toBe(true);
+    expect(logged.some((serialized) => serialized.includes('/documents'))).toBe(true);
   });
 });

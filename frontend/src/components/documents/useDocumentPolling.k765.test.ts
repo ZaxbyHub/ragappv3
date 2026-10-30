@@ -24,6 +24,13 @@
 //        vault switch clears it, so the old vault's failing document earns
 //        no further fetches and the new vault hydrates fresh.
 //
+// Review round 2 pins (final critic): PRR-004 (an exhausted failed id is
+// skipped by hydration on a key change), PRR-009 (a superseded wiki batch
+// still fetches its remaining documents), PRR-035 (a stale failure does not
+// mark a document failed after a newer success), and PRR-011 (a failed
+// upload-transition refetch keeps the loaded rows — relocated here from
+// useDocumentPolling.k766.test.ts, which is at its 500-line cap).
+//
 // Harness copied from useDocumentPolling.k01.test.ts (proven in this repo):
 // the vi.importActual-spread "@/lib/api" mock, the sonner mock, the
 // useAuthStore owner setup, the options() helper, and the deferred/flush
@@ -37,6 +44,7 @@ import type {
   DocumentStatsResponse,
   DocumentWikiStatus,
 } from "@/lib/api";
+import type { UploadFile } from "@/stores/useUploadStore";
 import { useAuthStore } from "@/stores/useAuthStore";
 
 const fixture = vi.hoisted(() => ({
@@ -174,7 +182,10 @@ function wikiStatus(
   };
 }
 
-function options(activeVaultId: number | null): PollingOptions {
+function options(
+  activeVaultId: number | null,
+  overrides?: Partial<PollingOptions>
+): PollingOptions {
   return {
     activeVaultId,
     search: "",
@@ -183,7 +194,19 @@ function options(activeVaultId: number | null): PollingOptions {
     tagFilterId: null,
     folderFilterId: null,
     uploads: [],
+    ...overrides,
   };
+}
+
+/** Fresh upload-monitor fixture row (a NEW object every call, like the store). */
+function uploadRow(id: string, status: string, progress = 0): UploadFile {
+  return {
+    id,
+    file: { name: `${id}.bin` } as File,
+    uploadProgress: progress,
+    progress,
+    status,
+  } as unknown as UploadFile;
 }
 
 describe("useDocumentPolling K765 acceptance checks", () => {
@@ -474,5 +497,265 @@ describe("useDocumentPolling K765 acceptance checks", () => {
     // dropping the older batch leaves 5 without any wiki status. At base the
     // stale-token guard discards the whole older batch.
     expect(view.result.current.wikiStatusMap["5"]?.wiki_status).toBe("compiled");
+  });
+
+  it("an exhausted failed id is not re-requested when the list key changes", { timeout: 30_000 }, async () => {
+    vi.useFakeTimers({
+      toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"],
+    });
+    // The empty search lists only the permanently failing doc 5; the "foo"
+    // search additionally returns doc 6 (a fresh, hydratable doc).
+    fixture.listDocuments.mockImplementation(({ search }: { search?: string }) =>
+      search === "foo"
+        ? Promise.resolve({
+            documents: [documentRow("5", "indexed"), documentRow("6", "indexed")],
+            total: 2,
+          })
+        : Promise.resolve({ documents: [documentRow("5", "indexed")], total: 1 }),
+    );
+    fixture.getDocumentWikiStatus.mockRejectedValue(
+      new Error("wiki status unavailable"),
+    );
+
+    const view = renderHook(
+      (props: { search: string }) =>
+        useDocumentPolling(options(1, { search: props.search })),
+      { initialProps: { search: "" } },
+    );
+    await act(async () => {
+      await flush();
+    });
+    // Exhaust the capped schedule exactly as the bounded check above:
+    // 16 ticks = 80 s, the [0,1,3,7] skip credits land all 5 attempts.
+    for (let index = 0; index < 16; index += 1) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5_000);
+      });
+    }
+    await act(async () => {
+      await flush();
+    });
+    expect(
+      fixture.getDocumentWikiStatus.mock.calls.filter(([fileId]) => fileId === 5),
+    ).toHaveLength(5);
+
+    // Change the list key: the query context changes and the hydration pass
+    // re-runs — it must hydrate the FRESH doc 6 while skipping the
+    // exhausted doc 5 (review round 2 PRR-004: a failed id is owned
+    // exclusively by its capped retry schedule).
+    await act(async () => {
+      view.rerender({ search: "foo" });
+    });
+    await act(async () => {
+      await flush();
+    });
+    expect(
+      fixture.getDocumentWikiStatus.mock.calls.filter(([fileId]) => fileId === 6).length,
+    ).toBeGreaterThanOrEqual(1);
+
+    // More retry ticks: doc 6 rides its own schedule; doc 5 stays skipped.
+    for (let index = 0; index < 6; index += 1) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5_000);
+      });
+    }
+    await act(async () => {
+      await flush();
+    });
+    // Discriminating assertion: the key-change hydration and every later
+    // tick leave the exhausted id alone. At base the hydration pass
+    // re-included it on every key change and the fetches never stopped.
+    expect(
+      fixture.getDocumentWikiStatus.mock.calls.filter(([fileId]) => fileId === 5),
+    ).toHaveLength(5);
+    expect(view.result.current.wikiFetchFailedIds.has("5")).toBe(true);
+  });
+
+  it("a superseded batch still fetches its remaining documents", { timeout: 30_000 }, async () => {
+    vi.useFakeTimers({
+      toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"],
+    });
+    // SEVEN indexed docs exhaust the six batch workers: docs 5..10 occupy
+    // the first worker iterations (each HELD in flight); doc 11 — LAST in
+    // cursor order — is only reachable by a worker's SECOND loop iteration,
+    // making it the run-to-completion witness (review round 2 PRR-009).
+    const docs = ["5", "6", "7", "8", "9", "10", "11"].map((id) =>
+      documentRow(id, "indexed"),
+    );
+    fixture.listDocuments.mockImplementation(() =>
+      Promise.resolve({ documents: docs, total: docs.length }),
+    );
+    const held = docs.slice(0, 6).map(() => deferred<DocumentWikiStatus>());
+    const callsPerDoc = new Map<number, number>();
+    fixture.getDocumentWikiStatus.mockImplementation((fileId: number) => {
+      const calls = (callsPerDoc.get(fileId) ?? 0) + 1;
+      callsPerDoc.set(fileId, calls);
+      if (fileId <= 10) {
+        // Old batch (call 1): held. Newer batch (call 2+): rejects.
+        return calls === 1
+          ? held[fileId - 5].promise
+          : Promise.reject(new Error("wiki status unavailable"));
+      }
+      // Doc 11: the NEWER batch reaches it first (call 1 rejects); the old
+      // batch's late loop iteration is call 2 → compiled.
+      return calls === 1
+        ? Promise.reject(new Error("wiki status unavailable"))
+        : Promise.resolve(wikiStatus("compiled", fileId));
+    });
+
+    const view = renderHook(
+      (props: { vault: number }) => useDocumentPolling(options(props.vault)),
+      { initialProps: { vault: 1 } },
+    );
+    await act(async () => {
+      await flush();
+    });
+    // Sentinel: the initial batch started; all six workers are held.
+    expect([...callsPerDoc.keys()].filter((fileId) => fileId <= 10)).toHaveLength(6);
+
+    // A NEWER wiki read: compile doc 7; the 2s follow-up refresh re-reads
+    // every indexed doc, superseding the initial batch's read token.
+    await act(async () => {
+      await view.result.current.handleCompileDocument("7");
+    });
+    expect(fixture.compileDocumentWiki).toHaveBeenCalledWith(7, 1);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    await act(async () => {
+      await flush();
+    });
+    // Sentinel: the newer batch ran (second calls for 5..10) and itself
+    // reached doc 11 (its call 1 rejected — only the OLD batch's continued
+    // loop can still give 11 a successful fetch).
+    expect(callsPerDoc.get(5)).toBe(2);
+    expect(callsPerDoc.get(11)).toBe(1);
+
+    // Release the old batch's held workers.
+    await act(async () => {
+      held.forEach((pending, index) =>
+        pending.resolve(wikiStatus("compiled", index + 5)),
+      );
+      await flush();
+    });
+
+    // Discriminating assertions: the old batch's workers looped PAST the
+    // supersession and fetched the remaining doc 11 (call 2), whose result
+    // committed. At base the whole-batch currency gate stopped every worker
+    // at its next loop iteration: call 2 never happened and the newer
+    // batch's rejection left 11 with no status at all.
+    expect(callsPerDoc.get(11)).toBe(2);
+    expect(view.result.current.wikiStatusMap["11"]?.wiki_status).toBe("compiled");
+    expect(view.result.current.wikiFetchFailedIds.has("11")).toBe(false);
+    // The old batch's held successes committed as well (the doc AFTER the
+    // held run did not abandon the batch's earlier documents either).
+    expect(view.result.current.wikiStatusMap["5"]?.wiki_status).toBe("compiled");
+  });
+
+  it("a stale failure does not mark a document failed after a newer success", { timeout: 30_000 }, async () => {
+    vi.useFakeTimers({
+      toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"],
+    });
+    fixture.listDocuments.mockImplementation(() =>
+      Promise.resolve({
+        documents: [documentRow("5", "indexed"), documentRow("6", "indexed")],
+        total: 2,
+      }),
+    );
+    // Doc 5 attempt 1 (initial batch) is HELD and will REJECT late; the
+    // newer attempt 2 (key-change batch) resolves compiled first. Doc 6
+    // always resolves.
+    const staleFailure = deferred<DocumentWikiStatus>();
+    let callsForFive = 0;
+    fixture.getDocumentWikiStatus.mockImplementation((fileId: number) => {
+      if (fileId === 5) {
+        callsForFive += 1;
+        return callsForFive === 1
+          ? staleFailure.promise
+          : Promise.resolve(wikiStatus("compiled", fileId));
+      }
+      return Promise.resolve(wikiStatus("not_compiled", fileId));
+    });
+
+    const view = renderHook(
+      (props: { search: string }) =>
+        useDocumentPolling(options(1, { search: props.search })),
+      { initialProps: { search: "" } },
+    );
+    await act(async () => {
+      await flush();
+    });
+    // Sentinel: the initial batch started; doc 5's first attempt is held.
+    expect(callsForFive).toBe(1);
+
+    // Key change: the new hydration batch re-requests doc 5 (still
+    // uncached — its first attempt has neither committed nor failed) and
+    // attempt 2 SUCCEEDS and commits first.
+    await act(async () => {
+      view.rerender({ search: "foo" });
+    });
+    await act(async () => {
+      await flush();
+    });
+    expect(callsForFive).toBe(2);
+    expect(view.result.current.wikiStatusMap["5"]?.wiki_status).toBe("compiled");
+
+    // NOW the older attempt rejects (a response that lost the race).
+    await act(async () => {
+      staleFailure.reject(new Error("wiki status unavailable"));
+      await flush();
+    });
+
+    // Discriminating assertion (review round 2 PRR-035): the attempt-
+    // recency watermark suppresses the stale failure — doc 5 is NOT marked
+    // failed and the newer success stays committed. At base the failure
+    // path had no guard and flipped the cell to "unavailable".
+    expect(view.result.current.wikiFetchFailedIds.has("5")).toBe(false);
+    expect(view.result.current.wikiStatusMap["5"]?.wiki_status).toBe("compiled");
+  });
+
+  // Relocated from useDocumentPolling.k766.test.ts (at its 500-line cap):
+  // the upload-transition refetch must not wipe a loaded list when it fails.
+  it("a failed transition refetch keeps the loaded rows", { timeout: 30_000 }, async () => {
+    vi.useFakeTimers({
+      toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"],
+    });
+    // The initial load commits row 5; the upload-transition refetch REJECTS.
+    fixture.listDocuments
+      .mockImplementationOnce(() =>
+        Promise.resolve({ documents: [documentRow("5", "indexed")], total: 1 }),
+      )
+      .mockRejectedValue(new Error("transient list failure"));
+
+    const view = renderHook(
+      (props: { uploads: UploadFile[] }) =>
+        useDocumentPolling(options(1, { uploads: props.uploads })),
+      { initialProps: { uploads: [] as UploadFile[] } },
+    );
+    await act(async () => {
+      await flush();
+    });
+    // Sentinel: the initial load settled with row 5 committed.
+    expect(view.result.current.documents.map((row) => row.id)).toEqual(["5"]);
+
+    // The indexed transition arms the 1s refetch; its list call rejects.
+    await act(async () => {
+      view.rerender({ uploads: [uploadRow("a", "indexed")] });
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    await act(async () => {
+      await flush();
+    });
+
+    // Discriminating assertions (review round 2 PRR-011,
+    // fetchDocuments({keepRowsOnFailure:true})): the refetch ran and failed
+    // (a toast firing is fine), but the loaded rows SURVIVE and no error
+    // state is set — the transition was consumed, so a wipe to the error
+    // state would never self-heal. At base the failure wiped the rows.
+    expect(fixture.listDocuments).toHaveBeenCalledTimes(2);
+    expect(view.result.current.documents.map((row) => row.id)).toEqual(["5"]);
+    expect(view.result.current.listError).toBe(false);
   });
 });

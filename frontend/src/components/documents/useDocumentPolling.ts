@@ -588,13 +588,15 @@ export function useDocumentPolling({
 
   // Per-document wiki fetch bookkeeping (#765 AC4/AC5):
   // - wikiDocAttemptRef counts, per document, every fetch START for that
-  //   document (across batches).
+  //   document (across batches). No whole-batch currency gate exists: batches
+  //   always run to completion, and the per-document watermark orders the
+  //   commits (review round 1 PRR-009).
   // - wikiDocCommittedRef is the per-document successful-commit watermark: a
   //   result commits when its attempt number exceeds it. A newer FAILURE
-  //   never raises the watermark (a held older success still commits), while
-  //   a newer SUCCESS blocks a subsequent older late success (no stale
-  //   clobber). The whole-batch currency check below still gates LAUNCHING
-  //   new per-document requests, but no longer discards in-flight results.
+  //   never raises the watermark (a held older success still commits), a
+  //   newer SUCCESS blocks a subsequent older late success (no stale
+  //   clobber), and the failure path applies the same recency guard
+  //   (review round 2 PRR-035).
   // - wikiRetryAttemptsRef/wikiRetrySkipTicksRef drive the capped
   //   per-document retry backoff (tick-based; see WIKI_RETRY_SKIP_TICKS);
   //   wikiFailedRef mirrors the render state for the workers.
@@ -709,7 +711,7 @@ export function useDocumentPolling({
         finishRead(token);
       }
     },
-    [activeVaultId, beginRead, clearWikiFetchFailure, finishRead, isContextLive, isReadCurrent, markWikiFetchFailed, scope]
+    [activeVaultId, beginRead, clearWikiFetchFailure, finishRead, isContextLive, markWikiFetchFailed, scope]
   );
 
   const compileInFlightRef = useRef(new Map<string, CompileToken>());
@@ -852,6 +854,16 @@ export function useDocumentPolling({
     if (!isContextLive(scope, lease)) return;
     const mountedLease = lease;
     const compileTimers = compileTimersRef.current;
+    // Copy the per-document collections out of the refs before the cleanup
+    // closes over them (review round 2: eslint react-hooks/exhaustive-deps —
+    // a ref value read at cleanup time is not guaranteed to be current; the
+    // maps themselves are stable module-style holders, so clearing the
+    // captured references clears the live collections).
+    const docAttempts = wikiDocAttemptRef.current;
+    const docCommitted = wikiDocCommittedRef.current;
+    const retryAttempts = wikiRetryAttemptsRef.current;
+    const retrySkipTicks = wikiRetrySkipTicksRef.current;
+    const failedIds = wikiFailedRef.current;
     return () => {
       mountedLease.retired = true;
       for (const entry of compileTimers) {
@@ -873,11 +885,11 @@ export function useDocumentPolling({
       // schedules, and the failed mirror are released with the scope so a
       // new vault/identity starts fresh and the collections cannot grow
       // without bound across a session.
-      wikiDocAttemptRef.current.clear();
-      wikiDocCommittedRef.current.clear();
-      wikiRetryAttemptsRef.current.clear();
-      wikiRetrySkipTicksRef.current.clear();
-      wikiFailedRef.current.clear();
+      docAttempts.clear();
+      docCommitted.clear();
+      retryAttempts.clear();
+      retrySkipTicks.clear();
+      failedIds.clear();
       if (wikiPollFlightRef.current?.lease === mountedLease) {
         wikiPollFlightRef.current = null;
       }

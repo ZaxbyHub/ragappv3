@@ -14,7 +14,7 @@
 // after the fix.
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render as rtlRender, act, waitFor, screen } from '@testing-library/react';
+import { render as rtlRender, act, waitFor, screen, fireEvent } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { MemoryRouter } from 'react-router-dom';
 
@@ -231,6 +231,8 @@ describe('DocumentsPage K765 acceptance check — failed wiki status fetch is no
   });
 
   afterEach(() => {
+    if (vi.isFakeTimers()) vi.clearAllTimers();
+    vi.useRealTimers();
     vi.restoreAllMocks();
   });
 
@@ -263,6 +265,66 @@ describe('DocumentsPage K765 acceptance check — failed wiki status fetch is no
     // cannot know is needed. At base the missing map entry is treated as
     // "not_compiled" and one Compile button renders.
     // RED at base, GREEN after the fix.
+    expect(screen.queryAllByRole('button', { name: 'Compile' }).length).toBe(0);
+  });
+
+  // Review round 2, PRR-037/B-2/R03 — the two-step shape the final critic
+  // asked for: a CACHED status plus a LATER failed refresh. A cached
+  // not_compiled renders Compile; when a subsequent refresh of that same
+  // document FAILS, the current failure must take precedence over the stale
+  // cached value and render "Wiki status unavailable" instead — the failure
+  // must never be masked by the value it superseded.
+  it('a cached status plus a later failed refresh renders unavailable, not Compile', { timeout: 30_000 }, async () => {
+    // Step 1: the first hydration SUCCEEDS with not_compiled (the cell
+    // renders the Compile affordance); every later fetch of this document
+    // REJECTS.
+    vi.mocked(getDocumentWikiStatus)
+      .mockResolvedValueOnce({
+        wiki_status: 'not_compiled',
+        pages_count: 0,
+        claims_count: 0,
+        lint_count: 0,
+      })
+      .mockRejectedValue(new Error('wiki status unavailable'));
+
+    await act(async () => {
+      render(<DocumentsPage />);
+    });
+
+    // Sentinel: the cached not_compiled committed and the Compile button IS
+    // on screen — the exact state a later failure must mask.
+    const compileButton = await screen.findByRole(
+      'button',
+      { name: 'Compile' },
+      { timeout: 10_000 },
+    );
+    expect(vi.mocked(getDocumentWikiStatus)).toHaveBeenCalledTimes(1);
+
+    // Step 2: drive a later refresh of the SAME document through the compile
+    // follow-up path (compileDocumentWiki resolves; the 2 s follow-up timer
+    // re-fetches every indexed row). A search-string rerender would NOT work
+    // here: the hydration pass skips documents with a cached non-transient
+    // status, so the compile follow-up is the workable driver.
+    vi.useFakeTimers({
+      toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'],
+    });
+    await act(async () => {
+      fireEvent.click(compileButton);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    await act(async () => {
+      for (let i = 0; i < 10; i += 1) await Promise.resolve();
+    });
+
+    // The follow-up refresh ran and failed.
+    expect(vi.mocked(getDocumentWikiStatus)).toHaveBeenCalledTimes(2);
+
+    // Discriminating assertions: the failed refresh is rendered as
+    // "Wiki status unavailable" and the cached not_compiled no longer
+    // surfaces the Compile affordance.
+    expect(screen.getByText('Wiki status unavailable')).toBeInTheDocument();
     expect(screen.queryAllByRole('button', { name: 'Compile' }).length).toBe(0);
   });
 });

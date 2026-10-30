@@ -335,11 +335,14 @@ export function DocumentTable({
                             </span>
                           );
                         }
-                        if (!ws && wikiFetchFailedIds.has(docId)) {
+                        if (wikiFetchFailedIds.has(docId)) {
                           // A FAILED wiki-status fetch is unknown, NOT
-                          // uncompiled (#765 AC6): it must not render the
-                          // Compile affordance that invites a pointless job —
-                          // only a server-confirmed not_compiled does.
+                          // uncompiled (#765 AC6), and a current failure
+                          // takes precedence over ANY cached value
+                          // (review round 2, PRR-037/B-2/R03: a cached
+                          // not_compiled plus a later failed refresh must
+                          // not render the Compile affordance — the failure
+                          // must never be masked by the stale value).
                           return (
                             <span
                               className="text-xs text-muted-foreground italic"

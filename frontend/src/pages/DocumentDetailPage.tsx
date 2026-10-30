@@ -508,6 +508,13 @@ export default function DocumentDetailPage() {
               <p className="text-muted-foreground">Chunks</p>
               <p>{chunkCount}</p>
             </div>
+            {status === "processing" &&
+              Number(doc.progress_percent ?? -1) >= 0 && (
+                <div>
+                  <p className="text-muted-foreground">Progress</p>
+                  <p>{Number(doc.progress_percent).toFixed(0)}%</p>
+                </div>
+              )}
             <div>
               <p className="text-muted-foreground">Size</p>
               <p>{formatFileSize(doc.size)}</p>

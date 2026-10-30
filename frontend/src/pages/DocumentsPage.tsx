@@ -238,6 +238,7 @@ export default function DocumentsPage() {
   const flushPendingDeletes = useCallback((pagehide: boolean) => {
     const timers = pendingDeleteTimersRef.current;
     let failed = 0;
+    const inflight: Promise<void>[] = [];
     const ownerNow = captureAuthOwner();
     timers.forEach((timer, docId) => {
       timers.delete(docId);
@@ -260,16 +261,26 @@ export default function DocumentsPage() {
         // id in the replay registry — pageshow (bfcache return) replays it.
         return;
       }
-      void deleteDocument(docId).catch(() => {
-        failed += 1;
-        toast.error("Failed to delete document", { id: "delete-flush-failure" });
-      });
+      inflight.push(
+        deleteDocument(docId).catch(() => {
+          failed += 1;
+        })
+      );
     });
-    if (failed > 1) {
-      // Aggregate count (review round 1 L1-05/M5-01): N independently failed
-      // deletes must not read as one.
-      toast.error(`Failed to delete ${failed} documents`, {
-        id: "delete-flush-failure-many",
+    if (inflight.length > 0) {
+      // Counted aggregate toast AFTER settlement (review round 1
+      // L1-05/M5-01; round-2 fix: the counter increments inside the async
+      // catches, so the toast must wait for every delete to settle or it
+      // can never fire — caught by frozen C13).
+      void Promise.allSettled(inflight).then(() => {
+        if (failed > 0) {
+          toast.error(
+            failed === 1
+              ? "Failed to delete document"
+              : `Failed to delete ${failed} documents`,
+            { id: "delete-flush-failure" }
+          );
+        }
       });
     }
   }, []);
@@ -277,20 +288,31 @@ export default function DocumentsPage() {
   useEffect(() => {
     const handlePageHide = () => flushPendingDeletes(true);
     // Bfcache restore (review round 1 PRR-006/PRR-008): the page is alive
-    // again — replay any pagehide delete whose keepalive dispatch could not
-    // be confirmed (no credential at teardown) through the normal path so
-    // the confirmed intent completes and Undo can never resurrect a deleted
-    // document.
+    // again — replay every pagehide delete whose keepalive dispatch was not
+    // confirmed (unconfirmed outcomes AND no-credential deferrals) through
+    // the normal path, so the confirmed intent completes. The backend DELETE
+    // is not idempotent (404 on a missing row), so a replay 404 means the
+    // keepalive delete ALREADY landed — treated as completion, not failure
+    // (review round 2). The registry is deliberately NOT cleared here: its
+    // entries keep the Undo guard ("Delete already sent") truthful for the
+    // rest of the page's life, including while a replay is in flight.
     const handlePageShow = (event: PageTransitionEvent) => {
       if (!event.persisted) return;
       const replay = Array.from(dispatchedPagehideDeletesRef.current);
-      dispatchedPagehideDeletesRef.current.clear();
       replay.forEach((docId) => {
         void deleteDocument(docId)
           .then(() => {
             toast.success("Deleted document");
           })
-          .catch(() => {
+          .catch((err: unknown) => {
+            const status =
+              (err as { status?: number } | null)?.status ??
+              (err as { response?: { status?: number } } | null)?.response?.status;
+            if (status === 404) {
+              // Already deleted by the keepalive dispatch.
+              toast.success("Deleted document");
+              return;
+            }
             toast.error("Failed to delete document", { id: "delete-flush-failure" });
           });
       });
@@ -304,13 +326,15 @@ export default function DocumentsPage() {
     };
   }, [flushPendingDeletes]);
 
-  // Before-logout flush (review round 1 PRR-007): logout clears the bearer
-  // and CSRF token before the router unmounts this page, so the SPA-unmount
-  // flush previously ran with no credentials and lost the confirmed delete
-  // (401 + a spurious toast on the login screen). The auth store dispatches
-  // this event FIRST, while the credentials are still valid.
+  // Before-logout flush (review round 1 PRR-007; round 2 channel fix): the
+  // auth store dispatches this event FIRST, while the bearer and CSRF
+  // credential are still valid — so this is SPA-unmount semantics (the
+  // normal deleteDocument path, which can complete or toast), NOT pagehide
+  // semantics. The pagehide-style keepalive/defer would drop the intent:
+  // a no-credential deferral writes the replay registry, but an SPA logout
+  // never fires pageshow, so nothing would ever replay it.
   useEffect(() => {
-    const handleBeforeLogout = () => flushPendingDeletes(true);
+    const handleBeforeLogout = () => flushPendingDeletes(false);
     window.addEventListener("ragapp:before-logout", handleBeforeLogout);
     return () => window.removeEventListener("ragapp:before-logout", handleBeforeLogout);
   }, [flushPendingDeletes]);
