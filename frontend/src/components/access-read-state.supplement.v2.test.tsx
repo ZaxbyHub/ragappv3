@@ -208,8 +208,10 @@ describe("access panel read ownership and outcome controls", () => {
 
     render(<VaultMembersPanel vaultId={42} />);
     await waitFor(() => {
-      expect(screen.getByText("Alice Example")).toBeInTheDocument();
-      expect(screen.getByRole("combobox", { name: "Change permission for alice" })).toHaveValue("read");
+      // #771: table-scoped (below-sm card list duplicates the text)
+      expect(inTable().getByText("Alice Example")).toBeInTheDocument();
+      // #771: table-scoped (below-sm card list duplicates the text)
+      expect(inTable().getByRole("combobox", { name: "Change permission for alice" })).toHaveValue("read");
     });
   });
 
@@ -257,10 +259,12 @@ describe("access panel read ownership and outcome controls", () => {
       .mockResolvedValueOnce({ data: { members: [memberRow()], total: 1 } })
       .mockReturnValueOnce(bRead.promise);
     const view = render(<VaultMembersPanel vaultId={720} />);
-    await waitFor(() => expect(screen.getByText("Alice Example")).toBeInTheDocument());
+    // #771: table-scoped (below-sm card list duplicates the text)
+    await waitFor(() => expect(inTable().getByText("Alice Example")).toBeInTheDocument());
     const draft = screen.getByRole("textbox", { name: "User ID to add as vault member" });
     fireEvent.change(draft, { target: { value: "82" } });
-    fireEvent.click(screen.getByRole("button", { name: /Remove alice from vault/i }));
+    // #771: table-scoped (below-sm card list duplicates the text)
+    fireEvent.click(inTable().getByRole("button", { name: /Remove alice from vault/i }));
     expect(screen.getByText(/Are you sure you want to remove/i)).toBeInTheDocument();
 
     view.rerender(<VaultMembersPanel vaultId={721} />);
@@ -304,7 +308,8 @@ describe("access panel read ownership and outcome controls", () => {
     await act(async () => b.resolve({ data: { members: [memberRow({ full_name: "Stale B Member" })], total: 1 } }));
     expect(screen.queryByText("Stale B Member")).not.toBeInTheDocument();
     await act(async () => currentA.resolve({ data: { members: [memberRow({ full_name: "Current A Member" })], total: 1 } }));
-    await waitFor(() => expect(screen.getByText("Current A Member")).toBeInTheDocument());
+    // #771: table-scoped (below-sm card list duplicates the text)
+    await waitFor(() => expect(inTable().getByText("Current A Member")).toBeInTheDocument());
   });
 
   it("keeps a captured Retry handler inert after principal replacement", async () => {
@@ -355,7 +360,8 @@ describe("access panel read ownership and outcome controls", () => {
     await act(async () => pending.resolve({ data: { members: [memberRow({ full_name: "Stale Owner Row" })], total: 1 } }));
     expect(screen.queryByText("Stale Owner Row")).not.toBeInTheDocument();
     await act(async () => replacement.resolve({ data: { members: [memberRow({ full_name: "Current Owner Row" })], total: 1 } }));
-    await waitFor(() => expect(screen.getByText("Current Owner Row")).toBeInTheDocument());
+    // #771: table-scoped (below-sm card list duplicates the text)
+    await waitFor(() => expect(inTable().getByText("Current Owner Row")).toBeInTheDocument());
   });
 
   it("retains same-vault rows during refresh and preserves group grant payload and busy state", async () => {
@@ -393,8 +399,10 @@ describe("access panel read ownership and outcome controls", () => {
     fixture.client.patch.mockReturnValueOnce(patch.promise);
 
     render(<VaultMembersPanel vaultId={505} />);
-    await waitFor(() => expect(screen.getByText("Alice Example")).toBeInTheDocument());
-    const permission = screen.getByRole("combobox", { name: "Change permission for alice" });
+    // #771: table-scoped (below-sm card list duplicates the text)
+    await waitFor(() => expect(inTable().getByText("Alice Example")).toBeInTheDocument());
+    // #771: table-scoped (below-sm card list duplicates the text)
+    const permission = inTable().getByRole("combobox", { name: "Change permission for alice" });
     fireEvent.change(permission, { target: { value: "admin" } });
     expect(permission).toBeDisabled();
     const patchCall = fixture.client.patch.mock.calls.at(-1)!;

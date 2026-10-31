@@ -351,7 +351,8 @@ describe("access panel read ownership and outcome controls", () => {
       await waitFor(() => expect(inTable().getByText("Editors")).toBeInTheDocument());
     } else {
       render(<VaultMembersPanel vaultId={vaultId} />);
-      await waitFor(() => expect(screen.getByText("Alice Example")).toBeInTheDocument());
+      // #771: table-scoped (below-sm card list duplicates the text)
+      await waitFor(() => expect(inTable().getByText("Alice Example")).toBeInTheDocument());
     }
 
     // #771: table-scoped (below-sm card list duplicates the text)
@@ -455,7 +456,8 @@ describe("access panel read ownership and outcome controls", () => {
     const retryA = latestButton(/retry/i);
     expect(retryA).toBeTypeOf("function");
     fireEvent.click(screen.getByRole("button", { name: /retry/i }));
-    await waitFor(() => expect(screen.getByText("Alice Example")).toBeInTheDocument());
+    // #771: table-scoped (below-sm card list duplicates the text)
+    await waitFor(() => expect(inTable().getByText("Alice Example")).toBeInTheDocument());
     const patchA = latestTableChange("Change permission for alice");
     expect(patchA).toBeTypeOf("function");
 
@@ -477,10 +479,12 @@ describe("access panel read ownership and outcome controls", () => {
     expect(fixture.client.patch).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole("button", { name: /retry/i }));
-    await waitFor(() => expect(screen.getByText("Alice Example")).toBeInTheDocument());
+    // #771: table-scoped (below-sm card list duplicates the text)
+    await waitFor(() => expect(inTable().getByText("Alice Example")).toBeInTheDocument());
     const patchCurrent = latestTableChange("Change permission for alice");
     expect(patchCurrent).toBeTypeOf("function");
-    fireEvent.change(screen.getByRole("combobox", { name: "Change permission for alice" }), { target: { value: "write" } });
+    // #771: table-scoped (below-sm card list duplicates the text)
+    fireEvent.change(inTable().getByRole("combobox", { name: "Change permission for alice" }), { target: { value: "write" } });
     await waitFor(() => expect(fixture.client.patch).toHaveBeenCalledTimes(1));
   });
 
