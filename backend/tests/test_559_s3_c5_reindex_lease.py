@@ -412,17 +412,28 @@ class TestReindexWorkerLoopSurvivesSettleException(_ProcessorHarness):
 
         self.processor._reindex_embed_all = fake_embed  # noqa: SLF001
 
-        task = asyncio.create_task(
-            self.processor._reindex_lease_worker_loop()  # noqa: SLF001
+        # CR-1 (implementation review): actually INSTALL the flaky settle for
+        # the duration of the loop task — the b13 pattern. Without this the
+        # settle-exception arm never fires and the test would pass vacuously
+        # while its docstring claims the exception path runs.
+        with _patch.object(JobLease, "complete", flaky_complete):
+            task = asyncio.create_task(
+                self.processor._reindex_lease_worker_loop()  # noqa: SLF001
+            )
+            try:
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + 5.0
+                while loop.time() < deadline and len(embed_calls) < 2:
+                    await asyncio.sleep(0.05)
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        self.assertGreaterEqual(
+            complete_calls["n"],
+            2,
+            "the settle-exception path must actually fire: the first "
+            "JobLease.complete raises and a later settle call is recorded",
         )
-        try:
-            loop = asyncio.get_running_loop()
-            deadline = loop.time() + 5.0
-            while loop.time() < deadline and len(embed_calls) < 2:
-                await asyncio.sleep(0.05)
-        finally:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
 
         self.assertEqual(
             len(embed_calls),

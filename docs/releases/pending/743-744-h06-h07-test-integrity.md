@@ -75,7 +75,7 @@ superadmin decision was made and shipped by #722.
 
 ## Guardrails
 
-Sixteen frozen acceptance checks (14 DISCRIMINATING mutation-kill/structural +
+Eighteen frozen acceptance checks (14 DISCRIMINATING mutation-kill/structural +
 4 PRESERVING baselines) run in CI's Backend job forever: each names a production
 mutation (org-member DELETE removed, lifespan stop() skipped, both addFilter
 call sites commented out, the reindex worker loop early-returned, the audit

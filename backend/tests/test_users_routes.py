@@ -1476,6 +1476,8 @@ class TestUpdateUserGroupsCallerOrgCheck(TestUserRoutes):
 
         assert response.status_code == 400
         assert "User is not a member of organization" in response.json()["detail"]
+
+
 class TestSecurityAuditTrail(TestUserRoutes):
     """Issues #743 (S02-SK2-08) + #744 (T1-21-KR-09): every users.py
     safe_record_security_event family must land a real security_audit_log row,
