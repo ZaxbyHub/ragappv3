@@ -109,8 +109,14 @@ jobs:
           fi
           if [ "$PREFLIGHT_RC" -eq 0 ] && [ "${GITHUB_EVENT_NAME:-}" = "workflow_dispatch" ]; then
             # A dispatch run checks out the dispatch ref, not the PR; artifact
-            # evidence must resolve against the PR head instead.
+            # evidence must resolve against the PR head instead. Fetch the PR
+            # head ref first: a fork PR's head commit is NOT in the base
+            # repository's object database, but GitHub always exposes the PR
+            # head as refs/pull/<n>/head on the BASE repo (works for forks).
             HEAD_SHA="$(printf '%s' "$PR_JSON" | python -I -c "import json,sys; print(json.load(sys.stdin)['head']['sha'])")" || PREFLIGHT_RC=$?
+            if [ "$PREFLIGHT_RC" -eq 0 ]; then
+              git fetch origin "refs/pull/$PR_NUMBER/head" || PREFLIGHT_RC=$?
+            fi
             if [ "$PREFLIGHT_RC" -eq 0 ]; then
               git checkout "$HEAD_SHA" || PREFLIGHT_RC=$?
             fi
@@ -126,9 +132,11 @@ jobs:
             restore_base_gate || PREFLIGHT_RC=$?
           fi
           EVAL_RC=0
+          GATE_RAN=1
           if [ "$PREFLIGHT_RC" -ne 0 ]; then
             echo "closure-evidence: ERROR — base-copy preflight failed (rc=$PREFLIGHT_RC); gate not run in this state" | tee evaluate.log
             EVAL_RC=1
+            GATE_RAN=0
           else
             # python -I (isolated mode): a PR-added module under scripts/ or
             # the working directory cannot shadow stdlib imports of the base
@@ -141,6 +149,7 @@ jobs:
           TEST_ID="$(grep -m1 '^closure-evidence: evidence-test ' evaluate.log | sed 's/^closure-evidence: evidence-test //')"
           {
             echo "eval_rc=$EVAL_RC"
+            echo "gate_ran=$GATE_RAN"
             echo "test_id=$TEST_ID"
             echo "mode=$MODE"
           } >> "$GITHUB_OUTPUT"
@@ -161,11 +170,26 @@ jobs:
           # Resolve base/head SHAs from the PR itself: on workflow_dispatch,
           # github.event.pull_request is null and github.sha would point at the
           # dispatch checkout, not the PR — so fetch both from the API (works
-          # identically for pull_request events).
-          PR_JSON="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")"
-          BASE_REF="$(printf '%s' "$PR_JSON" | python -I -c "import json,sys; print(json.load(sys.stdin)['base']['ref'])")"
-          HEAD_SHA="$(printf '%s' "$PR_JSON" | python -I -c "import json,sys; print(json.load(sys.stdin)['head']['sha'])")"
-          BASE_SHA="$(git merge-base "origin/$BASE_REF" "$HEAD_SHA")"
+          # identically for pull_request events). Every preflight call here is
+          # status-captured like the Evaluate step: a transient gh/git failure
+          # must reach the mode-application step as a verification failure
+          # (VERIFY_RC=1) instead of hard-aborting the job under bash -e.
+          VERIFY_PRE_RC=0
+          PR_JSON="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")" || VERIFY_PRE_RC=$?
+          if [ "$VERIFY_PRE_RC" -eq 0 ]; then
+            BASE_REF="$(printf '%s' "$PR_JSON" | python -I -c "import json,sys; print(json.load(sys.stdin)['base']['ref'])")" || VERIFY_PRE_RC=$?
+          fi
+          if [ "$VERIFY_PRE_RC" -eq 0 ]; then
+            HEAD_SHA="$(printf '%s' "$PR_JSON" | python -I -c "import json,sys; print(json.load(sys.stdin)['head']['sha'])")" || VERIFY_PRE_RC=$?
+          fi
+          if [ "$VERIFY_PRE_RC" -eq 0 ]; then
+            BASE_SHA="$(git merge-base "origin/$BASE_REF" "$HEAD_SHA")" || VERIFY_PRE_RC=$?
+          fi
+          if [ "$VERIFY_PRE_RC" -ne 0 ]; then
+            echo "closure-evidence: ERROR — verify-test preflight failed (rc=$VERIFY_PRE_RC); re-execution not run"
+            echo "verify_rc=1" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           echo "verify-test base=$BASE_SHA head=$HEAD_SHA test=$TEST_ID"
           # GitHub Actions runs run: blocks under bash -e: capture the
           # verify-test exit status with || so a FAILED verification (the
@@ -191,6 +215,15 @@ jobs:
           VERIFY_RC: ${{ steps.verify.outputs.verify_rc }}
           MODE: ${{ steps.evaluate.outputs.mode }}
         run: |
+          # Issue #1049 review (PRR-007): a gate that never RAN (preflight
+          # failure) must not be labeled a violation — the FAIL/WARN tokens
+          # key the documented reopen procedure. GATE_RAN defaults to 1 so
+          # legacy/absent outputs keep the historical violation semantics.
+          if [ "${GATE_RAN:-1}" != "1" ]; then
+            echo "closure-evidence: ERROR — gate not run (base-copy preflight failed); no violation observed"
+            if [ "$MODE" = "enforce" ]; then exit 1; fi
+            exit 0
+          fi
           VIOLATION=0
           if [ "$EVAL_RC" != "0" ]; then VIOLATION=1; fi
           if [ -n "${VERIFY_RC:-}" ] && [ "$VERIFY_RC" != "0" ]; then VIOLATION=1; fi

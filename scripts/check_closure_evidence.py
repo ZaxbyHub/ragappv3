@@ -21,11 +21,13 @@ reopen/comment-on-merge procedure in docs/ci/closure-evidence-gate.md.
 Rollout ships warn-only; the flip to enforce is the workflow's ``mode``
 input. Rollback is disabling or deleting .github/workflows/closure-evidence.yml.
 
-Evidence semantics (#741): URL-form artifacts are advisory-only (skipped at
-resolution, never a violation); artifact captures are Markdown-noise-stripped
-(backticks/emphasis deleted, not spaced) before path resolution; PR sub-lists
-(commits, files, reviews) are paginated to completeness and cross-checked
-against the pulls response's own totals so a truncated fetch fails closed;
+Evidence semantics (#741): URL-form (http/https) artifacts are advisory-only
+(skipped at resolution, never a violation); artifact captures are
+Markdown-noise-stripped (backticks/emphasis deleted, not spaced) before path
+resolution; the commit and file lists are paginated to completeness and
+cross-checked against the pulls response's own totals so a truncated fetch
+fails closed (the reviews list is paginated too, but GitHub exposes no
+authoritative review total to cross-check against);
 and cross-family approval counts only each reviewer's LATEST non-COMMENTED
 review (a superseded approval does not satisfy the rule). The workflow runs
 the BASE branch's copy of this script so a PR editing the gate cannot grade
@@ -196,10 +198,12 @@ def evaluate_snapshot(snapshot: dict, mode: str, repo_root: Path) -> tuple[list[
                 "existing captured artifact (artifact: <repo-relative-path>)"
             )
         elif URL_ARTIFACT_RE.match(artifact):
-            # URL-form artifacts are advisory only (documented contract): the
-            # gate never makes network calls to validate them, so they neither
-            # block nor satisfy the evidence requirement on their own — they
-            # are recorded as advisory and produce no violation (#741).
+            # URL-form (http/https) artifacts are advisory-only (issue #741
+            # AC1 mandates 0 violations): the gate never makes network calls
+            # to validate them, so a body whose ONLY evidence is a URL is
+            # treated as satisfying the requirement WITHOUT verification.
+            # Advisory means "not verified", not "verified" — reviewers of
+            # such PRs should treat the evidence claim as unbacked.
             pass
         else:
             resolved = (repo_root / artifact).resolve()

@@ -55,9 +55,13 @@ the gap is the historical 66-day window, not a current code defect.)
      <repo-relative-path>` — which must exist in the repository at the PR
      head. A named-but-missing artifact fails the gate: that is the #343
      pattern in artifact form, a claim with nothing behind it. URL-form
-     artifacts are advisory only (the gate never makes network calls to
-     validate them; they are skipped at resolution and produce no violation
-     — #741). Markdown emphasis/backticks around the artifact path are
+     (http:// or https://) artifacts are advisory only (the gate never makes
+     network calls to validate them; they are skipped at resolution and
+     produce no violation — #741). Consequence to be aware of: a body whose
+     ONLY evidence is a URL is treated as satisfying the requirement without
+     verification — advisory means "not verified", not "verified"; other URL
+     schemes (s3://, file://, ...) are still resolved as repository paths and
+     fail as missing. Markdown emphasis/backticks around the artifact path are
      stripped before resolution, so `artifact: `docs/x.md`` written with
      backticks still resolves to `docs/x.md`.
 3. **Re-execution (`verify-test`).** The named test is re-run at the
@@ -107,12 +111,18 @@ no hook can block that event itself. Enforcement is therefore:
 **Reopen-on-merge procedure** (operator): if a merged PR turns out to have
 closed an issue without valid evidence, reopen the issue with a comment
 linking the gate run (`closure-evidence: FAIL` in the Actions log) and naming
-the missing evidence. The gate's output lines (`closure-evidence: OK / WARN /
+the missing evidence. `closure-evidence: ERROR — gate not run (base-copy
+preflight failed)` is an infrastructure/availability outcome, NOT a violation
+token — it never keys this procedure (in enforce mode it still fails the
+check, fail-closed). The gate's output lines (`closure-evidence: OK / WARN /
 FAIL / ERROR / evidence-test`) are designed to be quoted directly.
 
 ## Modes, rollout, and rollback
 
-- **warn** (default): the gate evaluates and re-executes everything, prints
+- **warn** (default): the gate evaluates and re-executes everything (when the
+  base-copy preflight fails, nothing is evaluated or re-executed and the
+  verdict is `ERROR — gate not run`, non-blocking in warn / fail-closed in
+  enforce), prints
   `closure-evidence: WARN — …` (or `ERROR`) observations, and never fails the
   check. This is the one-release-cycle rollout mode so existing open PRs are
   not retroactively blocked.
@@ -155,7 +165,9 @@ FAIL / ERROR / evidence-test`) are designed to be quoted directly.
   evaluated by the base branch's copy, not its own edits. The checker and the
   workflow's inline JSON parsers run under `python -I` (isolated mode), so a
   PR-added module under `scripts/` cannot shadow stdlib imports. On
-  `workflow_dispatch` the PR head is checked out first so artifact evidence
+  `workflow_dispatch` the PR head is fetched (`refs/pull/<n>/head`, which
+  GitHub exposes on the base repo even for forks) and checked out first so
+  artifact evidence
   resolves against the PR's tree; preflight failures are status-captured and
   surface as the gate's ordinary ERROR handling (warn mode stays
   non-blocking, enforce mode fails closed).

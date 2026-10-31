@@ -39,11 +39,14 @@ Issues: #741 (Workstream H PR 3 of 10), #742 (Workstream H PR 4 of 10).
   tests cannot grade itself. Both checker invocations and the inline JSON
   parsers run under `python -I` (isolated mode), so a PR-added module under
   `scripts/` cannot shadow stdlib imports either. On `workflow_dispatch`
-  the PR head is checked out first so artifact evidence resolves against
-  the PR's tree. The preflight is status-captured: a failing `gh`/`git`
-  records a truthful `closure-evidence: ERROR — base-copy preflight failed`
-  (eval_rc=1) without running the checker — warn mode stays non-blocking,
-  enforce mode fails closed.
+  the PR head is fetched (`refs/pull/<n>/head` — GitHub exposes it on the
+  base repo even for fork PRs) and checked out first so artifact evidence
+  resolves against the PR's tree. The preflight is status-captured: a
+  failing `gh`/`git` records a truthful `closure-evidence: ERROR —
+  base-copy preflight failed` (`eval_rc=1`, `gate_ran=0`) without running
+  the checker, and the Apply step reports `closure-evidence: ERROR — gate
+  not run` instead of a violation label (warn mode stays non-blocking,
+  enforce mode fails closed).
 
 ### .github/workflows/ci.yml (#742)
 
@@ -92,9 +95,14 @@ a "22.22.0" pin that ci.yml no longer had).
   timeouts + hang stacks as PRESERVING pins of the #1034 state; step
   timeout, frontend-toolchain scoping, devcontainer/engines/docs Node floor
   as DISCRIMINATING).
-- Truthfulness touch-ups only in test_issue566_config_loader_native.py and
-  test_issue258_coverage_gate.py (skip-reason strings describing the new
-  CI layout); no behavior change.
+- Truthfulness touch-ups in test_issue566_config_loader_native.py and
+  test_issue258_coverage_gate.py (skip-reason strings describing the new CI
+  layout) plus the #1049-review round: test_issue258_build_contracts.py
+  (venue docstring), test_l02_ci_guards_feedback.py (NODE_PATH fallback to
+  the outside-tree TypeScript), test_l02_stack_workflow_reachability(.feedback).py
+  (pins track the `python -I` gate invocation), and backend/tests/conftest.py
+  (the bcrypt-cache fixture yields before its ImportError return — latent
+  generator-contract bug, no behavior change in full environments).
 
 ## Notes for operators
 

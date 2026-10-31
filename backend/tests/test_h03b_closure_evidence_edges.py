@@ -254,11 +254,20 @@ def _extract_evaluate_block() -> str:
     return blocks[0]
 
 
-def _run_preflight_case(tmp_path: Path, *, gh_succeeds: bool, git_succeeds: bool):
-    """Run the REAL evaluate block under bash -e with controllable shims."""
+def _run_preflight_case(tmp_path: Path, *, gh_succeeds: bool, git_succeeds: bool, dispatch: bool = False):
+    """Run the REAL evaluate block under bash -e with controllable shims.
+
+    The shims are payload-faithful: the python shim derives base.ref /
+    head.sha FROM the stdin payload (an empty or broken pipe/derivation
+    therefore yields an empty ref that the git-args assertions reject), and
+    the git shim records its argument lines so the tests assert WHICH ref
+    and pathspec the restore touched (#1049 review PRR-008).
+    """
     import shutil
     import stat
 
+    calls_file = str(tmp_path / "python.calls").replace("\\", "/")
+    git_calls_file = str(tmp_path / "git.calls").replace("\\", "/")
     shim = tmp_path / "shims"
     shim.mkdir(exist_ok=True)
     if gh_succeeds:
@@ -271,17 +280,25 @@ def _run_preflight_case(tmp_path: Path, *, gh_succeeds: bool, git_succeeds: bool
     else:
         gh_body = "#!/usr/bin/env bash\necho 'gh: api down' >&2\nexit 3\n"
     (shim / "gh").write_text(gh_body, encoding="utf-8")
+    git_fail = "" if git_succeeds else "echo 'git: failed' >&2\nexit 128\n"
     (shim / "git").write_text(
         "#!/usr/bin/env bash\n"
-        + ("" if git_succeeds else "echo 'git: checkout failed' >&2\nexit 128\n")
+        f'echo "$*" >> "{git_calls_file}"\n'
+        + git_fail
         + "exit 0\n",
         encoding="utf-8",
     )
-    # The python shim RECORDS every invocation; the checker leg must never be
-    # reached when the preflight fails.
+    # The python shim records every invocation AND faithfully parses the two
+    # workflow JSON fields from stdin (keyed on the -c program's argv, value
+    # extracted from the actual payload).
     (shim / "python").write_text(
         "#!/usr/bin/env bash\n"
-        'echo "$*" >> "' + str(tmp_path / "python.calls").replace("\\", "/") + '"\n'
+        f'echo "$*" >> "{calls_file}"\n'
+        "case \"$*\" in\n"
+        "  *evaluate*) exit 0 ;;\n"
+        "  *\"'base'\"*) payload=\"$(cat)\"; printf '%s' \"$payload\" | sed -n 's/.*\"base\": *{\"ref\": *\"\\([^\"]*\\)\".*/\\1/p'; exit 0 ;;\n"
+        "  *\"'head'\"*) payload=\"$(cat)\"; printf '%s' \"$payload\" | sed -n 's/.*\"head\": *{\"sha\": *\"\\([^\"]*\\)\".*/\\1/p'; exit 0 ;;\n"
+        "esac\n"
         "exit 0\n",
         encoding="utf-8",
     )
@@ -299,6 +316,8 @@ def _run_preflight_case(tmp_path: Path, *, gh_succeeds: bool, git_succeeds: bool
         "PR_NUMBER": "5",
         "MODE": "warn",
     }
+    if dispatch:
+        env["GITHUB_EVENT_NAME"] = "workflow_dispatch"
     for key in ("SYSTEMROOT", "SystemRoot", "COMSPEC", "PATHEXT", "WINDIR", "TEMP", "TMP"):
         if key in os.environ:
             env[key] = os.environ[key]
@@ -316,30 +335,58 @@ def _run_preflight_case(tmp_path: Path, *, gh_succeeds: bool, git_succeeds: bool
     calls_path = tmp_path / "python.calls"
     if calls_path.exists():
         calls = calls_path.read_text(encoding="utf-8")
-    return proc, out_file.read_text(encoding="utf-8"), calls
+    git_calls = ""
+    git_calls_path = tmp_path / "git.calls"
+    if git_calls_path.exists():
+        git_calls = git_calls_path.read_text(encoding="utf-8")
+    return proc, out_file.read_text(encoding="utf-8"), calls, git_calls
 
 
 def test_preflight_gh_failure_is_captured_and_skips_checker(tmp_path):
-    proc, outputs, python_calls = _run_preflight_case(tmp_path, gh_succeeds=False, git_succeeds=True)
+    proc, outputs, python_calls, _git_calls = _run_preflight_case(tmp_path, gh_succeeds=False, git_succeeds=True)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "preflight failed" in proc.stdout
     assert "eval_rc=1" in outputs
+    assert "gate_ran=0" in outputs, "a failed preflight must record gate_ran=0"
     assert "evaluate" not in python_calls, "checker must not run on a failed preflight"
 
 
 def test_preflight_git_failure_is_captured_and_skips_checker(tmp_path):
-    proc, outputs, python_calls = _run_preflight_case(tmp_path, gh_succeeds=True, git_succeeds=False)
+    proc, outputs, python_calls, _git_calls = _run_preflight_case(tmp_path, gh_succeeds=True, git_succeeds=False)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "preflight failed" in proc.stdout
     assert "eval_rc=1" in outputs
+    assert "gate_ran=0" in outputs, "a failed preflight must record gate_ran=0"
     assert "evaluate" not in python_calls, "checker must not run on a failed preflight"
 
 
 def test_preflight_success_runs_checker(tmp_path):
-    proc, outputs, python_calls = _run_preflight_case(tmp_path, gh_succeeds=True, git_succeeds=True)
+    proc, outputs, python_calls, git_calls = _run_preflight_case(tmp_path, gh_succeeds=True, git_succeeds=True)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "eval_rc=0" in outputs
+    assert "gate_ran=1" in outputs
     assert "evaluate" in python_calls, "clean preflight must reach the checker"
+    # PRR-008: the restore must target the BASE ref derived from the payload
+    # (gh shim serves base.ref=master) — a HEAD-ref or empty-ref restore
+    # (the exact self-grading #741 forbids) now fails these assertions.
+    assert "checkout origin/master -- scripts/" in git_calls, git_calls
+    assert "checkout HEAD -- scripts/" not in git_calls, git_calls
+
+
+def test_preflight_dispatch_fetches_and_checks_out_pr_head(tmp_path):
+    # PRR-006/PRR-008: the dispatch branch must fetch the PR head ref (fork
+    # heads are not in the base repo's object database) and check out the
+    # payload's head SHA before restoring the base scripts tree.
+    proc, outputs, python_calls, git_calls = _run_preflight_case(
+        tmp_path, gh_succeeds=True, git_succeeds=True, dispatch=True
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "eval_rc=0" in outputs
+    assert "gate_ran=1" in outputs
+    assert "fetch origin refs/pull/5/head" in git_calls, git_calls
+    assert "checkout cafe000000000000000000000000000000000000" in git_calls, git_calls
+    assert "checkout origin/master -- scripts/" in git_calls, git_calls
+    assert "evaluate" in python_calls
 
 
 # ── #742 final-critic round 1: the positive "exactly one CI venue" leg ────────
@@ -384,3 +431,69 @@ def test_frontend_toolchain_nodes_have_exactly_one_venue():
         "the venue step must install the Backend job's pytest provision "
         "(runtime lock + dev requirements) or it cannot collect its modules"
     )
+
+
+# ── #1049 feedback round: venue-order, nightly-scan, positive-control pins ───
+
+def test_venue_step_precedes_coverage_gate():
+    # PRR-016: the venue step is load-bearing ORDERED — test_ac11 asserts a
+    # clean frontend/coverage slate, and the job's later "Coverage gate" step
+    # creates that directory. Nothing else pins the ordering.
+    import yaml as _yaml
+
+    ci = _yaml.safe_load((REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8"))
+    steps = ci["jobs"]["frontend"]["steps"]
+    venue_idx = next(
+        i for i, s in enumerate(steps)
+        if "test_issue258_coverage_gate.py::test_ac11_coverage_command_passes" in str(s.get("run") or "")
+    )
+    coverage_idx = next(
+        i for i, s in enumerate(steps)
+        if "test:coverage" in str(s.get("run") or "")
+    )
+    assert venue_idx < coverage_idx, (venue_idx, coverage_idx)
+
+
+def test_no_second_venue_in_nightly_workflows():
+    # PRR-020: the exactly-one-venue pin scans ci.yml only; these scans keep
+    # the nightly workflows visible. A second venue needs BOTH a frontend
+    # tree (npm ci under working-directory frontend) AND a backend pytest run
+    # over tests/ in the same workflow — the stryker job installs a frontend
+    # tree but runs no backend pytest, and nightly runs pytest but installs
+    # no frontend tree. Assert the node ids never appear and the two halves
+    # never combine.
+    import re as _re
+
+    nightly = (REPO_ROOT / ".github" / "workflows" / "nightly.yml")
+    gates = (REPO_ROOT / ".github" / "workflows" / "nightly-quality-gates.yml")
+    for path in (nightly, gates):
+        assert path.exists(), path
+        text = path.read_text(encoding="utf-8")
+        for node in FRONTEND_TOOLCHAIN_NODES:
+            assert node not in text, f"{path.name} must not name {node}"
+        installs_frontend = "npm ci" in text and "working-directory: frontend" in text
+        runs_backend_pytest = _re.search(r"run:[^\n]*pytest[^\n]*tests/", text) is not None
+        assert not (installs_frontend and runs_backend_pytest), (
+            f"{path.name} combines a frontend install with a backend pytest "
+            "run — it would silently become a second venue for the "
+            "frontend-toolchain nodes"
+        )
+
+
+def test_engines_positive_control_and_non_admitted_majors():
+    # PRR-011/PRR-014: the frozen C14 test proves only that 22.22.0/.1 are
+    # EXCLUDED; this positive control proves the shipped engines range still
+    # ADMITS the supported versions (a nonsensical ">=99" range would pass
+    # C14) and rejects the majors the lockfile's dependency engines reject.
+    # Read the range from the package.json itself (no hardcoded duplicate).
+    import json as _json
+
+    from test_h04_ci_hygiene import _satisfies_range, _version_tuple
+
+    engines_node = _json.loads(
+        (REPO_ROOT / "frontend" / "package.json").read_text(encoding="utf-8")
+    )["engines"]["node"]
+    for admitted in ("22.22.2", "22.22.3", "24.15.0", "26.0.0"):
+        assert _satisfies_range(_version_tuple(admitted), engines_node), (admitted, engines_node)
+    for rejected in ("22.22.0", "22.22.1", "23.0.0", "25.1.0"):
+        assert not _satisfies_range(_version_tuple(rejected), engines_node), (rejected, engines_node)
