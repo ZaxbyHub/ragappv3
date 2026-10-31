@@ -208,10 +208,14 @@ vi.mock('@/components/shared/DocumentCard', () => ({
     document,
     onDelete,
     canDelete,
+    isSelected,
+    onSelectionChange,
   }: {
     document: { id: string; filename: string };
     onDelete?: (id: string) => void;
     canDelete?: boolean;
+    isSelected?: boolean;
+    onSelectionChange?: (id: string, checked: boolean) => void;
   }) => (
     <div data-testid="document-card">
       {document.filename}
@@ -219,6 +223,17 @@ vi.mock('@/components/shared/DocumentCard', () => ({
         <button aria-label={`Delete card ${document.filename}`} onClick={() => onDelete(document.id)}>
           Delete
         </button>
+      )}
+      {/* PRR-021: expose the organise-level selection wiring the cards list
+          re-gated to canOrganizeDocuments — an organizing writer gets a
+          checkbox, a non-organizer gets none. */}
+      {onSelectionChange && (
+        <input
+          type="checkbox"
+          aria-label={`Select card ${document.filename}`}
+          checked={!!isSelected}
+          onChange={(e) => onSelectionChange(document.id, e.target.checked)}
+        />
       )}
     </div>
   ),
@@ -254,7 +269,7 @@ vi.mock('@/components/documents/UploadDropzone', () => ({
 // Import component after mocks
 import DocumentsPage from '@/pages/DocumentsPage';
 import { useVaultStore } from '@/stores/useVaultStore';
-import { listDocuments, listFolders, getDocumentStats, deleteDocuments } from '@/lib/api';
+import { listDocuments, listFolders, getDocumentStats, deleteDocuments, scanDocuments, getDocumentWikiStatus } from '@/lib/api';
 
 interface ListDocumentsParams {
   folderId?: number;
@@ -374,6 +389,43 @@ describe('DocumentsPage K04 permission matrix (issue #767)', () => {
     expect(scanButtons.some((button) => !(button as HTMLButtonElement).disabled)).toBe(true);
   });
 
+  it('global admin (not just superadmin) gets an ENABLED Scan Directory button (PRR-016 mutant kill)', async () => {
+    selectVault('read');
+    authState.user = {
+      id: 11,
+      username: 'admin1',
+      full_name: 'Admin One',
+      role: 'admin',
+      is_active: true,
+    };
+
+    await renderPage();
+
+    const scanButtons = screen.queryAllByRole('button', { name: 'Scan Directory' });
+    expect(scanButtons.length).toBeGreaterThan(0);
+    expect(scanButtons.some((button) => !(button as HTMLButtonElement).disabled)).toBe(true);
+  });
+
+  it('clicking Scan Directory calls scanDocuments with NO arguments (PRR-017: vault_id dropped)', async () => {
+    selectVault('admin');
+    authState.user = {
+      id: 12,
+      username: 'admin2',
+      full_name: 'Admin Two',
+      role: 'admin',
+      is_active: true,
+    };
+    vi.mocked(scanDocuments).mockResolvedValue({ added: 0, scanned: 0, errors: [] });
+
+    await renderPage();
+
+    const scanButtons = screen.queryAllByRole('button', { name: 'Scan Directory' });
+    await act(async () => {
+      fireEvent.click(scanButtons.find((b) => !(b as HTMLButtonElement).disabled)!);
+    });
+    expect(scanDocuments).toHaveBeenCalledWith();
+  });
+
   it('global viewer gets a DISABLED Scan Directory button even with vault access', async () => {
     selectVault('admin');
     authState.user = {
@@ -490,6 +542,116 @@ describe('DocumentsPage K04 permission matrix (issue #767)', () => {
     expect(within(dialog).getByRole('button', { name: 'Delete' })).toBeInTheDocument();
   });
 
+
+  it('vault writer can select a MOBILE card; selection rides canOrganizeDocuments (PRR-021)', async () => {
+    selectVault('write');
+
+    await renderPage();
+
+    const cardBoxes = screen.getAllByLabelText(/Select card /);
+    expect(cardBoxes.length).toBeGreaterThan(0);
+    // Selecting a card opens the bulk bar (Tag/Move/Delete Selected surface).
+    await act(async () => {
+      fireEvent.click(cardBoxes[0]);
+    });
+    expect(screen.getByText('1 selected')).toBeInTheDocument();
+
+    // A reader gets no card checkboxes at all (selection hidden). The first
+    // render must unmount first (two mounted pages duplicate every landmark).
+    act(() => {
+      unmount?.();
+    });
+    selectVault('read');
+    await renderPage();
+    expect(screen.queryByLabelText(/Select card /)).toBeNull();
+  });
+
+  it('vault writer gets an ENABLED Compile control and a disabled Recompile stays informative (PRR-018)', async () => {
+    // PRR-018: the compile affordance is vault-WRITE (folders/tags/wiki all
+    // are) — the read-denial pin exists in k04; this pins the GRANTED side so
+    // an admin-gating mutant fails. getDocumentWikiStatus resolves
+    // not_compiled, so the not_compiled Compile branch renders.
+    selectVault('write');
+
+    await renderPage();
+
+    const compileButtons = screen.getAllByRole('button', { name: 'Compile' });
+    expect(compileButtons.length).toBeGreaterThan(0);
+    expect(compileButtons.every((b) => !(b as HTMLButtonElement).disabled)).toBe(true);
+  });
+
+  it('vault reader gets a DISABLED Recompile whose tooltip keeps the wiki details (PRR-010)', async () => {
+    // Recompile branch (wiki_status compiled) with a read-only viewer: the
+    // button is disabled AND the tooltip still carries status/pages/claims/
+    // lint (PRR-010 forbids replacing the details with the permission text).
+    // The wiki-status fetch only fires for status 'indexed' rows
+    // (useDocumentPolling), so this test seeds its own indexed document.
+    selectVault('read');
+    vi.mocked(getDocumentWikiStatus).mockResolvedValue({
+      wiki_status: 'compiled',
+      pages_count: 3,
+      claims_count: 5,
+      lint_count: 1,
+    });
+    vi.mocked(listDocuments).mockResolvedValue({
+      documents: [
+        { id: '9', filename: 'indexed.pdf', size: 1, created_at: '2024-01-01', metadata: { status: 'indexed', chunk_count: 2 } },
+      ],
+      total: 1,
+    });
+
+    await renderPage();
+
+    const recompile = await screen.findByLabelText(/Recompile wiki for indexed.pdf/);
+    expect(recompile).toBeDisabled();
+    expect(recompile.getAttribute('title')).toContain('3 pages');
+    expect(recompile.getAttribute('title')).toContain('1 lint issues');
+    expect(recompile.getAttribute('title')).toContain('required to recompile');
+    // The hover affordance is off while disabled (PRR-009).
+    expect(recompile.className).not.toContain('hover:text-foreground');
+  });
+
+  it('search-only miss: Clear filters resets the search and restores rows (PRR-001 no-op kill)', async () => {
+    // PRR-001: the search branch's action cleared only tag/folder filters —
+    // a no-op on a search-only miss. Kills it end to end.
+    selectVault('admin');
+    const twoDocs = [
+      { id: '1', filename: 'alpha.pdf', size: 1, created_at: '2024-01-01', metadata: { status: 'processed', chunk_count: 1 } },
+      { id: '2', filename: 'beta.pdf', size: 1, created_at: '2024-01-01', metadata: { status: 'processed', chunk_count: 1 } },
+    ];
+    // The page's search flows through a debounce, so the mock must filter:
+    // a non-empty search param returns zero rows (search-only miss).
+    vi.mocked(listDocuments).mockImplementation(async (params?: { search?: string }) =>
+      params?.search
+        ? { documents: [], total: 0 }
+        : { documents: twoDocs, total: 2 },
+    );
+
+    await renderPage();
+
+    // Type a search that matches nothing -> search-miss empty state appears.
+    const searchInputs = screen.getAllByPlaceholderText('Search documents and metadata...');
+    await act(async () => {
+      fireEvent.change(searchInputs[0], { target: { value: 'zzz-no-match' } });
+    });
+    await waitFor(() => {
+      expect(screen.getByText('No documents match your search')).toBeInTheDocument();
+    });
+
+    // The K04/K05 frozen suites may render secondary search inputs (mobile
+    // cards list etc.) — clear via the FIRST input the empty state's button
+    // is wired to (the toolbar search box drives debouncedSearchQuery).
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Clear filters' }));
+    });
+
+    // The search state must reset (input cleared) and the rows return.
+    await waitFor(() => {
+      expect(searchInputs[0].value).toBe('');
+      expect(screen.queryByText('No documents match your search')).toBeNull();
+    });
+    expect((await screen.findAllByText('alpha.pdf')).length).toBeGreaterThan(0);
+  });
 
   it('partial bulk delete ends with the SERVER total, not double-subtracted (impl-review R1 value pin)', async () => {
     // Seeds 10 docs, deletes 3, server reports 7 afterwards. The final

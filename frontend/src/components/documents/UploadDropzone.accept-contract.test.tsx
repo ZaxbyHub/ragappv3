@@ -132,10 +132,13 @@ describe("serverAcceptsFilename mirrors the server pipeline", () => {
     expect(serverAcceptsFilename("file.pdf ", [".pdf"])).toBe(false);
   });
 
-  it("suffix membership is case-insensitive in both directions", () => {
+  it("suffix is lowercased but the CONFIGURED set is raw (server mirror, PRR-004)", () => {
+    // Server: Path(name).suffix.lower() in settings.allowed_extensions — the
+    // suffix is lowercased, the configured entries are NOT normalized.
     expect(serverAcceptsFilename("DATA.PDF", [".pdf"])).toBe(true);
-    expect(serverAcceptsFilename("DATA.PDF", [".PDF"])).toBe(true);
+    expect(serverAcceptsFilename("DATA.PDF", [".PDF"])).toBe(false); // raw set keeps ".PDF"
     expect(serverAcceptsFilename("notes.TXT", [".txt", ".pdf"])).toBe(true);
+    expect(serverAcceptsFilename("notes.txt", ["pdf"])).toBe(false); // dotless entry never matches
   });
 
   it("near-miss extensions are refused (.htm is not .html)", () => {
@@ -148,9 +151,20 @@ describe("serverAcceptsFilename mirrors the server pipeline", () => {
     expect(serverAcceptsFilename("report.pdf", [])).toBe(false);
   });
 
-  it("path separators are stripped (basename) before the suffix is read", () => {
-    expect(serverAcceptsFilename("C:\\temp\\report.pdf", [".pdf"])).toBe(true);
+  it("basename uses POSIX semantics (split on / only, PRR-003) — agreeing with the server on backslash names", () => {
+    // POSIX os.path.basename leaves backslashes in the name; secure_filename
+    // then strips them. Both sides must reach the SAME suffix decision.
     expect(serverAcceptsFilename("/tmp/notes.csv", [".csv"])).toBe(true);
+    expect(serverAcceptsFilename("a" + String.fromCharCode(92) + ".pdf", [".pdf"])).toBe(true); // both -> "a.pdf" -> .pdf
+    expect(serverAcceptsFilename("report.pdf" + String.fromCharCode(92) + "notes", [".pdf"])).toBe(false); // both -> suffix ".pdfnotes"
+    expect(serverAcceptsFilename("report.pdf" + String.fromCharCode(92) + "notes", [".txt"])).toBe(false); // suffix ".pdfnotes" is non-empty: NO .txt fallback on either side
+  });
+
+  it("a name that sanitizes to EMPTY follows the server's unnamed_file.txt fallback (K-16)", () => {
+    // Server: secure_filename("") -> "" -> "unnamed_file.txt" -> suffix .txt.
+    expect(serverAcceptsFilename("文档", [".txt"])).toBe(true);
+    expect(serverAcceptsFilename("文档", [".pdf"])).toBe(false);
+    expect(serverAcceptsFilename("", [".txt"])).toBe(true);
   });
 });
 
@@ -293,24 +307,24 @@ describe("UploadDropzone drop acceptance contract (issue #768 AC9)", () => {
     );
   });
 
-  it("mounts silently with the accept option active: no Skipped warning and one valid MIME key", () => {
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+  it("accept option is exactly one valid MIME key carrying the extension list (K-39: real-hook shape)", () => {
     seedSettings(SERVER_ALLOWED_EXTENSIONS);
 
     renderDropzone();
 
-    // The advisory accept must be shaped so the real hook never logs a
-    // pickerOptionsFromAccept "Skipped" warning: exactly one valid MIME key.
+    // The advisory accept must be shaped so react-dropzone's
+    // pickerOptionsFromAccept accepts the key (a valid MIME type — otherwise
+    // the real hook console.warns "Skipped ... not a valid MIME type" at
+    // mount; asserted here on the captured option because this suite drives
+    // the hook through a mock, where the library warning cannot fire).
     const accept = dropzoneOptions.current?.accept as Record<
       string,
       string[]
     >;
     expect(accept).toBeTruthy();
-    expect(Object.keys(accept)).toEqual(["application/octet-stream"]);
-    const skippedWarnings = warnSpy.mock.calls.filter((args) =>
-      /Skipped/i.test(String(args[0]))
-    );
-    expect(skippedWarnings).toHaveLength(0);
+    const keys = Object.keys(accept);
+    expect(keys).toEqual(["application/octet-stream"]);
+    expect(keys[0]).toMatch(/^[-\w.]+\/([-\w.]+|\*)$/);
   });
 
   it("dims no ancestor of the disabled instruction (only the icon affordance dims)", () => {
@@ -324,7 +338,7 @@ describe("UploadDropzone drop acceptance contract (issue #768 AC9)", () => {
     let dimmedAncestors = 0;
     let element: HTMLElement | null = instruction;
     while (element) {
-      if (/\bopacity-(?!100\b)\d+/.test(String(element.className))) {
+      if (/\bopacity-(?!100\b)(\d+|\[\[^\]\])/.test(String(element.className))) {
         dimmedAncestors += 1;
       }
       element = element.parentElement;

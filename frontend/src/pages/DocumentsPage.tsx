@@ -828,6 +828,14 @@ export default function DocumentsPage() {
     setIsScanning(true);
     try {
       const result = await scanDocuments();
+      // PRR-002/K-01: per-directory failures reach the operator, not just the
+      // server log; error strings are vault-relative redactions from the
+      // backend (no absolute paths, no raw exception text).
+      if (result.errors?.length) {
+        toast.warning(
+          `Scan completed with ${result.errors.length} director${result.errors.length > 1 ? "ies" : "y"} unreadable: ${result.errors.join("; ")}`,
+        );
+      }
       toast.success(`Scan complete: ${result.added} new document(s) added, ${result.scanned} scanned`);
       await Promise.all([fetchDocuments(), fetchStats()]);
     } catch (err) {
@@ -934,6 +942,10 @@ export default function DocumentsPage() {
     [documents, optimisticallyDeletedIds]
   );
 
+  // Badge count: the matching server total with the loaded-window floor
+  // (issue #768 AC1); memoized so the pluralization/format read stays cheap.
+  const badgeCount = Math.max(total, filteredDocuments.length);
+
   // Header select-all applies ONLY to the visible rows: checking adds the
   // visible ids (selections outside the current view are preserved) and
   // unchecking removes exactly the visible ids.
@@ -980,6 +992,10 @@ export default function DocumentsPage() {
                 action: {
                   label: "Clear filters",
                   onClick: () => {
+                    // PRR-001: the active search IS a filter in this branch —
+                    // clear it too, or the button is a no-op on a search-only
+                    // miss.
+                    setSearchQuery("");
                     setTagFilterId(null);
                     setFolderFilterId(null);
                   },
@@ -1121,7 +1137,9 @@ export default function DocumentsPage() {
               understate the match set when only the first window is loaded
               (issue #768 AC1). The floor keeps the badge sane in the
               optimistic-delete window before the refetch lands. */}
-          <Badge variant="secondary">{Math.max(total, filteredDocuments.length)} documents</Badge>
+          <Badge variant="secondary">
+            {badgeCount.toLocaleString()} {badgeCount === 1 ? "document" : "documents"}
+          </Badge>
         </div>
       </div>
 

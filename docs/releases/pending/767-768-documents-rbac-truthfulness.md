@@ -26,7 +26,10 @@
   `_find_new_files` a `DirectoryScan(examined, new_files)`, so the scan endpoint reports
   `scanned = files_examined` (files actually examined) instead of aliasing the enqueued count.
   A scan that examined hundreds of already-known files no longer reads as "0 scanned".
-  Per-directory failures are returned in `errors` instead of living only in logs.
+  Per-directory failures are returned in
+  `errors` — vault-relative scope plus exception class only, never absolute
+  paths or raw exception text (the #562 no-path-echo direction) — and the
+  scan toast surfaces them to the operator instead of living only in logs.
 
 ### Documents-surface counts and copy say what actually happened (`frontend/src/pages/DocumentsPage.tsx`)
 
@@ -61,10 +64,11 @@
 
 ## Caveats
 
-- The client acceptance predicate mirrors the server pipeline step for step with one known
-  edge: a filename that sanitizes to EMPTY (pure non-ASCII/punctuation) is refused
-  client-side, while the server renames such uploads to `unnamed_file.txt` and accepts them
-  when `.txt` is allowed. The server remains authoritative on the API path.
+- The client acceptance predicate now falls back to `.txt` exactly as the server does when a
+  filename sanitizes to empty (the server renames it to `unnamed_file.txt` and accepts it
+  iff `.txt` is allowed) — the earlier "refused client-side" divergence is closed. Membership
+  is tested against the RAW configured allowlist entries, exactly as the server does (an
+  uppercase or dotless configured entry behaves identically on both sides).
 
 - Before settings load (failed fetch or first paint), the dropzone keeps the pre-existing
   behavior: hardcoded copy, the 100 MB fallback limit, and no client-side extension filter —
@@ -83,6 +87,12 @@
   exact-once, no mount warnings), `DocumentsPage.k04.matrix.test.tsx` (bidirectional RBAC
   matrix + dialog labels + filter empty-state copy/clear), `PageShell.k05.integration.test.tsx`
   (integrated settings path, deferred-response race, failure path, unmount).
+- Bandit baseline: the regeneration kept the finding identity multiset identical (125 = 125);
+  non-gating `metrics.loc` counters refreshed for files whose line counts moved since the
+  previous anchor (including files this PR does not touch).
+- Upload-limit reach: the settings-store fill covers the Documents upload surface (the
+  dropzone and its effective-limit consumers); the Composer and Draft Room attach paths keep
+  their own size-only guards and remain out of this change's scope.
 - Updated contracts: watcher suites moved to the `ScanResult` field access
   (adversarial/library-config/n02/b04-real-rows); DocumentsPage suites mock the auth store for
   the new global-role gate; detail-page suites seed write permission; the K-PR3 `Confirm`

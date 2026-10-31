@@ -51,9 +51,12 @@ class ScanResult:
 
     ``files_examined`` counts every candidate checked against the database
     across all scanned directories; ``files_enqueued`` counts real enqueues;
-    ``errors`` carries per-directory failure descriptions (a file failing the
-    structural screen is a per-file decision — examined, not enqueued, and NOT
-    an error).
+    ``errors`` carries REDACTED failure descriptions — vault-relative ("vault
+    <id> upload directory", "library directory") plus an exception CLASS only,
+    never absolute paths or raw exception text (the #562 no-path-echo
+    direction; these strings are returned to the scan caller). A file failing
+    the structural screen is a per-file decision — examined, not enqueued,
+    and NOT an error.
     """
 
     files_examined: int = 0
@@ -281,6 +284,7 @@ class FileWatcher:
         dir_vault_map: Dict[Path, int] = {}
 
         # Add each vault's upload directory
+        failing_vault_id: Optional[int] = None
         try:
             from app.models.database import get_pool
 
@@ -290,13 +294,23 @@ class FileWatcher:
                 vaults = conn.execute("SELECT id, name FROM vaults").fetchall()
                 for row in vaults:
                     vault_id = row[0]
+                    failing_vault_id = vault_id
                     vault_upload_dir = settings.vault_uploads_dir(vault_id)
                     dir_vault_map[vault_upload_dir] = vault_id
             finally:
                 pool.release_connection(conn)
         except Exception as e:
             logger.warning(f"Failed to get vault directories: {e}")
-            result.errors.append(f"vault directories: {e}")
+            # K-01: stable redacted phrasing — no absolute path, exception
+            # class only (the full exception stays in the server log above).
+            # The failing vault id (when the loop got that far) survives so
+            # the operator knows WHICH scope broke.
+            scope = (
+                f"vault {failing_vault_id} upload directory lookup"
+                if failing_vault_id is not None
+                else "vault directory enumeration"
+            )
+            result.errors.append(f"{scope}: {type(e).__name__}")
 
         # Add library_dir only if configured
         if settings.library_vault_id is not None:
@@ -342,7 +356,15 @@ class FileWatcher:
                     logger.info(f"Enqueued new file for processing: {file_path}")
             except Exception as e:
                 logger.error(f"Error scanning directory {directory}: {e}")
-                result.errors.append(f"{directory}: {e}")
+                # K-01: vault-relative redaction — the operator knows which
+                # scan scope failed without the server's absolute filesystem
+                # layout or the raw exception text (logged above).
+                scope = (
+                    "library directory"
+                    if vault_id == getattr(settings, "library_vault_id", None)
+                    else f"vault {vault_id} upload directory"
+                )
+                result.errors.append(f"{scope}: {type(e).__name__}")
 
         if result.files_enqueued > 0:
             logger.info(

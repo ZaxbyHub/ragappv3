@@ -360,7 +360,7 @@ export function DocumentTable({
                           return (
                             <button
                               type="button"
-                              className="text-xs text-muted-foreground hover:text-foreground underline"
+                              className={`text-xs text-muted-foreground underline ${canOrganizeDocuments ? "hover:text-foreground cursor-pointer" : "cursor-not-allowed"}`}
                               onClick={() => onCompileDocument(docId)}
                               disabled={!canOrganizeDocuments || isCompiling}
                               title={canOrganizeDocuments ? "Compile wiki for this document" : "Write access to this vault is required to compile the wiki"}
@@ -387,7 +387,7 @@ export function DocumentTable({
                             className={`text-xs font-mono bg-transparent border-0 p-0 ${color} ${canOrganizeDocuments ? "cursor-pointer" : "cursor-not-allowed"}`}
                             onClick={() => onCompileDocument(docId)}
                             disabled={!canOrganizeDocuments}
-                            title={canOrganizeDocuments ? `Wiki: ${ws.wiki_status} — ${ws.pages_count} pages, ${ws.claims_count} claims, ${ws.lint_count} lint issues. Click to recompile.` : "Write access to this vault is required to recompile the wiki"}
+                            title={`Wiki: ${ws.wiki_status} — ${ws.pages_count} pages, ${ws.claims_count} claims, ${ws.lint_count} lint issues.${canOrganizeDocuments ? " Click to recompile." : " Write access to this vault is required to recompile."}`}
                             aria-label={`Recompile wiki for ${doc.filename}. Status: ${ws.wiki_status}.`}
                           >
                             {label}

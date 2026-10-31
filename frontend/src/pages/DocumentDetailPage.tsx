@@ -551,7 +551,13 @@ export default function DocumentDetailPage() {
                 variant="outline"
                 onClick={handleSaveTags}
                 disabled={!canWriteDocVault || !tagsDirty || savingTags}
-                title={canWriteDocVault ? "Save tag changes" : "Write access to this vault is required to save tag changes"}
+                title={
+                  canWriteDocVault
+                    ? "Save tag changes"
+                    : docVaultPermission == null
+                      ? "Vault access could not be determined; save is unavailable"
+                      : "Write access to this vault is required to save tag changes"
+                }
               >
                 {savingTags ? (
                   <Loader2 className="w-4 h-4 mr-1 animate-spin" />

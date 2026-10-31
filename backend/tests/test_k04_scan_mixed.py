@@ -114,7 +114,10 @@ async def test_mixed_directory_reports_examined_and_enqueued_separately(tmp_path
     assert response.errors == []
     # Exactly the new file reached the processor, under its vault id.
     assert processor.enqueue.await_count == 1
-    enqueued_path, enqueued_kwargs = processor.enqueue.await_args[0][0], processor.enqueue.await_args.kwargs
+    enqueued_path, enqueued_kwargs = (
+        processor.enqueue.await_args[0][0],
+        processor.enqueue.await_args.kwargs,
+    )
     assert enqueued_path == str(fresh.resolve())
     assert enqueued_kwargs == {"vault_id": 1}
 
@@ -205,7 +208,134 @@ async def test_failing_vault_directory_keeps_healthy_vault_scanned(tmp_path):
     assert response.files_enqueued == 1
     assert processor.enqueue.await_count == 1
     assert processor.enqueue.await_args.kwargs == {"vault_id": 2}
-    # ...and the broken vault's failure is reported once, naming the cause.
+    # ...and the broken vault's failure is reported once — REDACTED shape
+    # (K-01): names the vault and the exception CLASS, never the raw message
+    # or any absolute path.
     assert len(response.errors) == 1
-    assert "vault directories" in response.errors[0]
-    assert "vault 1 uploads dir unavailable" in response.errors[0]
+    assert "vault 1 upload directory lookup" in response.errors[0]
+    assert "RuntimeError" in response.errors[0]
+    assert "vault 1 uploads dir unavailable" not in response.errors[0]
+    for error_entry in response.errors:
+        assert str(healthy_uploads) not in error_entry
+        assert str(tmp_path) not in error_entry
+
+
+async def test_per_directory_scan_failure_is_reported_redacted(tmp_path):
+    """K-10: a directory failing MID-scan (discovery raise) is reported.
+
+    The per-directory arm (file_watcher's scan-loop except) must append a
+    REDACTED error — vault-relative scope + exception class — while the other
+    directory's candidates still count. Replacing the append with ``pass``
+    makes this test fail (the mutant-and-canary gap the OOB review measured).
+    """
+    from app.api.routes.documents import scan_directories
+
+    good_dir = tmp_path / "vault-one-uploads"
+    good_dir.mkdir()
+    (good_dir / "good.txt").write_text("scannable", encoding="utf-8")
+
+    broken_dir = tmp_path / "vault-two-uploads"
+    broken_dir.mkdir()
+
+    async_pool = make_vaults_pool([(1, "Vault One"), (2, "Vault Two")])
+    files_pool = make_files_pool([])
+    processor = make_background_processor()
+
+    def vault_uploads_side_effect(vault_id):
+        return good_dir if vault_id == 1 else broken_dir
+
+    from app.services.file_watcher import DirectoryScan
+
+    def find_new_files_side_effect(directory):
+        if directory == broken_dir:
+            raise OSError("permission denied mid-scan")
+        # scan_once consumes DirectoryScan (the good dir's file is new).
+        return DirectoryScan(examined=1, new_files={good_dir / "good.txt"})
+
+    with patch("app.services.file_watcher.settings") as mock_settings:
+        mock_settings.sqlite_path = "/fake/sqlite.db"
+        mock_settings.library_vault_id = None
+        mock_settings.library_dir = tmp_path / "library"
+        mock_settings.vault_uploads_dir = MagicMock(
+            side_effect=vault_uploads_side_effect
+        )
+
+        with patch("app.models.database.get_pool", return_value=async_pool):
+            with patch.object(
+                __import__(
+                    "app.services.file_watcher", fromlist=["FileWatcher"]
+                ).FileWatcher,
+                "_find_new_files",
+                side_effect=find_new_files_side_effect,
+            ):
+                response = await scan_directories(
+                    request=MagicMock(),
+                    background_processor=processor,
+                    db_pool=files_pool,
+                    user=ADMIN_USER,
+                    _csrf_token="test-csrf-token",
+                )
+                response = await scan_directories(
+                    request=MagicMock(),
+                    background_processor=processor,
+                    db_pool=files_pool,
+                    user=ADMIN_USER,
+                    _csrf_token="test-csrf-token",
+                )
+
+    # The broken directory is reported REDACTED: vault-relative scope +
+    # exception class; no absolute path, no raw exception text.
+    assert len(response.errors) == 1
+    assert "vault 2 upload directory" in response.errors[0]
+    assert "OSError" in response.errors[0]
+    assert str(broken_dir) not in response.errors[0]
+    assert "permission denied mid-scan" not in response.errors[0]
+    # The healthy directory's file was still examined (and enqueued: it is new).
+    assert response.scanned == 1
+    assert response.files_enqueued == 1
+
+
+async def test_temp_artifacts_and_zero_byte_files_are_not_examined(tmp_path):
+    """K-08: temp artifacts and zero-byte files are excluded BEFORE counting.
+
+    Dropping either filter in ``_find_new_files`` inflates
+    ``ScanResult.files_examined`` and fails this test (the canary the OOB
+    review measured as a surviving mutant).
+    """
+    from app.api.routes.documents import scan_directories
+
+    uploads_dir = tmp_path / "vault-uploads"
+    uploads_dir.mkdir()
+    real = uploads_dir / "real.txt"
+    real.write_text("real content", encoding="utf-8")
+    # Canonical atomic-write temp artifact shape (app.services.atomic_write).
+    (uploads_dir / ".real.txt.1234567890abcdef1234567890abcdef.part").write_text(
+        "partial", encoding="utf-8"
+    )
+    # Zero-byte file (never ingestible).
+    (uploads_dir / "empty.txt").write_text("", encoding="utf-8")
+
+    async_pool = make_vaults_pool([(1, "Vault One")])
+    files_pool = make_files_pool([])
+    processor = make_background_processor()
+
+    with patch("app.services.file_watcher.settings") as mock_settings:
+        mock_settings.sqlite_path = "/fake/sqlite.db"
+        mock_settings.library_vault_id = None
+        mock_settings.library_dir = tmp_path / "library"
+        mock_settings.vault_uploads_dir = MagicMock(return_value=uploads_dir)
+
+        with patch("app.models.database.get_pool", return_value=async_pool):
+            response = await scan_directories(
+                request=MagicMock(),
+                background_processor=processor,
+                db_pool=files_pool,
+                user=ADMIN_USER,
+                _csrf_token="test-csrf-token",
+            )
+
+    # Only the ONE real file was examined; the excluded shapes are not
+    # "examined" and the temp artifact is not enqueued either.
+    assert response.scanned == 1
+    assert response.files_enqueued == 1
+    assert response.errors == []

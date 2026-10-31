@@ -30,8 +30,13 @@ export function UploadDropzone({
   // Effective upload limit: server-configured max_file_size_mb once settings
   // have loaded (the settings store is the only fetch path), else the client
   // fallback. Drives both react-dropzone's maxSize and the label.
+  // PRR-029: mirror DocumentsPage's positivity guard — a server-reported 0
+  // (no config validator forbids it) must fall back, not set maxSize 0.
+  const storeMaxFileSizeMb = useSettingsStore((s) => s.settings?.max_file_size_mb);
   const maxFileSizeMb =
-    useSettingsStore((s) => s.settings?.max_file_size_mb) ?? MAX_UPLOAD_FILE_SIZE_MB;
+    typeof storeMaxFileSizeMb === "number" && storeMaxFileSizeMb > 0
+      ? storeMaxFileSizeMb
+      : MAX_UPLOAD_FILE_SIZE_MB;
   const maxFileSizeBytes = maxFileSizeMb * 1024 * 1024;
   // Server allowlist: undefined = not loaded (server validates; today's
   // behavior); [] = loaded but empty (server rejects every suffix).
@@ -102,11 +107,15 @@ export function UploadDropzone({
   const disabled = !hasSelectedVault || !canWriteActiveVault;
   // Advertised types: the server allowlist once loaded; the historical
   // hardcoded copy is only the pre-load fallback (issue #768 AC8).
+  // PRR-007/K-23: an empty loaded allowlist joins to "" — render the truth
+  // (nothing is allowed server-side) instead of "Supports  files".
   const advertisedTypes = allowedExtensions
-    ? Array.from(new Set(allowedExtensions))
-        .sort()
-        .map((ext) => ext.replace(/^\./, "").toUpperCase())
-        .join(", ")
+    ? allowedExtensions.length > 0
+      ? Array.from(new Set(allowedExtensions))
+          .sort()
+          .map((ext) => ext.replace(/^\./, "").toUpperCase())
+          .join(", ")
+      : "no file types are currently allowed"
     : "PDF, DOCX, TXT, MD";
 
   return (
