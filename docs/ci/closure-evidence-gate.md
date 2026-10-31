@@ -112,10 +112,10 @@ no hook can block that event itself. Enforcement is therefore:
 **Reopen-on-merge procedure** (operator): if a merged PR turns out to have
 closed an issue without valid evidence, reopen the issue with a comment
 linking the gate run (`closure-evidence: FAIL` in the Actions log) and naming
-the missing evidence. `closure-evidence: ERROR — gate not run (base-copy
-preflight failed)` is an infrastructure/availability outcome, NOT a violation
-token — it never keys this procedure (in enforce mode it still fails the
-check, fail-closed). The gate's output lines (`closure-evidence: OK / WARN /
+the missing evidence. `closure-evidence: ERROR — gate not run` (preflight
+failure; the full line names the failed step) is an
+infrastructure/availability outcome, NOT a violation token — it never keys
+this procedure (in enforce mode it still fails the check, fail-closed). The gate's output lines (`closure-evidence: OK / WARN /
 FAIL / ERROR / evidence-test`) are designed to be quoted directly.
 
 ## Modes, rollout, and rollback
