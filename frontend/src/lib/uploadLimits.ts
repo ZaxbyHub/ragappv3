@@ -123,3 +123,34 @@ export function uploadAcceptOption(
   if (normalized.length === 0) return undefined;
   return { "application/octet-stream": normalized };
 }
+
+/**
+ * Raster image extensions, mirroring backend RASTER_IMAGE_EXTENSIONS
+ * (backend/app/services/document_artifacts.py). Exported for tests and for
+ * any future surface that needs the same exclusion.
+ */
+export const RASTER_IMAGE_EXTENSIONS: readonly string[] = [
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".gif",
+  ".bmp",
+  ".tif",
+  ".tiff",
+  ".webp",
+];
+
+/**
+ * The Draft Room surface allowlist: the server allowlist minus raster
+ * images, mirroring backend DRAFT_ROOM_ALLOWED_EXTENSIONS
+ * (backend/app/api/routes/draft_room.py — Draft Room is a parse-only text
+ * seam, issue #460, so the vault image allowlist does not apply there).
+ * Entries are normalized first so the subtraction sees the same
+ * lowercase/dot-prefixed form serverAcceptsFilename membership uses.
+ */
+export function draftRoomAllowedExtensions(serverAllowedExtensions: string[]): string[] {
+  const raster = new Set(RASTER_IMAGE_EXTENSIONS);
+  return serverAllowedExtensions
+    .map(normalizeAllowedExtension)
+    .filter((ext) => !raster.has(ext));
+}
