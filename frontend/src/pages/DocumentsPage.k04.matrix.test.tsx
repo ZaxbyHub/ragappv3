@@ -597,10 +597,34 @@ describe('DocumentsPage K04 permission matrix (issue #767)', () => {
   });
 
   it('delete-all ends with the SERVER total, not a hand-patched guess (PRR-019 value pin)', async () => {
-    // PRR-019: the frozen k05 delete-all check is call-count-only; this pins
-    // the final VALUE for the zeroing shape — the rendered total must equal
-    // the server's post-delete state (0), reconciled by the refetch.
+    // PRR-019: the frozen k05 delete-all check is call-count-only. This pins
+    // the final rendered VALUE against the refetched server state, modeling a
+    // post-delete server that reports 1 remaining document (a concurrent
+    // write): neither the no-op mutant (deleted_count 0 skips the whole
+    // handler) nor the refetch-drop mutant (hand-patched 0 left standing)
+    // can render it.
     selectVault('admin');
+    const seedDocs = [
+      { id: '1', filename: 'one.pdf', size: 1, created_at: '2024-01-01', metadata: { status: 'processed', chunk_count: 1 } },
+      { id: '2', filename: 'two.pdf', size: 1, created_at: '2024-01-01', metadata: { status: 'processed', chunk_count: 1 } },
+    ];
+    const survivor = { id: '3', filename: 'concurrent.pdf', size: 1, created_at: '2024-01-02', metadata: { status: 'processed', chunk_count: 1 } };
+    vi.mocked(listDocuments)
+      .mockResolvedValueOnce({ documents: seedDocs, total: 2 })
+      .mockResolvedValue({ documents: [survivor], total: 1 });
+    vi.mocked(getDocumentStats)
+      .mockResolvedValueOnce({
+        total_documents: 2,
+        total_chunks: 4,
+        total_size_bytes: 2,
+        documents_by_status: { processed: 2 },
+      })
+      .mockResolvedValue({
+        total_documents: 1,
+        total_chunks: 2,
+        total_size_bytes: 1,
+        documents_by_status: { processed: 1 },
+      });
     vi.mocked(deleteAllDocumentsInVault).mockResolvedValue({ deleted_count: 2 });
 
     await renderPage();
@@ -613,11 +637,32 @@ describe('DocumentsPage K04 permission matrix (issue #767)', () => {
     await act(async () => {
       fireEvent.click(within(dialog).getByRole('button', { name: /^(Confirm|Delete)$/ }));
     });
-    // After the refetch lands, the badge must read the server's 0 — and the
-    // empty state (not stale rows) must own the surface.
+
+    // The badge must read the SERVER's post-delete total (1 — the concurrent
+    // write), not the hand-patched 0 and not the pre-delete 2.
     await waitFor(() => {
-      expect(screen.getByText('0')).toBeInTheDocument();
+      expect(
+        screen.getByText((content, element) =>
+          element?.tagName === 'SPAN' && /^1 document$/.test(content.trim())
+        )
+      ).toBeInTheDocument();
     });
+    // The surviving server-side document renders after the refetch.
+    expect((await screen.findAllByText('concurrent.pdf')).length).toBeGreaterThan(0);
+    // The Documents STAT CARD (stats.total_documents, a different refetch
+    // arm from the badge's listDocuments total) must also read the server's
+    // post-delete value — kills the stats-refetch-drop mutant.
+    const documentsCard = screen.getByText('Total Documents', {
+      selector: '[data-testid="card-description"]',
+    }).closest('[data-testid="card"]') as HTMLElement | null;
+    expect(documentsCard).not.toBeNull();
+    expect(documentsCard!.querySelector('[data-testid="card-title"]')?.textContent).toBe('1');
+    // The hand-patched 0 must never be the standing value.
+    expect(
+      screen.queryByText((content, element) =>
+        element?.tagName === 'SPAN' && /^0 documents$/.test(content.trim())
+      )
+    ).toBeNull();
   });
 
   it('badge pluralizes and locale-formats the count (PRR-008)', async () => {
