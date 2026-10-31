@@ -207,31 +207,48 @@ test.describe("k08 evidence sheet snap (issue #771)", () => {
     const handle = sheet.getByRole("button", { name: /expand|maximize|full/i });
     await expect(handle).toBeVisible({ timeout: 10_000 });
 
-    const box = await handle.boundingBox();
-    if (!box) throw new Error("handle has no box");
-    const cx = box.x + box.width / 2;
-    // Upward drag: press on the handle, move up ~55% of the viewport, release.
-    await page.mouse.move(cx, box.y + box.height / 2);
-    await page.mouse.down();
-    await page.mouse.move(cx, box.y - 844 * 0.55, { steps: 12 });
-    await page.mouse.up();
-    await page.waitForTimeout(600);
+    // Synthetic TOUCH pointer events: a mouse drag ends with a click on the
+    // handle (the accessible toggle), which would satisfy the expansion even
+    // with the pointer handlers removed; touch pointerup produces no click,
+    // so this drives the drag path specifically.
+    const dragHandle = async (dy: number) => {
+      await handle.evaluate((el, delta) => {
+        const rect = el.getBoundingClientRect();
+        const cx = rect.left + rect.width / 2;
+        const cy = rect.top + rect.height / 2;
+        const opts = (y: number) => ({
+          bubbles: true, cancelable: true, pointerId: 7, pointerType: "touch",
+          clientX: cx, clientY: y, isPrimary: true,
+        });
+        el.dispatchEvent(new PointerEvent("pointerdown", opts(cy)));
+        el.dispatchEvent(new PointerEvent("pointermove", opts(cy - delta / 2)));
+        el.dispatchEvent(new PointerEvent("pointerup", opts(cy - delta)));
+      }, dy);
+      await page.waitForTimeout(600);
+    };
+
+    // Upward drag (55% of the viewport) snaps to full height.
+    await dragHandle(844 * 0.55);
     const expandedRatio = await sheet.evaluate(
       (el) => el.getBoundingClientRect().height / window.innerHeight
     );
     expect(expandedRatio, `sheet height after upward drag: ${Math.round(expandedRatio * 100)}%`).toBeGreaterThanOrEqual(0.7);
 
-    // Downward drag returns to peek. The control's accessible name flipped to
-    // the collapse form when the sheet expanded, so re-resolve it (plan-critic
-    // R2: the expand-named locator can no longer match).
+    // Downward drag returns to peek (re-resolve: the accessible name flipped).
     const collapseHandle = sheet.getByRole("button", { name: /collapse|minimize|peek/i });
     await expect(collapseHandle).toBeVisible({ timeout: 10_000 });
-    const box2 = await collapseHandle.boundingBox();
-    if (!box2) throw new Error("handle has no box after expand");
-    await page.mouse.move(cx, box2.y + box2.height / 2);
-    await page.mouse.down();
-    await page.mouse.move(cx, box2.y + 844 * 0.55, { steps: 12 });
-    await page.mouse.up();
+    await collapseHandle.evaluate((el) => {
+      const rect = el.getBoundingClientRect();
+      const cx = rect.left + rect.width / 2;
+      const cy = rect.top + rect.height / 2;
+      const opts = (y: number) => ({
+        bubbles: true, cancelable: true, pointerId: 8, pointerType: "touch",
+        clientX: cx, clientY: y, isPrimary: true,
+      });
+      el.dispatchEvent(new PointerEvent("pointerdown", opts(cy)));
+      el.dispatchEvent(new PointerEvent("pointermove", opts(cy + 220)));
+      el.dispatchEvent(new PointerEvent("pointerup", opts(cy + 460)));
+    });
     await page.waitForTimeout(600);
     const peekRatio = await sheet.evaluate(
       (el) => el.getBoundingClientRect().height / window.innerHeight
@@ -239,9 +256,6 @@ test.describe("k08 evidence sheet snap (issue #771)", () => {
     expect(peekRatio, `sheet height after downward drag: ${Math.round(peekRatio * 100)}%`).toBeLessThanOrEqual(0.5);
   });
 
-  // Plan-critic R1 hardening: expansion must not leak across close/reopen —
-  // a sheet reopened from a chip always starts at peek. RED at base (no
-  // expand control exists to set up the expanded state).
   test("evidence sheet resets to peek when closed and reopened", async ({ page }) => {
     await page.request.post(`${STUB_ORIGIN}/_e2e/a11y-seed`, { data: {} });
     await page.setViewportSize({ width: 390, height: 844 });
