@@ -136,7 +136,7 @@ export function GroupTable({
   // the desktop actions column and the below-sm card list carry BIT-FOR-BIT
   // the same callback-driven controls.
   const renderGroupActions = (group: Group) => (
-    <div className="flex flex-wrap items-center gap-1">
+    <div className="flex flex-wrap items-center justify-end gap-1">
       <Button
         variant="ghost"
         size="icon"

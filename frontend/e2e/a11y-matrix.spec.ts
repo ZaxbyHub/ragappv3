@@ -232,7 +232,11 @@ const ROUTES: RouteRow[] = [
     auth: "login",
     kind: "shell",
     // Static users fixture row — AdminUsersPage.tsx:486 {user.username}.
-    sentinel: { selector: "text=e2e-user" },
+    // Issue #771: the below-sm card list duplicates the username next to the
+    // desktop table; `>> visible=true` skips the table row that is
+    // display:none below sm (same amendment the /documents sentinel documents
+    // for handbook-a11y.pdf above).
+    sentinel: { selector: "text=e2e-user >> visible=true" },
   },
   {
     path: "/admin/groups",
@@ -240,7 +244,9 @@ const ROUTES: RouteRow[] = [
     kind: "shell",
     // Static groups fixture row — GroupTable.tsx:139
     // {row.original.name} (rendered by AdminGroupsPage.tsx:292).
-    sentinel: { selector: "text=e2e-group" },
+    // Issue #771: visible-scoped — the below-sm card list duplicates the
+    // group name next to the hidden desktop table row.
+    sentinel: { selector: "text=e2e-group >> visible=true" },
   },
   {
     path: "/admin/organizations",

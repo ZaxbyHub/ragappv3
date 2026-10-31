@@ -463,7 +463,7 @@ function AdminUsersPageContent({ authOwner, principalGeneration }: { authOwner: 
     </div>
   );
   const renderRowActions = (user: User) => (
-                  <div className="flex flex-wrap items-center gap-1">
+                  <div className="flex flex-wrap items-center justify-end gap-1">
                     {canManageUser(user) && (
                       <>
                         <Button

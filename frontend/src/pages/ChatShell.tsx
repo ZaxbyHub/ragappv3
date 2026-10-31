@@ -118,6 +118,11 @@ export default function ChatShell() {
   const sheetSuppressClickRef = useRef(false);
   const handleSheetHandlePointerDown = (event: React.PointerEvent<HTMLButtonElement>) => {
     if (event.pointerType === "mouse" && event.button !== 0) return;
+    // Clear at gesture start: a completed touch drag arms the flag but touch
+    // pointerup never produces the trailing click, so the flag must not
+    // survive into the user's NEXT tap (implementation-review R1: the armed
+    // flag swallowed the next tap outright).
+    sheetSuppressClickRef.current = false;
     sheetGestureRef.current = { active: true, startY: event.clientY, pointerId: event.pointerId };
     try { event.currentTarget.setPointerCapture(event.pointerId); } catch { /* capture is best-effort */ }
   };

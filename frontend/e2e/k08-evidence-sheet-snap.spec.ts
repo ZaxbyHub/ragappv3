@@ -256,6 +256,44 @@ test.describe("k08 evidence sheet snap (issue #771)", () => {
     expect(peekRatio, `sheet height after downward drag: ${Math.round(peekRatio * 100)}%`).toBeLessThanOrEqual(0.5);
   });
 
+  // Implementation-review R1 pin: a completed TOUCH drag arms the click
+  // suppression but touch pointerup produces no trailing click, so the flag
+  // must be cleared at the NEXT gesture's start — a tap after a touch drag
+  // must still toggle the sheet.
+  test("evidence sheet tap after a touch drag still toggles", async ({ page }) => {
+    await page.request.post(`${STUB_ORIGIN}/_e2e/a11y-seed`, { data: {} });
+    await page.setViewportSize({ width: 390, height: 844 });
+    await loginAndSelectVault(page);
+    await openEvidenceSheet(page);
+
+    const sheet = page.locator(SHEET_SELECTOR);
+    const handle = sheet.getByRole("button", { name: /expand|maximize|full/i });
+    await expect(handle).toBeVisible({ timeout: 10_000 });
+
+    // A short touch drag (above the 8px suppression threshold, below the 25%
+    // snap threshold) changes nothing visible but arms suppression.
+    await handle.evaluate((el) => {
+      const rect = el.getBoundingClientRect();
+      const cx = rect.left + rect.width / 2;
+      const cy = rect.top + rect.height / 2;
+      const opts = (y: number) => ({
+        bubbles: true, cancelable: true, pointerId: 11, pointerType: "touch",
+        clientX: cx, clientY: y, isPrimary: true,
+      });
+      el.dispatchEvent(new PointerEvent("pointerdown", opts(cy)));
+      el.dispatchEvent(new PointerEvent("pointerup", opts(cy - 40)));
+    });
+    await page.waitForTimeout(400);
+
+    // The next TAP must still toggle (no poisoned click suppression).
+    await handle.click();
+    await page.waitForTimeout(600);
+    const ratio = await sheet.evaluate(
+      (el) => el.getBoundingClientRect().height / window.innerHeight
+    );
+    expect(ratio, `sheet height after post-drag tap: ${Math.round(ratio * 100)}%`).toBeGreaterThanOrEqual(0.7);
+  });
+
   test("evidence sheet resets to peek when closed and reopened", async ({ page }) => {
     await page.request.post(`${STUB_ORIGIN}/_e2e/a11y-seed`, { data: {} });
     await page.setViewportSize({ width: 390, height: 844 });
