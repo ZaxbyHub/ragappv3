@@ -307,13 +307,17 @@ function MemoryPageContent({ activeVaultId }: { activeVaultId: number }) {
           description={searchQuery ? undefined : "Add some to get started."}
         />
       ) : (
-        <div className="space-y-3">
+        // Issue #770 (UI-ENH-01): multi-column memory grid on wide viewports
+        // (KMSPage pattern), and the memory paragraph carries a ch-based
+        // measure bound (max-w-[80ch]) so long prose stays readable at any
+        // column width — either mechanism alone satisfies the 80ch contract.
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
           {memories.map((memory) => (
             <Card key={memory.id}>
               <CardContent className="p-4">
                 <div className="flex items-start justify-between gap-4">
                   <div className="flex-1 space-y-2">
-                    <p className="text-sm whitespace-pre-wrap">{memory.content}</p>
+                    <p className="text-sm whitespace-pre-wrap max-w-[80ch]">{memory.content}</p>
                     <div className="flex flex-wrap items-center gap-2">
                       <Badge variant="outline">{getCategoryFromMetadata(memory.metadata)}</Badge>
                       {getTagsFromMetadata(memory.metadata).map((tag, idx) => (

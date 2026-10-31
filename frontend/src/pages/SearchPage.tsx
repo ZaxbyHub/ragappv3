@@ -212,6 +212,10 @@ export default function SearchPage() {
           <p className="text-xs text-muted-foreground">
             {results.length} {results.length === 1 ? "result" : "results"} for &ldquo;{q}&rdquo;
           </p>
+          {/* Issue #770 (UI-ENH-01): multi-column result grid on wide
+              viewports, matching KMSPage's own sm:2/lg:3 pattern; the count
+              line stays outside the grid so it spans the full content width. */}
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
           {results.map((result) => (
             <Card key={`${result.type}-${result.id}`}>
               <CardContent className="p-4">
@@ -247,6 +251,7 @@ export default function SearchPage() {
               </CardContent>
             </Card>
           ))}
+          </div>
         </div>
       )}
     </div>

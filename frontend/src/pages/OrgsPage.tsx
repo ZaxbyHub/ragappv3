@@ -490,6 +490,10 @@ function OrgsPageContent() {
                   </form>
                   )}
 
+                  {/* Issue #771 (UI-ENH-05): desktop member table hidden below
+                      sm; the card list after it renders the same members with
+                      identical owner/permission rules and handlers. */}
+                  <div className="hidden sm:block">
                   <Table>
                     <TableCaption className="sr-only">Organization Members</TableCaption>
                     <TableHeader>
@@ -546,6 +550,45 @@ function OrgsPageContent() {
                       )}
                     </TableBody>
                   </Table>
+                  </div>
+                  {/* Issue #771 (UI-ENH-05 stage 2): below-sm member card list,
+                      with card-visible loading/empty states. */}
+                  <div className="space-y-3 sm:hidden" aria-label="Organization members (compact)">
+                    {!org.members ? (
+                      <div className="py-4 text-center text-sm text-muted-foreground" role="status" aria-live="polite">Loading members</div>
+                    ) : org.members.length === 0 ? (
+                      <div className="py-4"><EmptyState title="No members yet" className="py-0" /></div>
+                    ) : (
+                      org.members.map((member) => (
+                        <div key={`card-${member.user_id}`} className="rounded-sm border p-3 space-y-2">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div>
+                              <div className="font-medium">{member.full_name || member.username}</div>
+                              <div className="text-sm text-muted-foreground">@{member.username}</div>
+                            </div>
+                            <div className="text-xs text-muted-foreground">{formatDate(member.joined_at)}</div>
+                          </div>
+                          {member.role === "owner" ? (
+                            <Badge variant="default" className="text-xs">Owner</Badge>
+                          ) : (
+                            <select value={member.role} onChange={(e) => handleRoleChange(org.id, member.user_id, e.target.value as OrgRole)} disabled={updatingMemberId === member.user_id} aria-label={`Change role for ${member.username}`} className={NATIVE_SELECT_CLASS_NAME}>
+                              {CHANGEABLE_ROLE_OPTIONS.map((opt) => (<option key={opt.value} value={opt.value}>{opt.label}</option>))}
+                            </select>
+                          )}
+                          <div className="flex flex-wrap items-center justify-end gap-1">
+                            {member.role !== "owner" && (isSuperAdmin || org.members?.some((m) => m.user_id === currentUser?.id && m.role === "owner")) && (
+                              <Button variant="ghost" size="sm" className="text-xs h-7 px-2" onClick={() => { setTransferOrgId(org.id); setTransferTargetId(member.user_id); setTransferDialogOpen(true); }} aria-label={`Transfer ownership to ${member.username}`} title="Transfer Ownership">
+                                Transfer
+                              </Button>
+                            )}
+                            <Button variant="destructive" size="icon" onClick={() => { setMemberToRemove(member); setOrgForMemberAction(org.id); setRemoveMemberDialogOpen(true); }} aria-label={`Remove ${member.username} from organization`} disabled={member.role === "owner"} title={member.role === "owner" ? "Cannot remove owner — transfer ownership first" : "Remove member"}>
+                              <UserX className="w-4 h-4" />
+                            </Button>
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
                 </CardContent>
               )}
             </Card>

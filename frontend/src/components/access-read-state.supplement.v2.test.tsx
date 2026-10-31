@@ -1,10 +1,14 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import "@testing-library/jest-dom";
 import * as React from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { VaultGroupAccessPanel } from "@/components/VaultGroupAccessPanel";
 import { VaultMembersPanel } from "@/components/VaultMembersPanel";
 import { useAuthStore } from "@/stores/useAuthStore";
+// Issue #771 (UI-ENH-05): the below-sm card list duplicates row
+// text next to the desktop table; scope data queries to the table subtree
+// (a card-only regression still fails these assertions).
+const inTable = () => within(screen.getByRole("table"));
 
 const fixture = vi.hoisted(() => ({
   client: {
@@ -188,7 +192,8 @@ describe("access panel read ownership and outcome controls", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /retry/i }));
     await act(async () => retry.resolve({ data: { group_access: [], total: 0 } }));
-    await waitFor(() => expect(screen.getByText(/No groups have access yet/i)).toBeInTheDocument());
+    // #771: table-scoped (below-sm card list duplicates the text)
+    await waitFor(() => expect(inTable().getByText(/No groups have access yet/i)).toBeInTheDocument());
   });
 
   it("publishes successful empty group and member reads, while positive rows retain permission context", async () => {
@@ -197,7 +202,8 @@ describe("access panel read ownership and outcome controls", () => {
       .mockResolvedValueOnce({ data: { members: [memberRow()], total: 1 } });
 
     const groupView = render(<VaultGroupAccessPanel vaultId={42} />);
-    await waitFor(() => expect(screen.getByText(/No groups have access yet/i)).toBeInTheDocument());
+    // #771: table-scoped (below-sm card list duplicates the text)
+    await waitFor(() => expect(inTable().getByText(/No groups have access yet/i)).toBeInTheDocument());
     groupView.unmount();
 
     render(<VaultMembersPanel vaultId={42} />);
@@ -218,7 +224,8 @@ describe("access panel read ownership and outcome controls", () => {
     expect(screen.queryByText("Old Vault Group")).not.toBeInTheDocument();
 
     await act(async () => second.resolve({ data: { group_access: [groupRow({ group_name: "Current Vault Group" })], total: 1 } }));
-    await waitFor(() => expect(screen.getByText("Current Vault Group")).toBeInTheDocument());
+    // #771: table-scoped (below-sm card list duplicates the text)
+    await waitFor(() => expect(inTable().getByText("Current Vault Group")).toBeInTheDocument());
   });
 
   it("clears group rows, draft input, and selected removal when B is pending or fails after A", async () => {
@@ -227,10 +234,12 @@ describe("access panel read ownership and outcome controls", () => {
       .mockResolvedValueOnce({ data: { group_access: [groupRow()], total: 1 } })
       .mockReturnValueOnce(bRead.promise);
     const view = render(<VaultGroupAccessPanel vaultId={710} />);
-    await waitFor(() => expect(screen.getByText("Editors")).toBeInTheDocument());
+    // #771: table-scoped (below-sm card list duplicates the text)
+    await waitFor(() => expect(inTable().getByText("Editors")).toBeInTheDocument());
     const draft = screen.getByRole("textbox", { name: "Group ID to grant vault access" });
     fireEvent.change(draft, { target: { value: "81" } });
-    fireEvent.click(screen.getByRole("button", { name: /Revoke access for Editors/i }));
+    // #771: table-scoped (below-sm card list duplicates the text)
+    fireEvent.click(inTable().getByRole("button", { name: /Revoke access for Editors/i }));
     expect(screen.getByText(/Are you sure you want to revoke vault access for/i)).toBeInTheDocument();
 
     view.rerender(<VaultGroupAccessPanel vaultId={711} />);
@@ -277,7 +286,8 @@ describe("access panel read ownership and outcome controls", () => {
     await act(async () => b.resolve({ data: { group_access: [groupRow({ group_name: "Stale B Group" })], total: 1 } }));
     expect(screen.queryByText("Stale B Group")).not.toBeInTheDocument();
     await act(async () => currentA.resolve({ data: { group_access: [groupRow({ group_name: "Current A Group" })], total: 1 } }));
-    await waitFor(() => expect(screen.getByText("Current A Group")).toBeInTheDocument());
+    // #771: table-scoped (below-sm card list duplicates the text)
+    await waitFor(() => expect(inTable().getByText("Current A Group")).toBeInTheDocument());
   });
 
   it("ignores an old member A completion across A to B to A even when the final context is A again", async () => {
@@ -357,7 +367,8 @@ describe("access panel read ownership and outcome controls", () => {
     fixture.client.post.mockReturnValueOnce(post.promise);
 
     render(<VaultGroupAccessPanel vaultId={404} />);
-    await waitFor(() => expect(screen.getByText("Editors")).toBeInTheDocument());
+    // #771: table-scoped (below-sm card list duplicates the text)
+    await waitFor(() => expect(inTable().getByText("Editors")).toBeInTheDocument());
     fireEvent.change(screen.getByRole("textbox", { name: "Group ID to grant vault access" }), { target: { value: "19" } });
     fireEvent.change(screen.getByRole("combobox", { name: "Permission level for group access" }), { target: { value: "write" } });
     fireEvent.submit(screen.getByRole("textbox", { name: "Group ID to grant vault access" }).closest("form")!);
@@ -369,9 +380,11 @@ describe("access panel read ownership and outcome controls", () => {
 
     await act(async () => post.resolve({}));
     await waitFor(() => expect(fixture.client.get).toHaveBeenCalledTimes(2));
-    expect(screen.getByText("Editors")).toBeInTheDocument();
+    // #771: table-scoped (below-sm card list duplicates the text)
+    expect(inTable().getByText("Editors")).toBeInTheDocument();
     await act(async () => refresh.resolve({ data: { group_access: [groupRow({ permission: "write", group_name: "Editors Updated" })], total: 1 } }));
-    await waitFor(() => expect(screen.getByText("Editors Updated")).toBeInTheDocument());
+    // #771: table-scoped (below-sm card list duplicates the text)
+    await waitFor(() => expect(inTable().getByText("Editors Updated")).toBeInTheDocument());
   });
 
   it("preserves member permission mutation payload, disabled busy readback, and latest permission", async () => {

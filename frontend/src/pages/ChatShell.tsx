@@ -92,6 +92,51 @@ export default function ChatShell() {
   // NOT suppress the fixed inset-0 bg-black/40 overlay — it would dim the whole
   // desktop layout whenever rightPaneOpen flips true on lg+ widths.
   const isBelowLg = useIsMobile(1024);
+
+  // Issue #771 (UI-ENH-05 stage 2): the below-lg evidence sheet gains a
+  // peek<->full snap point. sheetExpanded defaults to peek (the #689 45vh
+  // contract); it resets on EVERY close/breakpoint path — this effect fires
+  // for the Radix onOpenChange close, the Escape handler's closeRightPane,
+  // the details-toggle path, and the lg breakpoint transition, because they
+  // all flip rightPaneOpen or isBelowLg.
+  const [sheetExpanded, setSheetExpanded] = useState(false);
+  useEffect(() => {
+    if (!rightPaneOpen || !isBelowLg) setSheetExpanded(false);
+  }, [rightPaneOpen, isBelowLg]);
+
+  // Drag gesture lifecycle (plan-critic R1+R3): the handle carries
+  // touch-action none so the browser never converts a handle drag into a
+  // native pan (pointercancel); the snap commits ONLY on a completed
+  // pointerup past a 25%-of-viewport threshold; pointercancel and unexpected
+  // lostpointercapture abort and clean up WITHOUT snapping; the active flag
+  // cleared before commit means the capture loss after pointerup cannot
+  // double-process the gesture.
+  const sheetGestureRef = useRef<{ active: boolean; startY: number; pointerId: number }>({ active: false, startY: 0, pointerId: -1 });
+  // A completed drag ends with pointerup on the handle, which the browser
+  // also reports as a click; without suppression that click toggles the
+  // just-applied snap straight back.
+  const sheetSuppressClickRef = useRef(false);
+  const handleSheetHandlePointerDown = (event: React.PointerEvent<HTMLButtonElement>) => {
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    sheetGestureRef.current = { active: true, startY: event.clientY, pointerId: event.pointerId };
+    try { event.currentTarget.setPointerCapture(event.pointerId); } catch { /* capture is best-effort */ }
+  };
+  const handleSheetHandlePointerUp = (event: React.PointerEvent<HTMLButtonElement>) => {
+    const gesture = sheetGestureRef.current;
+    if (!gesture.active || gesture.pointerId !== event.pointerId) return;
+    sheetGestureRef.current = { active: false, startY: 0, pointerId: -1 };
+    try { event.currentTarget.releasePointerCapture(event.pointerId); } catch { /* already released */ }
+    const dy = gesture.startY - event.clientY; // positive = dragged upward
+    if (Math.abs(dy) >= 8) sheetSuppressClickRef.current = true;
+    const threshold = window.innerHeight * 0.25;
+    if (dy >= threshold) setSheetExpanded(true);
+    else if (-dy >= threshold) setSheetExpanded(false);
+  };
+  const abortSheetGesture = (event: React.PointerEvent<HTMLButtonElement>) => {
+    const gesture = sheetGestureRef.current;
+    if (!gesture.active || gesture.pointerId !== event.pointerId) return;
+    sheetGestureRef.current = { active: false, startY: 0, pointerId: -1 };
+  };
   // Fallback focus target when the evidence pane closes without a citation
   // chip to return to (issue #508 / PRODUCT-ENH-10).
   const rightPaneToggleRef = useRef<HTMLButtonElement>(null);
@@ -584,7 +629,7 @@ export default function ChatShell() {
            bottom-docked composer rides ABOVE the non-modal sheet instead of
            underneath it. Keep the 45vh literals in sync with the SheetContent
            height class below. */
-        style={{ paddingBottom: isBelowLg && rightPaneOpen ? "45vh" : undefined }}
+        style={{ paddingBottom: isBelowLg && rightPaneOpen ? (sheetExpanded ? "85vh" : "45vh") : undefined }}
       >
         <header className="flex h-14 items-center gap-2 border-b border-border px-4">
           {/* Page-level heading landmark (sr-only) so screen-reader heading
@@ -690,8 +735,41 @@ export default function ChatShell() {
           {/* Review PRR-002: scroll lives on the inner region so SheetContent's
               built-in close stays pinned; the duplicated custom close was
               removed (the built-in control remains the single close). */}
-          <SheetContent side="bottom" overlay={false} className="flex h-[45vh] flex-col rounded-t-xl p-0 lg:hidden" aria-describedby="evidence-sources-desc">
-            <SheetHeader className="shrink-0 px-4 pt-4 pb-2 border-b border-border">
+          <SheetContent
+            side="bottom"
+            overlay={false}
+            /* Issue #771 (UI-ENH-05): collapsed keeps the #689 45vh peek
+               (ChatShell.test.tsx pins that class in the collapsed default);
+               expanded snaps to 85vh. */
+            className={`flex ${sheetExpanded ? "h-[85vh]" : "h-[45vh]"} flex-col rounded-t-xl p-0 lg:hidden transition-[height] duration-200`}
+            aria-describedby="evidence-sources-desc"
+          >
+            {/* Snap-point handle (issue #771 AC8): touch-action none keeps the
+                browser from converting a handle drag into a native pan; the
+                button is both the accessible toggle (click) and the drag
+                handle (pointer events). */}
+            <div className="flex shrink-0 items-center justify-center border-b border-border py-1">
+              <button
+                type="button"
+                className="flex h-7 w-16 cursor-grab touch-none items-center justify-center rounded-full bg-muted focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 active:cursor-grabbing"
+                aria-label={sheetExpanded ? "Collapse evidence sheet" : "Expand evidence sheet"}
+                aria-expanded={sheetExpanded}
+                onClick={() => {
+                  if (sheetSuppressClickRef.current) {
+                    sheetSuppressClickRef.current = false;
+                    return;
+                  }
+                  setSheetExpanded((value) => !value);
+                }}
+                onPointerDown={handleSheetHandlePointerDown}
+                onPointerUp={handleSheetHandlePointerUp}
+                onPointerCancel={abortSheetGesture}
+                onLostPointerCapture={abortSheetGesture}
+              >
+                <span className="h-1.5 w-10 rounded-full bg-muted-foreground/60" aria-hidden="true" />
+              </button>
+            </div>
+            <SheetHeader className="shrink-0 px-4 pt-2 pb-2 border-b border-border">
               <SheetTitle id="evidence-sources-title" className="text-base text-left">Evidence</SheetTitle>
               <SheetDescription id="evidence-sources-desc" className="sr-only">
                 View retrieved evidence and source documents

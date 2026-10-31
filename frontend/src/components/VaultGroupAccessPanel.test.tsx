@@ -1,7 +1,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { fireEvent, render, screen, waitFor, act } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, act , within } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { VaultGroupAccessPanel } from '@/components/VaultGroupAccessPanel';
+// Issue #771 (UI-ENH-05): the below-sm card list duplicates row
+// text next to the desktop table; scope data queries to the table subtree
+// (a card-only regression still fails these assertions).
+const inTable = () => within(screen.getByRole('table'));
+
 
 // Mock API
 const mockApiClient = vi.hoisted(() => ({
@@ -102,7 +107,7 @@ describe('VaultGroupAccessPanel', () => {
     });
 
     await waitFor(() => {
-      expect(screen.getByText(/No groups have access yet/i)).toBeInTheDocument();
+      expect(screen.getAllByText(/No groups have access yet/i).length).toBeGreaterThan(0);
     });
   });
 
@@ -210,9 +215,9 @@ describe('VaultGroupAccessPanel', () => {
       () => new Promise((resolve) => { resolveRevoke = resolve; }),
     );
     await act(async () => { render(<VaultGroupAccessPanel vaultId={1} />); });
-    await waitFor(() => expect(screen.getByText('Editors')).toBeInTheDocument());
+    await waitFor(() => expect(inTable().getByText('Editors')).toBeInTheDocument());
 
-    fireEvent.click(screen.getByRole('button', { name: 'Revoke access for Editors' }));
+    fireEvent.click(inTable().getByRole('button', { name: 'Revoke access for Editors' }));
     fireEvent.click(screen.getByRole('button', { name: 'Revoke', exact: true }));
     await waitFor(() => expect(mockApiClient.delete).toHaveBeenCalledTimes(1));
     fireEvent.click(screen.getByRole('button', { name: 'Simulate dialog dismissal' }));
@@ -238,9 +243,9 @@ describe('VaultGroupAccessPanel', () => {
       () => new Promise((_, reject) => { rejectRevoke = reject; }),
     );
     await act(async () => { render(<VaultGroupAccessPanel vaultId={1} />); });
-    await waitFor(() => expect(screen.getByText('Editors')).toBeInTheDocument());
+    await waitFor(() => expect(inTable().getByText('Editors')).toBeInTheDocument());
 
-    fireEvent.click(screen.getByRole('button', { name: 'Revoke access for Editors' }));
+    fireEvent.click(inTable().getByRole('button', { name: 'Revoke access for Editors' }));
     fireEvent.click(screen.getByRole('button', { name: 'Revoke', exact: true }));
     await waitFor(() => expect(mockApiClient.delete).toHaveBeenCalledTimes(1));
     fireEvent.click(screen.getByRole('button', { name: 'Simulate dialog dismissal' }));
@@ -251,6 +256,6 @@ describe('VaultGroupAccessPanel', () => {
     expect(screen.getByRole('button', { name: 'Cancel' })).toBeEnabled();
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
     expect(screen.queryByTestId('dialog')).not.toBeInTheDocument();
-    expect(screen.getByText('Editors')).toBeInTheDocument();
+    expect(inTable().getByText('Editors')).toBeInTheDocument();
   });
 });

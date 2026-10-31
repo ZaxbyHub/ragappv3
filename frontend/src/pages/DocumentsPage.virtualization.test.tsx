@@ -328,8 +328,11 @@ describe("DocumentsPage - Virtualization", () => {
       });
 
       await waitFor(() => {
-        // Mobile container uses sm:hidden class
-        const mobileContainer = container.querySelector(".sm\\:hidden");
+        // Mobile container hides from the cards->table breakpoint upward.
+        // Issue #771 extended card coverage through the 640-767px band, so the
+        // container class moved sm:hidden -> md:hidden; accept either so the
+        // pin stays GREEN at base (sm) and at head (md).
+        const mobileContainer = container.querySelector(".sm\\:hidden, .md\\:hidden");
         expect(mobileContainer).toBeTruthy();
       });
     });
@@ -342,8 +345,9 @@ describe("DocumentsPage - Virtualization", () => {
       });
 
       await waitFor(() => {
-        // Find the mobile scroll container
-        const mobileScroll = container.querySelector(".sm\\:hidden");
+        // Find the mobile scroll container (sm:hidden at base, md:hidden
+        // after issue #771 extended the card band; accept either).
+        const mobileScroll = container.querySelector(".sm\\:hidden, .md\\:hidden");
         expect(mobileScroll).toBeTruthy();
         const style = mobileScroll?.getAttribute("style") || "";
         expect(style).toContain("max-height");

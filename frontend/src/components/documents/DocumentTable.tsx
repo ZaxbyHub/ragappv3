@@ -153,7 +153,7 @@ export function DocumentTable({
         );
 
   return (
-    <Card className="hidden sm:block">
+    <Card className="hidden md:block">
       <CardContent className="p-0">
         <div ref={tableScrollRef} className="overflow-auto" style={{ maxHeight: "70vh" }}>
           <table
@@ -235,7 +235,7 @@ export function DocumentTable({
                   onSort={onSort}
                   className="w-[140px]"
                 />
-                <th scope="col" className="text-right p-4 font-medium flex-none w-[110px]">Actions</th>
+                <th scope="col" className="text-right p-4 font-medium flex-none w-[110px] sticky right-0 bg-muted">Actions</th>
               </tr>
             </thead>
             <tbody
@@ -413,7 +413,7 @@ export function DocumentTable({
                     <td className="p-4 flex-none w-[140px] text-muted-foreground">
                       {formatDate(doc.created_at)}
                     </td>
-                    <td className="p-4 flex-none w-[110px] text-right">
+                    <td className="p-4 flex-none w-[110px] text-right sticky right-0 bg-card border-l border-border">
                       <Button
                         variant="ghost"
                         size="icon"

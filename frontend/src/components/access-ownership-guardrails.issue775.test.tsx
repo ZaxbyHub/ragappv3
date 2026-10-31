@@ -1,10 +1,14 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import "@testing-library/jest-dom";
 import * as React from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { VaultGroupAccessPanel } from "@/components/VaultGroupAccessPanel";
 import { VaultMembersPanel } from "@/components/VaultMembersPanel";
 import { useAuthStore } from "@/stores/useAuthStore";
+// Issue #771 (UI-ENH-05): the below-sm card list duplicates row
+// text next to the desktop table; scope data queries to the table subtree
+// (a card-only regression still fails these assertions).
+const inTable = () => within(screen.getByRole("table"));
 
 const fixture = vi.hoisted(() => ({
   client: {
@@ -315,7 +319,8 @@ describe("access panel read ownership and outcome controls", () => {
     expect(fixture.client.delete).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole("button", { name: /retry/i }));
-    await waitFor(() => expect(screen.getByText(row)).toBeInTheDocument());
+    // #771: table-scoped (below-sm card list duplicates the text)
+    await waitFor(() => expect(inTable().getByText(row)).toBeInTheDocument());
   });
 
   it.each([
@@ -342,13 +347,15 @@ describe("access panel read ownership and outcome controls", () => {
     fixture.client.delete.mockResolvedValue({});
     if (kind === "group") {
       render(<VaultGroupAccessPanel vaultId={vaultId} />);
-      await waitFor(() => expect(screen.getByText("Editors")).toBeInTheDocument());
+      // #771: table-scoped (below-sm card list duplicates the text)
+      await waitFor(() => expect(inTable().getByText("Editors")).toBeInTheDocument());
     } else {
       render(<VaultMembersPanel vaultId={vaultId} />);
       await waitFor(() => expect(screen.getByText("Alice Example")).toBeInTheDocument());
     }
 
-    fireEvent.click(screen.getByRole("button", { name: openButton }));
+    // #771: table-scoped (below-sm card list duplicates the text)
+    fireEvent.click(inTable().getByRole("button", { name: openButton }));
     await waitFor(() => expect(screen.getByText(confirm)).toBeInTheDocument());
     const dialogA = latestOpenDialog();
     const closeA = dialogA?.onOpenChange;
@@ -359,7 +366,8 @@ describe("access panel read ownership and outcome controls", () => {
     expect(actionA).toBeTypeOf("function");
 
     await act(async () => { closeA!(false); });
-    fireEvent.click(screen.getByRole("button", { name: openButton }));
+    // #771: table-scoped (below-sm card list duplicates the text)
+    fireEvent.click(inTable().getByRole("button", { name: openButton }));
     await waitFor(() => expect(screen.getByText(confirm)).toBeInTheDocument());
     const actionB = latestButton(action);
     expect(actionB).toBeTypeOf("function");
@@ -399,7 +407,8 @@ describe("access panel read ownership and outcome controls", () => {
     const retryA = latestButton(/retry/i);
     expect(retryA).toBeTypeOf("function");
     fireEvent.click(screen.getByRole("button", { name: /retry/i }));
-    await waitFor(() => expect(screen.getByText(/No groups have access yet/i)).toBeInTheDocument());
+    // #771: table-scoped (below-sm card list duplicates the text)
+    await waitFor(() => expect(inTable().getByText(/No groups have access yet/i)).toBeInTheDocument());
     fireEvent.change(screen.getByRole("textbox", { name: "Group ID to grant vault access" }), { target: { value: "81" } });
     const grantA = latestFormSubmit();
     expect(grantA).toBeTypeOf("function");
@@ -422,7 +431,8 @@ describe("access panel read ownership and outcome controls", () => {
     expect(fixture.client.post).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole("button", { name: /retry/i }));
-    await waitFor(() => expect(screen.getByText(/No groups have access yet/i)).toBeInTheDocument());
+    // #771: table-scoped (below-sm card list duplicates the text)
+    await waitFor(() => expect(inTable().getByText(/No groups have access yet/i)).toBeInTheDocument());
     fireEvent.change(screen.getByRole("textbox", { name: "Group ID to grant vault access" }), { target: { value: "82" } });
     const grantCurrent = latestFormSubmit();
     expect(grantCurrent).toBeTypeOf("function");

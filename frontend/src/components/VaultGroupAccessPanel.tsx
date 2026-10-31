@@ -374,6 +374,10 @@ function VaultGroupAccessPanelState({
         </form>
         {readStatus === "loading" && <div role="status" aria-live="polite">Loading group access</div>}
         {readStatus === "error" && <div role="alert"><p>{readError || "Failed to load group access"}</p><Button type="button" variant="outline" onClick={() => void refreshRows(true)}>Retry</Button></div>}
+        {/* Issue #771 (UI-ENH-05): desktop table hidden below sm; the card
+            list after it renders the same grants with identical canInteract
+            gating and handlers. */}
+        <div className="hidden sm:block">
         <Table>
           <TableCaption className="sr-only">Group Access List</TableCaption>
           <TableHeader>
@@ -407,6 +411,32 @@ function VaultGroupAccessPanelState({
             )}
           </TableBody>
         </Table>
+        </div>
+        {/* Issue #771 (UI-ENH-05 stage 2): below-sm card list, with a
+            card-visible empty state (loading/error already render above). */}
+        <div className="space-y-3 sm:hidden" aria-label="Vault group access (compact)">
+          {readStatus !== "success" && groupAccessList.length === 0 ? null : groupAccessList.length === 0 ? (
+            <div className="py-6 text-center text-sm text-muted-foreground" role="status" aria-live="polite">No groups have access yet. Grant access to organization groups to give their members vault permissions.</div>
+          ) : (
+            groupAccessList.map((group) => (
+              <div key={`card-${group.group_id}`} className="rounded-sm border p-3 space-y-2">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <div className="font-medium">{group.group_name}</div>
+                    <div className="text-sm text-muted-foreground">{group.org_name}</div>
+                  </div>
+                  <div className="text-xs text-muted-foreground">{formatDate(group.granted_at)}</div>
+                </div>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <select value={group.permission} onChange={(e) => handlePermissionChange(group.group_id, e.target.value as VaultPermission)} disabled={!canInteract} aria-label={`Change permission for ${group.group_name}`} className={NATIVE_SELECT_CLASS_NAME}>
+                    {PERMISSION_OPTIONS.map((opt) => (<option key={opt.value} value={opt.value}>{opt.label}</option>))}
+                  </select>
+                  <Button variant="destructive" size="icon" onClick={() => openRemoveDialog(group)} disabled={!canInteract} aria-label={`Revoke access for ${group.group_name}`}><UserX className="w-4 h-4" /></Button>
+                </div>
+              </div>
+            ))
+          )}
+        </div>
       </CardContent>
       <Dialog open={removeDialogOpen} onOpenChange={(nextOpen) => { if (!nextOpen) closeSelection(renderedSelection); }}>
         <DialogContent aria-labelledby="revoke-group-title" aria-describedby="revoke-group-desc">

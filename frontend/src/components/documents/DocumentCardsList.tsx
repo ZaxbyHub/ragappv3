@@ -38,7 +38,7 @@ export function DocumentCardsList({
   // a11y gate's below-fold scroll pass a class selector to match
   // (issue #778 review PRR-005).
   return (
-    <div ref={mobileScrollRef} className="sm:hidden overflow-y-auto" style={{ maxHeight: "70vh" }}>
+    <div ref={mobileScrollRef} className="md:hidden overflow-y-auto" style={{ maxHeight: "70vh" }}>
       <div style={{ height: mobileVirtualizer.getTotalSize(), position: "relative" }}>
         {mobileVirtualizer.getVirtualItems().map((virtualItem) => {
           const doc = documents[virtualItem.index];
