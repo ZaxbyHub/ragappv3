@@ -15,6 +15,15 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
+import { toast } from "sonner";
+import { useSettingsStore } from "@/stores/useSettingsStore";
+import {
+  MAX_UPLOAD_FILE_SIZE_MB,
+  draftRoomAllowedExtensions,
+  isUploadTooLarge,
+  serverAcceptsFilename,
+  uploadSizeExceededMessage,
+} from "@/lib/uploadLimits";
 import { ADD_SOURCE_FILES_CTA, INPUT_AUTHORITY_LABELS, INPUT_ROLE_LABELS } from "./labels";
 import {
   DRAFT_INPUT_AUTHORITIES,
@@ -287,12 +296,50 @@ export function DraftSourceUpload({
       });
   }, [items, startUpload]);
 
+  // Server-configured upload policy (issue #1052 AC2/AC3): the Draft Room
+  // server path stages uploads with the allowlist minus raster images
+  // (DRAFT_ROOM_ALLOWED_EXTENSIONS, issue #460) and max_file_size_mb bytes.
+  // Mirrored here so rejects happen at attach time, not after a wasted
+  // upload. Positivity guard per UploadDropzone (PRR-029): a server-reported
+  // 0 falls back rather than rejecting everything.
+  const storeMaxFileSizeMb = useSettingsStore((s) => s.settings?.max_file_size_mb);
+  const maxFileSizeMb =
+    typeof storeMaxFileSizeMb === "number" && storeMaxFileSizeMb > 0
+      ? storeMaxFileSizeMb
+      : MAX_UPLOAD_FILE_SIZE_MB;
+  const maxFileSizeBytes = maxFileSizeMb * 1024 * 1024;
+  const rawAllowedExtensions = useSettingsStore((s) => s.settings?.allowed_extensions);
+  const allowedExtensionsLoaded = rawAllowedExtensions !== undefined;
+  const allowedExtensions = Array.isArray(rawAllowedExtensions)
+    ? draftRoomAllowedExtensions(rawAllowedExtensions)
+    : null;
+
   const addFiles = useCallback(
     (files: File[]) => {
       if (files.length === 0) return;
+      // Shared uploadLimits helpers only (issue #1052 AC3) — the client
+      // decision reuses the exact server-acceptance predicate and message
+      // helpers so it cannot drift from the server pipeline. An unloaded
+      // allowlist skips the extension check (the server still validates).
+      const acceptable: File[] = [];
+      for (const file of files) {
+        if (
+          allowedExtensionsLoaded &&
+          !serverAcceptsFilename(file.name, allowedExtensions ?? [])
+        ) {
+          toast.error(`${file.name} (file type not allowed)`);
+          continue;
+        }
+        if (isUploadTooLarge(file, maxFileSizeBytes)) {
+          toast.error(uploadSizeExceededMessage(file.name, maxFileSizeMb));
+          continue;
+        }
+        acceptable.push(file);
+      }
+      if (acceptable.length === 0) return;
       setItems((prev) => [
         ...prev,
-        ...files.map(
+        ...acceptable.map(
           (file): UploadItem => ({
             id: nextUploadItemId(),
             file,
@@ -308,7 +355,7 @@ export function DraftSourceUpload({
         ),
       ]);
     },
-    [role, authority, asOfDate]
+    [role, authority, asOfDate, allowedExtensions, allowedExtensionsLoaded, maxFileSizeBytes, maxFileSizeMb]
   );
 
   const handleFileInputChange = useCallback(
