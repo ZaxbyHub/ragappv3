@@ -269,7 +269,7 @@ vi.mock('@/components/documents/UploadDropzone', () => ({
 // Import component after mocks
 import DocumentsPage from '@/pages/DocumentsPage';
 import { useVaultStore } from '@/stores/useVaultStore';
-import { listDocuments, listFolders, getDocumentStats, deleteDocuments, scanDocuments, getDocumentWikiStatus } from '@/lib/api';
+import { listDocuments, listFolders, getDocumentStats, deleteDocuments, deleteAllDocumentsInVault, scanDocuments, getDocumentWikiStatus } from '@/lib/api';
 
 interface ListDocumentsParams {
   folderId?: number;
@@ -594,6 +594,30 @@ describe('DocumentsPage K04 permission matrix (issue #767)', () => {
     selectVault('read');
     await renderPage();
     expect(screen.queryByLabelText(/Select card /)).toBeNull();
+  });
+
+  it('delete-all ends with the SERVER total, not a hand-patched guess (PRR-019 value pin)', async () => {
+    // PRR-019: the frozen k05 delete-all check is call-count-only; this pins
+    // the final VALUE for the zeroing shape — the rendered total must equal
+    // the server's post-delete state (0), reconciled by the refetch.
+    selectVault('admin');
+    vi.mocked(deleteAllDocumentsInVault).mockResolvedValue({ deleted_count: 2 });
+
+    await renderPage();
+
+    const deleteAll = await screen.findByRole('button', { name: 'Delete All in Vault' });
+    await act(async () => {
+      fireEvent.click(deleteAll);
+    });
+    const dialog = await screen.findByRole('dialog');
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole('button', { name: /^(Confirm|Delete)$/ }));
+    });
+    // After the refetch lands, the badge must read the server's 0 — and the
+    // empty state (not stale rows) must own the surface.
+    await waitFor(() => {
+      expect(screen.getByText('0')).toBeInTheDocument();
+    });
   });
 
   it('badge pluralizes and locale-formats the count (PRR-008)', async () => {

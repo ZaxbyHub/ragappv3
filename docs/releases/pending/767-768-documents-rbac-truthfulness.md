@@ -33,8 +33,9 @@
 
 ### Documents-surface counts and copy say what actually happened (`frontend/src/pages/DocumentsPage.tsx`)
 
-- The header count badge shows the server's matching total for the current query (the page
-  already held it), not the fetched window size.
+- The header count badge shows the matching server total with the loaded-window floor (the
+  floor keeps the badge sane during the optimistic-delete window before the refetch lands;
+  issue #768 AC1).
 - Bulk delete and Delete All now refetch document stats, so the Chunks/Size/Indexed cards
   agree with the server after destructive actions (previously only `total_documents` was
   hand-patched locally).
