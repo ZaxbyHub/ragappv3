@@ -423,7 +423,17 @@ class TestReindexWorkerLoopSurvivesSettleException(_ProcessorHarness):
             try:
                 loop = asyncio.get_running_loop()
                 deadline = loop.time() + 5.0
-                while loop.time() < deadline and len(embed_calls) < 2:
+                # Poll the SETTLE state, not just the embed calls: the second
+                # JobLease.complete runs after the embed returns (the run task
+                # crosses pool.connection_async() first), so exiting on
+                # embed_calls == 2 races task.cancel() into the settle window
+                # and the complete_calls assertion below flakes (final-critic
+                # round 1: 8/25 failures). Waiting for complete_calls >= 2
+                # means both settles have executed before we cancel.
+                while (
+                    loop.time() < deadline
+                    and (len(embed_calls) < 2 or complete_calls["n"] < 2)
+                ):
                     await asyncio.sleep(0.05)
             finally:
                 task.cancel()
