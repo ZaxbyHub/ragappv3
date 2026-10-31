@@ -69,6 +69,25 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
+// #767 AC4 companion: the detail page now gates Save on the document's vault
+// permission; these suites exercise the WRITE path, so the vault store mock
+// reports write for the documents' vaults (permission-aware since this PR).
+const { vaultState } = vi.hoisted(() => ({
+  vaultState: {
+    vaults: [
+      { id: 1, name: "Vault One", current_user_permission: "write" },
+      { id: 2, name: "Vault Two", current_user_permission: "write" },
+    ],
+    activeVaultId: 1,
+  },
+}));
+vi.mock("@/stores/useVaultStore", () => ({
+  useVaultStore: vi.fn(
+    (selector?: (state: typeof vaultState) => unknown) =>
+      selector ? selector(vaultState) : vaultState
+  ),
+}));
+
 const fakeBlob = (text: string) => ({ text: async () => text });
 
 async function flushMicrotasks(rounds = 10) {

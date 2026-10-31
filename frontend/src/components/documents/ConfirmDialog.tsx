@@ -14,6 +14,13 @@ export interface ConfirmDialogState {
   description: string;
   onConfirm: () => void;
   variant?: "destructive" | "default";
+  /**
+   * Per-dialog label for the destructive/default action button. The page
+   * renders ONE shared ConfirmDialog, so the label must travel with the
+   * dialog state, never the component (issue #768 AC6: the document-delete
+   * dialog says "Delete"; every other dialog keeps the "Confirm" default).
+   */
+  confirmLabel?: string;
 }
 
 interface ConfirmDialogProps {
@@ -40,7 +47,7 @@ export function ConfirmDialog({ state, onOpenChange }: ConfirmDialogProps) {
               state.onConfirm();
             }}
           >
-            Confirm
+            {state.confirmLabel ?? "Confirm"}
           </Button>
         </DialogFooter>
       </DialogContent>

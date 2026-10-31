@@ -22,6 +22,22 @@ import { MemoryRouter } from 'react-router-dom';
 const render: typeof rtlRender = (ui, options) =>
   rtlRender(ui, { wrapper: MemoryRouter, ...options });
 
+// #767 AC5: DocumentsPage now reads the user's global role (the scan route
+// requires GLOBAL admin); mock the auth store so the real module (with its
+// module-level attachCsrfInterceptor side effects and wide import graph)
+// never loads in this suite.
+const { authState } = vi.hoisted(() => ({
+  authState: {
+    user: { id: 1, username: "admin1", full_name: "Admin One", role: "admin", is_active: true },
+  },
+}));
+vi.mock("@/stores/useAuthStore", () => ({
+  useAuthStore: vi.fn(
+    (selector?: (state: typeof authState) => unknown) =>
+      selector ? selector(authState) : authState
+  ),
+}));
+
 vi.mock('@tanstack/react-virtual', () => ({
   useVirtualizer: vi.fn(({ count, estimateSize }) => {
     const size = estimateSize?.() ?? 72;

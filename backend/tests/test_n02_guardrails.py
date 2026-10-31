@@ -137,7 +137,7 @@ def test_watcher_skips_canonical_part_and_keeps_real_files():
         watcher = FileWatcher(processor=StubProcessor())
         count = asyncio.run(watcher.scan_once())
 
-        assert count >= 2
+        assert count.files_enqueued >= 2
         assert "genuine.txt" in enqueued, "real file must still be enqueued"
         assert ".notes.part" in enqueued, (
             "non-canonical .part-named user files must NOT be skipped"
@@ -611,4 +611,4 @@ def test_watcher_skips_zero_byte_placeholders_but_keeps_real_files():
             "a 0-byte reservation placeholder must never be an ingestion candidate"
         )
         assert "genuine.txt" in enqueued, "a complete file must still be enqueued"
-        assert count >= 1
+        assert count.files_enqueued >= 1

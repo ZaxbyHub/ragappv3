@@ -361,6 +361,34 @@ describe("useAuthStore", () => {
       expect(setJwtAccessToken).toHaveBeenCalledWith(null);
     });
 
+    it("resets the settings store on logout (PRR-013/K-20: no admin payload survives the identity boundary)", async () => {
+      // Seed the settings store the way PageShell's shell fill now does —
+      // an admin-session GET /settings payload including admin-scoped fields.
+      useSettingsStore.getState().setSettings({
+        chat_configured: true,
+        max_file_size_mb: 250,
+        allowed_extensions: [".pdf"],
+        ollama_chat_url: "http://admin-only.example",
+      } as never);
+      expect(useSettingsStore.getState().settings).not.toBeNull();
+
+      useAuthStore.setState({
+        user: mockUser,
+        accessToken: "jwt123",
+        isAuthenticated: true,
+        authMode: "jwt",
+      });
+      mockPost?.mockResolvedValueOnce({ data: {} });
+      const { logout } = useAuthStore.getState();
+      await logout();
+
+      // The identity boundary must FULLY reset the settings store: a member
+      // session in this tab must not inherit the admin's payload, and the
+      // shell's fill-only guard would keep it there if we only nulled
+      // `settings` without resetting the store.
+      expect(useSettingsStore.getState().settings).toBeNull();
+    });
+
     it("should clear state even if logout request fails", async () => {
       useAuthStore.setState({
         user: mockUser,
@@ -934,3 +962,4 @@ describe("useAuthStore", () => {
     });
   });
 });
+import { useSettingsStore } from "@/stores/useSettingsStore";

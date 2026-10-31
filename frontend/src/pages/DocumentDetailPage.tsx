@@ -15,6 +15,7 @@ import { ParseQualityPanel } from "@/components/documents/ParseQualityPanel";
 import { documentField } from "@/components/documents/documentProgress";
 import { formatFileSize, formatDate } from "@/lib/formatters";
 import { useChatModeStore } from "@/stores/useChatModeStore";
+import { useVaultStore } from "@/stores/useVaultStore";
 import { useUploadMonitoring } from "@/hooks/useUploadMonitoring";
 import {
   getDocument,
@@ -39,6 +40,17 @@ export default function DocumentDetailPage() {
   const id = Number(documentId);
 
   const [doc, setDoc] = useState<Document | null>(null);
+
+  // Vault permission for this document (issue #767 AC4): set_document_tags
+  // requires vault WRITE server-side, so the Save affordance mirrors it.
+  // FAIL CLOSED: unknown/absent vault or unresolved permission disables Save
+  // (no "unknown means writable" fallback).
+  const vaults = useVaultStore((s) => s.vaults);
+  const docVaultPermission =
+    doc?.vault_id != null
+      ? (vaults.find((v) => v.id === doc.vault_id)?.current_user_permission ?? null)
+      : null;
+  const canWriteDocVault = docVaultPermission === "write" || docVaultPermission === "admin";
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -534,7 +546,19 @@ export default function DocumentDetailPage() {
           <CardHeader className="pb-2 pt-3 px-4 flex flex-row flex-wrap items-center justify-between gap-2">
             <CardTitle className="text-sm">Tags</CardTitle>
             {doc.vault_id != null && (
-              <Button size="sm" variant="outline" onClick={handleSaveTags} disabled={!tagsDirty || savingTags}>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={handleSaveTags}
+                disabled={!canWriteDocVault || !tagsDirty || savingTags}
+                title={
+                  canWriteDocVault
+                    ? "Save tag changes"
+                    : docVaultPermission == null
+                      ? "Vault access could not be determined; save is unavailable"
+                      : "Write access to this vault is required to save tag changes"
+                }
+              >
                 {savingTags ? (
                   <Loader2 className="w-4 h-4 mr-1 animate-spin" />
                 ) : (

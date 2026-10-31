@@ -357,7 +357,9 @@ export const useUploadStore = create<UploadState>((set, get) => {
       toast.success(`${file.name} uploaded`);
     } catch (err) {
       if (generation !== uploadGeneration) return;
-      const errorMsg = normalizeUploadErrorMessage(err);
+      // #768 (plan R3): a size rejection must name the SERVER-configured
+      // limit, not the 100 MB fallback constant.
+      const errorMsg = normalizeUploadErrorMessage(err, effectiveUploadLimitMb());
       get().setStatus(uploadId, "error", errorMsg);
       toast.error(`Failed to upload ${file.name}: ${errorMsg}`);
     } finally {
