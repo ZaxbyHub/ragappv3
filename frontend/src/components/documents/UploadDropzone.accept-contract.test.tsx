@@ -307,6 +307,28 @@ describe("UploadDropzone drop acceptance contract (issue #768 AC9)", () => {
     );
   });
 
+  it("renders the empty-allowlist truth instead of malformed copy (PRR-007 render-level)", () => {
+    seedSettings([]);
+
+    renderDropzone();
+
+    // The fallback copy is skipped (an empty array is truthy), so the render
+    // must carry the truth sentence — Multi-Stage required a render-level pin.
+    expect(screen.getByText(/no file types are currently allowed/i)).toBeInTheDocument();
+    expect(screen.queryByText(/Supports PDF, DOCX, TXT, MD files/)).toBeNull();
+  });
+
+  it("falls back to the client limit when the server reports a non-positive max (PRR-029)", () => {
+    // config.py has no ge=1 validator on max_file_size_mb, so 0 is reachable
+    // from the environment; the dropzone must mirror the page's positivity
+    // guard instead of setting maxSize 0 ("Max 0 MB" + reject-everything).
+    seedSettings(SERVER_ALLOWED_EXTENSIONS, 0);
+
+    renderDropzone();
+
+    expect(screen.getByText(/Max 100 MB/)).toBeInTheDocument();
+  });
+
   it("accept option is exactly one valid MIME key carrying the extension list (K-39: real-hook shape)", () => {
     seedSettings(SERVER_ALLOWED_EXTENSIONS);
 
@@ -338,7 +360,9 @@ describe("UploadDropzone drop acceptance contract (issue #768 AC9)", () => {
     let dimmedAncestors = 0;
     let element: HTMLElement | null = instruction;
     while (element) {
-      if (/\bopacity-(?!100\b)(\d+|\[\[^\]\])/.test(String(element.className))) {
+      // Matches opacity-<n> (n != 100) and opacity-[arbitrary] Tailwind
+      // values (K-45: the digit-only form missed arbitrary-value classes).
+      if (new RegExp("opacity-(?!100\\b)(\\d+|\\[[^\\]]+\\])").test(String(element.className))) {
         dimmedAncestors += 1;
       }
       element = element.parentElement;

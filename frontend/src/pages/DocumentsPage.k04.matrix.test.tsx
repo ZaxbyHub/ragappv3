@@ -426,6 +426,36 @@ describe('DocumentsPage K04 permission matrix (issue #767)', () => {
     expect(scanDocuments).toHaveBeenCalledWith();
   });
 
+  it('scan with per-directory failures surfaces the redacted errors in a warning (PRR-002)', async () => {
+    selectVault('admin');
+    authState.user = {
+      id: 13,
+      username: 'admin3',
+      full_name: 'Admin Three',
+      role: 'admin',
+      is_active: true,
+    };
+    vi.mocked(scanDocuments).mockResolvedValue({
+      added: 0,
+      scanned: 2,
+      errors: ['vault 2 upload directory: OSError'],
+    });
+
+    await renderPage();
+
+    const scanButtons = screen.queryAllByRole('button', { name: 'Scan Directory' });
+    await act(async () => {
+      fireEvent.click(scanButtons.find((b) => !(b as HTMLButtonElement).disabled)!);
+    });
+    const { toast } = await import('sonner');
+    await waitFor(() => {
+      expect(vi.mocked(toast.warning).mock.calls.length).toBeGreaterThan(0);
+    });
+    const warningText = String(vi.mocked(toast.warning).mock.calls[0][0]);
+    expect(warningText).toContain('1 directory unreadable');
+    expect(warningText).toContain('vault 2 upload directory: OSError');
+  });
+
   it('global viewer gets a DISABLED Scan Directory button even with vault access', async () => {
     selectVault('admin');
     authState.user = {
@@ -564,6 +594,23 @@ describe('DocumentsPage K04 permission matrix (issue #767)', () => {
     selectVault('read');
     await renderPage();
     expect(screen.queryByLabelText(/Select card /)).toBeNull();
+  });
+
+  it('badge pluralizes and locale-formats the count (PRR-008)', async () => {
+    selectVault('admin');
+    vi.mocked(listDocuments).mockResolvedValue({
+      documents: [
+        { id: '1', filename: 'solo.pdf', size: 1, created_at: '2024-01-01', metadata: { status: 'processed', chunk_count: 1 } },
+      ],
+      total: 1,
+    });
+
+    await renderPage();
+
+    const badge = screen.getByText((content, element) =>
+      element?.tagName === 'SPAN' && /^1 document$/.test(content.trim())
+    );
+    expect(badge).toBeInTheDocument();
   });
 
   it('vault writer gets an ENABLED Compile control and a disabled Recompile stays informative (PRR-018)', async () => {

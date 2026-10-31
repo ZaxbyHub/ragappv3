@@ -183,5 +183,12 @@ describe("DocumentDetailPage K38 fail-closed Save pin (PR #1048 feedback)", () =
       (button) => !(button as HTMLButtonElement).disabled
     );
     expect(saveEnabled).toBe(false);
+
+    // K-26: the disabled-state wording must be honest about WHY — unresolved
+    // permission is not "write access required".
+    const saveButtonsWithTitle = screen.queryAllByTitle(
+      "Vault access could not be determined; save is unavailable"
+    );
+    expect(saveButtonsWithTitle.length).toBeGreaterThan(0);
   });
 });
