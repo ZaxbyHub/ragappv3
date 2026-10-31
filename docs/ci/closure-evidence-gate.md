@@ -62,8 +62,9 @@ the gap is the historical 66-day window, not a current code defect.)
      verification — advisory means "not verified", not "verified"; other URL
      schemes (s3://, file://, ...) are still resolved as repository paths and
      fail as missing. Markdown emphasis/backticks around the artifact path are
-     stripped before resolution, so `artifact: `docs/x.md`` written with
-     backticks still resolves to `docs/x.md`.
+     stripped before resolution, so an artifact written with backticks —
+     `artifact:` followed by backtick-wrapped `docs/x.md` — still resolves
+     to `docs/x.md`.
 3. **Re-execution (`verify-test`).** The named test is re-run at the
    merge-base of the PR's base branch and HEAD (the pre-fix commit — obtained
    via `git merge-base origin/<base-ref> HEAD`) and at the PR head. The gate

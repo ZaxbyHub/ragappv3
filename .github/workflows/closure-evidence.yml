@@ -214,13 +214,14 @@ jobs:
           EVAL_RC: ${{ steps.evaluate.outputs.eval_rc }}
           VERIFY_RC: ${{ steps.verify.outputs.verify_rc }}
           MODE: ${{ steps.evaluate.outputs.mode }}
+          GATE_RAN: ${{ steps.evaluate.outputs.gate_ran }}
         run: |
           # Issue #1049 review (PRR-007): a gate that never RAN (preflight
           # failure) must not be labeled a violation — the FAIL/WARN tokens
           # key the documented reopen procedure. GATE_RAN defaults to 1 so
           # legacy/absent outputs keep the historical violation semantics.
           if [ "${GATE_RAN:-1}" != "1" ]; then
-            echo "closure-evidence: ERROR — gate not run (base-copy preflight failed); no violation observed"
+            echo "closure-evidence: ERROR — gate not run (preflight failed; see the evaluate step); no violation observed"
             if [ "$MODE" = "enforce" ]; then exit 1; fi
             exit 0
           fi

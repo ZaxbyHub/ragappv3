@@ -232,7 +232,7 @@ def test_isolated_mode_blocks_script_dir_shadow_module(tmp_path):
     assert "gate not applicable" in proc.stdout
 
 
-def _extract_evaluate_block() -> str:
+def _extract_run_blocks() -> list[str]:
     lines = WORKFLOW_YML.read_text(encoding="utf-8").splitlines()
     blocks: list[str] = []
     i = 0
@@ -251,7 +251,11 @@ def _extract_evaluate_block() -> str:
         else:
             i += 1
     assert len(blocks) == 3, "expected evaluate/verify/apply-mode steps"
-    return blocks[0]
+    return blocks
+
+
+def _extract_evaluate_block() -> str:
+    return _extract_run_blocks()[0]
 
 
 def _run_preflight_case(tmp_path: Path, *, gh_succeeds: bool, git_succeeds: bool, dispatch: bool = False):
@@ -497,3 +501,74 @@ def test_engines_positive_control_and_non_admitted_majors():
         assert _satisfies_range(_version_tuple(admitted), engines_node), (admitted, engines_node)
     for rejected in ("22.22.0", "22.22.1", "23.0.0", "25.1.0"):
         assert not _satisfies_range(_version_tuple(rejected), engines_node), (rejected, engines_node)
+
+
+# ── #1049 review round 2: the gate_ran seam must be wired end to end ─────────
+
+def test_gate_ran_output_is_wired_into_apply_env():
+    # Round-2 reviewer Critical: Evaluate writes `gate_ran` but Apply never
+    # read it (no env mapping), so the ERROR-gate-not-run branch was dead in
+    # every real run and preflight failures kept the violation labels. Pin
+    # the seam: the output key exists AND the Apply env maps it.
+    text = WORKFLOW_YML.read_text(encoding="utf-8")
+    assert 'echo "gate_ran=$GATE_RAN"' in text, "evaluate must emit gate_ran"
+    assert "GATE_RAN: ${{ steps.evaluate.outputs.gate_ran }}" in text, (
+        "the Apply step env must map steps.evaluate.outputs.gate_ran — "
+        "without the mapping GATE_RAN is unset in every real run and the "
+        "ERROR-gate-not-run branch is dead"
+    )
+
+
+def _run_apply_block(tmp_path: Path, *, gate_ran: str, mode: str):
+    """Execute the REAL Apply run block under bash -e with given outputs."""
+    import shutil
+
+    apply_block = _extract_run_blocks()[2]
+    bash = shutil.which("bash")
+    if bash is None or "system32" in bash.replace("\\", "/").lower():
+        bash = r"C:\Program Files\Git\bin\bash.exe"
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "EVAL_RC": "1",
+        "VERIFY_RC": "",
+        "MODE": mode,
+        "GATE_RAN": gate_ran,
+    }
+    for key in ("SYSTEMROOT", "SystemRoot", "COMSPEC", "PATHEXT", "WINDIR", "TEMP", "TMP"):
+        if key in os.environ:
+            env[key] = os.environ[key]
+    return subprocess.run(
+        [bash, "-e", "-c", apply_block],
+        cwd=str(tmp_path),
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=120,
+    )
+
+
+def test_apply_gate_not_run_warn_is_nonblocking_and_enforce_fails(tmp_path):
+    # PRR-007 closure, executed against the real Apply block: a gate that
+    # never ran must NOT emit the violation tokens (FAIL/WARN), in either
+    # mode.
+    warn = _run_apply_block(tmp_path, gate_ran="0", mode="warn")
+    assert warn.returncode == 0, warn.stdout + warn.stderr
+    assert "gate not run" in warn.stdout
+    assert "no violation observed" in warn.stdout
+    assert "WARN — violation observed" not in warn.stdout
+    assert "FAIL — enforce-mode violation" not in warn.stdout
+    enforce = _run_apply_block(tmp_path, gate_ran="0", mode="enforce")
+    assert enforce.returncode == 1
+    assert "gate not run" in enforce.stdout
+    assert "FAIL — enforce-mode violation" not in enforce.stdout
+
+
+def test_apply_legacy_unset_gate_ran_keeps_violation_semantics(tmp_path):
+    # GATE_RAN unset (legacy outputs, and the frozen gate-suite shell
+    # contracts) keeps the historical violation labels — the frozen
+    # test_closure_evidence_gate.py apply tests pin exactly this shape.
+    warn = _run_apply_block(tmp_path, gate_ran="", mode="warn")
+    assert warn.returncode == 0
+    assert "WARN — violation observed" in warn.stdout
