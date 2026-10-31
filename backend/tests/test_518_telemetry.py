@@ -376,6 +376,82 @@ def test_metrics_endpoint_exposes_required_families():
 # ── C4 / AC4 — RequestIdFilter registration + shared identity ───────────
 
 
+import logging as _logging
+import tempfile as _tempfile
+from pathlib import Path as _Path
+
+
+async def test_lifespan_logging_setup_attaches_filters_at_runtime():
+    """Issue #743 (TQ-sibling-batch-08-06): runtime registration spy.
+
+    The source-substring check below cannot distinguish a live addFilter call
+    from a commented-out one (RequestIdFilter appears five times in
+    lifespan.py, so the count predicate holds even with both call sites
+    commented out — exactly what the frozen C3/C4 mutants do). This test
+    enters the REAL lifespan with the settings-derived paths pinned and
+    asserts RequestIdFilter/SensitiveFieldFilter instances sit on every root
+    logger handler, in BOTH logging-setup branches (fresh handler and
+    pre-existing handler)."""
+    from fastapi import FastAPI
+
+    from app.lifespan import (
+        RequestIdFilter,
+        SensitiveFieldFilter,
+        lifespan,
+    )
+    from tests.test_health_readiness_lifespan import _pin_lifespan_settings
+
+    root = _logging.getLogger()
+    saved_handlers = list(root.handlers)
+    restore = _pin_lifespan_settings(_Path(_tempfile.mkdtemp(prefix="l518-fb-")))
+    observed_fresh: list[tuple] = []
+    try:
+        # Fresh-handler branch: startup finds no root handlers.
+        root.handlers.clear()
+        async with lifespan(FastAPI()):
+            observed_fresh.extend(
+                tuple(type(f) for f in handler.filters)
+                for handler in list(root.handlers)
+            )
+    finally:
+        restore()
+        root.handlers = saved_handlers
+
+    assert observed_fresh, "startup must install a root handler (fresh branch)"
+    for filter_types in observed_fresh:
+        assert RequestIdFilter in filter_types, (
+            "RequestIdFilter must sit on every root handler (fresh branch)"
+        )
+        assert SensitiveFieldFilter in filter_types, (
+            "SensitiveFieldFilter must sit on every root handler (fresh branch)"
+        )
+
+    # Existing-handler branch: startup finds a pre-attached handler and must
+    # attach both filters to it (guarded by the not-in-type-set checks).
+    restore = _pin_lifespan_settings(_Path(_tempfile.mkdtemp(prefix="l518-eb-")))
+    preexisting = _logging.StreamHandler()
+    observed_existing: list[tuple] = []
+    try:
+        root.handlers = [preexisting]
+        async with lifespan(FastAPI()):
+            observed_existing.extend(
+                tuple(type(f) for f in handler.filters)
+                for handler in list(root.handlers)
+            )
+    finally:
+        restore()
+        root.handlers = saved_handlers
+
+    assert observed_existing, "the pre-attached handler must survive startup"
+    for filter_types in observed_existing:
+        assert RequestIdFilter in filter_types, (
+            "RequestIdFilter must be attached to a pre-existing root handler"
+        )
+        assert SensitiveFieldFilter in filter_types, (
+            "SensitiveFieldFilter must be attached to a pre-existing root handler"
+        )
+
+
 def test_request_id_filter_registered_through_logging_setup():
     """The actual logging setup in app/lifespan.py must attach
     RequestIdFilter to the root handlers (both the fresh-handler and

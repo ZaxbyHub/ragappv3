@@ -63,5 +63,148 @@ class TestLifespanMigrationFlagWiring(unittest.TestCase):
         )
 
 
+
+# ---------------------------------------------------------------------------
+# Issue #743 (P03-SK2-07): tests that enter and exit the REAL lifespan().
+# The source-text guards above stay (they pin ordering details cheaply); these
+# runtime tests pin the behavior they could only describe — startup wires
+# app.state.background_processor, shutdown awaits stop(), and the fresh-handler
+# logging branch attaches the request-id filter. The mutation check C2
+# (tests/test_h06_mutation_kills) freezes the shutdown half: replacing the
+# stop() call with `pass` fails test_real_lifespan_stop_is_awaited.
+# Feasibility follows the 2026-09-24 frontier-audit probe (P03): the real
+# lifespan runs in the standard CI dependency set once the settings-derived
+# paths are pinned — the old "impractical in unit CI" claim above is wrong.
+# ---------------------------------------------------------------------------
+
+import asyncio
+import logging
+import tempfile
+from pathlib import Path
+
+from fastapi import FastAPI
+
+
+def _pin_lifespan_settings(tmp_path: Path):
+    """Pin every settings path/flag the real lifespan touches to a temp dir.
+
+    Returns a restore callable. settings.vaults_dir and settings.sqlite_path
+    are read-only properties derived from data_dir, so pinning data_dir
+    redirects all of them. No env vars are touched (the settings singleton is
+    already constructed; attribute pinning is the only effective lever).
+
+    Entering the real lifespan wires process-global state (the module pool
+    cache and the wiki/draft event-bus singletons), so each entry first
+    closes stale pools and resets the buses — otherwise a second entry in
+    the same process trips loop-bound queues and closed pools."""
+    from app.config import settings
+    from app.models.database import _pool_cache, _pool_cache_lock
+
+    with _pool_cache_lock:
+        for pool in list(_pool_cache.values()):
+            try:
+                pool.close_all()
+            except Exception:  # noqa: BLE001 - an already-closed pool is fine
+                pass
+        _pool_cache.clear()
+    import app.services.background_tasks as _background_tasks
+    import app.services.draft_events as _draft_events
+    import app.services.wiki_events as _wiki_events
+
+    _wiki_events._bus = None  # noqa: SLF001 - reset singleton for a fresh loop
+    _draft_events._bus = None  # noqa: SLF001
+    _background_tasks._processor_instance = None  # noqa: SLF001 - its queues
+    # bind to the loop that first runs its workers; a second lifespan entry in
+    # the same process must get a fresh processor bound to the new loop.
+
+    saved = {
+        "data_dir": settings.data_dir,
+        "redis_url": settings.redis_url,
+        "users_enabled": settings.users_enabled,
+        "admin_secret_token": settings.admin_secret_token,
+        "jwt_secret_key": settings.jwt_secret_key,
+        "ollama_embedding_url": settings.ollama_embedding_url,
+        "allow_local_services": settings.allow_local_services,
+    }
+    settings.data_dir = tmp_path  # type: ignore[assignment]
+    settings.redis_url = ""
+    settings.users_enabled = False
+    settings.admin_secret_token = "lifespan-test-token-0123456789abcdef0123456789"
+    settings.jwt_secret_key = "lifespan-test-jwt-0123456789abcdef0123456789"
+    settings.ollama_embedding_url = "http://127.0.0.1:9/v1/embeddings"
+    settings.allow_local_services = True  # type: ignore[assignment]
+
+    def restore():
+        for key, value in saved.items():
+            setattr(settings, key, value)
+
+    return restore
+
+
+def test_real_lifespan_stop_is_awaited_on_shutdown():
+    """Startup wires the background processor; shutdown awaits its stop()."""
+    from app.lifespan import lifespan
+
+    restore = _pin_lifespan_settings(Path(tempfile.mkdtemp(prefix="lifespan-rt-")))
+    app = FastAPI()
+    stop_calls: list[int] = []
+    try:
+
+        async def scenario():
+            async with lifespan(app):
+                processor = app.state.background_processor
+                assert processor is not None, (
+                    "startup must wire app.state.background_processor"
+                )
+                original_stop = processor.stop
+
+                async def recording_stop():
+                    stop_calls.append(1)
+                    await original_stop()
+
+                processor.stop = recording_stop
+
+        asyncio.run(scenario())
+    finally:
+        restore()
+
+    assert stop_calls == [1], "shutdown must await background_processor.stop()"
+
+
+def test_real_lifespan_fresh_branch_attaches_request_id_filter():
+    """Fresh-handler branch: with no pre-existing root handlers, startup's
+    logging setup attaches RequestIdFilter (and SensitiveFieldFilter) to the
+    handler it installs. The C3/C4 mutation checks freeze both halves."""
+    from app.lifespan import RequestIdFilter, SensitiveFieldFilter, lifespan
+
+    root = logging.getLogger()
+    saved_handlers = list(root.handlers)
+    root.handlers.clear()
+    restore = _pin_lifespan_settings(Path(tempfile.mkdtemp(prefix="lifespan-fb-")))
+    app = FastAPI()
+    observed: list[tuple] = []
+    try:
+
+        async def scenario():
+            async with lifespan(app):
+                observed.extend(
+                    tuple(type(f) for f in handler.filters)
+                    for handler in list(root.handlers)
+                )
+
+        asyncio.run(scenario())
+    finally:
+        restore()
+        root.handlers = saved_handlers
+
+    assert observed, "startup must install a root logging handler"
+    for filter_types in observed:
+        assert RequestIdFilter in filter_types, (
+            "RequestIdFilter must sit on every root handler (fresh-handler branch)"
+        )
+        assert SensitiveFieldFilter in filter_types, (
+            "SensitiveFieldFilter must sit on every root handler (fresh-handler branch)"
+        )
+
 if __name__ == "__main__":
     unittest.main()

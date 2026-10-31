@@ -46,6 +46,15 @@ jobs:
           pip install -r requirements.txt
           pip install -r requirements-dev.txt
           pip install pytest-xdist
+          # OTel closure units: TestRealTracerPipeline skips without the SDK
+          # (issue #743, TQ-sibling-batch-04-01) — CI/nightly never installed
+          # requirements-otel.txt, so the F-001c held-span-lifetime guard was
+          # skipped on every run. Validated locally with this exact pin:
+          # opentelemetry-sdk 1.45.0 -> 10 passed, 0 skipped.
+          pip install -r requirements-otel.txt
+
+      - name: OTel closure units (real tracer pipeline, unskipped)
+        run: pytest --tb=short -v --timeout=300 --timeout-method=thread tests/test_518_closure_units.py
 
       - name: Verify the real parser stack is importable
         run: |
