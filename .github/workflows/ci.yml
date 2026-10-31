@@ -44,6 +44,46 @@ jobs:
           npm exec vite -- --version
           npm exec vitest -- --version
 
+      # Issue #742 (AC5, "never in neither"): the two frontend-toolchain
+      # contract nodes are pytest tests that need the frontend install, so
+      # THIS job is their single CI venue. The Backend job no longer
+      # installs a frontend tree (its #566 walker uses an outside-tree
+      # TypeScript via NODE_PATH), so without this step the nodes would run
+      # in no CI job at all. A skip here fails the step: a skipped node in
+      # its only venue is "neither" again.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements-lock-ci.txt
+            backend/requirements-dev.txt
+
+      - name: Frontend-toolchain contract nodes (#742 single-venue)
+        working-directory: backend
+        env:
+          REDIS_URL: ""
+        run: |
+          # Same provision the Backend job's pytest runs under (these nodes
+          # ran green there pre-#742): the runtime lock (which carries
+          # pyyaml — the venue module imports yaml at collection time) plus
+          # the dev requirements.
+          python -m pip install --quiet --require-hashes -r requirements-lock-ci.txt
+          python -m pip install --quiet -r requirements-dev.txt
+          set +e
+          python -m pytest \
+            tests/test_issue258_coverage_gate.py::test_ac11_coverage_command_passes \
+            tests/test_issue258_build_contracts.py::test_ac8_vite_node_config_project_typechecks \
+            -q -p no:randomly -p no:cacheprovider -rs > pytest-frontend-toolchain.log 2>&1
+          EXIT=$?
+          set -e
+          cat pytest-frontend-toolchain.log
+          if grep -Eq "[0-9]+ skipped" pytest-frontend-toolchain.log; then
+            echo "::error::a frontend-toolchain contract node SKIPPED in its single CI venue (must run here)"
+            exit 1
+          fi
+          exit "$EXIT"
+
       - name: Type check
         run: npm run typecheck
 
@@ -364,21 +404,25 @@ jobs:
           pip install pytest-xdist
 
       # test_issue566_config_loader_native.py parses the frontend config via
-      # the TypeScript compiler; the Backend checkout has no frontend install,
-      # so the guardrail's parser dependency is provided here (devDep version
-      # from frontend/package.json; --no-save leaves the lockfile untouched).
+      # the TypeScript compiler. Issue #742: the parser dependency installs
+      # OUTSIDE the repo tree ($RUNNER_TEMP) so the Backend checkout never
+      # gains a frontend/node_modules — the two issue-258 frontend-toolchain
+      # nodes stay scoped to the Frontend job, and the #566 walker resolves
+      # `typescript` through NODE_PATH on the Test step below.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
         with:
           node-version: "22.22.2"
 
-      - name: Install TypeScript for the #566 config guardrail
-        run: npm install --no-save typescript@6.0.3
-        working-directory: frontend
+      - name: Install TypeScript for the #566 config guardrail (outside the repo tree)
+        run: npm install --prefix "$RUNNER_TEMP/h03-gate-ts" typescript@6.0.3
 
       - name: Lint (ruff)
         run: ruff check .
 
       - name: Test
+        # Step-level timeout strictly inside the job's 60-minute budget
+        # (issue #742): a post-test wedge is cut off here and names THIS step
+        # instead of burning the whole job.
         # -rs: itemize skips (live-marker skips must be visible, not silent — issue #563)
         # --timeout-method=thread: the POSIX-default signal method fires only
         # when the main thread returns to the interpreter loop, so on the
@@ -388,9 +432,14 @@ jobs:
         # thread method aborts a wedged worker fast and xdist names the hung
         # test. This flag line itself is pinned by
         # backend/tests/test_1021_timeout_wiring.py.
+        timeout-minutes: 50
         run: pytest --tb=short -v --timeout=300 --timeout-method=thread -rs -n auto --cov --cov-report=term-missing tests/
         env:
           REDIS_URL: ""
+          # #742 / #566: makes the outside-tree TypeScript install resolvable
+          # by the walker's `require('typescript')` (cwd stays frontend/, so
+          # NODE_PATH carries the dependency instead of node_modules there).
+          NODE_PATH: ${{ runner.temp }}/h03-gate-ts/node_modules
 
       - name: Hang-class timeout canary (#1021)
         # Exercises the timeout mechanism on every non-cancelled run, on

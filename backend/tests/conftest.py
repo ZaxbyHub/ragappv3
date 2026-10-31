@@ -317,7 +317,12 @@ def _cache_bcrypt_hash_for_test_passwords():
     try:
         from app.services import auth_service as _auth_module
     except ImportError:
-        return  # app.services.auth_service not importable; skip this fixture
+        # Not importable (e.g. any minimal pytest environment without the
+        # runtime lock installed): yield so the generator contract holds,
+        # with nothing cached. Tests that actually exercise auth import it
+        # themselves and fail loudly there.
+        yield
+        return
 
     # The single password whose hash we memoize for suite speed.
     _CACHED_PASSWORD = "pass123"
