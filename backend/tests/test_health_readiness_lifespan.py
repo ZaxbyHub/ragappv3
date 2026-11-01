@@ -132,6 +132,18 @@ def _pin_lifespan_settings(tmp_path: Path):
         max_workers=4, thread_name_prefix="auth-cpu"
     )
 
+    # The lifespan startup raises the ROOT LOGGER LEVEL to settings.log_level
+    # (default INFO; lifespan.py). Under pytest the root normally sits at
+    # WARNING, which silently DROPS malformed log records before any handler
+    # formats them -- e.g. document_retrieval.py logs max_distance_threshold
+    # with %.3f, and a None threshold then raises TypeError inside handler
+    # formatting once the level admits the record (CI round 2: 4
+    # test_rag_engine_filtering_adversarial failures after a lifespan entry
+    # on the same worker). Save and restore the root level so an entry cannot
+    # change which records other tests' handlers see.
+    root_logger = logging.getLogger()
+    saved_root_level = root_logger.level
+
     saved = {
         "data_dir": settings.data_dir,
         "redis_url": settings.redis_url,
@@ -150,6 +162,7 @@ def _pin_lifespan_settings(tmp_path: Path):
     settings.allow_local_services = True  # type: ignore[assignment]
 
     def restore():
+        root_logger.setLevel(saved_root_level)
         for key, value in saved.items():
             setattr(settings, key, value)
         # Give back the ORIGINAL auth executor (see the sacrificial swap in
