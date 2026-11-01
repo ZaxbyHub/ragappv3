@@ -1204,11 +1204,13 @@ export async function uploadDocument(
   return response.data;
 }
 
-export async function scanDocuments(vaultId?: number): Promise<ScanDocumentsResponse> {
+export async function scanDocuments(): Promise<ScanDocumentsResponse> {
+  // No vault scoping: POST /documents/scan is a global-admin route that scans
+  // every vault's upload directory (issue #767) — a vault_id parameter would
+  // be silently ignored by the route.
   const response = await apiClient.post<ScanDocumentsResponse>(
     "/documents/scan",
-    undefined,
-    vaultId != null ? { params: { vault_id: vaultId } } : undefined
+    undefined
   );
   return response.data;
 }

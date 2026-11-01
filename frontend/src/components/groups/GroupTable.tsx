@@ -24,6 +24,7 @@ import {
 } from "@/components/ui/table";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
   Trash2,
@@ -131,6 +132,53 @@ export function GroupTable({
   // Table Columns Definition
   // ============================================================================
 
+  // Issue #771 (UI-ENH-05 stage 2): the group actions render as one helper so
+  // the desktop actions column and the below-sm card list carry BIT-FOR-BIT
+  // the same callback-driven controls.
+  const renderGroupActions = (group: Group) => (
+    <div className="flex flex-wrap items-center justify-end gap-1">
+      <Button
+        variant="ghost"
+        size="icon"
+        className="h-8 w-8"
+        onClick={() => onEdit(group)}
+        aria-label={`Edit group ${group.name}`}
+        title="Edit Group"
+      >
+        <Pencil className="w-4 h-4" />
+      </Button>
+      <Button
+        variant="ghost"
+        size="icon"
+        className="h-8 w-8"
+        onClick={() => onManageMembers(group)}
+        aria-label={`Manage members for ${group.name}`}
+        title="Manage Members"
+      >
+        <Users className="w-4 h-4" />
+      </Button>
+      <Button
+        variant="ghost"
+        size="icon"
+        className="h-8 w-8"
+        onClick={() => onManageVaults(group)}
+        aria-label={`Manage vault access for ${group.name}`}
+        title="Manage Vault Access"
+      >
+        <FolderOpen className="w-4 h-4" />
+      </Button>
+      <Button
+        variant="destructive"
+        size="icon"
+        className="h-8 w-8"
+        onClick={() => onDelete(group)}
+        aria-label={`Delete group ${group.name}`}
+      >
+        <Trash2 className="w-4 h-4" />
+      </Button>
+    </div>
+  );
+
   const columns: ColumnDef<Group>[] = [
     {
       accessorKey: "name",
@@ -162,49 +210,7 @@ export function GroupTable({
       header: "Actions",
       cell: ({ row }) => {
         const group = row.original;
-        return (
-          <div className="flex items-center justify-end gap-1">
-            <Button
-              variant="ghost"
-              size="icon"
-              className="h-8 w-8"
-              onClick={() => onEdit(group)}
-              aria-label={`Edit group ${group.name}`}
-              title="Edit Group"
-            >
-              <Pencil className="w-4 h-4" />
-            </Button>
-            <Button
-              variant="ghost"
-              size="icon"
-              className="h-8 w-8"
-              onClick={() => onManageMembers(group)}
-              aria-label={`Manage members for ${group.name}`}
-              title="Manage Members"
-            >
-              <Users className="w-4 h-4" />
-            </Button>
-            <Button
-              variant="ghost"
-              size="icon"
-              className="h-8 w-8"
-              onClick={() => onManageVaults(group)}
-              aria-label={`Manage vault access for ${group.name}`}
-              title="Manage Vault Access"
-            >
-              <FolderOpen className="w-4 h-4" />
-            </Button>
-            <Button
-              variant="destructive"
-              size="icon"
-              className="h-8 w-8"
-              onClick={() => onDelete(group)}
-              aria-label={`Delete group ${group.name}`}
-            >
-              <Trash2 className="w-4 h-4" />
-            </Button>
-          </div>
-        );
+        return renderGroupActions(group);
       },
     },
   ];
@@ -281,7 +287,10 @@ export function GroupTable({
       </div>
 
       {/* Groups Table */}
-      <div className="rounded-sm border">
+      {/* Issue #771 (UI-ENH-05): desktop table — hidden below sm; the card
+          list after it renders the same PAGE of groups in the table's sorted
+          order (getRowModel), with the same callback controls. */}
+      <div className="rounded-sm border hidden sm:block">
         <Table>
           <TableHeader>
             {table.getHeaderGroups().map((headerGroup) => (
@@ -362,6 +371,55 @@ export function GroupTable({
             )}
           </TableBody>
         </Table>
+      </div>
+
+      {/* Issue #771 (UI-ENH-05 stage 2): below-sm card list over the SAME
+          groups row model, with card-visible loading/empty states. */}
+      <div role="region" className="space-y-3 sm:hidden" aria-label="Groups (compact)">
+        {isLoading ? (
+          Array.from({ length: 3 }).map((_, index) => (
+            <Card key={`skeleton-${index}`}>
+              <CardContent className="p-4 space-y-2">
+                <Skeleton className="h-4 w-2/3" />
+                <Skeleton className="h-4 w-1/2" />
+              </CardContent>
+            </Card>
+          ))
+        ) : groups.length === 0 ? (
+          <Card>
+            <CardContent className="p-4">
+              <EmptyState
+                icon={Users}
+                title={searchInput ? "No groups match your search" : "No groups found"}
+                className="py-0"
+              />
+            </CardContent>
+          </Card>
+        ) : (
+          table.getRowModel().rows.map((row) => {
+            const group = row.original;
+            return (
+            <Card key={`card-${group.id}`}>
+              <CardContent className="p-4 space-y-2">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <div className="font-medium">{group.name}</div>
+                    {group.description && (
+                      <div className="text-sm text-muted-foreground">{group.description}</div>
+                    )}
+                  </div>
+                  <div className="text-xs text-muted-foreground">
+                    {new Date(group.created_at).toLocaleDateString()}
+                  </div>
+                </div>
+                {/* renderGroupActions already carries its own flex wrapper
+                    (review EXT-002): no second identical container here. */}
+                {renderGroupActions(group)}
+              </CardContent>
+            </Card>
+            );
+          })
+        )}
       </div>
 
       {/* Pagination */}

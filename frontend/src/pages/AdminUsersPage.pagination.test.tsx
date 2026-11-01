@@ -1,9 +1,12 @@
 // PAGINATION TESTS for AdminUsersPage — covers page/limit state, skip/limit query params,
 // encodeURIComponent for searchQuery, setPage(1) on search change, and Pagination component
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, waitFor, act, fireEvent } from '@testing-library/react';
+import { render, screen, waitFor, act, fireEvent, within } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import AdminUsersPage from '@/pages/AdminUsersPage';
+
+// #771: table-scoped (below-sm card list duplicates the text)
+const inTable = () => within(screen.getByRole('table'));
 
 // --- Mocks ---
 vi.mock('@/stores/useAuthStore', () => ({
@@ -277,7 +280,8 @@ describe('AdminUsersPage pagination', () => {
     vi.mocked(api.default.get).mockClear();
 
     await act(async () => { render(<AdminUsersPage />); });
-    await waitFor(() => expect(screen.getByText('alice')).toBeInTheDocument());
+    // #771: table-scoped (below-sm card list duplicates the text)
+    await waitFor(() => expect(inTable().getByText('alice')).toBeInTheDocument());
 
     expect(api.default.get).toHaveBeenCalledWith(
       expect.stringContaining('/users/?skip=0&limit=20')
@@ -349,7 +353,8 @@ describe('AdminUsersPage pagination', () => {
     });
 
     await act(async () => { render(<AdminUsersPage />); });
-    await waitFor(() => expect(screen.getByText('alice')).toBeInTheDocument());
+    // #771: table-scoped (below-sm card list duplicates the text)
+    await waitFor(() => expect(inTable().getByText('alice')).toBeInTheDocument());
 
     // Initial URL should have skip=0 for page 1
     expect(api.default.get).toHaveBeenCalledWith(

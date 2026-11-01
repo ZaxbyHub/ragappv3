@@ -163,7 +163,11 @@ async def _safe_record_action(
         await asyncio.to_thread(conn.commit)
     except Exception as exc:  # noqa: BLE001 — audit failures must not propagate
         logger.warning(
-            "Audit logging failed (%s/%s) for file_id=%s: %s", action, status, file_id, exc
+            "Audit logging failed (%s/%s) for file_id=%s: %s",
+            action,
+            status,
+            file_id,
+            exc,
         )
 
 
@@ -232,7 +236,9 @@ async def retry_document(
 ) -> dict:
     try:
         cursor = await asyncio.to_thread(
-            conn.execute, "SELECT file_path, vault_id FROM files WHERE id = ?", (file_id,)
+            conn.execute,
+            "SELECT file_path, vault_id FROM files WHERE id = ?",
+            (file_id,),
         )
         row = await asyncio.to_thread(cursor.fetchone)
         if not row:
@@ -462,9 +468,7 @@ async def retry_failed_chunks(
         raise HTTPException(status_code=404, detail="Document not found")
 
     if not await evaluate(user, "vault", file_row["vault_id"], "admin"):
-        raise HTTPException(
-            status_code=403, detail="Insufficient vault permissions"
-        )
+        raise HTTPException(status_code=403, detail="Insufficient vault permissions")
 
     processor = DocumentProcessor(
         chunk_size_chars=settings.chunk_size_chars,
@@ -533,7 +537,9 @@ class DocumentResponse(BaseModel):
     chunk_count: int
     chunks_failed: int = 0  # Chunks dropped due to embedding failures (Issue #221)
     failed_chunks: int = 0  # Count of failed chunks eligible for retry (Issue #396)
-    failed_chunk_ids: List[int] = Field(default_factory=list)  # Chunk indices (Issue #396)
+    failed_chunk_ids: List[int] = Field(
+        default_factory=list
+    )  # Chunk indices (Issue #396)
     size: Optional[int] = None  # Frontend expects size
     created_at: Optional[str]
     processed_at: Optional[str]
@@ -548,7 +554,9 @@ class DocumentResponse(BaseModel):
     processing_started_at: Optional[str] = None
     enrichment_status: Optional[str] = None
     enrichment_error: Optional[str] = None
-    enrichment_enabled: Optional[bool] = None  # Per-file override (null=inherit vault/global)
+    enrichment_enabled: Optional[bool] = (
+        None  # Per-file override (null=inherit vault/global)
+    )
     effective_enrichment_enabled: bool = False  # Resolved effective state
     # Advisory near-duplicate group (issue #513 W26): shared group_id when this
     # file's chunk-embedding centroid is near-identical to another file's in
@@ -730,9 +738,7 @@ def _build_order_clause(sort_by: str, sort_order: str) -> str:
     return f"ORDER BY {column} {direction}, id {direction}"
 
 
-def _near_duplicate_group_for(
-    conn: sqlite3.Connection, file_id: int
-) -> Optional[str]:
+def _near_duplicate_group_for(conn: sqlite3.Connection, file_id: int) -> Optional[str]:
     """Advisory near-duplicate group for a single document (issue #513 W26).
 
     Best-effort by construction: the field is pure metadata, so a missing
@@ -745,9 +751,7 @@ def _near_duplicate_group_for(
         return None
 
 
-def _near_duplicate_groups_for(
-    conn: sqlite3.Connection, file_ids: List[int]
-) -> dict:
+def _near_duplicate_groups_for(conn: sqlite3.Connection, file_ids: List[int]) -> dict:
     """Advisory near-duplicate groups for a page of documents in ONE query.
 
     Batched companion of ``_near_duplicate_group_for`` so list projections
@@ -860,7 +864,9 @@ def _resolve_page_enrichment(
     needed_vaults = {row["vault_id"] for row in rows if _needs_resolution(row)}
     if not needed_vaults:
         return {}
-    vault_overrides: dict = {vid: settings.chunk_enrichment_enabled for vid in needed_vaults}
+    vault_overrides: dict = {
+        vid: settings.chunk_enrichment_enabled for vid in needed_vaults
+    }
     try:
         placeholders = ",".join("?" * len(needed_vaults))
         override_rows = conn.execute(
@@ -907,9 +913,7 @@ def _row_to_document_response(
     file_name = row["file_name"]
     chunk_count = row["chunk_count"] or 0
     chunks_failed = (row["chunks_failed"] if "chunks_failed" in keys else 0) or 0
-    failed_chunks_count = (
-        row["failed_chunks"] if "failed_chunks" in keys else None
-    )
+    failed_chunks_count = row["failed_chunks"] if "failed_chunks" in keys else None
     failed_chunk_ids_raw = (
         row["failed_chunk_ids"] if "failed_chunk_ids" in keys else None
     )
@@ -941,7 +945,9 @@ def _row_to_document_response(
     processing_started_at = (
         row["processing_started_at"] if "processing_started_at" in keys else None
     )
-    enrichment_status = row["enrichment_status"] if "enrichment_status" in keys else None
+    enrichment_status = (
+        row["enrichment_status"] if "enrichment_status" in keys else None
+    )
     enrichment_error = row["enrichment_error"] if "enrichment_error" in keys else None
     folder_id = row["folder_id"] if "folder_id" in keys else None
     # Partial-success marker + parse-quality diagnostics (issues #514
@@ -949,16 +955,16 @@ def _row_to_document_response(
     # stage persisted; a malformed/legacy value degrades to None rather than
     # failing the read.
     partial_embeddings = (
-        int(row["partial_embeddings"] or 0)
-        if "partial_embeddings" in keys
-        else 0
+        int(row["partial_embeddings"] or 0) if "partial_embeddings" in keys else 0
     )
     extraction_diagnostics = _parse_extraction_diagnostics(
         row["extraction_diagnostics"] if "extraction_diagnostics" in keys else None
     )
 
     # Per-file enrichment override
-    file_enrichment_raw = row["enrichment_enabled"] if "enrichment_enabled" in keys else None
+    file_enrichment_raw = (
+        row["enrichment_enabled"] if "enrichment_enabled" in keys else None
+    )
     file_enrichment_override: Optional[bool] = None
     if file_enrichment_raw is not None:
         file_enrichment_override = bool(file_enrichment_raw)
@@ -1059,11 +1065,7 @@ def _escape_like_term(term: str) -> str:
     ``ESCAPE '\\'`` — the same recipe as the unified-search chat-title arm
     (issue #718 AC6) and the existing users/groups/search routes.
     """
-    return (
-        term.replace("\\", "\\\\")
-        .replace("%", "\\%")
-        .replace("_", "\\_")
-    )
+    return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 @router.get("", response_model=DocumentListResponse, include_in_schema=False)
@@ -1318,7 +1320,9 @@ class DocumentStatusResponse(BaseModel):
     chunk_count: int
     chunks_failed: int = 0  # Aggregate counter (Issue #221)
     failed_chunks: int = 0  # Count eligible for chunk-scoped retry (Issue #396)
-    failed_chunk_ids: List[int] = Field(default_factory=list)  # Chunk indices (Issue #396)
+    failed_chunk_ids: List[int] = Field(
+        default_factory=list
+    )  # Chunk indices (Issue #396)
     error_message: Optional[str] = None
     processed_at: Optional[str] = None
     # Phase-aware progress
@@ -1440,9 +1444,7 @@ def _latest_compile_job_statuses(
 
 @router.get("/status", response_model=DocumentBatchedStatusResponse)
 async def get_documents_status_batched(
-    ids: str = Query(
-        ..., description="Comma-separated file ids (max 100 per request)"
-    ),
+    ids: str = Query(..., description="Comma-separated file ids (max 100 per request)"),
     vault_id: Optional[int] = Query(
         None, description="Scope to a vault (same semantics as the list route)"
     ),
@@ -1473,8 +1475,7 @@ async def get_documents_status_batched(
         raise HTTPException(
             status_code=400,
             detail=(
-                f"At most {BATCHED_STATUS_MAX_IDS} ids per request "
-                f"(got {len(tokens)})"
+                f"At most {BATCHED_STATUS_MAX_IDS} ids per request (got {len(tokens)})"
             ),
         )
     requested: List[int] = []
@@ -1649,6 +1650,7 @@ async def get_document_status(
     if started:
         try:
             from datetime import datetime, timezone
+
             # SQLite stores CURRENT_TIMESTAMP as 'YYYY-MM-DD HH:MM:SS' (UTC, no tz).
             started_dt = datetime.strptime(str(started), "%Y-%m-%d %H:%M:%S")
             started_dt = started_dt.replace(tzinfo=timezone.utc)
@@ -1737,7 +1739,8 @@ async def get_document_raw(
         raise HTTPException(status_code=404, detail="Document file not found")
 
     allowed_roots = [
-        root.resolve(strict=False) for root in _allowed_document_roots(settings_dep, vault_id)
+        root.resolve(strict=False)
+        for root in _allowed_document_roots(settings_dep, vault_id)
     ]
     if not any(_path_is_within(file_path, root) for root in allowed_roots):
         logger.warning(
@@ -1760,7 +1763,9 @@ async def get_document_raw(
     )
 
     media_type = mimetypes.guess_type(row["file_name"])[0] or "application/octet-stream"
-    is_pdf = media_type == "application/pdf" or row["file_name"].lower().endswith(".pdf")
+    is_pdf = media_type == "application/pdf" or row["file_name"].lower().endswith(
+        ".pdf"
+    )
     response = FileResponse(
         path=file_path,
         media_type=media_type,
@@ -1806,7 +1811,9 @@ async def get_artifact_raw(
     if atom_row is None or not atom_row["asset_id"]:
         raise HTTPException(status_code=404, detail="Artifact not found")
     file_row = await asyncio.to_thread(
-        conn.execute, "SELECT id, vault_id FROM files WHERE id = ?", (atom_row["file_id"],)
+        conn.execute,
+        "SELECT id, vault_id FROM files WHERE id = ?",
+        (atom_row["file_id"],),
     )
     f = await asyncio.to_thread(file_row.fetchone)
     if f is None:
@@ -1888,7 +1895,9 @@ async def get_artifact_raw(
             },
         )
     except Exception:  # noqa: BLE001 — audit must never break asset serving
-        logger.warning("artifact_bytes_served audit failed (suppressed)", exc_info=False)
+        logger.warning(
+            "artifact_bytes_served audit failed (suppressed)", exc_info=False
+        )
     return response
 
 
@@ -2028,8 +2037,7 @@ async def search_documents(
         if guard is None:
             return call
         return (
-            f"CASE WHEN {guard} <= {int(FTS_SNIPPET_MAX_COLUMN_BYTES)} "
-            f"THEN {call} END"
+            f"CASE WHEN {guard} <= {int(FTS_SNIPPET_MAX_COLUMN_BYTES)} THEN {call} END"
         )
 
     # files_search_fts columns in excerpt-priority order:
@@ -2043,10 +2051,14 @@ async def search_documents(
     # keeps the old first-non-empty-column fallback for rows where no
     # snippet-able column carries a mark.
     _meta_snippets = [_meta_snippet(col) for col in (4, 5, 1, 3, 6, 0)]
-    _meta_excerpt_expr = "COALESCE(\n" + ",\n".join(
-        [f"NULLIF({s}, replace({s}, '<mark>', ''))" for s in _meta_snippets]
-        + [f"NULLIF({s}, '')" for s in _meta_snippets]
-    ) + ")"
+    _meta_excerpt_expr = (
+        "COALESCE(\n"
+        + ",\n".join(
+            [f"NULLIF({s}, replace({s}, '<mark>', ''))" for s in _meta_snippets]
+            + [f"NULLIF({s}, '')" for s in _meta_snippets]
+        )
+        + ")"
+    )
 
     ranked_sql = f"""
     WITH raw_matches AS (
@@ -2100,7 +2112,14 @@ async def search_documents(
     LIMIT ? OFFSET ?
     """
 
-    base_params = [fts_query, *vault_params, fts_query, *vault_params, like_query, *vault_params]
+    base_params = [
+        fts_query,
+        *vault_params,
+        fts_query,
+        *vault_params,
+        like_query,
+        *vault_params,
+    ]
     cursor = await asyncio.to_thread(
         conn.execute,
         ranked_sql,
@@ -2372,9 +2391,7 @@ async def toggle_file_enrichment(
     updated_enrichment = await asyncio.to_thread(
         _resolve_page_enrichment, conn, [updated_row]
     )
-    document = _row_to_document_response(
-        updated_row, enrichment_map=updated_enrichment
-    )
+    document = _row_to_document_response(updated_row, enrichment_map=updated_enrichment)
     document.near_duplicate_group = await asyncio.to_thread(
         _near_duplicate_group_for, conn, file_id
     )
@@ -2420,7 +2437,10 @@ async def upload_document_root(
         vault_id,
     )
     await _record_upload_audit(
-        response.file_id, user, getattr(request.app.state, "secret_manager", None), db_pool
+        response.file_id,
+        user,
+        getattr(request.app.state, "secret_manager", None),
+        db_pool,
     )
     return response
 
@@ -2458,7 +2478,10 @@ async def upload_document(
         vault_id,
     )
     await _record_upload_audit(
-        response.file_id, user, getattr(request.app.state, "secret_manager", None), db_pool
+        response.file_id,
+        user,
+        getattr(request.app.state, "secret_manager", None),
+        db_pool,
     )
     return response
 
@@ -2515,9 +2538,7 @@ async def _compensate_failed_registration(
                     connection.rollback()
                 try:
                     connection.execute("BEGIN IMMEDIATE")
-                    connection.execute(
-                        "DELETE FROM files WHERE id = ?", (file_id,)
-                    )
+                    connection.execute("DELETE FROM files WHERE id = ?", (file_id,))
                     connection.commit()
                 except sqlite3.Error:
                     try:
@@ -2658,7 +2679,9 @@ async def _do_upload(
             break
         except FileExistsError:
             counter += 1
-            file_path = upload_dir / f"{original_path.stem}_{counter}{original_path.suffix}"
+            file_path = (
+                upload_dir / f"{original_path.stem}_{counter}{original_path.suffix}"
+            )
 
     # Path safety: ensure file_path is within upload_dir
     # Clean up the atomically-created file if the safety check fails
@@ -2905,9 +2928,7 @@ async def _do_upload(
             )
             logger.exception("Document processing error for file: %s", file_name)
             if "maintenance mode" in str(e).lower():
-                raise HTTPException(
-                    status_code=503, detail="Processing error"
-                )
+                raise HTTPException(status_code=503, detail="Processing error")
             raise HTTPException(status_code=500, detail="Processing error")
         except Exception:
             # W19 (C14): same compensation for any other post-registration
@@ -2958,7 +2979,8 @@ async def scan_directories(
         watcher = FileWatcher(background_processor, pool=db_pool)
 
         # Perform scan
-        files_enqueued = await watcher.scan_once()
+        scan_result = await watcher.scan_once()
+        files_enqueued = scan_result.files_enqueued
 
         if files_enqueued > 0:
             message = (
@@ -2972,8 +2994,8 @@ async def scan_directories(
             status="success",
             message=message,
             added=files_enqueued,  # Frontend alias
-            scanned=files_enqueued,  # Frontend expects this (at least files_enqueued)
-            errors=[],  # Frontend expects this field
+            scanned=scan_result.files_examined,  # Files examined, not the enqueued count (issue #767 AC6)
+            errors=scan_result.errors,  # Per-directory failures from the scan
         )
     except Exception:
         logger.exception("Error during directory scan")
@@ -3020,7 +3042,13 @@ async def reindex_documents(
             )
         cur = conn.execute(
             "INSERT INTO document_reindex_jobs (vault_id, trigger_type, trigger_id, status, input_json) VALUES (?, ?, ?, ?, ?)",
-            (vault_id, "api", str(user.get("id", "")), "pending", json.dumps({"vault_id": vault_id})),
+            (
+                vault_id,
+                "api",
+                str(user.get("id", "")),
+                "pending",
+                json.dumps({"vault_id": vault_id}),
+            ),
         )
         conn.commit()
         return cur.lastrowid
@@ -3216,7 +3244,8 @@ def _unlink_document_file(stored_path: str, vault_id: int) -> None:
     except (OSError, RuntimeError, ValueError, TypeError):
         return
     roots = [
-        root.resolve(strict=False) for root in _allowed_document_roots(settings, vault_id)
+        root.resolve(strict=False)
+        for root in _allowed_document_roots(settings, vault_id)
     ]
     if not any(_path_is_within(file_path, root) for root in roots):
         logger.warning(

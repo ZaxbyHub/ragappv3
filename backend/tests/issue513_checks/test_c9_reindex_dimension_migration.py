@@ -188,8 +188,20 @@ async def _scenario() -> tuple[str, str, str, str]:
         "VALUES (?, ?, ?, ?, ?, 'indexed')",
         (vault_id, str(tmp / "doc.txt"), "doc.txt", "hashc9file", 12),
     )
+    # A second, already-indexed file in the same vault (issue #744 frozen
+    # check C13): with a bystander row in the index, a refusal that wiped or
+    # replaced the whole table (the pre-#691 auto-migrate shape) becomes
+    # observable — the bystander's vectors must survive untouched.
+    conn.execute(
+        "INSERT INTO files (vault_id, file_path, file_name, file_hash, file_size, status) "
+        "VALUES (?, ?, ?, ?, ?, 'indexed')",
+        (vault_id, str(tmp / "bystander.txt"), "bystander.txt", "hashc9bystander", 12),
+    )
     conn.commit()
     file_id = conn.execute("SELECT id FROM files LIMIT 1").fetchone()[0]
+    file_id1b = conn.execute(
+        "SELECT id FROM files WHERE file_name = 'bystander.txt'"
+    ).fetchone()[0]
     conn.close()
     upload_path = tmp / "doc.txt"
     upload_path.write_text("seed content", encoding="utf-8")
@@ -211,15 +223,28 @@ async def _scenario() -> tuple[str, str, str, str]:
         patch.object(settings, "contextual_chunking_enabled", False),
         patch.object(settings, "optimize_mode", "manual"),
     ):
-        # Seed the old-dimension native index.
+        # Seed the old-dimension native index with TWO files: the file the
+        # bare call reprocesses, and a bystander whose rows must survive the
+        # refusal untouched (issue #744 frozen check C13 — one file alone
+        # cannot distinguish fail-closed from table replacement).
         await store.init_table(OLD_DIM)
         await store.add_chunks(
-            [_record(f"{file_id}_0", file_id, "seed content", OLD_DIM)]
+            [
+                _record(f"{file_id}_0", file_id, "seed content", OLD_DIM),
+                _record(f"{file_id1b}_0", file_id1b, "bystander content", OLD_DIM),
+            ]
         )
         seeded_count = await store.count_by_file(str(file_id))
-        if seeded_count != 1:
+        bystander_count = await store.count_by_file(str(file_id1b))
+        if seeded_count != 1 or bystander_count != 1:
             _cleanup_tmp(tmp)
-            return f"harness invalid: seeded index has {seeded_count} rows", "", "", ""
+            return (
+                f"harness invalid: seeded index has {seeded_count} rows for "
+                f"file {file_id} and {bystander_count} for file {file_id1b}",
+                "",
+                "",
+                "",
+            )
 
         # ---- Part 1: bare-call dimension change must FAIL CLOSED (#691) ----
         refusal: DocumentProcessingError | None = None
@@ -252,9 +277,12 @@ async def _scenario() -> tuple[str, str, str, str]:
                     f"dimensions and the reindex remediation): {message}"
                 )
             else:
-                # The prior old-dimension index must be fully intact.
+                # The prior old-dimension index must be fully intact — for
+                # the reprocessed file AND the bystander (whose rows a
+                # table-replacing auto-migrate would have destroyed).
                 dim = await _table_dim(store)
                 count = await store.count_by_file(str(file_id))
+                bystander_after = await store.count_by_file(str(file_id1b))
                 searchable = False
                 if dim == OLD_DIM and count >= 1:
                     try:
@@ -266,10 +294,17 @@ async def _scenario() -> tuple[str, str, str, str]:
                         )
                     except Exception:  # noqa: BLE001
                         searchable = False
-                if dim != OLD_DIM or count < 1 or not searchable:
+                if (
+                    dim != OLD_DIM
+                    or count < 1
+                    or bystander_after != 1
+                    or not searchable
+                ):
                     part1_reason = (
                         f"refused ingest damaged the prior index: dim={dim}, "
-                        f"rows={count}, old-dimension content searchable={searchable}"
+                        f"rows={count}, bystander rows={bystander_after} "
+                        f"(expected 1 for file {file_id1b}), old-dimension "
+                        f"content searchable={searchable}"
                     )
                 else:
                     # The persisted (user-visible) error must be the
