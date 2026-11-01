@@ -236,7 +236,7 @@ export function DocumentCard({
 
         {/* Standalone delete button (visible on larger mobile screens) */}
         {canDelete && (
-          <div className="mt-4 flex sm:hidden">
+          <div className="mt-4 flex md:hidden">
             <Button
               variant="destructive"
               size="sm"

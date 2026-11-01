@@ -8,6 +8,7 @@ import { UploadIndicator } from "@/components/shared/UploadIndicator";
 import UnconfiguredChatBanner from "@/components/UnconfiguredChatBanner";
 import FirstRunChecklist from "@/components/onboarding/FirstRunChecklist";
 import { getSettings } from "@/lib/api";
+import { useSettingsStore } from "@/stores/useSettingsStore";
 import type { HealthStatus } from "@/types/health";
 import type { NavItemId } from "./navigationTypes";
 
@@ -35,7 +36,20 @@ export function PageShell({ children, activeItem, onItemSelect, healthStatus }: 
     Promise.resolve()
       .then(() => getSettings())
       .then((settings) => {
-        if (!cancelled) setChatConfigured(settings.chat_configured !== false);
+        if (cancelled) return;
+        setChatConfigured(settings.chat_configured !== false);
+        // Populate the settings store so server-configured upload limits
+        // (max_file_size_mb, allowed_extensions) reach every upload surface
+        // without the Settings page being opened (issue #768 AC7). The write
+        // is guarded to FILL-ONLY: a store already populated by the Settings
+        // page's load/save is newer than this shell response, so a late shell
+        // fetch must never clobber it (plan-critic Round 1 R6 stale-write
+        // guard). A failed fetch writes nothing — the store keeps the null
+        // "unloaded" state and consumers use their fallbacks.
+        const store = useSettingsStore.getState();
+        if (store.settings == null) {
+          store.setSettings(settings);
+        }
       })
       .catch(() => {
         if (!cancelled) setChatConfigured(null);

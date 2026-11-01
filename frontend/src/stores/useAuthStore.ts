@@ -17,6 +17,7 @@ import { useVaultStore } from "@/stores/useVaultStore";
 import { useChatStore } from "@/stores/useChatStore";
 import { useChatShellStore } from "@/stores/useChatShellStore";
 import { useUploadStore } from "@/stores/useUploadStore";
+import { useSettingsStore } from "@/stores/useSettingsStore";
 import {
   clearAllChatDrafts,
   invalidatePendingDraftWrites,
@@ -308,6 +309,11 @@ const resetChatStateForIdentitySwitch = () => {
   queryClient.resetQueries();
   queryClient.clear();
   useDraftRoomUiStore.getState().resetForIdentitySwitch();
+  // PR #1048 feedback (PRR-013/K-20): the settings store now holds the
+  // admin-scoped GET /settings payload on every shell mount — a member session
+  // following an admin in this tab must not inherit it (and the shell's
+  // fill-only guard would keep it there). Full reset, not just null settings.
+  useSettingsStore.getState().resetState();
 };
 
 // Wire up CSRF via centralized api.ts utilities

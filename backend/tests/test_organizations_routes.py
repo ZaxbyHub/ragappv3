@@ -540,6 +540,88 @@ class TestRemoveOrgMember:
         data = response.json()
         assert data["message"] == "Member removed"
 
+    def test_removal_actually_clears_org_and_group_rows(self, client):
+        """Issue #743 (S02-SK2-08): removal must delete the org_members row AND
+        cascade the member's group_members rows for that org's groups
+        (organizations.py #721 cascade) — asserted against the database, not
+        just the 200/message surface. The member holds no vault-admin grants,
+        so the effective-admin 409 refusal path cannot fire. The mutation
+        check C1 (tests/test_h06_mutation_kills) freezes exactly this: with
+        the org_members DELETE mutated away, this test fails."""
+        org_id = _create_org("Cascade Org", 2)  # admin1 as owner
+        _add_org_member(org_id, 3, "member")  # member1 as member
+
+        # A group membership in a DIFFERENT org must survive the removal.
+        # (Seeded before the shared seeding connection opens: an uncommitted
+        # transaction on that connection would lock out _create_org's write.)
+        other_org = _create_org("Other Cascade Org", 2)
+        _add_org_member(other_org, 3, "member")
+
+        conn = _get_db_conn()
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute(
+            "INSERT INTO groups (org_id, name, description) VALUES (?, ?, ?)",
+            (org_id, "Cascade Group", "group whose membership must cascade"),
+        )
+        group_id = conn.execute(
+            "SELECT id FROM groups WHERE org_id = ? AND name = 'Cascade Group'",
+            (org_id,),
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO group_members (group_id, user_id) VALUES (?, ?)",
+            (group_id, 3),
+        )
+        conn.execute(
+            "INSERT INTO groups (org_id, name, description) VALUES (?, ?, ?)",
+            (other_org, "Other Cascade Group", "unrelated group"),
+        )
+        other_group_id = conn.execute(
+            "SELECT id FROM groups WHERE org_id = ? AND name = 'Other Cascade Group'",
+            (other_org,),
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO group_members (group_id, user_id) VALUES (?, ?)",
+            (other_group_id, 3),
+        )
+        conn.commit()
+        conn.close()
+
+        response = client.delete(
+            f"/api/organizations/{org_id}/members/3",
+            headers=auth_headers(admin_token),
+        )
+        assert response.status_code == 200, response.text
+
+        conn = _get_db_conn()
+        try:
+            org_row = conn.execute(
+                "SELECT COUNT(*) FROM org_members WHERE org_id = ? AND user_id = 3",
+                (org_id,),
+            ).fetchone()[0]
+            group_row = conn.execute(
+                "SELECT COUNT(*) FROM group_members gm JOIN groups g ON g.id = gm.group_id "
+                "WHERE gm.user_id = 3 AND g.org_id = ?",
+                (org_id,),
+            ).fetchone()[0]
+            other_org_row = conn.execute(
+                "SELECT COUNT(*) FROM org_members WHERE org_id = ? AND user_id = 3",
+                (other_org,),
+            ).fetchone()[0]
+            other_group_row = conn.execute(
+                "SELECT COUNT(*) FROM group_members WHERE group_id = ? AND user_id = 3",
+                (other_group_id,),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+        assert org_row == 0, "org_members row must be deleted on member removal"
+        assert group_row == 0, (
+            "group_members rows for this org's groups must cascade on member removal"
+        )
+        assert other_org_row == 1, "memberships in other orgs must be untouched"
+        assert other_group_row == 1, "group rows in other orgs must be untouched"
+
+
     def test_cannot_remove_owner(self, client):
         """Cannot remove owner (403)."""
         org_id = _create_org("Remove Owner Org", 2)  # admin1 as owner

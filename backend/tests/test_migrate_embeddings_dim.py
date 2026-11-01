@@ -20,9 +20,11 @@ host-level corroboration path, per the issue #512 fix plan).
 import importlib.machinery
 import importlib.util
 import os
+import shutil
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -105,24 +107,67 @@ if _REAL_PYARROW is not None:
     )
 
 
+_SCHEMA_TEMPLATE_LOCK = threading.Lock()
+_SCHEMA_TEMPLATE_DB: Path | None = None
+
+
+def _production_schema_template() -> Path:
+    """Build the PRODUCTION schema (init_db + run_migrations) once per
+    session and cache it (issue #744: the files fixture must come from the
+    real schema, not a hand-rolled copy, so producer/consumer column drift
+    is visible to CI).
+
+    Hermeticity recipe copied from backend/tests/user_route_helpers.py
+    (``_build_template_db``): run_migrations reads settings-derived
+    filesystem paths (settings.vaults_dir / settings.lancedb_path are
+    read-only properties of settings.data_dir), so settings.data_dir is
+    pinned to a private temp dir for the duration of the build and restored
+    in a finally block; init_db/run_migrations always receive the explicit
+    absolute template path.
+    """
+    global _SCHEMA_TEMPLATE_DB
+    with _SCHEMA_TEMPLATE_LOCK:
+        if _SCHEMA_TEMPLATE_DB is None or not _SCHEMA_TEMPLATE_DB.exists():
+            from app.models.database import init_db, run_migrations
+
+            template_dir = Path(tempfile.mkdtemp(prefix="dim-schema-template-"))
+            template_db = template_dir / "template.db"
+
+            previous_data_dir = settings.data_dir
+            try:
+                settings.data_dir = template_dir  # type: ignore[assignment]
+                init_db(str(template_db))
+                run_migrations(str(template_db))
+            finally:
+                settings.data_dir = previous_data_dir
+
+            # init_db/run_migrations connections are closed by their own
+            # finally blocks; verify no WAL sidecar survives into the
+            # copies handed out.
+            for sidecar in (
+                template_dir / "template.db-wal",
+                template_dir / "template.db-shm",
+            ):
+                sidecar.unlink(missing_ok=True)
+            _SCHEMA_TEMPLATE_DB = template_db
+        return _SCHEMA_TEMPLATE_DB
+
+
 def _make_sqlite(sqlite_path, status="indexed"):
+    """A files fixture on the PRODUCTION schema (init_db + run_migrations
+    template): one vault and one row with the given status (issue #744 —
+    no hand-rolled files DDL)."""
+    shutil.copyfile(_production_schema_template(), sqlite_path)
     conn = sqlite3.connect(str(sqlite_path))
-    conn.executescript(
-        """
-        CREATE TABLE files (
-            id INTEGER PRIMARY KEY,
-            file_name TEXT,
-            status TEXT,
-            chunk_count INTEGER,
-            processed_at TIMESTAMP,
-            modified_at TIMESTAMP
-        );
-        """
+    conn.execute(
+        "INSERT OR IGNORE INTO vaults (id, name, description)"
+        " VALUES (1, 'Default', 'Default vault')"
     )
     conn.execute(
-        "INSERT INTO files (id, file_name, status, chunk_count)"
-        " VALUES (1, 'doc.txt', ?, 3)",
-        (status,),
+        "INSERT INTO files (id, vault_id, file_path, file_name, file_hash,"
+        " file_size, status, chunk_count)"
+        " VALUES (1, 1, ?, 'doc.txt', 'dimtesthash1', 12, ?, 3)",
+        (str(Path(sqlite_path).parent / "doc.txt"), status),
     )
     conn.commit()
     conn.close()
@@ -353,6 +398,52 @@ class TestRunMigrationUnknownDimEmptyIndex(unittest.TestCase):
                 self.assertIsNone(script.main())  # success: no sys.exit
         self.assertEqual(_files_status(sqlite_path), "indexed")
         self.assertFalse(lancedb_path.exists(), "nothing may be created/wiped")
+
+
+class TestResetFileStatusesPartialIndexed(unittest.TestCase):
+    """The reset predicate covers BOTH 'indexed' and 'partial' rows
+    (scripts/migrate_embeddings.py, issue #513 status fixed by #694): after
+    the whole index is wiped, a 'partial' row's non-zero chunk_count claims
+    vectors it no longer has. Verified on the PRODUCTION schema, where the
+    optional progress columns exist and must be restored to their
+    queue-entry values (phase='queued', partial_embeddings=0,
+    chunks_failed=0, error_message=NULL)."""
+
+    def test_indexed_and_partial_rows_are_both_reset(self):
+        tmp = Path(tempfile.mkdtemp(prefix="dimreset_"))
+        sqlite_path = tmp / "app.db"
+        _make_sqlite(sqlite_path)  # id 1, status='indexed'
+        conn = sqlite3.connect(str(sqlite_path))
+        conn.execute(
+            "INSERT INTO files (id, vault_id, file_path, file_name, file_hash,"
+            " file_size, status, chunk_count, phase, partial_embeddings,"
+            " chunks_failed, error_message)"
+            " VALUES (2, 1, ?, 'partial.txt', 'dimtesthash2', 12, 'partial',"
+            " 5, 'embedding', 2, 1, 'one chunk failed')",
+            (str(tmp / "partial.txt"),),
+        )
+        conn.commit()
+        conn.close()
+
+        reset = script._reset_file_statuses(sqlite_path, dry_run=False)
+
+        self.assertEqual(reset, 2)
+        conn = sqlite3.connect(str(sqlite_path))
+        try:
+            rows = conn.execute(
+                "SELECT status, chunk_count, phase, partial_embeddings,"
+                " chunks_failed, error_message FROM files ORDER BY id"
+            ).fetchall()
+        finally:
+            conn.close()
+        self.assertEqual(
+            rows,
+            [
+                ("pending", 0, "queued", 0, 0, None),
+                ("pending", 0, "queued", 0, 0, None),
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

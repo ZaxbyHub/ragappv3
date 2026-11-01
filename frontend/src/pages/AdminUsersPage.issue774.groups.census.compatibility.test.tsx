@@ -1,7 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import "@testing-library/jest-dom";
 import AdminUsersPage from "@/pages/AdminUsersPage";
+
+// #771: table-scoped (below-sm card list duplicates the text)
+const inTable = () => within(screen.getByRole("table"));
 
 const mockGet = vi.hoisted(() => vi.fn());
 const mockPut = vi.hoisted(() => vi.fn());
@@ -114,12 +117,15 @@ describe("AdminUsersPage group reads issue #774 census", () => {
     try {
       render(<AdminUsersPage />);
       await act(async () => first.reject(new Error("users read failed")));
-      expect(screen.getByRole("alert")).toHaveTextContent("users");
+      // #771: table-scoped (below-sm card list duplicates the text)
+      expect(inTable().getByRole("alert")).toHaveTextContent("users");
       expect(screen.queryByText("No users found")).not.toBeInTheDocument();
 
       mockGet.mockResolvedValueOnce(usersPayload);
-      fireEvent.click(screen.getByRole("button", { name: "Retry users" }));
-      expect(await screen.findByText("john")).toBeInTheDocument();
+      // #771: table-scoped (below-sm card list duplicates the text)
+      fireEvent.click(inTable().getByRole("button", { name: "Retry users" }));
+      // #771: table-scoped (below-sm card list duplicates the text)
+      expect(await inTable().findByText("john")).toBeInTheDocument();
     } finally {
       first.resolve(usersPayload);
     }
@@ -137,7 +143,8 @@ describe("AdminUsersPage group reads issue #774 census", () => {
 
     try {
       render(<AdminUsersPage />);
-      fireEvent.click(await screen.findByRole("button", { name: "Manage groups for john" }));
+      // #771: table-scoped (below-sm card list duplicates the text)
+      fireEvent.click(await inTable().findByRole("button", { name: "Manage groups for john" }));
       await act(async () => allGroups.reject(new Error("groups catalog read failed")));
       expect(screen.getByRole("alert")).toHaveTextContent("groups");
       expect(screen.queryByText("No groups available")).not.toBeInTheDocument();
@@ -169,7 +176,8 @@ describe("AdminUsersPage group reads issue #774 census", () => {
 
     try {
       render(<AdminUsersPage />);
-      fireEvent.click(await screen.findByRole("button", { name: "Manage groups for john" }));
+      // #771: table-scoped (below-sm card list duplicates the text)
+      fireEvent.click(await inTable().findByRole("button", { name: "Manage groups for john" }));
       await act(async () => memberships.reject(new Error("membership read failed")));
       expect(screen.getByRole("alert")).toHaveTextContent("groups");
       expect(screen.queryByText("No groups available")).not.toBeInTheDocument();
@@ -196,7 +204,8 @@ describe("AdminUsersPage group reads issue #774 census", () => {
       return Promise.resolve({ data: { groups: [] } });
     });
     render(<AdminUsersPage />);
-    fireEvent.click(await screen.findByRole("button", { name: "Manage groups for john" }));
+    // #771: table-scoped (below-sm card list duplicates the text)
+    fireEvent.click(await inTable().findByRole("button", { name: "Manage groups for john" }));
     expect(await screen.findByText("No groups available")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Save group changes" })).toBeEnabled();
   });
