@@ -1,7 +1,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, waitFor, act } from '@testing-library/react';
+import { render, screen, waitFor, act , within } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import OrgsPage from '@/pages/OrgsPage';
+// Issue #771 (UI-ENH-05): the below-sm card list duplicates row
+// text next to the desktop table; scope data queries to the table subtree
+// (a card-only regression still fails these assertions).
+const inTable = () => within(screen.getByRole('table'));
+
 
 // Mock useAuthStore for AdminGuard and user data
 vi.mock('@/stores/useAuthStore', () => ({
@@ -245,7 +250,7 @@ describe('OrgsPage', () => {
 
     // Wait for members to load and display
     await waitFor(() => {
-      expect(screen.getByText('Alice Johnson')).toBeInTheDocument();
+      expect(inTable().getByText('Alice Johnson')).toBeInTheDocument();
     });
   });
 
@@ -264,10 +269,10 @@ describe('OrgsPage', () => {
     });
 
     await waitFor(() => {
-      expect(screen.getByText('Alice Johnson')).toBeInTheDocument();
-      expect(screen.getByText('@alice')).toBeInTheDocument();
-      expect(screen.getByText('Bob Smith')).toBeInTheDocument();
-      expect(screen.getByText('@bob')).toBeInTheDocument();
+      expect(inTable().getByText('Alice Johnson')).toBeInTheDocument();
+      expect(inTable().getByText('@alice')).toBeInTheDocument();
+      expect(inTable().getByText('Bob Smith')).toBeInTheDocument();
+      expect(inTable().getByText('@bob')).toBeInTheDocument();
     });
   });
 

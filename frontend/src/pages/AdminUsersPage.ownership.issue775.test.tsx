@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import "@testing-library/jest-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import AdminUsersPage from "@/pages/AdminUsersPage";
@@ -6,6 +6,9 @@ import {
   publishAuthPrincipal,
   reserveReplacementAuthOwner,
 } from "@/lib/api/auth-lifecycle";
+
+// #771: table-scoped (below-sm card list duplicates the text)
+const inTable = () => within(screen.getByRole("table"));
 
 type Deferred<T> = {
   promise: Promise<T>;
@@ -281,12 +284,14 @@ describe("AdminUsersPage issue #775 ownership and query races", () => {
     queueGet("/groups", groupsA.promise);
     queueGet("/users/2/groups", membershipsA.promise);
     renderPage();
-    fireEvent.click(await screen.findByRole("button", { name: "Manage groups for target" }));
+    // #771: table-scoped (below-sm card list duplicates the text)
+    fireEvent.click(await inTable().findByRole("button", { name: "Manage groups for target" }));
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
 
     queueGet("/groups", groupsB.promise);
     queueGet("/users/2/groups", membershipsB.promise);
-    fireEvent.click(screen.getByRole("button", { name: "Manage groups for target" }));
+    // #771: table-scoped (below-sm card list duplicates the text)
+    fireEvent.click(inTable().getByRole("button", { name: "Manage groups for target" }));
 
     await act(async () => {
       groupsA.resolve({ data: { groups: [groupA] } });
@@ -324,7 +329,8 @@ describe("AdminUsersPage issue #775 ownership and query races", () => {
     queueGet("/organizations/", orgsA.promise);
     queueGet("/users/2/organizations", membershipsA.promise);
     renderPage();
-    fireEvent.click(await screen.findByRole("button", { name: "Manage organizations for target" }));
+    // #771: table-scoped (below-sm card list duplicates the text)
+    fireEvent.click(await inTable().findByRole("button", { name: "Manage organizations for target" }));
     await act(async () => {
       orgsA.resolve({ data: { organizations: [orgA] } });
       membershipsA.resolve({ data: { organizations: [] } });
@@ -343,11 +349,13 @@ describe("AdminUsersPage issue #775 ownership and query races", () => {
     await act(async () => closeA(false));
     expect(screen.queryByRole("button", { name: "Save organization changes" })).not.toBeInTheDocument();
     await act(async () => usersB.resolve({ data: { users: [targetUser], total: 40 } }));
-    expect(await screen.findByText("target")).toBeInTheDocument();
+    // #771: table-scoped (below-sm card list duplicates the text)
+    expect(await inTable().findByText("target")).toBeInTheDocument();
 
     queueGet("/organizations/", orgsB.promise);
     queueGet("/users/2/organizations", membershipsB.promise);
-    fireEvent.click(screen.getByRole("button", { name: "Manage organizations for target" }));
+    // #771: table-scoped (below-sm card list duplicates the text)
+    fireEvent.click(inTable().getByRole("button", { name: "Manage organizations for target" }));
     await act(async () => {
       orgsB.resolve({ data: { organizations: [orgB] } });
       membershipsB.resolve({ data: { organizations: [] } });
@@ -375,7 +383,8 @@ describe("AdminUsersPage issue #775 ownership and query races", () => {
     const usersB = deferred<unknown>();
     queueInitialUsers();
     renderPage();
-    const role = await screen.findByRole("combobox", { name: "Change role for target" });
+    // #771: table-scoped (below-sm card list duplicates the text)
+    const role = await inTable().findByRole("combobox", { name: "Change role for target" });
     const retainedA = mocks.selectHandlers.get("Change role for target");
     if (!retainedA) throw new Error("expected the A role callback to be captured");
     mocks.api.patch.mockReturnValueOnce(patch.promise);
@@ -385,7 +394,8 @@ describe("AdminUsersPage issue #775 ownership and query races", () => {
     queueGet(usersUrl(), usersB.promise.then(() => ({ data: { users: [targetUser], total: 40 } })));
     reserveReplacementAuthOwner();
     await act(async () => usersB.resolve({ data: { users: [targetUser], total: 40 } }));
-    const replacementRole = await screen.findByRole("combobox", { name: "Change role for target" });
+    // #771: table-scoped (below-sm card list duplicates the text)
+    const replacementRole = await inTable().findByRole("combobox", { name: "Change role for target" });
 
     await act(async () => retainedA("viewer"));
     expect(mocks.api.patch).toHaveBeenCalledTimes(1);
@@ -414,7 +424,8 @@ describe("AdminUsersPage issue #775 ownership and query races", () => {
     queueInitialUsers();
     queueGet(usersUrl(1, "target"), searchResults.promise);
     renderPage();
-    const role = await screen.findByRole("combobox", { name: "Change role for target" });
+    // #771: table-scoped (below-sm card list duplicates the text)
+    const role = await inTable().findByRole("combobox", { name: "Change role for target" });
     mocks.api.patch.mockReturnValueOnce(patch.promise);
     fireEvent.change(role, { target: { value: "admin" } });
 
@@ -425,7 +436,8 @@ describe("AdminUsersPage issue #775 ownership and query races", () => {
     expect(mocks.toast.success).toHaveBeenCalledExactlyOnceWith("Role updated successfully");
     expect(role).toHaveValue("member");
     await act(async () => searchResults.resolve({ data: { users: [targetUser], total: 40 } }));
-    expect(await screen.findByRole("combobox", { name: "Change role for target" })).toHaveValue("member");
+    // #771: table-scoped (below-sm card list duplicates the text)
+    expect(await inTable().findByRole("combobox", { name: "Change role for target" })).toHaveValue("member");
   });
 
   it("reports row-mutation failure after a search change without publishing a stale row update", async () => {
@@ -434,7 +446,8 @@ describe("AdminUsersPage issue #775 ownership and query races", () => {
     queueInitialUsers();
     queueGet(usersUrl(1, "target"), searchResults.promise);
     renderPage();
-    const role = await screen.findByRole("combobox", { name: "Change role for target" });
+    // #771: table-scoped (below-sm card list duplicates the text)
+    const role = await inTable().findByRole("combobox", { name: "Change role for target" });
     mocks.api.patch.mockReturnValueOnce(patch.promise);
     fireEvent.change(role, { target: { value: "admin" } });
 
@@ -445,7 +458,8 @@ describe("AdminUsersPage issue #775 ownership and query races", () => {
     expect(mocks.toast.error).toHaveBeenCalledTimes(1);
     expect(role).toHaveValue("member");
     await act(async () => searchResults.resolve({ data: { users: [targetUser], total: 40 } }));
-    expect(await screen.findByRole("combobox", { name: "Change role for target" })).toHaveValue("member");
+    // #771: table-scoped (below-sm card list duplicates the text)
+    expect(await inTable().findByRole("combobox", { name: "Change role for target" })).toHaveValue("member");
   });
 
   it("lets only the newest same-user mutation publish after a query change", async () => {
@@ -455,14 +469,16 @@ describe("AdminUsersPage issue #775 ownership and query races", () => {
     queueInitialUsers();
     queueGet(usersUrl(1, "target"), searchResults.promise);
     renderPage();
-    const role = await screen.findByRole("combobox", { name: "Change role for target" });
+    // #771: table-scoped (below-sm card list duplicates the text)
+    const role = await inTable().findByRole("combobox", { name: "Change role for target" });
     mocks.api.patch.mockReturnValueOnce(olderPatch.promise);
     fireEvent.change(role, { target: { value: "admin" } });
 
     fireEvent.change(screen.getByRole("textbox", { name: "Search users" }), { target: { value: "target" } });
     await waitFor(() => expect(mocks.api.get).toHaveBeenCalledTimes(2));
     await act(async () => searchResults.resolve({ data: { users: [{ ...targetUser, role: "member" }], total: 40 } }));
-    const currentRoleInput = await screen.findByRole("combobox", { name: "Change role for target" });
+    // #771: table-scoped (below-sm card list duplicates the text)
+    const currentRoleInput = await inTable().findByRole("combobox", { name: "Change role for target" });
     mocks.api.patch.mockReturnValueOnce(newerPatch.promise);
     const currentRole = mocks.selectHandlers.get("Change role for target");
     if (!currentRole) throw new Error("expected the current role callback");
@@ -476,7 +492,8 @@ describe("AdminUsersPage issue #775 ownership and query races", () => {
     expect(currentRoleInput).toHaveValue("member");
     await act(async () => newerPatch.resolve({ data: {} }));
     expect(mocks.toast.success).toHaveBeenCalledExactlyOnceWith("Role updated successfully");
-    expect(await screen.findByRole("combobox", { name: "Change role for target" })).toHaveValue("admin");
+    // #771: table-scoped (below-sm card list duplicates the text)
+    expect(await inTable().findByRole("combobox", { name: "Change role for target" })).toHaveValue("admin");
   });
 
   it("drops an in-flight page response after the page intent changes and shows the fresh page", async () => {
@@ -491,7 +508,8 @@ describe("AdminUsersPage issue #775 ownership and query races", () => {
     await act(async () => pageOne.resolve({ data: { users: [{ ...targetUser, username: "page-one" }], total: 40 } }));
     expect(screen.queryByText("page-one")).not.toBeInTheDocument();
     await act(async () => pageTwo.resolve({ data: { users: [{ ...targetUser, username: "page-two" }], total: 40 } }));
-    expect(await screen.findByText("page-two")).toBeInTheDocument();
+    // #771: table-scoped (below-sm card list duplicates the text)
+    expect(await inTable().findByText("page-two")).toBeInTheDocument();
   });
 
   it("drops an in-flight search response after the search intent changes and shows the fresh result", async () => {
@@ -506,7 +524,8 @@ describe("AdminUsersPage issue #775 ownership and query races", () => {
     await act(async () => initial.resolve({ data: { users: [{ ...targetUser, username: "old-search" }], total: 1 } }));
     expect(screen.queryByText("old-search")).not.toBeInTheDocument();
     await act(async () => search.resolve({ data: { users: [{ ...targetUser, username: "fresh-search" }], total: 1 } }));
-    expect(await screen.findByText("fresh-search")).toBeInTheDocument();
+    // #771: table-scoped (below-sm card list duplicates the text)
+    expect(await inTable().findByText("fresh-search")).toBeInTheDocument();
   });
 
   it("keeps a same-auth A save error visible without releasing reopened B", async () => {
@@ -523,7 +542,8 @@ describe("AdminUsersPage issue #775 ownership and query races", () => {
     queueGet("/users/2/groups", membershipsA.promise);
     mocks.api.put.mockReturnValueOnce(saveA.promise).mockReturnValueOnce(saveB.promise);
     renderPage();
-    fireEvent.click(await screen.findByRole("button", { name: "Manage groups for target" }));
+    // #771: table-scoped (below-sm card list duplicates the text)
+    fireEvent.click(await inTable().findByRole("button", { name: "Manage groups for target" }));
     await act(async () => {
       groupsA.resolve({ data: { groups: [group] } });
       membershipsA.resolve({ data: { groups: [] } });
@@ -539,7 +559,8 @@ describe("AdminUsersPage issue #775 ownership and query races", () => {
 
     queueGet("/groups", groupsB.promise);
     queueGet("/users/2/groups", membershipsB.promise);
-    fireEvent.click(screen.getByRole("button", { name: "Manage groups for target" }));
+    // #771: table-scoped (below-sm card list duplicates the text)
+    fireEvent.click(inTable().getByRole("button", { name: "Manage groups for target" }));
     await act(async () => {
       groupsB.resolve({ data: { groups: [group] } });
       membershipsB.resolve({ data: { groups: [] } });
@@ -566,16 +587,19 @@ describe("AdminUsersPage issue #775 ownership and query races", () => {
     await waitFor(() => expect(mocks.api.get).toHaveBeenCalledTimes(1));
     await act(async () => currentFailure.reject(new Error("current users failure")));
     await waitFor(() => expect(mocks.toast.error).toHaveBeenCalledWith("Failed to load users"));
-    expect(screen.getByRole("alert")).toHaveTextContent("Failed to load users");
+    // #771: table-scoped (below-sm card list duplicates the text)
+    expect(inTable().getByRole("alert")).toHaveTextContent("Failed to load users");
 
-    fireEvent.click(screen.getByRole("button", { name: "Retry users" }));
+    // #771: table-scoped (below-sm card list duplicates the text)
+    fireEvent.click(inTable().getByRole("button", { name: "Retry users" }));
     await waitFor(() => expect(mocks.api.get).toHaveBeenCalledTimes(2));
 
     queueGet(usersUrl(), { data: { users: [targetUser], total: 1 } });
     reserveReplacementAuthOwner();
     await act(async () => retiredFailure.reject(new Error("retired users failure")));
     expect(mocks.toast.error).toHaveBeenCalledTimes(1);
-    expect(await screen.findByText("target")).toBeInTheDocument();
+    // #771: table-scoped (below-sm card list duplicates the text)
+    expect(await inTable().findByText("target")).toBeInTheDocument();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 });
