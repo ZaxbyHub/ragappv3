@@ -80,6 +80,7 @@ class TestLifespanMigrationFlagWiring(unittest.TestCase):
 import asyncio
 import logging
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -117,6 +118,20 @@ def _pin_lifespan_settings(tmp_path: Path):
     # bind to the loop that first runs its workers; a second lifespan entry in
     # the same process must get a fresh processor bound to the new loop.
 
+    # The REAL lifespan shutdown kills the module-level auth executor
+    # (lifespan.py: `_auth_executor.shutdown(wait=False)`). Hand it a
+    # SACRIFICIAL executor for the duration of the entry so the original --
+    # which other test modules imported BY VALUE (`from auth_service import
+    # _auth_executor`) -- is never shut down. CI round 1 without this: 24
+    # "RuntimeError: cannot schedule new futures after shutdown" failures on
+    # one xdist worker (test_auth_service_async_hash, test_d07b).
+    from app.services import auth_service as _auth_service
+
+    saved_auth_executor = _auth_service._auth_executor
+    _auth_service._auth_executor = ThreadPoolExecutor(
+        max_workers=4, thread_name_prefix="auth-cpu"
+    )
+
     saved = {
         "data_dir": settings.data_dir,
         "redis_url": settings.redis_url,
@@ -137,6 +152,14 @@ def _pin_lifespan_settings(tmp_path: Path):
     def restore():
         for key, value in saved.items():
             setattr(settings, key, value)
+        # Give back the ORIGINAL auth executor (see the sacrificial swap in
+        # the pin above). Shut the sacrificial down if the lifespan's own
+        # shutdown somehow did not reach it.
+        from app.services import auth_service as _auth_service
+
+        if _auth_service._auth_executor is not saved_auth_executor:
+            _auth_service._auth_executor.shutdown(wait=False)
+        _auth_service._auth_executor = saved_auth_executor
 
     return restore
 
