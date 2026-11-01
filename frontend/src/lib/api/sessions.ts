@@ -650,41 +650,52 @@ export async function addChatMessagesBatch(
 /**
  * Best-effort lifecycle save for a pagehide event (issue #552).
  *
- * Keepalive requests cannot wait for CSRF-token discovery or response parsing.
- * Reuse the cached token or the readable CSRF cookie; when both are
- * unavailable, fail closed without sending rather than fabricating credentials
- * or starting another lifecycle request. The request body is bounded to the
- * browser keepalive quota, and HTTP status failures are intentionally not
- * observable or retryable during pagehide. Hard termination remains outside
- * the guarantee.
+ * Keepalive requests cannot wait for CSRF-token discovery. Reuse the cached
+ * token or the readable CSRF cookie; when both are unavailable, fail closed
+ * without sending rather than fabricating credentials or starting another
+ * lifecycle request. The request body is bounded to the browser keepalive
+ * quota, and HTTP status failures are intentionally not retryable during
+ * pagehide. Hard termination remains outside the guarantee.
+ *
+ * Issue #815: the response is now parsed OPPORTUNISTICALLY. When the page
+ * outlives the request (bfcache restore, canceled unload), the resolved
+ * save results carry the durable ids and seqs the chat store must migrate
+ * so a later Retry/Edit truncate anchor covers these rows; when the page
+ * dies, nobody is left to read them. Failures of any kind resolve `undefined` —
+ * the keepalive contract stays best-effort and never throws, and NO
+ * sequential single-message fallback is attempted during pagehide.
  */
 const KEEPALIVE_BODY_LIMIT_BYTES = 64 * 1024;
 
 export async function addChatMessagesBatchKeepalive(
   sessionId: number,
   messages: AddMessageRequest[],
-): Promise<void> {
+): Promise<ChatSessionMessage[] | undefined> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
   };
   const csrfToken = getCsrfToken() ?? getCsrfCookie();
-  if (!csrfToken) return;
+  if (!csrfToken) return undefined;
   headers["X-CSRF-Token"] = csrfToken;
   if (_jwtAccessToken) headers.Authorization = "Bearer " + _jwtAccessToken;
 
   const body = JSON.stringify({ messages });
-  if (new TextEncoder().encode(body).byteLength > KEEPALIVE_BODY_LIMIT_BYTES) return;
+  if (new TextEncoder().encode(body).byteLength > KEEPALIVE_BODY_LIMIT_BYTES) return undefined;
 
   try {
-    await fetch(API_BASE_URL + "/chat/sessions/" + sessionId + "/messages/batch", {
+    const response = await fetch(API_BASE_URL + "/chat/sessions/" + sessionId + "/messages/batch", {
       method: "POST",
       credentials: "include",
       headers,
       body,
       keepalive: true,
     });
+    if (!response.ok) return undefined;
+    const data = (await response.json()) as { messages?: ChatSessionMessage[] };
+    return Array.isArray(data?.messages) ? data.messages : undefined;
   } catch {
     // pagehide is best effort: there is no safe opportunity to retry.
+    return undefined;
   }
 }
 

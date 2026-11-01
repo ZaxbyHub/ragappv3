@@ -15,6 +15,7 @@ import { ParseQualityPanel } from "@/components/documents/ParseQualityPanel";
 import { documentField } from "@/components/documents/documentProgress";
 import { formatFileSize, formatDate } from "@/lib/formatters";
 import { useChatModeStore } from "@/stores/useChatModeStore";
+import { useVaultStore } from "@/stores/useVaultStore";
 import { useUploadMonitoring } from "@/hooks/useUploadMonitoring";
 import {
   getDocument,
@@ -39,8 +40,31 @@ export default function DocumentDetailPage() {
   const id = Number(documentId);
 
   const [doc, setDoc] = useState<Document | null>(null);
+
+  // Vault permission for this document (issue #767 AC4): set_document_tags
+  // requires vault WRITE server-side, so the Save affordance mirrors it.
+  // FAIL CLOSED: unknown/absent vault or unresolved permission disables Save
+  // (no "unknown means writable" fallback).
+  const vaults = useVaultStore((s) => s.vaults);
+  const docVaultPermission =
+    doc?.vault_id != null
+      ? (vaults.find((v) => v.id === doc.vault_id)?.current_user_permission ?? null)
+      : null;
+  const canWriteDocVault = docVaultPermission === "write" || docVaultPermission === "admin";
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  // Live mirror of the doc slot, written SYNCHRONOUSLY at every setDoc call
+  // site (issue #764 AC6) — never inside an updater (React may defer or re-run
+  // updaters in the render phase). handleSaveTags combines it with the load
+  // generation (loadGenRef) to decide whether its late result and success
+  // toast belong to the document still on screen: the id mirror alone cannot
+  // see a navigation whose next document is still loading.
+  const docRef = useRef<Document | null>(null);
+  // Save-generation token (issue #764 AC6): bumped per save so a stale save's
+  // finally cannot clear a NEWER save's saving flag (which would re-enable
+  // Save mid-save on the current document).
+  const savingTagGenRef = useRef(0);
 
   const [allTags, setAllTags] = useState<Tag[]>([]);
   const [selectedTagIds, setSelectedTagIds] = useState<Set<number>>(new Set());
@@ -88,7 +112,12 @@ export default function DocumentDetailPage() {
       // tags, or the vault tag list.
       if (loadGenRef.current === gen) {
         setDoc(d);
+        docRef.current = d;
         setSelectedTagIds(new Set((d.tags ?? []).map((t) => t.id)));
+        // Issue #764 AC7: drop the PREVIOUS document's tag vocabulary before
+        // this document's listTags resolves — a rejected listTags must render
+        // as "no tags" (empty), never the prior document's checkboxes.
+        setAllTags([]);
         // UI-011: the preview follows only the CURRENT load's payload. A
         // stale load must not re-trigger the preview effect: the effect's
         // cleanup would tear down the preview the user is looking at even
@@ -102,7 +131,9 @@ export default function DocumentDetailPage() {
             setAllTags(tags);
           }
         } catch {
-          // Tag editing is best-effort; ignore load failures.
+          // Tag editing is best-effort; the empty reset above already hid the
+          // previous document's vocabulary, so failure leaves an honest empty
+          // state rather than stale checkboxes (issue #764 AC7).
         }
       }
     } catch (err) {
@@ -119,6 +150,109 @@ export default function DocumentDetailPage() {
   useEffect(() => {
     load();
   }, [load]);
+
+  // #765 AC7: converge the page's own status without a remount. This is a
+  // DEDICATED background refresh, not the foreground load() — load() toggles
+  // the skeleton, resets tag selection and vocabulary, replaces the preview,
+  // and bumps the foreground generation; none of that may run on a poll. The
+  // refresh merges ONLY the live status/progress fields into the current
+  // document, is invalidated by any foreground load (generation compare) or
+  // id change, never overlaps itself, and disarms on any terminal status
+  // (pending/processing are the only non-terminal states the backend emits).
+  const statusRefreshInFlightRef = useRef(false);
+  const statusRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Consecutive failed refreshes (review round 1 PRR-010): the loop must
+  // terminate when the document is gone or the request keeps failing —
+  // previously a 404ing/deleted document was polled every 2 s forever.
+  const statusRefreshFailuresRef = useRef(0);
+  useEffect(() => {
+    const STATUS_REFRESH_INTERVAL_MS = 2_000;
+    const STATUS_REFRESH_MAX_FAILURES = 5;
+    // A fresh route id must not inherit the previous document's in-flight
+    // flag (review round 1 PRR-001 — Copilot, shard A and the critic all
+    // independently reproduced the wedge): reset it on every effect run.
+    statusRefreshInFlightRef.current = false;
+    statusRefreshFailuresRef.current = 0;
+    let disposed = false;
+    const tick = () => {
+      if (disposed) return;
+      const docId = Number(id);
+      if (!Number.isFinite(docId)) return;
+      const current = docRef.current;
+      // Only a LOADED document for THIS route id disarms the loop at a
+      // terminal status. While the foreground load has not committed yet
+      // (no doc, or the previous document still in the mirror) the tick has
+      // nothing to converge and MUST re-arm — returning here would kill the
+      // loop permanently and reintroduce the stuck-on-Processing symptom
+      // (#765 AC7; caught in implementation review).
+      const loadedForRoute = current != null && String(current.id) === String(id);
+      if (!loadedForRoute) {
+        statusRefreshTimerRef.current = setTimeout(tick, STATUS_REFRESH_INTERVAL_MS);
+        return;
+      }
+      const currentStatus = current.metadata?.status as string | undefined;
+      if (currentStatus !== "pending" && currentStatus !== "processing") {
+        return;
+      }
+      if (statusRefreshInFlightRef.current) {
+        // A request is already in flight: leave ONE successor armed rather
+        // than returning bare-handed (review round 1 PRR-001 — the bare
+        // return let a cross-document navigation wedge the new document's
+        // loop permanently).
+        statusRefreshTimerRef.current = setTimeout(tick, STATUS_REFRESH_INTERVAL_MS);
+        return;
+      }
+      if (statusRefreshFailuresRef.current >= STATUS_REFRESH_MAX_FAILURES) {
+        // The document has been deleted or the endpoint keeps failing
+        // (PRR-010): stop instead of polling forever.
+        return;
+      }
+      statusRefreshInFlightRef.current = true;
+      const gen = loadGenRef.current;
+      void getDocument(docId)
+        .then((d) => {
+          statusRefreshInFlightRef.current = false;
+          statusRefreshFailuresRef.current = 0;
+          if (disposed || loadGenRef.current !== gen) return;
+          const previous = docRef.current;
+          if (previous == null || String(previous.id) !== String(d.id)) return;
+          // Refresh the FULL live metadata plus the top-level progress
+          // fields (review round 1 B-5/R05: dropping production progress
+          // surfaces and leaving stale chunks_failed/extraction_diagnostics
+          // kept partial-status and failure copy wrong until reload). The
+          // merge never touches loading/error/tags/preview state.
+          const merged: Document = {
+            ...previous,
+            metadata: {
+              ...previous.metadata,
+              ...d.metadata,
+            },
+            progress_percent: d.progress_percent ?? previous.progress_percent,
+            processed_units: d.processed_units ?? previous.processed_units,
+            total_units: d.total_units ?? previous.total_units,
+            phase: d.phase ?? previous.phase,
+          } as Document;
+          docRef.current = merged;
+          setDoc(merged);
+        })
+        .catch(() => {
+          statusRefreshInFlightRef.current = false;
+          statusRefreshFailuresRef.current += 1;
+        })
+        .finally(() => {
+          if (disposed) return;
+          statusRefreshTimerRef.current = setTimeout(tick, STATUS_REFRESH_INTERVAL_MS);
+        });
+    };
+    statusRefreshTimerRef.current = setTimeout(tick, STATUS_REFRESH_INTERVAL_MS);
+    return () => {
+      disposed = true;
+      if (statusRefreshTimerRef.current !== null) {
+        clearTimeout(statusRefreshTimerRef.current);
+        statusRefreshTimerRef.current = null;
+      }
+    };
+  }, [id]);
 
   // Inline preview for text-like and PDF documents.
   useEffect(() => {
@@ -208,15 +342,46 @@ export default function DocumentDetailPage() {
 
   const handleSaveTags = async () => {
     if (!doc || doc.vault_id == null) return;
+    const savedDocId = String(doc.id);
+    const savedLoadGen = loadGenRef.current;
+    const saveGen = ++savingTagGenRef.current;
     setSavingTags(true);
     try {
       const updated = await setDocumentTags(Number(doc.id), doc.vault_id, Array.from(selectedTagIds));
-      setDoc((prev) => (prev ? { ...prev, tags: updated } : prev));
+      // Issue #764 AC6: commit/toast only if THIS document is still the one on
+      // screen. Two still-current signals, both needed: the live docRef must
+      // still hold the saved id (a closed-over `doc` compare would be a
+      // tautology), AND the load generation must be unchanged — a navigation
+      // bumps loadGenRef before the next document's getDocument resolves, and
+      // in that window docRef still names the previous document, so the id
+      // check alone would let a stale save toast over the loading screen.
+      const liveDoc = docRef.current;
+      const stillCurrent =
+        loadGenRef.current === savedLoadGen &&
+        liveDoc !== null &&
+        String(liveDoc.id) === savedDocId;
+      if (!stillCurrent) return;
+      // docRef is written at this call site, never inside the updater below:
+      // React may defer or re-run updaters in the render phase, so the mirror
+      // must not depend on them (the updater keeps its own live-prev guard as
+      // a backstop against any other writer racing the slot).
+      const nextDoc = { ...liveDoc, tags: updated };
+      docRef.current = nextDoc;
+      setDoc((prev) => {
+        if (prev === null || String(prev.id) !== savedDocId) return prev;
+        return { ...prev, tags: updated };
+      });
+      // Truthful success toast: it announces the document still on screen.
       toast.success("Tags updated");
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to update tags");
     } finally {
-      setSavingTags(false);
+      // Clear only if no NEWER save started meanwhile (issue #764 AC6): a
+      // stale save's finally must not re-enable Save mid-save on the current
+      // document.
+      if (savingTagGenRef.current === saveGen) {
+        setSavingTags(false);
+      }
     }
   };
 
@@ -258,6 +423,21 @@ export default function DocumentDetailPage() {
     (chunksFailed > 0 ? `${chunksFailed} chunks failed to embed` : null);
   const partialDescription =
     status === "partial" ? (failureMessage ?? "Completed with failures") : null;
+  // Truthful failure/cancelled copy (review round 1 PRR-027/R14): there is
+  // no one-click reindex affordance to point at, so the copy states the
+  // outcome and the real remediation instead of a nonexistent "retry from
+  // Documents" action; and the message renders VISIBLE text in the Details
+  // card, not only a title attribute on a disabled button
+  // (disabled:pointer-events-none makes a title there unreachable).
+  const failedCopy =
+    status === "error" || status === "failed"
+      ? "Indexing failed"
+      : status === "cancelled"
+        ? "Indexing was cancelled"
+        : null;
+  const failedDescription = failedCopy
+    ? `${failedCopy}${failureMessage ? ` — ${failureMessage}` : ""}. Re-upload the document to index it again.`
+    : null;
 
   const handleAskAboutDocument = () => {
     if (!doc || !isSearchable) return;
@@ -301,7 +481,9 @@ export default function DocumentDetailPage() {
                 title={
                   isSearchable
                     ? "Ask questions scoped to this document"
-                    : "Waiting until indexed — available once the document is searchable"
+                    : failedCopy
+                      ? failedDescription ?? failedCopy
+                      : "Waiting until indexed — available once the document is searchable"
                 }
               >
                 <MessageSquare className="w-4 h-4 mr-1" />
@@ -330,11 +512,21 @@ export default function DocumentDetailPage() {
               {partialDescription && (
                 <p className="text-xs text-warning mt-1">{partialDescription}</p>
               )}
+              {failedDescription && (
+                <p className="text-xs text-destructive mt-1">{failedDescription}</p>
+              )}
             </div>
             <div>
               <p className="text-muted-foreground">Chunks</p>
               <p>{chunkCount}</p>
             </div>
+            {status === "processing" &&
+              Number(doc.progress_percent ?? -1) >= 0 && (
+                <div>
+                  <p className="text-muted-foreground">Progress</p>
+                  <p>{Number(doc.progress_percent).toFixed(0)}%</p>
+                </div>
+              )}
             <div>
               <p className="text-muted-foreground">Size</p>
               <p>{formatFileSize(doc.size)}</p>
@@ -354,7 +546,19 @@ export default function DocumentDetailPage() {
           <CardHeader className="pb-2 pt-3 px-4 flex flex-row flex-wrap items-center justify-between gap-2">
             <CardTitle className="text-sm">Tags</CardTitle>
             {doc.vault_id != null && (
-              <Button size="sm" variant="outline" onClick={handleSaveTags} disabled={!tagsDirty || savingTags}>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={handleSaveTags}
+                disabled={!canWriteDocVault || !tagsDirty || savingTags}
+                title={
+                  canWriteDocVault
+                    ? "Save tag changes"
+                    : docVaultPermission == null
+                      ? "Vault access could not be determined; save is unavailable"
+                      : "Write access to this vault is required to save tag changes"
+                }
+              >
                 {savingTags ? (
                   <Loader2 className="w-4 h-4 mr-1 animate-spin" />
                 ) : (

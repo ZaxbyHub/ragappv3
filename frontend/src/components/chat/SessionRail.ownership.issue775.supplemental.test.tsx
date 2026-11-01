@@ -474,7 +474,7 @@ describe("SessionRail ownership, mutation, and cache boundaries (issue #775)", (
 
     await screen.findByText("A active");
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-    fireEvent.click(within(screen.getByRole("button", { name: "Chat session: A active" })).getByRole("button", { name: "Delete session" }));
+    fireEvent.click(within(screen.getByRole("button", { name: "Chat session: A active" }).closest('[role="listitem"]') as HTMLElement).getByRole("button", { name: "Delete session" }));
     expect(useChatShellStore.getState().activeSessionId).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Chat session: B selected" }));
     expect(useChatShellStore.getState().activeSessionId).toBe("2");
@@ -497,7 +497,7 @@ describe("SessionRail ownership, mutation, and cache boundaries (issue #775)", (
 
     await screen.findByText("A active");
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-    fireEvent.click(within(screen.getByRole("button", { name: "Chat session: A active" })).getByRole("button", { name: "Delete session" }));
+    fireEvent.click(within(screen.getByRole("button", { name: "Chat session: A active" }).closest('[role="listitem"]') as HTMLElement).getByRole("button", { name: "Delete session" }));
     const [, toastOptions] = notifications.toast.mock.calls[0] as [
       string,
       { action: { onClick: () => void } },

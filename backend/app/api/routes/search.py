@@ -63,6 +63,7 @@ class SearchResult(BaseModel):
     chunk_index: int
     metadata: Dict[str, Any]
     score: float
+    score_type: str = "distance"
 
 
 class SearchResponse(BaseModel):
@@ -148,7 +149,8 @@ async def search(
         request: SearchRequest containing query text and optional limit
 
     Returns:
-        SearchResponse with list of matching chunks and similarity scores
+        SearchResponse with list of matching chunks and distance scores
+        (score = LanceDB _distance, lower is closer; score_type declares it)
 
     Raises:
         HTTPException: 500 if embedding or search operation fails
@@ -175,9 +177,14 @@ async def search(
         # Generate embedding for the query
         query_embedding = await embedding_service.embed_single(body.query)
 
-        # Initialize vector store table
+        # Initialize vector store table only when it is not already open
+        # (issue #718): init_table unconditionally acquires the store write
+        # lock that add_chunks holds across ingest+optimize+index build, so a
+        # per-request call made every /search wait on ingestion. getattr keeps
+        # test fakes without a `table` attribute on the old cold-start path.
         embedding_dim = len(query_embedding)
-        await vector_store.init_table(embedding_dim)
+        if getattr(vector_store, "table", None) is None:
+            await vector_store.init_table(embedding_dim)
 
         # Perform semantic search
         vault_id_str = str(body.vault_id) if body.vault_id is not None else None
@@ -219,6 +226,11 @@ async def search(
                     # via the /search results either.
                     metadata=whitelist_metadata_for_wire(metadata),
                     score=score,
+                    # Issue #718: declare the ordering — `score` is LanceDB's
+                    # _distance (lower = closer), which the docstring called a
+                    # similarity score. The declared contract keeps consumers
+                    # from sorting on the wrong direction.
+                    score_type="distance",
                 )
             )
 
@@ -271,8 +283,14 @@ async def get_chunk_context(
             normalized_id = _strip_reupload_hash(chunk_id)
             if normalized_id != chunk_id:
                 chunks = await vector_store.get_chunks_by_uid([normalized_id])
-    except VectorStoreError as e:
-        raise HTTPException(status_code=500, detail=f"Vector store error: {str(e)}")
+    except VectorStoreError:
+        # Issue #718: a store failure is unavailability, not absence — 503
+        # with a fixed generic detail (no exception text; the old branch was
+        # unreachable dead code that would have echoed raw exception text).
+        logger.error(
+            "Chunk context lookup failed: vector store unavailable", exc_info=True
+        )
+        raise HTTPException(status_code=503, detail="vector store unavailable")
 
     if not chunks:
         raise HTTPException(status_code=404, detail="Chunk not found")
@@ -335,11 +353,27 @@ async def get_chunk_context(
             center_idx_int = int(center_idx)
         except (TypeError, ValueError):
             center_idx_int = 0
+        # Issue #718 review F-018: multi-scale indexing numbers every scale
+        # from 0, so the window MUST filter by the center chunk's scale or it
+        # mixes scales and returns wrong-region rows.
+        center_scale = _record_get(
+            chunk, "chunk_scale", metadata.get("chunk_scale")
+        )
         get_range = getattr(vector_store, "get_chunks_by_file_range", None)
         if get_range is not None:
+            # Only pass the scale filter when the center chunk carries one:
+            # duck-typed stores (and single-scale tables) keep the legacy
+            # unfiltered call shape.
+            range_kwargs: Dict[str, Any] = {}
+            if center_scale:
+                range_kwargs["chunk_scale"] = str(center_scale)
             try:
                 neighbors = await get_range(
-                    file_id, center_idx_int, context_before, context_after
+                    file_id,
+                    center_idx_int,
+                    context_before,
+                    context_after,
+                    **range_kwargs,
                 )
             except (OSError, RuntimeError, ValueError):
                 neighbors = []
@@ -582,8 +616,18 @@ async def unified_search(
         # Title substring match with the same visibility rules as
         # GET /chat/sessions: admins see the vault's sessions, non-admins
         # only their own (plus unowned) ones.
-        chat_sql = "SELECT id, vault_id, title FROM chat_sessions WHERE LOWER(title) LIKE ?"
-        chat_params: List[Any] = [f"%{query_lower}%"]
+        chat_sql = (
+            "SELECT id, vault_id, title FROM chat_sessions "
+            "WHERE LOWER(title) LIKE ? ESCAPE '\\'"
+        )
+        # Issue #718: escape LIKE wildcards so a user query of % or _
+        # matches literally instead of every title.
+        escaped_query = (
+            query_lower.replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
+        chat_params: List[Any] = [f"%{escaped_query}%"]
         if scope_vaults:
             placeholders = ",".join("?" * len(scope_vaults))
             chat_sql += f" AND vault_id IN ({placeholders})"

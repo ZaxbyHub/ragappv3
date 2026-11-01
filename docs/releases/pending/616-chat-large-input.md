@@ -81,3 +81,10 @@ time. Full trace under `.agents/issue-traces/chat-char-limit-browser-crash/`
   this matches the existing attachment contract. Scoping a question to
   specific attachments via `document_ids` remains a separate,
   pre-existing mechanism (unchanged).
+- **Update (PR #988, #922):** the backend now caps a LIVE chat message at
+  `CHAT_MESSAGE_MAX_CHARS` (default 20,000) with a 422 — see that PR's
+  release fragment. The 100,000 value here is the COMPOSER's inline-input
+  cap only; the "contradicted no backend contract" sentence above was
+  true when written but no longer holds for live messages. Aligning the
+  composer gate with the server cap and surfacing the server's 422 detail
+  is tracked as a follow-up from PR #988.

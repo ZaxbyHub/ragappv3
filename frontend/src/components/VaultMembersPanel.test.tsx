@@ -1,7 +1,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, waitFor, act, fireEvent } from '@testing-library/react';
+import { render, screen, waitFor, act, fireEvent , within } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { VaultMembersPanel } from '@/components/VaultMembersPanel';
+// Issue #771 (UI-ENH-05): the below-sm card list duplicates member
+// text next to the desktop table; scope data queries to the table subtree
+// (a card-only regression still fails these assertions).
+const inTable = () => within(screen.getByRole('table'));
+
 
 // Mock apiClient
 vi.mock('@/lib/api', () => ({
@@ -133,10 +138,10 @@ describe('VaultMembersPanel', () => {
     });
 
     await waitFor(() => {
-      expect(screen.getByText('Alice Johnson')).toBeInTheDocument();
-      expect(screen.getByText('@alice')).toBeInTheDocument();
-      expect(screen.getByText('Bob Smith')).toBeInTheDocument();
-      expect(screen.getByText('@bob')).toBeInTheDocument();
+      expect(inTable().getByText('Alice Johnson')).toBeInTheDocument();
+      expect(inTable().getByText('@alice')).toBeInTheDocument();
+      expect(inTable().getByText('Bob Smith')).toBeInTheDocument();
+      expect(inTable().getByText('@bob')).toBeInTheDocument();
     });
   });
 
@@ -161,7 +166,9 @@ describe('VaultMembersPanel', () => {
     });
 
     await waitFor(() => {
-      const removeButtons = document.querySelectorAll('button[aria-label*="Remove"]');
+      // Issue #771: scope to the desktop table subtree — the below-sm card
+      // list carries the same aria-labels by design.
+      const removeButtons = inTable().queryAllByRole('button', { name: /Remove/ });
       expect(removeButtons.length).toBe(2);
     });
   });
@@ -175,7 +182,7 @@ describe('VaultMembersPanel', () => {
     });
 
     await waitFor(() => {
-      expect(screen.getByText(/no members yet/i)).toBeInTheDocument();
+      expect(screen.getAllByText(/no members yet/i).length).toBeGreaterThan(0);
     });
   });
 
@@ -214,9 +221,9 @@ describe('VaultMembersPanel', () => {
       () => new Promise((resolve) => { resolveRemoval = resolve; }),
     );
     await act(async () => { render(<VaultMembersPanel vaultId={1} />); });
-    await waitFor(() => expect(screen.getByText('Alice Johnson')).toBeInTheDocument());
+    await waitFor(() => expect(inTable().getByText('Alice Johnson')).toBeInTheDocument());
 
-    fireEvent.click(screen.getByRole('button', { name: 'Remove alice from vault' }));
+    fireEvent.click(inTable().getByRole('button', { name: 'Remove alice from vault' }));
     fireEvent.click(screen.getByRole('button', { name: 'Remove', exact: true }));
     await waitFor(() => expect(apiClient.delete).toHaveBeenCalledTimes(1));
     fireEvent.click(screen.getByRole('button', { name: 'Simulate dialog dismissal' }));
@@ -238,9 +245,9 @@ describe('VaultMembersPanel', () => {
       () => new Promise((_, reject) => { rejectRemoval = reject; }),
     );
     await act(async () => { render(<VaultMembersPanel vaultId={1} />); });
-    await waitFor(() => expect(screen.getByText('Alice Johnson')).toBeInTheDocument());
+    await waitFor(() => expect(inTable().getByText('Alice Johnson')).toBeInTheDocument());
 
-    fireEvent.click(screen.getByRole('button', { name: 'Remove alice from vault' }));
+    fireEvent.click(inTable().getByRole('button', { name: 'Remove alice from vault' }));
     fireEvent.click(screen.getByRole('button', { name: 'Remove', exact: true }));
     await waitFor(() => expect(apiClient.delete).toHaveBeenCalledTimes(1));
     fireEvent.click(screen.getByRole('button', { name: 'Simulate dialog dismissal' }));
@@ -251,6 +258,6 @@ describe('VaultMembersPanel', () => {
     expect(screen.getByRole('button', { name: 'Cancel' })).toBeEnabled();
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
     expect(screen.queryByTestId('dialog')).not.toBeInTheDocument();
-    expect(screen.getByText('Alice Johnson')).toBeInTheDocument();
+    expect(inTable().getByText('Alice Johnson')).toBeInTheDocument();
   });
 });

@@ -43,7 +43,7 @@ class FakeCrossEncoder:
     def __init__(self, model_id):
         self.model_id = model_id
 
-    def predict(self, pairs):
+    def predict(self, pairs, activation_fn=None):
         logits = [0.9] if len(pairs) == 1 else [0.9, 0.1]
         PREDICT_CALLS.append((len(pairs), list(logits)))
         return logits

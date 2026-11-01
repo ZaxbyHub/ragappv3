@@ -5,14 +5,31 @@ Provides per-vault upload directories and handles migration from legacy flat str
 """
 
 import logging
+import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 from app.config import settings
+from app.services.atomic_write import temp_sibling
 
 logger = logging.getLogger(__name__)
+
+
+def _unlink_quietly(path: Path) -> None:
+    """Best-effort unlink that never raises.
+
+    Cleanup runs on failure paths, so a failure to delete the artifact must
+    not mask the original error — nor, in a per-file loop, abort the
+    remaining files (issue #786 review PRR-006). An un-unlinkable temp is a
+    canonical watcher-skipped ``.part``, so it is logged and left behind
+    rather than raised.
+    """
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("Could not remove upload temp %s: %s", path, exc)
 
 
 @dataclass
@@ -128,21 +145,35 @@ def migrate_uploads(dry_run: bool = False) -> MigrationResult:
             migrated += 1
             continue
 
+        # Copy to a canonical temp sibling and size-check BEFORE anything
+        # reaches the watched destination path (issue #786): a kill mid-copy
+        # leaves a `.part` artifact FileWatcher skips, not a truncated
+        # document the next scan ingests.
+        temp_path = temp_sibling(dest_path)
         try:
             # Copy to new location
-            shutil.copy2(f, dest_path)
+            shutil.copy2(f, temp_path)
 
             # Verify size match
-            if f.stat().st_size != dest_path.stat().st_size:
-                dest_path.unlink()  # Rollback copy
+            if f.stat().st_size != temp_path.stat().st_size:
+                _unlink_quietly(temp_path)  # Rollback copy
                 failed.append(f.name)
                 logger.warning(f"Size mismatch for {f.name}, skipping")
                 continue
+
+            # Bytes complete and size-verified: place them atomically.
+            os.replace(temp_path, dest_path)
 
             # Rename source instead of deleting - safe backup
             backup_path = f.with_suffix(f.suffix + ".migrated")
             f.rename(backup_path)
         except Exception as e:
+            # Best-effort cleanup: an unlink that itself raises (a Windows
+            # sharing violation on the temp, say) must NOT escape this arm —
+            # it would abort the whole per-file loop and drop every remaining
+            # file's migration, including the MigrationResult (issue #886
+            # review PRR-006).
+            _unlink_quietly(temp_path)
             failed.append(f.name)
             logger.error(f"Failed to migrate {f.name}: {e}")
             continue

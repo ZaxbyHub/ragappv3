@@ -14,7 +14,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { FilterToggle, FilterToggleGroup } from "@/components/ui/filter-toggle-group";
 import { AlertCircle, Layers, Search, Plus, Activity } from "lucide-react";
 import { PageTitleHeader } from "@/components/layout/PageTitleHeader";
 import { EmptyState } from "@/components/EmptyState";
@@ -318,15 +318,24 @@ export default function WikiPage() {
               </Button>
             </div>
           </div>
-          <Tabs value={activeType} onValueChange={setActiveType}>
-            <TabsList className="flex-wrap h-auto gap-1">
-              {PAGE_TYPES.map((t) => (
-                <TabsTrigger key={t.value} value={t.value} className="text-xs">
-                  {t.label}
-                </TabsTrigger>
-              ))}
-            </TabsList>
-          </Tabs>
+          {/* Page-type filter (#865): toggle group, not a trigger-only Tabs
+              bar — Tabs triggers carry aria-controls for panels that were
+              never rendered, which axe flags as aria-valid-attr-value. */}
+          <FilterToggleGroup
+            aria-label="Filter pages by type"
+            className="h-auto flex-wrap gap-1"
+          >
+            {PAGE_TYPES.map((t) => (
+              <FilterToggle
+                key={t.value}
+                pressed={activeType === t.value}
+                className="text-xs"
+                onClick={() => setActiveType(t.value)}
+              >
+                {t.label}
+              </FilterToggle>
+            ))}
+          </FilterToggleGroup>
         </div>
       )}
 

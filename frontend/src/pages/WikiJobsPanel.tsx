@@ -290,11 +290,11 @@ function WikiJobsPanelState({
               <SelectItem value="cancelled">Cancelled</SelectItem>
             </SelectContent>
           </Select>
-          <Button variant="outline" size="sm" onClick={() => void refreshRef.current()} disabled={loading}>
+          <Button variant="outline" size="sm" onClick={() => void refreshRef.current()} disabled={loading} aria-label="Refresh jobs">
             {loading ? (
-              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />
             ) : (
-              <RefreshCw className="w-3.5 h-3.5" />
+              <RefreshCw className="w-3.5 h-3.5" aria-hidden="true" />
             )}
           </Button>
           <Button variant="outline" size="sm" onClick={handleRecompile} disabled={loading}>

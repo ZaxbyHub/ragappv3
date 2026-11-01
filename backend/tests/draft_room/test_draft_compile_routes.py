@@ -496,11 +496,13 @@ class TestCompileIdempotency(CompileRouteTestBase):
             self._connection_pool.release_connection(conn)
 
     def test_same_key_different_fingerprint_is_409(self):
-        """A fresh compile (no prior checkpoints) always normalizes every
-        requested ``start_stage`` back to ``research`` (SPEC 8.1), so two
-        first-time compiles reusing a key never differ on start_stage alone
-        -- the fingerprint also folds in ``base_revision_id``, which this
-        test varies instead to produce a genuinely different fingerprint."""
+        """The request fingerprint folds in the client's requested
+        ``start_stage`` and ``base_revision_id`` (#789: the requested stage,
+        not the normalized one -- a fresh compile always normalizes back to
+        ``research`` per SPEC 8.1, and hashing that constant would alias two
+        genuinely different requests). This test varies ``base_revision_id``
+        to produce a genuinely different fingerprint; the n05 module covers
+        the requested-stage dimension."""
         draft_id = self._draft_with_ready_input()
         first = self._compile(
             draft_id, idempotency_key="dup-key", start_stage="research", base_revision_id=None

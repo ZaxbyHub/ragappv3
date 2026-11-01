@@ -14,6 +14,22 @@ import {
   ensureCsrfTokenPhysical,
 } from "@/lib/api";
 import { useVaultStore } from "@/stores/useVaultStore";
+import { useChatStore } from "@/stores/useChatStore";
+import { useChatShellStore } from "@/stores/useChatShellStore";
+import { useUploadStore } from "@/stores/useUploadStore";
+import { useSettingsStore } from "@/stores/useSettingsStore";
+import {
+  clearAllChatDrafts,
+  invalidatePendingDraftWrites,
+} from "@/lib/chatDrafts";
+import { clearAllFeedbackVotes } from "@/lib/chatFeedbackStorage";
+import {
+  clearAllCanvasDrafts,
+  invalidatePendingCanvasDraftWrites,
+} from "@/lib/canvasDrafts";
+import { clearAllDraftBriefTemplates } from "@/lib/draftBriefTemplates";
+import { queryClient } from "@/lib/queryClient";
+import { useDraftRoomUiStore } from "@/stores/useDraftRoomUiStore";
 import { resetCitationReport } from "@/lib/api/onboarding";
 import { AuthTransportTimeoutError, type AuthOwner, captureAuthOwner, captureAuthPrincipalGeneration, enqueueAuthTransport, isCurrentAuthOwner, publishAuthPrincipal, reserveReplacementAuthOwner, StaleAuthOwnerError, subscribeAuthPrincipal } from "@/lib/api/auth-lifecycle";
 import { onJwtAccessTokenPublished } from "@/lib/api/core";
@@ -190,12 +206,114 @@ async function initializeVaultsForScope(scope: InitScope): Promise<void> {
   await useVaultStore.getState().fetchVaults();
 }
 
-// Reset init guard state (exported for testing)
+/**
+ * Reset init guard state (exported for testing).
+ */
 export const resetInitState = () => {
   initAttemptedScope = null;
   initPromiseScope = null;
   initPromise = null;
   vaultsInitializedScope = null;
+};
+
+/**
+ * Issue #823: no per-user chat state may survive an identity boundary.
+ * ChatShell's session-load fast path renders whatever `activeChatId` holds
+ * without a server re-fetch, so a different user logging in within the same
+ * tab could otherwise see the previous user's transcript; the composer's
+ * unsent input, its persisted localStorage drafts, the shell's session
+ * title/evidence/search/pins, the feedback-vote mirror, and the upload
+ * store's attachment registrations and in-flight transfers are the same
+ * content class. Called ONLY at real credential boundaries: `logout` (after
+ * the auth resets), a different-principal `register`, and a
+ * different-principal `login` at its credential-publication instant.
+ */
+const resetChatStateForIdentitySwitch = () => {
+  // Kill delayed writers FIRST so they cannot re-create cleared state:
+  // pending draft debounce timers / unmount flushes, and async upload
+  // completions / queue continuations of the outgoing identity. Issue
+  // #1032: the canvas draft writers are the same delayed-writer class
+  // (debounce timer + unmount/artifact-switch flushes in CanvasPage).
+  invalidatePendingDraftWrites();
+  invalidatePendingCanvasDraftWrites();
+  useChatStore.getState().newChat();
+  useChatStore.getState().setInput("");
+  useChatStore.getState().setInputError(null);
+  // Best-effort wipes can partially fail on a degraded storage surface; the
+  // principal-scoped key namespaces keep the residue unreadable to the next
+  // principal, and the counts are logged so the residual is observable
+  // rather than silent (hermes review, final head). Issue #1032 extends the
+  // same contract to the canvas draft namespace.
+  const draftRemovalFailures = clearAllChatDrafts();
+  if (draftRemovalFailures > 0) {
+    console.warn(
+      "identity_switch_draft_wipe_incomplete failed_keys=%d",
+      draftRemovalFailures
+    );
+  }
+  const canvasDraftRemovalFailures = clearAllCanvasDrafts();
+  if (canvasDraftRemovalFailures < 0) {
+    // Enumeration itself failed: the wipe completeness is unknown, so the
+    // residual is unobservable (multi-stage review). Principal-scoped keys
+    // keep any residue unreadable to the next principal either way.
+    console.warn(
+      "identity_switch_canvas_draft_wipe_unknown storage_enumeration_failed"
+    );
+  } else if (canvasDraftRemovalFailures > 0) {
+    console.warn(
+      "identity_switch_canvas_draft_wipe_incomplete failed_keys=%d",
+      canvasDraftRemovalFailures
+    );
+  }
+  const feedbackRemovalFailures = clearAllFeedbackVotes();
+  if (feedbackRemovalFailures > 0) {
+    console.warn(
+      "identity_switch_feedback_wipe_incomplete failed_keys=%d",
+      feedbackRemovalFailures
+    );
+  }
+  // Issue #1036 AC2: saved brief templates are user-authored content in the
+  // same class as chat drafts and feedback votes. The keys are
+  // principal-scoped, so any residue a degraded storage surface leaves
+  // behind stays unreadable to the next principal.
+  const briefTemplateRemovalFailures = clearAllDraftBriefTemplates();
+  if (briefTemplateRemovalFailures < 0) {
+    console.warn(
+      "identity_switch_brief_template_wipe_unknown storage_enumeration_failed"
+    );
+  } else if (briefTemplateRemovalFailures > 0) {
+    console.warn(
+      "identity_switch_brief_template_wipe_incomplete failed_keys=%d",
+      briefTemplateRemovalFailures
+    );
+  }
+  const shell = useChatShellStore.getState();
+  shell.setActiveSessionId(null);
+  shell.setActiveSessionTitle(null);
+  shell.resetEvidenceSelection();
+  // Review round 1 (implementation review): the rail's search box holds
+  // user-typed text and the pin list is user-scoped persisted metadata —
+  // the same content class as the fields above.
+  shell.clearIdentityScopedState();
+  useUploadStore.getState().resetForIdentitySwitch();
+  // Issue #1032: the remaining per-user surfaces outside the chat store's
+  // namespace — the app-wide React Query cache (no query key carries a
+  // principal segment) and the Draft Room UI store's unsent editor text.
+  // resetQueries() FIRST: a mounted QueryObserver keeps rendering its own
+  // #currentQuery state after clear() empties the cache map, so clear()
+  // alone leaves the previous principal's payload on screen until the next
+  // refetch; resetQueries() resets every observer to its initial state
+  // (cancelling in-flight fetches), and the subsequent clear() removes the
+  // entries outright (blind-lane probe: clear() alone -> observer still
+  // renders user A's payload; resetQueries() -> data undefined, pending).
+  queryClient.resetQueries();
+  queryClient.clear();
+  useDraftRoomUiStore.getState().resetForIdentitySwitch();
+  // PR #1048 feedback (PRR-013/K-20): the settings store now holds the
+  // admin-scoped GET /settings payload on every shell mount — a member session
+  // following an admin in this tab must not inherit it (and the shell's
+  // fill-only guard would keep it there). Full reset, not just null settings.
+  useSettingsStore.getState().resetState();
 };
 
 // Wire up CSRF via centralized api.ts utilities
@@ -386,6 +504,14 @@ export const useAuthStore = create<AuthState>()(
 
       login: async (username: string, password: string) => {
         const owner = reserveReplacementAuthOwner();
+        // Issue #823: the identity this tab's chat surface currently belongs
+        // to. A login that publishes a DIFFERENT principal — including a
+        // user-less response, whose eventual principal is unknown until
+        // fetchMe — must reset the chat surface BEFORE the new credentials
+        // are published, so no bridge subscriber or request issued on the
+        // new token can ever observe the previous user's state (reviews
+        // PRR-009/PRR-015).
+        const prevUserId = get().user?.id ?? null;
         if (isCurrentAuthOwner(owner)) resetInitState();
         if (isCurrentAuthOwner(owner)) set({ isLoading: true, initializationFailed: false });
         if (!isCurrentAuthOwner(owner)) return;
@@ -398,7 +524,15 @@ export const useAuthStore = create<AuthState>()(
           });
           if (!isCurrentAuthOwner(owner)) return;
           const { access_token, user } = response.data;
-          // Publish the holder first: bridge subscribers may issue a request
+          // Identity boundary first: same principal -> provably the same
+          // surface, no reset (a fresh boot has prevUserId null and no
+          // state to clear, so the unconditional user-less arm costs
+          // nothing there). Everything else — different id, or an unknown
+          // principal — clears before the credentials become usable.
+          if (!user || user.id !== prevUserId) {
+            resetChatStateForIdentitySwitch();
+          }
+          // Publish the holder: bridge subscribers may issue a request
           // synchronously when the store state changes.
           setJwtAccessToken(access_token);
           if (!isCurrentAuthOwner(owner)) return;
@@ -473,6 +607,17 @@ export const useAuthStore = create<AuthState>()(
             is_active: userData.is_active ?? true,
           };
 
+          // Issue #823 identity boundary (review PRR-002): register is a
+          // principal publication like login. When the registered account is
+          // a DIFFERENT principal than the one this tab's chat surface
+          // belongs to — reachable because the auth-clearing arms
+          // (refreshToken failure, init 401/403) null the principal without
+          // clearing chat, which also disables RegisterPage's authenticated
+          // redirect — clear the surface BEFORE publishing the new
+          // credentials.
+          if (!isSamePrincipal(admissionUser, user)) {
+            resetChatStateForIdentitySwitch();
+          }
           setJwtAccessToken(access_token);
           if (!isPrePublicationCurrent()) return;
           resetInitState();
@@ -519,6 +664,14 @@ export const useAuthStore = create<AuthState>()(
       },
 
       logout: (): Promise<void> => {
+        // Before-logout flush (review round 1 PRR-007): give mounted pages
+        // holding confirmed destructive intent (e.g. DocumentsPage's pending
+        // deletes) one synchronous dispatch while the bearer and CSRF
+        // credential are still valid — everything below replaces the owner,
+        // clears the token, and resets CSRF, after which any flushed delete
+        // would 401 and the intent would be lost with a spurious toast on
+        // the login screen.
+        window.dispatchEvent(new Event("ragapp:before-logout"));
         const owner = reserveReplacementAuthOwner();
         if (isCurrentAuthOwner(owner)) set({ isLoading: true });
         const operation = (async () => {
@@ -546,6 +699,9 @@ export const useAuthStore = create<AuthState>()(
           resetSubpathRefreshDiagnostic();
           resetCitationReport();
           resetInitState();
+          // Issue #823: this tab's chat surface belongs to the identity that
+          // just ended — clear it before any other user can log in here.
+          resetChatStateForIdentitySwitch();
           if (timeoutFailure) throw timeoutFailure;
           // Preserve the longstanding best-effort server logout for ordinary
           // request failures while keeping lifecycle cancellation rejecting.

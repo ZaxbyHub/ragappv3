@@ -1,10 +1,10 @@
-import { BrowserRouter, Routes, Route, Navigate, useNavigate, useLocation } from "react-router-dom";
+import { BrowserRouter, Routes, Route, Navigate, useNavigate, useLocation, useMatch } from "react-router-dom";
 import { TestModeProvider } from "@/fixtures/TestModeContext";
 import { ProtectedRoute } from "@/components/auth/ProtectedRoute";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { PageShell } from "@/components/layout/PageShell";
 import { useHealthCheck } from "@/hooks/useHealthCheck";
-import { useCallback, useEffect, useRef, lazy, Suspense } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, lazy, Suspense, type ReactNode } from "react";
 import { useAuthStore } from "@/stores/useAuthStore";
 import { useNavigationGuardStore } from "@/stores/useNavigationGuardStore";
 import type { NavItemId } from "@/components/layout/navigationTypes";
@@ -154,8 +154,11 @@ function MainAppShell({ children, testMode = false }: { children: React.ReactNod
   const navigate = useNavigate();
   const location = useLocation();
 
-  // Determine active nav item from current route
-  const getActiveItemFromPath = (pathname: string): NavItemId => {
+  // Determine active nav item from current route. null means no nav item
+  // owns the route (e.g. /search, per its own route comment) — the mobile
+  // bottom nav then marks nothing aria-current, matching the desktop rail's
+  // own null-returning mapper (issue #779 / UI-R1-08).
+  const getActiveItemFromPath = (pathname: string): NavItemId | null => {
     if (pathname.startsWith("/chat")) return "chat";
     if (pathname.startsWith("/documents")) return "documents";
     if (pathname.startsWith("/memory")) return "memory";
@@ -168,7 +171,7 @@ function MainAppShell({ children, testMode = false }: { children: React.ReactNod
     if (pathname.startsWith("/admin/users")) return "users";
     if (pathname.startsWith("/admin/organizations")) return "organizations";
     if (pathname.startsWith("/profile")) return "profile";
-    return "documents";
+    return null;
   };
 
   const activeItem = getActiveItemFromPath(location.pathname);
@@ -249,8 +252,61 @@ function MainAppShell({ children, testMode = false }: { children: React.ReactNod
   );
 }
 
+// Demo user for the dev-only fixture mode. TestModeSessionBootstrap seeds it
+// after the router establishes a basename-relative location.
+function getDemoUser() {
+  const role = import.meta.env.VITE_DEMO_ROLE || "superadmin";
+  return {
+    id: 1,
+    username: import.meta.env.VITE_DEMO_USERNAME || "demo",
+    full_name: import.meta.env.VITE_DEMO_FULL_NAME || "Demo User",
+    role: role as "superadmin" | "admin" | "member" | "viewer",
+    is_active: true,
+  };
+}
+
+// Issue #779 (UI-R3-08): in DEV fixture mode, hold every non-registration
+// route behind PageLoader until this router-local bootstrap writes the demo
+// session from a layout effect. Guards and auth-reading pages therefore mount
+// only after their first state read can see the session, without an external
+// store mutation during render. /register is deliberately ungated so its
+// public form stays reachable; readiness never resets, so logout cannot
+// reseed the demo user.
+function TestModeSessionBootstrap({ children }: { children: ReactNode }) {
+  const [ready, setReady] = useState(() => !TEST_MODE);
+  const isRegisterRoute = useMatch({ path: "/register", caseSensitive: false, end: true }) !== null;
+  const gated = TEST_MODE && !isRegisterRoute && !ready;
+
+  useLayoutEffect(() => {
+    if (!gated) return;
+
+    const getState = useAuthStore.getState as typeof useAuthStore.getState | undefined;
+    const currentState = getState?.();
+    if (!currentState?.isAuthenticated) {
+      const setState = useAuthStore.setState as typeof useAuthStore.setState | undefined;
+      setState?.({
+        user: getDemoUser(),
+        accessToken: "demo-token",
+        isAuthenticated: true,
+        isInitialized: true,
+        needsSetup: false,
+        isLoading: false,
+        authMode: "jwt",
+      });
+    }
+    setReady(true);
+  }, [gated]);
+
+  if (gated) {
+    return <PageLoader />;
+  }
+
+  return <>{children}</>;
+}
+
 function App() {
   const initAuth = useAuthStore((state) => state.init);
+
   const health = useHealthCheck({ pollInterval: 30000 });
 
   useEffect(() => {
@@ -265,8 +321,9 @@ function App() {
       <BrowserRouter
         basename={APP_BASENAME || undefined}
       >
-        <Suspense fallback={<PageLoader />}>
-          <Routes>
+        <TestModeSessionBootstrap>
+          <Suspense fallback={<PageLoader />}>
+            <Routes>
               <Route path="/setup" element={<SetupPage />} />
               <Route path="/register" element={<RegisterPage />} />
               <Route path="/login" element={<LoginPage />} />
@@ -488,8 +545,9 @@ function App() {
 
               {/* H-12 fix: Proper 404 page instead of silently rendering DocumentsPage */}
               <Route path="/*" element={<NotFoundPage />} />
-            </Routes>
+              </Routes>
           </Suspense>
+        </TestModeSessionBootstrap>
       </BrowserRouter>
     </ErrorBoundary>
   );

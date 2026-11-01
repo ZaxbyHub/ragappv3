@@ -6,9 +6,11 @@ import type { WikiReference } from "@/lib/api";
 
 interface WikiCardProps {
   wikiRef: WikiReference;
+  /** Per-label support score from the done payload (issue #714); undefined = none. */
+  supportScore?: number;
 }
 
-function WikiCard({ wikiRef }: WikiCardProps) {
+function WikiCard({ wikiRef, supportScore }: WikiCardProps) {
   const [expanded, setExpanded] = useState(false);
   const navigate = useNavigate();
   const body = wikiRef.claim_text ?? wikiRef.excerpt ?? "";
@@ -64,6 +66,16 @@ function WikiCard({ wikiRef }: WikiCardProps) {
                 <span className="capitalize">{statusLabel}</span>
               </>
             )}
+            {supportScore != null && (
+              <>
+                <span aria-hidden>·</span>
+                <span
+                  title="Word overlap between the claim sentence and the cited evidence — a lexical measure, not a correctness probability"
+                >
+                  Support {Math.round(supportScore * 100)}%
+                </span>
+              </>
+            )}
             {(wikiRef.page_id != null || wikiRef.slug) && (
               <button
                 type="button"
@@ -111,9 +123,11 @@ function WikiCard({ wikiRef }: WikiCardProps) {
 
 interface WikiCardsProps {
   wikiRefs: WikiReference[];
+  /** Per-label support scores from the done payload; key = wiki_label (issue #714). */
+  citationConfidence?: Record<string, number>;
 }
 
-export function WikiCards({ wikiRefs }: WikiCardsProps) {
+export function WikiCards({ wikiRefs, citationConfidence }: WikiCardsProps) {
   if (!wikiRefs || wikiRefs.length === 0) return null;
   return (
     <div className="mt-3 space-y-2" data-testid="wiki-cards">
@@ -123,7 +137,11 @@ export function WikiCards({ wikiRefs }: WikiCardsProps) {
       </div>
       <div className="space-y-1.5">
         {wikiRefs.map((w) => (
-          <WikiCard key={w.wiki_label} wikiRef={w} />
+          <WikiCard
+            key={w.wiki_label}
+            wikiRef={w}
+            supportScore={citationConfidence?.[w.wiki_label]}
+          />
         ))}
       </div>
     </div>

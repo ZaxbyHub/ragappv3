@@ -252,6 +252,7 @@ On first launch, you'll be redirected to the **Setup Wizard** (`/setup`) to crea
 | `MEMORY_RRF_MIN_SCORE` | `0.005` | Minimum fused RRF score for hybrid memory retrieval. Candidates below this are discarded. |
 | `MEMORY_CONTEXT_TOP_K` | `3` | Maximum number of memories injected into each prompt after relevance filtering. |
 | `CHAT_RATE_LIMIT` | `30` | Maximum chat requests per minute per user (0 = unlimited) |
+| `CHAT_MESSAGE_MAX_CHARS` | `20000` | Maximum length in characters of a live chat message (POST /api/chat and the final message of POST /api/chat/stream). Prior-turn history is not bounded. |
 | `SEARCH_RATE_LIMIT` | `30` | Maximum search requests per minute per user (0 = unlimited) |
 | `VAULT_CREATE_RATE_LIMIT` | `30` | Maximum vault creation requests per minute per user (0 = unlimited) |
 | `MEMORY_MUTATION_RATE_LIMIT` | `30` | Maximum memory create/update/delete requests per minute per user (0 = unlimited) |
@@ -402,6 +403,53 @@ docker compose logs knowledgevault
 4. Ensure Ollama has GPU access if available
 
 ## Upgrading
+
+### Upgrading from v1.1.0 or any pre-#353 store (embedding identity fail-closed)
+
+If your data directory was created by v1.1.0 or any version before the embedding
+identity sidecar landed (#353, resolving #220), the vector store intentionally
+**fails closed** on the first boot after upgrading: chat and search return
+**503 "Embedding model mismatch — admin reindex required"** because the stored
+index predates embedding-model identity tracking, and serving it against an
+unknown model would silently corrupt retrieval. This is by design.
+
+To clear it, start a full reindex. The route is admin- and CSRF-protected
+(double-submit: fetch a token, send the cookie it sets plus the same value as
+an `X-CSRF-Token` header), and it takes a JSON body — `vault_id` omitted means
+all vaults:
+
+```bash
+# 1) Fetch a CSRF token (prints {"csrf_token": "..."} and saves the matching
+#    cookie into kv.cookies)
+curl -s -c kv.cookies http://localhost:9090/api/csrf-token
+
+# 2) Start the reindex. <admin token> is the access_token from
+#    POST /api/auth/login, or ADMIN_SECRET_TOKEN when USERS_ENABLED=false.
+#    Returns immediately: {"job_id": 1, "status": "pending", "vault_id": null}
+curl -X POST http://localhost:9090/api/documents/reindex \
+  -H "Authorization: Bearer <admin token>" \
+  -H "X-CSRF-Token: <csrf token>" -b kv.cookies \
+  -H "Content-Type: application/json" \
+  -d '{}'
+
+# 3) Poll the job (same auth headers and cookie) until "status": "completed".
+# The job-status GET is read-only: no CSRF handshake is needed, the admin
+# bearer is sufficient.
+curl -H "Authorization: Bearer <admin token>" -b kv.cookies \
+  http://localhost:9090/api/documents/reindex/jobs/<job_id>
+```
+
+The POST returns immediately with a `job_id`; the background job re-embeds
+every vault into a fresh index and records the embedding identity, and chat
+and search come back up once its status reaches `completed`. (The Harrier
+dimension-change migration below is the heavier, offline variant of the same
+re-index requirement.)
+
+One caveat: the job only re-embeds files whose status is `indexed` or `error`.
+A store with no such rows reports `completed` with `"processed": 0` **without**
+recording an identity, so the 503 persists and re-running changes nothing — in
+that case use the offline migration script below, which wipes the index (the
+next start records the identity on the fresh table).
 
 ### Embedding Dimension Change (Harrier Migration)
 

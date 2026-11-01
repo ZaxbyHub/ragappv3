@@ -336,13 +336,37 @@ async def _perform_memory_search(
     vault_id: Optional[int] = None,
     include_global: bool = False,
 ) -> List[MemoryResponse]:
+    # Precompute the query embedding ON THIS LOOP (issue #712) so the sync
+    # search below never spins a fresh event loop against the main-loop-bound
+    # embedding client. Own try/except: any precompute failure (service error
+    # or a store double without an awaitable embed_query) degrades to
+    # WARNING + FTS-only; the kwarg is still PASSED (as None) so the store's
+    # never-attempted WARNING cannot misfire on an attempted-but-failed
+    # precompute. Store doubles without an embedding_service attribute get
+    # no kwarg at all.
+    has_embedder = (
+        getattr(memory_store, "embedding_service", None) is not None
+    )
+    query_embedding = None
+    if has_embedder and query and query.strip():
+        try:
+            query_embedding = await memory_store.embed_query(query)
+        except Exception as exc:  # noqa: BLE001 — degrade, not fail the request
+            logger.warning(
+                "Memory query embedding precompute failed; continuing "
+                "FTS-only: %s",
+                exc,
+            )
+            query_embedding = None
+    search_kwargs: dict = {"vault_id": vault_id, "include_global": include_global}
+    if has_embedder:
+        search_kwargs["query_embedding"] = query_embedding
     try:
         records = await asyncio.to_thread(
             memory_store.search_memories,
             query=query,
             limit=limit,
-            vault_id=vault_id,
-            include_global=include_global,
+            **search_kwargs,
         )
     except MemoryStoreError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -520,6 +544,31 @@ async def create_memory(
             len(body.content),
         )
         raise HTTPException(status_code=500, detail="Server error")
+
+    # Embed on THIS loop right after the insert (issue #712): add_memory no
+    # longer bridges into the embedding service synchronously. Best-effort —
+    # a failure leaves the row FTS-only (observable via the WARNING); the
+    # healing paths are the startup backfill task and the superadmin
+    # backfill route, NOT a periodic timer, so the row stays FTS-only for
+    # this process's lifetime if both are missed.
+    if getattr(memory_store, "embedding_service", None) is not None:
+        try:
+            outcome = await memory_store.embed_and_store(record.id, body.content)
+            if outcome != "stored":
+                logger.warning(
+                    "Memory stored without embedding (id=%s, outcome=%s); "
+                    "dense recall degraded to FTS-only for this row until "
+                    "backfill",
+                    record.id,
+                    outcome,
+                )
+        except Exception:  # noqa: BLE001 — never fail the created row
+            logger.warning(
+                "Memory embedding after create failed (id=%s); dense recall "
+                "degraded to FTS-only for this row until backfill",
+                record.id,
+                exc_info=True,
+            )
 
     return _memory_record_to_response(record)
 
@@ -745,9 +794,25 @@ async def update_memory(
         # embed_and_store is best-effort: if the embedding service is down, FTS
         # fallback remains intact and the old embedding (now stale) is NULLed first
         # inside the method so searches won't use misleading vectors.
-        if content_changed and body.content is not None:
+        if (
+            content_changed
+            and body.content is not None
+            # "skipped" means no embedding service is configured at all — an
+            # FTS-only deployment, not a degradation to warn about.
+            and getattr(memory_store, "embedding_service", None) is not None
+        ):
             try:
-                await memory_store.embed_and_store(memory_id, body.content)
+                outcome = await memory_store.embed_and_store(memory_id, body.content)
+                if outcome != "stored":
+                    logger.warning(
+                        "Memory update left the row without an embedding "
+                        "(id=%s, outcome=%s); dense recall degraded to "
+                        "FTS-only for this row (healed by the startup "
+                        "backfill task or the superadmin backfill route, not "
+                        "on a timer)",
+                        memory_id,
+                        outcome,
+                    )
             except Exception:
                 logger.warning(
                     "Could not recompute embedding for memory %d after content update",

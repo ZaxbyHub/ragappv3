@@ -1,16 +1,19 @@
 """Admin-gated API endpoints for prompt versioning (FR-007).
 
-All endpoints require admin:config scope and CSRF protection.
+All endpoints require admin:config scope. CSRF protection applies to
+mutating routes only — safe (GET) methods are exempt per
+docs/engineering/conventions.md.
 """
 
 import asyncio
+import re
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from app.config import settings
 from app.models.database import get_pool
-from app.security import csrf_protect, require_scope
+from app.security import admin_scope_fingerprint, csrf_protect, require_scope
 from app.services.ab_testing import ABTestingService
 from app.services.prompt_store import PromptVersionStore
 
@@ -54,6 +57,7 @@ class CreatePromptVersionResponse(BaseModel):
     version: str
     created_at: str
     is_active: bool
+    warning: str | None = None
 
 
 class ActivatePromptVersionResponse(BaseModel):
@@ -70,7 +74,6 @@ class ActivatePromptVersionResponse(BaseModel):
 @router.get("", response_model=list[PromptVersionMetadata])
 async def list_prompt_versions(
     _auth: dict = Depends(require_scope("admin:config")),
-    _csrf_token: str = Depends(csrf_protect),
 ) -> list[PromptVersionMetadata]:
     """List all prompt versions (metadata only, no full content)."""
     pool = get_pool(str(settings.sqlite_path))
@@ -95,7 +98,6 @@ async def list_prompt_versions(
 @router.get("/active", response_model=PromptVersionContent | None)
 async def get_active_prompt_version(
     _auth: dict = Depends(require_scope("admin:config")),
-    _csrf_token: str = Depends(csrf_protect),
 ) -> PromptVersionContent | None:
     """Get the currently-active prompt version (metadata + content)."""
     pool = get_pool(str(settings.sqlite_path))
@@ -136,6 +138,26 @@ async def create_prompt_version(
     if not payload.content.strip():
         raise HTTPException(status_code=400, detail="content cannot be empty")
 
+    # Stored content feeds downstream parsing (citation-label vocabulary +
+    # SECURITY BOUNDARY untrusted-tag contract). Replacing the default prompt
+    # without those markers degrades citation enforcement and prompt-injection
+    # defenses, so surface an explicit warning instead of failing silently.
+    warning: str | None = None
+    missing = []
+    if not re.search(r"\[[SWKM]\d+\]", payload.content):
+        missing.append(
+            "citation-label vocabulary ([S#]/[W#]/[K#]/[M#])"
+        )
+    if "SECURITY BOUNDARY" not in payload.content:
+        missing.append("SECURITY BOUNDARY untrusted-tag directive")
+    if missing:
+        warning = (
+            "Stored content is missing the "
+            + " and ".join(missing)
+            + "; downstream citation parsing and the untrusted-tag security "
+            "boundary depend on them."
+        )
+
     pool = get_pool(str(settings.sqlite_path))
     conn = await pool.get_connection_async()
     try:
@@ -145,13 +167,15 @@ async def create_prompt_version(
             payload.version.strip(),
             payload.content,
             activate=payload.activate,
-            created_by=_auth.get("user_id"),
+            # Non-secret scope fingerprint — never the bearer token itself.
+            created_by=admin_scope_fingerprint(_auth.get("user_id", "")),
         )
         return CreatePromptVersionResponse(
             id=created.id,
             version=created.version,
             created_at=created.created_at,
             is_active=created.is_active,
+            warning=warning,
         )
     except Exception as exc:
         if "UNIQUE constraint failed" in str(exc):
@@ -324,7 +348,6 @@ async def create_ab_experiment(
 @router.get("/ab-experiments", response_model=list[ExperimentResponse])
 async def list_ab_experiments(
     _auth: dict = Depends(require_scope("admin:config")),
-    _csrf_token: str = Depends(csrf_protect),
 ) -> list[ExperimentResponse]:
     """List all A/B experiments with per-variant exposure counts."""
     pool = get_pool(str(settings.sqlite_path))
@@ -414,7 +437,6 @@ async def end_ab_experiment(
 async def get_prompt_version(
     version: str,
     _auth: dict = Depends(require_scope("admin:config")),
-    _csrf_token: str = Depends(csrf_protect),
 ) -> PromptVersionContent:
     """Recover a prior prompt version by name (returns full content)."""
     pool = get_pool(str(settings.sqlite_path))

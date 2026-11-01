@@ -59,6 +59,7 @@ from app.services.artifact_store import (
     resolve_confined,
     sniff_raster_mime,
 )
+from app.services.atomic_write import temp_sibling
 from app.services.background_tasks import BackgroundProcessor
 from app.services.document_processor import (
     DocumentProcessingError,
@@ -66,7 +67,8 @@ from app.services.document_processor import (
     DuplicateFileError,
 )
 from app.services.embeddings import EmbeddingService
-from app.services.fts_query import build_fts_match_query
+from app.services.fts_query import FTS_SNIPPET_MAX_COLUMN_BYTES, build_fts_match_query
+from app.services.job_lease import redact_legacy_result_json
 from app.services.near_duplicates import (
     clear_file_centroid,
     get_near_duplicate_group,
@@ -161,7 +163,11 @@ async def _safe_record_action(
         await asyncio.to_thread(conn.commit)
     except Exception as exc:  # noqa: BLE001 — audit failures must not propagate
         logger.warning(
-            "Audit logging failed (%s/%s) for file_id=%s: %s", action, status, file_id, exc
+            "Audit logging failed (%s/%s) for file_id=%s: %s",
+            action,
+            status,
+            file_id,
+            exc,
         )
 
 
@@ -230,7 +236,9 @@ async def retry_document(
 ) -> dict:
     try:
         cursor = await asyncio.to_thread(
-            conn.execute, "SELECT file_path, vault_id FROM files WHERE id = ?", (file_id,)
+            conn.execute,
+            "SELECT file_path, vault_id FROM files WHERE id = ?",
+            (file_id,),
         )
         row = await asyncio.to_thread(cursor.fetchone)
         if not row:
@@ -460,9 +468,7 @@ async def retry_failed_chunks(
         raise HTTPException(status_code=404, detail="Document not found")
 
     if not await evaluate(user, "vault", file_row["vault_id"], "admin"):
-        raise HTTPException(
-            status_code=403, detail="Insufficient vault permissions"
-        )
+        raise HTTPException(status_code=403, detail="Insufficient vault permissions")
 
     processor = DocumentProcessor(
         chunk_size_chars=settings.chunk_size_chars,
@@ -531,7 +537,9 @@ class DocumentResponse(BaseModel):
     chunk_count: int
     chunks_failed: int = 0  # Chunks dropped due to embedding failures (Issue #221)
     failed_chunks: int = 0  # Count of failed chunks eligible for retry (Issue #396)
-    failed_chunk_ids: List[int] = Field(default_factory=list)  # Chunk indices (Issue #396)
+    failed_chunk_ids: List[int] = Field(
+        default_factory=list
+    )  # Chunk indices (Issue #396)
     size: Optional[int] = None  # Frontend expects size
     created_at: Optional[str]
     processed_at: Optional[str]
@@ -546,7 +554,9 @@ class DocumentResponse(BaseModel):
     processing_started_at: Optional[str] = None
     enrichment_status: Optional[str] = None
     enrichment_error: Optional[str] = None
-    enrichment_enabled: Optional[bool] = None  # Per-file override (null=inherit vault/global)
+    enrichment_enabled: Optional[bool] = (
+        None  # Per-file override (null=inherit vault/global)
+    )
     effective_enrichment_enabled: bool = False  # Resolved effective state
     # Advisory near-duplicate group (issue #513 W26): shared group_id when this
     # file's chunk-embedding centroid is near-identical to another file's in
@@ -660,6 +670,13 @@ class ReindexJobStatusResponse(BaseModel):
     created_at: Optional[str] = None
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
+    # issue #1010: True for a RUNNING row whose progress watermark
+    # (progress_at, falling back to started_at/created_at) is older than
+    # jobs_stall_timeout_seconds — a machine-readable no-progress signal.
+    # A dead worker's row ALSO reads stalled=1 until the janitor's
+    # heartbeat-age arm flips it out of 'running'; the watchdog (not the
+    # reader) is what distinguishes live-stalled from dead.
+    stalled: bool = False
 
 
 class ReindexJobListResponse(BaseModel):
@@ -721,9 +738,7 @@ def _build_order_clause(sort_by: str, sort_order: str) -> str:
     return f"ORDER BY {column} {direction}, id {direction}"
 
 
-def _near_duplicate_group_for(
-    conn: sqlite3.Connection, file_id: int
-) -> Optional[str]:
+def _near_duplicate_group_for(conn: sqlite3.Connection, file_id: int) -> Optional[str]:
     """Advisory near-duplicate group for a single document (issue #513 W26).
 
     Best-effort by construction: the field is pure metadata, so a missing
@@ -736,9 +751,7 @@ def _near_duplicate_group_for(
         return None
 
 
-def _near_duplicate_groups_for(
-    conn: sqlite3.Connection, file_ids: List[int]
-) -> dict:
+def _near_duplicate_groups_for(conn: sqlite3.Connection, file_ids: List[int]) -> dict:
     """Advisory near-duplicate groups for a page of documents in ONE query.
 
     Batched companion of ``_near_duplicate_group_for`` so list projections
@@ -851,7 +864,9 @@ def _resolve_page_enrichment(
     needed_vaults = {row["vault_id"] for row in rows if _needs_resolution(row)}
     if not needed_vaults:
         return {}
-    vault_overrides: dict = {vid: settings.chunk_enrichment_enabled for vid in needed_vaults}
+    vault_overrides: dict = {
+        vid: settings.chunk_enrichment_enabled for vid in needed_vaults
+    }
     try:
         placeholders = ",".join("?" * len(needed_vaults))
         override_rows = conn.execute(
@@ -898,9 +913,7 @@ def _row_to_document_response(
     file_name = row["file_name"]
     chunk_count = row["chunk_count"] or 0
     chunks_failed = (row["chunks_failed"] if "chunks_failed" in keys else 0) or 0
-    failed_chunks_count = (
-        row["failed_chunks"] if "failed_chunks" in keys else None
-    )
+    failed_chunks_count = row["failed_chunks"] if "failed_chunks" in keys else None
     failed_chunk_ids_raw = (
         row["failed_chunk_ids"] if "failed_chunk_ids" in keys else None
     )
@@ -932,7 +945,9 @@ def _row_to_document_response(
     processing_started_at = (
         row["processing_started_at"] if "processing_started_at" in keys else None
     )
-    enrichment_status = row["enrichment_status"] if "enrichment_status" in keys else None
+    enrichment_status = (
+        row["enrichment_status"] if "enrichment_status" in keys else None
+    )
     enrichment_error = row["enrichment_error"] if "enrichment_error" in keys else None
     folder_id = row["folder_id"] if "folder_id" in keys else None
     # Partial-success marker + parse-quality diagnostics (issues #514
@@ -940,16 +955,16 @@ def _row_to_document_response(
     # stage persisted; a malformed/legacy value degrades to None rather than
     # failing the read.
     partial_embeddings = (
-        int(row["partial_embeddings"] or 0)
-        if "partial_embeddings" in keys
-        else 0
+        int(row["partial_embeddings"] or 0) if "partial_embeddings" in keys else 0
     )
     extraction_diagnostics = _parse_extraction_diagnostics(
         row["extraction_diagnostics"] if "extraction_diagnostics" in keys else None
     )
 
     # Per-file enrichment override
-    file_enrichment_raw = row["enrichment_enabled"] if "enrichment_enabled" in keys else None
+    file_enrichment_raw = (
+        row["enrichment_enabled"] if "enrichment_enabled" in keys else None
+    )
     file_enrichment_override: Optional[bool] = None
     if file_enrichment_raw is not None:
         file_enrichment_override = bool(file_enrichment_raw)
@@ -1042,14 +1057,29 @@ def _build_files_fts_query(raw_search: str) -> str:
     return build_fts_match_query(normalized)
 
 
+def _escape_like_term(term: str) -> str:
+    """Escape SQL LIKE wildcards in a user-supplied search term (issue #975).
+
+    ``\\``, ``%`` and ``_`` become literal characters instead of wildcards.
+    Every LIKE clause that binds the returned value must carry
+    ``ESCAPE '\\'`` — the same recipe as the unified-search chat-title arm
+    (issue #718 AC6) and the existing users/groups/search routes.
+    """
+    return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 @router.get("", response_model=DocumentListResponse, include_in_schema=False)
 @router.get("/", response_model=DocumentListResponse)
 async def list_documents(
     vault_id: Optional[int] = Query(None, description="Filter by vault ID"),
     page: int = Query(1, ge=1, description="Page number (1-indexed)"),
     per_page: int = Query(50, ge=1, le=1000, description="Items per page"),
+    # Cap mirrors /search's q: the escaped LIKE pattern roughly doubles
+    # special-dense terms, and past ~50k pattern chars SQLite raises
+    # "LIKE or GLOB pattern too complex" → uncaught 500.
     search: Optional[str] = Query(
         None,
+        max_length=200,
         description="Filter by document name or metadata fields (case-insensitive substring)",
     ),
     status: Optional[str] = Query(None, description="Filter by processing status"),
@@ -1093,7 +1123,7 @@ async def list_documents(
                 # build — must use the full virtual-table name in MATCH.
                 extra_where.append(
                     """(
-                        LOWER(file_name) LIKE ?
+                        LOWER(file_name) LIKE ? ESCAPE '\\'
                         OR id IN (
                             SELECT rowid FROM files_search_fts
                             WHERE files_search_fts MATCH ?
@@ -1106,14 +1136,14 @@ async def list_documents(
                         )
                     )"""
                 )
-                extra_params.append(f"%{search.strip().lower()}%")
+                extra_params.append(f"%{_escape_like_term(search.strip().lower())}%")
                 extra_params.append(fts_query)
                 extra_params.append(fts_query)
                 extra_params.append(vault_id)
             else:
                 extra_where.append(
                     """(
-                        LOWER(file_name) LIKE ?
+                        LOWER(file_name) LIKE ? ESCAPE '\\'
                         OR id IN (
                             SELECT rowid FROM files_search_fts
                             WHERE files_search_fts MATCH ?
@@ -1124,12 +1154,12 @@ async def list_documents(
                         )
                     )"""
                 )
-                extra_params.append(f"%{search.strip().lower()}%")
+                extra_params.append(f"%{_escape_like_term(search.strip().lower())}%")
                 extra_params.append(fts_query)
                 extra_params.append(fts_query)
         else:
-            extra_where.append("LOWER(file_name) LIKE ?")
-            extra_params.append(f"%{search.strip().lower()}%")
+            extra_where.append("LOWER(file_name) LIKE ? ESCAPE '\\'")
+            extra_params.append(f"%{_escape_like_term(search.strip().lower())}%")
     if status and status.strip():
         extra_where.append("status = ?")
         extra_params.append(status.strip())
@@ -1290,7 +1320,9 @@ class DocumentStatusResponse(BaseModel):
     chunk_count: int
     chunks_failed: int = 0  # Aggregate counter (Issue #221)
     failed_chunks: int = 0  # Count eligible for chunk-scoped retry (Issue #396)
-    failed_chunk_ids: List[int] = Field(default_factory=list)  # Chunk indices (Issue #396)
+    failed_chunk_ids: List[int] = Field(
+        default_factory=list
+    )  # Chunk indices (Issue #396)
     error_message: Optional[str] = None
     processed_at: Optional[str] = None
     # Phase-aware progress
@@ -1412,9 +1444,7 @@ def _latest_compile_job_statuses(
 
 @router.get("/status", response_model=DocumentBatchedStatusResponse)
 async def get_documents_status_batched(
-    ids: str = Query(
-        ..., description="Comma-separated file ids (max 100 per request)"
-    ),
+    ids: str = Query(..., description="Comma-separated file ids (max 100 per request)"),
     vault_id: Optional[int] = Query(
         None, description="Scope to a vault (same semantics as the list route)"
     ),
@@ -1445,8 +1475,7 @@ async def get_documents_status_batched(
         raise HTTPException(
             status_code=400,
             detail=(
-                f"At most {BATCHED_STATUS_MAX_IDS} ids per request "
-                f"(got {len(tokens)})"
+                f"At most {BATCHED_STATUS_MAX_IDS} ids per request (got {len(tokens)})"
             ),
         )
     requested: List[int] = []
@@ -1621,6 +1650,7 @@ async def get_document_status(
     if started:
         try:
             from datetime import datetime, timezone
+
             # SQLite stores CURRENT_TIMESTAMP as 'YYYY-MM-DD HH:MM:SS' (UTC, no tz).
             started_dt = datetime.strptime(str(started), "%Y-%m-%d %H:%M:%S")
             started_dt = started_dt.replace(tzinfo=timezone.utc)
@@ -1709,7 +1739,8 @@ async def get_document_raw(
         raise HTTPException(status_code=404, detail="Document file not found")
 
     allowed_roots = [
-        root.resolve(strict=False) for root in _allowed_document_roots(settings_dep, vault_id)
+        root.resolve(strict=False)
+        for root in _allowed_document_roots(settings_dep, vault_id)
     ]
     if not any(_path_is_within(file_path, root) for root in allowed_roots):
         logger.warning(
@@ -1732,7 +1763,9 @@ async def get_document_raw(
     )
 
     media_type = mimetypes.guess_type(row["file_name"])[0] or "application/octet-stream"
-    is_pdf = media_type == "application/pdf" or row["file_name"].lower().endswith(".pdf")
+    is_pdf = media_type == "application/pdf" or row["file_name"].lower().endswith(
+        ".pdf"
+    )
     response = FileResponse(
         path=file_path,
         media_type=media_type,
@@ -1778,7 +1811,9 @@ async def get_artifact_raw(
     if atom_row is None or not atom_row["asset_id"]:
         raise HTTPException(status_code=404, detail="Artifact not found")
     file_row = await asyncio.to_thread(
-        conn.execute, "SELECT id, vault_id FROM files WHERE id = ?", (atom_row["file_id"],)
+        conn.execute,
+        "SELECT id, vault_id FROM files WHERE id = ?",
+        (atom_row["file_id"],),
     )
     f = await asyncio.to_thread(file_row.fetchone)
     if f is None:
@@ -1860,7 +1895,9 @@ async def get_artifact_raw(
             },
         )
     except Exception:  # noqa: BLE001 — audit must never break asset serving
-        logger.warning("artifact_bytes_served audit failed (suppressed)", exc_info=False)
+        logger.warning(
+            "artifact_bytes_served audit failed (suppressed)", exc_info=False
+        )
     return response
 
 
@@ -1923,7 +1960,7 @@ async def search_documents(
     fts_query = _build_files_fts_query(query_text)
     if not fts_query:
         raise HTTPException(status_code=400, detail="Query has no searchable tokens")
-    like_query = f"%{query_text.lower()}%"
+    like_query = f"%{_escape_like_term(query_text.lower())}%"
 
     # Resolve the vault scope (mirrors list_documents).
     accessible_vaults: Optional[List[int]] = None
@@ -1963,12 +2000,44 @@ async def search_documents(
     # which returns the whole column), so a term late in a long body or in a
     # low-priority metadata column still appears — with its ``<mark>``
     # highlight — inside the excerpt.
+    #
+    # Issue #1002: snippet() over an unbounded parsed_text is a worker-thread
+    # wedge (super-linear in column size AND match density), so the content-arm
+    # call sits behind a lazily-evaluated CASE guard over BYTE length —
+    # length(CAST(col AS BLOB)) — since plain length() stops at the first NUL
+    # and would let a NUL-prefixed body bypass the guard (review F-001).
+    # Over-ceiling files fall back to the bounded parsed_text window below.
+    # The CTE also never materializes more than the 600-char head of
+    # parsed_text — the downstream fallback reads only ``[:200]``.
     _SNIPPET_TOKENS = 24
 
+    # Issue #1005: FTS columns 4/5 (email_subject/email_sender) are stored
+    # uncapped from mail headers, so only their snippets carry the
+    # length(CAST(col AS BLOB)) NUL-proof guard; the remaining metadata
+    # columns are bounded at write/validation time. The guard expressions
+    # are kept as literals (not f-string placeholders) so the k7 snippet
+    # census can bind each guard to its column.
+    _META_SNIPPET_LENGTH_GUARDS: dict[int, str] = {
+        4: "length(CAST(f.email_subject AS BLOB))",
+        5: "length(CAST(f.email_sender AS BLOB))",
+    }
+
     def _meta_snippet(col: int) -> str:
-        return (
+        call = (
             f"snippet(files_search_fts, {col}, '<mark>', '</mark>', '…', "
             f"{_SNIPPET_TOKENS})"
+        )
+        # Issue #1005: email_subject/email_sender are stored uncapped from
+        # mail headers, so their metadata snippets sit behind the same
+        # NUL-proof length guard as the content arm (issue #1002) — an
+        # oversized column skips snippet() entirely instead of costing
+        # seconds per matched row. The guard strings are literals so the
+        # k7 census can bind them to these columns.
+        guard = _META_SNIPPET_LENGTH_GUARDS.get(col)
+        if guard is None:
+            return call
+        return (
+            f"CASE WHEN {guard} <= {int(FTS_SNIPPET_MAX_COLUMN_BYTES)} THEN {call} END"
         )
 
     # files_search_fts columns in excerpt-priority order:
@@ -1982,24 +2051,32 @@ async def search_documents(
     # keeps the old first-non-empty-column fallback for rows where no
     # snippet-able column carries a mark.
     _meta_snippets = [_meta_snippet(col) for col in (4, 5, 1, 3, 6, 0)]
-    _meta_excerpt_expr = "COALESCE(\n" + ",\n".join(
-        [f"NULLIF({s}, replace({s}, '<mark>', ''))" for s in _meta_snippets]
-        + [f"NULLIF({s}, '')" for s in _meta_snippets]
-    ) + ")"
+    _meta_excerpt_expr = (
+        "COALESCE(\n"
+        + ",\n".join(
+            [f"NULLIF({s}, replace({s}, '<mark>', ''))" for s in _meta_snippets]
+            + [f"NULLIF({s}, '')" for s in _meta_snippets]
+        )
+        + ")"
+    )
 
     ranked_sql = f"""
     WITH raw_matches AS (
-        SELECT f.id, f.file_name, f.vault_id, f.status, f.parsed_text,
+        SELECT f.id, f.file_name, f.vault_id, f.status,
+               substr(f.parsed_text, 1, 600) AS parsed_text,
                bm25(files_content_fts) AS rank,
-               snippet(files_content_fts, 0, '<mark>', '</mark>', '…',
-                       {_SNIPPET_TOKENS}) AS excerpt_raw,
+               CASE WHEN length(CAST(f.parsed_text AS BLOB)) <= {int(FTS_SNIPPET_MAX_COLUMN_BYTES)}
+                    THEN snippet(files_content_fts, 0, '<mark>', '</mark>', '…',
+                                 {_SNIPPET_TOKENS})
+               END AS excerpt_raw,
                1 AS type_priority
         FROM files_content_fts
         JOIN files f ON f.id = files_content_fts.rowid
         WHERE files_content_fts MATCH ?
           AND {vault_clause_body}
         UNION ALL
-        SELECT f.id, f.file_name, f.vault_id, f.status, f.parsed_text,
+        SELECT f.id, f.file_name, f.vault_id, f.status,
+               substr(f.parsed_text, 1, 600) AS parsed_text,
                bm25(files_search_fts) AS rank,
                {_meta_excerpt_expr} AS excerpt_raw,
                2 AS type_priority
@@ -2008,11 +2085,12 @@ async def search_documents(
         WHERE files_search_fts MATCH ?
           AND {vault_clause_meta}
         UNION ALL
-        SELECT f.id, f.file_name, f.vault_id, f.status, f.parsed_text,
+        SELECT f.id, f.file_name, f.vault_id, f.status,
+               substr(f.parsed_text, 1, 600) AS parsed_text,
                0.0 AS rank, NULL AS excerpt_raw,
                3 AS type_priority
         FROM files f
-        WHERE LOWER(f.file_name) LIKE ?
+        WHERE LOWER(f.file_name) LIKE ? ESCAPE '\\'
           AND {vault_clause_name}
     ),
     ranked AS (
@@ -2034,7 +2112,14 @@ async def search_documents(
     LIMIT ? OFFSET ?
     """
 
-    base_params = [fts_query, *vault_params, fts_query, *vault_params, like_query, *vault_params]
+    base_params = [
+        fts_query,
+        *vault_params,
+        fts_query,
+        *vault_params,
+        like_query,
+        *vault_params,
+    ]
     cursor = await asyncio.to_thread(
         conn.execute,
         ranked_sql,
@@ -2061,7 +2146,7 @@ async def search_documents(
             WHERE files_search_fts MATCH ? AND {vault_clause_meta}
             UNION
             SELECT f.id FROM files f
-            WHERE LOWER(f.file_name) LIKE ? AND {vault_clause_name}
+            WHERE LOWER(f.file_name) LIKE ? ESCAPE '\\' AND {vault_clause_name}
         )
         SELECT COUNT(*) FROM raw_matches
         """
@@ -2306,9 +2391,7 @@ async def toggle_file_enrichment(
     updated_enrichment = await asyncio.to_thread(
         _resolve_page_enrichment, conn, [updated_row]
     )
-    document = _row_to_document_response(
-        updated_row, enrichment_map=updated_enrichment
-    )
+    document = _row_to_document_response(updated_row, enrichment_map=updated_enrichment)
     document.near_duplicate_group = await asyncio.to_thread(
         _near_duplicate_group_for, conn, file_id
     )
@@ -2354,7 +2437,10 @@ async def upload_document_root(
         vault_id,
     )
     await _record_upload_audit(
-        response.file_id, user, getattr(request.app.state, "secret_manager", None), db_pool
+        response.file_id,
+        user,
+        getattr(request.app.state, "secret_manager", None),
+        db_pool,
     )
     return response
 
@@ -2392,7 +2478,10 @@ async def upload_document(
         vault_id,
     )
     await _record_upload_audit(
-        response.file_id, user, getattr(request.app.state, "secret_manager", None), db_pool
+        response.file_id,
+        user,
+        getattr(request.app.state, "secret_manager", None),
+        db_pool,
     )
     return response
 
@@ -2449,9 +2538,7 @@ async def _compensate_failed_registration(
                     connection.rollback()
                 try:
                     connection.execute("BEGIN IMMEDIATE")
-                    connection.execute(
-                        "DELETE FROM files WHERE id = ?", (file_id,)
-                    )
+                    connection.execute("DELETE FROM files WHERE id = ?", (file_id,))
                     connection.commit()
                 except sqlite3.Error:
                     try:
@@ -2487,6 +2574,40 @@ async def _compensate_failed_registration(
 
     # No files row was touched by this request — remove only its bytes.
     _best_effort_unlink(file_path)
+
+
+async def _discard_upload_artifacts(file_path: Path, temp_file_path: Path) -> None:
+    """Remove the reserved final-path placeholder and the temp sibling.
+
+    Both artifacts get a SYNCHRONOUS best-effort unlink first, so neither is
+    left behind when a cancellation lands on the first ``await`` below: the
+    retry separator is an await point, and a task already inside a cancelled
+    scope raises there immediately (issue #786 review PRR-001). After that,
+    each artifact is retried across the loop with short sleeps — on
+    cancellation mid-stream the aiofiles executor close of the temp file may
+    still be in flight on Windows. A leftover canonical ``.part`` is skipped
+    by ``FileWatcher``, so a failed unlink is logged, never raised.
+    """
+    artifacts = (temp_file_path, file_path)
+    for artifact in artifacts:
+        try:
+            artifact.unlink(missing_ok=True)
+        except OSError:
+            pass  # Retried below, across an await point.
+    for artifact in artifacts:
+        for attempt in range(5):
+            try:
+                artifact.unlink(missing_ok=True)
+                break
+            except OSError:
+                if attempt == 4:
+                    logger.warning(
+                        "could not remove upload artifact %s; a canonical "
+                        ".part leftover is watcher-skipped",
+                        artifact,
+                    )
+                else:
+                    await asyncio.sleep(0.05)
 
 
 async def _do_upload(
@@ -2550,13 +2671,17 @@ async def _do_upload(
     original_path = file_path
     while True:
         try:
-            # O_EXCL ensures atomic create — fails if file exists
-            fd = os.open(str(file_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            # O_EXCL ensures atomic create — fails if file exists. No write
+            # flag: the fd only reserves the name; bytes land via a temp
+            # sibling and os.replace (issue #786).
+            fd = os.open(str(file_path), os.O_CREAT | os.O_EXCL)
             os.close(fd)
             break
         except FileExistsError:
             counter += 1
-            file_path = upload_dir / f"{original_path.stem}_{counter}{original_path.suffix}"
+            file_path = (
+                upload_dir / f"{original_path.stem}_{counter}{original_path.suffix}"
+            )
 
     # Path safety: ensure file_path is within upload_dir
     # Clean up the atomically-created file if the safety check fails
@@ -2600,55 +2725,65 @@ async def _do_upload(
                 ),
             )
 
-        # Save file using aiofiles with chunked reading and size validation
+        # Save file using aiofiles with chunked reading and size validation.
+        # Bytes stream to a canonical temp SIBLING of the final path and are
+        # os.replace'd onto the reserved placeholder only after every
+        # validation passes, so a kill mid-write leaves a FileWatcher-skipped
+        # .part artifact instead of a truncated document at the watched path
+        # (issue #786).
         total_bytes = len(header_bytes)
-        temp_file_path = file_path
-        async with aiofiles.open(temp_file_path, "wb") as f:
-            await f.write(header_bytes)
-            while chunk := await file.read(1024 * 1024):  # Read 1MB chunks
-                total_bytes += len(chunk)
-                if total_bytes > max_size_bytes:
-                    # Close and delete partial file
-                    await f.close()
-                    if temp_file_path.exists():
-                        temp_file_path.unlink(missing_ok=True)
+        temp_file_path = temp_sibling(file_path)
+        try:
+            async with aiofiles.open(temp_file_path, "wb") as f:
+                await f.write(header_bytes)
+                while chunk := await file.read(1024 * 1024):  # Read 1MB chunks
+                    total_bytes += len(chunk)
+                    if total_bytes > max_size_bytes:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"File too large. Max size: {settings_dep.max_file_size_mb} MB",
+                        )
+                    await f.write(chunk)
+
+            # OOXML structural validation (B3-1): the upload-time 8-byte check only
+            # proves the file is *a* ZIP. Now that the full file is on disk, verify
+            # a .docx/.xlsx/.pptx actually contains its format-specific member
+            # (word/document.xml | xl/workbook.xml | ppt/presentation.xml) so a
+            # non-OOXML ZIP or a cross-typed OOXML is rejected before ingestion.
+            required_member = _OOXML_REQUIRED_MEMBERS.get(file_suffix)
+            if required_member is not None:
+                if not _validate_ooxml_member(temp_file_path, required_member):
                     raise HTTPException(
-                        status_code=413,
-                        detail=f"File too large. Max size: {settings_dep.max_file_size_mb} MB",
+                        status_code=400,
+                        detail=f"File is not a valid {file_suffix} archive (missing {required_member}).",
                     )
-                await f.write(chunk)
 
-        # OOXML structural validation (B3-1): the upload-time 8-byte check only
-        # proves the file is *a* ZIP. Now that the full file is on disk, verify
-        # a .docx/.xlsx/.pptx actually contains its format-specific member
-        # (word/document.xml | xl/workbook.xml | ppt/presentation.xml) so a
-        # non-OOXML ZIP or a cross-typed OOXML is rejected before ingestion.
-        required_member = _OOXML_REQUIRED_MEMBERS.get(file_suffix)
-        if required_member is not None:
-            if not _validate_ooxml_member(temp_file_path, required_member):
-                if temp_file_path.exists():
-                    temp_file_path.unlink(missing_ok=True)
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"File is not a valid {file_suffix} archive (missing {required_member}).",
-                )
+            # Raster image content verification (issue #460): suffix acceptance alone
+            # is insufficient. Actually decode the image and enforce decompression /
+            # frame bounds; on any failure the partial upload is removed. SVG/HTML and
+            # corrupt/spoofed payloads are rejected here rather than reaching OCR.
+            if file_suffix in _IMAGE_MAGIC_BYTES:
+                image_ok, image_code = validate_image_content(temp_file_path)
+                if not image_ok:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"File is not a valid {file_suffix} image"
+                            + (f" ({image_code})" if image_code else "")
+                        ),
+                    )
 
-        # Raster image content verification (issue #460): suffix acceptance alone
-        # is insufficient. Actually decode the image and enforce decompression /
-        # frame bounds; on any failure the partial upload is removed. SVG/HTML and
-        # corrupt/spoofed payloads are rejected here rather than reaching OCR.
-        if file_suffix in _IMAGE_MAGIC_BYTES:
-            image_ok, image_code = validate_image_content(temp_file_path)
-            if not image_ok:
-                if temp_file_path.exists():
-                    temp_file_path.unlink(missing_ok=True)
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"File is not a valid {file_suffix} image"
-                        + (f" ({image_code})" if image_code else "")
-                    ),
-                )
+            # Bytes are complete and validated: place them at the final path
+            # atomically (replacing the empty O_EXCL placeholder).
+            os.replace(temp_file_path, file_path)
+        except BaseException:
+            # Any failure on the write/validate/place path — including the
+            # CancelledError a client disconnect delivers mid-stream, which
+            # bypasses `except Exception` below — removes both the reserved
+            # placeholder and the temp sibling (best-effort; a leftover
+            # canonical .part is watcher-skipped).
+            await _discard_upload_artifacts(file_path, temp_file_path)
+            raise
 
         # Async ingestion: register the file row synchronously (so duplicate
         # detection still happens at the request, not in the worker), then
@@ -2793,9 +2928,7 @@ async def _do_upload(
             )
             logger.exception("Document processing error for file: %s", file_name)
             if "maintenance mode" in str(e).lower():
-                raise HTTPException(
-                    status_code=503, detail="Processing error"
-                )
+                raise HTTPException(status_code=503, detail="Processing error")
             raise HTTPException(status_code=500, detail="Processing error")
         except Exception:
             # W19 (C14): same compensation for any other post-registration
@@ -2810,8 +2943,13 @@ async def _do_upload(
         raise
     except Exception:
         logger.exception("Error uploading file: %s", file_name)
-        if temp_file_path and temp_file_path.exists():
-            temp_file_path.unlink(missing_ok=True)
+        if temp_file_path is not None:
+            # Remove both the temp sibling and the reserved placeholder /
+            # placed bytes — matching the pre-#786 single-path cleanup, where
+            # temp and final were the same path.
+            await _discard_upload_artifacts(file_path, temp_file_path)
+        else:
+            file_path.unlink(missing_ok=True)
         raise HTTPException(status_code=500, detail="Upload failed")
 
 
@@ -2841,7 +2979,8 @@ async def scan_directories(
         watcher = FileWatcher(background_processor, pool=db_pool)
 
         # Perform scan
-        files_enqueued = await watcher.scan_once()
+        scan_result = await watcher.scan_once()
+        files_enqueued = scan_result.files_enqueued
 
         if files_enqueued > 0:
             message = (
@@ -2855,8 +2994,8 @@ async def scan_directories(
             status="success",
             message=message,
             added=files_enqueued,  # Frontend alias
-            scanned=files_enqueued,  # Frontend expects this (at least files_enqueued)
-            errors=[],  # Frontend expects this field
+            scanned=scan_result.files_examined,  # Files examined, not the enqueued count (issue #767 AC6)
+            errors=scan_result.errors,  # Per-directory failures from the scan
         )
     except Exception:
         logger.exception("Error during directory scan")
@@ -2903,7 +3042,13 @@ async def reindex_documents(
             )
         cur = conn.execute(
             "INSERT INTO document_reindex_jobs (vault_id, trigger_type, trigger_id, status, input_json) VALUES (?, ?, ?, ?, ?)",
-            (vault_id, "api", str(user.get("id", "")), "pending", json.dumps({"vault_id": vault_id})),
+            (
+                vault_id,
+                "api",
+                str(user.get("id", "")),
+                "pending",
+                json.dumps({"vault_id": vault_id}),
+            ),
         )
         conn.commit()
         return cur.lastrowid
@@ -2921,6 +3066,38 @@ async def reindex_documents(
     return ReindexResponse(job_id=job_id, status="pending", vault_id=vault_id)
 
 
+def _mask_reindex_row(row: dict) -> dict:
+    """Mask pre-redaction raw exception text on a reindex job row.
+
+    Issue #953/#957 review fix (PRR-007): the #957 write-side fix stops NEW
+    raw ``str(exc)`` reaching the legacy ``details`` list, but rows written
+    before it (and rows the boot sync copied forward) still carry raw text
+    there. The ``details`` payload is therefore masked at read time — the
+    same discipline the wiki/KMS job readers get.
+
+    The ``error`` column is deliberately NOT masked on this surface: it
+    carries operator constants ("Interrupted by process restart",
+    ``ReindexOperatorGuidance`` texts with dynamic counts) that no
+    stable-code vocabulary can enumerate without drift, and these routes
+    are admin-gated. The wiki/KMS job readers mask their ``error`` column
+    because that vocabulary IS closed.
+    """
+    row["result_json"] = redact_legacy_result_json(row.get("result_json"))
+    return row
+
+
+def _reindex_stall_cutoff() -> str:
+    """SQLite modifier for the stalled-signal cutoff (issue #1010).
+
+    MagicMock-safe numeric read (the frozen #494-style harness patches
+    Mock objects over settings); falls back to the shipped default.
+    """
+    value = getattr(settings, "jobs_stall_timeout_seconds", 900.0)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        value = 900.0
+    return f"-{float(value)} seconds"
+
+
 @router.get("/reindex/jobs/{job_id}", response_model=ReindexJobStatusResponse)
 @limiter.limit(settings.admin_rate_limit)
 async def get_reindex_job_status(
@@ -2928,7 +3105,6 @@ async def get_reindex_job_status(
     job_id: int,
     conn: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(require_admin_role),
-    csrf_token: str = Depends(csrf_protect),
 ) -> ReindexJobStatusResponse:
     """Return the full status of a reindex job by ID."""
 
@@ -2952,17 +3128,27 @@ async def get_reindex_job_status(
                        error, result_json,
                        json_extract(payload_json, '$.input_json') AS input_json,
                        attempts AS retry_count,
-                       created_at, started_at, completed_at
+                       created_at, started_at, completed_at,
+                       CASE WHEN status = 'running'
+                                 AND COALESCE(progress_at, started_at, created_at)
+                                     < strftime('%Y-%m-%d %H:%M:%f', 'now', ?)
+                            THEN 1 ELSE 0 END AS stalled
                 FROM jobs WHERE id = ? AND queue = 'reindex'
                 """,
-                (job_id,),
+                (
+                    _reindex_stall_cutoff(),
+                    job_id,
+                ),
             ).fetchone()
             if row is not None:
                 row = dict(row)
                 row["input_json"] = row.get("input_json") or "{}"
             return row
         row = conn.execute(
-            "SELECT id, vault_id, trigger_type, trigger_id, status, error, result_json, input_json, retry_count, created_at, started_at, completed_at FROM document_reindex_jobs WHERE id = ?",
+            "SELECT id, vault_id, trigger_type, trigger_id, status, error, "
+            "result_json, input_json, retry_count, created_at, started_at, "
+            "completed_at, 0 AS stalled "
+            "FROM document_reindex_jobs WHERE id = ?",
             (job_id,),
         ).fetchone()
         return row
@@ -2971,7 +3157,7 @@ async def get_reindex_job_status(
     if row is None:
         raise HTTPException(status_code=404, detail="Reindex job not found")
 
-    row_dict = dict(row)
+    row_dict = _mask_reindex_row(dict(row))
     return ReindexJobStatusResponse(**row_dict)
 
 
@@ -3008,15 +3194,20 @@ async def list_reindex_jobs(
                        error, result_json,
                        json_extract(payload_json, '$.input_json') AS input_json,
                        attempts AS retry_count,
-                       created_at, started_at, completed_at
+                       created_at, started_at, completed_at,
+                       CASE WHEN status = 'running'
+                                 AND COALESCE(progress_at, started_at, created_at)
+                                     < strftime('%Y-%m-%d %H:%M:%f', 'now', ?)
+                            THEN 1 ELSE 0 END AS stalled
                 FROM jobs WHERE queue = 'reindex'
                 ORDER BY created_at DESC, id DESC
                 LIMIT 20
-                """
+                """,
+                (_reindex_stall_cutoff(),),
             ).fetchall()
             out = []
             for row in rows:
-                row_dict = dict(row)
+                row_dict = _mask_reindex_row(dict(row))
                 row_dict["input_json"] = row_dict.get("input_json") or "{}"
                 out.append(row_dict)
             return out
@@ -3026,13 +3217,14 @@ async def list_reindex_jobs(
                    CASE WHEN status = 'interrupted' THEN 'failed' ELSE status END AS status,
                    error, result_json, input_json,
                    COALESCE(retry_count, 0) AS retry_count,
-                   created_at, started_at, completed_at
+                   created_at, started_at, completed_at,
+                   0 AS stalled
             FROM document_reindex_jobs
             ORDER BY created_at DESC, id DESC
             LIMIT 20
             """
         ).fetchall()
-        return [dict(row) for row in rows]
+        return [_mask_reindex_row(dict(row)) for row in rows]
 
     jobs = await asyncio.to_thread(_fetch_jobs)
     return ReindexJobListResponse(
@@ -3052,7 +3244,8 @@ def _unlink_document_file(stored_path: str, vault_id: int) -> None:
     except (OSError, RuntimeError, ValueError, TypeError):
         return
     roots = [
-        root.resolve(strict=False) for root in _allowed_document_roots(settings, vault_id)
+        root.resolve(strict=False)
+        for root in _allowed_document_roots(settings, vault_id)
     ]
     if not any(_path_is_within(file_path, root) for root in roots):
         logger.warning(

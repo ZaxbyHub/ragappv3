@@ -15,7 +15,11 @@
 
 set shell := ["bash", "-cu"]
 
-# Everything CI runs, in workflow order.
+# Everything CI runs, in workflow order (workflow-only steps that need CI
+# provisioning - the Backend 50-min step bound, the #566 outside-tree
+# TypeScript + NODE_PATH, and the #742 Frontend-job venue step running the
+# two issue-258 pytest nodes with a skip-fails gate - are noted here but
+# only executable with the same provisioning).
 ci: backend-verify-locks \
     backend-lint \
     backend-test \
@@ -61,7 +65,7 @@ backend-lint:
 
 # Backend tests (CI invocation; REDIS_URL empty like the workflow env)
 backend-test:
-    cd backend && REDIS_URL="" python -m pytest --tb=short -v --timeout=300 -rs -n auto --cov --cov-report=term-missing tests/
+    cd backend && REDIS_URL="" python -m pytest --tb=short -v --timeout=300 --timeout-method=thread -rs -n auto --cov --cov-report=term-missing tests/
 
 # Frontend type checks (CI: npm run typecheck / typecheck:contracts)
 frontend-typecheck:
@@ -107,7 +111,7 @@ frontend-build-subpath:
 frontend-build-subpath-derived:
     cd frontend && MSYS_NO_PATHCONV=1 VITE_APP_BASENAME=/meridian npm run build
 
-# Quality contracts job (all thirteen scripts, CI order)
+# Quality contracts job (all seventeen scripts, CI order)
 quality-contracts:
     python scripts/check_runtime_contract.py
     python scripts/check_config_contract.py
@@ -122,6 +126,10 @@ quality-contracts:
     python scripts/check_l05_raw_palette.py
     python scripts/check_l05_page_headers.py
     python scripts/check_l07_a11y_gate_wired.py
+    python scripts/check_l09_skill_trigger_paths.py
+    python scripts/check_l09_index_assets.py
+    python scripts/check_l09_memory_response_fields.py
+    python scripts/check_n05_draftclaim_nullable.py
 
 # SAST job (CI installs backend/requirements-dev.txt first)
 sast:

@@ -20,6 +20,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT))
+# backend.app.config imports ``app.*`` absolutely (config.py L13), which
+# only resolves with backend/ itself on the path — the documented
+# repo-root invocation has no PYTHONPATH (issue #727 / T1-28-K-01).
+sys.path.append(str(ROOT / "backend"))
 
 from backend.app.config import settings
 from backend.app.models.database import get_db_connection

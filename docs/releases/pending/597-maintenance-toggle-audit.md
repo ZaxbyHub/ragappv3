@@ -51,8 +51,10 @@ None. No API removals, schema, config, or wire-format changes;
 
 ## Known caveats
 
-- The audit row records the acting token as `user_id` (what `require_scope`'s
-  auth dict carries in single-admin mode), matching the generic toggle route.
+- The audit row's `user_id` records the acting admin's non-secret scope
+  fingerprint (since the #709 class-(a) fix; the raw bearer token is never
+  persisted), matching the generic toggle route. Historical rows written
+  before that fix are redacted at startup by issue #894's service.
 - Audit-INSERT failures surface as HTTP 500 with the flag change rolled back;
   exhausted optimistic-lock retries keep raising `MaintenanceError` with no
   audit row written.

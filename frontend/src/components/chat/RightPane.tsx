@@ -11,6 +11,7 @@ import {
   useLastCompletedAssistantSources,
   useLastCompletedAssistantWikiRefs,
   useLastCompletedAssistantKmsRefs,
+  useLastCompletedAssistantCitationConfidence,
   useLastUserContent,
   useSourcesForSourceId,
   useCompletedAssistantMessageIdsKey,
@@ -354,6 +355,18 @@ function SourcePreview({ source, query, onJumpToAnswer }: SourcePreviewProps) {
   const [artifactError, setArtifactError] = useState<string | null>(null);
   const artifactAbortRef = useRef<AbortController | null>(null);
   const previewContent = chunkContext?.context_text || source.snippet || "";
+  // Issue #718: chunk-context neighbor window — the chunks immediately
+  // before/after the matched one, when the payload carries them. Neighbors
+  // whose text is already inside the loaded context (e.g. the parent-window
+  // payload typically spans them) are suppressed so the pane never shows
+  // the same passage twice (issue #718 review F-001).
+  const inContext = (text: string) => previewContent.includes(text);
+  const neighborBefore = (chunkContext?.before ?? []).filter(
+    (text) => !inContext(text)
+  );
+  const neighborAfter = (chunkContext?.after ?? []).filter(
+    (text) => !inContext(text)
+  );
   const highlightedContent = useMemo(
     () => highlightQueryTerms(previewContent, query),
     [previewContent, query]
@@ -624,6 +637,21 @@ function SourcePreview({ source, query, onJumpToAnswer }: SourcePreviewProps) {
             {artifactError && (
               <span className="text-warning">{artifactError}</span>
             )}
+            {neighborBefore.length > 0 && (
+              <div
+                className="mb-3 border-l-2 border-border pl-3"
+                aria-label="Preceding context"
+              >
+                {neighborBefore.map((text, index) => (
+                  <p
+                    key={`chunk-before-${index}`}
+                    className="text-xs text-muted-foreground whitespace-pre-wrap"
+                  >
+                    {text}
+                  </p>
+                ))}
+              </div>
+            )}
             {previewContent ? (
               supportSpanRange ? (
                 <>
@@ -649,6 +677,21 @@ function SourcePreview({ source, query, onJumpToAnswer }: SourcePreviewProps) {
               )
             ) : (
               !artifactError && "No preview content available."
+            )}
+            {neighborAfter.length > 0 && (
+              <div
+                className="mt-3 border-l-2 border-border pl-3"
+                aria-label="Following context"
+              >
+                {neighborAfter.map((text, index) => (
+                  <p
+                    key={`chunk-after-${index}`}
+                    className="text-xs text-muted-foreground whitespace-pre-wrap"
+                  >
+                    {text}
+                  </p>
+                ))}
+              </div>
             )}
           </div>
         </ScrollArea>
@@ -690,6 +733,10 @@ export function RightPane() {
   const lastCompletedSources = useLastCompletedAssistantSources();
   const lastCompletedWikiRefs = useLastCompletedAssistantWikiRefs();
   const lastCompletedKmsRefs = useLastCompletedAssistantKmsRefs();
+  // Issue #965: the pane renders the same WikiCards/KMSCards components the
+  // assistant message does, so cited evidence cards here get the same
+  // "Support NN%" chip from the done payload's per-label scores.
+  const lastCompletedCitationConfidence = useLastCompletedAssistantCitationConfidence();
   const query = useLastUserContent();
   const completedAssistantIdsKey = useCompletedAssistantMessageIdsKey();
   // Streaming-only candidate preview (issue #508): the versioned evidence SSE
@@ -887,19 +934,25 @@ export function RightPane() {
             <div className="flex h-full flex-col min-h-0 gap-4">
               <div className="flex-1 min-h-0">
                 {shouldVirtualizeSources ? (
+                  // #868: the sizing div carries the list role — its DIRECT
+                  // children are the per-item wrappers, so the ownership
+                  // chain stays intact (each wrapper is a listitem).
                   <div
                     ref={sourcesScrollRef}
                     className="h-full overflow-y-auto w-full min-w-[320px]"
-                    aria-label="Sources list"
-                    role="list"
                   >
-                    <div style={{ height: sourcesVirtualizer.getTotalSize(), position: 'relative' }}>
+                    <div
+                      style={{ height: sourcesVirtualizer.getTotalSize(), position: 'relative' }}
+                      role="list"
+                      aria-label="Sources list"
+                    >
                       {sourcesVirtualizer.getVirtualItems().map((virtualItem) => {
                         const source = sources[virtualItem.index];
                         return (
                           <div
                             key={source.id}
                             data-index={virtualItem.index}
+                            role="listitem"
                             ref={sourcesVirtualizer.measureElement}
                             style={{
                               position: 'absolute',
@@ -923,16 +976,20 @@ export function RightPane() {
                   </div>
                 ) : (
                   <ScrollArea className="h-full min-w-[320px]">
-                    <div className="space-y-2">
+                    {/* #868: explicit list semantics on the non-virtualized
+                        Sources variant — each SourceListItem (a native
+                        button) sits in a listitem wrapper. */}
+                    <div className="space-y-2" role="list" aria-label="Sources list">
                       {sources.map((source, index) => (
-                        <SourceListItem
-                          key={source.id}
-                          source={source}
-                          index={index}
-                          isSelected={selectedSource?.id === source.id || selectedEvidenceSource?.id === source.id}
-                          scoreType={source.score_type}
-                          onClick={() => handleSourceClick(source)}
-                        />
+                        <div role="listitem" key={source.id}>
+                          <SourceListItem
+                            source={source}
+                            index={index}
+                            isSelected={selectedSource?.id === source.id || selectedEvidenceSource?.id === source.id}
+                            scoreType={source.score_type}
+                            onClick={() => handleSourceClick(source)}
+                          />
+                        </div>
                       ))}
                     </div>
                   </ScrollArea>
@@ -943,16 +1000,18 @@ export function RightPane() {
                   <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">
                     Retrieved — not yet cited
                   </h3>
-                  <div className="space-y-2">
+                  {/* #868: same list semantics for the candidates block. */}
+                  <div className="space-y-2" role="list" aria-label="Retrieved — not yet cited">
                     {candidateSources!.map((source, index) => (
-                      <SourceListItem
-                        key={source.id}
-                        source={source}
-                        index={index}
-                        isSelected={selectedSource?.id === source.id || selectedEvidenceSource?.id === source.id}
-                        scoreType={source.score_type}
-                        onClick={() => handleSourceClick(source)}
-                      />
+                      <div role="listitem" key={source.id}>
+                        <SourceListItem
+                          source={source}
+                          index={index}
+                          isSelected={selectedSource?.id === source.id || selectedEvidenceSource?.id === source.id}
+                          scoreType={source.score_type}
+                          onClick={() => handleSourceClick(source)}
+                        />
+                      </div>
                     ))}
                   </div>
                 </div>
@@ -999,7 +1058,10 @@ export function RightPane() {
           <TabsContent value="wiki" className="flex-1 min-h-0 mt-4">
             <ScrollArea className="h-full min-w-[320px]">
               <div className="pr-4">
-                <WikiCards wikiRefs={lastCompletedWikiRefs!} />
+                <WikiCards
+                  wikiRefs={lastCompletedWikiRefs!}
+                  citationConfidence={lastCompletedCitationConfidence}
+                />
               </div>
             </ScrollArea>
           </TabsContent>
@@ -1009,7 +1071,10 @@ export function RightPane() {
           <TabsContent value="kms" className="flex-1 min-h-0 mt-4">
             <ScrollArea className="h-full">
               <div className="pr-4">
-                <KMSCards kmsRefs={lastCompletedKmsRefs!} />
+                <KMSCards
+                  kmsRefs={lastCompletedKmsRefs!}
+                  citationConfidence={lastCompletedCitationConfidence}
+                />
               </div>
             </ScrollArea>
           </TabsContent>

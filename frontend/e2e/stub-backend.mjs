@@ -765,7 +765,13 @@ const server = http.createServer(async (req, res) => {
 
     // ---- vaults ----
     if (method === "GET" && (path === "/api/vaults/accessible" || path === "/api/vaults")) {
-      return sendJson(req, res, 200, { vaults });
+      // Model the full VaultListResponse contract (issue #725): total is the
+      // exact count and truncated is false below the 1000-row cap.
+      return sendJson(req, res, 200, {
+        vaults,
+        total: vaults.length,
+        truncated: false,
+      });
     }
     if (method === "POST" && path === "/api/vaults") {
       // Issue #781 walkthrough: create a vault via the real VaultsPage

@@ -864,6 +864,11 @@ export interface ChunkContextResponse {
   chunk_text: string;
   context_text: string;
   context_source: "parent_window" | "raw_text" | "chunk" | string;
+  /** Issue #718: neighbor window fields — optional because older sessions'
+   *  persisted context payloads predate the window. */
+  matched_text?: string;
+  before?: string[];
+  after?: string[];
 }
 
 /**
@@ -1199,11 +1204,13 @@ export async function uploadDocument(
   return response.data;
 }
 
-export async function scanDocuments(vaultId?: number): Promise<ScanDocumentsResponse> {
+export async function scanDocuments(): Promise<ScanDocumentsResponse> {
+  // No vault scoping: POST /documents/scan is a global-admin route that scans
+  // every vault's upload directory (issue #767) — a vault_id parameter would
+  // be silently ignored by the route.
   const response = await apiClient.post<ScanDocumentsResponse>(
     "/documents/scan",
-    undefined,
-    vaultId != null ? { params: { vault_id: vaultId } } : undefined
+    undefined
   );
   return response.data;
 }
@@ -1305,6 +1312,78 @@ export async function deleteDocument(fileId: string): Promise<void> {
   await apiClient.delete(`/documents/${fileId}`);
 }
 
+/**
+ * Best-effort keepalive DELETE for a pagehide flush of a confirmed document
+ * delete (#766). Mirrors addChatMessagesBatchKeepalive: keepalive requests
+ * cannot wait for CSRF-token discovery, so the cached token or the readable
+ * CSRF cookie is used; when neither exists NOTHING is sent and the caller
+ * must fall back to the normal deleteDocument path (never after a request
+ * was issued). Returns true when a keepalive fetch was attempted, false when
+ * no CSRF credential was available. Never throws; hard termination remains
+ * outside the guarantee.
+ */
+export function deleteDocumentKeepalive(fileId: string): boolean {
+  const csrfToken = getCsrfToken() ?? getCsrfCookie();
+  if (!csrfToken) return false;
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "X-CSRF-Token": csrfToken,
+  };
+  if (_jwtAccessToken) headers.Authorization = "Bearer " + _jwtAccessToken;
+  const url = API_BASE_URL + "/documents/" + fileId;
+  void fetch(url, {
+    method: "DELETE",
+    credentials: "include",
+    headers,
+    keepalive: true,
+  })
+    .then((response) => {
+      // Outcome is logged, never silently dropped (review round 1 PRR-006):
+      // a non-2xx means the confirmed delete did not land; DocumentsPage's
+      // bfcache pageshow replay completes the intent when the page returns.
+      if (!response.ok) {
+        logApiFailure(
+          "Keepalive document delete did not succeed:",
+          new Error(`keepalive DELETE returned HTTP ${response.status}`),
+          `${response.status} /documents/${fileId}`
+        );
+      }
+    })
+    .catch((error: unknown) => {
+      logApiFailure("Keepalive document delete did not reach the server:", error);
+    });
+  return true;
+}
+
+/**
+ * Sanitized API-failure logging for the documents surfaces (#766): logs the
+ * error's message plus response status and request URL — never the raw error
+ * object or its config, whose toJSON() serialization would carry the
+ * Authorization header to the browser console. Reads BOTH error shapes this
+ * repo produces (review round 1 PRR-014/M3-01): the apiClient response
+ * interceptor's normalized Error (top-level `status`, original error under
+ * `originalError`) and a raw AxiosError (`.response`/`.config`).
+ */
+export function logApiFailure(prefix: string, err: unknown, where?: string): void {
+  const message = err instanceof Error ? err.message : String(err);
+  const candidate = err as {
+    status?: unknown;
+    response?: { status?: unknown };
+    config?: { url?: string };
+    originalError?: { response?: { status?: unknown }; config?: { url?: string } };
+  };
+  let status: unknown;
+  if (candidate.status != null) status = candidate.status;
+  else if (candidate.response?.status != null) status = candidate.response.status;
+  else if (candidate.originalError?.response?.status != null) {
+    status = candidate.originalError.response.status;
+  }
+  const url = candidate.config?.url ?? candidate.originalError?.config?.url;
+  const whereResolved =
+    where ?? (url ? (status != null ? `${String(status)} ${url}` : url) : status != null ? String(status) : "");
+  console.error(prefix, message, whereResolved);
+}
+
 export async function deleteDocuments(fileIds: string[]): Promise<{ deleted_count: number, failed_ids: string[] }> {
   const response = await apiClient.post<{ deleted_count: number, failed_ids: string[] }>("/documents/batch", { file_ids: fileIds });
   return response.data;
@@ -1322,7 +1401,11 @@ export async function getDocumentStats(vaultId?: number): Promise<DocumentStatsR
 
 export async function getChunkContext(chunkId: string): Promise<ChunkContextResponse> {
   const response = await apiClient.get<ChunkContextResponse>(
-    `/search/chunks/${encodeURIComponent(chunkId)}/context`
+    `/search/chunks/${encodeURIComponent(chunkId)}/context`,
+    // Issue #718: request a small neighbor window so the Evidence pane can
+    // render the chunks around the matched one. Defaults live here (not in
+    // callers) to keep the one-arg call sites stable.
+    { params: { context_before: 1, context_after: 1 } }
   );
   return response.data;
 }

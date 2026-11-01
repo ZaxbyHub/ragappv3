@@ -550,7 +550,8 @@ data/draft-room/<user_id>/<draft_id>/inputs/<input_id>/<uuid><extension>
 ### 6.3 Deletion and retained derivations
 
 - An input that has not been referenced by completed evidence/revision artifacts may be deleted with the tombstone flow.
-- If an input has been used by a completed compile, `DELETE /inputs/{input_id}` returns `409 input_in_use`. The UI explains that immutable revisions and evidence contain derivatives and offers whole-draft deletion. Partial deletion must not pretend those derivatives disappeared.
+- Compile usage is durable in two shapes, and an input referenced by either one is in use: an evidence row citing it (`draft_evidence.source_kind='draft_input'`), or membership in that compile's immutable `input_json` input snapshot, which records every input the compile was given. The snapshot is the only durable record when a run finishes without evidence rows — a late-stage retry, or an input the retrieval stages never cited directly (for example a `style`-role input) — so an input listed in a completed, failed, or cancelled compile's snapshot cannot be deleted piecemeal. Whole-draft deletion is how such an input is removed.
+- If an input has been used by a compile, `DELETE /inputs/{input_id}` returns `409 input_in_use`. The UI explains that immutable revisions and evidence contain derivatives and offers whole-draft deletion. Partial deletion must not pretend those derivatives disappeared.
 - Whole-draft deletion is the comprehensive project purge: raw/parsed inputs, revisions, evidence passages, claims, findings, jobs, and project events are removed; only the content-free HMAC security-audit deletion event survives.
 - When an ordinary vault document, Wiki claim/page, or KMS entry is deleted while its vault remains, its private historical evidence snapshot stays with the draft until whole-draft deletion. Before deleting the source row, set `source_deleted_at` on matching evidence and apply §12.6 invalidation. The UI labels it `Source deleted after this revision`; it cannot be reused for a new run or treated as current evidence. Updates likewise compare/capture the new canonical hash and invalidate affected Ready state.
 - A deployment requiring source deletion to erase all derivatives must delete the affected drafts; selective redaction of immutable revisions is out of scope and MUST NOT be simulated by nulling provenance.
@@ -770,7 +771,7 @@ Implementation rules:
 - Before compile, the UI names the configured provider/model class and states that selected project text and vault passages will be sent to it. This is disclosure, not an extra permission grant; endpoint access remains controlled by deployment settings.
 - Before enqueue and again before each model call, require `draft_room_enabled`, normalize the selected client's origin as exact `http[s]://host:port`, and require membership in `draft_allowed_model_origins`. Sensitive drafts also require membership in `draft_sensitive_allowed_model_origins`. Reject other schemes, userinfo, path, query, fragment, wildcard, and suffix matching in configured origins. A mid-job policy revocation fails safely before the next call. Never return the allowlist or raw endpoint to non-admin clients.
 - Model HTTP clients set `follow_redirects=False`. Any 3xx fails with `provider_redirect_blocked`; never replay manuscript content or authorization headers to a redirect target. Ordinary tiers may use explicitly allowlisted HTTP origins. `sensitive` requires HTTPS or a literal loopback origin (`localhost`, `127.0.0.1`, or `[::1]`); cleartext LAN/Docker hostnames remain blocked even if listed.
-- When `draft_room_enabled=false`, keep capabilities, owner list/read/export, cancel, and whole-draft delete available for cleanup, but return `503 draft_room_disabled` for create/edit/upload/compile/Ready/promote. Public navigation stays hidden.
+- When `draft_room_enabled=false`, keep capabilities, owner list/read/export, cancel, revision export, and whole-draft delete available for cleanup, but return `503 draft_room_disabled` for create/edit/upload/compile/Ready/promote and for every other mutation, including single-input delete (a piecemeal mutation; whole-draft delete is the cleanup path while disabled). Public navigation stays hidden.
 
 ### 9.3 Audit events
 
@@ -779,7 +780,7 @@ Append an immutable `draft_events` row for at least:
 - draft creation, archive, unarchive, and deletion request;
 - compile enqueue, cancel, retry, failure, and completion;
 - manual revision save;
-- finding disposition or waiver, including the user's reason;
+- finding disposition or waiver, recording that a note was supplied (`has_note`); the note text itself is stored on `draft_findings.resolution_note` and never in the audit row;
 - Ready approval and Ready invalidation;
 - export, including format and revision ID;
 - promotion, including the new vault file/document ID.
@@ -824,6 +825,7 @@ draft -> queued -> running -> needs_review
 draft -> archived
 queued|running -> failed|cancelled
 running -> queued                       startup orphan recovery only
+failed|cancelled -> needs_review        manual revision or applied finding; keeps a draft with a current revision editable
 failed|cancelled|needs_review -> queued
 needs_review -> ready                    human action only
 ready -> needs_review                    new revision, brief/input change, or factual invalidation
@@ -1064,7 +1066,7 @@ Atomic claim verdicts are a separate process:
 - `unsupported`: no passage supports it after claim-specific retrieval;
 - `opinion`: the value judgment, recommendation, or prediction itself rather than a verifiable proposition.
 
-`supported`, `contradicted`, `ambiguous`, and `stale` store the exact passage and chunk/source identity used. `unsupported` may have no passage; its `retrieval_audit_json` instead records normalized query, vault/scope hash, retrieval configuration, timestamp, returned labels or zero-result state, and nearest-context metadata without implying support. `supported` means supported by the captured evidence, not verified as universally true.
+`supported`, `contradicted`, `ambiguous`, and `stale` store the exact passage and chunk/source identity used. `unsupported` may have no passage; its `retrieval_audit_json` instead records normalized query, vault/scope hash, retrieval configuration, timestamp, returned labels or zero-result state, and nearest-context metadata without implying support. That audit is recorded for FACTUAL claims, which are the claims the pipeline re-searches; a non-factual claim (`quote`, `opinion`) is not re-searched and stores an empty audit object. The desk never supplies the audit — a model-invented one is discarded (issue #787). `supported` means supported by the captured evidence, not verified as universally true.
 
 A named person's authorship, utterance, position, or quotation is a separate factual attribution claim and requires evidence even when the attributed content is an opinion. Only the expressed judgment receives `opinion` status.
 
@@ -1161,7 +1163,7 @@ Persist prompt ID, version, SHA-256 of rendered system/developer content, model,
 
 | Stage | Client | Default temperature |
 |---|---|---:|
-| facet extraction/research synthesis | thinking | 0.1 |
+| research contradictions/gaps classification (facets and retrieval are pipeline-derived) | thinking | 0.1 |
 | outline/critic | thinking | 0.2 |
 | section drafting | thinking | 0.5 |
 | lint rewrite | thinking | 0.3 |

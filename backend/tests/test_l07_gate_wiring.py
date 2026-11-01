@@ -123,10 +123,11 @@ def test_guard_flags_missing_viewport_literals(tmp_path: Path) -> None:
     assert "viewport literal height: 360 missing" in result.stdout
 
 
-# ---- issue #778 feedback round: failing-tree pins for the strengthened
-# checker legs (comment-skip, if:/continue-on-error, roster, waiver set,
-# census, single-job literal). FULL_CI/FULL_SPEC satisfy every check; each
-# mutant below flips exactly one leg and must go red.
+# ---- issue #778 feedback round + #865-#868 re-arm: failing-tree pins for
+# the strengthened checker legs (comment-skip, if:/continue-on-error,
+# roster, zero-waiver, census, single-job literal). FULL_CI/FULL_SPEC
+# satisfy every check; each mutant below flips exactly one leg and must
+# go red.
 
 FULL_CI = """name: CI
 on: [push]
@@ -143,19 +144,16 @@ jobs:
 
 _NL = chr(10)
 
-_FULL_ROUTES = "".join(f'  {{ path: "r{i}" }},{_NL}' for i in range(1, 21))
+_FULL_ROUTES = "".join(f'    path: "r{i}",{_NL}' for i in range(1, 21))
 
+# Re-armed shape (#865-#868 closed): the spec carries NO rule-disable
+# rows; the checker requires zero waivers.
 FULL_SPEC = (
     "const VIEWPORTS = [{ width: 320, height: 568 }, { width: 640, height: 360 }];" + _NL
     + "const ROUTES = [" + _NL
     + _FULL_ROUTES
     + "];" + _NL
-    + "axe.run({ rules: {" + _NL
-    + '  "aria-valid-attr-value": { enabled: false },' + _NL
-    + '  "nested-interactive": { enabled: false },' + _NL
-    + '  "button-name": { enabled: false },' + _NL
-    + '  "aria-required-children": { enabled: false },' + _NL
-    + "} });" + _NL
+    + "axe.run();" + _NL
 )
 
 
@@ -164,6 +162,15 @@ def _plant_full(tmp_path: Path, ci_text: str = FULL_CI, spec_text: str = FULL_SP
     (tmp_path / CI_REL).write_text(ci_text, encoding="utf-8")
     (tmp_path / SPEC_REL.parent).mkdir(parents=True, exist_ok=True)
     (tmp_path / SPEC_REL).write_text(spec_text, encoding="utf-8")
+
+
+def test_planted_full_is_green(tmp_path: Path) -> None:
+    # Green baseline: the planted FULL fixture satisfies EVERY checker leg
+    # (roster included — the fixture routes use the production line shape),
+    # so each mutant below isolates exactly one leg.
+    _plant_full(tmp_path)
+    result = _run_guard(tmp_path)
+    assert result.returncode == 0, result.stdout
 
 
 def test_comment_only_wiring_rejected(tmp_path: Path) -> None:
@@ -181,31 +188,33 @@ def test_comment_only_wiring_rejected(tmp_path: Path) -> None:
 
 def test_if_false_job_rejected(tmp_path: Path) -> None:
     # GitHub reports an if:-false job as success - the gate would be a no-op.
-    neutered = FULL_CI.replace(
-        "  a11y-matrix:\n",
-        "  a11y-matrix:\n    if: false\n",
-    )
-    _plant_full(tmp_path, neutered)
-    result = _run_guard(tmp_path)
-    assert result.returncode == 1
-    assert "if:-false" in result.stdout
+    for condition in ("false", "False", '${{ !true }}', "!1"):
+        neutered = FULL_CI.replace(
+            "  a11y-matrix:\n",
+            f"  a11y-matrix:\n    if: {condition}\n",
+        )
+        _plant_full(tmp_path, neutered)
+        result = _run_guard(tmp_path)
+        assert result.returncode == 1, condition
+        assert "if:-false" in result.stdout, condition
 
 
 def test_continue_on_error_job_rejected(tmp_path: Path) -> None:
-    neutered = FULL_CI.replace(
-        "  a11y-matrix:\n",
-        "  a11y-matrix:\n    continue-on-error: true\n",
-    )
-    _plant_full(tmp_path, neutered)
-    result = _run_guard(tmp_path)
-    assert result.returncode == 1
-    assert "continue-on-error: true" in result.stdout
+    for value in ("true", '"true"', "True", "true # neutered"):
+        neutered = FULL_CI.replace(
+            "  a11y-matrix:\n",
+            f"  a11y-matrix:\n    continue-on-error: {value}\n",
+        )
+        _plant_full(tmp_path, neutered)
+        result = _run_guard(tmp_path)
+        assert result.returncode == 1, value
+        assert "continue-on-error: true" in result.stdout, value
 
 
 def test_roster_below_minimum_rejected(tmp_path: Path) -> None:
     shrunken = FULL_SPEC.replace(
         _FULL_ROUTES,
-        "  {" + _NL + '    path: "r1" },' + _NL + "  {" + _NL + '    path: "r2" },' + _NL,
+        '    path: "r1",' + _NL + '    path: "r2",' + _NL,
     )
     _plant_full(tmp_path, spec_text=shrunken)
     result = _run_guard(tmp_path)
@@ -213,23 +222,33 @@ def test_roster_below_minimum_rejected(tmp_path: Path) -> None:
     assert "route roster has 2 entries" in result.stdout
 
 
-def test_fifth_waiver_rejected(tmp_path: Path) -> None:
-    widened = FULL_SPEC.replace(
-        "} });",
-        '  "region": { enabled: false },\n} });',
+def test_axe_run_options_rejected(tmp_path: Path) -> None:
+    # Re-arm invariant (#865-#868 closed): the gate runs the FULL default
+    # rule set -- ANY axe.run option object (rules, runOnly, exclude) is a
+    # waiver channel and is rejected, whatever its spelling.
+    for spelling in (
+        'axe.run({ rules: { "region": { enabled: false } } });',
+        'axe.run({"runOnly": ["wcag2a"]});',
+        "axe.run(\n  { exclude: [[\"#app\"]] },\n);",
+        'axe.run({ rules: { "region": { "enabled": false } } });',
+    ):
+        seeded = FULL_SPEC.replace("axe.run();", spelling)
+        _plant_full(tmp_path, spec_text=seeded)
+        result = _run_guard(tmp_path)
+        assert result.returncode == 1, spelling
+        assert "axe.run with options" in result.stdout, spelling
+
+
+def test_axe_run_comment_not_counted(tmp_path: Path) -> None:
+    # Comments are skipped by the option scan: prose mentioning waiver
+    # spellings stays legal (the re-arm note in the spec does exactly this).
+    commented = FULL_SPEC.replace(
+        "axe.run();",
+        "// historical: rules were once { enabled: false } via axe.run({ rules })" + _NL + "axe.run();",
     )
-    _plant_full(tmp_path, spec_text=widened)
+    _plant_full(tmp_path, spec_text=commented)
     result = _run_guard(tmp_path)
-    assert result.returncode == 1
-    assert "disables 5 axe rules" in result.stdout
-
-
-def test_missing_disabled_rule_rejected(tmp_path: Path) -> None:
-    dropped = FULL_SPEC.replace('  "button-name": { enabled: false },\n', "")
-    _plant_full(tmp_path, spec_text=dropped)
-    result = _run_guard(tmp_path)
-    assert result.returncode == 1
-    assert "disabled rule 'button-name' missing" in result.stdout
+    assert "axe.run with options" not in result.stdout, result.stdout
 
 
 def test_census_unnamed_spec_rejected(tmp_path: Path) -> None:

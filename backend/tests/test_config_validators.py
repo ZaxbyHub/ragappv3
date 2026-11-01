@@ -45,6 +45,75 @@ class TestRejectInsecureDefaults:
         assert settings.users_enabled is False
         assert settings.admin_secret_token == "some-token"
 
+    # --- well-known default admin token (issue #1001, Item A) ---
+
+    def test_users_disabled_with_default_admin_token_raises(self):
+        """users_enabled=False, admin_secret_token='admin-secret-token' (the
+        well-known literal) should raise — in single-admin mode the literal is
+        a public sole credential AND public audit-HMAC key material (#1001 AC1)."""
+        with pytest.raises(ValueError, match="ADMIN_SECRET_TOKEN") as exc_info:
+            Settings(users_enabled=False, admin_secret_token="admin-secret-token")
+        message = str(exc_info.value)
+        # Message shape mirrors the empty-token refusal: field name,
+        # single-admin rationale, and the generation one-liner.
+        assert "well-known default" in message
+        assert "single-admin" in message
+        assert "secrets.token_urlsafe(48)" in message
+
+    def test_users_disabled_with_case_variant_admin_token_boots(self):
+        """users_enabled=False, case variants of the literal (e.g.
+        'ADMIN-SECRET-TOKEN') still boot — the refusal is EXACT-match only
+        (predicate differs from main.py's startup warning, which is likewise
+        untrimmed-exact; #1001 AC2 decision)."""
+        for variant in ("ADMIN-SECRET-TOKEN", "Admin-Secret-Token"):
+            settings = Settings(users_enabled=False, admin_secret_token=variant)
+            assert settings.admin_secret_token == variant
+
+    @pytest.mark.parametrize(
+        "padded", [" admin-secret-token ", "\tadmin-secret-token\n"]
+    )
+    def test_users_disabled_with_whitespace_padded_default_token_raises(self, padded):
+        """users_enabled=False with the literal wrapped in whitespace must also
+        be refused: derive_audit_key() strips the token before using it as HMAC
+        key material, so a padded literal boots but still derives the PUBLIC
+        key b'admin-secret-token' (#1001 — the hole has to actually close)."""
+        with pytest.raises(ValueError, match="well-known default"):
+            Settings(users_enabled=False, admin_secret_token=padded)
+
+    def test_boot_error_suppresses_input_repr_echoing_env_values(self):
+        """The refusal must not echo co-located env values into boot output:
+        pydantic's ValidationError message embeds the whole input-dict repr
+        (input_value=...) unless the model sets hide_input_in_errors=True, so
+        a distinctive JWT_SECRET_KEY passed alongside the refused token would
+        otherwise leak into startup logs (#1001 feedback V-1007-4). The
+        marker is deliberately short so it survives pydantic's repr
+        truncation — this pin only passes while the echo is suppressed."""
+        marker = "jwt-echo-marker-9987"
+        with pytest.raises(ValueError, match="ADMIN_SECRET_TOKEN") as exc_info:
+            Settings(
+                users_enabled=False,
+                admin_secret_token="admin-secret-token",
+                jwt_secret_key=marker,
+            )
+        message = str(exc_info.value)
+        # (a) the actionability text must survive the suppression (same
+        # shape-pins as the sibling default-token refusal pin).
+        assert "well-known default" in message
+        assert "single-admin" in message
+        assert "secrets.token_urlsafe(48)" in message
+        # (b) the co-located marker value must not be echoed anywhere in the
+        # raised text.
+        assert marker not in message
+
+    def test_users_enabled_with_default_admin_token_boots(self):
+        """users_enabled=True, admin_secret_token='admin-secret-token' still
+        boots — under multi-user auth the token is the required
+        bootstrap/first-admin credential and seeds admin_token_scopes, so only
+        the empty-token refusal applies (#1001 AC3 decision: UNCHANGED)."""
+        settings = Settings(users_enabled=True, admin_secret_token="admin-secret-token")
+        assert settings.admin_secret_token == "admin-secret-token"
+        assert settings.admin_token_scopes == {"admin-secret-token": ["admin:config"]}
+
     # --- JWT_SECRET_KEY validators ---
 
     def test_users_enabled_with_empty_jwt_secret_key_raises(self):

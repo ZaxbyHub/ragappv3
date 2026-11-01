@@ -190,7 +190,8 @@ const ROUTES: RouteRow[] = [
     // Seeded document row filename — DocumentTable.tsx:268 {doc.filename}.
     // Amendment 5 + review F-18: viewport-stable AND readiness-correct.
     // text=handbook-a11y.pdf matched the desktop table row that is
-    // display:none below sm (mobile card list renders instead); the page h1
+    // display:none below md (issue #771 moved the cards/table switch from
+    // sm to md; the mobile card list renders instead); the page h1
     // is visible at every width but renders while the list skeleton is still
     // up. `>> visible=true` waits for a VISIBLE seeded-row match at either
     // breakpoint, which only exists once the document list has loaded.
@@ -232,7 +233,11 @@ const ROUTES: RouteRow[] = [
     auth: "login",
     kind: "shell",
     // Static users fixture row — AdminUsersPage.tsx:486 {user.username}.
-    sentinel: { selector: "text=e2e-user" },
+    // Issue #771: the below-sm card list duplicates the username next to the
+    // desktop table; `>> visible=true` skips the table row that is
+    // display:none below sm (same amendment the /documents sentinel documents
+    // for handbook-a11y.pdf above).
+    sentinel: { selector: "text=e2e-user >> visible=true" },
   },
   {
     path: "/admin/groups",
@@ -240,7 +245,9 @@ const ROUTES: RouteRow[] = [
     kind: "shell",
     // Static groups fixture row — GroupTable.tsx:139
     // {row.original.name} (rendered by AdminGroupsPage.tsx:292).
-    sentinel: { selector: "text=e2e-group" },
+    // Issue #771: visible-scoped — the below-sm card list duplicates the
+    // group name next to the hidden desktop table row.
+    sentinel: { selector: "text=e2e-group >> visible=true" },
   },
   {
     path: "/admin/organizations",
@@ -544,25 +551,17 @@ async function runAxe(page: Page): Promise<AxeViolation[]> {
     if (!win.axe) {
       throw new Error("window.axe is missing — axe.min.js injection failed");
     }
-    // Amendment 5 (AC_CHANGED_BY_USER, user-sanctioned 2026-10-09): the axe
-    // gate enforces the full default rule set EXCEPT four rule families the
-    // user moved to numbered follow-up issues (Radix Tabs dangling
-    // aria-controls on unmounted panels; clickable-card nested interactive
-    // content; remaining unnamed controls; chat empty-state list semantics).
-    // color-contrast and every other serious/critical rule stay enforced —
-    // at full matrix run 2 those other rules found only the four tracked-out
-    // classes after the body base-coat fix.
-    const results = await win.axe.run({
-      rules: {
-        // Each disabled family is owned by an open follow-up issue whose AC1
-        // re-enables it (issue #778 review F-05 — keep the refs beside the
-        // rules so the waiver never outlives its issues).
-        "aria-valid-attr-value": { enabled: false }, // #865
-        "nested-interactive": { enabled: false }, // #866
-        "button-name": { enabled: false }, // #867
-        "aria-required-children": { enabled: false }, // #868
-      },
-    });
+    // Re-arm (issues #865/#866/#867/#868, closed by the rearm PR): the axe
+    // gate enforces the FULL default rule set again. The amendment-5 waiver
+    // (aria-valid-attr-value, nested-interactive, button-name,
+    // aria-required-children disabled 2026-10-09 pending those four issues)
+    // is gone — the underlying violations were fixed at their sources
+    // (trigger-only filter bars converted to toggle groups; clickable cards
+    // de-buttoned; unnamed controls labeled; list semantics made native;
+    // Radix's hidden inactive panel shells already resolve aria-controls).
+    // scripts/check_l07_a11y_gate_wired.py now enforces that NO axe rule
+    // is disabled here (any axe.run options object fails CI).
+    const results = await win.axe.run();
     return results.violations
       .filter((v) => v.impact === "serious" || v.impact === "critical")
       .map((v) => ({

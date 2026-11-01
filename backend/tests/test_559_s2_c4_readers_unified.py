@@ -172,7 +172,7 @@ class TestC3WikiSemanticStatusMapping(unittest.IsolatedAsyncioTestCase):
             trigger_type="ingest",
             trigger_id="file:72",
             status="failed",
-            error="compile exploded",
+            error="COMPILE_FAILED: wiki compile dispatch failed; see server logs",
             started_at=now,
             completed_at=now,
         )
@@ -364,7 +364,7 @@ class TestC3WikiJobEndpoints(unittest.IsolatedAsyncioTestCase):
             trigger_type="ingest",
             trigger_id="file:91",
             status="failed",
-            error="compile exploded",
+            error="COMPILE_FAILED: wiki compile dispatch failed; see server logs",
             input_json={"file_id": 91},
             started_at=now,
             completed_at=now,
@@ -427,7 +427,10 @@ class TestC3WikiJobEndpoints(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(failed["trigger_type"], "ingest")
         self.assertEqual(failed["trigger_id"], "file:91")
         self.assertEqual(failed["status"], "failed")
-        self.assertEqual(failed["error"], "compile exploded")
+        self.assertEqual(
+            failed["error"],
+            "COMPILE_FAILED: wiki compile dispatch failed; see server logs",
+        )
         self.assertIn("result_json", failed)
         self.assertIsNotNone(failed["created_at"])
         self.assertIsNotNone(failed["started_at"])
@@ -450,7 +453,10 @@ class TestC3WikiJobEndpoints(unittest.IsolatedAsyncioTestCase):
             evaluate=_allow_all,
         )
         self.assertEqual(got["status"], "failed")
-        self.assertEqual(got["error"], "compile exploded")
+        self.assertEqual(
+            got["error"],
+            "COMPILE_FAILED: wiki compile dispatch failed; see server logs",
+        )
         self.assertEqual(got["trigger_id"], "file:91")
 
         with pytest.raises(HTTPException) as ctx:
@@ -554,7 +560,7 @@ class TestC3KmsJobEndpoints(unittest.IsolatedAsyncioTestCase):
             trigger_type="ingest",
             trigger_id="file:96",
             status="failed",
-            error="kms compile exploded",
+            error="COMPILE_FAILED: KMS compile dispatch failed; see server logs",
             started_at=now,
             completed_at=now,
             created_at="2026-01-01T00:00:01",
@@ -590,7 +596,10 @@ class TestC3KmsJobEndpoints(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(failed["trigger_type"], "ingest")
         self.assertEqual(failed["trigger_id"], "file:96")
         self.assertEqual(failed["status"], "failed")
-        self.assertEqual(failed["error"], "kms compile exploded")
+        self.assertEqual(
+            failed["error"],
+            "COMPILE_FAILED: KMS compile dispatch failed; see server logs",
+        )
         self.assertIsNotNone(failed["created_at"])
         self.assertIsNotNone(failed["started_at"])
         self.assertIsNotNone(failed["completed_at"])

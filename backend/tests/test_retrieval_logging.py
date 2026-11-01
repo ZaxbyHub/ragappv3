@@ -191,12 +191,15 @@ class RetrievalLoggingTests(unittest.IsolatedAsyncioTestCase):
 
         # Mock settings.context_max_tokens to enable packing
         with patch("app.services.rag_engine.settings") as mock_settings:
+            mock_settings.maintenance_mode = False  #715: bare MagicMock attr is truthy; pin the maintenance gate closed
             mock_settings.context_max_tokens = 1000  # Enable token packing
             mock_settings.retrieval_evaluation_enabled = False
             mock_settings.reranking_enabled = False
             mock_settings.hybrid_search_enabled = False
             mock_settings.hybrid_alpha = 0.5
             mock_settings.initial_retrieval_top_k = 10
+            mock_settings.retrieval_top_k = 10
+            # PRR-010: bare-Mock retrieval_top_k makes int(Mock)==1 and truncates results
             mock_settings.reranker_top_n = 5
             mock_settings.retrieval_recency_weight = (
                 0.0  # Disable recency for logging tests
@@ -245,12 +248,15 @@ class RetrievalLoggingTests(unittest.IsolatedAsyncioTestCase):
 
         # Mock settings.context_max_tokens to disable packing
         with patch("app.services.rag_engine.settings") as mock_settings:
+            mock_settings.maintenance_mode = False  #715: bare MagicMock attr is truthy; pin the maintenance gate closed
             mock_settings.context_max_tokens = 0  # Disable token packing
             mock_settings.retrieval_evaluation_enabled = False
             mock_settings.reranking_enabled = False
             mock_settings.hybrid_search_enabled = False
             mock_settings.hybrid_alpha = 0.5
             mock_settings.initial_retrieval_top_k = 10
+            mock_settings.retrieval_top_k = 10
+            # PRR-010: bare-Mock retrieval_top_k makes int(Mock)==1 and truncates results
             mock_settings.reranker_top_n = 5
             mock_settings.retrieval_recency_weight = (
                 0.0  # Disable recency for logging tests
@@ -293,12 +299,15 @@ class RetrievalLoggingTests(unittest.IsolatedAsyncioTestCase):
 
         # Mock settings.context_max_tokens to enable packing (but no results)
         with patch("app.services.rag_engine.settings") as mock_settings:
+            mock_settings.maintenance_mode = False  #715: bare MagicMock attr is truthy; pin the maintenance gate closed
             mock_settings.context_max_tokens = 1000  # Enable packing (but no results)
             mock_settings.retrieval_evaluation_enabled = False
             mock_settings.reranking_enabled = False
             mock_settings.hybrid_search_enabled = False
             mock_settings.hybrid_alpha = 0.5
             mock_settings.initial_retrieval_top_k = 10
+            mock_settings.retrieval_top_k = 10
+            # PRR-010: bare-Mock retrieval_top_k makes int(Mock)==1 and truncates results
             mock_settings.reranker_top_n = 5
             mock_settings.retrieval_recency_weight = (
                 0.0  # Disable recency for logging tests

@@ -401,8 +401,8 @@ export function WikiPageDetail({ page, onBack, onEdit, onDelete }: WikiPageDetai
                 <Edit className="w-4 h-4 mr-1" />
                 Edit
               </Button>
-              <Button variant="destructive" size="sm" onClick={onDelete}>
-                <Trash2 className="w-4 h-4" />
+              <Button variant="destructive" size="sm" onClick={onDelete} aria-label="Delete page">
+                <Trash2 className="w-4 h-4" aria-hidden="true" />
               </Button>
             </>
           }

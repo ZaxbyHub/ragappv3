@@ -43,10 +43,26 @@ const { mockListAccessibleVaults, mockGetVault, mockListFolders, mockListTags } 
 // on mount — never opened or interacted with here, so Radix Select does not
 // need the jsdom pointer-capture workaround the components' own tests use.
 vi.mock("@/lib/api", () => ({
+  // API_BASE_URL is read by useAuthStore (imported via DraftAssignmentForm
+  // for the principal-scoped brief-template gate, issue #1036 AC2).
+  API_BASE_URL: "/api",
   listAccessibleVaults: mockListAccessibleVaults,
   getVault: mockGetVault,
   listFolders: mockListFolders,
   listTags: mockListTags,
+}));
+
+// DraftAssignmentForm reads the session principal for its template gate;
+// these axe scans assert nothing template- or auth-driven, so a signed-out
+// stand-in is fine.
+const { mockAuthState } = vi.hoisted(() => ({
+  mockAuthState: { user: null as { id: number } | null },
+}));
+vi.mock("@/stores/useAuthStore", () => ({
+  useAuthStore: Object.assign(
+    (selector: (s: typeof mockAuthState) => unknown) => selector(mockAuthState),
+    { getState: () => mockAuthState }
+  ),
 }));
 
 beforeEach(() => {

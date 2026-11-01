@@ -63,7 +63,9 @@ def sa_db_path() -> Generator[str, None, None]:
             created_at TEXT NOT NULL,
             last_rotated_at TEXT,
             revoked_at TEXT,
-            created_by TEXT
+            created_by TEXT,
+            previous_key_hash TEXT,
+            previous_key_expires_at TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_service_accounts_key_hash
             ON service_accounts(key_hash);
@@ -305,7 +307,9 @@ class TestServiceAccountRotate:
     def test_rotate_invalidates_old_key(
         self, sa_client: TestClient, sa_db_path: str, admin_headers: dict
     ):
-        """Verify the old key is immediately invalidated after rotation."""
+        """Rotation grace (issue #724 AC10): the old key stays valid until the
+        NEW key is first used (or the grace TTL expires) — an undelivered
+        rotation response must be recoverable without a second rotation."""
         sa_id, old_key = self._create_sa(sa_client, admin_headers)
 
         # Use old key on a service-account-protected endpoint — should work BEFORE rotation
@@ -323,12 +327,12 @@ class TestServiceAccountRotate:
         assert rotate_resp.status_code == 200
         new_key = rotate_resp.json()["key"]
 
-        # Old key should now 401
+        # Old key still works inside the grace window (new key unused)
         with self._sa_protected_app(old_key, sa_db_path) as client:
             resp = client.get(
                 "/sa-protected", headers={"Authorization": f"Bearer {old_key}"}
             )
-            assert resp.status_code == 401, f"Old key should be invalid after rotation: {resp.json()}"
+            assert resp.status_code == 200, f"Old key must stay valid until the new key is used (rotation grace): {resp.json()}"
 
         # New key should work
         with self._sa_protected_app(new_key, sa_db_path) as client:

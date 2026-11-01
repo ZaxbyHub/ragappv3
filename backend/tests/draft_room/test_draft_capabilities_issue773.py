@@ -1,9 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 from app.api.routes import draft_room
 from app.config import settings
+
+
+def _request_with_live_processor() -> SimpleNamespace:
+    """Minimal Request stand-in for the direct get_capabilities call.
+
+    Since #789 the route derives ``compile_available`` from
+    ``request.app.state.draft_job_processor``; this mirrors a worker that
+    started (presence is the liveness contract).
+    """
+    return SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(draft_job_processor=object()))
+    )
 
 
 def test_capabilities_emit_configured_poll_interval_and_job_budget() -> None:
@@ -13,10 +26,13 @@ def test_capabilities_emit_configured_poll_interval_and_job_budget() -> None:
         settings.draft_poll_interval_seconds = 3.5
         settings.draft_job_max_model_calls = 27
 
-        capabilities = asyncio.run(draft_room.get_capabilities(user={}))
+        capabilities = asyncio.run(
+            draft_room.get_capabilities(_request_with_live_processor(), user={})
+        )
 
         assert capabilities.limits["poll_interval_seconds"] == 3.5
         assert capabilities.limits["job_max_model_calls"] == 27
+        assert capabilities.compile_available is True
     finally:
         settings.draft_poll_interval_seconds = original_interval
         settings.draft_job_max_model_calls = original_budget

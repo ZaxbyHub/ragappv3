@@ -354,9 +354,11 @@ export interface DraftClaim {
   revision_id: number;
   ordinal: number;
   claim_text: string;
-  claim_sha256: string;
-  span_start: number;
-  span_end: number;
+  /** NULL when the claim has no verifiable span (issue #517 / DRAFT-010) —
+   *  the backend emits NULL, so the wire type is nullable (#789). */
+  claim_sha256: string | null;
+  span_start: number | null;
+  span_end: number | null;
   claim_type: DraftClaimType;
   status: DraftClaimStatus;
   severity: DraftClaimSeverity;

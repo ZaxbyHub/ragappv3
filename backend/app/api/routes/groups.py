@@ -5,7 +5,7 @@ import sqlite3
 from collections.abc import Callable
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.api.deps import (
@@ -14,11 +14,50 @@ from app.api.deps import (
     get_evaluate_policy,
     get_user_primary_org,
     require_role,
+    resolve_granted_by,
 )
 from app.models.database import transaction_context
 from app.security import csrf_protect
+from app.services.authz_policy import (
+    direct_vault_admin_ids,
+    group_derived_vault_admin_ids,
+)
 
 router = APIRouter(prefix="/groups", tags=["groups"])
+
+
+def _covered_vault_ids(db: sqlite3.Connection, vault_ids: set) -> set:
+    """Return the candidate vaults that still have an effective admin (#1028).
+
+    Route-layer composition of the shared effective-admin inventory
+    (``authz_policy.direct_vault_admin_ids`` /
+    ``authz_policy.group_derived_vault_admin_ids``); the inventory functions
+    themselves stay untouched per #1028's scope. Callers run this inside the
+    same BEGIN IMMEDIATE transaction as the mutation (both the pre-state and
+    the ACTUAL post-state read).
+    """
+    return {
+        vault_id
+        for vault_id in vault_ids
+        if direct_vault_admin_ids(db, vault_id)
+        | group_derived_vault_admin_ids(db, vault_id)
+    }
+
+
+def _group_admin_grant_vault_ids(db: sqlite3.Connection, group_id: int) -> set:
+    """Vaults whose group-derived admin coverage runs through this group (#1028).
+
+    Only admin ``vault_group_access`` rows can contribute effective admins, so
+    read/write grants are not candidates.
+    """
+    return {
+        row[0]
+        for row in db.execute(
+            "SELECT DISTINCT vault_id FROM vault_group_access"
+            " WHERE group_id = ? AND permission = 'admin'",
+            (group_id,),
+        )
+    }
 
 
 class GroupResponse(BaseModel):
@@ -43,19 +82,56 @@ class GroupListResponse(BaseModel):
     per_page: int
 
 
+def _validate_group_name(v: Optional[str]) -> Optional[str]:
+    """Enforce the UI's exact name contract: trimmed length >= 2 AND raw
+    length <= 100 (GroupFormDialog checks trim().length < 2 then
+    .length > 100). Validation-only: the stored value is never rewritten
+    (issue #726, R1-G5b-02 — API and UI reject and accept identical inputs
+    for BMP text; lengths are Python code points vs the UI's UTF-16 units,
+    so names containing astral characters (e.g. emoji) can diverge by up to
+    1 UTF-16 unit per astral char).
+    """
+    if v is None:
+        return v
+    if len(v.strip()) < 2:
+        raise ValueError("Group name must be at least 2 characters (after trimming whitespace)")
+    if len(v) > 100:
+        raise ValueError("Group name must be at most 100 characters")
+    return v
+
+
+def _validate_group_description(v: Optional[str]) -> Optional[str]:
+    """UI parity: description capped at 500 raw characters."""
+    if v is None:
+        return v
+    if len(v) > 500:
+        raise ValueError("Group description must be at most 500 characters")
+    return v
+
+
 class GroupCreateRequest(BaseModel):
     """Request model for creating a group."""
 
-    name: str = Field(..., min_length=1)
-    description: Optional[str] = None
+    name: str = Field(..., min_length=1, max_length=255)
+    description: Optional[str] = Field(default=None, max_length=2000)
     org_id: Optional[int] = None
+
+    _name_check = field_validator("name")(_validate_group_name)
+    _description_check = field_validator("description")(_validate_group_description)
 
 
 class GroupUpdateRequest(BaseModel):
-    """Request model for updating a group."""
+    """Request model for updating a group.
 
-    name: Optional[str] = None
-    description: Optional[str] = None
+    None means "leave unchanged"; a provided name/description is validated
+    with the same bounds as creation (an empty-after-trim rename is rejected).
+    """
+
+    name: Optional[str] = Field(default=None, max_length=255)
+    description: Optional[str] = Field(default=None, max_length=2000)
+
+    _name_check = field_validator("name")(_validate_group_name)
+    _description_check = field_validator("description")(_validate_group_description)
 
 
 class GroupMemberResponse(BaseModel):
@@ -105,6 +181,15 @@ class GroupVaultsUpdateRequest(BaseModel):
     vault_access: Optional[List[VaultAccessItem]] = None
     vault_ids: Optional[List[int]] = None  # legacy; maps to read permission
 
+    def any_field_set(self) -> bool:
+        """True when at least one replace-set field was explicitly provided.
+
+        Omitted/null fields are rejected upstream (422) so an empty-body PUT
+        can never clear every vault grant for the group (issue #725 census,
+        same family as the vault-groups and user-organizations routes).
+        """
+        return self.vault_access is not None or self.vault_ids is not None
+
     def resolved_access(self) -> List[VaultAccessItem]:
         """Return the canonical list of vault+permission pairs."""
         if self.vault_access is not None:
@@ -119,7 +204,7 @@ class GroupVaultsUpdateRequest(BaseModel):
 @router.get("/", response_model=GroupListResponse)
 async def list_groups(
     page: int = 1,
-    per_page: int = 100,
+    per_page: int = Query(100, ge=1),
     search: Optional[str] = None,
     user: dict = Depends(require_role("admin")),
     db: sqlite3.Connection = Depends(get_db),
@@ -561,16 +646,38 @@ async def delete_group(
             )
 
     # ON DELETE CASCADE handles group_members and vault_group_access cleanup
-    cursor = await asyncio.to_thread(
-        db.execute,
-        "DELETE FROM groups WHERE id = ?",
-        (group_id,),
-    )
+    def _delete_group():
+        # Issue #1028: one BEGIN IMMEDIATE over candidate discovery, the
+        # pre-state read, the cascade DELETE, and the ACTUAL post-state
+        # re-read. The FK cascade deletes the group's admin grants WITH the
+        # row, so a vault whose only effective admin was group-derived through
+        # this group would otherwise be silently orphaned. The refusal fires
+        # only for vaults that HAD effective admins (pre-state-non-empty), so
+        # an already-broken vault stays repairable (issue AC7).
+        with transaction_context(db):
+            candidate_vault_ids = _group_admin_grant_vault_ids(db, group_id)
+            covered_before = _covered_vault_ids(db, candidate_vault_ids)
+            delete_cursor = db.execute(
+                "DELETE FROM groups WHERE id = ?",
+                (group_id,),
+            )
+            if delete_cursor.rowcount == 0:
+                raise HTTPException(status_code=404, detail="Group not found")
+            # ACTUAL post-state re-read over the persisted rows, before commit.
+            refused_vault_ids = sorted(
+                covered_before - _covered_vault_ids(db, candidate_vault_ids)
+            )
+            if refused_vault_ids:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Deleting this group would leave vault(s)"
+                        f" {refused_vault_ids} without an effective admin: each"
+                        " vault must keep at least one effective admin"
+                    ),
+                )
 
-    if cursor.rowcount == 0:
-        raise HTTPException(status_code=404, detail="Group not found")
-
-    await asyncio.to_thread(db.commit)
+    await asyncio.to_thread(_delete_group)
 
 
 @router.get("/{group_id}/members", response_model=List[GroupMemberResponse])
@@ -708,40 +815,45 @@ async def update_group_members(
                 detail="You must be a member of the organization to modify this group",
             )
 
-    # Verify all user_ids exist and are members of the group's organization
-    if request.user_ids:
-        placeholders = ",".join(["?"] * len(request.user_ids))
-        cursor = await asyncio.to_thread(
-            db.execute,
-            f"SELECT id FROM users WHERE id IN ({placeholders})",
-            tuple(request.user_ids),
-        )
-        found_users = await asyncio.to_thread(cursor.fetchall)
-        found_ids = {row[0] for row in found_users}
-        missing_ids = set(request.user_ids) - found_ids
-        if missing_ids:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Users not found: {sorted(missing_ids)}",
-            )
-        # Check that all users are members of the group's organization
-        cursor = await asyncio.to_thread(
-            db.execute,
-            f"SELECT user_id FROM org_members WHERE org_id = ? AND user_id IN ({placeholders})",
-            (group_org_id,) + tuple(request.user_ids),
-        )
-        org_members = await asyncio.to_thread(cursor.fetchall)
-        org_member_ids = {row[0] for row in org_members}
-        non_member_ids = set(request.user_ids) - org_member_ids
-        if non_member_ids:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Users are not members of this organization: {sorted(non_member_ids)}",
-            )
-
-    # Atomic update: delete existing and insert new in transaction
+    # Atomic update: delete existing and insert new in transaction. The
+    # user-existence and org-membership preconditions run INSIDE the
+    # transaction so a concurrent org removal cannot commit between the
+    # check and the INSERT and leave an orphaned group_members row
+    # (issue #721 claim 7); with the removal-side cleanups (organizations.py
+    # remove_org_member, users.py update_user_organizations) SQLite's
+    # one-writer serialization makes every interleaving converge.
     def _update_members():
         with transaction_context(db):
+            if request.user_ids:
+                placeholders = ",".join(["?"] * len(request.user_ids))
+                found_users = db.execute(
+                    f"SELECT id FROM users WHERE id IN ({placeholders})",
+                    tuple(request.user_ids),
+                ).fetchall()
+                found_ids = {row[0] for row in found_users}
+                missing_ids = set(request.user_ids) - found_ids
+                if missing_ids:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Users not found: {sorted(missing_ids)}",
+                    )
+                # All users must be members of the group's organization
+                org_members = db.execute(
+                    f"SELECT user_id FROM org_members WHERE org_id = ? AND user_id IN ({placeholders})",
+                    (group_org_id,) + tuple(request.user_ids),
+                ).fetchall()
+                org_member_ids = {row[0] for row in org_members}
+                non_member_ids = set(request.user_ids) - org_member_ids
+                if non_member_ids:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Users are not members of this organization: {sorted(non_member_ids)}",
+                    )
+            # Issue #1028: candidate discovery and the pre-state read inside
+            # the same BEGIN IMMEDIATE as the replacement — removing a member
+            # deletes the rows that realize this group's admin grants.
+            candidate_vault_ids = _group_admin_grant_vault_ids(db, group_id)
+            covered_before = _covered_vault_ids(db, candidate_vault_ids)
             # Delete existing memberships
             db.execute(
                 "DELETE FROM group_members WHERE group_id = ?",
@@ -752,6 +864,22 @@ async def update_group_members(
                 db.execute(
                     "INSERT INTO group_members (group_id, user_id) VALUES (?, ?)",
                     (group_id, user_id),
+                )
+            # ACTUAL post-state re-read before commit; refusal only for vaults
+            # that HAD effective admins (AC7 keeps pre-broken vaults
+            # repairable), and any refused vault rolls back the whole
+            # replacement.
+            refused_vault_ids = sorted(
+                covered_before - _covered_vault_ids(db, candidate_vault_ids)
+            )
+            if refused_vault_ids:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Replacing this group's members would leave vault(s)"
+                        f" {refused_vault_ids} without an effective admin: each"
+                        " vault must keep at least one effective admin"
+                    ),
                 )
 
     await asyncio.to_thread(_update_members)
@@ -877,54 +1005,118 @@ async def update_group_vaults(
                 detail="You must be a member of the organization to modify this group",
             )
 
+    # Omitted (or null) list fields are NOT an explicit clear: reject with 422
+    # before any DELETE or audit event runs (issue #725 census — same family
+    # as the vault-groups and user-organizations replace routes).
+    if not request.any_field_set():
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Provide at least one of 'vault_access' or 'vault_ids' "
+                "(an explicit empty list clears all vault access for this group)"
+            ),
+        )
+
     # Resolve canonical access list (handles both vault_access and legacy vault_ids)
     access_list = request.resolved_access()
 
-    # Verify all vaults exist and belong to the same organization as the group
-    if access_list:
-        vault_ids = [item.vault_id for item in access_list]
-        placeholders = ",".join(["?"] * len(vault_ids))
-        cursor = await asyncio.to_thread(
-            db.execute,
-            f"SELECT id, org_id FROM vaults WHERE id IN ({placeholders})",
-            tuple(vault_ids),
-        )
-        found_vaults = await asyncio.to_thread(cursor.fetchall)
-        found_ids = {row[0] for row in found_vaults}
-        missing_ids = set(vault_ids) - found_ids
-        if missing_ids:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Vaults not found: {sorted(missing_ids)}",
-            )
-        # A vault with org_id IS NULL is treated as global (unscoped) and allowed.
-        # Only reject vaults that explicitly belong to a *different* organization.
-        cross_org_vaults = [
-            row[0]
-            for row in found_vaults
-            if row[1] is not None and row[1] != group_org_id
-        ]
-        if cross_org_vaults:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Vaults do not belong to this organization: {sorted(cross_org_vaults)}",
-            )
+    # granted_by is FK-safe: the single-admin sentinel (id 0, no users row)
+    # records NULL provenance instead of tripping the granted_by FK (issue
+    # #1025, PRR-001; at base commit this INSERT loop answered 500 in
+    # single-admin mode).
+    granted_by = resolve_granted_by(user)
 
-    # Atomic update: delete existing and insert new in transaction
+    # Atomic update: the existing transaction wrapper, expanded to cover
+    # validation and the per-vault effective-admin guard
     def _update_vaults():
+        # One BEGIN IMMEDIATE over validation, the per-vault pre-state reads,
+        # DELETE, INSERTs, and the per-vault ACTUAL post-state re-reads. The
+        # vault-org validation must not race a vault adoption (#1003), and
+        # the last-effective-admin guard must observe persisted rows for
+        # EVERY vault in the old-union-new grant set — one vault's preserved
+        # admin must never mask another vault's zeroing, so ANY refused vault
+        # rolls the whole replacement back (issue #1025, PRR-010).
         with transaction_context(db):
+            if access_list:
+                vault_ids = [item.vault_id for item in access_list]
+                placeholders = ",".join(["?"] * len(vault_ids))
+                found_vaults = db.execute(
+                    f"SELECT id, org_id FROM vaults WHERE id IN ({placeholders})",
+                    tuple(vault_ids),
+                ).fetchall()
+                found_ids = {row[0] for row in found_vaults}
+                missing_ids = set(vault_ids) - found_ids
+                if missing_ids:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Vaults not found: {sorted(missing_ids)}",
+                    )
+                # A vault with org_id IS NULL is treated as global (unscoped)
+                # and allowed. Only reject vaults that explicitly belong to a
+                # *different* organization.
+                cross_org_vaults = [
+                    row[0]
+                    for row in found_vaults
+                    if row[1] is not None and row[1] != group_org_id
+                ]
+                if cross_org_vaults:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Vaults do not belong to this organization: {sorted(cross_org_vaults)}",
+                    )
+
+            # Every vault whose group-derived coverage this replacement can
+            # change: the old grant set union the incoming one.
+            affected_vault_ids = {
+                row[0]
+                for row in db.execute(
+                    "SELECT vault_id FROM vault_group_access WHERE group_id = ?",
+                    (group_id,),
+                )
+            } | {item.vault_id for item in access_list}
+            pre_nonempty_vault_ids = {
+                vid
+                for vid in affected_vault_ids
+                if direct_vault_admin_ids(db, vid)
+                | group_derived_vault_admin_ids(db, vid)
+            }
+
             db.execute(
                 "DELETE FROM vault_group_access WHERE group_id = ?",
                 (group_id,),
             )
             seen: set[int] = set()
+            # Insert new memberships (deduplicated). granted_by records the
+            # acting caller, identical to the vault-side grant writers
+            # (vaults.py, vault_members.py) — issue #721 AC6.
             for item in access_list:
                 if item.vault_id not in seen:
                     seen.add(item.vault_id)
                     db.execute(
-                        "INSERT INTO vault_group_access (vault_id, group_id, permission) VALUES (?, ?, ?)",
-                        (item.vault_id, group_id, item.permission),
+                        "INSERT INTO vault_group_access (vault_id, group_id, permission, granted_by) VALUES (?, ?, ?, ?)",
+                        (item.vault_id, group_id, item.permission, granted_by),
                     )
+
+            # ACTUAL per-vault post-state re-read over the persisted rows,
+            # before commit. Refusal only fires for vaults that HAD effective
+            # admins, so an already-broken vault stays repairable.
+            refused_vault_ids = sorted(
+                vid
+                for vid in pre_nonempty_vault_ids
+                if not (
+                    direct_vault_admin_ids(db, vid)
+                    | group_derived_vault_admin_ids(db, vid)
+                )
+            )
+            if refused_vault_ids:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Replacing vault access would leave vault(s)"
+                        f" {refused_vault_ids} without an effective admin: each"
+                        " vault must keep at least one effective admin"
+                    ),
+                )
 
     await asyncio.to_thread(_update_vaults)
 

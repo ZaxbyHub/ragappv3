@@ -153,9 +153,16 @@ async def create_kms_entry(
             status=request.status,
             created_by=user.get("id"),
         )
-    except Exception as e:
+    except Exception:
+        # Issue #796 (TQ-sweep-B03-03): KMSStore.create_entry has no
+        # deliberate input-validation raises (slug uniqueness is resolved
+        # internally; _validate_status ran before this try), so anything
+        # landing here is a server-side failure. Report a generic 500 — the
+        # raw text stays in the server log via logger.exception, never in
+        # the response (every other status site in this file already uses
+        # specific codes with fixed messages).
         logger.exception("Error creating KMS entry")
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to create KMS entry")
     return _entry_dict(entry)
 
 

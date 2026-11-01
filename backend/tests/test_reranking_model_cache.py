@@ -48,7 +48,7 @@ class FakeCrossEncoder:
         LOADS.append(model_id)
         self.model_id = model_id
 
-    def predict(self, pairs):
+    def predict(self, pairs, activation_fn=None):
         # Identity-tagged raw logit so cross-contamination is observable in
         # the service's sigmoid-normalized _rerank_score values.
         return [1.0 + 1.0 * LOADS.index(self.model_id)] * len(pairs)

@@ -1066,7 +1066,10 @@ curl -s -H "Authorization: Bearer <token>" \
 # 2. Check failed files in database
 # error_message carries a stable code prefix (PARSER_UNAVAILABLE / PARSE_FAILED /
 # PARSE_TIMEOUT / FILE_MISSING / ENRICHMENT_FAILED / DIMENSION_CHANGED /
-# EMBEDDING_FAILED / VECTOR_STORE_FAILED) plus a short
+# EMBEDDING_FAILED / VECTOR_STORE_FAILED / VECTOR_STORE_LOCK_TIMEOUT [issue #1011:
+# write-lock contention, retried non-terminally] / REINDEX_INTERRUPTED [issue
+# #1010: reindex attempt interrupted mid-file, re-selected by the next pass])
+# plus a short
 # content-free reason — raw exception text and server paths stay in the
 # server log only (issue #562; DIMENSION_CHANGED since issue #691;
 # PARSE_TIMEOUT since issue #703; EMBEDDING_FAILED / VECTOR_STORE_FAILED

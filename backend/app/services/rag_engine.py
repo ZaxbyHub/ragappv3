@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import html
 import logging
 import re
 import sqlite3
@@ -60,7 +61,12 @@ from app.services.query_transformer import QueryPlanner, QueryTransformer
 from app.services.rag_trace import RAGTrace
 from app.services.retrieval_evaluator import RetrievalEvaluator
 from app.services.telemetry import _status_to_outcome, current_turn_id, get_telemetry
-from app.services.vector_store import SearchSemaphoreTimeoutError, VectorStore
+from app.services.vector_store import (
+    SearchSemaphoreTimeoutError,
+    VectorStore,
+    end_request_fts_attribution,
+    start_request_fts_attribution,
+)
 from app.services.vision_evidence import (
     VisionRunContext,
     apply_vision_to_sources,
@@ -492,46 +498,58 @@ class RAGEngine:
         return planner
 
     def _resolve_effective_prompt_sync(self, vault_id: Optional[int]) -> Tuple[Optional[str], Optional[str]]:
-        """Resolve the effective system-prompt content and version label for a vault's org.
+        """Resolve the effective system-prompt content and version label for a query.
 
-        Called per-query so the org-specific prompt is always current and is not
+        Resolution order on the standard pipeline (issue #708): the vault's
+        org override, else the global active version, else None (the caller
+        falls back to the builder's built-in default). Vaults without an org
+        (``org_id`` NULL — e.g. the built-in Default vault), unknown vault
+        ids, and All-Vaults queries (``vault_id`` None) resolve the global
+        active version directly.
+
+        Called per-query so the effective prompt is always current and is not
         cached on the long-lived engine instance.
 
         Returns:
             Tuple of (prompt_content, prompt_version_label).
-            prompt_content is None when no org-specific override is set.
+            prompt_content is None when neither an org override nor a global
+            active version exists.
             prompt_version_label is the version string (e.g. 'v3.5') or None.
         """
-        if vault_id is None:
-            return None, None
         try:
             conn = sqlite3.connect(self._db_path)
             try:
                 conn.execute("PRAGMA foreign_keys = ON")
                 conn.row_factory = sqlite3.Row
-                # Look up org_id for the vault
-                row = conn.execute(
-                    "SELECT org_id FROM vaults WHERE id = ?",
-                    (vault_id,),
-                ).fetchone()
-                if row is None or row["org_id"] is None:
-                    return None, None
-                org_id = row["org_id"]
+                org_id: Optional[int] = None
+                if vault_id is not None:
+                    # Look up org_id for the vault
+                    row = conn.execute(
+                        "SELECT org_id FROM vaults WHERE id = ?",
+                        (vault_id,),
+                    ).fetchone()
+                    if row is not None:
+                        org_id = row["org_id"]
                 # Resolve effective version via store
                 from app.services.prompt_store import PromptVersionStore
 
                 store = PromptVersionStore(conn)
-                effective = store.resolve_for_org(org_id)
+                if org_id is not None:
+                    effective = store.resolve_for_org(org_id)
+                else:
+                    # Org-less vault, unknown vault, or All-Vaults query:
+                    # serve the global active version (issue #708).
+                    effective = store.get_active()
                 if effective is not None:
                     return effective.content, effective.version
                 return None, None
             finally:
                 conn.close()
-        except Exception:
+        except Exception as exc:
             # Prompt resolution failures should not crash queries; fall through
             # to normal builder resolution.
             logger.warning(
-                "Could not resolve org-specific prompt for vault_id=%s", vault_id
+                "Could not resolve effective prompt for vault_id=%s: %s", vault_id, exc
             )
             return None, None
 
@@ -542,20 +560,25 @@ class RAGEngine:
     ) -> Tuple[Optional[str], Optional[int], Optional[str], Optional[str]]:
         """Resolve the effective prompt with A/B experiment layering (FR-007 part 3).
 
-        Resolution order:
-          1. 3.5 org override (if set for this vault's org)
+        Resolution order (standard pipeline):
+          1. 3.5 effective version: org override (if set for this vault's
+             org), else the global active version — org-less vaults, unknown
+             vault ids, and All-Vaults queries resolve the global active
+             version directly (issue #708)
           2. A/B experiment override (if an active global experiment exists)
 
-        A/B layering is additional to the 3.5 org override: when an active
-        experiment exists, its assigned variant takes precedence over the 3.5
-        effective version for this query.  This lets experiments run across
-        all orgs uniformly (global experiment scope for v1 simplicity).
+        A/B layering is additional to the 3.5 effective version: when an
+        active experiment exists, its assigned variant takes precedence over
+        the 3.5 effective version for this query.  This lets experiments run
+        across all orgs uniformly (global experiment scope for v1 simplicity).
 
         Exposure is recorded idempotently (INSERT OR IGNORE) so re-exposure of
         the same subject_key to the same experiment does not double-count.
 
         Args:
             vault_id: Vault ID to look up org_id from (for 3.5 resolution).
+                None, an unknown id, or a vault with no org all resolve the
+                global active version (issue #708).
             user_id: User ID for per-user sticky A/B assignment (SC-017).
                 If None and vault_id is available, org_id is derived from
                 vault_id for an org-scoped fallback subject_key.
@@ -609,23 +632,67 @@ class RAGEngine:
                         active = ab_service.get_active_experiment()
                         if active is not None:
                             variant = ABTestingService.assign(active, subject_key)
-                            # Record exposure idempotently
-                            ab_service.record_exposure(active.id, subject_key, variant)
                             # Pick the prompt content from the assigned variant
                             if variant == "challenger":
                                 ab_content = active.challenger_version
                             else:
                                 ab_content = active.control_version
-                            # ab_content is a VERSION STRING — look up its content
-                            from app.services.prompt_store import PromptVersionStore
-
-                            store = PromptVersionStore(conn)
-                            pv = store.get_version(ab_content)
-                            if pv is not None:
-                                effective_content = pv.content
+                            # Record the assignment BEFORE any write or lookup:
+                            # a failure in exposure telemetry or content
+                            # retrieval must never silently drop the variant
+                            # the subject was assigned (issue #709 / T1-02-S2-06).
                             ab_experiment_id = active.id
                             ab_variant = variant
                             prompt_version = ab_content  # A/B version label
+                            # Record exposure idempotently. Exposure logging is
+                            # telemetry — a failed write (e.g. sqlite
+                            # writer-lock timeout) logs and continues while the
+                            # assigned variant above is still served.
+                            try:
+                                ab_service.record_exposure(
+                                    active.id, subject_key, variant
+                                )
+                            except Exception as exc:
+                                logger.warning(
+                                    "A/B exposure recording failed for "
+                                    "experiment=%s subject=%s (serving "
+                                    "assigned variant anyway): %s",
+                                    active.id,
+                                    subject_key,
+                                    exc,
+                                )
+                            # ab_content is a VERSION STRING — look up its
+                            # content. Best-effort: on failure keep the 3.5
+                            # effective content (same semantic as a missing
+                            # version directly below) while retaining the
+                            # assigned-variant metadata.
+                            from app.services.prompt_store import PromptVersionStore
+
+                            try:
+                                store = PromptVersionStore(conn)
+                                pv = store.get_version(ab_content)
+                            except Exception as exc:
+                                logger.warning(
+                                    "A/B variant content lookup failed for "
+                                    "version=%s (serving 3.5 effective "
+                                    "content; assignment attribution "
+                                    "retained): %s",
+                                    ab_content,
+                                    exc,
+                                )
+                                pv = None
+                                # prompt_version labels what SERVED: the
+                                # variant content did not load, so report the
+                                # 3.5 effective version while ab_variant keeps
+                                # the assignment truth (review finding).
+                                prompt_version = effective_version
+                            if pv is not None:
+                                effective_content = pv.content
+                            else:
+                                # Missing version row (get_version -> None):
+                                # same honesty rule as the exception path —
+                                # prompt_version labels what SERVED.
+                                prompt_version = effective_version
                 finally:
                     conn.close()
             except Exception as exc:
@@ -870,11 +937,28 @@ class RAGEngine:
         try:
             from app.services.metadata_filter import resolve_metadata_filter
 
-            active_filter_expr = resolve_metadata_filter(
-                metadata_filter, vault_id
-            )
-        except Exception as exc:  # noqa: BLE001 — validation errors surface above
-            logger.warning("[query] metadata_filter rejected: %s", exc)
+            # Off-loop resolution (issue #707): the resolver performs a
+            # blocking pool checkout + SQLite query; run it on a worker
+            # thread so the event loop stays responsive. Same shape as the
+            # _check_supersession/_get_indexed_file_ids precedents in this
+            # file. Under pool saturation the bounded checkout wait (up to
+            # ~15s) occupies a default-executor worker; the dedicated
+            # checkout-executor routing (#645/#592) is the established
+            # remedy should filtered turns ever run hot (plan trade-off).
+            #
+            # The no-filter case short-circuits BEFORE the offload: the
+            # resolver returns None without touching the pool, so paying a
+            # context copy + executor round-trip for it would add load to
+            # exactly the shared worker pool this call is careful not to
+            # congest (PR #881 review F-05).
+            if metadata_filter is None:
+                active_filter_expr = None
+            else:
+                active_filter_expr = await asyncio.to_thread(
+                    resolve_metadata_filter, metadata_filter, vault_id
+                )
+        except Exception as exc:  # noqa: BLE001 — pydantic validation AND resolver programming errors surface here
+            logger.warning("[query] metadata_filter resolution failed: %s", exc)
             raise
         # Document scope (issue #514 PRODUCT-ENH-05): resolved into the SAME
         # local filter expression so every retrieval seam below — the agentic
@@ -913,7 +997,14 @@ class RAGEngine:
         #   - full trace assembly (no extended trace logged to evidence)
         # Use the standard pipeline below for those features.
         # ------------------------------------------------------------------
-        if settings.agentic_rag_enabled:
+        # PRR-003 (#715 feedback): under maintenance the agentic path would
+        # swallow the choke-point raise (RetrievalTool converts it to a
+        # failed ToolResult) and synthesize an ungrounded answer with zero
+        # degraded signal. Fall through to the standard pipeline, whose
+        # maintenance gates produce the fallback notice and the
+        # "unavailable" abstention basis.
+        agentic_active = settings.agentic_rag_enabled and not self.maintenance_mode
+        if agentic_active:
             logger.info("[query] Agentic RAG enabled — routing through AgenticPlanner")
             # DEFENSE-IN-DEPTH NOTE (zaxbysauce review, Z-1): this early return
             # bypasses the include_global / can_write_memory gates below because
@@ -942,6 +1033,14 @@ class RAGEngine:
                 registry.register(synthesis_tool)
                 planner = AgenticPlanner(registry, llm_client=self.llm_client)
                 result = await planner.plan_and_execute(user_input, vault_id=vault_id)
+                # #715 TQ-instruction-batch-4-07: the planner's source dicts
+                # carried a private _chunk_text evidence channel for
+                # SynthesisTool. Strip it in place BEFORE any yield — both
+                # wire boundaries below (agentic_done["sources"] and the
+                # evidence_candidates event) share these dicts, and neither
+                # may ship full chunk text to the client.
+                for _agentic_src in result.all_sources:
+                    _agentic_src.pop("_chunk_text", None)
                 yield {"type": "content", "content": result.output}
                 agentic_done: Dict[str, Any] = {
                     "sources": result.all_sources,
@@ -1099,6 +1198,37 @@ class RAGEngine:
                         source="chat",
                         vault_id=vault_id,
                     )
+                    # Embed on THIS loop right after the insert (issue #712):
+                    # add_memory no longer bridges into the embedding service
+                    # synchronously. Only the newly-inserted branch embeds —
+                    # a re-sent directive hits the found-existing branch and
+                    # leaves that row's embedding as it stands (a prior
+                    # failed embed stays NULL; healing is the backfill's job).
+                    if (
+                        getattr(self.memory_store, "embedding_service", None)
+                        is not None
+                    ):
+                        try:
+                            outcome = await self.memory_store.embed_and_store(
+                                memory.id, memory_content
+                            )
+                            if outcome != "stored":
+                                logger.warning(
+                                    "Memory stored without embedding (id=%s, "
+                                    "outcome=%s); dense recall degraded to "
+                                    "FTS-only for this row (healed by the "
+                                    "startup backfill task or the superadmin "
+                                    "backfill route, not on a timer)",
+                                    memory.id,
+                                    outcome,
+                                )
+                        except Exception as exc:  # noqa: BLE001 — chat hot path
+                            logger.warning(
+                                "Memory embedding after remember-directive "
+                                "failed (id=%s): %s",
+                                memory.id,
+                                exc,
+                            )
                 yield {
                     "type": "content",
                     "content": f"Memory stored: {memory.content}",
@@ -1242,12 +1372,45 @@ class RAGEngine:
 
             async def _memory_retrieve() -> List[Any]:
                 try:
+                    # Precompute the query embedding ON THIS LOOP (issue #712):
+                    # awaiting the embedding service here and passing the
+                    # result down means search_memories never spins a fresh
+                    # event loop against the main-loop-bound httpx client.
+                    # Own try/except so ANY precompute failure (service error
+                    # or a store double without an awaitable embed_query)
+                    # degrades to WARNING + FTS-only instead of aborting the
+                    # memory search; the kwarg is still PASSED (as None) so
+                    # the store's never-attempted WARNING cannot misfire.
+                    # Store doubles without an embedding_service attribute
+                    # (plain test stubs) get no kwarg at all.
+                    has_embedder = (
+                        getattr(self.memory_store, "embedding_service", None)
+                        is not None
+                    )
+                    query_embedding: Optional[List[float]] = None
+                    if has_embedder and user_input and user_input.strip():
+                        try:
+                            query_embedding = await self.memory_store.embed_query(
+                                user_input
+                            )
+                        except Exception as exc:  # noqa: BLE001 — degrade, not abort
+                            logger.warning(
+                                "Memory query embedding precompute failed; "
+                                "continuing FTS-only: %s",
+                                exc,
+                            )
+                            query_embedding = None
+                    search_kwargs: Dict[str, Any] = {
+                        "vault_id": vault_id,
+                        "include_global": include_global,
+                    }
+                    if has_embedder:
+                        search_kwargs["query_embedding"] = query_embedding
                     candidates = await asyncio.to_thread(
                         self.memory_store.search_memories,
                         user_input,
                         settings.memory_retrieval_top_k,
-                        vault_id=vault_id,
-                        include_global=include_global,
+                        **search_kwargs,
                     )
                     # Apply context_top_k cap so prompt context stays bounded
                     # even when memory_retrieval_top_k is large.
@@ -1387,17 +1550,20 @@ class RAGEngine:
                     for vt, text in transformed_queries
                     if vt == 'original'
                 ] or [('original', retrieval_query)]
-            embed_tasks = [_embed_one(vt, t) for vt, t in variants_to_embed]
             # E3 admission (issue #518): the embedding device budget is shared
-            # process-wide (and cross-process via ADMISSION_STORE_URL).
+            # process-wide (and cross-process via ADMISSION_STORE_URL). The
+            # variant coroutines are built INSIDE the admitted context so a
+            # rejected admission never leaves un-awaited coroutines behind.
             try:
                 async with get_admission_controller().admit(
                     AdmissionClass.EMBEDDING
                 ):
+                    embed_tasks = [_embed_one(vt, t) for vt, t in variants_to_embed]
                     raw_embeddings = await asyncio.gather(
                         *embed_tasks, return_exceptions=True
                     )
             except AdmissionRejected as exc:
+                _cancel_overlap_tasks()
                 if stream:
                     _merge_request_llm_failure(
                         {"status": "admission_rejected", "detail": str(exc)}
@@ -1410,9 +1576,9 @@ class RAGEngine:
                     return
                 raise RAGEngineError(f"Embedding admission rejected: {exc}")
 
-            for (variant_type, _), result in zip(variants_to_embed, raw_embeddings):
+            for (variant_label, _), result in zip(variants_to_embed, raw_embeddings):
                 if isinstance(result, EmbeddingError):
-                    if variant_type == 'original':
+                    if variant_label == 'original':
                         logger.error(
                             "Query embedding failure for original query: %s", result
                         )
@@ -1429,11 +1595,11 @@ class RAGEngine:
                             return
                         raise RAGEngineError(f"Original query embedding failed: {result}")
                     logger.warning(
-                        "Query embedding failure for variant '%s': %s", variant_type, result
+                        "Query embedding failure for variant '%s': %s", variant_label, result
                     )
-                    variants_dropped.append(variant_type)
+                    variants_dropped.append(variant_label)
                 elif isinstance(result, BaseException):
-                    if variant_type == 'original':
+                    if variant_label == 'original':
                         logger.error("Query embedding failure for original query: %s", result)
                         _cancel_overlap_tasks()
                         if stream:
@@ -1447,9 +1613,9 @@ class RAGEngine:
                             }
                             return
                         raise RAGEngineError(f"Original query embedding failed: {result}")
-                    variants_dropped.append(variant_type)
+                    variants_dropped.append(variant_label)
                 else:
-                    query_embeddings.append((variant_type, result))
+                    query_embeddings.append((variant_label, result))
 
             if not query_embeddings:
                 error_msg = "Unable to encode any query variants"
@@ -1539,7 +1705,7 @@ class RAGEngine:
                 ) = await self._orchestrate_sub_query_retrieval(
                     plan=plan,
                     vault_id=vault_id,
-                    user_input=user_input,
+                    user_input=retrieval_query,
                     effective_alpha=effective_alpha,
                     variants_dropped=[],
                     effective_initial_top_k=effective_initial_top_k,
@@ -1561,9 +1727,14 @@ class RAGEngine:
                 _multi_sub_rerank_status = rerank_status
                 trace.fusion_used = fusion_applied
                 if sub_queries_failed:
+                    # Sub-query text is user-derived — count-only at INFO,
+                    # full (truncated) text at DEBUG only (#287/#710).
                     logger.info(
-                        "[query] %d sub-queries failed (degraded fusion): %s",
+                        "[query] %d sub-queries failed (degraded fusion)",
                         len(sub_queries_failed),
+                    )
+                    logger.debug(
+                        "[query] failed sub-queries (degraded fusion): %s",
                         [sq[:40] for sq in sub_queries_failed],
                     )
             except SearchSemaphoreTimeoutError:
@@ -1620,19 +1791,19 @@ class RAGEngine:
                         )
                     _fusion_evaluator = self._retrieval_evaluators[evaluator_key]
                     eval_result = await _fusion_evaluator.evaluate(
-                        user_input, vector_results
+                        retrieval_query, vector_results
                     )
                     if eval_result == "NO_MATCH":
                         relevance_hint = "Note: The retrieved documents may not be directly relevant to your query."
                         if logger.isEnabledFor(logging.DEBUG):
                             logger.debug(
                                 "Multi-sub-query fusion evaluation: NO_MATCH for query (len=%d)",
-                                len(user_input),
+                                len(retrieval_query),
                             )
                     elif eval_result == "AMBIGUOUS" and logger.isEnabledFor(logging.DEBUG):
                         logger.debug(
                             "Multi-sub-query fusion evaluation: AMBIGUOUS for query (len=%d)",
-                            len(user_input),
+                            len(retrieval_query),
                         )
                 except Exception as _fusion_eval_exc:
                     logger.warning(
@@ -1660,7 +1831,7 @@ class RAGEngine:
                 try:
                     vector_results, relevance_hint, eval_result, rerank_success, score_type, hybrid_status, fts_exceptions, rerank_status, variants_dropped, exact_match_promoted, token_pack_stats = await self._execute_retrieval(
                         query_embeddings,
-                        user_input,
+                        retrieval_query,
                         vault_id,
                         effective_alpha=effective_alpha,
                         variants_dropped=variants_dropped,
@@ -1796,7 +1967,7 @@ class RAGEngine:
                 )
                 trace.distillation_before = len(relevant_chunks)
                 distill_result = await distiller.distill(
-                    user_input, relevant_chunks, eval_result
+                    retrieval_query, relevant_chunks, eval_result
                 )
                 relevant_chunks = distill_result.sources
                 sentence_provenance = distill_result.sentence_provenance
@@ -1880,6 +2051,20 @@ class RAGEngine:
                 "results": [],
                 "total": 0,
                 "fallback": True,
+                # #715 T1-32-K-01: every chunk consumer reads `content` — a
+                # degraded-retrieval notice here makes the outage visible in
+                # the transcript instead of rendering as an empty turn that
+                # looks like a legitimate abstention. FIXED generic text:
+                # fallback_reason is str(exc) on the generic error path, and
+                # exception detail belongs in the server-side WARNING (and
+                # the `reason` field), never in client-visible content
+                # (A04/#562 leak hygiene). The trailing "\n\n" keeps the
+                # notice a separate block from the answer in both route
+                # collectors.
+                "content": (
+                    "Retrieval is degraded, so this answer is not grounded "
+                    "in retrieved documents.\n\n"
+                ),
             }
 
         # Collect memories from the task launched concurrently above (hybrid:
@@ -1962,8 +2147,10 @@ class RAGEngine:
         }
 
         # Build messages using prompt builder service.
-        # Resolve the org-specific prompt (if any) per-query so different orgs
-        # always get their own version without stale caching on the builder.
+        # Resolve the effective prompt per-query (org override, else the global
+        # active version; org-less/All-Vaults queries get the global active one)
+        # so different orgs always get their own version, and an activated
+        # version is served everywhere, without stale caching on the builder.
         # FR-007 part 3: A/B experiment layering — if an active global experiment
         # exists, its assigned variant takes precedence over the 3.5 effective version.
         effective_prompt_override, ab_eid, ab_var, p_version = await asyncio.to_thread(
@@ -2146,7 +2333,12 @@ class RAGEngine:
             abstention_decision: Optional[bool] = False
         elif not done_msg.get("sources") and not done_msg.get("memories_used") \
                 and not done_msg.get("wiki_used") and not done_msg.get("kms_used"):
-            abstention_decision = True
+            # #715 T1-32-K-01: a retrieval-degraded turn (fallback_reason set)
+            # never offered the model evidence to decide over — that is
+            # "unavailable", not a legitimate "nothing relevant" decision.
+            # Cited answers keep the explicit False above: citing
+            # memories/wiki/kms during document degradation is a real decision.
+            abstention_decision = None if fallback_reason else True
         else:
             abstention_decision = None
         done_msg["answer_contract"] = build_answer_contract(
@@ -2165,34 +2357,77 @@ class RAGEngine:
         # silently return an ordinary uncited answer — emit an explicit
         # enforcement status consumers can display.
         if active_citation_mode == "required":
-            # Label-set membership (Copilot review thread + prior probe): a
-            # phantom [S99] in the raw parse output must not count as
-            # "satisfied" — validity requires the label to name an
-            # actually-provided source, matching the agentic path's semantics.
+            # Label-set membership for EVERY citation family (issue #709 /
+            # T1-32-K-03): a label is a valid citation only if it names an
+            # actually-provided item of its own family. Parsed labels that do
+            # not resolve — a phantom [M9] with no memories offered, [W4] past
+            # the wiki evidence count, [S99] past the source count — must not
+            # count toward "satisfied". (The agentic path enforces S-family
+            # membership only; extending phantom checks there is tracked
+            # separately — do not read parity into this comment.)
             from app.services.citation_validator import _CITATION_RE
 
-            source_labels = {
-                s.get("source_label")
-                for s in done_msg.get("sources", [])
-                if s.get("source_label")
+            offered_labels = {
+                "S": {
+                    s.get("source_label")
+                    for s in done_msg.get("sources", [])
+                    if s.get("source_label")
+                },
+                "M": {f"M{i + 1}" for i in range(len(memories))},
+                "W": {
+                    ev.label_placeholder
+                    for ev in (wiki_evidence or [])
+                },
+                "K": {
+                    ev.label_placeholder
+                    for ev in (kms_evidence or [])
+                },
             }
-            parsed_source_labels = {
-                f"{kind}{num}"
-                for kind, num in _CITATION_RE.findall(full_response or "")
+            parsed_by_kind: Dict[str, set] = {
+                "S": set(),
+                "M": set(),
+                "W": set(),
+                "K": set(),
             }
-            has_valid_source_citation = bool(parsed_source_labels & source_labels)
-            if (
-                not has_valid_source_citation
-                and not cited_memories and not cited_wikis
-                and not cited_kms and done_msg.get("sources")
+            for kind, num in _CITATION_RE.findall(full_response or ""):
+                if kind in parsed_by_kind:
+                    parsed_by_kind[kind].add(f"{kind}{num}")
+            phantom_labels = {
+                label
+                for kind, offered in offered_labels.items()
+                for label in parsed_by_kind.get(kind, set()) - offered
+            }
+            has_valid_citation = any(
+                parsed_by_kind[kind] & offered_labels[kind]
+                for kind in parsed_by_kind
+            )
+            # Citations can only be required when citable evidence was
+            # offered at all — documents, memories, wiki, or KMS.
+            any_citable_evidence = bool(
+                done_msg.get("sources")
+                or memories
+                or wiki_evidence
+                or kms_evidence
+            )
+            if any_citable_evidence and (
+                not has_valid_citation or phantom_labels
             ):
+                if phantom_labels:
+                    detail = (
+                        "Citations were required but the answer cites labels "
+                        "that were not offered: "
+                        + ", ".join(sorted(phantom_labels))
+                        + "."
+                    )
+                else:
+                    detail = (
+                        "Citations were required but the answer contains no "
+                        "valid citation labels."
+                    )
                 done_msg["citation_enforcement"] = {
                     "mode": "required",
                     "status": "missing_citations",
-                    "detail": (
-                        "Citations were required but the answer contains no "
-                        "valid citation labels."
-                    ),
+                    "detail": detail,
                 }
             else:
                 done_msg["citation_enforcement"] = {
@@ -2230,6 +2465,31 @@ class RAGEngine:
         # query observation). Wire-facing source metadata does not carry a `text`
         # key; scoring must use this internal registry (issue #462). Lexical/Jaccard
         # overlap here is support-scoring only — never pixel-level entailment.
+        #
+        # Issue #714: a SECOND registry maps every cited non-document label
+        # (M#/W#/K#) to the evidence BODY the prompt rendered for it — memory
+        # `content` (rendered inline by PromptBuilderService.build_messages),
+        # wiki `claim_text or excerpt` (prompt_builder.format_wiki_evidence),
+        # KMS `excerpt or summary` (prompt_builder.format_kms_evidence).
+        # Bodies only, by necessity: EVERY family's rendered block embeds the
+        # label token itself — "[W1] Title…", "[K1] Title…", "[M1] <memory>…"
+        # — and _tokenize strips punctuation, so scoring the full rendered
+        # block would put token "w1"/"m1" in both the claim and evidence sets
+        # and force Jaccard > 0 for every citation, breaking the zero-overlap
+        # contract. The registries hold only offered-and-cited
+        # evidence (memories_used/wiki_used/kms_used are built by intersecting
+        # candidates with cited labels), so phantom labels never reach scoring —
+        # the same label-membership base as repair_against_sources_and_memories.
+        # Empty bodies score a natural 0.0 (flagged, not omitted). #716 ships
+        # the ESCAPING half of rendered-evidence parity: every registry body
+        # is normalized with html.unescape() on the model side so entity
+        # encoding cancels regardless of whether the model echoed the
+        # escaped prompt fragments or emitted natural characters (PRR-003
+        # feedback: escaping the evidence side instead INVERTED the score
+        # for natural-character answers — 0.875 became 0.4545 on the probe
+        # pair). Sources stay RAW (wiki_curator's keep-source-raw pattern).
+        # The S#-arm SOURCE divergence (raw_text vs distilled text) stays
+        # with PR 9's disclosed limitation.
         try:
             support_texts: List[str] = []
             for chunk in relevant_chunks:
@@ -2242,10 +2502,28 @@ class RAGEngine:
                 if getattr(chunk, "vision_observation", None):
                     parts.append(chunk.vision_observation)
                 support_texts.append("\n".join(parts))
+            support_by_label: Dict[str, str] = {}
+            for mem in done_msg.get("memories_used", []) or []:
+                label = mem.get("memory_label")
+                if label:
+                    support_by_label[label] = mem.get("content") or ""
+            for ev in done_msg.get("wiki_used", []) or []:
+                label = ev.get("wiki_label")
+                if label:
+                    support_by_label[label] = (
+                        ev.get("claim_text") or ev.get("excerpt") or ""
+                    )
+            for ev in done_msg.get("kms_used", []) or []:
+                label = ev.get("kms_label")
+                if label:
+                    support_by_label[label] = (
+                        ev.get("excerpt") or ev.get("summary") or ""
+                    )
             confidence_result = score_citations(
-                full_response,
+                html.unescape(full_response),
                 support_texts,
                 sentence_provenance=_request_distillation_provenance.get(),
+                support_texts_by_label=support_by_label,
             )
             trace.citation_confidence = confidence_result.citation_confidence
             trace.unverifiable_claims = list(confidence_result.unverifiable_claims)
@@ -2317,7 +2595,13 @@ class RAGEngine:
         Args:
             plan: List of sub-query strings from QueryPlanner.plan().
             vault_id: Vault scope for retrieval.
-            user_input: Original user query (used as fallback if all sub-queries fail).
+            user_input: The retrieval query text for this fan-out — the
+                follow-up rewrite threaded from query() (the raw input when
+                no rewrite fired). Drives every seam inside: the per-sub-query
+                BM25/FTS ``query_text``, the consolidated rerank ``query``,
+                the fusion CRAG evaluator, and the all-failed fallback
+                single-query retrieval (including the reuse check against
+                ``original_query_text``).
             effective_alpha: Hybrid search alpha weight.
             variants_dropped: Accumulated list of variant types that failed.
             effective_initial_top_k: Initial retrieval top-k.
@@ -2385,15 +2669,26 @@ class RAGEngine:
                 emb = await self.embedding_service.embed_single(sq)
                 return sq, emb, None
             except Exception as exc:
+                # Sub-query text is user-derived — keep it out of default
+                # (WARNING) logs; DEBUG carries the truncated text (#710).
                 logger.warning(
-                    "[_orchestrate_sub_query_retrieval] sub-query embedding failed: %s (%s)",
-                    sq[:60],
+                    "[_orchestrate_sub_query_retrieval] sub-query embedding failed (%s)",
                     exc,
+                )
+                logger.debug(
+                    "[_orchestrate_sub_query_retrieval] failed sub-query text: %s",
+                    sq[:60],
                 )
                 return sq, None, str(exc)
 
-        embed_tasks = [_embed_sub_query(sq) for sq in unique_plan]
-        embed_results = await asyncio.gather(*embed_tasks, return_exceptions=True)
+        # E3 admission (issue #518): sub-query embeds share the process-wide
+        # embedding budget; the coroutines are built inside the admitted
+        # context so a rejection never leaves un-awaited coroutines behind.
+        async with get_admission_controller().admit(AdmissionClass.EMBEDDING):
+            embed_tasks = [_embed_sub_query(sq) for sq in unique_plan]
+            embed_results = await asyncio.gather(
+                *embed_tasks, return_exceptions=True
+            )
 
         # Collect successful embeddings; track failures.
         sub_query_embeddings: List[Tuple[str, List[float]]] = []
@@ -2403,10 +2698,14 @@ class RAGEngine:
                 sq = unique_plan[i] if i < len(unique_plan) else f"<sub_query_{i}>"
                 failed_sub_queries.append(sq)
                 logger.warning(
-                    "[_orchestrate_sub_query_retrieval] embed task %d (%s) raised: %s",
+                    "[_orchestrate_sub_query_retrieval] embed task %d raised: %s",
+                    i,
+                    result,
+                )
+                logger.debug(
+                    "[_orchestrate_sub_query_retrieval] failed sub-query text (task %d): %s",
                     i,
                     sq[:60],
-                    result,
                 )
             else:
                 sq, emb, exc = result
@@ -2414,16 +2713,21 @@ class RAGEngine:
                     failed_sub_queries.append(sq)
                     if exc:
                         logger.warning(
-                            "[_orchestrate_sub_query_retrieval] sub-query '%s' embedding failed: %s",
-                            sq[:60],
+                            "[_orchestrate_sub_query_retrieval] sub-query embedding failed: %s",
                             exc,
+                        )
+                        logger.debug(
+                            "[_orchestrate_sub_query_retrieval] failed sub-query text: %s",
+                            sq[:60],
                         )
                 else:
                     sub_query_embeddings.append((sq, emb))
 
-        # Fallback embedding of the original user query for the two
-        # all-failed paths below — reuse the query()-level original
-        # embedding when the text matches (RAG-DEEP-01).
+        # Fallback embedding of the retrieval query for the two all-failed
+        # paths below — reuse the query()-level original embedding when the
+        # text matches (RAG-DEEP-01). With a follow-up rewrite active,
+        # original_query_text IS the rewrite, so the reuse check keys on the
+        # rewrite, not the raw user input.
         async def _fallback_embedding() -> List[float]:
             if (
                 original_query_embedding is not None
@@ -2431,7 +2735,10 @@ class RAGEngine:
                 and user_input == original_query_text
             ):
                 return original_query_embedding
-            return await self.embedding_service.embed_single(user_input)
+            async with get_admission_controller().admit(
+                AdmissionClass.EMBEDDING
+            ):
+                return await self.embedding_service.embed_single(user_input)
 
         # If ALL sub-query embeddings failed, fall back to single-query retrieval.
         if not sub_query_embeddings:
@@ -2513,12 +2820,23 @@ class RAGEngine:
         per_sub_results: List[List[Dict[str, Any]]] = []
         for i, result in enumerate(gathered):
             sq = retrieval_tasks[i][0] if i < len(retrieval_tasks) else f"<sub_query_{i}>"
+            if isinstance(result, SearchSemaphoreTimeoutError):
+                # OPS-006 (issue #494/#715 T1-32-S2-01): a search-capacity
+                # timeout on ANY sub-query is a server-busy signal for the
+                # whole turn — propagate it before fusion (and before the
+                # all-failed fallback re-contends the same saturated
+                # semaphore a second time) so the outer handlers surface the
+                # documented 503 contract.
+                raise result
             if isinstance(result, BaseException):
                 failed_sub_queries.append(sq)
                 logger.warning(
-                    "[_orchestrate_sub_query_retrieval] sub-query '%s' retrieval failed: %s",
-                    sq[:60],
+                    "[_orchestrate_sub_query_retrieval] sub-query retrieval failed: %s",
                     result,
+                )
+                logger.debug(
+                    "[_orchestrate_sub_query_retrieval] failed sub-query text: %s",
+                    sq[:60],
                 )
                 per_sub_results.append([])
             else:
@@ -2682,7 +3000,10 @@ class RAGEngine:
                         "failed, keeping fused order: %s",
                         exc,
                     )
-                    agg_rerank_success = None
+                    # #715 T1-32-K-06 (sibling): attempted-and-failed maps to
+                    # "fallback" here too, mirroring _execute_retrieval's
+                    # exception semantics, never the turned-off "disabled".
+                    agg_rerank_success = False
             score_type = "rerank" if agg_rerank_success else "distance"
             if agg_rerank_success is True:
                 agg_rerank_status = "ok"
@@ -2713,7 +3034,11 @@ class RAGEngine:
 
         Args:
             query_embeddings: List of (variant_type, embedding) tuples to search
-            user_input: Original user query
+            user_input: Query text for the lexical (BM25/FTS) arm, the
+                reranker, and the CRAG evaluator. Callers pass the retrieval
+                query for their route: query() passes the follow-up rewrite
+                (``retrieval_query``); the eval/retrieve_sources surfaces
+                pass their own query verbatim.
             vault_id: Optional vault ID to filter by
             effective_alpha: Hybrid search alpha weight
             variants_dropped: List of variant types that failed embedding (e.g., step_back, hyde)
@@ -2744,6 +3069,16 @@ class RAGEngine:
             self.retrieval_top_k,
             len(query_embeddings),
         )
+        # OPS-005 (issue #494) / #715 T1-32-K-08: single choke point. Every
+        # retrieval surface (standard query, multi-sub-query fan-out, eval,
+        # retrieve_sources' document kinds, agentic RetrievalTool) reaches the
+        # store through here, so the maintenance gate belongs here rather than
+        # at each call site. Callers absorb the raise: query()'s upstream gates
+        # keep their fallback-answer UX, retrieve_eval_results surfaces
+        # ``unavailable``, retrieve_sources records the kind as failed, and
+        # RetrievalTool returns a failed ToolResult.
+        if self.maintenance_mode:
+            raise RAGEngineError("RAG index is under maintenance")
         # Controls arrive exclusively via explicit parameters (PR #523 review
         # PRR-001): the former per-query engine-state fallback read
         # self._active_* instance attributes that raced across concurrent
@@ -2755,6 +3090,10 @@ class RAGEngine:
         rerank_success: Optional[bool] = None
         fts_exceptions = 0  # Initialize before try in case get_fts_exceptions() raises
         final_relevance_hint: Optional[str] = None  # Initialize before try block
+        # #715 T1-32-S-06: request-scoped FTS attribution window. Opened below
+        # just before the search tasks are created, closed in the finally after
+        # the diagnostics read — never left dangling on a raised path.
+        fts_attribution_token = None
 
         # Phase 1: Search phase - original query failures propagate immediately
         vector_results = []
@@ -2787,6 +3126,11 @@ class RAGEngine:
                 _alpha = effective_alpha
             _top_k = int(top_k_value) if top_k_value is not None else 10
             _vault = str(vault_id) if vault_id is not None else None
+            # #715 T1-32-S-06: open the per-request FTS attribution window
+            # BEFORE the search tasks exist — gather-created Tasks inherit the
+            # buffer object through their copied context, so every increment
+            # inside this request's searches lands on this request's buffer.
+            fts_attribution_token, _fts_buffer = start_request_fts_attribution()
             search_tasks = [
                 self.vector_store.search(
                     embedding_tuple[1],  # Extract embedding from (variant_type, embedding) tuple
@@ -2819,8 +3163,8 @@ class RAGEngine:
 
                     # Paraphrase/step_back/hyde failure: log and track
                     logger.warning(
-                        "[_execute_retrieval] vector search variant=%d (%s) failed: %s",
-                        i, variant_type, result,
+                        "[_execute_retrieval] vector search variant=%d failed: %s",
+                        i, result,
                     )
                     if variant_type not in variants_dropped:
                         variants_dropped.append(variant_type)
@@ -2987,7 +3331,11 @@ class RAGEngine:
                     )
                 except Exception as e:
                     logger.warning("Reranking failed, using original results: %s", e)
-                    # rerank_success remains None (unattempted due to exception)
+                    # #715 T1-32-K-06: the rerank WAS attempted and failed —
+                    # that maps to status "fallback", not "disabled" (the
+                    # turned-off value), so operators can tell a reranker
+                    # outage from a configuration choice.
+                    rerank_success = False
 
             # Determine final rerank_success value
             # rerank_success is set inside the reranking block (from unpacking)
@@ -3013,8 +3361,11 @@ class RAGEngine:
             else:
                 score_type = "distance"
 
-            # Compute hybrid_status from _fts_status in results
-            if not self.hybrid_search_enabled:
+            # Compute hybrid_status from the EFFECTIVE per-query hybrid flag
+            # (#715 T1-32-K-06): retrieval_mode "semantic" resolves _hybrid to
+            # False above, and reporting "both"/"dense_only" for a dense-only
+            # query would claim a lexical arm that never ran.
+            if not _hybrid:
                 hybrid_status = "disabled"
             else:
                 # Check if any result has _fts_status='ok'
@@ -3053,6 +3404,14 @@ class RAGEngine:
             fts_exceptions = 0
             rerank_status = "disabled"
             exact_match_promoted = False
+        finally:
+            # #715 T1-32-S-06: close the attribution window on every exit
+            # path. On the normal path the get_fts_exceptions() read above
+            # has already consumed this request's buffer; on a raised path
+            # the unconsumed buffer is simply discarded.
+            if fts_attribution_token is not None:
+                end_request_fts_attribution(fts_attribution_token)
+                fts_attribution_token = None
 
         # Phase 2: Evaluation/post-processing phase (only reached if search succeeds with results)
         token_pack_stats: Dict[str, int] = {
@@ -3163,15 +3522,13 @@ class RAGEngine:
         else:
             score_type = "distance"
 
-        # Compute hybrid_status from _fts_status in results
-        if not self.hybrid_search_enabled:
-            hybrid_status = "disabled"
-        else:
-            # Check if any result has _fts_status='ok'
-            has_fts_ok = any(
-                r.get("_fts_status") == "ok" for r in vector_results
-            )
-            hybrid_status = "both" if has_fts_ok else "dense_only"
+        # hybrid_status was already derived inside the search try-block from
+        # the EFFECTIVE per-query hybrid flag (#715 T1-32-K-06); the former
+        # second derivation here was flag-blind (self.hybrid_search_enabled)
+        # and unconditionally overwrote that value before the return, so the
+        # per-query fix never reached callers. Removed — the in-try value is
+        # authoritative, including on the except path (which sets
+        # "disabled").
 
         # Compute rerank_status string from rerank_success boolean
         if rerank_success is True:
@@ -3315,6 +3672,20 @@ class RAGEngine:
                 content = await candidate.chat_completion(
                     messages, **completion_kwargs
                 )
+                # Same visible-answer contract as _stream_llm_response,
+                # classified at the content level (the streaming sibling
+                # tracks emitted chunks instead of a completed string): a
+                # blank (or reasoning-only) completion is a failed visible
+                # answer, not a success to persist as an empty 200.
+                if not content or not content.strip():
+                    last_error = LLMError(
+                        "LLM completion returned no user-visible content"
+                    )
+                    logger.warning(
+                        "[_get_llm_response] Empty visible response from %s; trying fallback",
+                        getattr(candidate, "base_url", "<unknown>"),
+                    )
+                    continue
                 metrics = dict(getattr(candidate, "last_metrics", {}) or {})
                 if candidate is not target:
                     metrics["fallback_from"] = getattr(target, "base_url", None)
@@ -3755,7 +4126,11 @@ class RAGEngine:
             finally:
                 pool.release_connection(conn)
         except Exception as exc:
-            logger.debug("_get_indexed_file_ids failed: %s", exc)
+            # #715 T1-32-K-05: the atomic-visibility filter (issue #13) just
+            # silently disabled itself — that is an operational degradation,
+            # not debug noise. WARNING so operators can see partial-ingest
+            # state leaking into prompts when the DB layer fails.
+            logger.warning("_get_indexed_file_ids failed: %s", exc)
             return None
 
     def _get_scoped_partial_file_ids(
@@ -3915,24 +4290,31 @@ class RAGEngine:
                 return await self.embedding_service.embed_passage(text)
             return await self.embedding_service.embed_single(text)
 
-        embed_tasks = [_embed_one(vt, t) for vt, t in transformed_queries]
-        raw_embeddings = await asyncio.gather(*embed_tasks, return_exceptions=True)
+        # E3 admission (issue #518): the eval/retrieve_sources query embeds
+        # share the process-wide embedding budget; the coroutines are built
+        # inside the admitted context so a rejection never leaves un-awaited
+        # coroutines behind.
+        async with get_admission_controller().admit(AdmissionClass.EMBEDDING):
+            embed_tasks = [_embed_one(vt, t) for vt, t in transformed_queries]
+            raw_embeddings = await asyncio.gather(
+                *embed_tasks, return_exceptions=True
+            )
 
         query_embeddings: List[Tuple[str, List[float]]] = []
         variants_dropped: List[str] = []
 
-        for (variant_type, _), result in zip(transformed_queries, raw_embeddings):
+        for (variant_label, _), result in zip(transformed_queries, raw_embeddings):
             if isinstance(result, BaseException):
-                if variant_type == "original":
+                if variant_label == "original":
                     raise RAGEngineError(f"Original query embedding failed: {result}") from result
                 logger.warning(
                     "Query embedding failed for variant '%s': %s",
-                    variant_type,
+                    variant_label,
                     result,
                 )
-                variants_dropped.append(variant_type)
+                variants_dropped.append(variant_label)
             else:
-                query_embeddings.append((variant_type, result))
+                query_embeddings.append((variant_label, result))
 
         if not query_embeddings:
             raise RAGEngineError("Unable to encode any query variants")
@@ -4014,7 +4396,7 @@ class RAGEngine:
             # ``retrieve_eval_results`` docstring) rather than propagating and
             # aborting the whole eval run. It therefore sits inside this try.
             query_embeddings, variants_dropped = await self._build_query_embeddings(query)
-            vector_results, _, _, _, _, _, _, _, _, _, _ = await self._execute_retrieval(
+            vector_results, _, _, rerank_success, _, _, _, _, _, _, _ = await self._execute_retrieval(
                 query_embeddings,
                 query,
                 vault_id,
@@ -4041,7 +4423,7 @@ class RAGEngine:
         self._sync_document_retrieval_settings()
         relevant_chunks = await self.document_retrieval.filter_relevant(
             vector_results,
-            reranked=False,
+            reranked=rerank_success if rerank_success is not None else False,
             indexed_file_ids=indexed_file_ids,
         )
         capped = relevant_chunks[:top_k]

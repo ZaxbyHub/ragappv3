@@ -1,4 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { canvasDraftKey } from "@/lib/canvasDrafts";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -244,7 +245,7 @@ describe("CanvasPage localStorage draft durability", () => {
 
     // The debounced write lands in localStorage (500ms debounce, real timers).
     await waitFor(
-      () => expect(storage.get("canvas-draft:cav_test1")).toBe(draft),
+      () => expect(storage.get(canvasDraftKey("cav_test1", null))).toBe(draft),
       { timeout: 2000 }
     );
     first.unmount();
@@ -270,13 +271,13 @@ describe("CanvasPage localStorage draft durability", () => {
     fireEvent.change(await screen.findByLabelText("Canvas content editor"), {
       target: { value: draft },
     });
-    await waitFor(() => expect(storage.get("canvas-draft:cav_test1")).toBe(draft), {
+    await waitFor(() => expect(storage.get(canvasDraftKey("cav_test1", null))).toBe(draft), {
       timeout: 2000,
     });
 
     fireEvent.click(screen.getByTestId("canvas-save-button"));
     await waitFor(() => expect(saveCanvasVersionMock).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(storage.has("canvas-draft:cav_test1")).toBe(false));
+    await waitFor(() => expect(storage.has(canvasDraftKey("cav_test1", null))).toBe(false));
   });
 
   it("does not crash or restore anything when localStorage is unavailable", async () => {

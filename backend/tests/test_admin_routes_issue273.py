@@ -188,6 +188,12 @@ def test_admin_toggle_rolls_back_when_audit_write_fails():
         app.dependency_overrides[admin_module.get_secret_manager] = (
             lambda: secret_manager
         )
+        # Issue #724 (B1): set_toggle now enforces csrf_protect like its
+        # sibling mutation; this bare app has no CSRF manager, so install
+        # the per-app pass-through override (the _maintenance_app idiom).
+        # Assertions below are unchanged — this harness change only routes
+        # the request past the new dependency.
+        app.dependency_overrides[csrf_protect] = lambda: "test-csrf-token"
 
         client = TestClient(app)
         with patch.object(settings, "admin_secret_token", "test-admin-key"):

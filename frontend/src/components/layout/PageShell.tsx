@@ -2,17 +2,20 @@ import { ReactNode, useEffect, useState } from "react";
 import { useLocation } from "react-router-dom";
 import { motion, AnimatePresence, useReducedMotion } from "framer-motion";
 import { Navigation } from "./Navigation";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { ActivityTray } from "./ActivityTray";
 import { UploadIndicator } from "@/components/shared/UploadIndicator";
 import UnconfiguredChatBanner from "@/components/UnconfiguredChatBanner";
 import FirstRunChecklist from "@/components/onboarding/FirstRunChecklist";
 import { getSettings } from "@/lib/api";
+import { useSettingsStore } from "@/stores/useSettingsStore";
 import type { HealthStatus } from "@/types/health";
 import type { NavItemId } from "./navigationTypes";
 
 interface PageShellProps {
   children: ReactNode;
-  activeItem: NavItemId;
+  // null = no nav item owns the route (issue #779 / UI-R1-08).
+  activeItem: NavItemId | null;
   onItemSelect: (id: NavItemId) => void;
   healthStatus: HealthStatus;
 }
@@ -33,7 +36,20 @@ export function PageShell({ children, activeItem, onItemSelect, healthStatus }: 
     Promise.resolve()
       .then(() => getSettings())
       .then((settings) => {
-        if (!cancelled) setChatConfigured(settings.chat_configured !== false);
+        if (cancelled) return;
+        setChatConfigured(settings.chat_configured !== false);
+        // Populate the settings store so server-configured upload limits
+        // (max_file_size_mb, allowed_extensions) reach every upload surface
+        // without the Settings page being opened (issue #768 AC7). The write
+        // is guarded to FILL-ONLY: a store already populated by the Settings
+        // page's load/save is newer than this shell response, so a late shell
+        // fetch must never clobber it (plan-critic Round 1 R6 stale-write
+        // guard). A failed fetch writes nothing — the store keeps the null
+        // "unloaded" state and consumers use their fallbacks.
+        const store = useSettingsStore.getState();
+        if (store.settings == null) {
+          store.setSettings(settings);
+        }
       })
       .catch(() => {
         if (!cancelled) setChatConfigured(null);
@@ -106,19 +122,37 @@ export function PageShell({ children, activeItem, onItemSelect, healthStatus }: 
             branch caps the content measure so `mx-auto` actually centers wide
             screens. Desktop chat keeps its exact edge-to-edge layout (md:pb-0). */}
         <div className={isChat ? "flex-1 min-h-0 overflow-hidden pb-20 md:pb-0" : "flex-1 min-h-0 p-6 lg:p-8 overflow-auto pb-20 md:pb-6 max-w-[1536px] mx-auto w-full"}>
-          <AnimatePresence mode="wait">
-            <motion.div
-              key={location.pathname}
-              variants={pageVariants}
-              initial="initial"
-              animate="animate"
-              exit="exit"
-              transition={{ duration: prefersReducedMotion ? 0.1 : 0.15, ease: "easeOut" }}
-              className="h-full"
-            >
-              {children}
-            </motion.div>
-          </AnimatePresence>
+          {/* Issue #779 (UI-R2-06): route-scoped containment. The only
+              other boundary wraps the whole router (App.tsx), so a page
+              render error used to unmount navigation entirely and its
+              Retry re-rendered the same cached failing tree. This boundary
+              wraps the routed content area with the default fallback
+              ("Something went wrong" + Try Again); the top-level boundary
+              remains as the last resort.
+
+              Recovery-on-navigation is a STATE reset, not a remount. The
+              boundary stays persistent while resetOnChange serializes pathname,
+              search, and hash, so query/hash-only transitions recover a fault.
+              The pathname key remains on the motion subtree to preserve the
+              existing exit/enter behavior for same-component route transitions
+              like /chat -> /chat/:id (the #821 regression class). */}
+          <ErrorBoundary
+            resetOnChange={JSON.stringify([location.pathname, location.search, location.hash])}
+          >
+            <AnimatePresence mode="wait">
+              <motion.div
+                key={location.pathname}
+                variants={pageVariants}
+                initial="initial"
+                animate="animate"
+                exit="exit"
+                transition={{ duration: prefersReducedMotion ? 0.1 : 0.15, ease: "easeOut" }}
+                className="h-full"
+              >
+                {children}
+              </motion.div>
+            </AnimatePresence>
+          </ErrorBoundary>
         </div>
       </main>
 

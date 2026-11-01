@@ -19,10 +19,10 @@ review feedback round) wires the gate:
      width: 640 / height: 360 — a comment mentioning the numbers does not
      count) and carries a roster of at least 20 routes (>= 20 `path: "`
      entries).
-  4. The axe waiver cannot silently widen: the spec names exactly the four
-     tracked-out rule families (#865 aria-valid-attr-value, #866
-     nested-interactive, #867 button-name, #868 aria-required-children) and
-     disables exactly four rules (`enabled: false` x 4).
+  4. No axe rule may be waived (re-arm of issues #865-#868): the spec must
+     contain ZERO rule-disable rows, matched whitespace-tolerantly
+     (`enabled[ws]:[ws]false`) on non-comment lines so formatting variants
+     cannot slip a waiver past the count.
   5. The `e2e` job's Playwright run lines name their own specs and never
      reference a11y-matrix.spec.ts; NO job may run playwright without naming
      at least one *.spec.ts, and the a11y-matrix literal may appear in only
@@ -49,7 +49,6 @@ CI_REL = Path(".github") / "workflows" / "ci.yml"
 E2E_JOB = "e2e"
 SPEC_LITERAL = "a11y-matrix.spec.ts"
 VIEWPORT_STRUCTURAL = (("320", "width"), ("568", "height"), ("640", "width"), ("360", "height"))
-DISABLED_RULES = ("aria-valid-attr-value", "nested-interactive", "button-name", "aria-required-children")
 MIN_ROUTES = 20
 
 # A job key inside the GitHub Actions `jobs:` map: exactly two-space indent,
@@ -166,9 +165,9 @@ def main() -> int:
     else:
         for name in wired_jobs:
             joined = "\n".join(jobs[name])
-            if re.search(r"^\s*if:.*\bfalse\b", joined, re.MULTILINE):
+            if re.search(r"^\s*if:.*(false|False|!\s*true|!\s*1\b)", joined, re.MULTILINE):
                 misses.append(f"the '{name}' job carries an if:-false condition")
-            if re.search(r"^\s*continue-on-error:\s*true", joined, re.MULTILINE):
+            if re.search(r"^\s*continue-on-error:\s*[\"']?(true|True|TRUE)[\"']?(?:\s*#.*)?$", joined, re.MULTILINE):
                 misses.append(f"the '{name}' job sets continue-on-error: true")
 
     # Structural spec checks (only meaningful when the spec exists).
@@ -200,17 +199,30 @@ def main() -> int:
                 f"{MIN_ROUTES} (>= 20 gated routes)"
             )
 
-        # 4. The axe waiver cannot silently widen: exactly the four tracked
-        #    rule ids, exactly four disables (issue #778 review PRR-006).
-        for rule in DISABLED_RULES:
-            if f'"{rule}"' not in spec_text:
-                misses.append(f"disabled rule '{rule}' missing from the spec")
-        disables = spec_text.count("enabled: false")
-        if disables != len(DISABLED_RULES):
-            misses.append(
-                f"the spec disables {disables} axe rules; exactly "
-                f"{len(DISABLED_RULES)} are sanctioned (the #865-#868 set)"
-            )
+        # 4. Re-arm invariant (issues #865-#868 closed): the gate runs axe
+        #    with its FULL default rule set -- every axe.run( call in every
+        #    a11y-gate spec must be argument-less. This subsumes every
+        #    waiver spelling (rules/enabled:false in any quoting or line
+        #    split, runOnly, exclude): any option object restricts what the
+        #    gate measures.
+        for spec_path in sorted((root / E2E_DIR_REL).glob("*.spec.ts")):
+            try:
+                spec_code = spec_path.read_text(encoding="utf-8")
+            except OSError as exc:
+                misses.append(f"a11y-gate spec unreadable: {exc}")
+                continue
+            code = re.sub(r"/\*.*?\*/", " ", spec_code, flags=re.S)
+            code = re.sub(r"^\s*//.*$", " ", code, flags=re.M)
+            for m in re.finditer(r"axe\.run\s*\(", code):
+                tail = code[m.end():].lstrip()
+                if not tail.startswith(")"):
+                    rel = spec_path.relative_to(root).as_posix()
+                    line_no = code[: m.start()].count("\n") + 1
+                    misses.append(
+                        f"{rel}:{line_no} calls axe.run with options; the "
+                        "re-armed gate runs the full default rule set "
+                        "(axe.run() takes no arguments)"
+                    )
 
     # 5. Run-line hygiene across ALL jobs (issue #778 review PRR-016):
     #    every playwright invocation names at least one *.spec.ts; the e2e

@@ -160,6 +160,28 @@ CREATE TABLE {name} (
 )
 """
 
+# Minimal wiki_relations fixture mirroring the production shape
+# (backend/app/models/database.py, wiki_relations DDL): every production
+# column is kept and claim_id carries the exact production
+# REFERENCES wiki_claims(id) ON DELETE CASCADE — the FK the claims-dedup
+# migration must remap before deleting the doomed twin. The two
+# wiki_entities FK columns are plain INTEGER here because this fixture
+# builds no wiki_entities parent (entity ids stay NULL, which are never FK
+# violations); the claim_id cascade contract is the behavior under test.
+_MIN_RELATIONS_DDL = """
+CREATE TABLE {name} (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    vault_id INTEGER NOT NULL,
+    subject_entity_id INTEGER,
+    predicate TEXT NOT NULL,
+    object_entity_id INTEGER,
+    object_text TEXT,
+    claim_id INTEGER REFERENCES wiki_claims(id) ON DELETE CASCADE,
+    confidence REAL DEFAULT 0.0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+"""
+
 _UNIQUE_TOKEN = "quokkazypher"
 _DOC_TEXT = (
     f"Ledger entry: the {_UNIQUE_TOKEN} clause governs appendix Z "
@@ -594,6 +616,15 @@ class TestClaimsUniqueDedupRemapsEvidence(unittest.TestCase):
             "INSERT INTO wiki_claim_sources (id, claim_id, source_kind, quote)"
             " VALUES (11, 2, 'document', 'evidence on survivor')"
         )
+        # The SECOND FK child of wiki_claims (issue #744, frozen check C15):
+        # one relation hanging off the DOOMED twin. Its claim_id carries
+        # ON DELETE CASCADE, so only the dedup's remap-to-survivor can keep
+        # it alive — without the remap the twin's delete cascades it away.
+        conn.execute(_MIN_RELATIONS_DDL.format(name="wiki_relations"))
+        conn.execute(
+            "INSERT INTO wiki_relations (id, vault_id, predicate, object_text,"
+            " claim_id) VALUES (20, 7, 'governs', 'relation on doomed twin', 1)"
+        )
         conn.commit()
         conn.close()
 
@@ -608,6 +639,13 @@ class TestClaimsUniqueDedupRemapsEvidence(unittest.TestCase):
                 "SELECT id, claim_id, quote FROM wiki_claim_sources ORDER BY id"
             ).fetchall()
             self.assertEqual(sources, [(10, 2, "evidence on doomed twin"), (11, 2, "evidence on survivor")])
+            # The relation SURVIVED the dedup by remap: it still exists and
+            # its claim_id now points at the SURVIVOR claim id 2, not the
+            # cascade-deleted twin id 1.
+            relations = conn.execute(
+                "SELECT id, claim_id, object_text FROM wiki_relations ORDER BY id"
+            ).fetchall()
+            self.assertEqual(relations, [(20, 2, "relation on doomed twin")])
             self.assertEqual(conn.execute("PRAGMA foreign_key_check").fetchall(), [])
             idx = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='index'"

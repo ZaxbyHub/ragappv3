@@ -289,9 +289,19 @@ class DraftJobProcessor:
         with self._pool.connection() as conn:
             store = DraftStore(conn)
             valid_pairs = store.list_all_owner_draft_pairs()
+            # Issue #723 (T1-21-S2-03): the exact restore rule — reconcile
+            # restores a tombstone only when its relpath is still backed by a
+            # live draft_inputs row, never merely because its draft survives.
+            valid_input_relpaths = {
+                relpath
+                for owner_id, draft_id in valid_pairs
+                for relpath in store.list_input_relpaths(draft_id)
+            }
         try:
             self._storage.reconcile(
-                valid_pairs, max_age_seconds=_RECONCILE_MAX_AGE_SECONDS
+                valid_pairs,
+                max_age_seconds=_RECONCILE_MAX_AGE_SECONDS,
+                valid_input_relpaths=valid_input_relpaths,
             )
         except Exception as exc:
             logger.error(

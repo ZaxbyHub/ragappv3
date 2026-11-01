@@ -19,6 +19,10 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT))
+# backend.app.config imports ``app.*`` absolutely (config.py L13), which
+# only resolves with backend/ itself on the path — the documented
+# repo-root invocation has no PYTHONPATH (issue #727 / T1-28-K-01).
+sys.path.append(str(ROOT / "backend"))
 
 from backend.app.config import settings
 from backend.app.services.secret_manager import SecretManager
@@ -49,7 +53,11 @@ def backup_sqlite(output_dir: Path) -> Path:
     data = snapshot_sqlite(sqlite_path)
     ciphertext = aesgcm.encrypt(nonce, data, None)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-    backup_path = output_dir / f"db_{timestamp}_k{version}.enc"
+    # Same-second runs must not overwrite each other (issue #727,
+    # T1-28-S2-16 naming class): a per-run token keeps the legacy
+    # single-file names unique; the pruner glob db_*_k*.enc still matches.
+    run_token = secrets.token_hex(4)
+    backup_path = output_dir / f"db_{timestamp}-{run_token}_k{version}.enc"
     with open(backup_path, "wb") as fout:
         fout.write(nonce)
         fout.write(ciphertext)

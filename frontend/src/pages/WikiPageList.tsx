@@ -158,34 +158,38 @@ export function WikiPageList({ pages, loading, onSelect, vaultId, onRefresh, has
         </div>
       )}
       {pages.map((page) => (
+        // #866: the card is a layout surface, not a button — the open action
+        // moved onto the title button below so the card never nests its
+        // per-row Checkbox (an interactive control) inside an interactive
+        // container (axe nested-interactive, serious).
         <Card
           key={page.id}
-          className={`cursor-pointer hover:bg-card/60 transition-colors ${selectedIds.includes(page.id) ? "ring-2 ring-primary/50" : ""}`}
-          onClick={() => onSelect(page.id)}
-          role="button"
-          tabIndex={0}
-          onKeyDown={(e) => e.key === "Enter" && onSelect(page.id)}
+          className={`hover:bg-card/60 transition-colors ${selectedIds.includes(page.id) ? "ring-2 ring-primary/50" : ""}`}
         >
           <CardContent className="py-3 px-4">
             <div className="flex items-start gap-2">
               <Checkbox
                 checked={selectedIds.includes(page.id)}
                 onCheckedChange={(checked) => {
-                  // Stop propagation so the click does not also trigger the
-                  // row's onClick (which would open the page).
+                  // Selection only — the title button owns opening the page.
                   if (!checked) {
                     setSelectedIds((prev) => prev.filter((id) => id !== page.id));
                   } else {
                     setSelectedIds((prev) => [...prev, page.id]);
                   }
                 }}
-                onClick={(e) => e.stopPropagation()}
                 className="h-6 w-6 -mt-0.5 shrink-0"
                 aria-label={`Select ${page.title}`}
               />
               <div className="flex items-start justify-between gap-2 flex-1 min-w-0">
                 <div className="flex-1 min-w-0">
-                  <p className="font-medium text-sm truncate">{page.title}</p>
+                  <button
+                    type="button"
+                    onClick={() => onSelect(page.id)}
+                    className="block w-full text-left font-medium text-sm truncate hover:underline focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 rounded-sm"
+                  >
+                    {page.title}
+                  </button>
                   <p className="text-xs text-muted-foreground truncate">{page.slug}</p>
                   {page.summary && (
                     <p className="text-xs text-muted-foreground mt-1 line-clamp-2">{page.summary}</p>

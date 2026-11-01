@@ -19,6 +19,7 @@ from app.middleware.logging import SensitiveFieldFilter
 from app.models.database import SQLiteConnectionPool, get_pool, run_migrations
 from app.models.migration_journal import MIGRATION_CONNECT_TIMEOUT_SECONDS
 from app.security import CSRFManager
+from app.services.audit_redaction import run_startup_audit_redaction
 from app.services.background_tasks import get_background_processor
 from app.services.document_extraction import DocumentExtractionService
 from app.services.draft_input_storage import DraftInputStorage
@@ -264,6 +265,8 @@ def _load_persisted_settings(sqlite_path: str) -> None:
             "jobs_heartbeat_interval_seconds",
             "jobs_lease_reclaim_timeout_seconds",
             "jobs_max_attempts",
+            # Reindex stall watchdog budget (issue #1010)
+            "jobs_stall_timeout_seconds",
             "reranking_enabled",
             "reranker_top_n",
             "initial_retrieval_top_k",
@@ -432,6 +435,33 @@ async def _safe_await(coro, name, timeout=10):
         logger.warning(f"{name} timed out after {timeout}s (continuing)")
     except Exception as e:
         logger.warning(f"{name} failed: {e} (continuing)")
+
+
+async def _await_migration(coro, name):
+    """Await a migration WITHOUT a cancel-on-timeout deadline (issue #706).
+
+    A wall-clock deadline can cancel a staging swap mid-drop — CancelledError
+    is a BaseException and bypasses the swap's except-Exception critical
+    handling, leaving a half-swapped table whose next-boot reconcile could
+    silently discard one generation. Migrations run unbounded; genuine
+    failures are still caught-and-logged (fail-soft startup).
+
+    A shutdown cancellation (SIGTERM/restart mid-boot) is the remaining
+    cancel source: it is logged CRITICAL before propagating, so the operator
+    gets the same "swap was interrupted, staging holds the recoverable
+    copy" evidence the removed deadline used to suppress.
+    """
+    try:
+        await coro
+    except Exception as e:
+        logger.warning(f"{name} failed: {e} (continuing)")
+    except BaseException:
+        logger.critical(
+            f"{name} was interrupted by cancellation mid-swap; the staging "
+            f"table holds the recoverable copy and a restart reconciles it "
+            f"before the app serves."
+        )
+        raise
 
 
 async def _validate_tei_embedding_model(embedding_service) -> None:
@@ -718,25 +748,24 @@ async def lifespan(app: FastAPI):
     # Critical: fail fast if the vector store cannot connect or initialize its table.
     # Without these two, no search or ingestion is possible.
     await asyncio.wait_for(app.state.vector_store.connect(), timeout=15)
-    await _safe_await(
+    # [issue #706] Migrations run WITHOUT a cancel-on-timeout deadline: a
+    # deadline cancelling a mid-swap migration can silently drop a corpus
+    # generation (see _await_migration).
+    await _await_migration(
         app.state.vector_store.migrate_add_vault_id(),
         "Vector store migrate vault_id",
-        timeout=10,
     )
-    await _safe_await(
+    await _await_migration(
         app.state.vector_store.migrate_add_chunk_scale(),
         "Vector store migrate chunk_scale",
-        timeout=10,
     )
-    await _safe_await(
+    await _await_migration(
         app.state.vector_store.migrate_add_sparse_embedding(),
         "Vector store migrate sparse",
-        timeout=10,
     )
-    await _safe_await(
+    await _await_migration(
         app.state.vector_store.migrate_add_parent_window(),
         "Vector store migrate parent_window",
-        timeout=10,
     )
 
     # Initialize vector store table before FTS validation
@@ -814,6 +843,10 @@ async def lifespan(app: FastAPI):
         app.state.db_pool, embedding_service=app.state.embedding_service
     )
     app.state.secret_manager = SecretManager()
+    # Issue #894: scrub raw admin-token material from historical
+    # audit_toggle_log rows now that the HMAC key exists; fail-soft with an
+    # app-state flag (audit_redaction_ok), mirroring migrations_ok above.
+    await asyncio.to_thread(run_startup_audit_redaction, app)
     app.state.toggle_manager = ToggleManager(app.state.db_pool)
     try:
         app.state.csrf_manager = CSRFManager(
@@ -831,12 +864,6 @@ async def lifespan(app: FastAPI):
         instant_client=app.state.instant_llm_client,
     )
     app.state.model_checker = ModelChecker()
-    app.state.model_validation = (
-        settings.enable_model_validation
-        or app.state.toggle_manager.get_toggle(
-            "model_validation", settings.enable_model_validation
-        )
-    )
     ingestion_llm_client = select_ingestion_llm_client(
         app, settings.ingestion_llm_mode
     )

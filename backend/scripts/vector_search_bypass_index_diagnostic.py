@@ -15,6 +15,11 @@ import sys
 from pathlib import Path
 from typing import Any
 
+# ``app.*`` only resolves with backend/ on the path; the documented
+# repo-root invocation puts only backend/scripts on sys.path (issue
+# #727 / T1-28-K-01).
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+
 from app.services.vector_store import VectorStore
 
 

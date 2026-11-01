@@ -2,6 +2,7 @@
 
 import argparse
 import os
+import secrets
 import shutil
 import sqlite3
 import sys
@@ -10,6 +11,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT))
+# backend.app.config imports ``app.*`` absolutely (config.py L13), which
+# only resolves with backend/ itself on the path — the documented
+# repo-root invocation has no PYTHONPATH (issue #727 / T1-28-K-01).
+sys.path.append(str(ROOT / "backend"))
 
 # Set up basic environment for migrations
 os.environ.setdefault("DATA_DIR", str(ROOT / "data"))
@@ -53,7 +58,10 @@ def backup_sqlite_fallback(output_dir: Path) -> Path:
     app holds the database open.
     """
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    backup_path = output_dir / f"app_backup_{timestamp}.db"
+    # Same-second runs must not open the same fallback file (issue
+    # #727, T1-28-S2-16 naming class sibling).
+    backup_path = output_dir / (f"app_backup_{timestamp}-"
+                                f"{secrets.token_hex(4)}.db")
     backup_path.parent.mkdir(parents=True, exist_ok=True)
     source = Path(settings.sqlite_path)
     if source.exists():

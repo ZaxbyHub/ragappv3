@@ -18,7 +18,11 @@ from typing import Any, Optional
 
 from app.config import settings
 from app.services.fts_query import FTS_CANDIDATE_CAP, build_fts_match_query
-from app.services.job_lease import ensure_jobs_schema
+from app.services.job_lease import (
+    ensure_jobs_schema,
+    redact_legacy_error_text,
+    redact_legacy_result_json,
+)
 from app.services.wiki_store import (
     _job_lease,
     _lease_enabled,
@@ -48,6 +52,9 @@ class KMSEntry:
     created_at: str
     updated_at: str
     last_compiled_at: Optional[str]
+    # Issue #1002: populated (true body length) by the bounded list projection;
+    # None on detail reads, which intentionally return the full body.
+    body_chars: Optional[int] = None
 
     @property
     def tags(self) -> list:
@@ -95,6 +102,7 @@ def _to_entry(row: sqlite3.Row) -> KMSEntry:
         created_at=d["created_at"],
         updated_at=d["updated_at"],
         last_compiled_at=d.get("last_compiled_at"),
+        body_chars=d.get("body_chars"),
     )
 
 
@@ -106,8 +114,12 @@ def _to_job(row: sqlite3.Row) -> KMSCompileJob:
         trigger_type=d["trigger_type"],
         trigger_id=d.get("trigger_id"),
         status=d["status"],
-        error=d.get("error"),
-        result_json=d.get("result_json") or "{}",
+        # Issue #953: pre-redaction rows pass through the legacy-error mask
+        # so the lease-rollback read path never surfaces raw str(exc) text.
+        error=redact_legacy_error_text(d.get("error")),
+        # PRR-002: result_json gets the same read-time treatment for
+        # pre-#958 curator error strings (clean payloads unchanged).
+        result_json=redact_legacy_result_json(d.get("result_json") or "{}"),
         created_at=d["created_at"],
         started_at=d.get("started_at"),
         completed_at=d.get("completed_at"),
@@ -119,15 +131,31 @@ def _to_job(row: sqlite3.Row) -> KMSCompileJob:
 def _compile_job_from_jobs_row(row: sqlite3.Row) -> KMSCompileJob:
     """Map a unified ``jobs`` row (queue='kms') onto the unchanged DTO."""
     d = dict(row)
-    payload = json.loads(d.get("payload_json") or "{}")
+    # Issue #792 feedback: a payload that is unparseable, or valid JSON that
+    # is not an object (scalar, array, or nested deep enough to overflow the
+    # parser), degrades to the empty payload — the guard pattern the file's
+    # other JSON-column reads (tags) use — so no reader of the vault's job
+    # list ever raises on a stored row. The processors settle such rows
+    # terminally failed at claim (vault_id is None).
+    try:
+        payload = json.loads(d.get("payload_json") or "{}")
+    except (TypeError, ValueError, RecursionError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
     return KMSCompileJob(
         id=d["id"],
         vault_id=payload.get("vault_id"),
         trigger_type=payload.get("trigger_type") or "manual",
         trigger_id=payload.get("trigger_id"),
         status=d["status"],
-        error=d.get("error"),
-        result_json=d.get("result_json") or "{}",
+        # Issue #953: rows written before the #951 write-time redaction
+        # (and legacy rows the boot sync copies forward) still hold raw
+        # str(exc) text; mask it at read time, codes pass through.
+        error=redact_legacy_error_text(d.get("error")),
+        # PRR-002: result_json gets the same read-time treatment for
+        # pre-#958 curator error strings (clean payloads unchanged).
+        result_json=redact_legacy_result_json(d.get("result_json") or "{}"),
         created_at=d["created_at"],
         started_at=d.get("started_at"),
         completed_at=d.get("completed_at"),
@@ -212,13 +240,19 @@ class KMSStore:
 
     def get_entry_by_file(
         self, vault_id: int, file_id: int, source_type: str = "document"
-    ) -> Optional[KMSEntry]:
-        """Return the document-sourced entry for a file, or None."""
+    ) -> Optional[int]:
+        """Return the id of the file's entry, or None.
+
+        Issue #1002: id-only. The sole caller (``upsert_document_entry``)
+        consumes just ``existing.id`` — a full-row SELECT here materialized the
+        whole (potentially multi-megabyte) body for nothing. Full-body reads
+        belong to ``get_entry`` (explicit single-entry detail path).
+        """
         row = self._db.execute(
-            "SELECT * FROM kms_entries WHERE vault_id = ? AND file_id = ? AND source_type = ? LIMIT 1",
+            "SELECT id FROM kms_entries WHERE vault_id = ? AND file_id = ? AND source_type = ? LIMIT 1",
             (vault_id, file_id, source_type),
         ).fetchone()
-        return _to_entry(row) if row else None
+        return int(row["id"]) if row else None
 
     def list_entries(
         self,
@@ -231,16 +265,28 @@ class KMSStore:
     ) -> list[KMSEntry]:
         offset = (page - 1) * per_page
         params: list[Any] = []
+        # Issue #1002: the list path never materializes a full body — a
+        # multi-megabyte compiled spreadsheet body would otherwise ship in
+        # every row of every page. The projection bounds ``body`` to a head
+        # window and reports the true length via ``body_chars``; the
+        # single-entry detail path (``get_entry``) still returns the full body.
+        columns = (
+            "id, vault_id, file_id, slug, title, "
+            "substr(body, 1, 2048) AS body, length(body) AS body_chars, "
+            "summary, tags_json, source_type, status, created_by, "
+            "created_at, updated_at, last_compiled_at"
+        )
         if search:
             ids = self._fts_entry_ids(search)
             if not ids:
                 return []
             placeholders = ",".join("?" * len(ids))
-            sql = f"SELECT * FROM kms_entries WHERE id IN ({placeholders}) AND vault_id = ?"
+            where = f"id IN ({placeholders}) AND vault_id = ?"
             params = [*ids, vault_id]
         else:
-            sql = "SELECT * FROM kms_entries WHERE vault_id = ?"
+            where = "vault_id = ?"
             params = [vault_id]
+        sql = f"SELECT {columns} FROM kms_entries WHERE {where}"
         if status:
             sql += " AND status = ?"
             params.append(status)
@@ -302,6 +348,11 @@ class KMSStore:
             f"UPDATE kms_entries SET {set_clause} WHERE id = ? AND vault_id = ?", values
         )
         if cur.rowcount == 0:
+            # The 0-row UPDATE opened an implicit transaction on a
+            # default-isolation connection; every sibling 0-row path in this
+            # store rolls back before returning so the pooled connection is
+            # never handed back in-transaction (issue #791).
+            self._db.rollback()
             return None
         if "body" in updates:
             # SPEC section 12.6: an entry-body change invalidates Draft Room
@@ -339,13 +390,13 @@ class KMSStore:
         last_compiled_at.
         """
         now = datetime.utcnow().isoformat()
-        existing = self.get_entry_by_file(vault_id, file_id, source_type="document")
-        if existing:
+        existing_id = self.get_entry_by_file(vault_id, file_id, source_type="document")
+        if existing_id is not None:
             self._db.execute(
                 """UPDATE kms_entries
                    SET title = ?, body = ?, summary = ?, updated_at = ?, last_compiled_at = ?
                    WHERE id = ?""",
-                (title, body, summary, now, now, existing.id),
+                (title, body, summary, now, now, existing_id),
             )
             # SPEC section 12.6 (issue #516 DRAFT-025): a recompiled entry body
             # invalidates Draft Room evidence rows carrying this kms_entry_id.
@@ -353,9 +404,9 @@ class KMSStore:
             # hook's own hash guard (mirrors update_entry).
             from app.services.draft_evidence_freshness import on_kms_entry_changed
 
-            on_kms_entry_changed(self._db, entry_id=existing.id, new_body=body)
+            on_kms_entry_changed(self._db, entry_id=existing_id, new_body=body)
             self._db.commit()
-            return self.get_entry(existing.id)  # type: ignore[return-value]
+            return self.get_entry(existing_id)  # type: ignore[return-value]
         slug = self._unique_slug(vault_id, title)
         cur = self._db.execute(
             """INSERT INTO kms_entries
@@ -439,7 +490,9 @@ class KMSStore:
             ensure_jobs_schema(self._db)
             sql = (
                 "SELECT * FROM jobs WHERE queue = ? "
-                "AND CAST(json_extract(payload_json, '$.vault_id') AS INTEGER) = ?"
+                "AND CASE WHEN json_valid(payload_json) "
+                "THEN CAST(json_extract(payload_json, '$.vault_id') AS INTEGER) "
+                "ELSE NULL END = ?"
             )
             params: list[Any] = [KMS_QUEUE, vault_id]
             if status:
@@ -465,7 +518,9 @@ class KMSStore:
             ensure_jobs_schema(self._db)
             row = self._db.execute(
                 "SELECT * FROM jobs WHERE id = ? AND queue = ? "
-                "AND CAST(json_extract(payload_json, '$.vault_id') AS INTEGER) = ?",
+                "AND CASE WHEN json_valid(payload_json) "
+                "THEN CAST(json_extract(payload_json, '$.vault_id') AS INTEGER) "
+                "ELSE NULL END = ?",
                 (job_id, KMS_QUEUE, vault_id),
             ).fetchone()
             return _compile_job_from_jobs_row(row) if row else None
@@ -626,7 +681,9 @@ class KMSStore:
             cur = self._db.execute(
                 "UPDATE jobs SET status = 'cancelled', completed_at = ? "
                 "WHERE id = ? AND queue = ? "
-                "AND CAST(json_extract(payload_json, '$.vault_id') AS INTEGER) = ? "
+                "AND CASE WHEN json_valid(payload_json) "
+                "THEN CAST(json_extract(payload_json, '$.vault_id') AS INTEGER) "
+                "ELSE NULL END = ? "
                 "AND status IN ('pending', 'running')",
                 (datetime.utcnow().isoformat(), job_id, KMS_QUEUE, vault_id),
             )
@@ -651,6 +708,9 @@ class KMSStore:
 
         The ``status = 'failed'`` predicate makes the check-and-flip atomic:
         a job that was concurrently cancelled or completed cannot be reset.
+        Issue #956: an operator-initiated retry grants a full fresh attempt
+        budget — ``attempts`` resets to 0 (see WikiStore.retry_job; no KMS
+        retry route exists today, the store contract stays in parity).
         """
         if _lease_enabled():
             ensure_jobs_schema(self._db)
@@ -658,9 +718,11 @@ class KMSStore:
                 "UPDATE jobs SET status = 'pending', error = NULL, "
                 "started_at = NULL, completed_at = NULL, run_after = NULL, "
                 "worker_id = NULL, lease_generation = lease_generation + 1, "
-                "heartbeat_at = NULL "
+                "heartbeat_at = NULL, attempts = 0 "
                 "WHERE id = ? AND queue = ? "
-                "AND CAST(json_extract(payload_json, '$.vault_id') AS INTEGER) = ? "
+                "AND CASE WHEN json_valid(payload_json) "
+                "THEN CAST(json_extract(payload_json, '$.vault_id') AS INTEGER) "
+                "ELSE NULL END = ? "
                 "AND status = 'failed'",
                 (job_id, KMS_QUEUE, vault_id),
             )

@@ -54,39 +54,22 @@ import {
 const DRAFT_PERSIST_DEBOUNCE_MS = 500;
 
 // ============================================================================
-// localStorage draft persistence — every access wrapped in try/catch
-// (DraftRoomDetailPage pattern). Persistence is best-effort: when storage is
+// localStorage draft persistence lives in @/lib/canvasDrafts (issue #1032):
+// keys are principal-scoped so residue can never be read by another
+// principal, and delayed writers are generation-gated so a pending debounce
+// / unmount / artifact-switch flush scheduled before an identity switch can
+// never re-create a cleared key. Persistence is best-effort: when storage is
 // unavailable the in-memory draft still survives in-session navigation and
 // the dirty banner still shows.
 // ============================================================================
 
-function canvasDraftKey(artifactUid: string): string {
-  return `canvas-draft:${artifactUid}`;
-}
-
-function readCanvasDraft(artifactUid: string): string | null {
-  try {
-    return localStorage.getItem(canvasDraftKey(artifactUid));
-  } catch {
-    return null;
-  }
-}
-
-function writeCanvasDraft(artifactUid: string, content: string): void {
-  try {
-    localStorage.setItem(canvasDraftKey(artifactUid), content);
-  } catch {
-    // Storage unavailable (private mode / quota) — best-effort only.
-  }
-}
-
-function clearCanvasDraft(artifactUid: string): void {
-  try {
-    localStorage.removeItem(canvasDraftKey(artifactUid));
-  } catch {
-    // Ignore — nothing persisted means nothing to clear.
-  }
-}
+import {
+  clearCanvasDraft,
+  currentCanvasDraftGeneration,
+  readCanvasDraft,
+  writeCanvasDraft,
+} from "@/lib/canvasDrafts";
+import { useAuthStore } from "@/stores/useAuthStore";
 
 /** Triggers a browser download of `blob` under `filename` without touching a
  * single byte of it, then releases the object URL (DraftExportDialog pattern). */
@@ -148,6 +131,12 @@ export default function CanvasPage() {
   const queryClient = useQueryClient();
   const artifactUid = params.artifactUid ?? "";
   const sessionId = params.sessionId ?? "";
+  // Issue #1032 (Composer.tsx precedent): the canvas draft namespace is
+  // principal-scoped, so the component reads the principal REACTIVELY — a
+  // principal switch on the same artifact re-runs the rehydrate effect
+  // below under the new key instead of leaving the previous principal's
+  // editor text in component state.
+  const canvasPrincipalId = useAuthStore((s) => s.user?.id ?? null);
 
   // Capability wiring (DraftRoomDetailPage pattern): the route renders even
   // when the feature is off so a direct visit gets an honest banner, never a
@@ -215,9 +204,13 @@ export default function CanvasPage() {
   // timer has not yet written. Flushed on unmount and artifact switch; cleared
   // wherever the draft is discarded. lastWrittenDraftRef backs the
   // differs-from-last-write skip so a flush after an already-written value is
-  // a no-op.
-  const pendingDraftRef = useRef<{ uid: string; text: string } | null>(null);
-  const lastWrittenDraftRef = useRef<{ uid: string; text: string } | null>(null);
+  // a no-op. The `gen` field is the canvas-draft WRITER GENERATION captured
+  // when the write was SCHEDULED (issue #1032): a flush checks it against the
+  // current generation before writing, so a flush scheduled before an
+  // identity switch can never re-create a cleared key, and the dedup carries
+  // it so an identical text typed by the NEXT principal is not swallowed.
+  const pendingDraftRef = useRef<{ uid: string; text: string; gen: number } | null>(null);
+  const lastWrittenDraftRef = useRef<{ uid: string; text: string; gen: number } | null>(null);
   const cancelDraftTimer = () => {
     if (draftTimerRef.current != null) {
       clearTimeout(draftTimerRef.current);
@@ -234,11 +227,20 @@ export default function CanvasPage() {
     const pending = pendingDraftRef.current;
     pendingDraftRef.current = null;
     const last = lastWrittenDraftRef.current;
-    if (pending && (last?.uid !== pending.uid || last?.text !== pending.text)) {
-      writeCanvasDraft(pending.uid, pending.text);
+    if (
+      pending &&
+      pending.gen === currentCanvasDraftGeneration() &&
+      (last?.uid !== pending.uid || last?.text !== pending.text || last?.gen !== pending.gen)
+    ) {
+      writeCanvasDraft(
+        pending.uid,
+        canvasPrincipalId,
+        pending.text,
+        pending.gen,
+      );
       lastWrittenDraftRef.current = pending;
     }
-  }, []);
+  }, [canvasPrincipalId]);
 
   // Reset all per-artifact state on navigation to a different artifact.
   useEffect(() => {
@@ -264,10 +266,23 @@ export default function CanvasPage() {
 
   // Initialize (or re-initialize, when the server moved ahead) the editor
   // from the current version, rehydrating any persisted draft.
+  const prevPrincipalRef = useRef<number | string | null>(canvasPrincipalId);
   useEffect(() => {
+    // Issue #1032 (multi-stage review, same-artifact principal switch): a
+    // principal change must always take the FULL rehydrate path below — the
+    // version guard would otherwise short-circuit and leave the previous
+    // principal's unsent editor text in component state for the next one.
+    const principalChanged = prevPrincipalRef.current !== canvasPrincipalId;
+    prevPrincipalRef.current = canvasPrincipalId;
     if (currentContent == null || currentVersionNo == null) return;
-    if (editorBaseVersionNo != null && currentVersionNo <= editorBaseVersionNo) return;
-    const draft = readCanvasDraft(artifactUid);
+    if (
+      !principalChanged &&
+      editorBaseVersionNo != null &&
+      currentVersionNo <= editorBaseVersionNo
+    ) {
+      return;
+    }
+    const draft = readCanvasDraft(artifactUid, canvasPrincipalId);
     if (draft != null && draft !== currentContent) {
       setEditorText(draft);
       setDraftNotice(CANVAS_DRAFT_RESTORED_NOTICE);
@@ -282,7 +297,7 @@ export default function CanvasPage() {
     setSelectedVersionNo((prev) =>
       prev == null || currentVersionNo > prev ? currentVersionNo : prev
     );
-  }, [artifactUid, currentContent, currentVersionNo, editorBaseVersionNo]);
+  }, [artifactUid, canvasPrincipalId, currentContent, currentVersionNo, editorBaseVersionNo]);
 
   const isDirty = editorText != null && currentContent != null && editorText !== currentContent;
 
@@ -314,17 +329,24 @@ export default function CanvasPage() {
       // applied-content arm covers the stale-cache window before the
       // refetch lands (external F-003).
       cancelDraftTimer();
-      clearCanvasDraft(artifactUid);
+      clearCanvasDraft(artifactUid, canvasPrincipalId);
       return;
     }
-    pendingDraftRef.current = { uid: artifactUid, text: editorText };
+    pendingDraftRef.current = {
+      uid: artifactUid,
+      text: editorText,
+      // Schedule-time capture (issue #1032): a flush checks this against the
+      // live generation, so a write scheduled before an identity switch is
+      // dropped even though the flush runs later.
+      gen: currentCanvasDraftGeneration(),
+    };
     const timer = setTimeout(flushPendingDraft, DRAFT_PERSIST_DEBOUNCE_MS);
     draftTimerRef.current = timer;
     return () => {
       clearTimeout(timer);
       if (draftTimerRef.current === timer) draftTimerRef.current = null;
     };
-  }, [artifactUid, editorText, currentContent, flushPendingDraft]);
+  }, [artifactUid, canvasPrincipalId, editorText, currentContent, flushPendingDraft]);
 
   // Unmount: never lose the tail of an edit that had not hit the debounce
   // edge yet (Composer.tsx pattern).
@@ -386,7 +408,7 @@ export default function CanvasPage() {
   // #3) — no artifact envelope.
   const applyNewVersion = (version: CanvasVersion) => {
     cancelDraftTimer();
-    clearCanvasDraft(artifactUid);
+    clearCanvasDraft(artifactUid, canvasPrincipalId);
     lastAppliedRef.current = { uid: artifactUid, text: version.content };
     setEditorText(version.content);
     setEditorBaseVersionNo(version.version_no);
@@ -430,7 +452,7 @@ export default function CanvasPage() {
 
   const handleReloadLatest = async () => {
     cancelDraftTimer();
-    clearCanvasDraft(artifactUid);
+    clearCanvasDraft(artifactUid, canvasPrincipalId);
     setConflict(null);
     setDraftNotice(null);
     setEditorBaseVersionNo(null); // force re-init from the server on arrival

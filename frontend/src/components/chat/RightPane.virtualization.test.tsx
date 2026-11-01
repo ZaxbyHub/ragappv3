@@ -76,6 +76,10 @@ vi.mock("@/stores/useChatStore", () => {
   });
   const useLastCompletedAssistantWikiRefsMock = vi.fn(() => undefined);
   const useLastCompletedAssistantKmsRefsMock = vi.fn(() => undefined);
+  // Issue #965: one-line stub (sibling pattern) — the real selector's
+  // scan-back is pinned in useChatStore.selectors.test.ts and the dedicated
+  // c09 pane suite; no assertion in this file observes its output.
+  const useLastCompletedAssistantCitationConfidenceMock = vi.fn(() => undefined);
   const useStreamingCandidateSourcesMock = vi.fn(() => {
     const state = chatStoreMock() ?? {};
     const id = (state as { streamingMessageId?: string }).streamingMessageId;
@@ -89,6 +93,7 @@ vi.mock("@/stores/useChatStore", () => {
     useLastCompletedAssistantSources: useLastCompletedAssistantSourcesMock,
     useLastCompletedAssistantWikiRefs: useLastCompletedAssistantWikiRefsMock,
     useLastCompletedAssistantKmsRefs: useLastCompletedAssistantKmsRefsMock,
+    useLastCompletedAssistantCitationConfidence: useLastCompletedAssistantCitationConfidenceMock,
     useLastUserContent: useLastUserContentMock,
     useSourcesForSourceId: useSourcesForSourceIdMock,
     useCompletedAssistantMessageIdsKey: useCompletedAssistantMessageIdsKeyMock,
@@ -255,10 +260,13 @@ describe("RightPane virtualization", () => {
 
       render(<RightPane />);
 
-      // Should show the virtualized container (overflow-y-auto div with aria-label)
-      const virtualizedContainer = screen.getByLabelText("Sources list");
-      expect(virtualizedContainer).toBeInTheDocument();
-      expect(virtualizedContainer).toHaveClass("overflow-y-auto");
+      // #868: the aria-label now sits on the role="list" sizing div; the
+      // scrollable wrapper is its parent (the overflow-y-auto container).
+      const virtualizedList = screen.getByLabelText("Sources list");
+      expect(virtualizedList).toBeInTheDocument();
+      expect(virtualizedList.getAttribute("role")).toBe("list");
+      const scrollWrapper = virtualizedList.parentElement as HTMLElement;
+      expect(scrollWrapper).toHaveClass("overflow-y-auto");
     });
   });
 
@@ -400,9 +408,11 @@ describe("RightPane virtualization", () => {
 
       render(<RightPane />);
 
+      // #868: label sits on the role="list" sizing div; the scroll wrapper
+      // is its parent (the overflow-y-auto container).
       const container = screen.getByLabelText("Sources list");
       expect(container).toBeInTheDocument();
-      expect(container).toHaveClass("overflow-y-auto");
+      expect((container.parentElement as HTMLElement).className).toContain("overflow-y-auto");
     });
 
     it("should render virtualized container for 50 sources", () => {

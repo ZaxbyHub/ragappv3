@@ -8,7 +8,7 @@
 // DraftRevisionDiff are left REAL — the real findings panel provides the
 // focusable row, and the real diff proves the compare wiring end to end.
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
-import { render as rtlRender, screen, waitFor, fireEvent, cleanup } from "@testing-library/react";
+import { render as rtlRender, screen, within, waitFor, fireEvent, cleanup } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
@@ -460,6 +460,8 @@ describe("DraftWorkspace (issue #533)", () => {
       expect(useDraftRoomUiStore.getState().compareToRevisionId).toBe(100);
     });
     expect(screen.getByRole("tab", { name: "Compare" })).toHaveAttribute("aria-selected", "true");
+    // The editor panel unmounts while Compare is active — the editor is
+    // unreachable in the DOM, not merely hidden.
     expect(screen.queryByLabelText("Draft content")).not.toBeInTheDocument();
 
     // The real DraftRevisionDiff renders the two served revisions as a diff.

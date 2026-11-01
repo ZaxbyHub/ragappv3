@@ -64,7 +64,6 @@ describe("api barrel", () => {
 
   it("re-exports users exports", () => {
     expect(typeof api.listAllUsers).toBe("function");
-    expect(typeof api.getUserGroups).toBe("function");
     expect(typeof api.updateUserGroups).toBe("function");
   });
 

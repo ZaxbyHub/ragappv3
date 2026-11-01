@@ -118,6 +118,12 @@ function SettingsPageContent({
   // the load effect (state-driven retry). The effect body does not read
   // the value — the dependency alone re-triggers the fetch.
   const [loadAttempt, setLoadAttempt] = useState(0);
+  // K-21 (PR #1048 feedback): the shell now fills the settings store for every
+  // page, so a non-null `settings` no longer means "this page loaded". Track
+  // THIS page's load outcome so a failed GET /settings keeps the error card
+  // (with Retry) instead of silently rendering the form over stale-or-default
+  // values; reset on a successful (re)load.
+  const [pageLoadFailed, setPageLoadFailed] = useState(false);
 
   useEffect(() => {
     if (testMode) {
@@ -129,6 +135,7 @@ function SettingsPageContent({
     getSettings()
       .then((data) => {
         if (mounted) {
+          setPageLoadFailed(false);
           setSettings(data);
           initializeForm(data);
         }
@@ -137,6 +144,7 @@ function SettingsPageContent({
         if (mounted) {
           // setLoadError records the failure AND clears `loading` — the
           // plain setError left the skeleton rendered forever (UI-029).
+          setPageLoadFailed(true);
           setLoadError(
             err instanceof Error ? err.message : "Failed to load settings",
           );
@@ -145,7 +153,7 @@ function SettingsPageContent({
     return () => {
       mounted = false;
     };
-  }, [setSettings, initializeForm, setLoadError, testMode, loadAttempt]);
+  }, [setSettings, initializeForm, setLoadError, setPageLoadFailed, testMode, loadAttempt]);
 
   const dirtySet = dirtyFields();
   const dirtyCount = dirtySet.size;
@@ -282,7 +290,9 @@ function SettingsPageContent({
     );
   }
 
-  if (error && !settings) {
+  // K-21: page-owned failure gate — a shell-filled store must not mask this
+  // page's failed load behind the defaults form.
+  if ((error && !settings) || pageLoadFailed) {
     return (
       <Card>
         <CardContent className="py-8 space-y-4">

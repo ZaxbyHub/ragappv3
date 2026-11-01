@@ -20,7 +20,7 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Set, Tuple, Uni
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from fastapi.sse import format_sse_event
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.api.deps import (
     _evaluate_policy,
@@ -106,6 +106,23 @@ class ChatRequest(BaseModel):
     # the same 100-id bound as the batched status route
     # (BATCHED_STATUS_MAX_IDS) so the resolved IN (...) filter stays bounded.
     document_ids: Optional[List[int]] = Field(default=None, max_length=100)
+
+    @field_validator("message")
+    @classmethod
+    def _cap_message_length(cls, value: str) -> str:
+        """Reject over-length live messages before any generation work (#922).
+
+        The cap bounds raw-user-input regex work on the query-transformer
+        hot path and prompt cost. Prior-turn history is intentionally
+        uncapped (legitimate assistant answers can be long); only the live
+        message is bounded.
+        """
+        cap = settings.chat_message_max_chars
+        if len(value) > cap:
+            raise ValueError(
+                f"message exceeds chat_message_max_chars ({cap} characters)"
+            )
+        return value
 
 
 class UsedMemory(BaseModel):
@@ -217,6 +234,12 @@ class ChatStreamRequest(BaseModel):
     # the pre-#553 behavior).
     session_id: Optional[int] = None
     turn_id: Optional[str] = Field(default=None, max_length=64)
+    # NOTE (#922, review F-001): the FINAL message's chat_message_max_chars
+    # cap is enforced inside the chat_stream route body AFTER
+    # get_stream_auth and the last-message role check — not as a pydantic
+    # validator — so the check is authenticated, does not echo the message
+    # list in a validation envelope, and preserves the route's own
+    # error-code ordering (400 empty / 400 role / 422 over-cap).
 
 
 class CreateSessionRequest(BaseModel):
@@ -835,6 +858,29 @@ def _finalize_durable_turn_sync(db_pool, turn_state: Dict[str, Any], status: str
         return False
 
 
+def _redact_llm_metrics(
+    metrics: Optional[Dict[str, Any]], *, redact: bool
+) -> Optional[Dict[str, Any]]:
+    """Drop configured provider base URLs from llm_metrics for non-admins.
+
+    ``LLMClient.last_metrics`` always carries ``provider_url`` (the
+    configured endpoint), and the LLM-fallback path adds ``fallback_from``
+    (the endpoint the answer fell back FROM — also a configured provider
+    URL; rag_engine sets it whenever a fallback candidate serves the
+    answer). Either value flows into the SSE done payload and
+    ``ChatResponse.llm_metrics``. Non-admin callers must not receive
+    configured provider URLs (the ``GET /settings`` redaction contract,
+    extended to this path — issue #717). Returns the dict unchanged for
+    admins (redact=False) and when metrics are absent.
+    """
+    if metrics is None or not redact:
+        return metrics
+    redacted = dict(metrics)
+    redacted.pop("provider_url", None)
+    redacted.pop("fallback_from", None)
+    return redacted
+
+
 def stream_chat_response(
     message: str,
     history: List[Dict[str, Any]],
@@ -855,6 +901,7 @@ def stream_chat_response(
     durable_turn_id: Optional[str] = None,
     db_pool: Optional[object] = None,
     last_event_id: Optional[int] = None,
+    is_admin: bool = False,
 ) -> StreamingResponse:
     """
     Generate a streaming chat response using SSE format.
@@ -870,6 +917,12 @@ def stream_chat_response(
     finalized at stream end (complete / interrupted / failed) keyed on the
     client's ``turn_id`` — so a proxy drop, tab close, or crash never loses
     the question or the partial answer from server history.
+
+    Issue #717: ``is_admin`` (derived by the route from the caller's role)
+    controls ``llm_metrics`` redaction — non-admin done frames (and the
+    durable frames persisted for them) drop ``provider_url`` and
+    ``fallback_from``; admins keep the full metrics bag. Default False =
+    redact, so an un-mapped future caller fails closed.
 
     Issue #555 resumable streams: on the durable path the generation runs in
     a per-turn producer task decoupled from the HTTP connection, and every
@@ -1068,7 +1121,12 @@ def stream_chat_response(
                         citation_enforcement = chunk.get("citation_enforcement")
                         trace_payload = chunk.get("trace")
                         answer_contract = chunk.get("answer_contract")
-                        llm_metrics = chunk.get("llm_metrics")
+                        # Non-admin callers never receive the configured
+                        # provider URL (issue #717); durable-persisted frames
+                        # store exactly what was emitted for this caller.
+                        llm_metrics = _redact_llm_metrics(
+                            chunk.get("llm_metrics"), redact=not is_admin
+                        )
                         # Issue #553 durable turn: capture the done payload's
                         # persistence-relevant fields for the finalize upsert.
                         turn_state["payload"].update({
@@ -1659,6 +1717,7 @@ async def non_stream_chat_response(
     mode: Optional[ChatMode] = None,
     metadata_filter: Optional[MetadataFilter] = None,
     require_vault: bool = False,
+    is_admin: bool = False,
     user_id: Optional[int] = None,
     temperature: Optional[float] = None,
     retrieval_mode: Optional[RetrievalMode] = None,
@@ -1718,6 +1777,13 @@ async def non_stream_chat_response(
             # evidence_candidates is intentionally ignored here — candidates surface only in streaming responses.
             if chunk_type == "content":
                 collected_content.append(chunk.get("content", ""))
+            elif chunk_type == "fallback":
+                # #715 T1-32-K-01: surface the degraded-retrieval notice in
+                # the non-streaming answer exactly as the stream route's
+                # fallback branch does, so both surfaces behave identically.
+                fallback_content = chunk.get("content", "")
+                if fallback_content:
+                    collected_content.append(fallback_content)
             elif chunk_type == "done":
                 sources = chunk.get("sources", [])
                 memories_used = chunk.get("memories_used", [])
@@ -1733,7 +1799,12 @@ async def non_stream_chat_response(
                 citation_confidence = chunk.get("citation_confidence")
                 unverifiable_claims = chunk.get("unverifiable_claims")
                 answer_contract = chunk.get("answer_contract")
-                llm_metrics = chunk.get("llm_metrics")
+                # Non-admin callers never receive configured provider URLs
+                # (issue #717). is_admin defaults False = redact (fail-closed),
+                # matching the stream path's polarity.
+                llm_metrics = _redact_llm_metrics(
+                    chunk.get("llm_metrics"), redact=not is_admin
+                )
     except RAGEngineError as exc:
         logger.warning("RAG engine error in non_stream_chat_response: %s", exc)
         raise HTTPException(status_code=503, detail="Chat processing failed")
@@ -1907,6 +1978,9 @@ async def chat(
                     vault_id=body.vault_id,
                     mode=effective_mode,
                     require_vault=require_vault,
+                    # Admins keep full llm_metrics; non-admin responses drop
+                    # configured provider URLs (issue #717).
+                    is_admin=not require_vault,
                     user_id=user.get("id"),
                     include_global=include_global,
                     can_write_memory=can_write_memory,
@@ -2041,6 +2115,20 @@ async def chat_stream(
             status_code=400, detail="The last message must be from the user"
         )
 
+    # Live-message cap (#922, review F-001): enforced here in the route
+    # body — after get_stream_auth and the role check — rather than as a
+    # pydantic validator, so the check is authenticated, the error detail
+    # does not echo the message list, and the route's own error-code
+    # ordering (400 empty / 400 role / 422 over-cap) is preserved.
+    cap = settings.chat_message_max_chars
+    if len(last_message.content) > cap:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"the final message exceeds chat_message_max_chars ({cap} characters)"
+            ),
+        )
+
     require_vault = user.get("role") not in ("superadmin", "admin")
     # Role-derived flags resolved inside get_stream_auth (issue #404).
     include_global = bool(user.get("_include_global_memories"))
@@ -2094,6 +2182,10 @@ async def chat_stream(
         durable_turn_id=body.turn_id,
         db_pool=getattr(request.app.state, "db_pool", None),
         last_event_id=last_event_id,
+        # Admins keep full llm_metrics; non-admin responses drop the
+        # configured provider URL (issue #717). require_vault is False
+        # exactly for admin/superadmin roles.
+        is_admin=not require_vault,
     )
 
 
@@ -2911,10 +3003,10 @@ async def _auto_name_session(
                     if affected > 0:
                         await asyncio.to_thread(conn.commit)
                         logger.info(
-                            "Auto-named session %d: %s (rows_affected=%d)",
+                            "Auto-named session %d (rows_affected=%d, title_len=%d)",
                             session_id,
-                            title,
                             affected,
+                            len(title),
                         )
                     else:
                         logger.warning(
@@ -2937,12 +3029,19 @@ async def _auto_name_session(
                 affected = cursor.rowcount
                 if affected > 0:
                     await asyncio.to_thread(conn.commit)
-                    logger.info("Auto-named untitled session %d: %s", session_id, title)
+                    logger.info(
+                        "Auto-named untitled session %d (title_len=%d)",
+                        session_id,
+                        len(title),
+                    )
 
     except Exception as e:
         logger.warning(
-            "Auto-name session %d failed: %s. Using fallback.", session_id, e
+            "Auto-name session %d failed (%s). Using fallback.",
+            session_id,
+            type(e).__name__,
         )
+        logger.debug("Auto-name session %d failed: %s", session_id, e)
         try:
             auto_title = "New conversation"
             async with pool.connection_async() as conn:

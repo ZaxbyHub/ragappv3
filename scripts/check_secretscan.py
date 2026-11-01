@@ -42,13 +42,24 @@ repository root.
 
 from __future__ import annotations
 
+import importlib.util as _ilu
+import os
 import re
-import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SECRETSCANIGNORE = ROOT / ".secretscanignore"
+
+# Shared hardened git plumbing (issue #740): bounded, OSError-tolerant,
+# NUL-delimited listings. Loaded file-relative so the module resolves
+# identically under `python scripts/check_secretscan.py` and under test
+# loaders that spec-load this script without scripts/ on sys.path.
+_gate_git_spec = _ilu.spec_from_file_location(
+    "_gate_git", Path(__file__).resolve().parent / "_gate_git.py"
+)
+_gate_git = _ilu.module_from_spec(_gate_git_spec)
+_gate_git_spec.loader.exec_module(_gate_git)
 
 # Adversarial positive samples — each MUST match at least one pattern.
 POSITIVE_SAMPLES = (
@@ -88,6 +99,13 @@ NEGATIVE_SAMPLES = (
 )
 
 OVERLY_BROAD_FRACTION = 0.50
+
+# Directory names never descended by the on-disk walkers (issue #740):
+# dependency and virtualenv trees are not part of this repository's scan
+# surface, and walking them made the gate take ~36s on a developer checkout
+# (111,500 files). Same family as check_test_collection_scope's degraded-mode
+# prune set, plus the dotted .venv convention.
+PRUNE_DIR_NAMES = {"node_modules", ".venv", "venv", "env", "ENV"}
 
 # Trailing-comment marker that declares a pattern as defensive: it may match
 # nothing today but guards a path that may appear in other configurations or
@@ -239,35 +257,122 @@ def glob_to_regex(pattern: str) -> re.Pattern[str]:
     return re.compile("".join(out))
 
 
-def matches_any(path: str, patterns: list[tuple[int, str, str, bool]]) -> int | None:
-    """Return the line number of the first matching pattern, or None."""
-    for line_no, _raw, glob, _defensive in patterns:
-        if glob_to_regex(glob).match(path):
+def matches_any(path: str, patterns: list[tuple[int, str, str, bool, re.Pattern[str]]]) -> int | None:
+    """Return the line number of the first matching compiled pattern, or None."""
+    for line_no, _raw, _glob, _defensive, regex in patterns:
+        if regex.match(path):
             return line_no
     return None
 
 
+def compile_patterns(
+    patterns: list[tuple[int, str, str, bool]],
+) -> tuple[list[tuple[int, str, str, bool, re.Pattern[str]]], list[str]]:
+    """Compile every glob ONCE (issue #740).
+
+    Returns (compiled, failures): an invalid glob (glob_to_regex raising
+    ``re.error``, e.g. the reversed char class ``[z-a]``) becomes a
+    C-SSECRETSCAN-1 failure line and is EXCLUDED from the compiled list, so
+    no later pass can re-compile it and traceback — main() returns 1 with a
+    finding instead of raising.
+    """
+    compiled: list[tuple[int, str, str, bool, re.Pattern[str]]] = []
+    failures: list[str] = []
+    for line_no, _raw, glob, defensive in patterns:
+        try:
+            regex = glob_to_regex(glob)
+        except re.error as exc:
+            failures.append(
+                f"secretscan: C-SSECRETSCAN-1 line {line_no} glob {glob!r} is "
+                f"malformed ({exc}) — a malformed glob makes secretscan skip "
+                "files it should flag"
+            )
+            continue
+        compiled.append((line_no, _raw, glob, defensive, regex))
+    return compiled, failures
+
+
 def tracked_files() -> list[str]:
-    """Return git-tracked file paths (relative, posix) under ROOT."""
-    proc = subprocess.run(
-        ["git", "ls-files"],
-        cwd=ROOT,
-        check=False,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    if proc.returncode != 0:
-        return []
-    return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    """Return git-tracked file paths (relative, posix) under ROOT.
+
+    Goes through the shared NUL-delimited helper (issue #740): under git's
+    default ``core.quotePath`` a non-ASCII tracked path prints C-quoted, and
+    a quoted token can never match a glob built from the real name. Bounded
+    and OSError-tolerant — git missing/hanging degrades to [].
+    """
+    return _gate_git.git_lines(ROOT, "ls-files") or []
 
 
 def on_disk_files() -> list[str]:
-    """Return on-disk file paths (relative, posix) under ROOT, excluding .git."""
+    """Return on-disk file paths (relative, posix) under ROOT, excluding .git.
+
+    Walks with os.scandir instead of Path.rglob so a directory that is
+    created/removed by a concurrent process mid-walk (e.g. the coverage
+    gate's npm run under pytest-xdist) skips the vanished entry instead of
+    crashing the whole scan with FileNotFoundError. Dependency and
+    virtualenv trees (PRUNE_DIR_NAMES) are not descended at all (issue #740).
+    """
     out: list[str] = []
-    for path in ROOT.rglob("*"):
-        if path.is_file() and ".git" not in path.parts:
-            out.append(path.relative_to(ROOT).as_posix())
+    stack = [ROOT]
+    while stack:
+        current = stack.pop()
+        try:
+            entries = list(os.scandir(current))
+        except OSError:
+            # Vanished, replaced, or unreadable between listing and walking.
+            continue
+        for entry in entries:
+            try:
+                if entry.is_file():
+                    path = Path(entry.path)
+                    if ".git" not in path.parts:
+                        out.append(path.relative_to(ROOT).as_posix())
+                elif entry.is_dir(follow_symlinks=False):
+                    if ".git" not in Path(entry.path).parts and entry.name not in PRUNE_DIR_NAMES:
+                        stack.append(Path(entry.path))
+            except OSError:
+                continue
+    return out
+
+
+def on_disk_dirs() -> list[str]:
+    """Return on-disk directory paths (relative, posix) under ROOT, excluding
+    .git.
+
+    Same os.scandir discipline as on_disk_files (issue #943): Path.rglob
+    raises FileNotFoundError when a directory vanishes between listing and
+    stat mid-walk — this scan's stale-glob advisory previously had exactly
+    that exposure against the coverage gate's transient artifacts under
+    pytest-xdist, so the directory census uses the same tolerant walk.
+    Dependency/virtualenv trees (PRUNE_DIR_NAMES) are not descended, same
+    as on_disk_files (issue #740).
+
+    Deliberate semantic change vs the replaced ``ROOT.rglob`` comprehension:
+    symlinked directories are listed but not followed here
+    (``follow_symlinks=False``), matching on_disk_files' directory
+    handling, whereas rglob recursed into them. A ``<dir>/**`` ignore
+    pattern whose target is only reachable through a symlinked directory
+    will now be reported by the stale-glob advisory; the repo carries no
+    symlinked directories today.
+    """
+    out: list[str] = []
+    stack = [ROOT]
+    while stack:
+        current = stack.pop()
+        try:
+            entries = list(os.scandir(current))
+        except OSError:
+            # Vanished, replaced, or unreadable between listing and walking.
+            continue
+        for entry in entries:
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    path = Path(entry.path)
+                    if ".git" not in path.parts and entry.name not in PRUNE_DIR_NAMES:
+                        out.append(path.relative_to(ROOT).as_posix())
+                        stack.append(path)
+            except OSError:
+                continue
     return out
 
 
@@ -279,14 +384,20 @@ def main() -> int:
 
     failures: list[str] = []
 
-    # C-SSECRETSCAN-1: parseability — every parsed glob must be non-empty.
+    # C-SSECRETSCAN-1: parseability — every parsed glob must be non-empty AND
+    # compile. Compilation happens exactly once here; invalid globs become
+    # findings and are excluded from `compiled`, so no later pass can
+    # re-compile them and traceback (issue #740: a malformed glob used to
+    # raise an uncaught re.error from the sample checks).
     for line_no, _raw, glob, _defensive in patterns:
         if not glob:
-            failures.append(f"secretscan: line {line_no} empty glob")
+            failures.append(f"secretscan: C-SSECRETSCAN-1 line {line_no} empty glob")
+    compiled, compile_failures = compile_patterns(patterns)
+    failures.extend(compile_failures)
 
     # C-SSECRETSCAN-2: positive samples must be ignored.
     for sample in POSITIVE_SAMPLES:
-        hit = matches_any(sample, patterns)
+        hit = matches_any(sample, compiled)
         if hit is None:
             failures.append(
                 f"secretscan: positive sample {sample!r} not matched by any pattern"
@@ -294,7 +405,7 @@ def main() -> int:
 
     # C-SSECRETSCAN-3: negative samples must NOT be ignored.
     for sample in NEGATIVE_SAMPLES:
-        hit = matches_any(sample, patterns)
+        hit = matches_any(sample, compiled)
         if hit is not None:
             failures.append(
                 f"secretscan: negative sample {sample!r} matched by line {hit} "
@@ -305,8 +416,7 @@ def main() -> int:
     candidates = sorted(set(tracked_files()) | set(on_disk_files()))
     if candidates:
         threshold = max(1, int(len(candidates) * OVERLY_BROAD_FRACTION))
-        for line_no, _raw, glob, _defensive in patterns:
-            regex = glob_to_regex(glob)
+        for line_no, _raw, glob, _defensive, regex in compiled:
             count = sum(1 for c in candidates if regex.match(c))
             if count >= threshold:
                 _print(
@@ -327,13 +437,13 @@ def main() -> int:
         # whether a `<dir>/**` pattern targets a directory that exists at any
         # depth. We match the pattern itself against these paths via the same
         # glob_to_regex the validator uses elsewhere — no ad-hoc last-segment
-        # heuristics.
-        on_disk_dirs = [
-            p.relative_to(ROOT).as_posix()
-            for p in ROOT.rglob("*")
-            if p.is_dir() and ".git" not in p.parts
-        ]
-        for line_no, _raw, glob, is_defensive in patterns:
+        # heuristics. Issue #943: on_disk_dirs() walks with the same
+        # vanish-tolerant os.scandir discipline as on_disk_files() — the
+        # previous ROOT.rglob("*") comprehension crashed the whole scan with
+        # FileNotFoundError when a directory (e.g. the coverage gate's
+        # transient frontend/coverage) vanished mid-walk under pytest-xdist.
+        dirs_cache = on_disk_dirs()
+        for line_no, _raw, glob, is_defensive, regex in compiled:
             if is_defensive:
                 continue
             if "*" in glob or "?" in glob:
@@ -353,7 +463,7 @@ def main() -> int:
                     self_regex = glob_to_regex(dir_glob)
                     anywhere = any(
                         dir_regex.match(d + "/") or self_regex.match(d)
-                        for d in on_disk_dirs
+                        for d in dirs_cache
                     )
                     if not anywhere:
                         _print(
@@ -362,7 +472,6 @@ def main() -> int:
                             f"(stale)"
                         )
                 continue
-            regex = glob_to_regex(glob)
             if not any(regex.match(c) for c in candidates):
                 _print(
                     f"secretscan: warning line {line_no} pattern {glob!r} matches no "

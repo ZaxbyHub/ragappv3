@@ -1,9 +1,13 @@
 // ADVERSARIAL TESTS for AdminUsersPage — XSS, injection, self-action, role escalation, edge cases
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, waitFor, act, fireEvent } from '@testing-library/react';
+import { render, screen, waitFor, act, fireEvent, within } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import AdminUsersPage from '@/pages/AdminUsersPage';
 import { toast } from 'sonner';
+// Issue #771 (UI-ENH-05): the below-sm card list duplicates row
+// text next to the desktop table; scope data queries to the table subtree
+// (a card-only regression still fails these assertions).
+const inTable = () => within(screen.getByRole('table'));
 
 // --- Mocks ---
 vi.mock('@/stores/useAuthStore', () => ({
@@ -147,7 +151,8 @@ describe('AdminUsersPage ADVERSARIAL', () => {
 
       await waitFor(() => {
         // The text content should contain the literal string, not execute
-        const cell = screen.getByText((content) => content.includes(payload) || content.includes('script'));
+        // #771: table-scoped (below-sm card list duplicates the text)
+        const cell = inTable().getByText((content) => content.includes(payload) || content.includes('script'));
         expect(cell).toBeInTheDocument();
       });
 
@@ -164,7 +169,8 @@ describe('AdminUsersPage ADVERSARIAL', () => {
       await act(async () => { render(<AdminUsersPage />); });
 
       await waitFor(() => {
-        const cell = screen.getByText((content) => content.includes(payload) || content.includes('script'));
+        // #771: table-scoped (below-sm card list duplicates the text)
+        const cell = inTable().getByText((content) => content.includes(payload) || content.includes('script'));
         expect(cell).toBeInTheDocument();
       });
 
@@ -178,11 +184,13 @@ describe('AdminUsersPage ADVERSARIAL', () => {
       await act(async () => { render(<AdminUsersPage />); });
 
       await waitFor(() => {
-        expect(screen.getByText('superadmin')).toBeInTheDocument();
+        // #771: table-scoped (below-sm card list duplicates the text)
+        expect(inTable().getByText('superadmin')).toBeInTheDocument();
       });
 
       // The role select for user id=1 (current user) should be disabled
-      const roleSelects = document.querySelectorAll('select[aria-label*="superadmin"]');
+      // #771: table-scoped (below-sm card list duplicates the text)
+      const roleSelects = screen.getByRole('table').querySelectorAll('select[aria-label*="superadmin"]');
       roleSelects.forEach(sel => expect(sel).toBeDisabled());
     });
 
@@ -190,10 +198,12 @@ describe('AdminUsersPage ADVERSARIAL', () => {
       await act(async () => { render(<AdminUsersPage />); });
 
       await waitFor(() => {
-        expect(screen.getByText('superadmin')).toBeInTheDocument();
+        // #771: table-scoped (below-sm card list duplicates the text)
+        expect(inTable().getByText('superadmin')).toBeInTheDocument();
       });
 
-      const toggle = screen.getByLabelText(/deactivate user superadmin/i);
+      // #771: table-scoped (below-sm card list duplicates the text)
+      const toggle = inTable().getByLabelText(/deactivate user superadmin/i);
       expect(toggle).toBeDisabled();
     });
 
@@ -201,7 +211,8 @@ describe('AdminUsersPage ADVERSARIAL', () => {
       await act(async () => { render(<AdminUsersPage />); });
 
       await waitFor(() => {
-        expect(screen.getByText('superadmin')).toBeInTheDocument();
+        // #771: table-scoped (below-sm card list duplicates the text)
+        expect(inTable().getByText('superadmin')).toBeInTheDocument();
       });
 
       // There should be no delete button for the current user (id=1)
@@ -221,11 +232,13 @@ describe('AdminUsersPage ADVERSARIAL', () => {
       await act(async () => { render(<AdminUsersPage />); });
 
       await waitFor(() => {
-        expect(screen.getByText('john')).toBeInTheDocument();
+        // #771: table-scoped (below-sm card list duplicates the text)
+        expect(inTable().getByText('john')).toBeInTheDocument();
       });
 
       // Current user is superadmin (id=1), so delete buttons for OTHER users should exist
-      const otherUserDeleteBtns = document.querySelectorAll('button[aria-label="Delete user john"], button[aria-label="Delete user jane"]');
+      // #771: table-scoped (below-sm card list duplicates the text)
+      const otherUserDeleteBtns = screen.getByRole('table').querySelectorAll('button[aria-label="Delete user john"], button[aria-label="Delete user jane"]');
       expect(otherUserDeleteBtns.length).toBe(2);
 
       // But NO delete button for self (id=1)
@@ -254,10 +267,12 @@ describe('AdminUsersPage ADVERSARIAL', () => {
       await act(async () => { render(<AdminUsersPage />); });
 
       await waitFor(() => {
-        expect(screen.getByText('john')).toBeInTheDocument();
+        // #771: table-scoped (below-sm card list duplicates the text)
+        expect(inTable().getByText('john')).toBeInTheDocument();
       });
 
-      const roleSelects = document.querySelectorAll('select[aria-label*="john"]');
+      // #771: table-scoped (below-sm card list duplicates the text)
+      const roleSelects = screen.getByRole('table').querySelectorAll('select[aria-label*="john"]');
       await act(async () => {
         fireEvent.change(roleSelects[0], { target: { value: 'admin' } });
       });
@@ -274,10 +289,12 @@ describe('AdminUsersPage ADVERSARIAL', () => {
       await act(async () => { render(<AdminUsersPage />); });
 
       await waitFor(() => {
-        expect(screen.getByText('john')).toBeInTheDocument();
+        // #771: table-scoped (below-sm card list duplicates the text)
+        expect(inTable().getByText('john')).toBeInTheDocument();
       });
 
-      const deleteBtn = document.querySelector('button[aria-label="Delete user john"]') as HTMLElement;
+      // #771: table-scoped (below-sm card list duplicates the text)
+      const deleteBtn = screen.getByRole('table').querySelector('button[aria-label="Delete user john"]') as HTMLElement;
       expect(deleteBtn).not.toBeNull();
       await act(async () => { fireEvent.click(deleteBtn); });
 
@@ -316,7 +333,8 @@ describe('AdminUsersPage ADVERSARIAL', () => {
       await act(async () => { render(<AdminUsersPage />); });
 
       await waitFor(() => {
-        expect(screen.getByText('nulluser')).toBeInTheDocument();
+        // #771: table-scoped (below-sm card list duplicates the text)
+        expect(inTable().getByText('nulluser')).toBeInTheDocument();
       });
     });
 
@@ -356,7 +374,8 @@ describe('AdminUsersPage ADVERSARIAL', () => {
       await act(async () => { render(<AdminUsersPage />); });
 
       await waitFor(() => {
-        expect(screen.getByText('Normal Name')).toBeInTheDocument();
+        // #771: table-scoped (below-sm card list duplicates the text)
+        expect(inTable().getByText('Normal Name')).toBeInTheDocument();
       });
     });
 
@@ -370,7 +389,8 @@ describe('AdminUsersPage ADVERSARIAL', () => {
       await act(async () => { render(<AdminUsersPage />); });
 
       await waitFor(() => {
-        expect(screen.getByText('user')).toBeInTheDocument();
+        // #771: table-scoped (below-sm card list duplicates the text)
+        expect(inTable().getByText('user')).toBeInTheDocument();
       });
     });
   });
@@ -381,7 +401,8 @@ describe('AdminUsersPage ADVERSARIAL', () => {
       await act(async () => { render(<AdminUsersPage />); });
 
       await waitFor(() => {
-        expect(screen.getByText('john')).toBeInTheDocument();
+        // #771: table-scoped (below-sm card list duplicates the text)
+        expect(inTable().getByText('john')).toBeInTheDocument();
       });
 
       const searchInput = screen.getByPlaceholderText('Search by username or name...');
@@ -410,10 +431,12 @@ describe('AdminUsersPage ADVERSARIAL', () => {
       await act(async () => { render(<AdminUsersPage />); });
 
       await waitFor(() => {
-        expect(screen.getByText('john')).toBeInTheDocument();
+        // #771: table-scoped (below-sm card list duplicates the text)
+        expect(inTable().getByText('john')).toBeInTheDocument();
       });
 
-      const roleSelect = document.querySelector('select[aria-label*="john"]');
+      // #771: table-scoped (below-sm card list duplicates the text)
+      const roleSelect = screen.getByRole('table').querySelector('select[aria-label*="john"]');
       // Rapidly change role 5 times
       for (let i = 0; i < 5; i++) {
         await act(async () => {
@@ -423,7 +446,8 @@ describe('AdminUsersPage ADVERSARIAL', () => {
 
       // The updatingUserId guard should prevent concurrent calls for the same user
       // At minimum, the component should not crash
-      expect(screen.getByText('john')).toBeInTheDocument();
+      // #771: table-scoped (below-sm card list duplicates the text)
+      expect(inTable().getByText('john')).toBeInTheDocument();
     });
   });
 
@@ -438,7 +462,8 @@ describe('AdminUsersPage ADVERSARIAL', () => {
       await act(async () => { render(<AdminUsersPage />); });
 
       await waitFor(() => {
-        expect(screen.getByText('negative')).toBeInTheDocument();
+        // #771: table-scoped (below-sm card list duplicates the text)
+        expect(inTable().getByText('negative')).toBeInTheDocument();
       });
     });
 
@@ -451,7 +476,8 @@ describe('AdminUsersPage ADVERSARIAL', () => {
       await act(async () => { render(<AdminUsersPage />); });
 
       await waitFor(() => {
-        expect(screen.getByText('zeroid')).toBeInTheDocument();
+        // #771: table-scoped (below-sm card list duplicates the text)
+        expect(inTable().getByText('zeroid')).toBeInTheDocument();
       });
     });
   });
@@ -480,10 +506,12 @@ describe('AdminUsersPage ADVERSARIAL', () => {
       await act(async () => { render(<AdminUsersPage />); });
 
       await waitFor(() => {
-        expect(screen.getByText('john')).toBeInTheDocument();
+        // #771: table-scoped (below-sm card list duplicates the text)
+        expect(inTable().getByText('john')).toBeInTheDocument();
       });
 
-      const roleSelect = document.querySelector('select[aria-label*="john"]');
+      // #771: table-scoped (below-sm card list duplicates the text)
+      const roleSelect = screen.getByRole('table').querySelector('select[aria-label*="john"]');
       await act(async () => {
         fireEvent.change(roleSelect!, { target: { value: 'admin' } });
       });
@@ -502,10 +530,12 @@ describe('AdminUsersPage ADVERSARIAL', () => {
       await act(async () => { render(<AdminUsersPage />); });
 
       await waitFor(() => {
-        expect(screen.getByText('john')).toBeInTheDocument();
+        // #771: table-scoped (below-sm card list duplicates the text)
+        expect(inTable().getByText('john')).toBeInTheDocument();
       });
 
-      const deleteBtn = document.querySelector('button[aria-label="Delete user john"]') as HTMLElement;
+      // #771: table-scoped (below-sm card list duplicates the text)
+      const deleteBtn = screen.getByRole('table').querySelector('button[aria-label="Delete user john"]') as HTMLElement;
       expect(deleteBtn).not.toBeNull();
       await act(async () => { fireEvent.click(deleteBtn); });
 
@@ -536,9 +566,10 @@ describe('AdminUsersPage ADVERSARIAL', () => {
       await act(async () => { render(<AdminUsersPage />); });
 
       await waitFor(() => {
-        expect(screen.getByText('张三')).toBeInTheDocument();
-        expect(screen.getByText('عربي')).toBeInTheDocument();
-        expect(screen.getByText('🎉 Name')).toBeInTheDocument();
+        // #771: table-scoped (below-sm card list duplicates the text)
+        expect(inTable().getByText('张三')).toBeInTheDocument();
+        expect(inTable().getByText('عربي')).toBeInTheDocument();
+        expect(inTable().getByText('🎉 Name')).toBeInTheDocument();
       });
     });
 
@@ -566,7 +597,8 @@ describe('AdminUsersPage ADVERSARIAL', () => {
       await act(async () => { render(<AdminUsersPage />); });
 
       await waitFor(() => {
-        expect(screen.getByText('baddate')).toBeInTheDocument();
+        // #771: table-scoped (below-sm card list duplicates the text)
+        expect(inTable().getByText('baddate')).toBeInTheDocument();
       });
     });
   });

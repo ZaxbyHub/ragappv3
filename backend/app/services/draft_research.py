@@ -33,7 +33,13 @@ from typing import TYPE_CHECKING, Awaitable, Callable, Literal, Sequence
 
 from pydantic import ValidationError
 
-from .draft_prompts import PROMPTS, ResearchEvidenceItem, ResearchFacet, ResearchPacket
+from .draft_prompts import (
+    PROMPTS,
+    ResearchEvidenceItem,
+    ResearchFacet,
+    ResearchModelPacket,
+    ResearchPacket,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids importing rag_engine
     from .rag_engine import RAGRetrievalResult
@@ -378,9 +384,12 @@ def _build_research_prompt(
     )
 
 
-def _parse_packet(raw: str) -> ResearchPacket:
+def _parse_packet(raw: str) -> ResearchModelPacket:
+    # Issue #787: the model is asked only for contradictions/gaps (the fields
+    # kept from its response); legacy full-packet responses still parse
+    # because pydantic ignores extra keys.
     data = json.loads(raw)
-    return ResearchPacket.model_validate(data)
+    return ResearchModelPacket.model_validate(data)
 
 
 def _build_repair_prompt(original_prompt: str, invalid_output: str, error: Exception) -> str:
@@ -399,7 +408,7 @@ async def _complete_packet(
     *,
     complete: Callable[..., Awaitable[str]],
     prompt: str,
-) -> ResearchPacket:
+) -> ResearchModelPacket:
     """Call the model, parse/validate its JSON, and allow exactly one repair
     attempt on failure (SPEC §14.3). A second invalid result raises."""
     prompt_def = PROMPTS["research"]
@@ -542,16 +551,19 @@ async def run_research(
     prompt = _build_research_prompt(brief=brief, inputs=inputs, evidence=evidence)
     model_packet = await _complete_packet(complete=complete, prompt=prompt)
 
-    packet = model_packet.model_copy(
-        update={
-            "facets": facets,
-            "retrieval_status": retrieval_status,
-            "requested_source_kinds": requested_list,
-            "successful_source_kinds": successful_list,
-            "failed_source_kinds": failed_list,
-            "evidence": evidence_items,
-            "source_only": source_only,
-        }
+    # Issue #787: explicit construction (never model_copy on the narrow
+    # model) so the persisted artifact keeps every deterministic field and
+    # the assembled packet is re-validated.
+    packet = ResearchPacket(
+        facets=facets,
+        retrieval_status=retrieval_status,
+        requested_source_kinds=requested_list,
+        successful_source_kinds=successful_list,
+        failed_source_kinds=failed_list,
+        evidence=evidence_items,
+        contradictions=model_packet.contradictions,
+        gaps=model_packet.gaps,
+        source_only=source_only,
     )
     return ResearchOutcome(
         packet=packet,

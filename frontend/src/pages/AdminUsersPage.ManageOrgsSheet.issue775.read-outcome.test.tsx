@@ -1,9 +1,12 @@
 import type { ReactNode } from "react";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import "@testing-library/jest-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import AdminUsersPage from "@/pages/AdminUsersPage";
 import { useAuthStore } from "@/stores/useAuthStore";
+
+// #771: table-scoped (below-sm card list duplicates the text)
+const inTable = () => within(screen.getByRole("table"));
 
 const mockGet = vi.hoisted(() => vi.fn());
 const mockPut = vi.hoisted(() => vi.fn());
@@ -118,8 +121,10 @@ describe("C25 ManageOrgsSheet read outcome", () => {
 
     try {
       render(<AdminUsersPage />);
-      expect(await screen.findByText("john")).toBeInTheDocument();
-      fireEvent.click(screen.getByRole("button", { name: "Manage organizations for john" }));
+      // #771: table-scoped (below-sm card list duplicates the text)
+      expect(await inTable().findByText("john")).toBeInTheDocument();
+      // #771: table-scoped (below-sm card list duplicates the text)
+      fireEvent.click(inTable().getByRole("button", { name: "Manage organizations for john" }));
       await waitFor(() => {
         expect(mockGet).toHaveBeenCalledWith("/organizations/");
         expect(mockGet).toHaveBeenCalledWith("/users/2/organizations");

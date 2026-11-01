@@ -16,8 +16,7 @@ from app.api.deps import (
     get_secret_manager,
     get_toggle_manager,
 )
-from app.config import settings
-from app.security import csrf_protect, require_scope
+from app.security import admin_scope_fingerprint, csrf_protect, require_scope
 from app.services.maintenance import MaintenanceAudit, MaintenanceService
 from app.services.secret_manager import SecretManager
 from app.services.toggle_manager import ToggleManager
@@ -108,14 +107,19 @@ async def set_toggle(
     toggle_manager: ToggleManager = Depends(get_toggle_manager),
     secret_manager: SecretManager = Depends(get_secret_manager),
     auth: dict = Depends(require_scope("admin:config")),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     key, key_version = secret_manager.get_hmac_key()
+    # Audit identity is the non-secret scope fingerprint, never the bearer
+    # token (issue #709 class (a)): the token must not live in a durable
+    # audit column or an HMAC message derived into one.
+    actor = admin_scope_fingerprint(auth.get("user_id", ""))
     try:
         hmac_digest, timestamp = _compute_hmac(
             key,
             payload.feature,
             payload.enabled,
-            auth.get("user_id"),
+            actor,
             request.client.host if request.client else None,
         )
     except Exception:
@@ -128,7 +132,7 @@ async def set_toggle(
             toggle_manager,
             payload.feature,
             payload.enabled,
-            auth.get("user_id"),
+            actor,
             request.client.host if request.client else None,
             key_version,
             hmac_digest,
@@ -137,9 +141,12 @@ async def set_toggle(
     except sqlite3.Error:
         logger.exception("Failed to update feature toggle")
         raise HTTPException(status_code=500, detail="Failed to update toggle")
-    request.app.state.model_validation = await asyncio.to_thread(
-        toggle_manager.get_toggle, "model_validation", settings.enable_model_validation
-    )
+    except RuntimeError:
+        # Issue #724 (S06-SK-06): the pool raises RuntimeError on checkout
+        # exhaustion/closure — a different failure class from sqlite3.Error,
+        # mapped to 503 (dependency unavailable), not the write-failure 500.
+        logger.exception("Feature toggle dependency unavailable")
+        raise HTTPException(status_code=503, detail="Toggle storage temporarily unavailable")
     return {"feature": payload.feature, "enabled": payload.enabled, "hmac": hmac_digest}
 
 
@@ -164,12 +171,14 @@ async def set_maintenance(
     """Set write-blocking maintenance flag state."""
     key, key_version = secret_manager.get_hmac_key()
     ip = request.client.host if request.client else None
+    # Non-secret audit identity (issue #709 class (a)) — see set_toggle.
+    actor = admin_scope_fingerprint(auth.get("user_id", ""))
     try:
         hmac_digest, timestamp = _compute_hmac(
             key,
             MaintenanceService.FLAG_NAME,
             payload.enabled,
-            auth.get("user_id"),
+            actor,
             ip,
         )
     except Exception:
@@ -183,7 +192,7 @@ async def set_maintenance(
             payload.enabled,
             payload.reason,
             MaintenanceAudit(
-                user_id=auth.get("user_id"),
+                user_id=actor,
                 ip=ip,
                 key_version=key_version,
                 hmac_sha256=hmac_digest,

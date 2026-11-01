@@ -1,6 +1,6 @@
 # Stage 1: Build Frontend
 # Pinned to node 22.22 (current LTS line; node 20 is EOL since 2026-04-30) to match
-# CI (ci.yml node-version "22.22.0") so a green CI run proves the shipped image
+# CI (ci.yml node-version "22.22.2") so a green CI run proves the shipped image
 # builds. Parity across this FROM, frontend/Dockerfile, ci.yml, package.json
 # engines and CONTRIBUTING.md is enforced by scripts/check_runtime_contract.py
 # (Quality contracts job) — move majors through that gate, not by editing here.
@@ -90,6 +90,25 @@ RUN pip install --no-cache-dir --require-hashes -r requirements-lock.txt
 # image stays buildable (BUILD-002 docker smoke, #258).
 RUN python -c "import spacy" 2>/dev/null     && python -m spacy download en_core_web_sm     || echo "spacy not installed - skipping en_core_web_sm download"
 
+# Bake the NLTK data packages unstructured's partitioners load lazily at
+# first parse. nltk ships as a locked library (via unstructured in
+# requirements-lock.txt) but pip has no artifact for the tokenizer corpora,
+# so an offline `--no-index` install can never provide them — without this
+# bake a fresh container either hangs on the lazy download or silently
+# returns zero elements per document (issue #1008). Unlike the optional
+# spaCy model above there is NO skip fallback: nltk is a locked dependency,
+# so a missing corpus is a build defect and the pre-flight nltk.data.find
+# assertions below fail the build when the downloader could not reach a
+# mirror. Like the apt/pip steps above this needs network access at build
+# time; restricted/airgapped builds pass a proxy via Docker's standard
+# build args or pre-seed a mirror. /usr/local/nltk_data persists into the
+# runtime image and is world-readable, so the non-root appuser resolves it
+# via NLTK_DATA on first parse.
+ENV NLTK_DATA=/usr/local/nltk_data
+RUN python -m nltk.downloader -d /usr/local/nltk_data punkt punkt_tab \
+        averaged_perceptron_tagger averaged_perceptron_tagger_eng \
+    && python -c "import nltk.data; nltk.data.find('tokenizers/punkt'); nltk.data.find('tokenizers/punkt_tab'); nltk.data.find('taggers/averaged_perceptron_tagger'); nltk.data.find('taggers/averaged_perceptron_tagger_eng')"
+
 # Copy backend code
 COPY backend/app ./app
 
@@ -110,4 +129,4 @@ USER appuser
 
 EXPOSE 9090
 
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port 9090 --proxy-headers --forwarded-allow-ips \"${FORWARDED_ALLOW_IPS:-127.0.0.1}\""]
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port 9090 --proxy-headers --forwarded-allow-ips \"${FORWARDED_ALLOW_IPS:-127.0.0.1}\" --no-access-log"]
