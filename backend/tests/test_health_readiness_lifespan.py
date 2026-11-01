@@ -80,7 +80,9 @@ class TestLifespanMigrationFlagWiring(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 import asyncio
+import atexit
 import logging
+import shutil
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -206,11 +208,13 @@ def test_real_lifespan_stop_is_awaited_on_shutdown():
     # list alone would reinstate the same mutated objects (the leak the
     # reviewer's probe demonstrated).
     saved_handlers = [(h, list(h.filters)) for h in root.handlers]
-    # PRR-012 (delta-review corrected): hold the TemporaryDirectory object
-    # in a local — `.name` alone let the object be GC'd immediately, which
-    # deleted the dir BEFORE the lifespan re-created it untracked.
-    _tmp_cm = tempfile.TemporaryDirectory(prefix="lifespan-rt-")
-    restore = _pin_lifespan_settings(Path(_tmp_cm.name))
+    # PRR-012: mkdtemp + atexit rmtree — the TemporaryDirectory finalizer
+    # silently fails on Windows while the lifespan's background handles are
+    # open (delta-review after-exit probe); atexit runs at interpreter exit
+    # when every handle is closed (user_route_helpers proves the pattern).
+    _tmp_dir = Path(tempfile.mkdtemp(prefix="lifespan-rt-"))
+    atexit.register(shutil.rmtree, _tmp_dir, True)
+    restore = _pin_lifespan_settings(_tmp_dir)
     app = FastAPI()
     stop_calls: list[int] = []
     try:
@@ -248,8 +252,9 @@ def test_real_lifespan_fresh_branch_attaches_request_id_filter():
     root = logging.getLogger()
     saved_handlers = list(root.handlers)
     root.handlers.clear()
-    _tmp_cm = tempfile.TemporaryDirectory(prefix="lifespan-fb-")
-    restore = _pin_lifespan_settings(Path(_tmp_cm.name))
+    _tmp_dir = Path(tempfile.mkdtemp(prefix="lifespan-fb-"))
+    atexit.register(shutil.rmtree, _tmp_dir, True)
+    restore = _pin_lifespan_settings(_tmp_dir)
     app = FastAPI()
     observed: list[tuple] = []
     try:
