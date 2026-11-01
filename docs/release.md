@@ -566,7 +566,7 @@ All HTTP requests are logged in structured JSON format:
 
 ```json
 {
-  "timestamp": "2026-02-06T12:34:56.789Z",
+  "ts": "2026-02-06T12:34:56.789Z",
   "level": "INFO",
   "logger": "http",
   "message": "http_request",

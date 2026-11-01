@@ -1,4 +1,5 @@
-"""must_change_password exempt-path classification guard (issue #202, AC6).
+"""must_change_password exempt-path classification guard (issue #202, AC6;
+maintenance-subset guard added for issue #731).
 
 deps.py enforces must_change_password with a CLOSED allowlist (exempt_paths,
 me_read_paths). Behavior tests pin today's routes; this guard pins the
@@ -6,6 +7,17 @@ CLASSIFICATION COVERAGE: every /auth route the app actually mounts must be
 consciously classified as exempt, me-read, or explicitly blocked here. Adding a
 new auth route without a classification decision fails this test with an
 actionable message — the exact maintenance fragility the audit finding names.
+
+The maintenance-subset guard (issue #731, the disagreeing-exempt-sets class
+C17): every must_change_password-exempt POST path, canonicalized to its
+mounted runtime spelling, must also be maintenance-exempt
+(``_EXEMPT_POST_PATHS``). Without it, the one route the forced-change gate
+leaves open can be the one route maintenance blocks — during a window a
+flagged user could authenticate but never finish the change (login exempt,
+change-password 503), the exact wedge #731 reported. Canonicalization:
+deps.py carries both router-local (``/auth/...``) and mounted
+(``/api/auth/...``) spellings; maintenance matches mounted runtime paths, so
+router-local spellings are prefixed with ``/api`` before comparison.
 
 The real sets are AST-extracted from deps.py source (they are function-local
 literals), so deps.py drift changes what this test sees.
@@ -167,6 +179,69 @@ class TestExemptPathsClassificationGuard(unittest.TestCase):
             or local in BLOCKED_AUTH_ROUTES
         )
         self.assertFalse(is_classified)
+
+
+class TestMaintenanceSubsetGuard(unittest.TestCase):
+    """Issue #731: the two exempt allowlists must never disagree again.
+
+    Every must_change_password-exempt POST path (canonicalized to its mounted
+    runtime spelling) must be a member of maintenance's
+    ``_EXEMPT_POST_PATHS``. RED at the pre-#731 base (change-password was
+    maintenance-blocked); GREEN after. New deps.py POST exemptions fail here
+    until maintenance covers them — the disagreeing-exempt-sets class the
+    audit named as the missing catcher.
+    """
+
+    def _maintenance_exempt(self) -> frozenset:
+        from app.middleware import maintenance
+
+        return maintenance._EXEMPT_POST_PATHS
+
+    def test_flagged_user_post_exemptions_are_maintenance_exempt(self):
+        sets = _extract_local_sets()
+        exempt = sets["exempt_paths"]
+        self.assertTrue(exempt, "deps.py exempt_paths literal not found")
+
+        maintenance_exempt = self._maintenance_exempt()
+        missing = []
+        for path in sorted(exempt):
+            # Canonicalize: maintenance matches mounted runtime paths, deps.py
+            # carries both router-local and mounted spellings.
+            canonical = path if path.startswith("/api") else f"/api{path}"
+            if canonical not in maintenance_exempt:
+                missing.append(f"{path} -> {canonical}")
+
+        self.assertEqual(
+            missing,
+            [],
+            "must_change_password POST exemptions that maintenance would "
+            "block during a window (a flagged user can authenticate but "
+            "never finish the forced change): add the canonical path to "
+            "maintenance._EXEMPT_POST_PATHS: " + "; ".join(missing),
+        )
+
+    def test_guard_bites_on_disagreeing_sets(self):
+        """Mutation probe: the guard must fail when the sets disagree.
+
+        Simulates the pre-#731 state (change-password missing from the
+        maintenance exemptions) against the canonicalization the guard uses.
+        """
+        sets = _extract_local_sets()
+        exempt = sets["exempt_paths"]
+        simulated = set(self._maintenance_exempt())
+        simulated.discard("/api/auth/change-password")
+
+        missing = [
+            path
+            for path in sorted(exempt)
+            if (path if path.startswith("/api") else f"/api{path}") not in simulated
+        ]
+        self.assertIn(
+            "/api/auth/change-password",
+            missing,
+            "probe must reproduce the #731 wedge under the guard's own "
+            f"canonicalization; got missing={missing}",
+        )
 
 
 if __name__ == "__main__":
