@@ -55,8 +55,16 @@ the gap is the historical 66-day window, not a current code defect.)
      <repo-relative-path>` — which must exist in the repository at the PR
      head. A named-but-missing artifact fails the gate: that is the #343
      pattern in artifact form, a claim with nothing behind it. URL-form
-     artifacts are advisory only (the gate never makes network calls to
-     validate them).
+     (http:// or https://) artifacts are advisory only (the gate never makes
+     network calls to validate them; they are skipped at resolution and
+     produce no violation — #741). Consequence to be aware of: a body whose
+     ONLY evidence is a URL is treated as satisfying the requirement without
+     verification — advisory means "not verified", not "verified"; other URL
+     schemes (s3://, file://, ...) are still resolved as repository paths and
+     fail as missing. Markdown emphasis/backticks around the artifact path are
+     stripped before resolution, so an artifact written with backticks —
+     `artifact:` followed by backtick-wrapped `docs/x.md` — still resolves
+     to `docs/x.md`.
 3. **Re-execution (`verify-test`).** The named test is re-run at the
    merge-base of the PR's base branch and HEAD (the pre-fix commit — obtained
    via `git merge-base origin/<base-ref> HEAD`) and at the PR head. The gate
@@ -68,7 +76,11 @@ the gap is the historical 66-day window, not a current code defect.)
    one APPROVED review must come from a login that authored no commit in the
    PR touching the file families of the PR's changed files. Approvals from
    `[bot]` accounts never count — a bot approval is not a human second-family
-   review.
+   review. Review histories are reduced per login (#741, decided rule): only
+   a reviewer's **latest non-COMMENTED review** counts — an approval later
+   superseded by CHANGES_REQUESTED or DISMISSED does not satisfy the rule,
+   while CHANGES_REQUESTED later superseded by APPROVED does. Reviews with
+   an empty/missing login never count.
 
 ### File-family mapping
 
@@ -100,12 +112,18 @@ no hook can block that event itself. Enforcement is therefore:
 **Reopen-on-merge procedure** (operator): if a merged PR turns out to have
 closed an issue without valid evidence, reopen the issue with a comment
 linking the gate run (`closure-evidence: FAIL` in the Actions log) and naming
-the missing evidence. The gate's output lines (`closure-evidence: OK / WARN /
+the missing evidence. `closure-evidence: ERROR — gate not run` (preflight
+failure; the full line names the failed step) is an
+infrastructure/availability outcome, NOT a violation token — it never keys
+this procedure (in enforce mode it still fails the check, fail-closed). The gate's output lines (`closure-evidence: OK / WARN /
 FAIL / ERROR / evidence-test`) are designed to be quoted directly.
 
 ## Modes, rollout, and rollback
 
-- **warn** (default): the gate evaluates and re-executes everything, prints
+- **warn** (default): the gate evaluates and re-executes everything (when the
+  base-copy preflight fails, nothing is evaluated or re-executed and the
+  verdict is `ERROR — gate not run`, non-blocking in warn / fail-closed in
+  enforce), prints
   `closure-evidence: WARN — …` (or `ERROR`) observations, and never fails the
   check. This is the one-release-cycle rollout mode so existing open PRs are
   not retroactively blocked.
@@ -133,10 +151,27 @@ FAIL / ERROR / evidence-test`) are designed to be quoted directly.
   only* and are **not re-executed** by `verify-test` in v1 ("where feasible"
   per issue #568 — only backend pytest ids are re-executed). Name the vitest
   file/function as the artifact and link its captured run output.
-- **Commit cap**: per-commit files are fetched for the first 100 PR commits;
-  a commit whose files could not be fetched is treated conservatively — its
-  author counts as same-family and can never serve as the cross-family
-  approver (an unfetched commit must not weaken the reviewer rule).
+- **Commit cap / pagination** (#741): the commit, file and review lists are
+  paginated to completeness, and the fetched counts are cross-checked against
+  the pull request's own `commits`/`changed_files` totals — a mismatch (for
+  example GitHub's 250-commit list cap, which ends on a short page at exactly
+  250) raises `FetchError` instead of silently evaluating a truncated
+  snapshot. A commit whose per-commit files could not be fetched is treated
+  conservatively — its author counts as same-family and can never serve as
+  the cross-family approver (an unfetched commit must not weaken the reviewer
+  rule).
+- **Base-copy execution** (#741): the workflow restores `scripts/` from the
+  PR's **base branch** (`git checkout origin/<base-ref> -- scripts/`) before
+  invoking the checker, so a PR that edits the gate script or its tests is
+  evaluated by the base branch's copy, not its own edits. The checker and the
+  workflow's inline JSON parsers run under `python -I` (isolated mode), so a
+  PR-added module under `scripts/` cannot shadow stdlib imports. On
+  `workflow_dispatch` the PR head is fetched (`refs/pull/<n>/head`, which
+  GitHub exposes on the base repo even for forks) and checked out first so
+  artifact evidence
+  resolves against the PR's tree; preflight failures are status-captured and
+  surface as the gate's ordinary ERROR handling (warn mode stays
+  non-blocking, enforce mode fails closed).
 
 ## Satisfying the gate (for PR authors)
 

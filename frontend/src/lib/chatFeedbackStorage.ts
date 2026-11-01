@@ -14,6 +14,33 @@ export function feedbackKey(messageId: string): string {
   return `${FEEDBACK_KEY_PREFIX}${messageId}`;
 }
 
+/**
+ * Remove every persisted feedback vote (issue #823 identity boundary): the
+ * keys are server message ids, so they are per-principal state exactly like
+ * the transcript — the reset clears them rather than leaving the previous
+ * user's vote history readable by the next one.
+ */
+export function clearAllFeedbackVotes(): number {
+  let failed = 0;
+  try {
+    const doomed: string[] = [];
+    for (let i = 0; i < localStorage.length; i += 1) {
+      const key = localStorage.key(i);
+      if (key && key.startsWith(FEEDBACK_KEY_PREFIX)) doomed.push(key);
+    }
+    for (const key of doomed) {
+      try {
+        localStorage.removeItem(key);
+      } catch {
+        failed += 1;
+      }
+    }
+  } catch {
+    /* storage unavailable — nothing to enumerate */
+  }
+  return failed;
+}
+
 export function readFeedbackVote(messageId: string): FeedbackVote | null {
   try {
     const stored = localStorage.getItem(feedbackKey(messageId));

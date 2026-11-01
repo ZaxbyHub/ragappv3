@@ -391,3 +391,32 @@ Stop and ask the user or present options when:
 - root cause spans multiple subsystems and the approved scope is too narrow
 - the critic returns `BLOCKED`
 - confidence remains below 90% after reasonable investigation
+
+## Contract addendum (2026-10-12)
+
+- **Named-mutation discipline.** Every DISCRIMINATING check must name, in its
+  08-test-results block, one concrete mutation that kills it and the test that
+  fails under it — "the suite passes" is not evidence a check bites. A check
+  whose named mutant survives the shipped suite is a coverage gap, not a pass.
+  Probe hygiene is part of the contract: restore with `git checkout -- <file>`
+  after every probe and verify `git status --porcelain` clean before any
+  commit; a stray uncommitted mutant can ride explicit-path staging into the
+  fix commit (or `git add -A` into the release).
+- **Frozen-docstring wording.** Check authors must phrase frozen-file
+  docstrings to stay true at both ends: "RED at base, GREEN after the fix",
+  never "must FAIL at the current tree" — the file ships and the claim becomes
+  false, and correcting it costs a checkpoint AMEND plus a re-anchored receipt.
+- **Replay script at freeze.** Write `repro/replay-all.sh` beside the manifest:
+  one explicit `repro-check.sh run` per check with `--base --class --id
+  --expect --copy --deps` spelled out (every file the base leg needs listed in
+  `--copy`). Replays then run one command instead of re-assembling flags — an
+  omitted `--copy` silently rewrites certified RED base logs as ERROR.
+- **Closure reconciliation.** Closure is a reconciliation against the final
+  PUBLISHED artifacts: every requirement and every source finding keeps a
+  stable identity through to the closure ledger; each disposition names what
+  was actually discharged (a mutant identity, a file, a published sentence)
+  and is grep-verified against the artifact it claims; any partial closure
+  carries explicit deferment authority (a filed follow-up issue or a quoted
+  user decision). A ledger that keeps the FIXED label while the obligation
+  changed shape is a false closure even when the code is correct. Mutation
+  identities must never be substituted between obligation and proof.

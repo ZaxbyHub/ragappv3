@@ -1,4 +1,5 @@
-import { useEffect } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useLocation } from "react-router-dom";
 import { Database, ChevronDown, Globe } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -10,6 +11,10 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import {
+  useCommandPaletteAction,
+  type CommandPaletteActionGuard,
+} from "@/lib/commandPaletteActions";
 import { useVaultStore } from "@/stores/useVaultStore";
 import { cn } from "@/lib/utils";
 
@@ -18,9 +23,37 @@ interface VaultSelectorProps {
 }
 
 export function VaultSelector({ className }: VaultSelectorProps) {
+  const { pathname } = useLocation();
   const { vaults, activeVaultId, setActiveVault, fetchVaults, getActiveVault } = useVaultStore();
   const activeVault = getActiveVault();
   const totalFiles = (vaults ?? []).reduce((sum, v) => sum + (v.file_count ?? 0), 0);
+  const [open, setOpen] = useState(false);
+  const menuGuardRef = useRef<CommandPaletteActionGuard | null>(null);
+  const menuOpeningRef = useRef<symbol | null>(null);
+  const actionGuardRef = useRef<CommandPaletteActionGuard | null>(null);
+
+  const switchVaultActionGuard = useCommandPaletteAction({
+    id: "switch-vault",
+    label: "Switch vault",
+    enabled: pathname === "/chat",
+    execute: (dispatchGuard) => {
+      if (!dispatchGuard.isCurrent()) return;
+      const consumerGuard = actionGuardRef.current;
+      if (!consumerGuard?.isCurrent()) return;
+      menuGuardRef.current = consumerGuard;
+      menuOpeningRef.current = Symbol("vault-menu");
+      setOpen(true);
+    },
+  });
+  actionGuardRef.current = switchVaultActionGuard;
+
+  useEffect(() => {
+    if (open && menuGuardRef.current && !menuGuardRef.current.isCurrent()) {
+      menuOpeningRef.current = null;
+      menuGuardRef.current = null;
+      setOpen(false);
+    }
+  }, [open, switchVaultActionGuard]);
 
   useEffect(() => {
     if (!vaults || vaults.length === 0) {
@@ -29,8 +62,42 @@ export function VaultSelector({ className }: VaultSelectorProps) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [vaults?.length, fetchVaults]);
 
+  const renderedOpeningToken = menuOpeningRef.current;
+  const handleOpenChange = useCallback((nextOpen: boolean) => {
+    if (nextOpen) {
+      if (menuOpeningRef.current !== renderedOpeningToken || !switchVaultActionGuard.isCurrent()) return;
+      menuOpeningRef.current = Symbol("vault-menu");
+      menuGuardRef.current = switchVaultActionGuard;
+      setOpen(true);
+      return;
+    }
+    if (menuOpeningRef.current !== renderedOpeningToken) return;
+    menuOpeningRef.current = null;
+    menuGuardRef.current = null;
+    setOpen(false);
+  }, [renderedOpeningToken, switchVaultActionGuard]);
+
+  const handleVaultSelect = useCallback(
+    (openingToken: symbol | null, nextVaultId: number | null) => {
+      if (openingToken !== menuOpeningRef.current) return;
+      const guard = menuGuardRef.current;
+      if (!guard?.isCurrent()) {
+        menuOpeningRef.current = null;
+        menuGuardRef.current = null;
+        setOpen(false);
+        return;
+      }
+      setActiveVault(nextVaultId);
+      if (menuOpeningRef.current !== openingToken) return;
+      menuOpeningRef.current = null;
+      menuGuardRef.current = null;
+      setOpen(false);
+    },
+    [setActiveVault]
+  );
+
   return (
-    <DropdownMenu>
+    <DropdownMenu open={open && !!menuOpeningRef.current && !!menuGuardRef.current?.isCurrent()} onOpenChange={handleOpenChange}>
       <DropdownMenuTrigger asChild>
         <Button
           variant="outline"
@@ -55,7 +122,7 @@ export function VaultSelector({ className }: VaultSelectorProps) {
         <DropdownMenuLabel>Select Vault</DropdownMenuLabel>
         <DropdownMenuSeparator />
         <DropdownMenuItem
-          onClick={() => setActiveVault(null)}
+          onClick={() => handleVaultSelect(renderedOpeningToken, null)}
           className={cn(activeVaultId === null && "font-semibold bg-accent")}
         >
           <Globe className="mr-2 h-4 w-4" aria-hidden="true" />
@@ -68,7 +135,7 @@ export function VaultSelector({ className }: VaultSelectorProps) {
         {vaults?.map((vault) => (
           <DropdownMenuItem
             key={vault.id}
-            onClick={() => setActiveVault(vault.id)}
+            onClick={() => handleVaultSelect(renderedOpeningToken, vault.id)}
             className={cn(vault.id === activeVaultId && "font-semibold bg-accent")}
           >
             <Database className="mr-2 h-4 w-4" aria-hidden="true" />

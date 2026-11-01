@@ -607,3 +607,67 @@ describe("useUploadStore — snapshot-ordering map eviction (issue #514)", () =>
     expect(after.statusSeen).toBe(true);
   });
 });
+
+describe("applyStatusSnapshot cancelled mapping (issue #783 PRR-006)", () => {
+  it("maps a server-cancelled ingest to the terminal store 'cancelled'", () => {
+    const store = useUploadStore.getState();
+    store.uploads.forEach((u) => store.removeUpload(u.id));
+    useUploadStore.setState({
+      uploads: [
+        {
+          id: "u-cancel-1",
+          file: new File(["x"], "cancel-me.txt", { type: "text/plain" }),
+          name: "cancel-me.txt",
+          size: 1,
+          status: "processing",
+          progress: 40,
+          vaultId: 1,
+          seq: 1,
+        } as never,
+      ],
+    });
+    store.applyStatusSnapshot("u-cancel-1", {
+      status: "cancelled",
+      phase: "cancelled",
+      phase_message: "Cancelled by user",
+      chunk_count: 0,
+    } as never, 2);
+    const upload = useUploadStore.getState().uploads.find((u) => u.id === "u-cancel-1");
+    expect(upload?.status).toBe("cancelled");
+    expect(upload?.status).not.toBe("processing");
+  });
+});
+
+describe("useUploadStore — 413 names the effective server limit (issue #768)", () => {
+  // runTransfer must pass effectiveUploadLimitMb() into
+  // normalizeUploadErrorMessage (uploadLimits.ts formats the message with
+  // that limit; the parameter's default is the 100 MB fallback).
+  it("a 413 with settings loaded names the server-configured limit (50 MB), not the 100 MB fallback", async () => {
+    settingsState.settings = { max_file_size_mb: 50 };
+    uploadDocumentMock.mockRejectedValue(
+      Object.assign(new Error("Request Entity Too Large"), { status: 413 })
+    );
+
+    useUploadStore.getState().addUploads([makeFile("over-limit.pdf")], 1);
+    await vi.advanceTimersByTimeAsync(1);
+
+    const u = useUploadStore.getState().uploads[0];
+    expect(u.status).toBe("error");
+    expect(u.error).toContain("50 MB");
+    expect(u.error).not.toContain("100 MB");
+  });
+
+  it("a 413 before settings load still names the 100 MB fallback", async () => {
+    settingsState.settings = null;
+    uploadDocumentMock.mockRejectedValue(
+      Object.assign(new Error("Request Entity Too Large"), { status: 413 })
+    );
+
+    useUploadStore.getState().addUploads([makeFile("over-limit.pdf")], 1);
+    await vi.advanceTimersByTimeAsync(1);
+
+    const u = useUploadStore.getState().uploads[0];
+    expect(u.status).toBe("error");
+    expect(u.error).toBe("File too large. Max size: 100 MB.");
+  });
+});

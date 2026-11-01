@@ -29,7 +29,7 @@ CI is a single PR-triggered workflow (`.github/workflows/ci.yml`, triggered on
 | Job | Steps that can fail | Run locally from |
 |-----|--------------------|------------------|
 | **Frontend** | `npm ci --engine-strict`, toolchain graph check, `npm run typecheck`, `npm run lint` (`--max-warnings 0`), API smoke subset, `npm test`, `npm run build`, two subpath builds | `frontend/` |
-| **Backend** | `ruff check .`, **`pytest --tb=short -v --timeout=300 tests/`** (full suite, 3918 tests), `pytest --cov=app --cov-report=term-missing -q --timeout=300 tests/` (coverage) | `backend/` |
+| **Backend** | `ruff check .`, **`pytest --tb=short -v --timeout=300 --timeout-method=thread tests/`** (full suite, ~9.9k tests; the four-leg hang-class canary step runs after Test), `pytest --cov=app --cov-report=term-missing -q --timeout=300 --timeout-method=thread tests/` (coverage) | `backend/` |
 | **Quality contracts** | `python scripts/check_config_contract.py`, `python scripts/check_pr_scope_drift.py`, `python scripts/check_sast_baseline.py`, `python scripts/check_secretscan.py` (`.secretscanignore` globs), `python scripts/check_test_collection_scope.py` (pytest files outside `backend/tests/`) | repo root |
 | **SAST** | `python scripts/run_bandit.py` (bandit baseline gate; fails on new findings vs `backend/security/bandit-baseline.json`) | repo root |
 
@@ -72,10 +72,18 @@ marker:
   tells you expected vs actual) or an error like `database is locked` /
   `Incorrect number of bindings`. Note the `<file>.py::<Class>::<test>`.
   - For pytest-timeout failures: look for `TimeoutExpired` and the test name.
-  - For C-level hangs (no log output, pytest-timeout=300 doesn't fire): the
-    hang is in a native extension (bcrypt hashpw, sqlite3.connect, fcntl
-    locks). Look for the last PASSED test before silence and audit its
-    test setUp/tearDown for blocking I/O.
+  - Since #1021 the suite runs `--timeout-method=thread`: an in-suite hang
+    aborts the wedged worker within the per-test timeout and the output
+    names the hung node — `worker 'gwN' crashed while running '<nodeid>'`
+    (xdist replaces the worker and the suite keeps running; the RUN goes
+    red at end-of-suite with the crashed node named). The worker's stack
+    dump does not surface through xdist — re-run that nodeid standalone
+    with `--timeout-method=thread --timeout=30` to get the Timeout banner +
+    all-thread stack dump. A slow-but-completing test over 300s also shows
+    as a crashed worker. Disclosed residual: a native call that holds the
+    GIL indefinitely starves both timeout methods — that subclass still
+    wedges to the job ceiling; audit it as the pre-#1021 C-level case
+    (bcrypt hashpw, sqlite3.connect, fcntl locks) via the last PASSED test.
 - **Frontend → typecheck/build**: `error TS####` with file + line. `npm run
   build` runs `tsc` first, so a type error fails the build too.
 - **Frontend → lint**: an eslint warning line — CI uses `--max-warnings 0`, so a
@@ -94,7 +102,7 @@ Do not guess the cause from the job name. Read the log.
 | **Introduced by this PR** | Failure references a file/area your branch touched | Fix it before merge |
 | **Pre-existing on `master`** | Same check fails on `master`'s latest run, unrelated to your diff | Document in PR body; do not fix unless scoped |
 | **Environment / branch drift** | `npm ci` lockfile mismatch, or `check_pr_scope_drift.py` empty diff because base history isn't fetched | Re-sync (rebase onto `master`, refetch `origin/master`) |
-| **C-level hang (silent)** | pytest -v produces zero output for 30+ min, no TimeoutExpired | Native extension hang. Find the last PASSED test, audit its setUp/tearDown for blocking I/O (bcrypt, sqlite3, fcntl). Apply targeted fix. |
+| **C-level hang (GIL-held, silent)** | pytest -v produces zero output for 30+ min, no TimeoutExpired, and the #1021 thread-method crashed-worker signature is ABSENT | GIL-held native hang (bcrypt, sqlite3, fcntl) — the only residual class both timeout methods cannot fire on. Find the last PASSED test, audit its setUp/tearDown for blocking I/O. File it: the diagnostics this class needs (out-of-process watchdog) do not exist yet. |
 
 Confirm "pre-existing" by reproducing on `master` in a throwaway worktree (see
 `running-tests` → *Confirming a pre-existing failure*) before claiming it.
@@ -123,7 +131,7 @@ cd backend && pytest --tb=short -v tests/<file>.py::<Class>::<test>
 
 For full-suite reproduction (mimics CI):
 ```bash
-cd backend && pytest --tb=short -v --timeout=300 tests/
+cd backend && pytest --tb=short -v --timeout=300 --timeout-method=thread tests/
 # Expect ~18m on CI Linux, ~3-5m locally. If you don't have 3-5m, use a narrower scope.
 ```
 

@@ -62,7 +62,11 @@ export function CanvasVersionRail({
               >
                 {CANVAS_ORIGIN_LABELS[version.origin] ?? version.origin}
               </Badge>
-              <span className="text-xs text-muted-foreground">
+              {/* Issue #778: the SELECTED row carries bg-accent, where
+                  muted-foreground measured under AA on that tint — foreground
+                  there; unselected rows sit on the plain background where
+                  muted passes and keeps the hierarchy. */}
+              <span className={cn("text-xs", isSelected ? "text-foreground" : "text-muted-foreground")}>
                 {new Date(version.created_at).toLocaleString()}
               </span>
             </span>

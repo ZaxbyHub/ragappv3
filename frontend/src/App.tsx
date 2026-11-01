@@ -1,10 +1,10 @@
-import { BrowserRouter, Routes, Route, Navigate, useNavigate, useLocation } from "react-router-dom";
+import { BrowserRouter, Routes, Route, Navigate, useNavigate, useLocation, useMatch } from "react-router-dom";
 import { TestModeProvider } from "@/fixtures/TestModeContext";
 import { ProtectedRoute } from "@/components/auth/ProtectedRoute";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { PageShell } from "@/components/layout/PageShell";
 import { useHealthCheck } from "@/hooks/useHealthCheck";
-import { useEffect, lazy, Suspense } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, lazy, Suspense, type ReactNode } from "react";
 import { useAuthStore } from "@/stores/useAuthStore";
 import { useNavigationGuardStore } from "@/stores/useNavigationGuardStore";
 import type { NavItemId } from "@/components/layout/navigationTypes";
@@ -12,6 +12,12 @@ import { Loader2 } from "lucide-react";
 import { APP_BASENAME } from "@/lib/paths";
 import ReconnectingBanner from "@/components/ReconnectingBanner";
 import { CommandPalette } from "@/components/shared/CommandPalette";
+import {
+  KeyboardShortcutsDialog,
+  useKeyboardShortcuts,
+} from "@/components/shared/KeyboardShortcuts";
+import { useCommandPaletteAction, type CommandPaletteActionGuard } from "@/lib/commandPaletteActions";
+import { useThemeStore } from "@/stores/useThemeStore";
 import { DocumentsTableSkeleton } from "@/components/documents/DocumentsTableSkeleton";
 
 // Toggle mock-data mode via: VITE_TEST_MODE=true npm run dev
@@ -71,14 +77,88 @@ function DocumentsPageFallback() {
   );
 }
 
+// App-wide keyboard-shortcuts surface (issue #775): the hook's listener and
+// the dialog live at the shell level so both the "?" shortcut and the
+// palette's "Show keyboard shortcuts" action (which dispatches the bound
+// combo) reach them on every route. Chat-page behavior is unchanged — the
+// same listener/dialog ChatShell used to mount, one level up.
+function AppShortcutsMount() {
+  const { open: shortcutsOpen, setOpen: setShortcutsOpen } = useKeyboardShortcuts();
+  const { pathname } = useLocation();
+  const shortcutsActionGuardRef = useRef<CommandPaletteActionGuard | null>(null);
+  const shortcutsOpeningTokenRef = useRef<symbol | null>(null);
+  const shortcutsOpeningGuardRef = useRef<CommandPaletteActionGuard | null>(null);
+  const commandPaletteShortcutsGuard = useCommandPaletteAction({
+    id: "open-keyboard-shortcuts",
+    label: "Open keyboard shortcuts",
+    enabled: pathname === "/chat",
+    execute: (dispatchGuard) => {
+      if (!dispatchGuard.isCurrent()) return;
+      const consumerGuard = shortcutsActionGuardRef.current;
+      if (!consumerGuard?.isCurrent()) return;
+      shortcutsOpeningTokenRef.current = Symbol("keyboard-shortcuts");
+      shortcutsOpeningGuardRef.current = consumerGuard;
+      setShortcutsOpen(true);
+    },
+  });
+  shortcutsActionGuardRef.current = commandPaletteShortcutsGuard;
+  const renderedShortcutsOpeningToken = shortcutsOpeningTokenRef.current;
+  const renderedShortcutsOpeningGuard = shortcutsOpeningGuardRef.current;
+  const handleShortcutsOpenChange = useCallback((nextOpen: boolean) => {
+    if (shortcutsOpeningTokenRef.current !== renderedShortcutsOpeningToken) return;
+    if (renderedShortcutsOpeningGuard && !renderedShortcutsOpeningGuard.isCurrent()) {
+      shortcutsOpeningTokenRef.current = null;
+      shortcutsOpeningGuardRef.current = null;
+      setShortcutsOpen(false);
+      return;
+    }
+    if (nextOpen) {
+      setShortcutsOpen(true);
+      return;
+    }
+    shortcutsOpeningTokenRef.current = null;
+    shortcutsOpeningGuardRef.current = null;
+    setShortcutsOpen(false);
+  }, [renderedShortcutsOpeningGuard, renderedShortcutsOpeningToken, setShortcutsOpen]);
+  useEffect(() => {
+    const openingGuard = shortcutsOpeningGuardRef.current;
+    if (shortcutsOpen && shortcutsOpeningTokenRef.current && openingGuard && !openingGuard.isCurrent()) {
+      shortcutsOpeningTokenRef.current = null;
+      shortcutsOpeningGuardRef.current = null;
+      setShortcutsOpen(false);
+    }
+  }, [commandPaletteShortcutsGuard, setShortcutsOpen, shortcutsOpen]);
+  return (
+    <KeyboardShortcutsDialog open={shortcutsOpen} onOpenChange={handleShortcutsOpenChange} />
+  );
+}
+
+function CapabilityCommandPalette() {
+  const { pathname } = useLocation();
+  const { theme, setTheme } = useThemeStore();
+  useCommandPaletteAction({
+    id: "cycle-theme",
+    label: "Cycle theme",
+    enabled: pathname === "/chat",
+    execute: (guard) => {
+      if (!guard.isCurrent()) return;
+      setTheme(theme === "light" ? "dark" : theme === "dark" ? "system" : "light");
+    },
+  });
+  return <CommandPalette />;
+}
+
 // Main app shell wrapper that provides the navigation and page layout
 function MainAppShell({ children, testMode = false }: { children: React.ReactNode; testMode?: boolean }) {
   const health = useHealthCheck({ pollInterval: 30000 });
   const navigate = useNavigate();
   const location = useLocation();
 
-  // Determine active nav item from current route
-  const getActiveItemFromPath = (pathname: string): NavItemId => {
+  // Determine active nav item from current route. null means no nav item
+  // owns the route (e.g. /search, per its own route comment) — the mobile
+  // bottom nav then marks nothing aria-current, matching the desktop rail's
+  // own null-returning mapper (issue #779 / UI-R1-08).
+  const getActiveItemFromPath = (pathname: string): NavItemId | null => {
     if (pathname.startsWith("/chat")) return "chat";
     if (pathname.startsWith("/documents")) return "documents";
     if (pathname.startsWith("/memory")) return "memory";
@@ -91,7 +171,7 @@ function MainAppShell({ children, testMode = false }: { children: React.ReactNod
     if (pathname.startsWith("/admin/users")) return "users";
     if (pathname.startsWith("/admin/organizations")) return "organizations";
     if (pathname.startsWith("/profile")) return "profile";
-    return "documents";
+    return null;
   };
 
   const activeItem = getActiveItemFromPath(location.pathname);
@@ -150,10 +230,17 @@ function MainAppShell({ children, testMode = false }: { children: React.ReactNod
 
   return (
     <TestModeProvider testMode={testMode}>
-      {/* Global command palette (issue #258 / legacy-14): Ctrl/Cmd+K opens a
-          navigation palette from any shell route. Closed state renders
-          nothing, so it is layout-inert. */}
-      <CommandPalette />
+      {/* Global command palette (issue #258 / legacy-14; v2 per issue #775):
+          Ctrl/Cmd+K opens the palette from shell routes off /chat (the chat
+          rail owns the combo on /chat by design). Closed state renders
+          nothing, so it is layout-inert. The keyboard-shortcuts
+          surface ("?" + the dialog) is mounted HERE at the app shell since
+          issue #775 — one mount on every shell route instead of
+          ChatShell-only — so the palette's "Show keyboard shortcuts" action
+          and the "?" shortcut work app-wide through the single existing
+          dispatcher. */}
+      <CapabilityCommandPalette />
+      <AppShortcutsMount />
       <PageShell
         activeItem={activeItem}
         onItemSelect={handleItemSelect}
@@ -165,8 +252,61 @@ function MainAppShell({ children, testMode = false }: { children: React.ReactNod
   );
 }
 
+// Demo user for the dev-only fixture mode. TestModeSessionBootstrap seeds it
+// after the router establishes a basename-relative location.
+function getDemoUser() {
+  const role = import.meta.env.VITE_DEMO_ROLE || "superadmin";
+  return {
+    id: 1,
+    username: import.meta.env.VITE_DEMO_USERNAME || "demo",
+    full_name: import.meta.env.VITE_DEMO_FULL_NAME || "Demo User",
+    role: role as "superadmin" | "admin" | "member" | "viewer",
+    is_active: true,
+  };
+}
+
+// Issue #779 (UI-R3-08): in DEV fixture mode, hold every non-registration
+// route behind PageLoader until this router-local bootstrap writes the demo
+// session from a layout effect. Guards and auth-reading pages therefore mount
+// only after their first state read can see the session, without an external
+// store mutation during render. /register is deliberately ungated so its
+// public form stays reachable; readiness never resets, so logout cannot
+// reseed the demo user.
+function TestModeSessionBootstrap({ children }: { children: ReactNode }) {
+  const [ready, setReady] = useState(() => !TEST_MODE);
+  const isRegisterRoute = useMatch({ path: "/register", caseSensitive: false, end: true }) !== null;
+  const gated = TEST_MODE && !isRegisterRoute && !ready;
+
+  useLayoutEffect(() => {
+    if (!gated) return;
+
+    const getState = useAuthStore.getState as typeof useAuthStore.getState | undefined;
+    const currentState = getState?.();
+    if (!currentState?.isAuthenticated) {
+      const setState = useAuthStore.setState as typeof useAuthStore.setState | undefined;
+      setState?.({
+        user: getDemoUser(),
+        accessToken: "demo-token",
+        isAuthenticated: true,
+        isInitialized: true,
+        needsSetup: false,
+        isLoading: false,
+        authMode: "jwt",
+      });
+    }
+    setReady(true);
+  }, [gated]);
+
+  if (gated) {
+    return <PageLoader />;
+  }
+
+  return <>{children}</>;
+}
+
 function App() {
   const initAuth = useAuthStore((state) => state.init);
+
   const health = useHealthCheck({ pollInterval: 30000 });
 
   useEffect(() => {
@@ -181,8 +321,9 @@ function App() {
       <BrowserRouter
         basename={APP_BASENAME || undefined}
       >
-        <Suspense fallback={<PageLoader />}>
-          <Routes>
+        <TestModeSessionBootstrap>
+          <Suspense fallback={<PageLoader />}>
+            <Routes>
               <Route path="/setup" element={<SetupPage />} />
               <Route path="/register" element={<RegisterPage />} />
               <Route path="/login" element={<LoginPage />} />
@@ -404,8 +545,9 @@ function App() {
 
               {/* H-12 fix: Proper 404 page instead of silently rendering DocumentsPage */}
               <Route path="/*" element={<NotFoundPage />} />
-            </Routes>
+              </Routes>
           </Suspense>
+        </TestModeSessionBootstrap>
       </BrowserRouter>
     </ErrorBoundary>
   );

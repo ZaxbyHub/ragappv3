@@ -53,16 +53,16 @@ there is no consumer for a routing YAML, and adding one would be unwired
 - **CI is the source of truth.** Before any push or PR, run `ci-compatibility-audit`: backend `ruff check .` + targeted pytest, frontend `typecheck`/`lint`/`test`/`build`, and `scripts/check_*.py`. A lint/type error caught locally is free; caught in CI it costs a round trip.
 - **CI pins Python 3.11.** On local 3.14+, some tests fail with `RuntimeError: There is no current event loop` — that's a local-interpreter artifact, not a regression. See `docs/engineering/testing.md`.
 - **Frontend is Vitest, not `bun:test`.** Ignore any `bun:test` guidance.
-- **Never ship unwired code, never defer work, and never make scope decisions without explicit instruction.**
+- **Never ship unwired code, never defer work, and never make scope decisions without explicit instruction.** Work found in review that the PR does not fix is routed by `CONTRIBUTING.md` "Filing follow-up issues": a visible `RECORD` row is a closure, not a deferral, and anything consequential goes to an issue or to the maintainer.
 - New behavior ships with tests; assert real behavior, not just status codes.
 
 ## CI gates
 
-`.github/workflows/ci.yml` — jobs: **Backend** (ruff + targeted pytest),
-**Frontend** (typecheck, lint `--max-warnings 0`, test, build, subpath build),
-**Playwright e2e** (`frontend/e2e/` smoke suite against the production build + stub backend; separate job, issue #573),
-**Quality contracts** (`check_runtime_contract.py`, `check_config_contract.py`, `check_settings_consumers.py`, `check_batch_mock_seq.py`, `check_pr_scope_drift.py`, `check_sast_baseline.py`, `check_secretscan.py`, `check_test_collection_scope.py`, `check_a04_http500_detail_hygiene.py`, `check_b03_upload_migration_timeout.py`),
+`.github/workflows/ci.yml` — jobs: **Backend** (ruff + full pytest under a step-level 50-min timeout),
+**Frontend** (frontend-toolchain contract nodes, typecheck, lint `--max-warnings 0`, test, build, subpath build),
+**Playwright e2e** (`frontend/e2e/` smoke suite against the production build + stub backend; separate job, issue #573), **Playwright a11y matrix** (`frontend/e2e/a11y-matrix.spec.ts` route x viewport accessibility gate; separate job, issue #778),
+**Quality contracts** (`check_runtime_contract.py`, `check_config_contract.py`, `check_settings_consumers.py`, `check_batch_mock_seq.py`, `check_pr_scope_drift.py`, `check_sast_baseline.py`, `check_secretscan.py`, `check_test_collection_scope.py`, `check_a04_http500_detail_hygiene.py`, `check_b03_upload_migration_timeout.py`, `check_l05_raw_palette.py`, `check_l05_page_headers.py`, `check_l07_a11y_gate_wired.py`, `check_l09_skill_trigger_paths.py`, `check_l09_index_assets.py`, `check_l09_memory_response_fields.py`, `check_n05_draftclaim_nullable.py`),
 **Detect docker scope** + **Docker build smoke** (the smoke builds the images when the docker surface changed),
 **SAST** (`scripts/run_bandit.py` — bandit baseline gate, fails on new findings or unused `# nosec` suppressions).
 **Closure evidence** (`.github/workflows/closure-evidence.yml` — PRs whose bodies `Closes #N` an issue must name verifiable closure evidence; `high`/`critical` issues need a cross-family approval; warn-mode rollout — see `docs/ci/closure-evidence-gate.md`).
-Scheduled: `nightly.yml` (full deps) and `nightly-quality-gates.yml` (mutmut / schemathesis / stryker).
+Scheduled: `nightly.yml` (full deps), `nightly-quality-gates.yml` (mutmut / schemathesis / stryker), and `gate-liveness.yml` (scheduled-workflow liveness, issue #739).

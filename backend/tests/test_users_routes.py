@@ -379,7 +379,12 @@ class TestUpdateUserActive(TestUserRoutes):
         assert "Cannot deactivate your own account" in response.json()["detail"]
 
     def test_update_user_active_admin_cannot_deactivate(self):
-        """Admin cannot be deactivated by regular admin (only superadmin)."""
+        """Admin cannot deactivate a superadmin target (#722 AC5).
+
+        RED at base (400 — the last-superadmin guard fires because the target
+        is the sole superadmin), GREEN after the fix (403 — the
+        superadmin-target check runs before the last-superadmin count guard
+        for non-superadmin actors)."""
         token = get_token(self.admin_id, "admin", "admin")
         response = self.client.patch(
             f"/users/{self.superadmin_id}/active",
@@ -387,8 +392,8 @@ class TestUpdateUserActive(TestUserRoutes):
             headers={"Authorization": f"Bearer {token}"},
         )
 
-        assert response.status_code == 400
-        assert "last superadmin" in response.json()["detail"]
+        assert response.status_code == 403
+        assert "Only superadmin" in response.json()["detail"]
 
     def test_update_user_active_not_found(self):
         """Updating non-existent user returns 404."""
@@ -1471,3 +1476,182 @@ class TestUpdateUserGroupsCallerOrgCheck(TestUserRoutes):
 
         assert response.status_code == 400
         assert "User is not a member of organization" in response.json()["detail"]
+
+
+class TestSecurityAuditTrail(TestUserRoutes):
+    """Issues #743 (S02-SK2-08) + #744 (T1-21-KR-09): every users.py
+    safe_record_security_event family must land a real security_audit_log row,
+    and deactivation must revoke sessions (production deletes them before
+    the single commit; this test pins the observable outcome).
+
+    These assertions became possible when setup_test_db switched to the
+    production schema (user_route_helpers): the route-test database now
+    carries security_audit_log and user_sessions, which the hand-copied
+    TEST_SCHEMA never declared — so all audit emissions silently no-opped
+    through safe_record_security_event's swallowed OperationalError, and no
+    test could observe session revocation. Freezing the no-op mutant of
+    safe_record_security_event is check C10 (tests/test_h07_fixture_fidelity).
+    """
+
+    def _audit_count(
+        self,
+        event_type: str,
+        target_user_id=None,
+        actor_user_id=None,
+    ) -> int:
+        """Count audit rows by event, target AND actor (PRR-002): attribution
+        is the trail's documented purpose, so a regression recording the wrong
+        actor (or None) must fail these tests, not just a missing row."""
+        sql = "SELECT COUNT(*) FROM security_audit_log WHERE event_type = ?"
+        params: list = [event_type]
+        if target_user_id is not None:
+            sql += " AND target_user_id = ?"
+            params.append(target_user_id)
+        if actor_user_id is not None:
+            sql += " AND actor_user_id = ?"
+            params.append(actor_user_id)
+        return self.conn.execute(sql, params).fetchone()[0]
+
+    def _auth(self, user_id: int, username: str, role: str):
+        return {"Authorization": f"Bearer {get_token(user_id, username, role)}"}
+
+    def test_user_created_emits_audit_row(self):
+        response = self.client.post(
+            "/users/",
+            json={
+                "username": "audit-createe",
+                "password": "SecurePass123!",
+                "full_name": "Audit Createe",
+                "role": "member",
+            },
+            headers=self._auth(self.admin_id, "admin", "admin"),
+        )
+        assert response.status_code == 200, response.text
+        assert self._audit_count("user.created", response.json()["id"], actor_user_id=self.admin_id) == 1
+
+    def test_user_updated_emits_audit_row(self):
+        response = self.client.patch(
+            f"/users/{self.member_id}",
+            json={"full_name": "Renamed Member"},
+            headers=self._auth(self.admin_id, "admin", "admin"),
+        )
+        assert response.status_code == 200, response.text
+        assert self._audit_count("user.updated", self.member_id, actor_user_id=self.admin_id) == 1
+
+    def test_admin_password_reset_emits_audit_row(self):
+        response = self.client.patch(
+            f"/users/{self.member_id}/password",
+            json={"new_password": "NewSecurePass123!"},
+            headers=self._auth(self.admin_id, "admin", "admin"),
+        )
+        assert response.status_code == 200, response.text
+        assert self._audit_count("user.password_reset", self.member_id, actor_user_id=self.admin_id) == 1
+
+    def test_role_update_emits_audit_row(self):
+        response = self.client.patch(
+            f"/users/{self.viewer_id}/role",
+            json={"role": "member"},
+            headers=self._auth(self.superadmin_id, "superadmin", "superadmin"),
+        )
+        assert response.status_code == 200, response.text
+        assert self._audit_count("user.role_updated", self.viewer_id, actor_user_id=self.superadmin_id) == 1
+
+    def test_active_update_emits_audit_row_and_revokes_sessions(self):
+        """Deactivation must (a) emit user.active_updated and (b) revoke the
+        target's user_sessions rows while leaving other users' sessions
+        untouched. The production implementation deletes the sessions on the
+        same connection before the single commit (users.py #722 AC2); this
+        test pins the observable outcome (post-response state), not the
+        commit ordering."""
+        self.conn.execute(
+            "INSERT INTO user_sessions (user_id, refresh_token_hash, expires_at) "
+            "VALUES (?, 'hash-member-1', datetime('now', '+30 days'))",
+            (self.member_id,),
+        )
+        self.conn.execute(
+            "INSERT INTO user_sessions (user_id, refresh_token_hash, expires_at) "
+            "VALUES (?, 'hash-viewer-1', datetime('now', '+30 days'))",
+            (self.viewer_id,),
+        )
+        self.conn.commit()
+
+        response = self.client.patch(
+            f"/users/{self.member_id}/active",
+            json={"is_active": False},
+            headers=self._auth(self.admin_id, "admin", "admin"),
+        )
+        assert response.status_code == 200, response.text
+        assert self._audit_count("user.active_updated", self.member_id, actor_user_id=self.admin_id) == 1
+
+        member_sessions = self.conn.execute(
+            "SELECT COUNT(*) FROM user_sessions WHERE user_id = ?",
+            (self.member_id,),
+        ).fetchone()[0]
+        viewer_sessions = self.conn.execute(
+            "SELECT COUNT(*) FROM user_sessions WHERE user_id = ?",
+            (self.viewer_id,),
+        ).fetchone()[0]
+        assert member_sessions == 0, "deactivation must revoke the target's sessions"
+        assert viewer_sessions == 1, "deactivation must not touch other users' sessions"
+
+    def test_user_deleted_emits_audit_row(self):
+        response = self.client.delete(
+            f"/users/{self.viewer_id}",
+            headers=self._auth(self.superadmin_id, "superadmin", "superadmin"),
+        )
+        assert response.status_code == 200, response.text
+        assert self._audit_count("user.deleted", self.viewer_id, actor_user_id=self.superadmin_id) == 1
+
+    def test_update_user_organizations_emits_membership_audit_row(self):
+        cursor = self.conn.execute(
+            "INSERT INTO organizations (name, description) VALUES (?, ?)",
+            ("Audit Org", "Org for the membership audit assertion"),
+        )
+        org_id = cursor.lastrowid
+        self.conn.execute(
+            "INSERT INTO org_members (org_id, user_id, role) VALUES (?, ?, ?)",
+            (org_id, self.member_id, "member"),
+        )
+        self.conn.commit()
+
+        response = self.client.put(
+            f"/users/{self.member_id}/organizations",
+            json={"memberships": [{"org_id": org_id, "role": "admin"}]},
+            headers=self._auth(self.superadmin_id, "superadmin", "superadmin"),
+        )
+        assert response.status_code == 200, response.text
+        assert (
+            self._audit_count(
+                "membership.organizations_replaced",
+                self.member_id,
+                actor_user_id=self.superadmin_id,
+            )
+            == 1
+        )
+
+    def test_update_user_groups_emits_membership_audit_row(self):
+        cursor = self.conn.execute(
+            "INSERT INTO organizations (name, description) VALUES (?, ?)",
+            ("Audit Groups Org", "Org for the groups audit assertion"),
+        )
+        org_id = cursor.lastrowid
+        cursor = self.conn.execute(
+            "INSERT INTO groups (org_id, name, description) VALUES (?, ?, ?)",
+            (org_id, "Audit Group", "Group for the audit assertion"),
+        )
+        group_id = cursor.lastrowid
+        self.conn.execute(
+            "INSERT INTO org_members (org_id, user_id, role) VALUES (?, ?, ?)",
+            (org_id, self.member_id, "member"),
+        )
+        self.conn.commit()
+
+        response = self.client.put(
+            f"/users/{self.member_id}/groups",
+            json={"group_ids": [group_id]},
+            headers=self._auth(self.superadmin_id, "superadmin", "superadmin"),
+        )
+        assert response.status_code == 200, response.text
+        assert self._audit_count("membership.groups_replaced", self.member_id, actor_user_id=self.superadmin_id) == 1
+
+

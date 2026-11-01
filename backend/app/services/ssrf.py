@@ -35,8 +35,17 @@ _LOCAL_SERVICES_HINT = "Local service endpoints require ALLOW_LOCAL_SERVICES=1."
 
 
 def _local_services_opt_in_enabled() -> bool:
-    """Read ALLOW_LOCAL_SERVICES=1 at call time so tests can flip it."""
-    return os.environ.get(_LOCAL_SERVICES_ENV, "").strip() in ("1", "true", "True")
+    """Read the ALLOW_LOCAL_SERVICES opt-in at call time.
+
+    Same precedence as curator_ssrf (issue #726 census, T1-02-K-12 family):
+    a key present in the process environment wins verbatim (dynamic
+    flipping preserved); otherwise the .env-backed Settings field applies.
+    """
+    if _LOCAL_SERVICES_ENV in os.environ:
+        return os.environ.get(_LOCAL_SERVICES_ENV, "").strip() in ("1", "true", "True")
+    from app.config import settings as _settings
+
+    return bool(_settings.allow_local_services)
 
 
 def _is_blocked_address(ip: str) -> bool:

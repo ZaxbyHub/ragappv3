@@ -114,6 +114,7 @@ vi.mock("@/lib/api", () => ({
 }));
 vi.mock("react-router-dom", () => ({
   useNavigate: () => mockNavigate,
+  useInRouterContext: () => false,
 }));
 vi.mock("sonner", () => ({
   toast: {

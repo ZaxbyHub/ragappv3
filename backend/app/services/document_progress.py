@@ -1,7 +1,8 @@
 """Phase-aware processing-progress helpers for the `files` table.
 
-Status (`files.status`) stays in the canonical 4-value enum
-('pending','processing','indexed','error'). All async lifecycle detail
+Status (`files.status`) stays in the canonical 6-value enum
+('pending','processing','indexed','partial','error','cancelled'). All
+async lifecycle detail
 (queued / parsing / chunking / embedding / writing-index / wiki) lives in
 the new `phase` column and friends. Frontend polls
 `GET /documents/{file_id}/status` and uses these fields to render
@@ -13,11 +14,54 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from typing import Any, Optional
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator, Optional
 
 from app.models.database import SQLiteConnectionPool
 
 logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def write_session(
+    pool: SQLiteConnectionPool, permit: Optional[object] = None
+) -> AsyncIterator[sqlite3.Connection]:
+    """Yield a pooled connection under the shared SQLite write permit.
+
+    Single safe pattern for every status/commit write (issue #513 W1/RC-3,
+    extended by issue #704 T1-25-KR-09 to the module-level progress helpers):
+    the permit is acquired FIRST, but the fallible pool checkout happens
+    INSIDE the region protected by the permit's finally, so a
+    ``get_connection`` failure (RuntimeError on exhaustion/closed pool) can
+    never leak the permit. The connection is released in a nested finally
+    before the permit is released in the outer finally.
+
+    ``permit`` defaults to the pool-carried ``write_permit`` attribute when
+    the caller does not pass one: the BackgroundProcessor that owns the
+    semaphore installs it on the pool at startup, so every module-level
+    helper shares the exact permit the DocumentProcessor's ``_write_session``
+    uses. ``None`` (no BackgroundProcessor / tests / sync routes) means no
+    serialization, matching the pre-#704 behavior of those contexts.
+    """
+    if permit is None:
+        # Instance-dict probe, not getattr: the attribute must have been
+        # ACTUALLY SET on the pool (BackgroundProcessor does that at startup).
+        # getattr would let mock pools auto-fabricate a non-awaitable
+        # "write_permit" and crash the acquire below.
+        permit = (
+            pool.__dict__.get("write_permit") if hasattr(pool, "__dict__") else None
+        )
+    if permit is not None:
+        await permit.acquire()
+    try:
+        conn = await pool.get_connection_async()
+        try:
+            yield conn
+        finally:
+            pool.release_connection(conn)
+    finally:
+        if permit is not None:
+            permit.release()
 
 
 # Canonical phase strings emitted by DocumentProcessor. The frontend maps
@@ -31,6 +75,10 @@ PHASE_EMBEDDING = "embedding"
 PHASE_WRITING_INDEX = "writing_index"
 PHASE_INDEXED = "indexed"
 PHASE_ERROR = "error"
+# Terminal phase of a user-cancelled ingest (issue #783): the cancel route
+# flips files.status to 'cancelled' and the worker's unwind clears transient
+# counters while landing this phase.
+PHASE_CANCELLED = "cancelled"
 
 ALL_PHASES = frozenset(
     {
@@ -42,6 +90,7 @@ ALL_PHASES = frozenset(
         PHASE_WRITING_INDEX,
         PHASE_INDEXED,
         PHASE_ERROR,
+        PHASE_CANCELLED,
     }
 )
 
@@ -77,8 +126,7 @@ async def set_phase(
     params: list[Any] = []
 
     try:
-        conn = await pool.get_connection_async()
-        try:
+        async with write_session(pool) as conn:
             current_phase: Optional[str] = None
             if phase is not None:
                 row = conn.execute(
@@ -126,8 +174,6 @@ async def set_phase(
                 params,
             )
             conn.commit()
-        finally:
-            pool.release_connection(conn)
     except (sqlite3.Error, RuntimeError) as e:  # pragma: no cover - defensive
         # RuntimeError = expected pool-checkout failure (exhaustion/closed pool,
         # database.py) — best-effort contract absorbs it (issue #513 W2).
@@ -135,7 +181,13 @@ async def set_phase(
         logger.warning("set_phase failed for file_id=%s: %s", file_id, e)
 
 
-async def clear_progress(pool: SQLiteConnectionPool, file_id: int) -> None:
+async def clear_progress(
+    pool: SQLiteConnectionPool,
+    file_id: int,
+    *,
+    phase: str = PHASE_INDEXED,
+    phase_message: Optional[str] = None,
+) -> None:
     """Reset transient progress fields on terminal success.
 
     Called after a successful indexing run so the next poll snapshot shows
@@ -143,15 +195,19 @@ async def clear_progress(pool: SQLiteConnectionPool, file_id: int) -> None:
     `phase` is left at ``indexed`` so the frontend can distinguish "ready"
     from "still mid-pipeline". The checkout runs off the event loop via the
     pool's dedicated checkout executor (#645).
+
+    Issue #783 adds the keyword-only ``phase``/``phase_message`` overrides so
+    a cancelled ingest can land its terminal phase (``PHASE_CANCELLED``) and
+    a user-facing note in the same single write; the defaults preserve the
+    historical behavior byte-for-byte (indexed + message cleared).
     """
     try:
-        conn = await pool.get_connection_async()
-        try:
+        async with write_session(pool) as conn:
             conn.execute(
                 """
                 UPDATE files
                 SET phase = ?,
-                    phase_message = NULL,
+                    phase_message = ?,
                     progress_percent = NULL,
                     processed_units = NULL,
                     total_units = NULL,
@@ -159,13 +215,12 @@ async def clear_progress(pool: SQLiteConnectionPool, file_id: int) -> None:
                     phase_started_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
-                (PHASE_INDEXED, file_id),
+                (phase, phase_message, file_id),
             )
             conn.commit()
-        finally:
-            pool.release_connection(conn)
     except (sqlite3.Error, RuntimeError) as e:  # pragma: no cover - defensive
-        # RuntimeError = expected pool-checkout failure (issue #513 W2).
+        # RuntimeError = expected pool-checkout failure (exhaustion/closed pool,
+        # database.py) — best-effort contract absorbs it (issue #513 W2).
         logger.warning("clear_progress failed for file_id=%s: %s", file_id, e)
 
 
@@ -182,15 +237,12 @@ async def set_wiki_pending(
     loop via the pool's dedicated checkout executor (#645).
     """
     try:
-        conn = await pool.get_connection_async()
-        try:
+        async with write_session(pool) as conn:
             conn.execute(
                 "UPDATE files SET wiki_pending = ? WHERE id = ?",
                 (1 if pending else 0, file_id),
             )
             conn.commit()
-        finally:
-            pool.release_connection(conn)
     except (sqlite3.Error, RuntimeError) as e:  # pragma: no cover - defensive
         # RuntimeError = expected pool-checkout failure (issue #513 W2).
         logger.warning("set_wiki_pending failed for file_id=%s: %s", file_id, e)

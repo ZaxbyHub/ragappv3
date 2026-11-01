@@ -24,7 +24,10 @@ from dataclasses import dataclass
 from typing import Any, List, Optional
 
 from app.config import settings
-from app.services.fts_query import build_fts_match_query
+from app.services.fts_query import (
+    FTS_SNIPPET_MAX_COLUMN_BYTES,
+    build_fts_match_query,
+)
 from app.services.store_utils import DualPoolMixin
 
 logger = logging.getLogger(__name__)
@@ -132,14 +135,31 @@ class KMSRetrievalService(DualPoolMixin):
         self, conn: sqlite3.Connection, fts_query: str, vault_id: int
     ) -> List[KMSEvidence]:
         try:
+            # Issue #1002: snippet() over an unbounded body is a worker-thread
+            # wedge (super-linear in column size AND match density; a 43M-char
+            # body never returns). Every aux call sits behind a lazily-evaluated
+            # CASE guard over BYTE length — length(CAST(col AS BLOB)) — because
+            # plain length() stops at the first NUL byte and a NUL-prefixed
+            # body would otherwise bypass the guard (review F-001). The full
+            # body is never materialized into the result — only a bounded head
+            # window. Over-ceiling rows fall through to the summary-or-head
+            # excerpt below; for entries compiled from ingested files that head
+            # is itself the document head and the full match-centered evidence
+            # still reaches chat answers through the chunked RAG path (manual
+            # oversized entries get only this bounded excerpt — disclosed).
             rows = conn.execute(
                 """
-                SELECT e.id, e.slug, e.title, e.summary, e.body, e.tags_json,
+                SELECT e.id, e.slug, e.title, e.summary, e.tags_json,
                        e.status, e.source_type, e.file_id,
-                       snippet(kms_entries_fts, 2, '<mark>', '</mark>', '…',
-                               ?) AS body_snippet,
-                       snippet(kms_entries_fts, 1, '<mark>', '</mark>', '…',
-                               ?) AS summary_snippet
+                       substr(e.body, 1, ?) AS body_head,
+                       CASE WHEN length(CAST(e.summary AS BLOB)) <= ?
+                            THEN snippet(kms_entries_fts, 1, '<mark>', '</mark>', '…',
+                                         ?)
+                       END AS summary_snippet,
+                       CASE WHEN length(CAST(e.body AS BLOB)) <= ?
+                            THEN snippet(kms_entries_fts, 2, '<mark>', '</mark>', '…',
+                                         ?)
+                       END AS body_snippet
                 FROM kms_entries_fts
                 JOIN kms_entries e ON kms_entries_fts.rowid = e.id
                 WHERE kms_entries_fts MATCH ?
@@ -149,7 +169,10 @@ class KMSRetrievalService(DualPoolMixin):
                 LIMIT ?
                 """,
                 (
+                    _EXCERPT_CHARS,
+                    FTS_SNIPPET_MAX_COLUMN_BYTES,
                     _SNIPPET_TOKENS,
+                    FTS_SNIPPET_MAX_COLUMN_BYTES,
                     _SNIPPET_TOKENS,
                     fts_query,
                     vault_id,
@@ -169,7 +192,7 @@ class KMSRetrievalService(DualPoolMixin):
                     tags = []
             except (json.JSONDecodeError, TypeError):
                 tags = []
-            body = d.get("body") or ""
+            body = d.get("body_head") or ""
             summary = d.get("summary") or ""
             # C22 (SEARCH-001, issue #515): match-centered evidence excerpts.
             # snippet() windows the column around the FTS match, so a term

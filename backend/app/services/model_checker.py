@@ -15,12 +15,17 @@ successful listing that lacks the configured model is authoritative
 "unavailable" (genuine misconfiguration surfaces instead of being masked).
 """
 import asyncio
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import httpx
 
 from app.config import settings
-from app.services.circuit_breaker import CircuitBreakerError, model_checker_cb
+from app.services.circuit_breaker import (
+    BreakerNeutralError,
+    CircuitBreakerError,
+    is_outage_status,
+    model_checker_cb,
+)
 from app.services.ssrf import assert_url_safe
 from app.services.telemetry import correlation_headers as _correlation_headers
 
@@ -43,10 +48,17 @@ class _ProbeFailureResult(dict):
     """An unavailable probe result caused by a transport/host failure.
 
     Produced only by :func:`_model_check_error` (timeouts, connection
-    errors, non-404/405 HTTP errors). The probe circuit breaker (FU-004,
-    issue #494) charges exactly these; listing-based "model not found"
-    results are authoritative answers from a healthy endpoint and must not
-    open the breaker. Serializes/compares exactly like a plain dict.
+    errors, non-404/405 HTTP errors; HTTP errors additionally carry a
+    ``status_code`` key so the breaker wrapper can classify them).
+    Outage-class failures (5xx/429/timeouts/connection errors) charge the
+    probe circuit breaker (FU-004, issue #494); non-outage HTTP 4xx
+    results (a 401 from a wrong key, for example) are NEUTRAL — they
+    would fail identically on every retry, so they neither charge the
+    breaker nor erase its accumulated failure evidence (they pass through
+    as :class:`BreakerNeutralError`); listing-based "model not found"
+    results are authoritative answers from a healthy endpoint and must
+    not open the breaker either. Serializes/compares exactly like a plain
+    dict.
     """
 
 
@@ -79,6 +91,9 @@ def _model_check_error(timeout: float, exc: BaseException) -> Dict[str, Any]:
         return _ProbeFailureResult({
             'available': False,
             'error': f"HTTP error {exc.response.status_code}: {exc.response.text}",
+            # Structured status so the breaker wrapper can classify without
+            # parsing the message (issue #717).
+            'status_code': exc.response.status_code,
         })
     if isinstance(exc, httpx.RequestError):
         return _ProbeFailureResult({'available': False, 'error': f"Request failed: {str(exc)}"})
@@ -182,15 +197,40 @@ class ModelChecker:
             follow_redirects=False,
             transport=SSRFSafeTransport(),
         ) as client:
+            # Keyed remote providers reject unauthenticated /v1/models probes
+            # with 401; send the configured key per endpoint so deep health
+            # reflects the endpoint, not a missing header (issue #717 — the
+            # setup-wizard sibling probe already did this). The instant
+            # endpoint falls back to the chat key, mirroring the runtime
+            # client's instant-key-with-thinking-fallback (issue #622).
+            chat_headers = (
+                {"Authorization": f"Bearer {settings.chat_api_key}"}
+                if settings.chat_api_key
+                else None
+            )
+            effective_instant_key = (
+                settings.instant_api_key or settings.chat_api_key
+            )
+            instant_headers = (
+                {"Authorization": f"Bearer {effective_instant_key}"}
+                if effective_instant_key
+                else None
+            )
             embedding_result, chat_result, instant_result = await asyncio.gather(
                 self._check_model_availability(
                     client, settings.ollama_embedding_url, settings.embedding_model
                 ),
                 self._check_model_availability(
-                    client, settings.ollama_chat_url, settings.chat_model
+                    client,
+                    settings.ollama_chat_url,
+                    settings.chat_model,
+                    headers=chat_headers,
                 ),
                 self._check_model_availability(
-                    client, settings.instant_chat_url, settings.instant_chat_model
+                    client,
+                    settings.instant_chat_url,
+                    settings.instant_chat_model,
+                    headers=instant_headers,
                 ),
             )
 
@@ -294,10 +334,19 @@ class ModelChecker:
         client: httpx.AsyncClient,
         base_url: str,
         model_name: str,
+        headers: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """
         Check if a model is available at the given endpoint, trying each API
         dialect in turn until one answers.
+
+        Args:
+            client: Shared SSRF-safe HTTP client.
+            base_url: Configured endpoint base URL.
+            model_name: Model name to look for.
+            headers: Optional auth headers for the endpoint's probes (the
+                configured provider API key, issue #717) merged with any
+                telemetry correlation headers.
 
         Returns:
             Dictionary with 'available' (bool) and 'error' (str or None);
@@ -336,19 +385,47 @@ class ModelChecker:
                 Swallowed failures are re-surfaced here as exceptions (the
                 breaker records failures only on exceptions), while
                 wrong-dialect answers pass through as values so the chain's
-                normal fallback never charges the breaker.
+                normal fallback never charges the breaker. Non-outage HTTP
+                4xx failures (auth/config errors such as a 401 from a wrong
+                key) also pass through as values — they would fail
+                identically on every retry and must NOT trip the breaker
+                (OPS-002 policy, issue #717).
                 """
                 try:
-                    result = await checker(client, base_url, model_name, timeout)
+                    result = await checker(client, base_url, model_name, timeout, headers)
                 except _DialectMismatch as mismatch:
                     return mismatch
                 if isinstance(result, _ProbeFailureResult):
+                    status_code = result.get('status_code')
+                    if (
+                        isinstance(status_code, int)
+                        and status_code >= 400
+                        and not is_outage_status(status_code)
+                    ):
+                        # Non-outage 4xx (auth/config error): NEUTRAL — the
+                        # old `return result` made the breaker record a
+                        # SUCCESS, erasing accumulated outage evidence for
+                        # the host (issue #717 review).
+                        neutral = BreakerNeutralError(
+                            _ProbeFailure(result), result=result
+                        )
+                        raise neutral
                     raise _ProbeFailure(result)
                 return result
 
             try:
-                outcome = await model_checker_cb(_breaker_probe)()
+                # Per-host breaker (issue #717): failures on this endpoint's
+                # host charge this host's breaker only; other hosts — and
+                # the setup wizard's operator-typed URL — are isolated.
+                outcome = await model_checker_cb.breaker_for(base_url).call(
+                    _breaker_probe
+                )
             except _ProbeFailure as e:
+                result = e.result
+            except BreakerNeutralError as e:
+                # Non-outage 4xx: authoritative failure answer from a
+                # reachable-but-misconfigured endpoint; recorded on neither
+                # side of the breaker (issue #717 review).
                 result = e.result
             except CircuitBreakerError as e:
                 # A tripped breaker means the host has failed consecutively;
@@ -386,15 +463,17 @@ class ModelChecker:
         base_url: str,
         model_name: str,
         timeout: float,
+        headers: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """Check model availability using Ollama's /api/tags endpoint."""
         url = f"{_derive_base(base_url)}/api/tags"
 
         try:
             _corr = _correlation_headers()
-            if _corr:
+            probe_headers = {**(_corr or {}), **(headers or {})} or None
+            if probe_headers:
                 response = await client.get(
-                    url, timeout=timeout, headers=_corr
+                    url, timeout=timeout, headers=probe_headers
                 )
             else:
                 response = await client.get(url, timeout=timeout)
@@ -437,6 +516,7 @@ class ModelChecker:
         base_url: str,
         model_name: str,
         timeout: float,
+        headers: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """
         Check model availability using native TEI's /info endpoint.
@@ -449,7 +529,12 @@ class ModelChecker:
         url = f"{_derive_base(base_url)}/info"
 
         try:
-            response = await client.get(url, timeout=timeout)
+            _corr = _correlation_headers()
+            probe_headers = {**(_corr or {}), **(headers or {})} or None
+            if probe_headers:
+                response = await client.get(url, timeout=timeout, headers=probe_headers)
+            else:
+                response = await client.get(url, timeout=timeout)
             response.raise_for_status()
             try:
                 data = response.json()
@@ -495,6 +580,7 @@ class ModelChecker:
         base_url: str,
         model_name: str,
         timeout: float,
+        headers: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """
         Check model availability using the OpenAI-compatible /v1/models listing.
@@ -502,7 +588,12 @@ class ModelChecker:
         url = f"{_derive_base(base_url)}/v1/models"
 
         try:
-            response = await client.get(url, timeout=timeout)
+            _corr = _correlation_headers()
+            probe_headers = {**(_corr or {}), **(headers or {})} or None
+            if probe_headers:
+                response = await client.get(url, timeout=timeout, headers=probe_headers)
+            else:
+                response = await client.get(url, timeout=timeout)
             response.raise_for_status()
             try:
                 data = response.json()

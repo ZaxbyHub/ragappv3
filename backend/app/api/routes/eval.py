@@ -37,7 +37,10 @@ class HeuristicEvaluationRequest(BaseModel):
     query: str = Field(..., min_length=1, description="User query to evaluate")
     answer: str = Field(..., description="Generated answer to evaluate")
     contexts: List[str] = Field(
-        ..., min_length=1, description="Retrieved context chunks"
+        ...,
+        min_length=1,
+        max_length=50,
+        description="Retrieved context chunks (issue #718: bounded per request)",
     )
     ground_truth: Optional[str] = Field(
         None, description="Ground truth answer for comparison"
@@ -414,7 +417,12 @@ async def _calculate_answer_similarity(
         if norm1 == 0 or norm2 == 0:
             return 0.0
 
-        return dot_product / (norm1 * norm2)
+        # Issue #718: clamp to [-1, 1] — IEEE-754 rounding makes identical
+        # vectors compute e.g. 1.0000000000000002, above
+        # HeuristicMetrics.answer_similarity's le=1.0 bound, which turned a
+        # near-perfect score into an HTTP 500.
+        similarity = dot_product / (norm1 * norm2)
+        return max(-1.0, min(1.0, similarity))
     except Exception as e:
         logger.warning("Failed to calculate answer similarity: %s", e)
         return None
@@ -561,13 +569,17 @@ class LiveEvalRequest(BaseModel):
     benchmark: List[LiveBenchmarkItem] = Field(
         ...,
         min_length=1,
-        description="Benchmark set: queries with ground-truth relevant_ids",
+        max_length=50,
+        description="Benchmark set: queries with ground-truth relevant_ids (issue #718: bounded per request)",
     )
     vault_id: Optional[int] = Field(
         None, description="Vault scope for all queries (optional)"
     )
     top_k: Optional[int] = Field(
-        None, ge=1, description="Override recall@k / nDCG@k k value"
+        None,
+        ge=1,
+        le=200,
+        description="Override recall@k / nDCG@k k value (issue #718: ceiling)",
     )
 
     @model_validator(mode="after")
@@ -595,6 +607,9 @@ class LiveEvalResponse(BaseModel):
     mrr_mean: Optional[float] = Field(None, description="Mean Reciprocal Rank")
     ndcg_mean: Optional[float] = Field(None, description="Mean nDCG@k")
     recall_mean: Optional[float] = Field(None, description="Mean recall@k")
+    persisted: bool = Field(
+        True, description="Issue #718: False when writing the run record failed"
+    )
 
 
 @router.post("/eval/live", response_model=LiveEvalResponse)
@@ -610,7 +625,9 @@ async def live_eval(
        retrieved file_ids from the live vector store + reranker pipeline.
     2. Computes MRR, nDCG@k, and recall@k against the ground-truth ``relevant_ids``.
     3. Persists the run record (timestamp, release_id, per-query and aggregate
-       metrics) as JSONL to ``data/eval-runs/runs.jsonl``.
+       metrics) as JSONL to ``data/eval-runs/runs.jsonl``, plus a per-run
+       single-object report ``runs-<run_id>.json`` carrying the
+       ``load_run_report`` envelope — the documented ``compare_runs`` input.
 
     This bridges the offline eval harness (which consumes pre-supplied JSONL
     contexts) with the live retrieval pipeline, enabling production retrieval
@@ -666,6 +683,12 @@ async def live_eval(
             result.recall_mean or 0.0,
         )
 
+        persisted = adapter.last_persist_report is not None
+        if not persisted:
+            logger.warning(
+                "Live eval run %s completed but the run record was NOT persisted",
+                result.run_id,
+            )
         return LiveEvalResponse(
             run_id=result.run_id,
             timestamp=result.timestamp,
@@ -675,6 +698,7 @@ async def live_eval(
             mrr_mean=result.mrr_mean,
             ndcg_mean=result.ndcg_mean,
             recall_mean=result.recall_mean,
+            persisted=persisted,
         )
 
     except Exception:

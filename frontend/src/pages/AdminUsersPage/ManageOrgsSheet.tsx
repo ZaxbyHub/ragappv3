@@ -29,6 +29,9 @@ interface ManageOrgsSheetProps {
   allOrgs: OrgItem[];
   orgMemberships: Map<number, string>;
   isLoading: boolean;
+  catalogStatus: "unknown" | "pending" | "success" | "error";
+  membershipsStatus: "unknown" | "pending" | "success" | "error";
+  onRetry: () => void;
   isSaving: boolean;
   searchQuery: string;
   onSearchChange: (query: string) => void;
@@ -44,6 +47,9 @@ export function ManageOrgsSheet({
   allOrgs,
   orgMemberships,
   isLoading,
+  catalogStatus,
+  membershipsStatus,
+  onRetry,
   isSaving,
   searchQuery,
   onSearchChange,
@@ -52,6 +58,8 @@ export function ManageOrgsSheet({
   onSave,
   onClose,
 }: ManageOrgsSheetProps) {
+  const failed = catalogStatus === "error" || membershipsStatus === "error";
+  const ready = catalogStatus === "success" && membershipsStatus === "success";
   const filteredOrgs = useMemo(() => {
     const searchLower = searchQuery.toLowerCase();
     return allOrgs.filter((org) =>
@@ -90,12 +98,17 @@ export function ManageOrgsSheet({
               onChange={(e) => onSearchChange(e.target.value)}
               className="pl-10"
               aria-label="Search organizations"
-              disabled={isLoading}
+              disabled={isLoading || !ready}
             />
           </div>
 
           <ScrollArea className="flex-1 -mx-6 px-6">
-            {isLoading ? (
+            {failed ? (
+              <div className="space-y-3">
+                <div role="alert">Failed to load organizations or user memberships.</div>
+                <Button variant="outline" onClick={onRetry} disabled={isSaving}>Retry organizations</Button>
+              </div>
+            ) : isLoading || !ready ? (
               <div className="space-y-3" role="status" aria-label="Loading organizations">
                 {Array.from({ length: 5 }).map((_, i) => (
                   <div key={i} className="flex items-center gap-3 p-3 rounded-sm border">
@@ -130,7 +143,7 @@ export function ManageOrgsSheet({
                         checked={isMember}
                         onCheckedChange={() => onToggleOrg(org.id)}
                         aria-label={`Select ${org.name}`}
-                        disabled={isSaving}
+                        disabled={isSaving || !ready}
                         className="mt-0.5"
                       />
                       <div className="flex-1 min-w-0">
@@ -144,7 +157,7 @@ export function ManageOrgsSheet({
                           <Select
                             value={role}
                             onValueChange={(v) => onSetOrgRole(org.id, v)}
-                            disabled={!isMember || isSaving}
+                            disabled={!isMember || isSaving || !ready}
                           >
                             <SelectTrigger className="h-7 w-24 text-xs" aria-label={`Role in ${org.name}`}>
                               <SelectValue />
@@ -180,7 +193,7 @@ export function ManageOrgsSheet({
           </Button>
           <Button
             onClick={onSave}
-            disabled={isSaving || isLoading || !user}
+            disabled={isSaving || isLoading || !ready || !user}
             className="w-full sm:w-auto"
             aria-label="Save organization changes"
           >

@@ -9,7 +9,9 @@ export interface SearchMemoriesRequest {
 export interface MemoryResult {
   id: string;
   content: string;
-  metadata?: Record<string, unknown>;
+  // The backend emits an explicit null (not an absent key) when a memory has
+  // no metadata — hence `| null`, not just the optional key.
+  metadata?: Record<string, unknown> | null;
   score?: number;
   updated_at?: string | null;
 }
@@ -21,10 +23,14 @@ export interface AddMemoryRequest {
   source?: string;
 }
 
-export interface AddMemoryResponse {
-  id: string;
-  status: string;
-}
+// #780 (L09): POST /memories is typed by the backend MemoryResponse
+// ({id, content, metadata, score, importance, expires_at, created_at,
+// updated_at}). AddMemoryResponse deliberately aliases the five fields the
+// app consumes (MemoryResult) — a strict subset, so no field the backend
+// never sends can appear (the phantom direction scripts/
+// check_l09_memory_response_fields.py enforces in CI; under-declaring
+// backend-only fields is fine for structural typing).
+export type AddMemoryResponse = MemoryResult;
 
 export interface SearchMemoriesResponse {
   results: MemoryResult[];

@@ -37,12 +37,13 @@ class SecretManager:
         """Return the HMAC key and version.
 
         Resolution order: ``AUDIT_HMAC_KEY_<VERSION>`` -> ``AUDIT_HMAC_KEY`` ->
-        shared fallback derivation (JWT secret -> admin token -> development
-        constant, identical to ``security_audit_log``'s key, see
-        ``app.services.audit_keys``). The fallback keeps ``document_actions``
-        audit rows flowing on configurations that never set a dedicated key
-        (issue #561); the version string stays the requested version so
-        versioned reporting is unchanged.
+        shared fallback derivation (JWT secret when CHANGED from the insecure
+        default -> admin token -> development constant, identical to
+        ``security_audit_log``'s key, see ``app.services.audit_keys``; issue
+        #993 treats the unchanged-default JWT secret as unset). The fallback
+        keeps ``document_actions`` audit rows flowing on configurations that
+        never set a dedicated key (issue #561); the version string stays the
+        requested version so versioned reporting is unchanged.
         """
         version = (version or self.default_hmac_version).lower()
         env_name = f"AUDIT_HMAC_KEY_{version.upper()}"

@@ -1,50 +1,53 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
+import { captureAuthOwner, captureAuthPrincipalGeneration, isCurrentAuthOwner } from "@/lib/api/auth-lifecycle";
 import { Navigate, useLocation } from "react-router-dom";
 import { useAuthStore } from "@/stores/useAuthStore";
 import { Loader2 } from "lucide-react";
+import { Button } from "@/components/ui/button";
 
 interface ProtectedRouteProps {
   children: React.ReactNode;
   testMode?: boolean;
 }
 
-function getDemoUser() {
-  const role = import.meta.env.VITE_DEMO_ROLE || "superadmin";
-  return {
-    id: 1,
-    username: import.meta.env.VITE_DEMO_USERNAME || "demo",
-    full_name: import.meta.env.VITE_DEMO_FULL_NAME || "Demo User",
-    role: role as "superadmin" | "admin" | "member" | "viewer",
-    is_active: true,
-  };
-}
-
 export function ProtectedRoute({ children, testMode = false }: ProtectedRouteProps) {
   const location = useLocation();
 
   // H-10 fix: Use only the JWT auth store — legacy AuthContext OR removed
-  const { isAuthenticated, isLoading, isInitialized, needsSetup, user } = useAuthStore();
+  const { isAuthenticated, isLoading, isInitialized, initializationFailed, needsSetup, user } = useAuthStore();
+  const init = useAuthStore((state) => state.init);
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
 
   // testMode is a development-only convenience (see App.tsx, where it is gated
   // by import.meta.env.DEV so it can never be enabled in a production build).
-  // Seed a demo session once — in an effect, not during render — so protected
-  // routes are reachable without a backend. Pages use useTestMode() for mock data.
-  useEffect(() => {
-    if (testMode && !isAuthenticated) {
-      useAuthStore.setState({
-        user: getDemoUser(),
-        accessToken: "demo-token",
-        isAuthenticated: true,
-        isInitialized: true,
-        needsSetup: false,
-        isLoading: false,
-        authMode: "jwt",
-      });
-    }
-  }, [testMode, isAuthenticated]);
-
-  if (testMode) {
+  // App's router-local bootstrap (issue #779 / UI-R3-08) renders PageLoader
+  // until its layout effect has prepared the demo session, so this guard mounts
+  // only after its first auth-state read is ready. This component never seeds
+  // the store; pages use useTestMode() for mock data.
+  if (testMode && isAuthenticated) {
     return <>{children}</>;
+  }
+
+  // Show a recoverable error when authentication setup initialization fails.
+  if (initializationFailed) {
+    const retryOwner = captureAuthOwner();
+    const retryPrincipalGeneration = captureAuthPrincipalGeneration();
+    const retry = () => {
+      if (!mountedRef.current || !isCurrentAuthOwner(retryOwner)) return;
+      if (captureAuthPrincipalGeneration() !== retryPrincipalGeneration) return;
+      void init();
+    };
+    return (
+      <div className="flex h-screen w-full flex-col items-center justify-center gap-4" role="alert">
+        <p>Unable to initialize authentication.</p>
+        <Button type="button" variant="outline" onClick={retry}>Retry</Button>
+      </div>
+    );
   }
 
   // Show loading while auth state or setup check is still initializing

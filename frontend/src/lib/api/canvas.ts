@@ -127,18 +127,35 @@ export interface CanvasArtifactResponse {
  * top-level `version` key is also accepted for tolerance. Normalized by
  * `normalizeCanvasDetail` before it reaches the UI.
  */
-export interface CanvasDetailPayload {
-  artifact: CanvasArtifact;
-  current_version?: CanvasVersion;
+export type CanvasDetailPayload =
+  | (CanvasArtifact & {
+      current_version?: CanvasVersion | null;
+      version?: CanvasVersion | null;
+    })
+  | {
+      artifact?: CanvasArtifact;
+      current_version?: CanvasVersion | null;
+      version?: CanvasVersion | null;
+    };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /** Normalizes a raw detail/create payload into `{artifact, version}`. */
 export function normalizeCanvasDetail(payload: CanvasDetailPayload): CanvasArtifactResponse {
-  const version = payload.current_version;
-  if (!version || !payload.artifact) {
+  const raw = payload as unknown as Record<string, unknown>;
+  const nestedArtifact = raw.artifact;
+  const artifact = isRecord(nestedArtifact) ? nestedArtifact : raw;
+  const version = raw.current_version ?? raw.version;
+
+  if (!isRecord(version) || typeof artifact.artifact_uid !== "string") {
     throw new Error("Canvas detail response is missing its version payload");
   }
-  return { artifact: payload.artifact, version };
+  return {
+    artifact: artifact as unknown as CanvasArtifact,
+    version: version as unknown as CanvasVersion,
+  };
 }
 
 /**

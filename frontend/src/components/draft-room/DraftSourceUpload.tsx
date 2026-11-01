@@ -20,6 +20,7 @@ import {
   DRAFT_INPUT_AUTHORITIES,
   DRAFT_INPUT_ROLES,
   draftRoomKeys,
+  getDraftRoomPollIntervalMs,
   getDraft,
   parseDraftRoomError,
   uploadDraftInput,
@@ -29,9 +30,6 @@ import {
   type DraftRoomCapabilities,
   type DraftRoomErrorInfo,
 } from "@/lib/api/draftRoom";
-
-/** Default poll cadence when `capabilities.limits.poll_interval_seconds` isn't cached yet. */
-const DEFAULT_POLL_INTERVAL_MS = 2000;
 
 export interface DraftSourceUploadProps {
   draftId: number;
@@ -179,10 +177,7 @@ export function DraftSourceUpload({
     draftRoomKeys.capabilities()
   );
   const rawPollSeconds = cachedCapabilities?.limits?.poll_interval_seconds;
-  const pollIntervalMs =
-    typeof rawPollSeconds === "number" && rawPollSeconds > 0
-      ? rawPollSeconds * 1000
-      : DEFAULT_POLL_INTERVAL_MS;
+  const pollIntervalMs = getDraftRoomPollIntervalMs(rawPollSeconds);
 
   // Polls the canonical draft detail (shared cache key — no second source of
   // truth) only while a locally-tracked upload is still parsing; stops the

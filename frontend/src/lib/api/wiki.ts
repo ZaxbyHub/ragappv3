@@ -143,7 +143,10 @@ export interface WikiLintFinding {
   details: string;
   related_page_ids_json: string;
   related_claim_ids_json: string;
-  status: "open" | "acknowledged" | "resolved" | "dismissed";
+  // "auto_resolved" is system-only (issue #791): the lint reconciler writes
+  // it when detection stops, and it reopens on recurrence; users can only
+  // set resolved/dismissed/acknowledged.
+  status: "open" | "acknowledged" | "resolved" | "dismissed" | "auto_resolved";
   created_at: string;
   updated_at: string;
 }
@@ -287,6 +290,9 @@ export async function promoteMemoryToWiki(request: PromoteMemoryRequest): Promis
 export async function listWikiJobs(params: {
   vault_id: number;
   status?: string;
+  /** Server-side row bound (#774 / TQ-sweep-B09-01): caps the query and the
+   *  payload instead of shipping the whole job history for a client slice. */
+  limit?: number;
 }): Promise<{ jobs: WikiCompileJob[] }> {
   const response = await apiClient.get<{ jobs: WikiCompileJob[] }>("/wiki/jobs", { params });
   return response.data;

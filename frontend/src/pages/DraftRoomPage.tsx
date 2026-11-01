@@ -16,7 +16,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { FilterToggle, FilterToggleGroup } from "@/components/ui/filter-toggle-group";
 
 import { DraftCreateDialog } from "@/components/draft-room/DraftCreateDialog";
 import {
@@ -183,13 +183,16 @@ export default function DraftRoomPage() {
 
   return (
     <div className="animate-in fade-in space-y-6 pb-12 duration-300">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <PageTitleHeader title="Draft Room" description={DRAFT_ROOM_PAGE_DESCRIPTION} />
-        <Button type="button" onClick={() => setCreateOpen(true)} disabled={newDraftDisabled} title={newDraftDisabledReason}>
-          <Plus className="mr-1 h-4 w-4" aria-hidden="true" />
-          {NEW_DRAFT_CTA}
-        </Button>
-      </div>
+      <PageTitleHeader
+        title="Draft Room"
+        description={DRAFT_ROOM_PAGE_DESCRIPTION}
+        actions={
+          <Button type="button" onClick={() => setCreateOpen(true)} disabled={newDraftDisabled} title={newDraftDisabledReason}>
+            <Plus className="mr-1 h-4 w-4" aria-hidden="true" />
+            {NEW_DRAFT_CTA}
+          </Button>
+        }
+      />
 
       {capabilityDisabled && (
         <Alert variant="warning">
@@ -234,15 +237,23 @@ export default function DraftRoomPage() {
                 </SelectContent>
               </Select>
             </div>
-            <Tabs value={statusFilterKey} onValueChange={setStatusFilterKey}>
-              <TabsList className="h-auto flex-wrap justify-start">
-                {DRAFT_LIST_FILTERS.map((filter) => (
-                  <TabsTrigger key={filter.id} value={filter.id}>
-                    {filter.label}
-                  </TabsTrigger>
-                ))}
-              </TabsList>
-            </Tabs>
+            {/* Status filter (#865): toggle group, not a trigger-only Tabs
+                bar — Tabs triggers carry aria-controls for panels that were
+                never rendered, which axe flags as aria-valid-attr-value. */}
+            <FilterToggleGroup
+              aria-label="Filter drafts by status"
+              className="h-auto flex-wrap justify-start"
+            >
+              {DRAFT_LIST_FILTERS.map((filter) => (
+                <FilterToggle
+                  key={filter.id}
+                  pressed={statusFilterKey === filter.id}
+                  onClick={() => setStatusFilterKey(filter.id)}
+                >
+                  {filter.label}
+                </FilterToggle>
+              ))}
+            </FilterToggleGroup>
           </div>
 
           {draftsQuery.isError ? (

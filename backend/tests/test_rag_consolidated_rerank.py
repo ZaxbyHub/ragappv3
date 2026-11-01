@@ -11,8 +11,8 @@ Regression tests:
 2. Flag off (rollback): per-sub-query rerank behavior is preserved
    exactly (one rerank call per sub-query).
 3. A failing consolidated rerank call degrades to the fused order with
-   score_type="distance" / rerank_status="disabled" (same semantics as
-   ``_execute_retrieval``'s rerank exception fallback).
+   score_type="distance" / rerank_status="fallback" (same semantics as
+   ``_execute_retrieval``'s rerank exception fallback; #715 T1-32-K-06).
 4. Identical plan strings are deduplicated before fan-out (order
    preserved), so a repeated sub-query costs no extra embedding, search,
    or rerank.
@@ -450,8 +450,9 @@ async def test_flag_off_keeps_per_sub_query_rerank():
 # ------------------------------------------------------------------
 async def test_consolidated_rerank_failure_falls_back_to_fused_order():
     """A reranker outage on the consolidated call keeps the fused order with
-    score_type='distance' and rerank_status='disabled' (mirrors
-    _execute_retrieval's exception semantics)."""
+    score_type='distance' and rerank_status='fallback' (mirrors
+    _execute_retrieval's exception semantics: attempted-and-failed is never
+    reported as the turned-off 'disabled' — #715 T1-32-K-06)."""
     Q = "multi-facet question about facet one, facet two and facet three"
     S1 = "sub-query one about facet one"
     S2 = "sub-query two about facet two"
@@ -476,7 +477,7 @@ async def test_consolidated_rerank_failure_falls_back_to_fused_order():
         f"fused evidence must survive the reranker outage; got {sorted(final_file_ids)}"
     )
     assert done.get("score_type") == "distance"
-    assert (done.get("retrieval_debug") or {}).get("rerank_status") == "disabled"
+    assert (done.get("retrieval_debug") or {}).get("rerank_status") == "fallback"
 
 
 # ------------------------------------------------------------------

@@ -91,7 +91,11 @@ the guard repo-wide so a new on-loop checkout fails CI.
   they are not regressions of this PR.
 - `utils/transaction.py::db_transaction` has no production callers today; it
   is fixed in place rather than deleted (public util surface — removal is an
-  owner decision).
+  owner decision). [Amended by #705: that owner decision has now been made —
+  the unwired helper, whose `finally` released the pooled connection
+  unguarded outside the convention every live caller follows, is removed by
+  issue #705 (S06-SK-05); the module no longer exists, so the site count
+  above is one lower than written.]
 - Adjacent on-loop SQL retained by written disposition (the issue lists both
   as adjacent/bounded-latency; neither performs a pooled checkout on the
   loop, which is the class this issue closes):
@@ -105,3 +109,25 @@ the guard repo-wide so a new on-loop checkout fails CI.
     `api/deps.py`): a sync helper invoked with a connection already held
     from an off-loop checkout; a few trivial INSERT/SELECT statements on
     that held connection — no checkout, no queue wait.
+- Update (issue #697, Workstream B PR 8): the enrichment-resolution sites this
+  document previously failed to enumerate are now converted. The
+  `_row_to_document_response` enrichment branch — reachable from
+  `list_documents` (per row, up to `per_page=1000`), `get_document`, and
+  `toggle_file_enrichment` in `api/routes/documents.py` — no longer performs
+  the per-row synchronous `is_enrichment_enabled_for_file` pooled checkout on
+  the event loop: routes resolve the page's effective enrichment in one
+  batched off-loop query (`_resolve_page_enrichment`, the same shape as the
+  batched near-dup-group lookup), and the sync per-file helper remains only as
+  a standalone fallback inside the builder (unreachable from async frames;
+  pinned by the scoped AST census in `backend/tests/test_b08_guardrail_sync_census.py`
+  — the repo-wide structural guard remains owned by #803). The advisory
+  near-duplicate scan `near_duplicates.record_file_centroid` (also on-loop,
+  and re-fingerprinting unmatched legacy texts per ingest) is dispatched to a
+  worker thread and scan-marked by the same issue. REMAINING debt, unchanged
+  and owned by the Workstream B ingest-pipeline PRs (slots 9/14/15): the
+  `is_enrichment_enabled_for_file`/`is_enrichment_enabled_for_vault` calls
+  inside `should_enqueue_enrichment` (reached from the async
+  background-tasks loop) and `_get_chunk_enrichment_service` (reached from
+  async `run_enrichment_job`) still run synchronously on the loop — single
+  bounded checkouts, logged on DB-error fallback since #697, but not yet
+  dispatched.

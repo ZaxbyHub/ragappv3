@@ -52,7 +52,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 # 70 -> 71: issue #555 (2026-09-14) adds chat_stream_events (per-turn SSE replay log)
 # 71 -> 72: issue #559 (stage 1) adds jobs — the shared DB-claimed lease table
 # for background workers (ingestion first; wiki/KMS, reindex and draft follow).
-EXPECTED_BASE_TABLE_COUNT = 72
+# 72 -> 73: issue #782 (UI-ENH-07 stage 2) adds user_onboarding_state (the
+# per-user first-run milestone record: first citation open + checklist dismissal).
+EXPECTED_BASE_TABLE_COUNT = 73
 
 # Curated set of critical application tables that must always exist. If any of
 # these disappears, the drift test fails with a clear message naming the table.

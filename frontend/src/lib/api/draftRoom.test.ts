@@ -52,6 +52,7 @@ import {
   DRAFT_TIERS,
   DRAFT_VAULT_ACCESS_LEVELS,
   FACT_CURRENT_STATUSES,
+  getDraftRoomPollIntervalMs,
   exportDraftRevision,
   getDraft,
   getDraftEventsUrl,
@@ -84,6 +85,21 @@ beforeEach(() => {
   mockPost.mockReset().mockResolvedValue({ data: {} });
   mockPatch.mockReset().mockResolvedValue({ data: {} });
   mockDelete.mockReset().mockResolvedValue({ data: undefined });
+});
+
+describe("getDraftRoomPollIntervalMs", () => {
+  it.each([
+    [undefined, 2000],
+    [0, 2000],
+    [-1, 2000],
+    [Number.NaN, 2000],
+    [Number.POSITIVE_INFINITY, 2000],
+    [0.5, 500],
+    [2.5, 2500],
+    [1e306, 2000],
+  ])("normalizes %s seconds to %s milliseconds", (seconds, expected) => {
+    expect(getDraftRoomPollIntervalMs(seconds)).toBe(expected);
+  });
 });
 
 // ============================================================================

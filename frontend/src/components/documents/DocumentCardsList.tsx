@@ -5,15 +5,19 @@ import type { Document } from "@/lib/api";
 
 interface DocumentCardsListProps {
   documents: Document[];
+  /** Organize-level capability (vault write): row selection (issue #767). */
+  canOrganizeDocuments: boolean;
+  /** Admin-level capability (vault admin): delete only (issue #767). */
   canMutateDocuments: boolean;
   selectedIds: Set<string>;
   onSelectOne: (docId: string, checked: boolean) => void;
-  onDelete: (docId: string) => void;
+  onDelete: (docId: string, filename?: string) => void;
   onDownload: (doc: Document) => void;
 }
 
 export function DocumentCardsList({
   documents,
+  canOrganizeDocuments,
   canMutateDocuments,
   selectedIds,
   onSelectOne,
@@ -30,8 +34,11 @@ export function DocumentCardsList({
     measureElement: (el) => el?.getBoundingClientRect().height ?? 0,
   });
 
+  // overflow-y-auto is redundant with the inline style but gives the
+  // a11y gate's below-fold scroll pass a class selector to match
+  // (issue #778 review PRR-005).
   return (
-    <div ref={mobileScrollRef} className="sm:hidden" style={{ maxHeight: "70vh", overflowY: "auto" }}>
+    <div ref={mobileScrollRef} className="md:hidden overflow-y-auto" style={{ maxHeight: "70vh" }}>
       <div style={{ height: mobileVirtualizer.getTotalSize(), position: "relative" }}>
         {mobileVirtualizer.getVirtualItems().map((virtualItem) => {
           const doc = documents[virtualItem.index];
@@ -51,12 +58,12 @@ export function DocumentCardsList({
             >
               <DocumentCard
                 document={doc}
-                onDelete={(id) => onDelete(String(id))}
+                onDelete={(id) => onDelete(String(id), doc.filename)}
                 onDownload={() => onDownload(doc)}
                 canDelete={canMutateDocuments}
                 isSelected={selectedIds.has(String(doc.id))}
                 onSelectionChange={
-                  canMutateDocuments
+                  canOrganizeDocuments
                     ? (id, checked) => onSelectOne(String(id), checked)
                     : undefined
                 }

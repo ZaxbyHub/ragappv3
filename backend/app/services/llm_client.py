@@ -15,12 +15,12 @@ import httpx
 
 from app.config import settings
 from app.services.circuit_breaker import (
+    BreakerNeutralError,
     CircuitBreakerError,
-    CircuitBreakerState,
     create_llm_circuit_breaker,
     is_outage_status,
 )
-from app.services.ssrf import assert_url_safe
+from app.services.ssrf import URLBlocked, assert_url_safe
 from app.services.telemetry import (
     correlation_headers as _correlation_headers,
 )
@@ -30,6 +30,14 @@ from app.utils.assistant_sanitizer import sanitize_assistant_content
 logger = logging.getLogger(__name__)
 
 _MAX_THINKING_BUFFER = 1024 * 1024  # 1MB max thinking buffer
+
+# Seconds allowed for the post-``[DONE]`` tail drain (issue #719 / R2-L5-C01).
+# The generation is already complete when the drain runs, so the tail is pure
+# connection-reuse housekeeping: it must be bounded and must never be able to
+# charge the breaker or fail a delivered answer. Short by design — a server
+# that trickles keep-alive comments after ``[DONE]`` must not pin the request
+# past the read timeout (review PRR-001 / F-1).
+_STREAM_TAIL_DRAIN_TIMEOUT = 5.0
 
 # Matches a complete <think> open tag case-insensitively, with optional attributes.
 # Examples: <think>, <THINK>, <think type="reasoning">, <Think foo="bar">
@@ -99,7 +107,7 @@ def select_no_think_chat_template_kwargs(
     if model and "qwen" in model.lower():
         return {"enable_thinking": False}
     logger.warning(
-        "No verified no-think control for instant model %r; sending none "
+        "No verified no-think control for model %r; sending none "
         "(fail open — provider default governs)",
         model,
     )
@@ -143,6 +151,11 @@ class LLMError(Exception):
 # Sentinel for LLMClient.reconfigure: "leave chat_template_kwargs unchanged".
 # None itself is a meaningful value there (omit the kwarg from the payload).
 _KEEP_TEMPLATE_KWARGS = object()
+
+# Sentinel for per-call chat_completion overrides: "leave the client's
+# reasoning_effort unchanged for this call". An explicit value (including
+# None, which strips the field) wins for that call only (issue #712).
+_KEEP_REASONING = object()
 
 
 class LLMClient:
@@ -318,6 +331,41 @@ class LLMClient:
         if changed:
             self._circuit_breaker.reset()
 
+    async def _drain_stream_tail(self, events: AsyncGenerator[str, None]) -> None:
+        """Consume the SSE tail after ``[DONE]`` so httpx can pool the connection.
+
+        Called only once the generation has completed: everything after the
+        marker is legal trailer (blank line, SSE comment, usage frame) that is
+        never parsed. A tail that ends badly — a chunked body truncated before
+        its terminator, a peer reset, a server that never closes, or a
+        keep-alive trickle that resets the per-read timeout — must NOT be
+        charged to the circuit breaker nor surfaced to the caller as a failed
+        generation, because the answer was already delivered in full
+        (issue #719 review PRR-001 / F-1). The drain is bounded by
+        ``_STREAM_TAIL_DRAIN_TIMEOUT`` for the same reason.
+        """
+        while True:
+            try:
+                await asyncio.wait_for(
+                    events.__anext__(), timeout=_STREAM_TAIL_DRAIN_TIMEOUT
+                )
+            except StopAsyncIteration:
+                return
+            except asyncio.TimeoutError:
+                logger.debug(
+                    "Stream tail not drained within %.1fs after [DONE]; the "
+                    "generation itself completed (issue #719)",
+                    _STREAM_TAIL_DRAIN_TIMEOUT,
+                )
+                return
+            except (httpx.HTTPError, OSError) as exc:
+                logger.debug(
+                    "Stream tail ended with %s after [DONE]; the generation "
+                    "itself completed and is reported as successful (issue #719)",
+                    type(exc).__name__,
+                )
+                return
+
     async def prime_residency(self) -> bool:
         """One-shot native model-load call pinning residency/context (issue #571).
 
@@ -328,8 +376,8 @@ class LLMClient:
         ``options.num_ctx`` sizes the loaded instance's context window (the
         OpenAI-compatible surface cannot express either). LM Studio clients
         (``context_length`` set) request the context length from the native
-        model-load endpoint, trying the current v1 API first and the legacy
-        v0 path on 404 for pre-0.4.0 servers; residency for LM Studio comes
+        v1 model-load endpoint (the never-existed ``/api/v0`` fallback was
+        removed in issue #719); residency for LM Studio comes
         from the per-payload ``ttl`` every chat request already carries.
 
         Best-effort by contract: any transport/HTTP failure is logged and
@@ -341,16 +389,27 @@ class LLMClient:
         client = await self._ensure_started()
         try:
             if self.context_length is not None:
-                # LM Studio native load (v1, with a v0 fallback for older
-                # servers). `ttl` is intentionally not part of the load
-                # request: it rides every chat payload instead.
+                # LM Studio native load via the v1 REST API. The pre-0.4.0
+                # `/api/v0/models/load` retry was removed (issue #719): that
+                # endpoint never existed in LM Studio's v0 reference, so the
+                # fallback 404'd on exactly the old servers it existed for.
+                # `ttl` is intentionally not part of the load request: it
+                # rides every chat payload instead.
                 body = {"model": self.model, "context_length": self.context_length}
                 url = f"{self.base_url}/api/v1/models/load"
                 response = await client.post(url, json=body)
                 if response.status_code == 404:
-                    response = await client.post(
-                        f"{self.base_url}/api/v0/models/load", json=body
+                    logger.warning(
+                        "LM Studio context-length priming returned 404 for %s "
+                        "(model %r) - LM_STUDIO_CONTEXT_LENGTH=%s was not "
+                        "applied; either this server predates the v1 REST load "
+                        "API or it does not know the model id. The model will "
+                        "load on demand with provider defaults instead",
+                        url,
+                        self.model,
+                        self.context_length,
                     )
+                    return False
                 response.raise_for_status()
                 logger.info(
                     "Model residency primed via LM Studio load API (%s, ctx=%d)",
@@ -491,6 +550,8 @@ class LLMClient:
         temperature: float = 0.7,
         max_tokens: int = _UNSET_MAX_TOKENS,
         response_format: Optional[Dict[str, Any]] = None,
+        reasoning_effort: object = _KEEP_REASONING,
+        chat_template_kwargs: object = _KEEP_TEMPLATE_KWARGS,
     ) -> str:
         """
         Send a chat completion request and return the full response.
@@ -501,6 +562,16 @@ class LLMClient:
             max_tokens: Maximum tokens to generate (default: 32768, or the
                 client's configured per-mode budget when one was supplied
                 at construction — ENH-015, issue #494)
+            reasoning_effort: PER-CALL override of the client's reasoning
+                control (issue #712). Omit it to keep the client's configured
+                value; pass an explicit string (e.g. ``"none"``) to override
+                it for this call only; pass ``None`` to REMOVE the field from
+                this call's payload without mutating the client.
+            chat_template_kwargs: PER-CALL override of the client's
+                chat-template controls (issue #712), same sentinel semantics
+                as ``reasoning_effort`` — omit to keep the client default,
+                pass a dict to override for this call, pass ``None`` to drop
+                the field.
 
         Returns:
             The generated content string
@@ -526,10 +597,25 @@ class LLMClient:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
-        if self.chat_template_kwargs:
-            payload["chat_template_kwargs"] = self.chat_template_kwargs
-        if self.reasoning_effort is not None:
-            payload["reasoning_effort"] = self.reasoning_effort
+        # Per-call overrides (issue #712): sentinel keeps the client default;
+        # an explicit value — including None, which strips the field — wins
+        # for this call only. The retrieval evaluator uses this to ask
+        # thinking-mode servers not to reason on its one-word classification
+        # call, so the small token budget is not consumed by reasoning.
+        effective_template_kwargs = (
+            self.chat_template_kwargs
+            if chat_template_kwargs is _KEEP_TEMPLATE_KWARGS
+            else chat_template_kwargs
+        )
+        if effective_template_kwargs:
+            payload["chat_template_kwargs"] = effective_template_kwargs
+        effective_reasoning_effort = (
+            self.reasoning_effort
+            if reasoning_effort is _KEEP_REASONING
+            else reasoning_effort
+        )
+        if effective_reasoning_effort is not None:
+            payload["reasoning_effort"] = effective_reasoning_effort
         if self.ttl is not None:
             # LM Studio idle TTL (issue #571): seconds until an idle JIT-loaded
             # model is unloaded; the timer resets on every request. LM Studio
@@ -542,6 +628,13 @@ class LLMClient:
 
         started_at = time.perf_counter()
         prompt_tokens = self._prompt_token_estimate(messages)
+        # Per-call metrics state (issue #717): reset at entry so a failed
+        # turn can never report the previous call's success.
+        self.last_metrics = {
+            "provider_url": self.base_url,
+            "model": self.model,
+            "status": "started",
+        }
         try:
             # OPS-002 (issue #494): run the POST and the HTTP status check
             # as ONE breaker-wrapped operation so HTTPStatusError trips the
@@ -565,9 +658,18 @@ class LLMClient:
                 # (review RP-002, PR #576): ordinary 4xx are input/config
                 # errors that would recur on every retry — raising them
                 # here would open the shared breaker off a misconfigured
-                # request, not a provider outage.
+                # request, not a provider outage. They are raised as
+                # NEUTRAL (neither charge nor credit): the old behavior
+                # returned them as values, which the breaker recorded as a
+                # SUCCESS, erasing accumulated outage evidence for the
+                # host (issue #717 review).
                 if is_outage_status(response.status_code):
                     response.raise_for_status()
+                if response.status_code >= 400:
+                    try:
+                        response.raise_for_status()
+                    except httpx.HTTPStatusError as status_exc:
+                        raise BreakerNeutralError(status_exc) from status_exc
                 return response
 
             # E3 closure (#518): gen_ai client span for the non-stream
@@ -583,7 +685,23 @@ class LLMClient:
             response.raise_for_status()
             data = response.json()
 
+            if not isinstance(data, dict):
+                # A provider returning valid-but-non-object JSON (a list,
+                # scalar, or null) must surface as LLMError like any other
+                # malformed body, not escape as AttributeError (issue #717
+                # review).
+                self.last_metrics = {
+                    "provider_url": self.base_url,
+                    "model": self.model,
+                    "status": "invalid_response",
+                }
+                raise LLMError("Invalid response: expected a JSON object")
             if "choices" not in data or not data["choices"]:
+                self.last_metrics = {
+                    "provider_url": self.base_url,
+                    "model": self.model,
+                    "status": "invalid_response",
+                }
                 raise LLMError("Invalid response: no choices in response")
 
             message = data["choices"][0].get("message", {})
@@ -640,6 +758,12 @@ class LLMClient:
         except httpx.RequestError as e:
             self.last_metrics = {"provider_url": self.base_url, "model": self.model, "status": "request_error"}
             raise LLMError(f"Request failed: {str(e)}") from e
+        except URLBlocked as e:
+            # The SSRF guard's request-time re-resolution failure is a
+            # transport-layer failure: map it onto LLMError so every
+            # LLMError-catching fallback/degrade caller engages (issue #717).
+            self.last_metrics = {"provider_url": self.base_url, "model": self.model, "status": "url_blocked"}
+            raise LLMError(f"LLM provider URL blocked: {e}") from e
         except json.JSONDecodeError as e:
             self.last_metrics = {"provider_url": self.base_url, "model": self.model, "status": "invalid_json"}
             raise LLMError(f"Failed to parse response JSON: {str(e)}") from e
@@ -712,16 +836,32 @@ class LLMClient:
         # captured before the empty-choices skip so the reporting chunk is
         # never dropped.
         _usage: Dict[str, Any] = {}
+        # Per-call metrics state (issue #717): reset at entry so a failed
+        # stream can never report the previous call's success.
+        self.last_metrics = {
+            "provider_url": self.base_url,
+            "model": self.model,
+            "status": "started",
+        }
 
-        # Check circuit breaker state before attempting stream connection.
-        # Use the lock to avoid race conditions with concurrent requests.
-        async with self._circuit_breaker._lock:
-            if self._circuit_breaker.current_state == CircuitBreakerState.OPEN:
-                self._circuit_breaker._check_timeout()
-                if self._circuit_breaker.current_state == CircuitBreakerState.OPEN:
-                    raise LLMError(
-                        "LLM service is currently unavailable (circuit breaker open)"
-                    )
+        # Circuit-breaker admission (issue #717): the public seam admits at
+        # most ONE concurrent HALF_OPEN trial. The previous inline check
+        # rejected only OPEN, so every concurrent stream was admitted at
+        # exactly the moment the breaker should have been probing gently.
+        _holds_breaker_trial = False
+        try:
+            _holds_breaker_trial = (
+                await self._circuit_breaker.acquire_trial_or_raise()
+            )
+        except CircuitBreakerError as e:
+            self.last_metrics = {
+                "provider_url": self.base_url,
+                "model": self.model,
+                "status": "circuit_open",
+            }
+            raise LLMError(
+                "LLM service is currently unavailable (circuit breaker open)"
+            ) from e
 
         # State for filtering thinking content. Handles three open markers:
         #   <think>             — standard (gpt-oss-120b and most others)
@@ -771,8 +911,14 @@ class LLMClient:
         _reasoning_chars = 0
         _reasoning_started_at: Optional[float] = None
         _reasoning_last_at: Optional[float] = None
+        # Issue #719: one-shot-per-stream flag for the no-think leak warning.
+        _no_think_leak_warned = False
 
         stream_succeeded = False
+        # Set once the provider sent the [DONE] marker: the generation is then
+        # complete, so any tail outcome is connection-reuse housekeeping and
+        # must not be charged to the breaker or reported as a failure.
+        done_seen = False
         # E3 closure (#518): gen_ai client span for the streaming chat call.
         # Entered manually (not via ``with``) so the large stream-consumption
         # block keeps its existing indentation; exited in the finally below
@@ -781,15 +927,21 @@ class LLMClient:
         # span object instead of the CM, or letting the CM be GC'd early
         # (PR #595 review F-001c), ends the span at enter time — 0ms
         # duration, orphaned child spans, and SDK end-twice warnings.
-        _genai_stream_cm = start_span(
-            "gen_ai chat stream",
-            attributes={
-                "gen_ai.operation.name": "chat",
-                "gen_ai.request.model": str(payload.get("model", "")),
-            },
-        )
-        _genai_stream_cm.__enter__()
+        # Issue #717 review: the span is created and entered INSIDE the
+        # protected try below — every other tracer call site in the repo
+        # guarantees tracing can never break the record, and an exception
+        # here (before the finally that releases the HALF_OPEN trial) would
+        # wedge that trial permanently.
+        _genai_stream_cm: Optional[Any] = None
         try:
+            _genai_stream_cm = start_span(
+                "gen_ai chat stream",
+                attributes={
+                    "gen_ai.operation.name": "chat",
+                    "gen_ai.request.model": str(payload.get("model", "")),
+                },
+            )
+            _genai_stream_cm.__enter__()
             # E3 telemetry (issue #518): propagate correlation headers when
             # bound; kwarg omitted when empty (strict test fakes compat).
             _corr = _correlation_headers()
@@ -805,24 +957,43 @@ class LLMClient:
                 # Validate content-type for SSE
                 content_type = response.headers.get("content-type", "")
                 if "text/event-stream" not in content_type:
-                    # Fall back to non-stream completion for providers that don't return SSE
-                    content = await self.chat_completion(
-                        messages=messages,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        # Issue #652: keep the caller's schema contract on the
-                        # non-SSE fallback too, mirroring the streamed payload.
-                        response_format=response_format,
+                    # Non-SSE provider answer (issue #717): the complete JSON
+                    # answer is already in THIS response's body — read it and
+                    # yield it instead of discarding a finished generation
+                    # and re-POSTing a second one at double cost/latency.
+                    raw = await response.aread()
+                    data = json.loads(raw)
+                    if not isinstance(data, dict):
+                        self.last_metrics = {"provider_url": self.base_url, "model": self.model, "status": "invalid_response"}
+                        raise LLMError("Invalid response: expected a JSON object")
+                    choices = data.get("choices") or []
+                    if (
+                        not choices
+                        or not isinstance(choices[0], dict)
+                    ):
+                        self.last_metrics = {"provider_url": self.base_url, "model": self.model, "status": "invalid_response"}
+                        raise LLMError("Invalid response: no choices in response")
+                    body_choice = choices[0]
+                    content = self._strip_thinking_content(
+                        body_choice.get("message", {}).get("content", "")
                     )
-                    # Issue #571: keep the provider-exact usage the non-stream
-                    # call just recorded — the stream summary below would
-                    # otherwise overwrite last_metrics and drop those keys
-                    # (the fallback response never rode the SSE usage chunk).
-                    _fallback_metrics = self.last_metrics or {}
-                    if _fallback_metrics.get("prompt_tokens") is not None:
+                    # The answer text is visible output: count it and record
+                    # why the generation stopped, exactly as the SSE delta
+                    # paths and the old non-stream fallback did (issue #717
+                    # review — the estimate/finish_reason were lost here).
+                    completion_chars += len(content)
+                    _finish_reason = body_choice.get("finish_reason")
+                    # Issue #571 kept: provider-exact usage from the first
+                    # body feeds the stream summary below (the old
+                    # _fallback_metrics block read it off the nested
+                    # re-POST's metrics instead).
+                    _body_usage = data.get("usage") or {}
+                    if _body_usage.get("prompt_tokens") is not None or _body_usage.get(
+                        "completion_tokens"
+                    ) is not None:
                         _usage = {
-                            "prompt_tokens": _fallback_metrics["prompt_tokens"],
-                            "completion_tokens": _fallback_metrics.get("completion_tokens"),
+                            "prompt_tokens": _body_usage.get("prompt_tokens"),
+                            "completion_tokens": _body_usage.get("completion_tokens"),
                         }
                     if content:
                         yield content
@@ -860,21 +1031,76 @@ class LLMClient:
                             value = value[1:]
                         if field == "data":
                             data_lines.append(value)
+                        elif line.startswith("{"):
+                            # Issue #719 (review PRR-012): some servers report a
+                            # mid-stream failure as a BARE JSON object on a
+                            # non-``data`` line. Framing alone must not decide
+                            # whether a failure is visible, so dispatch it as a
+                            # one-line event and let the parser classify it.
+                            if data_lines:
+                                yield "\n".join(data_lines)
+                                data_lines.clear()
+                            yield line
                     # Stream ended mid-event: dispatch any remaining data.
                     if data_lines:
                         yield "\n".join(data_lines)
                         data_lines.clear()
 
                 try:
-                    async for data_str in _sse_events():
+                    _events = _sse_events()
+                    async for data_str in _events:
                         # Check for stream end marker
                         if data_str == "[DONE]":
+                            done_seen = True
+                            # The generation is complete; the remaining tail
+                            # exists only so httpx can pool the connection.
+                            await self._drain_stream_tail(_events)
                             break
 
                         try:
                             data = json.loads(data_str)
                         except json.JSONDecodeError:
                             continue
+                        if not isinstance(data, dict):
+                            # Bare array/scalar payloads carry no choices and
+                            # no error; skip instead of crashing on .get
+                            # (issue #719).
+                            continue
+
+                        # In-band mid-stream failure (issue #719): vLLM and
+                        # other OpenAI-compatible servers can report an error
+                        # AFTER the 200 inside the SSE body. Treating it as
+                        # ignorable would record a breaker success and
+                        # last_metrics.status='ok' for a failed generation.
+                        error_obj = data.get("error")
+                        if error_obj is not None:
+                            if isinstance(error_obj, dict):
+                                error_msg = str(
+                                    error_obj.get("message")
+                                    or error_obj.get("code")
+                                    or error_obj
+                                )
+                                error_code = error_obj.get("code")
+                            else:
+                                error_msg = str(error_obj)
+                                error_code = None
+                            # OPS-002 (issue #494): charge the breaker for
+                            # outage-class failures only. A 400-class in-band
+                            # error is an input/config error that would recur
+                            # on every retry and must not open the circuit —
+                            # the same rule the HTTP status path follows
+                            # (review PRR-002).
+                            if is_outage_status(error_code):
+                                async with self._circuit_breaker._lock:
+                                    self._circuit_breaker.record_failure()
+                            self.last_metrics = {
+                                "provider_url": self.base_url,
+                                "model": self.model,
+                                "status": "inband_error",
+                            }
+                            raise LLMError(
+                                f"In-band stream error from provider: {error_msg}"
+                            )
 
                         # Extract content delta from choices
                         choices = data.get("choices", [])
@@ -916,6 +1142,29 @@ class LLMClient:
                             if not isinstance(reasoning_text, str) or not reasoning_text:
                                 reasoning_text = None
                         if reasoning_text is not None:
+                            # Issue #719: a no-think control was requested for
+                            # this client, so a reasoning delta means the host
+                            # ignored it (reported for recent Qwen GGUF builds
+                            # on LM Studio). Surface that once per stream —
+                            # None-safe because reconfigure() stores None when
+                            # thinking is (re-)enabled.
+                            if (
+                                (self.chat_template_kwargs or {}).get(
+                                    "enable_thinking"
+                                )
+                                is False
+                                and not _no_think_leak_warned
+                            ):
+                                _no_think_leak_warned = True
+                                logger.warning(
+                                    "Model %s produced reasoning content despite "
+                                    "the instant-mode no-think control "
+                                    "(chat_template_kwargs enable_thinking=false); "
+                                    "the host ignored the control - reasoning is "
+                                    "being routed to the reasoning channel. Check "
+                                    "the model build/host capability.",
+                                    self.model,
+                                )
                             _now = time.perf_counter()
                             if _reasoning_started_at is None:
                                 _reasoning_started_at = _now
@@ -977,6 +1226,11 @@ class LLMClient:
                                 )
                                 pre_think, _, remainder = _buffer.partition("_lhs")
                                 if pre_think:
+                                    # Counted like the <think> sibling above
+                                    # (issue #717): text yielded before the
+                                    # marker is visible output and must be
+                                    # billed into the token estimate.
+                                    completion_chars += len(pre_think)
                                     yield pre_think
                                     _content_emitted = True
                                 _thinking_active = True
@@ -1079,19 +1333,49 @@ class LLMClient:
                     # Generator was closed by consumer - clean exit
                     stream_succeeded = True
                     raise
+                except asyncio.CancelledError:
+                    # Consumer (or a shutdown) cancelled mid-stream. If the
+                    # generation already completed at [DONE] the answer was
+                    # delivered in full, so record it as the success it was
+                    # rather than leaving status='error' for a turn that
+                    # actually finished (issue #719 review PRR-023).
+                    if done_seen:
+                        stream_succeeded = True
+                    raise
         except LLMError:
-            # Don't record LLMError as transport failure — it may come from
-            # the chat_completion() fallback path and represent an app-level error,
-            # not a service-unavailability signal.
+            # Don't record LLMError as transport failure — it represents an
+            # app-level error (malformed body, admission refusal), not a
+            # service-unavailability signal.
             raise
         except httpx.TimeoutException as e:
+            if done_seen:
+                # Defense in depth: _drain_stream_tail already swallows tail
+                # transport errors, so this arm is unreachable today. It stays
+                # because a future refactor that drains outside that helper
+                # must not turn a delivered answer into a charged failure
+                # (issue #719 review PRR-001 / F-1).
+                # The answer was fully delivered before the tail stalled; the
+                # stall is a pooling artifact, not a failed generation.
+                logger.debug(
+                    "Streaming tail timed out after [DONE]; the completed "
+                    "generation is unaffected: %s", e
+                )
+                stream_succeeded = True
+                return
             async with self._circuit_breaker._lock:
                 self._circuit_breaker.record_failure()
+            self.last_metrics = {"provider_url": self.base_url, "model": self.model, "status": "timeout"}
             raise LLMError(f"Streaming request timed out after {self.timeout}s") from e
         except httpx.HTTPStatusError as e:
             # Charge the breaker for OUTAGE statuses only (review RP-002,
             # PR #576): ordinary 4xx are input/config errors that would
             # recur on every retry, not provider outages.
+            self.last_metrics = {
+                "provider_url": self.base_url,
+                "model": self.model,
+                "status": "http_error",
+                "status_code": e.response.status_code,
+            }
             if is_outage_status(e.response.status_code):
                 async with self._circuit_breaker._lock:
                     self._circuit_breaker.record_failure()
@@ -1106,11 +1390,41 @@ class LLMClient:
                 f"HTTP error {e.response.status_code}: {response_text}"
             ) from e
         except httpx.RequestError as e:
+            if done_seen:
+                # Defense in depth — unreachable while the drain helper owns
+                # tail errors; see the TimeoutException arm above
+                # (issue #719 review PRR-001 / F-1).
+                # The answer was fully delivered before the tail failed; a
+                # truncated/reset tail is a pooling artifact, not a failed
+                # generation.
+                logger.debug(
+                    "Streaming tail ended with a transport error after "
+                    "[DONE]; the completed generation is unaffected: %s", e
+                )
+                stream_succeeded = True
+                return
             async with self._circuit_breaker._lock:
                 self._circuit_breaker.record_failure()
+            self.last_metrics = {"provider_url": self.base_url, "model": self.model, "status": "request_error"}
             raise LLMError(f"Streaming request failed: {str(e)}") from e
+        except URLBlocked as e:
+            # SSRF request-time re-resolution failure during the streamed
+            # POST: an outage-class transport failure — charge the breaker
+            # and surface LLMError (issue #717).
+            async with self._circuit_breaker._lock:
+                self._circuit_breaker.record_failure()
+            self.last_metrics = {"provider_url": self.base_url, "model": self.model, "status": "url_blocked"}
+            raise LLMError(f"LLM provider URL blocked: {e}") from e
+        except json.JSONDecodeError as e:
+            self.last_metrics = {"provider_url": self.base_url, "model": self.model, "status": "invalid_json"}
+            raise LLMError(f"Failed to parse response JSON: {str(e)}") from e
         finally:
-            _genai_stream_cm.__exit__(*sys.exc_info())
+            if _genai_stream_cm is not None:
+                _genai_stream_cm.__exit__(*sys.exc_info())
+            if _holds_breaker_trial:
+                # Release the HALF_OPEN trial slot on BOTH outcomes — a
+                # wedged slot would reject every later admission (issue #717).
+                self._circuit_breaker.release_trial()
             if stream_succeeded:
                 async with self._circuit_breaker._lock:
                     self._circuit_breaker.record_success()
@@ -1147,12 +1461,15 @@ class LLMClient:
                 # Streaming failed — record a failure metric so the done
                 # payload's llm_metrics does not report a stale/ok value for
                 # a failed turn (mirrors the non-streaming per-error
-                # branches above and in chat_completion). If the SSE-fallback
-                # path already set a more specific status (timeout/http_error/
-                # request_error/circuit_open via chat_completion), preserve it
-                # rather than overwriting with the generic "error".
+                # branches above and in chat_completion). The per-error
+                # handlers above now write their specific statuses
+                # (timeout/http_error/request_error/circuit_open/
+                # url_blocked/invalid_json); preserve those rather than
+                # overwriting with the generic "error". A fresh call's entry
+                # reset leaves "started", which the summary always replaces
+                # (issue #717).
                 _existing_status = (self.last_metrics or {}).get("status", "ok")
-                if _existing_status == "ok":
+                if _existing_status in ("ok", "started"):
                     self.last_metrics = {
                         "provider_url": self.base_url,
                         "model": self.model,

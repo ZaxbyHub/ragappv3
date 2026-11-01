@@ -171,6 +171,8 @@ vi.mock("framer-motion", () => ({
 
 vi.mock("react-router-dom", () => ({
   useNavigate: () => vi.fn(),
+  useInRouterContext: () => false,
+  useLocation: () => ({ pathname: "/" }),
 }));
 
 // Mock MessageBubble and AssistantMessage to render simple divs

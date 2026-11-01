@@ -31,6 +31,7 @@ from app.api.routes.groups import router as groups_router
 from app.api.routes.health import router as health_router
 from app.api.routes.kms import router as kms_router
 from app.api.routes.memories import router as memories_router
+from app.api.routes.onboarding import router as onboarding_router
 from app.api.routes.organizations import router as organizations_router
 from app.api.routes.prompts import router as prompts_router
 from app.api.routes.quality_reports import router as quality_reports_router
@@ -181,6 +182,7 @@ app.include_router(folders_router, prefix="/api")
 app.include_router(service_accounts_router, prefix="/api")
 app.include_router(prompts_router, prefix="/api")
 app.include_router(quality_reports_router, prefix="/api")
+app.include_router(onboarding_router, prefix="/api")
 
 # Register exception handler for validation errors (empty filename)
 app.add_exception_handler(RequestValidationError, validation_exception_handler)

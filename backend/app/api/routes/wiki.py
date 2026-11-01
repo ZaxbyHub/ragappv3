@@ -9,7 +9,7 @@ import json
 import logging
 import sqlite3
 from dataclasses import asdict
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
@@ -87,27 +87,57 @@ async def _require_vault_write(evaluate: Callable, user: dict, vault_id: int) ->
 # ---------------------------------------------------------------------------
 # Request / Response models
 # ---------------------------------------------------------------------------
+# Issue #796: request-model vocabularies mirror the schema CHECK constraints
+# exactly (wiki_pages / wiki_claims, database.py — both DDL occurrences).
+# Values the store always rejected now fail request validation (422) instead
+# of surfacing as SQLite IntegrityError (generic 400 on create, unhandled 500
+# on update). `claim_type` deliberately stays str: wiki_claims has no CHECK
+# on it, so a Literal would invent a vocabulary narrower than the store.
+
+WikiPageTypeName = Literal[
+    "entity", "procedure", "system", "acronym", "qa",
+    "contradiction", "open_question", "overview", "manual",
+]
+WikiPageStatusName = Literal[
+    "draft", "verified", "stale", "needs_review", "archived",
+]
+WikiClaimStatusName = Literal[
+    "active", "contradicted", "superseded", "unverified",
+    "archived", "needs_review",
+]
+WikiClaimSourceTypeName = Literal[
+    "document", "memory", "chat_synthesis", "manual", "mixed",
+]
+# 5-value CHECK vocabulary of wiki_lint_findings.status. The STORE's
+# actionable set (resolved/dismissed/acknowledged, wiki_store.py) is
+# deliberately narrower — users cannot SET open/auto_resolved (issue #791
+# contract, pinned by test_o01_lint_resolve_route.py) — so those two
+# in-vocabulary values still reach the store's ValueError -> 400.
+LintFindingStatusName = Literal[
+    "open", "acknowledged", "resolved", "dismissed", "auto_resolved",
+]
+
 
 class WikiPageCreateRequest(BaseModel):
     vault_id: int
     title: str = Field(..., min_length=1, max_length=500)
-    page_type: str
+    page_type: WikiPageTypeName
     slug: Optional[str] = None
     markdown: str = ""
     summary: str = ""
-    status: str = "draft"
-    confidence: float = 0.0
+    status: WikiPageStatusName = "draft"
+    confidence: float = Field(0.0, ge=0.0, le=1.0)
     parent_id: Optional[int] = None
 
 
 class WikiPageUpdateRequest(BaseModel):
-    title: Optional[str] = None
-    page_type: Optional[str] = None
+    title: Optional[str] = Field(None, min_length=1, max_length=500)
+    page_type: Optional[WikiPageTypeName] = None
     slug: Optional[str] = None
     markdown: Optional[str] = None
     summary: Optional[str] = None
-    status: Optional[str] = None
-    confidence: Optional[float] = None
+    status: Optional[WikiPageStatusName] = None
+    confidence: Optional[float] = Field(None, ge=0.0, le=1.0)
     parent_id: Optional[int] = None
     expected_version: Optional[int] = None
 
@@ -115,34 +145,34 @@ class WikiPageUpdateRequest(BaseModel):
 class WikiClaimCreateRequest(BaseModel):
     vault_id: int
     claim_text: str = Field(..., min_length=1, max_length=2000)
-    source_type: str
+    source_type: WikiClaimSourceTypeName
     page_id: Optional[int] = None
     claim_type: str = "fact"
     subject: Optional[str] = None
     predicate: Optional[str] = None
     object: Optional[str] = None
-    status: str = "active"
-    confidence: float = 0.0
+    status: WikiClaimStatusName = "active"
+    confidence: float = Field(0.0, ge=0.0, le=1.0)
 
 
 class WikiClaimUpdateRequest(BaseModel):
-    claim_text: Optional[str] = None
-    source_type: Optional[str] = None
+    claim_text: Optional[str] = Field(None, min_length=1, max_length=2000)
+    source_type: Optional[WikiClaimSourceTypeName] = None
     page_id: Optional[int] = None
     claim_type: Optional[str] = None
     subject: Optional[str] = None
     predicate: Optional[str] = None
     object: Optional[str] = None
-    status: Optional[str] = None
-    confidence: Optional[float] = None
+    status: Optional[WikiClaimStatusName] = None
+    confidence: Optional[float] = Field(None, ge=0.0, le=1.0)
 
 
 class PromoteMemoryRequest(BaseModel):
     memory_id: int
     vault_id: int
-    page_type: Optional[str] = None
+    page_type: Optional[WikiPageTypeName] = None
     target_page_id: Optional[int] = None
-    status: str = "needs_review"
+    status: WikiPageStatusName = "needs_review"
 
 
 class LintRunRequest(BaseModel):
@@ -154,11 +184,29 @@ class WikiFileAttachRequest(BaseModel):
     file_id: int
 
 
+class WikiPageBulkUpdateFields(BaseModel):
+    """Typed bulk-update payload (issue #796): the same bounds/vocabularies
+    as WikiPageUpdateRequest for every field a bulk caller may set.
+    ``expected_version`` is deliberately excluded (per-page optimistic
+    concurrency has no bulk meaning — mirroring it would flow version-
+    conflict ValueErrors into an unhandled bulk 500), as is
+    ``last_compiled_at`` (compile-internal; in the store's allowed set but
+    never sent by any bulk caller — exposing it would be new surface)."""
+    title: Optional[str] = Field(None, min_length=1, max_length=500)
+    page_type: Optional[WikiPageTypeName] = None
+    slug: Optional[str] = None
+    markdown: Optional[str] = None
+    summary: Optional[str] = None
+    status: Optional[WikiPageStatusName] = None
+    confidence: Optional[float] = Field(None, ge=0.0, le=1.0)
+    parent_id: Optional[int] = None
+
+
 class WikiBulkRequest(BaseModel):
     vault_id: int
     page_ids: list[int] = Field(..., min_length=1)
     action: str = Field(..., description="Action: delete or update")
-    updates: Optional[dict] = None
+    updates: Optional[WikiPageBulkUpdateFields] = None
 
 
 # ---------------------------------------------------------------------------
@@ -466,9 +514,28 @@ async def bulk_wiki_pages(
         count = store.bulk_delete_pages(request.page_ids, request.vault_id)
         return {"action": "delete", "deleted": count}
     elif request.action == "update":
-        if not request.updates:
+        # Issue #796: the typed model is always truthy (even when no field
+        # was set), so the old `if not request.updates` guard is replaced by
+        # an explicit no-fields-set check that preserves BOTH historical 400
+        # shapes: absent `updates` and an empty `{}` payload.
+        fields_set = (
+            request.updates.model_fields_set if request.updates is not None else set()
+        )
+        if not fields_set:
             raise HTTPException(status_code=400, detail="updates field required for update action")
-        pages = store.bulk_update_pages(request.page_ids, request.vault_id, **request.updates)
+        # Same explicit-null semantics as update_wiki_page: a null on a
+        # NOT NULL column is dropped (a no-op) instead of being written and
+        # turning into a store IntegrityError; nullable fields accept null.
+        nullable_update_fields = frozenset({"parent_id", "summary"})
+        updates: Dict[str, object] = {}
+        for field_name in fields_set:
+            value = getattr(request.updates, field_name)
+            if value is None and field_name not in nullable_update_fields:
+                continue
+            updates[field_name] = value
+        if not updates:
+            raise HTTPException(status_code=400, detail="updates field required for update action")
+        pages = store.bulk_update_pages(request.page_ids, request.vault_id, **updates)
         return {"action": "update", "updated": len(pages), "pages": [_as_dict(p) for p in pages]}
     else:
         raise HTTPException(status_code=400, detail=f"Unknown bulk action: {request.action}")
@@ -630,7 +697,8 @@ async def update_wiki_claim(
                     "Cannot auto-activate curator-authored claim: no source "
                     "row references a document file (this claim was likely "
                     "produced from a chat-query or manual-promote curator "
-                    "trigger). Edit the claim and attach a file source, or "
+                    "trigger, or its curator run could not verify a chunk "
+                    "id). Edit the claim and attach a file source, or "
                     "leave it in 'needs_review' status for manual handling."
                 )
             elif not any_quote:
@@ -773,6 +841,15 @@ async def promote_memory_to_wiki(
         logger.exception("Error promoting memory to wiki")
         raise HTTPException(status_code=500, detail="Failed to promote memory to wiki")
 
+    # Issue #723 review (F-8): the compile worker's vault-existence guard
+    # returns a skip shape without page/claims keys when the vault was
+    # deleted mid-flight; the interactive route must answer 404 instead of
+    # KeyErroring on the missing keys.
+    if result.get("skipped"):
+        raise HTTPException(
+            status_code=404, detail=result.get("reason", "vault no longer exists")
+        )
+
     return {
         "page": _page_dict(result["page"]),
         "claims": [_as_dict(c) for c in result["claims"]],
@@ -789,13 +866,19 @@ async def promote_memory_to_wiki(
 async def list_wiki_jobs(
     vault_id: int = Query(...),
     status: Optional[str] = Query(None),
+    # Server-side row bound (#774 / TQ-sweep-B09-01): WikiStore.list_jobs
+    # already accepts a limit; exposing it lets bounded consumers (e.g. the
+    # Maintenance tab's "recent jobs" list) cap the query instead of pulling
+    # the vault's entire job history for a client-side slice. Payload shape
+    # is unchanged — the bound only limits the row count.
+    limit: Optional[int] = Query(None, ge=1, le=500),
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
     evaluate: Callable = Depends(get_evaluate_policy),
 ):
     await _require_vault_read(evaluate, user, vault_id)
     store = WikiStore(db)
-    jobs = store.list_jobs(vault_id, status=status)
+    jobs = store.list_jobs(vault_id, status=status, limit=limit)
     return {"jobs": [_as_dict(j) for j in jobs]}
 
 
@@ -807,7 +890,7 @@ async def wiki_events_stream(
     """SSE stream of terminal-state wiki compile job events for a vault.
 
     Emits ``data: {json}\\n\\n`` lines whenever a wiki compile job finishes
-    (completed / permanently failed). Clients refetch the canonical state via
+    (completed / failed / cancelled). Clients refetch the canonical state via
     the existing REST endpoints on each event. A 15-second keepalive comment
     keeps proxies and load balancers from idling the connection out.
 
@@ -942,6 +1025,33 @@ async def cancel_wiki_job(
             status_code=404,
             detail=f"Job {job_id} not found or not cancellable",
         )
+    # Issue #955: announce the cancellation on the wiki event bus so SSE
+    # consumers refetch — the row settled above is otherwise invisible to
+    # the event-driven UI. Call-time import (the processor's
+    # _publish_event pattern) and best-effort: a fan-out failure must
+    # never fail a settle that already committed.
+    try:
+        from app.services.wiki_events import get_wiki_event_bus
+
+        settled = store.get_job(job_id, vault_id)
+        get_wiki_event_bus().publish(
+            vault_id,
+            {
+                "type": "job_cancelled",
+                "job_id": job_id,
+                "vault_id": vault_id,
+                "trigger_type": (settled.trigger_type if settled else "manual"),
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 — fan-out must never fail the route
+        # PRR-015: keep the cause diagnosable (the sibling fan-out guards
+        # in the processor and the bus all log exc_info=True).
+        logger.warning(
+            "wiki cancel event publish failed for job %s: %s",
+            job_id,
+            exc,
+            exc_info=True,
+        )
     return {"job_id": job_id, "status": "cancelled"}
 
 
@@ -968,12 +1078,46 @@ async def compile_document_wiki(
     if not file_row:
         raise HTTPException(status_code=404, detail=f"File {file_id} not found in vault {vault_id}")
     store = WikiStore(db)
-    job = store.create_job(
-        vault_id=vault_id,
-        trigger_type="ingest",
-        trigger_id=f"file:{file_id}",
-        input_json={"file_id": file_id, "vault_id": vault_id},
-    )
+    # Idempotent re-click (#765): while an ingest job for this file is still
+    # active (pending or running), a second Compile returns the existing job
+    # instead of enqueueing a duplicate. The lookup -> create sequence runs
+    # under BEGIN IMMEDIATE (review round 1, PRR-012: the check-then-act was
+    # not atomic across processes) so a concurrent request cannot observe
+    # "no active job" between this request's lookup and its insert; both
+    # storage arms tolerate the caller-owned transaction (job_lease._write_txn
+    # yields ownership when one is already open, and the legacy arm's commit
+    # releases the write lock after the insert).
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        for active_status in ("pending", "running"):
+            active_jobs = store.list_jobs(
+                vault_id,
+                status=active_status,
+                trigger_type="ingest",
+                trigger_id=f"file:{file_id}",
+                limit=1,
+            )
+            if active_jobs:
+                existing = active_jobs[0]
+                db.commit()
+                return {"job_id": existing.id, "status": existing.status}
+        job = store.create_job(
+            vault_id=vault_id,
+            trigger_type="ingest",
+            trigger_id=f"file:{file_id}",
+            input_json={"file_id": file_id, "vault_id": vault_id},
+        )
+        # Commit before releasing the request connection: the unified-storage
+        # arm inserts under the caller-owned transaction (job_lease._write_txn
+        # yields ownership when one is open) and the production pool ROLLS
+        # BACK a dirty connection at release — without this commit the
+        # created job would be silently discarded (caught by the round-2
+        # check-amendment author; the C2 harness hit the same missing
+        # request-boundary commit).
+        db.commit()
+    except BaseException:
+        db.rollback()
+        raise
     return {"job_id": job.id, "status": job.status}
 
 
@@ -1003,6 +1147,11 @@ async def get_document_wiki_status(
     if latest_job is None:
         wiki_status = "not_compiled"
     elif latest_job.status == "running":
+        wiki_status = "compiling"
+    elif latest_job.status == "pending":
+        # Every job starts pending (wiki_store.create_job); a queued job is a
+        # transient state the frontend must poll to completion, not the
+        # terminal not_compiled it was previously collapsed into (#765).
         wiki_status = "compiling"
     elif latest_job.status == "failed":
         wiki_status = "failed"
@@ -1273,7 +1422,7 @@ async def list_wiki_relations(
 # ---------------------------------------------------------------------------
 
 class LintFindingUpdateRequest(BaseModel):
-    status: str = Field(..., description="New status: resolved, dismissed, or acknowledged")
+    status: LintFindingStatusName = Field(..., description="New status: resolved, dismissed, or acknowledged")
 
 
 @router.post("/wiki/lint/{finding_id}/resolve", status_code=200)

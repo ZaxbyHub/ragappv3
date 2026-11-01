@@ -19,7 +19,22 @@ const { mockListAccessibleVaults } = vi.hoisted(() => ({
 }));
 
 vi.mock("@/lib/api", () => ({
+  // API_BASE_URL is read by useAuthStore (imported by the form for the
+  // principal-scoped brief-template gate, issue #1036 AC2).
+  API_BASE_URL: "/api",
   listAccessibleVaults: mockListAccessibleVaults,
+}));
+
+// The form reads the session principal for its template gate; this suite
+// asserts nothing template-driven, so a signed-out stand-in is fine.
+const { mockAuthState } = vi.hoisted(() => ({
+  mockAuthState: { user: null as { id: number } | null },
+}));
+vi.mock("@/stores/useAuthStore", () => ({
+  useAuthStore: Object.assign(
+    (selector: (s: typeof mockAuthState) => unknown) => selector(mockAuthState),
+    { getState: () => mockAuthState }
+  ),
 }));
 
 // Radix Select cannot be driven in jsdom (no pointer-capture / scrollIntoView).

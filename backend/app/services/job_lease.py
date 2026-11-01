@@ -26,11 +26,223 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 from contextlib import contextmanager
 from typing import Any, Iterator, Optional
 
 logger = logging.getLogger(__name__)
+
+# Issue #953: the stable-code vocabulary that may appear in a jobs-table
+# ``error`` column written by this codebase. Rows written before the
+# redaction work (pre-#951) carry raw ``str(exc)`` text instead; the row
+# mappers mask those at read time (``redact_legacy_error_text``) so vault
+# readers never see them, while the raw text stays in server logs.
+# ``lease_attempt_cap_exceeded`` is the janitor's cap-settle code
+# (``_RECLAIM_SQL_TEMPLATE`` below); ``lease_disabled_rollback`` is the
+# reverse-sync settle code; ``admission rejected:`` is always followed by
+# one of AdmissionRejected.REASONS (a closed set).
+_LEGACY_ERROR_STABLE_PREFIXES = (
+    "COMPILE_FAILED:",
+    "PAYLOAD_MALFORMED:",
+    "lease_attempt_cap_exceeded",
+    "lease_disabled_rollback",
+    # issue #1010: the reindex stall watchdog's settle code — a
+    # no-progress release is a stable server-side reason, never a raw
+    # exception text.
+    "lease_stall_reclaimed",
+    "admission rejected:",
+)
+
+# PRR-001 review fix: ``attempt_cap_exceeded:`` is a COMPOSITION prefix, not
+# a leaf code — the pre-#792 writer wrapped raw ``str(exc)`` in it
+# (``f"attempt_cap_exceeded: {error}"``), so a bare prefix match would pass
+# those historical rows through byte-identically. It is therefore checked
+# remainder-aware: whatever follows must itself be a stable code.
+_ATTEMPT_CAP_PREFIX = "attempt_cap_exceeded:"
+
+# PRR-005 review fix: the #562 ingest vocabulary (document_processor.py) is
+# part of the same stable-code family — the reindex detail composer emits
+# those codes, so a boundary that only knows the wiki/KMS vocabulary would
+# destroy them. Imported lazily: document_processor is a heavy module and
+# job_lease sits below it in the import graph.
+_INGEST_ERROR_STABLE_PREFIXES: tuple[str, ...] = ()
+
+
+def _ingest_error_prefixes() -> tuple[str, ...]:
+    global _INGEST_ERROR_STABLE_PREFIXES
+    if not _INGEST_ERROR_STABLE_PREFIXES:
+        try:
+            from app.services import document_processor as _dp
+
+            _INGEST_ERROR_STABLE_PREFIXES = tuple(
+                sorted(
+                    value
+                    for name, value in vars(_dp).items()
+                    if name.startswith("INGEST_ERROR_")
+                    and isinstance(value, str)
+                    and name != "INGEST_ERROR_MAX_CHARS"
+                )
+            )
+        except Exception:  # pragma: no cover - defensive, keeps the mask safe
+            _INGEST_ERROR_STABLE_PREFIXES = ()
+    return _INGEST_ERROR_STABLE_PREFIXES
+
+
+LEGACY_ERROR_REDACTED = (
+    "REDACTED_LEGACY_ERROR: pre-redaction failure detail withheld; "
+    "see server logs"
+)
+
+
+def _is_stable_error_text(text: str, _depth: int = 0) -> bool:
+    """True when ``text`` is a known stable code (never raw exception text)."""
+    if not text:
+        return True
+    if text.startswith(_LEGACY_ERROR_STABLE_PREFIXES):
+        return True
+    if text.startswith(_ingest_error_prefixes()):
+        return True
+    if text.startswith(_ATTEMPT_CAP_PREFIX) and _depth < 8:
+        # Remainder-aware: only a nested stable code may follow the
+        # composition prefix (PRR-001). Bounded depth — a crafted
+        # deeply-nested column value must not raise out of the read path.
+        return _is_stable_error_text(
+            text[len(_ATTEMPT_CAP_PREFIX):].lstrip(), _depth + 1
+        )
+    return False
+
+
+def redact_legacy_error_text(error) -> Optional[str]:
+    """Mask pre-redaction raw error text on the wiki/KMS job read paths.
+
+    Issue #953: values that are stable codes pass through byte-identically
+    (operators keep the codes they can act on); anything else is a
+    pre-redaction ``str(exc)`` remnant and is replaced with the marker.
+    Read-side only — writers, retries, and the janitor are untouched, and
+    the raw detail remains in the server logs.
+
+    PRR-011 review fix: a non-string column value (SQLite is dynamically
+    typed; a blob or numeric written by any non-Python writer is
+    representable) is masked rather than raising — the read path must not
+    become a crash.
+    """
+    if error is None:
+        return None
+    if not isinstance(error, str):
+        return LEGACY_ERROR_REDACTED
+    if not error:
+        return error
+    if _is_stable_error_text(error):
+        return error
+    return LEGACY_ERROR_REDACTED
+
+
+# PRR-002 review fix: the #958 fix narrowed the curator/compiler WRITERS to
+# class-only, but historical ``result_json`` payloads still carry the raw
+# ``<code>: <Class>: <message>`` strings. Those reach vault readers through
+# the verbatim ``result_json`` field, so the read path masks them too —
+# the same discipline the ``error`` column gets. Only the three #958 sink
+# codes are rewritten; every other payload key/value is preserved and the
+# original string is returned byte-identical when nothing needs masking.
+_DETAIL_ENTRY_SHAPE = re.compile(r"^(file_id=\d+: )(.*)$", re.DOTALL)
+
+_RESULT_JSON_LEGACY_ERROR_RE = re.compile(
+    r"^(transport_error|orchestration_error|persist_error|lint_persist_error"
+    r"|ssrf_blocked)"
+    r": [A-Za-z_][A-Za-z0-9_.]*: .+$"
+)
+
+
+def _mask_legacy_error_string(value: str) -> str:
+    """Drop the message tail from a legacy curator/compiler error string."""
+    code, sep, rest = value.partition(": ")
+    if not sep:
+        return value
+    cls, sep2, _msg = rest.partition(": ")
+    if not sep2:
+        return value
+    return f"{code}: {cls}"
+
+
+def redact_legacy_detail_entry(entry: object) -> str:
+    """Mask one ``result["details"]`` entry (the reindex legacy-persist shape).
+
+    PRR-005/PRR-007: the stable-code check runs on the message part AFTER the
+    ``file_id=<id>: `` prefix — a composed-clean entry
+    (``file_id=5: PARSE_FAILED: ...``) passes byte-identically; an entry
+    without that shape, or one whose message part carries no stable code,
+    maps to the ``file_id=<id>: <marker>`` form (or the bare marker for
+    shape-less entries). Entry count, ordering and result keys are unchanged.
+    """
+    text = entry if isinstance(entry, str) else str(entry)
+    match = _DETAIL_ENTRY_SHAPE.match(text)
+    if match is None:
+        return redact_legacy_error_text(text) or LEGACY_ERROR_REDACTED
+    prefix, message = match.group(1), match.group(2)
+    redacted = redact_legacy_error_text(message)
+    if not redacted:
+        redacted = LEGACY_ERROR_REDACTED
+    return f"{prefix}{redacted}"
+
+
+def redact_legacy_result_json(result_json) -> Optional[str]:
+    """Mask pre-redaction raw error strings inside a stored ``result_json``.
+
+    Issue #953/#958 review fix (PRR-002/PRR-007): parses the stored payload
+    and rewrites only the reader-visible error strings that still carry raw
+    text — the curator/compiler ``errors`` lists (``<code>: <Class>: <msg>``,
+    nested under ``curator`` or at the top level) and the reindex
+    legacy-persist ``details`` list (``file_id=<id>: <raw str(exc)>``). Rows
+    without such an entry are returned byte-identical so clean payloads never
+    change shape. Non-dict or unparseable payloads are returned unchanged
+    (nothing reader-sensitive to mask).
+    """
+    if not result_json or not isinstance(result_json, str):
+        return result_json
+    if "error" not in result_json:
+        return result_json
+    try:
+        payload = json.loads(result_json)
+    except (TypeError, ValueError, RecursionError):
+        return result_json
+    if not isinstance(payload, dict):
+        return result_json
+
+    changed = False
+    curator = payload.get("curator")
+    # (container, key, masker) — curator errors are nested; details and any
+    # top-level errors list are on the payload root.
+    targets = [(payload, "details", redact_legacy_detail_entry)]
+    if isinstance(curator, dict):
+        targets.append((curator, "errors", _mask_legacy_error_string))
+    targets.append((payload, "errors", _mask_legacy_error_string))
+
+    for container, key, masker in targets:
+        entries = container.get(key)
+        if not isinstance(entries, list):
+            continue
+        if masker is _mask_legacy_error_string:
+            masked = [
+                masker(entry)
+                if isinstance(entry, str)
+                and _RESULT_JSON_LEGACY_ERROR_RE.match(entry)
+                else entry
+                for entry in entries
+            ]
+        else:
+            masked = [
+                masker(entry) if isinstance(entry, str) else entry
+                for entry in entries
+            ]
+        if masked != entries:
+            container[key] = masked
+            changed = True
+
+    if not changed:
+        return result_json
+    return json.dumps(payload)
+
 
 _JOBS_TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -48,7 +260,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     started_at TIMESTAMP,
     heartbeat_at TIMESTAMP,
-    completed_at TIMESTAMP
+    completed_at TIMESTAMP,
+    progress_at TIMESTAMP
 )
 """
 
@@ -70,6 +283,12 @@ ON jobs(status, heartbeat_at) WHERE status = 'running'
 # reclaim. Only allowlisted table/column fragments are interpolated. The
 # {error_col} fragment is the table's single error column ("error" on jobs;
 # "error_code" on draft_jobs, which splits error into code+message).
+# Issue #1010: the expiry predicate is a PARENTHESIZED group with the queue
+# filter OUTSIDE it — the age arm (dead heartbeat) ORs with the stall arm
+# (live-but-no-progress watermark, present only on shapes that carry a
+# progress_at column), so the stall arm can never bypass the queue filter.
+# A wedged-but-heartbeating worker matches the stall arm; a dead worker
+# matches the age arm; both settle identically (requeue, or cap-fail).
 _RECLAIM_SQL_TEMPLATE = """
 UPDATE {table}
 SET status = CASE
@@ -84,28 +303,56 @@ SET status = CASE
     worker_id = NULL,
     lease_generation = lease_generation + 1,
     {reclaim_started_at_set},
+    {reclaim_completed_at_set},
     heartbeat_at = NULL
-WHERE status = 'running'
-  AND heartbeat_at IS NOT NULL
-  AND heartbeat_at < datetime('now', ?)
-  AND {queue_column} = COALESCE(?, {queue_column})
+WHERE {queue_column} = COALESCE(?, {queue_column})
+  AND status = 'running'
+  AND (
+        (heartbeat_at IS NOT NULL AND heartbeat_at < datetime('now', ?))
+        {stall_arm}
+      )
 """
 
+# The stall arm fragment (issue #1010): interpolated only for shapes whose
+# table carries the progress watermark column. The leading OR is part of
+# the fragment so shapes without it collapse to today's single predicate.
+# Both sides carry millisecond precision: a second-granular datetime('now')
+# next to a %f stamp would fire the arm up to a second early (issue #1010).
+_STALL_ARM_FRAGMENT = (
+    " OR (progress_at IS NOT NULL AND progress_at < "
+    "strftime('%Y-%m-%d %H:%M:%f', 'now', ?))"
+)
 
-def _reclaim_sql(shape: _TableShape, table: str) -> str:
+
+def _reclaim_sql(
+    shape: _TableShape,
+    table: str,
+    stall_arm: str = "",
+) -> str:
     return _RECLAIM_SQL_TEMPLATE.format(
         table=table,
         queue_column=shape.queue_column,
         error_col="error_code" if shape.error_set.startswith("error_code") else "error",
         reclaim_started_at_set=shape.reclaim_started_at_set,
+        reclaim_completed_at_set=shape.reclaim_completed_at_set,
+        stall_arm=stall_arm,
     )
+
+
+def _jobs_column_names(conn: sqlite3.Connection) -> set[str]:
+    """The ``jobs`` table's current column names (pragma table_info)."""
+    return {str(row[1]) for row in conn.execute("PRAGMA table_info(jobs)")}
 
 
 def ensure_jobs_schema(conn: sqlite3.Connection) -> None:
     """Create the shared ``jobs`` table and its indexes if absent.
 
     Idempotent (``IF NOT EXISTS``) and safe to run on every boot; commits only
-    when it opened the transaction itself.
+    when it opened the transaction itself. Issue #1010: pre-existing
+    deployments gain the ``progress_at`` watermark column through a guarded
+    ``ALTER TABLE`` (idempotent via pragma table_info — the database.py
+    guarded-ALTER precedent); NULL watermark rows simply never match the
+    stall arm.
     """
     statements = (
         _JOBS_TABLE_DDL,
@@ -118,6 +365,8 @@ def ensure_jobs_schema(conn: sqlite3.Connection) -> None:
     try:
         for statement in statements:
             conn.execute(statement)
+        if "progress_at" not in _jobs_column_names(conn):
+            conn.execute("ALTER TABLE jobs ADD COLUMN progress_at TIMESTAMP")
     except BaseException:
         if owned:
             conn.rollback()
@@ -146,12 +395,29 @@ class _TableShape:
         error_set: str,
         supports_enqueue: bool,
         reclaim_started_at_set: str = "started_at = NULL",
+        # PRR-010: the cap-failed settle stamps completed_at (the boot
+        # reconcile and every terminal reader key on it); the pending arm
+        # preserves the existing value. Tables without the column no-op.
+        reclaim_completed_at_set: str = "completed_at = completed_at",
+        # Issue #1010: the stall-arm WHERE fragment, interpolated only for
+        # shapes whose table carries the progress_at watermark column; the
+        # default empty string collapses the expiry group to the age arm.
+        stall_arm: str = "",
+        # Issue #1010 review: the claim-time progress reset, interpolated
+        # only for shapes whose table carries progress_at. Without it a
+        # re-claimed row carries its OLD stale watermark until the run's
+        # entry stamp lands, so a janitor sweep or watchdog probe in that
+        # claim→stamp window can burn an attempt on a freshly claimed job.
+        claim_progress_reset: str = "",
     ) -> None:
         self.queue_column = queue_column
         self.has_run_after = has_run_after
         self.error_set = error_set
         self.supports_enqueue = supports_enqueue
         self.reclaim_started_at_set = reclaim_started_at_set
+        self.reclaim_completed_at_set = reclaim_completed_at_set
+        self.stall_arm = stall_arm
+        self.claim_progress_reset = claim_progress_reset
 
 
 # The table allowlist (issue #559 stage 4, plan-critic MAJOR-2: one primitive,
@@ -165,12 +431,33 @@ _TABLE_SHAPES: dict[str, _TableShape] = {
         has_run_after=True,
         error_set="error = ?,",
         supports_enqueue=True,
+        # PRR-010: cap-failed rows carry a completed_at stamp so the #955
+        # boot reconcile (completed_at IS NOT NULL) sees them.
+        reclaim_completed_at_set=(
+            "completed_at = CASE WHEN ? IS NOT NULL AND attempts >= ? "
+            "THEN CURRENT_TIMESTAMP ELSE completed_at END"
+        ),
+        # Issue #1010: jobs carries the progress_at watermark, so its
+        # reclaim carries the stall arm and its claim resets the watermark
+        # (each attempt's stall baseline is claim-time, never a prior
+        # attempt's stale watermark).
+        stall_arm=_STALL_ARM_FRAGMENT,
+        claim_progress_reset=(
+            ", progress_at = strftime('%Y-%m-%d %H:%M:%f', 'now')"
+        ),
     ),
     "draft_jobs": _TableShape(
         queue_column="job_type",
         has_run_after=False,
         error_set="error_code = ?,",
         supports_enqueue=False,
+        # draft_jobs carries completed_at too (database.py), so it takes the
+        # same CASE fragment — the reclaim statement's placeholder count must
+        # match its shape's fragments for EVERY allowlisted table.
+        reclaim_completed_at_set=(
+            "completed_at = CASE WHEN ? IS NOT NULL AND attempts >= ? "
+            "THEN CURRENT_TIMESTAMP ELSE completed_at END"
+        ),
         # Deadline continuation (issue #516 DRAFT-013): a reclaim must NOT
         # clear started_at — the resumed run keeps burning the original
         # wall-clock budget instead of being re-granted a full timeout.
@@ -216,6 +503,7 @@ class JobLease:
         table: str = "jobs",
         claim_order: str = "id ASC",
         claim_started_at: str = "CURRENT_TIMESTAMP",
+        stall_timeout_seconds: Optional[float] = None,
     ) -> None:
         shape = _TABLE_SHAPES.get(table)
         if shape is None:
@@ -235,6 +523,11 @@ class JobLease:
         self._conn = conn
         self._reclaim_timeout_seconds = float(reclaim_timeout_seconds)
         self._max_attempts = max_attempts
+        self._stall_timeout_seconds = (
+            None
+            if stall_timeout_seconds is None
+            else float(stall_timeout_seconds)
+        )
         self._table = table
         self._shape = shape
         self._claim_order = claim_order
@@ -244,10 +537,12 @@ class JobLease:
     def _write_txn(self) -> Iterator[bool]:
         """``BEGIN IMMEDIATE`` when we hold the connection's transaction.
 
-        Production pool connections run autocommit and test connections run
-        default isolation; a caller that already has a transaction open keeps
-        ownership (the single-statement writes below are atomic regardless).
-        Yields whether WE own the transaction (and therefore commit it).
+        Pooled production connections use sqlite3's default deferred
+        isolation (a write opens an implicit transaction), and test
+        connections may already sit in a caller-owned transaction; a caller
+        that has a transaction open keeps ownership (the single-statement
+        writes below are atomic regardless). Yields whether WE own the
+        transaction (and therefore commit it).
         """
         if self._conn.in_transaction:
             yield False
@@ -353,7 +648,7 @@ class JobLease:
                     lease_generation = lease_generation + 1,
                     attempts = attempts + 1,
                     started_at = {self._claim_started_at},
-                    heartbeat_at = CURRENT_TIMESTAMP
+                    heartbeat_at = CURRENT_TIMESTAMP{self._shape.claim_progress_reset}
                 WHERE id = (
                     SELECT id FROM {self._table}
                     WHERE {self._shape.queue_column} = ?
@@ -420,6 +715,21 @@ class JobLease:
             done = cur.rowcount > 0
         return done
 
+    def cancel(self, job_id: int, worker_id: str, reason: str = "cancelled") -> bool:
+        """Fenced terminal cancellation (issue #783); ``False`` (and no
+        mutation) when the lease was lost or already settled. Mirrors
+        ``fail`` but lands ``status='cancelled'`` — a cancelled ingest must
+        never be requeued by the retry scheduler."""
+        with self._write_txn():
+            cur = self._conn.execute(
+                f"UPDATE {self._table} SET status = 'cancelled', {self._shape.error_set} "  # nosec B608 - allowlist fragments only
+                "completed_at = CURRENT_TIMESTAMP, heartbeat_at = CURRENT_TIMESTAMP "
+                "WHERE id = ? AND worker_id = ? AND status = 'running'",
+                (reason, job_id, worker_id),
+            )
+            done = cur.rowcount > 0
+        return done
+
     def requeue(
         self,
         job_id: int,
@@ -466,11 +776,18 @@ class JobLease:
 
     def release(self, job_id: int, worker_id: str) -> bool:
         """Fenced graceful-shutdown release: give the job up immediately
-        (back to ``pending``) instead of waiting out the reclaim timeout."""
+        (back to ``pending``) instead of waiting out the reclaim timeout.
+
+        The attempt this claim burned is refunded (issue #702 / P02-SK2-11):
+        a graceful handback is not a failure, so it must not consume durable
+        retry budget. Genuine failures settle through ``requeue``/``fail``,
+        which keep ``attempts`` by design.
+        """
         with self._write_txn():
             cur = self._conn.execute(
                 f"UPDATE {self._table} SET status = 'pending', worker_id = NULL, "  # nosec B608 - table is an allowlist value
-                "lease_generation = lease_generation + 1, heartbeat_at = NULL "
+                "lease_generation = lease_generation + 1, "
+                "attempts = MAX(attempts - 1, 0), heartbeat_at = NULL "
                 "WHERE id = ? AND worker_id = ? AND status = 'running'",
                 (job_id, worker_id),
             )
@@ -484,20 +801,39 @@ class JobLease:
         to ``pending`` (generation bumped, worker cleared) — or terminally to
         ``failed`` when this lease was constructed with ``max_attempts`` and
         the row is at/over the cap. Returns the number of rows settled.
+
+        Issue #1010: when constructed with ``stall_timeout_seconds`` on a
+        shape carrying the progress watermark, a ``running`` row whose
+        ``progress_at`` is older than the stall budget is ALSO settled —
+        a live-but-wedged worker (fresh heartbeat, zero per-file progress)
+        can no longer hold its lease forever.
         """
         cutoff = f"-{self._reclaim_timeout_seconds} seconds"
+        stall_armed = (
+            self._stall_timeout_seconds is not None and self._shape.stall_arm
+        )
+        stall_cutoff = (
+            f"-{self._stall_timeout_seconds} seconds" if stall_armed else None
+        )
+        params = [
+            self._max_attempts,
+            self._max_attempts,
+            self._max_attempts,
+            self._max_attempts,
+            self._max_attempts,
+            self._max_attempts,
+            queue,
+            cutoff,
+        ]
+        if stall_cutoff is not None:
+            params.append(stall_cutoff)
+        sql = _reclaim_sql(
+            self._shape,
+            self._table,
+            stall_arm=_STALL_ARM_FRAGMENT if stall_armed else "",
+        )
         with self._write_txn():
-            cur = self._conn.execute(
-                _reclaim_sql(self._shape, self._table),
-                (
-                    self._max_attempts,
-                    self._max_attempts,
-                    self._max_attempts,
-                    self._max_attempts,
-                    cutoff,
-                    queue,
-                ),
-            )
+            cur = self._conn.execute(sql, params)
             settled = cur.rowcount
         if settled:
             logger.debug(

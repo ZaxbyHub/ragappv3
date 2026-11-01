@@ -134,7 +134,10 @@ class AgenticPlanner:
                 decision["action"] == "retrieve_more"
                 and rounds < self._max_rounds
             ):
-                sub_query = decision.get("sub_query", current_query)
+                # T1-35-K-13 (#715): a retrieve_more decision may omit
+                # sub_query (or send it empty) — the documented fallback is
+                # the current query, never an empty-string retrieval.
+                sub_query = decision.get("sub_query") or current_query
                 sub_queries_used.append(sub_query)
 
                 retrieval_result = await retrieval_tool.execute(

@@ -8,7 +8,9 @@
  *     tolerating both array and {versions:[...]} shapes.
  *   - AttachmentsSection lazy-fetches getWikiPageFiles; empty -> empty state.
  *   - BacklinksSection lazy-fetches getWikiPageBacklinks and renders entries.
- *   - A rejected fetch is swallowed to [] and shows the empty state.
+ *   - A rejected fetch renders a failure line, not the empty verdict
+ *     (issue #774 / TQ-sibling-batch-08-04: a failed load must not read as
+ *     "no history / no attachments / no backlinks").
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import {
@@ -256,25 +258,35 @@ describe("WikiPageDetail BacklinksSection", () => {
 });
 
 describe("WikiPageDetail fetch error handling", () => {
-  it("swallows a rejected versions fetch and shows the empty state", async () => {
+  // Issue #774 (TQ-sibling-batch-08-04): these two tests previously pinned
+  // the swallow-to-empty behavior the issue classifies as the defect — a
+  // rejected fetch rendered the same "nothing here" text a genuinely empty
+  // result would. They now pin the failure line instead.
+  it("shows a failure line, not the empty verdict, when the versions fetch rejects", async () => {
     mockGetVersions.mockRejectedValue(new Error("network down"));
     renderDetail();
     fireEvent.click(screen.getByText("Version History"));
 
     await waitFor(() => expect(mockGetVersions).toHaveBeenCalledTimes(1));
     expect(
-      await screen.findByText("No version history available."),
+      await screen.findByText("Failed to load version history."),
     ).toBeInTheDocument();
+    expect(
+      screen.queryByText("No version history available."),
+    ).not.toBeInTheDocument();
   });
 
-  it("swallows a rejected backlinks fetch and shows the empty state", async () => {
+  it("shows a failure line, not the empty verdict, when the backlinks fetch rejects", async () => {
     mockGetBacklinks.mockRejectedValue(new Error("boom"));
     renderDetail();
     fireEvent.click(screen.getByText("Backlinks"));
 
     await waitFor(() => expect(mockGetBacklinks).toHaveBeenCalledTimes(1));
     expect(
-      await screen.findByText("No pages link to this page."),
+      await screen.findByText("Failed to load backlinks."),
     ).toBeInTheDocument();
+    expect(
+      screen.queryByText("No pages link to this page."),
+    ).not.toBeInTheDocument();
   });
 });

@@ -80,6 +80,21 @@ def _cleanup_store(store: MemoryStore, path: str) -> None:
     os.remove(path)
 
 
+def _embed_rows(store: MemoryStore, *records) -> None:
+    """Embed rows via the caller-loop helper (issue #712: add_memory no
+    longer embeds inline — production async callers follow up with
+    embed_and_store; these sync tests mirror that with asyncio.run)."""
+    for rec in records:
+        asyncio.run(store.embed_and_store(rec.id, rec.content))
+
+
+def _search_with_query_embedding(store: MemoryStore, query: str, **kwargs):
+    """Mirror of the production call pattern (issue #712): precompute the
+    query embedding on the caller's loop, then run the sync search with it."""
+    query_embedding = asyncio.run(store.embedding_service.embed_single(query))
+    return store.search_memories(query, query_embedding=query_embedding, **kwargs)
+
+
 class TestHybridFallbacks(unittest.TestCase):
     def test_fts_only_when_no_embedding_service(self):
         store, path = _make_store(embedding_service=None)
@@ -178,14 +193,17 @@ class TestHybridSemanticPath(unittest.TestCase):
             # Memory phrasing uses "summary" + "concise"; query uses
             # "report" + "brief". No lexical overlap → FTS misses, dense
             # hits via the synonym map.
-            store.add_memory(
+            rec_a = store.add_memory(
                 "User likes concise summary writing", category="pref", vault_id=1
             )
-            store.add_memory(
+            rec_b = store.add_memory(
                 "Project deadline is next Monday", category="task", vault_id=1
             )
+            _embed_rows(store, rec_a, rec_b)
 
-            results = store.search_memories("brief report style", limit=5, vault_id=1)
+            results = _search_with_query_embedding(
+                store, "brief report style", limit=5, vault_id=1
+            )
             self.assertTrue(results, "expected at least one hybrid match")
             # The first memory should appear in the result set even though
             # the query shares NO tokens with it.
@@ -217,15 +235,16 @@ class TestHybridSemanticPath(unittest.TestCase):
             # A: lexical FTS hit for the single-token query "brief" — so the FTS
             # candidate set is non-empty (the condition under which the old code
             # restricted dense to those ids).
-            store.add_memory("brief notes draft", category="task", vault_id=1)
+            rec_a = store.add_memory("brief notes draft", category="task", vault_id=1)
             # B: semantic-only — shares NO token with "brief", but its concepts
             # ("concise"→brief dim) make it a strong dense match.
-            store.add_memory("concise summary writing", category="pref", vault_id=1)
+            rec_b = store.add_memory("concise summary writing", category="pref", vault_id=1)
+            _embed_rows(store, rec_a, rec_b)
 
             # Query "brief" (single token): FTS matches only A, while dense (now
             # unfiltered) also finds B. On the old FTS-gated code, dense was
             # restricted to [A] and B was dropped — this assertion would fail.
-            results = store.search_memories("brief", limit=5, vault_id=1)
+            results = _search_with_query_embedding(store, "brief", limit=5, vault_id=1)
             contents = [r.content for r in results]
             self.assertTrue(
                 any("summary writing" in c for c in contents),
@@ -238,22 +257,35 @@ class TestHybridSemanticPath(unittest.TestCase):
         embedder = _StubEmbedder()
         store, path = _make_store(embedding_service=embedder)
         try:
-            store.add_memory("citation evidence policy", vault_id=1)
-            store.add_memory("unrelated meeting note", vault_id=1)
+            rec_a = store.add_memory("citation evidence policy", vault_id=1)
+            rec_b = store.add_memory("unrelated meeting note", vault_id=1)
+            _embed_rows(store, rec_a, rec_b)
             # Query shares the lexical "citation" term AND maps to the
             # "evidence" concept dimension, so both paths match.
-            results = store.search_memories("citation policy", limit=5, vault_id=1)
+            results = _search_with_query_embedding(
+                store, "citation policy", limit=5, vault_id=1
+            )
             self.assertTrue(results)
             self.assertEqual(results[0].score_type, "rrf")
         finally:
             _cleanup_store(store, path)
 
     def test_update_memory_clears_and_refreshes_embedding(self):
+        # Caller-driven halves since issue #712: add_memory and
+        # update_memory_content no longer embed inline (the sync->async
+        # bridge is gone); production callers follow up with embed_and_store
+        # on their own loop, which this test now mirrors explicitly.
         embedder = _StubEmbedder()
         store, path = _make_store(embedding_service=embedder)
         try:
             rec = store.add_memory("brief weekly summary", vault_id=1)
-            # Confirm embedding stored.
+            # Insert leaves the row un-embedded until the caller embeds.
+            with closing(sqlite3.connect(path)) as conn:
+                row = conn.execute(
+                    "SELECT embedding FROM memories WHERE id = ?", (rec.id,)
+                ).fetchone()
+                self.assertIsNone(row[0])
+            _embed_rows(store, rec)
             with closing(sqlite3.connect(path)) as conn:
                 row = conn.execute(
                     "SELECT embedding FROM memories WHERE id = ?", (rec.id,)
@@ -261,7 +293,18 @@ class TestHybridSemanticPath(unittest.TestCase):
                 self.assertIsNotNone(row[0])
                 first_emb = json.loads(row[0])
 
+            # Update resets the embedding to NULL...
             store.update_memory_content(rec.id, "weekly format guideline")
+            with closing(sqlite3.connect(path)) as conn:
+                row = conn.execute(
+                    "SELECT content, embedding FROM memories WHERE id = ?", (rec.id,)
+                ).fetchone()
+                self.assertEqual(row[0], "weekly format guideline")
+                self.assertIsNone(row[1])
+            # ...and the caller refreshes it (content-matched vector).
+            asyncio.run(
+                store.embed_and_store(rec.id, "weekly format guideline")
+            )
             with closing(sqlite3.connect(path)) as conn:
                 row = conn.execute(
                     "SELECT content, embedding FROM memories WHERE id = ?", (rec.id,)

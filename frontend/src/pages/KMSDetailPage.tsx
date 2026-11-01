@@ -25,6 +25,7 @@ import {
   type KMSEntry,
 } from "@/lib/api";
 import { MarkdownMessage } from "@/components/chat/MarkdownMessage";
+import { PageTitleHeader } from "@/components/layout/PageTitleHeader";
 
 const STATUS_VALUES = ["draft", "published", "archived"] as const;
 
@@ -144,8 +145,8 @@ export default function KMSDetailPage() {
     <ScrollArea className="h-full">
       <div className="flex flex-col gap-4 p-6 max-w-3xl mx-auto">
         {/* Header */}
-        <div className="flex items-start justify-between gap-2">
-          <div className="flex items-center gap-2">
+        <PageTitleHeader
+          before={
             <Button
               variant="ghost"
               size="icon"
@@ -154,73 +155,75 @@ export default function KMSDetailPage() {
             >
               <ArrowLeft className="w-4 h-4" />
             </Button>
-            <div>
-              {editing ? (
-                <>
-                  <label htmlFor="kms-edit-title" className="sr-only">
-                    Title
-                  </label>
-                  <Input
-                    id="kms-edit-title"
-                    value={title}
-                    onChange={(e) => setTitle(e.target.value)}
-                    className="text-lg font-semibold"
-                  />
-                </>
-              ) : (
-                <h1 className="text-lg font-semibold">{entry.title}</h1>
-              )}
-              <p className="text-xs text-muted-foreground">{entry.slug}</p>
-            </div>
-          </div>
-          <div className="flex gap-1">
-            {entry.source_type === "document" && entry.file_id != null && (
-              <Button variant="outline" size="sm" onClick={handleDownload}>
-                <Download className="w-4 h-4 mr-1" />
-                Source
-              </Button>
-            )}
-            {editing ? (
+          }
+          title={
+            editing ? (
               <>
-                <Button variant="outline" size="sm" onClick={handleSave} disabled={saving}>
-                  <Save className="w-4 h-4 mr-1" />
-                  {saving ? "Saving…" : "Save"}
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  aria-label="Cancel edit"
-                  onClick={() => {
-                    setEditing(false);
-                    setTitle(entry.title);
-                    setBody(entry.body);
-                    setSummary(entry.summary);
-                    setTags(entry.tags.join(", "));
-                    setStatus(entry.status);
-                  }}
-                >
-                  <X className="w-4 h-4" />
-                </Button>
+                <label htmlFor="kms-edit-title" className="sr-only">
+                  Title
+                </label>
+                <Input
+                  id="kms-edit-title"
+                  value={title}
+                  onChange={(e) => setTitle(e.target.value)}
+                  className="text-lg font-semibold"
+                />
               </>
             ) : (
-              <>
-                <Button variant="outline" size="sm" onClick={() => setEditing(true)}>
-                  <Edit className="w-4 h-4 mr-1" />
-                  Edit
+              entry.title
+            )
+          }
+          description={<span className="text-xs">{entry.slug}</span>}
+          actions={
+            <>
+              {entry.source_type === "document" && entry.file_id != null && (
+                <Button variant="outline" size="sm" onClick={handleDownload}>
+                  <Download className="w-4 h-4 mr-1" />
+                  Source
                 </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={handleDelete}
-                  aria-label="Delete entry"
-                  className="text-destructive hover:text-destructive"
-                >
-                  <Trash2 className="w-4 h-4" />
-                </Button>
-              </>
-            )}
-          </div>
-        </div>
+              )}
+              {editing ? (
+                <>
+                  <Button variant="outline" size="sm" onClick={handleSave} disabled={saving}>
+                    <Save className="w-4 h-4 mr-1" />
+                    {saving ? "Saving…" : "Save"}
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    aria-label="Cancel edit"
+                    onClick={() => {
+                      setEditing(false);
+                      setTitle(entry.title);
+                      setBody(entry.body);
+                      setSummary(entry.summary);
+                      setTags(entry.tags.join(", "));
+                      setStatus(entry.status);
+                    }}
+                  >
+                    <X className="w-4 h-4" />
+                  </Button>
+                </>
+              ) : (
+                <>
+                  <Button variant="outline" size="sm" onClick={() => setEditing(true)}>
+                    <Edit className="w-4 h-4 mr-1" />
+                    Edit
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={handleDelete}
+                    aria-label="Delete entry"
+                    className="text-destructive hover:text-destructive"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                  </Button>
+                </>
+              )}
+            </>
+          }
+        />
 
         {/* Meta */}
         <div className="flex gap-2 flex-wrap items-center">

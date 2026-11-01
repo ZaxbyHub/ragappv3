@@ -209,6 +209,9 @@ CREATE TABLE vault_group_access (
 CREATE TABLE group_members (
     group_id INTEGER NOT NULL, user_id INTEGER NOT NULL
 );
+CREATE TABLE groups (
+    id INTEGER PRIMARY KEY, org_id INTEGER NOT NULL
+);
 CREATE TABLE org_members (
     org_id INTEGER NOT NULL, user_id INTEGER NOT NULL, role TEXT NOT NULL
 );

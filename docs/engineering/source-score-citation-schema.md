@@ -77,10 +77,16 @@ Retrieval relevance (`score`/`score_type`), textual support
   retrieved document may have a newer version in the vault). Surfaced in the
   done payload on **both** stream and non-stream paths.
 - `citation_confidence` — per-label citation support scores from the engine's
-  citation validator (`Dict[str, float]`, e.g. `{"S1": 0.9}`). Surfaced on
-  **both** stream and non-stream paths (issue #688 completed the non-stream
-  parity; the response field is pass-typed — the engine's payload shape is
-  the contract).
+  citation validator (`Dict[str, float]`, e.g. `{"S1": 0.9}`). Since issue
+  #714 the dict spans every cited label family: `[S#]` document scores plus
+  `[M#]`/`[W#]`/`[K#]` scores computed against the evidence body the prompt
+  rendered (memory `content`, wiki `claim_text or excerpt`, KMS
+  `excerpt or summary`). Key presence is registry-gated: a label scores only
+  when it was cited AND its evidence was offered, so a cited `[W3]` with no
+  offered W3 evidence has no key at all (a zero overlap, by contrast, scores
+  `0.0`). Surfaced on **both** stream and non-stream paths (issue #688
+  completed the non-stream parity; the response field is pass-typed — the
+  engine's payload shape is the contract).
 - `unverifiable_claims: string[]` — answer sentences the engine could not tie
   to any citation. Surfaced on **both** stream and non-stream paths (issue
   #688).
@@ -95,9 +101,13 @@ Present when the request's `citation_mode` is `"required"`:
 {"mode": "required", "status": "satisfied" | "missing_citations", "detail": "…"}
 ```
 
-`missing_citations` means the answer contained no valid citation labels while
-citable sources existed — the response is flagged, never silently returned as
-an ordinary uncited answer.
+`missing_citations` means the answer's citation labels did not resolve
+against what was actually offered, while citable evidence (documents,
+memories, wiki, or KMS entries) existed: either no valid citation label was
+found, or the answer cited labels that were never offered (phantom labels,
+named in `detail`). The response is flagged, never silently returned as an
+ordinary uncited answer. With zero citable evidence offered, the status is
+`satisfied` (there is nothing citations could be required against).
 
 ## Request controls
 
@@ -112,8 +122,10 @@ previous behavior):
   accepted arbitrary strings and ignored them; they are now Literal-validated,
   so a caller passing an unsupported value (e.g. `"hybrid"`) gets a 422
   instead of silent no-op behavior.
-- `citation_mode: "enabled" | "disabled" | "required"` — `disabled` removes
-  the citation instruction from the prompt; `required` strengthens it and
+- `citation_mode: "enabled" | "disabled" | "required"` — `disabled` strips the
+  citation instruction block when present and appends an explicit
+  no-citations directive (so the mode takes effect on any prompt chain,
+  including stored custom overrides); `required` strengthens it and
   enables the `citation_enforcement` field. Unknown values are rejected (422)
   (same Literal tightening as above). Both controls apply on the standard
   pipeline AND the agentic path (`agentic_rag_enabled=True`): the agentic

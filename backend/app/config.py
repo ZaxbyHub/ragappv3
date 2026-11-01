@@ -3,11 +3,12 @@ Application configuration using Pydantic Settings.
 """
 
 import logging
+import math
 import warnings
 from pathlib import Path
-from typing import Annotated, Mapping, Optional
+from typing import Annotated, Literal, Mapping, Optional, Union
 
-from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic import Field, PrivateAttr, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from app.services.document_artifacts import RASTER_IMAGE_EXTENSIONS
@@ -19,6 +20,15 @@ logger = logging.getLogger(__name__)
 # reject_insecure_defaults to REFUSE unchanged secrets: the comparison IS the
 # security guard, so B105 is suppressed at this single definition site.
 _INSECURE_DEFAULT_JWT_SECRET = "change-me-to-a-random-64-char-string"  # nosec B105 — intentional placeholder constant used only to detect unchanged defaults
+
+# The well-known insecure default admin token (issue #1001, Item A). The exact
+# literal is published in this repository (docs/tests), so in single-admin mode
+# it is both a public sole credential and public audit-HMAC key material via
+# derive_audit_key's fallback. Compared against in reject_insecure_defaults to
+# REFUSE the unchanged literal: the comparison IS the security guard, so B105
+# is suppressed at this single definition site (twin inline literals live in
+# main.py's startup warning and deps.py's defense-in-depth guard).
+_INSECURE_DEFAULT_ADMIN_TOKEN = "admin-secret-token"  # nosec B105 — intentional placeholder constant used only to detect unchanged defaults
 
 
 # Legacy → new settings-field migration table (issue #494 CONFIG-004).
@@ -33,6 +43,24 @@ LEGACY_SETTINGS_CONVERSIONS: tuple[tuple[str, str, int], ...] = (
     ("chunk_overlap", "chunk_overlap_chars", 4),
     ("vector_top_k", "retrieval_top_k", 1),
 )
+
+
+VECTOR_METRIC_ALIASES: Mapping[str, str] = {
+    "euclidean": "l2",
+    "dot_product": "dot",
+}
+
+
+def canonicalize_vector_metric(value: object) -> object:
+    """Map the two supported legacy vector metric aliases to LanceDB names.
+
+    Unknown values deliberately pass through unchanged for existing
+    API, environment, and persisted-setting compatibility. No separate
+    validation rejects values outside this narrow backward-compatibility mapping.
+    """
+    if isinstance(value, str):
+        return VECTOR_METRIC_ALIASES.get(value, value)
+    return value
 
 
 def apply_legacy_settings_conversion(data: Mapping[str, object]) -> dict:
@@ -79,14 +107,37 @@ def apply_legacy_settings_conversion(data: Mapping[str, object]) -> dict:
                 new_field,
                 legacy_value * factor,
             )
+    if "vector_metric" in converted:
+        converted["vector_metric"] = canonicalize_vector_metric(
+            converted["vector_metric"]
+        )
     return converted
+
+
+# Hard per-text embedding input cap (issue #698): chunk-size-family
+# configuration is bounded by what the embedder can actually accept, so an
+# out-of-bounds value fails at configuration time instead of mid-ingest.
+# EmbeddingService.MAX_TEXT_LENGTH (app/services/embeddings.py) mirrors this
+# value; config cannot import the service (circular import), so the equality
+# is pinned by a guardrail test instead of by an import.
+EMBEDDING_MAX_TEXT_CHARS = 8192
 
 
 class Settings(BaseSettings):
     """Application settings with environment variable support."""
 
+    # Pydantic Settings applies ``_env_file`` during construction but does not
+    # retain that per-instance choice.  The settings API needs that resolved
+    # source configuration to report provenance faithfully, including callers
+    # that intentionally use an alternate dotenv file in tests or tooling.
+    _configured_env_file: object = PrivateAttr(default=None)
+
     model_config = SettingsConfigDict(
-        env_file=".env", env_file_encoding="utf-8", extra="ignore"
+        # hide_input_in_errors: boot validation errors must not echo
+        # co-located env values (the ValidationError input repr) into
+        # startup logs (pydantic >= 2.6; #1001 feedback V-1007-4).
+        hide_input_in_errors=True,
+        env_file=".env", env_file_encoding="utf-8", extra="ignore",
     )
     # NOTE (PR #576 review F2): empty-string values are MEANINGFUL here —
     # OLLAMA_EMBEDDING_URL="" disables embeddings, RERANKER_URL="" selects
@@ -94,6 +145,11 @@ class Settings(BaseSettings):
     # file therefore forwards documented keys in short form (`- KEY`), which
     # OMITS unset keys entirely instead of injecting "" — do not add
     # env_ignore_empty=True, it would silently break those contracts.
+
+    def __init__(self, **values: object) -> None:
+        configured_env_file = values.get("_env_file", self.model_config.get("env_file"))
+        super().__init__(**values)
+        self._configured_env_file = configured_env_file
 
     # Server configuration
     port: int = 9090
@@ -248,6 +304,21 @@ class Settings(BaseSettings):
     budget; an oversized single text ships alone (per-text validation still
     applies). Bounds the token cost of each request alongside
     ``embedding_batch_size``. Range 4096-1048576."""
+    embedding_probe_batch_count: int = 4
+    """Number of synthetic inputs in the deep-health embedding probe's batch
+    payload (issue #1009). The probe must exercise the LIST input shape
+    ingest traffic uses, so a provider that only has capacity for single
+    short texts reports unhealthy during a live outage. Defaults are a
+    deliberately light capacity-shape smoke (count x chars completes well
+    inside the health checker's timeout); raise toward ``embedding_batch_size``
+    to approximate the full production ingest batch. Same 1-128 ceiling as
+    ``embedding_batch_size``; count*chars must stay within
+    ``embedding_batch_max_chars``."""
+    embedding_probe_batch_chars: int = 512
+    """Character size of each synthetic input in the deep-health embedding
+    probe's batch payload (issue #1009); bounded by the documented
+    chunk-scale ceiling (2000 chars) so the probe payload is chunk-shaped.
+    See ``embedding_probe_batch_count`` for the probe contract."""
     embedding_cache_max_entries: int = 50000
     """Capacity bound for the persistent embedding cache (issue #513 W24),
     stored in its own sqlite file under ``data_dir`` by
@@ -272,6 +343,16 @@ class Settings(BaseSettings):
     'running' job whose heartbeat is older than this is requeued (or failed at
     the attempts cap). Must exceed 4x jobs_heartbeat_interval_seconds.
     Range 15.0-3600.0."""
+    jobs_stall_timeout_seconds: float = 900.0
+    """Per-file progress stall budget for lease-mode reindex jobs (issue
+    #1010): a 'running' job whose progress watermark (progress_at, falling
+    back to started_at/created_at) is older than this while its worker is
+    live is released by the deadline-driven stall watchdog and re-claimed by
+    the same worker — the heartbeat proves liveness, not progress, so a
+    wedged-but-heartbeating job otherwise stays 'running' forever. The
+    janitor's heartbeat-age reclaim remains the crash backstop. Must exceed
+    jobs_lease_reclaim_timeout_seconds AND document_parse_timeout (a single
+    slow first file must never look stalled). Range 60.0-7200.0."""
     jobs_max_attempts: int = 3
     """Durable attempt cap per ingestion job row (issue #559): the janitor
     settles a row at/over this many attempts terminally instead of requeuing
@@ -323,7 +404,17 @@ class Settings(BaseSettings):
     search_semaphore_timeout_seconds: float = 30.0
     """Timeout in seconds for search semaphore acquisitions. Prevents indefinite blocking if search concurrency is saturated."""
     write_lock_timeout_seconds: float = 30.0
-    """Timeout in seconds for write lock acquisitions. Prevents indefinite deadlock if a write operation hangs."""
+    """Timeout in seconds for write lock acquisitions. Prevents indefinite
+    deadlock if a write operation hangs. The 1.0-300.0 range is deliberately
+    RETAINED even though a full vector-index build can hold the lock for
+    longer (a 204K-row IVF-PQ build measured ~706 s in the 2026-10-22
+    incident): a waiter that times out on maintenance contention raises
+    WriteLockTimeoutError, which classifies to its own stable code and
+    requeues with backoff floored at this window (capped at
+    max(60, this value)) WITHOUT consuming the terminal attempt cap, so an
+    ingest survives any build length without a bigger wait (issue #1011).
+    The janitor still cap-settles a contention-marked row whose WORKER DIED
+    (the crash path); the never-terminal guarantee is for a live worker."""
 
     # ── Shared inference admission (issue #518, Workstream E3) ──────────────
     # Per-endpoint/per-device admission budgets shared by chat, Instant,
@@ -386,6 +477,11 @@ class Settings(BaseSettings):
     """Number of chunks to keep after reranking."""
     initial_retrieval_top_k: int = 20
     """Chunks fetched from vector store BEFORE reranking."""
+    reranker_max_batch: int = 32
+    """Max texts per /rerank request (issue #719). TEI enforces a per-request
+    client batch cap (bundled default 32; host-side --max-client-batch-size).
+    A larger candidate set is split into batches of this size so an over-cap
+    set still reranks instead of silently degrading to vector order."""
     reranker_timeout_seconds: float = 12.0
     """HTTP timeout (seconds) for the TEI reranker endpoint. On timeout or failure the
     query degrades to un-reranked vector order, so keep this comfortably above the
@@ -501,6 +597,13 @@ class Settings(BaseSettings):
 
     query_transform_cache_ttl_sec: int = 86400
     """Time-to-live in seconds for cached query transformation results. Default 24 hours."""
+
+    chat_message_max_chars: int = 20000
+    """Maximum length in characters of a LIVE chat message accepted by the chat
+    endpoints (POST /api/chat message and POST /api/chat/stream final message).
+    Bounds raw-user-input regex work on the query-transformer hot path (#922)
+    and prompt cost. Prior-turn history is intentionally NOT bounded by this
+    setting (legitimate assistant answers can be long)."""
 
     active_user_cache_ttl_seconds: int = 30
     """Time-to-live in seconds for cached active-user lookups in get_current_active_user.
@@ -674,7 +777,10 @@ class Settings(BaseSettings):
     wiki_llm_curator_temperature: float = 0.0
     """Temperature for curator calls. Default 0.0 for determinism."""
     wiki_llm_curator_max_input_chars: int = 6000
-    """Maximum source text passed to the curator per call (1000-24000)."""
+    """Maximum source characters, taken from the start of the document,
+    curated across all curator calls for one document (1000-24000); each
+    call's prompt re-applies this bound to its own chunk snippet. The
+    curated span never goes below one 2000-char chunk."""
     wiki_llm_curator_max_output_tokens: int = 2048
     """max_tokens passed to the curator per call."""
     wiki_llm_curator_timeout_sec: float = 120.0
@@ -694,6 +800,48 @@ class Settings(BaseSettings):
     """Run the curator in query compile jobs. Default OFF to protect chat latency."""
     wiki_llm_curator_run_on_manual: bool = True
     """Run the curator in manual / recompile jobs when curator is enabled."""
+    # SSRF-guard local-endpoint opt-ins (issue #726, T1-02-K-12). These are
+    # ENV-ONLY keys (documented in .env.example; deliberately NOT part of the
+    # admin-writable SettingsUpdate surface). Tolerant of the shipped EMPTY
+    # value (`.env.example` ships `ALLOW_LOCAL_CURATOR=` and compose forwards
+    # an empty default, which plain bool parsing would reject at startup):
+    # empty and unset both mean disabled.
+    allow_local_curator: Union[bool, Literal[""]] = False
+    """Allow loopback/private curator endpoints when ALLOW_LOCAL_CURATOR=1/true
+    (case-sensitive, after trimming — the same grammar as the process
+    environment; any other value is disabled, never a boot error).
+
+    Read at call time with process-environment precedence (see
+    services/curator_ssrf.py): a key present in os.environ wins verbatim so
+    dynamic flipping keeps working; otherwise this .env-backed field applies.
+    """
+
+    allow_local_services: Union[bool, Literal[""]] = False
+    """Allow loopback service endpoints when ALLOW_LOCAL_SERVICES=1/true
+    (same grammar and precedence notes as allow_local_curator).
+
+    Same precedence and empty-tolerance as allow_local_curator (read at call
+    time in services/ssrf.py).
+    """
+
+    @field_validator("allow_local_curator", "allow_local_services", mode="before")
+    @classmethod
+    def _normalize_optin_bool(cls, v):
+        # Normalize to the SAME grammar the call-time process-environment
+        # readers use (curator_ssrf.py / ssrf.py: only "1"/"true"/"True"
+        # enable, after trimming) so one operator value means one posture
+        # regardless of source (review round: grammar-split closure). Empty
+        # must boot as disabled, not crash pydantic's bool parser (issue
+        # #726 review probe); unknown values are disabled, never boot-fatal
+        # (base treated unknown keys as inert via extra="ignore").
+        if isinstance(v, bool):
+            return v
+        if v is None:
+            return False
+        if isinstance(v, str):
+            return v.strip() in ("1", "true", "True")
+        return v
+
 
     # ── KMS / Knowledge Management configuration ─────────────────────────
     kms_enabled: bool = True
@@ -705,7 +853,7 @@ class Settings(BaseSettings):
     # PR 1 subset. Compile/model-routing limits below this block (issue #436)
     # complete the SPEC.md §15 settings table.
     draft_room_enabled: bool = False
-    """Master switch for Draft Room. Default False: create/edit/upload return 503 draft_room_disabled while capability discovery and owner cleanup stay available."""
+    """Master switch for Draft Room. Default False: every mutating route (create, edit, upload, compile, Ready, promote, single-input delete) returns 503 draft_room_disabled, while capability discovery, owner list/read/export, job cancel, revision export, and whole-draft delete stay available for cleanup."""
     draft_max_inputs: int = 10
     """Maximum number of uploaded inputs per Draft Room project."""
     draft_max_total_input_mb: int = 250
@@ -996,7 +1144,17 @@ class Settings(BaseSettings):
     def _validate_float_range(
         v: float, min_val: float | None, max_val: float | None, field_name: str
     ) -> float:
-        """Validate a float is within a specified range."""
+        """Validate a float is within a specified range (and finite).
+
+        NaN slips past both ``<`` and ``>`` comparisons, and a non-finite
+        value reaching a SQLite ``datetime('now', ?)`` modifier or budget
+        computation silently disables the guarded behavior (issue #1011
+        review: ``'-nan seconds'`` evaluates to NULL). Every knob this
+        helper validates is finite-bounded, so non-finite values are
+        rejected outright.
+        """
+        if not math.isfinite(v):
+            raise ValueError(f"{field_name} must be a finite number")
         if min_val is not None and v < min_val:
             raise ValueError(f"{field_name} must be >= {min_val}")
         if max_val is not None and v > max_val:
@@ -1153,6 +1311,46 @@ class Settings(BaseSettings):
             )
             return legacy_chunk_size * 4
         return 2000  # ~500 tokens with llama.cpp -ub 8192 batch size
+
+    @field_validator("chunk_size_chars", mode="after")
+    @classmethod
+    def validate_chunk_size_chars_bounds(cls, v: int | None) -> int | None:
+        """Bound chunk_size_chars to the embedder's per-text cap (issue #698).
+
+        Runs after the legacy `mode="before"` migrator, so direct values and
+        legacy chunk_size x4 conversions are both checked. An out-of-bounds
+        chunk size can only fail per-chunk mid-ingest otherwise — the exact
+        settings-to-runtime contract drift this closes.
+        """
+        if v is not None and (v <= 0 or v > EMBEDDING_MAX_TEXT_CHARS):
+            raise ValueError(
+                f"chunk_size_chars must be between 1 and "
+                f"{EMBEDDING_MAX_TEXT_CHARS} (the embedder's per-text cap; "
+                f"see EMBEDDING_MAX_TEXT_CHARS)"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def validate_chunk_overlap_below_size(self) -> "Settings":
+        """chunk_overlap_chars must stay strictly below chunk_size_chars.
+
+        The chunker (unstructured, pinned 0.18.32) rejects overlap >= size
+        with ``'overlap' argument must be less than max_characters`` — a
+        config that passes validation here would otherwise fail EVERY
+        document ingest at chunk time (issue #698 review: the same
+        knowable-but-unenforced bound class as the per-text cap). Runs after
+        both legacy migrators, so direct and chunk_size/chunk_overlap x4
+        derived values are both checked.
+        """
+        overlap = self.chunk_overlap_chars
+        size = self.chunk_size_chars
+        if overlap is not None and size is not None and overlap >= size:
+            raise ValueError(
+                f"chunk_overlap_chars ({overlap}) must be strictly less than "
+                f"chunk_size_chars ({size}) — the chunker rejects overlap >= "
+                f"chunk size at ingest time (issue #698)"
+            )
+        return self
 
     @field_validator("chunk_overlap_chars", mode="before")
     @classmethod
@@ -1386,6 +1584,26 @@ class Settings(BaseSettings):
         """Validate the durable per-job attempt cap is in range 1-20."""
         return cls._validate_int_range(v, 1, 20, "jobs_max_attempts")
 
+    @field_validator("jobs_stall_timeout_seconds", mode="after")
+    @classmethod
+    def validate_jobs_stall_timeout_seconds(cls, v: float) -> float:
+        """Validate the per-file progress stall budget is in range 60-7200 s."""
+        return cls._validate_float_range(
+            v, 60.0, 7200.0, "jobs_stall_timeout_seconds"
+        )
+
+    @field_validator("embedding_probe_batch_count", mode="after")
+    @classmethod
+    def validate_embedding_probe_batch_count(cls, v: int) -> int:
+        """Probe batch count shares embedding_batch_size's 1-128 ceiling."""
+        return cls._validate_int_range(v, 1, 128, "embedding_probe_batch_count")
+
+    @field_validator("embedding_probe_batch_chars", mode="after")
+    @classmethod
+    def validate_embedding_probe_batch_chars(cls, v: int) -> int:
+        """Probe input size is bounded by the chunk-scale ceiling (2000)."""
+        return cls._validate_int_range(v, 64, 2000, "embedding_probe_batch_chars")
+
     @model_validator(mode="after")
     def validate_jobs_lease_coherence(self) -> "Settings":
         """The janitor reclaim timeout must exceed 4x the heartbeat interval.
@@ -1401,6 +1619,40 @@ class Settings(BaseSettings):
             raise ValueError(
                 "jobs_lease_reclaim_timeout_seconds must be > 4x "
                 "jobs_heartbeat_interval_seconds"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_jobs_stall_coherence(self) -> "Settings":
+        """The stall budget must exceed the reclaim timeout AND the parse
+        deadline (issue #1010).
+
+        Below the reclaim timeout a stall release could race the crash
+        backstop; below ``document_parse_timeout`` one legitimately slow
+        first file would look stalled — the exact false positive the
+        "slow-but-alive worker" promise forbids.
+        """
+        if self.jobs_stall_timeout_seconds <= self.jobs_lease_reclaim_timeout_seconds:
+            raise ValueError(
+                "jobs_stall_timeout_seconds must be > "
+                "jobs_lease_reclaim_timeout_seconds"
+            )
+        if self.jobs_stall_timeout_seconds <= self.document_parse_timeout:
+            raise ValueError(
+                "jobs_stall_timeout_seconds must be > document_parse_timeout"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_embedding_probe_shape_budget(self) -> "Settings":
+        """The probe batch must fit the per-request character budget."""
+        if (
+            self.embedding_probe_batch_count * self.embedding_probe_batch_chars
+            > self.embedding_batch_max_chars
+        ):
+            raise ValueError(
+                "embedding_probe_batch_count * embedding_probe_batch_chars must "
+                "be <= embedding_batch_max_chars"
             )
         return self
 
@@ -1433,13 +1685,33 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "multi_scale_chunk_sizes must contain only positive integers"
                 )
+            if size > EMBEDDING_MAX_TEXT_CHARS:
+                raise ValueError(
+                    f"multi_scale_chunk_sizes entries must not exceed "
+                    f"{EMBEDDING_MAX_TEXT_CHARS} (the embedder's per-text cap) — "
+                    f"an oversized scale would silently drop every chunk it "
+                    f"produces at ingest (issue #698)"
+                )
         return ",".join(str(x) for x in unique_sizes)
 
     @field_validator("multi_scale_overlap_ratio", mode="after")
     @classmethod
     def validate_multi_scale_overlap_ratio(cls, v: float) -> float:
-        """Validate multi_scale_overlap_ratio is in range 0.0-1.0."""
-        return cls._validate_float_range(v, 0.0, 1.0, "multi_scale_overlap_ratio")
+        """Validate multi_scale_overlap_ratio is in range [0.0, 1.0).
+
+        Strictly less than 1.0 (issue #698 review): at exactly 1.0 the
+        per-scale overlap becomes ``int(scale * 1.0) == scale`` and the
+        underlying chunker rejects every ingest with
+        "'overlap' argument must be less than max_characters" — so the
+        degenerate ratio fails at configuration time instead.
+        """
+        if v < 0.0 or v >= 1.0:
+            raise ValueError(
+                "multi_scale_overlap_ratio must be in [0.0, 1.0) — at 1.0 the "
+                "per-scale chunk overlap equals the scale size and every "
+                "ingest fails in the chunker (issue #698)"
+            )
+        return v
 
     @field_validator("index_rebuild_delta", mode="after")
     @classmethod
@@ -1452,6 +1724,12 @@ class Settings(BaseSettings):
     def validate_per_doc_chunk_cap(cls, v: int) -> int:
         """Validate per_doc_chunk_cap is >= 1."""
         return cls._validate_int_range(v, 1, None, "per_doc_chunk_cap")
+
+    @field_validator("chat_message_max_chars", mode="after")
+    @classmethod
+    def validate_chat_message_max_chars(cls, v: int) -> int:
+        """Validate chat_message_max_chars is >= 1."""
+        return cls._validate_int_range(v, 1, None, "chat_message_max_chars")
 
     @field_validator("unique_docs_in_top_k", mode="after")
     @classmethod
@@ -1520,6 +1798,16 @@ class Settings(BaseSettings):
         query to un-reranked vector order — so we fail fast at startup instead."""
         if v <= 0:
             raise ValueError("reranker_timeout_seconds must be > 0")
+        return v
+
+    @field_validator("reranker_max_batch", mode="after")
+    @classmethod
+    def validate_reranker_max_batch(cls, v: int) -> int:
+        """Validate the rerank client batch size is positive (issue #719).
+        A value < 1 would slice every candidate set into zero-text batches
+        and fail every rerank call, silently degrading to vector order."""
+        if v < 1:
+            raise ValueError("reranker_max_batch must be >= 1")
         return v
 
     @field_validator("default_chat_mode", mode="after")
@@ -1666,6 +1954,34 @@ class Settings(BaseSettings):
             raise ValueError(
                 "ADMIN_SECRET_TOKEN must be set when USERS_ENABLED=False (single-admin mode). "
                 "In single-admin mode this token is the sole authentication mechanism. "
+                'Generate one with: python -c "import secrets; print(secrets.token_urlsafe(48))"'
+            )
+        # Single-admin mode: refuse the well-known literal token (issue #1001,
+        # Item A). The exact string is published in this repository, so it is a
+        # public sole credential AND public audit-HMAC key material via
+        # derive_audit_key's admin-token fallback. EXACT match on the trimmed
+        # value (predicate intentionally DIFFERS from main.py's untrimmed-exact
+        # startup warning): case variants are not the
+        # published literal and keep booting (AC2 decision). NOT refused under
+        # USERS_ENABLED=True (AC3 decision: UNCHANGED) — there the token is
+        # the required bootstrap/first-admin credential and seeds
+        # admin_token_scopes, so only the empty-token arm above applies.
+        #
+        # The trim matters: derive_audit_key() strips the token before using it
+        # as HMAC key material, so a whitespace-padded literal (' admin-secret-
+        # token ') would otherwise boot and still derive the public key
+        # b'admin-secret-token'. Trimming here matches what the derivation
+        # actually does; the empty-token arm above trims for the same reason.
+        if (
+            not self.users_enabled
+            and self.admin_secret_token.strip() == _INSECURE_DEFAULT_ADMIN_TOKEN
+        ):
+            raise ValueError(
+                "ADMIN_SECRET_TOKEN must be changed from the well-known default "
+                "'admin-secret-token' when USERS_ENABLED=False (single-admin mode). "
+                "In single-admin mode this token is the sole authentication mechanism "
+                "and the audit-key derivation fallback, so the published default "
+                "leaves both the API and audit digests computable by anyone. "
                 'Generate one with: python -c "import secrets; print(secrets.token_urlsafe(48))"'
             )
         return self

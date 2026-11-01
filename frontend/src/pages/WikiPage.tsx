@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { useVaultStore } from "@/stores/useVaultStore";
 import { VaultSelector } from "@/components/vault/VaultSelector";
+import { VaultGate } from "@/components/vault/VaultGate";
 import { WikiPageList, PAGE_TYPES } from "./WikiPageList";
 import { WikiPageDetail } from "./WikiPageDetail";
 import { WikiEditDialog } from "./WikiEditDialog";
@@ -13,7 +14,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { FilterToggle, FilterToggleGroup } from "@/components/ui/filter-toggle-group";
 import { AlertCircle, Layers, Search, Plus, Activity } from "lucide-react";
 import { PageTitleHeader } from "@/components/layout/PageTitleHeader";
 import { EmptyState } from "@/components/EmptyState";
@@ -45,6 +46,9 @@ export default function WikiPage() {
   const [lintPanelOpen, setLintPanelOpen] = useState(false);
   const [jobsPanelOpen, setJobsPanelOpen] = useState(false);
   const [activityPanelOpen, setActivityPanelOpen] = useState(false);
+  // True when the last activity fetch failed (issue #774): a failed load
+  // must not read as "No recent activity."
+  const [activityError, setActivityError] = useState(false);
   const [activityEntries, setActivityEntries] = useState<
     Array<{ id: number; action: string; page_title?: string; user?: string; created_at: string }>
   >([]);
@@ -159,11 +163,28 @@ export default function WikiPage() {
   // Fetch activity feed when panel opens
   useEffect(() => {
     if (!activityPanelOpen || !activeVaultId) return;
+    // A superseded fetch (vault switch / panel re-open) must not stamp its
+    // outcome over the current feed (PRR-006).
+    let cancelled = false;
     setActivityLoading(true);
     getWikiActivityFeed(activeVaultId, 50)
-      .then((data) => setActivityEntries(Array.isArray(data) ? data : data.entries ?? []))
-      .catch(() => setActivityEntries([]))
-      .finally(() => setActivityLoading(false));
+      .then((data) => {
+        if (cancelled) return;
+        setActivityEntries(Array.isArray(data) ? data : data.entries ?? []);
+        setActivityError(false);
+      })
+      .catch(() => {
+        // A failed load must not read as "no activity" (#774).
+        if (cancelled) return;
+        setActivityEntries([]);
+        setActivityError(true);
+      })
+      .finally(() => {
+        if (!cancelled) setActivityLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [activityPanelOpen, activeVaultId]);
 
   function handleCreateClick() {
@@ -235,39 +256,41 @@ export default function WikiPage() {
 
   return (
     <div className="space-y-6 animate-in fade-in duration-300 pb-12">
-      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between shrink-0">
-        <div className="flex items-center gap-3">
-          <PageTitleHeader title="Wiki" description="Knowledge base pages" />
-        </div>
-        <div className="flex items-center gap-2">
-          <VaultSelector />
-          <Button
-            variant="outline"
-            onClick={() => { setActivityPanelOpen((v) => !v); setJobsPanelOpen(false); setLintPanelOpen(false); }}
-          >
-            <Activity className="w-4 h-4 mr-1" />
-            Activity
-          </Button>
-          <Button
-            variant="outline"
-            onClick={() => { setJobsPanelOpen((v) => !v); setLintPanelOpen(false); setActivityPanelOpen(false); }}
-          >
-            <Layers className="w-4 h-4 mr-1" />
-            Jobs
-          </Button>
-          <Button
-            variant="outline"
-            onClick={() => { setLintPanelOpen((v) => !v); setJobsPanelOpen(false); setActivityPanelOpen(false); }}
-          >
-            <AlertCircle className="w-4 h-4 mr-1" />
-            Lint {lintFindings.length > 0 && `(${lintFindings.length})`}
-          </Button>
-          <Button onClick={handleCreateClick}>
-            <Plus className="size-4 mr-1" />
-            New Page
-          </Button>
-        </div>
-      </div>
+      <PageTitleHeader
+        className="shrink-0"
+        title="Wiki"
+        description="Knowledge base pages"
+        actions={
+          <>
+            <VaultSelector />
+            <Button
+              variant="outline"
+              onClick={() => { setActivityPanelOpen((v) => !v); setJobsPanelOpen(false); setLintPanelOpen(false); }}
+            >
+              <Activity className="w-4 h-4 mr-1" />
+              Activity
+            </Button>
+            <Button
+              variant="outline"
+              onClick={() => { setJobsPanelOpen((v) => !v); setLintPanelOpen(false); setActivityPanelOpen(false); }}
+            >
+              <Layers className="w-4 h-4 mr-1" />
+              Jobs
+            </Button>
+            <Button
+              variant="outline"
+              onClick={() => { setLintPanelOpen((v) => !v); setJobsPanelOpen(false); setActivityPanelOpen(false); }}
+            >
+              <AlertCircle className="w-4 h-4 mr-1" />
+              Lint {lintFindings.length > 0 && `(${lintFindings.length})`}
+            </Button>
+            <Button onClick={handleCreateClick}>
+              <Plus className="size-4 mr-1" />
+              New Page
+            </Button>
+          </>
+        }
+      />
 
       {/* Toolbar */}
       {activeVaultId && (
@@ -295,15 +318,24 @@ export default function WikiPage() {
               </Button>
             </div>
           </div>
-          <Tabs value={activeType} onValueChange={setActiveType}>
-            <TabsList className="flex-wrap h-auto gap-1">
-              {PAGE_TYPES.map((t) => (
-                <TabsTrigger key={t.value} value={t.value} className="text-xs">
-                  {t.label}
-                </TabsTrigger>
-              ))}
-            </TabsList>
-          </Tabs>
+          {/* Page-type filter (#865): toggle group, not a trigger-only Tabs
+              bar — Tabs triggers carry aria-controls for panels that were
+              never rendered, which axe flags as aria-valid-attr-value. */}
+          <FilterToggleGroup
+            aria-label="Filter pages by type"
+            className="h-auto flex-wrap gap-1"
+          >
+            {PAGE_TYPES.map((t) => (
+              <FilterToggle
+                key={t.value}
+                pressed={activeType === t.value}
+                className="text-xs"
+                onClick={() => setActiveType(t.value)}
+              >
+                {t.label}
+              </FilterToggle>
+            ))}
+          </FilterToggleGroup>
         </div>
       )}
 
@@ -319,6 +351,7 @@ export default function WikiPage() {
             <EmptyState
               title="Select a vault"
               description="Choose a vault to view its wiki pages."
+              action={<VaultGate />}
             />
           ) : (
             <WikiPageList
@@ -376,7 +409,12 @@ export default function WikiPage() {
               <h3 className="text-sm font-semibold">Activity Feed</h3>
             </div>
             {activityLoading && <p className="text-xs text-muted-foreground">Loading...</p>}
-            {!activityLoading && activityEntries.length === 0 && (
+            {!activityLoading && activityError && (
+              <p className="text-xs text-destructive" role="alert">
+                Failed to load activity.
+              </p>
+            )}
+            {!activityLoading && !activityError && activityEntries.length === 0 && (
               <p className="text-xs text-muted-foreground">No recent activity.</p>
             )}
             {!activityLoading && activityEntries.length > 0 && (

@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import hmac
 import inspect
 import logging
-import secrets
 import sqlite3
 import time
 from collections.abc import Callable
@@ -18,8 +16,12 @@ from typing import TYPE_CHECKING, Optional
 from fastapi import Cookie, Depends, Header, HTTPException, Query, Request
 
 from app.config import Settings, settings
-from app.models.database import SQLiteConnectionPool, get_pool
-from app.security import get_csrf_manager  # noqa: F401
+from app.models.database import (
+    SQLiteConnectionPool,
+    get_pool,
+    lookup_service_account,
+)
+from app.security import constant_time_equals, get_csrf_manager  # noqa: F401
 from app.services.auth_service import (
     TokenExpiredError,
     TokenInvalidError,
@@ -265,6 +267,29 @@ def get_email_service(request: Request) -> EmailIngestionService:
     return request.app.state.email_service
 
 
+def resolve_granted_by(user: dict) -> int | None:
+    """Map a principal to an FK-safe ``granted_by`` value.
+
+    The single-admin sentinel principal minted by ``_resolve_active_user``
+    (``users_enabled=False``) carries ``id: 0`` and has no ``users`` row,
+    while every ``granted_by`` column is an ``INTEGER ... REFERENCES users(id)``
+    foreign key enforced on pooled connections (``PRAGMA foreign_keys = ON``).
+    Binding the raw id would raise IntegrityError, so sharing writers bind
+    ``resolve_granted_by(current_user)`` instead: the sentinel records NULL
+    provenance, every real user records their id (issue #1025, PRR-001).
+
+    The guard is a strict int type check (F-008): only a genuine non-zero int
+    id is returned as-is. Every other shape — ``None``, the id-0 sentinel, or
+    a NON-INT id such as a service-account principal's ``"sa:<id>"`` string —
+    maps to NULL, so a truthy-but-non-int principal can never be bound into
+    the users(id) FK.
+    """
+    uid = user.get("id")
+    if isinstance(uid, int) and uid != 0:
+        return uid
+    return None
+
+
 def _fetch_user_row_with_pwc(db: sqlite3.Connection, user_id: int) -> tuple | None:
     """Fetch a user row, tolerating the absence of the password_changed_at column.
 
@@ -336,7 +361,7 @@ async def _resolve_active_user(
     if not settings.users_enabled:
         DEFAULT_TOKEN = "admin-secret-token"
 
-        if not settings.admin_secret_token and secrets.compare_digest(
+        if not settings.admin_secret_token and constant_time_equals(
             token, DEFAULT_TOKEN
         ):
             raise HTTPException(
@@ -344,7 +369,7 @@ async def _resolve_active_user(
                 detail="Invalid credentials - change default admin token",
             )
 
-        if not secrets.compare_digest(token, settings.admin_secret_token):
+        if not constant_time_equals(token, settings.admin_secret_token):
             raise HTTPException(status_code=403, detail="Invalid credentials")
 
         return {
@@ -394,7 +419,7 @@ async def _resolve_active_user(
     if token_fpt is not None:
         current_ua = request.headers.get("user-agent", "")
         current_fpt = compute_client_fingerprint(current_ua)
-        if not secrets.compare_digest(token_fpt, current_fpt):
+        if not constant_time_equals(token_fpt, current_fpt):
             raise HTTPException(
                 status_code=401,
                 detail="token_invalid",
@@ -600,16 +625,13 @@ async def get_current_user_or_service_account(
     # Hash the raw key and look up service_accounts
     key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
 
-    def _fetch_sa_row():
-        cursor = db.execute(
-            "SELECT id, name, scopes, revoked_at FROM service_accounts WHERE key_hash = ?",
-            (key_hash,),
-        )
-        return cursor.fetchone()
-
     # F-3: run the synchronous DB read off the event loop, mirroring
     # _resolve_active_user's _fetch_user_row_with_pwc + asyncio.to_thread pattern.
-    row = await asyncio.to_thread(_fetch_sa_row)
+    # Issue #724 (T1-01-S-09): the shared lookup carries the rotation grace —
+    # the previous key stays valid here exactly as on require_service_account.
+    row, _via_previous = await asyncio.to_thread(
+        lookup_service_account, db, key_hash
+    )
     if not row:
         raise HTTPException(status_code=401, detail="Not authenticated")
     sa_id, sa_name, sa_scopes_str, revoked_at = row
@@ -666,7 +688,7 @@ async def require_health_probe_auth(
     if (
         key
         and settings.health_check_api_key
-        and hmac.compare_digest(key, settings.health_check_api_key)
+        and constant_time_equals(key, settings.health_check_api_key)
     ):
         # id stays an int to match the codebase-wide user-dict invariant;
         # the principal is never passed to authz checks (role is a marker).

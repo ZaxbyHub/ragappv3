@@ -11,6 +11,7 @@ import {
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { PasswordRequirements } from "@/components/shared/PasswordRequirements";
 import { Label } from "@/components/ui/label";
 import {
   Select,
@@ -150,9 +151,7 @@ export function CreateUserDialog({
                 minLength={8}
                 aria-describedby="password-requirements"
               />
-              <p id="password-requirements" className="text-xs text-muted-foreground">
-                Min 8 characters, at least 1 digit and 1 uppercase letter
-              </p>
+              <PasswordRequirements id="password-requirements" />
             </div>
             <div className="space-y-2">
               <Label htmlFor="create-role">Role</Label>

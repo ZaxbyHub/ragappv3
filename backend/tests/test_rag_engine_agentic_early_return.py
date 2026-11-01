@@ -134,8 +134,12 @@ class TestAgenticRAGCommentDocumentation(unittest.TestCase):
         match = note_pattern.search(source)
         self.assertIsNotNone(match, 'NOTE comment about agentic_rag_enabled=True must exist')
 
-        # Find the line index of the if settings.agentic_rag_enabled check
-        branch_idx = source.index('if settings.agentic_rag_enabled:')
+        # Find the line index of the agentic_rag_enabled branch check.
+        # #715 feedback (PRR-003): the branch is now gated on maintenance
+        # too (`agentic_active = settings.agentic_rag_enabled and not
+        # self.maintenance_mode`), so the pinned substring is the flag
+        # assignment — the agentic early-return itself.
+        branch_idx = source.index('agentic_active = settings.agentic_rag_enabled')
 
         # The NOTE comment should appear before the if statement
         self.assertLess(
@@ -225,6 +229,9 @@ class TestAgenticRAGEarlyReturnBehavior(unittest.TestCase):
         """When agentic_rag_enabled, done message must not contain answer_contract."""
         # Configure agentic mode
         mock_settings.agentic_rag_enabled = True
+        # PRR-003 gate: bare-Mock maintenance_mode is truthy and would block
+        # the agentic branch — pin it False (default in real Settings).
+        mock_settings.maintenance_mode = False
 
         async def run():
             engine = self._make_engine()
@@ -257,6 +264,9 @@ class TestAgenticRAGEarlyReturnBehavior(unittest.TestCase):
     def test_agentic_branch_does_not_yield_citation_confidence(self, mock_settings):
         """When agentic_rag_enabled, done message must not contain citation_confidence."""
         mock_settings.agentic_rag_enabled = True
+        # PRR-003 gate: bare-Mock maintenance_mode is truthy and would block
+        # the agentic branch — pin it False (default in real Settings).
+        mock_settings.maintenance_mode = False
 
         async def run():
             engine = self._make_engine()
@@ -286,6 +296,9 @@ class TestAgenticRAGEarlyReturnBehavior(unittest.TestCase):
     def test_agentic_branch_does_not_yield_trace(self, mock_settings):
         """When agentic_rag_enabled, done message must not contain trace."""
         mock_settings.agentic_rag_enabled = True
+        # PRR-003 gate: bare-Mock maintenance_mode is truthy and would block
+        # the agentic branch — pin it False (default in real Settings).
+        mock_settings.maintenance_mode = False
 
         async def run():
             engine = self._make_engine()
@@ -315,6 +328,9 @@ class TestAgenticRAGEarlyReturnBehavior(unittest.TestCase):
     def test_agentic_branch_yields_only_two_events(self, mock_settings):
         """When agentic_rag_enabled succeeds, it yields exactly 2 events."""
         mock_settings.agentic_rag_enabled = True
+        # PRR-003 gate: bare-Mock maintenance_mode is truthy and would block
+        # the agentic branch — pin it False (default in real Settings).
+        mock_settings.maintenance_mode = False
 
         async def run():
             engine = self._make_engine()
@@ -346,6 +362,9 @@ class TestAgenticRAGEarlyReturnBehavior(unittest.TestCase):
     def test_agentic_done_message_has_answer_source_mode_agentic(self, mock_settings):
         """done message from agentic branch should have answer_source_mode='agentic'."""
         mock_settings.agentic_rag_enabled = True
+        # PRR-003 gate: bare-Mock maintenance_mode is truthy and would block
+        # the agentic branch — pin it False (default in real Settings).
+        mock_settings.maintenance_mode = False
 
         async def run():
             engine = self._make_engine()
@@ -375,6 +394,9 @@ class TestAgenticRAGEarlyReturnBehavior(unittest.TestCase):
     def test_agentic_branch_returns_before_citation_repair(self, mock_settings):
         """Verify agentic branch returns before reaching repair_against_sources_and_memories."""
         mock_settings.agentic_rag_enabled = True
+        # PRR-003 gate: bare-Mock maintenance_mode is truthy and would block
+        # the agentic branch — pin it False (default in real Settings).
+        mock_settings.maintenance_mode = False
 
         async def run():
             engine = self._make_engine()
@@ -402,6 +424,9 @@ class TestAgenticRAGEarlyReturnBehavior(unittest.TestCase):
     def test_agentic_branch_returns_before_trace_log(self, mock_settings):
         """Verify agentic branch returns before reaching trace.log() at line 1453."""
         mock_settings.agentic_rag_enabled = True
+        # PRR-003 gate: bare-Mock maintenance_mode is truthy and would block
+        # the agentic branch — pin it False (default in real Settings).
+        mock_settings.maintenance_mode = False
 
         async def run():
             engine = self._make_engine()

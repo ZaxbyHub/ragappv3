@@ -24,6 +24,7 @@ from app.config import settings
 from app.models.database import SQLiteConnectionPool, run_migrations
 from app.services.background_tasks import (
     BackgroundProcessor,
+    ReindexOperatorGuidance,
     _embedding_identity_changed,
 )
 from app.services.embeddings import (
@@ -497,7 +498,11 @@ async def test_r1_completion_guard_on_in_place_path(tmp_path):
             1, vault_id=None
         )
         assert status == "failed"
-        assert error is None  # guard outcome is log-guided, not a raw exception
+        # issue #702: the guard outcome now travels in the failure channel as
+        # the verbatim operator-guidance exception (persisted at the lease
+        # settle boundary) instead of a log-only None.
+        assert isinstance(error, ReindexOperatorGuidance)
+        assert "re-run the reindex" in str(error)
         assert store.record_embedding_metadata.await_count == 0
         assert store.mark_ready.await_count == 0
         # In-place path: nothing to clear (no staged snapshot exists).
@@ -935,7 +940,11 @@ async def test_identity_flip_during_commit_clears_drain(job_harness):
     assert harness.store.clear_draining_embedding_config.await_count == 1
     assert harness.store.mark_ready.await_count == 0
     assert harness.store.record_embedding_metadata.await_count == 0
-    assert error is None  # guard outcome is log-guided, not a raw exception
+    # issue #702: the guard outcome now travels in the failure channel as
+    # the verbatim operator-guidance exception (persisted at the lease
+    # settle boundary) instead of a log-only None.
+    assert isinstance(error, ReindexOperatorGuidance)
+    assert "re-run the reindex" in str(error)
 
 
 async def test_post_commit_metadata_failure_clears_drain(job_harness):

@@ -608,7 +608,7 @@ export const MarkdownMessage = memo(function MarkdownMessage({
       return (
         <button
           type="button"
-          className="inline-flex items-center align-baseline px-1.5 py-0.5 mx-0.5 rounded-sm border border-indigo-500/40 bg-indigo-500/10 text-indigo-700 dark:text-indigo-300 text-[10px] font-semibold tracking-wide hover:bg-indigo-500/20 hover:border-indigo-500/60 transition-colors focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+          className="inline-flex items-center align-baseline px-1.5 py-0.5 mx-0.5 rounded-sm border border-primary/40 bg-primary/10 text-primary text-[10px] font-semibold tracking-wide hover:bg-primary/20 hover:border-primary/60 transition-colors focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
           onClick={() => wiki && onWikiCitationClick?.(wiki)}
           disabled={!wiki}
           title={titleText}
@@ -637,7 +637,7 @@ export const MarkdownMessage = memo(function MarkdownMessage({
       return (
         <button
           type="button"
-          className="inline-flex items-center align-baseline px-1.5 py-0.5 mx-0.5 rounded-md border border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 text-[10px] font-semibold tracking-wide hover:bg-emerald-500/20 hover:border-emerald-500/60 transition-colors focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+          className="inline-flex items-center align-baseline px-1.5 py-0.5 mx-0.5 rounded-md border border-success/40 bg-success/10 text-success text-[10px] font-semibold tracking-wide hover:bg-success/20 hover:border-success/60 transition-colors focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
           onClick={() => kms && onKmsCitationClick?.(kms)}
           disabled={!kms}
           title={titleText}
@@ -666,7 +666,7 @@ export const MarkdownMessage = memo(function MarkdownMessage({
       return (
         <button
           type="button"
-          className="inline-flex items-center align-baseline px-1.5 py-0.5 mx-0.5 rounded-sm border border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300 text-[10px] font-semibold tracking-wide hover:bg-amber-500/20 hover:border-amber-500/60 transition-colors focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+          className="inline-flex items-center align-baseline px-1.5 py-0.5 mx-0.5 rounded-sm border border-warning/40 bg-warning/10 text-warning text-[10px] font-semibold tracking-wide hover:bg-warning/20 hover:border-warning/60 transition-colors focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
           onClick={() => memory && onMemoryCitationClick?.(memory)}
           disabled={!memory}
           title={titleText}
@@ -802,16 +802,16 @@ export const MarkdownMessage = memo(function MarkdownMessage({
       )}
       {unverifiableClaims && unverifiableClaims.length > 0 && (
         <div
-          className="mt-3 flex items-start gap-2 rounded-sm border border-amber-500/40 bg-amber-500/10 px-3 py-2"
+          className="mt-3 flex items-start gap-2 rounded-sm border border-warning/40 bg-warning/10 px-3 py-2"
           role="alert"
         >
-          <AlertTriangle className="h-4 w-4 shrink-0 text-amber-500 mt-0.5" aria-hidden />
+          <AlertTriangle className="h-4 w-4 shrink-0 text-warning mt-0.5" aria-hidden />
           <div className="flex flex-col gap-1">
-            <p className="text-xs font-semibold text-amber-600 dark:text-amber-400">
+            <p className="text-xs font-semibold text-warning">
               Unverifiable Claims
             </p>
             {unverifiableClaims.map((claim, i) => (
-              <p key={i} className="text-xs text-amber-600/80 dark:text-amber-400/80">
+              <p key={i} className="text-xs text-warning/80">
                 {claim}
               </p>
             ))}

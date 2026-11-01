@@ -10,6 +10,9 @@ const {
   mockRevokeSession,
   mockRevokeAllSessions,
   mockSetJwtAccessToken,
+  mockUpdateProfile,
+  mockToastSuccess,
+  mockToastError,
 } = vi.hoisted(() => ({
   mockListOrganizations: vi.fn(),
   mockListAccessibleVaults: vi.fn(),
@@ -17,6 +20,9 @@ const {
   mockRevokeSession: vi.fn(),
   mockRevokeAllSessions: vi.fn(),
   mockSetJwtAccessToken: vi.fn(),
+  mockUpdateProfile: vi.fn(),
+  mockToastSuccess: vi.fn(),
+  mockToastError: vi.fn(),
 }));
 
 // Mock useAuthStore
@@ -31,7 +37,7 @@ vi.mock('@/stores/useAuthStore', () => ({
       },
       isAuthenticated: true,
       isLoading: false,
-      updateProfile: vi.fn().mockResolvedValue({}),
+      updateProfile: mockUpdateProfile,
     };
     if (typeof selector === 'function') {
       return selector(mockState);
@@ -47,14 +53,15 @@ vi.mock('@/lib/api', () => ({
   listSessions: mockListSessions,
   revokeSession: mockRevokeSession,
   revokeAllSessions: mockRevokeAllSessions,
+  updateProfile: mockUpdateProfile,
   setJwtAccessToken: mockSetJwtAccessToken,
 }));
 
 // Mock sonner toast
 vi.mock('sonner', () => ({
   toast: {
-    success: vi.fn(),
-    error: vi.fn(),
+    success: mockToastSuccess,
+    error: mockToastError,
   },
 }));
 
@@ -114,6 +121,7 @@ describe('ProfilePage', () => {
         },
       ],
     });
+    mockUpdateProfile.mockResolvedValue(undefined);
     mockRevokeSession.mockResolvedValue(undefined);
     mockRevokeAllSessions.mockResolvedValue({
       access_token: 'rotated-token',
@@ -126,6 +134,33 @@ describe('ProfilePage', () => {
     vi.restoreAllMocks();
   });
 
+  it('keeps profile success feedback when ProtectedRoute unmounts during the save', async () => {
+    let resolveUpdate!: () => void;
+    mockUpdateProfile.mockReturnValue(new Promise<void>((resolve) => { resolveUpdate = resolve; }));
+    const view = render(<ProfilePage />);
+    fireEvent.change(screen.getByLabelText('Full name'), { target: { value: 'Updated User' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save Changes' }));
+    await waitFor(() => expect(mockUpdateProfile).toHaveBeenCalledOnce());
+
+    view.unmount();
+    await act(async () => { resolveUpdate(); });
+
+    expect(mockToastSuccess).toHaveBeenCalledWith('Profile updated successfully');
+  });
+
+  it('keeps profile failure feedback when ProtectedRoute unmounts during the save', async () => {
+    let rejectUpdate!: (error: Error) => void;
+    mockUpdateProfile.mockReturnValue(new Promise<void>((_resolve, reject) => { rejectUpdate = reject; }));
+    const view = render(<ProfilePage />);
+    fireEvent.change(screen.getByLabelText('Full name'), { target: { value: 'Updated User' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save Changes' }));
+    await waitFor(() => expect(mockUpdateProfile).toHaveBeenCalledOnce());
+
+    view.unmount();
+    await act(async () => { rejectUpdate(new Error('save failed')); });
+
+    expect(mockToastError).toHaveBeenCalledWith('Failed to update profile');
+  });
   it('renders the page title', async () => {
     await act(async () => {
       render(<ProfilePage />);
@@ -367,23 +402,26 @@ describe('ProfilePage', () => {
     expect(saveButton).toBeDisabled();
   });
 
-  it('renders empty vault list gracefully when listAccessibleVaults rejects', async () => {
-    mockListAccessibleVaults.mockRejectedValue(new Error('Network error'));
+  it('distinguishes a rejected vault read from a valid empty list and retries vault access', async () => {
+    mockListAccessibleVaults.mockRejectedValueOnce(new Error('Network error')).mockResolvedValueOnce({ vaults: [] });
 
     await act(async () => {
       render(<ProfilePage />);
     });
 
-    // Wait for loading to finish (Promise.allSettled resolves)
     await waitFor(() => {
-      expect(screen.queryByRole('status')).not.toBeInTheDocument();
+      expect(screen.getByText('Unable to load vault access.')).toBeInTheDocument();
     });
-
-    // Page renders without crashing
-    expect(screen.getByText('Profile')).toBeInTheDocument();
-
-    // Vault section renders empty state due to graceful degradation
     expect(screen.getByText('Vault Access')).toBeInTheDocument();
-    expect(screen.getByText('No vaults accessible.')).toBeInTheDocument();
+    expect(screen.queryByText('No vaults accessible.')).not.toBeInTheDocument();
+
+    const retry = screen.getByRole('button', { name: 'Retry vault access' });
+    await act(async () => {
+      fireEvent.click(retry);
+    });
+    await waitFor(() => {
+      expect(screen.getByText('No vaults accessible.')).toBeInTheDocument();
+    });
+    expect(mockListAccessibleVaults).toHaveBeenCalledTimes(2);
   });
 });

@@ -462,3 +462,33 @@ def test_walk_violations_missing_root_returns_empty():
         module.subprocess, "run", side_effect=FileNotFoundError("git")
     ):
         assert module.find_violations(missing) == []
+
+
+def test_configured_pattern_files_are_candidates(tmp_path, monkeypatch):
+    """PRR-010: a file matching a CONFIGURED python_files pattern that is not
+    legacy test-shaped (e.g. spec_*.py) must be a gate candidate — the
+    legacy-only pre-filter hid such files everywhere."""
+    repo = tmp_path
+    (repo / "backend").mkdir(parents=True)
+    (repo / "backend" / "pyproject.toml").write_text(
+        '[tool.pytest.ini_options]\npython_files = ["test_*.py", "spec_*.py"]\n',
+        encoding="utf-8",
+    )
+    (repo / "backend" / "spec_widget.py").write_text("def test_x():\n    pass\n", encoding="utf-8")
+
+    def _git(*args):
+        return subprocess.run(
+            ["git", "-C", str(repo), *args], check=True, capture_output=True, text=True
+        )
+
+    _git("init", "-q")
+    _git("config", "user.email", "t@t")
+    _git("config", "user.name", "t")
+    _git("add", "-A")
+    _git("commit", "-qm", "seed")
+    mod = _load_gate_module()
+    violations = mod.find_violations(repo)
+    assert any(v.endswith("backend/spec_widget.py") for v in violations), (
+        f"a configured-pattern file outside backend/tests/ must be flagged; got {violations!r}"
+    )
+    assert len(violations) == 1, f"exactly the spec_widget.py violation; got {violations!r}"

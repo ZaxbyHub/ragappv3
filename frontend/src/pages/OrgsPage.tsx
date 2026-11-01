@@ -18,6 +18,7 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { RoleGuard } from "@/components/auth/RoleGuard";
 import { Building2, Plus, Trash2, Users, Vault, ChevronDown, ChevronUp, Loader2, UserPlus, UserX, Search } from "lucide-react";
 import { EmptyState } from "@/components/EmptyState";
+import { ErrorState } from "@/components/shared/ErrorState";
 import { NATIVE_SELECT_CLASS_NAME } from "@/lib/utils";
 import { LoadingSpinner } from "@/components/LoadingSpinner";
 import { useTestMode } from "@/fixtures/TestModeContext";
@@ -81,6 +82,11 @@ function OrgsPageContent() {
   const testMode = useTestMode();
   const [orgs, setOrgs] = useState<Organization[]>(testMode ? MOCK_ORGS : []);
   const [loading, setLoading] = useState(!testMode);
+  // True when the LAST organizations fetch failed (issue #774 / UI-R4-10): a
+  // failed load must not render the same "No organizations found" empty
+  // state a genuinely empty account would (mirrors useDocumentPolling's
+  // listError from #258).
+  const [orgsError, setOrgsError] = useState(false);
   const [expandedOrgId, setExpandedOrgId] = useState<number | null>(null);
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
@@ -95,6 +101,9 @@ function OrgsPageContent() {
   const [userSearchResults, setUserSearchResults] = useState<UserResult[]>([]);
   const [showUserDropdown, setShowUserDropdown] = useState(false);
   const [searchingUsers, setSearchingUsers] = useState(false);
+  // True when the last user search failed (issue #774): "No users found" is
+  // a verdict about the directory, not about a failed request.
+  const [userSearchError, setUserSearchError] = useState(false);
   const userSearchRef = useRef<HTMLDivElement>(null);
   const [newMemberRole, setNewMemberRole] = useState<OrgRole>("member");
   const [updatingMemberId, setUpdatingMemberId] = useState<number | null>(null);
@@ -124,6 +133,10 @@ function OrgsPageContent() {
   const searchUsers = useCallback(async (query: string) => {
     if (!query.trim()) {
       setUserSearchResults([]);
+      // A cleared query is not a failed search: drop any stale error so the
+      // destructive line cannot bleed into the next query's debounce window
+      // (PRR-005).
+      setUserSearchError(false);
       setShowUserDropdown(false);
       return;
     }
@@ -131,15 +144,25 @@ function OrgsPageContent() {
     try {
       const response = await apiClient.get<{ users: UserResult[] }>("/users/", { params: { q: query, limit: 10 } });
       setUserSearchResults(response.data.users.filter((u) => u.is_active));
+      setUserSearchError(false);
       setShowUserDropdown(true);
     } catch {
       setUserSearchResults([]);
+      setUserSearchError(true);
+      // Open the dropdown on failure too (#774): otherwise a first-attempt
+      // failure stays invisible and the leg's failure line never renders.
+      setShowUserDropdown(true);
     } finally {
       setSearchingUsers(false);
     }
   }, []);
 
   const handleUserSearchChange = (value: string) => {
+    // The error described the PREVIOUS query: editing the field retires it,
+    // so the destructive line cannot bleed into the new query's debounce
+    // window (PRR-005 re-gate; the blank-query reset in searchUsers covers
+    // the explicit-clear path).
+    setUserSearchError(false);
     setUserSearchQuery(value);
     setSelectedUser(null);
   };
@@ -165,8 +188,10 @@ function OrgsPageContent() {
     try {
       const response = await apiClient.get<{ organizations: Organization[]; total: number }>("/organizations/");
       setOrgs(Array.isArray(response.data) ? response.data : response.data.organizations ?? []);
+      setOrgsError(false);
     } catch (err: any) {
       console.error("Failed to fetch organizations:", err);
+      setOrgsError(true);
       toast.error((err as any)?.originalError?.response?.data?.detail || (err as any)?.response?.data?.detail || "Failed to load organizations");
     } finally {
       setLoading(false);
@@ -207,6 +232,10 @@ function OrgsPageContent() {
         description: newOrgDescription.trim() || "",
       });
       setOrgs((prev) => [...prev, response.data]);
+      // The list is demonstrably live again: a successful create must clear
+      // a stale load-failure flag or the ErrorState would hide the new org
+      // (OOB review F-008).
+      setOrgsError(false);
       toast.success("Organization created successfully");
       setCreateDialogOpen(false);
       setNewOrgName("");
@@ -315,20 +344,27 @@ function OrgsPageContent() {
 
   return (
     <div className="space-y-6 animate-in fade-in duration-300 pb-12">
-      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-        <PageTitleHeader
-          title="Organizations"
-          description="Manage organizations and their members"
-        />
-        {!isMember && (
-          <Button onClick={() => setCreateDialogOpen(true)}>
-            <Plus className="w-4 h-4 mr-2" />Create Organization
-          </Button>
-        )}
-      </div>
+      <PageTitleHeader
+        title="Organizations"
+        description="Manage organizations and their members"
+        actions={
+          !isMember && (
+            <Button onClick={() => setCreateDialogOpen(true)}>
+              <Plus className="w-4 h-4 mr-2" />Create Organization
+            </Button>
+          )
+        }
+      />
 
       {loading ? (
         <LoadingSpinner label="Loading organizations…" />
+      ) : orgsError ? (
+        <ErrorState
+          title="No organizations found — couldn't load"
+          description="The organizations request failed. Check your connection, then retry."
+          action={{ label: "Retry", onClick: () => void fetchOrgs() }}
+          size="sm"
+        />
       ) : orgs.length === 0 ? (
         <EmptyState
           icon={Building2}
@@ -340,7 +376,7 @@ function OrgsPageContent() {
           {orgs.map((org) => (
             <Card key={org.id} className="overflow-hidden">
               <CardHeader className="pb-4">
-                <div className="flex items-center justify-between">
+                <div className="flex flex-wrap items-center justify-between gap-2">
                   <div className="flex items-center gap-3">
                     <div className="w-10 h-10 rounded-sm bg-primary/10 flex items-center justify-center">
                       <Building2 className="w-5 h-5 text-primary" />
@@ -418,8 +454,13 @@ function OrgsPageContent() {
                         </div>
                       )}
                       {showUserDropdown && userSearchQuery.trim() && !searchingUsers && userSearchResults.length === 0 && (
-                        <div className="absolute z-50 top-full left-0 right-0 mt-1 bg-popover border rounded-sm shadow-md px-3 py-2 text-sm text-muted-foreground">
-                          No users found
+                        <div
+                          role={userSearchError ? "alert" : undefined}
+                          className={`absolute z-50 top-full left-0 right-0 mt-1 bg-popover border rounded-sm shadow-md px-3 py-2 text-sm ${userSearchError ? "text-destructive" : "text-muted-foreground"}`}
+                        >
+                          {userSearchError
+                            ? "User search failed — check your connection and try again."
+                            : "No users found"}
                         </div>
                       )}
                     </div>
@@ -449,6 +490,10 @@ function OrgsPageContent() {
                   </form>
                   )}
 
+                  {/* Issue #771 (UI-ENH-05): desktop member table hidden below
+                      sm; the card list after it renders the same members with
+                      identical owner/permission rules and handlers. */}
+                  <div className="hidden sm:block">
                   <Table>
                     <TableCaption className="sr-only">Organization Members</TableCaption>
                     <TableHeader>
@@ -505,6 +550,45 @@ function OrgsPageContent() {
                       )}
                     </TableBody>
                   </Table>
+                  </div>
+                  {/* Issue #771 (UI-ENH-05 stage 2): below-sm member card list,
+                      with card-visible loading/empty states. */}
+                  <div role="region" className="space-y-3 sm:hidden" aria-label="Organization members (compact)">
+                    {!org.members ? (
+                      <div className="py-4 text-center text-sm text-muted-foreground" role="status" aria-live="polite">Loading members</div>
+                    ) : org.members.length === 0 ? (
+                      <div className="py-4"><EmptyState title="No members yet" className="py-0" /></div>
+                    ) : (
+                      org.members.map((member) => (
+                        <div key={`card-${member.user_id}`} className="rounded-sm border p-3 space-y-2">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div>
+                              <div className="font-medium">{member.full_name || member.username}</div>
+                              <div className="text-sm text-muted-foreground">@{member.username}</div>
+                            </div>
+                            <div className="text-xs text-muted-foreground">{formatDate(member.joined_at)}</div>
+                          </div>
+                          {member.role === "owner" ? (
+                            <Badge variant="default" className="text-xs">Owner</Badge>
+                          ) : (
+                            <select value={member.role} onChange={(e) => handleRoleChange(org.id, member.user_id, e.target.value as OrgRole)} disabled={updatingMemberId === member.user_id} aria-label={`Change role for ${member.username}`} className={NATIVE_SELECT_CLASS_NAME}>
+                              {CHANGEABLE_ROLE_OPTIONS.map((opt) => (<option key={opt.value} value={opt.value}>{opt.label}</option>))}
+                            </select>
+                          )}
+                          <div className="flex flex-wrap items-center justify-end gap-1">
+                            {member.role !== "owner" && (isSuperAdmin || org.members?.some((m) => m.user_id === currentUser?.id && m.role === "owner")) && (
+                              <Button variant="ghost" size="sm" className="text-xs h-7 px-2" onClick={() => { setTransferOrgId(org.id); setTransferTargetId(member.user_id); setTransferDialogOpen(true); }} aria-label={`Transfer ownership to ${member.username}`} title="Transfer Ownership">
+                                Transfer
+                              </Button>
+                            )}
+                            <Button variant="destructive" size="icon" onClick={() => { setMemberToRemove(member); setOrgForMemberAction(org.id); setRemoveMemberDialogOpen(true); }} aria-label={`Remove ${member.username} from organization`} disabled={member.role === "owner"} title={member.role === "owner" ? "Cannot remove owner — transfer ownership first" : "Remove member"}>
+                              <UserX className="w-4 h-4" />
+                            </Button>
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
                 </CardContent>
               )}
             </Card>

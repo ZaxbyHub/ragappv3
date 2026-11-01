@@ -13,6 +13,7 @@ import {
 } from "@/lib/api";
 import { toast } from "sonner";
 import { useChatStore, type Message } from "@/stores/useChatStore";
+import { useVaultStore } from "@/stores/useVaultStore";
 import { useChatModeStore } from "@/stores/useChatModeStore";
 import { useChatShellStore } from "@/stores/useChatShellStore";
 import { useLlmHealthStore } from "@/stores/useLlmHealthStore";
@@ -37,6 +38,8 @@ export const MAX_INPUT_LENGTH = 100_000;
 // The module slot survives the remount; it is single-slot because sendingRef
 // makes turns strictly sequential.
 let activeTurnPersistence: CurrentTurnPersistence | null = null;
+let activeStreamToken: symbol | null = null;
+let stoppingStreamToken: symbol | null = null;
 
 export interface UseSendMessageReturn {
   handleSend: () => Promise<void>;
@@ -88,6 +91,15 @@ export function useSendMessage(
   const [currentStage, setCurrentStage] = useState<string | null>(null);
 
   // Atomic guard — prevents double-send from rapid clicks / Enter
+  // Issue #815 (review PRR-001): a keepalive save result that settles while
+  // the stream is still live stamps the durable seq immediately but defers the
+  // id rename to the stream-end choke point (endStreamingRow), so the row
+  // heals to its server id once nothing references the temp id anymore.
+  const deferredKeepaliveIdRef = useRef<{
+    assistantId: string;
+    save: ChatSessionMessage;
+  } | null>(null);
+
   const sendingRef = useRef(false);
 
   // Generation token (issue #507 / UI-003): captured per send, bumped on Stop.
@@ -127,15 +139,40 @@ export function useSendMessage(
       sendingRef.current = true;
       setIsStreaming(true);
       const gen = ++sendGenRef.current;
+      const streamToken = Symbol("chat-stream");
+      activeStreamToken = streamToken;
+      stoppingStreamToken = null;
 
+      // Issue #815 (review PRR-001): a keepalive save result that settles
+      // while the stream is still live stamps the durable seq immediately
+      // but defers the id rename to the stream-end choke point, so the row
+      // heals to its server id once nothing references the temp id anymore.
+      // Declared before the abort-handle closure below because that closure
+      // can run during session creation (UI-003), before the rest of the
+      // hook body has executed.
+      const healDeferredKeepaliveId = () => {
+        const deferred = deferredKeepaliveIdRef.current;
+        deferredKeepaliveIdRef.current = null;
+        if (deferred && useChatStore.getState().streamingMessageId !== deferred.assistantId) {
+          migrateId(deferred.assistantId, deferred.save);
+        }
+      };
       // UI-003: install the abort handle BEFORE the first await. A Stop
       // pressed during session creation (while no stream exists to abort)
       // invalidates this send's generation so generation can never start
       // afterward with no visible Stop control.
       setAbortFn(() => {
+        const ownsActive = activeStreamToken === streamToken && sendGenRef.current === gen;
+        const ownsStop = stoppingStreamToken === streamToken;
+        if (!ownsActive && !ownsStop) return;
+        activeStreamToken = null;
+        stoppingStreamToken = null;
         sendGenRef.current += 1;
-        setIsStreaming(false);
-        setAbortFn(null);
+        useChatStore.setState({ isStreaming: false, abortFn: null, streamingMessageId: null });
+        // A keepalive result can only be pending once a stream existed, but keeping
+        // this stream-end path on the same heal as the others makes the enumeration
+        // exhaustive (reviewer round-4 note).
+        healDeferredKeepaliveId();
         sendingRef.current = false;
       });
 
@@ -146,19 +183,45 @@ export function useSendMessage(
       // existing session must not re-navigate (a session switch racing the
       // create would otherwise bounce the user back to the created id).
       let createdSession = false;
+      // Issue #781 (UI-R1-05): resolve the vault for THIS send at the point
+      // of use. With exactly one accessible vault there is nothing to choose
+      // between, so the send proceeds in that vault — without overwriting
+      // the persisted "All Vaults" selection that Documents/Search scoping
+      // rely on (no setActiveVault, no localStorage write). The resolved id
+      // scopes both the created session and the streamed turn; zero or
+      // multiple accessible vaults keep the gate, but with a message that
+      // names the constraint and the control instead of contradicting the
+      // composer's own "All Vaults" affordance.
+      //
+      // PR #845 review follow-up (Copilot): the resolution must run for
+      // EVERY send, not only session creation — a follow-up in the
+      // auto-created session re-enters with activeChatId set, and an
+      // unresolved null vault_id makes /chat/stream 403 for non-admins
+      // ("Searching all vaults requires admin access"). With exactly one
+      // accessible vault that is the only vault the session could belong
+      // to, so scoping follow-ups to it is safe.
+      let sendVaultId = activeVaultId;
+      if (!sendVaultId) {
+        const { vaults } = useVaultStore.getState();
+        if (vaults.length === 1) {
+          sendVaultId = vaults[0].id;
+        }
+      }
 
       if (currentState.activeChatId) {
         sessionId = parseInt(currentState.activeChatId);
       } else {
-        if (!activeVaultId) {
-          setInputError("Please select a vault before starting a chat.");
+        if (!sendVaultId) {
+          setInputError(
+            "Pick a vault to chat in — choose one from the vault selector, or create a vault."
+          );
           setIsStreaming(false);
           setAbortFn(null);
           sendingRef.current = false;
           return;
         }
         try {
-          const newSession = await createChatSession({ vault_id: activeVaultId });
+          const newSession = await createChatSession({ vault_id: sendVaultId });
           sessionId = newSession.id;
           useChatStore.setState({ activeChatId: newSession.id.toString() });
           createdSession = true;
@@ -366,6 +429,19 @@ export function useSendMessage(
       };
 
       let turnPersistenceClaimed = false;
+      // Issue #815 (review PRR-001): a keepalive save result that settles
+      // while the stream is still live stamps the durable seq immediately but
+      // must NOT rename the row (the stream's appends still address the temp
+      // id). The rename is deferred to here — the single choke point every
+      // stream-end path funnels through — so the row heals to its server id
+      // once nothing references the temp id anymore. Without it the tail row
+      // would keep a numeric temp id and the next Retry/Edit would ship a
+      // bogus expected_tail_id (a false 409).
+      const endStreamingRow = () => {
+        setStreamingMessageId(null);
+        healDeferredKeepaliveId();
+      };
+
       const claimTurnPersistence = (): boolean => {
         if (turnPersistenceClaimed) return false;
         turnPersistenceClaimed = true;
@@ -384,16 +460,63 @@ export function useSendMessage(
 
         if (options.keepalive) {
           const persistPromise = addChatMessagesBatchKeepalive(sessionId, prepared.messages);
+          // Issue #815: the keepalive save is durable server-side the moment
+          // the request lands; when the page outlives it (bfcache restore,
+          // canceled unload) the resolved save results must migrate into the
+          // store rows — same migrateId forwarding as the normal path — so
+          // durableKeepSeq/observedTail cover these rows and a later
+          // Retry/Edit truncate cannot delete the turn. The migration lives
+          // INSIDE the registered pending-save chain (revision operations
+          // await it before computing the truncate boundary) and never
+          // throws into the pagehide caller; no refreshHistory here (the
+          // sidebar heals on the next interaction).
+          const { assistantMsg } = prepared;
+          const tracked = persistPromise
+            .then((saved) => {
+              if (!saved) return;
+              const [userSaveResult, assistantSaveResult] = saved;
+              if (userSaveResult) migrateId(userMessage.id, userSaveResult);
+              if (assistantMsg && assistantSaveResult) {
+                // Issue #815 CI round (issue552 suite): a canceled unload can
+                // fire pagehide while the stream is STILL LIVE — the stream's
+                // appends and the terminal path keep referencing the temp
+                // assistant id, so renaming it mid-stream orphans them. The
+                // durable SEQ is the payload the Retry/Edit anchor needs;
+                // stamp it immediately, and only run the full id migration
+                // once this row is no longer the live streaming row (the
+                // true page-death/bfcache case — where nothing else ever
+                // will).
+                const state = useChatStore.getState();
+                if (state.streamingMessageId === assistantMessageId) {
+                  state.updateMessage(assistantMessageId, {
+                    saveState: "saved",
+                    seq: assistantSaveResult.seq,
+                  });
+                  deferredKeepaliveIdRef.current = {
+                    assistantId: assistantMessageId,
+                    save: assistantSaveResult,
+                  };
+                  return;
+                }
+                migrateId(assistantMessageId, assistantSaveResult);
+              }
+            })
+            .catch((err) => {
+              // The keepalive save already succeeded server-side; a failure
+              // here is only the local mirror. Log it rather than swallowing
+              // it silently (out-of-band review M-19).
+              console.error("Failed to mirror the keepalive save into the store:", err);
+            });
           const { setPendingTurnPersist, registerPendingTurnPersist } = useChatStore.getState();
-          setPendingTurnPersist(persistPromise);
-          registerPendingTurnPersist?.(persistPromise);
-          void persistPromise.finally(() => {
-            if (useChatStore.getState().pendingTurnPersist === persistPromise) {
+          setPendingTurnPersist(tracked);
+          registerPendingTurnPersist?.(tracked);
+          void tracked.finally(() => {
+            if (useChatStore.getState().pendingTurnPersist === tracked) {
               useChatStore.getState().setPendingTurnPersist(null);
             }
-            useChatStore.getState().unregisterPendingTurnPersist?.(persistPromise);
+            useChatStore.getState().unregisterPendingTurnPersist?.(tracked);
           });
-          return persistPromise;
+          return tracked;
         }
 
         const persistPromise = (async () => {
@@ -537,6 +660,16 @@ export function useSendMessage(
       const abort = chatStream(
         chatMessages,
         {
+          onRetired: () => {
+            if (activeStreamToken !== streamToken || sendGenRef.current !== gen) return;
+            activeStreamToken = null;
+            sendGenRef.current++;
+            clearTurnPersistence();
+            sendingRef.current = false;
+            setCurrentStage(null);
+            useChatStore.setState({ isStreaming: false, abortFn: null, streamingMessageId: null });
+            healDeferredKeepaliveId();
+          },
           onMessage: (chunk) => {
             setCurrentStage(null);
             // Coalesce SSE appends behind requestAnimationFrame (UI-PERF-2):
@@ -641,7 +774,8 @@ export function useSendMessage(
             // leaves this generation alive so its later terminal callback can
             // still clear the UI, while a session switch/Stop bumps the token
             // and makes this callback a no-op.
-            if (sendGenRef.current !== gen) return;
+            if (sendGenRef.current !== gen || activeStreamToken !== streamToken) return;
+            activeStreamToken = null;
             // Flush any buffered streaming content before reading store state
             // (UI-PERF-2): rAF-batched appends may not have fired yet, so
             // synchronously drain the buffer to avoid losing the partial tail.
@@ -665,7 +799,7 @@ export function useSendMessage(
               clearTurnPersistence();
               setIsStreaming(false);
               setAbortFn(null);
-              setStreamingMessageId(null);
+              endStreamingRow();
               sendingRef.current = false;
               return;
             }
@@ -683,7 +817,7 @@ export function useSendMessage(
               setCurrentStage(null);
               setIsStreaming(false);
               setAbortFn(null);
-              setStreamingMessageId(null);
+              endStreamingRow();
               sendingRef.current = false;
               if (ownsPersistence) void persistTurn("interrupted");
               return;
@@ -709,7 +843,7 @@ export function useSendMessage(
             setCurrentStage(null);
             setIsStreaming(false);
             setAbortFn(null);
-            setStreamingMessageId(null);
+            endStreamingRow();
             sendingRef.current = false;
             if (ownsPersistence) void persistTurn("failed");
             // Issue #684 (T1-13-S-08): ADMISSION_REJECTED is emitted by the
@@ -736,7 +870,8 @@ export function useSendMessage(
             // A pagehide callback may have already claimed the one-shot save.
             // Terminal cleanup still belongs to this live generation; only the
             // durable persistence call is skipped when the claim is consumed.
-            if (sendGenRef.current !== gen) return;
+            if (sendGenRef.current !== gen || activeStreamToken !== streamToken) return;
+            activeStreamToken = null;
             const ownsPersistence = claimTurnPersistence();
             clearTurnPersistence();
             // Flush any buffered streaming content before reading store state
@@ -779,12 +914,12 @@ export function useSendMessage(
             setCurrentStage(null);
             setIsStreaming(false);
             setAbortFn(null);
-            setStreamingMessageId(null);
+            endStreamingRow();
             sendingRef.current = false;
             if (ownsPersistence) await persistTurn("complete");
           },
         },
-        activeVaultId ?? undefined,
+        sendVaultId ?? undefined,
         effectiveMode,
         useChatModeStore.getState().temperature,
         useChatModeStore.getState().retrievalMode,
@@ -812,7 +947,13 @@ export function useSendMessage(
       // navigation would leave sendingRef stuck true and block the next send.
       // Stop-path candidate clearing lives in stopStreaming, which owns the
       // message write in that flow.
+      if (activeStreamToken !== streamToken || sendGenRef.current !== gen) return;
       setAbortFn(() => {
+        const ownsActive = activeStreamToken === streamToken && sendGenRef.current === gen;
+        const ownsStop = stoppingStreamToken === streamToken;
+        if (!ownsActive && !ownsStop) return;
+        activeStreamToken = null;
+        stoppingStreamToken = null;
         abort();
         clearTurnPersistence();
         sendingRef.current = false;
@@ -873,6 +1014,9 @@ export function useSendMessage(
     // Invalidate the in-flight generation BEFORE touching the store: a Stop
     // pressed during session creation has no stream to abort, and without
     // this bump the send would start generating once creation resolved.
+    const stopToken = activeStreamToken;
+    activeStreamToken = null;
+    stoppingStreamToken = stopToken;
     sendGenRef.current += 1;
     // Issue #685 (PRR-001): the mounted instance may be a REMOUNT (PageShell
     // keys page content by pathname, so the first-send navigate replaces the

@@ -56,6 +56,7 @@ vi.mock("@/stores/useChatShellStore", () => ({
 }));
 vi.mock("react-router-dom", () => ({
   useNavigate: () => vi.fn(),
+  useInRouterContext: () => false,
 }));
 
 function seedTurn(finishReason: string | undefined, status: "complete" | "interrupted") {

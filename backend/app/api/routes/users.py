@@ -1,13 +1,15 @@
 """User management routes (admin/superadmin only)."""
 
 import asyncio
+import concurrent.futures
 import logging
 import sqlite3
+import threading
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from pydantic import BaseModel, Field, field_validator
 
 from app.api.deps import (
     assign_user_to_default_vault,
@@ -18,13 +20,18 @@ from app.api.deps import (
 )
 from app.api.routes.auth import async_hash_password
 from app.config import settings
-from app.models.database import get_pool
+from app.models.database import get_pool, transaction_context
 from app.security import csrf_protect
 from app.services.auth_service import password_strength_check
+from app.services.authz_policy import (
+    direct_vault_admin_ids,
+    group_derived_vault_admin_ids,
+)
 from app.services.draft_deletion import DraftDeletionService
 from app.services.draft_input_storage import DraftInputStorage, DraftInputStorageError
 from app.services.draft_store import DraftStore
 from app.services.security_audit import safe_record_security_event
+from app.services.task_drain import drain_audit, drain_await
 
 router = APIRouter(prefix="/users", tags=["users"])
 logger = logging.getLogger(__name__)
@@ -72,6 +79,24 @@ def assert_can_assign_role(
         )
 
 
+def assert_can_modify_target(actor_role: Optional[str], target_role: Optional[str]) -> None:
+    """The single rule for who may modify a superadmin target (issue #722).
+
+    Every route that edits a target user's state (``update_user``,
+    ``admin_reset_password``, ``update_user_active``,
+    ``update_user_organizations``, ``update_user_groups``) must invoke this
+    helper after reading the target row so the routes cannot drift apart
+    (same pattern as ``assert_can_assign_role``, issue #560): a
+    non-superadmin actor can never modify any field of a superadmin target —
+    not even a no-op field on the account (admin-guide role-assignment rule).
+    """
+    if target_role == "superadmin" and actor_role != "superadmin":
+        raise HTTPException(
+            status_code=403,
+            detail="Only superadmin can modify superadmin users",
+        )
+
+
 class UpdateRoleRequest(BaseModel):
     role: str = Field(...)
 
@@ -80,10 +105,27 @@ class UpdateActiveRequest(BaseModel):
     is_active: bool = Field(...)
 
 
+def _validate_username_after_strip(v: Optional[str]) -> Optional[str]:
+    """Reject usernames shorter than 3 characters AFTER stripping.
+
+    Validation-only: the stored value is never rewritten (issue #725,
+    T1-21-KR-12 — the raw min_length=3 floor left whitespace-padded short
+    names accepted). Shared by admin create and update so both ends of the
+    contract are identical.
+    """
+    if v is None:
+        return v
+    if len(v.strip()) < 3:
+        raise ValueError("username must be at least 3 characters (after trimming whitespace)")
+    return v
+
+
 class UpdateUserRequest(BaseModel):
-    username: Optional[str] = Field(default=None, max_length=255)
+    username: Optional[str] = Field(default=None, min_length=3, max_length=255)
     full_name: Optional[str] = Field(default=None, max_length=255)
     role: Optional[str] = Field(default=None)
+
+    _strip_check = field_validator("username")(_validate_username_after_strip)
 
 
 class AdminResetPasswordRequest(BaseModel):
@@ -99,6 +141,8 @@ class CreateUserRequest(BaseModel):
     password: str = Field(..., min_length=8, max_length=128)
     full_name: str = Field(default="", max_length=255)
     role: str = Field(default="member")
+
+    _strip_check = field_validator("username")(_validate_username_after_strip)
 
 
 class OrgMembershipItem(BaseModel):
@@ -116,6 +160,14 @@ class UserOrgsUpdateRequest(BaseModel):
     memberships: Optional[List[OrgMembershipItem]] = None
     org_ids: Optional[List[int]] = None
     role: str = Field(default="member")
+
+    def any_field_set(self) -> bool:
+        """True when at least one replace-set field was explicitly provided.
+
+        Omitted/null fields are rejected upstream (422) so an empty-body PUT
+        can never clear all memberships (issue #725, T1-21-KR-11).
+        """
+        return self.memberships is not None or self.org_ids is not None
 
     def resolved_memberships(self) -> List[OrgMembershipItem]:
         """Return canonical per-org membership list."""
@@ -198,7 +250,7 @@ async def create_user(
             "is_active": bool(row[4]),
             "created_at": row[5],
         }
-        await safe_record_security_event(
+        await drain_audit(safe_record_security_event(
             conn,
             event_type="user.created",
             actor=user,
@@ -206,7 +258,7 @@ async def create_user(
             target_username=row[1],
             request=request,
             metadata={"role": row[3]},
-        )
+        ))
         return response
     except HTTPException:
         await asyncio.to_thread(conn.rollback)
@@ -225,8 +277,10 @@ async def create_user(
 @router.get("", include_in_schema=False)
 @router.get("/")
 async def list_users(
-    skip: int = 0,
-    limit: int = 100,
+    skip: int = Query(0, ge=0, description="Rows to skip (non-negative)"),
+    limit: int = Query(
+        100, ge=1, le=1000, description="Rows to return (1-1000; matches the vault-list cap)"
+    ),
     q: str | None = None,
     user: dict = Depends(require_role("admin")),
 ):
@@ -317,6 +371,11 @@ async def update_user(
     if not target_row:
         raise HTTPException(status_code=404, detail="User not found")
 
+    # Superadmin targets are modifiable by superadmins only, across every
+    # field combination (issue #722 AC3) — runs before any field application,
+    # including for bodies that omit the role field entirely.
+    assert_can_modify_target(user.get("role"), target_row[3])
+
     # Build update fields based on whitelist
     update_fields = []
     update_values = []
@@ -340,16 +399,11 @@ async def update_user(
         if user_id == user.get("id"):
             raise HTTPException(status_code=400, detail="Cannot change your own role")
 
-        if target_row[3] == "superadmin" and user.get("role") != "superadmin":
-            raise HTTPException(
-                status_code=403,
-                detail="Only superadmin can change role of superadmin users",
-            )
-
         # One rule for who may assign which role (issue #560 C22), shared
         # with create_user and update_user_role. Re-asserting the target's
         # current role is a no-op so the Edit dialog's always-sent role
-        # field does not 403 unrelated saves.
+        # field does not 403 unrelated saves. The superadmin-target half of
+        # the rule is assert_can_modify_target above.
         assert_can_assign_role(user.get("role"), target_row[3], body.role)
 
         update_fields.append("role = ?")
@@ -366,13 +420,63 @@ async def update_user(
             "created_at": target_row[5],
         }
 
-    # Execute update
+    # Execute update. Demoting an active superadmin carries the same atomic
+    # at-least-one-active-superadmin guard update_user_role uses (issue #722
+    # AC6): the count predicate rides the WHERE clause of this single
+    # statement, so on guard rejection NONE of the co-submitted fields apply
+    # (all-or-nothing, stated intentionally). The is_active-aware trigger is
+    # deliberately stricter than update_user_role's (which ignores is_active)
+    # — demoting an already-inactive superadmin cannot lock out actives.
+    demotes_last_superadmin = (
+        body.role is not None
+        and target_row[3] == "superadmin"
+        and body.role != "superadmin"
+        and bool(target_row[4])
+    )
     update_values.append(user_id)
-    await asyncio.to_thread(db.execute, f"UPDATE users SET {', '.join(update_fields)} WHERE id = ?", tuple(update_values))
+    sql = f"UPDATE users SET {', '.join(update_fields)} WHERE id = ?"
+    if demotes_last_superadmin:
+        sql += " AND (SELECT COUNT(*) FROM users WHERE role = 'superadmin' AND is_active = 1) > 1"
+    update_cursor = await asyncio.to_thread(db.execute, sql, tuple(update_values))
+    if demotes_last_superadmin and await asyncio.to_thread(lambda: update_cursor.rowcount) == 0:
+        raise HTTPException(
+            status_code=400, detail="Cannot demote the last superadmin"
+        )
+
+    if body.username is not None and body.username != target_row[1]:
+        # Org invites bind to the invitee's username at creation time and
+        # acceptance compares that stored identifier against the CURRENT
+        # username (organizations.py), so a rename must re-bind the user's own
+        # pending invites or they become unacceptably orphaned (issue #721
+        # AC7). Both statements run in the same transaction as the rename.
+        now_iso = datetime.now(timezone.utc).isoformat()
+        # Step 1: revoke PRE-EXISTING pending invites addressed to the NEW
+        # username (username-form invites may target not-yet-provisioned
+        # users, #300) — after the rename they would re-bind to the renaming
+        # user. Runs BEFORE the rewrite and excludes the old-name rows so it
+        # can never touch the user's own invites; revoked_at format matches
+        # revoke_org_invite.
+        await asyncio.to_thread(
+            db.execute,
+            """UPDATE org_invites SET revoked_at = ?
+                WHERE email = ? COLLATE NOCASE
+                  AND accepted_at IS NULL AND revoked_at IS NULL
+                  AND email != ? COLLATE NOCASE""",
+            (now_iso, body.username.lower(), target_row[1].lower()),
+        )
+        # Step 2: re-bind the user's own pending invites to the new username
+        # so the renamed user can still accept them.
+        await asyncio.to_thread(
+            db.execute,
+            """UPDATE org_invites SET email = ?
+                WHERE email = ? COLLATE NOCASE
+                  AND accepted_at IS NULL AND revoked_at IS NULL""",
+            (body.username.lower(), target_row[1].lower()),
+        )
     await asyncio.to_thread(db.commit)
 
     invalidate_active_user_cache(user_id)
-    await safe_record_security_event(
+    await drain_audit(safe_record_security_event(
         db,
         event_type="user.updated",
         actor=user,
@@ -383,11 +487,15 @@ async def update_user(
             "fields": [field.split(" = ")[0] for field in update_fields],
             "role": body.role,
         },
-    )
+    ))
 
     # Fetch updated user
     cursor = await asyncio.to_thread(db.execute, "SELECT id, username, full_name, role, is_active, created_at FROM users WHERE id = ?", (user_id,))
     row = await asyncio.to_thread(cursor.fetchone)
+    if row is None:
+        # Post-commit re-read guard: a concurrent delete must answer 404, not
+        # an untyped TypeError 500 (issue #726 census, T1-01-S2-08 class).
+        raise HTTPException(status_code=404, detail=f"User with id {user_id} not found")
 
     return {
         "id": row[0],
@@ -413,9 +521,13 @@ async def admin_reset_password(
     Forces must_change_password=1 for the target user.
     """
     # Verify target user exists
-    cursor = await asyncio.to_thread(db.execute, "SELECT id FROM users WHERE id = ?", (user_id,))
-    if not await asyncio.to_thread(cursor.fetchone):
+    cursor = await asyncio.to_thread(db.execute, "SELECT id, role FROM users WHERE id = ?", (user_id,))
+    target_row = await asyncio.to_thread(cursor.fetchone)
+    if not target_row:
         raise HTTPException(status_code=404, detail="User not found")
+
+    # Superadmin targets are modifiable by superadmins only (issue #722 AC4).
+    assert_can_modify_target(user.get("role"), target_row[1])
 
     # Validate password strength
     try:
@@ -426,7 +538,10 @@ async def admin_reset_password(
     # Hash the new password
     hashed_password = await async_hash_password(body.new_password)
 
+    sessions_revoked = False
+
     def _admin_reset_password_db():
+        nonlocal sessions_revoked
         try:
             db.execute("BEGIN EXCLUSIVE")
         except sqlite3.OperationalError:
@@ -440,6 +555,7 @@ async def admin_reset_password(
             )
             try:
                 db.execute("DELETE FROM user_sessions WHERE user_id = ?", (user_id,))
+                sessions_revoked = True
             except sqlite3.OperationalError as e:
                 err_str = str(e)
                 if "no such table" in err_str:
@@ -458,14 +574,14 @@ async def admin_reset_password(
     await asyncio.to_thread(_admin_reset_password_db)
 
     invalidate_active_user_cache(user_id)
-    await safe_record_security_event(
+    await drain_audit(safe_record_security_event(
         db,
         event_type="user.password_reset",
         actor=user,
         target_user_id=user_id,
         request=request,
-        metadata={"must_change_password": True, "sessions_revoked": True},
-    )
+        metadata={"must_change_password": True, "sessions_revoked": sessions_revoked},
+    ))
 
     return {
         "message": "Password reset successfully",
@@ -513,14 +629,14 @@ async def update_user_role(
         await asyncio.to_thread(conn.commit)
 
         invalidate_active_user_cache(user_id)
-        await safe_record_security_event(
+        await drain_audit(safe_record_security_event(
             conn,
             event_type="user.role_updated",
             actor=user,
             target_user_id=user_id,
             request=request,
             metadata={"old_role": current_role, "new_role": body.role},
-        )
+        ))
 
         return {
             "message": f"User role updated to {body.role}",
@@ -564,6 +680,12 @@ async def update_user_active(
         target_role = target_row[0]
         currently_active = bool(target_row[1])
 
+        # Superadmin targets are modifiable by superadmins only, before any
+        # guard below can answer (issue #722 AC5: with a second active
+        # superadmin the last-superadmin guard cannot fire, so without this
+        # check a plain admin could deactivate a superadmin).
+        assert_can_modify_target(user.get("role"), target_role)
+
         if target_role == "superadmin" and not body.is_active and currently_active:
             # Atomic guard: only deactivate if there are other active superadmins
             await asyncio.to_thread(cursor.execute, """UPDATE users SET is_active = ?
@@ -574,19 +696,40 @@ async def update_user_active(
                 )
         else:
             await asyncio.to_thread(cursor.execute, "UPDATE users SET is_active = ? WHERE id = ?", (1 if body.is_active else 0, user_id))
+
+        if not body.is_active:
+            # Deactivation revokes the user's sessions in the same transaction
+            # as the is_active flip (issue #722 AC2), so a refresh cookie
+            # issued before deactivation can never mint tokens again after
+            # reactivation. Missing-table tolerance mirrors
+            # admin_reset_password (pre-migration DBs / test fixtures).
+            try:
+                await asyncio.to_thread(
+                    conn.execute,
+                    "DELETE FROM user_sessions WHERE user_id = ?",
+                    (user_id,),
+                )
+            except sqlite3.OperationalError as e:
+                if "no such table" in str(e):
+                    logger.warning(
+                        "Could not delete user_sessions for user %d (table may not exist)",
+                        user_id,
+                    )
+                else:
+                    raise
         await asyncio.to_thread(conn.commit)
 
         invalidate_active_user_cache(user_id)
 
         status_str = "activated" if body.is_active else "deactivated"
-        await safe_record_security_event(
+        await drain_audit(safe_record_security_event(
             conn,
             event_type="user.active_updated",
             actor=user,
             target_user_id=user_id,
             request=request,
             metadata={"is_active": body.is_active, "old_is_active": currently_active},
-        )
+        ))
         return {
             "message": f"User {status_str}",
             "user_id": user_id,
@@ -596,24 +739,126 @@ async def update_user_active(
         pool.release_connection(conn)
 
 
+def _covered_vault_ids(conn: sqlite3.Connection, vault_ids) -> set:
+    """Return the candidate vaults that still have an effective admin (#1028).
+
+    Route-layer composition of the shared effective-admin inventory
+    (``authz_policy.direct_vault_admin_ids`` /
+    ``authz_policy.group_derived_vault_admin_ids``); the inventory functions
+    themselves stay untouched per #1028's scope. Callers run this inside the
+    same BEGIN IMMEDIATE transaction as the mutation (both the pre-state and
+    the ACTUAL post-state read).
+    """
+    return {
+        vault_id
+        for vault_id in vault_ids
+        if direct_vault_admin_ids(conn, vault_id)
+        | group_derived_vault_admin_ids(conn, vault_id)
+    }
+
+
+def _user_derived_admin_vault_ids(conn: sqlite3.Connection, user_id: int) -> set:
+    """Vaults where ``user_id`` currently holds GROUP-DERIVED admin (#1028).
+
+    Conservative superset for the membership/org replacement routes: it omits
+    the inventory join's ``org_members`` EXISTS on purpose — candidacy only
+    decides which vaults get the pre/post inventory reads, so a superset is
+    safe while remaining complete for every row the routes can remove. Stale
+    memberships (grant without the org premise) surface here but contribute no
+    effective admin, so a pre-broken vault among them is never refused (AC7).
+    """
+    return {
+        row[0]
+        for row in conn.execute(
+            """SELECT DISTINCT vga.vault_id FROM vault_group_access vga
+               JOIN group_members gm ON vga.group_id = gm.group_id
+               WHERE gm.user_id = ? AND vga.permission = 'admin'""",
+            (user_id,),
+        )
+    }
+
+
+def _vaults_orphaned_by_user_delete(
+    conn: sqlite3.Connection, user_id: int
+) -> List[int]:
+    """Vaults that deleting ``user_id`` would leave without any effective admin.
+
+    Shared effective-admin inventory over both coverage layers (issue #1025,
+    PRR-010): the candidate set is every vault where the target holds admin
+    DIRECTLY (``vault_members``) or group-derived (``vault_group_access`` via
+    ``group_members``/``groups`` with the org-membership EXISTS, the exact
+    join the policy evaluator honors). A vault is orphaned when, with the
+    target excluded from BOTH layers, no effective admin remains.
+    """
+    admin_vault_ids = {
+        row[0]
+        for row in conn.execute(
+            "SELECT DISTINCT vault_id FROM vault_members"
+            " WHERE user_id = ? AND permission = 'admin'",
+            (user_id,),
+        )
+    }
+    admin_vault_ids |= {
+        row[0]
+        for row in conn.execute(
+            """SELECT DISTINCT vga.vault_id FROM vault_group_access vga
+               JOIN group_members gm ON vga.group_id = gm.group_id
+               JOIN groups g ON g.id = gm.group_id
+               WHERE gm.user_id = ? AND vga.permission = 'admin'
+                 AND EXISTS (
+                     SELECT 1 FROM org_members om
+                     WHERE om.org_id = g.org_id AND om.user_id = ?
+                 )""",
+            (user_id, user_id),
+        )
+    }
+    return [
+        vault_id
+        for vault_id in sorted(admin_vault_ids)
+        if not (
+            direct_vault_admin_ids(conn, vault_id, exclude_user_id=user_id)
+            | group_derived_vault_admin_ids(conn, vault_id, exclude_user_id=user_id)
+        )
+    ]
+
+
+def _refuse_user_delete_orphaning_vaults(orphaned_vaults: List[int]) -> None:
+    """Refuse a user deletion that would strand vaults with zero admins.
+
+    Mirrors the existing last-superadmin/org-owner guards' shape: a 400 naming
+    the affected vault ids (issue #1025, AC5).
+    """
+    if orphaned_vaults:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"User is the last effective admin of vault(s) {orphaned_vaults}."
+                " Grant another admin before deleting."
+            ),
+        )
+
+
 @router.delete("/{user_id}")
 async def delete_user(
     user_id: int,
+    request: Request,
     user: dict = Depends(require_role("superadmin")),
     _csrf_token: str = Depends(csrf_protect),
 ):
-    """Delete user (superadmin only). Cannot delete last superadmin or self."""
+    """Delete user (superadmin only). Cannot delete last superadmin or self.
+    Refuses 400 naming vaults where the user is the last effective admin."""
     pool = get_pool(str(settings.sqlite_path))
     conn = await pool.get_connection_async()
 
     try:
-        cursor = await asyncio.to_thread(conn.execute, "SELECT role FROM users WHERE id = ?", (user_id,))
+        cursor = await asyncio.to_thread(conn.execute, "SELECT role, username FROM users WHERE id = ?", (user_id,))
         target_row = await asyncio.to_thread(cursor.fetchone)
 
         if not target_row:
             raise HTTPException(status_code=404, detail="User not found")
 
         target_role = target_row[0]
+        target_username = target_row[1]
 
         if user_id == user.get("id"):
             raise HTTPException(
@@ -628,6 +873,16 @@ async def delete_user(
                 status_code=400,
                 detail=f"User owns organization(s) {owned_orgs}. Transfer ownership before deleting.",
             )
+
+        # Fast-path effective-admin refusal BEFORE the purge preparation below
+        # (no side effects have run yet, issue #1025 AC5): deleting the user
+        # cascades away their vault_members rows and org/group memberships,
+        # which must not strand any vault with zero effective admins. The
+        # authoritative recheck runs inside the deletion transaction.
+        orphaned_vaults = await asyncio.to_thread(
+            _vaults_orphaned_by_user_delete, conn, user_id
+        )
+        _refuse_user_delete_orphaning_vaults(orphaned_vaults)
 
         # Prepare the Draft Room purge before the DELETE below: drafts.created_by
         # cascades on user delete (ON DELETE CASCADE), losing the rows that
@@ -666,60 +921,352 @@ async def delete_user(
                 type(e).__name__,
             )
 
-        try:
-            if target_role == "superadmin":
-                # Atomic guard: only delete if there are other active superadmins
-                await asyncio.to_thread(cursor.execute, """DELETE FROM users
-                       WHERE id = ? AND (SELECT COUNT(*) FROM users WHERE role = 'superadmin' AND is_active = 1) > 1""", (user_id,))
-                if await asyncio.to_thread(lambda: cursor.rowcount) == 0:
-                    raise HTTPException(
-                        status_code=400, detail="Cannot delete the last superadmin"
-                    )
-            else:
-                await asyncio.to_thread(cursor.execute, "DELETE FROM users WHERE id = ?", (user_id,))
-            await asyncio.to_thread(conn.commit)
-        except HTTPException:
-            await asyncio.to_thread(conn.rollback)
-            if draft_purge_plan is not None:
-                try:
-                    await asyncio.to_thread(draft_deletion.restore_purge, draft_purge_plan)
-                except Exception as restore_exc:
-                    logger.error(
-                        "draft_room_user_purge_restore_failed user_id=%s reason=%s",
-                        user_id,
-                        type(restore_exc).__name__,
-                    )
-            raise
-        except (sqlite3.Error, OSError, RuntimeError) as e:
-            await asyncio.to_thread(conn.rollback)
-            if draft_purge_plan is not None:
-                try:
-                    await asyncio.to_thread(draft_deletion.restore_purge, draft_purge_plan)
-                except Exception as restore_exc:
-                    logger.error(
-                        "draft_room_user_purge_restore_failed user_id=%s reason=%s",
-                        user_id,
-                        type(restore_exc).__name__,
-                    )
-            logger.exception("Error deleting user %d", user_id)
-            raise HTTPException(
-                status_code=500, detail="Failed to delete user"
-            ) from e
+        # Issue #1019: worker-outcome-aware recovery for the delete window.
+        # The purge tombstones must be restored whenever the rows survived,
+        # and stay discarded only after a PROVEN commit. Enumerated except
+        # tuples cannot express that: an exception class outside the two
+        # handlers below (transaction_context has already rolled ordinary
+        # Exceptions back, so conn.in_transaction is False by then), or
+        # cancellation of the await while the worker runs detached, both
+        # previously escaped with the tombstones stranded in .trash.
+        delete_outcome: dict = {"committed": False}
+        delete_settled = threading.Event()
 
-        if draft_purge_plan is not None:
+        def _delete_user_row() -> None:
+            # One BEGIN IMMEDIATE over the org-detach, the authoritative
+            # effective-admin recheck, and the DELETE (issue #1025): a grant
+            # written between the fast-path check and here still refuses the
+            # delete, and transaction_context rolls any refusal (or the
+            # last-superadmin guard's) back atomically with the org-detach.
             try:
-                await asyncio.to_thread(draft_deletion.commit_purge, draft_purge_plan)
+                with transaction_context(conn):
+                    # Detach historical org authorship first: organizations.created_by
+                    # has no ON DELETE action, so a user who created an org they no
+                    # longer own would otherwise trip the FK and 500 the delete
+                    # (issue #722 AC8). Same transaction as the DELETE below.
+                    conn.execute(
+                        "UPDATE organizations SET created_by = NULL WHERE created_by = ?",
+                        (user_id,),
+                    )
+                    # Issue #1037 item 1: the owner refusal above read the
+                    # target's owned organizations BEFORE this transaction
+                    # opened, so a transfer_ownership committing in that gap
+                    # promoted the delete-target to owner and the cascading
+                    # DELETE below removed their membership — leaving the
+                    # organization with zero owners. BEGIN IMMEDIATE holds
+                    # the write lock, so this in-transaction re-read is
+                    # definitive (mirrors #1033's remove_org_member fix).
+                    owner_cursor = conn.execute(
+                        "SELECT org_id FROM org_members WHERE user_id = ? AND role = 'owner'",
+                        (user_id,),
+                    )
+                    owned_now = [row[0] for row in owner_cursor.fetchall()]
+                    if owned_now:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"User owns organization(s) {owned_now}. Transfer ownership before deleting.",
+                        )
+                    _refuse_user_delete_orphaning_vaults(
+                        _vaults_orphaned_by_user_delete(conn, user_id)
+                    )
+                    if target_role == "superadmin":
+                        # Atomic guard: only delete if there are other active superadmins
+                        guard_cursor = conn.execute(
+                            """DELETE FROM users
+                               WHERE id = ? AND (SELECT COUNT(*) FROM users WHERE role = 'superadmin' AND is_active = 1) > 1""",
+                            (user_id,),
+                        )
+                        if guard_cursor.rowcount == 0:
+                            raise HTTPException(
+                                status_code=400, detail="Cannot delete the last superadmin"
+                            )
+                    else:
+                        conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+                delete_outcome["committed"] = True
+            finally:
+                delete_settled.set()
+
+        # A dedicated single-worker executor so the route holds a REAL
+        # concurrent.futures.Future (loop.run_in_executor returns an asyncio
+        # future whose cancelled() state cannot distinguish a queued item
+        # cancelled before entry from a still-running one). Only a queued
+        # work item can ever transition to cancelled, so
+        # delete_future.cancelled() is the race-free "never entered" signal.
+        #
+        # Construction and submission live INSIDE the recovery boundary: a
+        # thread-start/submission failure (RuntimeError "can't start new
+        # thread" under resource exhaustion) must take the same
+        # rollback-plus-restore path as every other failure in the delete
+        # window — at base the dispatch was wrapped by the same except
+        # tuples, so leaving it outside would have been a regression (issue
+        # #1019, review PRR-003).
+        delete_executor: concurrent.futures.ThreadPoolExecutor | None = None
+        delete_future: concurrent.futures.Future | None = None
+
+        # Issue #1031: the post-commit bookkeeping (purge discard, cache
+        # invalidation, the user.deleted audit event) must run on EVERY
+        # committed path — including a cancellation delivered at the delete
+        # await while the detached worker commits, or during the
+        # bookkeeping awaits themselves. `_drain` awaits a shielded task
+        # through repeated cancellations and reports BOTH whether a
+        # cancellation was absorbed and the task's own failure, so the
+        # absorption state survives a finalization exception (plan-critic
+        # round 2/3) and the caller re-raises cancellation AFTER the
+        # bookkeeping completes (plan-critic round 2 finding 6).
+        async def _drain(
+            task: asyncio.Future,
+        ) -> tuple[bool, BaseException | None]:
+            # Thin alias over the shared drain (task_drain.drain_await) so the
+            # delete path reads as one pattern with the 31 sibling audit
+            # sites (issue #1036 AC1); semantics are byte-for-byte the
+            # shield/absorb/report loop PR #1035 shipped.
+            return await drain_await(task)
+
+        async def _finalize_committed_delete() -> None:
+            # Best-effort purge discard, then the cache invalidation and the
+            # security-audit event — the exact sequence the normal path has
+            # always run, now reachable from the cancelled-committed path
+            # too. Scheduled at most once per request via finalize_task.
+            if draft_purge_plan is not None:
+                try:
+                    await asyncio.to_thread(
+                        draft_deletion.commit_purge, draft_purge_plan
+                    )
+                except Exception as e:
+                    # Bytes are already tombstoned in `.trash`; failing to
+                    # finish discarding them must not turn a successful
+                    # user delete into an error response.
+                    logger.warning(
+                        "draft_room_user_purge_commit_failed user_id=%s reason=%s",
+                        user_id,
+                        type(e).__name__,
+                    )
+
+            # Multi-stage review: the audit event is the mandatory step — a
+            # cache-invalidation failure must be logged and NEVER prevent the
+            # user.deleted record from being attempted (same best-effort
+            # contract as commit_purge above).
+            try:
+                invalidate_active_user_cache(user_id)
             except Exception as e:
-                # Bytes are already tombstoned in `.trash`; failing to finish
-                # discarding them must not turn a successful user delete into
-                # an error response.
                 logger.warning(
-                    "draft_room_user_purge_commit_failed user_id=%s reason=%s",
+                    "user_delete_cache_invalidate_failed user_id=%s reason=%s",
                     user_id,
                     type(e).__name__,
                 )
 
-        invalidate_active_user_cache(user_id)
+            # Security-relevant event, same helper/tamper-evident contract
+            # as every other users.py mutation (issue #722 AC1).
+            # security_audit_log carries no FK on user ids, so recording
+            # after the delete commits cannot violate constraints; metadata
+            # snapshots the pre-delete row.
+            await safe_record_security_event(
+                conn,
+                event_type="user.deleted",
+                actor=user,
+                target_user_id=user_id,
+                target_username=target_username,
+                request=request,
+                metadata={"role": target_role, "username": target_username},
+            )
+
+        finalize_task: asyncio.Future | None = None
+        try:
+            delete_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="user_delete"
+            )
+            delete_future = delete_executor.submit(_delete_user_row)
+            await asyncio.wrap_future(delete_future)
+        except HTTPException:
+            # transaction_context already rolled the transaction back; a late
+            # refusal restores the tombstoned Draft Room bytes (see the purge
+            # preparation above for the ordering contract). Issue #1036 AC4:
+            # the restore is DRAINED — a cancellation delivered at this await
+            # must not strand the tombstones; it propagates only after the
+            # restore completes.
+            if draft_purge_plan is not None:
+                restore_cancelled, restore_error = await _drain(
+                    asyncio.ensure_future(
+                        asyncio.to_thread(
+                            draft_deletion.restore_purge, draft_purge_plan
+                        )
+                    )
+                )
+                if restore_error is not None and not isinstance(
+                    restore_error, asyncio.CancelledError
+                ):
+                    logger.error(
+                        "draft_room_user_purge_restore_failed user_id=%s reason=%s",
+                        user_id,
+                        type(restore_error).__name__,
+                    )
+                if restore_cancelled:
+                    raise asyncio.CancelledError
+            raise
+        except (sqlite3.Error, OSError, RuntimeError) as e:
+            if draft_purge_plan is not None:
+                restore_cancelled, restore_error = await _drain(
+                    asyncio.ensure_future(
+                        asyncio.to_thread(
+                            draft_deletion.restore_purge, draft_purge_plan
+                        )
+                    )
+                )
+                if restore_error is not None and not isinstance(
+                    restore_error, asyncio.CancelledError
+                ):
+                    logger.error(
+                        "draft_room_user_purge_restore_failed user_id=%s reason=%s",
+                        user_id,
+                        type(restore_error).__name__,
+                    )
+                if restore_cancelled:
+                    raise asyncio.CancelledError
+            logger.exception("Error deleting user %d", user_id)
+            raise HTTPException(
+                status_code=500, detail="Failed to delete user"
+            ) from e
+        except BaseException:
+            # Issue #1019 backstop: every exception class the two handlers
+            # above do not name (asyncio.CancelledError on client
+            # disconnect, KeyboardInterrupt, any other exception type), plus
+            # cancellation of the await while the worker runs detached.
+            # Settlement is observed through the worker-side event — never by
+            # re-awaiting the future, which would re-raise the worker's own
+            # exception and replace this one before the restore could run.
+            # A cancelled (never-entered) work item has no event to wait
+            # for: nothing ran, so the rows trivially survived. A submission
+            # failure means the item never existed at all — the same
+            # disposition, and the wait below is skipped for it too.
+            # Issue #1031: the settlement wait itself is DRAINED — a second
+            # cancellation delivered while it is pending must not exit this
+            # arm before the committed check below (plan-critic round 1
+            # finding 3). The EVENT is the truth, never any single wait
+            # task: a settle-wait task that fails or is cancelled (loop
+            # shutdown) is re-created until the worker actually settles, so
+            # a failed wait can never be mistaken for an observed
+            # non-commit (review lane finding: the discarded drain tuple
+            # previously let the arm roll back and release the connection
+            # while the worker was still inside its transaction).
+            if delete_future is not None and not delete_future.cancelled():
+                while not delete_settled.is_set():
+                    settle_wait_task: asyncio.Future = asyncio.ensure_future(
+                        asyncio.to_thread(delete_settled.wait)
+                    )
+                    await _drain(settle_wait_task)
+            if not delete_outcome["committed"]:
+                # Restore whenever a commit was never proven. The rollback
+                # covers a BaseException raised inside the worker that
+                # skipped transaction_context's `except Exception` rollback;
+                # it is guarded so a cleanup failure cannot replace the
+                # primary exception. Issue #1036 AC4: the WHOLE recovery
+                # sequence (rollback + restore_purge) is DRAINED with
+                # cancellation deferred until the sequence completes — a
+                # second cancellation delivered at either await is absorbed
+                # and re-raised only AFTER the restore, never between the
+                # two steps (plan-critic round 2, finding 5).
+                recovery_cancelled = False
+                try:
+                    if conn.in_transaction:
+                        rollback_cancelled, rollback_error = await _drain(
+                            asyncio.ensure_future(
+                                asyncio.to_thread(lambda: conn.rollback())
+                            )
+                        )
+                        recovery_cancelled = recovery_cancelled or rollback_cancelled
+                        if rollback_error is not None and not isinstance(
+                            rollback_error, asyncio.CancelledError
+                        ):
+                            logger.warning(
+                                "draft_room_user_delete_rollback_failed user_id=%s",
+                                user_id,
+                            )
+                except Exception:
+                    logger.warning(
+                        "draft_room_user_delete_rollback_failed user_id=%s",
+                        user_id,
+                    )
+                if draft_purge_plan is not None:
+                    restore_cancelled, restore_error = await _drain(
+                        asyncio.ensure_future(
+                            asyncio.to_thread(
+                                draft_deletion.restore_purge, draft_purge_plan
+                            )
+                        )
+                    )
+                    recovery_cancelled = recovery_cancelled or restore_cancelled
+                    if restore_error is not None and not isinstance(
+                        restore_error, asyncio.CancelledError
+                    ):
+                        logger.error(
+                            "draft_room_user_purge_restore_failed user_id=%s reason=%s",
+                            user_id,
+                            type(restore_error).__name__,
+                        )
+                if recovery_cancelled:
+                    # The recovery completed; now the absorbed cancellation
+                    # propagates (never swallowed — same contract as the
+                    # committed-path finalization).
+                    raise asyncio.CancelledError
+            else:
+                # Issue #1031: the delete COMMITTED even though this request
+                # is being cancelled — the audit event, cache invalidation
+                # and purge finalization must still run before the original
+                # exception propagates. Drained so a second cancellation
+                # cannot skip it; a finalization failure is logged, never a
+                # replacement for the propagating exception.
+                if finalize_task is None:
+                    finalize_task = asyncio.ensure_future(
+                        _finalize_committed_delete()
+                    )
+                finalize_cancelled, finalize_error = await _drain(finalize_task)
+                if finalize_error is not None:
+                    logger.warning(
+                        "user_delete_finalize_failed user_id=%s reason=%s",
+                        user_id,
+                        type(finalize_error).__name__,
+                    )
+                elif finalize_cancelled:
+                    # The original cancellation below already propagates;
+                    # this records that the drain absorbed additional
+                    # cancellations during the bookkeeping itself.
+                    logger.info(
+                        "user_delete_finalize_absorbed_cancellation user_id=%s",
+                        user_id,
+                    )
+            raise
+        finally:
+            # After any observed settlement the worker thread is already
+            # done, so no join is needed; in the disclosed second-cancellation
+            # residual the thread finishes its single item on its own. A
+            # construction failure leaves nothing to shut down.
+            if delete_executor is not None:
+                delete_executor.shutdown(wait=False)
+
+        # Issue #1031: the post-commit bookkeeping runs as one at-most-once
+        # DRAINED task on the normal path too — a cancellation delivered
+        # during the commit_purge or audit awaits previously skipped the
+        # remaining steps. `_drain` reports whether a cancellation was
+        # absorbed; the delete succeeded, so cancellation propagates only
+        # AFTER the bookkeeping completes (never swallowed — plan-critic
+        # round 2 findings 4 and 6).
+        if finalize_task is None:
+            finalize_task = asyncio.ensure_future(_finalize_committed_delete())
+        finalize_cancelled, finalize_error = await _drain(finalize_task)
+        if finalize_error is not None:
+            logger.warning(
+                "user_delete_finalize_failed user_id=%s reason=%s",
+                user_id,
+                type(finalize_error).__name__,
+            )
+            if isinstance(finalize_error, asyncio.CancelledError):
+                # A cancellation raised INSIDE the finalization (e.g. a
+                # scripted commit_purge cancel) is a cancellation-class
+                # event: propagate it after logging, never convert the
+                # request into a silent 200.
+                finalize_cancelled = True
+        if finalize_cancelled:
+            raise asyncio.CancelledError
 
         return {"message": "User deleted", "user_id": user_id}
     finally:
@@ -780,15 +1327,38 @@ async def update_user_organizations(
     user: dict = Depends(require_role("admin")),
     _csrf_token: str = Depends(csrf_protect),
 ):
-    """Replace user's organization memberships (admin/superadmin only)."""
+    """Replace a user's organization memberships (admin/superadmin only).
+
+    Superadmin callers replace the full membership set; other admins replace
+    only memberships in organizations they themselves belong to (issue #721
+    AC5). Dropped organizations' group memberships are revoked in the same
+    transaction.
+    """
+    # Omitted (or null) list fields are NOT an explicit clear: reject with 422
+    # before any DELETE runs (issue #725, T1-21-KR-11). An explicit empty list
+    # is the only way to clear all memberships.
+    if not body.any_field_set():
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Provide at least one of 'memberships' or 'org_ids' "
+                "(an explicit empty list clears all organization memberships)"
+            ),
+        )
+
     pool = get_pool(str(settings.sqlite_path))
     conn = await pool.get_connection_async()
 
     def _update_orgs():
         # Verify user exists
-        cursor = conn.execute("SELECT id FROM users WHERE id = ?", (user_id,))
-        if not cursor.fetchone():
+        cursor = conn.execute("SELECT id, role FROM users WHERE id = ?", (user_id,))
+        target_row = cursor.fetchone()
+        if not target_row:
             raise HTTPException(status_code=404, detail="User not found")
+
+        # Superadmin targets are modifiable by superadmins only (issue #722,
+        # five-writer parity for assert_can_modify_target).
+        assert_can_modify_target(user.get("role"), target_row[1])
 
         # For non-superadmins, verify caller shares an org with target user
         # and can only assign orgs they belong to (parity + scope restriction).
@@ -841,11 +1411,52 @@ async def update_user_organizations(
                 )
 
         try:
-            # Delete existing memberships (except owner roles to protect org ownership)
-            conn.execute(
-                "DELETE FROM org_members WHERE user_id = ? AND role != 'owner'",
+            # Take the write lock BEFORE the before-snapshot: without an
+            # explicit transaction, before_orgs is read in autocommit and
+            # after_orgs lands inside the write txn the first DELETE opens —
+            # two different snapshots — so a concurrent grant committed
+            # between them could be deleted by this request while its
+            # group_members rows survived the dropped-set derivation
+            # (issue #721 review F-001). BEGIN IMMEDIATE pins the write lock
+            # and both reads into one snapshot.
+            conn.execute("BEGIN IMMEDIATE")
+
+            # Issue #1028: candidate discovery and the pre-state read inside
+            # the same write transaction — dropping an org membership (or the
+            # group rows its cleanup removes) can strip the target's only
+            # group-derived admin coverage. The refusal at the bottom fires
+            # only for vaults that HAD effective admins (AC7).
+            candidate_vault_ids = _user_derived_admin_vault_ids(conn, user_id)
+            covered_before = _covered_vault_ids(conn, candidate_vault_ids)
+
+            # Snapshot the target's current non-owner orgs before the replace so
+            # group memberships can be cleaned up for orgs this call actually
+            # drops (issue #721 AC3). Owner rows are excluded by the same
+            # role != 'owner' filter the DELETE below uses.
+            cursor = conn.execute(
+                "SELECT org_id FROM org_members WHERE user_id = ? AND role != 'owner'",
                 (user_id,),
             )
+            before_orgs = {row[0] for row in cursor.fetchall()}
+
+            # Delete existing memberships (except owner roles to protect org
+            # ownership). Scoped to the caller's own orgs for non-superadmins —
+            # an org admin replaces only the memberships they can see (issue
+            # #721 AC5), mirroring update_user_groups' scoped delete below.
+            # The caller's scope is expressed as a subquery (their org_members
+            # rows) rather than dynamically interpolated placeholders.
+            if caller_orgs is None:
+                conn.execute(
+                    "DELETE FROM org_members WHERE user_id = ? AND role != 'owner'",
+                    (user_id,),
+                )
+            else:
+                conn.execute(
+                    """DELETE FROM org_members
+                        WHERE user_id = ? AND role != 'owner'
+                          AND org_id IN (SELECT org_id FROM org_members WHERE user_id = ?)""",
+                    (user_id, user.get("id")),
+                )
 
             # Insert new memberships
             for m in memberships:
@@ -858,6 +1469,47 @@ async def update_user_organizations(
                         "INSERT INTO org_members (org_id, user_id, role) VALUES (?, ?, ?)",
                         (m.org_id, user_id, m.role),
                     )
+
+            # Group membership implies organization membership: drop the
+            # target's group_members rows for orgs this call actually removed.
+            # The dropped set is derived purely from the target's own row
+            # state (present in the before-snapshot, absent after the
+            # replace): whatever the scoped or unscoped DELETE above actually
+            # removed is exactly before − after — owner-protected rows never
+            # entered the snapshot, re-inserted orgs are in after, and orgs
+            # outside the DELETE's scope survive into after. Deriving the set
+            # from a second caller-orgs read instead would race the DELETE's
+            # own subquery (implementation-review finding: a caller-orgs
+            # addition committed between two reads could orphan rows).
+            cursor = conn.execute(
+                "SELECT org_id FROM org_members WHERE user_id = ?",
+                (user_id,),
+            )
+            after_orgs = {row[0] for row in cursor.fetchall()}
+            dropped_orgs = before_orgs - after_orgs
+            for org_id in dropped_orgs:
+                conn.execute(
+                    """DELETE FROM group_members
+                        WHERE user_id = ?
+                          AND group_id IN (SELECT id FROM groups WHERE org_id = ?)""",
+                    (user_id, org_id),
+                )
+            # ACTUAL post-state re-read over the persisted rows, before commit
+            # (issue #1028). Any refused vault rolls back the whole
+            # replacement through the handler below.
+            refused_vault_ids = sorted(
+                covered_before - _covered_vault_ids(conn, candidate_vault_ids)
+            )
+            if refused_vault_ids:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Replacing this user's organization memberships would"
+                        f" leave vault(s) {refused_vault_ids} without an"
+                        " effective admin: each vault must keep at least one"
+                        " effective admin"
+                    ),
+                )
             conn.commit()
         except Exception:
             conn.rollback()
@@ -883,7 +1535,7 @@ async def update_user_organizations(
 
     try:
         result = await asyncio.to_thread(_update_orgs)
-        await safe_record_security_event(
+        await drain_audit(safe_record_security_event(
             conn,
             event_type="membership.organizations_replaced",
             actor=user,
@@ -895,7 +1547,7 @@ async def update_user_organizations(
                     for m in body.resolved_memberships()
                 ]
             },
-        )
+        ))
         return result
     finally:
         pool.release_connection(conn)
@@ -972,9 +1624,14 @@ async def update_user_groups(
 
     def _update_groups():
         # Verify user exists
-        cursor = conn.execute("SELECT id FROM users WHERE id = ?", (user_id,))
-        if not cursor.fetchone():
+        cursor = conn.execute("SELECT id, role FROM users WHERE id = ?", (user_id,))
+        target_row = cursor.fetchone()
+        if not target_row:
             raise HTTPException(status_code=404, detail="User not found")
+
+        # Superadmin targets are modifiable by superadmins only (issue #722,
+        # five-writer parity for assert_can_modify_target).
+        assert_can_modify_target(user.get("role"), target_row[1])
 
         # For non-superadmins, verify caller shares an org with target user
         # (parity with get_user_groups and update_user_organizations).
@@ -997,19 +1654,41 @@ async def update_user_groups(
 
         # If group_ids is empty, clear only the caller-managed org scope.
         if not body.group_ids:
-            if caller_orgs is None:
-                conn.execute("DELETE FROM group_members WHERE user_id = ?", (user_id,))
-            else:
-                placeholders = ",".join("?" * len(caller_orgs))
-                conn.execute(
-                    f"""DELETE FROM group_members
-                        WHERE user_id = ?
-                          AND group_id IN (
-                              SELECT id FROM groups WHERE org_id IN ({placeholders})
-                          )""",
-                    (user_id, *caller_orgs),
+            # Issue #1028: one BEGIN IMMEDIATE over candidate discovery, the
+            # pre-state read, the scoped/unscoped clear, and the ACTUAL
+            # post-state re-read. Removing the target's group memberships can
+            # strip their only group-derived admin coverage; refusal fires
+            # only for vaults that HAD effective admins (AC7).
+            with transaction_context(conn):
+                candidate_vault_ids = _user_derived_admin_vault_ids(conn, user_id)
+                covered_before = _covered_vault_ids(conn, candidate_vault_ids)
+                if caller_orgs is None:
+                    conn.execute(
+                        "DELETE FROM group_members WHERE user_id = ?", (user_id,)
+                    )
+                else:
+                    placeholders = ",".join("?" * len(caller_orgs))
+                    conn.execute(
+                        f"""DELETE FROM group_members
+                            WHERE user_id = ?
+                              AND group_id IN (
+                                  SELECT id FROM groups WHERE org_id IN ({placeholders})
+                              )""",
+                        (user_id, *caller_orgs),
+                    )
+                refused_vault_ids = sorted(
+                    covered_before - _covered_vault_ids(conn, candidate_vault_ids)
                 )
-            conn.commit()
+                if refused_vault_ids:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Replacing this user's group memberships would"
+                            f" leave vault(s) {refused_vault_ids} without an"
+                            " effective admin: each vault must keep at least"
+                            " one effective admin"
+                        ),
+                    )
             cursor = conn.execute(
                 """SELECT g.id, g.name, g.description, g.org_id
                    FROM groups g
@@ -1050,41 +1729,72 @@ async def update_user_groups(
                     detail=f"Cannot assign groups from organizations you are not a member of: {sorted(unauthorized)}",
                 )
 
-        # Check user is a member of each group's organization (skip for superadmins)
-        if user.get("role") != "superadmin":
-            for group_id, org_id in found_groups.items():
-                cursor.execute(
-                    "SELECT 1 FROM org_members WHERE user_id = ? AND org_id = ?",
-                    (user_id, org_id),
+        # Check the TARGET user is a member of each group's organization. This
+        # is a data-integrity precondition of group membership (groups.py
+        # enforces the same one), so it must run for every caller including
+        # superadmins; the caller-authorization bypass above (caller_orgs is
+        # None for superadmins) is what superadmin privilege waives, not this
+        # check (issue #721 AC1).
+        for group_id, org_id in found_groups.items():
+            cursor.execute(
+                "SELECT 1 FROM org_members WHERE user_id = ? AND org_id = ?",
+                (user_id, org_id),
+            )
+            if not cursor.fetchone():
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"User is not a member of organization for group {group_id}",
                 )
-                if not cursor.fetchone():
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"User is not a member of organization for group {group_id}",
-                    )
 
-        # Replace only memberships in the caller-managed org scope.
-        if caller_orgs is None:
-            cursor.execute("DELETE FROM group_members WHERE user_id = ?", (user_id,))
-        else:
-            placeholders = ",".join("?" * len(caller_orgs))
-            cursor.execute(
-                f"""DELETE FROM group_members
-                    WHERE user_id = ?
-                      AND group_id IN (
-                          SELECT id FROM groups WHERE org_id IN ({placeholders})
-                      )""",
-                (user_id, *caller_orgs),
+        # Replace only memberships in the caller-managed org scope, inside one
+        # BEGIN IMMEDIATE with the #1028 effective-admin guard (same shape as
+        # the clear branch above; the refusal rolls back the whole
+        # replacement).
+        with transaction_context(conn):
+            candidate_vault_ids = _user_derived_admin_vault_ids(conn, user_id)
+            covered_before = _covered_vault_ids(conn, candidate_vault_ids)
+            if caller_orgs is None:
+                cursor.execute(
+                    "DELETE FROM group_members WHERE user_id = ?", (user_id,)
+                )
+            else:
+                placeholders = ",".join("?" * len(caller_orgs))
+                cursor.execute(
+                    f"""DELETE FROM group_members
+                        WHERE user_id = ?
+                          AND group_id IN (
+                              SELECT id FROM groups WHERE org_id IN ({placeholders})
+                              )""",
+                    (user_id, *caller_orgs),
+                )
+
+            # Insert new memberships; dedupe by group id first: group_members has
+            # UNIQUE(group_id, user_id) and a duplicate id in one body would 500
+            # on the second insert (issue #725, S02-SK-03; groups.py dedupes the
+            # same way).
+            seen_group_ids = set()
+            for group_id in body.group_ids:
+                if group_id in seen_group_ids:
+                    continue
+                seen_group_ids.add(group_id)
+                cursor.execute(
+                    "INSERT INTO group_members (group_id, user_id) VALUES (?, ?)",
+                    (group_id, user_id),
+                )
+
+            refused_vault_ids = sorted(
+                covered_before - _covered_vault_ids(conn, candidate_vault_ids)
             )
-
-        # Insert new memberships
-        for group_id in body.group_ids:
-            cursor.execute(
-                "INSERT INTO group_members (group_id, user_id) VALUES (?, ?)",
-                (group_id, user_id),
-            )
-
-        conn.commit()
+            if refused_vault_ids:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Replacing this user's group memberships would leave"
+                        f" vault(s) {refused_vault_ids} without an effective"
+                        " admin: each vault must keep at least one effective"
+                        " admin"
+                    ),
+                )
 
         # Return updated list of groups
         cursor.execute(
@@ -1111,14 +1821,14 @@ async def update_user_groups(
 
     try:
         groups = await asyncio.to_thread(_update_groups)
-        await safe_record_security_event(
+        await drain_audit(safe_record_security_event(
             conn,
             event_type="membership.groups_replaced",
             actor=user,
             target_user_id=user_id,
             request=request,
             metadata={"group_ids": list(body.group_ids)},
-        )
+        ))
         return {"groups": groups}
     finally:
         pool.release_connection(conn)

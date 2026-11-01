@@ -59,7 +59,9 @@ class _FakeEmbeddingService:
         self._dim = dim
 
     async def embed_batch(self, texts, fail_fast=False):  # noqa: ANN001, ANN202
-        embeddings = [[float(len(t) % 7) + 0.1 * i for i in range(self._dim)] for t in texts]
+        embeddings = [
+            [float(len(t) % 7) + 0.1 * i for i in range(self._dim)] for t in texts
+        ]
         return embeddings, []
 
 
@@ -113,7 +115,7 @@ def _run_existing_path(processor, file_id: int, file_path: str, vault_id: int): 
         processor,
         "_process_document_file",
         new=AsyncMock(
-            return_value=( [chunk], "alpha beta gamma", ParsedDocument(atoms=()) )
+            return_value=([chunk], "alpha beta gamma", ParsedDocument(atoms=()))
         ),
     ):
         return asyncio.run(
@@ -132,20 +134,22 @@ def _run_control_path(processor, file_id: int, file_path: str, vault_id: int):  
         metadata={"chunk_scale": "default", "raw_text": "alpha beta gamma"},
         chunk_index=0,
     )
-    with patch.object(processor, "_check_duplicate", return_value=None), \
-        patch.object(processor, "_insert_or_get_file_record", return_value=file_id), \
-        patch.object(processor, "_get_chunk_enrichment_service", return_value=None), \
+    with (
+        patch.object(processor, "_check_duplicate", return_value=None),
+        patch.object(processor, "_insert_or_get_file_record", return_value=file_id),
+        patch.object(processor, "_get_chunk_enrichment_service", return_value=None),
         patch.object(
             processor,
             "_process_document_file",
             new=AsyncMock(
-                return_value=( [chunk], "alpha beta gamma", ParsedDocument(atoms=()) )
+                return_value=([chunk], "alpha beta gamma", ParsedDocument(atoms=()))
             ),
-        ), \
-        patch("app.services.document_processor.set_phase"), \
-        patch("app.services.document_processor.clear_progress"), \
-        patch("app.services.document_processor.compute_parent_windows"), \
-        patch("app.services.document_processor.set_wiki_pending"):
+        ),
+        patch("app.services.document_processor.set_phase"),
+        patch("app.services.document_processor.clear_progress"),
+        patch("app.services.document_processor.compute_parent_windows"),
+        patch("app.services.document_processor.set_wiki_pending"),
+    ):
         return asyncio.run(processor.process_file(file_path, vault_id=vault_id))
 
 
@@ -155,12 +159,13 @@ def main() -> int:
     import sqlite3
 
     from app.config import settings
-    from app.models.database import get_pool, init_db
+    from app.models.database import get_pool, init_db, run_migrations
     from app.services.document_processor import DocumentProcessor
 
     tmp = Path(tempfile.mkdtemp(prefix="c5_db_"))
     db_path = str(tmp / "app.db")
     init_db(db_path)
+    run_migrations(db_path)
 
     conn = sqlite3.connect(db_path)
     conn.execute("INSERT INTO vaults (name) VALUES ('v')")
@@ -186,14 +191,15 @@ def main() -> int:
             vector_store=_FakeVectorStore(),
         )
 
-    with patch.object(settings, "data_dir", tmp), \
-        patch.object(settings, "kms_enabled", True), \
-        patch.object(settings, "kms_compile_on_ingest", True), \
-        patch.object(settings, "wiki_enabled", False), \
-        patch.object(settings, "wiki_compile_on_ingest", False), \
-        patch.object(settings, "multi_scale_indexing_enabled", False), \
-        patch.object(settings, "contextual_chunking_enabled", False):
-
+    with (
+        patch.object(settings, "data_dir", tmp),
+        patch.object(settings, "kms_enabled", True),
+        patch.object(settings, "kms_compile_on_ingest", True),
+        patch.object(settings, "wiki_enabled", False),
+        patch.object(settings, "wiki_compile_on_ingest", False),
+        patch.object(settings, "multi_scale_indexing_enabled", False),
+        patch.object(settings, "contextual_chunking_enabled", False),
+    ):
         # Control: process_file (synchronous entry point) must enqueue exactly one job.
         try:
             _run_control_path(_make_processor(), file_id, str(upload_path), vault_id)
@@ -228,9 +234,13 @@ def main() -> int:
         # Case 2: flags disabled -> no additional job from the existing-file path.
         with patch.object(settings, "kms_enabled", False):
             try:
-                _run_existing_path(_make_processor(), file_id, str(upload_path), vault_id)
+                _run_existing_path(
+                    _make_processor(), file_id, str(upload_path), vault_id
+                )
             except Exception as exc:  # noqa: BLE001
-                print(f"C5 CHECK: FAIL: process_existing_file (disabled) crashed: {exc!r}")
+                print(
+                    f"C5 CHECK: FAIL: process_existing_file (disabled) crashed: {exc!r}"
+                )
                 return 1
         disabled_count = _kms_job_count(db_path, f"file:{file_id}")
         if disabled_count != 2:
@@ -249,9 +259,7 @@ def test_c5_kms_enqueue_existing_file_path(monkeypatch) -> None:
     # (issue #559 stage 2); monkeypatch restores after the test.
     from app.config import settings as _settings
 
-    monkeypatch.setattr(
-        _settings, "wiki_kms_job_lease_enabled", False, raising=False
-    )
+    monkeypatch.setattr(_settings, "wiki_kms_job_lease_enabled", False, raising=False)
 
     assert main() == 0
 

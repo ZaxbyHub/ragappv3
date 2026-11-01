@@ -6,9 +6,13 @@
 // calls in catch blocks receive the correct messages. We test directly via the
 // mock rather than through complex UI interactions.
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, waitFor, act, fireEvent } from '@testing-library/react';
+import { render, screen, waitFor, act, fireEvent, within } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import AdminUsersPage from '@/pages/AdminUsersPage';
+// Issue #771 (UI-ENH-05): the below-sm card list duplicates row
+// text next to the desktop table; scope data queries to the table subtree
+// (a card-only regression still fails these assertions).
+const inTable = () => within(screen.getByRole('table'));
 
 // --- Mocks ---
 vi.mock('@/stores/useAuthStore', () => ({
@@ -116,7 +120,19 @@ vi.mock('@/components/ui/table', () => ({
 }));
 
 vi.mock('@/components/layout/PageTitleHeader', () => ({
-  PageTitleHeader: ({ title }: any) => <div data-testid="page-title">{title}</div>,
+  PageTitleHeader: ({ title, description, actions, before, srOnly, id }: any) =>
+    srOnly ? (
+      <h1 id={id} className="sr-only">{title}</h1>
+    ) : (
+      <div data-testid="page-title">
+        {before}
+        <div>
+          <h1 id={id}>{title}</h1>
+          {description ?? null}
+        </div>
+        {actions ?? null}
+      </div>
+    ),
 }));
 
 vi.mock('@/components/EmptyState', () => ({
@@ -246,7 +262,7 @@ describe('AdminUsersPage error handling', () => {
       if (pathname.endsWith('/groups')) {
         return Promise.resolve(DEFAULT_GROUPS_RESPONSE);
       }
-      if (pathname.endsWith('/organizations')) {
+      if (pathname.endsWith('/organizations') || pathname.endsWith('/organizations/')) {
         return Promise.resolve(DEFAULT_ORGS_RESPONSE);
       }
       return Promise.resolve({ data: {} });
@@ -322,10 +338,12 @@ describe('AdminUsersPage error handling', () => {
     api.default.patch.mockRejectedValueOnce(makeApiError('Cannot change role of superadmin'));
 
     await act(async () => { render(<AdminUsersPage />); });
-    await vi.waitFor(() => expect(screen.getByText('alice')).toBeInTheDocument());
+    // #771: table-scoped (below-sm card list duplicates the text)
+    await vi.waitFor(() => expect(inTable().getByText('alice')).toBeInTheDocument());
 
     // Trigger role change via the select
-    const selects = document.querySelectorAll('select');
+    // #771: table-scoped (below-sm card list duplicates the text)
+    const selects = screen.getByRole('table').querySelectorAll('select');
     await act(async () => {
       fireEvent.change(selects[1], { target: { value: 'admin' } });
     });
@@ -339,9 +357,11 @@ describe('AdminUsersPage error handling', () => {
     api.default.patch.mockRejectedValueOnce(makeNetworkError());
 
     await act(async () => { render(<AdminUsersPage />); });
-    await vi.waitFor(() => expect(screen.getByText('alice')).toBeInTheDocument());
+    // #771: table-scoped (below-sm card list duplicates the text)
+    await vi.waitFor(() => expect(inTable().getByText('alice')).toBeInTheDocument());
 
-    const selects = document.querySelectorAll('select');
+    // #771: table-scoped (below-sm card list duplicates the text)
+    const selects = screen.getByRole('table').querySelectorAll('select');
     await act(async () => {
       fireEvent.change(selects[1], { target: { value: 'admin' } });
     });
@@ -358,10 +378,12 @@ describe('AdminUsersPage error handling', () => {
     api.default.patch.mockRejectedValueOnce(makeApiError('User is protected'));
 
     await act(async () => { render(<AdminUsersPage />); });
-    await vi.waitFor(() => expect(screen.getByText('alice')).toBeInTheDocument());
+    // #771: table-scoped (below-sm card list duplicates the text)
+    await vi.waitFor(() => expect(inTable().getByText('alice')).toBeInTheDocument());
 
     // Click toggle for bob (second user, index 1)
-    const toggles = document.querySelectorAll('button[role="switch"]');
+    // #771: table-scoped (below-sm card list duplicates the text)
+    const toggles = screen.getByRole('table').querySelectorAll('button[role="switch"]');
     await act(async () => {
       fireEvent.click(toggles[1]);
     });
@@ -375,9 +397,11 @@ describe('AdminUsersPage error handling', () => {
     api.default.patch.mockRejectedValueOnce(makeNetworkError());
 
     await act(async () => { render(<AdminUsersPage />); });
-    await vi.waitFor(() => expect(screen.getByText('alice')).toBeInTheDocument());
+    // #771: table-scoped (below-sm card list duplicates the text)
+    await vi.waitFor(() => expect(inTable().getByText('alice')).toBeInTheDocument());
 
-    const toggles = document.querySelectorAll('button[role="switch"]');
+    // #771: table-scoped (below-sm card list duplicates the text)
+    const toggles = screen.getByRole('table').querySelectorAll('button[role="switch"]');
     await act(async () => {
       fireEvent.click(toggles[1]);
     });
@@ -394,10 +418,12 @@ describe('AdminUsersPage error handling', () => {
     api.default.delete.mockRejectedValueOnce(makeApiError('Cannot delete last superadmin'));
 
     await act(async () => { render(<AdminUsersPage />); });
-    await vi.waitFor(() => expect(screen.getByText('alice')).toBeInTheDocument());
+    // #771: table-scoped (below-sm card list duplicates the text)
+    await vi.waitFor(() => expect(inTable().getByText('alice')).toBeInTheDocument());
 
     // Click delete button for bob (aria-label specific)
-    const deleteButton = document.querySelector('button[aria-label="Delete user bob"]');
+    // #771: table-scoped (below-sm card list duplicates the text)
+    const deleteButton = screen.getByRole('table').querySelector('button[aria-label="Delete user bob"]');
     await act(async () => {
       fireEvent.click(deleteButton!);
     });
@@ -420,9 +446,11 @@ describe('AdminUsersPage error handling', () => {
     api.default.delete.mockRejectedValueOnce(makeNetworkError());
 
     await act(async () => { render(<AdminUsersPage />); });
-    await vi.waitFor(() => expect(screen.getByText('alice')).toBeInTheDocument());
+    // #771: table-scoped (below-sm card list duplicates the text)
+    await vi.waitFor(() => expect(inTable().getByText('alice')).toBeInTheDocument());
 
-    const deleteButton = document.querySelector('button[aria-label="Delete user bob"]');
+    // #771: table-scoped (below-sm card list duplicates the text)
+    const deleteButton = screen.getByRole('table').querySelector('button[aria-label="Delete user bob"]');
     await act(async () => {
       fireEvent.click(deleteButton!);
     });
@@ -447,10 +475,12 @@ describe('AdminUsersPage error handling', () => {
     api.default.patch.mockRejectedValueOnce(makeApiError('Username already taken'));
 
     await act(async () => { render(<AdminUsersPage />); });
-    await vi.waitFor(() => expect(screen.getByText('alice')).toBeInTheDocument());
+    // #771: table-scoped (below-sm card list duplicates the text)
+    await vi.waitFor(() => expect(inTable().getByText('alice')).toBeInTheDocument());
 
     // Click edit button for bob
-    const editButton = document.querySelector('button[aria-label="Edit user bob"]');
+    // #771: table-scoped (below-sm card list duplicates the text)
+    const editButton = screen.getByRole('table').querySelector('button[aria-label="Edit user bob"]');
     await act(async () => {
       fireEvent.click(editButton!);
     });
@@ -473,9 +503,11 @@ describe('AdminUsersPage error handling', () => {
     api.default.patch.mockRejectedValueOnce(makeNetworkError());
 
     await act(async () => { render(<AdminUsersPage />); });
-    await vi.waitFor(() => expect(screen.getByText('alice')).toBeInTheDocument());
+    // #771: table-scoped (below-sm card list duplicates the text)
+    await vi.waitFor(() => expect(inTable().getByText('alice')).toBeInTheDocument());
 
-    const editButton = document.querySelector('button[aria-label="Edit user bob"]');
+    // #771: table-scoped (below-sm card list duplicates the text)
+    const editButton = screen.getByRole('table').querySelector('button[aria-label="Edit user bob"]');
     await act(async () => {
       fireEvent.click(editButton!);
     });
@@ -500,10 +532,12 @@ describe('AdminUsersPage error handling', () => {
     api.default.patch.mockRejectedValueOnce(makeApiError('Password does not meet complexity requirements'));
 
     await act(async () => { render(<AdminUsersPage />); });
-    await vi.waitFor(() => expect(screen.getByText('alice')).toBeInTheDocument());
+    // #771: table-scoped (below-sm card list duplicates the text)
+    await vi.waitFor(() => expect(inTable().getByText('alice')).toBeInTheDocument());
 
     // Click reset password button for bob
-    const resetButton = document.querySelector('button[aria-label="Reset password for bob"]');
+    // #771: table-scoped (below-sm card list duplicates the text)
+    const resetButton = screen.getByRole('table').querySelector('button[aria-label="Reset password for bob"]');
     await act(async () => {
       fireEvent.click(resetButton!);
     });
@@ -533,9 +567,11 @@ describe('AdminUsersPage error handling', () => {
     api.default.patch.mockRejectedValueOnce(makeNetworkError());
 
     await act(async () => { render(<AdminUsersPage />); });
-    await vi.waitFor(() => expect(screen.getByText('alice')).toBeInTheDocument());
+    // #771: table-scoped (below-sm card list duplicates the text)
+    await vi.waitFor(() => expect(inTable().getByText('alice')).toBeInTheDocument());
 
-    const resetButton = document.querySelector('button[aria-label="Reset password for bob"]');
+    // #771: table-scoped (below-sm card list duplicates the text)
+    const resetButton = screen.getByRole('table').querySelector('button[aria-label="Reset password for bob"]');
     await act(async () => {
       fireEvent.click(resetButton!);
     });
@@ -636,10 +672,12 @@ describe('AdminUsersPage error handling', () => {
     api.default.put.mockImplementation(() => Promise.reject(makeApiError('User not in required group')));
 
     await act(async () => { render(<AdminUsersPage />); });
-    await vi.waitFor(() => expect(screen.getByText('alice')).toBeInTheDocument());
+    // #771: table-scoped (below-sm card list duplicates the text)
+    await vi.waitFor(() => expect(inTable().getByText('alice')).toBeInTheDocument());
 
     // Open groups sheet for bob
-    const groupButton = document.querySelector('button[aria-label="Manage groups for bob"]');
+    // #771: table-scoped (below-sm card list duplicates the text)
+    const groupButton = screen.getByRole('table').querySelector('button[aria-label="Manage groups for bob"]');
     await act(async () => {
       fireEvent.click(groupButton!);
     });
@@ -663,9 +701,11 @@ describe('AdminUsersPage error handling', () => {
     api.default.put.mockImplementation(() => Promise.reject(makeNetworkError()));
 
     await act(async () => { render(<AdminUsersPage />); });
-    await vi.waitFor(() => expect(screen.getByText('alice')).toBeInTheDocument());
+    // #771: table-scoped (below-sm card list duplicates the text)
+    await vi.waitFor(() => expect(inTable().getByText('alice')).toBeInTheDocument());
 
-    const groupButton = document.querySelector('button[aria-label="Manage groups for bob"]');
+    // #771: table-scoped (below-sm card list duplicates the text)
+    const groupButton = screen.getByRole('table').querySelector('button[aria-label="Manage groups for bob"]');
     await act(async () => {
       fireEvent.click(groupButton!);
     });
@@ -691,10 +731,12 @@ describe('AdminUsersPage error handling', () => {
     api.default.put.mockImplementation(() => Promise.reject(makeApiError('User cannot manage this organization')));
 
     await act(async () => { render(<AdminUsersPage />); });
-    await vi.waitFor(() => expect(screen.getByText('alice')).toBeInTheDocument());
+    // #771: table-scoped (below-sm card list duplicates the text)
+    await vi.waitFor(() => expect(inTable().getByText('alice')).toBeInTheDocument());
 
     // Open orgs sheet for bob
-    const orgButton = document.querySelector('button[aria-label="Manage organizations for bob"]');
+    // #771: table-scoped (below-sm card list duplicates the text)
+    const orgButton = screen.getByRole('table').querySelector('button[aria-label="Manage organizations for bob"]');
     await act(async () => {
       fireEvent.click(orgButton!);
     });
@@ -718,9 +760,11 @@ describe('AdminUsersPage error handling', () => {
     api.default.put.mockImplementation(() => Promise.reject(makeNetworkError()));
 
     await act(async () => { render(<AdminUsersPage />); });
-    await vi.waitFor(() => expect(screen.getByText('alice')).toBeInTheDocument());
+    // #771: table-scoped (below-sm card list duplicates the text)
+    await vi.waitFor(() => expect(inTable().getByText('alice')).toBeInTheDocument());
 
-    const orgButton = document.querySelector('button[aria-label="Manage organizations for bob"]');
+    // #771: table-scoped (below-sm card list duplicates the text)
+    const orgButton = screen.getByRole('table').querySelector('button[aria-label="Manage organizations for bob"]');
     await act(async () => {
       fireEvent.click(orgButton!);
     });
@@ -745,9 +789,11 @@ describe('AdminUsersPage error handling', () => {
     registerUrlResponse('/groups', makeApiError('Insufficient permissions to view groups'));
 
     await act(async () => { render(<AdminUsersPage />); });
-    await vi.waitFor(() => expect(screen.getByText('alice')).toBeInTheDocument());
+    // #771: table-scoped (below-sm card list duplicates the text)
+    await vi.waitFor(() => expect(inTable().getByText('alice')).toBeInTheDocument());
 
-    const groupButton = document.querySelector('button[aria-label="Manage groups for bob"]');
+    // #771: table-scoped (below-sm card list duplicates the text)
+    const groupButton = screen.getByRole('table').querySelector('button[aria-label="Manage groups for bob"]');
     await act(async () => {
       fireEvent.click(groupButton!);
     });
@@ -761,9 +807,11 @@ describe('AdminUsersPage error handling', () => {
     registerUrlResponse('/groups', makeNetworkError());
 
     await act(async () => { render(<AdminUsersPage />); });
-    await vi.waitFor(() => expect(screen.getByText('alice')).toBeInTheDocument());
+    // #771: table-scoped (below-sm card list duplicates the text)
+    await vi.waitFor(() => expect(inTable().getByText('alice')).toBeInTheDocument());
 
-    const groupButton = document.querySelector('button[aria-label="Manage groups for bob"]');
+    // #771: table-scoped (below-sm card list duplicates the text)
+    const groupButton = screen.getByRole('table').querySelector('button[aria-label="Manage groups for bob"]');
     await act(async () => {
       fireEvent.click(groupButton!);
     });
@@ -781,9 +829,11 @@ describe('AdminUsersPage error handling', () => {
     registerUrlResponse(`/users/2/groups`, makeApiError('User group fetch forbidden'));
 
     await act(async () => { render(<AdminUsersPage />); });
-    await vi.waitFor(() => expect(screen.getByText('alice')).toBeInTheDocument());
+    // #771: table-scoped (below-sm card list duplicates the text)
+    await vi.waitFor(() => expect(inTable().getByText('alice')).toBeInTheDocument());
 
-    const groupButton = document.querySelector('button[aria-label="Manage groups for bob"]');
+    // #771: table-scoped (below-sm card list duplicates the text)
+    const groupButton = screen.getByRole('table').querySelector('button[aria-label="Manage groups for bob"]');
     await act(async () => {
       fireEvent.click(groupButton!);
     });
@@ -798,9 +848,11 @@ describe('AdminUsersPage error handling', () => {
     registerUrlResponse(`/users/2/groups`, makeNetworkError());
 
     await act(async () => { render(<AdminUsersPage />); });
-    await vi.waitFor(() => expect(screen.getByText('alice')).toBeInTheDocument());
+    // #771: table-scoped (below-sm card list duplicates the text)
+    await vi.waitFor(() => expect(inTable().getByText('alice')).toBeInTheDocument());
 
-    const groupButton = document.querySelector('button[aria-label="Manage groups for bob"]');
+    // #771: table-scoped (below-sm card list duplicates the text)
+    const groupButton = screen.getByRole('table').querySelector('button[aria-label="Manage groups for bob"]');
     await act(async () => {
       fireEvent.click(groupButton!);
     });
@@ -809,19 +861,40 @@ describe('AdminUsersPage error handling', () => {
     await vi.waitFor(() => expect(toastError).toHaveBeenCalledWith('Failed to load user groups'));
   });
 
-  it('fetchUserGroups: renders empty groups when response.data.groups is missing', async () => {
+  it('fetchUserGroups: treats a missing groups payload as an error and enables save after a valid retry', async () => {
+    const api = await import('@/lib/api');
     registerUrlResponse('/groups', { data: {} });
     registerUrlResponse(`/users/2/groups`, { data: {} });
 
     await act(async () => { render(<AdminUsersPage />); });
-    await vi.waitFor(() => expect(screen.getByText('alice')).toBeInTheDocument());
+    // #771: table-scoped (below-sm card list duplicates the text)
+    await vi.waitFor(() => expect(inTable().getByText('alice')).toBeInTheDocument());
 
-    const groupButton = document.querySelector('button[aria-label="Manage groups for bob"]');
+    // #771: table-scoped (below-sm card list duplicates the text)
+    const groupButton = screen.getByRole('table').querySelector('button[aria-label="Manage groups for bob"]');
     await act(async () => {
       fireEvent.click(groupButton!);
     });
 
-    await vi.waitFor(() => expect(screen.getByText('No groups available')).toBeInTheDocument());
+    await vi.waitFor(() =>
+      expect(screen.getByRole('alert')).toHaveTextContent('Failed to load groups or user memberships.')
+    );
+    expect(screen.queryByText('No groups available')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Save group changes' })).toBeDisabled();
+    expect(api.default.put).not.toHaveBeenCalled();
+
+    registerUrlResponse('/groups', {
+      data: { groups: [{ id: 1, name: 'Admins', description: null }] },
+    });
+    registerUrlResponse(`/users/2/groups`, { data: { groups: [] } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Retry groups' }));
+    });
+
+    await vi.waitFor(() =>
+      expect(screen.getByRole('checkbox', { name: 'Select Admins' })).toBeInTheDocument()
+    );
+    expect(screen.getByRole('button', { name: 'Save group changes' })).toBeEnabled();
   });
 
   // ============================================================
@@ -831,9 +904,11 @@ describe('AdminUsersPage error handling', () => {
     registerUrlResponse('/organizations/', makeApiError('Organization access denied'));
 
     await act(async () => { render(<AdminUsersPage />); });
-    await vi.waitFor(() => expect(screen.getByText('alice')).toBeInTheDocument());
+    // #771: table-scoped (below-sm card list duplicates the text)
+    await vi.waitFor(() => expect(inTable().getByText('alice')).toBeInTheDocument());
 
-    const orgButton = document.querySelector('button[aria-label="Manage organizations for bob"]');
+    // #771: table-scoped (below-sm card list duplicates the text)
+    const orgButton = screen.getByRole('table').querySelector('button[aria-label="Manage organizations for bob"]');
     await act(async () => {
       fireEvent.click(orgButton!);
     });
@@ -846,9 +921,11 @@ describe('AdminUsersPage error handling', () => {
     registerUrlResponse('/organizations/', makeNetworkError());
 
     await act(async () => { render(<AdminUsersPage />); });
-    await vi.waitFor(() => expect(screen.getByText('alice')).toBeInTheDocument());
+    // #771: table-scoped (below-sm card list duplicates the text)
+    await vi.waitFor(() => expect(inTable().getByText('alice')).toBeInTheDocument());
 
-    const orgButton = document.querySelector('button[aria-label="Manage organizations for bob"]');
+    // #771: table-scoped (below-sm card list duplicates the text)
+    const orgButton = screen.getByRole('table').querySelector('button[aria-label="Manage organizations for bob"]');
     await act(async () => {
       fireEvent.click(orgButton!);
     });
@@ -857,18 +934,40 @@ describe('AdminUsersPage error handling', () => {
     await vi.waitFor(() => expect(toastError).toHaveBeenCalledWith('Failed to load organizations'));
   });
 
-  it('fetchAllOrgs: renders empty organizations when response.data.organizations is missing', async () => {
+  it('fetchAllOrgs: treats a missing organizations payload as an error and enables save after a valid retry', async () => {
+    const api = await import('@/lib/api');
     registerUrlResponse('/organizations/', { data: {} });
+    registerUrlResponse('/users/2/organizations', { data: {} });
 
     await act(async () => { render(<AdminUsersPage />); });
-    await vi.waitFor(() => expect(screen.getByText('alice')).toBeInTheDocument());
+    // #771: table-scoped (below-sm card list duplicates the text)
+    await vi.waitFor(() => expect(inTable().getByText('alice')).toBeInTheDocument());
 
-    const orgButton = document.querySelector('button[aria-label="Manage organizations for bob"]');
+    // #771: table-scoped (below-sm card list duplicates the text)
+    const orgButton = screen.getByRole('table').querySelector('button[aria-label="Manage organizations for bob"]');
     await act(async () => {
       fireEvent.click(orgButton!);
     });
 
-    await vi.waitFor(() => expect(screen.getByText('No organizations available')).toBeInTheDocument());
+    await vi.waitFor(() =>
+      expect(screen.getByRole('alert')).toHaveTextContent('Failed to load organizations or user memberships.')
+    );
+    expect(screen.queryByText('No organizations available')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Save organization changes' })).toBeDisabled();
+    expect(api.default.put).not.toHaveBeenCalled();
+
+    registerUrlResponse('/organizations/', {
+      data: { organizations: [{ id: 1, name: 'Org A', description: 'desc' }] },
+    });
+    registerUrlResponse('/users/2/organizations', { data: { organizations: [] } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Retry organizations' }));
+    });
+
+    await vi.waitFor(() =>
+      expect(screen.getByRole('checkbox', { name: 'Select Org A' })).toBeInTheDocument()
+    );
+    expect(screen.getByRole('button', { name: 'Save organization changes' })).toBeEnabled();
   });
 
   // ============================================================
@@ -880,9 +979,11 @@ describe('AdminUsersPage error handling', () => {
     registerUrlResponse('/users/2/organizations', makeApiError('User org fetch forbidden'));
 
     await act(async () => { render(<AdminUsersPage />); });
-    await vi.waitFor(() => expect(screen.getByText('alice')).toBeInTheDocument());
+    // #771: table-scoped (below-sm card list duplicates the text)
+    await vi.waitFor(() => expect(inTable().getByText('alice')).toBeInTheDocument());
 
-    const orgButton = document.querySelector('button[aria-label="Manage organizations for bob"]');
+    // #771: table-scoped (below-sm card list duplicates the text)
+    const orgButton = screen.getByRole('table').querySelector('button[aria-label="Manage organizations for bob"]');
     await act(async () => {
       fireEvent.click(orgButton!);
     });
@@ -897,9 +998,11 @@ describe('AdminUsersPage error handling', () => {
     registerUrlResponse('/users/2/organizations', makeNetworkError());
 
     await act(async () => { render(<AdminUsersPage />); });
-    await vi.waitFor(() => expect(screen.getByText('alice')).toBeInTheDocument());
+    // #771: table-scoped (below-sm card list duplicates the text)
+    await vi.waitFor(() => expect(inTable().getByText('alice')).toBeInTheDocument());
 
-    const orgButton = document.querySelector('button[aria-label="Manage organizations for bob"]');
+    // #771: table-scoped (below-sm card list duplicates the text)
+    const orgButton = screen.getByRole('table').querySelector('button[aria-label="Manage organizations for bob"]');
     await act(async () => {
       fireEvent.click(orgButton!);
     });

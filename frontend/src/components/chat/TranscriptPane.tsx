@@ -117,19 +117,24 @@ export function EmptyTranscript({
         </p>
 
         {hasIndexedDocs ? (
-          <div className="grid w-full grid-cols-1 gap-2.5 sm:grid-cols-2" role="list" aria-label="Suggested prompts">
+          // #868: native list semantics — the previous div role="list" with
+          // plain button children was a critical aria-required-children
+          // violation on /chat empty transcripts. The grid layout lives on
+          // the <ul> unchanged; each prompt button sits in an <li>.
+          <ul className="grid w-full grid-cols-1 gap-2.5 sm:grid-cols-2" aria-label="Suggested prompts">
             {SUGGESTED_PROMPTS.map((prompt, i) => (
-              <button
-                key={i}
-                onClick={() => onPromptClick(prompt.text)}
-                className="group flex items-start gap-3 rounded-xl border border-border bg-card p-4 text-left transition-all duration-200 hover:border-primary/30 hover:bg-accent/5 hover:-translate-y-0.5 hover:shadow-xs focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
-                aria-label={`Use prompt: ${prompt.text}`}
-              >
-                <prompt.Icon className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground group-hover:text-primary transition-colors" aria-hidden />
-                <span className="text-sm font-medium">{prompt.text}</span>
-              </button>
+              <li key={i}>
+                <button
+                  onClick={() => onPromptClick(prompt.text)}
+                  className="group flex w-full items-start gap-3 rounded-xl border border-border bg-card p-4 text-left transition-all duration-200 hover:border-primary/30 hover:bg-accent/5 hover:-translate-y-0.5 hover:shadow-xs focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+                  aria-label={`Use prompt: ${prompt.text}`}
+                >
+                  <prompt.Icon className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground group-hover:text-primary transition-colors" aria-hidden />
+                  <span className="text-sm font-medium">{prompt.text}</span>
+                </button>
+              </li>
             ))}
-          </div>
+          </ul>
         ) : (
           <Button onClick={onNavigateToDocuments} className="gap-2" aria-label="Go to documents page">
             <Database className="h-4 w-4" aria-hidden />
@@ -300,13 +305,13 @@ const MessageRow = memo(function MessageRow({
           </AnimatePresence>
           {showInterruptedStatusBanner && (
             <div
-              className="mt-3 flex items-start gap-2 rounded-sm border border-amber-500/40 bg-amber-500/10 px-3 py-2"
+              className="mt-3 flex items-start gap-2 rounded-sm border border-warning/40 bg-warning/10 px-3 py-2"
               role="status"
               data-interrupted-status={safeMessage.status}
             >
-              <AlertTriangle className="h-4 w-4 shrink-0 text-amber-500 mt-0.5" aria-hidden />
+              <AlertTriangle className="h-4 w-4 shrink-0 text-warning mt-0.5" aria-hidden />
               <div className="min-w-0">
-                <p className="text-xs font-medium text-amber-700 dark:text-amber-300">
+                <p className="text-xs font-medium text-warning">
                   {safeMessage.status === "partial"
                     ? "Response is incomplete — you can retry."
                     : safeMessage.status === "failed"
@@ -319,7 +324,7 @@ const MessageRow = memo(function MessageRow({
                   <Button
                     variant="link"
                     size="sm"
-                    className="h-auto p-0 mt-1 text-amber-700 dark:text-amber-300 text-xs"
+                    className="h-auto p-0 mt-1 text-warning text-xs"
                     onClick={onRetry}
                   >
                     Retry
@@ -467,8 +472,8 @@ export function TranscriptPane({ className, onSessionCreated }: TranscriptPanePr
   // below-lg evidence sheet pads <main> by 45vh, which shrinks or grows this
   // scroll container WITHOUT a scroll event — a bottom-pinned user would
   // silently end up half a viewport above the newest content. Re-pin on
-  // container size changes when the user is still pinned. (Guarded: jsdom
-  // has no ResizeObserver.)
+  // container size changes when the user is still pinned. (ResizeObserver is
+  // stubbed to a no-op in tests, so the callback never fires there.)
   useEffect(() => {
     if (typeof ResizeObserver === "undefined") return;
     const el = scrollRef.current;

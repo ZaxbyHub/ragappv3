@@ -41,7 +41,7 @@ function controllableSse() {
           }
         })
     ),
-    cancel: vi.fn(),
+    cancel: vi.fn().mockResolvedValue(undefined),
   };
   const emit = (chunk: string) => {
     const item = { value: encoder.encode(chunk), done: false };
@@ -102,7 +102,7 @@ function doneResponse(): Response {
     body: {
       getReader: () => ({
         read: vi.fn().mockResolvedValue({ done: true, value: undefined }),
-        cancel: vi.fn(),
+        cancel: vi.fn().mockResolvedValue(undefined),
       }),
     },
   } as unknown as Response;
@@ -623,6 +623,49 @@ describe("useDraftRoomEvents", () => {
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: draftRoomKeys.jobs(DRAFT_ID) });
 
     unmount();
+  });
+
+  it("clamps a sub-500ms configured fallback interval to 500ms", async () => {
+    vi.useFakeTimers();
+    const intervalSpy = vi.spyOn(globalThis, "setInterval");
+    queryClient.setQueryData(
+      draftRoomKeys.detail(DRAFT_ID),
+      { active_compile_job: { id: 1 } } as unknown as DraftDetail
+    );
+    queryClient.setQueryData(
+      draftRoomKeys.capabilities(),
+      { limits: { poll_interval_seconds: 0.1 } } as unknown as DraftRoomCapabilities
+    );
+    fetchMock
+      .mockResolvedValueOnce(errorResponse(500, "e1"))
+      .mockResolvedValueOnce(errorResponse(500, "e2"))
+      .mockResolvedValueOnce(errorResponse(500, "e3"))
+      .mockImplementation(() => new Promise<Response>(() => {}));
+
+    const { result, unmount } = renderEvents();
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await advance(1100);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    await advance(2100);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    await vi.waitFor(() => expect(result.current.pollingFallback).toBe(true));
+
+    expect(intervalSpy.mock.calls.some(([, delay]) => delay === 500)).toBe(true);
+    const beforeFirstPoll = invalidateSpy.mock.calls.length;
+    await act(async () => {
+      await vi.advanceTimersToNextTimerAsync();
+    });
+    expect(invalidateSpy.mock.calls.length - beforeFirstPoll).toBe(2);
+    invalidateSpy.mockClear();
+    await advance(499);
+    expect(invalidateSpy).not.toHaveBeenCalled();
+    await advance(1);
+    await vi.waitFor(() =>
+      expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: draftRoomKeys.detail(DRAFT_ID) })
+    );
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: draftRoomKeys.jobs(DRAFT_ID) });
+    unmount();
+    intervalSpy.mockRestore();
   });
 
   it("stops polling once the draft has no active job", async () => {

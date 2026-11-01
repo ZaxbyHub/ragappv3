@@ -1,9 +1,11 @@
 // ADVERSARIAL TESTS for VaultMembersPanel — XSS, injection, edge cases, error handling
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, waitFor, act, fireEvent } from '@testing-library/react';
+import { render, screen, waitFor, act, fireEvent, within } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { VaultMembersPanel } from '@/components/VaultMembersPanel';
 import { toast } from 'sonner';
+// #771: table-scoped (below-sm card list duplicates the text)
+const inTable = () => within(screen.getByRole('table'));
 
 // --- Mocks ---
 vi.mock('@/lib/api', () => ({
@@ -103,7 +105,8 @@ describe('VaultMembersPanel ADVERSARIAL', () => {
       await act(async () => { render(<VaultMembersPanel vaultId={1} />); });
 
       await waitFor(() => {
-        expect(screen.getByText((content) => content.includes(payload) || content.includes('script'))).toBeInTheDocument();
+        // #771: table-scoped (below-sm card list duplicates the text)
+        expect(inTable().getByText((content) => content.includes(payload) || content.includes('script'))).toBeInTheDocument();
       });
       expect(document.querySelectorAll('script')).toHaveLength(0);
     });
@@ -117,7 +120,8 @@ describe('VaultMembersPanel ADVERSARIAL', () => {
       await act(async () => { render(<VaultMembersPanel vaultId={1} />); });
 
       await waitFor(() => {
-        expect(screen.getByText('Safe Name')).toBeInTheDocument();
+        // #771: table-scoped (below-sm card list duplicates the text)
+        expect(inTable().getByText('Safe Name')).toBeInTheDocument();
       });
       expect(document.querySelectorAll('script')).toHaveLength(0);
     });
@@ -142,7 +146,8 @@ describe('VaultMembersPanel ADVERSARIAL', () => {
       await act(async () => { render(<VaultMembersPanel vaultId={1} />); });
 
       await waitFor(() => {
-        expect(screen.getByText('Alice Johnson')).toBeInTheDocument();
+        // #771: table-scoped (below-sm card list duplicates the text)
+        expect(inTable().getByText('Alice Johnson')).toBeInTheDocument();
       });
 
       // Enter a user ID into the plain add-member input
@@ -169,7 +174,8 @@ describe('VaultMembersPanel ADVERSARIAL', () => {
       await act(async () => { render(<VaultMembersPanel vaultId={1} />); });
 
       await waitFor(() => {
-        expect(screen.getByText('Alice Johnson')).toBeInTheDocument();
+        // #771: table-scoped (below-sm card list duplicates the text)
+        expect(inTable().getByText('Alice Johnson')).toBeInTheDocument();
       });
 
       const permSelects = document.querySelectorAll('select[aria-label*="alice"]');
@@ -189,7 +195,8 @@ describe('VaultMembersPanel ADVERSARIAL', () => {
       await act(async () => { render(<VaultMembersPanel vaultId={1} />); });
 
       await waitFor(() => {
-        expect(screen.getByText('Alice Johnson')).toBeInTheDocument();
+        // #771: table-scoped (below-sm card list duplicates the text)
+        expect(inTable().getByText('Alice Johnson')).toBeInTheDocument();
       });
 
       const removeBtn = document.querySelector('button[aria-label="Remove alice from vault"]') as HTMLElement;
@@ -219,7 +226,8 @@ describe('VaultMembersPanel ADVERSARIAL', () => {
       await act(async () => { render(<VaultMembersPanel vaultId={1} />); });
 
       await waitFor(() => {
-        expect(screen.getByText(/no members yet/i)).toBeInTheDocument();
+        // #771: table-scoped (below-sm card list duplicates the text)
+        expect(inTable().getByText(/no members yet/i)).toBeInTheDocument();
       });
     });
 
@@ -232,7 +240,8 @@ describe('VaultMembersPanel ADVERSARIAL', () => {
       await act(async () => { render(<VaultMembersPanel vaultId={1} />); });
 
       await waitFor(() => {
-        expect(screen.getByText('@nullname')).toBeInTheDocument();
+        // #771: table-scoped (below-sm card list duplicates the text)
+        expect(inTable().getByText('@nullname')).toBeInTheDocument();
       });
     });
 
@@ -240,7 +249,8 @@ describe('VaultMembersPanel ADVERSARIAL', () => {
       await act(async () => { render(<VaultMembersPanel vaultId={1} />); });
 
       await waitFor(() => {
-        expect(screen.getByText('Alice Johnson')).toBeInTheDocument();
+        // #771: table-scoped (below-sm card list duplicates the text)
+        expect(inTable().getByText('Alice Johnson')).toBeInTheDocument();
       });
 
       const addButton = screen.getByRole('button', { name: /add/i });
@@ -260,7 +270,8 @@ describe('VaultMembersPanel ADVERSARIAL', () => {
       await act(async () => { render(<VaultMembersPanel vaultId={1} />); });
 
       await waitFor(() => {
-        expect(screen.getByText('@longuser')).toBeInTheDocument();
+        // #771: table-scoped (below-sm card list duplicates the text)
+        expect(inTable().getByText('@longuser')).toBeInTheDocument();
       });
     });
   });
@@ -274,7 +285,8 @@ describe('VaultMembersPanel ADVERSARIAL', () => {
       await act(async () => { render(<VaultMembersPanel vaultId={1} />); });
 
       await waitFor(() => {
-        expect(screen.getByText('Alice Johnson')).toBeInTheDocument();
+        // #771: table-scoped (below-sm card list duplicates the text)
+        expect(inTable().getByText('Alice Johnson')).toBeInTheDocument();
       });
 
       const permSelect = document.querySelector('select[aria-label*="alice"]') as HTMLElement;
@@ -286,7 +298,8 @@ describe('VaultMembersPanel ADVERSARIAL', () => {
       }
 
       // Should not crash
-      expect(screen.getByText('Alice Johnson')).toBeInTheDocument();
+      // #771: table-scoped (below-sm card list duplicates the text)
+      expect(inTable().getByText('Alice Johnson')).toBeInTheDocument();
     });
   });
 
@@ -302,8 +315,9 @@ describe('VaultMembersPanel ADVERSARIAL', () => {
       await act(async () => { render(<VaultMembersPanel vaultId={1} />); });
 
       await waitFor(() => {
-        expect(screen.getByText('张三')).toBeInTheDocument();
-        expect(screen.getByText('🎉 Name')).toBeInTheDocument();
+        // #771: table-scoped (below-sm card list duplicates the text)
+        expect(inTable().getByText('张三')).toBeInTheDocument();
+        expect(inTable().getByText('🎉 Name')).toBeInTheDocument();
       });
     });
   });
@@ -319,7 +333,8 @@ describe('VaultMembersPanel ADVERSARIAL', () => {
       await act(async () => { render(<VaultMembersPanel vaultId={1} />); });
 
       await waitFor(() => {
-        expect(screen.getByText('Bad Date')).toBeInTheDocument();
+        // #771: table-scoped (below-sm card list duplicates the text)
+        expect(inTable().getByText('Bad Date')).toBeInTheDocument();
       });
     });
   });
@@ -332,7 +347,10 @@ describe('VaultMembersPanel ADVERSARIAL', () => {
       await act(async () => { render(<VaultMembersPanel vaultId={999} />); });
 
       await waitFor(() => {
-        expect(api.default.get).toHaveBeenCalledWith('/vaults/999/members');
+        expect(api.default.get).toHaveBeenCalledWith(
+          '/vaults/999/members',
+          expect.objectContaining({ signal: expect.any(AbortSignal) }),
+        );
       });
     });
 
@@ -342,7 +360,10 @@ describe('VaultMembersPanel ADVERSARIAL', () => {
       await act(async () => { render(<VaultMembersPanel vaultId={0} />); });
 
       await waitFor(() => {
-        expect(api.default.get).toHaveBeenCalledWith('/vaults/0/members');
+        expect(api.default.get).toHaveBeenCalledWith(
+          '/vaults/0/members',
+          expect.objectContaining({ signal: expect.any(AbortSignal) }),
+        );
       });
     });
 
@@ -352,7 +373,10 @@ describe('VaultMembersPanel ADVERSARIAL', () => {
       await act(async () => { render(<VaultMembersPanel vaultId={-1} />); });
 
       await waitFor(() => {
-        expect(api.default.get).toHaveBeenCalledWith('/vaults/-1/members');
+        expect(api.default.get).toHaveBeenCalledWith(
+          '/vaults/-1/members',
+          expect.objectContaining({ signal: expect.any(AbortSignal) }),
+        );
       });
     });
   });

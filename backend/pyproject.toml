@@ -58,7 +58,11 @@ filterwarnings = [
 # mutant test runs.
 [tool.mutmut]
 source_paths = ["app/security.py"]
-pytest_add_cli_args = "-p no:randomly"
+# Must be a LIST: mutmut 3.7 concatenates this value onto a list of args, so
+# the string form raises `TypeError: can only concatenate list (not "str") to
+# list` inside `mutmut run` before any mutant is tested (PR #1045 feedback,
+# CR-NEW-1).
+pytest_add_cli_args = ["-p", "no:randomly"]
 
 # Coverage gating (H4). Scoped to the SSRF guard modules — these are small,
 # fully exercised in CI, and the security-critical surface this issue's SSRF

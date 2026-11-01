@@ -53,30 +53,15 @@ function SourceCard({ source, fallbackIndex, validCitationLabels, onClick }: Sou
   const citedState = resolveCitedState(source.source_label, validCitationLabels);
 
   return (
+    // #866: the card is a layout surface, not a button — the open action
+    // moved onto the filename button below so the card never nests the
+    // More/Less expander (an interactive control) inside an interactive
+    // container (axe nested-interactive).
     <div
       className={cn(
-        "rounded-sm border border-border bg-card p-3 text-sm cursor-pointer",
-        "hover:border-primary/30 hover:bg-accent/5 transition-colors duration-150",
-        "focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+        "rounded-sm border border-border bg-card p-3 text-sm",
+        "hover:border-primary/30 hover:bg-accent/5 transition-colors duration-150"
       )}
-      onClick={onClick}
-      role="button"
-      tabIndex={0}
-      onKeyDown={(e) => {
-        // role="button" owes the full native button keyboard contract: Space
-        // activates exactly like Enter (and must not scroll the page).
-        // Guard the nested interactive controls (the More/Less expander):
-        // their keydowns bubble here, and hijacking them would cancel the
-        // button's native activation (F-1). Ignore key auto-repeat so a
-        // held key does not machine-gun the activation.
-        if (e.target !== e.currentTarget) return;
-        if (e.repeat) return;
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          onClick();
-        }
-      }}
-      aria-label={`Source ${badgeLabel}: ${source.filename}`}
     >
       <div className="flex items-start justify-between gap-2">
         <div className="flex items-center gap-2 min-w-0">
@@ -86,9 +71,14 @@ function SourceCard({ source, fallbackIndex, validCitationLabels, onClick }: Sou
           >
             {badgeLabel}
           </span>
-          <span className="font-medium text-foreground truncate" title={source.filename}>
+          <button
+            type="button"
+            onClick={onClick}
+            aria-label={`Source ${badgeLabel}: ${source.filename}`}
+            className="font-medium text-foreground truncate hover:underline focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 rounded-sm"
+          >
             {source.filename}
-          </span>
+          </button>
         </div>
         <div className="flex items-center gap-1 shrink-0">
           {source.modality && ARTIFACT_MODALITIES.has(source.modality) && (
@@ -101,7 +91,7 @@ function SourceCard({ source, fallbackIndex, validCitationLabels, onClick }: Sou
           )}
           {source.vision_status && source.vision_status !== "used" && (
             <span
-              className="shrink-0 rounded-sm bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-600"
+              className="shrink-0 rounded-sm bg-warning/15 px-1.5 py-0.5 text-[10px] font-medium text-warning"
               aria-label={`vision status: ${source.vision_status}`}
             >
               proxy
@@ -121,7 +111,7 @@ function SourceCard({ source, fallbackIndex, validCitationLabels, onClick }: Sou
               className={cn(
                 "text-[10px] px-1.5 py-0",
                 citedState === "cited"
-                  ? "text-emerald-600 border-emerald-500/30 bg-emerald-500/5"
+                  ? "text-success border-success/30 bg-success/5"
                   : "text-muted-foreground"
               )}
               aria-label={
@@ -181,7 +171,7 @@ export function SourceCards({ sources, onSourceClick, onViewAll, hideIfEmpty = t
 
   if (sources.length === 0) {
     return (
-      <p className="mt-3 text-xs text-muted-foreground/60 italic">No sources found.</p>
+      <p className="mt-3 text-xs text-muted-foreground italic">No sources found.</p>
     );
   }
 

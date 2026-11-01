@@ -49,6 +49,11 @@ def mock_settings():
         mock.exact_match_promote = False
         mock.reranking_enabled = False
         mock.hybrid_search_enabled = False
+        # #715 T1-32-K-08: _execute_retrieval now gates on maintenance_mode at
+        # the choke point; a bare MagicMock attr is truthy, so pin it False.
+        mock.maintenance_mode = False
+        # PRR-010: bare-Mock retrieval_top_k makes int(Mock)==1 and truncates results
+        mock.retrieval_top_k = 10
         yield mock
 
 
@@ -232,8 +237,9 @@ def _query_settings(mock):
     mock.parent_retrieval_enabled = False
     mock.kms_enabled = False
     mock.reranking_enabled = False
-    mock.hybrid_search_enabled = False
     mock.maintenance_mode = False
+    # PRR-010: bare-Mock retrieval_top_k makes int(Mock)==1 and truncates results
+    mock.retrieval_top_k = 10
     mock.context_max_tokens = 0
     mock.retrieval_recency_weight = 0.0
     mock.rrf_legacy_mode = False

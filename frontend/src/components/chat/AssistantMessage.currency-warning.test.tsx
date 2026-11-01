@@ -62,7 +62,7 @@ describe("AssistantMessage currency warnings (issue #510 AC-17)", () => {
 });
 
 describe("AssistantMessage citation enforcement display (issue #510 UI-004)", () => {
-  it("renders a visible warning when enforcement reports missing_citations", () => {
+  it("renders the backend detail when enforcement reports missing_citations", () => {
     render(
       <AssistantMessage
         message={createMessage({
@@ -71,6 +71,46 @@ describe("AssistantMessage citation enforcement display (issue #510 UI-004)", ()
             status: "missing_citations",
             detail: "Citations were required but the answer contains no valid citation labels.",
           },
+        })}
+      />
+    );
+
+    expect(
+      screen.getByText(
+        "Citations were required but the answer contains no valid citation labels."
+      )
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("Citations were required but none were found in this answer")
+    ).not.toBeInTheDocument();
+  });
+
+  it("names the offending phantom labels in the banner detail (issue #709)", () => {
+    render(
+      <AssistantMessage
+        message={createMessage({
+          citationEnforcement: {
+            mode: "required",
+            status: "missing_citations",
+            detail:
+              "Citations were required but the answer cites labels that were not offered: M9.",
+          },
+        })}
+      />
+    );
+
+    expect(
+      screen.getByText(
+        "Citations were required but the answer cites labels that were not offered: M9."
+      )
+    ).toBeInTheDocument();
+  });
+
+  it("falls back to the fixed text when detail is absent", () => {
+    render(
+      <AssistantMessage
+        message={createMessage({
+          citationEnforcement: { mode: "required", status: "missing_citations" },
         })}
       />
     );

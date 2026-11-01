@@ -87,7 +87,7 @@ export function SourceCitation({ source, index, onClick, variant = "strip" }: So
             )}
             {source.vision_status && source.vision_status !== "used" && (
               <span
-                className="shrink-0 rounded-sm bg-amber-500/15 px-1 text-[9px] font-medium text-amber-600"
+                className="shrink-0 rounded-sm bg-warning/15 px-1 text-[9px] font-medium text-warning"
                 aria-label={`vision status: ${source.vision_status}`}
               >
                 proxy

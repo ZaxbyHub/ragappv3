@@ -113,7 +113,33 @@ const STAGES_LOOKUP_PAGE_SIZE = 100;
 const REVISIONS_LOOKUP_PAGE_SIZE = 50;
 const OPEN_FINDINGS_LOOKUP_PAGE_SIZE = 100;
 
+/** id of the paragraph explaining why compile/retry are disabled; the disabled
+ *  controls reference it with aria-describedby (issue #789 review F-010). */
+const CAPABILITY_BLOCK_REASON_ID = "draft-capability-block-reason";
+
 const FACT_CURRENT = new Set<string>(FACT_CURRENT_STATUSES);
+
+export const DEFAULT_DRAFT_MAX_INPUTS = 10;
+export const ZERO_READY_INPUTS_BLOCKER = "Add at least one parsed, ready source file before compiling.";
+export const INCOMPLETE_INPUTS_BLOCKER = "Every source file must be parsed and ready before compiling.";
+
+/** Keep the client compile gate aligned with the server's all-input rule. */
+export function draftCompileInputBlocker(
+  inputs: Array<Pick<DraftInput, "parse_status">>,
+): string | null {
+  const readyInputCount = inputs.filter((input) => input.parse_status === "ready").length;
+  if (readyInputCount === 0) return ZERO_READY_INPUTS_BLOCKER;
+  if (inputs.some((input) => input.parse_status !== "ready")) return INCOMPLETE_INPUTS_BLOCKER;
+  return null;
+}
+
+/** Use the shipped server default while capability discovery is unresolved. */
+export function draftMaxInputs(capabilities: DraftRoomCapabilities | undefined): number {
+  const maxInputs = capabilities?.limits?.max_inputs;
+  return typeof maxInputs === "number" && Number.isFinite(maxInputs) && maxInputs > 0
+    ? maxInputs
+    : DEFAULT_DRAFT_MAX_INPUTS;
+}
 
 const WORKSPACE_TAB_ITEMS: ReadonlyArray<{ value: WorkspaceTab; label: string }> = [
   { value: "assignment", label: "Assignment" },
@@ -271,6 +297,14 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
   const hasActiveJob = activeJob != null;
   const canManageContent = !archived && !vaultRevoked;
   const canPromote = canManageContent && vaultAccess === "write";
+  // Upload is a mutating capability. Fail closed until the capability response
+  // is hydrated, and keep the server's explicit deployment switch authoritative.
+  const uploadCapabilityBlocked = capabilities == null || capabilities.enabled === false;
+  // Editing and deleting a stored source are mutations too: PATCH input and
+  // DELETE .../inputs/{input_id} both answer 503 while the room is disabled.
+  // Gate their affordances on the same flag so the UI never offers a control
+  // that can only fail.
+  const editSourceCapabilityBlocked = uploadCapabilityBlocked;
 
   // ---- Job / stage lookups -------------------------------------------------
   const jobsQuery = useQuery({
@@ -510,8 +544,6 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
   }
 
   // ---- Compile --------------------------------------------------------------
-  const readyInputCount = detail.inputs.filter((input) => input.parse_status === "ready").length;
-
   function compileBlockedReason(): string | null {
     if (!capabilities) return "Loading Draft Room capabilities…";
     if (capabilities.enabled === false || capabilities.compile_available === false) {
@@ -520,7 +552,8 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
     if (archived) return "This project is archived. Restore it before compiling.";
     if (vaultRevoked) return READY_BLOCKER_LABELS.vault_access_revoked;
     if (hasActiveJob) return "A newsroom run is already active for this project.";
-    if (readyInputCount === 0) return "Add at least one parsed, ready source file before compiling.";
+    const inputBlocker = draftCompileInputBlocker(detail.inputs);
+    if (inputBlocker) return inputBlocker;
     const briefErrors = validateDraftAssignmentForm(toFormValue(draft, detail.brief), "edit");
     const firstInvalidKey = DRAFT_ASSIGNMENT_FIELD_ORDER.find((key) => key in briefErrors);
     if (firstInvalidKey) return briefErrors[firstInvalidKey];
@@ -570,7 +603,9 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
     return index === -1 ? stageOrder.length : stageOrder.length - index;
   }
   const maxModelCalls =
-    typeof capabilities?.limits?.max_model_calls === "number" ? capabilities.limits.max_model_calls : null;
+    typeof capabilities?.limits?.job_max_model_calls === "number"
+      ? capabilities.limits.job_max_model_calls
+      : null;
 
   // ---- Cancel ---------------------------------------------------------------
   const [cancelConfirmOpen, setCancelConfirmOpen] = useState(false);
@@ -809,7 +844,7 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
     <div className="space-y-4">
       <DraftSourceUpload
         draftId={draftId}
-        disabled={!canManageContent || hasActiveJob}
+        disabled={!canManageContent || hasActiveJob || uploadCapabilityBlocked}
         disabledReason={
           !canManageContent
             ? archived
@@ -817,9 +852,13 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
               : READY_BLOCKER_LABELS.vault_access_revoked
             : hasActiveJob
               ? "Editing is unavailable while a newsroom run is active."
-              : undefined
+              : !capabilities
+                ? "Loading Draft Room capabilities…"
+                : capabilities.enabled === false
+                  ? DRAFT_ROOM_DISABLED_MESSAGE
+                  : undefined
         }
-        maxInputs={typeof capabilities?.limits?.max_inputs === "number" ? capabilities.limits.max_inputs : 50}
+        maxInputs={draftMaxInputs(capabilities)}
         currentInputCount={detail.inputs.length}
       />
       <DraftSourceList
@@ -828,6 +867,7 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
         locked={hasActiveJob}
         lockedReason={activeJob ? STAGE_LABELS[activeJob.active_stage ?? ""] : undefined}
         canEdit={canManageContent}
+        editCapabilityBlocked={editSourceCapabilityBlocked}
       />
     </div>
   );
@@ -926,6 +966,7 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
           type="button"
           onClick={() => openCompileDialog(undefined)}
           disabled={blockedReason != null}
+          aria-describedby={blockedReason != null ? CAPABILITY_BLOCK_REASON_ID : undefined}
         >
           {compileCtaLabel(draft.mode)}
         </Button>
@@ -979,7 +1020,19 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
           Delete project
         </Button>
       </div>
-      {blockedReason != null && <p className="text-sm text-muted-foreground">{blockedReason}</p>}
+      {/* Issue #789 review F-010: the disabled compile/retry controls below are
+          unfocusable, so their reason must be programmatically associated or a
+          keyboard/screen-reader user never learns why the action is unavailable.
+          Deliberately NOT role="status": the loading paragraph already owns that
+          role and the workspace contract keeps exactly one live region. */}
+      {blockedReason != null && (
+        <p
+          id={CAPABILITY_BLOCK_REASON_ID}
+          className="text-sm text-muted-foreground"
+        >
+          {blockedReason}
+        </p>
+      )}
       {archiveBlockedReason != null && (
         <p className="text-sm text-muted-foreground">{archiveBlockedReason}</p>
       )}
@@ -997,7 +1050,15 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
             onValueChange={(value) => setRetryStage(value as DraftCompileStartStage)}
             disabled={retryCapabilityBlocked}
           >
-            <SelectTrigger id={`draft-${draftId}-retry-stage`} className="w-48">
+            <SelectTrigger
+              id={`draft-${draftId}-retry-stage`}
+              className="w-48"
+              aria-describedby={
+                retryCapabilityBlocked && blockedReason != null
+                  ? CAPABILITY_BLOCK_REASON_ID
+                  : undefined
+              }
+            >
               <SelectValue placeholder="Choose a stage" />
             </SelectTrigger>
             <SelectContent>
@@ -1013,6 +1074,11 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
             size="sm"
             onClick={() => retryStage && retryMutation.mutate(retryStage)}
             disabled={!retryStage || retryMutation.isPending || retryCapabilityBlocked}
+            aria-describedby={
+              retryCapabilityBlocked && blockedReason != null
+                ? CAPABILITY_BLOCK_REASON_ID
+                : undefined
+            }
           >
             {retryMutation.isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" aria-hidden="true" />}
             Retry
@@ -1043,11 +1109,12 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
               (one hidden via CSS below `lg`, one above) would leave two live
               tablists in the DOM at once, which is both wasted markup and a
               trap for assistive tech that doesn't honour the same media query
-              context. The bar scrolls horizontally instead of wrapping to a
-              second row, so it never causes page-level horizontal overflow. */}
+              context. Below lg the bar wraps (issue #778: a single-row
+              scroll put the right-most tabs past the 320px viewport); at lg+,
+              where the tabs fit, it keeps the original single-row scroll. */}
           <nav aria-label="Draft sections">
             <Tabs value={workspaceTab} onValueChange={(value) => setWorkspaceTab(value as WorkspaceTab)}>
-              <TabsList className="h-auto w-full flex-nowrap justify-start overflow-x-auto">
+              <TabsList className="h-auto w-full flex-wrap justify-start gap-1 lg:flex-nowrap lg:overflow-x-auto">
                 {WORKSPACE_TAB_ITEMS.map((item) => (
                   <TabsTrigger key={item.value} value={item.value} className="shrink-0">
                     {item.label}

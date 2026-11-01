@@ -235,6 +235,14 @@ class TestExactMatchPromotion(unittest.IsolatedAsyncioTestCase):
         # A is NOT in top-5, but feature is disabled
         with patch("app.services.rag_engine.rrf_fuse") as mock_fuse, \
              patch("app.services.rag_engine.settings") as mock_settings:
+            mock_settings.maintenance_mode = False  #715: pin the maintenance gate closed
+            # PRR-009 (feedback): pin the fusion weights + Phase-2 gate so
+            # the suite exercises real fusion semantics, not Mock TypeErrors
+            # swallowed by the broad search-phase handler.
+            mock_settings.rrf_weight_original = 1.0
+            mock_settings.rrf_weight_stepback = 0.5
+            mock_settings.rrf_weight_hyde = 0.5
+            mock_settings.context_max_tokens = 0
             mock_fuse.return_value = [
                 make_chunk("C"),
                 make_chunk("D"),
@@ -281,6 +289,14 @@ class TestExactMatchPromotion(unittest.IsolatedAsyncioTestCase):
 
         with patch("app.services.rag_engine.rrf_fuse") as mock_fuse, \
              patch("app.services.rag_engine.settings") as mock_settings:
+            mock_settings.maintenance_mode = False  #715: pin the maintenance gate closed
+            # PRR-009 (feedback): pin the fusion weights + Phase-2 gate so
+            # the suite exercises real fusion semantics, not Mock TypeErrors
+            # swallowed by the broad search-phase handler.
+            mock_settings.rrf_weight_original = 1.0
+            mock_settings.rrf_weight_stepback = 0.5
+            mock_settings.rrf_weight_hyde = 0.5
+            mock_settings.context_max_tokens = 0
             mock_fuse.return_value = [
                 make_chunk("C"),
                 make_chunk("D"),
