@@ -403,7 +403,7 @@ async def test_lifespan_logging_setup_attaches_filters_at_runtime():
 
     root = _logging.getLogger()
     saved_handlers = list(root.handlers)
-    restore = _pin_lifespan_settings(_Path(_tempfile.mkdtemp(prefix="l518-fb-")))
+    restore = _pin_lifespan_settings(_Path(_tempfile.TemporaryDirectory(prefix="l518-fb-").name))
     observed_fresh: list[tuple] = []
     try:
         # Fresh-handler branch: startup finds no root handlers.
@@ -428,7 +428,7 @@ async def test_lifespan_logging_setup_attaches_filters_at_runtime():
 
     # Existing-handler branch: startup finds a pre-attached handler and must
     # attach both filters to it (guarded by the not-in-type-set checks).
-    restore = _pin_lifespan_settings(_Path(_tempfile.mkdtemp(prefix="l518-eb-")))
+    restore = _pin_lifespan_settings(_Path(_tempfile.TemporaryDirectory(prefix="l518-eb-").name))
     preexisting = _logging.StreamHandler()
     observed_existing: list[tuple] = []
     try:

@@ -1481,7 +1481,8 @@ class TestUpdateUserGroupsCallerOrgCheck(TestUserRoutes):
 class TestSecurityAuditTrail(TestUserRoutes):
     """Issues #743 (S02-SK2-08) + #744 (T1-21-KR-09): every users.py
     safe_record_security_event family must land a real security_audit_log row,
-    and deactivation must revoke sessions in the same transaction.
+    and deactivation must revoke sessions (production deletes them before
+    the single commit; this test pins the observable outcome).
 
     These assertions became possible when setup_test_db switched to the
     production schema (user_route_helpers): the route-test database now
@@ -1492,12 +1493,23 @@ class TestSecurityAuditTrail(TestUserRoutes):
     safe_record_security_event is check C10 (tests/test_h07_fixture_fidelity).
     """
 
-    def _audit_count(self, event_type: str, target_user_id=None) -> int:
+    def _audit_count(
+        self,
+        event_type: str,
+        target_user_id=None,
+        actor_user_id=None,
+    ) -> int:
+        """Count audit rows by event, target AND actor (PRR-002): attribution
+        is the trail's documented purpose, so a regression recording the wrong
+        actor (or None) must fail these tests, not just a missing row."""
         sql = "SELECT COUNT(*) FROM security_audit_log WHERE event_type = ?"
         params: list = [event_type]
         if target_user_id is not None:
             sql += " AND target_user_id = ?"
             params.append(target_user_id)
+        if actor_user_id is not None:
+            sql += " AND actor_user_id = ?"
+            params.append(actor_user_id)
         return self.conn.execute(sql, params).fetchone()[0]
 
     def _auth(self, user_id: int, username: str, role: str):
@@ -1515,7 +1527,7 @@ class TestSecurityAuditTrail(TestUserRoutes):
             headers=self._auth(self.admin_id, "admin", "admin"),
         )
         assert response.status_code == 200, response.text
-        assert self._audit_count("user.created", response.json()["id"]) == 1
+        assert self._audit_count("user.created", response.json()["id"], actor_user_id=self.admin_id) == 1
 
     def test_user_updated_emits_audit_row(self):
         response = self.client.patch(
@@ -1524,7 +1536,7 @@ class TestSecurityAuditTrail(TestUserRoutes):
             headers=self._auth(self.admin_id, "admin", "admin"),
         )
         assert response.status_code == 200, response.text
-        assert self._audit_count("user.updated", self.member_id) == 1
+        assert self._audit_count("user.updated", self.member_id, actor_user_id=self.admin_id) == 1
 
     def test_admin_password_reset_emits_audit_row(self):
         response = self.client.patch(
@@ -1533,7 +1545,7 @@ class TestSecurityAuditTrail(TestUserRoutes):
             headers=self._auth(self.admin_id, "admin", "admin"),
         )
         assert response.status_code == 200, response.text
-        assert self._audit_count("user.password_reset", self.member_id) == 1
+        assert self._audit_count("user.password_reset", self.member_id, actor_user_id=self.admin_id) == 1
 
     def test_role_update_emits_audit_row(self):
         response = self.client.patch(
@@ -1542,12 +1554,15 @@ class TestSecurityAuditTrail(TestUserRoutes):
             headers=self._auth(self.superadmin_id, "superadmin", "superadmin"),
         )
         assert response.status_code == 200, response.text
-        assert self._audit_count("user.role_updated", self.viewer_id) == 1
+        assert self._audit_count("user.role_updated", self.viewer_id, actor_user_id=self.superadmin_id) == 1
 
     def test_active_update_emits_audit_row_and_revokes_sessions(self):
-        """Deactivation must (a) emit user.active_updated and (b) delete the
-        target's user_sessions rows in the same transaction (users.py #722
-        AC2), while leaving other users' sessions untouched."""
+        """Deactivation must (a) emit user.active_updated and (b) revoke the
+        target's user_sessions rows while leaving other users' sessions
+        untouched. The production implementation deletes the sessions on the
+        same connection before the single commit (users.py #722 AC2); this
+        test pins the observable outcome (post-response state), not the
+        commit ordering."""
         self.conn.execute(
             "INSERT INTO user_sessions (user_id, refresh_token_hash, expires_at) "
             "VALUES (?, 'hash-member-1', datetime('now', '+30 days'))",
@@ -1566,7 +1581,7 @@ class TestSecurityAuditTrail(TestUserRoutes):
             headers=self._auth(self.admin_id, "admin", "admin"),
         )
         assert response.status_code == 200, response.text
-        assert self._audit_count("user.active_updated", self.member_id) == 1
+        assert self._audit_count("user.active_updated", self.member_id, actor_user_id=self.admin_id) == 1
 
         member_sessions = self.conn.execute(
             "SELECT COUNT(*) FROM user_sessions WHERE user_id = ?",
@@ -1585,7 +1600,7 @@ class TestSecurityAuditTrail(TestUserRoutes):
             headers=self._auth(self.superadmin_id, "superadmin", "superadmin"),
         )
         assert response.status_code == 200, response.text
-        assert self._audit_count("user.deleted", self.viewer_id) == 1
+        assert self._audit_count("user.deleted", self.viewer_id, actor_user_id=self.superadmin_id) == 1
 
     def test_update_user_organizations_emits_membership_audit_row(self):
         cursor = self.conn.execute(
@@ -1606,7 +1621,11 @@ class TestSecurityAuditTrail(TestUserRoutes):
         )
         assert response.status_code == 200, response.text
         assert (
-            self._audit_count("membership.organizations_replaced", self.member_id)
+            self._audit_count(
+                "membership.organizations_replaced",
+                self.member_id,
+                actor_user_id=self.superadmin_id,
+            )
             == 1
         )
 
@@ -1633,6 +1652,6 @@ class TestSecurityAuditTrail(TestUserRoutes):
             headers=self._auth(self.superadmin_id, "superadmin", "superadmin"),
         )
         assert response.status_code == 200, response.text
-        assert self._audit_count("membership.groups_replaced", self.member_id) == 1
+        assert self._audit_count("membership.groups_replaced", self.member_id, actor_user_id=self.superadmin_id) == 1
 
 

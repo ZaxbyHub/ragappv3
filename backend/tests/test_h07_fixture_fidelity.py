@@ -27,6 +27,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Frozen ignore set for the mutation-copy harness (identical to the one in
@@ -112,8 +114,21 @@ def _run_suite(copy_root: Path, suite: list, tmp_path: Path, check_name: str) ->
         errors="replace",
         timeout=_SUBPROCESS_TIMEOUT_S,
     )
-    match = re.search(r"(\d+) failed", proc.stdout)
-    n_failed = int(match.group(1)) if match else 0
+    if proc.returncode not in (0, 1):
+        # PRR-006: pytest exit 2 = collection/interrupt error, 4 = usage
+        # error, 5 = no tests collected. Those are HARNESS failures, not
+        # a surviving mutant — fail loudly instead of reporting survival.
+        tail = "\n".join(proc.stdout.splitlines()[-15:])
+        pytest.fail(
+            f"{check_name}: nested pytest exited {proc.returncode} "
+            f"(collection/usage/no-tests error) — harness problem, not a "
+            f"mutant verdict.\n--- suite output tail ---\n{tail}"
+        )
+    # Anchor to the LAST `N failed` (pytest summary line) — a first-match
+    # anywhere in stdout can pick up "N failed" text from a test's own
+    # output (review PRR-006 demonstration).
+    matches = re.findall(r"(\d+) failed", proc.stdout)
+    n_failed = int(matches[-1]) if matches else 0
     tail = "\n".join(proc.stdout.splitlines()[-15:])
     assert n_failed >= 1, (
         f"{check_name}: the mutant SURVIVED — the suite passed with the "
@@ -181,8 +196,19 @@ def _build_test_and_production_dbs(tmp_path: Path) -> dict:
             test_conn.close()
 
         prod_path = str(tmp_path / "prod.db")
-        init_db(prod_path)
-        run_migrations(prod_path)
+        # PRR-015: pin settings.data_dir around the build — run_migrations
+        # reads settings.vaults_dir (a property of data_dir that mkdirs on
+        # access), and without the pin that creates ./data/vaults under the
+        # pytest cwd instead of staying inside tmp_path.
+        from app.config import settings as _settings
+
+        _saved_data_dir = _settings.data_dir
+        try:
+            _settings.data_dir = tmp_path  # type: ignore[assignment]
+            init_db(prod_path)
+            run_migrations(prod_path)
+        finally:
+            _settings.data_dir = _saved_data_dir
         prod_conn = sqlite3.connect(prod_path)
         try:
             prod_tables = _table_names(prod_conn)
@@ -295,8 +321,15 @@ def test_migrate_embeddings_fixture_has_no_handrolled_files_ddl():
     """
     path = REPO_ROOT / "backend" / "tests" / "test_migrate_embeddings_dim.py"
     src = path.read_text(encoding="utf-8")
+    # PRR-008: also catch quoted ("files" / 'files' / [files] / `files`) and
+    # schema-qualified (main.files) spellings of the same hand-rolled DDL.
     n_handrolled = len(
-        re.findall(r"CREATE\s+TABLE\s+(IF\s+NOT\s+EXISTS\s+)?files\b", src, re.I)
+        re.findall(
+            r"CREATE\s+TABLE\s+(IF\s+NOT\s+EXISTS\s+)?"
+            r"(?:(?:\"|'|\[|`)?files(?:\"|'|\]|`)?|\w+\.files)\b",
+            src,
+            re.I,
+        )
     )
     assert n_handrolled == 0, (
         f"test_migrate_embeddings_dim.py hand-rolls the files table "
@@ -345,6 +378,19 @@ def test_c9_part1_seeds_two_files():
                     and len(element.args) >= 2
                 ):
                     file_ids.add(ast.unparse(element.args[1]))
+    # PRR-008: subtract simple aliases — a bare `name = collected_expr`
+    # assignment in the module makes two collected names resolve to one
+    # runtime id.
+    alias_assigned = set()
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, ast.Name)
+        ):
+            alias_assigned.add(ast.unparse(node.targets[0]))
+    file_ids -= alias_assigned
     assert len(file_ids) >= 2, (
         f"the C9 Part-1 seed feeds store.add_chunks only "
         f"{len(file_ids)} distinct file id(s) ({sorted(file_ids)}); with a "
@@ -392,7 +438,13 @@ def test_vault_path_suite_has_name_id_collision_case():
     the collision.
     """
     path = REPO_ROOT / "backend" / "tests" / "test_vault_path_migration.py"
-    src = path.read_text(encoding="utf-8")
+    raw_src = path.read_text(encoding="utf-8")
+    # PRR-007: a commented-out example INSERT cannot seed a collision —
+    # drop comment lines before collecting inserts.
+    src = "\n".join(
+        line for line in raw_src.splitlines()
+        if not line.strip().startswith("#")
+    )
     function_chunks = src.split("def test_")[1:]
     collision_functions = 0
     for chunk in function_chunks:

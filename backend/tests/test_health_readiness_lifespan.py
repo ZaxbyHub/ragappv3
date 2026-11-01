@@ -6,9 +6,11 @@ guard locks the OTHER half of the wiring: lifespan must actually record the
 outcome of its run_migrations call on app.state, or the readiness signal is
 dead code. Source-text inspection follows the repo convention for lifespan
 wiring claims that are invisible to behavior tests (see
-test_lifespan_pool_seeding_order.py): running the real lifespan() needs heavy
-optional deps (lancedb, LLM clients) impractical in unit CI. The guards match
-literal code identifiers, so reverting the fix fails them.
+test_lifespan_pool_seeding_order.py); the guards match literal code
+identifiers, so reverting the fix fails them. Runtime entry into the real
+lifespan is covered by the tests appended below — the earlier
+"impractical in unit CI" justification was refuted (see the appended
+section for the working recipe).
 """
 
 import os
@@ -162,26 +164,49 @@ def _pin_lifespan_settings(tmp_path: Path):
     settings.allow_local_services = True  # type: ignore[assignment]
 
     def restore():
-        root_logger.setLevel(saved_root_level)
+        # PRR-018: isolate each step so one failure cannot strand the
+        # executor swap or leave settings half-restored.
+        import contextlib
+
+        with contextlib.suppress(Exception):
+            root_logger.setLevel(saved_root_level)
         for key, value in saved.items():
-            setattr(settings, key, value)
+            with contextlib.suppress(Exception):
+                setattr(settings, key, value)
         # Give back the ORIGINAL auth executor (see the sacrificial swap in
         # the pin above). Shut the sacrificial down if the lifespan's own
         # shutdown somehow did not reach it.
         from app.services import auth_service as _auth_service
 
-        if _auth_service._auth_executor is not saved_auth_executor:
-            _auth_service._auth_executor.shutdown(wait=False)
-        _auth_service._auth_executor = saved_auth_executor
+        try:
+            if _auth_service._auth_executor is not saved_auth_executor:
+                _auth_service._auth_executor.shutdown(wait=False)
+        finally:
+            _auth_service._auth_executor = saved_auth_executor
 
     return restore
 
 
 def test_real_lifespan_stop_is_awaited_on_shutdown():
-    """Startup wires the background processor; shutdown awaits its stop()."""
+    """Startup wires the background processor; shutdown awaits its stop().
+
+    Root HANDLERS are snapshotted and restored (PRR-014): with handlers
+    present, the lifespan's existing-handler branch attaches
+    RequestIdFilter/SensitiveFieldFilter to them — including pytest's
+    session-reused capture handlers — and without the snapshot those
+    filters would redact captured log extras for every later test on this
+    worker (the same pollution class as the executor/level fixes)."""
+    import logging as _logging
+
     from app.lifespan import lifespan
 
-    restore = _pin_lifespan_settings(Path(tempfile.mkdtemp(prefix="lifespan-rt-")))
+    root = _logging.getLogger()
+    # Snapshot each handler's FILTER list too: the existing-handler branch
+    # addFilter()s the handler OBJECTS in place, so restoring the handler
+    # list alone would reinstate the same mutated objects (the leak the
+    # reviewer's probe demonstrated).
+    saved_handlers = [(h, list(h.filters)) for h in root.handlers]
+    restore = _pin_lifespan_settings(Path(tempfile.TemporaryDirectory(prefix="lifespan-rt-").name))
     app = FastAPI()
     stop_calls: list[int] = []
     try:
@@ -203,6 +228,9 @@ def test_real_lifespan_stop_is_awaited_on_shutdown():
         asyncio.run(scenario())
     finally:
         restore()
+        root.handlers = [h for h, _ in saved_handlers]
+        for handler, filters in saved_handlers:
+            handler.filters = list(filters)
 
     assert stop_calls == [1], "shutdown must await background_processor.stop()"
 
@@ -216,7 +244,7 @@ def test_real_lifespan_fresh_branch_attaches_request_id_filter():
     root = logging.getLogger()
     saved_handlers = list(root.handlers)
     root.handlers.clear()
-    restore = _pin_lifespan_settings(Path(tempfile.mkdtemp(prefix="lifespan-fb-")))
+    restore = _pin_lifespan_settings(Path(tempfile.TemporaryDirectory(prefix="lifespan-fb-").name))
     app = FastAPI()
     observed: list[tuple] = []
     try:

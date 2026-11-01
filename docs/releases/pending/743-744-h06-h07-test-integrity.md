@@ -18,8 +18,9 @@ proxies weaker than the invariants they guard.
   audit family (all eight: `user.created`, `user.updated`, `user.password_reset`,
   `user.role_updated`, `user.active_updated`, `user.deleted`,
   `membership.organizations_replaced`, `membership.groups_replaced`), plus a
-  deactivation test asserting `user_sessions` rows are revoked in the same
-  transaction while bystanders keep theirs.
+  deactivation test asserting `user_sessions` rows are revoked while
+  bystanders keep theirs (production deletes them on the same connection
+  before the single commit; the test pins the observable outcome).
 - The first tests that enter and exit the REAL `lifespan()` (the "impractical in
   unit CI" justification did not hold): startup wiring
   (`app.state.background_processor`), shutdown awaits `stop()`, and the logging
@@ -42,7 +43,12 @@ proxies weaker than the invariants they guard.
 
 - `user_route_helpers.setup_test_db` now builds from the PRODUCTION schema
   (`init_db` + `run_migrations`, session-cached template copied per test —
-  1.5 s once, milliseconds per test) instead of the hand-copied `TEST_SCHEMA`:
+  1.5 s once, milliseconds per test) instead of the hand-copied `TEST_SCHEMA`.
+  Fixture-baseline note: the production template carries the migration-seeded
+  'Default' vault (id=1), so every route-test DB now includes it —
+  `include_default_vault` is retained as a compatible no-op and vaults created
+  by consumers start at id=2 (all ten consumers verified green with this
+  baseline):
   the route-test DB carries `security_audit_log` and `user_sessions` (the eight
   users.py audit emissions were silently no-op'ing without them) and declares no
   `vaults` foreign keys production does not have. Hermetic build: settings
@@ -75,12 +81,16 @@ superadmin decision was made and shipped by #722.
 
 ## Guardrails
 
-Eighteen frozen acceptance checks (14 DISCRIMINATING mutation-kill/structural +
-4 PRESERVING baselines) run in CI's Backend job forever: each names a production
-mutation (org-member DELETE removed, lifespan stop() skipped, both addFilter
-call sites commented out, the reindex worker loop early-returned, the audit
-wrapper no-op'ed, a migration skipped) and requires the hardened suites to fail
-under it. Anchor receipt (pre-implementation): see the issue-tracer checkpoint
+Eighteen frozen acceptance checks guard this work: the 14 DISCRIMINATING
+checks (9 mutation-kill + 5 structural drift predicates) live in
+`backend/tests/test_h06_mutation_kills.py` and
+`backend/tests/test_h07_fixture_fidelity.py` and run in CI's Backend job on
+every push — mutation-kill checks name a production mutation
+(org-member DELETE removed, lifespan stop() skipped, both addFilter call
+sites commented out, the reindex worker loop early-returned, the audit
+wrapper no-op'ed, a migration skipped) and require the hardened suites to
+fail under it. The 4 PRESERVING baselines are issue-tracer replay wrappers
+(local `.agents/issue-traces/` artifacts, not CI-wired). Anchor receipt (pre-implementation): see the issue-tracer checkpoint
 comments on #743/#744.
 
 ## Impact

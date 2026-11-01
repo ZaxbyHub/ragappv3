@@ -361,10 +361,6 @@ class TestReindexInterruptedMappedAway(_ProcessorHarness):
         )
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestReindexWorkerLoopSurvivesSettleException(_ProcessorHarness):
     """Issue #743 (P02-SK2-13): drive the REAL _reindex_lease_worker_loop.
 
@@ -471,3 +467,7 @@ class TestReindexWorkerLoopSurvivesSettleException(_ProcessorHarness):
         self.assertGreaterEqual(
             len(settled), 1, "at least the post-exception job must settle completed"
         )
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -19,6 +19,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Frozen ignore set for the mutation-copy harness (shared verbatim by every
@@ -36,6 +38,10 @@ _COPY_IGNORE = shutil.ignore_patterns(
     ".ruff_cache",
     ".coverage*",
 )
+# 600s governs LOCAL runs (no pytest-timeout there); the CI Backend job
+# applies per-test --timeout=300 --timeout-method=thread, which
+# supersedes this bound inside CI and aborts a wedged worker by design
+# (issue #1021).
 _SUBPROCESS_TIMEOUT_S = 600
 
 
@@ -116,8 +122,21 @@ def _run_suite(
         errors="replace",
         timeout=_SUBPROCESS_TIMEOUT_S,
     )
-    match = re.search(r"(\d+) failed", proc.stdout)
-    n_failed = int(match.group(1)) if match else 0
+    if proc.returncode not in (0, 1):
+        # PRR-006: pytest exit 2 = collection/interrupt error, 4 = usage
+        # error, 5 = no tests collected. Those are HARNESS failures, not
+        # a surviving mutant — fail loudly instead of reporting survival.
+        tail = "\n".join(proc.stdout.splitlines()[-15:])
+        pytest.fail(
+            f"{check_name}: nested pytest exited {proc.returncode} "
+            f"(collection/usage/no-tests error) — harness problem, not a "
+            f"mutant verdict.\n--- suite output tail ---\n{tail}"
+        )
+    # Anchor to the LAST `N failed` (pytest summary line) — a first-match
+    # anywhere in stdout can pick up "N failed" text from a test's own
+    # output (review PRR-006 demonstration).
+    matches = re.findall(r"(\d+) failed", proc.stdout)
+    n_failed = int(matches[-1]) if matches else 0
     tail = "\n".join(proc.stdout.splitlines()[-15:])
     assert n_failed >= 1, (
         f"{check_name}: the mutant SURVIVED — the suite passed with the "
@@ -321,17 +340,27 @@ def test_otel_guard_runs_unskipped_in_some_workflow():
     workflows_dir = REPO_ROOT / ".github" / "workflows"
     yml_files = sorted(workflows_dir.glob("*.yml"))
     assert yml_files, f"no .github/workflows/*.yml files found under {workflows_dir}"
+    def _executable_lines(block):
+        # PRR-001: a comment mentioning requirements-otel.txt cannot
+        # install anything — only executable (non-comment, non-empty)
+        # lines count toward the predicates.
+        return [
+            line for line in block
+            if line.strip() and not line.strip().startswith("#")
+        ]
+
     count = 0
     for yml_path in yml_files:
         text = yml_path.read_text(encoding="utf-8")
         for block in _workflow_job_blocks(text):
+            lines = _executable_lines(block)
             installs_otel = any(
-                "requirements-otel.txt" in line for line in block
+                "requirements-otel.txt" in line for line in lines
             )
             runs_closure_units = any(
                 "pytest" in line
                 and ("tests/" in line or "test_518_closure_units.py" in line)
-                for line in block
+                for line in lines
             )
             if installs_otel and runs_closure_units:
                 count += 1

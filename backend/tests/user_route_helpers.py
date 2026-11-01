@@ -17,6 +17,8 @@ settings.data_dir to a private temp dir and restores it in a finally block;
 init_db/run_migrations always receive the explicit absolute template path.
 """
 
+import atexit
+import os
 import shutil
 import sqlite3
 import tempfile
@@ -45,6 +47,9 @@ def _build_template_db() -> Path:
     from app.models.database import init_db, run_migrations
 
     template_dir = Path(tempfile.mkdtemp(prefix="route-schema-template-"))
+    # Best-effort residue reclaim: pytest tmp_path cleanup never reaches
+    # system-temp dirs created outside its basetemp (review PRR-012).
+    atexit.register(shutil.rmtree, template_dir, True)
     template_db = template_dir / "template.db"
 
     previous_data_dir = settings.data_dir
@@ -68,7 +73,20 @@ def _template_path() -> Path:
         if _TEMPLATE_DB is None or not _TEMPLATE_DB.exists():
             _TEMPLATE_DIR = Path(tempfile.mkdtemp(prefix="route-schema-cache-"))
             _TEMPLATE_DB = _TEMPLATE_DIR / "template.db"
-            shutil.copyfile(_build_template_db(), _TEMPLATE_DB)
+            atexit.register(shutil.rmtree, _TEMPLATE_DIR, True)
+            # PRR-011: publish the cache atomically — copy to a temp name in
+            # the SAME directory (os.replace is same-filesystem atomic) and
+            # invalidate the cache on any failure, so a truncated file can
+            # never pass the .exists() cache-hit test on a later call.
+            staging = _TEMPLATE_DIR / "template.db.staging"
+            try:
+                shutil.copyfile(_build_template_db(), staging)
+                os.replace(staging, _TEMPLATE_DB)
+            except BaseException:
+                _TEMPLATE_DB = None
+                _TEMPLATE_DIR = None
+                staging.unlink(missing_ok=True)
+                raise
         return _TEMPLATE_DB
 
 
@@ -94,9 +112,22 @@ def setup_test_db(
     connects with the same pragmas the route tests rely on (WAL, enforced
     foreign keys). The copy is a plain file copy: each test owns an
     independent writable database (proven by test_h07_schema_template_isolation).
+
+    In-memory databases (":memory:" / "file::memory:?...") are populated via
+    sqlite3's backup API instead of a filesystem copy (PRR-010). Any stale
+    WAL/SHM sidecars at db_path are removed before the copy so a previous
+    database's hot WAL frames can never be recovered against the new main
+    file (PRR-009).
     """
-    shutil.copyfile(_template_path(), db_path)
-    conn = sqlite3.connect(db_path)
+    if db_path == ":memory:" or db_path.startswith("file::memory:"):
+        with sqlite3.connect(_template_path()) as src, sqlite3.connect(db_path) as dst:
+            src.backup(dst)
+        conn = sqlite3.connect(db_path)
+    else:
+        for sidecar in (str(db_path) + "-wal", str(db_path) + "-shm"):
+            Path(sidecar).unlink(missing_ok=True)
+        shutil.copyfile(_template_path(), db_path)
+        conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA foreign_keys = ON;")
 
