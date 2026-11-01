@@ -85,7 +85,9 @@ class TestProcessImageContract:
         Image.new("RGB", (4, 4), "white").save(buf, format="PNG")
         return buf.getvalue()
 
-    def test_process_image_accepts_real_image_with_metadata(self, tmp_path):
+    def test_process_image_accepts_real_image_with_metadata(
+        self, tmp_path, monkeypatch
+    ):
         """PRR-006/018: the processor accepts a real raster and extracts
         metadata (replaces the previously-skipped placeholder test).
         """
@@ -95,6 +97,16 @@ class TestProcessImageContract:
             pytest.skip("Pillow not available")
         path = tmp_path / "ok.png"
         path.write_bytes(self._png_bytes())
+
+        # Deterministic OCR (issue #703): the tesseract binary is absent in
+        # CI, and since #703 an OCR failure correctly flags the result
+        # degraded; this test pins the metadata path, not host OCR.
+        from app.services import image_processor as _ip
+
+        if _ip._pytesseract_AVAILABLE:
+            monkeypatch.setattr(
+                _ip._pytesseract, "image_to_string", lambda *a, **k: ""
+            )
 
         import asyncio
 

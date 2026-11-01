@@ -1,13 +1,18 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 // Use vi.hoisted to make mock functions available at mock time
-const { mockPostFn, mockGetFn, mockPatchFn, mockResetCsrfToken, mockEnsureCsrfToken, mockResetSubpathRefreshDiagnostic } = vi.hoisted(() => ({
+const { mockPostFn, mockGetFn, mockPatchFn, mockResetCsrfToken, mockEnsureCsrfToken, mockResetSubpathRefreshDiagnostic, mockResetCitationReport } = vi.hoisted(() => ({
   mockPostFn: vi.fn(),
   mockGetFn: vi.fn(),
   mockPatchFn: vi.fn(),
   mockResetCsrfToken: vi.fn(),
   mockEnsureCsrfToken: vi.fn().mockResolvedValue("mock-csrf-token"),
   mockResetSubpathRefreshDiagnostic: vi.fn(),
+  mockResetCitationReport: vi.fn(),
+}));
+
+const { mockJwtTokenHolder } = vi.hoisted(() => ({
+  mockJwtTokenHolder: { value: null as string | null },
 }));
 
 // Mock axios before importing the store
@@ -28,13 +33,22 @@ vi.mock("axios", () => ({
 }));
 
 // Mock @/lib/api
+// Keep the direct core import used by useAuthStore synchronized with the public API mock.
+vi.mock("@/lib/api/core", () => ({
+  getJwtAccessToken: vi.fn(() => mockJwtTokenHolder.value),
+  onJwtAccessTokenPublished: vi.fn(() => () => {}),
+}));
+
 vi.mock("@/lib/api", () => ({
   API_BASE_URL: "/api",
-  setJwtAccessToken: vi.fn(),
-  getJwtAccessToken: vi.fn(() => null),
+  setJwtAccessToken: vi.fn((token: string | null) => {
+    mockJwtTokenHolder.value = token;
+  }),
+  getJwtAccessToken: vi.fn(() => mockJwtTokenHolder.value),
   refreshAccessToken: vi.fn(),
   resetCsrfToken: mockResetCsrfToken,
   ensureCsrfToken: mockEnsureCsrfToken,
+  ensureCsrfTokenPhysical: mockEnsureCsrfToken,
   resetSubpathRefreshDiagnostic: mockResetSubpathRefreshDiagnostic,
   attachCsrfInterceptor: vi.fn(),
   default: {
@@ -46,6 +60,15 @@ vi.mock("@/lib/api", () => ({
       response: { use: vi.fn() },
     },
   },
+}));
+
+// Issue #849 EXT-001: useAuthStore.logout resets the citation-report
+// once-guard so a same-tab user switch records the next user's milestone.
+vi.mock("@/lib/api/onboarding", () => ({
+  resetCitationReport: mockResetCitationReport,
+  getOnboardingMilestones: vi.fn(),
+  markCitationOpened: vi.fn(),
+  dismissChecklist: vi.fn(),
 }));
 
 // Mock @/stores/useVaultStore
@@ -88,6 +111,8 @@ describe("useAuthStore", () => {
     mockEnsureCsrfToken.mockResolvedValue("mock-csrf-token");
     mockFetchVaults.mockReset();
     mockFetchVaults.mockResolvedValue(undefined);
+    mockJwtTokenHolder.value = null;
+    vi.mocked(refreshAccessToken).mockReset();
 
     // Reset module-level init guard state
     resetInitState();
@@ -98,6 +123,7 @@ describe("useAuthStore", () => {
       accessToken: null,
       isAuthenticated: false,
       isInitialized: false,
+      initializationFailed: false,
       isLoading: false,
       needsSetup: false,
       authMode: "unknown",
@@ -335,6 +361,34 @@ describe("useAuthStore", () => {
       expect(setJwtAccessToken).toHaveBeenCalledWith(null);
     });
 
+    it("resets the settings store on logout (PRR-013/K-20: no admin payload survives the identity boundary)", async () => {
+      // Seed the settings store the way PageShell's shell fill now does —
+      // an admin-session GET /settings payload including admin-scoped fields.
+      useSettingsStore.getState().setSettings({
+        chat_configured: true,
+        max_file_size_mb: 250,
+        allowed_extensions: [".pdf"],
+        ollama_chat_url: "http://admin-only.example",
+      } as never);
+      expect(useSettingsStore.getState().settings).not.toBeNull();
+
+      useAuthStore.setState({
+        user: mockUser,
+        accessToken: "jwt123",
+        isAuthenticated: true,
+        authMode: "jwt",
+      });
+      mockPost?.mockResolvedValueOnce({ data: {} });
+      const { logout } = useAuthStore.getState();
+      await logout();
+
+      // The identity boundary must FULLY reset the settings store: a member
+      // session in this tab must not inherit the admin's payload, and the
+      // shell's fill-only guard would keep it there if we only nulled
+      // `settings` without resetting the store.
+      expect(useSettingsStore.getState().settings).toBeNull();
+    });
+
     it("should clear state even if logout request fails", async () => {
       useAuthStore.setState({
         user: mockUser,
@@ -417,6 +471,37 @@ describe("useAuthStore", () => {
       await logout();
 
       expect(mockResetSubpathRefreshDiagnostic).toHaveBeenCalled();
+    });
+
+    it("resets the citation-report once-guard during logout cleanup, even when the server logout fails (issue #849 EXT-001)", async () => {
+      useAuthStore.setState({
+        user: mockUser,
+        accessToken: "jwt123",
+        isAuthenticated: true,
+        authMode: "jwt",
+      });
+
+      const { logout } = useAuthStore.getState();
+      mockPost?.mockRejectedValueOnce(new Error("Network error"));
+
+      await logout();
+
+      expect(mockResetCitationReport).toHaveBeenCalled();
+    });
+
+    it("resets the citation-report once-guard on a successful logout (issue #849 EXT-001)", async () => {
+      useAuthStore.setState({
+        user: mockUser,
+        accessToken: "jwt123",
+        isAuthenticated: true,
+        authMode: "jwt",
+      });
+
+      const { logout } = useAuthStore.getState();
+
+      await logout();
+
+      expect(mockResetCitationReport).toHaveBeenCalled();
     });
   });
 
@@ -549,14 +634,14 @@ describe("useAuthStore", () => {
       expect(useAuthStore.getState().needsSetup).toBe(false);
     });
 
-    it("should set needsSetup to false on error", async () => {
+    it("should preserve unknown setup state and reject on error", async () => {
       const { checkSetupStatus } = useAuthStore.getState();
-      
+
       mockGet?.mockRejectedValueOnce(new Error("Network error"));
 
-      await checkSetupStatus();
+      await expect(checkSetupStatus()).rejects.toThrow("Network error");
 
-      expect(useAuthStore.getState().needsSetup).toBe(false);
+      expect(useAuthStore.getState().needsSetup).toBeNull();
     });
   });
 
@@ -571,6 +656,9 @@ describe("useAuthStore", () => {
       mockGet?.mockResolvedValueOnce({
         data: mockUser,
       });
+      mockGet?.mockResolvedValueOnce({
+        data: { needs_setup: false, auth_mode: "jwt" },
+      });
 
       await init();
 
@@ -578,6 +666,9 @@ describe("useAuthStore", () => {
       expect(state.authMode).toBe("jwt");
       expect(state.isAuthenticated).toBe(true);
       expect(state.user).toEqual(mockUser);
+      expect(state.isInitialized).toBe(true);
+      expect(state.isLoading).toBe(false);
+      expect(state.needsSetup).toBe(false);
       // Vault state is initialized to validate cached activeVaultId
       expect(mockFetchVaults).toHaveBeenCalledTimes(1);
     });
@@ -595,6 +686,9 @@ describe("useAuthStore", () => {
       mockGetFn?.mockResolvedValueOnce({
         data: mockUser,
       });
+      mockGetFn?.mockResolvedValueOnce({
+        data: { needs_setup: false, auth_mode: "jwt" },
+      });
 
       await init();
 
@@ -602,6 +696,9 @@ describe("useAuthStore", () => {
       expect(state.authMode).toBe("jwt");
       expect(state.isAuthenticated).toBe(true);
       expect(state.user).toEqual(mockUser);
+      expect(state.isInitialized).toBe(true);
+      expect(state.isLoading).toBe(false);
+      expect(state.needsSetup).toBe(false);
       // Vault state is initialized via refresh token branch
       expect(mockFetchVaults).toHaveBeenCalledTimes(1);
     });
@@ -614,7 +711,7 @@ describe("useAuthStore", () => {
       const { init } = useAuthStore.getState();
 
       // Mock refresh token failure (no httpOnly cookie)
-      mockPostFn?.mockRejectedValueOnce(new Error("Unauthorized"));
+      vi.mocked(refreshAccessToken).mockResolvedValueOnce(null);
       // Mock setup-status success
       mockGet?.mockResolvedValueOnce({
         data: { needs_setup: false },
@@ -628,24 +725,27 @@ describe("useAuthStore", () => {
       expect(state.isAuthenticated).toBe(false);
     });
 
-    it("should default to jwt mode when no auth methods available", async () => {
+    it("should preserve unknown mode when no auth methods are available", async () => {
       useAuthStore.setState({
         accessToken: null,
       });
 
       const { init } = useAuthStore.getState();
 
-      // Mock refresh token failure (no access token, cookie-based refresh fails)
-      mockPostFn?.mockRejectedValueOnce(new Error("Unauthorized"));
-      // Mock setup-status failure
+      // Mock refresh token failure at the public boundary.
+      vi.mocked(refreshAccessToken).mockResolvedValueOnce(null);
+      // Mock setup-status failure.
       mockGet?.mockRejectedValueOnce(new Error("Network error"));
 
       await init();
 
       const state = useAuthStore.getState();
-      // After auth consolidation (H-10), we always default to jwt mode
-      expect(state.authMode).toBe("jwt");
+      expect(state.authMode).toBe("unknown");
       expect(state.isAuthenticated).toBe(false);
+      expect(state.needsSetup).toBeNull();
+      expect(state.isInitialized).toBe(false);
+      expect(state.initializationFailed).toBe(true);
+      expect(state.isLoading).toBe(false);
     });
 
     it("should use initial needsSetup value for authMode when no API key", async () => {
@@ -681,6 +781,8 @@ describe("useAuthStore", () => {
       expect(state.authMode).toBe("jwt");
       // Note: needsSetup gets updated by checkSetupStatus to false
       expect(state.needsSetup).toBe(false);
+      expect(state.isInitialized).toBe(true);
+      expect(state.initializationFailed).toBe(false);
     });
   });
 
@@ -860,3 +962,4 @@ describe("useAuthStore", () => {
     });
   });
 });
+import { useSettingsStore } from "@/stores/useSettingsStore";

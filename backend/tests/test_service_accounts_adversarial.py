@@ -62,7 +62,9 @@ def sa_db_path() -> Generator[str, None, None]:
             created_at TEXT NOT NULL,
             last_rotated_at TEXT,
             revoked_at TEXT,
-            created_by TEXT
+            created_by TEXT,
+            previous_key_hash TEXT,
+            previous_key_expires_at TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_service_accounts_key_hash
             ON service_accounts(key_hash);
@@ -192,12 +194,11 @@ class TestRotationWindow:
     def test_immediately_after_rotate_old_key_401_new_key_200(
         self, sa_client: TestClient, sa_db_path: str, admin_headers: dict
     ):
-        """Immediately after rotate, old key returns 401 and new key returns 200.
-
-        There must be no window where both keys work (overlap) and no window
-        where neither works (gap). This is tested sequentially to catch any
-        timing-dependent race condition in the rotation implementation.
-        """
+        """Rotation grace (issue #724 AC10): immediately after rotate, BOTH keys
+        work; once the new key is used the old key dies. The grace removes the
+        delivery gap (an undelivered rotation response stranded integrations
+        with a dead old key and an unusable new one) at the cost of a bounded,
+        deliberate overlap that ends at first new-key use or the grace TTL."""
         sa_id, old_key = _create_sa_via_api(sa_client, "window-test-sa", ["documents:read"], admin_headers)
 
         # Verify old key works before rotation
@@ -211,15 +212,19 @@ class TestRotationWindow:
         new_key = rotate_resp.json()["key"]
         assert new_key != old_key
 
-        # IMMEDIATELY after rotate: old must 401
+        # IMMEDIATELY after rotate: both keys work (grace window)
         with _sa_app(old_key, sa_db_path, ["documents:read"]) as client:
             resp = client.get("/sa-protected", headers={"Authorization": f"Bearer {old_key}"})
-            assert resp.status_code == 401, f"Old key must be 401 immediately after rotate: {resp.json()}"
+            assert resp.status_code == 200, f"Old key must be 200 inside the rotation grace: {resp.json()}"
 
-        # IMMEDIATELY after rotate: new must 200
         with _sa_app(new_key, sa_db_path, ["documents:read"]) as client:
             resp = client.get("/sa-protected", headers={"Authorization": f"Bearer {new_key}"})
             assert resp.status_code == 200, f"New key must be 200 immediately after rotate: {resp.json()}"
+
+        # After the NEW key is used, the old key dies (grace retires)
+        with _sa_app(old_key, sa_db_path, ["documents:read"]) as client:
+            resp = client.get("/sa-protected", headers={"Authorization": f"Bearer {old_key}"})
+            assert resp.status_code == 401, f"Old key must 401 after the new key is first used: {resp.json()}"
 
     def test_rotate_returns_different_key(
         self, sa_client: TestClient, admin_headers: dict

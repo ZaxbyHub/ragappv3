@@ -46,7 +46,7 @@ function controllableSse() {
           }
         })
     ),
-    cancel: vi.fn(),
+    cancel: vi.fn(() => Promise.resolve()),
   };
   const emit = (chunk: string) => {
     const item = { value: encoder.encode(chunk), done: false };

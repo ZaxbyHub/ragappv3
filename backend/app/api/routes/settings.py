@@ -7,9 +7,14 @@ from urllib.parse import urlparse
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, field_validator, model_validator
+from pydantic_settings import DotEnvSettingsSource, EnvSettingsSource, SettingsError
 
 from app.api.deps import get_csrf_manager, get_current_active_user, get_db, require_role
-from app.config import apply_legacy_settings_conversion, settings
+from app.config import (
+    EMBEDDING_MAX_TEXT_CHARS,
+    apply_legacy_settings_conversion,
+    settings,
+)
 from app.limiter import limiter
 from app.security import CSRFManager, csrf_protect, issue_csrf_token
 from app.services.model_provider_policy import ProviderPolicyError, _parse_strict_origin
@@ -50,6 +55,9 @@ class SettingsUpdate(BaseModel):
     jobs_heartbeat_interval_seconds: Optional[float] = None
     jobs_lease_reclaim_timeout_seconds: Optional[float] = None
     jobs_max_attempts: Optional[int] = None
+    # Reindex stall watchdog budget (issue #1010); same five-point wiring
+    # as the sibling job-lease knobs above.
+    jobs_stall_timeout_seconds: Optional[float] = None
 
     # Reranker config
     reranker_url: Optional[str] = None
@@ -253,8 +261,11 @@ class SettingsUpdate(BaseModel):
     @field_validator("chunk_size_chars")
     @classmethod
     def validate_chunk_size_chars(cls, v):
-        if v is not None and v <= 0:
-            raise ValueError("chunk_size_chars must be a positive integer")
+        if v is not None and (v <= 0 or v > EMBEDDING_MAX_TEXT_CHARS):
+            raise ValueError(
+                f"chunk_size_chars must be a positive integer no greater than "
+                f"{EMBEDDING_MAX_TEXT_CHARS} (the embedder's per-text cap)"
+            )
         return v
 
     @field_validator("chunk_overlap_chars")
@@ -358,6 +369,16 @@ class SettingsUpdate(BaseModel):
     def validate_jobs_max_attempts(cls, v):
         if v is not None and not (1 <= v <= 20):
             raise ValueError("jobs_max_attempts must be between 1 and 20")
+        return v
+
+    @field_validator("jobs_stall_timeout_seconds")
+    @classmethod
+    def validate_jobs_stall_timeout_seconds(cls, v):
+        # Same envelope as the Settings model (issue #1010).
+        if v is not None and not (60.0 <= v <= 7200.0):
+            raise ValueError(
+                "jobs_stall_timeout_seconds must be between 60.0 and 7200.0"
+            )
         return v
 
     @field_validator("reranker_top_n")
@@ -535,6 +556,47 @@ class SettingsUpdate(BaseModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def _enforce_jobs_stall_coherence(self):
+        """Reject an update leaving the stall budget incoherent (issue #1010).
+
+        setattr persistence onto the settings singleton bypasses the
+        Settings model validators, so the PUT path enforces the same rules
+        here against effective (body-value-else-current) values on EVERY
+        body: the stall budget must exceed the reclaim timeout AND
+        document_parse_timeout. A reclaim-only PUT that raises the reclaim
+        timeout above the live stall budget would otherwise persist a pair
+        the boot validator rejects — accepted live, then silently reverted
+        by the startup replay (PR #1018 review F-001). This deliberately
+        supersedes the pre-#1010 sibling-only acceptance contract; the #559
+        heartbeat/reclaim pair check above still governs independently."""
+        from app.config import settings as _settings
+
+        stall = (
+            float(self.jobs_stall_timeout_seconds)
+            if self.jobs_stall_timeout_seconds is not None
+            else float(_settings.jobs_stall_timeout_seconds)
+        )
+        reclaim = (
+            float(self.jobs_lease_reclaim_timeout_seconds)
+            if self.jobs_lease_reclaim_timeout_seconds is not None
+            else float(_settings.jobs_lease_reclaim_timeout_seconds)
+        )
+        if stall <= reclaim:
+            raise ValueError(
+                "jobs_stall_timeout_seconds must be > "
+                "jobs_lease_reclaim_timeout_seconds "
+                f"(effective stall={stall:g}, reclaim={reclaim:g})"
+            )
+        parse_timeout = float(
+            getattr(_settings, "document_parse_timeout", 0.0)
+        )
+        if stall <= parse_timeout:
+            raise ValueError(
+                "jobs_stall_timeout_seconds must be > document_parse_timeout"
+            )
+        return self
+
     # ── Curator validators ────────────────────────────────────────────────
     @field_validator("wiki_llm_curator_temperature")
     @classmethod
@@ -639,6 +701,8 @@ ALLOWED_FIELDS = [
     "jobs_heartbeat_interval_seconds",
     "jobs_lease_reclaim_timeout_seconds",
     "jobs_max_attempts",
+    # Reindex stall watchdog budget (issue #1010)
+    "jobs_stall_timeout_seconds",
     "reranker_url",
     "reranker_model",
     "reranking_enabled",
@@ -874,7 +938,49 @@ def _validate_settings_update(update: SettingsUpdate) -> dict[str, object]:
         raise HTTPException(
             status_code=400, detail="No valid fields provided for update"
         )
-    return apply_legacy_settings_conversion(values)
+    converted = apply_legacy_settings_conversion(values)
+    # Issue #698: the legacy→new converter can DERIVE chunk_size_chars from a
+    # legacy chunk_size PUT (x4) AFTER the SettingsUpdate field validators
+    # have already run, so the derived value bypasses their bound. Re-check
+    # the POST-conversion value here — persistence is a bare setattr on the
+    # singleton, so an out-of-bounds value would otherwise poison live
+    # ingest until restart. Same predicate as the field validators.
+    derived_size = converted.get("chunk_size_chars")
+    if derived_size is not None and (
+        derived_size <= 0 or derived_size > EMBEDDING_MAX_TEXT_CHARS
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"chunk_size_chars must be between 1 and "
+                f"{EMBEDDING_MAX_TEXT_CHARS} (the embedder's per-text cap); "
+                f"the derived value {derived_size!r} is out of range "
+                f"(legacy chunk_size is converted x4)"
+            ),
+        )
+    # Issue #698 review: the modern pair has no cross-field rule anywhere,
+    # while the legacy seam enforces chunk_overlap < chunk_size — an overlap
+    # >= the resulting size passes every existing check and then fails EVERY
+    # ingest in the chunker. Check the EFFECTIVE pair (updated value when
+    # provided, current singleton value otherwise).
+    effective_size = converted.get("chunk_size_chars", settings.chunk_size_chars)
+    effective_overlap = converted.get(
+        "chunk_overlap_chars", settings.chunk_overlap_chars
+    )
+    if (
+        effective_size is not None
+        and effective_overlap is not None
+        and effective_overlap >= effective_size
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"chunk_overlap_chars ({effective_overlap}) must be strictly "
+                f"less than chunk_size_chars ({effective_size}) — the chunker "
+                f"rejects overlap >= chunk size at ingest time (issue #698)"
+            ),
+        )
+    return converted
 
 
 class SettingsResponse(BaseModel):
@@ -957,6 +1063,7 @@ class SettingsResponse(BaseModel):
     jobs_heartbeat_interval_seconds: float = 30.0
     jobs_lease_reclaim_timeout_seconds: float = 300.0
     jobs_max_attempts: int = 3
+    jobs_stall_timeout_seconds: float = 900.0
 
     # Reranker config
     reranker_url: str = ""
@@ -1111,6 +1218,7 @@ def _build_settings_dict() -> dict:
         "jobs_heartbeat_interval_seconds": settings.jobs_heartbeat_interval_seconds,
         "jobs_lease_reclaim_timeout_seconds": settings.jobs_lease_reclaim_timeout_seconds,
         "jobs_max_attempts": settings.jobs_max_attempts,
+        "jobs_stall_timeout_seconds": settings.jobs_stall_timeout_seconds,
         "maintenance_mode": settings.maintenance_mode,
         "auto_scan_enabled": settings.auto_scan_enabled,
         "auto_scan_interval_minutes": settings.auto_scan_interval_minutes,
@@ -1224,6 +1332,17 @@ _REDACT_TO_FALSE_FIELDS: frozenset[str] = frozenset(
     {"chat_api_key_set", "instant_api_key_set"}
 )
 
+# These booleans are redacted for the same deployment-privacy reason as their
+# related infrastructure fields, but must remain separate from the type-aware
+# blanking set above. They are forced to False for non-admin responses.
+_NON_ADMIN_HIDDEN_FEATURE_FLAG_FIELDS: frozenset[str] = frozenset(
+    {
+        "wiki_llm_curator_enabled",
+        "multimodal_enrichment_enabled",
+        "multimodal_query_vision_enabled",
+    }
+)
+
 
 def _redact_infra_for_non_admin(settings_dict: dict, role: str) -> dict:
     """Blank infra-URL/model fields for callers below the admin role.
@@ -1258,22 +1377,31 @@ def _redact_infra_for_non_admin(settings_dict: dict, role: str) -> dict:
                 settings_dict[field] = False
             else:
                 settings_dict[field] = ""
-    # Keep the curator enable flag consistent with the redacted URL/model so
-    # the frontend's required-when-enabled validator does not fire for non-admins.
-    settings_dict["wiki_llm_curator_enabled"] = False
-    # Same for multimodal: redacted URL/model; don't disclose an enabled multimodal
-    # backend to non-admins.
-    settings_dict["multimodal_enrichment_enabled"] = False
-    # The query-time vision flag likewise discloses that a multimodal query-vision
-    # backend is wired; redact it symmetrically for non-admins (F-08).
-    settings_dict["multimodal_query_vision_enabled"] = False
+    # Keep redacted feature flags consistent with their hidden infrastructure
+    # and remove their provenance just as for the infrastructure fields.
+    for field in _NON_ADMIN_HIDDEN_FEATURE_FLAG_FIELDS:
+        settings_dict[field] = False
     # Drop the provenance hints for redacted fields so a non-admin cannot learn
-    # from effective_sources whether an infra URL was set (kv) vs default.
+    # from effective_sources whether an infra URL or feature gate was set (kv).
     effective_sources = settings_dict.get("effective_sources")
     if isinstance(effective_sources, dict):
-        for field in INFRA_REDACTED_FIELDS:
+        for field in (*INFRA_REDACTED_FIELDS, *_NON_ADMIN_HIDDEN_FEATURE_FLAG_FIELDS):
             effective_sources.pop(field, None)
     return settings_dict
+
+
+def _read_effective_source_values(source_kind: str, source_factory) -> dict:
+    """Read a Pydantic settings source without letting inspection break GET."""
+    try:
+        source = source_factory()
+    except (SettingsError, OSError, UnicodeDecodeError):
+        logger.warning("Unable to inspect %s settings source", source_kind)
+        return {}
+    try:
+        return source()
+    except (SettingsError, OSError, UnicodeDecodeError):
+        logger.warning("Unable to inspect %s settings source", source_kind)
+        return {}
 
 
 def _compute_effective_sources(conn: Optional[sqlite3.Connection]) -> dict[str, str]:
@@ -1284,12 +1412,15 @@ def _compute_effective_sources(conn: Optional[sqlite3.Connection]) -> dict[str, 
     ``setattr(settings, key, value)`` overwrites env-derived values, so
     persistence wins after the first save. Values:
       - "kv":      a row exists in ``settings_kv`` for this field.
-      - "env":     no kv row, and an env variable with the same name
-                   (uppercased) is set.
+      - "env":     no kv row, and Pydantic resolved the field from its
+                   environment or configured dotenv source.
       - "default": neither.
 
-    The Models tab uses this to label inputs honestly without disabling
-    them on env presence.
+    Each Pydantic source is inspected best-effort: a SettingsError or OSError
+    produces an empty map for only that source, preserving the other source and
+    any kv badges. Fields unavailable from a non-kv source fall back to the
+    existing ``default`` badge. The Models tab uses this to label inputs honestly
+    without disabling them on env presence.
     """
     kv_keys: set[str] = set()
     if conn is not None:
@@ -1298,21 +1429,38 @@ def _compute_effective_sources(conn: Optional[sqlite3.Connection]) -> dict[str, 
             kv_keys = {row[0] for row in cursor.fetchall()}
         except sqlite3.Error:
             kv_keys = set()
+    settings_cls = type(settings)
+    env_values = _read_effective_source_values(
+        "environment", lambda: EnvSettingsSource(settings_cls)
+    )
+    dotenv_values = _read_effective_source_values(
+        "dotenv",
+        lambda: DotEnvSettingsSource(
+            settings_cls,
+            env_file=getattr(
+                settings, "_configured_env_file", settings_cls.model_config.get("env_file")
+            ),
+        ),
+    )
+
+    def source_badge(field: str) -> str:
+        # EnvSettingsSource has higher precedence than DotEnvSettingsSource.
+        # Keep the existing UI convention that an explicit empty source value
+        # receives the default badge, even though selected settings use empty
+        # strings as meaningful runtime values.
+        if field in env_values:
+            return "env" if env_values[field] != "" else "default"
+        if field in dotenv_values:
+            return "env" if dotenv_values[field] != "" else "default"
+        return "default"
+
     out: dict[str, str] = {}
-    import os as _os
 
     for field in ALLOWED_FIELDS:
         if field in kv_keys:
             out[field] = "kv"
         else:
-            # Treat ``X=""`` as "not set". Pydantic typically falls back
-            # to its default for empty strings, so labelling the source
-            # as "env" would mislead the Models tab badges.
-            env_val = _os.environ.get(field.upper(), "")
-            if env_val != "":
-                out[field] = "env"
-            else:
-                out[field] = "default"
+            out[field] = source_badge(field)
     return out
 
 

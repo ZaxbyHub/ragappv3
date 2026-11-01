@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { act, fireEvent, render } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { VaultSelector } from "@/components/vault/VaultSelector";
 import type { Vault } from "@/lib/api";
 
@@ -8,13 +9,17 @@ let mockVaults: Vault[] = [];
 
 // Mock the useVaultStore
 vi.mock("@/stores/useVaultStore", () => ({
-  useVaultStore: vi.fn(() => ({
+  useVaultStore: Object.assign(vi.fn(() => ({
     vaults: mockVaults,
     activeVaultId: null,
     setActiveVault: vi.fn(),
     fetchVaults: vi.fn(),
     getActiveVault: vi.fn(),
   })),
+  {
+    getState: vi.fn(() => ({ activeVaultId: null })),
+    subscribe: vi.fn(() => () => {}),
+  }),
 }));
 
 // Mock UI components
@@ -105,7 +110,7 @@ describe("VaultSelector Permission Badge", () => {
       mockVaults = [vaultWithAdmin];
 
       await act(async () => {
-        render(<VaultSelector />);
+        render(<MemoryRouter><VaultSelector /></MemoryRouter>);
       });
 
       // The dropdown is closed initially, we need to open it
@@ -132,7 +137,7 @@ describe("VaultSelector Permission Badge", () => {
       mockVaults = [vaultWithRead];
 
       await act(async () => {
-        render(<VaultSelector />);
+        render(<MemoryRouter><VaultSelector /></MemoryRouter>);
       });
 
       // Open the dropdown
@@ -153,7 +158,7 @@ describe("VaultSelector Permission Badge", () => {
       mockVaults = [vaultWithoutPermission];
 
       await act(async () => {
-        render(<VaultSelector />);
+        render(<MemoryRouter><VaultSelector /></MemoryRouter>);
       });
 
       // Open the dropdown
@@ -181,7 +186,7 @@ describe("VaultSelector Permission Badge", () => {
       mockVaults = [vaultWithAdmin, vaultWithRead, vaultWithoutPermission];
 
       await act(async () => {
-        render(<VaultSelector />);
+        render(<MemoryRouter><VaultSelector /></MemoryRouter>);
       });
 
       // Open the dropdown
@@ -203,7 +208,7 @@ describe("VaultSelector Permission Badge", () => {
       mockVaults = [vaultWithNullPermission];
 
       await act(async () => {
-        render(<VaultSelector />);
+        render(<MemoryRouter><VaultSelector /></MemoryRouter>);
       });
 
       // Open the dropdown
@@ -233,7 +238,7 @@ describe("VaultSelector Permission Badge", () => {
       mockVaults = [vaultWithAdmin];
 
       await act(async () => {
-        render(<VaultSelector />);
+        render(<MemoryRouter><VaultSelector /></MemoryRouter>);
       });
 
       // Open the dropdown

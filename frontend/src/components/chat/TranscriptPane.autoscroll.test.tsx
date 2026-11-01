@@ -113,6 +113,7 @@ vi.mock("@/hooks/useChatHistory", () => ({
 
 vi.mock("react-router-dom", () => ({
   useNavigate: () => vi.fn(),
+  useInRouterContext: () => false,
 }));
 
 vi.mock("./MessageBubble", () => ({

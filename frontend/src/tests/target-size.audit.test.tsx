@@ -206,6 +206,8 @@ vi.mock("@/hooks/useUploadMonitoring", () => ({
 }));
 
 vi.mock("@/lib/api", () => ({
+  API_BASE_URL: "/api",
+  attachCsrfInterceptor: vi.fn(),
   uploadDocument: vi.fn(),
   getDocumentStatus: vi.fn(),
 }));

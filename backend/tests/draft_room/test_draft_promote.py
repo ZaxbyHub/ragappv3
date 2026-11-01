@@ -13,6 +13,7 @@ see ``test_draft_compile_routes.py``'s own harness docstring).
 
 import asyncio
 import json
+import logging
 import os
 import shutil
 import sqlite3
@@ -585,6 +586,63 @@ class TestPromoteDisabled(DraftPromoteTestBase):
             settings.draft_room_enabled = True
         self.assertEqual(resp.status_code, 503, resp.text)
         self.assertEqual(resp.json()["code"], "draft_room_disabled")
+
+    def test_disabled_503_logs_at_warning_not_error(self):
+        """Issue #789 review F-013: a deliberately disabled room is normal
+        configuration, not a server fault — the feature flag defaults to off,
+        so ERROR per request would alert-grade every unconfigured deployment.
+        assertLogs(WARNING) also captures ERROR, so the LEVELS are asserted
+        separately."""
+        draft_id = self._create_draft().json()["id"]
+        upload = self._upload_input(draft_id)
+        input_id = upload.json()["input"]["id"]
+        self._mark_input_ready(input_id)
+
+        settings.draft_room_enabled = False
+        try:
+            with self.assertLogs(
+                "app.api.routes.draft_room", level="WARNING"
+            ) as captured:
+                resp = self._promote(
+                    draft_id, source_type="input", source_id=input_id
+                )
+        finally:
+            settings.draft_room_enabled = True
+
+        self.assertEqual(resp.status_code, 503, resp.text)
+        matching = [
+            r for r in captured.records if "draft_room_disabled" in r.getMessage()
+        ]
+        self.assertTrue(matching, captured.records)
+        self.assertTrue(any(r.levelno == logging.WARNING for r in matching))
+        self.assertFalse(
+            any(r.levelno >= logging.ERROR for r in captured.records),
+            "a configuration 503 must not be logged at ERROR",
+        )
+
+    def test_promotion_500_still_logs_at_error(self):
+        """The downgrade is narrow: a genuine server fault keeps ERROR so the
+        existing 5xx-observability contract still holds."""
+        draft_id = self._create_draft().json()["id"]
+        upload = self._upload_input(draft_id)
+        input_id = upload.json()["input"]["id"]
+        self._mark_input_ready(input_id)
+
+        self._mock_background_processor.enqueue = AsyncMock(
+            side_effect=RuntimeError("queue unavailable")
+        )
+        with self.assertLogs(
+            "app.api.routes.draft_room", level="ERROR"
+        ) as captured:
+            resp = self._promote(
+                draft_id, source_type="input", source_id=input_id
+            )
+
+        self.assertEqual(resp.status_code, 500, resp.text)
+        self.assertTrue(
+            any(r.levelno >= logging.ERROR for r in captured.records),
+            "a promotion 500 must still leave an ERROR record",
+        )
 
 
 class TestPromoteCSRF(DraftPromoteTestBase):
@@ -1390,6 +1448,11 @@ class TestPromoteCleanupFailureIsRecorded(DraftPromoteTestBase):
 
         self.assertEqual(resp.status_code, 500, resp.text)
         self.assertEqual(resp.json()["code"], "promotion_failed_incomplete_cleanup")
+        # Issue #789 review F-007: the point of the fixed detail is that raw
+        # infrastructure exception text (here the queue failure) never reaches
+        # the client — a revert to str(exc) must fail here, not pass silently.
+        self.assertIn("cleanup could not be verified", resp.json()["detail"])
+        self.assertNotIn("queue unavailable", resp.json()["detail"])
 
         rows = self._security_audit_rows("draft_promotion_cleanup_failed")
         self.assertEqual(len(rows), 1)
@@ -1627,6 +1690,10 @@ class TestPromoteCorrelatedPoolExhaustion(DraftPromoteTestBase):
         body = resp.json()
         self.assertEqual(body["code"], "promotion_failed_incomplete_cleanup")
         self.assertIn("detail", body)
+        # Issue #789 review F-007: pool-exhaustion internals are the leak this
+        # path used to echo; the client detail must stay fixed.
+        self.assertIn("cleanup could not be verified", body["detail"])
+        self.assertNotIn("Could not obtain a connection", body["detail"])
 
         files = self._files_rows()
         self.assertEqual(len(files), 1, "the orphan is real -- the pool genuinely could not clean it up")

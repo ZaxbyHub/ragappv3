@@ -11,11 +11,17 @@ import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
+from html import unescape as _html_unescape
 from typing import Any, Iterator, Optional
 
 from app.config import settings
 from app.services.fts_query import FTS_CANDIDATE_CAP, build_fts_match_query
-from app.services.job_lease import JobLease, ensure_jobs_schema
+from app.services.job_lease import (
+    JobLease,
+    ensure_jobs_schema,
+    redact_legacy_error_text,
+    redact_legacy_result_json,
+)
 
 WIKI_QUEUE = "wiki"
 
@@ -371,8 +377,12 @@ def _to_compile_job(row: sqlite3.Row) -> WikiCompileJob:
         trigger_type=d["trigger_type"],
         trigger_id=d.get("trigger_id"),
         status=d["status"],
-        error=d.get("error"),
-        result_json=d.get("result_json") or "{}",
+        # Issue #953: pre-redaction rows pass through the legacy-error mask
+        # so the lease-rollback read path never surfaces raw str(exc) text.
+        error=redact_legacy_error_text(d.get("error")),
+        # PRR-002: result_json gets the same read-time treatment for
+        # pre-#958 curator error strings (clean payloads unchanged).
+        result_json=redact_legacy_result_json(d.get("result_json") or "{}"),
         created_at=d["created_at"],
         started_at=d.get("started_at"),
         completed_at=d.get("completed_at"),
@@ -384,15 +394,33 @@ def _to_compile_job(row: sqlite3.Row) -> WikiCompileJob:
 def _compile_job_from_jobs_row(row: sqlite3.Row) -> WikiCompileJob:
     """Map a unified ``jobs`` row (queue='wiki') onto the unchanged DTO."""
     d = _row_to_dict(row)
-    payload = json.loads(d.get("payload_json") or "{}")
+    # Issue #792 feedback: a payload that is unparseable, or valid JSON that
+    # is not an object (scalar, array, or nested deep enough to overflow the
+    # parser), degrades to the empty payload — the guard pattern the file's
+    # other JSON-column reads (aliases, lint fingerprints) use — so no reader
+    # of the vault's job list ever raises on a stored row. (The complete_job
+    # result_json parse is different: its input is the caller's own dict,
+    # re-dumped in-process, never a stored column read.) The processors
+    # settle such rows terminally failed at claim (vault_id is None).
+    try:
+        payload = json.loads(d.get("payload_json") or "{}")
+    except (TypeError, ValueError, RecursionError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
     return WikiCompileJob(
         id=d["id"],
         vault_id=payload.get("vault_id"),
         trigger_type=payload.get("trigger_type") or "manual",
         trigger_id=payload.get("trigger_id"),
         status=d["status"],
-        error=d.get("error"),
-        result_json=d.get("result_json") or "{}",
+        # Issue #953: rows written before the #951 write-time redaction
+        # (and legacy rows the boot sync copies forward) still hold raw
+        # str(exc) text; mask it at read time, codes pass through.
+        error=redact_legacy_error_text(d.get("error")),
+        # PRR-002: result_json gets the same read-time treatment for
+        # pre-#958 curator error strings (clean payloads unchanged).
+        result_json=redact_legacy_result_json(d.get("result_json") or "{}"),
         created_at=d["created_at"],
         started_at=d.get("started_at"),
         completed_at=d.get("completed_at"),
@@ -954,7 +982,24 @@ class WikiStore:
         ``status = 'superseded'`` predicate makes the check-and-flip atomic,
         so a claim that concurrently reached any other state can never be
         blanket-reactivated. Returns True when the transition committed.
+
+        On a successful flip this also deletes the OPEN invalidation 'stale'
+        findings that reference the claim (#794 feedback): the claim is
+        active and served again, so a permanently-open "source content
+        changed" row would be a false positive. Rows a user already
+        dispositioned (resolved/dismissed/acknowledged) are left alone.
         """
+        if not self.reactivate_claim_if_superseded(claim_id):
+            return False
+        self._db.commit()
+        return True
+
+    def reactivate_claim_if_superseded(self, claim_id: int) -> bool:
+        """No-commit reactivation: atomically flip a superseded claim to
+        'active' and, when the flip landed, delete its OPEN invalidation
+        'stale' findings (#794). The caller owns the transaction — the
+        curator's inline find-or-create calls this inside its SAVEPOINT, and
+        ``reactivate_claim`` wraps it with the commit."""
         cur = self._db.execute(
             "UPDATE wiki_claims SET status = 'active', updated_at = ? "
             "WHERE id = ? AND status = 'superseded'",
@@ -966,7 +1011,12 @@ class WikiStore:
             # sqlite3 opened for the 0-row UPDATE so the connection stays clean.
             self._db.rollback()
             return False
-        self._db.commit()
+        self._db.execute(
+            "DELETE FROM wiki_lint_findings WHERE status = 'open' "
+            "AND finding_type = 'stale' AND EXISTS ("
+            "SELECT 1 FROM json_each(related_claim_ids_json) WHERE value = ?)",
+            (claim_id,),
+        )
         return True
 
     def get_claim_sources(self, claim_id: int) -> list[WikiClaimSource]:
@@ -1208,17 +1258,27 @@ class WikiStore:
             # shapes are unchanged (AC4) — including migrated history.
             sql = (
                 "SELECT * FROM jobs WHERE queue = ? "
-                "AND CAST(json_extract(payload_json, '$.vault_id') AS INTEGER) = ?"
+                "AND CASE WHEN json_valid(payload_json) "
+                "THEN CAST(json_extract(payload_json, '$.vault_id') AS INTEGER) "
+                "ELSE NULL END = ?"
             )
             params: list[Any] = [WIKI_QUEUE, vault_id]
             if status:
                 sql += " AND status = ?"
                 params.append(status)
             if trigger_type is not None:
-                sql += " AND json_extract(payload_json, '$.trigger_type') = ?"
+                sql += (
+                    " AND CASE WHEN json_valid(payload_json) "
+                    "THEN json_extract(payload_json, '$.trigger_type') "
+                    "ELSE NULL END = ?"
+                )
                 params.append(trigger_type)
             if trigger_id is not None:
-                sql += " AND json_extract(payload_json, '$.trigger_id') = ?"
+                sql += (
+                    " AND CASE WHEN json_valid(payload_json) "
+                    "THEN json_extract(payload_json, '$.trigger_id') "
+                    "ELSE NULL END = ?"
+                )
                 params.append(trigger_id)
             sql += " ORDER BY id DESC"
             if limit is not None:
@@ -1252,7 +1312,9 @@ class WikiStore:
             ensure_jobs_schema(self._db)
             row = self._db.execute(
                 "SELECT * FROM jobs WHERE id = ? AND queue = ? "
-                "AND CAST(json_extract(payload_json, '$.vault_id') AS INTEGER) = ?",
+                "AND CASE WHEN json_valid(payload_json) "
+                "THEN CAST(json_extract(payload_json, '$.vault_id') AS INTEGER) "
+                "ELSE NULL END = ?",
                 (job_id, WIKI_QUEUE, vault_id),
             ).fetchone()
             return _compile_job_from_jobs_row(row) if row else None
@@ -1450,7 +1512,9 @@ class WikiStore:
                     "UPDATE jobs SET status = 'cancelled', completed_at = ?, "
                     "result_json = ? "
                     "WHERE id = ? AND queue = ? "
-                    "AND CAST(json_extract(payload_json, '$.vault_id') AS INTEGER) = ? "
+                    "AND CASE WHEN json_valid(payload_json) "
+                    "THEN CAST(json_extract(payload_json, '$.vault_id') AS INTEGER) "
+                    "ELSE NULL END = ? "
                     "AND status IN ('pending', 'running')",
                     [datetime.utcnow().isoformat(), result_json, job_id, WIKI_QUEUE, vault_id],
                 )
@@ -1458,7 +1522,9 @@ class WikiStore:
                 cur = self._db.execute(
                     "UPDATE jobs SET status = 'cancelled', completed_at = ? "
                     "WHERE id = ? AND queue = ? "
-                    "AND CAST(json_extract(payload_json, '$.vault_id') AS INTEGER) = ? "
+                    "AND CASE WHEN json_valid(payload_json) "
+                    "THEN CAST(json_extract(payload_json, '$.vault_id') AS INTEGER) "
+                    "ELSE NULL END = ? "
                     "AND status IN ('pending', 'running')",
                     [datetime.utcnow().isoformat(), job_id, WIKI_QUEUE, vault_id],
                 )
@@ -1487,6 +1553,11 @@ class WikiStore:
 
         The ``status = 'failed'`` predicate makes the check-and-flip atomic:
         a job that was concurrently cancelled or completed cannot be reset.
+        Issue #956: an operator-initiated retry grants a full fresh attempt
+        budget — ``attempts`` resets to 0, so the next
+        ``jobs_max_attempts`` claims are real attempts instead of an
+        immediate cap-settle. The janitor's reclaim accounting is a
+        separate SQL path and is unaffected.
         """
         if _lease_enabled():
             ensure_jobs_schema(self._db)
@@ -1494,9 +1565,11 @@ class WikiStore:
                 "UPDATE jobs SET status = 'pending', error = NULL, "
                 "started_at = NULL, completed_at = NULL, run_after = NULL, "
                 "worker_id = NULL, lease_generation = lease_generation + 1, "
-                "heartbeat_at = NULL "
+                "heartbeat_at = NULL, attempts = 0 "
                 "WHERE id = ? AND queue = ? "
-                "AND CAST(json_extract(payload_json, '$.vault_id') AS INTEGER) = ? "
+                "AND CASE WHEN json_valid(payload_json) "
+                "THEN CAST(json_extract(payload_json, '$.vault_id') AS INTEGER) "
+                "ELSE NULL END = ? "
                 "AND status = 'failed'",
                 (job_id, WIKI_QUEUE, vault_id),
             )
@@ -1534,9 +1607,9 @@ class WikiStore:
         return cur.rowcount
 
     def mark_claims_stale_by_file(self, file_id: int, vault_id: int) -> dict:
-        """Mark wiki claims stale when their source document is deleted/reindexed.
+        """Mark wiki claims stale when their source document is deleted.
 
-        - Claims whose ONLY source was this file are set status='stale'.
+        - Claims whose ONLY source was this file are set status='superseded'.
         - Claims with other sources get a 'weak_provenance' lint finding only.
         Returns counts of stale/weak findings created.
         """
@@ -1569,8 +1642,8 @@ class WikiStore:
                 self._db.execute(
                     """INSERT INTO wiki_lint_findings
                        (vault_id, finding_type, severity, title, details,
-                        related_page_ids_json, related_claim_ids_json, status, created_at, updated_at)
-                       VALUES (?, 'stale', 'medium', ?, ?, '[]', ?, 'open', ?, ?)""",
+                        related_page_ids_json, related_claim_ids_json, status, origin, created_at, updated_at)
+                       VALUES (?, 'stale', 'medium', ?, ?, '[]', ?, 'open', 'invalidation', ?, ?)""",
                     (
                         vault_id,
                         f"Claim stale: source document deleted (file_id={file_id})",
@@ -1584,8 +1657,8 @@ class WikiStore:
                 self._db.execute(
                     """INSERT INTO wiki_lint_findings
                        (vault_id, finding_type, severity, title, details,
-                        related_page_ids_json, related_claim_ids_json, status, created_at, updated_at)
-                       VALUES (?, 'weak_provenance', 'low', ?, ?, '[]', ?, 'open', ?, ?)""",
+                        related_page_ids_json, related_claim_ids_json, status, origin, created_at, updated_at)
+                       VALUES (?, 'weak_provenance', 'low', ?, ?, '[]', ?, 'open', 'invalidation', ?, ?)""",
                     (
                         vault_id,
                         f"Weak provenance: source document deleted (file_id={file_id})",
@@ -1604,10 +1677,247 @@ class WikiStore:
         # still exists, leaving orphan lint findings (DD-C009 / #108).
         return {"stale": stale_count, "weak_provenance": weak_count}
 
+    def supersede_unrederived_file_claims(
+        self,
+        file_id: int,
+        vault_id: int,
+        page_id: int,
+        keep_claim_ids: set,
+        current_text: str,
+    ) -> dict:
+        """Supersede claims left behind by a content change on recompile (#794).
+
+        Called from ``WikiCompiler.compile_ingest_job`` after the deterministic
+        claims pass: claims whose only file support is a stored quote that is
+        verifiably absent from the CURRENT text (and that this run did not
+        re-derive) must stop co-serving in retrieval next to their replacements.
+
+        Candidate/keep policy:
+        - Candidates are claims with a ``wiki_claim_sources`` row for this
+          file, bound to this file's page and this vault. Query-synthesis
+          claims carry no page binding and are never touched; neither are
+          non-active claims (retrieval serves 'active' only, and unverified /
+          contradicted / needs_review rows are not this defect).
+        - A claim is KEPT when it was re-derived this run (``keep_claim_ids``,
+          which includes normalized-text reuse), or when ANY of its
+          document-source quotes for this file still appears in
+          ``current_text`` — exact substring first (including the HTML-unescaped
+          form of the quote, mirroring the curator acceptance arms), then the
+          same normalization used by ``find_claim_by_normalized_text`` with
+          token-boundary padding (case / punctuation / whitespace variants,
+          without partial-word matches like "Director" inside "Directorate").
+        - Undecidable inputs fail open and never supersede: no non-empty quote
+          on any source row, a quote that normalizes to the empty string
+          (punctuation-only), or whitespace-only/empty ``current_text``.
+        - Sole-source claims are set status='superseded' plus one 'stale' lint
+          finding; claims with other INDEPENDENT sources stay active with one
+          'weak_provenance' finding (the delete-path policy split). Independent
+          support means another file, a memory, or a non-echo manual source:
+          chat-synthesis usage rows (``source_kind='manual'`` with
+          ``source_label='chat_synthesis'``) are usage echoes, not provenance,
+          and do not keep a stale document claim alive (#794 feedback F-1).
+
+        Finding lifecycle (#794 feedback round): findings use per-claim titles
+        keyed on (vault_id, finding_type, title), and a new row is inserted
+        only when NO row with that fingerprint exists in ANY status — a user's
+        resolved/dismissed/acknowledged disposition permanently suppresses the
+        fingerprint (the ``upsert_lint_findings`` Rule-2 semantics), and
+        reactivation via ``reactivate_claim`` deletes the OPEN finding whose
+        claim it restored, so a supersede→reactivate→supersede flap produces a
+        fresh finding per genuine stale event without resurrection or orphans.
+
+        Deliberate divergences from the delete-path siblings
+        (``mark_claims_stale_by_file``/``_by_memory``): this pass gates on
+        ``status='active'`` (retrieval-facing claims only), dedupes findings by
+        fingerprint, keys findings per claim, and binds ``related_page_ids``
+        for page-panel visibility — the siblings fire once at delete time on a
+        then-current claim set and keep their original shape.
+
+        Does NOT commit: the caller owns the transaction, same discipline as
+        ``mark_claims_stale_by_file`` (DD-C009 / #108).
+        """
+        superseded_count = 0
+        weak_count = 0
+        now = datetime.utcnow().isoformat()
+        current_text = current_text or ""
+        normalized_text = normalize_claim_text(current_text)
+        padded_normalized = f" {normalized_text} " if normalized_text else ""
+
+        candidate_rows = self._db.execute(
+            "SELECT DISTINCT wcs.claim_id FROM wiki_claim_sources wcs "
+            "JOIN wiki_claims c ON c.id = wcs.claim_id "
+            "WHERE wcs.file_id = ? AND wcs.claim_id IS NOT NULL "
+            "AND c.page_id = ? AND c.vault_id = ?",
+            (file_id, page_id, vault_id),
+        ).fetchall()
+
+        for row in candidate_rows:
+            claim_id = dict(row)["claim_id"]
+            if claim_id in keep_claim_ids:
+                continue
+            claim_row = self._db.execute(
+                "SELECT status, claim_text FROM wiki_claims WHERE id = ? AND vault_id = ?",
+                (claim_id, vault_id),
+            ).fetchone()
+            if not claim_row or dict(claim_row)["status"] != "active":
+                continue
+
+            quotes = [
+                dict(q)["quote"] or ""
+                for q in self._db.execute(
+                    "SELECT quote FROM wiki_claim_sources WHERE claim_id = ? AND file_id = ?",
+                    (claim_id, file_id),
+                ).fetchall()
+            ]
+            file_quotes = [q for q in quotes if q.strip()]
+            if not file_quotes:
+                # Undecidable provenance — fail open, never supersede on
+                # absence of evidence.
+                continue
+            if not normalized_text:
+                # Whitespace-only/empty current text carries no positive
+                # evidence about any quote — fail open (feedback F-7).
+                continue
+            quote_present = False
+            has_matchable_absence_evidence = False
+            padded_raw = f" {current_text} "
+            for q in file_quotes:
+                # Token-padded raw containment: a verbatim span that ends
+                # mid-word ("Director" inside "Directorate") is not a real
+                # span (feedback F-5). Edge padding keeps start/end-of-text
+                # spans matchable.
+                if f" {q} " in padded_raw:
+                    quote_present = True
+                    break
+                # Curator quotes may be stored XML-escaped (the curator
+                # accepts them via its HTML-unescape arm and persists the raw
+                # echo) — try the unescaped form before giving up (F-2).
+                unescaped = _html_unescape(q)
+                if unescaped != q and f" {unescaped} " in padded_raw:
+                    quote_present = True
+                    break
+                # Normalized/token-boundary arm: case, punctuation and
+                # whitespace variants count as present.
+                nq = normalize_claim_text(q)
+                if nq and f" {nq} " in padded_normalized:
+                    quote_present = True
+                    break
+                # A quote that normalizes to "" (punctuation-only) never
+                # textually matches anything, so its absence is NOT evidence
+                # of a content change (feedback F-6): only a quote with real
+                # word content that failed every arm counts as that evidence.
+                if nq:
+                    has_matchable_absence_evidence = True
+            if quote_present:
+                continue
+            if not has_matchable_absence_evidence:
+                # Every absent quote was unmatchable noise — undecidable,
+                # fail open.
+                continue
+
+            # Independent support only: chat-synthesis usage echoes do not
+            # keep a stale document claim co-serving next to its replacement
+            # (F-1). Other files, memories and non-echo manual sources do.
+            other_sources = self._db.execute(
+                "SELECT COUNT(*) FROM wiki_claim_sources WHERE claim_id = ? "
+                "AND (file_id != ? OR file_id IS NULL) "
+                "AND NOT (source_kind = 'manual' "
+                "AND IFNULL(source_label, '') = 'chat_synthesis')",
+                (claim_id, file_id),
+            ).fetchone()[0]
+            claim_text = dict(claim_row)["claim_text"]
+            if other_sources == 0:
+                # Vault-scoped, atomic check-and-flip (mirrors
+                # reactivate_claim's predicate discipline): a claim that
+                # concurrently left 'active' is not blanket-superseded.
+                flipped = self._db.execute(
+                    "UPDATE wiki_claims SET status = 'superseded', updated_at = ? "
+                    "WHERE id = ? AND vault_id = ? AND status = 'active'",
+                    (now, claim_id, vault_id),
+                ).rowcount
+                if flipped == 0:
+                    continue
+                self._insert_recompile_finding_once(
+                    vault_id=vault_id,
+                    finding_type="stale",
+                    severity="medium",
+                    title=(
+                        f"Claim stale: source content changed in recompile "
+                        f"(file_id={file_id}, claim_id={claim_id})"
+                    ),
+                    details=claim_text[:200],
+                    claim_id=claim_id,
+                    page_id=page_id,
+                    now=now,
+                )
+                superseded_count += 1
+            else:
+                self._insert_recompile_finding_once(
+                    vault_id=vault_id,
+                    finding_type="weak_provenance",
+                    severity="low",
+                    title=(
+                        f"Weak provenance: source content changed in recompile "
+                        f"(file_id={file_id}, claim_id={claim_id})"
+                    ),
+                    details=claim_text[:200],
+                    claim_id=claim_id,
+                    page_id=page_id,
+                    now=now,
+                )
+                weak_count += 1
+
+        return {"superseded": superseded_count, "weak_provenance": weak_count}
+
+    def _insert_recompile_finding_once(
+        self,
+        vault_id: int,
+        finding_type: str,
+        severity: str,
+        title: str,
+        details: str,
+        claim_id: int,
+        now: str,
+        page_id: Optional[int] = None,
+    ) -> None:
+        """Insert an invalidation lint finding unless a row with the same
+        (vault_id, finding_type, title) fingerprint already exists in ANY
+        status (per-claim titles make the fingerprint per-claim; #794).
+
+        No status filter means one stale event surfaces at most once ever per
+        claim: a user's resolved/dismissed/acknowledged disposition suppresses
+        the fingerprint permanently (Rule-2 semantics), and reactivation
+        deletes the OPEN row (see ``reactivate_claim``), so a later genuine
+        stale event after a flap is a new fingerprint-free insert."""
+        existing = self._db.execute(
+            "SELECT 1 FROM wiki_lint_findings WHERE vault_id = ? AND finding_type = ? "
+            "AND title = ? LIMIT 1",
+            (vault_id, finding_type, title),
+        ).fetchone()
+        if existing:
+            return
+        self._db.execute(
+            """INSERT INTO wiki_lint_findings
+               (vault_id, finding_type, severity, title, details,
+                related_page_ids_json, related_claim_ids_json, status, origin, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'open', 'invalidation', ?, ?)""",
+            (
+                vault_id,
+                finding_type,
+                severity,
+                title,
+                details,
+                json.dumps([page_id]) if page_id is not None else "[]",
+                json.dumps([claim_id]),
+                now,
+                now,
+            ),
+        )
+
     def mark_claims_stale_by_memory(self, memory_id: int, vault_id: int) -> dict:
         """Mark wiki claims stale when their source memory is edited or deleted.
 
-        Same policy as mark_claims_stale_by_file: sole-source → stale,
+        Same policy as mark_claims_stale_by_file: sole-source → superseded,
         multi-source → weak_provenance lint finding.
         """
         stale_count = 0
@@ -1639,8 +1949,8 @@ class WikiStore:
                 self._db.execute(
                     """INSERT INTO wiki_lint_findings
                        (vault_id, finding_type, severity, title, details,
-                        related_page_ids_json, related_claim_ids_json, status, created_at, updated_at)
-                       VALUES (?, 'stale', 'medium', ?, ?, '[]', ?, 'open', ?, ?)""",
+                        related_page_ids_json, related_claim_ids_json, status, origin, created_at, updated_at)
+                       VALUES (?, 'stale', 'medium', ?, ?, '[]', ?, 'open', 'invalidation', ?, ?)""",
                     (
                         vault_id,
                         f"Claim stale: source memory edited/deleted (memory_id={memory_id})",
@@ -1654,8 +1964,8 @@ class WikiStore:
                 self._db.execute(
                     """INSERT INTO wiki_lint_findings
                        (vault_id, finding_type, severity, title, details,
-                        related_page_ids_json, related_claim_ids_json, status, created_at, updated_at)
-                       VALUES (?, 'weak_provenance', 'low', ?, ?, '[]', ?, 'open', ?, ?)""",
+                        related_page_ids_json, related_claim_ids_json, status, origin, created_at, updated_at)
+                       VALUES (?, 'weak_provenance', 'low', ?, ?, '[]', ?, 'open', 'invalidation', ?, ?)""",
                     (
                         vault_id,
                         f"Weak provenance: source memory edited/deleted (memory_id={memory_id})",
@@ -1682,6 +1992,7 @@ class WikiStore:
             (status, now, finding_id, vault_id),
         )
         if cur.rowcount == 0:
+            self._db.rollback()
             return None
         self._db.commit()
         row = self._db.execute(
@@ -1702,13 +2013,23 @@ class WikiStore:
         details: str = "",
         related_page_ids: Optional[list] = None,
         related_claim_ids: Optional[list] = None,
+        origin: str = "invalidation",
     ) -> WikiLintFinding:
         """Insert one OPEN lint finding and commit.
 
         AC35 (#515): callers that re-detect the same issue across runs should
         prefer ``upsert_lint_findings`` (fingerprint-aware, respects
-        dismissals); this direct insert is for one-off findings (e.g. claim
-        invalidation writing 'stale'/'weak_provenance' rows).
+        dismissals); this direct insert is for one-off findings a lint run
+        did not detect. The ``origin`` default is therefore 'invalidation' —
+        a non-linter marker, so the lint reconciler never auto-resolves rows
+        seeded here — and producers that re-detect must call
+        ``upsert_lint_findings`` with their own origin instead.
+
+        Note: the invalidation writers (``mark_claims_stale_by_file`` /
+        ``mark_claims_stale_by_memory``) do NOT route through this method;
+        they issue their own origin-tagged INSERTs. After #791 moved the
+        curator onto the upsert path, this method's remaining callers are
+        one-off seeders and tests.
         """
         return self._insert_lint_finding_row(
             vault_id=vault_id,
@@ -1718,6 +2039,7 @@ class WikiStore:
             details=details,
             related_page_ids=related_page_ids,
             related_claim_ids=related_claim_ids,
+            origin=origin,
             commit=True,
         )
 
@@ -1741,7 +2063,15 @@ class WikiStore:
             # page_id=1 would also match arrays containing 10, 11, 21, etc.
             sql += " AND EXISTS (SELECT 1 FROM json_each(related_page_ids_json) WHERE value = ?)"
             params.append(page_id)
-        sql += " ORDER BY severity DESC, created_at DESC"
+        # Rank order (issue #791): severity is a TEXT column whose values sort
+        # lexically (critical < high < low < medium), so a bare DESC renders
+        # medium, low, high, critical. Map to ranks first; created_at only
+        # breaks ties inside one rank. The CHECK constraint guarantees the
+        # four vocabulary values, so the ELSE arm is 'low' by construction.
+        sql += (
+            " ORDER BY CASE severity WHEN 'critical' THEN 4 WHEN 'high' THEN 3"
+            " WHEN 'medium' THEN 2 ELSE 1 END DESC, created_at DESC"
+        )
         rows = self._db.execute(sql, params).fetchall()
         return [_to_lint_finding(r) for r in rows]
 
@@ -1767,9 +2097,21 @@ class WikiStore:
         drift without changing identity; whitespace/case differences in the
         title do not either.
         """
-        pages = tuple(sorted({int(p) for p in (related_page_ids or []) if p}))
+        # Issue #791 review: the CHECK constrains related_page_ids_json to a
+        # JSON *array*, not to integer elements, so a legacy/hand-edited row
+        # could carry a non-castable element. Skip those instead of raising —
+        # an exception here would abort the whole reconciliation (and 500 the
+        # lint route) over one malformed row.
+        pages = set()
+        for p in (related_page_ids or []):
+            if not p:
+                continue
+            try:
+                pages.add(int(p))
+            except (TypeError, ValueError):
+                continue
         normalized_title = re.sub(r"\s+", " ", (title or "").strip().lower())
-        return (finding_type, pages, normalized_title)
+        return (finding_type, tuple(sorted(pages)), normalized_title)
 
     @staticmethod
     def _row_lint_fingerprint(row: sqlite3.Row) -> tuple:
@@ -1791,6 +2133,7 @@ class WikiStore:
         details: str = "",
         related_page_ids: Optional[list] = None,
         related_claim_ids: Optional[list] = None,
+        origin: str = "linter",
         commit: bool = True,
     ) -> WikiLintFinding:
         """INSERT one open lint finding (shared by create/upsert paths)."""
@@ -1798,10 +2141,11 @@ class WikiStore:
         cur = self._db.execute(
             """INSERT INTO wiki_lint_findings
                (vault_id, finding_type, severity, title, details,
-                related_page_ids_json, related_claim_ids_json, status, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)""",
+                related_page_ids_json, related_claim_ids_json, status, origin, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)""",
             (vault_id, finding_type, severity, title, details,
-             json.dumps(related_page_ids or []), json.dumps(related_claim_ids or []), now, now),
+             json.dumps(related_page_ids or []), json.dumps(related_claim_ids or []),
+             origin, now, now),
         )
         if commit:
             self._db.commit()
@@ -1810,20 +2154,36 @@ class WikiStore:
         ).fetchone()
         return _to_lint_finding(row)
 
-    def upsert_lint_findings(self, vault_id: int, specs: list) -> list:
+    # Statuses a USER can set through update_lint_finding. 'auto_resolved' is
+    # system-only (written by the resolve pass below); rows in any of these
+    # user-terminal statuses permanently suppress their fingerprint (#515
+    # AC35), while 'auto_resolved' rows reopen on recurrence (issue #791).
+    _USER_TERMINAL_LINT_STATUSES = ("dismissed", "resolved", "acknowledged")
+
+    def upsert_lint_findings(
+        self, vault_id: int, specs: list, origin: str = "linter"
+    ) -> list:
         """Reconcile this run's DETECTED findings against existing rows.
 
-        AC35 (#515): a dismissed/resolved finding must not resurrect as a new
-        open row on the next lint run. Instead of clear-open-then-recreate:
+        AC35 (#515): a dismissed/resolved/acknowledged finding must not
+        resurrect as a new open row on the next lint run. Instead of
+        clear-open-then-recreate, for each DETECTED fingerprint:
 
-        - a detected fingerprint that matches an existing NON-open row
-          (dismissed / resolved / acknowledged) is SUPPRESSED — no new row;
-        - a detected fingerprint with an existing open row keeps that row
-          (no duplicate insert);
-        - a detected fingerprint with no existing row inserts a fresh open
-          finding;
-        - an open row whose fingerprint was NOT detected this run transitions
-          to 'resolved' (the underlying issue went away).
+        1. an existing open row keeps that row (no duplicate insert);
+        2. otherwise, any row in a USER-terminal status (dismissed /
+           resolved / acknowledged) suppresses the fingerprint — on purpose,
+           regardless of 'auto_resolved' siblings;
+        3. otherwise, the NEWEST same-origin 'auto_resolved' row flips back
+           to open — recurrence reopens the same row (no per-flap growth);
+        4. otherwise a fresh open row is inserted with the caller's origin.
+
+        ``origin`` records the producing caller ('linter', 'curator', ...).
+        The resolve pass — open rows the caller did NOT detect — runs only
+        for the linter's own reconciliation (``origin == 'linter'``) and
+        only over ``origin='linter'`` rows, flipping them to the
+        system-only 'auto_resolved' status: rows the linter did not create
+        (invalidation / compiler / curator) are never force-resolved
+        (issue #791).
 
         Returns the open findings representing this run (kept + newly
         created); suppressed fingerprints contribute nothing.
@@ -1852,11 +2212,101 @@ class WikiStore:
                 if matches:
                     open_rows = [r for r in matches if r["status"] == "open"]
                     if open_rows:
-                        # Still open — keep the existing row as-is.
-                        result.append(_to_lint_finding(open_rows[0]))
-                    # else: only terminal (dismissed/resolved/acknowledged)
-                    # rows share this fingerprint — suppressed on purpose.
-                    continue
+                        # Rule 1: still open — keep the existing row, but
+                        # refresh the mutable payload when the new detection
+                        # carries different severity/details/related ids
+                        # (issue #791 review: the fingerprint does not cover
+                        # them, so a growing contradiction would otherwise
+                        # keep showing its first-detection payload forever).
+                        kept = open_rows[0]
+                        if (
+                            kept["severity"] != spec.get("severity", "medium")
+                            or kept["details"] != spec.get("details", "")
+                            or kept["related_page_ids_json"]
+                            != json.dumps(spec.get("related_page_ids") or [])
+                            or kept["related_claim_ids_json"]
+                            != json.dumps(spec.get("related_claim_ids") or [])
+                        ):
+                            self._db.execute(
+                                "UPDATE wiki_lint_findings SET severity = ?,"
+                                " details = ?, related_page_ids_json = ?,"
+                                " related_claim_ids_json = ?, updated_at = ?"
+                                " WHERE id = ? AND vault_id = ?",
+                                (
+                                    spec.get("severity", "medium"),
+                                    spec.get("details", ""),
+                                    json.dumps(spec.get("related_page_ids") or []),
+                                    json.dumps(spec.get("related_claim_ids") or []),
+                                    now,
+                                    kept["id"],
+                                    vault_id,
+                                ),
+                            )
+                            kept = self._db.execute(
+                                "SELECT * FROM wiki_lint_findings WHERE id = ?",
+                                (kept["id"],),
+                            ).fetchone()
+                            if kept is None:
+                                # Vanished between the snapshot read and the
+                                # UPDATE (same unreachable trigger as rule 3);
+                                # fall through instead of crashing.
+                                kept = open_rows[0]
+                        result.append(_to_lint_finding(kept))
+                        continue
+                    # Rule 2: a user disposition (dismissed / resolved /
+                    # acknowledged) permanently suppresses this fingerprint —
+                    # on purpose, even when auto_resolved siblings exist.
+                    if any(
+                        r["status"] in self._USER_TERMINAL_LINT_STATUSES
+                        for r in matches
+                    ):
+                        continue
+                    # Rule 3: only same-origin auto_resolved rows remain —
+                    # the issue recurred after this producer auto-resolved
+                    # it, so reopen the newest such row instead of growing
+                    # a history row per flap. Cross-origin history (e.g. a
+                    # curator detection over linter history) falls through
+                    # to rule 4.
+                    flippable = [
+                        r
+                        for r in matches
+                        if r["status"] == "auto_resolved" and r["origin"] == origin
+                    ]
+                    if flippable:
+                        newest = max(flippable, key=lambda r: (r["created_at"], r["id"]))
+                        # Refresh the mutable payload from the new detection
+                        # (issue #791 review): identity is the fingerprint, so
+                        # severity/details/related ids may legitimately have
+                        # changed since the row was auto-resolved — e.g. a
+                        # contradiction that gained a third claim. Without
+                        # this the reopened row would keep the stale payload.
+                        self._db.execute(
+                            "UPDATE wiki_lint_findings SET status = 'open',"
+                            " severity = ?, details = ?,"
+                            " related_page_ids_json = ?, related_claim_ids_json = ?,"
+                            " updated_at = ? WHERE id = ? AND vault_id = ?",
+                            (
+                                spec.get("severity", "medium"),
+                                spec.get("details", ""),
+                                json.dumps(spec.get("related_page_ids") or []),
+                                json.dumps(spec.get("related_claim_ids") or []),
+                                now,
+                                newest["id"],
+                                vault_id,
+                            ),
+                        )
+                        fresh = self._db.execute(
+                            "SELECT * FROM wiki_lint_findings WHERE id = ?",
+                            (newest["id"],),
+                        ).fetchone()
+                        if fresh is not None:
+                            result.append(_to_lint_finding(fresh))
+                            continue
+                        # The row vanished between the snapshot read and the
+                        # UPDATE (a concurrent delete). Fall through to rule 4
+                        # rather than crashing the whole reconciliation on an
+                        # unguarded re-read.
+                # Rule 4: fresh open row for this producer.
                 result.append(
                     self._insert_lint_finding_row(
                         vault_id=vault_id,
@@ -1866,16 +2316,22 @@ class WikiStore:
                         details=spec.get("details", ""),
                         related_page_ids=spec.get("related_page_ids"),
                         related_claim_ids=spec.get("related_claim_ids"),
+                        origin=origin,
                         commit=False,
                     )
                 )
-            for row in rows:
-                if row["status"] == "open" and self._row_lint_fingerprint(row) not in detected:
-                    self._db.execute(
-                        "UPDATE wiki_lint_findings SET status = 'resolved', updated_at = ? "
-                        "WHERE id = ? AND vault_id = ?",
-                        (now, row["id"], vault_id),
-                    )
+            if origin == "linter":
+                for row in rows:
+                    if (
+                        row["status"] == "open"
+                        and row["origin"] == "linter"
+                        and self._row_lint_fingerprint(row) not in detected
+                    ):
+                        self._db.execute(
+                            "UPDATE wiki_lint_findings SET status = 'auto_resolved', updated_at = ? "
+                            "WHERE id = ? AND vault_id = ?",
+                            (now, row["id"], vault_id),
+                        )
         return result
 
     # -----------------------------------------------------------------------

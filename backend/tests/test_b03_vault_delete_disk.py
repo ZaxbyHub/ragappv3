@@ -131,6 +131,7 @@ def _ac1_unlinks_uploaded_file() -> int:
 
         asyncio.run(
             delete_vault(
+                http_request=None,  # audit-event param (issue #722 AC1); None is safe for safe_record_security_event
                 vault_id=vault_id,
                 conn=conn,
                 vector_store=_FakeVectorStore(),
@@ -162,6 +163,7 @@ def _ac2_removes_vault_directory() -> int:
 
         asyncio.run(
             delete_vault(
+                http_request=None,  # audit-event param (issue #722 AC1); None is safe for safe_record_security_event
                 vault_id=vault_id,
                 conn=conn,
                 vector_store=_FakeVectorStore(),
@@ -224,6 +226,7 @@ async def _ac3_ingest_vs_delete() -> int:
         async def _parse_with_mid_flight_delete(*args, **kwargs):  # noqa: ANN002, ANN003
             try:
                 await delete_vault(
+                    http_request=None,  # audit-event param (issue #722 AC1); None is safe for safe_record_security_event
                     vault_id=vault_id,
                     conn=conn,
                     vector_store=store,

@@ -86,7 +86,11 @@ if (-not $SkipEmbedding) {
             $dockerArgs += @("-e", "HUGGING_FACE_HUB_TOKEN=$env:HF_TOKEN")
         }
 
-        $dockerArgs += @($EmbeddingImage, "--model-id", $EmbeddingModel, "--port", "8080", "--max-batch-tokens", "16384")
+        # --max-client-batch-size matches docker-compose.yml (128): TEI's own
+        # default client batch cap is 32, while the app's default
+        # EMBEDDING_BATCH_SIZE is 64 — without the flag, every ingestion batch
+        # over 32 texts fails with a 422 on this launch path (issue #698).
+        $dockerArgs += @($EmbeddingImage, "--model-id", $EmbeddingModel, "--port", "8080", "--max-batch-tokens", "16384", "--max-client-batch-size", "128")
         docker @dockerArgs 2>&1 | Out-Null
     } else {
         Write-Output "$EmbeddingContainerName container already running"

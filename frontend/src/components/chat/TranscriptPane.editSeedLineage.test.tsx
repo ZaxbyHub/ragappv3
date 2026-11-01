@@ -61,6 +61,7 @@ vi.mock("@/stores/useChatShellStore", () => ({
 }));
 vi.mock("react-router-dom", () => ({
   useNavigate: () => vi.fn(),
+  useInRouterContext: () => false,
 }));
 
 let nextId = 200;

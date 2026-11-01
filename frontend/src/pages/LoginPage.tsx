@@ -1,6 +1,7 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useNavigate, Navigate, Link, useLocation } from "react-router-dom";
 import { useAuthStore } from "@/stores/useAuthStore";
+import { captureAuthOwner, captureAuthPrincipalGeneration, isCurrentAuthOwner } from "@/lib/api/auth-lifecycle";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -34,12 +35,20 @@ export default function LoginPage() {
   const [error, setError] = useState("");
   const [showPassword, setShowPassword] = useState(false);
 
-  const { login, needsSetup, isLoading, authMode } = useAuthStore();
+  const { login, needsSetup, isLoading, authMode, initializationFailed } = useAuthStore();
+  const init = useAuthStore((state) => state.init);
+  const mountedRef = useRef(true);
+  const activeLoginInvocationRef = useRef(0);
 
   const navigate = useNavigate();
   const location = useLocation();
   // RT-03 fix: restore return-to URL after login
   const returnTo = (location.state as { from?: { pathname: string } })?.from?.pathname || "/";
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
 
   // Initialize auth store on mount (skip in test mode)
   useEffect(() => {
@@ -47,6 +56,24 @@ export default function LoginPage() {
       useAuthStore.getState().init();
     }
   }, []);
+
+  if (initializationFailed && needsSetup === null) {
+    const retryOwner = captureAuthOwner();
+    const retryPrincipalGeneration = captureAuthPrincipalGeneration();
+    const retry = () => {
+      if (!mountedRef.current || !isCurrentAuthOwner(retryOwner)) return;
+      if (captureAuthPrincipalGeneration() !== retryPrincipalGeneration) return;
+      void init();
+    };
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-background p-4" role="alert">
+        <div className="flex flex-col items-center gap-3">
+          <p className="text-sm text-muted-foreground">Unable to initialize authentication.</p>
+          <Button type="button" onClick={retry}>Retry</Button>
+        </div>
+      </div>
+    );
+  }
 
   // Show loading while checking setup status
   if (needsSetup === null) {
@@ -96,6 +123,8 @@ export default function LoginPage() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError("");
+    let loginInvocation: number | null = null;
+    let loginOwner: ReturnType<typeof captureAuthOwner> | null = null;
 
     if (!credentials.username.trim() || !credentials.password) {
       setError("Please enter both username and password");
@@ -131,10 +160,32 @@ export default function LoginPage() {
         throw new Error("Invalid demo credentials");
       }
 
-      await login(credentials.username, credentials.password);
-      navigate(returnTo, { replace: true });
+      if (!mountedRef.current) return;
+      const invocation = ++activeLoginInvocationRef.current;
+      const loginPromise = login(credentials.username, credentials.password);
+      // login synchronously reserves its replacement owner before its first await.
+      const owner = captureAuthOwner();
+      loginInvocation = invocation;
+      loginOwner = owner;
+      await loginPromise;
+      if (mountedRef.current
+        && activeLoginInvocationRef.current === invocation
+        && isCurrentAuthOwner(owner)) {
+        navigate(returnTo, { replace: true });
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Login failed");
+      const message = err instanceof Error ? err.message : "Login failed";
+      if (loginInvocation === null || loginOwner === null) {
+        setError(message);
+        return;
+      }
+      setError((previous) => (
+        mountedRef.current
+        && activeLoginInvocationRef.current === loginInvocation
+        && isCurrentAuthOwner(loginOwner)
+          ? message
+          : previous
+      ));
     }
   };
 

@@ -7,6 +7,8 @@ import { Composer } from "./Composer";
 import { useUploadStore } from "@/stores/useUploadStore";
 
 const apiMock = vi.hoisted(() => ({
+  API_BASE_URL: "/api",
+  attachCsrfInterceptor: vi.fn(),
   uploadDocument: vi.fn(),
   getDocumentStatus: vi.fn(),
 }));

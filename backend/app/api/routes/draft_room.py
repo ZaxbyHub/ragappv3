@@ -68,9 +68,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import sqlite3
 from pathlib import Path
 from typing import Annotated, Any, Callable, Generic, Optional, TypeVar
+from urllib.parse import quote
 
 from fastapi import (
     APIRouter,
@@ -154,9 +156,25 @@ from app.services.draft_store import (
 from app.services.folder_store import FolderStore
 from app.services.security_audit import safe_record_security_event
 from app.services.tag_store import TagStore
+from app.services.task_drain import drain_audit
 from app.services.upload_validation import secure_filename
 
 logger = logging.getLogger(__name__)
+
+# 503 codes that are a deliberate configuration decision, not a server fault:
+# the room is switched off (`DRAFT_ROOM_ENABLED` defaults to false) or the
+# configured model provider is not permitted. `draft_room_exception_handler`
+# logs these at WARNING so a deployment that has not enabled the room does not
+# emit one ERROR record per mutating request (issue #789 review F-013). Every
+# other 5xx stays ERROR.
+_CONFIGURATION_5XX_CODES: frozenset[str] = frozenset(
+    {
+        "draft_room_disabled",
+        "provider_origin_not_allowed",
+        "provider_scheme_not_allowed",
+        "provider_policy_misconfigured",
+    }
+)
 
 # Draft Room's own upload allowlist excludes raster images (parse-only text
 # seam, issue #460). The vault image allowlist is a document-ingestion feature,
@@ -201,10 +219,13 @@ _RETRY_STAGE_NORMALIZATION: dict[str, str] = {"assemble": "fact", "intake": "res
 #: transaction, so the write always lands on ``queued`` from a legal prior.
 #: Draft statuses from which applying a finding may legally land on
 #: ``needs_review``. Mirrors the ``_DRAFT_TRANSITIONS`` edges into
-#: ``needs_review``; ``failed``/``cancelled``/``archived`` are excluded because
-#: those may only move to ``queued``/``archived``/``draft``.
+#: ``needs_review``; ``archived`` is excluded (an archived draft accepts no
+#: revisions), and ``failed``/``cancelled`` are included since the
+#: stuck-draft recovery edge landed (issue #788): applying a finding is one
+#: of the paths that recovers a compile-cancelled/failed draft with a current
+#: revision back into review.
 _APPLY_FINDING_ALLOWED_PRIOR_STATUSES: frozenset[str] = frozenset(
-    {"draft", "needs_review", "ready"}
+    {"draft", "needs_review", "ready", "failed", "cancelled"}
 )
 
 _COMPILE_ALLOWED_PRIOR_STATUSES: frozenset[str] = frozenset(
@@ -238,14 +259,6 @@ _MAX_CLAIM_SOURCES = 50
 
 _IDEMPOTENCY_HEADER = "Idempotency-Key"
 
-#: ``draft_events.event_type`` written for each human finding disposition
-#: (SPEC section 5.8 requires at minimum ``finding_waived``).
-_DISPOSITION_EVENT_TYPES: dict[str, str] = {
-    "apply": "finding_applied",
-    "dismiss": "finding_dismissed",
-    "waive": "finding_waived",
-}
-
 
 # ── error contract (SPEC section 8.3) ───────────────────────────────────────
 
@@ -277,7 +290,31 @@ async def draft_room_exception_handler(
 
     Registered in ``app.main`` above the SPA catch-all. ``context`` is
     omitted (not sent as ``{}``) when empty, matching SPEC section 8.3.
+
+    5xx responses are logged with their cause and target before rendering
+    (issue #789): a server error that leaves no ERROR record is invisible to
+    operators. 4xx stays unlogged — client errors are normal traffic.
     """
+    if exc.status_code >= 500:
+        # A deliberate configuration/feature gate is not a server fault: 503s
+        # for `draft_room_disabled` and the provider-policy codes are expected
+        # traffic on a deployment that has not enabled the room, and the
+        # feature flag defaults to off — logging them at ERROR turned every
+        # mutating attempt on such a deployment into an alert-grade record
+        # (issue #789 review F-013). Genuine 5xx stays ERROR.
+        log = (
+            logger.warning
+            if exc.status_code == 503 and exc.code in _CONFIGURATION_5XX_CODES
+            else logger.error
+        )
+        log(
+            "draft_room: %s %s -> %s %s cause=%r",
+            request.method,
+            request.url.path,
+            exc.status_code,
+            exc.code,
+            exc.__cause__,
+        )
     body: dict[str, Any] = {"detail": exc.detail, "code": exc.code}
     if exc.context:
         body["context"] = exc.context
@@ -323,11 +360,17 @@ async def _run_store(func: Callable[[], T]) -> T:
 
 
 def _require_enabled() -> None:
-    """Gate create/edit/upload/revision-create behind ``draft_room_enabled``.
+    """Gate every mutating Draft Room route behind ``draft_room_enabled``.
+
+    That covers create, edit, upload, revision-create, archive/restore, compile,
+    Ready, promote, job retry, finding disposition, and single-input delete —
+    each mutates private data or project state.
 
     Capability discovery, owner list/read/export, job cancel, and whole-draft
-    delete stay available even when disabled so an owner can always inspect
-    and clean up their private data (SPEC section 9.2).
+    delete stay available even when disabled so an owner can always inspect and
+    clean up their private data (SPEC section 9.2). Single-input delete is a
+    piecemeal mutation and is NOT on that allowlist: with the room disabled,
+    whole-draft delete is the cleanup path.
     """
     if not settings.draft_room_enabled:
         raise DraftRoomHTTPError(503, "draft room is disabled", "draft_room_disabled")
@@ -829,8 +872,17 @@ class DraftClaim(BaseModel):
 class DraftFinding(BaseModel):
     """A finding plus its disposition eligibility (SPEC section 8.2).
 
-    ``can_dismiss`` is False for every blocker — blockers may only be applied
-    or validly waived. ``can_waive`` additionally requires ``waivable``.
+    The flags mirror the guards the disposition route actually enforces
+    (issue #788), so a client never offers an action the server refuses:
+
+    * ``can_apply`` requires an open finding with a suggestion and span, the
+      finding raised against the draft's **current** revision, a draft status
+      the apply path accepts (``_APPLY_FINDING_ALLOWED_PRIOR_STATUSES``), and
+      no active compile job.
+    * ``can_dismiss`` is False for every blocker — blockers may only be applied
+      or validly waived — and False once the draft is archived.
+    * ``can_waive`` additionally requires ``waivable`` and, like dismiss, an
+      unarchived draft.
     """
 
     id: int
@@ -1072,7 +1124,25 @@ def _to_claim(
     )
 
 
-def _to_finding(record: DraftFindingRecord) -> DraftFinding:
+def _to_finding(
+    record: DraftFindingRecord,
+    *,
+    current_revision_id: Optional[int] = None,
+    draft_status: Optional[str] = None,
+    has_active_compile: bool = False,
+) -> DraftFinding:
+    """Render a finding with disposition flags the route can actually honor.
+
+    ``can_apply``/``can_dismiss``/``can_waive`` agree with the disposition
+    route's guards (issue #788): apply additionally requires revision
+    currency, a draft status the apply path accepts, and no active compile;
+    dismiss/waive are refused only on archived drafts. Parameter defaults
+    are asymmetric by design: ``draft_status=None`` keeps the legacy
+    status-blind behavior for callers that pass nothing, while
+    ``current_revision_id=None`` yields ``can_apply=False`` — a caller that
+    cannot determine the current revision must not advertise apply (the
+    route 409s ``finding_revision_stale``).
+    """
     is_open = record.status == "open"
     is_blocker = record.severity == "blocker"
     return DraftFinding(
@@ -1104,10 +1174,23 @@ def _to_finding(record: DraftFindingRecord) -> DraftFinding:
             and record.suggestion is not None
             and record.span_start is not None
             and record.span_end is not None
+            and record.revision_id is not None
+            and record.revision_id == current_revision_id
+            and (draft_status is None or draft_status in _APPLY_FINDING_ALLOWED_PRIOR_STATUSES)
+            and not has_active_compile
         ),
-        # SPEC section 8.2: dismiss is allowed only for non-blockers.
-        can_dismiss=bool(is_open and not is_blocker),
-        can_waive=bool(is_open and record.waivable),
+        # SPEC section 8.2: dismiss is allowed only for non-blockers; the
+        # store refuses every disposition on an archived draft.
+        can_dismiss=bool(
+            is_open
+            and not is_blocker
+            and (draft_status is None or draft_status != "archived")
+        ),
+        can_waive=bool(
+            is_open
+            and record.waivable
+            and (draft_status is None or draft_status != "archived")
+        ),
     )
 
 
@@ -1429,13 +1512,20 @@ def _validate_locked_spans(
 async def _delete_input_row_best_effort(
     store: DraftStore, *, draft_id: int, owner_id: int, input_id: int
 ) -> None:
-    """Best-effort rollback of a reserved input row after a later upload step fails."""
+    """Best-effort rollback of a reserved input row after a later upload step fails.
+
+    Uses ``best_effort=True``: the row was created by this same request and its
+    bytes have already been discarded, so the in-use / active-job refusal guards
+    do not apply. Applying them here would strand a row whose file is gone and
+    permanently 409 the owner's re-upload on ``UNIQUE(draft_id, content_sha256)``.
+    """
     try:
         await asyncio.to_thread(
             store.delete_input_row,
             draft_id=draft_id,
             owner_id=owner_id,
             input_id=input_id,
+            best_effort=True,
         )
     except DraftStoreError:
         logger.error(
@@ -1445,8 +1535,21 @@ async def _delete_input_row_best_effort(
         )
 
 
+_EXPORT_TITLE_SEPARATOR_RE = re.compile(r"[/\\]")
+
+
 def _export_filename(title: str, revision_no: int, tag: str) -> str:
-    safe_title = secure_filename(title.replace(" ", "_")) or "draft"
+    """Filesystem-safe export name preserving as much of the title as possible.
+
+    ``secure_filename`` strips client *paths* (``os.path.basename`` first), so
+    feeding it a raw title would silently drop everything before a ``/`` or
+    ``\\`` (issue #789: ``A/B test results`` exported as
+    ``B_test_results-rev1-REVIEW.md``). In a title the separator is content,
+    not a path, so it is rewritten to an underscore before sanitizing; the
+    ASCII-safe name itself is unchanged for pure-ASCII separator-free titles.
+    """
+    folded = _EXPORT_TITLE_SEPARATOR_RE.sub("_", title)
+    safe_title = secure_filename(folded.replace(" ", "_")) or "draft"
     base = f"{safe_title}-rev{revision_no}"
     if tag:
         base = f"{base}-{tag}"
@@ -1533,6 +1636,16 @@ def _request_fingerprint(
     across a prompt-bundle upgrade, can never alias. The authenticated user is
     not hashed in — it is the other half of the key's scope and is enforced by
     the ``(created_by, idempotency_key)`` unique index.
+
+    ``start_stage`` is the client's *requested* stage, deliberately not the
+    server-normalized one: for a fresh compile the normalized value is always
+    ``research`` (issue #789), which would alias every requested stage under
+    one key. The *compile* fingerprint (checkpoint-resume identity,
+    ``_sync_compile_fingerprint``) keeps hashing the normalized stage — the
+    two fingerprints answer different questions. A retry hashes the parent
+    job's frozen ``input_revision_id`` rather than the live current revision,
+    because the retried job itself changes the current revision on success and
+    must not invalidate its own replay (issue #789).
     """
     return sha256_text(
         canonical_json(
@@ -1685,6 +1798,20 @@ def _conflict(detail: str, code: str, **context: Any) -> DraftRoomHTTPError:
     return DraftRoomHTTPError(409, detail, code, context or None)
 
 
+def _stale_lock_conflict() -> DraftConflictError:
+    """The one error every stale-``lock_version`` raise emits (issue #789).
+
+    The store's ``DraftConflictError`` default code is the generic
+    ``conflict``; the same condition on the disposition path already used the
+    precise ``stale_lock_version``. One condition, one code, everywhere —
+    clients can distinguish "reload and retry" from every other conflict
+    without parsing detail strings.
+    """
+    err = DraftConflictError("draft was modified by another request; reload and retry")
+    err.code = "stale_lock_version"
+    return err
+
+
 def _sync_enqueue_compile(
     conn: sqlite3.Connection,
     *,
@@ -1747,9 +1874,7 @@ def _sync_enqueue_compile(
                 )
 
         if current_lock != lock_version:
-            raise DraftConflictError(
-                "draft was modified by another request; reload and retry"
-            )
+            raise _stale_lock_conflict()
         if status not in _COMPILE_ALLOWED_PRIOR_STATUSES:
             raise _conflict(
                 "draft is not in a state that can start a compile", "invalid_state"
@@ -1850,10 +1975,56 @@ def _sync_enqueue_compile(
         except sqlite3.IntegrityError as exc:
             # Either the one-active-compile index or the (created_by,
             # idempotency_key) index lost a race. Both are conflicts, never 500s.
+            # Discriminate by the violated constraint's identity (issue #789):
+            # sqlite reports plain unique-index violations as a COLUMN list
+            # ("UNIQUE constraint failed: draft_jobs.created_by,
+            # draft_jobs.idempotency_key") and names the index only for
+            # expression indexes, so match either shape; the prefix anchor
+            # keeps CHECK/NOT NULL/FK messages out. When one INSERT violates
+            # both indexes at once, whichever sqlite reports first picks the
+            # arm — both outcomes are correct (replay-return the winner, or
+            # active_job).
+            msg = str(exc)
+            if msg.startswith("UNIQUE constraint failed") and (
+                "idempotency_key" in msg or "idx_draft_jobs_idempotency" in msg
+            ):
+                # The key index lost the race. This path may RETURN (a racing
+                # identical replay gets the winner), so it owns its rollback —
+                # a return must not rely on the outer except's conn.rollback().
+                conn.rollback()
+                winner = conn.execute(
+                    "SELECT id, draft_id, input_json FROM draft_jobs "
+                    "WHERE created_by = ? AND idempotency_key = ?",
+                    (owner_id, idempotency_key),
+                ).fetchone()
+                if winner is not None:
+                    stored = _json_or(winner[2], {})
+                    if (
+                        int(winner[1]) == draft_id
+                        and stored.get("request_fingerprint") == request_fingerprint
+                    ):
+                        return int(winner[0]), False
+                # Same wording as the pre-check conflict above so one condition
+                # answers with one detail string (issue #789 review F-021).
+                raise _conflict(
+                    "this idempotency-key was already used for a different request",
+                    "idempotency_key_conflict",
+                ) from exc
+            # The one-active-compile index lost the race. Re-read the winner so
+            # this arm carries the same `active_job_id` context the pre-check arm
+            # gives the identical condition (issue #789 review F-009); the read
+            # is best-effort and the conflict stands without it.
+            conn.rollback()
+            active_row = conn.execute(
+                "SELECT id FROM draft_jobs WHERE draft_id = ? "
+                "AND status IN ('pending','running') LIMIT 1",
+                (draft_id,),
+            ).fetchone()
+            context = {"active_job_id": int(active_row[0])} if active_row else None
             raise _conflict(
-                "a compile job is already active for this draft or the "
-                "idempotency-key is already in use",
+                "a job is already active for this draft",
                 "active_job",
+                **(context or {}),
             ) from exc
         job_id = int(cur.lastrowid)
 
@@ -1958,9 +2129,7 @@ def _sync_apply_finding(
             draft_row[2],
         )
         if current_lock != lock_version:
-            raise DraftConflictError(
-                "draft was modified by another request; reload and retry"
-            )
+            raise _stale_lock_conflict()
         if status == "archived":
             raise _conflict(
                 "archived draft cannot accept new revisions", "invalid_state"
@@ -2073,10 +2242,13 @@ def _sync_apply_finding(
             (owner_id, note, finding_id),
         )
         # Any prior factual approval described the old bytes. Guard the prior
-        # status: _DRAFT_TRANSITIONS allows failed/cancelled -> queued|archived
-        # only, so moving one of those straight to needs_review would corrupt
-        # the state machine. Mirrors DraftStore.create_manual_revision, which
-        # routes the same edge through _check_transition.
+        # status against _DRAFT_TRANSITIONS: applying a finding lands on
+        # needs_review, so a failed/cancelled draft is now a legal prior (the
+        # stuck-draft recovery edge, issue #788) exactly as it is for a manual
+        # revision, while queued/running (a compile is in flight) and archived
+        # remain refused here. Mirrors DraftStore.create_manual_revision, which
+        # routes the same edge through _check_transition; the allowlist itself
+        # is _APPLY_FINDING_ALLOWED_PRIOR_STATUSES above.
         prior_status_row = conn.execute(
             "SELECT status FROM drafts WHERE id = ? AND created_by = ?",
             (draft_id, owner_id),
@@ -2168,9 +2340,7 @@ def _sync_mark_ready(
             str(draft_row[2]),
         )
         if current_lock != lock_version:
-            raise DraftConflictError(
-                "draft was modified by another request; reload and retry"
-            )
+            raise _stale_lock_conflict()
         # 'needs_review' is the only prior status with a legal edge to 'ready'.
         if status != "needs_review":
             raise _conflict(
@@ -2295,10 +2465,14 @@ def _sync_mark_ready(
                     )
 
         # Rule 3: unqualified factual claim verdicts are non-waivable blockers.
+        # Resolution is deliberately NOT part of this predicate (issue #788 /
+        # S05-SK-04): ``set_claim_resolution`` documents resolution as "an
+        # audit annotation, not a gate", so a blocking verdict blocks Ready
+        # regardless of its audit resolution.
         unresolved_claims = int(
             conn.execute(
                 "SELECT COUNT(*) FROM draft_claims WHERE revision_id = ? "
-                "AND resolution = 'open' AND status IN "
+                "AND status IN "
                 "('contradicted','unsupported','ambiguous','stale')",
                 (revision_id,),
             ).fetchone()[0]
@@ -2428,6 +2602,7 @@ def _sync_get_finding(
 
 @router.get("/capabilities", response_model=DraftRoomCapabilities)
 async def get_capabilities(
+    request: Request,
     user: dict = Depends(get_current_active_user),
 ) -> DraftRoomCapabilities:
     return DraftRoomCapabilities(
@@ -2442,6 +2617,7 @@ async def get_capabilities(
             "max_total_parsed_chars": settings.draft_max_total_parsed_chars,
             "parse_timeout_seconds": settings.draft_parse_timeout_seconds,
             "upload_rate_limit": settings.draft_upload_rate_limit,
+            "poll_interval_seconds": settings.draft_poll_interval_seconds,
             "compile_rate_limit": settings.draft_compile_rate_limit,
             "max_sections": settings.draft_max_sections,
             "job_timeout_seconds": settings.draft_job_timeout_seconds,
@@ -2468,8 +2644,14 @@ async def get_capabilities(
         # Honest capability reporting (SPEC section 8.2). Each flag below is
         # True because the feature is reachable end to end: the route exists
         # here, its store accessors shipped in draft_store, and the compile
-        # orchestrator that populates the ledgers shipped in draft_pipeline.
-        compile_available=True,
+        # orchestrator that populates the ledgers shipped in draft_pipeline —
+        # except ``compile_available``, which is derived from the live worker:
+        # startup continues with ``app.state.draft_job_processor = None`` when
+        # DraftJobProcessor fails to start, and advertising compile as
+        # available then would promise jobs nothing will ever claim (#789).
+        compile_available=(
+            getattr(request.app.state, "draft_job_processor", None) is not None
+        ),
         findings_available=True,
         claims_available=True,
         evidence_available=True,
@@ -2661,13 +2843,13 @@ async def delete_draft(
     # still existing — recording after the cascade loses no information
     # while guaranteeing the record only ever reflects a real deletion
     # (SPEC section 9.3).
-    await safe_record_security_event(
+    await drain_audit(safe_record_security_event(
         db,
         event_type="draft_deleted",
         actor=user,
         request=request,
         metadata={"draft_id": draft_id},
-    )
+    ))
 
 
 # ── inputs ───────────────────────────────────────────────────────────────────
@@ -2818,12 +3000,12 @@ async def upload_draft_input(
             )
         )
     except DraftRoomHTTPError:
-        await asyncio.to_thread(
-            lambda: storage.resolve(input_record.storage_relpath).unlink(missing_ok=True)
-        )
-        await _delete_input_row_best_effort(
-            store, draft_id=draft_id, owner_id=owner_id, input_id=input_record.id
-        )
+        # Same guarded compensation as the generic branch below: a translated
+        # domain error must still roll back BOTH the staged bytes and the input
+        # row, and a fault inside the compensation itself (e.g. an OSError from
+        # unlink on a Windows sharing violation) must neither skip the row
+        # rollback nor replace the domain error the client sees (issue #789).
+        await _compensate_enqueue_phase()
         raise
     except Exception:
         # Same compensation as the translated-domain-error branch above, but
@@ -2924,6 +3106,7 @@ async def delete_draft_input(
     storage: DraftInputStorage = Depends(get_draft_input_storage),
     _csrf_token: str = Depends(csrf_protect),
 ) -> None:
+    _require_enabled()
     owner_id = int(user["id"])
     store = DraftStore(db)
     draft = await _run_store(lambda: store.get_draft(draft_id, owner_id))
@@ -3056,7 +3239,7 @@ async def cancel_draft_job(
             draft_id=draft_id, owner_id=owner_id, job_id=job_id
         )
     )
-    await safe_record_security_event(
+    await drain_audit(safe_record_security_event(
         db,
         event_type="draft_job_cancelled",
         actor=user,
@@ -3067,7 +3250,7 @@ async def cancel_draft_job(
             "job_type": job.job_type,
             "status": job.status,
         },
-    )
+    ))
     return _to_job(job)
 
 
@@ -3127,8 +3310,10 @@ async def retry_draft_job(
     idempotency_key = _validate_idempotency_key(request.headers.get(_IDEMPOTENCY_HEADER))
 
     def _prepare_retry() -> dict[str, Any]:
-        # ``start_stage`` is part of the compile fingerprint (SPEC section
-        # 5.4), so the NORMALIZED value must be resolved first.
+        # The *compile* fingerprint hashes the NORMALIZED stage (SPEC section
+        # 5.4) because it is the checkpoint-resume identity; the *request*
+        # fingerprint below hashes the client's requested stage because it is
+        # the idempotency identity (SPEC section 8.2, issue #789).
         normalized = _sync_normalize_start_stage(db, job_id=job_id, requested=requested)
         return {
             "input_snapshot": _sync_input_snapshot(store, draft),
@@ -3147,8 +3332,11 @@ async def retry_draft_job(
     fingerprint = _request_fingerprint(
         operation="retry",
         draft=draft,
-        base_revision_id=base_revision_id,
-        start_stage=prepared["normalized"],
+        # The parent's frozen base, not the live current revision: the retried
+        # job itself changes the current revision on success, and a replay
+        # after that must still match this fingerprint (issue #789).
+        base_revision_id=parent.input_revision_id,
+        start_stage=requested,
         parent_job_id=job_id,
         input_snapshot=prepared["input_snapshot"],
     )
@@ -3173,7 +3361,7 @@ async def retry_draft_job(
         lambda: store.get_job(draft_id=draft_id, owner_id=owner_id, job_id=new_job_id)
     )
     if created:
-        await safe_record_security_event(
+        await drain_audit(safe_record_security_event(
             db,
             event_type="draft_job_retried",
             actor=user,
@@ -3187,7 +3375,7 @@ async def retry_draft_job(
                 "compile_input_sha256": prepared["compile_fingerprint"],
                 "prompt_bundle_version": PROMPT_BUNDLE_VERSION,
             },
-        )
+        ))
     return _to_job(job)
 
 
@@ -3226,8 +3414,10 @@ async def compile_draft(
     idempotency_key = _validate_idempotency_key(request.headers.get(_IDEMPOTENCY_HEADER))
 
     def _prepare_compile() -> dict[str, Any]:
-        # ``start_stage`` is part of the compile fingerprint (SPEC section
-        # 5.4), so the NORMALIZED value must be resolved first.
+        # The *compile* fingerprint hashes the NORMALIZED stage (SPEC section
+        # 5.4) because it is the checkpoint-resume identity; the *request*
+        # fingerprint below hashes the client's requested stage because it is
+        # the idempotency identity (SPEC section 8.2, issue #789).
         normalized = _sync_normalize_start_stage(
             db, job_id=None, requested=body.start_stage
         )
@@ -3244,7 +3434,7 @@ async def compile_draft(
         operation="compile",
         draft=draft,
         base_revision_id=body.base_revision_id,
-        start_stage=prepared["normalized"],
+        start_stage=body.start_stage,
         parent_job_id=None,
         input_snapshot=prepared["input_snapshot"],
     )
@@ -3269,7 +3459,7 @@ async def compile_draft(
         lambda: store.get_job(draft_id=draft_id, owner_id=owner_id, job_id=job_id)
     )
     if created:
-        await safe_record_security_event(
+        await drain_audit(safe_record_security_event(
             db,
             event_type="draft_compile_requested",
             actor=user,
@@ -3285,7 +3475,7 @@ async def compile_draft(
                 "tier": draft.tier,
                 "idempotent_replay": False,
             },
-        )
+        ))
     else:
         # Idempotent replay. The job's request snapshot is a large body, so it
         # is fetched explicitly through the store's dedicated accessor rather
@@ -3293,7 +3483,7 @@ async def compile_draft(
         stored = await _run_store(
             lambda: store.get_job_json_field(job_id=job_id, field="input_json")
         )
-        await safe_record_security_event(
+        await drain_audit(safe_record_security_event(
             db,
             event_type="draft_compile_requested",
             actor=user,
@@ -3304,7 +3494,7 @@ async def compile_draft(
                 "start_stage": stored.get("normalized_start_stage"),
                 "idempotent_replay": True,
             },
-        )
+        ))
     return _to_job(job)
 
 
@@ -3503,13 +3693,13 @@ async def mark_revision_ready(
             acknowledge_source_only=body.acknowledge_source_only,
         )
     )
-    await safe_record_security_event(
+    await drain_audit(safe_record_security_event(
         db,
         event_type="draft_ready_marked",
         actor=user,
         request=request,
         metadata={"draft_id": draft_id, **audit},
-    )
+    ))
     updated = await _run_store(lambda: store.get_draft(draft_id, owner_id))
     return await _build_summary(db, store, updated, evaluate, user)
 
@@ -3608,7 +3798,7 @@ async def export_draft_revision(
             },
         )
     )
-    await safe_record_security_event(
+    await drain_audit(safe_record_security_event(
         db,
         event_type="draft_exported",
         actor=user,
@@ -3621,12 +3811,25 @@ async def export_draft_revision(
             "approval_status": approval_status,
             "content_sha256": revision.content_sha256,
         },
+    ))
+    # RFC 6266: the ASCII-safe ``filename`` parameter stays for legacy
+    # clients, and the additive ``filename*`` parameter carries the raw title
+    # (percent-encoded, ``safe=""`` so a title's own ``/`` never passes
+    # through) so non-ASCII titles survive end-to-end for modern clients
+    # (issue #789 — the ASCII name deliberately ASCII-folds them).
+    raw_name = _EXPORT_TITLE_SEPARATOR_RE.sub("_", draft.title or "draft")
+    disposition = (
+        f'attachment; filename="{filename}"; '
+        f"filename*=UTF-8''{quote(raw_name, safe='')}-rev{revision.revision_no}"
     )
+    if tag:
+        disposition += f"-{tag}"
+    disposition += ".md"
     return Response(
         content=revision.content_md or "",
         media_type="text/markdown; charset=utf-8",
         headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Disposition": disposition,
             "X-Draft-Fact-Status": fact_status,
             "X-Draft-Approval-Status": approval_status,
             "X-Draft-Content-Sha256": revision.content_sha256,
@@ -3724,10 +3927,18 @@ async def _run_promotion(
             await _record_promotion_cleanup_failure(db, request, user, draft_id, exc)
         raise DraftRoomHTTPError(409, str(exc), "promotion_path_conflict") from exc
     except DraftPromotionError as exc:
+        # A 500 must never be silent (issue #789): every exit from this branch
+        # carries the exception into the server log. The cleanup-incomplete
+        # sub-branch answers with a fixed client detail — the raw wrapped
+        # exception text (which embeds infra errors like pool exhaustion) is
+        # logged here and recorded in the audit event, not echoed to clients.
+        logger.exception("draft_room: promotion failed draft_id=%s", draft_id)
         if exc.cleanup_incomplete:
             await _record_promotion_cleanup_failure(db, request, user, draft_id, exc)
             raise DraftRoomHTTPError(
-                500, str(exc), "promotion_failed_incomplete_cleanup"
+                500,
+                "promotion failed and cleanup could not be verified",
+                "promotion_failed_incomplete_cleanup",
             ) from exc
         raise DraftRoomHTTPError(500, "promotion failed", "internal_error") from exc
 
@@ -3744,13 +3955,13 @@ async def _record_promotion_cleanup_failure(
     ``draft_promotions`` row, or on-disk file may still exist. Distinct
     ``event_type`` from ``draft_promoted`` so operators can search for it
     specifically."""
-    await safe_record_security_event(
+    await drain_audit(safe_record_security_event(
         db,
         event_type="draft_promotion_cleanup_failed",
         actor=user,
         request=request,
         metadata={"draft_id": draft_id, "detail": str(exc)},
-    )
+    ))
 
 
 def _apply_promotion_organization(
@@ -3964,7 +4175,7 @@ async def promote_draft_source(
     # is deliberately the final opportunity to record provenance for a
     # promotion that has already, irreversibly, happened.
     try:
-        await safe_record_security_event(
+        await drain_audit(safe_record_security_event(
             db,
             event_type="draft_promoted",
             actor=user,
@@ -3982,7 +4193,7 @@ async def promote_draft_source(
                 "organization_error": organization_error,
                 "draft_event_error": draft_event_error,
             },
-        )
+        ))
     except BaseException as exc:  # noqa: BLE001 — the promotion already succeeded; this must not prevent the response either
         logger.warning(
             "draft_room: failed to record draft_promoted security audit "
@@ -4169,6 +4380,18 @@ async def list_draft_findings(
     draft = await _run_store(lambda: store.get_draft(draft_id, owner_id))
     await _require_vault_read(evaluate, user, draft.vault_id)
 
+    # The disposition flags must agree with the disposition route (issue
+    # #788): fetch the current revision and the compile-liveness probe once
+    # so every item's can_apply reflects revision currency, draft status,
+    # and active-compile eligibility.
+    current_revision = await _run_store(
+        lambda: store.get_current_revision(draft_id=draft_id, owner_id=owner_id)
+    )
+    current_revision_id = None if current_revision is None else current_revision.id
+    has_active_compile = await _run_store(
+        lambda: store.has_active_compile_job(draft_id)
+    )
+
     # The store binds status/severity in SQL and returns the exact filtered
     # total, so pages reach rows older than any scan window and the count is
     # never capped by one.
@@ -4184,7 +4407,15 @@ async def list_draft_findings(
         )
     )
     return PaginatedResponse[DraftFinding](
-        items=[_to_finding(f) for f in findings],
+        items=[
+            _to_finding(
+                f,
+                current_revision_id=current_revision_id,
+                draft_status=draft.status,
+                has_active_compile=has_active_compile,
+            )
+            for f in findings
+        ],
         total=total,
         page=page,
         per_page=per_page,
@@ -4215,6 +4446,12 @@ async def dispose_draft_finding(
     * ``dismiss`` is prohibited for blockers (409 ``blocker_not_dismissable``).
     * ``waive`` needs ``waivable=1``, an unchanged span text and rule version,
       a user actor, and a non-empty ``note``.
+
+    Dismiss and waive additionally refuse an archived draft (409
+    ``invalid_state``) and a stale ``lock_version`` (409
+    ``stale_lock_version``) from inside the same transaction that writes the
+    status change, the lock bump, and the audit event — so all three persist
+    together or not at all (issue #788).
 
     Pipeline-authored resolutions use the internal ``resolved_by_revision``
     status and never travel through this route, so they cannot impersonate a
@@ -4271,6 +4508,7 @@ async def dispose_draft_finding(
                 finding_id=finding_id,
                 resolved_by=owner_id,
                 resolution_note=body.note,
+                lock_version=body.lock_version,
             )
         )
     else:
@@ -4291,26 +4529,16 @@ async def dispose_draft_finding(
                 # text it was granted against, so a later edit invalidates it.
                 waiver_rule_version=finding.rule_version,
                 waiver_text_sha256=finding.span_text_sha256,
+                lock_version=body.lock_version,
             )
         )
 
-    await _run_store(
-        lambda: store.record_event(
-            draft_id=draft_id,
-            owner_id=owner_id,
-            event_type=_DISPOSITION_EVENT_TYPES[body.action],
-            actor_user_id=owner_id,
-            revision_id=new_revision.id if new_revision else finding.revision_id,
-            payload={
-                "finding_id": finding_id,
-                "rule_id": finding.rule_id,
-                "rule_version": finding.rule_version,
-                "severity": finding.severity,
-                "reason": (body.note or "")[:500],
-            },
-        )
-    )
-    await safe_record_security_event(
+    # No route-tail event: each disposition writes exactly one audit row
+    # inside its own transaction — apply's has existed there all along, and
+    # dismiss/waive moved theirs into DraftStore with the same guards (issue
+    # #788 / T1-08-K-02). The note text stays in
+    # ``draft_findings.resolution_note``; payloads carry IDs and codes only.
+    await drain_audit(safe_record_security_event(
         db,
         event_type=f"draft_finding_{body.action}",
         actor=user,
@@ -4325,13 +4553,23 @@ async def dispose_draft_finding(
             "span_text_sha256": finding.span_text_sha256,
             "revision_id": new_revision.id if new_revision else finding.revision_id,
         },
-    )
+    ))
     updated = await _run_store(
         lambda: _sync_get_finding(
             db, draft_id=draft_id, owner_id=owner_id, finding_id=finding_id
         )
     )
+    refreshed = await _run_store(lambda: store.get_draft(draft_id, owner_id))
     return FindingDispositionResponse(
-        finding=_to_finding(updated),
+        finding=_to_finding(
+            updated,
+            current_revision_id=(
+                new_revision.id if new_revision is not None else finding.revision_id
+            ),
+            draft_status=refreshed.status,
+            has_active_compile=await _run_store(
+                lambda: store.has_active_compile_job(draft_id)
+            ),
+        ),
         revision=_to_revision_summary(new_revision) if new_revision else None,
     )

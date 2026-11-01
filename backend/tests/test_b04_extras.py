@@ -27,6 +27,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from app.models.database import run_migrations  # noqa: E402
+
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "backend"))
 
@@ -55,9 +57,10 @@ def _record(rec_id: str, file_id: int, text: str, dim: int = _DIM) -> dict:
 def _make_db(tag: str) -> str:
     tmp = Path(tempfile.mkdtemp(prefix=f"b04x_{tag}_"))
     db_path = str(tmp / "app.db")
-    from app.models.database import init_db
+    from app.models.database import init_db, run_migrations
 
     init_db(db_path)
+    run_migrations(db_path)
     conn = sqlite3.connect(db_path)
     conn.execute("INSERT INTO vaults (name) VALUES (?)", (f"v_{tag}",))
     conn.commit()
@@ -161,9 +164,9 @@ async def test_guard_falls_open_on_transient_count_failure(tmp_path, caplog):
     assert {r["id"] for r in rows} == {r["id"] for r in records}, (
         "fail-open fallback must still append"
     )
-    assert any(
-        "generation guard failed" in rec.message for rec in caplog.records
-    ), "the fallback must log a warning"
+    assert any("generation guard failed" in rec.message for rec in caplog.records), (
+        "the fallback must log a warning"
+    )
 
 
 async def test_equal_count_different_ids_resets(tmp_path):
@@ -183,12 +186,8 @@ async def test_equal_count_different_ids_resets(tmp_path):
         generation_prefix=prefix,
     )
     assert await store.count_by_file("9") == 3
-    old_rows = await store.get_chunks_by_uid(
-        [f"{prefix}scaleA_{i}" for i in range(3)]
-    )
-    new_rows = await store.get_chunks_by_uid(
-        [f"{prefix}scaleB_{i}" for i in range(3)]
-    )
+    old_rows = await store.get_chunks_by_uid([f"{prefix}scaleA_{i}" for i in range(3)])
+    new_rows = await store.get_chunks_by_uid([f"{prefix}scaleB_{i}" for i in range(3)])
     assert old_rows == []
     assert len(new_rows) == 3
 
@@ -219,9 +218,7 @@ async def test_guard_counts_rebuild_target_not_live_table(tmp_path):
 
     handle = await store.begin_dimension_rebuild(_DIM)
     try:
-        await store.add_chunks(
-            records, target=handle, generation_prefix=prefix
-        )
+        await store.add_chunks(records, target=handle, generation_prefix=prefix)
         target_count = await handle.table.count_rows("file_id = '13'")
         assert target_count == 2, "rebuild temp table must receive the rows"
         assert await store.count_by_file("13") == 2
@@ -302,6 +299,7 @@ async def test_scan_gate_matrix(tmp_path):
     with patch.object(settings, "data_dir", tmp_path):
         db_path = str(settings.sqlite_path)
         init_db(db_path)
+        run_migrations(db_path)
         conn = sqlite3.connect(db_path)
         conn.execute("INSERT INTO vaults (name) VALUES ('v')")
         conn.commit()
@@ -360,6 +358,7 @@ async def test_widened_unique_index_positive_and_staleness(tmp_path):
 
     db_path = str(tmp_path / "a.db")
     init_db(db_path)
+    run_migrations(db_path)
     conn = sqlite3.connect(db_path)
     _widen_files_hash_vault_unique_index(conn)
     conn.row_factory = sqlite3.Row
@@ -402,6 +401,8 @@ async def test_widened_unique_index_rollback_restores_narrow(tmp_path):
 
     db_path = str(tmp_path / "b.db")
     init_db(db_path)
+    # NOTE (issue #704): no run_migrations here BY DESIGN — this test
+    # replays the index-widening migration against a legacy narrow index.
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     # The pre-#693 narrow index, then rows only IT considers legal.
@@ -448,6 +449,7 @@ async def test_enqueue_dedupe_across_path_forms():
         settings.data_dir = Path("data")
         db_path = str(settings.sqlite_path)
         init_db(db_path)
+        run_migrations(db_path)
         conn = sqlite3.connect(db_path)
         conn.execute("INSERT INTO vaults (name) VALUES ('v')")
         ensure_jobs_schema(conn)
@@ -493,6 +495,7 @@ async def test_corrupt_stored_path_does_not_abort_directory_scan(tmp_path, caplo
     with patch.object(settings, "data_dir", tmp_path):
         db_path = str(settings.sqlite_path)
         init_db(db_path)
+        run_migrations(db_path)
         conn = sqlite3.connect(db_path)
         conn.execute("INSERT INTO vaults (name) VALUES ('v')")
         conn.commit()
@@ -518,9 +521,7 @@ async def test_corrupt_stored_path_does_not_abort_directory_scan(tmp_path, caplo
             await fw.scan_once()
 
     enqueued = {
-        Path(
-            str(call.kwargs.get("file_path", call.args[0] if call.args else ""))
-        ).name
+        Path(str(call.kwargs.get("file_path", call.args[0] if call.args else ""))).name
         for call in processor.enqueue.await_args_list
     }
     assert enqueued == {"healthy.txt"}, (
@@ -541,11 +542,14 @@ async def test_process_file_same_hash_reingest_after_error_updates_in_place(tmp_
     from app.services.document_processor import DocumentProcessor
     from app.services.vector_store import VectorStore
 
-    with patch.object(settings, "data_dir", tmp_path), patch.object(
-        settings, "wiki_enabled", False
-    ), patch.object(settings, "wiki_compile_on_ingest", False):
+    with (
+        patch.object(settings, "data_dir", tmp_path),
+        patch.object(settings, "wiki_enabled", False),
+        patch.object(settings, "wiki_compile_on_ingest", False),
+    ):
         db_path = str(settings.sqlite_path)
         init_db(db_path)
+        run_migrations(db_path)
         conn = sqlite3.connect(db_path)
         conn.execute("INSERT INTO vaults (name) VALUES ('v')")
         conn.commit()
@@ -567,11 +571,16 @@ async def test_process_file_same_hash_reingest_after_error_updates_in_place(tmp_
             metadata={"chunk_scale": "default", "raw_text": "reingest content"},
             chunk_index=0,
         )
-        with patch.object(
-            processor,
-            "_process_document_file",
-            new=AsyncMock(return_value=([chunk], "reingest content", ParsedDocument(atoms=()))),
-        ), patch("app.services.document_processor.compute_parent_windows"):
+        with (
+            patch.object(
+                processor,
+                "_process_document_file",
+                new=AsyncMock(
+                    return_value=([chunk], "reingest content", ParsedDocument(atoms=()))
+                ),
+            ),
+            patch("app.services.document_processor.compute_parent_windows"),
+        ):
             await processor.process_file(str(src), vault_id=vid)
             with pool.connection() as conn:
                 file_id = conn.execute(
@@ -580,9 +589,7 @@ async def test_process_file_same_hash_reingest_after_error_updates_in_place(tmp_
             # A later failure moves the row to 'error'; 'error' is exempt
             # from the duplicate check, so the re-ingest is allowed.
             conn2 = sqlite3.connect(db_path)
-            conn2.execute(
-                "UPDATE files SET status = 'error' WHERE id = ?", (file_id,)
-            )
+            conn2.execute("UPDATE files SET status = 'error' WHERE id = ?", (file_id,))
             conn2.commit()
             conn2.close()
             await processor.process_file(str(src), vault_id=vid)

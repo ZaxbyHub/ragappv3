@@ -10,13 +10,14 @@ wiki claim when its source_quote verifies against the chunk it cites.
 
 import asyncio
 import concurrent.futures
+import contextvars
 import json
 import logging
 import re
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from app.config import settings as _app_settings
 from app.services.wiki_curator import (
@@ -214,6 +215,22 @@ class WikiCompiler:
         self._db = db
         self._store = store or WikiStore(db)
 
+    def _vault_row_exists(self, vault_id: Optional[int]) -> bool:
+        """True when vault_id names a live vault row (None is never checked).
+
+        Issue #723 (T1-21-S-07): compile entry points refuse to write wiki
+        rows for a vault that was deleted while the job sat pending or was
+        already running — the entry-point re-check narrows the write race to
+        inside a single compile (an irreducible residual disclosed in the
+        issue's PR).
+        """
+        if vault_id is None:
+            return True
+        row = self._db.execute(
+            "SELECT 1 FROM vaults WHERE id = ?", (vault_id,)
+        ).fetchone()
+        return row is not None
+
     def _find_or_create_claim(
         self,
         vault_id: int,
@@ -251,9 +268,11 @@ class WikiCompiler:
             # re-derives the claim text unchanged from a current source (e.g. a
             # reindex re-promoting a memory whose claim sentence survived an
             # edit). Only the found-by-text claim is touched, and only from
-            # 'superseded' — a claim whose supporting content changed resolves to
-            # a DIFFERENT sentence, so it never reaches this branch and stays
-            # superseded while its replacement gets its own claim row.
+            # 'superseded' — a claim whose supporting content changed resolves
+            # to a DIFFERENT sentence, so it never reaches this branch; on the
+            # file-recompile path such claims are retired by the post-pass in
+            # compile_ingest_job (issue #794), and on the memory-edit path by
+            # mark_claims_stale_by_memory.
             if existing.status == "superseded" and new_status == "active":
                 if self._store.reactivate_claim(existing.id):
                     existing.status = "active"
@@ -338,6 +357,9 @@ class WikiCompiler:
         role-derived value; trusted system callers (e.g. the background
         WikiCompileProcessor) pass ``True`` explicitly.
         """
+        if not self._vault_row_exists(vault_id):
+            return {"skipped": True, "reason": f"vault {vault_id} no longer exists"}
+
         # Load memory — FK verify vault scope
         self._db.row_factory = sqlite3.Row
         row = self._db.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
@@ -532,6 +554,9 @@ class WikiCompiler:
 
         source_type is derived per-claim from the kinds of sources actually cited.
         """
+        if not self._vault_row_exists(vault_id):
+            return {"skipped": True, "reason": f"vault {vault_id} no longer exists"}
+
         assistant_answer: str = input_json.get("assistant_answer") or ""
         # Per-claim source mapping: {"sentence text": [source_dicts]}
         per_claim_sources: dict = input_json.get("per_claim_sources") or {}
@@ -741,13 +766,15 @@ class WikiCompiler:
             self._db.commit()
             claims_created.append(self._store.get_claim(claim.id))
 
-            # Lint finding for every unverified claim (only on first creation)
+            # Lint finding for every unverified claim (only on first creation).
+            # origin='compiler' (issue #791): the lint reconciler must never
+            # auto-resolve these rows — they belong to the compile path.
             if _created and claim_status == "unverified":
                 self._db.execute(
                     """INSERT INTO wiki_lint_findings
                        (vault_id, finding_type, severity, title, details,
-                        related_page_ids_json, related_claim_ids_json, status, created_at, updated_at)
-                       VALUES (?, 'unsupported_claim', 'low', ?, ?, '[]', ?, 'open', ?, ?)""",
+                        related_page_ids_json, related_claim_ids_json, status, origin, created_at, updated_at)
+                       VALUES (?, 'unsupported_claim', 'low', ?, ?, '[]', ?, 'open', 'compiler', ?, ?)""",
                     (
                         vault_id,
                         "Unverified claim: extracted from query answer with no per-claim citations",
@@ -804,6 +831,16 @@ class WikiCompiler:
         directly; otherwise the method reads from the file path recorded in
         the files table.
         """
+        if not self._vault_row_exists(vault_id):
+            return {
+                "page": None,
+                "claims": [],
+                "entities": [],
+                "relations_count": 0,
+                "skipped": True,
+                "reason": f"vault {vault_id} no longer exists",
+            }
+
         file_id: Optional[int] = input_json.get("file_id")
         if not file_id:
             return {"page": None, "claims": [], "entities": [], "relations_count": 0, "skipped": True}
@@ -1025,6 +1062,19 @@ class WikiCompiler:
             )
             relations_count += 1
 
+        # Issue #794 feedback: surface what the supersede post-pass retired so
+        # the compile job's result_json (persisted with the job and returned
+        # by the document-status route) shows the
+        # retirement instead of leaving it observable only via lint rows.
+        supersede_counts = self._store.supersede_unrederived_file_claims(
+            file_id=file_id,
+            vault_id=vault_id,
+            page_id=page_id,
+            keep_claim_ids={c["id"] for c in claims_created},
+            current_text=text,
+        )
+        self._db.commit()
+
         # ----------- Optional LLM Wiki Curator (PR C) -----------
         # Gated by settings.wiki_llm_curator_enabled AND the per-trigger
         # flag. Curator output never replaces deterministic output; it
@@ -1046,6 +1096,8 @@ class WikiCompiler:
             "claims": claims_created,
             "entities": [{"id": e.id, "name": e.canonical_name} for e in entities_created],
             "relations_count": relations_count,
+            "claims_superseded": supersede_counts["superseded"],
+            "claims_weak_provenance": supersede_counts["weak_provenance"],
         }
         if curator_summary is not None:
             result_dict["curator"] = curator_summary
@@ -1142,14 +1194,19 @@ class WikiCompiler:
 
         try:
             # The compiler is sync, but CuratorClient.propose is async.
-            # When called from inside a running event loop (e.g. an
-            # async FastAPI handler), we can't block on the same loop —
-            # run_coroutine_threadsafe().result() would deadlock it. The
-            # safe sync→async bridge from inside a running loop is to
-            # run the coroutine in a worker thread. Reuse a module-level
-            # executor (issue #109) so we don't pay the per-call cost
-            # of constructing+tearing-down a ThreadPoolExecutor on the
-            # curator hot path.
+            # Issue #795: ALWAYS dispatch through the module-level
+            # single-worker offload executor (issue #109). The previous
+            # inline asyncio.run branch ran whenever no loop was active in
+            # the calling thread — exactly the case for both real callers,
+            # which reach the compiler via asyncio.to_thread pool threads
+            # (the background processor and the promote-memory route) — so
+            # two concurrent jobs could drive two concurrent event loops
+            # against one shared curator breaker. The single worker
+            # serializes every curator loop process-wide; within a job the
+            # concurrency knob still bounds parallel propose calls. The
+            # wait on the result is intentionally untimed: the per-call
+            # HTTP timeout bounds each request, and the curator must never
+            # fail the enclosing job.
             coro = curator.curate(
                 vault_id=vault_id,
                 file_id=file_id,
@@ -1158,26 +1215,25 @@ class WikiCompiler:
                 existing_entities_brief=existing_brief,
                 deterministic_dedupe_keys=dedupe_seed,
             )
-            try:
-                running_loop = asyncio.get_running_loop()
-            except RuntimeError:
-                running_loop = None
-            if running_loop is None:
-                cur_result = asyncio.run(coro)
-            else:
-                # The thread is required to break the event-loop deadlock;
-                # the executor is shared across calls so we only construct
-                # it once per process.
-                cur_result = _CURATOR_OFFLOAD_EXECUTOR.submit(
-                    asyncio.run, coro
-                ).result()
+            # Issue #795 review: submit does NOT copy contextvars, so a bare
+            # submit(asyncio.run, coro) would drop the caller's request
+            # identity (traceparent/X-Request-ID) from every curator POST
+            # and log line. Copy the context here and run the coroutine
+            # inside it on the worker thread.
+            submit_ctx = contextvars.copy_context()
+            cur_result = _CURATOR_OFFLOAD_EXECUTOR.submit(
+                submit_ctx.run, asyncio.run, coro
+            ).result()
         except Exception as e:  # broad — curator must never fail the job
             logger.warning(
                 "wiki curator: orchestration failed for vault=%s file=%s: %s",
                 vault_id, file_id, e,
             )
+            # Issue #958: these strings reach vault readers through the
+            # job's result_json — exception CLASS only (the adjacent lint
+            # path's discipline); the message stays in the log line above.
             return {
-                "errors": [f"orchestration_error: {type(e).__name__}: {e}"],
+                "errors": [f"orchestration_error: {type(e).__name__}"],
                 "accepted": 0,
                 "rejected": 0,
                 "lint": 0,
@@ -1203,31 +1259,75 @@ class WikiCompiler:
             for accepted in cur_result.accepted:
                 self._db.execute("SAVEPOINT claim_pair")
                 try:
-                    claim = self._store.create_claim(
-                        vault_id=vault_id,
-                        claim_text=accepted.claim_text,
-                        source_type="document",
-                        page_id=page_id,
-                        claim_type=accepted.claim_type,
-                        subject=accepted.subject,
-                        predicate=accepted.predicate,
-                        object=accepted.object,
-                        status=accepted.status,
-                        confidence=accepted.confidence,
-                        created_by_kind="llm_curator",
-                        commit=False,
+                    # Find-or-create (issue #791 / T1-35-S-03): a repeated
+                    # claim_text used to hit UNIQUE(vault_id, claim_text),
+                    # roll the claim+source savepoint back, and silently drop
+                    # this file's provenance. Replicate _find_or_create_claim's
+                    # lookup + source-dedupe semantics INLINE — its own
+                    # promotion/reactivation branches commit internally, which
+                    # would break the pair-atomicity established above.
+                    existing = self._store.find_claim_by_text(
+                        vault_id, accepted.claim_text
+                    ) or self._store.find_claim_by_normalized_text(
+                        vault_id, accepted.claim_text
                     )
-                    self._store.attach_source(
-                        claim_id=claim.id,
-                        source_kind="document",
-                        file_id=accepted.file_id,
-                        chunk_id=accepted.chunk_id,
-                        source_label=accepted.source_label or (
-                            f"file:{accepted.file_id}" if accepted.file_id else "curator"
-                        ),
-                        quote=accepted.source_quote,
-                        confidence=accepted.confidence,
-                    )
+                    if existing is not None:
+                        claim = existing
+                        # Issue #794 feedback: the supersede post-pass runs
+                        # BEFORE the curator, so a claim it just superseded
+                        # (or one superseded by an earlier edit) can match
+                        # here by text while its quote is verifiably present
+                        # again. Reactivate it with the same no-commit
+                        # helper the deterministic path uses — leaving it
+                        # superseded would bury live, quote-verified
+                        # knowledge (the curator's find-or-create
+                        # deliberately omits reactivation to keep
+                        # pair-atomicity, so the flip must be inline too).
+                        # Issue #795 review: gate on THIS candidate's own
+                        # computed status — the deterministic twin gates
+                        # identically (new_status == "active") — so a
+                        # needs_review candidate (draft mode, unknown
+                        # chunk, quote check off) can never resurrect a
+                        # superseded claim as active.
+                        if (
+                            existing.status == "superseded"
+                            and accepted.status == "active"
+                        ):
+                            self._store.reactivate_claim_if_superseded(existing.id)
+                            existing.status = "active"
+                        already = any(
+                            s.source_kind == "document"
+                            and s.file_id == accepted.file_id
+                            for s in existing.sources
+                        )
+                    else:
+                        claim = self._store.create_claim(
+                            vault_id=vault_id,
+                            claim_text=accepted.claim_text,
+                            source_type="document",
+                            page_id=page_id,
+                            claim_type=accepted.claim_type,
+                            subject=accepted.subject,
+                            predicate=accepted.predicate,
+                            object=accepted.object,
+                            status=accepted.status,
+                            confidence=accepted.confidence,
+                            created_by_kind="llm_curator",
+                            commit=False,
+                        )
+                        already = False
+                    if not already:
+                        self._store.attach_source(
+                            claim_id=claim.id,
+                            source_kind="document",
+                            file_id=accepted.file_id,
+                            chunk_id=accepted.chunk_id,
+                            source_label=accepted.source_label or (
+                                f"file:{accepted.file_id}" if accepted.file_id else "curator"
+                            ),
+                            quote=accepted.source_quote,
+                            confidence=accepted.confidence,
+                        )
                     self._db.execute("RELEASE claim_pair")
                 except Exception as e:  # pragma: no cover - defensive
                     # Undo this pair only; RELEASE the (still-open) savepoint
@@ -1236,28 +1336,91 @@ class WikiCompiler:
                     self._db.execute("ROLLBACK TO claim_pair")
                     self._db.execute("RELEASE claim_pair")
                     cur_result.errors.append(
-                        f"persist_error: {type(e).__name__}: {e}"
+                        f"persist_error: {type(e).__name__}"
                     )
                     logger.warning(
                         "wiki curator: failed to persist accepted claim: %s", e
                     )
 
-        # Persist lint findings.
-        for finding in cur_result.lint_findings:
-            try:
-                self._store.create_lint_finding(
-                    vault_id=vault_id,
-                    finding_type=finding["finding_type"],
-                    severity=finding.get("severity", "medium"),
-                    title=finding.get("title", "Curator lint"),
-                    details=finding.get("details", ""),
+        # Persist lint findings. One fingerprint-aware upsert carries the
+        # whole list with origin='curator' (issue #791 / T1-35-S-03): a
+        # curator rerun used to insert a fresh open copy of each finding via
+        # the raw create_lint_finding INSERT. Curator rows are also outside
+        # the linter's origin-scoped resolve pass, so a lint run can never
+        # force-resolve them. The try/except keeps the per-finding loop's
+        # recorded-never-raised contract (the orchestration catch above
+        # returns early and does not cover this block): a persist failure is
+        # recorded into the summary, never raised into the compile job.
+        if cur_result.lint_findings:
+            # Issue #791 review: the single upsert is one transaction, so a
+            # malformed spec would abort the whole batch where the old
+            # per-finding loop dropped only the offender. Validate each spec
+            # first and quarantine the invalid ones into errors, restoring
+            # that isolation without giving up the batch dedupe.
+            specs = []
+            for finding in cur_result.lint_findings:
+                problem = self._curator_spec_problem(finding)
+                if problem is not None:
+                    cur_result.errors.append(f"lint_spec_error: {problem}")
+                    continue
+                specs.append(
+                    {
+                        "finding_type": finding["finding_type"],
+                        "severity": finding.get("severity", "medium"),
+                        "title": finding.get("title", "Curator lint"),
+                        "details": finding.get("details", ""),
+                        "related_page_ids": finding.get("related_page_ids", []),
+                        "related_claim_ids": finding.get("related_claim_ids", []),
+                    }
                 )
-            except Exception as e:  # pragma: no cover - defensive
-                cur_result.errors.append(
-                    f"lint_persist_error: {type(e).__name__}: {e}"
-                )
+            if specs:
+                try:
+                    self._store.upsert_lint_findings(vault_id, specs, origin="curator")
+                except Exception as e:  # pragma: no cover - defensive
+                    # Exception CLASS only (issue #791 review): sqlite3 driver
+                    # messages quote CHECK expressions and table/column names,
+                    # and this string reaches vault readers through the job's
+                    # result_json.
+                    cur_result.errors.append(
+                        f"lint_persist_error: {type(e).__name__}"
+                    )
 
         return cur_result.to_summary()
+
+    # Vocabularies enforced by the wiki_lint_findings CHECK constraints
+    # (backend/app/models/database.py). A curator spec outside them would
+    # abort the whole batched upsert.
+    _LINT_FINDING_TYPES = frozenset(
+        {
+            "contradiction",
+            "stale",
+            "orphan",
+            "missing_page",
+            "unsupported_claim",
+            "duplicate_entity",
+            "weak_provenance",
+        }
+    )
+    _LINT_SEVERITIES = frozenset({"low", "medium", "high", "critical"})
+
+    @classmethod
+    def _curator_spec_problem(cls, finding: Any) -> Optional[str]:
+        """Return None when a curator lint spec is persistable, else a short
+        reason string for the run's error list (issue #791 review)."""
+        if not isinstance(finding, dict):
+            return "spec_not_a_dict"
+        if "finding_type" not in finding:
+            return "missing_finding_type"
+        if finding["finding_type"] not in cls._LINT_FINDING_TYPES:
+            return "unknown_finding_type"
+        severity = finding.get("severity", "medium")
+        if severity not in cls._LINT_SEVERITIES:
+            return "unknown_severity"
+        for key in ("related_page_ids", "related_claim_ids"):
+            value = finding.get(key, [])
+            if not isinstance(value, list):
+                return f"{key}_not_a_list"
+        return None
 
     @staticmethod
     def _build_curator_chunks(
@@ -1271,9 +1434,11 @@ class WikiCompiler:
         out: list[CuratorChunk] = []
         max_input = int(getattr(_app_settings, "wiki_llm_curator_max_input_chars", 6000))
         budget = max(_COMPILE_CHUNK_SIZE, max_input)
-        # Take from the start of the text up to budget; bounded by the
-        # curator's own per-call max_input_chars, so we don't need to
-        # paginate here.
+        # Take from the start of the text up to budget. This is the
+        # per-document curated span (never below one 2000-char chunk) — the knob's documented semantics
+        # (issue #795) — NOT a per-call prompt bound; build_user_prompt
+        # re-applies its own bound to each call's chunk snippet, so we
+        # don't need to paginate here.
         bound_text = text[:budget]
         for i in range(0, len(bound_text), _COMPILE_CHUNK_SIZE):
             window = bound_text[i : i + _COMPILE_CHUNK_SIZE]

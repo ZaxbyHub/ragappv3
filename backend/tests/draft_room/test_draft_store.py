@@ -445,6 +445,33 @@ class TestCreateManualRevision(DraftStoreTestBase):
                 base_revision_id=None, content_md="v1",
             )
 
+    def test_stale_lock_version_carries_the_precise_wire_code(self):
+        """Issue #789 review F-006: only the exception TYPE was pinned, so
+        reverting the store's code override to the generic ``conflict`` shipped
+        green while breaking the one-condition-one-code contract. This pins the
+        code the store actually renders for the update/archive/restore/
+        manual-revision stale-lock refusals."""
+        draft = self._make_draft()
+        with self.assertRaises(DraftConflictError) as ctx:
+            self.store.create_manual_revision(
+                draft_id=draft.id, owner_id=OWNER_ID, lock_version=draft.lock_version + 99,
+                base_revision_id=None, content_md="v1",
+            )
+        self.assertEqual(ctx.exception.code, "stale_lock_version")
+
+    def test_stale_lock_version_code_matches_the_route_layer_code(self):
+        """The store and the route must emit ONE code for the same condition
+        (AC6 compares the two route paths; this covers the store half)."""
+        from app.api.routes.draft_room import _stale_lock_conflict
+
+        draft = self._make_draft()
+        with self.assertRaises(DraftConflictError) as ctx:
+            self.store.create_manual_revision(
+                draft_id=draft.id, owner_id=OWNER_ID, lock_version=draft.lock_version + 99,
+                base_revision_id=None, content_md="v1",
+            )
+        self.assertEqual(ctx.exception.code, _stale_lock_conflict().code)
+
     def test_wrong_base_revision_id_raises_conflict(self):
         draft = self._make_draft()
         with self.assertRaises(DraftConflictError):

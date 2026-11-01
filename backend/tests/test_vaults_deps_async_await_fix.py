@@ -320,7 +320,9 @@ class TestVaultsAsyncFunctionsDirectAwait(unittest.TestCase):
         """_fetch_accessible_vaults awaits get_effective_vault_permissions directly."""
         from app.api.routes import vaults
 
-        source = get_function_source(vaults, '_fetch_accessible_vaults')
+        # The permission awaits live in the core helper since #725 (the
+        # list-only _fetch_accessible_vaults wrapper delegates to it).
+        source = get_function_source(vaults, '_accessible_vaults_with_total')
         self.assertIsNotNone(source)
 
         # Must contain 'await get_effective_vault_permissions' directly
@@ -382,7 +384,10 @@ class TestVaultsAsyncFunctionsDirectAwait(unittest.TestCase):
 
         source = get_function_source(vaults, 'list_accessible_vaults')
         self.assertIsNotNone(source)
-        self.assertIn('await _fetch_accessible_vaults', source)
+        # Since #725 the route awaits the totals-carrying core helper (same
+        # await, no to_thread wrapping); the list-only wrapper remains for
+        # direct callers.
+        self.assertIn('await _accessible_vaults_with_total', source)
 
         # Verify _fetch_accessible_vaults is NOT inside asyncio.to_thread
         tree = ast.parse(source)
@@ -467,7 +472,7 @@ class TestVaultsDbOperationsUseToThread(unittest.TestCase):
         """_fetch_accessible_vaults wraps conn.execute in asyncio.to_thread."""
         from app.api.routes import vaults
 
-        source = get_function_source(vaults, '_fetch_accessible_vaults')
+        source = get_function_source(vaults, '_accessible_vaults_with_total')
         self.assertIsNotNone(source)
         self.assertIn('asyncio.to_thread', source)
         self.assertIn('conn.execute', source)

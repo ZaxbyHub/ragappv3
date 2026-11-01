@@ -29,8 +29,21 @@ from pathlib import Path
 
 
 def _extract_counts_from_obj(obj: dict) -> tuple[int, int] | None:
-    """Best-effort extraction of (killed, total) from a known-ish shape."""
+    """Best-effort extraction of (killed, total) from a known-ish shape.
+
+    When the object carries an explicit ``total`` key it is authoritative:
+    mutmut 3.7's ``save_cicd_stats`` writes ``total`` already summing every
+    status bucket (killed/survived/no_tests/skipped/suspicious/timeout/
+    segfault/...), so adding the individual buckets again would inflate the
+    denominator and understate the score. The bucket-addition pass only
+    fires for legacy shapes that report the categories WITHOUT any total key.
+    """
     killed = survived = total = None
+    has_total_key = any(
+        key.lower() in ("total", "total_mutants", "totalmutants", "mutants", "count")
+        and isinstance(value, (int, float))
+        for key, value in obj.items()
+    )
     for key, value in obj.items():
         lk = key.lower()
         if not isinstance(value, (int, float)):
@@ -41,8 +54,9 @@ def _extract_counts_from_obj(obj: dict) -> tuple[int, int] | None:
             survived = int(value)
         elif lk in ("total", "total_mutants", "totalmutants", "mutants", "count"):
             total = int(value)
-        elif lk in ("timeout", "suspicious", "skipped"):
-            # counted towards total but neither killed nor survived
+        elif lk in ("timeout", "suspicious", "skipped") and not has_total_key:
+            # counted towards total but neither killed nor survived (legacy
+            # shapes without an explicit total only)
             total = (total or 0) + int(value)
     if killed is None:
         return None

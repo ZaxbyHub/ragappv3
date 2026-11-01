@@ -39,7 +39,10 @@ services:
     image: ghcr.io/huggingface/text-embeddings-inference:cuda-latest@sha256:1bf10562b37c8b835693084e1bab4d80232188cb258da886eaf1e6eaf6770353
     container_name: reranker
     restart: unless-stopped
-    command: --model-id BAAI/bge-reranker-v2-m3 --port 8081 --max-batch-tokens 8192
+    # --max-client-batch-size declares TEI's per-request client batch cap
+    # (issue #719): the backend splits /rerank candidate sets at
+    # RERANKER_MAX_BATCH (default 32) to match it.
+    command: --model-id BAAI/bge-reranker-v2-m3 --port 8081 --max-batch-tokens 8192 --max-client-batch-size 32
     ports:
       - "8081:8081"
     volumes:
@@ -87,6 +90,14 @@ services:
         VITE_API_URL: ${VITE_API_URL:-}
     container_name: knowledgevault
     restart: unless-stopped
+    # Shutdown budget (issue #700, T1-04-S2-02): BackgroundProcessor.stop()
+    # applies its 60 s timeout PER DRAIN PHASE (queues, enrichment, atoms,
+    # lease settle) and the final optimize is unbounded, so the composed
+    # worst case exceeds 4x60 s. 90 s covers the common single-phase drain;
+    # a busy multi-phase shutdown can still be SIGKILLed (tracked follow-up
+    # for a composed stop() budget). Keep this >= stop()'s per-phase timeout
+    # when changing either.
+    stop_grace_period: 90s
     ports:
       - "${PORT:-9090}:9090"
     volumes:
@@ -188,6 +199,7 @@ services:
       - RERANKER_MODEL=${RERANKER_MODEL:-BAAI/bge-reranker-v2-m3}
       - RERANKING_ENABLED=${RERANKING_ENABLED:-true}
       - RERANKER_TOP_N=${RERANKER_TOP_N:-7}
+      - RERANKER_MAX_BATCH=${RERANKER_MAX_BATCH:-32}
       - INITIAL_RETRIEVAL_TOP_K=${INITIAL_RETRIEVAL_TOP_K:-20}
       - HYBRID_SEARCH_ENABLED=${HYBRID_SEARCH_ENABLED:-true}
       - HYBRID_ALPHA=${HYBRID_ALPHA:-0.6}
@@ -214,6 +226,7 @@ services:
       - INGESTION_JOB_LEASE_ENABLED=${INGESTION_JOB_LEASE_ENABLED:-true}
       - JOBS_HEARTBEAT_INTERVAL_SECONDS=${JOBS_HEARTBEAT_INTERVAL_SECONDS:-30.0}
       - JOBS_LEASE_RECLAIM_TIMEOUT_SECONDS=${JOBS_LEASE_RECLAIM_TIMEOUT_SECONDS:-300.0}
+      - JOBS_STALL_TIMEOUT_SECONDS=${JOBS_STALL_TIMEOUT_SECONDS:-900.0}
       - JOBS_MAX_ATTEMPTS=${JOBS_MAX_ATTEMPTS:-3}
       - WIKI_KMS_JOB_LEASE_ENABLED=${WIKI_KMS_JOB_LEASE_ENABLED:-true}
       - REINDEX_JOB_LEASE_ENABLED=${REINDEX_JOB_LEASE_ENABLED:-true}
@@ -298,6 +311,7 @@ services:
       - SEARCH_SEMAPHORE_TIMEOUT_SECONDS
       - WRITE_LOCK_TIMEOUT_SECONDS
       - ACTIVE_USER_CACHE_TTL_SECONDS
+      - CHAT_MESSAGE_MAX_CHARS
       - MEMORY_STORE_POOL_SIZE
       - DB_POOL_MAX_SIZE
       # Legacy/deprecated aliases (still honored for backward compatibility)

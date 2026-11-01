@@ -1,9 +1,13 @@
 // ADVERSARIAL TESTS for OrgsPage — XSS, injection, self-action, edge cases, error handling
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, waitFor, act, fireEvent } from '@testing-library/react';
+import { render, screen, waitFor, act, fireEvent, within } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import OrgsPage from '@/pages/OrgsPage';
 import { toast } from 'sonner';
+// Issue #771 (UI-ENH-05): the below-sm card list duplicates row
+// text next to the desktop table; scope data queries to the table subtree
+// (a card-only regression still fails these assertions).
+const inTable = () => within(screen.getByRole('table'));
 
 // --- Mocks ---
 vi.mock('@/stores/useAuthStore', () => ({
@@ -139,7 +143,8 @@ describe('OrgsPage ADVERSARIAL', () => {
       await act(async () => { fireEvent.click(expandBtn); });
 
       await waitFor(() => {
-        expect(screen.getByText((content) => content.includes(xssPayload) || content.includes('script'))).toBeInTheDocument();
+        // #771: table-scoped (below-sm card list duplicates the text)
+        expect(inTable().getByText((content) => content.includes(xssPayload) || content.includes('script'))).toBeInTheDocument();
       });
       expect(document.querySelectorAll('script')).toHaveLength(0);
     });
@@ -255,7 +260,8 @@ describe('OrgsPage ADVERSARIAL', () => {
       await act(async () => { fireEvent.click(expandBtn); });
 
       await waitFor(() => {
-        expect(screen.getByText(/no members yet/i)).toBeInTheDocument();
+        // #771: table-scoped (below-sm card list duplicates the text)
+        expect(inTable().getByText(/no members yet/i)).toBeInTheDocument();
       });
     });
   });
@@ -383,11 +389,13 @@ describe('OrgsPage ADVERSARIAL', () => {
       await act(async () => { fireEvent.click(expandBtn); });
 
       await waitFor(() => {
-        expect(screen.getByText('Alice Johnson')).toBeInTheDocument();
+        // #771: table-scoped (below-sm card list duplicates the text)
+        expect(inTable().getByText('Alice Johnson')).toBeInTheDocument();
       });
 
       // Verify the role select exists and is changeable
-      const roleSelect = document.querySelector('select[aria-label*="alice"]') as HTMLElement;
+      // #771: table-scoped (below-sm card list duplicates the text)
+      const roleSelect = screen.getByRole('table').querySelector('select[aria-label*="alice"]') as HTMLElement;
       expect(roleSelect).not.toBeNull();
 
       // Change role and verify no crash
@@ -400,7 +408,8 @@ describe('OrgsPage ADVERSARIAL', () => {
       });
 
       // Component should still render
-      expect(screen.getByText('Alice Johnson')).toBeInTheDocument();
+      // #771: table-scoped (below-sm card list duplicates the text)
+      expect(inTable().getByText('Alice Johnson')).toBeInTheDocument();
     });
   });
 

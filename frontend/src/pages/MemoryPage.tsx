@@ -19,6 +19,7 @@ import { EmptyState } from "@/components/EmptyState";
 import { toast } from "sonner";
 import { useVaultStore } from "@/stores/useVaultStore";
 import { VaultSelector } from "@/components/vault/VaultSelector";
+import { VaultGate } from "@/components/vault/VaultGate";
 import { PageTitleHeader } from "@/components/layout/PageTitleHeader";
 import { useMemorySearch } from "@/hooks/useMemorySearch";
 import { useMemoryCrud, getCategoryFromMetadata, getTagsFromMetadata, getSourceFromMetadata, MAX_MEMORY_CONTENT_LENGTH } from "@/hooks/useMemoryCrud";
@@ -28,14 +29,24 @@ export default function MemoryPage() {
   const { activeVaultId } = useVaultStore();
 
   if (activeVaultId === null) {
+    // Issue #781 (UI-R2-03 + UI-R4-08): this branch told the user to pick
+    // from "the vault selector" without rendering one, under a title that
+    // differed from the populated branch. The gate now renders the selector
+    // itself via VaultGate, under the same "Memory" title as the
+    // vault-selected branch. MemoryPageContent (and its memory queries)
+    // still never mounts here — no vault-less search is issued.
     return (
       <>
-        <PageTitleHeader title="Memories" />
+        <PageTitleHeader
+          title="Memory"
+          description="View and manage AI memory and context"
+        />
         <div className="p-8">
           <EmptyState
             icon={Brain}
             title="Select a vault"
             description="Choose a vault from the vault selector to view its memories."
+            action={<VaultGate reason="Memories are scoped to a single vault." />}
           />
         </div>
       </>
@@ -171,19 +182,19 @@ function MemoryPageContent({ activeVaultId }: { activeVaultId: number }) {
 
   return (
     <div className="space-y-6 animate-in fade-in duration-300 pb-12">
-      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-        <PageTitleHeader
-          title="Memory"
-          description="View and manage AI memory and context"
-        />
-        <div className="flex items-center gap-2">
-          <VaultSelector />
-          <Button onClick={() => setIsAddDialogOpen(true)}>
-            <Plus className="w-4 h-4 mr-2" />
-            Add Memory
-          </Button>
-        </div>
-      </div>
+      <PageTitleHeader
+        title="Memory"
+        description="View and manage AI memory and context"
+        actions={
+          <>
+            <VaultSelector />
+            <Button onClick={() => setIsAddDialogOpen(true)}>
+              <Plus className="w-4 h-4 mr-2" />
+              Add Memory
+            </Button>
+          </>
+        }
+      />
 
       <div className="flex items-center gap-2">
         <div className="relative flex-1 max-w-md">
@@ -196,7 +207,7 @@ function MemoryPageContent({ activeVaultId }: { activeVaultId: number }) {
             onKeyDown={(e) => e.key === "Enter" && handleSearch()}
           />
         </div>
-        <Button variant="outline" size="icon" onClick={handleSearch} disabled={loading}>
+        <Button variant="outline" size="icon" onClick={handleSearch} disabled={loading} aria-label="Search memories">
           {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />}
         </Button>
         <Badge variant="secondary">{memories?.length || 0} {searchQuery ? "results" : "memories"}</Badge>
@@ -296,13 +307,17 @@ function MemoryPageContent({ activeVaultId }: { activeVaultId: number }) {
           description={searchQuery ? undefined : "Add some to get started."}
         />
       ) : (
-        <div className="space-y-3">
+        // Issue #770 (UI-ENH-01): multi-column memory grid on wide viewports
+        // (KMSPage pattern), and the memory paragraph carries a ch-based
+        // measure bound (max-w-[80ch]) so long prose stays readable at any
+        // column width — either mechanism alone satisfies the 80ch contract.
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
           {memories.map((memory) => (
             <Card key={memory.id}>
               <CardContent className="p-4">
                 <div className="flex items-start justify-between gap-4">
                   <div className="flex-1 space-y-2">
-                    <p className="text-sm whitespace-pre-wrap">{memory.content}</p>
+                    <p className="text-sm whitespace-pre-wrap break-words max-w-[80ch]">{memory.content}</p>
                     <div className="flex flex-wrap items-center gap-2">
                       <Badge variant="outline">{getCategoryFromMetadata(memory.metadata)}</Badge>
                       {getTagsFromMetadata(memory.metadata).map((tag, idx) => (
@@ -317,9 +332,9 @@ function MemoryPageContent({ activeVaultId }: { activeVaultId: number }) {
                         const ws = wikiStatusMap[memory.id];
                         if (!ws || ws.wiki_status === "not_promoted") return null;
                         const colorMap: Record<string, string> = {
-                          promoted: "text-green-600",
-                          stale: "text-yellow-600",
-                          promoting: "text-blue-500",
+                          promoted: "text-success",
+                          stale: "text-warning",
+                          promoting: "text-primary",
                         };
                         const labelMap: Record<string, string> = {
                           promoted: `Wiki: ${ws.active_claims}c / ${ws.linked_pages.length}p`,

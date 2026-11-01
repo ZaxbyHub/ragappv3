@@ -216,17 +216,26 @@ class TestSQLiteConnectionPoolBoundaryConditions(unittest.TestCase):
         # The obtained conn is still valid
         conn.execute("SELECT 1")
 
-    def test_pool_release_after_close_raises_runtime_error(self):
-        """Releasing a connection to a closed pool must raise RuntimeError."""
+    def test_pool_release_after_close_never_raises_and_closes(self):
+        """Releasing a connection to a closed pool must NEVER raise.
+
+        Issue #700 (S03-SK2-05) changed this contract: ~100 call sites
+        release from bare ``finally`` blocks, so a raise here masks the
+        handler's own in-flight exception AND leaks the connection. The
+        release now logs pool_release_after_close and CLOSES the
+        connection (after close_all() the queue is drained, so queueing it
+        back would strand it open in a dead pool)."""
+        import sqlite3 as _sqlite3
+
         from app.models.database import SQLiteConnectionPool
 
         pool = SQLiteConnectionPool(str(self.db_path), max_size=1)
         conn = pool.get_connection()
         pool.close_all()
 
-        with self.assertRaises(RuntimeError) as ctx:
-            pool.release_connection(conn)
-        self.assertIn("closed", str(ctx.exception).lower())
+        pool.release_connection(conn)  # must not raise
+        with self.assertRaises(_sqlite3.ProgrammingError):
+            conn.execute("SELECT 1")  # closed, not leaked open
 
     def test_connection_leak_without_release_blocks_future_gets(self):
         """If release_connection is never called, the pool eventually blocks

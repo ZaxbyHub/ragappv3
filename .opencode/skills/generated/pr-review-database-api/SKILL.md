@@ -16,7 +16,9 @@ trigger:
       include:
         - "backend/app/api/routes/*.py"
         - "backend/app/services/*.py"
-        - "frontend/src/lib/api.ts"
+        - "frontend/src/lib/api/**/*.ts"
+        - "frontend/src/stores/**/*.ts"
+        - "frontend/src/hooks/**/*.ts"
         - "frontend/src/pages/*.tsx"
         - "backend/app/models/database.py"
       exclude:
@@ -37,7 +39,7 @@ Use this skill alongside `swarm-pr-review` or `reviewing-code-core` when reviewi
 - [ ] Red flag: field in model, absent from SELECT, silently returns `null` via a guard clause.
 
 ### 2. Frontend / Backend Type Boundary
-- [ ] Verify the TypeScript interface in `frontend/src/lib/api.ts` matches the backend response model.
+- [ ] Verify the TypeScript interface in the matching `frontend/src/lib/api/*.ts` module matches the backend response model.
 - [ ] Do not assume backend `int` maps to frontend `number` — check the actual interface definition.
 - [ ] Watch for `Set<string>.has(number)` or similar mismatches when document IDs are strings in the API but numbers in the database.
 - [ ] Verify that frontend selection state (bulk selection, filters) uses the same ID type as the API response.

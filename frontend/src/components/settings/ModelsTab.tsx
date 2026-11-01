@@ -11,7 +11,7 @@
  * saving here will shadow any env var at runtime — that's documented in
  * the help text rather than enforced by disabling inputs.
  */
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import {
   Card,
   CardContent,
@@ -41,6 +41,13 @@ import {
 } from "@/stores/useSettingsStore";
 import { ReindexFieldWarning } from "./ReindexFieldWarning";
 import { getVault, toggleVaultMultimodalProvider } from "@/lib/api";
+import { useAuthOwner } from "@/hooks/useAuthOwner";
+import {
+  captureAuthPrincipalGeneration,
+  isCurrentAuthOwner,
+  subscribeAuthPrincipal,
+  type AuthOwner,
+} from "@/lib/api/auth-lifecycle";
 
 export interface ModelsTabProps {
   formData: SettingsFormData;
@@ -385,77 +392,196 @@ function DefaultModeField({
   );
 }
 
-export function ModelsTab({
+type VaultMultimodal = {
+  multimodal_provider_enabled: boolean | null;
+  effective_multimodal_enabled: boolean;
+  current_user_permission: string | null;
+};
+
+type OwnerScope = {
+  owner: AuthOwner;
+  generation: number;
+  vaultId: number | null;
+};
+
+function isVaultMultimodal(value: unknown): value is VaultMultimodal {
+  if (!value || typeof value !== "object") return false;
+  const vault = value as Record<string, unknown>;
+  return (
+    (vault.multimodal_provider_enabled === null || typeof vault.multimodal_provider_enabled === "boolean") &&
+    typeof vault.effective_multimodal_enabled === "boolean" &&
+    (vault.current_user_permission === null || typeof vault.current_user_permission === "string")
+  );
+}
+
+export function ModelsTab(props: ModelsTabProps) {
+  const owner = useAuthOwner();
+  const generation = useSyncExternalStore(
+    subscribeAuthPrincipal,
+    captureAuthPrincipalGeneration,
+    captureAuthPrincipalGeneration,
+  );
+  const scope = useMemo<OwnerScope>(
+    () => ({ owner, generation, vaultId: props.vaultId ?? null }),
+    [generation, owner, props.vaultId],
+  );
+  const scopeSerial = useRef(0);
+  const previousScope = useRef<OwnerScope | null>(null);
+  if (
+    previousScope.current?.owner !== scope.owner ||
+    previousScope.current?.generation !== scope.generation ||
+    previousScope.current?.vaultId !== scope.vaultId
+  ) {
+    scopeSerial.current += 1;
+    previousScope.current = scope;
+  }
+
+  return <ModelsTabContent key={`models-scope-${scopeSerial.current}`} {...props} scope={scope} />;
+}
+
+function ModelsTabContent({
   formData,
   errors,
-  onChange,
+  onChange: originalOnChange,
   effectiveSources,
   vaultId = null,
   onClearKey,
-}: ModelsTabProps) {
+  scope,
+}: ModelsTabProps & { scope: OwnerScope }) {
   // Per-vault multimodal provider opt-in (tri-state: inherit/on/off)
   const [vaultMultimodal, setVaultMultimodal] = useState<{
     multimodal_provider_enabled: boolean | null;
     effective_multimodal_enabled: boolean;
     current_user_permission?: string | null;
   } | null>(null);
+  const [vaultReadState, setVaultReadState] = useState<"idle" | "loading" | "ready" | "error">(vaultId ? "loading" : "idle");
+  const [vaultReadError, setVaultReadError] = useState<string | null>(null);
   const [togglingMultimodal, setTogglingMultimodal] = useState(false);
   const [clearingKey, setClearingKey] = useState<string | null>(null);
+  const [clearError, setClearError] = useState<string | null>(null);
+  const scopeRef = useRef(scope);
+  const mountedLeaseRef = useRef<symbol | null>(null);
+  const readIntentRef = useRef<symbol | null>(null);
+  const readPendingRef = useRef<symbol | null>(null);
+  const toggleIntentRef = useRef<symbol | null>(null);
+  const togglePendingRef = useRef<symbol | null>(null);
+  const clearIntentRef = useRef<symbol | null>(null);
+  const clearPendingRef = useRef<symbol | null>(null);
+  scopeRef.current = scope;
 
   useEffect(() => {
-    if (!vaultId) {
-      setVaultMultimodal(null);
-      return;
-    }
-    getVault(vaultId)
-      .then((vault) => {
-        setVaultMultimodal({
-          multimodal_provider_enabled: vault.multimodal_provider_enabled ?? null,
-          effective_multimodal_enabled: vault.effective_multimodal_enabled ?? false,
-          current_user_permission: vault.current_user_permission,
-        });
-      })
-      .catch(() => setVaultMultimodal(null));
-  }, [vaultId]);
+    const lease = Symbol("models-mounted");
+    mountedLeaseRef.current = lease;
+    return () => {
+      if (mountedLeaseRef.current === lease) mountedLeaseRef.current = null;
+    };
+  }, []);
 
-  const handleVaultMultimodalToggle = async (
-    enabled: boolean | null,
-  ): Promise<void> => {
+  const isLive = useCallback((lease: symbol | null = mountedLeaseRef.current) =>
+    lease !== null && mountedLeaseRef.current === lease && scopeRef.current === scope &&
+    isCurrentAuthOwner(scope.owner) && captureAuthPrincipalGeneration() === scope.generation,
+    [scope]);
+
+  const onChange = <K extends keyof SettingsFormData>(field: K, value: SettingsFormData[K]) => {
+    if (isLive()) originalOnChange(field, value);
+  };
+
+  const loadVault = useCallback(async (lease: symbol | null, supersede = false) => {
+    if (!isLive(lease) || (readPendingRef.current && !supersede)) return;
     if (!vaultId) return;
-    setTogglingMultimodal(true);
+    const intent = Symbol("vault-read");
+    readIntentRef.current = intent;
+    readPendingRef.current = intent;
+    const currentRead = () => isLive(lease) && readIntentRef.current === intent;
+    setVaultReadState((current) => currentRead() ? "loading" : current);
+    setVaultReadError((current) => currentRead() ? null : current);
     try {
-      const updated = await toggleVaultMultimodalProvider(vaultId, {
-        enabled,
-      });
-      setVaultMultimodal({
-        multimodal_provider_enabled: updated.multimodal_provider_enabled ?? null,
-        effective_multimodal_enabled: updated.effective_multimodal_enabled ?? false,
-        current_user_permission: updated.current_user_permission,
-      });
-    } catch {
-      if (vaultId) {
-        getVault(vaultId)
-          .then((vault) =>
-            setVaultMultimodal({
-              multimodal_provider_enabled:
-                vault.multimodal_provider_enabled ?? null,
-              effective_multimodal_enabled:
-                vault.effective_multimodal_enabled ?? false,
-              current_user_permission: vault.current_user_permission,
-            }),
-          )
-          .catch(() => setVaultMultimodal(null));
-      }
+      const vault = await getVault(vaultId);
+      if (!currentRead()) return;
+      if (!isVaultMultimodal(vault)) throw new Error("Malformed vault response");
+      setVaultMultimodal((current) => currentRead() ? vault : current);
+      setVaultReadState((current) => currentRead() ? "ready" : current);
+    } catch (error) {
+      if (!currentRead()) return;
+      const message = error instanceof Error ? error.message : "Could not load vault settings. Retry to continue.";
+      setVaultReadState((current) => currentRead() ? "error" : current);
+      setVaultReadError((current) => currentRead() ? message : current);
     } finally {
-      setTogglingMultimodal(false);
+      if (readPendingRef.current === intent) readPendingRef.current = null;
+    }
+  }, [isLive, vaultId]);
+
+  useEffect(() => {
+    const lease = mountedLeaseRef.current;
+    void loadVault(lease, true);
+    const intent = readIntentRef.current;
+    return () => {
+      if (readIntentRef.current === intent) readIntentRef.current = null;
+      if (readPendingRef.current === intent) readPendingRef.current = null;
+    };
+  }, [loadVault]);
+
+  const handleVaultMultimodalToggle = async (enabled: boolean | null): Promise<void> => {
+    if (!vaultId || !canToggleMultimodal || togglePendingRef.current || !isLive()) return;
+    const lease = mountedLeaseRef.current;
+    const intent = Symbol("vault-toggle");
+    toggleIntentRef.current = intent;
+    togglePendingRef.current = intent;
+    // A mutation supersedes an older Retry before the physical write starts.
+    readIntentRef.current = null;
+    readPendingRef.current = null;
+    const currentToggle = () => isLive(lease) && toggleIntentRef.current === intent;
+    setTogglingMultimodal((current) => currentToggle() ? true : current);
+    try {
+      try {
+        const updated = await toggleVaultMultimodalProvider(vaultId, { enabled });
+        if (!currentToggle()) return;
+        if (!isVaultMultimodal(updated)) throw new Error("Malformed vault response");
+        setVaultMultimodal((current) => currentToggle() ? updated : current);
+      } catch {
+        if (!currentToggle()) return;
+      }
+      if (currentToggle()) await loadVault(lease, true);
+    } finally {
+      if (togglePendingRef.current === intent) togglePendingRef.current = null;
+      setTogglingMultimodal((current) => currentToggle() ? false : current);
     }
   };
 
-  const canToggleMultimodal =
-    vaultMultimodal?.current_user_permission === "admin";
+  const canToggleMultimodal = vaultMultimodal?.current_user_permission === "admin";
+
+  const handleClearKey = async (field: "chat_api_key" | "instant_api_key") => {
+    if (!onClearKey || clearingKey || clearPendingRef.current || !isLive()) return;
+    const lease = mountedLeaseRef.current;
+    const intent = Symbol("models-clear");
+    clearIntentRef.current = intent;
+    clearPendingRef.current = intent;
+    setClearError(null);
+    setClearingKey(field);
+    try {
+      await onClearKey(field);
+      if (isLive(lease) && clearIntentRef.current === intent) onChange(field, "");
+    } catch {
+      if (isLive(lease) && clearIntentRef.current === intent) {
+        setClearError((current) => isLive(lease) && clearIntentRef.current === intent ? "Could not clear the API key. Retry to continue." : current);
+      }
+    } finally {
+      if (isLive(lease) && clearIntentRef.current === intent) {
+        if (clearPendingRef.current === intent) clearPendingRef.current = null;
+        setClearingKey((current) => isLive(lease) && clearIntentRef.current === intent ? null : current);
+      }
+    }
+  };
+
+  const retryVaultRead = () => {
+    const lease = mountedLeaseRef.current;
+    if (!isLive(lease) || togglePendingRef.current || readPendingRef.current) return;
+    void loadVault(lease);
+  };
 
   return (
     <div className="space-y-4">
+      {clearError && <p role="alert" className="text-sm text-destructive">{clearError}</p>}
       <Card>
         <CardHeader>
           <CardTitle>Model endpoints</CardTitle>
@@ -562,15 +688,7 @@ export function ModelsTab({
                   size="sm"
                   disabled={clearingKey !== null}
                   aria-label="Clear thinking API key"
-                  onClick={async () => {
-                    setClearingKey("chat_api_key");
-                    try {
-                      await onClearKey("chat_api_key");
-                      onChange("chat_api_key", "");
-                    } finally {
-                      setClearingKey(null);
-                    }
-                  }}
+                  onClick={() => void handleClearKey("chat_api_key")}
                 >
                   Clear
                 </Button>
@@ -604,15 +722,7 @@ export function ModelsTab({
                   size="sm"
                   disabled={clearingKey !== null}
                   aria-label="Clear instant API key"
-                  onClick={async () => {
-                    setClearingKey("instant_api_key");
-                    try {
-                      await onClearKey("instant_api_key");
-                      onChange("instant_api_key", "");
-                    } finally {
-                      setClearingKey(null);
-                    }
-                  }}
+                  onClick={() => void handleClearKey("instant_api_key")}
                 >
                   Clear
                 </Button>
@@ -917,7 +1027,18 @@ export function ModelsTab({
                 are configured.
               </AlertDescription>
             </Alert>
-            {vaultMultimodal === null ? null : (
+            {vaultReadState === "loading" && !vaultMultimodal && (
+              <p role="status">Loading vault multimodal</p>
+            )}
+            {vaultReadState === "error" && (
+              <div role="alert" className="space-y-2">
+                <p>{vaultReadError}</p>
+                {!togglingMultimodal && (<Button type="button" variant="outline" onClick={retryVaultRead}>
+                  Retry
+                </Button>)}
+              </div>
+            )}
+            {vaultMultimodal && (
               <div className="space-y-2">
                 <div className="flex items-center gap-2">
                   <span className="text-sm font-medium">Override</span>

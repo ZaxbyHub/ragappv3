@@ -33,7 +33,6 @@ export function RAGSettings({
                 id="max-distance-threshold"
                 type="number"
                 min={0}
-                max={1}
                 step={0.01}
                 value={formData.max_distance_threshold}
                 onChange={(e) => onChange("max_distance_threshold", e.target.value)}
@@ -42,7 +41,11 @@ export function RAGSettings({
               <input
                 type="range"
                 min={0}
-                max={1}
+                max={
+                  Number.isFinite(formData.max_distance_threshold)
+                    ? Math.max(1, Math.ceil(formData.max_distance_threshold))
+                    : 1
+                }
                 step={0.01}
                 value={formData.max_distance_threshold}
                 onChange={(e) => onChange("max_distance_threshold", e.target.value)}
@@ -54,7 +57,7 @@ export function RAGSettings({
               <p role="alert" className="text-xs text-destructive">{errors.max_distance_threshold}</p>
             )}
             <p className="text-xs text-muted-foreground">
-              Maximum distance (1-0) for chunks to be included in context (lower = more strict)
+              Maximum distance (0 or greater) for chunks to be included in context (lower = more strict)
             </p>
           </div>
 
@@ -65,7 +68,6 @@ export function RAGSettings({
               id="retrieval-window"
               type="number"
               min={0}
-              max={3}
               value={formData.retrieval_window}
               onChange={(e) => onChange("retrieval_window", e.target.value)}
               className={errors.retrieval_window ? "border-destructive" : ""}
@@ -74,7 +76,7 @@ export function RAGSettings({
               <p role="alert" className="text-xs text-destructive">{errors.retrieval_window}</p>
             )}
             <p className="text-xs text-muted-foreground">
-              Number of adjacent chunks to include (0-3)
+              Number of adjacent chunks to include (0 or greater)
             </p>
           </div>
 
@@ -89,9 +91,9 @@ export function RAGSettings({
                 <SelectValue placeholder="Select metric" />
               </SelectTrigger>
               <SelectContent>
+                <SelectItem value="l2">L2 Distance</SelectItem>
                 <SelectItem value="cosine">Cosine Similarity</SelectItem>
-                <SelectItem value="euclidean">Euclidean Distance</SelectItem>
-                <SelectItem value="dot_product">Dot Product</SelectItem>
+                <SelectItem value="dot">Dot Product</SelectItem>
               </SelectContent>
             </Select>
             {errors.vector_metric && (
@@ -109,9 +111,9 @@ export function RAGSettings({
             <Input
               id="embedding-batch-size"
               type="number"
-              min={64}
-              max={2048}
-              step={64}
+              min={1}
+              max={128}
+              step={1}
               value={formData.embedding_batch_size}
               onChange={(e) => onChange("embedding_batch_size", e.target.value)}
               className={errors.embedding_batch_size ? "border-destructive" : ""}

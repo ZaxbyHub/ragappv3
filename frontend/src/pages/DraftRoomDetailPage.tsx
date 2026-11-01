@@ -11,6 +11,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { DraftStatusBanner } from "@/components/draft-room/DraftStatusBanner";
 import { DraftWorkspace, type DraftWorkspaceHandle, type DraftDerivedStatus } from "@/components/draft-room/DraftWorkspace";
 import { DRAFT_ROOM_DISABLED_MESSAGE } from "@/components/draft-room/labels";
+import { PageTitleHeader } from "@/components/layout/PageTitleHeader";
 import { useDraftRoomCapabilities } from "@/hooks/useDraftRoomCapabilities";
 import { useDraftRoomEvents } from "@/hooks/useDraftRoomEvents";
 import { useDraftRoomUiStore } from "@/stores/useDraftRoomUiStore";
@@ -227,24 +228,25 @@ export default function DraftRoomDetailPage() {
       <div aria-live="polite" className="sr-only">
         {pollingAnnouncement}
       </div>
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div>
+      <PageTitleHeader
+        id="draft-room-detail-heading"
+        before={
           <Link to="/draft-room" className="text-sm text-muted-foreground hover:underline">
             &larr; Back to Draft Room
           </Link>
-          <h1 id="draft-room-detail-heading" className="text-2xl font-semibold tracking-tight">
-            {draft.title}
-          </h1>
-        </div>
-        {pollingFallback && (
-          <Badge
-            variant="outline"
-            title="Live updates are unavailable. This page is polling for changes instead."
-          >
-            Polling for updates
-          </Badge>
-        )}
-      </div>
+        }
+        title={draft.title}
+        actions={
+          pollingFallback && (
+            <Badge
+              variant="outline"
+              title="Live updates are unavailable. This page is polling for changes instead."
+            >
+              Polling for updates
+            </Badge>
+          )
+        }
+      />
 
       {capabilityDisabled && (
         <Alert variant="warning">

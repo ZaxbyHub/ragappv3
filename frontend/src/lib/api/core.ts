@@ -1,6 +1,7 @@
 import { APP_BASENAME } from "@/lib/paths";
 import axios, { AxiosRequestHeaders } from "axios";
 import { appPath } from "../paths";
+import { type AuthOwner, captureAuthPrincipalGeneration, captureAuthOwner, enqueueAuthTransport, getAuthTransportContext, getAuthTransportOwner, isCurrentAuthOwner, StaleAuthOwnerError } from "./auth-lifecycle";
 
 export const API_BASE_URL = import.meta.env.VITE_API_URL || appPath("/api");
 console.info("[KnowledgeVault] API_BASE_URL:", API_BASE_URL);
@@ -26,11 +27,60 @@ function wait(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+const actualRequestOwners = new WeakMap<object, AuthOwner>();
+
+function capturedRequestOwner(config: unknown): AuthOwner | null {
+  if (!config || typeof config !== "object") return null;
+  const signal = (config as { signal?: unknown }).signal;
+  // Credential FIFO transports carry an explicit owner on their private signal.
+  // That lease wins over the ordinary invocation snapshot.
+  return getAuthTransportOwner(signal) ?? actualRequestOwners.get(config) ?? null;
+}
+
+function assertCurrentRequestOwner(config: unknown): AuthOwner | null {
+  const owner = capturedRequestOwner(config);
+  if (config && typeof config === "object") {
+    getAuthTransportContext((config as { signal?: unknown }).signal)?.assertCurrent();
+  }
+  if (owner && !isCurrentAuthOwner(owner)) throw new StaleAuthOwnerError();
+  return owner;
+}
+
+// Axios invokes runWhen synchronously on its newly merged request config,
+// before it starts the asynchronous interceptor chain. Capture the owner there
+// without modifying the config that the CSRF interceptor will receive.
+function recordActualRequestOwner(config: unknown): void {
+  if (config && typeof config === "object" && !actualRequestOwners.has(config)) {
+    const signal = (config as { signal?: unknown }).signal;
+    actualRequestOwners.set(config, getAuthTransportOwner(signal) ?? captureAuthOwner());
+  }
+}
+
 // Module-level JWT token holder - persisted via useAuthStore persist middleware
 export let _jwtAccessToken: string | null = null;
+let jwtPublicationGeneration = 0;
+const jwtBridgeListeners = new Set<(token: string | null) => void>();
+const jwtAccessTokenListeners = new Set<(token: string | null) => void>();
 
 export function setJwtAccessToken(token: string | null): void {
+  // Store/core synchronization can reenter with the identical token. It is
+  // already published, so repeating public callbacks would deliver stale work.
+  if (_jwtAccessToken === token) return;
+  const owner = captureAuthOwner();
+  const generation = ++jwtPublicationGeneration;
   _jwtAccessToken = token;
+  // The store bridge is deliberately first so public subscribers which issue
+  // a request observe both the holder and store's authoritative token.
+  for (const listener of [...jwtBridgeListeners, ...jwtAccessTokenListeners]) {
+    listener(token);
+    if (jwtPublicationGeneration !== generation || !isCurrentAuthOwner(owner)) break;
+  }
+}
+
+export function onJwtAccessTokenPublished(listener: (token: string | null) => void, bridge = false): () => void {
+  const listeners = bridge ? jwtBridgeListeners : jwtAccessTokenListeners;
+  listeners.add(listener);
+  return () => listeners.delete(listener);
 }
 
 export function getJwtAccessToken(): string | null {
@@ -82,73 +132,174 @@ export function purgeStaleCsrfCookies(): void {
   }
 }
 
-// CSRF token cache and deduplication — single source of truth
+// CSRF cache and deduplication.  Physical requests are owner-scoped: a later
+// auth owner never inherits an earlier owner's unresolved token publication.
 let _csrfToken: string | null = null;
-let _csrfFetchPromise: Promise<string> | null = null;
+let _csrfTokenOwnerId: number | null = null;
+let _csrfTokenPrincipalGeneration: number | null = null;
+let _csrfGeneration = 0;
+
+interface CsrfAttempt {
+  readonly owner: AuthOwner;
+  readonly generation: number;
+  readonly principalGeneration: number;
+  readonly controller: AbortController;
+  readonly physical: Promise<string>;
+  readonly logical: Promise<string>;
+  finishLogical: (error?: unknown, token?: string) => void;
+  removeOwnerAbort: () => void;
+  active: boolean;
+}
+const csrfAttempts = new Map<number, CsrfAttempt>();
+const CSRF_FETCH_TIMEOUT_MS = 10_000;
 
 export function resetCsrfToken(): void {
+  _csrfGeneration += 1;
   _csrfToken = null;
-  _csrfFetchPromise = null;
+  _csrfTokenOwnerId = null;
+  _csrfTokenPrincipalGeneration = null;
 }
 
-/**
- * Get the cached CSRF token.
- * Lifecycle keepalive callers use this non-blocking cache read when a refresh
- * has cleared the in-memory token; awaited requests should prefer
- * ensureCsrfToken() so the cookie/network fallback can run.
- */
 export function getCsrfToken(): string | null {
-  return _csrfToken;
+  return _csrfTokenOwnerId === captureAuthOwner().id &&
+    _csrfTokenPrincipalGeneration === captureAuthPrincipalGeneration() ? _csrfToken : null;
 }
 
-export async function ensureCsrfToken(force: boolean = false): Promise<string> {
-  // `force` bypasses the in-memory cache as well as the cookie jar: callers
-  // force exactly when the cached token is known-stale (post-403 retry,
-  // post-refresh rotation), so serving the cache would defeat the point.
-  if (_csrfToken && !force) return _csrfToken;
+function csrfTimeoutError(cause?: unknown): Error {
+  const error = new Error("csrf token fetch timed out");
+  (error as Error & { cause?: unknown }).cause = cause;
+  return error;
+}
 
-  // Check cookie first — unless forced: after a CSRF 403 the cookie may hold
-  // the very token the server just rejected (rotated by login/refresh, or
-  // expired server-side while Max-Age keeps it in the jar). A forced refresh
-  // bypasses the jar and gets a server-issued token + fresh cookie pair.
-  if (!force) {
-    const cookieToken = getCsrfCookie();
-    if (cookieToken) {
-      _csrfToken = cookieToken;
-      return cookieToken;
-    }
-  }
-
-  if (!_csrfFetchPromise) {
-    const newPromise: Promise<string> = fetch(`${API_BASE_URL}/csrf-token`, { credentials: "include" })
+function getCsrfAttempt(owner: AuthOwner): CsrfAttempt {
+  if (!isCurrentAuthOwner(owner)) throw new StaleAuthOwnerError();
+  const principalGeneration = captureAuthPrincipalGeneration();
+  const existing = csrfAttempts.get(owner.id);
+  if (existing && existing.generation === _csrfGeneration && existing.principalGeneration === principalGeneration && existing.active) return existing;
+  const generation = _csrfGeneration;
+  const controller = new AbortController();
+  let finishLogical!: (error?: unknown, token?: string) => void;
+  const logical = new Promise<string>((resolve, reject) => {
+    let settled = false;
+    finishLogical = (error, token) => {
+      if (settled) return;
+      settled = true;
+      if (error !== undefined) reject(error); else resolve(token as string);
+    };
+  });
+  const onOwnerAbort = () => {
+    if (!attempt.active) return;
+    attempt.active = false;
+    controller.abort();
+    finishLogical(new StaleAuthOwnerError());
+    if (csrfAttempts.get(owner.id) === attempt) csrfAttempts.delete(owner.id);
+  };
+  const removeOwnerAbort = () => owner.signal.removeEventListener("abort", onOwnerAbort);
+  const attempt: CsrfAttempt = {
+    owner,
+    generation,
+    principalGeneration,
+    controller,
+    physical: fetch(`${API_BASE_URL}/csrf-token`, { credentials: "include", signal: controller.signal })
       .then(async (resp) => {
         if (!resp.ok) throw new Error("Failed to fetch CSRF token");
         const data = await resp.json();
-        if (!data.csrf_token || typeof data.csrf_token !== "string") {
-          throw new Error("CSRF token missing from response");
-        }
-        const token: string = data.csrf_token;
-        _csrfToken = token;
-        return token;
-      });
-    _csrfFetchPromise = newPromise;
-    newPromise
-      .catch(() => {
-        // Mark rejection as handled to prevent unhandled rejection warnings in test environments
-        // Callers will handle the actual error when they await the promise
+        if (!data.csrf_token || typeof data.csrf_token !== "string") throw new Error("CSRF token missing from response");
+        return data.csrf_token as string;
       })
-      .finally(() => {
-        _csrfFetchPromise = null;
-      });
-  }
-  return _csrfFetchPromise as Promise<string>;
+      .catch((error: unknown) => {
+        if (controller.signal.aborted && attempt.active) throw csrfTimeoutError(error);
+        throw error;
+      }),
+    logical,
+    finishLogical,
+    removeOwnerAbort,
+    active: true,
+  };
+  const physical = attempt.physical;
+  owner.signal.addEventListener("abort", onOwnerAbort, { once: true });
+  // Deadline is logical only.  Abort requests cooperation from fetch, but a
+  // non-cooperative body remains a physical attempt until it actually settles.
+  const deadline = setTimeout(() => {
+    if (!attempt.active) return;
+    attempt.active = false;
+    controller.abort();
+    finishLogical(csrfTimeoutError());
+    if (csrfAttempts.get(owner.id) === attempt) csrfAttempts.delete(owner.id);
+  }, CSRF_FETCH_TIMEOUT_MS);
+  physical.then(
+    (token) => {
+      clearTimeout(deadline);
+      removeOwnerAbort();
+      const publishable = attempt.active && generation === _csrfGeneration && isCurrentAuthOwner(owner) && captureAuthPrincipalGeneration() === principalGeneration;
+      attempt.active = false;
+      if (publishable) {
+        _csrfToken = token;
+        _csrfTokenOwnerId = owner.id;
+        _csrfTokenPrincipalGeneration = principalGeneration;
+        finishLogical(undefined, token);
+      } else {
+        finishLogical(new StaleAuthOwnerError());
+      }
+    },
+    (error) => {
+      clearTimeout(deadline);
+      removeOwnerAbort();
+      attempt.active = false;
+      finishLogical(error);
+    },
+  ).finally(() => {
+    if (csrfAttempts.get(owner.id) === attempt) csrfAttempts.delete(owner.id);
+  });
+  // Both lifetimes are always observed. Queue-owned callers may await physical
+  // while public callers use logical, so neither late branch can leak.
+  void physical.catch(() => undefined);
+  void logical.catch(() => undefined);
+  csrfAttempts.set(owner.id, attempt);
+  return attempt;
 }
 
+/** Public bounded CSRF acquisition used by interceptors and ordinary callers. */
+export async function ensureCsrfToken(force: boolean = false, owner: AuthOwner = captureAuthOwner()): Promise<string> {
+  if (_csrfToken && _csrfTokenOwnerId === owner.id && _csrfTokenPrincipalGeneration === captureAuthPrincipalGeneration() && isCurrentAuthOwner(owner) && !force) return _csrfToken;
+  if (!force) {
+    const cookieToken = getCsrfCookie();
+    if (cookieToken && isCurrentAuthOwner(owner)) {
+      _csrfToken = cookieToken;
+      _csrfTokenOwnerId = owner.id;
+      _csrfTokenPrincipalGeneration = captureAuthPrincipalGeneration();
+      return cookieToken;
+    }
+  }
+  return getCsrfAttempt(owner).logical;
+}
+
+/** Queue-owned auth transports await physical settlement so FIFO cannot advance early. */
+export async function ensureCsrfTokenPhysical(force: boolean, owner: AuthOwner): Promise<string> {
+  if (!isCurrentAuthOwner(owner)) throw new StaleAuthOwnerError();
+  if (_csrfToken && _csrfTokenOwnerId === owner.id && _csrfTokenPrincipalGeneration === captureAuthPrincipalGeneration() && isCurrentAuthOwner(owner) && !force) return _csrfToken;
+  if (!force) {
+    const cookieToken = getCsrfCookie();
+    if (cookieToken && isCurrentAuthOwner(owner)) return cookieToken;
+  }
+  return getCsrfAttempt(owner).physical;
+}
 export function attachCsrfInterceptor(instance: ReturnType<typeof axios.create>): void {
-  // Request interceptor: attach CSRF to mutating requests
+  // Axios evaluates runWhen synchronously on the merged request config before
+  // building the asynchronous request chain. Record the owner there, then keep
+  // this interceptor in that chain so its public registration remains the CSRF
+  // interceptor and its asynchronous token refresh behavior is unchanged.
   instance.interceptors.request.use(async (config) => {
+    const owner = assertCurrentRequestOwner(config);
     if (config.method && ["post", "put", "patch", "delete"].includes(config.method.toLowerCase())) {
-      const token = await ensureCsrfToken();
+      const transportOwner = getAuthTransportOwner(config.signal);
+      const token = transportOwner
+        ? await ensureCsrfTokenPhysical(false, transportOwner)
+        : await ensureCsrfToken(false, owner ?? captureAuthOwner());
+      assertCurrentRequestOwner(config);
+      if (owner && (!isCurrentAuthOwner(owner) || (transportOwner === owner && config.signal?.aborted))) {
+        throw new StaleAuthOwnerError();
+      }
       if (token) {
         if (!config.headers) {
           config.headers = {} as AxiosRequestHeaders;
@@ -157,13 +308,20 @@ export function attachCsrfInterceptor(instance: ReturnType<typeof axios.create>)
       }
     }
     return config;
+  }, undefined, {
+    runWhen: (config) => {
+      recordActualRequestOwner(config);
+      return true;
+    },
   });
 
   // Response interceptor: on CSRF-specific 403, clear cached token and retry once
   instance.interceptors.response.use(
     (resp) => resp,
     async (error) => {
+      if (error instanceof StaleAuthOwnerError) return Promise.reject(error);
       const config = error.config;
+      const owner = assertCurrentRequestOwner(config);
       // Blob error bodies (responseType: "blob", e.g. the draft export
       // download) carry no .detail/.code — axios delivers the raw Blob. Decode
       // JSON blob bodies regardless of status and replace
@@ -187,6 +345,7 @@ export function attachCsrfInterceptor(instance: ReturnType<typeof axios.create>)
         } catch {
           // non-JSON body — leave the Blob as-is
         }
+        if (owner) assertCurrentRequestOwner(config);
       }
       const detail = error.response?.data?.detail || "";
       const isCsrfError = error.response?.status === 403 && (
@@ -197,7 +356,22 @@ export function attachCsrfInterceptor(instance: ReturnType<typeof axios.create>)
         resetCsrfToken(); // force refresh on next request
         purgeStaleCsrfCookies(); // drop shadow cookies before refetch
         config._csrfRetry = true;
-        const newToken = await ensureCsrfToken(true);
+        let newToken: string;
+        try {
+          const transportOwner = getAuthTransportOwner(config.signal);
+          newToken = transportOwner
+            ? await ensureCsrfTokenPhysical(true, transportOwner)
+            : await ensureCsrfToken(true, owner ?? captureAuthOwner());
+          assertCurrentRequestOwner(config);
+          if (owner && (!isCurrentAuthOwner(owner) || (transportOwner === owner && config.signal?.aborted))) {
+            return Promise.reject(new StaleAuthOwnerError());
+          }
+        } catch (retryError) {
+          if (retryError instanceof StaleAuthOwnerError) return Promise.reject(retryError);
+          // Token fetch failed (incl. the #774 deadline) — keep the caller's
+          // original CSRF error instead of surfacing the fetch failure.
+          return Promise.reject(error);
+        }
         if (!config.headers) {
           config.headers = {};
         }
@@ -223,89 +397,82 @@ export function redirectToLogin(): void {
 // Singleton refresh promise — ensures only one /auth/refresh call is in flight
 // at a time. Concurrent 401s share the same promise so the refresh cookie is
 // not rotated twice (which would invalidate the second caller's session).
-let _refreshInFlight: Promise<string | null> | null = null;
+let _refreshInFlight: { owner: AuthOwner; principalGeneration: number; promise: Promise<string | null> } | null = null;
 
-// Subpath deployment guardrail: this bundle bakes VITE_APP_BASENAME at build
-// time while the refresh cookie's Path comes from the backend's APP_ROOT_PATH
-// env. When the two diverge, the browser never returns the cookie and every
-// refresh is rejected with one of two signatures — a 401 from /auth/refresh
-// (cookie missing) or a CSRF-marked 403 (csrf_protect rejects before the
-// handler when the CSRF cookie also misses the prefixed path; the raw fetch
-// here bypasses the axios CSRF retry). Only those authentication-shaped
-// rejections emit the diagnostic, once per failure burst, so unrelated
-// outages (5xx, network errors) and ordinary session expiry noise stay
-// appropriately phrased instead of asserting a misconfiguration.
 let _refreshMismatchDiagnosed = false;
-
 function isAuthShapedRefreshRejection(response: Response): boolean {
   if (response.status === 401) return true;
   return response.status === 403 && response.headers.get("x-csrf-error") === "true";
 }
-
 function diagnoseSubpathRefreshFailure(): void {
   if (_refreshMismatchDiagnosed || !APP_BASENAME) return;
   _refreshMismatchDiagnosed = true;
-  console.error(
-    `[Auth] Silent token refresh was rejected while the app is served under "${APP_BASENAME}" (VITE_APP_BASENAME). If this is unexpected for an active session, verify APP_ROOT_PATH and VITE_APP_BASENAME are identical in .env (or the Compose environment). VITE_APP_BASENAME is baked into the frontend image; rebuild and restart with \`docker compose build --no-cache && docker compose up -d\`.`
-  );
+  console.error(`[Auth] Silent token refresh was rejected while the app is served under "${APP_BASENAME}" (VITE_APP_BASENAME). If this is unexpected for an active session, verify APP_ROOT_PATH and VITE_APP_BASENAME are identical in .env (or the Compose environment). VITE_APP_BASENAME is baked into the frontend bundle, so rebuild the Docker image after changing it.`);
 }
+export function resetSubpathRefreshDiagnostic(): void { _refreshMismatchDiagnosed = false; }
+const AUTH_REFRESH_TIMEOUT_MS = 10_000;
 
-// Session boundaries (login/register/logout) start a new diagnostic burst.
-export function resetSubpathRefreshDiagnostic(): void {
-  _refreshMismatchDiagnosed = false;
-}
-
-// Standalone refresh function to avoid circular dependencies
-export async function refreshAccessToken(): Promise<string | null> {
-  if (_refreshInFlight) {
-    return _refreshInFlight;
+export function refreshAccessToken(owner: AuthOwner = captureAuthOwner()): Promise<string | null> {
+  const principalGeneration = captureAuthPrincipalGeneration();
+  if (_refreshInFlight?.owner === owner && _refreshInFlight.principalGeneration === principalGeneration) {
+    return _refreshInFlight.promise;
   }
-  _refreshInFlight = _doRefresh().finally(() => {
-    _refreshInFlight = null;
-  });
-  return _refreshInFlight;
+  // Principal authority may change without a new credential owner. A queued
+  // refresh may not dispatch or publish for the replacement principal.
+  const isScopeCurrent = () => captureAuthPrincipalGeneration() === principalGeneration;
+  const promise = enqueueAuthTransport(owner, (context) => doRefresh(owner, context), AUTH_REFRESH_TIMEOUT_MS, isScopeCurrent);
+  _refreshInFlight = { owner, principalGeneration, promise };
+  const releaseCompletedRefresh = () => {
+    if (_refreshInFlight?.promise === promise) _refreshInFlight = null;
+  };
+  // Register directly on the public promise so a resumed awaiter can start a
+  // fresh refresh. The credential FIFO still owns physical transport cleanup.
+  void promise.then(releaseCompletedRefresh, releaseCompletedRefresh);
+  return promise;
 }
 
-async function _doRefresh(): Promise<string | null> {
+async function doRefresh(owner: AuthOwner, context: { signal: AbortSignal; timedOut: boolean; assertCurrent(): void }): Promise<string | null> {
+  let csrfToken: string | null = null;
+  try { csrfToken = await ensureCsrfTokenPhysical(true, owner); } catch { /* genuine settled CSRF failure preserves the refresh fallback */ }
+  // A stale queued refresh may finish CSRF bootstrap, but cannot start a late
+  // refresh-cookie mutation after its logical authority was revoked.
+  context.assertCurrent();
+  const headers: Record<string, string> = {};
+  if (csrfToken) headers["X-CSRF-Token"] = csrfToken;
+  let response: Response;
   try {
-    // The /auth/refresh endpoint requires the CSRF token.
-    // Read it from the non-httpOnly cookie; if missing, fetch a fresh one.
-    // Force a server-issued token: the jar's cookie may have expired in step
-    // with its Redis TTL (both 900s) while the access token outlived it, which
-    // is exactly when a silent refresh fires.
-    let csrfToken: string | null = null;
-    try {
-      csrfToken = await ensureCsrfToken(true);
-    } catch {
-      // proceed without CSRF — server will reject if required
+    response = await fetch(`${API_BASE_URL}/auth/refresh`, { method: "POST", credentials: "include", headers, signal: context.signal });
+  } catch (error) {
+    if (context.timedOut) {
+      const timeout = new Error("auth refresh timed out");
+      (timeout as Error & { cause?: unknown }).cause = error;
+      throw timeout;
     }
-
-    const headers: Record<string, string> = {};
-    if (csrfToken) {
-      headers["X-CSRF-Token"] = csrfToken;
-    }
-
-    const response = await fetch(`${API_BASE_URL}/auth/refresh`, {
-      method: "POST",
-      credentials: "include", // Send httpOnly cookie with refresh token
-      headers,
-    });
-    if (!response.ok) {
-      if (isAuthShapedRefreshRejection(response)) {
-        diagnoseSubpathRefreshFailure();
-      }
-      return null;
-    }
-    // /auth/refresh rotates the CSRF cookie (issue_csrf_token in the handler).
-    // Drop the cached token so the next mutating request re-reads the cookie
-    // instead of sending the stale pre-refresh token (403 CSRF mismatch).
-    resetCsrfToken();
-    const data = await response.json();
-    _jwtAccessToken = data.access_token;
-    _refreshMismatchDiagnosed = false;
-    return data.access_token;
-  } catch {
+    throw error;
+  }
+  context.assertCurrent();
+  if (!response.ok) {
+    if (isAuthShapedRefreshRejection(response)) { diagnoseSubpathRefreshFailure(); return null; }
+    if (response.status >= 500) throw new Error(`auth refresh failed with status ${response.status}`);
     return null;
+  }
+  try {
+    const data = await response.json();
+    context.assertCurrent();
+    resetCsrfToken();
+    const token = data?.access_token ?? null;
+    setJwtAccessToken(token);
+    context.assertCurrent();
+    _refreshMismatchDiagnosed = false;
+    return token;
+  } catch (error) {
+    if (context.timedOut) {
+      const timeout = new Error("auth refresh timed out");
+      (timeout as Error & { cause?: unknown }).cause = error;
+      throw timeout;
+    }
+    if (error instanceof SyntaxError) return null;
+    throw error;
   }
 }
 
@@ -319,6 +486,7 @@ export const apiClient = axios.create({
 
 // Attach JWT authentication token to all apiClient requests
 apiClient.interceptors.request.use((config) => {
+  assertCurrentRequestOwner(config);
   if (_jwtAccessToken) {
     config.headers.Authorization = `Bearer ${_jwtAccessToken}`;
   }
@@ -351,10 +519,11 @@ export function isTokenNearExpiry(token: string, bufferMs: number = 60000): bool
 apiClient.interceptors.response.use(
   (response) => response,
   async (error) => {
-    // Preserve AbortError for cancellation handling
-    if (error.name === "AbortError" || error.code === "ERR_CANCELED") {
+    // Preserve cancellation and ownership rejection identities for callers.
+    if (error instanceof StaleAuthOwnerError || error.name === "AbortError" || error.code === "ERR_CANCELED") {
       return Promise.reject(error);
     }
+    const owner = assertCurrentRequestOwner(error.config);
 
     // Handle 401 Unauthorized — attempt silent token refresh for expired JWTs
     if (error.response?.status === 401) {
@@ -362,6 +531,14 @@ apiClient.interceptors.response.use(
       const isTokenInvalid = typeof detail === "string" && (
         detail.includes("token_invalid") || detail.includes("user_inactive")
       );
+      // True when the refresh failed for transport reasons (#774): the
+      // session is kept, no logout/redirect, and the error skips the logout
+      // below so control reaches the shared normalizer tail — callers get
+      // the standard .message/.status/.originalError shape instead of a raw
+      // AxiosError (PRR-011 / OOB F-006). No retry loop is possible: 401 is
+      // not a transient status and non-idempotent methods never
+      // transient-retry.
+      let refreshTransportFailure = false;
 
       if (_jwtAccessToken && !isTokenInvalid) {
         // Token may be refreshable — retry with exponential backoff
@@ -375,21 +552,35 @@ apiClient.interceptors.response.use(
           try {
             // Wait before retrying (exponential backoff)
             await new Promise((resolve) => setTimeout(resolve, delays[retryCount] || 2000));
+            if (owner) assertCurrentRequestOwner(error.config);
 
-            const newToken = await refreshAccessToken();
+            // A cookie-mutating request already owns the FIFO slot. Refresh
+            // inside that same physical slot; enqueueing behind itself deadlocks.
+            const transportContext = getAuthTransportContext(error.config.signal);
+            const newToken = transportContext
+              ? await doRefresh(owner ?? captureAuthOwner(), transportContext)
+              : await refreshAccessToken(owner ?? captureAuthOwner());
+            if (owner) assertCurrentRequestOwner(error.config);
             if (newToken) {
               error.config.headers.Authorization = `Bearer ${newToken}`;
               return apiClient(error.config);
             }
-          } catch {
-            // Refresh failed — fall through to logout
+          } catch (refreshError) {
+            if (refreshError instanceof StaleAuthOwnerError) return Promise.reject(refreshError);
+            // Refresh transport failure (#774): refreshAccessToken only
+            // rejects for transport-class failures; an auth-shaped rejection
+            // resolves null and takes the logout below.
+            refreshTransportFailure = true;
           }
         }
       }
 
-      // Clear auth state and redirect to login
-      _jwtAccessToken = null;
-      redirectToLogin();
+      if (!refreshTransportFailure) {
+        if (owner) assertCurrentRequestOwner(error.config);
+        // Clear auth state and redirect to login
+        _jwtAccessToken = null;
+        redirectToLogin();
+      }
     }
 
     const retryConfig = error.config;
@@ -405,6 +596,7 @@ apiClient.interceptors.response.use(
     ) {
       retryConfig._transientRetryCount = retryCount + 1;
       await wait(transientRetryDelayMs(retryCount));
+      if (owner) assertCurrentRequestOwner(retryConfig);
       return apiClient(retryConfig);
     }
 
@@ -552,8 +744,10 @@ export interface UploadDocumentResponse {
 /**
  * Phase-aware status payload returned by GET /documents/{id}/status.
  *
- * `status` stays in the canonical 4-value enum
- * ("pending" | "processing" | "indexed" | "error"). Async lifecycle detail
+ * `status` stays in the canonical files.status enum
+ * ("pending" | "processing" | "indexed" | "partial" | "error" | "cancelled"
+ * — "partial" = completed with failed chunks, issue #513; "cancelled" =
+ * user-cancelled ingest, issue #783). Async lifecycle detail
  * (queued / parsing / extracting_text / chunking / embedding / writing_index)
  * lives in `phase`. `wiki_status` is derived server-side from the latest
  * wiki_compile_jobs row for this file (or "pending" when the processor has
@@ -670,6 +864,11 @@ export interface ChunkContextResponse {
   chunk_text: string;
   context_text: string;
   context_source: "parent_window" | "raw_text" | "chunk" | string;
+  /** Issue #718: neighbor window fields — optional because older sessions'
+   *  persisted context payloads predate the window. */
+  matched_text?: string;
+  before?: string[];
+  after?: string[];
 }
 
 /**
@@ -770,6 +969,8 @@ export interface CitationEnforcement {
 
 export interface ChatStreamCallbacks {
   onMessage: (chunk: string) => void;
+  /** Called once when auth ownership retires this stream. */
+  onRetired?: () => void;
   onSources?: (sources: Source[]) => void;
   onMemories?: (memories: UsedMemory[]) => void;
   onWiki?: (wikiRefs: WikiReference[]) => void;
@@ -928,6 +1129,48 @@ export async function getDocument(fileId: string | number): Promise<Document> {
   return response.data;
 }
 
+/**
+ * Cancel a running or queued document ingest (issue #783's endpoint,
+ * `POST /documents/{file_id}/cancel`). The server returns 200 with the
+ * terminal status; 409 when the ingest already finished (nothing to cancel).
+ */
+export async function cancelDocumentIngest(
+  fileId: string | number
+): Promise<{ file_id: number; status: string }> {
+  const response = await apiClient.post<{ file_id: number; status: string }>(
+    `/documents/${encodeURIComponent(fileId)}/cancel`,
+    null
+  );
+  return response.data;
+}
+
+/** One embedding-reindex job row from `GET /documents/reindex/jobs` (issue #784). */
+export interface ReindexJobSummary {
+  id: number;
+  vault_id?: number | null;
+  trigger_type?: string | null;
+  trigger_id?: string | null;
+  status: string;
+  error?: string | null;
+  result_json?: string | null;
+  input_json?: string | null;
+  retry_count?: number;
+  created_at?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+}
+
+/**
+ * List recent embedding-reindex jobs (admin route; non-admin callers get 403
+ * and callers treat that as "family hidden", per the Activity tray contract).
+ */
+export async function listReindexJobs(): Promise<{ jobs: ReindexJobSummary[] }> {
+  const response = await apiClient.get<{ jobs: ReindexJobSummary[] }>(
+    "/documents/reindex/jobs"
+  );
+  return response.data;
+}
+
 export async function uploadDocument(
   file: File,
   onProgress?: (progress: number) => void,
@@ -961,11 +1204,13 @@ export async function uploadDocument(
   return response.data;
 }
 
-export async function scanDocuments(vaultId?: number): Promise<ScanDocumentsResponse> {
+export async function scanDocuments(): Promise<ScanDocumentsResponse> {
+  // No vault scoping: POST /documents/scan is a global-admin route that scans
+  // every vault's upload directory (issue #767) — a vault_id parameter would
+  // be silently ignored by the route.
   const response = await apiClient.post<ScanDocumentsResponse>(
     "/documents/scan",
-    undefined,
-    vaultId != null ? { params: { vault_id: vaultId } } : undefined
+    undefined
   );
   return response.data;
 }
@@ -1067,6 +1312,78 @@ export async function deleteDocument(fileId: string): Promise<void> {
   await apiClient.delete(`/documents/${fileId}`);
 }
 
+/**
+ * Best-effort keepalive DELETE for a pagehide flush of a confirmed document
+ * delete (#766). Mirrors addChatMessagesBatchKeepalive: keepalive requests
+ * cannot wait for CSRF-token discovery, so the cached token or the readable
+ * CSRF cookie is used; when neither exists NOTHING is sent and the caller
+ * must fall back to the normal deleteDocument path (never after a request
+ * was issued). Returns true when a keepalive fetch was attempted, false when
+ * no CSRF credential was available. Never throws; hard termination remains
+ * outside the guarantee.
+ */
+export function deleteDocumentKeepalive(fileId: string): boolean {
+  const csrfToken = getCsrfToken() ?? getCsrfCookie();
+  if (!csrfToken) return false;
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "X-CSRF-Token": csrfToken,
+  };
+  if (_jwtAccessToken) headers.Authorization = "Bearer " + _jwtAccessToken;
+  const url = API_BASE_URL + "/documents/" + fileId;
+  void fetch(url, {
+    method: "DELETE",
+    credentials: "include",
+    headers,
+    keepalive: true,
+  })
+    .then((response) => {
+      // Outcome is logged, never silently dropped (review round 1 PRR-006):
+      // a non-2xx means the confirmed delete did not land; DocumentsPage's
+      // bfcache pageshow replay completes the intent when the page returns.
+      if (!response.ok) {
+        logApiFailure(
+          "Keepalive document delete did not succeed:",
+          new Error(`keepalive DELETE returned HTTP ${response.status}`),
+          `${response.status} /documents/${fileId}`
+        );
+      }
+    })
+    .catch((error: unknown) => {
+      logApiFailure("Keepalive document delete did not reach the server:", error);
+    });
+  return true;
+}
+
+/**
+ * Sanitized API-failure logging for the documents surfaces (#766): logs the
+ * error's message plus response status and request URL — never the raw error
+ * object or its config, whose toJSON() serialization would carry the
+ * Authorization header to the browser console. Reads BOTH error shapes this
+ * repo produces (review round 1 PRR-014/M3-01): the apiClient response
+ * interceptor's normalized Error (top-level `status`, original error under
+ * `originalError`) and a raw AxiosError (`.response`/`.config`).
+ */
+export function logApiFailure(prefix: string, err: unknown, where?: string): void {
+  const message = err instanceof Error ? err.message : String(err);
+  const candidate = err as {
+    status?: unknown;
+    response?: { status?: unknown };
+    config?: { url?: string };
+    originalError?: { response?: { status?: unknown }; config?: { url?: string } };
+  };
+  let status: unknown;
+  if (candidate.status != null) status = candidate.status;
+  else if (candidate.response?.status != null) status = candidate.response.status;
+  else if (candidate.originalError?.response?.status != null) {
+    status = candidate.originalError.response.status;
+  }
+  const url = candidate.config?.url ?? candidate.originalError?.config?.url;
+  const whereResolved =
+    where ?? (url ? (status != null ? `${String(status)} ${url}` : url) : status != null ? String(status) : "");
+  console.error(prefix, message, whereResolved);
+}
+
 export async function deleteDocuments(fileIds: string[]): Promise<{ deleted_count: number, failed_ids: string[] }> {
   const response = await apiClient.post<{ deleted_count: number, failed_ids: string[] }>("/documents/batch", { file_ids: fileIds });
   return response.data;
@@ -1084,7 +1401,11 @@ export async function getDocumentStats(vaultId?: number): Promise<DocumentStatsR
 
 export async function getChunkContext(chunkId: string): Promise<ChunkContextResponse> {
   const response = await apiClient.get<ChunkContextResponse>(
-    `/search/chunks/${encodeURIComponent(chunkId)}/context`
+    `/search/chunks/${encodeURIComponent(chunkId)}/context`,
+    // Issue #718: request a small neighbor window so the Evidence pane can
+    // render the chunks around the matched one. Defaults live here (not in
+    // callers) to keep the one-arg call sites stable.
+    { params: { context_before: 1, context_after: 1 } }
   );
   return response.data;
 }

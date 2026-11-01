@@ -95,7 +95,9 @@ class ReindexDimensionProbeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, "failed", "missing file must fail per-file, not crash the job")
         self.assertEqual(result["processed"], 0)
         self.assertEqual(result["failed"], 1)
-        self.assertIsNone(error)
+        # issue #702: a per-file failure carries the first failing exception
+        # (redacted at the persist boundary) instead of a detail-free None.
+        self.assertIsInstance(error, FileNotFoundError)
         # The probe ran exactly once in fail_fast mode before any file work.
         self.assertEqual(len(self.emb.calls), 1)
         self.assertEqual(self.emb.calls[0], (("dimension_probe",), True))

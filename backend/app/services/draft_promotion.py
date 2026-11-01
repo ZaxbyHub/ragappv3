@@ -58,9 +58,11 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import inspect
 import logging
 import os
 import shutil
+import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -70,6 +72,7 @@ import anyio
 
 from app.config import settings
 from app.models.database import SQLiteConnectionPool
+from app.services.atomic_write import temp_sibling
 from app.services.background_tasks import BackgroundProcessor
 from app.services.document_processor import DocumentProcessor
 from app.services.document_progress import PHASE_QUEUED, set_phase
@@ -192,7 +195,10 @@ def _reserve_destination_path(upload_dir: Path, file_name: str) -> Path:
     counter = 0
     while True:
         try:
-            fd = os.open(str(file_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            # O_EXCL ensures atomic create — fails if file exists. No write
+            # flag: the placeholder reserves the name only; the bytes land
+            # via a temp sibling and os.replace (issue #786).
+            fd = os.open(str(file_path), os.O_CREAT | os.O_EXCL)
             os.close(fd)
             break
         except OSError as exc:
@@ -235,6 +241,95 @@ async def _reserve_destination_path_shielded(upload_dir: Path, file_name: str) -
     """
     with anyio.CancelScope(shield=True):
         return await asyncio.to_thread(_reserve_destination_path, upload_dir, file_name)
+
+
+def _reap_detached_temp(temp: Path, worker_done: threading.Event) -> None:
+    """Best-effort background cleanup of a temp written by a worker thread
+    that outlived its cancelled await (issue #786).
+
+    Cancelling a task that awaits an executor future cancels the wrapper
+    immediately while the thread keeps running, so the reaper must FIRST
+    wait for the worker to finish (``worker_done``) and only then unlink:
+    an unlink of a not-yet-created temp would silently read as success
+    while the worker is still about to create the file. After the worker
+    finishes, unlink is retried while it releases the Windows handle. A
+    survivor is a canonical ``.part`` that ``FileWatcher`` skips, never
+    ingestable bytes.
+    """
+    async def _reap() -> None:
+        for _ in range(600):  # bounded: ~60s at 100ms for the worker to end
+            if worker_done.is_set():
+                break
+            await asyncio.sleep(0.1)
+        for _attempt in range(60):  # bounded: ~15s at 250ms for handle release
+            try:
+                temp.unlink(missing_ok=True)
+                return
+            except OSError:
+                await asyncio.sleep(0.25)
+        logger.warning(
+            "draft_room_promote: could not reap detached write temp %s; "
+            "the canonical .part is watcher-skipped",
+            temp,
+        )
+
+    try:
+        asyncio.get_running_loop().create_task(_reap())
+    except RuntimeError:
+        pass
+
+
+async def _write_bytes_via_temp(write_bytes, dest: Path) -> None:
+    """Two-phase placement of promoted bytes (issue #786).
+
+    The worker thread only ever writes a canonical temp SIBLING of ``dest``
+    (plus the size check); the ``os.replace`` onto the reserved final path
+    happens HERE, on the event loop, only after the write await returns
+    normally. A cancellation during the copy therefore can never let a
+    detached worker place bytes at the watched final path after compensation
+    has already discarded the placeholder — the replace simply never runs
+    (shielding the await cannot achieve this: cancelling a task that awaits
+    an executor future cancels the wrapper immediately while the thread
+    keeps running, verified empirically). The worst cancellation residue is
+    a canonical ``.part`` (watcher-skipped), which ``_reap_detached_temp``
+    removes once the worker finishes.
+    """
+    temp = temp_sibling(dest)
+    worker_done = threading.Event()
+
+    def _worker() -> None:
+        try:
+            try:
+                write_bytes(temp)
+                _enforce_size_limit(temp)
+            except BaseException:
+                temp.unlink(missing_ok=True)
+                raise
+        finally:
+            worker_done.set()
+
+    try:
+        await asyncio.to_thread(_worker)
+    except asyncio.CancelledError:
+        _reap_detached_temp(temp, worker_done)
+        raise
+    try:
+        os.replace(temp, dest)
+    except BaseException:
+        # Placement is the one exit with no cleanup arm: a failed replace (a
+        # Windows sharing violation on the reserved placeholder or the temp)
+        # would otherwise orphan the temp forever, unlike the sibling producers
+        # in documents.py / upload_path.py (issue #786 review PRR-004).
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning(
+                "draft_room_promote: could not remove unwritten temp %s after a "
+                "failed placement: %s",
+                temp,
+                exc,
+            )
+        raise
 
 
 def _copy_input_bytes(storage: DraftInputStorage, input_record: DraftInputRecord, dest: Path) -> None:
@@ -580,7 +675,20 @@ async def _compensate(
         # (and a processor lacking the API — older test doubles — only costs
         # this step's success flag, never the compensation itself).
         try:
-            background_processor.cancel_pending_jobs(file_id=enqueued_file_id)
+            cancel_async = getattr(
+                background_processor, "cancel_pending_jobs_async", None
+            )
+            if inspect.iscoroutinefunction(cancel_async):
+                # Lease mode (the default) does a blocking pooled checkout
+                # inside the jobs-row pass; the async twin runs it off the
+                # event loop so the surrounding move_on_after budget can
+                # actually fire (issue #786). Anything that is not a
+                # coroutine function — older test doubles without the twin,
+                # or a MagicMock whose attribute access auto-creates a plain
+                # mock — keeps the synchronous call.
+                await cancel_async(file_id=enqueued_file_id)
+            else:
+                background_processor.cancel_pending_jobs(file_id=enqueued_file_id)
         except Exception:
             cleanup_ok = False
             logger.warning(
@@ -747,7 +855,7 @@ async def _promote(
     enqueued_file_id: Optional[int] = None
     try:
         dest_path = await _reserve_destination_path_shielded(upload_dir, file_name)
-        await asyncio.to_thread(write_bytes, dest_path)
+        await _write_bytes_via_temp(write_bytes, dest_path)
         await asyncio.to_thread(_enforce_size_limit, dest_path)
         source_sha256 = await asyncio.to_thread(compute_file_hash, str(dest_path))
         file_id = await asyncio.to_thread(_register_file, db_pool, dest_path, source_sha256, vault_id)

@@ -1,7 +1,10 @@
 // Composer — extracted from TranscriptPane for maintainability.
 // Handles draft persistence, auto-grow, slash commands, IME guard, file attachments.
 
-import { useRef, useEffect, useState, useCallback } from "react";
+import { useRef, useEffect, useLayoutEffect, useState, useCallback, useMemo } from "react";
+import { flushSync } from "react-dom";
+import { useInRouterContext, useLocation } from "react-router-dom";
+import { useCommandPaletteAction, type CommandPaletteActionGuard } from "@/lib/commandPaletteActions";
 import { useDropzone } from "react-dropzone";
 import {
   Send,
@@ -34,6 +37,7 @@ import { cn } from "@/lib/utils";
 import { useChatStore } from "@/stores/useChatStore";
 import { useChatModeStore } from "@/stores/useChatModeStore";
 import { useLlmHealthStore } from "@/stores/useLlmHealthStore";
+import { useAuthStore } from "@/stores/useAuthStore";
 import { useSettingsStore } from "@/stores/useSettingsStore";
 import { useVaultStore } from "@/stores/useVaultStore";
 import { useUploadStore } from "@/stores/useUploadStore";
@@ -43,6 +47,7 @@ import { computeEffectiveChatMode } from "@/lib/chatMode";
 import { MAX_INPUT_LENGTH } from "@/hooks/useSendMessage";
 import { useEscapeToStop } from "@/hooks/useEscapeToStop";
 import { toast } from "sonner";
+import { currentDraftGeneration, getDraftKey } from "@/lib/chatDrafts";
 
 // =============================================================================
 // Types
@@ -116,8 +121,8 @@ const SLASH_COMMANDS: SlashCommand[] = [
   { id: "actions",   label: "/actions",   description: "List action items",        icon: <ListChecks className="h-4 w-4" /> },
 ];
 
-const DRAFT_PREFIX = "ragapp_chat_draft_";
-const getDraftKey = (sessionId: string | null) => `${DRAFT_PREFIX}${sessionId ?? "new"}`;
+// Draft key scheme + identity-boundary invalidation live in
+// @/lib/chatDrafts (issue #823: the auth identity-switch reset shares them).
 
 // Draft persistence bounds (issue #616): a leading+trailing debounce keeps
 // rapid input bursts from rewriting the FULL draft string to localStorage
@@ -139,7 +144,51 @@ export const LARGE_PASTE_THRESHOLD = 4_000;
 // Composer
 // =============================================================================
 
+// The receiver lives inside the router in the app; isolated Composer consumers
+// retain their ordinary attachment controls without requiring a router provider.
+function ComposerPaletteAction({ open, guardRef, isStreaming }: {
+  open: () => void;
+  guardRef: React.MutableRefObject<CommandPaletteActionGuard | null>;
+  isStreaming: boolean;
+}) {
+  const { pathname } = useLocation();
+  const chatRevision = useRef(0);
+  useLayoutEffect(() => useChatStore.subscribe((next, previous) => {
+    if (next.activeChatId !== previous.activeChatId) chatRevision.current += 1;
+  }), []);
+  const consumerGuard = useCommandPaletteAction({
+    id: "attach-file",
+    label: "Attach file",
+    enabled: pathname === "/chat" && !isStreaming,
+    execute: (dispatchGuard) => {
+      if (dispatchGuard.isCurrent()) open();
+    },
+  });
+  const revision = chatRevision.current;
+  const chatId = useChatStore.getState().activeChatId;
+  const attachmentGuard = useMemo(() => ({
+    isCurrent: () => consumerGuard.isCurrent()
+      && chatRevision.current === revision
+      && useChatStore.getState().activeChatId === chatId,
+  }), [chatId, consumerGuard, revision]);
+  guardRef.current = attachmentGuard;
+  useLayoutEffect(() => {
+    guardRef.current = attachmentGuard;
+    return () => {
+      if (guardRef.current === attachmentGuard) guardRef.current = null;
+    };
+  }, [attachmentGuard, guardRef]);
+  return null;
+}
+
 export function Composer({ onSend, onStop, isStreaming, className, inputRef }: ComposerProps) {
+  const inRouter = useInRouterContext();
+  const attachmentGuardRef = useRef<CommandPaletteActionGuard | null>(null);
+  const selectionGuards = useRef(new WeakMap<object, CommandPaletteActionGuard | null>());
+  const pickerSequence = useRef(0);
+  const [pickerOpening, setPickerOpening] = useState<{
+    id: number; guard: CommandPaletteActionGuard | null;
+  }>({ id: 0, guard: null });
   const internalRef = useRef<HTMLTextAreaElement>(null);
   const textareaRef = (inputRef ?? internalRef) as React.RefObject<HTMLTextAreaElement>;
 
@@ -148,6 +197,9 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
   // individual selectors keep the #616 render budget.
   const input = useChatStore((s) => s.input);
   const setInput = useChatStore((s) => s.setInput);
+  // Issue #823: composer drafts are keyed per principal so a failed removal
+  // can never leak the previous user's unsent text to the next one.
+  const draftPrincipalId = useAuthStore((s) => s.user?.id ?? null);
   const inputError = useChatStore((s) => s.inputError);
   const setInputError = useChatStore((s) => s.setInputError);
   const activeChatId = useChatStore((s) => s.activeChatId);
@@ -234,14 +286,16 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
   const lastLoadedRef = useRef<string | null>(null);
   useEffect(() => {
     if (typeof window === "undefined") return;
-    const key = activeChatId ?? "new";
+    // The dedup key IS the storage key: a principal switch on the same
+    // session id must re-restore from the new principal's key (issue #823).
+    const key = getDraftKey(activeChatId, draftPrincipalId);
     if (lastLoadedRef.current === key) return;
     lastLoadedRef.current = key;
     try {
-      setInput(localStorage.getItem(getDraftKey(activeChatId)) ?? "");
+      setInput(localStorage.getItem(key) ?? "");
     } catch { /* private mode */ }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeChatId]);
+  }, [activeChatId, draftPrincipalId]);
 
   // Debounced draft persistence (issue #616). Leading+trailing: the first
   // change after an idle window writes synchronously (preserving the
@@ -250,8 +304,16 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
   // key is captured when the write is scheduled, so a session switch
   // mid-debounce can never bleed a draft across sessions.
   const draftTimerRef = useRef<number | null>(null);
-  const pendingDraftRef = useRef<{ key: string; value: string } | null>(null);
-  const lastWrittenRef = useRef<{ key: string; value: string } | null>(null);
+  const pendingDraftRef = useRef<{
+    key: string;
+    value: string;
+    gen: number;
+  } | null>(null);
+  const lastWrittenRef = useRef<{
+    key: string;
+    value: string;
+    gen: number;
+  } | null>(null);
 
   const writeDraftNow = useCallback((key: string, value: string) => {
     try {
@@ -267,8 +329,22 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
     }
     const pending = pendingDraftRef.current;
     pendingDraftRef.current = null;
+    // Issue #823: an identity switch (logout / different-principal login)
+    // both cleared every stored draft and bumped the generation this write
+    // was scheduled under. Executing it would resurrect the previous user's
+    // unsent text; drop it instead.
+    if (pending && pending.gen !== currentDraftGeneration()) return;
     const last = lastWrittenRef.current;
-    if (pending && (last?.key !== pending.key || last?.value !== pending.value)) {
+    // The generation is part of the "already persisted" comparison: an
+    // identity switch deletes the stored key AND bumps the generation, so a
+    // byte-identical draft typed by the NEXT identity must be written again
+    // rather than skipped as already-persisted (review PRR-007).
+    if (
+      pending &&
+      (last?.key !== pending.key ||
+        last?.value !== pending.value ||
+        last?.gen !== pending.gen)
+    ) {
       writeDraftNow(pending.key, pending.value);
       lastWrittenRef.current = pending;
     }
@@ -276,7 +352,7 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
 
   const persistDraft = useCallback((value: string) => {
     if (typeof window === "undefined") return;
-    const key = getDraftKey(activeChatId);
+    const key = getDraftKey(activeChatId, draftPrincipalId);
     // Session switched mid-debounce: the pending timer belongs to the OLD
     // session's key. Flush the old session's final value first, then take a
     // fresh leading edge so the new session's first write is synchronous
@@ -284,17 +360,17 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
     if (draftTimerRef.current !== null && pendingDraftRef.current?.key !== key) {
       flushPendingDraft();
     }
-    pendingDraftRef.current = { key, value };
+    pendingDraftRef.current = { key, value, gen: currentDraftGeneration() };
     if (draftTimerRef.current !== null) return;
     // Leading edge: write immediately, then hold the trailing window open
     // for the burst that often follows (paste, IME, fast typing).
     writeDraftNow(key, value);
-    lastWrittenRef.current = { key, value };
+    lastWrittenRef.current = { key, value, gen: currentDraftGeneration() };
     draftTimerRef.current = window.setTimeout(() => {
       draftTimerRef.current = null;
       flushPendingDraft();
     }, DRAFT_DEBOUNCE_MS);
-  }, [activeChatId, writeDraftNow, flushPendingDraft]);
+  }, [activeChatId, draftPrincipalId, writeDraftNow, flushPendingDraft]);
 
   // Synchronous clear used by the send path: the draft must be gone from
   // localStorage before onSend() runs, not 400ms later.
@@ -306,10 +382,10 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
     }
     pendingDraftRef.current = null;
     try {
-      localStorage.removeItem(getDraftKey(activeChatId));
+      localStorage.removeItem(getDraftKey(activeChatId, draftPrincipalId));
       lastWrittenRef.current = null;
     } catch { /* ignore */ }
-  }, [activeChatId]);
+  }, [activeChatId, draftPrincipalId]);
 
   // Unmount: never lose the tail of a burst that had not hit the trailing
   // edge yet.
@@ -436,19 +512,43 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
   // pool; the returned ids register the files as chat attachments so the
   // chips live in the store (surviving navigation) instead of this mount.
   const enqueueFiles = useCallback(
-    (files: File[]) => {
-      if (files.length === 0) return;
+    (files: File[], guard = attachmentGuardRef.current) => {
+      if (files.length === 0 || (inRouter && !guard) || (guard && !guard.isCurrent())) return;
       const queuedIds = addUploads(files, activeVaultId ?? undefined);
-      queuedIds.forEach((id) => attachToChat(id));
+      for (const id of queuedIds) {
+        if (guard && !guard.isCurrent()) return;
+        attachToChat(id);
+      }
     },
-    [activeVaultId, addUploads, attachToChat]
+    [activeVaultId, addUploads, attachToChat, inRouter]
   );
 
   const { getRootProps, getInputProps, isDragActive, open: openFilePicker } = useDropzone({
     noClick: true,
     noKeyboard: true,
-    onDrop: enqueueFiles,
+    onDrop: (files, _rejections, event) => {
+      // react-dropzone reads files asynchronously. The event retains the guard
+      // captured before that work, including the native input's own opening.
+      const guard = event && selectionGuards.current.has(event)
+        ? selectionGuards.current.get(event) ?? null
+        : attachmentGuardRef.current;
+      if (event) selectionGuards.current.delete(event);
+      enqueueFiles(files, guard);
+    },
   });
+  const openAttachmentPicker = () => {
+    const guard = attachmentGuardRef.current;
+    if (isStreaming || (inRouter && !guard) || (guard && !guard.isCurrent())) return;
+    const id = ++pickerSequence.current;
+    const selectionGuard = {
+      isCurrent: () => pickerSequence.current === id && (!guard || guard.isCurrent()),
+    };
+    // Replace the input before its synchronous click. An old native dialog
+    // cannot deliver a selection through a later opening's input handler;
+    // the sequence also retires extraction that has already begun.
+    flushSync(() => setPickerOpening({ id, guard: selectionGuard }));
+    if (selectionGuard.isCurrent()) openFilePicker();
+  };
 
   // Handle paste with files, and large plain-text pastes as attachments
   // (issue #616): paste-sized text becomes a text/plain File through the
@@ -490,7 +590,11 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
 
   return (
     <TooltipProvider>
-      <div className={cn("relative", className)} {...getRootProps()}>
+      {inRouter && <ComposerPaletteAction open={openAttachmentPicker} guardRef={attachmentGuardRef} isStreaming={isStreaming} />}
+      <div className={cn("relative", className)} {...getRootProps({
+        onDrop: (event) => { selectionGuards.current.set(event, attachmentGuardRef.current); },
+        onPaste: (event) => { selectionGuards.current.set(event, attachmentGuardRef.current); },
+      })}>
         {/* Drag overlay */}
         {isDragActive && (
           <div className="absolute inset-0 z-20 flex items-center justify-center rounded-xl border-2 border-dashed border-primary bg-primary/5">
@@ -540,8 +644,8 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
                     "flex items-center gap-2 rounded-sm border px-2 py-1.5 text-xs",
                     status === "error" && "border-destructive/50 bg-destructive/5",
                     status === "indexed" && "border-success/50 bg-success/5",
-                    status === "uploaded" && "border-amber-500/40 bg-amber-500/5",
-                    status === "indexing" && "border-amber-500/40 bg-amber-500/5",
+                    status === "uploaded" && "border-warning/40 bg-warning/5",
+                    status === "indexing" && "border-warning/40 bg-warning/5",
                     status === "uploading" && "border-border bg-muted/50"
                   )}
                   aria-label={`Attachment ${att.file.name}: ${statusText}`}
@@ -563,7 +667,7 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
                       status === "error" && "text-destructive",
                       status === "indexed" && "text-success",
                       (status === "uploaded" || status === "indexing") &&
-                        "text-amber-700 dark:text-amber-300",
+                        "text-warning",
                       status === "uploading" && "text-muted-foreground"
                     )}
                   >
@@ -582,7 +686,7 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
             {hasIndexing && (
               <div
                 role="status"
-                className="text-[11px] text-amber-700 dark:text-amber-300 self-center"
+                className="text-[11px] text-warning self-center"
                 aria-live="polite"
               >
                 Some attachments are still indexing — they may not be searchable yet.
@@ -595,7 +699,7 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
         <div
           className={cn(
             "relative rounded-xl border bg-card shadow-xs transition-all duration-150",
-            "focus-within:border-primary/50 focus-within:shadow-md focus-within:shadow-primary/5",
+            "ring-offset-background focus-within:border-primary/50 focus-within:ring-2 focus-within:ring-ring focus-within:ring-offset-2 focus-within:shadow-md focus-within:shadow-primary/5",
             isStreaming ? "border-primary/30" : "border-input",
           )}
         >
@@ -608,8 +712,10 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
             onPaste={handlePaste}
             placeholder={isStreaming ? "Generating..." : "Message... (Enter to send · Shift+Enter for newline · / for commands)"}
             className={cn(
+              // Bare muted-foreground placeholder: the /60 override measured
+              // 2.45:1 on the card surface in light theme (#777/UI-R3-03).
               "min-h-[44px] max-h-[200px] resize-none border-0 bg-transparent px-4 py-3",
-              "text-sm placeholder:text-muted-foreground/60",
+              "text-sm placeholder:text-muted-foreground",
               "focus-visible:ring-0 focus-visible:ring-offset-0",
             )}
             readOnly={isStreaming}
@@ -695,7 +801,7 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
                       textareaRef.current?.focus();
                     }}
                     aria-label="Open slash commands"
-                    tabIndex={-1}
+                    tabIndex={0}
                   >
                     <Slash className="h-4 w-4" />
                   </Button>
@@ -710,9 +816,9 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
                     variant="ghost"
                     size="icon"
                     className="h-8 w-8 text-muted-foreground active:scale-95"
-                    onClick={openFilePicker}
+                    onClick={openAttachmentPicker}
                     aria-label="Attach file"
-                    tabIndex={-1}
+                    tabIndex={0}
                     disabled={isStreaming}
                   >
                     <Paperclip className="h-4 w-4" />
@@ -721,7 +827,9 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
                 <TooltipContent><p>Attach file</p></TooltipContent>
               </Tooltip>
               {/* Hidden dropzone input */}
-              <input {...getInputProps()} />
+              <input key={pickerOpening.id} {...getInputProps({
+                onChange: (event) => { selectionGuards.current.set(event, pickerOpening.guard); },
+              })} />
             </div>
 
             {/* Generation status label */}
@@ -891,7 +999,7 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
                 <span
                   role="status"
                   aria-live="polite"
-                  className="text-[10px] text-amber-700 dark:text-amber-300"
+                  className="text-[10px] text-warning"
                 >
                   Using {effectiveChatMode} — {desiredChatMode} unavailable
                 </span>

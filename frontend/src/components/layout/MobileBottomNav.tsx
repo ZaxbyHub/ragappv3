@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { MessageSquare, FileText, Brain, MoreHorizontal, Database, Settings, Users, X, User, Building2, UserCog, BookOpen, Library, LogOut, PenLine } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { MessageSquare, FileText, Brain, MoreHorizontal, Database, Settings, Users, User, Building2, UserCog, BookOpen, Library, LogOut, PenLine } from "lucide-react";
 import {
   Sheet,
   SheetContent,
@@ -10,13 +10,15 @@ import {
 } from "@/components/ui/sheet";
 import { cn } from "@/lib/utils";
 import { useAuthStore } from "@/stores/useAuthStore";
+import { captureAuthOwner, isCurrentAuthOwner } from "@/lib/api/auth-lifecycle";
 import { useNavigate } from "react-router-dom";
 import type { NavItemId } from "./navigationTypes";
 import { useDraftRoomVisible } from "@/hooks/useDraftRoomCapabilities";
 import { DRAFT_ROOM_NAV_LABEL } from "@/components/draft-room/labels";
 
 interface MobileBottomNavProps {
-  activeItem: NavItemId;
+  // null = no item active (unmapped routes like /search; issue #779/UI-R1-08).
+  activeItem: NavItemId | null;
   onItemSelect: (id: NavItemId) => void;
 }
 
@@ -42,16 +44,32 @@ const moreNavItems: { id: NavItemId; label: string; icon: React.ComponentType<{ 
 
 export function MobileBottomNav({ activeItem, onItemSelect }: MobileBottomNavProps) {
   const [moreOpen, setMoreOpen] = useState(false);
+  const isMounted = useRef(true);
+  useEffect(() => {
+    isMounted.current = true;
+    return () => { isMounted.current = false; };
+  }, []);
   const navigate = useNavigate();
   const userRole = useAuthStore((state) => state.user?.role);
   const logout = useAuthStore((state) => state.logout);
   const isAdmin = userRole === "admin" || userRole === "superadmin";
   const draftRoomVisible = useDraftRoomVisible();
 
-  const handleLogout = async () => {
+  const handleLogout = () => {
     setMoreOpen(false);
-    await logout();
-    navigate("/login", { replace: true });
+    // The store deliberately rejects stale/deadline logout to its callers.
+    // This UI boundary consumes that rejection so a dropped click never leaks
+    // an unhandled promise, and it navigates only after the current success.
+    const operation = logout();
+    const logoutOwner = captureAuthOwner();
+    return operation.then(
+      () => {
+        if (isMounted.current && isCurrentAuthOwner(logoutOwner)) {
+          navigate("/login", { replace: true });
+        }
+      },
+      () => undefined,
+    );
   };
 
   return (
@@ -68,8 +86,13 @@ export function MobileBottomNav({ activeItem, onItemSelect }: MobileBottomNavPro
               onClick={() => onItemSelect(item.id)}
               className={cn(
                 "flex flex-col items-center gap-1 min-w-[44px] min-h-[44px] px-3 py-2 rounded-sm transition-all duration-200",
-                "hover:bg-secondary focus:outline-hidden focus-visible:ring-2 focus-visible:ring-ring",
-                isActive && "bg-primary/10"
+                "hover:bg-secondary focus:outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
+                // Issue #778: the active label is foreground text + an inset
+                // ring cue (the #862 tabs pattern) — text-primary at text-xs
+                // on the bg-primary/10 pill measured ~4.4:1 in light theme,
+                // under the 4.5:1 AA floor; the pill alone measured ~1.1:1,
+                // so the ring restores a >=3:1 non-text state cue.
+                isActive && "bg-primary/10 ring-2 ring-inset ring-foreground"
               )}
               aria-label={item.label}
               aria-current={isActive ? "page" : undefined}
@@ -83,7 +106,7 @@ export function MobileBottomNav({ activeItem, onItemSelect }: MobileBottomNavPro
               <span
                 className={cn(
                   "text-xs font-medium transition-colors",
-                  isActive ? "text-primary" : "text-muted-foreground"
+                  isActive ? "text-foreground" : "text-muted-foreground"
                 )}
               >
                 {item.label}
@@ -98,8 +121,10 @@ export function MobileBottomNav({ activeItem, onItemSelect }: MobileBottomNavPro
             <button
               className={cn(
                 "flex flex-col items-center gap-1 min-w-[44px] min-h-[44px] px-3 py-2 rounded-sm transition-all duration-200",
-                "hover:bg-secondary focus:outline-hidden focus-visible:ring-2 focus-visible:ring-ring",
-                moreOpen && "bg-primary/10"
+                "hover:bg-secondary focus:outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
+                // Issue #778: same open-state cue contract as the active tab
+                // above (foreground label + inset ring, not text-primary).
+                moreOpen && "bg-primary/10 ring-2 ring-inset ring-foreground"
               )}
               aria-label="More navigation options"
               aria-expanded={moreOpen}
@@ -114,29 +139,25 @@ export function MobileBottomNav({ activeItem, onItemSelect }: MobileBottomNavPro
               <span
                 className={cn(
                   "text-xs font-medium transition-colors",
-                  moreOpen ? "text-primary" : "text-muted-foreground"
+                  moreOpen ? "text-foreground" : "text-muted-foreground"
                 )}
               >
                 More
               </span>
             </button>
           </SheetTrigger>
-          <SheetContent side="bottom" className="h-[50vh] rounded-t-2xl" aria-describedby="mobile-more-desc">
-            <SheetHeader className="mb-6">
-              <div className="flex items-center justify-between">
-                <SheetTitle id="mobile-more-title" className="text-xl font-semibold">More</SheetTitle>
-                <button
-                  onClick={() => setMoreOpen(false)}
-                  className="p-2 rounded-sm hover:bg-secondary focus:outline-hidden focus-visible:ring-2 focus-visible:ring-ring min-w-[44px] min-h-[44px]"
-                  aria-label="Close"
-                >
-                  <X className="w-5 h-5" />
-                </button>
-</div>
+          {/* Issue #776 (UI-R4-03): admin tile lists exceed 50vh, so the sheet
+              content scrolls — the scroll lives on an inner region so the
+              built-in close control (absolutely positioned on SheetContent)
+              stays pinned and reachable while scrolled (review PRR-002).
+              Issue #776 (UI-R4-04): this sheet must not add a second close. */}
+          <SheetContent side="bottom" className="flex h-[50vh] flex-col rounded-t-2xl" aria-describedby="mobile-more-desc">
+            <SheetHeader className="shrink-0 pb-2">
+              <SheetTitle id="mobile-more-title" className="text-xl font-semibold">More</SheetTitle>
               <SheetDescription id="mobile-more-desc">Access settings, help, and other options</SheetDescription>
             </SheetHeader>
 
-            <div className="grid grid-cols-2 gap-3">
+            <div className="grid flex-1 grid-cols-2 content-start gap-3 overflow-y-auto">
               {moreNavItems
                 .filter((item) => (!item.adminOnly || isAdmin) && (!item.capabilityGated || draftRoomVisible))
                 .map((item) => {
@@ -152,8 +173,10 @@ export function MobileBottomNav({ activeItem, onItemSelect }: MobileBottomNavPro
                     }}
                     className={cn(
                       "flex flex-col items-center gap-3 p-4 rounded-xl border border-border transition-all duration-200",
-                      "hover:bg-secondary focus:outline-hidden focus-visible:ring-2 focus-visible:ring-ring",
-                      isActive && "bg-primary/10 border-primary/20"
+                      "hover:bg-secondary focus:outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
+                      // Issue #778: foreground label + inset ring cue for the
+                      // active tile (same contract as the primary tabs).
+                      isActive && "bg-primary/10 border-primary/20 ring-2 ring-inset ring-foreground"
                     )}
                     aria-label={item.label}
                   >
@@ -163,12 +186,7 @@ export function MobileBottomNav({ activeItem, onItemSelect }: MobileBottomNavPro
                         isActive ? "text-primary" : "text-muted-foreground"
                       )}
                     />
-                    <span
-                      className={cn(
-                        "text-sm font-medium transition-colors",
-                        isActive ? "text-primary" : "text-foreground"
-                      )}
-                    >
+                    <span className="text-sm font-medium transition-colors text-foreground">
                       {item.label}
                     </span>
                   </button>

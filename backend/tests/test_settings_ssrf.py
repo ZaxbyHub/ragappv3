@@ -732,13 +732,21 @@ class TestRerankerUrlSettingsGate(unittest.TestCase):
     """
 
     def setUp(self):
-        # The SSRF guard only blocks private/loopback targets when
-        # ALLOW_LOCAL_SERVICES is unset. Pop it for the lifetime of these tests
-        # so the rejection assertions are deterministic regardless of the
-        # ambient environment (sibling localhost tests require it set).
+        # The SSRF guard only blocks private/loopback targets when the
+        # ALLOW_LOCAL_SERVICES opt-in is off. Since issue #726 the opt-in
+        # also falls back to the .env-backed Settings field when the env var
+        # is absent, so popping the var alone is no longer hermetic: pin the
+        # Settings field too (and restore it) alongside the env pop.
         self._orig_allow_local = os.environ.pop("ALLOW_LOCAL_SERVICES", None)
+        from app.config import settings as _settings
+
+        self._orig_allow_local_field = _settings.allow_local_services
+        _settings.allow_local_services = False
 
     def tearDown(self):
+        from app.config import settings as _settings
+
+        _settings.allow_local_services = self._orig_allow_local_field
         if self._orig_allow_local is not None:
             os.environ["ALLOW_LOCAL_SERVICES"] = self._orig_allow_local
         else:

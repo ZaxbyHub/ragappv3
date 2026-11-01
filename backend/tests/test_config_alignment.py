@@ -368,26 +368,28 @@ class TestRefactoredValidators:
             assert settings.multi_scale_overlap_ratio == 0.5
 
     def test_multi_scale_overlap_ratio_at_boundaries(self):
-        """multi_scale_overlap_ratio should accept boundary values 0.0 and 1.0."""
+        """0.0 stays valid; 1.0 is rejected (issue #698: at 1.0 the per-scale
+        overlap equals the scale size and every ingest fails in the chunker)."""
         with patch.dict("os.environ", {"MULTI_SCALE_OVERLAP_RATIO": "0.0"}):
             settings = Settings()
             assert settings.multi_scale_overlap_ratio == 0.0
 
         with patch.dict("os.environ", {"MULTI_SCALE_OVERLAP_RATIO": "1.0"}):
-            settings = Settings()
-            assert settings.multi_scale_overlap_ratio == 1.0
+            with pytest.raises(ValidationError) as exc_info:
+                Settings()
+            assert "multi_scale_overlap_ratio" in str(exc_info.value)
 
     def test_multi_scale_overlap_ratio_out_of_range(self):
-        """multi_scale_overlap_ratio should reject values outside 0.0-1.0."""
+        """multi_scale_overlap_ratio should reject values outside [0.0, 1.0)."""
         with patch.dict("os.environ", {"MULTI_SCALE_OVERLAP_RATIO": "-0.1"}):
             with pytest.raises(ValidationError) as exc_info:
                 Settings()
-            assert "multi_scale_overlap_ratio must be >= 0.0" in str(exc_info.value)
+            assert "multi_scale_overlap_ratio" in str(exc_info.value)
 
         with patch.dict("os.environ", {"MULTI_SCALE_OVERLAP_RATIO": "1.5"}):
             with pytest.raises(ValidationError) as exc_info:
                 Settings()
-            assert "multi_scale_overlap_ratio must be <= 1.0" in str(exc_info.value)
+            assert "multi_scale_overlap_ratio" in str(exc_info.value)
 
 
 class TestBatchConfigConsistencyValidator:

@@ -51,7 +51,7 @@ vi.mock("@/lib/api", () => ({
   recompileVaultWiki: vi.fn(),
   // File-name resolution paths the post-fix detail sections may use.
   getDocument: vi.fn(),
-  listDocuments: vi.fn().mockResolvedValue({ documents: [] }),
+  listDocuments: vi.fn().mockResolvedValue({ documents: [], total: 0 }),
   // useWikiEventStream reads these from the barrel.
   API_BASE_URL: "/api",
   getJwtAccessToken: vi.fn(() => null),
@@ -122,7 +122,7 @@ beforeEach(() => {
         body: {
           getReader: () => ({
             read: () => new Promise<{ value?: Uint8Array; done: boolean }>(() => {}),
-            cancel: vi.fn(),
+            cancel: vi.fn(() => Promise.resolve()),
           }),
         },
       } as unknown as Response)

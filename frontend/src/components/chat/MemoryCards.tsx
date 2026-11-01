@@ -6,9 +6,11 @@ import type { UsedMemory } from "@/lib/api";
 
 interface MemoryCardProps {
   memory: UsedMemory;
+  /** Per-label support score from the done payload (issue #714); undefined = none. */
+  supportScore?: number;
 }
 
-function MemoryCard({ memory }: MemoryCardProps) {
+function MemoryCard({ memory, supportScore }: MemoryCardProps) {
   const [expanded, setExpanded] = useState(false);
   const isLong = memory.content.length > 160;
   const display = expanded || !isLong ? memory.content : memory.content.slice(0, 160) + "…";
@@ -17,8 +19,8 @@ function MemoryCard({ memory }: MemoryCardProps) {
   return (
     <div
       className={cn(
-        "rounded-sm border border-amber-500/30 bg-amber-500/5 p-3 text-sm",
-        "hover:border-amber-500/50 hover:bg-amber-500/10 transition-colors duration-150",
+        "rounded-sm border border-warning/30 bg-warning/5 p-3 text-sm",
+        "hover:border-warning/50 hover:bg-warning/10 transition-colors duration-150",
       )}
       role="article"
       aria-label={`Memory ${memory.memory_label}`}
@@ -26,13 +28,13 @@ function MemoryCard({ memory }: MemoryCardProps) {
     >
       <div className="flex items-start gap-2">
         <span
-          className="shrink-0 inline-flex items-center justify-center min-w-6 h-5 px-1.5 rounded-full bg-amber-500/20 text-amber-700 dark:text-amber-300 text-[10px] font-bold"
+          className="shrink-0 inline-flex items-center justify-center min-w-6 h-5 px-1.5 rounded-full bg-warning/20 text-warning text-[10px] font-bold"
           aria-label={`Memory label ${memory.memory_label}`}
         >
           {memory.memory_label}
         </span>
         <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-1.5 text-xs text-amber-700/80 dark:text-amber-300/80 mb-1">
+          <div className="flex items-center gap-1.5 text-xs text-warning/80 mb-1">
             <Brain className="h-3 w-3" aria-hidden />
             <span className="font-medium">Memory</span>
             {memory.category && (
@@ -47,13 +49,24 @@ function MemoryCard({ memory }: MemoryCardProps) {
                 <span className="italic">{memory.source}</span>
               </>
             )}
+            {supportScore != null && (
+              <>
+                <span aria-hidden>·</span>
+                <span
+                  className="text-foreground"
+                  title="Word overlap between the claim sentence and the cited evidence — a lexical measure, not a correctness probability"
+                >
+                  Support {Math.round(supportScore * 100)}%
+                </span>
+              </>
+            )}
           </div>
           <p className="text-xs leading-relaxed text-foreground/90">{display}</p>
           {isLong && (
             <button
               type="button"
               onClick={() => setExpanded((v) => !v)}
-              className="mt-1 text-[10px] text-amber-700 dark:text-amber-300 hover:underline flex items-center gap-0.5"
+              className="mt-1 text-[10px] text-warning hover:underline flex items-center gap-0.5"
               aria-expanded={expanded}
             >
               {expanded ? (
@@ -73,7 +86,7 @@ function MemoryCard({ memory }: MemoryCardProps) {
                 <Badge
                   key={t}
                   variant="outline"
-                  className="text-[10px] px-1.5 py-0 border-amber-500/30 text-amber-700 dark:text-amber-300"
+                  className="text-[10px] px-1.5 py-0 border-warning/30 text-warning"
                 >
                   <Tag className="h-2.5 w-2.5 mr-0.5" aria-hidden /> {t}
                 </Badge>
@@ -102,9 +115,11 @@ function parseTagList(tags: string | null | undefined): string[] {
 
 interface MemoryCardsProps {
   memories: UsedMemory[];
+  /** Per-label support scores from the done payload; key = memory_label (issue #714). */
+  citationConfidence?: Record<string, number>;
 }
 
-export function MemoryCards({ memories }: MemoryCardsProps) {
+export function MemoryCards({ memories, citationConfidence }: MemoryCardsProps) {
   if (!memories || memories.length === 0) return null;
   return (
     <div className="mt-3 space-y-2" data-testid="memory-cards">
@@ -114,7 +129,11 @@ export function MemoryCards({ memories }: MemoryCardsProps) {
       </div>
       <div className="space-y-1.5">
         {memories.map((m) => (
-          <MemoryCard key={m.id || m.memory_label} memory={m} />
+          <MemoryCard
+            key={m.id || m.memory_label}
+            memory={m}
+            supportScore={citationConfidence?.[m.memory_label]}
+          />
         ))}
       </div>
     </div>

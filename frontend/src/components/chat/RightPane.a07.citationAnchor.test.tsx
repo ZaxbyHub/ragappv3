@@ -9,7 +9,7 @@
 // shows msg1's list.
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import { RightPane } from "./RightPane";
 import { useChatStore } from "@/stores/useChatStore";
 import { useChatShellStore } from "@/stores/useChatShellStore";

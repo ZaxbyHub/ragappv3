@@ -14,10 +14,12 @@ from typing import Union, get_args, get_origin
 from fastapi import FastAPI
 
 from app.api.routes.settings import PERSISTED_FUNCTIONAL_FIELDS
-from app.config import Settings, settings
+from app.config import Settings, canonicalize_vector_metric, settings
 from app.middleware.logging import SensitiveFieldFilter
 from app.models.database import SQLiteConnectionPool, get_pool, run_migrations
+from app.models.migration_journal import MIGRATION_CONNECT_TIMEOUT_SECONDS
 from app.security import CSRFManager
+from app.services.audit_redaction import run_startup_audit_redaction
 from app.services.background_tasks import get_background_processor
 from app.services.document_extraction import DocumentExtractionService
 from app.services.draft_input_storage import DraftInputStorage
@@ -168,14 +170,36 @@ def _validate_setting_value(key: str, value) -> bool:
         current[key] = value
         type(settings).model_validate(current)
         return True
-    except Exception as e:
-        logger.warning("Persisted setting %s=%r failed validation: %s", key, value, e)
+    except Exception:
+        # Persisted values may contain credentials or other sensitive settings.
+        # Log the field name only; callers retain the validation boundary.
+        logger.warning("Persisted setting %s failed validation", key)
+        return False
+
+
+def _batch_validate_persisted(converted_pairs: dict) -> bool:
+    """Validate ALL persisted values as one merged candidate state.
+
+    Cross-field model validators (chunk overlap vs size, jobs-lease
+    coherence) reject a persisted pair when each key is validated alone
+    against the not-yet-updated singleton, silently reverting one field of
+    an operator-saved pair on restart (issue #698 feedback). Validating the
+    merged candidate once makes a jointly-valid pair replay as a unit;
+    callers fall back to per-key replay when this returns False.
+    """
+    try:
+        candidate = settings.model_dump()
+        candidate.update(converted_pairs)
+        type(settings).model_validate(candidate)
+        return True
+    except Exception:
+        logger.warning("Persisted settings rejected as a set; falling back to per-key replay")
         return False
 
 
 def _load_persisted_settings(sqlite_path: str) -> None:
     """Load user-configurable settings from DB if they were previously saved."""
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     conn.row_factory = sqlite3.Row
     try:
         cursor = conn.execute("SELECT key, value FROM settings_kv")
@@ -204,8 +228,8 @@ def _load_persisted_settings(sqlite_path: str) -> None:
                         converted = persisted[key]
                     if _validate_setting_value(key, converted):
                         setattr(settings, key, converted)
-                except Exception as e:
-                    logger.warning(f"Failed to restore persisted setting {key}: {e}")
+                except Exception:
+                    logger.warning("Failed to restore persisted setting %s", key)
 
         # Every remaining persisted functional field replays through the typed
         # converter map (issue #494 CONFIG-003).
@@ -241,6 +265,8 @@ def _load_persisted_settings(sqlite_path: str) -> None:
             "jobs_heartbeat_interval_seconds",
             "jobs_lease_reclaim_timeout_seconds",
             "jobs_max_attempts",
+            # Reindex stall watchdog budget (issue #1010)
+            "jobs_stall_timeout_seconds",
             "reranking_enabled",
             "reranker_top_n",
             "initial_retrieval_top_k",
@@ -337,36 +363,62 @@ def _load_persisted_settings(sqlite_path: str) -> None:
         # Iterate the exported single source of truth; the guard above
         # guarantees the literal mirror (plus the legacy-loop keys above)
         # covers exactly this set.
+        #
+        # Two-pass replay (issue #698 feedback): convert every persisted key
+        # first, then batch-validate the merged candidate state ONCE before
+        # applying. Per-key validation alone rejects a jointly-valid pair
+        # (e.g. chunk_size_chars=150 + chunk_overlap_chars=100 replayed over
+        # boot defaults {2000,200}) because the first key is checked against
+        # the not-yet-updated sibling — silently reverting one field of an
+        # operator-saved pair on restart. When the merged set is rejected,
+        # fall back to the historical per-key behavior (warn + skip each
+        # offender individually).
+        converted_pairs: dict = {}
         for key in PERSISTED_FUNCTIONAL_FIELDS:
-            if key in persisted:
-                try:
-                    if not hasattr(settings, key):
-                        logger.warning(f"Unknown persisted setting {key}, skipping")
-                        continue
-                    decoder = _PERSISTED_FIELD_DECODERS.get(key)
-                    if decoder is not None:
-                        converted = decoder(persisted[key])
+            if key not in persisted:
+                continue
+            try:
+                if not hasattr(settings, key):
+                    logger.warning(f"Unknown persisted setting {key}, skipping")
+                    continue
+                decoder = _PERSISTED_FIELD_DECODERS.get(key)
+                if decoder is not None:
+                    converted = decoder(persisted[key])
+                else:
+                    # Fallback: infer from the current value's runtime type.
+                    expected_type = type(getattr(settings, key))
+                    raw = persisted[key]
+                    if expected_type is type(None):  # NoneType - just set as string
+                        converted = raw
+                    elif expected_type is bool:
+                        converted = str(raw).lower() in ("true", "1", "yes", "on")
+                    elif expected_type is int:
+                        converted = int(raw)
+                    elif expected_type is float:
+                        converted = float(raw)
                     else:
-                        # Fallback: infer from the current value's runtime type.
-                        expected_type = type(getattr(settings, key))
-                        raw = persisted[key]
-                        if expected_type is type(None):  # NoneType - just set as string
+                        try:
+                            converted = json.loads(raw)
+                        except (json.JSONDecodeError, ValueError):
                             converted = raw
-                        elif expected_type is bool:
-                            converted = str(raw).lower() in ("true", "1", "yes", "on")
-                        elif expected_type is int:
-                            converted = int(raw)
-                        elif expected_type is float:
-                            converted = float(raw)
-                        else:
-                            try:
-                                converted = json.loads(raw)
-                            except (json.JSONDecodeError, ValueError):
-                                converted = raw
+                if key == "vector_metric":
+                    converted = canonicalize_vector_metric(converted)
+                converted_pairs[key] = converted
+            except Exception:
+                logger.warning("Failed to restore persisted setting %s", key)
+        if converted_pairs and _batch_validate_persisted(converted_pairs):
+            for key, converted in converted_pairs.items():
+                setattr(settings, key, converted)
+        else:
+            for key in PERSISTED_FUNCTIONAL_FIELDS:
+                if key not in converted_pairs:
+                    continue
+                converted = converted_pairs[key]
+                try:
                     if _validate_setting_value(key, converted):
                         setattr(settings, key, converted)
-                except Exception as e:
-                    logger.warning(f"Failed to restore persisted setting {key}: {e}")
+                except Exception:
+                    logger.warning("Failed to restore persisted setting %s", key)
     except sqlite3.OperationalError:
         logger.debug(
             "Settings table not yet created; skipping persisted settings load (expected on first startup)"
@@ -383,6 +435,33 @@ async def _safe_await(coro, name, timeout=10):
         logger.warning(f"{name} timed out after {timeout}s (continuing)")
     except Exception as e:
         logger.warning(f"{name} failed: {e} (continuing)")
+
+
+async def _await_migration(coro, name):
+    """Await a migration WITHOUT a cancel-on-timeout deadline (issue #706).
+
+    A wall-clock deadline can cancel a staging swap mid-drop — CancelledError
+    is a BaseException and bypasses the swap's except-Exception critical
+    handling, leaving a half-swapped table whose next-boot reconcile could
+    silently discard one generation. Migrations run unbounded; genuine
+    failures are still caught-and-logged (fail-soft startup).
+
+    A shutdown cancellation (SIGTERM/restart mid-boot) is the remaining
+    cancel source: it is logged CRITICAL before propagating, so the operator
+    gets the same "swap was interrupted, staging holds the recoverable
+    copy" evidence the removed deadline used to suppress.
+    """
+    try:
+        await coro
+    except Exception as e:
+        logger.warning(f"{name} failed: {e} (continuing)")
+    except BaseException:
+        logger.critical(
+            f"{name} was interrupted by cancellation mid-swap; the staging "
+            f"table holds the recoverable copy and a restart reconciles it "
+            f"before the app serves."
+        )
+        raise
 
 
 async def _validate_tei_embedding_model(embedding_service) -> None:
@@ -544,10 +623,17 @@ async def lifespan(app: FastAPI):
     # Operator visibility (issue #512 recovery journal): one summary line
     # with the latest migration/recovery outcomes so a prior failed or
     # recovered migration is visible without querying the journal table.
+    # Issue #699: clean boots no longer write routine journal rows, and an
+    # UNRESOLVED failure/recovery (no later succeeded row for the same
+    # migration — on upgraded databases it is typically buried under
+    # pre-existing noise rows) is surfaced as one extra signal line; resolved
+    # failures are never re-warned.
     try:
-        from app.models.migration_journal import latest_outcomes
+        from app.models.migration_journal import latest_outcomes_with_signal
 
-        _recent = latest_outcomes(str(settings.sqlite_path), limit=3)
+        _recent, _signal = latest_outcomes_with_signal(
+            str(settings.sqlite_path), limit=3
+        )
         if _recent:
             logger.info(
                 "Migration journal (latest %d): %s",
@@ -556,6 +642,17 @@ async def lifespan(app: FastAPI):
                     f"{row['migration_name']}[{row['phase']}:{row['outcome']}]"
                     for row in _recent
                 ),
+            )
+        if _signal is not None:
+            logger.warning(
+                "Migration journal (unresolved failure/recovery, %s, outside "
+                "latest %d): %s[%s:%s] %s",
+                _signal.get("created_at") or "unknown time",
+                len(_recent),
+                _signal["migration_name"],
+                _signal["phase"],
+                _signal["outcome"],
+                _signal.get("detail") or "",
             )
     except Exception as e:  # pragma: no cover - journal is best-effort
         logger.debug("Could not read migration journal at startup: %s", e)
@@ -651,25 +748,24 @@ async def lifespan(app: FastAPI):
     # Critical: fail fast if the vector store cannot connect or initialize its table.
     # Without these two, no search or ingestion is possible.
     await asyncio.wait_for(app.state.vector_store.connect(), timeout=15)
-    await _safe_await(
+    # [issue #706] Migrations run WITHOUT a cancel-on-timeout deadline: a
+    # deadline cancelling a mid-swap migration can silently drop a corpus
+    # generation (see _await_migration).
+    await _await_migration(
         app.state.vector_store.migrate_add_vault_id(),
         "Vector store migrate vault_id",
-        timeout=10,
     )
-    await _safe_await(
+    await _await_migration(
         app.state.vector_store.migrate_add_chunk_scale(),
         "Vector store migrate chunk_scale",
-        timeout=10,
     )
-    await _safe_await(
+    await _await_migration(
         app.state.vector_store.migrate_add_sparse_embedding(),
         "Vector store migrate sparse",
-        timeout=10,
     )
-    await _safe_await(
+    await _await_migration(
         app.state.vector_store.migrate_add_parent_window(),
         "Vector store migrate parent_window",
-        timeout=10,
     )
 
     # Initialize vector store table before FTS validation
@@ -747,6 +843,10 @@ async def lifespan(app: FastAPI):
         app.state.db_pool, embedding_service=app.state.embedding_service
     )
     app.state.secret_manager = SecretManager()
+    # Issue #894: scrub raw admin-token material from historical
+    # audit_toggle_log rows now that the HMAC key exists; fail-soft with an
+    # app-state flag (audit_redaction_ok), mirroring migrations_ok above.
+    await asyncio.to_thread(run_startup_audit_redaction, app)
     app.state.toggle_manager = ToggleManager(app.state.db_pool)
     try:
         app.state.csrf_manager = CSRFManager(
@@ -764,12 +864,6 @@ async def lifespan(app: FastAPI):
         instant_client=app.state.instant_llm_client,
     )
     app.state.model_checker = ModelChecker()
-    app.state.model_validation = (
-        settings.enable_model_validation
-        or app.state.toggle_manager.get_toggle(
-            "model_validation", settings.enable_model_validation
-        )
-    )
     ingestion_llm_client = select_ingestion_llm_client(
         app, settings.ingestion_llm_mode
     )

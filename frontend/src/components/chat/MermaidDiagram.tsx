@@ -82,7 +82,7 @@ const MermaidDiagram = memo(function MermaidDiagram({ chart }: MermaidDiagramPro
   if (error) {
     return (
       <div
-        className="my-3 rounded-sm border border-red-500/40 bg-red-500/10 p-4 text-sm text-red-700 dark:text-red-300"
+        className="my-3 rounded-sm border border-destructive/40 bg-destructive/10 p-4 text-sm text-destructive"
         role="alert"
         data-testid="mermaid-error"
       >

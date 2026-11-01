@@ -1,8 +1,32 @@
 """SQLite persistence for Draft Room (issue #435, ``specs/draft-room/SPEC.md``).
 
-``DraftStore`` owns *all* Draft Room CRUD, atomic job claims, centralized status
-transitions, revision numbering, and audit-event records. Routes and the durable
-job processor go through it; no other module writes these tables.
+``DraftStore`` is the default owner of the six Draft Room tables (``drafts``,
+``draft_jobs``, ``draft_revisions``, ``draft_events``, ``draft_inputs``,
+``draft_findings``). It implements the atomic job claim, the status transition
+tables, revision-number allocation, and audit-event recording. Three declared
+co-owners write these tables directly as well, each owning the write families
+listed below (issue #790):
+
+* ``api/routes/draft_room.py`` — cross-table transactional helpers: compile
+  enqueue/retry (``drafts``, ``draft_jobs``), apply-finding and manual
+  revisions (``draft_revisions``, ``draft_findings``, ``drafts``), and the
+  Ready transition (``drafts``).
+* ``services/draft_job_processor.py`` — worker-lifecycle writes:
+  ``drafts.status`` fail/requeue settles, retry ``draft_jobs`` rows, and
+  ``draft_inputs.parse_status``.
+* ``services/draft_pipeline.py`` — compile-time writes: ``draft_jobs``
+  progress columns, revision publication (``draft_revisions`` including the
+  ``is_current`` flip), ``draft_events`` inserts, and the ``drafts.status``
+  settle.
+
+A fourth writer exists by design and is not Draft Room-specific:
+``services/job_lease.py`` is a shared lease primitive parameterized on a table
+name, and this module constructs it with ``table="draft_jobs"`` for claims,
+heartbeats, and reclaims. Because the table is a Python attribute rather than
+static SQL, it is invisible to
+``backend/tests/draft_room/test_table_ownership_census.py``, which AST-censuses
+``backend/app`` and fails the build for a module outside the owner set that
+writes these tables through static SQL.
 
 Invariants enforced here that SQLite cannot express (SPEC sections 5.7, 9.1, 10.3):
 
@@ -14,8 +38,11 @@ Invariants enforced here that SQLite cannot express (SPEC sections 5.7, 9.1, 10.
 * ``draft_revisions.job_id`` is null for manual revisions and otherwise names a
   job on the same draft; ``parent_revision_id`` belongs to the same draft.
 * A draft's owner and vault are immutable after creation.
-* No caller may write an arbitrary status string — every status change goes
-  through the transition tables below and is rejected otherwise.
+* A caller of this store may not write an arbitrary status string — every
+  status change routed through here goes through the transition tables below
+  and is rejected otherwise. The declared co-owners above write
+  ``drafts.status`` directly and therefore keep their own mirrored prior-status
+  allowlists instead of calling the module-private tables below.
 * Revision-number allocation and current-revision replacement happen inside a
   single ``BEGIN IMMEDIATE`` transaction.
 
@@ -168,8 +195,16 @@ _DRAFT_TRANSITIONS: dict[str, frozenset[str]] = {
     "running": frozenset({"needs_review", "failed", "cancelled"}),
     "needs_review": frozenset({"queued", "ready", "archived"}),
     "ready": frozenset({"needs_review", "archived"}),
-    "failed": frozenset({"queued", "archived"}),
-    "cancelled": frozenset({"queued", "archived"}),
+    # failed/cancelled -> needs_review is the recovery edge for the stuck-draft
+    # dead end (issue #788 / S05-SK2-02): a draft with a current revision must
+    # always have a path back to an editable/reviewable state after its
+    # compile was cancelled or failed. The writers that take it guard the
+    # precondition -- create_manual_revision requires a matching
+    # base_revision_id and the apply route's _sync_apply_finding requires a
+    # current revision -- so the edge cannot strand a revision-less draft in
+    # needs_review.
+    "failed": frozenset({"queued", "needs_review", "archived"}),
+    "cancelled": frozenset({"queued", "needs_review", "archived"}),
     "archived": frozenset({"draft", "needs_review"}),
 }
 _JOB_TRANSITIONS: dict[str, frozenset[str]] = {
@@ -378,6 +413,32 @@ def _truncate(value: Optional[str], limit: int) -> Optional[str]:
     if value is None:
         return None
     return value[:limit]
+
+
+def _snapshot_lists_input(input_json: Optional[str], input_id: int) -> bool:
+    """True when a compile job's frozen input snapshot lists ``input_id``.
+
+    The snapshot shape is ``{"inputs": [[id, role, authority, sha, sha], ...]}``
+    as written by the compile enqueue (``_sync_input_snapshot`` in the route
+    module) and copied verbatim by compile-retry inserts. Rows with an absent,
+    malformed, or legacy-empty snapshot are skipped: no production compile
+    writer omits the snapshot, so an empty one cannot mean the compile used
+    nothing.
+    """
+    if not input_json:
+        return False
+    try:
+        snapshot = json.loads(input_json)
+    except (TypeError, ValueError, RecursionError):
+        return False
+    entries = snapshot.get("inputs") if isinstance(snapshot, dict) else None
+    if not isinstance(entries, list):
+        return False
+    return any(
+        isinstance(entry, list) and entry and entry[0] is not None
+        and type(entry[0]) is int and entry[0] == input_id
+        for entry in entries
+    )
 
 
 def validate_evidence_identity(
@@ -1108,8 +1169,17 @@ class DraftStore:
                 _DRAFT_TRANSITIONS, _DRAFT_RECOVERY_TRANSITIONS,
             )
             self._assert_no_active_job(draft_id)
+            # The Ready pointer invariant ("set iff status='ready'") holds
+            # after every writer (issue #788 / S05-SK-02): archiving clears
+            # the pointer columns and audits the invalidation, so a restored
+            # draft cannot carry a stale Ready revision that the next compile
+            # enqueue would misread as an active approval.
+            was_ready = (
+                draft.status == "ready" or draft.ready_revision_id is not None
+            )
             self._db.execute(
                 "UPDATE drafts SET status = 'archived', archived_at = CURRENT_TIMESTAMP, "
+                "ready_revision_id = NULL, ready_by = NULL, ready_at = NULL, "
                 "lock_version = lock_version + 1, updated_at = CURRENT_TIMESTAMP "
                 "WHERE id = ? AND created_by = ?",
                 (draft_id, owner_id),
@@ -1120,6 +1190,14 @@ class DraftStore:
                 actor_user_id=owner_id,
                 payload={},
             )
+            if was_ready:
+                self._insert_event(
+                    draft_id=draft_id,
+                    event_type="ready_invalidated",
+                    actor_user_id=owner_id,
+                    revision_id=draft.ready_revision_id,
+                    payload={"reason": "archived"},
+                )
             self._db.commit()
         except Exception:
             self._db.rollback()
@@ -1152,8 +1230,14 @@ class DraftStore:
                 "draft", draft.status, target,
                 _DRAFT_TRANSITIONS, _DRAFT_RECOVERY_TRANSITIONS,
             )
+            # Defensive for rows archived before the archive path cleared the
+            # pointer (issue #788): restoring lands on needs_review/draft, so
+            # any surviving Ready pointer is an invariant violation -- clear
+            # it and audit the invalidation only when one actually survived.
+            had_stale_pointer = draft.ready_revision_id is not None
             self._db.execute(
                 "UPDATE drafts SET status = ?, archived_at = NULL, "
+                "ready_revision_id = NULL, ready_by = NULL, ready_at = NULL, "
                 "lock_version = lock_version + 1, updated_at = CURRENT_TIMESTAMP "
                 "WHERE id = ? AND created_by = ?",
                 (target, draft_id, owner_id),
@@ -1164,6 +1248,14 @@ class DraftStore:
                 actor_user_id=owner_id,
                 payload={"status": target},
             )
+            if had_stale_pointer:
+                self._insert_event(
+                    draft_id=draft_id,
+                    event_type="ready_invalidated",
+                    actor_user_id=owner_id,
+                    revision_id=draft.ready_revision_id,
+                    payload={"reason": "restored"},
+                )
             self._db.commit()
         except Exception:
             self._db.rollback()
@@ -1184,9 +1276,13 @@ class DraftStore:
             raise DraftNotFoundError("draft not found")
         draft = _row_to_draft(row)
         if lock_version is not None and draft.lock_version != lock_version:
-            raise DraftConflictError(
+            # Same precise code as every other stale-lock raise (issue #789);
+            # the class default ``conflict`` is reserved for other conflicts.
+            err = DraftConflictError(
                 "draft was modified by another request; reload and retry"
             )
+            err.code = "stale_lock_version"
+            raise err
         return draft
 
     def _assert_no_active_compile(self, draft_id: int) -> None:
@@ -1196,7 +1292,9 @@ class DraftStore:
             (draft_id,),
         ).fetchone()
         if row is not None:
-            raise DraftConflictError("a compile job is active for this draft")
+            err = DraftConflictError("a compile job is active for this draft")
+            err.code = "active_job"
+            raise err
 
     def _assert_no_active_job(self, draft_id: int) -> None:
         row = self._db.execute(
@@ -1613,20 +1711,52 @@ class DraftStore:
         return int(row[0])
 
     def delete_input_row(
-        self, *, draft_id: int, owner_id: int, input_id: int
+        self, *, draft_id: int, owner_id: int, input_id: int, best_effort: bool = False
     ) -> None:
         """Delete an input row (phase 2 of the tombstone flow) and audit it.
 
         The file is renamed into ``.trash`` *before* this runs and is restored if
-        this transaction fails, so bytes and rows can never disagree.
+        this transaction fails, so bytes and rows can never disagree. Inside the
+        same transaction the delete refuses when the input was used by a compile
+        (SPEC 6.3), when a parse job is active for it, or when a compile is active
+        for the draft (SPEC 8.2 route table); the evidence CHECK's integrity
+        error — the only ``ON DELETE SET NULL``-into-CHECK foreign key on this
+        table — is translated to the same conflict as a backstop for a race the
+        checks above cannot see.
+
+        ``best_effort=True`` skips the refusal checks. It exists only for upload
+        compensation, which deletes the row it just created in the same request:
+        that row cannot have been used by a compile, and applying the guards
+        there would strand a row whose bytes have already been discarded.
         """
         self._begin_immediate()
         try:
             self._locked_draft(draft_id, owner_id, None)
-            cur = self._db.execute(
-                "DELETE FROM draft_inputs WHERE id = ? AND draft_id = ?",
-                (input_id, draft_id),
-            )
+            if not best_effort:
+                # Order matches DraftDeletionService.delete_input so the same
+                # observable state always produces the same conflict code.
+                if self.input_is_in_use(draft_id=draft_id, input_id=input_id):
+                    err = DraftConflictError(
+                        "input was used by a compile and may back derived artifacts"
+                    )
+                    err.code = "input_in_use"
+                    raise err
+                if self.get_active_parse_job_id(input_id) is not None:
+                    err = DraftConflictError("input has an active parse job")
+                    err.code = "input_in_use"
+                    raise err
+                self._assert_no_active_compile(draft_id)
+            try:
+                cur = self._db.execute(
+                    "DELETE FROM draft_inputs WHERE id = ? AND draft_id = ?",
+                    (input_id, draft_id),
+                )
+            except sqlite3.IntegrityError as exc:
+                err = DraftConflictError(
+                    "input was used by a compile and may back derived artifacts"
+                )
+                err.code = "input_in_use"
+                raise err from exc
             if cur.rowcount == 0:
                 raise DraftNotFoundError("input not found")
             self._insert_event(
@@ -1641,15 +1771,46 @@ class DraftStore:
             raise
 
     def input_is_in_use(self, *, draft_id: int, input_id: int) -> bool:
-        """True when a completed job derived durable artifacts from this input.
+        """True when a compile used this input, so it may back derived artifacts.
 
         A used input cannot be deleted piecemeal (``409 input_in_use``): immutable
         revisions contain derivatives, and pretending otherwise would be dishonest.
         Whole-draft deletion is the comprehensive purge.
+
+        Provenance is read from the shapes production actually writes: the
+        compile's evidence ledger (``draft_evidence`` rows citing the input)
+        and the immutable ``input_json`` snapshot every compile enqueue freezes.
+        Both legs accept a compile in any terminal state — a run that was
+        cancelled or that failed after writing evidence still holds derivative
+        data, and the FK CHECK would refuse the delete anyway, so restricting the
+        query to ``completed`` would only turn a correct refusal into a misleading
+        one. Snapshot membership is deliberately broader than citation: the
+        snapshot records which inputs a compile was given, which is the only
+        durable record of usage when a run finishes without evidence rows. The
+        legacy ``draft_jobs.input_id`` legs stay for rows written before those
+        writers existed.
         """
         row = self._db.execute(
+            "SELECT 1 FROM draft_evidence e JOIN draft_jobs j ON j.id = e.job_id "
+            "WHERE j.draft_id = ? AND e.draft_input_id = ? "
+            "AND j.job_type = 'compile' "
+            "AND j.status IN ('completed','failed','cancelled') LIMIT 1",
+            (draft_id, input_id),
+        ).fetchone()
+        if row is not None:
+            return True
+        for (input_json,) in self._db.execute(
+            "SELECT input_json FROM draft_jobs "
+            "WHERE draft_id = ? AND job_type = 'compile' "
+            "AND status IN ('completed','failed','cancelled')",
+            (draft_id,),
+        ).fetchall():
+            if _snapshot_lists_input(input_json, input_id):
+                return True
+        row = self._db.execute(
             "SELECT 1 FROM draft_jobs WHERE draft_id = ? AND input_id = ? "
-            "AND job_type = 'compile' AND status = 'completed' LIMIT 1",
+            "AND job_type = 'compile' "
+            "AND status IN ('completed','failed','cancelled') LIMIT 1",
             (draft_id, input_id),
         ).fetchone()
         if row is not None:
@@ -2116,19 +2277,23 @@ class DraftStore:
                 )
                 # A pending compile job is terminated here rather than by the
                 # worker, so nothing else will settle the draft. Enqueue moved
-                # it to 'queued', and 'queued' may only exit to running/failed/
-                # cancelled -- none of which can still happen once the job is
-                # terminal. Without this the draft is permanently stuck and no
-                # HTTP path can compile it again, because 'queued' is not a
-                # compilable status. A running job needs no equivalent: the
-                # pipeline settles the draft itself.
+                # it to 'queued' (or a crash-recovered claim left it
+                # 'running' with a re-pending job — both priors have legal
+                # edges to 'cancelled'), and neither can still happen once
+                # the job is terminal. Without this the draft is permanently
+                # stuck and no HTTP path can compile it again, because
+                # neither status is compilable. A running job needs no
+                # equivalent: the pipeline settles the draft itself.
                 if job_type == "compile":
                     draft_status = self._db.execute(
                         "SELECT status FROM drafts WHERE id = ?", (draft_id,)
                     ).fetchone()
-                    if draft_status is not None and draft_status[0] == "queued":
+                    if (
+                        draft_status is not None
+                        and draft_status[0] in ("queued", "running")
+                    ):
                         _check_transition(
-                            "draft", "queued", "cancelled",
+                            "draft", draft_status[0], "cancelled",
                             _DRAFT_TRANSITIONS, _DRAFT_RECOVERY_TRANSITIONS,
                         )
                         self._db.execute(
@@ -3556,23 +3721,6 @@ class DraftStore:
         ).fetchone()
         return int(row[0])
 
-    def apply_finding(
-        self,
-        *,
-        draft_id: int,
-        finding_id: int,
-        resolved_by: int,
-        resolution_note: Optional[str] = None,
-    ) -> None:
-        """Mark a finding ``applied`` (its suggested fix was incorporated)."""
-        self._set_finding_status(
-            draft_id=draft_id,
-            finding_id=finding_id,
-            target="applied",
-            resolved_by=resolved_by,
-            resolution_note=resolution_note,
-        )
-
     def dismiss_finding(
         self,
         *,
@@ -3580,29 +3728,62 @@ class DraftStore:
         finding_id: int,
         resolved_by: int,
         resolution_note: Optional[str] = None,
+        lock_version: Optional[int] = None,
     ) -> None:
         """Mark a finding ``dismissed``.
 
+        One ``BEGIN IMMEDIATE`` transaction mirroring the apply path
+        (issue #788): the draft is re-read inside the transaction, an archived
+        draft and a stale ``lock_version`` are refused, the status change, the
+        ``lock_version`` bump, and the ``finding_dismissed`` audit event
+        commit together or not at all.
+
         Raises:
-            DraftNotFoundError: The finding does not exist in this draft.
+            DraftNotFoundError: The finding (or draft) does not exist.
             DraftValidationError: The finding is a ``blocker`` — blockers
                 cannot be dismissed, only applied or waived.
+            DraftConflictError: The draft is archived, the lock is stale, or
+                the disposition could not be recorded (rolled back whole).
         """
-        row = self._db.execute(
-            "SELECT severity FROM draft_findings WHERE id = ? AND draft_id = ?",
-            (finding_id, draft_id),
-        ).fetchone()
-        if row is None:
-            raise DraftNotFoundError("finding not found")
-        if row[0] == "blocker":
-            raise DraftValidationError("blocker findings cannot be dismissed")
-        self._set_finding_status(
-            draft_id=draft_id,
-            finding_id=finding_id,
-            target="dismissed",
-            resolved_by=resolved_by,
-            resolution_note=resolution_note,
-        )
+        self._begin_immediate()
+        try:
+            self._guard_draft_for_disposition(
+                draft_id, resolved_by, lock_version
+            )
+            row = self._db.execute(
+                "SELECT severity, status, rule_id, rule_version, revision_id "
+                "FROM draft_findings WHERE id = ? AND draft_id = ?",
+                (finding_id, draft_id),
+            ).fetchone()
+            if row is None:
+                raise DraftNotFoundError("finding not found")
+            severity, _status, rule_id, rule_version, revision_id = row
+            if severity == "blocker":
+                raise DraftValidationError("blocker findings cannot be dismissed")
+            self._complete_finding_disposition(
+                draft_id=draft_id,
+                finding_id=finding_id,
+                resolved_by=resolved_by,
+                resolution_note=resolution_note,
+                target="dismissed",
+                event_type="finding_dismissed",
+                severity=severity,
+                rule_id=rule_id,
+                rule_version=rule_version,
+                revision_id=revision_id,
+            )
+        except DraftStoreError:
+            self._db.rollback()
+            raise
+        except sqlite3.Error as exc:
+            self._db.rollback()
+            err = DraftConflictError(
+                "the disposition could not be recorded and was rolled back"
+            )
+            raise err from exc
+        except Exception:
+            self._db.rollback()
+            raise
 
     def waive_finding(
         self,
@@ -3613,13 +3794,21 @@ class DraftStore:
         resolution_note: str,
         waiver_rule_version: str,
         waiver_text_sha256: Optional[str] = None,
+        lock_version: Optional[int] = None,
     ) -> None:
         """Mark a finding ``waived``.
 
+        Same guarded single transaction as :meth:`dismiss_finding`: archived
+        drafts and stale locks are refused, and the waiver, the
+        ``lock_version`` bump, and the ``finding_waived`` audit event persist
+        together or not at all (issue #788 / T1-08-S2-05).
+
         Raises:
-            DraftNotFoundError: The finding does not exist in this draft.
+            DraftNotFoundError: The finding (or draft) does not exist.
             DraftValidationError: The finding is not ``waivable``, or
                 ``resolution_note`` is empty.
+            DraftConflictError: The draft is archived, the lock is stale, or
+                the disposition could not be recorded (rolled back whole).
         """
         if not resolution_note or not resolution_note.strip():
             raise DraftValidationError(
@@ -3627,17 +3816,21 @@ class DraftStore:
             )
         self._begin_immediate()
         try:
+            self._guard_draft_for_disposition(
+                draft_id, resolved_by, lock_version
+            )
             row = self._db.execute(
-                "SELECT status, waivable FROM draft_findings "
-                "WHERE id = ? AND draft_id = ?",
+                "SELECT status, waivable, severity, rule_id, rule_version, "
+                "revision_id FROM draft_findings WHERE id = ? AND draft_id = ?",
                 (finding_id, draft_id),
             ).fetchone()
             if row is None:
                 raise DraftNotFoundError("finding not found")
-            if not row[1]:
+            status, waivable, severity, rule_id, rule_version, revision_id = row
+            if not waivable:
                 raise DraftValidationError("this finding is not waivable")
             _check_transition(
-                "finding", row[0], "waived",
+                "finding", status, "waived",
                 _FINDING_TRANSITIONS, _FINDING_RECOVERY_TRANSITIONS,
             )
             self._db.execute(
@@ -3654,42 +3847,133 @@ class DraftStore:
                     draft_id,
                 ),
             )
+            self._db.execute(
+                "UPDATE drafts SET lock_version = lock_version + 1, "
+                "updated_at = CURRENT_TIMESTAMP WHERE id = ? AND created_by = ?",
+                (draft_id, resolved_by),
+            )
+            # IDs and reason codes only (the ``_insert_event`` payload
+            # contract): the note text lives in ``resolution_note``.
+            self._insert_event(
+                draft_id=draft_id,
+                event_type="finding_waived",
+                actor_user_id=resolved_by,
+                revision_id=revision_id,
+                payload={
+                    "finding_id": finding_id,
+                    "rule_id": str(rule_id),
+                    "rule_version": str(rule_version),
+                    "severity": str(severity),
+                    "has_note": bool(resolution_note),
+                },
+            )
             self._db.commit()
+        except DraftStoreError:
+            self._db.rollback()
+            raise
+        except sqlite3.Error as exc:
+            self._db.rollback()
+            err = DraftConflictError(
+                "the disposition could not be recorded and was rolled back"
+            )
+            raise err from exc
         except Exception:
             self._db.rollback()
             raise
 
-    def _set_finding_status(
+    def _guard_draft_for_disposition(
+        self, draft_id: int, owner_id: int, lock_version: Optional[int]
+    ) -> str:
+        """Re-read the draft inside an open disposition transaction.
+
+        Mirrors the apply path's in-transaction guards (issue #788 /
+        S05-SK-03): the archived check and the ``lock_version`` re-check both
+        happen on the row the mutation will commit against, not on a
+        pre-call snapshot.
+
+        Returns the draft's current status.
+        """
+        row = self._db.execute(
+            "SELECT status, lock_version FROM drafts "
+            "WHERE id = ? AND created_by = ?",
+            (draft_id, owner_id),
+        ).fetchone()
+        if row is None:
+            raise DraftNotFoundError("draft not found")
+        if lock_version is not None and int(row[1]) != lock_version:
+            err = DraftConflictError(
+                "draft was modified by another request; reload and retry"
+            )
+            err.code = "stale_lock_version"
+            raise err
+        if str(row[0]) == "archived":
+            err = DraftConflictError(
+                "archived draft cannot accept finding dispositions"
+            )
+            err.code = "invalid_state"
+            raise err
+        return str(row[0])
+
+    def _complete_finding_disposition(
         self,
         *,
         draft_id: int,
         finding_id: int,
-        target: str,
-        resolved_by: Optional[int],
+        resolved_by: int,
         resolution_note: Optional[str],
+        target: str,
+        event_type: str,
+        severity: str,
+        rule_id,
+        rule_version,
+        revision_id: Optional[int] = None,
     ) -> None:
-        self._begin_immediate()
-        try:
-            row = self._db.execute(
-                "SELECT status FROM draft_findings WHERE id = ? AND draft_id = ?",
-                (finding_id, draft_id),
-            ).fetchone()
-            if row is None:
-                raise DraftNotFoundError("finding not found")
-            _check_transition(
-                "finding", row[0], target,
-                _FINDING_TRANSITIONS, _FINDING_RECOVERY_TRANSITIONS,
-            )
-            self._db.execute(
-                "UPDATE draft_findings SET status = ?, resolved_by = ?, "
-                "resolved_at = CURRENT_TIMESTAMP, resolution_note = ? "
-                "WHERE id = ? AND draft_id = ?",
-                (target, resolved_by, resolution_note, finding_id, draft_id),
-            )
-            self._db.commit()
-        except Exception:
-            self._db.rollback()
-            raise
+        """Finish a guarded disposition: status, lock bump, event, commit.
+
+        The finding-transition check, the finding UPDATE, the draft
+        ``lock_version`` bump, and the ``draft_events`` row all commit in the
+        caller's open transaction, then the caller's handler rolls everything
+        back on any failure. ``revision_id`` links the audit row to the
+        revision the finding was raised against, matching what the apply path
+        and the ``ready_invalidated`` writers record.
+        """
+        status_row = self._db.execute(
+            "SELECT status FROM draft_findings WHERE id = ? AND draft_id = ?",
+            (finding_id, draft_id),
+        ).fetchone()
+        if status_row is None:
+            raise DraftNotFoundError("finding not found")
+        _check_transition(
+            "finding", status_row[0], target,
+            _FINDING_TRANSITIONS, _FINDING_RECOVERY_TRANSITIONS,
+        )
+        self._db.execute(
+            "UPDATE draft_findings SET status = ?, resolved_by = ?, "
+            "resolved_at = CURRENT_TIMESTAMP, resolution_note = ? "
+            "WHERE id = ? AND draft_id = ?",
+            (target, resolved_by, resolution_note, finding_id, draft_id),
+        )
+        self._db.execute(
+            "UPDATE drafts SET lock_version = lock_version + 1, "
+            "updated_at = CURRENT_TIMESTAMP WHERE id = ? AND created_by = ?",
+            (draft_id, resolved_by),
+        )
+        # IDs and reason codes only (the ``_insert_event`` payload
+        # contract): the note text lives in ``resolution_note``.
+        self._insert_event(
+            draft_id=draft_id,
+            event_type=event_type,
+            actor_user_id=resolved_by,
+            revision_id=revision_id,
+            payload={
+                "finding_id": finding_id,
+                "rule_id": str(rule_id),
+                "rule_version": str(rule_version),
+                "severity": str(severity),
+                "has_note": bool(resolution_note),
+            },
+        )
+        self._db.commit()
 
     # ── compile jobs ─────────────────────────────────────────────────────
 
@@ -3706,6 +3990,23 @@ class DraftStore:
         ).fetchone()
         return row is not None
 
+    def has_active_compile_job(self, draft_id: int) -> bool:
+        """True while a ``compile`` job for this draft is pending or running.
+
+        Scope note (issue #788): this is the compile-only predicate the apply
+        route enforces — unlike :meth:`count_active_jobs` (all job types, for
+        the delete/archive guards) and :meth:`has_pending_compile_job`
+        (pending-only, misses a claimed compile), it matches
+        ``_assert_no_active_compile`` exactly, so ``can_apply`` agrees with
+        the disposition route even while an input-parse job is active.
+        """
+        row = self._db.execute(
+            "SELECT id FROM draft_jobs WHERE draft_id = ? AND job_type = 'compile' "
+            "AND status IN ('pending','running') LIMIT 1",
+            (draft_id,),
+        ).fetchone()
+        return row is not None
+
     def claim_next_compile_job(
         self, worker_id: Optional[str] = None
     ) -> Optional[DraftJobRecord]:
@@ -3716,14 +4017,32 @@ class DraftStore:
         ``started_at`` mode so a recovered job keeps its original claim time —
         overwriting it would re-grant the full timeout to a job that already
         spent most of it (issue #516 DRAFT-013, wired up in the #532 review).
+
+        The claimed job's draft moves ``queued -> running`` inside the same
+        transaction (issue #788 / S05-SK2-03): ``running`` is declared in
+        ``DRAFT_STATUSES`` and the transition table, so the declared lifecycle
+        now matches what actually happens while a compile is in flight. Only
+        a ``queued`` draft is moved; every settle/recovery path already
+        tolerates both ``queued`` and ``running``.
         """
         if _draft_lease_enabled():
             wid = worker_id or f"draft-compile-{id(self)}"
-            claimed = _draft_job_lease(self._db, compile_claim=True).claim(
-                "compile", wid
-            )
-            if claimed is None:
-                return None
+            # Own the transaction so the lease claim and the draft-status
+            # write commit together: JobLease._write_txn joins a caller-held
+            # BEGIN IMMEDIATE instead of opening (and committing) its own.
+            self._begin_immediate()
+            try:
+                claimed = _draft_job_lease(self._db, compile_claim=True).claim(
+                    "compile", wid
+                )
+                if claimed is None:
+                    self._db.rollback()
+                    return None
+                self._mark_draft_running_locked(int(claimed["draft_id"]))
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
             row = self._db.execute(
                 f"SELECT {_JOB_COLUMNS} FROM draft_jobs WHERE id = ?",  # nosec B608
                 (int(claimed["id"]),),
@@ -3732,7 +4051,7 @@ class DraftStore:
         self._begin_immediate()
         try:
             row = self._db.execute(
-                "SELECT id FROM draft_jobs WHERE status = 'pending' "
+                "SELECT id, draft_id FROM draft_jobs WHERE status = 'pending' "
                 "AND job_type = 'compile' ORDER BY created_at ASC, id ASC LIMIT 1"
             ).fetchone()
             if row is None:
@@ -3755,6 +4074,7 @@ class DraftStore:
             if cur.rowcount == 0:
                 self._db.rollback()
                 return None
+            self._mark_draft_running_locked(int(row[1]))
             self._db.commit()
         except Exception:
             self._db.rollback()
@@ -3764,6 +4084,30 @@ class DraftStore:
             (job_id,),
         ).fetchone()
         return None if row is None else _row_to_job(row)
+
+    def _mark_draft_running_locked(self, draft_id: int) -> None:
+        """Move a claimed compile's draft ``queued -> running`` in-txn.
+
+        Caller must already hold the transaction. Only a ``queued`` draft is
+        moved: any other status means the draft already moved on (e.g. a
+        cancel raced the claim), and the settle/recovery paths own those.
+        No ``lock_version`` bump, matching the terminal settles
+        (``_move_draft`` / the processor's fail settle).
+        """
+        row = self._db.execute(
+            "SELECT status FROM drafts WHERE id = ?", (draft_id,)
+        ).fetchone()
+        if row is None or row[0] != "queued":
+            return
+        _check_transition(
+            "draft", "queued", "running",
+            _DRAFT_TRANSITIONS, _DRAFT_RECOVERY_TRANSITIONS,
+        )
+        self._db.execute(
+            "UPDATE drafts SET status = 'running', "
+            "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (draft_id,),
+        )
 
     def get_job_json_field(self, *, job_id: int, field: str) -> dict:
         """Fetch one large compile JSON body for ``job_id``, decoded.
@@ -3781,6 +4125,9 @@ class DraftStore:
 
         Returns:
             The decoded object, or ``{}`` when the row or value is absent.
+            A present-but-undecodable or non-object value also returns ``{}``
+            (issue #787), with a WARNING naming the job id and field so the
+            corruption is distinguishable from absence in operations.
 
         Raises:
             ValueError: if ``field`` is not one of the four allowed names.
@@ -3800,8 +4147,23 @@ class DraftStore:
         try:
             decoded = json.loads(row[0])
         except (TypeError, ValueError):
+            # A present-but-undecodable body is corruption, not absence; the
+            # {} return contract stays, but the swallow must leave a trace so
+            # operators can distinguish rot from never-written (issue #787).
+            logger.warning(
+                "draft_jobs json field undecodable: job=%s field=%s",
+                job_id,
+                field,
+            )
             return {}
-        return decoded if isinstance(decoded, dict) else {}
+        if not isinstance(decoded, dict):
+            logger.warning(
+                "draft_jobs json field not an object: job=%s field=%s",
+                job_id,
+                field,
+            )
+            return {}
+        return decoded
 
     def set_job_json_field(self, *, job_id: int, field: str, value: dict) -> None:
         """Persist one large compile JSON body for ``job_id``.
@@ -3831,13 +4193,16 @@ class DraftStore:
             raise
 
     def _settle_draft_after_lost_compile_locked(
-        self, draft_id: int, target: str
+        self, draft_id: int, target: str, *, allow_recovery: bool = False
     ) -> None:
         """Move a draft off ``queued``/``running`` when its compile is gone.
 
         Caller must already hold the transaction. Only acts when the draft is
         actually parked on a compile-lifecycle status, so a draft that has
-        already moved on is left untouched.
+        already moved on is left untouched. ``allow_recovery`` admits the
+        ``running -> queued`` edge reserved for orphan recovery and is set only
+        by :meth:`recover_orphaned_compile_jobs`, which owns that edge — the
+        startup sweep and the periodic lease janitor both route through it.
         """
         row = self._db.execute(
             "SELECT status FROM drafts WHERE id = ?", (draft_id,)
@@ -3845,7 +4210,8 @@ class DraftStore:
         if row is None or row[0] not in ("queued", "running"):
             return
         _check_transition(
-            "draft", row[0], target, _DRAFT_TRANSITIONS, _DRAFT_RECOVERY_TRANSITIONS
+            "draft", row[0], target, _DRAFT_TRANSITIONS,
+            _DRAFT_RECOVERY_TRANSITIONS, allow_recovery=allow_recovery,
         )
         self._db.execute(
             "UPDATE drafts SET status = ?, updated_at = CURRENT_TIMESTAMP "
@@ -3916,6 +4282,14 @@ class DraftStore:
                     "error_code = 'worker_restart', error_message = "
                     "'previous attempt abandoned by a worker restart' WHERE id = ?",
                     (job_id,),
+                )
+                # The claim moved the draft to 'running'; the reset job is
+                # 'pending' again, so the draft must go back to 'queued' on
+                # the recovery edge -- without this, cancelling the re-pending
+                # job would settle only a 'queued' draft and strand this one
+                # on 'running' (recompile and archive both refused).
+                self._settle_draft_after_lost_compile_locked(
+                    draft_id, "queued", allow_recovery=True
                 )
                 reset += 1
             self._db.commit()

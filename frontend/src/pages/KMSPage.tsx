@@ -1,10 +1,20 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
-import { FileText, Library, Plus, RefreshCw, Search } from "lucide-react";
+import {
+  FileText,
+  Library,
+  Loader2,
+  Plus,
+  RefreshCw,
+  Search,
+} from "lucide-react";
 
 import { useVaultStore } from "@/stores/useVaultStore";
 import { VaultSelector } from "@/components/vault/VaultSelector";
+import { VaultGate } from "@/components/vault/VaultGate";
+import { PageTitleHeader } from "@/components/layout/PageTitleHeader";
+import { EmptyState } from "@/components/EmptyState";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -28,9 +38,11 @@ import {
 import {
   createKMSEntry,
   listKMSEntries,
+  listKMSJobs,
   recompileVaultKMS,
   type KMSEntry,
 } from "@/lib/api";
+import { isTerminalJobStatus, useJobStatus } from "@/hooks/useJobStatus";
 
 const STATUS_OPTIONS = ["all", "draft", "published", "archived"] as const;
 
@@ -104,6 +116,38 @@ export default function KMSPage() {
     return () => clearTimeout(t);
   }, [activeVaultId, search, statusFilter, fetchEntries]);
 
+  // Recompile job polling (issue #783): the POST /kms/recompile handle is
+  // kept and polled through listKMSJobs until a terminal status, then the
+  // entries refetch and the toast reports the real outcome. The listKMSJobs
+  // call lives ONLY inside the poll-time fetcher (lazy-closure constraint)
+  // so suites mocking @/lib/api with partial factories never dereference it
+  // outside a poll.
+  const recompileJobIdRef = useRef<number | null>(null);
+  const recompilePoll = useJobStatus("kms", {
+    fetchJob: async () => {
+      const vaultId = activeVaultId;
+      const jobId = recompileJobIdRef.current;
+      if (vaultId == null || jobId == null) return null;
+      const { jobs } = await listKMSJobs(vaultId);
+      return jobs.find((j) => j.id === jobId) ?? null;
+    },
+    onTerminal: (job) => {
+      if (job.status === "failed") {
+        toast.error(
+          job.error ? `Recompile failed: ${job.error}` : "Recompile failed"
+        );
+      } else if (job.status === "cancelled") {
+        toast.info("Recompile cancelled");
+      } else {
+        toast.success("Recompile complete — entries refreshed");
+      }
+      void fetchEntries(1, false);
+    },
+    onTimeout: () => {
+      toast.error("Recompile did not finish in time");
+    },
+  });
+
   // C37: past the fixed per_page=200 window the remaining entries are fetched
   // on demand; the page-2 request retains the current search/vault filters.
   // PRR-007 (#531): no-op while a fetch is already in flight so a load-more
@@ -140,45 +184,74 @@ export default function KMSPage() {
     }
   }
 
+  const recompilePostInFlightRef = useRef(false);
   async function handleRecompile() {
-    if (!activeVaultId) return;
+    if (!activeVaultId || recompilePoll.active) return;
+    if (recompilePostInFlightRef.current) return; // double-click guard (PRR-020)
+    recompilePostInFlightRef.current = true;
     try {
-      await recompileVaultKMS(activeVaultId);
-      toast.info("Recompile queued — document entries will refresh shortly");
+      const handle = await recompileVaultKMS(activeVaultId);
+      if (isTerminalJobStatus(handle.status)) {
+        // Already terminal (e.g. a synchronous compile result): no polling.
+        if (handle.status === "failed") {
+          toast.error("Recompile failed");
+        } else if (handle.status === "cancelled") {
+          toast.info("Recompile cancelled");
+        } else {
+          toast.success("Recompile complete — entries refreshed");
+        }
+        void fetchEntries(1, false);
+        return;
+      }
+      recompileJobIdRef.current = handle.job_id;
+      recompilePoll.start();
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "Failed to queue recompile");
+    } finally {
+      recompilePostInFlightRef.current = false;
     }
   }
 
   return (
     <div className="flex flex-col h-full">
       {/* Header */}
-      <div className="flex items-center justify-between px-6 py-4 border-b border-border shrink-0">
-        <div className="flex items-center gap-3">
-          <Library className="w-5 h-5 text-muted-foreground" />
-          <h1 className="text-xl font-semibold">Knowledge Management</h1>
-          <VaultSelector />
-        </div>
-        <div className="flex items-center gap-2">
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={handleRecompile}
-            disabled={!activeVaultId}
-            title="Recompile document entries for this vault"
-          >
-            <RefreshCw className="w-4 h-4 mr-1" />
-            Recompile
-          </Button>
-          <Button
-            size="sm"
-            onClick={() => setCreateOpen(true)}
-            disabled={!activeVaultId}
-          >
-            <Plus className="w-4 h-4 mr-1" />
-            New entry
-          </Button>
-        </div>
+      <div className="px-6 py-4 border-b border-border shrink-0">
+        <PageTitleHeader
+          before={<Library className="w-5 h-5 text-muted-foreground" />}
+          title="Knowledge Management"
+          actions={
+            <>
+              <VaultSelector />
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleRecompile}
+                disabled={!activeVaultId || recompilePoll.active}
+                aria-busy={recompilePoll.active}
+                title={
+                  recompilePoll.active
+                    ? "Recompile in progress…"
+                    : "Recompile document entries for this vault"
+                }
+              >
+                {recompilePoll.active ? (
+                  <Loader2 className="w-4 h-4 mr-1 animate-spin" />
+                ) : (
+                  <RefreshCw className="w-4 h-4 mr-1" />
+                )}
+                Recompile
+              </Button>
+              <Button
+                size="sm"
+                onClick={() => setCreateOpen(true)}
+                disabled={!activeVaultId}
+              >
+                <Plus className="w-4 h-4 mr-1" />
+                New entry
+              </Button>
+            </>
+          }
+        />
       </div>
 
       {/* Toolbar */}
@@ -194,7 +267,10 @@ export default function KMSPage() {
           />
         </div>
         <Select value={statusFilter} onValueChange={setStatusFilter}>
-          <SelectTrigger className="w-40">
+          {/* Issue #778: the trigger needs an explicit accessible name —
+              placeholder-only SelectValue leaves the combobox unnamed
+              (axe button-name, critical). */}
+          <SelectTrigger className="w-40" aria-label="Status filter">
             <SelectValue placeholder="Status" />
           </SelectTrigger>
           <SelectContent>
@@ -211,9 +287,11 @@ export default function KMSPage() {
       <ScrollArea className="flex-1">
         <div className="p-6">
           {!activeVaultId ? (
-            <p className="text-sm text-muted-foreground text-center py-12">
-              Select a vault to view its knowledge entries.
-            </p>
+            <EmptyState
+              title="Select a vault"
+              description="Select a vault to view its knowledge entries."
+              action={<VaultGate />}
+            />
           ) : error ? (
             <p className="text-sm text-destructive py-8">{error}</p>
           ) : loading && entries.length === 0 ? (

@@ -315,8 +315,12 @@ async def test_ac4_documents_guards_and_repeated_start_are_idempotent(caller_nam
             def __init__(self, *_args, **_kwargs):
                 pass
 
+            # #767 AC6: scan_once returns ScanResult (files_examined,
+            # files_enqueued, errors) — the route reads .files_enqueued.
             async def scan_once(self):
-                return 0
+                from app.services.file_watcher import ScanResult
+
+                return ScanResult()
 
         monkeypatch.setattr("app.services.file_watcher.FileWatcher", Watcher)
         def call():

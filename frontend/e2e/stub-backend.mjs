@@ -49,7 +49,11 @@
 
 import http from "node:http";
 
-const PORT = 9090;
+// E2E_STUB_PORT (issue #781): local runs can move the stub off the default
+// :9090 (e.g. when a foreign service squats it) — playwright.config.ts and
+// the vite preview proxy read the same variable, so the whole e2e tier moves
+// together. CI never sets it, so the default keeps CI byte-identical.
+const PORT = Number(process.env.E2E_STUB_PORT || 9090);
 
 const nowIso = () => new Date().toISOString();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -59,12 +63,54 @@ const ACCESS_TOKEN = "stub-access-token";
 // process, so anonymous contexts get 401 and the login form renders.
 let loggedIn = false;
 
+// Issue #782: first-run onboarding milestone state. DEFAULT OFF — the
+// checklist surface and the setup wizard are opt-in via the /_e2e/* control
+// routes so the other shared-stub specs (chat-smoke, chat-width-budget)
+// never observe them, whatever the run order. Module-level defaults re-arm
+// at process start (the PRR-010 loggedIn pattern).
+let setupMode = false;
+const onboarding = {
+  enabled: false,
+  vault_created: false,
+  upload_indexed: false,
+  first_question_asked: false,
+  first_citation_opened: false,
+  dismissed: false,
+};
+
+function onboardingPayload() {
+  const allFour =
+    onboarding.vault_created &&
+    onboarding.upload_indexed &&
+    onboarding.first_question_asked &&
+    onboarding.first_citation_opened;
+  // Mirrors the server formula (GET /onboarding/milestones): hidden once
+  // dismissed or complete — gated additionally on the test-control enable.
+  return {
+    vault_created: onboarding.vault_created,
+    upload_indexed: onboarding.upload_indexed,
+    first_question_asked: onboarding.first_question_asked,
+    first_citation_opened: onboarding.first_citation_opened,
+    show_checklist: onboarding.enabled && !onboarding.dismissed && !allFour,
+  };
+}
+
+function resetOnboarding() {
+  onboarding.enabled = false;
+  onboarding.vault_created = false;
+  onboarding.upload_indexed = false;
+  onboarding.first_question_asked = false;
+  onboarding.first_citation_opened = false;
+  onboarding.dismissed = false;
+}
+
 const USER = {
   id: 1,
   username: "e2e-user",
   full_name: "E2E User",
   role: "superadmin",
   is_active: true,
+  created_at: nowIso(),
 };
 
 const VAULT = {
@@ -101,6 +147,86 @@ const SOURCE = {
 const sessions = new Map(); // id -> { session, messages: [] }
 let nextSessionId = 1;
 let nextMessageId = 1;
+
+// Mutable vault list (issue #781): the first-run walkthrough creates a vault
+// through the real /vaults UI, so GET must reflect POSTs.
+const vaults = [VAULT];
+let nextVaultId = 2;
+
+// Uploaded documents (issue #781): the walkthrough uploads one file through
+// the real UploadDropzone; the list and stats reflect it.
+const documents = [];
+let nextDocumentId = 1;
+
+// Activity tray job seeds (issue #784): created through POST /_e2e/jobs.
+// Every family's seed materializes in the REAL route shape the tray's
+// useActivityJobs adapters poll (wiki/kms/reindex job rows, a draft + its
+// job for draft-room, and a processing document row for ingest — seed
+// status "running" is not a document status, so it lands as "processing").
+// The action routes below mutate these same seed records, which is what
+// GET /_e2e/jobs?family= reads back.
+const E2E_JOB_FAMILIES = ["ingest", "wiki", "kms", "draft-room", "reindex"];
+const e2eSeeds = Object.fromEntries(E2E_JOB_FAMILIES.map((f) => [f, []]));
+let nextE2eJobId = 1;
+let nextE2eDraftId = 1;
+
+const E2E_TERMINAL_JOB_STATUSES = ["completed", "failed", "cancelled"];
+
+function resetE2eJobs() {
+  for (const family of E2E_JOB_FAMILIES) {
+    e2eSeeds[family] = [];
+  }
+  // Ingest seeds materialize document rows; drop only the rows a seeder
+  // created (flagged at seed time), never walkthrough-uploaded documents.
+  for (let i = documents.length - 1; i >= 0; i -= 1) {
+    if (documents[i].e2eSeed || documents[i].e2eA11ySeed) documents.splice(i, 1);
+  }
+}
+
+function e2eJobShape(family, seed) {
+  const base = {
+    id: seed.id,
+    status: seed.status,
+    // A failed seed's title rides the error field - the same place the
+    // real backend puts a failed job's reason, and the field the tray
+    // surfaces as a failed row's title.
+    error: seed.status === "failed" ? seed.title ?? `job ${seed.id} failed` : null,
+    result_json: "{}",
+    created_at: seed.created_at,
+    started_at: seed.created_at,
+    completed_at: null,
+    retry_count: 0,
+  };
+  if (family === "wiki") {
+    return { ...base, vault_id: 1, trigger_type: "manual", trigger_id: null };
+  }
+  if (family === "kms") {
+    return { ...base, vault_id: 1, trigger_type: "manual", trigger_id: null, input_json: "{}" };
+  }
+  if (family === "reindex") {
+    return { ...base, vault_id: 1, trigger_type: "api", trigger_id: "1", input_json: "{}" };
+  }
+  // draft-room
+  return {
+    ...base,
+    draft_id: seed.draftId,
+    job_type: "compile",
+    start_stage: null,
+    active_stage: seed.status === "running" ? "compiling" : null,
+    progress_percent: 0,
+    model_call_count: 0,
+    max_model_calls: 0,
+    parent_job_id: null,
+    attempt_no: 1,
+    compile_input_sha256: null,
+    prompt_bundle_version: null,
+    timeout_seconds: 1800,
+    cancel_requested_at: null,
+    heartbeat_at: null,
+    error_code: null,
+    error_message: null,
+  };
+}
 
 function createSession(vaultId = 1) {
   const id = nextSessionId++;
@@ -145,6 +271,337 @@ function addMessage(sessionId, { role, content, sources = null, turn_id = null, 
   entry.session.updated_at = nowIso();
   return message;
 }
+
+// ---- a11y-matrix fixtures (issue #778) ---------------------------------------
+//
+// Two tiers, per the frozen a11y-matrix.spec.ts seeding contract:
+//   STATIC (always served, no seed call needed): /api/settings,
+//   /api/users/, /api/groups, /api/auth/sessions, /api/draft-room/
+//   capabilities. /api/canvas/capabilities is always SERVED but its VALUE
+//   is seed-gated (enabled flips false->true on a11y-seed; review PRR-003).
+//   GET /api/organizations/ is
+//   always SERVED but returns [] until the a11y seed runs —
+//   first-run-baseline.m01.spec.ts reads this endpoint on /vaults and must
+//   not observe fixture rows.
+//   SEED-GATED (POST /_e2e/a11y-seed, undone by /_e2e/a11y-reset): the
+//   seeded document/tags/folders/memory/wiki/KMS/canvas/draft/search rows
+//   and chat session 1. Mutable families (documents list, draft-room list)
+//   route through the EXISTING stores above so sibling specs' assertions
+//   stay intact when unseeded.
+
+const SETTINGS_FIXTURE = {
+  port: 8000,
+  data_dir: "/data",
+  ollama_embedding_url: "http://localhost:11435",
+  ollama_chat_url: "http://localhost:11434",
+  embedding_model: "nomic-embed-text",
+  chat_model: "llama3.1",
+  chat_configured: true,
+  instant_configured: true,
+  default_chat_mode: "thinking",
+  chunk_size_chars: 1200,
+  chunk_overlap_chars: 200,
+  retrieval_top_k: 8,
+  max_distance_threshold: 1.2,
+  retrieval_window: 4,
+  vector_metric: "cosine",
+  embedding_doc_prefix: "search_document",
+  embedding_query_prefix: "search_query",
+  maintenance_mode: false,
+  auto_scan_enabled: false,
+  auto_scan_interval_minutes: 30,
+  enable_model_validation: false,
+  embedding_batch_size: 32,
+  reranking_enabled: false,
+  wiki_enabled: true,
+  wiki_lint_enabled: true,
+  kms_enabled: true,
+  draft_room_enabled: true,
+  effective_sources: {},
+  max_file_size_mb: 50,
+  allowed_extensions: [".pdf", ".txt", ".md", ".csv"],
+  backend_cors_origins: [],
+};
+
+const GROUPS_FIXTURE = {
+  groups: [
+    {
+      id: 1,
+      name: "e2e-group",
+      description: "a11y fixture group",
+      created_at: nowIso(),
+      org_id: null,
+      organization_name: null,
+    },
+  ],
+  total: 1,
+  page: 1,
+  per_page: 20,
+};
+
+const AUTH_SESSIONS_FIXTURE = {
+  sessions: [
+    {
+      id: "s1",
+      user_id: 1,
+      user_agent: "e2e-stub",
+      ip_address: "127.0.0.1",
+      created_at: nowIso(),
+      expires_at: nowIso(),
+      is_current: true,
+    },
+  ],
+};
+
+const DRAFT_CAPABILITIES_FIXTURE = {
+  enabled: true,
+  modes: ["rewrite", "compose"],
+  tiers: ["standard", "high_stakes", "sensitive"],
+  piece_types: ["memo", "article"],
+  transformation_strengths: ["light", "medium", "heavy"],
+  limits: { max_inputs: 10 },
+  export_formats: ["md"],
+  logical_model_modes: ["thinking", "instant"],
+  default_logical_mode: "thinking",
+  compile_start_stages: ["research", "outline", "draft", "lint", "copy", "standards", "fact"],
+  compile_stage_order: [
+    "intake",
+    "research",
+    "outline",
+    "draft",
+    "lint",
+    "copy",
+    "standards",
+    "fact",
+    "assemble",
+  ],
+  prompt_bundle_version: "e2e",
+  editorial_gates_installed: false,
+  compile_available: true,
+  findings_available: true,
+  claims_available: true,
+  evidence_available: true,
+  ready_available: true,
+  promote_available: true,
+};
+
+// Seed-gated fixture rows (populated by seedA11yFixtures()).
+let a11ySeeded = false;
+let a11yOrgs = [];
+const A11Y_DOC_ID = "1";
+const A11Y_SESSION_ID = 1;
+const A11Y_DRAFT_ID = 1;
+
+function a11yDocumentRow() {
+  return {
+    id: A11Y_DOC_ID,
+    filename: "handbook-a11y.pdf",
+    vault_id: 1,
+    content_type: "application/pdf",
+    size: 2048,
+    created_at: nowIso(),
+    processed_at: nowIso(),
+    error_message: null,
+    metadata: { status: "indexed", chunk_count: 7, phase: "done" },
+    e2eA11ySeed: true,
+  };
+}
+
+function a11yWikiPage() {
+  return {
+    id: 1,
+    vault_id: 1,
+    slug: "coolant-maintenance",
+    title: "Coolant Maintenance Wiki",
+    page_type: "entity",
+    markdown: "Coolant intervals run every 500 hours.",
+    summary: "Maintenance cadence for the coolant system.",
+    status: "verified",
+    confidence: 0.9,
+    version: 1,
+    created_by: null,
+    created_at: nowIso(),
+    updated_at: nowIso(),
+    last_compiled_at: null,
+    claims: [],
+    entities: [],
+    lint_findings: [],
+  };
+}
+
+function a11yKmsEntry() {
+  return {
+    id: 1,
+    vault_id: 1,
+    file_id: null,
+    slug: "coolant-schedule",
+    title: "Coolant Schedule Entry",
+    body: "Replace coolant every 500 hours of runtime.",
+    summary: "Coolant replacement cadence.",
+    tags_json: '["guide"]',
+    tags: ["guide"],
+    source_type: "manual",
+    status: "published",
+    created_by: null,
+    created_at: nowIso(),
+    updated_at: nowIso(),
+    last_compiled_at: null,
+  };
+}
+
+function a11yCanvasPayload() {
+  const artifact = {
+    artifact_uid: "cav_a11y_fixture_0",
+    session_id: A11Y_SESSION_ID,
+    message_id: null,
+    turn_id: null,
+    kind: "code",
+    name: "A11Y Fixture Canvas",
+    language: "javascript",
+    current_version_no: 1,
+    source_refs: [],
+    vault_id: 1,
+    created_by: null,
+    created_at: nowIso(),
+    updated_at: nowIso(),
+  };
+  const version = {
+    version_no: 1,
+    name: null,
+    origin: "created",
+    model_edit: null,
+    content_sha256: "e2e-fixture",
+    created_by: null,
+    created_at: nowIso(),
+    content: "// fixture",
+  };
+  return { artifact, version };
+}
+
+function a11yDraftDetail() {
+  const summary = {
+    id: A11Y_DRAFT_ID,
+    vault_id: 1,
+    vault_access: "write",
+    title: "A11Y Fixture Draft",
+    mode: "rewrite",
+    status: "ready",
+    tier: "standard",
+    lock_version: 1,
+    current_revision_id: null,
+    active_job_id: null,
+    input_count: 0,
+    open_blocker_count: 0,
+    created_at: nowIso(),
+    updated_at: nowIso(),
+    ready_at: null,
+    ready_by: null,
+    ready_by_username: null,
+  };
+  const brief = {
+    piece_type: "memo",
+    audience: "operators",
+    purpose: "fixture",
+    tone: "neutral",
+    target_words: 200,
+    transformation_strength: "light",
+    primary_input_id: null,
+    must_include: [],
+    must_avoid: [],
+    preserve_quotes: true,
+    preserve_numbers: true,
+    preserve_uncertainty: true,
+    drafting_priority: "accuracy",
+    additional_instructions: "",
+  };
+  return {
+    summary,
+    brief,
+    inputs: [],
+    current_revision_summary: null,
+    active_compile_job: null,
+    revision_count: 0,
+    evidence_count: 0,
+    claim_counts_by_status: {},
+    finding_counts_by_severity: {},
+  };
+}
+
+function seedA11yFixtures() {
+  if (!documents.some((d) => d.e2eA11ySeed)) {
+    documents.push(a11yDocumentRow());
+    // Reserve the hardcoded fixture ids so later allocators cannot mint a
+    // second row with the same id on a reused stub (issue #778 review).
+    nextDocumentId = Math.max(nextDocumentId, Number(A11Y_DOC_ID) + 1);
+  }
+  // Chat session 1 with the transcript the /chat/1 sentinel waits for. Only
+  // created when absent so a chat-smoke run sharing the stub is untouched.
+  if (!sessions.has(A11Y_SESSION_ID)) {
+    const session = {
+      id: A11Y_SESSION_ID,
+      vault_id: 1,
+      title: "A11Y fixture session",
+      created_at: nowIso(),
+      updated_at: nowIso(),
+      message_count: 0,
+      forked_from_session_id: null,
+      fork_message_index: null,
+    };
+    sessions.set(A11Y_SESSION_ID, { session, messages: [], a11ySeed: true });
+    nextSessionId = Math.max(nextSessionId, A11Y_SESSION_ID + 1);
+    addMessage(A11Y_SESSION_ID, {
+      role: "user",
+      content: "What did the maintenance manual say about coolant?",
+    });
+    addMessage(A11Y_SESSION_ID, {
+      role: "assistant",
+      content: "The coolant interval is 500 hours.",
+      sources: [SOURCE],
+    });
+  }
+  // Draft list row through the shared seeds array (idempotent by title).
+  if (!e2eSeeds["draft-room"].some((s) => s.title === "A11Y Fixture Draft")) {
+    e2eSeeds["draft-room"].push({
+      id: nextE2eJobId++,
+      family: "draft-room",
+      status: "completed",
+      title: "A11Y Fixture Draft",
+      created_at: nowIso(),
+      vaultId: 1,
+      draftId: A11Y_DRAFT_ID,
+      a11ySeed: true,
+    });
+    nextE2eDraftId = Math.max(nextE2eDraftId, A11Y_DRAFT_ID + 1);
+  }
+  a11yOrgs = [
+    {
+      id: 1,
+      name: "e2e-org",
+      description: "a11y fixture org",
+      member_count: 1,
+      vault_count: 1,
+      created_at: nowIso(),
+    },
+  ];
+  a11ySeeded = true;
+  return { ok: true };
+}
+
+function resetA11yFixtures() {
+  for (let i = documents.length - 1; i >= 0; i -= 1) {
+    if (documents[i].e2eA11ySeed) documents.splice(i, 1);
+  }
+  const entry = sessions.get(A11Y_SESSION_ID);
+  if (entry?.a11ySeed) sessions.delete(A11Y_SESSION_ID);
+  e2eSeeds["draft-room"] = e2eSeeds["draft-room"].filter((s) => !s.a11ySeed);
+  a11yOrgs = [];
+  a11ySeeded = false;
+  // Full unseeded state includes the identity flag /_e2e/user-flags flips —
+  // a crashed run must not leave later specs redirecting to /change-password.
+  USER.must_change_password = false;
+  return { ok: true };
+}
+
 
 // ---- helpers ----------------------------------------------------------------
 
@@ -231,7 +688,7 @@ const server = http.createServer(async (req, res) => {
     // ---- auth ----
     if (method === "GET" && path === "/api/auth/setup-status") {
       return sendJson(req, res, 200, {
-        needs_setup: false,
+        needs_setup: setupMode,
         auth_mode: "jwt",
         users_enabled: true,
       });
@@ -248,6 +705,26 @@ const server = http.createServer(async (req, res) => {
     if (method === "POST" && path === "/api/auth/login") {
       await readBody(req); // accept any credentials
       loggedIn = true;
+      return sendJson(
+        req,
+        res,
+        200,
+        { access_token: ACCESS_TOKEN, user: USER },
+        {
+          "Set-Cookie": [
+            "ragapp_refresh_token=stub-refresh-token; Path=/; HttpOnly; SameSite=Lax",
+            "X-CSRF-Token=stub-csrf-token; Path=/; SameSite=Lax",
+          ],
+        }
+      );
+    }
+    if (method === "POST" && path === "/api/auth/register") {
+      // Issue #782 setup leg: the wizard's account step registers the first
+      // admin. Mirrors login's session side-effects (PRR-010-critical: the
+      // post-wizard reloads POST /api/auth/refresh) and ends setup mode.
+      await readBody(req); // accept any payload
+      loggedIn = true;
+      setupMode = false;
       return sendJson(
         req,
         res,
@@ -288,7 +765,190 @@ const server = http.createServer(async (req, res) => {
 
     // ---- vaults ----
     if (method === "GET" && (path === "/api/vaults/accessible" || path === "/api/vaults")) {
-      return sendJson(req, res, 200, { vaults: [VAULT] });
+      // Model the full VaultListResponse contract (issue #725): total is the
+      // exact count and truncated is false below the 1000-row cap.
+      return sendJson(req, res, 200, {
+        vaults,
+        total: vaults.length,
+        truncated: false,
+      });
+    }
+    if (method === "POST" && path === "/api/vaults") {
+      // Issue #781 walkthrough: create a vault via the real VaultsPage
+      // dialog. Accept { name, description? } and append to the list so the
+      // selector (and the chat recovery leg) can pick it up.
+      const body = await readBody(req);
+      const name = String(body.name || "E2E Vault").slice(0, 100);
+      const vault = {
+        ...VAULT,
+        id: nextVaultId++,
+        name,
+        description: String(body.description || ""),
+        created_at: nowIso(),
+        updated_at: nowIso(),
+        file_count: 0,
+      };
+      vaults.push(vault);
+      onboarding.vault_created = true;
+      return sendJson(req, res, 200, vault);
+    }
+
+    // ---- documents (issue #781 walkthrough; #784 adds the status filter
+    // the Activity tray's ingest adapter polls) ----
+    if (method === "GET" && path === "/api/documents") {
+      const vaultId = Number(url.searchParams.get("vault_id") || 0);
+      const status = url.searchParams.get("status");
+      let scoped = vaultId ? documents.filter((d) => d.vault_id === vaultId) : documents;
+      if (status) {
+        scoped = scoped.filter((d) => (d.metadata?.status ?? "") === status);
+      }
+      return sendJson(req, res, 200, { documents: scoped, total: scoped.length });
+    }
+    if (method === "GET" && path === "/api/documents/stats") {
+      return sendJson(req, res, 200, {
+        total_documents: documents.length,
+        total_chunks: documents.length,
+        total_size_bytes: documents.reduce((sum, d) => sum + (d.size ?? 0), 0),
+        documents_by_status: documents.length ? { processed: documents.length } : {},
+      });
+    }
+    if (method === "POST" && path === "/api/documents") {
+      // Multipart upload — read the raw body and lift the filename from the
+      // content-disposition part header; the stub never parses the payload.
+      const raw = await new Promise((resolve) => {
+        const chunks = [];
+        let size = 0;
+        req.on("data", (c) => {
+          size += c.length;
+          if (size > MAX_BODY_BYTES) {
+            resolve("");
+            req.destroy();
+            return;
+          }
+          chunks.push(c);
+        });
+        req.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
+        req.on("error", () => resolve(""));
+      });
+      const disposition = raw.match(/filename="([^"]+)"/);
+      const filename = disposition ? disposition[1] : `e2e-upload-${nextDocumentId}.txt`;
+      const vaultId = Number(url.searchParams.get("vault_id") || 0) || vaults[0]?.id || 1;
+      const doc = {
+        id: String(nextDocumentId++),
+        filename,
+        vault_id: vaultId,
+        content_type: "text/plain",
+        size: raw.length,
+        created_at: nowIso(),
+        processed_at: nowIso(),
+        error_message: null,
+        metadata: { status: "processed", chunk_count: 1 },
+      };
+      documents.push(doc);
+      onboarding.upload_indexed = true;
+      return sendJson(req, res, 200, { id: doc.id, filename, status: "processed" });
+    }
+
+    // ---- Activity tray job routes (issue #784) ----
+    // List routes mirror the real backend shapes the tray's adapters poll.
+    // (Dedicated matcher: the chat section's `let m` is declared further
+    // down — using it here would hit its temporal dead zone.)
+    let trayMatch;
+    // Wiki/KMS lists honor the vault_id query the real adapters send, so a
+    // multi-vault stub state cannot duplicate rows per vault the way the
+    // real per-vault backend never would (review F-003/M-PLAT-01).
+    const trayVaultId = Number(url.searchParams.get("vault_id") || 0);
+    const inTrayVault = (seed) => !trayVaultId || (seed.vaultId ?? 1) === trayVaultId;
+    if (method === "GET" && path === "/api/wiki/jobs") {
+      return sendJson(req, res, 200, {
+        jobs: e2eSeeds.wiki.filter(inTrayVault).map((s) => e2eJobShape("wiki", s)),
+      });
+    }
+    if (method === "GET" && path === "/api/kms/jobs") {
+      return sendJson(req, res, 200, {
+        jobs: e2eSeeds.kms.filter(inTrayVault).map((s) => e2eJobShape("kms", s)),
+      });
+    }
+    if (method === "GET" && path === "/api/documents/reindex/jobs") {
+      return sendJson(req, res, 200, {
+        jobs: e2eSeeds.reindex.map((s) => e2eJobShape("reindex", s)),
+      });
+    }
+    if (method === "GET" && path === "/api/draft-room/drafts") {
+      const items = e2eSeeds["draft-room"].map((s) => ({
+        id: s.draftId,
+        vault_id: 1,
+        title: s.title ?? `Draft ${s.draftId}`,
+        status: "ready",
+        active_job_id: s.status === "running" ? s.id : null,
+      }));
+      return sendJson(req, res, 200, { items, total: items.length, page: 1, per_page: 50 });
+    }
+    if ((trayMatch = path.match(/^\/api\/draft-room\/drafts\/(\d+)\/jobs$/)) && method === "GET") {
+      const draftId = Number(trayMatch[1]);
+      const items = e2eSeeds["draft-room"]
+        .filter((s) => s.draftId === draftId)
+        .map((s) => e2eJobShape("draft-room", s));
+      return sendJson(req, res, 200, { items, total: items.length, page: 1, per_page: 50 });
+    }
+    // Action routes: mutate the SAME seed records the list routes and
+    // GET /_e2e/jobs read, with the production terminal-state gates — a
+    // cancel on a terminal job 404s (wiki_store refuses non-pending/
+    // non-running), a retry only from failed, an ingest cancel on a
+    // finished document 409s (documents.py) — so the e2e cannot pass with
+    // an affordance the real server would refuse (review F-003/M-PLAT-01,
+    // PRR-026).
+    if ((trayMatch = path.match(/^\/api\/wiki\/jobs\/(\d+)\/(cancel|retry)$/)) && method === "POST") {
+      const seed = e2eSeeds.wiki.find((s) => s.id === Number(trayMatch[1]));
+      if (!seed) return sendJson(req, res, 404, { detail: "Job not found or not cancellable" });
+      if (trayMatch[2] === "cancel") {
+        if (E2E_TERMINAL_JOB_STATUSES.includes(seed.status)) {
+          return sendJson(req, res, 404, { detail: "Job not found or not cancellable" });
+        }
+        seed.status = "cancelled";
+      } else {
+        if (seed.status !== "failed") {
+          return sendJson(req, res, 404, { detail: "Job is not in 'failed' state" });
+        }
+        seed.status = "pending";
+      }
+      return sendJson(req, res, 200, { job_id: seed.id, status: seed.status });
+    }
+    if (
+      (trayMatch = path.match(/^\/api\/draft-room\/drafts\/(\d+)\/jobs\/(\d+)\/(cancel|retry)$/)) &&
+      method === "POST"
+    ) {
+      const seed = e2eSeeds["draft-room"].find(
+        (s) => s.draftId === Number(trayMatch[1]) && s.id === Number(trayMatch[2])
+      );
+      if (!seed) return sendJson(req, res, 404, { detail: "job not found" });
+      if (trayMatch[3] === "cancel") {
+        if (E2E_TERMINAL_JOB_STATUSES.includes(seed.status)) {
+          return sendJson(req, res, 404, { detail: "job not cancellable" });
+        }
+        seed.status = "cancelled";
+      } else {
+        if (seed.status !== "failed") {
+          return sendJson(req, res, 404, { detail: "job not in 'failed' state" });
+        }
+        seed.status = "pending";
+      }
+      return sendJson(req, res, 200, e2eJobShape("draft-room", seed));
+    }
+    if ((trayMatch = path.match(/^\/api\/documents\/(\d+)\/cancel$/)) && method === "POST") {
+      const doc = documents.find((d) => String(d.id) === trayMatch[1]);
+      if (!doc) return sendJson(req, res, 404, { detail: "file not found" });
+      const current = doc.metadata?.status ?? "";
+      if (current === "cancelled") {
+        return sendJson(req, res, 200, { file_id: doc.id, status: "cancelled" });
+      }
+      if (["indexed", "partial", "error"].includes(current)) {
+        return sendJson(req, res, 409, { detail: "Ingest already finished; nothing to cancel" });
+      }
+      doc.metadata = { ...(doc.metadata ?? {}), status: "cancelled" };
+      const seed = e2eSeeds.ingest.find((s) => String(s.docId) === trayMatch[1]);
+      if (seed) seed.status = "cancelled";
+      return sendJson(req, res, 200, { file_id: doc.id, status: "cancelled" });
     }
 
     // ---- chat sessions ----
@@ -340,6 +1000,7 @@ const server = http.createServer(async (req, res) => {
     if (method === "POST" && path === "/api/chat/stream") {
       const body = await readBody(req);
       const lastUser = (body.messages || []).filter((x) => x.role === "user").pop();
+      if (lastUser) onboarding.first_question_asked = true;
       const userText = String(lastUser?.content ?? "");
       const slow = /SLOW/i.test(userText);
       const finishReason = /LENGTH/i.test(userText) ? "length" : "stop";
@@ -405,6 +1066,236 @@ const server = http.createServer(async (req, res) => {
       });
       res.end();
       return;
+    }
+
+    // ---- onboarding milestones (issue #782) ----
+    if (method === "GET" && path === "/api/onboarding/milestones") {
+      return sendJson(req, res, 200, onboardingPayload());
+    }
+    if (method === "POST" && path === "/api/onboarding/milestones/citation-opened") {
+      await readBody(req);
+      onboarding.first_citation_opened = true;
+      return sendJson(req, res, 200, { ok: true });
+    }
+    if (method === "POST" && path === "/api/onboarding/milestones/dismiss") {
+      await readBody(req);
+      onboarding.dismissed = true;
+      return sendJson(req, res, 200, { ok: true });
+    }
+
+    // ---- e2e control routes (issue #782; test-only) ----
+    // Activity tray seeding (issue #784): POST /_e2e/jobs body
+    // { family, status?, title? } seeds one job; default status "running".
+    // Ingest seeds materialize as a PROCESSING document row (the adapter
+    // polls GET /api/documents?status=...); draft-room seeds as a draft +
+    // its job; wiki/kms/reindex land in vault 1.
+    if (method === "POST" && path === "/_e2e/jobs") {
+      const body = await readBody(req);
+      const family = String(body.family || "");
+      if (!E2E_JOB_FAMILIES.includes(family)) {
+        return sendJson(req, res, 400, { detail: `unknown family ${family}` });
+      }
+      const status = String(body.status || "running");
+      const title = body.title ? String(body.title) : null;
+      const id = nextE2eJobId++;
+      const seed = { id, family, status, title, created_at: nowIso(), vaultId: 1 };
+      if (family === "ingest") {
+        const docId = nextDocumentId++;
+        seed.docId = String(docId);
+        documents.push({
+          id: String(docId),
+          filename: title ?? `activity-tray-ingest-${docId}.txt`,
+          vault_id: 1,
+          size: 128,
+          content_type: "text/plain",
+          created_at: seed.created_at,
+          // Seeded phase text so the tray's documentProgress-derived phase
+          // is assertable end-to-end.
+          metadata: {
+            status: status === "pending" ? "pending" : "processing",
+            phase: "parsing",
+            chunk_count: 0,
+          },
+          e2eSeed: true,
+        });
+      } else if (family === "draft-room") {
+        seed.draftId = nextE2eDraftId++;
+      }
+      e2eSeeds[family].push(seed);
+      return sendJson(req, res, 200, { id: seed.id, family: seed.family, status: seed.status });
+    }
+    if (method === "GET" && path === "/_e2e/jobs") {
+      const family = url.searchParams.get("family") || "";
+      if (!E2E_JOB_FAMILIES.includes(family)) {
+        return sendJson(req, res, 400, { detail: `unknown family ${family}` });
+      }
+      return sendJson(req, res, 200, { jobs: e2eSeeds[family] });
+    }
+    // Reset the tray's seed state between tests: exact-count and id-scoped
+    // assertions must not depend on seeds leaked from an earlier spec or a
+    // reused stub server (PRR-003 / review F-004).
+    if (method === "POST" && path === "/_e2e/reset-jobs") {
+      await readBody(req);
+      resetE2eJobs();
+      return sendJson(req, res, 200, { ok: true });
+    }
+    if (method === "POST" && path === "/_e2e/onboarding") {
+      const body = await readBody(req);
+      resetOnboarding();
+      if (body.enable) onboarding.enabled = true;
+      return sendJson(req, res, 200, onboardingPayload());
+    }
+    if (method === "POST" && path === "/_e2e/setup-mode") {
+      const body = await readBody(req);
+      setupMode = Boolean(body.needs_setup);
+      return sendJson(req, res, 200, { needs_setup: setupMode });
+    }
+
+    // ---- a11y-matrix fixture routes (issue #778; see the fixture block
+    // above for the static-vs-seed-gated split) ----
+    if (method === "GET" && path === "/api/settings") {
+      return sendJson(req, res, 200, SETTINGS_FIXTURE);
+    }
+    if (method === "GET" && path === "/api/users") {
+      const q = (url.searchParams.get("q") || "").toLowerCase();
+      const rows = q ? [USER].filter((u) => u.username.includes(q)) : [USER];
+      return sendJson(req, res, 200, { users: rows, total: rows.length });
+    }
+    if (method === "GET" && path === "/api/organizations") {
+      return sendJson(req, res, 200, a11yOrgs);
+    }
+    if (method === "GET" && path === "/api/groups") {
+      return sendJson(req, res, 200, GROUPS_FIXTURE);
+    }
+    if (method === "GET" && path === "/api/auth/sessions") {
+      return sendJson(req, res, 200, AUTH_SESSIONS_FIXTURE);
+    }
+    if (method === "GET" && path === "/api/draft-room/capabilities") {
+      return sendJson(req, res, 200, DRAFT_CAPABILITIES_FIXTURE);
+    }
+    if (method === "GET" && path === "/api/canvas/capabilities") {
+      // Seed-gated (issue #778 review PRR-003): an always-enabled capability
+      // flips the "Open in canvas" affordance on for the sibling chat specs.
+      if (!a11ySeeded) return sendJson(req, res, 200, { enabled: false });
+      return sendJson(req, res, 200, { enabled: true });
+    }
+    // Seed-gated rows below: 404 until POST /_e2e/a11y-seed.
+    if (method === "GET" && path === "/api/tags") {
+      if (!a11ySeeded) return sendJson(req, res, 404, { detail: "not seeded" });
+      return sendJson(req, res, 200, {
+        tags: [
+          {
+            id: 1,
+            vault_id: 1,
+            name: "maintenance",
+            color: "#2563eb",
+            created_at: nowIso(),
+            updated_at: nowIso(),
+            document_count: 1,
+          },
+        ],
+      });
+    }
+    if (method === "GET" && path === "/api/folders") {
+      if (!a11ySeeded) return sendJson(req, res, 404, { detail: "not seeded" });
+      return sendJson(req, res, 200, {
+        folders: [{ id: 1, vault_id: 1, name: "Manuals", parent_id: null, created_at: nowIso() }],
+      });
+    }
+    if (method === "GET" && path === "/api/memories") {
+      if (!a11ySeeded) return sendJson(req, res, 404, { detail: "not seeded" });
+      return sendJson(req, res, 200, {
+        memories: [
+          {
+            id: "m1",
+            content: "Coolant intervals run every 500 hours.",
+            metadata: { category: "maintenance" },
+            updated_at: nowIso(),
+          },
+        ],
+      });
+    }
+    if (method === "GET" && path === "/api/wiki/pages") {
+      if (!a11ySeeded) return sendJson(req, res, 404, { detail: "not seeded" });
+      return sendJson(req, res, 200, { pages: [a11yWikiPage()], page: 1, per_page: 20, total: 1 });
+    }
+    if (method === "GET" && path === "/api/wiki/lint") {
+      if (!a11ySeeded) return sendJson(req, res, 404, { detail: "not seeded" });
+      return sendJson(req, res, 200, { findings: [] });
+    }
+    if (method === "GET" && path === "/api/wiki/claims") {
+      if (!a11ySeeded) return sendJson(req, res, 404, { detail: "not seeded" });
+      return sendJson(req, res, 200, { claims: [] });
+    }
+    if (method === "GET" && path === "/api/kms/entries") {
+      if (!a11ySeeded) return sendJson(req, res, 404, { detail: "not seeded" });
+      return sendJson(req, res, 200, { entries: [a11yKmsEntry()], total: 1, page: 1, per_page: 200 });
+    }
+    if (method === "GET" && path === "/api/kms/entries/1") {
+      if (!a11ySeeded) return sendJson(req, res, 404, { detail: "not seeded" });
+      return sendJson(req, res, 200, a11yKmsEntry());
+    }
+    if (method === "GET" && path === `/api/documents/${A11Y_DOC_ID}`) {
+      const doc = documents.find((d) => d.id === A11Y_DOC_ID && d.e2eA11ySeed);
+      if (!doc) return sendJson(req, res, 404, { detail: "file not found" });
+      return sendJson(req, res, 200, doc);
+    }
+    if (method === "GET" && path === `/api/documents/${A11Y_DOC_ID}/raw`) {
+      const doc = documents.find((d) => d.id === A11Y_DOC_ID && d.e2eA11ySeed);
+      if (!doc) return sendJson(req, res, 404, { detail: "file not found" });
+      res.writeHead(200, {
+        "Content-Type": "application/pdf",
+        "Content-Disposition": 'attachment; filename="handbook-a11y.pdf"',
+        ...corsHeaders(req),
+      });
+      res.end("a11y fixture document body");
+      return;
+    }
+    if (method === "GET" && path === "/api/search/unified") {
+      if (!a11ySeeded) return sendJson(req, res, 404, { detail: "not seeded" });
+      const q = (url.searchParams.get("q") || "").toLowerCase();
+      const results = q.includes("coolant")
+        ? [
+            {
+              type: "document",
+              id: 1,
+              title: "handbook-a11y.pdf",
+              snippet: "The coolant interval is 500 hours.",
+              vault_id: 1,
+              url_hint: "/documents/1",
+              score: 1.0,
+            },
+          ]
+        : [];
+      return sendJson(req, res, 200, { results });
+    }
+    if (method === "GET" && path === "/api/canvas/artifacts/cav_a11y_fixture_0") {
+      if (!a11ySeeded) return sendJson(req, res, 404, { detail: "not seeded" });
+      return sendJson(req, res, 200, a11yCanvasPayload());
+    }
+    if (method === "GET" && path === "/api/canvas/artifacts/cav_a11y_fixture_0/versions") {
+      if (!a11ySeeded) return sendJson(req, res, 404, { detail: "not seeded" });
+      const { version } = a11yCanvasPayload();
+      return sendJson(req, res, 200, { versions: [version] });
+    }
+    if (method === "GET" && path === `/api/draft-room/drafts/${A11Y_DRAFT_ID}`) {
+      if (!a11ySeeded) return sendJson(req, res, 404, { detail: "draft not found" });
+      return sendJson(req, res, 200, a11yDraftDetail());
+    }
+    if (method === "POST" && path === "/_e2e/a11y-seed") {
+      await readBody(req);
+      return sendJson(req, res, 200, seedA11yFixtures());
+    }
+    if (method === "POST" && path === "/_e2e/a11y-reset") {
+      await readBody(req);
+      return sendJson(req, res, 200, resetA11yFixtures());
+    }
+    if (method === "POST" && path === "/_e2e/user-flags") {
+      const body = await readBody(req);
+      if (typeof body.must_change_password === "boolean") {
+        USER.must_change_password = body.must_change_password;
+      }
+      return sendJson(req, res, 200, USER);
     }
 
     // ---- fallback ----

@@ -13,6 +13,12 @@
 import { defineConfig } from "@playwright/test";
 import path from "node:path";
 
+// E2E_STUB_PORT (issue #781): local runs can move the stub off :9090 (a
+// foreign service may squat it). stub-backend.mjs and the vite preview proxy
+// (frontend/vite.paths.ts) read the same variable, so the whole tier moves
+// together; CI never sets it and stays on the default.
+const stubPort = process.env.E2E_STUB_PORT || "9090";
+
 export default defineConfig({
   testDir: ".",
   timeout: 60_000,
@@ -23,6 +29,11 @@ export default defineConfig({
   reporter: [["line"]],
   use: {
     baseURL: "http://localhost:4173",
+    // Bound un-timed waits across the e2e tier: the app polls /api/health,
+    // so a "networkidle" wait may never settle — without bounds a spec
+    // could hang until the test timeout with no record written.
+    actionTimeout: 20_000,
+    navigationTimeout: 30_000,
     trace: "off",
     screenshot: "off",
     video: "off",
@@ -31,7 +42,7 @@ export default defineConfig({
   webServer: [
     {
       command: "node stub-backend.mjs",
-      url: "http://localhost:9090/api/health",
+      url: `http://localhost:${stubPort}/api/health`,
       timeout: 30_000,
       reuseExistingServer: true,
     },

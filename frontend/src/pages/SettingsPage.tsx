@@ -118,6 +118,12 @@ function SettingsPageContent({
   // the load effect (state-driven retry). The effect body does not read
   // the value — the dependency alone re-triggers the fetch.
   const [loadAttempt, setLoadAttempt] = useState(0);
+  // K-21 (PR #1048 feedback): the shell now fills the settings store for every
+  // page, so a non-null `settings` no longer means "this page loaded". Track
+  // THIS page's load outcome so a failed GET /settings keeps the error card
+  // (with Retry) instead of silently rendering the form over stale-or-default
+  // values; reset on a successful (re)load.
+  const [pageLoadFailed, setPageLoadFailed] = useState(false);
 
   useEffect(() => {
     if (testMode) {
@@ -129,6 +135,7 @@ function SettingsPageContent({
     getSettings()
       .then((data) => {
         if (mounted) {
+          setPageLoadFailed(false);
           setSettings(data);
           initializeForm(data);
         }
@@ -137,6 +144,7 @@ function SettingsPageContent({
         if (mounted) {
           // setLoadError records the failure AND clears `loading` — the
           // plain setError left the skeleton rendered forever (UI-029).
+          setPageLoadFailed(true);
           setLoadError(
             err instanceof Error ? err.message : "Failed to load settings",
           );
@@ -145,7 +153,7 @@ function SettingsPageContent({
     return () => {
       mounted = false;
     };
-  }, [setSettings, initializeForm, setLoadError, testMode, loadAttempt]);
+  }, [setSettings, initializeForm, setLoadError, setPageLoadFailed, testMode, loadAttempt]);
 
   const dirtySet = dirtyFields();
   const dirtyCount = dirtySet.size;
@@ -282,7 +290,9 @@ function SettingsPageContent({
     );
   }
 
-  if (error && !settings) {
+  // K-21: page-owned failure gate — a shell-filled store must not mask this
+  // page's failed load behind the defaults form.
+  if ((error && !settings) || pageLoadFailed) {
     return (
       <Card>
         <CardContent className="py-8 space-y-4">
@@ -318,16 +328,16 @@ function SettingsPageContent({
   return (
     <>
       {reindexRequired && (
-        <div className="flex items-start gap-3 rounded-sm border border-amber-300 bg-amber-50 dark:bg-amber-950/20 dark:border-amber-800 p-4">
+        <div className="flex items-start gap-3 rounded-sm border border-warning/50 bg-warning/10 p-4">
           <AlertTriangle
-            className="h-5 w-5 text-amber-600 shrink-0 mt-0.5"
+            className="h-5 w-5 text-warning shrink-0 mt-0.5"
             aria-hidden
           />
           <div className="flex-1 min-w-0">
-            <p className="text-sm font-medium text-amber-800 dark:text-amber-200">
+            <p className="text-sm font-medium text-warning">
               Reindex required
             </p>
-            <p className="text-xs text-amber-700 dark:text-amber-300 mt-0.5">
+            <p className="text-xs text-warning/80 mt-0.5">
               Changes to embedding model, chunk size, or vector settings
               invalidate existing document embeddings. Re-process documents
               from the Documents page or run a wiki recompile from the
@@ -336,7 +346,7 @@ function SettingsPageContent({
           </div>
           <button
             onClick={() => setReindexRequired(false)}
-            className="text-amber-600 hover:text-amber-800 text-xs underline shrink-0"
+            className="text-warning hover:text-warning/80 text-xs underline shrink-0"
           >
             Dismiss
           </button>
@@ -476,18 +486,18 @@ function SettingsPageWithStatus({ health }: { health: HealthStatus }) {
 
   return (
     <div className="space-y-6 animate-in fade-in duration-300 pb-12">
-      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-        <PageTitleHeader
-          title="Settings"
-          description="Configure your application preferences"
-        />
-        <div className="flex flex-col items-end gap-1">
-          <ConnectionStatusBadges health={health} />
-          <span className="text-xs text-muted-foreground">
-            {formatLastChecked(health.lastChecked)}
-          </span>
-        </div>
-      </div>
+      <PageTitleHeader
+        title="Settings"
+        description="Configure your application preferences"
+        actions={
+          <div className="flex flex-col items-end gap-1">
+            <ConnectionStatusBadges health={health} />
+            <span className="text-xs text-muted-foreground">
+              {formatLastChecked(health.lastChecked)}
+            </span>
+          </div>
+        }
+      />
       <SettingsPageContent
         health={health}
         connectionResult={connectionResult}

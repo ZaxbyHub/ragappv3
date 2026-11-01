@@ -18,9 +18,15 @@ import type {
   SortOrder,
 } from "@/lib/api";
 
+// Shared immutable default for the optional wikiFetchFailedIds prop.
+const EMPTY_WIKI_FETCH_FAILED_IDS: Set<string> = new Set();
+
 interface DocumentTableProps {
   documents: Document[];
   selectedIds: Set<string>;
+  /** Organize-level capability (vault write): row selection + wiki compile (issue #767). */
+  canOrganizeDocuments: boolean;
+  /** Admin-level capability (vault admin): destructive actions only (issue #767). */
   canMutateDocuments: boolean;
   filenameColWidth: number;
   onResizeMouseDown: (e: React.MouseEvent<HTMLDivElement>) => void;
@@ -29,10 +35,11 @@ interface DocumentTableProps {
   onSelectAll: (checked: boolean | "indeterminate") => void;
   onSelectOne: (docId: string, checked: boolean) => void;
   wikiStatusMap: Record<string, DocumentWikiStatus>;
+  wikiFetchFailedIds?: Set<string>;
   compilingDocIds: Set<string>;
   onCompileDocument: (docId: string) => void;
   onDownload: (doc: Document) => void;
-  onDelete: (docId: string) => void;
+  onDelete: (docId: string, filename?: string) => void;
   sortBy: DocumentSortBy;
   sortOrder: SortOrder;
   onSort: (column: DocumentSortBy) => void;
@@ -77,6 +84,7 @@ function SortHeader({
 export function DocumentTable({
   documents,
   selectedIds,
+  canOrganizeDocuments,
   canMutateDocuments,
   filenameColWidth,
   onResizeMouseDown,
@@ -85,6 +93,10 @@ export function DocumentTable({
   onSelectAll,
   onSelectOne,
   wikiStatusMap,
+  // Optional so existing renderers (and their test doubles) that do not
+  // track fetch failures keep compiling; absence simply means no document is
+  // rendered as "status unavailable".
+  wikiFetchFailedIds = EMPTY_WIKI_FETCH_FAILED_IDS,
   compilingDocIds,
   onCompileDocument,
   onDownload,
@@ -141,7 +153,7 @@ export function DocumentTable({
         );
 
   return (
-    <Card className="hidden sm:block">
+    <Card className="hidden md:block">
       <CardContent className="p-0">
         <div ref={tableScrollRef} className="overflow-auto" style={{ maxHeight: "70vh" }}>
           <table
@@ -157,7 +169,7 @@ export function DocumentTable({
                   <Checkbox
                     checked={headerChecked}
                     onCheckedChange={onSelectAll}
-                    disabled={!canMutateDocuments}
+                    disabled={!canOrganizeDocuments}
                     aria-label="Select all documents"
                   />
                 </th>
@@ -223,7 +235,7 @@ export function DocumentTable({
                   onSort={onSort}
                   className="w-[140px]"
                 />
-                <th scope="col" className="text-right p-4 font-medium flex-none w-[110px]">Actions</th>
+                <th scope="col" className="text-right p-4 font-medium flex-none w-[110px] sticky right-0 bg-muted">Actions</th>
               </tr>
             </thead>
             <tbody
@@ -253,7 +265,7 @@ export function DocumentTable({
                       <Checkbox
                         checked={isSelected}
                         onCheckedChange={(checked) => onSelectOne(docId, !!checked)}
-                        disabled={!canMutateDocuments}
+                        disabled={!canOrganizeDocuments}
                         aria-label={`Select ${doc.filename}`}
                       />
                     </td>
@@ -313,6 +325,23 @@ export function DocumentTable({
                         const ws = wikiStatusMap[docId];
                         const isCompiling =
                           compilingDocIds.has(docId) || ws?.wiki_status === "compiling";
+                        // A FAILED wiki-status fetch is unknown, NOT
+                        // uncompiled (#765 AC6), and a current failure takes
+                        // precedence over ANY cached value (review rounds
+                        // 2-3, PRR-037/B-2/R03 + critic round 3: the branch
+                        // sits ABOVE the skipped/Compile interpretations so
+                        // no stale cached value — not_compiled OR skipped —
+                        // can mask the failure).
+                        if (wikiFetchFailedIds.has(docId)) {
+                          return (
+                            <span
+                              className="text-xs text-muted-foreground italic"
+                              title="Wiki status unavailable — the status fetch failed."
+                            >
+                              Wiki status unavailable
+                            </span>
+                          );
+                        }
                         // AC29 (#515): a document the compiler SKIPPED (no
                         // extractable knowledge) gets a distinct label — it is
                         // NOT uncompiled, so it must not offer the generic
@@ -331,10 +360,10 @@ export function DocumentTable({
                           return (
                             <button
                               type="button"
-                              className="text-xs text-muted-foreground hover:text-foreground underline"
+                              className={`text-xs text-muted-foreground underline ${canOrganizeDocuments ? "hover:text-foreground cursor-pointer" : "cursor-not-allowed"}`}
                               onClick={() => onCompileDocument(docId)}
-                              disabled={isCompiling}
-                              title="Compile wiki for this document"
+                              disabled={!canOrganizeDocuments || isCompiling}
+                              title={canOrganizeDocuments ? "Compile wiki for this document" : "Write access to this vault is required to compile the wiki"}
                             >
                               {isCompiling ? "Queuing…" : "Compile"}
                             </button>
@@ -355,9 +384,10 @@ export function DocumentTable({
                         return (
                           <button
                             type="button"
-                            className={`text-xs font-mono cursor-pointer bg-transparent border-0 p-0 ${color}`}
+                            className={`text-xs font-mono bg-transparent border-0 p-0 ${color} ${canOrganizeDocuments ? "cursor-pointer" : "cursor-not-allowed"}`}
                             onClick={() => onCompileDocument(docId)}
-                            title={`Wiki: ${ws.wiki_status} — ${ws.pages_count} pages, ${ws.claims_count} claims, ${ws.lint_count} lint issues. Click to recompile.`}
+                            disabled={!canOrganizeDocuments}
+                            title={`Wiki: ${ws.wiki_status} — ${ws.pages_count} pages, ${ws.claims_count} claims, ${ws.lint_count} lint issues.${canOrganizeDocuments ? " Click to recompile." : " Write access to this vault is required to recompile."}`}
                             aria-label={`Recompile wiki for ${doc.filename}. Status: ${ws.wiki_status}.`}
                           >
                             {label}
@@ -383,7 +413,7 @@ export function DocumentTable({
                     <td className="p-4 flex-none w-[140px] text-muted-foreground">
                       {formatDate(doc.created_at)}
                     </td>
-                    <td className="p-4 flex-none w-[110px] text-right">
+                    <td className="p-4 flex-none w-[110px] text-right sticky right-0 bg-card border-l border-border">
                       <Button
                         variant="ghost"
                         size="icon"
@@ -398,7 +428,7 @@ export function DocumentTable({
                           variant="ghost"
                           size="icon"
                           className="min-w-[44px] min-h-[44px]"
-                          onClick={() => onDelete(docId)}
+                          onClick={() => onDelete(docId, doc.filename)}
                           aria-label="Delete document"
                         >
                           <Trash2 className="w-4 h-4 text-destructive" aria-hidden="true" />

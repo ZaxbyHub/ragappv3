@@ -75,6 +75,13 @@ def _get_conn() -> sqlite3.Connection:
                 )
                 """
             )
+            # The store() prune orders by created_at; without this index the
+            # DELETE subquery full-scans and sorts the whole table on every
+            # capped store call (issue #698).
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_embedding_cache_created_at "
+                "ON embedding_cache(created_at)"
+            )
             conn.commit()
             _conn = conn
         return _conn

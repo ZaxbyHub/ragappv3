@@ -107,6 +107,7 @@ def main() -> int:
         try:
             asyncio.run(
                 delete_vault(
+                    http_request=None,  # audit-event param (issue #722 AC1); None is safe for safe_record_security_event
                     vault_id=vault_id,
                     conn=failing_conn,
                     vector_store=vs,
@@ -177,6 +178,7 @@ def main() -> int:
             try:
                 asyncio.run(
                     delete_vault(
+                        http_request=None,  # audit-event param (issue #722 AC1); None is safe for safe_record_security_event
                         vault_id=vault_id,
                         conn=conn,
                         vector_store=vs,

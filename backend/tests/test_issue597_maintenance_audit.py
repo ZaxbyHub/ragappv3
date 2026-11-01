@@ -44,6 +44,7 @@ from fastapi.testclient import TestClient
 from app.api.routes import admin as admin_module
 from app.config import settings
 from app.models.database import SQLiteConnectionPool, init_db
+from app.security import admin_scope_fingerprint
 from app.services.maintenance import MaintenanceError, MaintenanceService
 
 CSRF_TEST_POLICY = "naive"
@@ -81,9 +82,19 @@ def _audit_payload() -> SimpleNamespace:
     The pre-fix tree has no MaintenanceAudit symbol (importing it here would
     break every check on the base leg); the service reads only these five
     fields, and a foreign HMAC value is fine for the AC3 row-gate assertions.
+    ``user_id`` carries the non-secret scoped fingerprint of the acting
+    token — the identity value the production routes pass since the #709
+    class-(a) fix (issue #942 AC4) — computed under the same patched
+    settings the routes run under, because ``admin_scope_fingerprint`` reads
+    the scope map from settings.
     """
+    with patch.object(settings, "admin_secret_token", ADMIN_TOKEN):
+        with patch.object(
+            settings, "admin_token_scopes", {ADMIN_TOKEN: ["admin:config"]}
+        ):
+            identity = admin_scope_fingerprint(ADMIN_TOKEN)
     return SimpleNamespace(
-        user_id=ADMIN_TOKEN,
+        user_id=identity,
         ip=TESTCLIENT_HOST,
         key_version=TEST_KEY_VERSION,
         hmac_sha256=hashlib.sha256(b"issue597-ac3-payload").hexdigest(),
@@ -226,8 +237,11 @@ def test_issue597_ac1_audit_row_written():
                 f"toggle (2 for enable+disable), found {len(rows)}"
             )
             expected = [
-                ("maintenance", 1, ADMIN_TOKEN, TESTCLIENT_HOST),
-                ("maintenance", 0, ADMIN_TOKEN, TESTCLIENT_HOST),
+                # Issue #709: the audit identity is the non-secret scope
+                # fingerprint of the acting token, never the raw bearer
+                # (the route computes it before the HMAC + INSERT).
+                ("maintenance", 1, admin_scope_fingerprint(ADMIN_TOKEN), TESTCLIENT_HOST),
+                ("maintenance", 0, admin_scope_fingerprint(ADMIN_TOKEN), TESTCLIENT_HOST),
             ]
             actual = [(r[0], r[1], r[2], r[3]) for r in rows]
             assert actual == expected, (

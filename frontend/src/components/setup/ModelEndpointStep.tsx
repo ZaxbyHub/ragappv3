@@ -190,7 +190,7 @@ export default function ModelEndpointStep({ onFinish }: ModelEndpointStepProps) 
             aria-live="polite"
             className={
               probeStatus.status === "ok"
-                ? "text-sm text-green-600 dark:text-green-400"
+                ? "text-sm text-success"
                 : "text-sm text-destructive"
             }
           >

@@ -164,9 +164,11 @@ describe("CSRF Exports from @/lib/api", () => {
         })
       );
       const { ensureCsrfToken, resetCsrfToken } = await import("@/lib/api");
+      const { StaleAuthOwnerError } = await import("@/lib/api/auth-lifecycle");
 
-      // Start a fetch
+      // Start a fetch and observe the deliberate invalidation immediately.
       const p1 = ensureCsrfToken();
+      const staleRejection = expect(p1).rejects.toBeInstanceOf(StaleAuthOwnerError);
 
       // Reset before fetch completes
       resetCsrfToken();
@@ -184,6 +186,7 @@ describe("CSRF Exports from @/lib/api", () => {
       });
 
       const token = await ensureCsrfToken();
+      await staleRejection;
       expect(token).toBe("fresh");
     });
   });

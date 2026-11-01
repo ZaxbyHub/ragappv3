@@ -11,10 +11,15 @@ logger at INFO level for any query, and surfaced in the streaming
 is true. The default keeps trace data out of normal user-visible
 metadata — operators flip the flag on for evaluation runs.
 
-The logged form never contains the raw user query: ``log()`` emits
-``to_log_dict()`` (which omits ``original_query`` and carries only a
-length/hash), while ``to_dict()`` (which keeps ``original_query``) is
-reserved for the in-response trace behind ``rag_trace_in_response``.
+The logged form never contains user-derived query or answer text: ``log()``
+emits ``to_log_dict()``, an ALLOWLIST projection of the trace — only the
+fields allowlisted in ``_LOG_SAFE_FIELDS`` flow verbatim (counts, statuses,
+ids, labels, timing), each of the user-derived fields listed in
+``_REDACTED_FIELDS`` is emitted as an explicit length/hash/count summary
+written per field in ``to_log_dict()``, and any field neither set names is
+excluded from the log form by default. ``to_dict()`` (which keeps the
+raw text fields) is reserved for the streaming ``done`` event's ``trace``
+field behind ``settings.rag_trace_in_response``.
 """
 
 from __future__ import annotations
@@ -25,6 +30,84 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+# Fields safe to log verbatim: counts, statuses, identifiers, labels, timing
+# and flags — never user/LLM-derived free text. The logged form is an
+# allowlist: a field is emitted only if explicitly listed here. The fields in
+# _REDACTED_FIELDS (below) are the classification counterpart — they name the
+# user-derived text fields whose summaries to_log_dict() emits explicitly
+# instead of iterating this set. Adding a trace field therefore requires an
+# explicit classification decision — enforced by
+# tests/test_no_query_text_in_default_logs.py (allowlist parity guard, issue
+# #710), which fails until a new field joins one of the two sets.
+_LOG_SAFE_FIELDS: frozenset = frozenset(
+    {
+        "fts_status",
+        "fts_exceptions",
+        "fused_hits",
+        "reranked_hits",
+        "rerank_status",
+        "filtered_hits",
+        "distance_threshold",
+        "distillation_before",
+        "distillation_after",
+        "parent_windows_expanded",
+        "token_pack_included",
+        "token_pack_skipped",
+        "token_pack_truncated",
+        "final_sources",
+        "final_memories",
+        "cited_sources",
+        "cited_memories",
+        "invalid_citations",
+        "citation_confidence",
+        "answer_supported",
+        "exact_match_promoted",
+        "multi_scale_used",
+        "dense_hits_per_variant",
+        "wiki_candidates_total",
+        "wiki_injected",
+        "wiki_cited",
+        "wiki_filtered",
+        "answer_source_mode",
+        "fusion_used",
+        "ab_experiment_id",
+        "ab_variant",
+        "prompt_version",
+        "artifact_sources_retrieved",
+        "vision_eligible",
+        "vision_selected",
+        "vision_deduped",
+        "vision_capped",
+        "vision_used",
+        "vision_proxy_only",
+        "vision_policy_blocked",
+        "vision_asset_missing",
+        "vision_provider_unavailable",
+        "vision_empty_response",
+        "vision_latency_ms",
+        "vision_payload_bytes",
+        "finish_reason",
+    }
+)
+
+# User-derived text fields: the raw chat input, its transforms/rewrites, the
+# LLM-generated query plan, dropped query variants, and answer sentences with
+# no supporting citation. These carry the same (or LLM-rewritten) user text as
+# original_query and must never reach the default (INFO) log verbatim; the
+# log form keeps only count / length+hash summaries (issue #710, contract
+# from #287: no raw user/query text at default log level).
+_REDACTED_FIELDS: frozenset = frozenset(
+    {
+        "original_query",
+        "transformed_queries",
+        "variants_dropped",
+        "wiki_query",
+        "followup_rewrite",
+        "query_plan",
+        "unverifiable_claims",
+    }
+)
 
 
 @dataclass
@@ -160,32 +243,61 @@ class RAGTrace:
             "finish_reason": self.finish_reason,
         }
 
+    @staticmethod
+    def _text_hash(value: str) -> str:
+        """SHA-1 truncated to 12 hex chars — enough to correlate logs to a
+        specific query without persisting the query text itself.
+
+        ``usedforsecurity=False``: this is a correlation id for log
+        correlation, never a security primitive, and it must keep working on
+        FIPS-enabled interpreters where plain SHA-1 is unavailable.
+        """
+        digest = hashlib.sha1(value.encode("utf-8"), usedforsecurity=False)
+        return digest.hexdigest()[:12]
+
     def to_log_dict(self) -> Dict[str, Any]:
         """Return a redaction-safe dict for the LOG path.
 
-        Identical to :meth:`to_dict` except ``original_query`` (the raw
-        user chat input) is replaced by a non-reversible length + short
-        hash. This is the form emitted by :meth:`log`; the full
-        ``original_query`` is only ever returned via :meth:`to_dict`,
-        which is reserved for the in-response trace behind the
-        ``rag_trace_in_response`` setting.
+        An allowlist projection of :meth:`to_dict`: fields listed in
+        ``_LOG_SAFE_FIELDS`` flow verbatim; each user-derived field listed in
+        ``_REDACTED_FIELDS`` is emitted as an explicit non-reversible summary
+        (length+hash for strings, counts for lists) assigned per field below;
+        and any field neither set names is EXCLUDED from the log form by
+        default, so a future text-bearing field cannot reintroduce the
+        #287/#710 leak. The emitted key set and every redacted value's shape
+        are asserted by tests/test_no_query_text_in_default_logs.py, so a
+        deleted summary or a verbatim emission fails there. The full values
+        remain available via :meth:`to_dict`, which is reserved for the
+        in-response trace behind the ``rag_trace_in_response`` setting.
         """
         data = self.to_dict()
+        loggable: Dict[str, Any] = {
+            key: value for key, value in data.items() if key in _LOG_SAFE_FIELDS
+        }
         query = self.original_query or ""
-        # SHA-1 truncated to 12 hex chars — enough to correlate logs to a
-        # specific query without persisting the query text itself.
-        query_hash = hashlib.sha1(query.encode("utf-8")).hexdigest()[:12]
-        data["original_query"] = f"<redacted len={len(query)} hash={query_hash}>"
-        return data
+        loggable["original_query"] = f"<redacted len={len(query)} hash={self._text_hash(query)}>"
+        # List-shaped user text -> count-only summaries.
+        loggable["transformed_queries"] = f"<redacted count={len(self.transformed_queries)}>"
+        loggable["variants_dropped"] = f"<redacted count={len(self.variants_dropped)}>"
+        loggable["query_plan"] = f"<redacted count={len(self.query_plan)}>"
+        loggable["unverifiable_claims"] = f"<redacted count={len(self.unverifiable_claims)}>"
+        # String-shaped user text -> length+hash when present, empty/None kept.
+        for attr in ("wiki_query", "followup_rewrite"):
+            value = getattr(self, attr)
+            if value:
+                loggable[attr] = f"<redacted len={len(value)} hash={self._text_hash(value)}>"
+            else:
+                loggable[attr] = value
+        return loggable
 
     def log(self) -> None:
         """Emit the trace to the application logger.
 
         Uses INFO so that production deployments capture the structured
-        signal without flipping debug logging globally. Reasoning text is
-        never persisted to the trace, only counts and identifiers — and
-        the raw ``original_query`` is never logged (see
-        :meth:`to_log_dict`).
+        signal without flipping debug logging globally. Reasoning text and
+        every other user-derived text field are never persisted to the
+        default log — only counts, identifiers, statuses and non-reversible
+        length/hash summaries (see :meth:`to_log_dict`).
         """
         try:
             logger.info("RAG trace: %s", self.to_log_dict())

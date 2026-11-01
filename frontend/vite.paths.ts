@@ -34,7 +34,11 @@ export function normalizeBasePath(value?: string | null): string {
   return `/${stripped}`
 }
 
-const API_PROXY_TARGET = 'http://localhost:9090'
+// E2E_STUB_PORT (issue #781): the e2e tier can move the stub backend off
+// :9090 (e.g. a foreign service squats it locally); the dev/preview proxy
+// follows so vite preview serves the app against whichever stub the tier
+// booted. Unset — the default — keeps dev and CI byte-identical.
+const API_PROXY_TARGET = `http://localhost:${process.env.E2E_STUB_PORT || '9090'}`
 
 export interface ApiProxyOptions {
   target: string

@@ -228,7 +228,7 @@ class EmbeddingService:
     # Hard caps for input validation
     MAX_BATCH_SIZE = 512  # Maximum number of texts per batch call
     MAX_TEXT_LENGTH = (
-        8192  # Maximum characters per text (derived from chunk_size_chars=8192)
+        8192  # Hard per-text cap for embedder input; unrelated to chunk_size_chars (default 2000)
     )
     MIN_SPLIT_CHARS = 200  # Minimum text length to attempt single-text splitting
 
@@ -836,8 +836,9 @@ class EmbeddingService:
                     response.status_code
                 ):
                     logger.warning(
-                        f"Embedding API returned status {response.status_code} for {config.mode} mode: {response.text}"
+                        f"Embedding API returned status {response.status_code} for {config.mode} mode (body_len={len(response.text)})"
                     )
+                    logger.debug(f"Embedding API error body: {response.text[:2000]}")
                     raise EmbeddingError(
                         f"Embedding API returned status {response.status_code}"
                     )
@@ -858,8 +859,9 @@ class EmbeddingService:
                 # raised OUTSIDE the breaker: they are caller errors that
                 # would recur on every retry, not provider outages.
                 logger.warning(
-                    f"Embedding API returned status {response.status_code} for {config.mode} mode: {response.text}"
+                    f"Embedding API returned status {response.status_code} for {config.mode} mode (body_len={len(response.text)})"
                 )
+                logger.debug(f"Embedding API error body: {response.text[:2000]}")
                 raise EmbeddingError(
                     f"Embedding API returned status {response.status_code}"
                 )
@@ -868,8 +870,9 @@ class EmbeddingService:
                 data = response.json()
             except ValueError as e:
                 logger.warning(
-                    f"Invalid JSON response from embedding API for {config.mode} mode: {e}, response: {response.text}"
+                    f"Invalid JSON response from embedding API for {config.mode} mode: {e} (body_len={len(response.text)})"
                 )
+                logger.debug(f"Embedding API error body: {response.text[:2000]}")
                 raise EmbeddingError("Invalid response from embedding service")
 
             embedding = self._extract_embedding(data, config)
@@ -993,10 +996,139 @@ class EmbeddingService:
         # place (embed_passage_with_label); the label is discarded here.
         return (await self.embed_passage_with_label(text))[0]
 
-    async def embed_probe(self, timeout: float) -> None:
-        """Issue a cache-bypassing ping embedding for deep-health checks.
+    def _build_batch_payload(
+        self, texts: List[str], config: Optional[_EmbeddingRequestConfig] = None
+    ) -> dict:
+        """Build a LIST-input payload per provider dialect (issue #1009).
 
-        Runs the ping through the breaker-wrapped checked POST with a
+        The legacy ``prompt``-only Ollama dialect has no list form and is NOT
+        handled here — callers must fall back to a single large text for it
+        (``embed_probe`` documents that fallback in its error text).
+        """
+        if config is None:
+            config = self._request_config()
+        if config.mode == "openai":
+            return {"model": config.model, "input": texts}
+        if config.mode == "tei":
+            return {"inputs": texts}
+        if config.ollama_style == "modern":
+            return {"model": config.model, "input": texts}
+        raise ValueError(
+            "legacy ollama dialect does not support list payloads"
+        )
+
+    @staticmethod
+    def _int_probe_setting(name: str, default: int) -> int:
+        """Read an int setting with a MagicMock-safe numeric fallback.
+
+        The frozen #494 harness patches a MagicMock over this module's
+        ``settings``; a plain ``getattr`` would return a Mock (MagicMock
+        synthesizes unknown attributes), so only a real non-bool int counts.
+        """
+        value = getattr(settings, name, default)
+        if isinstance(value, bool) or not isinstance(value, int):
+            return default
+        return value
+
+    def _build_probe_inputs(self) -> List[str]:
+        """Deterministic synthetic probe inputs (issue #1009).
+
+        Never document text: a fixed filler pattern of the configured
+        chunk-sized length, repeated for the configured batch count — the
+        LIST input shape ingest traffic uses, so capacity-class provider
+        failures surface in deep health.
+        """
+        count = max(1, self._int_probe_setting("embedding_probe_batch_count", 4))
+        chars = max(
+            8, self._int_probe_setting("embedding_probe_batch_chars", 512)
+        )
+        unit = "probe "
+        filler = (unit * (chars // len(unit) + 1))[:chars]
+        return [filler for _ in range(count)]
+
+    def _validate_probe_response(self, data, config) -> None:
+        """Validate a probe response in EVERY dialect (issue #1009).
+
+        Count parity is deliberately NOT required — a provider may answer a
+        batch with a single representative embedding; the probe's contract
+        is that the payload SHAPE was accepted and at least one usable
+        embedding row came back (an empty container is NOT embedding-like:
+        the replaced ``_extract_embedding`` oracle rejected empties, and a
+        200-with-empty-payload must not vouch for capacity — PR #1018
+        review F-005).
+        """
+        if config.mode == "tei":
+            # Native TEI answers a bare list-of-lists; some TEI deployments
+            # wrap the same matrix as {"embeddings": [[...]]} — the ingest
+            # path accepts that wrapper, so the probe must too (PR #1018
+            # review C-26: rejecting it produces a false unhealthy).
+            tei_matrix = data
+            if isinstance(data, dict) and isinstance(
+                data.get("embeddings"), list
+            ):
+                tei_matrix = data["embeddings"]
+            if not (
+                isinstance(tei_matrix, list)
+                and tei_matrix
+                and all(
+                    isinstance(row, list) and row for row in tei_matrix
+                )
+            ):
+                raise EmbeddingError(
+                    "Invalid response from embedding service"
+                )
+            return
+        if config.mode == "openai":
+            if (
+                not isinstance(data, dict)
+                or not isinstance(data.get("data"), list)
+                or not data["data"]
+            ):
+                raise EmbeddingError(
+                    "Invalid response from embedding service"
+                )
+            return
+        # Modern ollama {"embeddings": [[...]]} plus the compatibility
+        # {"embedding": [...]} shape; legacy prompt dialect answers the
+        # scalar shape too. Native TEI deployments may also wrap the matrix
+        # as {"embeddings": [[...]]} (the ingest path accepts the same
+        # wrapper), so it is honored here as well. Empty containers are
+        # rejected in every arm (F-005): a 200-with-empty-payload must not
+        # vouch for capacity.
+        if isinstance(data, dict):
+            # "embeddings" is a matrix (list of vectors); "embedding" is a
+            # single flat compatibility vector. Both must be non-empty.
+            matrix = data.get("embeddings")
+            if isinstance(matrix, list):
+                if not matrix or not all(
+                    isinstance(row, list) and row for row in matrix
+                ):
+                    raise EmbeddingError(
+                        "Invalid response from embedding service"
+                    )
+                return
+            vector = data.get("embedding")
+            if isinstance(vector, list):
+                if not vector:
+                    raise EmbeddingError(
+                        "Invalid response from embedding service"
+                    )
+                return
+            raise EmbeddingError("Invalid response from embedding service")
+        if isinstance(data, list):
+            if not data or not all(
+                isinstance(row, list) and row for row in data
+            ):
+                raise EmbeddingError(
+                    "Invalid response from embedding service"
+                )
+            return
+        raise EmbeddingError("Invalid response from embedding service")
+
+    async def embed_probe(self, timeout: float) -> None:
+        """Issue a cache-bypassing capacity-shaped probe for deep-health checks.
+
+        Runs the probe through the breaker-wrapped checked POST with a
         per-request ``timeout`` — httpx per-request timeouts override the
         persistent client's default without mutating the shared client or
         any service state (OPS-004, issue #494) — and skips both cache
@@ -1004,6 +1136,15 @@ class EmbeddingService:
         nor populated, so the probe observes the live provider instead of a
         stale healthy past (OPS-003, issue #494). ``last_metrics`` is left
         untouched so health probes do not pollute operational metrics.
+
+        Issue #1009: the payload is INGEST-SHAPED — a list of
+        ``embedding_probe_batch_count`` synthetic chunk-sized inputs — so a
+        provider with capacity for one short text but not an ingest batch
+        answers the probe with a capacity-class failure instead of a 200
+        that vouches for throughput it cannot deliver. The legacy
+        scalar-only ``prompt`` Ollama dialect cannot carry a list: the probe
+        falls back to ONE text of the configured size and, when that leg
+        fails, names the fallback in the error.
 
         Args:
             timeout: Per-request timeout in seconds for the probe POST.
@@ -1015,30 +1156,54 @@ class EmbeddingService:
                 unchanged for the caller to classify.
         """
         config = self._request_config()
+        legacy_dialect = (
+            config.mode != "openai"
+            and config.mode != "tei"
+            and config.ollama_style != "modern"
+        )
+        if legacy_dialect:
+            probe_inputs = self._build_probe_inputs()
+            fallback_note = (
+                "legacy ollama dialect supports scalar inputs only; probe "
+                f"sent a single {len(probe_inputs[0])}-char text"
+            )
+        else:
+            probe_inputs = self._build_probe_inputs()
+            fallback_note = ""
+
+        def _probe_payload() -> dict:
+            if legacy_dialect:
+                return self._build_payload(probe_inputs[0], config)
+            return self._build_batch_payload(probe_inputs, config)
 
         async def _checked_probe_post() -> httpx.Response:
             _corr = _correlation_headers()
             if _corr:
                 response = await self._client.post(
                     config.url,
-                    json=self._build_payload("ping", config),
+                    json=_probe_payload(),
                     timeout=timeout,
                     headers=_corr,
                 )
             else:
                 response = await self._client.post(
                     config.url,
-                    json=self._build_payload("ping", config),
+                    json=_probe_payload(),
                     timeout=timeout,
                 )
             if response.status_code != 200 and _is_outage_status(
                 response.status_code
             ):
                 logger.warning(
-                    f"Embedding API returned status {response.status_code} for {config.mode} mode: {response.text}"
+                    f"Embedding API returned status {response.status_code} for {config.mode} mode (body_len={len(response.text)})"
+                )
+                logger.debug(f"Embedding API error body: {response.text[:2000]}")
+                detail = (
+                    f" ({fallback_note})" if fallback_note else ""
                 )
                 raise EmbeddingError(
-                    f"Embedding API returned status {response.status_code}"
+                    f"Embedding API returned status "
+                    f"{response.status_code}{detail}"
                 )
             return response
 
@@ -1056,22 +1221,28 @@ class EmbeddingService:
 
         if response.status_code != 200:
             logger.warning(
-                f"Embedding API returned status {response.status_code} for {config.mode} mode: {response.text}"
+                f"Embedding API returned status {response.status_code} for {config.mode} mode (body_len={len(response.text)})"
+            )
+            logger.debug(f"Embedding API error body: {response.text[:2000]}")
+            detail = (
+                f" ({fallback_note})" if fallback_note else ""
             )
             raise EmbeddingError(
-                f"Embedding API returned status {response.status_code}"
+                f"Embedding API returned status {response.status_code}{detail}"
             )
 
         try:
             data = response.json()
         except ValueError as e:
             logger.warning(
-                f"Invalid JSON response from embedding API for {config.mode} mode: {e}, response: {response.text}"
+                f"Invalid JSON response from embedding API for {config.mode} mode: {e} (body_len={len(response.text)})"
             )
+            logger.debug(f"Embedding API error body: {response.text[:2000]}")
             raise EmbeddingError("Invalid response from embedding service")
 
-        # Validate the response shape (raises EmbeddingError when malformed).
-        self._extract_embedding(data, config)
+        # Validate the response shape in every dialect (raises
+        # EmbeddingError when malformed); count parity is not required.
+        self._validate_probe_response(data, config)
 
     async def validate_embedding_dimension(self, expected_dim: int) -> bool:
         """
@@ -1123,16 +1294,19 @@ class EmbeddingService:
         Args:
             texts: List of texts to embed.
             batch_size: Maximum number of texts per API request (default: 512).
-            fail_fast: If True (default), raise on any batch failure.
-                       If False, return (embeddings, failed_batch_indices) with None
-                       placeholders for failed batches.
+            fail_fast: If True (default), raise on the first invalid text
+                       (None/whitespace/oversized) and on any batch failure.
+                       If False, return (embeddings, failed_batch_indices)
+                       with None placeholders at invalid-text positions and
+                       at failed-batch positions (issue #698: a single
+                       oversized text degrades per-item instead of raising).
 
         Returns:
             When fail_fast=True: List of embedding vectors.
-            When fail_fast=False: Tuple of (embeddings, failed_batch_indices) where failed batch positions contain None.
+            When fail_fast=False: Tuple of (embeddings, failed_batch_indices) where invalid texts and failed batch positions contain None; len(embeddings) == len(texts) always.
 
         Raises:
-            EmbeddingError: If any batch fails and fail_fast=True.
+            EmbeddingError: If any text is invalid or any batch fails and fail_fast=True.
         """
         if not texts:
             return [] if fail_fast else ([], [])
@@ -1142,19 +1316,46 @@ class EmbeddingService:
         # the configuration that issued the call.
         config = self._request_config()
 
-        # Input validation guards
+        # Input validation guards (issue #698): classify invalid texts up
+        # front. fail_fast=True raises on the first one (existing contract,
+        # message shapes unchanged); fail_fast=False degrades per-text — an
+        # invalid text never reaches the provider, receives a None
+        # placeholder at its ORIGINAL position, and is reported in one
+        # WARNING. Downstream ingest callers already skip per-text failures
+        # via the None placeholders ([W10] contract), so a single oversized
+        # chunk no longer fails the whole document.
         prefix_len = len(config.doc_prefix) if config.doc_prefix else 0
         effective_max = self.MAX_TEXT_LENGTH - prefix_len
 
+        invalid_reasons: dict[int, str] = {}
         for idx, text in enumerate(texts):
             if text is None:
-                raise EmbeddingError(f"Text at index {idx} is None")
-            if not text.strip():
-                raise EmbeddingError(f"Text at index {idx} is empty or whitespace only")
-            if len(text) > effective_max:
-                raise EmbeddingError(
-                    f"Text at index {idx} exceeds maximum length ({effective_max} characters after prefix accounting)"
+                invalid_reasons[idx] = f"Text at index {idx} is None"
+            elif not text.strip():
+                invalid_reasons[idx] = (
+                    f"Text at index {idx} is empty or whitespace only"
                 )
+            elif len(text) > effective_max:
+                invalid_reasons[idx] = (
+                    f"Text at index {idx} exceeds maximum length "
+                    f"({effective_max} characters after prefix accounting)"
+                )
+
+        if invalid_reasons and fail_fast:
+            first = min(invalid_reasons)
+            raise EmbeddingError(invalid_reasons[first])
+        if invalid_reasons:
+            logger.warning(
+                "embed_batch(fail_fast=False): skipping %d invalid text(s) "
+                "at position(s) %s; reasons: %s",
+                len(invalid_reasons),
+                sorted(invalid_reasons),
+                "; ".join(invalid_reasons[i] for i in sorted(invalid_reasons)),
+            )
+
+        invalid_set = set(invalid_reasons)
+        valid_positions = [i for i in range(len(texts)) if i not in invalid_set]
+        valid_texts = [texts[i] for i in valid_positions]
 
         # Use configured batch size if not specified
         if batch_size is None:
@@ -1163,9 +1364,11 @@ class EmbeddingService:
         # Clamp batch_size to valid range
         batch_size = max(1, min(batch_size, self.MAX_BATCH_SIZE))
 
-        # Apply document prefix to all texts
+        # Apply document prefix to the VALID texts only (invalid ones never
+        # reach the provider — issue #698); with fail_fast=True no invalid
+        # texts can be present here (they raised above).
         texts_to_embed = []
-        for text in texts:
+        for text in valid_texts:
             if config.doc_prefix:
                 texts_to_embed.append(config.doc_prefix + text)
             else:
@@ -1225,7 +1428,7 @@ class EmbeddingService:
             return all_embeddings
         else:
             failed_indices: List[int] = []
-            all_embeddings_with_nones: List[Optional[List[float]]] = []
+            valid_with_nones: List[Optional[List[float]]] = []
             for batch_idx, result in enumerate(batch_results):
                 if isinstance(result, Exception):
                     failed_indices.append(batch_idx)
@@ -1233,11 +1436,24 @@ class EmbeddingService:
                     # (placeholders track the ACTUAL char-bounded batch size —
                     # batches are no longer uniform batch_size slices).
                     for _ in batches[batch_idx][1]:
-                        all_embeddings_with_nones.append(None)
+                        valid_with_nones.append(None)
                     logger.warning(f"Batch {batch_idx} failed (skipping): {result}")
                 else:
-                    all_embeddings_with_nones.extend(result)
-            return all_embeddings_with_nones, failed_indices
+                    valid_with_nones.extend(result)
+            # Splice the valid-subsequence results back to ORIGINAL positions,
+            # placing None at each invalid text's position (issue #698). The
+            # count contract len(embeddings) == len(texts) holds for empty,
+            # all-invalid, and mixed inputs; failed_indices reference the
+            # valid-subsequence batches (provider failures only — invalid
+            # texts are reported through their None placeholders).
+            embeddings_with_nones: List[Optional[List[float]]] = []
+            valid_iter = iter(valid_with_nones)
+            for i in range(len(texts)):
+                if i in invalid_set:
+                    embeddings_with_nones.append(None)
+                else:
+                    embeddings_with_nones.append(next(valid_iter))
+            return embeddings_with_nones, failed_indices
 
     async def _embed_batch_api(
         self, texts: List[str], config: Optional[_EmbeddingRequestConfig] = None
@@ -1454,8 +1670,9 @@ class EmbeddingService:
                     ):
                         return response
                     logger.warning(
-                        f"Embedding API returned status {response.status_code} for {config.mode} mode: {response.text}"
+                        f"Embedding API returned status {response.status_code} for {config.mode} mode (body_len={len(response.text)})"
                     )
+                    logger.debug(f"Embedding API error body: {response.text[:2000]}")
                     raise EmbeddingError(
                         f"Embedding API returned status {response.status_code}"
                     )
@@ -1471,8 +1688,9 @@ class EmbeddingService:
                 error_text = response.text.lower()
                 if self._is_token_overflow_error(error_text):
                     logger.warning(
-                        f"Token overflow error for {config.mode} mode: {response.text}"
+                        f"Token overflow error for {config.mode} mode (body_len={len(response.text)})"
                     )
+                    logger.debug(f"Embedding API error body: {response.text[:2000]}")
                     # Handle overflow using the shared helper
                     return await self._handle_overflow_retry(
                         client, texts, max_retries, min_sub_size, retry_count, config
@@ -1480,8 +1698,9 @@ class EmbeddingService:
 
             if response.status_code != 200:
                 logger.warning(
-                    f"Embedding API returned status {response.status_code} for {config.mode} mode: {response.text}"
+                    f"Embedding API returned status {response.status_code} for {config.mode} mode (body_len={len(response.text)})"
                 )
+                logger.debug(f"Embedding API error body: {response.text[:2000]}")
                 raise EmbeddingError(
                     f"Embedding API returned status {response.status_code}"
                 )
@@ -1591,8 +1810,9 @@ class EmbeddingService:
                 error_msg
             ) or self._is_token_overflow_error(response_text):
                 logger.warning(
-                    f"Token overflow error for {config.mode} mode: {response_text}"
+                    f"Token overflow error for {config.mode} mode (body_len={len(response_text)})"
                 )
+                logger.debug(f"Embedding API error body: {response_text[:2000]}")
                 # Handle overflow using the shared helper
                 return await self._handle_overflow_retry(
                     client, texts, max_retries, min_sub_size, retry_count, config

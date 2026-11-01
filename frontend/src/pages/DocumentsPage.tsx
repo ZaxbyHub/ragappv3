@@ -31,12 +31,19 @@ import {
   type DocumentSortBy,
   type SortOrder,
 } from "@/lib/api";
+// #766: the keepalive helper and the sanitized logger are imported directly
+// from the api core module — the page's test suites replace the "@/lib/api"
+// barrel with a manual mock object that does not re-export new helpers.
+import { deleteDocumentKeepalive, logApiFailure } from "@/lib/api/core";
+import { captureAuthOwner, type AuthOwner } from "@/lib/api/auth-lifecycle";
 import { useDebounce } from "@/hooks/useDebounce";
 import { useUploadMonitoring } from "@/hooks/useUploadMonitoring";
 import { useVaultStore } from "@/stores/useVaultStore";
+import { useAuthStore } from "@/stores/useAuthStore";
 import { useSettingsStore } from "@/stores/useSettingsStore";
 import { useUploadStore } from "@/stores/useUploadStore";
 import { VaultSelector } from "@/components/vault/VaultSelector";
+import { VaultGate } from "@/components/vault/VaultGate";
 import { EmptyState } from "@/components/EmptyState";
 import { ErrorState } from "@/components/shared/ErrorState";
 import {
@@ -195,6 +202,15 @@ export default function DocumentsPage() {
   // Optimistic delete state
   const [optimisticallyDeletedIds, setOptimisticallyDeletedIds] = useState<Set<string>>(new Set());
   const pendingDeleteTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  // Owner captured when the delete was confirmed (review round 1 PRR-015):
+  // a pending delete confirmed by one principal must never be dispatched
+  // under another principal's bearer after an identity switch.
+  const pendingDeleteOwnersRef = useRef<Map<string, AuthOwner>>(new Map());
+  // Doc ids whose pagehide keepalive DELETE was dispatched but whose outcome
+  // is unconfirmed (review round 1 PRR-006/PRR-008): a bfcache restore
+  // replays them through the normal path so an Undo click can never re-show
+  // a document whose delete already survived teardown.
+  const dispatchedPagehideDeletesRef = useRef<Set<string>>(new Set());
 
   useEffect(
     () => () => {
@@ -203,24 +219,126 @@ export default function DocumentsPage() {
     []
   );
 
-  // Flush pending deletes on unmount. The user already confirmed each delete
-  // (the 3s undo window simply hadn't elapsed); cancelling the timers would
-  // silently discard a confirmed destructive action and the document would
-  // reappear. Instead, execute the deletes best-effort. Fire-and-forget — the
-  // component is unmounting, so there is no toast/refetch to perform.
-  useEffect(() => {
-    // Capture the stable ref'd Map instance so the cleanup reads the same one.
+  // Flush pending deletes (#766 AC1/AC2, hardened per review round 1). The
+  // user already confirmed each delete (the 3s undo window simply hadn't
+  // elapsed); cancelling the timers would silently discard a confirmed
+  // destructive action. The SPA-unmount flush and a pagehide flush share one
+  // exactly-once helper: each timer entry is removed from the map BEFORE its
+  // channel fires, so pagehide followed by unmount (or logout) can never
+  // double-delete. Channel rules:
+  // - pagehide: the keepalive channel when a CSRF credential is cached;
+  //   when none is cached, NO request is attempted — the axios fallback
+  //   would need a CSRF-discovery round trip the browser aborts during
+  //   teardown (PRR-028), so the entry is dropped to the replay registry
+  //   and, if the page returns (bfcache), replayed on pageshow.
+  // - unmount (SPA navigation / logout): the normal deleteDocument path,
+  //   whose failures now surface as a toast (AC13); a delete confirmed by a
+  //   DIFFERENT principal than the current one is skipped and its row
+  //   un-hidden — a principal never executes another principal's intent
+  //   (PRR-015), and a 403 would lie about the outcome anyway.
+  const flushPendingDeletes = useCallback((pagehide: boolean) => {
     const timers = pendingDeleteTimersRef.current;
-    return () => {
-      timers.forEach((timer, docId) => {
-        clearTimeout(timer);
-        void deleteDocument(docId).catch(() => {
-          /* best-effort on unmount; nothing to surface */
+    let failed = 0;
+    const inflight: Promise<void>[] = [];
+    const ownerNow = captureAuthOwner();
+    timers.forEach((timer, docId) => {
+      timers.delete(docId);
+      clearTimeout(timer);
+      const confirmedOwner = pendingDeleteOwnersRef.current.get(docId);
+      pendingDeleteOwnersRef.current.delete(docId);
+      if (confirmedOwner && ownerNow !== confirmedOwner) {
+        // The confirming principal is gone; the intent dies with it.
+        setOptimisticallyDeletedIds((previous) => {
+          const next = new Set(previous);
+          next.delete(docId);
+          return next;
         });
+        return;
+      }
+      if (pagehide) {
+        dispatchedPagehideDeletesRef.current.add(docId);
+        if (deleteDocumentKeepalive(docId)) return;
+        // No CSRF credential: the keepalive channel never fired. Leave the
+        // id in the replay registry — pageshow (bfcache return) replays it.
+        return;
+      }
+      inflight.push(
+        deleteDocument(docId).catch(() => {
+          failed += 1;
+        })
+      );
+    });
+    if (inflight.length > 0) {
+      // Counted aggregate toast AFTER settlement (review round 1
+      // L1-05/M5-01; round-2 fix: the counter increments inside the async
+      // catches, so the toast must wait for every delete to settle or it
+      // can never fire — caught by frozen C13).
+      void Promise.allSettled(inflight).then(() => {
+        if (failed > 0) {
+          toast.error(
+            failed === 1
+              ? "Failed to delete document"
+              : `Failed to delete ${failed} documents`,
+            { id: "delete-flush-failure" }
+          );
+        }
       });
-      timers.clear();
-    };
+    }
   }, []);
+
+  useEffect(() => {
+    const handlePageHide = () => flushPendingDeletes(true);
+    // Bfcache restore (review round 1 PRR-006/PRR-008): the page is alive
+    // again — replay every pagehide delete whose keepalive dispatch was not
+    // confirmed (unconfirmed outcomes AND no-credential deferrals) through
+    // the normal path, so the confirmed intent completes. The backend DELETE
+    // is not idempotent (404 on a missing row), so a replay 404 means the
+    // keepalive delete ALREADY landed — treated as completion, not failure
+    // (review round 2). The registry is deliberately NOT cleared here: its
+    // entries keep the Undo guard ("Delete already sent") truthful for the
+    // rest of the page's life, including while a replay is in flight.
+    const handlePageShow = (event: PageTransitionEvent) => {
+      if (!event.persisted) return;
+      const replay = Array.from(dispatchedPagehideDeletesRef.current);
+      replay.forEach((docId) => {
+        void deleteDocument(docId)
+          .then(() => {
+            toast.success("Deleted document");
+          })
+          .catch((err: unknown) => {
+            const status =
+              (err as { status?: number } | null)?.status ??
+              (err as { response?: { status?: number } } | null)?.response?.status;
+            if (status === 404) {
+              // Already deleted by the keepalive dispatch.
+              toast.success("Deleted document");
+              return;
+            }
+            toast.error("Failed to delete document", { id: "delete-flush-failure" });
+          });
+      });
+    };
+    window.addEventListener("pagehide", handlePageHide);
+    window.addEventListener("pageshow", handlePageShow);
+    return () => {
+      window.removeEventListener("pagehide", handlePageHide);
+      window.removeEventListener("pageshow", handlePageShow);
+      flushPendingDeletes(false);
+    };
+  }, [flushPendingDeletes]);
+
+  // Before-logout flush (review round 1 PRR-007; round 2 channel fix): the
+  // auth store dispatches this event FIRST, while the bearer and CSRF
+  // credential are still valid — so this is SPA-unmount semantics (the
+  // normal deleteDocument path, which can complete or toast), NOT pagehide
+  // semantics. The pagehide-style keepalive/defer would drop the intent:
+  // a no-credential deferral writes the replay registry, but an SPA logout
+  // never fires pageshow, so nothing would ever replay it.
+  useEffect(() => {
+    const handleBeforeLogout = () => flushPendingDeletes(false);
+    window.addEventListener("ragapp:before-logout", handleBeforeLogout);
+    return () => window.removeEventListener("ragapp:before-logout", handleBeforeLogout);
+  }, [flushPendingDeletes]);
 
   const { uploads, addUploads, cancelUpload, removeUpload, clearCompleted, retryUpload } =
     useUploadStore();
@@ -236,7 +354,18 @@ export default function DocumentsPage() {
     activeVaultPermission === "write" || activeVaultPermission === "admin";
   const canAdminActiveVault = activeVaultPermission === "admin";
   const hasSelectedVault = activeVaultId != null && activeVault != null;
+  // Destructive capability (vault ADMIN): mirrors the per-file vault-admin
+  // delete routes (documents.py delete/batch/delete-all). Issue #767.
   const canMutateDocuments = hasSelectedVault && canAdminActiveVault;
+  // Organise capability (vault WRITE): folders, bulk tag/move, row selection,
+  // and wiki compile are all vault-write server-side (folders.py, tags.py,
+  // wiki.py) — the UI must require no more and no less. Issue #767.
+  const canOrganizeDocuments = hasSelectedVault && canWriteActiveVault;
+  // Scan Directory is a GLOBAL-admin route (documents.py -> require_admin_role
+  // accepts only global admin/superadmin); the client gate mirrors the user's
+  // global role, not vault permission. Issue #767 AC5.
+  const globalRole = useAuthStore((s) => s.user?.role);
+  const canScanDirectories = globalRole === "admin" || globalRole === "superadmin";
 
   const {
     documents,
@@ -248,6 +377,7 @@ export default function DocumentsPage() {
     fetchDocuments,
     fetchStats,
     wikiStatusMap,
+    wikiFetchFailedIds,
     compilingDocIds,
     handleCompileDocument,
     total,
@@ -264,13 +394,46 @@ export default function DocumentsPage() {
   });
 
   const { selectedIds, setSelectedIds, clear: clearSelection, selectMany, selectOne } =
-    useBulkSelection(canMutateDocuments);
+    useBulkSelection(canOrganizeDocuments);
+
+  // Live mirror of the active vault for still-current checks inside async
+  // continuations (fetch commits, dialog confirms): a ref read at commit time
+  // sees switches the closure that started the work did not.
+  const activeVaultIdRef = useRef<number | null>(activeVaultId);
+  activeVaultIdRef.current = activeVaultId;
+  // The vault the currently open confirm dialog was opened for; written by
+  // every setConfirmDialog call site (all four) and READ by the two bulk
+  // executors' execute-time guards — the folder and single-document confirms
+  // are per-resource actions backed by per-vault server authorization and are
+  // deliberately unguarded (recorded residual).
+  const confirmVaultRef = useRef<number | null>(null);
+  // Vault-context GENERATION for confirmations (complements confirmVaultRef):
+  // a monotone counter bumped on every vault transition, so a round trip
+  // (vault 1 -> 2 -> 1) — which the numeric-id compare cannot see — still
+  // invalidates a dialog opened in the earlier incarnation. The numeric id
+  // and the generation cover each other's windows: the id read is live from
+  // render (catches a switch before the bump effect runs); the generation is
+  // bumped in the switch effect (catches round trips back to the same id).
+  const vaultSwitchGenRef = useRef(0);
+  const confirmVaultGenRef = useRef(0);
 
   useEffect(() => {
-    if (!canMutateDocuments) {
+    if (!canOrganizeDocuments) {
       setSelectedIds(new Set());
     }
-  }, [canMutateDocuments, setSelectedIds]);
+  }, [canOrganizeDocuments, setSelectedIds]);
+
+  // Bulk selection is per-vault display state: an admin->admin vault switch
+  // never flips canMutateDocuments, so the permission-keyed effect above never
+  // fires for it — clear the selection on the switch itself (issue #764 AC1;
+  // the confirm-dialog path is covered by the execute-time guards instead).
+  // Every transition also bumps the confirmation generation, so dialogs
+  // opened before any later transition (including ABA round trips) refuse at
+  // execute time.
+  useEffect(() => {
+    setSelectedIds(new Set());
+    vaultSwitchGenRef.current += 1;
+  }, [activeVaultId, setSelectedIds]);
 
   // Load the vault's tags for the filter + bulk-assign dialog.
   const fetchTags = useCallback(async () => {
@@ -278,10 +441,17 @@ export default function DocumentsPage() {
       setTags([]);
       return;
     }
+    // Issue #764 AC13: bind the commit to the ISSUED vault id (the argument
+    // this call fetches for), not a live read — a stale-closure re-invocation
+    // issues the old vault's request and must not commit over the current
+    // vault's state when it resolves late.
+    const issuedVaultId = activeVaultId;
     try {
-      setTags(await listTags(activeVaultId));
+      const next = await listTags(issuedVaultId);
+      if (activeVaultIdRef.current !== issuedVaultId) return;
+      setTags(next);
     } catch (err) {
-      console.error("Failed to load tags:", err);
+      logApiFailure("Failed to load tags:", err);
     }
   }, [activeVaultId]);
 
@@ -289,9 +459,12 @@ export default function DocumentsPage() {
     fetchTags();
   }, [fetchTags]);
 
-  // Reset the tag filter when switching vaults (tag ids are vault-scoped).
+  // Reset the tag filter when switching vaults (tag ids are vault-scoped),
+  // and drop the previous vault's tag vocabulary immediately so a failed or
+  // slow refetch can never render it (issue #764 AC4/AC5/AC13).
   useEffect(() => {
     setTagFilterId(null);
+    setTags([]);
   }, [activeVaultId]);
 
   // Load the vault's folders for the sidebar tree + move dialog. Returns the
@@ -302,12 +475,15 @@ export default function DocumentsPage() {
       setFolders([]);
       return [];
     }
+    // Same issued-vault guard as fetchTags (issue #764 AC13).
+    const issuedVaultId = activeVaultId;
     try {
-      const refreshed = await listFolders(activeVaultId);
+      const refreshed = await listFolders(issuedVaultId);
+      if (activeVaultIdRef.current !== issuedVaultId) return [];
       setFolders(refreshed);
       return refreshed;
     } catch (err) {
-      console.error("Failed to load folders:", err);
+      logApiFailure("Failed to load folders:", err);
       return [];
     }
   }, [activeVaultId]);
@@ -316,9 +492,12 @@ export default function DocumentsPage() {
     fetchFolders();
   }, [fetchFolders]);
 
-  // Reset the folder filter when switching vaults (folder ids are vault-scoped).
+  // Reset the folder filter when switching vaults (folder ids are vault-
+  // scoped), and drop the previous vault's folders immediately (issue #764
+  // AC4/AC5/AC13).
   useEffect(() => {
     setFolderFilterId(null);
+    setFolders([]);
   }, [activeVaultId]);
 
   const handleCreateFolder = useCallback(
@@ -352,6 +531,8 @@ export default function DocumentsPage() {
 
   const handleDeleteFolder = useCallback(
     (folder: Folder) => {
+      confirmVaultRef.current = activeVaultId;
+      confirmVaultGenRef.current = vaultSwitchGenRef.current;
       setConfirmDialog({
         open: true,
         title: "Delete Folder",
@@ -380,7 +561,7 @@ export default function DocumentsPage() {
         },
       });
     },
-    [folderFilterId, fetchFolders, fetchDocuments]
+    [folderFilterId, fetchFolders, fetchDocuments, activeVaultId]
   );
 
   const handleMoveFolderTrigger = useCallback((folder: Folder) => {
@@ -449,6 +630,20 @@ export default function DocumentsPage() {
       toast.error("Select a vault you administer before deleting documents");
       return;
     }
+    // Execute-time still-current guard (issue #764 AC1/AC14): the dialog
+    // captured this closure with the selection from the vault it was opened
+    // for; if the active vault changed while the modal was open (e.g. a
+    // background fetchVaults correction), the captured ids belong to another
+    // vault — refuse instead of sending them. A live-ref read, not a closed
+    // value, sees the switch.
+    if (
+      confirmVaultRef.current !== activeVaultIdRef.current ||
+      confirmVaultGenRef.current !== vaultSwitchGenRef.current
+    ) {
+      toast.error("Selection changed — select documents again");
+      clearSelection();
+      return;
+    }
     setIsBulkDeleting(true);
     try {
       const result = await deleteDocuments(Array.from(selectedIds));
@@ -470,6 +665,11 @@ export default function DocumentsPage() {
       // server just deleted) while retaining the failed rows either way.
       await fetchDocuments();
       setDocuments((prev) => prev.filter((doc) => !deletedIds.has(String(doc.id))));
+      // Optimistic single-field patch FIRST for the immediate render, then
+      // refetch the authoritative stats LAST so the final committed value is
+      // the server's post-delete state — ordering matters: patching after the
+      // refetch would double-subtract deleted_count from the fresh server
+      // total (implementation-review Round 1; issue #768 AC2).
       setStats((prev) =>
         prev
           ? {
@@ -478,6 +678,7 @@ export default function DocumentsPage() {
             }
           : prev
       );
+      await fetchStats();
       fetchFolders();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to delete documents");
@@ -491,11 +692,14 @@ export default function DocumentsPage() {
     setStats,
     clearSelection,
     fetchDocuments,
+    fetchStats,
     fetchFolders,
   ]);
 
   const handleBulkDelete = useCallback(() => {
     if (selectedIds.size === 0) return;
+    confirmVaultRef.current = activeVaultId;
+    confirmVaultGenRef.current = vaultSwitchGenRef.current;
     setConfirmDialog({
       open: true,
       title: "Delete Selected Documents",
@@ -503,10 +707,21 @@ export default function DocumentsPage() {
       onConfirm: executeBulkDelete,
       variant: "destructive",
     });
-  }, [selectedIds, executeBulkDelete]);
+  }, [selectedIds, executeBulkDelete, activeVaultId]);
 
   const executeDeleteAllInVault = useCallback(async () => {
     if (!activeVaultId || !canMutateDocuments) return;
+    // Same execute-time guard as executeBulkDelete (per the bulk-mutation
+    // scope decision): the dialog captured the open-time activeVaultId in
+    // this closure, so a stale confirm would wipe the PREVIOUS vault.
+    // Delete-all is a bulk mutation.
+    if (
+      confirmVaultRef.current !== activeVaultIdRef.current ||
+      confirmVaultGenRef.current !== vaultSwitchGenRef.current
+    ) {
+      toast.error("Vault changed — reopen the confirmation and try again");
+      return;
+    }
     setIsBulkDeletingAll(true);
     try {
       const result = await deleteAllDocumentsInVault(activeVaultId);
@@ -515,13 +730,22 @@ export default function DocumentsPage() {
         setDocuments([]);
         setStats((prev) => (prev ? { ...prev, total_documents: 0 } : prev));
         fetchFolders();
+        // Refetch the authoritative list: the optimistic empty above does not
+        // touch the polling hook's `total`, which would otherwise leave
+        // "Showing 0 of N" and a Load-more control pointing at rows that no
+        // longer exist.
+        await fetchDocuments();
+        // Refetch stats for the same reason (issue #768 AC3): the optimistic
+        // patch above only zeroes total_documents — Chunks/Size/Indexed must
+        // agree with the emptied vault too.
+        await fetchStats();
       }
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to delete documents");
     } finally {
       setIsBulkDeletingAll(false);
     }
-  }, [activeVaultId, canMutateDocuments, setDocuments, setStats, fetchFolders]);
+  }, [activeVaultId, canMutateDocuments, setDocuments, setStats, fetchFolders, fetchDocuments, fetchStats]);
 
   const handleDeleteAllInVault = useCallback(() => {
     if (!documents || documents.length === 0) return;
@@ -529,6 +753,8 @@ export default function DocumentsPage() {
       toast.error("Select a vault you administer before deleting documents");
       return;
     }
+    confirmVaultRef.current = activeVaultId;
+    confirmVaultGenRef.current = vaultSwitchGenRef.current;
     setConfirmDialog({
       open: true,
       title: "Delete All Documents in Vault",
@@ -536,7 +762,7 @@ export default function DocumentsPage() {
       onConfirm: executeDeleteAllInVault,
       variant: "destructive",
     });
-  }, [documents, canMutateDocuments, executeDeleteAllInVault]);
+  }, [documents, canMutateDocuments, executeDeleteAllInVault, activeVaultId]);
 
   // Effective client-side upload limit: the server-configured
   // max_file_size_mb from the settings store is the source of truth; the
@@ -592,13 +818,24 @@ export default function DocumentsPage() {
   }, []);
 
   const handleScan = async () => {
-    if (!hasSelectedVault || !canWriteActiveVault) {
-      toast.error("Select a vault with write access before scanning");
+    // Mirrors the route: POST /documents/scan depends on the GLOBAL admin
+    // role and scans every vault's upload directory (issue #767 AC5/AC8) —
+    // vault-write never granted scan rights.
+    if (!canScanDirectories) {
+      toast.error("A global admin role is required to scan directories");
       return;
     }
     setIsScanning(true);
     try {
-      const result = await scanDocuments(activeVaultId ?? undefined);
+      const result = await scanDocuments();
+      // PRR-002/K-01: per-directory failures reach the operator, not just the
+      // server log; error strings are vault-relative redactions from the
+      // backend (no absolute paths, no raw exception text).
+      if (result.errors?.length) {
+        toast.warning(
+          `Scan completed with ${result.errors.length} director${result.errors.length > 1 ? "ies" : "y"} unreadable: ${result.errors.join("; ")}`,
+        );
+      }
       toast.success(`Scan complete: ${result.added} new document(s) added, ${result.scanned} scanned`);
       await Promise.all([fetchDocuments(), fetchStats()]);
     } catch (err) {
@@ -608,17 +845,26 @@ export default function DocumentsPage() {
     }
   };
 
-  const handleDeleteDocument = (docId: string) => {
+  const handleDeleteDocument = (docId: string, filename?: string) => {
     if (!canMutateDocuments) {
       toast.error("Select a vault you administer before deleting documents");
       return;
     }
+    confirmVaultRef.current = activeVaultId;
+    confirmVaultGenRef.current = vaultSwitchGenRef.current;
+    const target = filename ?? `document ${docId}`;
     setConfirmDialog({
       open: true,
       title: "Delete Document",
-      description: "Are you sure you want to delete this document? This will also remove all associated chunks.",
+      // Name the target (issue #768 AC5): the dialog is the only user-facing
+      // identification of what is about to be destroyed.
+      description: `Are you sure you want to delete "${target}"? This will also remove all associated chunks.`,
+      confirmLabel: "Delete",
       onConfirm: () => {
         if (pendingDeleteTimersRef.current.has(docId)) return;
+        // Owner at confirm time (review round 1 PRR-015): the flush never
+        // dispatches another principal's confirmed intent.
+        pendingDeleteOwnersRef.current.set(docId, captureAuthOwner());
 
         setOptimisticallyDeletedIds((prev) => new Set(prev).add(docId));
 
@@ -633,6 +879,15 @@ export default function DocumentsPage() {
                 clearTimeout(timer);
                 pendingDeleteTimersRef.current.delete(docId);
               }
+              // If a teardown flush already dispatched this delete
+              // (review round 1 PRR-008), Undo must not resurrect the
+              // row: the destructive intent is already in flight and the
+              // pageshow replay (bfcache) completes it.
+              if (dispatchedPagehideDeletesRef.current.has(docId)) {
+                toast.dismiss(toastId);
+                toast.info("Delete already sent — the document will be removed");
+                return;
+              }
               setOptimisticallyDeletedIds((prev) => {
                 const next = new Set(prev);
                 next.delete(docId);
@@ -645,6 +900,7 @@ export default function DocumentsPage() {
 
         const timer = setTimeout(async () => {
           pendingDeleteTimersRef.current.delete(docId);
+          pendingDeleteOwnersRef.current.delete(docId);
           toast.dismiss(toastId);
           try {
             await deleteDocument(docId);
@@ -686,6 +942,10 @@ export default function DocumentsPage() {
     [documents, optimisticallyDeletedIds]
   );
 
+  // Badge count: the matching server total with the loaded-window floor
+  // (issue #768 AC1); memoized so the pluralization/format read stays cheap.
+  const badgeCount = Math.max(total, filteredDocuments.length);
+
   // Header select-all applies ONLY to the visible rows: checking adds the
   // visible ids (selections outside the current view are preserved) and
   // unchecking removes exactly the visible ids.
@@ -701,7 +961,11 @@ export default function DocumentsPage() {
   const hasActiveSearch = searchQuery.trim().length > 0;
   const hasStats = stats !== null;
   const totalVaultDocuments = stats?.total_documents ?? 0;
-  const isResolvingSearchEmptyState = hasSelectedVault && hasActiveSearch && !hasStats;
+  // Issue #764 AC10: the resolving placeholder must also require that no rows
+  // are visible — after a stats failure `!hasStats` stays true forever, and
+  // without the row check the skeleton hides real search results permanently.
+  const isResolvingSearchEmptyState =
+    hasSelectedVault && hasActiveSearch && !hasStats && filteredDocuments.length === 0;
   const emptyState =
     vaults.length === 0
       ? {
@@ -713,12 +977,43 @@ export default function DocumentsPage() {
         ? {
             title: "Select a vault to view documents",
             description: "Documents are scoped to the active vault.",
+            // Issue #781 (UI-R2-03): the no-selection state points at
+            // vault scoping without offering a control from where the user
+            // stands — VaultGate renders the selector (and the create/open
+            // action) inline, unlike the copy-only branch it replaces.
+            action: <VaultGate />,
           }
-        : hasActiveSearch && totalVaultDocuments > 0
-          ? {
-              title: "No documents match your search",
-              description: "Search checks filename, type, status, source, sender, subject, and document date.",
-            }
+        : (hasActiveSearch || tagFilterId != null || folderFilterId != null) &&
+            totalVaultDocuments > 0
+          ? hasActiveSearch
+            ? {
+                title: "No documents match your search",
+                description: "Search checks filename, type, status, source, sender, subject, and document date.",
+                action: {
+                  label: "Clear filters",
+                  onClick: () => {
+                    // PRR-001: the active search IS a filter in this branch —
+                    // clear it too, or the button is a no-op on a search-only
+                    // miss.
+                    setSearchQuery("");
+                    setTagFilterId(null);
+                    setFolderFilterId(null);
+                  },
+                },
+              }
+            : {
+                // A tag/folder filter with zero matches in a populated vault is
+                // a filter miss, not an empty vault (issue #768 AC4).
+                title: "No documents match your filters",
+                description: "The selected tag or folder does not match any document in this vault.",
+                action: {
+                  label: "Clear filters",
+                  onClick: () => {
+                    setTagFilterId(null);
+                    setFolderFilterId(null);
+                  },
+                },
+              }
           : {
             title: "No documents yet",
             description: canWriteActiveVault
@@ -744,40 +1039,41 @@ export default function DocumentsPage() {
 
   return (
     <div className="space-y-6 animate-in fade-in duration-300 pb-12">
-      <div className="flex items-center justify-between">
-        <PageTitleHeader title="Documents" description="Manage your knowledge base documents" />
-        <div className="flex items-center gap-2">
-          <VaultSelector />
-          <Button
-            onClick={handleScan}
-            disabled={isScanning || !hasSelectedVault || !canWriteActiveVault}
-            title={
-              !hasSelectedVault
-                ? "Select a vault to scan documents"
-                : !canWriteActiveVault
-                  ? "Write access is required to scan this vault"
-                  : "Scan directory"
-            }
-          >
-            {isScanning ? (
-              <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-            ) : (
-              <ScanLine className="w-4 h-4 mr-2" />
-            )}
-            Scan Directory
-          </Button>
-          {filteredDocuments.length > 0 && canMutateDocuments && (
-            <Button variant="destructive" onClick={handleDeleteAllInVault} disabled={isBulkDeletingAll}>
-              {isBulkDeletingAll ? (
+      <PageTitleHeader
+        title="Documents"
+        description="Manage your knowledge base documents"
+        actions={
+          <>
+            <VaultSelector />
+            <Button
+              onClick={handleScan}
+              disabled={isScanning || !canScanDirectories}
+              title={
+                canScanDirectories
+                  ? "Scan every vault's upload directory for new files"
+                  : "A global admin role is required to scan directories"
+              }
+            >
+              {isScanning ? (
                 <Loader2 className="w-4 h-4 mr-2 animate-spin" />
               ) : (
-                <Trash className="w-4 h-4 mr-2" />
+                <ScanLine className="w-4 h-4 mr-2" />
               )}
-              Delete All in Vault
+              Scan Directory
             </Button>
-          )}
-        </div>
-      </div>
+            {filteredDocuments.length > 0 && canMutateDocuments && (
+              <Button variant="destructive" onClick={handleDeleteAllInVault} disabled={isBulkDeletingAll}>
+                {isBulkDeletingAll ? (
+                  <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                ) : (
+                  <Trash className="w-4 h-4 mr-2" />
+                )}
+                Delete All in Vault
+              </Button>
+            )}
+          </>
+        }
+      />
 
       {stats && <DocumentStatsCards stats={stats} />}
 
@@ -814,7 +1110,7 @@ export default function DocumentsPage() {
         </div>
         <TagFilter tags={tags} value={tagFilterId} onChange={setTagFilterId} />
         <div className="flex items-center gap-2">
-          {selectedIds.size > 0 && canMutateDocuments && (
+          {selectedIds.size > 0 && canOrganizeDocuments && (
             <>
               <Badge variant="outline">{selectedIds.size} selected</Badge>
               <Button variant="outline" size="sm" onClick={() => setBulkTagOpen(true)}>
@@ -825,27 +1121,38 @@ export default function DocumentsPage() {
                 <FolderInput className="w-4 h-4 mr-2" />
                 Move
               </Button>
-              <Button variant="destructive" size="sm" onClick={handleBulkDelete} disabled={isBulkDeleting}>
+              {canMutateDocuments && (
+                <Button variant="destructive" size="sm" onClick={handleBulkDelete} disabled={isBulkDeleting}>
                 {isBulkDeleting ? (
                   <Loader2 className="w-4 h-4 mr-2 animate-spin" />
                 ) : (
                   <Trash2 className="w-4 h-4 mr-2" />
                 )}
-                Delete Selected
-              </Button>
+                  Delete Selected
+                </Button>
+              )}
             </>
           )}
-          <Badge variant="secondary">{filteredDocuments.length} documents</Badge>
+          {/* Server total for the current filtered query — the badge must not
+              understate the match set when only the first window is loaded
+              (issue #768 AC1). The floor keeps the badge sane in the
+              optimistic-delete window before the refetch lands. */}
+          <Badge variant="secondary">
+            {badgeCount.toLocaleString()} {badgeCount === 1 ? "document" : "documents"}
+          </Badge>
         </div>
       </div>
 
-      <div className="flex gap-6">
+      {/* Issue #778 (WCAG 1.4.10 reflow): the folder tree stacks above the
+          list below lg — a flat flex row squeezed the document list to ~8px
+          at 320px. */}
+      <div className="flex flex-col gap-6 lg:flex-row">
         {hasSelectedVault && (
           <FolderTree
             folders={folders}
             selectedFolderId={folderFilterId}
             onSelect={setFolderFilterId}
-            canMutate={canMutateDocuments}
+            canMutate={canOrganizeDocuments}
             onCreate={handleCreateFolder}
             onRename={handleRenameFolder}
             onDelete={handleDeleteFolder}
@@ -878,6 +1185,7 @@ export default function DocumentsPage() {
           <DocumentTable
             documents={filteredDocuments}
             selectedIds={selectedIds}
+            canOrganizeDocuments={canOrganizeDocuments}
             canMutateDocuments={canMutateDocuments}
             filenameColWidth={filenameColWidth}
             onResizeMouseDown={handleResizeMouseDown}
@@ -886,6 +1194,7 @@ export default function DocumentsPage() {
             onSelectAll={handleSelectAll}
             onSelectOne={selectOne}
             wikiStatusMap={wikiStatusMap}
+            wikiFetchFailedIds={wikiFetchFailedIds}
             compilingDocIds={compilingDocIds}
             onCompileDocument={handleCompileDocument}
             onDownload={handleDownloadDocument}
@@ -896,6 +1205,7 @@ export default function DocumentsPage() {
           />
           <DocumentCardsList
             documents={filteredDocuments}
+            canOrganizeDocuments={canOrganizeDocuments}
             canMutateDocuments={canMutateDocuments}
             selectedIds={selectedIds}
             onSelectOne={selectOne}

@@ -11,7 +11,9 @@ recovery outcome for the migrations owned by Workstream C1. Consumers:
 - the vector-store staging swap (`app.services.vector_store`) calls
   ``publish_index_generation`` on every successful swap (the generation
   publication interface for slot C2);
-- startup logs the latest outcomes so operators see recovery state.
+- startup composes the latest outcomes with the newest unresolved
+  failure/recovery (``latest_outcomes_with_signal``) so operators see
+  recovery state.
 
 This module deliberately keeps to stdlib sqlite3 so it can be called from any
 connection a migration already holds.
@@ -21,6 +23,14 @@ from __future__ import annotations
 import logging
 import sqlite3
 from typing import Optional
+
+# Startup/migration connections must be no more lock-fragile than
+# init_db's own connection (issue #700, T1-05-S-05): Python's default
+# 5 s busy timeout makes a sibling worker's migration fail with
+# "database is locked" during a slow per-start rebuild. database.py and
+# lifespan.py import this constant (they already import this module; the
+# reverse import would cycle).
+MIGRATION_CONNECT_TIMEOUT_SECONDS = 30.0
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +51,7 @@ CREATE TABLE IF NOT EXISTS migration_journal (
 """
 
 _PHASES = ("start", "succeeded", "failed", "recovered")
-_OUTCOMES = ("ok", "error", "recovered_from_backup", "rebuilt", "noop")
+_OUTCOMES = ("ok", "error", "recovered_from_backup", "rebuilt")
 
 
 def _ensure_table(conn: sqlite3.Connection) -> None:
@@ -58,11 +68,24 @@ def record_migration_outcome(
 ) -> None:
     """Append one journal row for a migration phase/outcome transition.
 
-    Never raises: journaling must not take a recovering migration down. Rows
-    commit independently of the caller's swap transaction (migrations run
-    with ``isolation_level = None`` and journal outside ``BEGIN
-    IMMEDIATE``), so a rolled-back swap still records its failure — the
-    recovery journal must describe attempts, not only completions.
+    Never raises: journaling must not take a recovering migration down.
+    Commit semantics depend on the caller's connection, and both shapes are
+    deliberate (issue #699 review): writers on an ``isolation_level = None``
+    autocommit connection that journal OUTSIDE ``BEGIN IMMEDIATE`` commit
+    immediately, so a rolled-back swap still records its failure; writers
+    that journal INSIDE their delete/swap transaction (the destructive-dedup
+    count rows) commit atomically with it — the record exists iff the
+    destructive work committed, and a failed attempt must journal its
+    ``failed`` row on a fresh committed transaction after the rollback.
+    Issue #995 adds a sanctioned variant of that in-transaction shape: a
+    writer holding one ``BEGIN IMMEDIATE`` may journal ``start`` inside the
+    transaction, wrap the data work in a ``SAVEPOINT``, and — on failure —
+    ``ROLLBACK TO SAVEPOINT``, journal ``failed`` inside the SAME writer
+    transaction, then commit, so the terminal row lands while the data is
+    reverted and the write lock is taken exactly once. That terminal row is
+    best-effort: if its commit itself fails under contention the row is
+    lost — the caller stays fail-soft and retries on the next boot (see
+    ``audit_redaction``'s failure handler).
     """
     try:
         _ensure_table(conn)
@@ -115,8 +138,12 @@ def invalidate_derived_data(
     """Explicit schema/claim-source invalidation interface (slots D1/D2).
 
     Marks derived state (FTS rows, claim-source projections, cached schema
-    views) as invalidated after a repair rebuilt authoritative rows, so
-    consumers that derive from the repaired tables know to rebuild.
+    views) as invalidated after a repair rebuilt authoritative rows. The row
+    is a durable, operator-visible audit marker only: no automated consumer
+    currently rebuilds derived state from this signal (issue #699 removed the
+    earlier docstring claim to the contrary), so a reader must treat it as
+    "derived state was rebuilt/invalidated by this migration", not as a
+    trigger.
     """
     record_migration_outcome(
         conn,
@@ -151,7 +178,7 @@ def publish_index_generation(
 
 def latest_outcomes(sqlite_path: str, *, limit: int = 20) -> list[dict]:
     """Operator-visible tail of the journal (newest first)."""
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         _ensure_table(conn)
         rows = conn.execute(
@@ -172,3 +199,45 @@ def latest_outcomes(sqlite_path: str, *, limit: int = 20) -> list[dict]:
         ]
     finally:
         conn.close()
+
+
+def latest_outcomes_with_signal(
+    sqlite_path: str, *, limit: int = 3
+) -> tuple[list[dict], Optional[dict]]:
+    """Startup-summary composition (issue #699): the unchanged newest-first
+    ``latest_outcomes`` window, plus — only when that window contains no
+    failed/recovered row — the newest UNRESOLVED failure-or-recovery row from
+    the whole journal (else ``None``). A failed/recovered row is resolved
+    when a later ``succeeded`` row exists for the same ``migration_name``;
+    resolved rows never surface here, so a boot does not re-warn about a
+    failure the next boot already fixed. This keeps a genuine failure visible
+    in the startup summary even on databases that still carry routine
+    per-boot noise rows written before that noise was eliminated, without
+    changing ``latest_outcomes``' ordering contract.
+    """
+    recent = latest_outcomes(sqlite_path, limit=limit)
+    if any(r.get("phase") in ("failed", "recovered") for r in recent):
+        return recent, None
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
+    try:
+        _ensure_table(conn)
+        row = conn.execute(
+            "SELECT id, migration_name, phase, outcome, detail, created_at"
+            " FROM migration_journal j WHERE phase IN ('failed', 'recovered')"
+            " AND NOT EXISTS (SELECT 1 FROM migration_journal r"
+            " WHERE r.migration_name = j.migration_name"
+            " AND r.phase = 'succeeded' AND r.id > j.id)"
+            " ORDER BY j.id DESC LIMIT 1"
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return recent, None
+    return recent, {
+        "id": row[0],
+        "migration_name": row[1],
+        "phase": row[2],
+        "outcome": row[3],
+        "detail": row[4],
+        "created_at": row[5],
+    }

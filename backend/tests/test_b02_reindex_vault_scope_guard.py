@@ -26,7 +26,7 @@ from pathlib import Path
 from tempfile import mkdtemp
 
 from app.models.database import SQLiteConnectionPool, run_migrations
-from app.services.background_tasks import BackgroundProcessor
+from app.services.background_tasks import BackgroundProcessor, ReindexOperatorGuidance
 
 LIVE_DIM = 4
 PROBE_DIM = 6
@@ -119,8 +119,11 @@ class ReindexVaultScopeGuardTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(status, "failed")
         self.assertIsNotNone(error)
-        self.assertIn("vault-scoped reindex cannot migrate", error)
-        self.assertIn("full reindex", error)
+        # issue #702: the guidance travels as the verbatim operator-guidance
+        # exception object (persisted verbatim at the lease settle boundary).
+        self.assertIsInstance(error, ReindexOperatorGuidance)
+        self.assertIn("vault-scoped reindex cannot migrate", str(error))
+        self.assertIn("full reindex", str(error))
         # The rebuild was never opened: nothing can commit a partial corpus.
         self.assertEqual(self.store.begin_attempts, 0)
         # Only the probe ran; no file was re-embedded.

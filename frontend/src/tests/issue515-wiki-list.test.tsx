@@ -80,7 +80,7 @@ beforeEach(() => {
         body: {
           getReader: () => ({
             read: () => new Promise<{ value?: Uint8Array; done: boolean }>(() => {}),
-            cancel: vi.fn(),
+            cancel: vi.fn(() => Promise.resolve()),
           }),
         },
       } as unknown as Response)

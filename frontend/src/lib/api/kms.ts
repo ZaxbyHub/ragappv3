@@ -20,6 +20,11 @@ export interface KMSEntry {
   created_at: string;
   updated_at: string;
   last_compiled_at: string | null;
+  /** True body length; present on list responses (body is bounded to a head
+   *  window there). `null` on the single-entry detail, create, and update
+   *  responses, which all carry the FULL body (the key itself is always
+   *  emitted; `null` means "full body / not applicable", never "truncated"). */
+  body_chars?: number | null;
 }
 
 export interface KMSEntryListResponse {

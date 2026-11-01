@@ -235,7 +235,7 @@ function makeCapabilities(overrides: Partial<DraftRoomCapabilities> = {}): Draft
     tiers: ["standard", "high_stakes", "sensitive"],
     piece_types: ["article"],
     transformation_strengths: ["light", "moderate", "substantial"],
-    limits: { max_model_calls: 40, max_inputs: 20 },
+    limits: { job_max_model_calls: 40, max_inputs: 20 },
     export_formats: ["md"],
     logical_model_modes: ["default"],
     default_logical_mode: "default",

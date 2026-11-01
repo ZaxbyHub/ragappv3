@@ -25,7 +25,7 @@ import { Database, Plus, Pencil, Trash2, FileText, Brain, MessageSquare, Loader2
 import { EmptyState } from "@/components/EmptyState";
 import { useVaultStore } from "@/stores/useVaultStore";
 import { listOrganizations } from "@/lib/api";
-import type { Vault, Organization } from "@/lib/api";
+import type { Vault, Organization, VaultUpdateRequest } from "@/lib/api";
 import { useTestMode } from "@/fixtures/TestModeContext";
 import { mockVaults, mockOrganizations } from "@/fixtures/vaults";
 import { PageTitleHeader } from "@/components/layout/PageTitleHeader";
@@ -40,6 +40,7 @@ export default function VaultsPage() {
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [orgId, setOrgId] = useState<number | null>(null);
+  const [editOrgId, setEditOrgId] = useState<number | null>(null);
   const [orgs, setOrgs] = useState<Organization[]>([]);
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -56,7 +57,13 @@ export default function VaultsPage() {
       setOrgs(data);
       // Auto-select if user has exactly one org
       if (data.length === 1) setOrgId(data[0].id);
-    }).catch(() => {});
+    }).catch((err: unknown) => {
+      // Surfaced, not swallowed (issue #774 / T1-20-K-07): a silent failure
+      // makes the Organization selector disappear and the create-vault POST
+      // 400 later with no explanation.
+      console.error("Failed to load organizations:", err);
+      toast.error("Failed to load organizations");
+    });
   }, [fetchVaults, testMode]);
 
   function openCreateDialog() {
@@ -71,6 +78,10 @@ export default function VaultsPage() {
     setSelectedVault(vault);
     setName(vault.name);
     setDescription(vault.description);
+    // Organization adoption is offered once per vault: the selection resets
+    // every time the dialog opens so a previous vault's pick never leaks
+    // into this edit (issue #1003).
+    setEditOrgId(null);
     setEditDialogOpen(true);
   }
 
@@ -110,7 +121,15 @@ export default function VaultsPage() {
     if (!selectedVault) return;
     setSaving(true);
     try {
-      await editVault(selectedVault.id, { name: name.trim(), description: description.trim() });
+      // org_id joins the PUT payload ONLY when an organization was actually
+      // selected in the edit dialog: name/description-only edits keep the
+      // exact legacy payload shape (pinned by VaultsPage.test.tsx; org
+      // adoption is offered for org-less vaults only, #1003).
+      const payload: VaultUpdateRequest = { name: name.trim(), description: description.trim() };
+      if (selectedVault.org_id == null && editOrgId !== null) {
+        payload.org_id = editOrgId;
+      }
+      await editVault(selectedVault.id, payload);
       toast.success("Vault updated successfully");
       setEditDialogOpen(false);
       setSelectedVault(null);
@@ -165,15 +184,15 @@ export default function VaultsPage() {
 
   return (
     <div className="space-y-6 animate-in fade-in duration-300 pb-12">
-      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-        <PageTitleHeader
-          title="Vaults"
-          description="Manage your knowledge vaults"
-        />
-        <Button onClick={openCreateDialog}>
-          <Plus className="mr-2 h-4 w-4" /> New Vault
-        </Button>
-      </div>
+      <PageTitleHeader
+        title="Vaults"
+        description="Manage your knowledge vaults"
+        actions={
+          <Button onClick={openCreateDialog}>
+            <Plus className="mr-2 h-4 w-4" /> New Vault
+          </Button>
+        }
+      />
 
       {/* Failed load — distinct from the success+empty state (UI-053): a
           retriable error must never read as "you have no vaults". */}
@@ -384,6 +403,32 @@ export default function VaultsPage() {
                 onChange={(e) => setDescription(e.target.value)}
               />
             </div>
+            {/* Organization adoption for org-less vaults only (#1003); a
+                vault that already has an organization shows no control —
+                org-to-org reassignment is out of scope. */}
+            {orgs.length > 0 && selectedVault?.org_id == null && (
+              <div>
+                <Label htmlFor="edit-vault-org">Organization</Label>
+                <Select
+                  value={editOrgId !== null ? String(editOrgId) : ""}
+                  onValueChange={(v) => setEditOrgId(v ? Number(v) : null)}
+                >
+                  <SelectTrigger id="edit-vault-org">
+                    <SelectValue placeholder="Select organization…" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {orgs.map((org) => (
+                      <SelectItem key={org.id} value={String(org.id)}>
+                        {org.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-muted-foreground mt-1">
+                  Optional: join this vault to an organization. This cannot be changed later.
+                </p>
+              </div>
+            )}
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setEditDialogOpen(false)}>
                 Cancel
@@ -409,7 +454,7 @@ export default function VaultsPage() {
         <DialogHeader>
           <DialogTitle id="delete-vault-title">Delete Vault</DialogTitle>
           <DialogDescription id="delete-vault-desc">
-            Are you sure you want to delete "{selectedVault?.name}"? This will permanently delete all documents, memories, and chat sessions in this vault. This action cannot be undone.
+            Are you sure you want to delete "{selectedVault?.name}"? This will permanently delete all documents and chat sessions in this vault. Memories will be kept and moved to global memories. This action cannot be undone.
           </DialogDescription>
         </DialogHeader>
           <DialogFooter>

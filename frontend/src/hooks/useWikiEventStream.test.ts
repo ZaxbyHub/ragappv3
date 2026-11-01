@@ -26,7 +26,7 @@ function controllableSse() {
           else pending = resolve;
         })
     ),
-    cancel: vi.fn(),
+    cancel: vi.fn(() => Promise.resolve()),
   };
   const emit = (chunk: string) => {
     const item = { value: encoder.encode(chunk), done: false };
@@ -80,7 +80,7 @@ function doneResponse(): Response {
     body: {
       getReader: () => ({
         read: vi.fn().mockResolvedValue({ done: true, value: undefined }),
-        cancel: vi.fn(),
+        cancel: vi.fn(() => Promise.resolve()),
       }),
     },
   } as unknown as Response;

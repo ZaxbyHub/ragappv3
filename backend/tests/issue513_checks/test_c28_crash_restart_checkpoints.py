@@ -50,6 +50,7 @@ def _hermetic_env() -> None:
     os.environ["JWT_SECRET_KEY"] = "test-jwt-secret-key-for-testing-only"
     os.environ["REDIS_URL"] = ""
 
+
 _WAIT_S = 10.0
 _DIM = 4
 _FILE_HASH = "hashc28crash"
@@ -78,7 +79,9 @@ def _record(rec_id: str, file_id: int, text: str) -> dict:
 def _file_status(db_path: str, file_id: int) -> str | None:
     conn = sqlite3.connect(db_path)
     try:
-        row = conn.execute("SELECT status FROM files WHERE id = ?", (file_id,)).fetchone()
+        row = conn.execute(
+            "SELECT status FROM files WHERE id = ?", (file_id,)
+        ).fetchone()
         return str(row[0]) if row else None
     finally:
         conn.close()
@@ -87,12 +90,13 @@ def _file_status(db_path: str, file_id: int) -> str | None:
 async def _scenario() -> str:
     import app.services.background_tasks as bt
     from app.config import settings
-    from app.models.database import get_pool, init_db
+    from app.models.database import get_pool, init_db, run_migrations
     from app.services.vector_store import VectorStore
 
     tmp = Path(tempfile.mkdtemp(prefix="c28_db_"))
     db_path = str(tmp / "app.db")
     init_db(db_path)
+    run_migrations(db_path)
     conn = sqlite3.connect(db_path)
     conn.execute("INSERT INTO vaults (name) VALUES ('v')")
     vault_id = conn.execute("SELECT id FROM vaults LIMIT 1").fetchone()[0]
@@ -116,28 +120,38 @@ async def _scenario() -> str:
     orig_instance = bt._processor_instance
     bt._processor_instance = None
     processor = bt.BackgroundProcessor(
-        max_retries=1, retry_delay=0.01, pool=pool,
-        vector_store=store, embedding_service=_FixedEmbedding(),
+        max_retries=1,
+        retry_delay=0.01,
+        pool=pool,
+        vector_store=store,
+        embedding_service=_FixedEmbedding(),
     )
     try:
-        with patch.object(settings, "data_dir", tmp), \
-                patch.object(settings, "wiki_enabled", False), \
-                patch.object(settings, "wiki_compile_on_ingest", False), \
-                patch.object(settings, "kms_enabled", False), \
-                patch.object(settings, "multi_scale_indexing_enabled", False), \
-                patch.object(settings, "contextual_chunking_enabled", False), \
-                patch.object(settings, "optimize_mode", "manual"), \
-                patch(
-                    "app.services.document_processor.compute_file_hash",
-                    return_value=_FILE_HASH,
-                ), \
-                patch.object(
-                    processor.processor,
-                    "_process_document_file",
-                    new=AsyncMock(return_value=(_crash_chunks(), "crash test document body", _parsed())),
-                ), \
-                patch("app.services.document_processor.compute_parent_windows"):
-
+        with (
+            patch.object(settings, "data_dir", tmp),
+            patch.object(settings, "wiki_enabled", False),
+            patch.object(settings, "wiki_compile_on_ingest", False),
+            patch.object(settings, "kms_enabled", False),
+            patch.object(settings, "multi_scale_indexing_enabled", False),
+            patch.object(settings, "contextual_chunking_enabled", False),
+            patch.object(settings, "optimize_mode", "manual"),
+            patch(
+                "app.services.document_processor.compute_file_hash",
+                return_value=_FILE_HASH,
+            ),
+            patch.object(
+                processor.processor,
+                "_process_document_file",
+                new=AsyncMock(
+                    return_value=(
+                        _crash_chunks(),
+                        "crash test document body",
+                        _parsed(),
+                    )
+                ),
+            ),
+            patch("app.services.document_processor.compute_parent_windows"),
+        ):
             # Pre-crash partial vector write: chunk 0 is already durable.
             await store.init_table(_DIM)
             await store.add_chunks([_record(f"{file_id}_0", file_id, "chapter 0 text")])

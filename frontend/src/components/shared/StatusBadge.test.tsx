@@ -152,5 +152,14 @@ describe("StatusBadge", () => {
       const badge = screen.getByText("Error").closest("span");
       expect(badge).toHaveClass("bg-destructive");
     });
+
+    it("cancelled badge renders the truthful terminal label (issue #783)", () => {
+      render(<StatusBadge status="cancelled" />);
+      expect(screen.getByText("Cancelled")).toBeInTheDocument();
+      expect(FILE_STATUS_LABELS.cancelled).toBe("Cancelled");
+      expect(FILE_STATUS_COLORS.cancelled).toBeDefined();
+      // Never the pre-fix fallback for an unmapped status.
+      expect(screen.queryByText("Unknown")).not.toBeInTheDocument();
+    });
   });
 });

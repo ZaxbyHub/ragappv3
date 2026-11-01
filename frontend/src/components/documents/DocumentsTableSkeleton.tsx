@@ -8,7 +8,7 @@ export function DocumentsTableSkeleton() {
     // "Loading..."; this wrapper tells screen-reader users WHAT is loading.
     <div role="status" aria-label="Loading documents">
       {/* Desktop Table Skeleton (hidden on mobile) */}
-      <Card className="hidden sm:block">
+      <Card className="hidden md:block">
         <CardContent className="p-0">
           <div className="overflow-x-auto">
             <table className="w-full">
@@ -56,7 +56,7 @@ export function DocumentsTableSkeleton() {
       </Card>
 
       {/* Mobile Cards Skeleton (hidden on desktop) */}
-      <div className="grid grid-cols-1 gap-3 sm:hidden">
+      <div className="grid grid-cols-1 gap-3 md:hidden">
         {[...Array(3)].map((_, i) => (
           <Card key={i} className="w-full">
             <CardContent className="p-4">
@@ -88,7 +88,7 @@ export function DocumentsTableSkeleton() {
                   <Skeleton className="h-4 w-12" />
                 </div>
               </div>
-              <div className="mt-4 flex sm:hidden">
+              <div className="mt-4 flex md:hidden">
                 <Skeleton className="h-11 w-full rounded-md" />
               </div>
             </CardContent>

@@ -4,9 +4,16 @@ import { render, screen, act } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { VaultGroupAccessPanel } from '@/components/VaultGroupAccessPanel';
 
+const mockApiClient = vi.hoisted(() => ({
+  get: vi.fn(),
+  post: vi.fn(),
+  patch: vi.fn(),
+  delete: vi.fn(),
+}));
+
 vi.mock('@/lib/api', () => ({
-  default: { get: vi.fn(), post: vi.fn(), patch: vi.fn(), delete: vi.fn() },
-  apiClient: { get: vi.fn(), post: vi.fn(), patch: vi.fn(), delete: vi.fn() },
+  default: mockApiClient,
+  apiClient: mockApiClient,
 }));
 
 vi.mock('sonner', () => ({ toast: { success: vi.fn(), error: vi.fn() } }));

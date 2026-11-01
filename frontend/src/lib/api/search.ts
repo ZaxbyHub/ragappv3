@@ -2,7 +2,7 @@ import { apiClient } from "./core";
 
 // ---------------------------------------------------------------------------
 // Unified cross-entity discovery search (Issue #515 / PRODUCT-ENH-11)
-// Backed by GET /api/search/unified — documents, wiki pages, KMS entries and
+// Backed by GET /api/search/unified - documents, wiki pages, KMS entries and
 // chat session titles in one SQL/FTS pass (no vector store involvement).
 // ---------------------------------------------------------------------------
 
@@ -12,7 +12,7 @@ export const UNIFIED_SEARCH_TYPES = ["document", "wiki", "kms", "chat"] as const
 export type UnifiedSearchType = (typeof UNIFIED_SEARCH_TYPES)[number];
 
 export interface UnifiedSearchResult {
-  /** Entity kind — discriminates the renderer and the url_hint target. */
+  /** Entity kind - discriminates the renderer and the url_hint target. */
   type: UnifiedSearchType;
   id: number;
   title: string;
@@ -28,17 +28,22 @@ export interface UnifiedSearchResponse {
   results: UnifiedSearchResult[];
 }
 
-export async function unifiedSearch(params: {
+export async function unifiedSearch({
+  signal,
+  ...params
+}: {
   q: string;
   vault_id?: number;
   /** Comma-separated subset of document,wiki,kms,chat. Omit for all. */
   types?: string;
   /** Maximum results per entity type (backend bounds 1..50). */
   limit?: number;
+  /** Cancels only this caller's HTTP request. */
+  signal?: AbortSignal;
 }): Promise<UnifiedSearchResponse> {
   const response = await apiClient.get<UnifiedSearchResponse>(
     "/search/unified",
-    { params }
+    { params, signal }
   );
   return response.data;
 }

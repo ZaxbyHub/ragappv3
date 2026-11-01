@@ -72,12 +72,17 @@ class AtomKind(str, Enum):
 
 
 # Map of Unstructured element categories to canonical atom kinds. Anything not
-# listed degrades to AtomKind.UNKNOWN with a warning (never crashes).
+# listed degrades to AtomKind.UNKNOWN with a warning (never crashes). The
+# UncategorizedText/Formula keys are the categories unstructured 0.18.x
+# actually emits for plain text and formulas (issue #703 / T1-25-KR-07);
+# Formula maps to EQUATION so it stays in the verbatim-preserved kinds.
 _CATEGORY_TO_KIND: dict[str, AtomKind] = {
     "Title": AtomKind.TITLE,
     "NarrativeText": AtomKind.TEXT,
+    "UncategorizedText": AtomKind.TEXT,
     "Text": AtomKind.TEXT,
     "UnformattedText": AtomKind.TEXT,
+    "Formula": AtomKind.EQUATION,
     "ListItem": AtomKind.LIST,
     "BulletedText": AtomKind.LIST,
     "Image": AtomKind.IMAGE,

@@ -27,6 +27,8 @@ import sqlite3
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+from app.models.database import run_migrations  # noqa: E402
+
 
 class _FakeEmbeddingService:
     """Embedding double (b02 harness pattern): ``embed_batch -> (vectors, [])``."""
@@ -61,7 +63,7 @@ async def test_same_hash_reprocess_does_not_duplicate_vectors(
     third pass must still leave exactly ONE vector row for the file.
     """
     from app.config import settings
-    from app.models.database import get_pool, init_db
+    from app.models.database import get_pool, init_db, run_migrations
     from app.services.chunking import ProcessedChunk
     from app.services.document_artifacts import ParsedDocument
     from app.services.document_processor import DocumentProcessor
@@ -71,6 +73,7 @@ async def test_same_hash_reprocess_does_not_duplicate_vectors(
     tmp.mkdir()
     db_path = str(tmp / "app.db")
     init_db(db_path)
+    run_migrations(db_path)
     conn = sqlite3.connect(db_path)
     conn.execute("INSERT INTO vaults (name) VALUES ('v1')")
     vid = int(conn.execute("SELECT id FROM vaults LIMIT 1").fetchone()[0])
@@ -100,18 +103,26 @@ async def test_same_hash_reprocess_does_not_duplicate_vectors(
         },
         chunk_index=0,
     )
-    with patch.object(settings, "data_dir", tmp), patch.object(
-        settings, "wiki_enabled", False
-    ), patch.object(settings, "wiki_compile_on_ingest", False), patch.object(
-        processor,
-        "_process_document_file",
-        new=AsyncMock(
-            return_value=([chunk], "idempotent probe content", ParsedDocument(atoms=()))
+    with (
+        patch.object(settings, "data_dir", tmp),
+        patch.object(settings, "wiki_enabled", False),
+        patch.object(settings, "wiki_compile_on_ingest", False),
+        patch.object(
+            processor,
+            "_process_document_file",
+            new=AsyncMock(
+                return_value=(
+                    [chunk],
+                    "idempotent probe content",
+                    ParsedDocument(atoms=()),
+                )
+            ),
         ),
-    ), patch(
-        "app.services.document_processor.compute_file_hash", return_value="aaaa1111aaaa"
-    ), patch(
-        "app.services.document_processor.compute_parent_windows"
+        patch(
+            "app.services.document_processor.compute_file_hash",
+            return_value="aaaa1111aaaa",
+        ),
+        patch("app.services.document_processor.compute_parent_windows"),
     ):
         for _ in range(3):
             await processor.process_existing_file(
@@ -138,6 +149,7 @@ async def test_queued_path_not_reenqueued_by_scan(tmp_path: Path) -> None:
 
     db_path = str(tmp_path / "app.db")
     init_db(db_path)
+    run_migrations(db_path)
     conn = sqlite3.connect(db_path)
     conn.execute("INSERT INTO vaults (name) VALUES ('v7')")
     conn.commit()
@@ -147,8 +159,9 @@ async def test_queued_path_not_reenqueued_by_scan(tmp_path: Path) -> None:
 
     pool = SQLiteConnectionPool(db_path, max_size=4)
     try:
-        with patch.object(settings, "data_dir", tmp_path), patch.object(
-            settings, "ingestion_job_lease_enabled", True
+        with (
+            patch.object(settings, "data_dir", tmp_path),
+            patch.object(settings, "ingestion_job_lease_enabled", True),
         ):
             att = settings.vault_uploads_dir(vid) / "att.txt"
             att.write_text("attachment", encoding="utf-8")

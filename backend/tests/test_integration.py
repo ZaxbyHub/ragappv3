@@ -129,9 +129,7 @@ class FakeLLMClient:
         self.raise_error = raise_error
         self.call_count = 0
 
-    async def chat_completion(
-        self, messages: List[Dict[str, str]], **kwargs
-    ) -> str:
+    async def chat_completion(self, messages: List[Dict[str, str]], **kwargs) -> str:
         self.call_count += 1
         if self.raise_error:
             from app.services.llm_client import LLMError
@@ -139,9 +137,7 @@ class FakeLLMClient:
             raise LLMError("LLM service unavailable")
         return self.response
 
-    async def chat_completion_stream(
-        self, messages: List[Dict[str, str]], **kwargs
-    ):
+    async def chat_completion_stream(self, messages: List[Dict[str, str]], **kwargs):
         self.call_count += 1
         if self.raise_error:
             from app.services.llm_client import LLMError
@@ -166,7 +162,12 @@ class FakeVectorStore:
         self.deleted_file_ids: List[str] = []
 
     async def search(
-        self, embedding: List[float], limit: int = 10, filter_expr=None, vault_id=None, **kwargs
+        self,
+        embedding: List[float],
+        limit: int = 10,
+        filter_expr=None,
+        vault_id=None,
+        **kwargs,
     ) -> List[Dict]:
         return self.search_results[:limit]
 
@@ -241,7 +242,9 @@ class FakeMemoryStore:
             updated_at=None,
         )
 
-    def search_memories(self, query: str, limit: int = 5, vault_id=None, include_global: bool = False) -> List:
+    def search_memories(
+        self, query: str, limit: int = 5, vault_id=None, include_global: bool = False
+    ) -> List:
         # include_global accepted (issue #404); global-exclusion behavior is
         # covered by dedicated tests against the real MemoryStore.
         return self._memories[:limit]
@@ -281,9 +284,13 @@ def setup_app_state(app, **overrides):
     settings.data_dir = test_data_dir
 
     # Now initialize the database (it will use settings.sqlite_path)
-    from app.models.database import get_pool, init_db
+    from app.models.database import get_pool, init_db, run_migrations
 
     init_db(str(settings.sqlite_path))
+    # issue #704 (T1-25-S2-10): finalize writes parsed_text in the status
+    # transaction; the column is migration-added, so e2e app state must run
+    # migrations like production startup does.
+    run_migrations(str(settings.sqlite_path))
 
     # Create db_pool for testing
     db_pool = get_pool(str(settings.sqlite_path), max_size=2)
@@ -309,7 +316,9 @@ def setup_app_state(app, **overrides):
     fake_rag_engine = overrides.get(
         "rag_engine",
         RAGEngine(
-            embedding_service=overrides.get("embedding_service", FakeEmbeddingService()),
+            embedding_service=overrides.get(
+                "embedding_service", FakeEmbeddingService()
+            ),
             vector_store=overrides.get("vector_store", FakeVectorStore()),
             memory_store=overrides.get("memory_store", FakeMemoryStore()),
             llm_client=overrides.get("llm_client", FakeLLMClient()),
@@ -410,6 +419,7 @@ class TestIntegration(unittest.TestCase):
         self.temp_dir = tempfile.mkdtemp()
 
         from app.config import settings
+
         self._orig_data_dir = settings.data_dir
 
         # Create fake services
@@ -426,11 +436,13 @@ class TestIntegration(unittest.TestCase):
         from app.api.routes.chat import get_stream_auth
         from app.main import app
         from app.security import csrf_protect
+
         app.dependency_overrides.pop(get_current_active_user, None)
         app.dependency_overrides.pop(csrf_protect, None)
         app.dependency_overrides.pop(get_stream_auth, None)
 
         from app.config import settings
+
         settings.data_dir = self._orig_data_dir
 
         if os.path.exists(self.temp_dir):
@@ -934,7 +946,9 @@ class TestAsyncIntegration(unittest.IsolatedAsyncioTestCase):
 
         results = []
         async for chunk in self.rag_engine.query(
-            "remember that integration tests are important", [], stream=False,
+            "remember that integration tests are important",
+            [],
+            stream=False,
             can_write_memory=True,
         ):
             results.append(chunk)

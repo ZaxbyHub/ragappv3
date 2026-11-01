@@ -1,7 +1,9 @@
 import { useState, useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuthStore } from "@/stores/useAuthStore";
+import { captureAuthOwner, captureAuthPrincipalGeneration, isCurrentAuthOwner } from "@/lib/api/auth-lifecycle";
 import { Button } from "@/components/ui/button";
+import { PasswordRequirements } from "@/components/shared/PasswordRequirements";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -16,6 +18,7 @@ type SetupStep = "account" | "models";
 export default function SetupPage() {
   const [step, setStep] = useState<SetupStep>("account");
   const modelsHeadingRef = useRef<HTMLParagraphElement>(null);
+  const mountedRef = useRef(true);
   const [formData, setFormData] = useState({
     username: "",
     full_name: "",
@@ -26,8 +29,14 @@ export default function SetupPage() {
   const [error, setError] = useState("");
   const [showPassword, setShowPassword] = useState(false);
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
-  const { register, needsSetup, isLoading } = useAuthStore();
+  const { register, needsSetup, isLoading, initializationFailed } = useAuthStore();
+  const init = useAuthStore((state) => state.init);
   const navigate = useNavigate();
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
 
   // Redirect to login if setup is already complete. Two guards keep the
   // just-registered superadmin on the wizard (issue #622): (1) step — the
@@ -111,6 +120,26 @@ export default function SetupPage() {
       setError(msg || "Setup failed. Please try again.");
     }
   };
+
+  if (initializationFailed && needsSetup === null) {
+    const retryOwner = captureAuthOwner();
+    const retryPrincipalGeneration = captureAuthPrincipalGeneration();
+    const retry = () => {
+      if (!mountedRef.current || !isCurrentAuthOwner(retryOwner)) return;
+      if (captureAuthPrincipalGeneration() !== retryPrincipalGeneration) return;
+      void init();
+    };
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-background p-4" role="alert">
+        <Card className="w-full max-w-md">
+          <CardContent className="flex flex-col items-center justify-center gap-4 py-12">
+            <p className="font-medium text-foreground">Unable to initialize authentication.</p>
+            <Button type="button" onClick={retry}>Retry</Button>
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
 
   // Show loading state while checking setup status
   if (needsSetup === null || needsSetup === undefined) {
@@ -226,7 +255,7 @@ export default function SetupPage() {
                   onChange={handleChange("password")}
                   disabled={isLoading}
                   aria-required="true"
-                  aria-describedby={errors.password ? "setup-password-error" : undefined}
+                  aria-describedby={errors.password ? "setup-password-error setup-password-requirements" : "setup-password-requirements"}
                   aria-invalid={!!errors.password}
                   className="pl-10 pr-10"
                 />
@@ -241,6 +270,7 @@ export default function SetupPage() {
                   {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
                 </Button>
               </div>
+              <PasswordRequirements id="setup-password-requirements" />
               {errors.password && (
                 <p id="setup-password-error" className="text-sm text-destructive">{errors.password}</p>
               )}

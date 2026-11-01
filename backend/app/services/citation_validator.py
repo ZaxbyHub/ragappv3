@@ -59,6 +59,25 @@ def _labels_from_count(prefix: str, count: int) -> set[str]:
     return {f"{prefix}{i}" for i in range(1, count + 1)}
 
 
+# The exact refusal sentence the default prompt prescribes (issue #709 /
+# TQ-instruction-batch-4-11). prompt_builder embeds this constant in
+# CITATION_INSTRUCTION so the prompt and the refusal detector below share ONE
+# wording instead of drifting apart.
+PROMPT_REFUSAL_SENTENCE = "This information is not available in the provided context."
+
+# Substrings that mark an answer as a no-match refusal rather than factual
+# claims. Includes the shared prompt sentence's key fragments plus
+# "provided documents" so paraphrases of the instructed wording are caught.
+REFUSAL_PHRASES = (
+    "not available in the retrieved",
+    "not available in the provided context",
+    "not available in the provided documents",
+    "i don't have enough",
+    "no relevant",
+    "the retrieved documents",
+)
+
+
 _LABEL_FORMAT_RE = re.compile(r"^([SMWKD])(\d+)$")
 
 
@@ -119,13 +138,7 @@ def _looks_factual(content: str) -> bool:
     if not content or len(content) < 80:
         return False
     lower = content.lower()
-    refusal_phrases = (
-        "not available in the retrieved",
-        "i don't have enough",
-        "no relevant",
-        "the retrieved documents",
-    )
-    if any(p in lower for p in refusal_phrases):
+    if any(p in lower for p in REFUSAL_PHRASES):
         return False
     # Count sentence-terminating punctuation.
     return sum(1 for ch in content if ch in ".!?") >= 2
@@ -502,13 +515,26 @@ def score_citations(
     content: str,
     source_texts: Sequence[str],
     sentence_provenance: Optional[Sequence[object]] = None,
+    support_texts_by_label: Optional[Mapping[str, str]] = None,
 ) -> CitationValidationResult:
     """Compute citation confidence scores and unverifiable-claims list.
 
     This is a pure, side-effect-free extension to ``validate_and_repair_citations``.
     It adds:
-      - ``citation_confidence``: Jaccard overlap score per valid [S#] citation.
-      - ``unverifiable_claims``: answer sentences with no citation AND low overlap.
+      - ``citation_confidence``: Jaccard overlap score per valid [S#] citation,
+        plus one entry per non-S label supplied in ``support_texts_by_label``
+        that is actually cited in the content (issue #714: per-sentence support
+        scoring for the memory/wiki/KMS families).
+      - ``unverifiable_claims``: answer sentences with no citation AND low overlap
+        (document sources only — unchanged by the registry).
+
+    All scores are lexical-overlap diagnostics, never verification: a high score
+    says the claim sentence shares words with the cited evidence body, nothing
+    more. For the non-S families, registry membership IS the validity gate — the
+    caller builds the registry from offered-and-cited evidence (the same
+    label-membership base as ``repair_against_sources_and_memories``), so phantom
+    labels never score. An empty registry body scores a natural 0.0 (flagged,
+    not omitted).
 
     Callers that only need valid/invalid citation labels should continue calling
     ``validate_and_repair_citations`` directly.
@@ -522,12 +548,19 @@ def score_citations(
             provenance character offsets to narrow the source span used for
             overlap scoring. Currently unused in v1 (reserved for future use);
             the full source text is used for lexical overlap.
+        support_texts_by_label: Optional mapping from a non-S citation label
+            (e.g. ``"M1"``, ``"W2"``, ``"K3"``) to the evidence BODY text the
+            prompt rendered for that label. Bodies only — rendered headers embed
+            the label token itself, which would contaminate the token sets and
+            inflate every overlap. Labels not cited in ``content`` are omitted.
 
     Returns:
         A CitationValidationResult (created from a minimal valid result) that
         carries ``citation_confidence`` and ``unverifiable_claims``. The result
         is not repaired (repaired_content == content); use
         ``validate_and_repair_citations`` separately when repair is also needed.
+        ``valid_citations``/``has_any_citation`` remain document-[S#]-scoped;
+        only ``citation_confidence`` spans all supplied families.
     """
     if not content:
         return CitationValidationResult(
@@ -556,6 +589,21 @@ def score_citations(
     unverifiable = _find_unverifiable_claims(
         content, valid_citations, source_texts
     )
+
+    if support_texts_by_label:
+        registry_sentences: Dict[str, str] = {}
+        for sentence in _split_sentences(content):
+            for match in _CITATION_RE.finditer(sentence):
+                label = f"{match.group(1)}{match.group(2)}"
+                if label not in registry_sentences:
+                    registry_sentences[label] = sentence
+        for label, text in support_texts_by_label.items():
+            if label in citation_confidence:
+                continue
+            claim = registry_sentences.get(label)
+            if claim is None:
+                continue
+            citation_confidence[label] = _sentence_overlap(claim, text or "")
 
     return CitationValidationResult(
         repaired_content=content,

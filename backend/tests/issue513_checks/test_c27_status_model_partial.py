@@ -112,7 +112,9 @@ def _file_row(db_path, name: str) -> int:
         (f"/tmp/{name}.txt", name, f"hash-{name}"),
     )
     conn.commit()
-    fid = conn.execute("SELECT id FROM files WHERE file_hash = ?", (f"hash-{name}",)).fetchone()[0]
+    fid = conn.execute(
+        "SELECT id FROM files WHERE file_hash = ?", (f"hash-{name}",)
+    ).fetchone()[0]
     conn.close()
     return fid
 
@@ -147,14 +149,23 @@ async def _ingest(processor, file_id: int, tmp: Path, name: str) -> None:  # noq
     from app.services.document_artifacts import ParsedDocument
 
     chunks = _chunks()
-    with patch.object(
-        processor,
-        "_process_document_file",
-        new=AsyncMock(return_value=(chunks, " ".join(c.text for c in chunks), ParsedDocument(atoms=()))),
-    ), patch(
-        "app.services.document_processor.compute_file_hash", return_value=f"hash-{name}"
-    ), patch(
-        "app.services.document_processor.compute_parent_windows"
+    with (
+        patch.object(
+            processor,
+            "_process_document_file",
+            new=AsyncMock(
+                return_value=(
+                    chunks,
+                    " ".join(c.text for c in chunks),
+                    ParsedDocument(atoms=()),
+                )
+            ),
+        ),
+        patch(
+            "app.services.document_processor.compute_file_hash",
+            return_value=f"hash-{name}",
+        ),
+        patch("app.services.document_processor.compute_parent_windows"),
     ):
         await processor.process_existing_file(
             file_id=file_id, file_path=str(tmp / f"{name}.txt"), vault_id=1
@@ -165,12 +176,13 @@ async def _scenario() -> str:
     import sqlite3
 
     from app.config import settings
-    from app.models.database import get_pool, init_db
+    from app.models.database import get_pool, init_db, run_migrations
     from app.services.document_processor import DocumentProcessor
 
     tmp = Path(tempfile.mkdtemp(prefix="c27_db_"))
     db_path = str(tmp / "app.db")
     init_db(db_path)
+    run_migrations(db_path)
     conn = sqlite3.connect(db_path)
     conn.execute("INSERT INTO vaults (name) VALUES ('v')")
     conn.commit()
@@ -189,14 +201,15 @@ async def _scenario() -> str:
         vector_store=vstore,
     )
 
-    with patch.object(settings, "data_dir", tmp), \
-            patch.object(settings, "wiki_enabled", False), \
-            patch.object(settings, "wiki_compile_on_ingest", False), \
-            patch.object(settings, "kms_enabled", False), \
-            patch.object(settings, "multi_scale_indexing_enabled", False), \
-            patch.object(settings, "contextual_chunking_enabled", False), \
-            patch.object(settings, "embedding_batch_size", 1):
-
+    with (
+        patch.object(settings, "data_dir", tmp),
+        patch.object(settings, "wiki_enabled", False),
+        patch.object(settings, "wiki_compile_on_ingest", False),
+        patch.object(settings, "kms_enabled", False),
+        patch.object(settings, "multi_scale_indexing_enabled", False),
+        patch.object(settings, "contextual_chunking_enabled", False),
+        patch.object(settings, "embedding_batch_size", 1),
+    ):
         # --- Clause 1: partial embedding failure (1 of 3 chunks, 33%) ---
         embedder.fail_indices = {1}
         try:
@@ -248,9 +261,7 @@ async def _scenario() -> str:
                 f"(AC27)"
             )
         if rrow.get("status") != "indexed":
-            return (
-                f"harness invalid: retry-to-success ended at status={rrow.get('status')!r}"
-            )
+            return f"harness invalid: retry-to-success ended at status={rrow.get('status')!r}"
     return ""
 
 

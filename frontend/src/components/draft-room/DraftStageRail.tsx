@@ -118,7 +118,8 @@ function formatElapsed(startedAt: string | null | undefined, nowMs: number): str
 }
 
 /**
- * Horizontally-scrollable rail of compile stage buttons. Keyboard operable with arrow-key
+ * Wrapping rail of compile stage buttons (issue #778: a single-row scroll put
+ * the right-most stages past the 320px viewport). Keyboard operable with arrow-key
  * roving focus (Left/Right, Home/End) and a single tab stop; each button's accessible name
  * states its stage's status so colour is never the only signal.
  */
@@ -197,8 +198,12 @@ export function DraftStageRail({
 
   return (
     <nav aria-label="Compile stages" className="w-full">
-      <div className="overflow-x-auto">
-        <ul className="flex min-w-max items-stretch gap-2 p-1">
+      {/* Issue #778 (WCAG 1.4.10 reflow): the rail wraps instead of
+          horizontally scrolling — at 320px a min-w-max rail put the stage
+          buttons outside the viewport. Desktop is unchanged (the chips fit
+          one row at every wider size). */}
+      <div>
+        <ul className="flex flex-wrap items-stretch gap-2 p-1">
           {entries.map(({ stage, entry, blockerCount, warningCount, state }, index) => {
             const Icon = STATE_ICONS[state];
             const label = STAGE_LABELS[stage] ?? stage;

@@ -90,7 +90,9 @@ from app.services.document_progress import (
 def _columns(db_path: str, table: str) -> set[str]:
     conn = sqlite3.connect(db_path)
     try:
-        return {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        return {
+            row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
     finally:
         conn.close()
 
@@ -102,6 +104,9 @@ class TestProgressMigration(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self.db = os.path.join(self.tmp, "app.db")
         init_db(self.db)
+        # issue #704 (T1-25-S2-10): finalize writes parsed_text in the status
+        # transaction; the column is migration-added.
+        run_migrations(self.db)
 
     def tearDown(self):
         if os.path.exists(self.db):
@@ -168,6 +173,10 @@ class TestSetPhase(unittest.IsolatedAsyncioTestCase):
         self.tmp = tempfile.mkdtemp()
         self.db = os.path.join(self.tmp, "app.db")
         init_db(self.db)
+        # issue #704 (T1-25-S2-10): success finalization writes parsed_text
+        # in the status transaction; the column is migration-added, so this
+        # fixture must run migrations like production startup does.
+        run_migrations(self.db)
         self.pool = SQLiteConnectionPool(self.db, max_size=2)
         # Seed a row.
         conn = sqlite3.connect(self.db)
@@ -247,6 +256,36 @@ class TestSetPhase(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(row["total_units"])
         self.assertIsNone(row["unit_label"])
 
+    async def test_clear_progress_terminal_overrides(self):
+        """Issue #783: keyword-only phase/message overrides land the terminal
+        phase in the same single write; the 2-arg default behavior above is
+        the pinned compatibility contract."""
+        from app.services.document_progress import PHASE_CANCELLED
+
+        await set_phase(
+            self.pool,
+            self.file_id,
+            phase=PHASE_CHUNKING,
+            message="x",
+            total=5,
+            processed=5,
+            unit="chunks",
+            percent=100.0,
+        )
+        await clear_progress(
+            self.pool,
+            self.file_id,
+            phase=PHASE_CANCELLED,
+            phase_message="Cancelled by user",
+        )
+        row = self._row()
+        self.assertEqual(row["phase"], PHASE_CANCELLED)
+        self.assertEqual(row["phase_message"], "Cancelled by user")
+        self.assertIsNone(row["progress_percent"])
+        self.assertIsNone(row["processed_units"])
+        self.assertIsNone(row["total_units"])
+        self.assertIsNone(row["unit_label"])
+
     async def test_set_wiki_pending(self):
         await set_wiki_pending(self.pool, self.file_id, True)
         self.assertEqual(self._row()["wiki_pending"], 1)
@@ -261,6 +300,9 @@ class TestProcessExistingFileSkipsDuplicateCheck(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self.db = os.path.join(self.tmp, "app.db")
         init_db(self.db)
+        # issue #704 (T1-25-S2-10): finalize writes parsed_text in the status
+        # transaction; the column is migration-added.
+        run_migrations(self.db)
         self._original_data_dir = settings.data_dir
         settings.data_dir = Path(self.tmp)
         self.pool = SQLiteConnectionPool(self.db, max_size=2)
@@ -660,9 +702,7 @@ class TestStatusRouteAndAsyncUpload(unittest.TestCase):
         # Cross-vault must NOT match.
         conn = self.pool.get_connection()
         try:
-            self.assertIsNone(
-                proc._check_duplicate_in_flight(h, conn, vault_id=3)
-            )
+            self.assertIsNone(proc._check_duplicate_in_flight(h, conn, vault_id=3))
         finally:
             self.pool.release_connection(conn)
 
@@ -676,9 +716,7 @@ class TestStatusRouteAndAsyncUpload(unittest.TestCase):
                 (h2,),
             )
             conn.commit()
-            self.assertIsNone(
-                proc._check_duplicate_in_flight(h2, conn, vault_id=2)
-            )
+            self.assertIsNone(proc._check_duplicate_in_flight(h2, conn, vault_id=2))
         finally:
             self.pool.release_connection(conn)
 
@@ -798,6 +836,9 @@ class TestHandleFailurePreservesFileId(unittest.TestCase):
         bp.processor = MagicMock()
         bp.processor.process_file = AsyncMock()
         bp.processor.process_existing_file = AsyncMock()
+        # issue #704: the worker now awaits the (async) enrichment-status
+        # setter; this routing test disables the enrichment fan-out.
+        bp.processor.should_enqueue_enrichment = MagicMock(return_value=False)
 
         async def runner():
             task = TaskItem(

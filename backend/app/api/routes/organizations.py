@@ -13,11 +13,66 @@ from pydantic import BaseModel, Field, field_validator
 
 from app.api.deps import UserRole, require_role
 from app.config import settings
-from app.models.database import get_pool
+from app.models.database import get_pool, transaction_context
 from app.security import csrf_protect
+from app.services.authz_policy import (
+    direct_vault_admin_ids,
+    group_derived_vault_admin_ids,
+)
 from app.utils.slug import generate_org_slug
 
 router = APIRouter(prefix="/organizations", tags=["organizations"])
+
+
+def _covered_vault_ids(conn: sqlite3.Connection, vault_ids) -> set:
+    """Return the candidate vaults that still have an effective admin (#1028).
+
+    Route-layer composition of the shared effective-admin inventory
+    (``authz_policy.direct_vault_admin_ids`` /
+    ``authz_policy.group_derived_vault_admin_ids``); the inventory functions
+    themselves stay untouched per #1028's scope. Callers run this inside the
+    same BEGIN IMMEDIATE transaction as the mutation (both the pre-state and
+    the ACTUAL post-state read).
+    """
+    return {
+        vault_id
+        for vault_id in vault_ids
+        if direct_vault_admin_ids(conn, vault_id)
+        | group_derived_vault_admin_ids(conn, vault_id)
+    }
+
+
+def _user_derived_admin_vault_ids(conn: sqlite3.Connection, user_id: int) -> set:
+    """Vaults where ``user_id`` currently holds GROUP-DERIVED admin (#1028).
+
+    Conservative superset for the member-removal route: candidacy only decides
+    which vaults get the pre/post inventory reads, so a superset is safe while
+    remaining complete for every row the route can remove. Stale memberships
+    (grant without the org premise) surface here but contribute no effective
+    admin, so a pre-broken vault among them is never refused (AC7).
+    """
+    return {
+        row[0]
+        for row in conn.execute(
+            """SELECT DISTINCT vga.vault_id FROM vault_group_access vga
+               JOIN group_members gm ON vga.group_id = gm.group_id
+               WHERE gm.user_id = ? AND vga.permission = 'admin'""",
+            (user_id,),
+        )
+    }
+
+
+def _org_group_admin_grant_vault_ids(conn: sqlite3.Connection, org_id: int) -> set:
+    """Vaults whose group-derived admin coverage runs through this org's groups (#1028)."""
+    return {
+        row[0]
+        for row in conn.execute(
+            """SELECT DISTINCT vga.vault_id FROM vault_group_access vga
+               JOIN groups g ON g.id = vga.group_id
+               WHERE g.org_id = ? AND vga.permission = 'admin'""",
+            (org_id,),
+        )
+    }
 
 
 class OrganizationCreateRequest(BaseModel):
@@ -104,6 +159,35 @@ def _generate_invite_token() -> tuple[str, str]:
 
 def _generate_slug(name: str) -> str:
     return generate_org_slug(name)
+
+
+def _assert_invite_redeemable(conn: sqlite3.Connection, email: str) -> None:
+    """Redeemability precondition shared by create_org_invite and resend_org_invite.
+
+    Fails closed at mint time for identifiers that could never be redeemed:
+    acceptance matches the stored identifier against the invitee's USERNAME
+    (#300's delivered design) and requires a global role of member or above.
+    Username-form identifiers may address not-yet-provisioned users and stay
+    allowed; email-form identifiers that are nobody's username are rejected
+    (issue #560 C24). Resend re-asserts the same checks so an invite whose
+    invitee has since become unredeemable is not re-minted (issue #721 AC8).
+    """
+    invitee_row = conn.execute(
+        "SELECT role FROM users WHERE username = ? COLLATE NOCASE",
+        (email.lower(),),
+    ).fetchone()
+    if invitee_row is None and "@" in email:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No user found with username '{email.lower()}'; email-form invites must match an existing username",
+        )
+    if invitee_row:
+        invitee_level = UserRole.level(invitee_row[0])
+        if invitee_level < UserRole.MEMBER.value:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot invite a user with a global role below member",
+            )
 
 
 def _is_org_admin_or_owner(conn: sqlite3.Connection, org_id: int, user_id: int) -> bool:
@@ -660,31 +744,9 @@ async def create_org_invite(
             )
 
         # Fail closed at creation time for identifiers that could never be
-        # redeemed: acceptance matches the stored identifier against the
-        # invitee's USERNAME (#300's delivered design) and requires a global
-        # role of member or above.
-        invitee_cursor = await asyncio.to_thread(
-            conn.execute,
-            "SELECT role FROM users WHERE username = ? COLLATE NOCASE",
-            (req.email.lower(),),
-        )
-        invitee_row = await asyncio.to_thread(invitee_cursor.fetchone)
-        if invitee_row is None and "@" in req.email:
-            # An email-form identifier that is nobody's username mints a
-            # token nobody can ever redeem (issue #560 C24). Username-form
-            # identifiers may address not-yet-provisioned users (see #300)
-            # and stay allowed.
-            raise HTTPException(
-                status_code=400,
-                detail=f"No user found with username '{req.email.lower()}'; email-form invites must match an existing username",
-            )
-        if invitee_row:
-            invitee_level = UserRole.level(invitee_row[0])
-            if invitee_level < UserRole.MEMBER.value:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Cannot invite a user with a global role below member",
-                )
+        # redeemed (issue #560 C24, #721 AC8): the shared helper applies the
+        # exact checks resend re-asserts.
+        await asyncio.to_thread(_assert_invite_redeemable, conn, req.email)
 
         # Generate token
         raw_token, token_hash = _generate_invite_token()
@@ -764,6 +826,11 @@ async def resend_org_invite(
             raise HTTPException(status_code=400, detail="Invite has been revoked")
         if invite[4]:  # accepted_at
             raise HTTPException(status_code=400, detail="Invite has already been accepted")
+
+        # Re-assert the same redeemability checks creation applies (issue #721
+        # AC8): an invite whose invitee has since become unable to redeem it
+        # (e.g. global role dropped below member) must not be re-minted.
+        await asyncio.to_thread(_assert_invite_redeemable, conn, invite[1])
 
         # Generate new token
         raw_token, token_hash = _generate_invite_token()
@@ -1063,30 +1130,65 @@ async def update_org_member_role(
                 detail="Use the ownership transfer endpoint to assign the owner role",
             )
 
-        # Update role
-        try:
-            await asyncio.to_thread(
-                conn.execute,
-                "UPDATE org_members SET role = ? WHERE org_id = ? AND user_id = ?",
-                (req.role, org_id, member_user_id),
-            )
-            await asyncio.to_thread(conn.commit)
-        except sqlite3.Error:
-            await asyncio.to_thread(conn.rollback)
-            raise HTTPException(
-                status_code=409,
-                detail="Could not update member role. Please try again.",
-            )
+        # Issue #1037 item 2 (plus #1036 AC3's caller family): the target-role
+        # read above ran OUTSIDE any transaction and the UPDATE below was
+        # un-predicated, so a transfer_ownership committing in that gap made
+        # the target owner and this UPDATE silently demoted them — leaving
+        # the organization with zero owners. One BEGIN IMMEDIATE now covers
+        # caller-privilege and target-role re-reads, a predicated UPDATE with
+        # a rowcount check, and the response read; every refusal rolls back
+        # atomically (mirrors #1033's fix). This route has no superadmin
+        # bypass, so the caller re-read is unconditional like its outer check.
+        def _update_member_role() -> tuple:
+            with transaction_context(conn):
+                if not _is_org_admin_or_owner(conn, org_id, user["id"]):
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Insufficient privileges. Organization admin or owner required",
+                    )
+                role_cursor = conn.execute(
+                    "SELECT role FROM org_members WHERE org_id = ? AND user_id = ?",
+                    (org_id, member_user_id),
+                )
+                target_role_now = role_cursor.fetchone()
+                if target_role_now is None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Member not found",
+                    )
+                if target_role_now[0] == "owner":
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Cannot change the role of the organization owner",
+                    )
+                update_cursor = conn.execute(
+                    "UPDATE org_members SET role = ? WHERE org_id = ? AND user_id = ? AND role != 'owner'",
+                    (req.role, org_id, member_user_id),
+                )
+                if update_cursor.rowcount == 0:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Could not update member role. Please try again.",
+                    )
+                # Response read inside the transaction: a concurrent removal
+                # cannot make this row vanish mid-flight, and a vanished
+                # member answers 404 instead of an unhandled error.
+                resp_cursor = conn.execute(
+                    """SELECT u.id, u.username, u.full_name, om.role, om.joined_at
+                       FROM org_members om JOIN users u ON om.user_id = u.id
+                       WHERE om.org_id = ? AND om.user_id = ?""",
+                    (org_id, member_user_id),
+                )
+                row = resp_cursor.fetchone()
+                if row is None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Member not found",
+                    )
+                return row
 
-        # Fetch updated member details
-        cursor = await asyncio.to_thread(
-            conn.execute,
-            """SELECT u.id, u.username, u.full_name, om.role, om.joined_at
-               FROM org_members om JOIN users u ON om.user_id = u.id
-               WHERE om.org_id = ? AND om.user_id = ?""",
-            (org_id, member_user_id),
-        )
-        row = await asyncio.to_thread(cursor.fetchone)
+        row = await asyncio.to_thread(_update_member_role)
+
         return {
             "user_id": row[0],
             "username": row[1],
@@ -1149,17 +1251,81 @@ async def remove_org_member(
                 status_code=400, detail="Cannot remove yourself from an organization"
             )
 
-        # Delete member
-        try:
-            await asyncio.to_thread(
-                conn.execute,
-                "DELETE FROM org_members WHERE org_id = ? AND user_id = ?",
-                (org_id, member_user_id),
-            )
-            await asyncio.to_thread(conn.commit)
-        except Exception:
-            await asyncio.to_thread(conn.rollback)
-            raise
+        # Delete member. Issue #1028: one BEGIN IMMEDIATE over candidate
+        # discovery, the pre-state read, both DELETEs, and the ACTUAL
+        # post-state re-read — removing the org row (or the group rows its
+        # cleanup removes) can strip the member's only group-derived admin
+        # coverage. Refusal fires only for vaults that HAD effective admins
+        # (AC7), and rolls both DELETEs back.
+        def _remove_member():
+            with transaction_context(conn):
+                # Issue #1036 item 3 (same family as the transfer windows):
+                # the caller-privilege check above ran OUTSIDE this
+                # transaction, so a concurrent role change demoting the
+                # caller between check and BEGIN still executed their
+                # removal. This route has no superadmin bypass — its outer
+                # check applies to every caller — so the re-read does too.
+                if not _is_org_admin_or_owner(conn, org_id, user["id"]):
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Insufficient privileges. Organization admin or owner required",
+                    )
+                # Issue #1033: the owner refusal above read the target's
+                # role BEFORE this write transaction opened, so a
+                # transfer_ownership committing in that window promoted the
+                # target to owner and the un-predicated DELETE below would
+                # remove them — leaving the organization with zero owners.
+                # BEGIN IMMEDIATE holds the write lock for the transaction's
+                # duration, so this in-transaction re-read is definitive.
+                role_cursor = conn.execute(
+                    "SELECT role FROM org_members WHERE org_id = ? AND user_id = ?",
+                    (org_id, member_user_id),
+                )
+                target_role_now = role_cursor.fetchone()
+                if target_role_now is None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Member not found in organization",
+                    )
+                if target_role_now[0] == "owner":
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Cannot remove the organization owner. Transfer ownership first.",
+                    )
+                candidate_vault_ids = _user_derived_admin_vault_ids(
+                    conn, member_user_id
+                )
+                covered_before = _covered_vault_ids(conn, candidate_vault_ids)
+                conn.execute(
+                    "DELETE FROM org_members WHERE org_id = ? AND user_id = ?",
+                    (org_id, member_user_id),
+                )
+                # Group membership implies organization membership: also drop the
+                # member's group_members rows for this org's groups in the same
+                # transaction, so the removal revokes their derived vault grants
+                # (issue #721 AC2).
+                conn.execute(
+                    """DELETE FROM group_members
+                        WHERE user_id = ?
+                          AND group_id IN (SELECT id FROM groups WHERE org_id = ?)""",
+                    (member_user_id, org_id),
+                )
+                refused_vault_ids = sorted(
+                    covered_before
+                    - _covered_vault_ids(conn, candidate_vault_ids)
+                )
+                if refused_vault_ids:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Removing this organization member would leave"
+                            f" vault(s) {refused_vault_ids} without an"
+                            " effective admin: each vault must keep at least"
+                            " one effective admin"
+                        ),
+                    )
+
+        await asyncio.to_thread(_remove_member)
 
         return {
             "message": "Member removed",
@@ -1222,21 +1388,57 @@ async def transfer_ownership(
                 detail="New owner must be an active member of the organization",
             )
 
+        # Issue #1036 AC3: the authorization reads above ran OUTSIDE the
+        # write transaction, so a concurrent transfer could demote the caller
+        # (authorization window) or a concurrent remove_org_member could
+        # delete the new owner's member row — the unconditional demote plus
+        # the un-predicated promote (matching zero rows) then left the
+        # organization with ZERO owners while returning 200. Everything is
+        # re-validated under BEGIN IMMEDIATE, where the write lock makes the
+        # reads definitive (mirrors #1033's fix), and the promote rowcount is
+        # checked so a zero-row transfer refuses and transaction_context
+        # rolls the demote back.
+        def _transfer_ownership() -> None:
+            with transaction_context(conn):
+                if user.get("role") != "superadmin":
+                    caller_cursor = conn.execute(
+                        "SELECT role FROM org_members WHERE org_id = ? AND user_id = ?",
+                        (org_id, user["id"]),
+                    )
+                    caller_row = caller_cursor.fetchone()
+                    if not caller_row or caller_row[0] != "owner":
+                        raise HTTPException(
+                            status_code=403,
+                            detail="Only the organization owner or a superadmin can transfer ownership",
+                        )
+                member_cursor = conn.execute(
+                    """SELECT u.id FROM users u
+                       JOIN org_members om ON u.id = om.user_id
+                       WHERE u.id = ? AND om.org_id = ? AND u.is_active = 1""",
+                    (req.new_owner_user_id, org_id),
+                )
+                if not member_cursor.fetchone():
+                    raise HTTPException(
+                        status_code=400,
+                        detail="New owner must be an active member of the organization",
+                    )
+                conn.execute(
+                    "UPDATE org_members SET role = 'admin' WHERE org_id = ? AND role = 'owner'",
+                    (org_id,),
+                )
+                promote_cursor = conn.execute(
+                    "UPDATE org_members SET role = 'owner' WHERE org_id = ? AND user_id = ?",
+                    (org_id, req.new_owner_user_id),
+                )
+                if promote_cursor.rowcount == 0:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Could not transfer ownership. Please try again.",
+                    )
+
         try:
-            await asyncio.to_thread(conn.execute, "BEGIN IMMEDIATE")
-            await asyncio.to_thread(
-                conn.execute,
-                "UPDATE org_members SET role = 'admin' WHERE org_id = ? AND role = 'owner'",
-                (org_id,),
-            )
-            await asyncio.to_thread(
-                conn.execute,
-                "UPDATE org_members SET role = 'owner' WHERE org_id = ? AND user_id = ?",
-                (org_id, req.new_owner_user_id),
-            )
-            await asyncio.to_thread(conn.commit)
+            await asyncio.to_thread(_transfer_ownership)
         except sqlite3.Error:
-            await asyncio.to_thread(conn.rollback)
             raise HTTPException(status_code=500, detail="Failed to transfer ownership")
 
         return {
@@ -1267,13 +1469,36 @@ async def delete_organization(
         if not await asyncio.to_thread(cursor.fetchone):
             raise HTTPException(status_code=404, detail="Organization not found")
 
-        # Delete organization (FK cascades handle org_members, groups, group_members)
-        await asyncio.to_thread(
-            conn.execute,
-            "DELETE FROM organizations WHERE id = ?",
-            (org_id,),
-        )
-        await asyncio.to_thread(conn.commit)
+        # Delete organization (FK cascades handle org_members, groups, group_members,
+        # and vault_group_access). Issue #1028: one BEGIN IMMEDIATE over candidate
+        # discovery, the pre-state read, the cascade DELETE, and the ACTUAL
+        # post-state re-read — the cascade can strip every org group's admin
+        # grants at once, orphaning vaults whose only coverage ran through them
+        # (vaults.org_id carries no FK, so vault rows survive with a dangling
+        # org_id). Refusal fires only for vaults that HAD effective admins (AC7).
+        def _delete_organization():
+            with transaction_context(conn):
+                candidate_vault_ids = _org_group_admin_grant_vault_ids(conn, org_id)
+                covered_before = _covered_vault_ids(conn, candidate_vault_ids)
+                conn.execute(
+                    "DELETE FROM organizations WHERE id = ?",
+                    (org_id,),
+                )
+                refused_vault_ids = sorted(
+                    covered_before
+                    - _covered_vault_ids(conn, candidate_vault_ids)
+                )
+                if refused_vault_ids:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Deleting this organization would leave vault(s)"
+                            f" {refused_vault_ids} without an effective admin:"
+                            " each vault must keep at least one effective admin"
+                        ),
+                    )
+
+        await asyncio.to_thread(_delete_organization)
 
         return {
             "message": "Organization deleted",

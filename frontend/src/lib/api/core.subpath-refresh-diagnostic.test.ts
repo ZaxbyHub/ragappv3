@@ -22,8 +22,13 @@
 //   a successful refresh resets the flag, and session boundaries
 //   (login/register/logout in useAuthStore) start a new burst.
 //
-//   The refresh STILL resolves null: the fix adds an observable signal, it
-//   does not change the return contract.
+//   For AUTH-SHAPED rejections the refresh resolves null. Since issue #774,
+//   transport-class failures (network errors, refresh timeouts, 5xx) REJECT
+//   instead — an outage is no longer coerced to the session-rejection null —
+//   so the 5xx and network cases below assert rejection while keeping their
+//   suppression assertions. This file was trace meridian-canvas-401-vault-zero's
+//   frozen C1; that trace's freeze-time evidence predates the #774 contract
+//   change (disclosed in #774's PR).
 //
 // Base behavior (94c0b925): _doRefresh() swallows the failure with no
 // diagnostic anywhere, so the emission scenarios are RED at base for that
@@ -127,9 +132,8 @@ describe("api/core subpath refresh-failure diagnostic (trace meridian-canvas-401
     routeFetch(jsonResponse(401), jsonResponse(503));
     const core = await import("@/lib/api/core");
 
-    const token = await core.refreshAccessToken();
-
-    expect(token).toBeNull();
+    // #774: a 5xx is transport-class and rejects instead of resolving null.
+    await expect(core.refreshAccessToken()).rejects.toThrow(/status 503/);
     expect(diagnosticText()).toBe("");
   });
 
@@ -137,9 +141,9 @@ describe("api/core subpath refresh-failure diagnostic (trace meridian-canvas-401
     fetchMock.mockRejectedValue(new TypeError("Failed to fetch"));
     const core = await import("@/lib/api/core");
 
-    const token = await core.refreshAccessToken();
-
-    expect(token).toBeNull();
+    // #774: a network error is transport-class and rejects with the original
+    // error instead of resolving null.
+    await expect(core.refreshAccessToken()).rejects.toThrow("Failed to fetch");
     expect(diagnosticText()).toBe("");
   });
 

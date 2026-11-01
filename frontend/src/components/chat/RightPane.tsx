@@ -11,6 +11,7 @@ import {
   useLastCompletedAssistantSources,
   useLastCompletedAssistantWikiRefs,
   useLastCompletedAssistantKmsRefs,
+  useLastCompletedAssistantCitationConfidence,
   useLastUserContent,
   useSourcesForSourceId,
   useCompletedAssistantMessageIdsKey,
@@ -19,6 +20,7 @@ import {
 } from "@/stores/useChatStore";
 import { useChatShellStore } from "@/stores/useChatShellStore";
 import { getChunkContext, getDocumentRawBlob, getArtifactRawBlob, type ChunkContextResponse, type Source } from "@/lib/api";
+import { reportCitationOpened } from "@/lib/api/onboarding";
 import { buildEvidenceView, type EvidenceLocation } from "@/lib/evidence";
 import { WikiCards } from "./WikiCards";
 import { KMSCards } from "./KMSCards";
@@ -72,7 +74,7 @@ function highlightQueryTerms(text: string, query: string): React.ReactNode[] {
       return (
         <mark
           key={index}
-          className="bg-amber-200/80 dark:bg-amber-500/30 rounded-sm px-0.5"
+          className="bg-warning/20 rounded-sm px-0.5"
           aria-label={`Search match: ${part}`}
         >
           {part}
@@ -258,7 +260,7 @@ function SourceListItem({
             </span>
           </div>
           {source.section && (
-            <div className="text-[11px] text-muted-foreground/80 mt-0.5 truncate">
+            <div className="text-[11px] text-muted-foreground mt-0.5 truncate">
               <span className="font-medium">§</span> {source.section}
             </div>
           )}
@@ -273,7 +275,7 @@ function SourceListItem({
               )}
             {source.vision_status && source.vision_status !== "used" && (
               <span
-                className="shrink-0 rounded-sm bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-600"
+                className="shrink-0 rounded-sm bg-warning/15 px-1.5 py-0.5 text-[10px] font-medium text-warning"
                 aria-label={`vision status: ${source.vision_status}`}
               >
                 proxy
@@ -353,6 +355,18 @@ function SourcePreview({ source, query, onJumpToAnswer }: SourcePreviewProps) {
   const [artifactError, setArtifactError] = useState<string | null>(null);
   const artifactAbortRef = useRef<AbortController | null>(null);
   const previewContent = chunkContext?.context_text || source.snippet || "";
+  // Issue #718: chunk-context neighbor window — the chunks immediately
+  // before/after the matched one, when the payload carries them. Neighbors
+  // whose text is already inside the loaded context (e.g. the parent-window
+  // payload typically spans them) are suppressed so the pane never shows
+  // the same passage twice (issue #718 review F-001).
+  const inContext = (text: string) => previewContent.includes(text);
+  const neighborBefore = (chunkContext?.before ?? []).filter(
+    (text) => !inContext(text)
+  );
+  const neighborAfter = (chunkContext?.after ?? []).filter(
+    (text) => !inContext(text)
+  );
   const highlightedContent = useMemo(
     () => highlightQueryTerms(previewContent, query),
     [previewContent, query]
@@ -558,7 +572,7 @@ function SourcePreview({ source, query, onJumpToAnswer }: SourcePreviewProps) {
           )}
           {evidenceView.availability.state === "unavailable" && (
             <>
-              <span className="text-warning-foreground" role="status">
+              <span className="text-warning" role="status">
                 Showing saved excerpt — original context unavailable
               </span>
               <Button
@@ -572,7 +586,7 @@ function SourcePreview({ source, query, onJumpToAnswer }: SourcePreviewProps) {
             </>
           )}
           {documentError && (
-            <span className="text-warning-foreground">{documentError}</span>
+            <span className="text-warning">{documentError}</span>
           )}
           {source.snippet && (
             <span className="min-w-0 flex-1 truncate italic">
@@ -621,7 +635,22 @@ function SourcePreview({ source, query, onJumpToAnswer }: SourcePreviewProps) {
         <ScrollArea className="flex-1 min-h-0 rounded-sm border p-4">
           <div className="text-sm leading-relaxed whitespace-pre-wrap">
             {artifactError && (
-              <span className="text-warning-foreground">{artifactError}</span>
+              <span className="text-warning">{artifactError}</span>
+            )}
+            {neighborBefore.length > 0 && (
+              <div
+                className="mb-3 border-l-2 border-border pl-3"
+                aria-label="Preceding context"
+              >
+                {neighborBefore.map((text, index) => (
+                  <p
+                    key={`chunk-before-${index}`}
+                    className="text-xs text-muted-foreground whitespace-pre-wrap"
+                  >
+                    {text}
+                  </p>
+                ))}
+              </div>
             )}
             {previewContent ? (
               supportSpanRange ? (
@@ -629,7 +658,7 @@ function SourcePreview({ source, query, onJumpToAnswer }: SourcePreviewProps) {
                   {highlightQueryTerms(previewContent.slice(0, supportSpanRange[0]), query)}
                   <mark
                     data-support-span
-                    className="bg-sky-200/70 dark:bg-sky-500/25 rounded-sm px-0.5"
+                    className="bg-primary/20 rounded-sm px-0.5"
                     aria-label="Supporting passage"
                   >
                     {previewContent.slice(supportSpanRange[0], supportSpanRange[1])}
@@ -648,6 +677,21 @@ function SourcePreview({ source, query, onJumpToAnswer }: SourcePreviewProps) {
               )
             ) : (
               !artifactError && "No preview content available."
+            )}
+            {neighborAfter.length > 0 && (
+              <div
+                className="mt-3 border-l-2 border-border pl-3"
+                aria-label="Following context"
+              >
+                {neighborAfter.map((text, index) => (
+                  <p
+                    key={`chunk-after-${index}`}
+                    className="text-xs text-muted-foreground whitespace-pre-wrap"
+                  >
+                    {text}
+                  </p>
+                ))}
+              </div>
             )}
           </div>
         </ScrollArea>
@@ -689,6 +733,10 @@ export function RightPane() {
   const lastCompletedSources = useLastCompletedAssistantSources();
   const lastCompletedWikiRefs = useLastCompletedAssistantWikiRefs();
   const lastCompletedKmsRefs = useLastCompletedAssistantKmsRefs();
+  // Issue #965: the pane renders the same WikiCards/KMSCards components the
+  // assistant message does, so cited evidence cards here get the same
+  // "Support NN%" chip from the done payload's per-label scores.
+  const lastCompletedCitationConfidence = useLastCompletedAssistantCitationConfidence();
   const query = useLastUserContent();
   const completedAssistantIdsKey = useCompletedAssistantMessageIdsKey();
   // Streaming-only candidate preview (issue #508): the versioned evidence SSE
@@ -789,6 +837,10 @@ export function RightPane() {
     setSelectedEvidenceSource(source);
     setActiveTab("preview");
     setActiveRightTab("preview");
+    // Issue #782: first-run milestone — the user opened a citation (the
+    // evidence-pane list is a second entry point beside AssistantMessage's
+    // funnel; the client-side once-guard keeps this to one POST).
+    void reportCitationOpened();
   }, [setSelectedEvidenceSource, setActiveRightTab]);
 
   const handleJumpToAnswer = useCallback(() => {
@@ -835,7 +887,7 @@ export function RightPane() {
           <TabsTrigger value="sources" className="text-xs flex items-center gap-1.5">
             Sources
             {hasSources && (
-              <span className="text-[11px] text-muted-foreground">
+              <span className="text-[11px]">
                 ({sources.length})
               </span>
             )}
@@ -846,7 +898,7 @@ export function RightPane() {
           <TabsTrigger value="extracted" disabled={!hasStructuredOutputs} className="text-xs flex items-center gap-1.5">
             Extracted
             {hasStructuredOutputs && (
-              <span className="text-[11px] text-muted-foreground">
+              <span className="text-[11px]">
                 ({structuredOutputs.length})
               </span>
             )}
@@ -854,7 +906,7 @@ export function RightPane() {
           {hasWikiRefs && (
             <TabsTrigger value="wiki" className="text-xs flex items-center gap-1.5">
               Wiki
-              <span className="text-[11px] text-muted-foreground">
+              <span className="text-[11px]">
                 ({lastCompletedWikiRefs!.length})
               </span>
             </TabsTrigger>
@@ -862,7 +914,7 @@ export function RightPane() {
           {hasKmsRefs && (
             <TabsTrigger value="kms">
               Knowledge
-              <span className="ml-1.5 text-xs text-muted-foreground">
+              <span className="ml-1.5 text-xs">
                 ({lastCompletedKmsRefs!.length})
               </span>
             </TabsTrigger>
@@ -882,19 +934,25 @@ export function RightPane() {
             <div className="flex h-full flex-col min-h-0 gap-4">
               <div className="flex-1 min-h-0">
                 {shouldVirtualizeSources ? (
+                  // #868: the sizing div carries the list role — its DIRECT
+                  // children are the per-item wrappers, so the ownership
+                  // chain stays intact (each wrapper is a listitem).
                   <div
                     ref={sourcesScrollRef}
                     className="h-full overflow-y-auto w-full min-w-[320px]"
-                    aria-label="Sources list"
-                    role="list"
                   >
-                    <div style={{ height: sourcesVirtualizer.getTotalSize(), position: 'relative' }}>
+                    <div
+                      style={{ height: sourcesVirtualizer.getTotalSize(), position: 'relative' }}
+                      role="list"
+                      aria-label="Sources list"
+                    >
                       {sourcesVirtualizer.getVirtualItems().map((virtualItem) => {
                         const source = sources[virtualItem.index];
                         return (
                           <div
                             key={source.id}
                             data-index={virtualItem.index}
+                            role="listitem"
                             ref={sourcesVirtualizer.measureElement}
                             style={{
                               position: 'absolute',
@@ -918,16 +976,20 @@ export function RightPane() {
                   </div>
                 ) : (
                   <ScrollArea className="h-full min-w-[320px]">
-                    <div className="space-y-2">
+                    {/* #868: explicit list semantics on the non-virtualized
+                        Sources variant — each SourceListItem (a native
+                        button) sits in a listitem wrapper. */}
+                    <div className="space-y-2" role="list" aria-label="Sources list">
                       {sources.map((source, index) => (
-                        <SourceListItem
-                          key={source.id}
-                          source={source}
-                          index={index}
-                          isSelected={selectedSource?.id === source.id || selectedEvidenceSource?.id === source.id}
-                          scoreType={source.score_type}
-                          onClick={() => handleSourceClick(source)}
-                        />
+                        <div role="listitem" key={source.id}>
+                          <SourceListItem
+                            source={source}
+                            index={index}
+                            isSelected={selectedSource?.id === source.id || selectedEvidenceSource?.id === source.id}
+                            scoreType={source.score_type}
+                            onClick={() => handleSourceClick(source)}
+                          />
+                        </div>
                       ))}
                     </div>
                   </ScrollArea>
@@ -938,16 +1000,18 @@ export function RightPane() {
                   <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">
                     Retrieved — not yet cited
                   </h3>
-                  <div className="space-y-2">
+                  {/* #868: same list semantics for the candidates block. */}
+                  <div className="space-y-2" role="list" aria-label="Retrieved — not yet cited">
                     {candidateSources!.map((source, index) => (
-                      <SourceListItem
-                        key={source.id}
-                        source={source}
-                        index={index}
-                        isSelected={selectedSource?.id === source.id || selectedEvidenceSource?.id === source.id}
-                        scoreType={source.score_type}
-                        onClick={() => handleSourceClick(source)}
-                      />
+                      <div role="listitem" key={source.id}>
+                        <SourceListItem
+                          source={source}
+                          index={index}
+                          isSelected={selectedSource?.id === source.id || selectedEvidenceSource?.id === source.id}
+                          scoreType={source.score_type}
+                          onClick={() => handleSourceClick(source)}
+                        />
+                      </div>
                     ))}
                   </div>
                 </div>
@@ -994,7 +1058,10 @@ export function RightPane() {
           <TabsContent value="wiki" className="flex-1 min-h-0 mt-4">
             <ScrollArea className="h-full min-w-[320px]">
               <div className="pr-4">
-                <WikiCards wikiRefs={lastCompletedWikiRefs!} />
+                <WikiCards
+                  wikiRefs={lastCompletedWikiRefs!}
+                  citationConfidence={lastCompletedCitationConfidence}
+                />
               </div>
             </ScrollArea>
           </TabsContent>
@@ -1004,7 +1071,10 @@ export function RightPane() {
           <TabsContent value="kms" className="flex-1 min-h-0 mt-4">
             <ScrollArea className="h-full">
               <div className="pr-4">
-                <KMSCards kmsRefs={lastCompletedKmsRefs!} />
+                <KMSCards
+                  kmsRefs={lastCompletedKmsRefs!}
+                  citationConfidence={lastCompletedCitationConfidence}
+                />
               </div>
             </ScrollArea>
           </TabsContent>

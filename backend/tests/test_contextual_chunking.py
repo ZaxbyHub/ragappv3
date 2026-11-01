@@ -6,7 +6,7 @@ import sys
 import unittest
 from dataclasses import dataclass, field
 from typing import List, Optional
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -34,6 +34,7 @@ class ProcessedChunk:
     original_indices: List[int] = field(default_factory=list)
 
 
+from app.config import settings
 from app.services.contextual_chunking import ContextualChunker
 
 
@@ -55,8 +56,13 @@ class TestContextualChunkerInit(unittest.TestCase):
         self.assertIsInstance(chunker._semaphore, asyncio.Semaphore)
 
 
-class TestTruncateDocument(unittest.TestCase):
-    """Test _truncate_document method."""
+class TestBoundedDocumentView(unittest.TestCase):
+    """Test _bounded_document_view (issue #698 settings-derived budget).
+
+    Replaces the old _truncate_document tests: the fixed 100k/50k constants
+    were the defect — the view is now bounded by whatever budget the caller
+    (the per-chunk prompt builder) derives from model_context_tokens.
+    """
 
     def setUp(self):
         """Set up test fixtures."""
@@ -64,48 +70,121 @@ class TestTruncateDocument(unittest.TestCase):
         self.chunker = ContextualChunker(llm_client=self.mock_llm_client)
 
     def test_no_truncation_for_short_document(self):
-        """Test that short documents are not truncated."""
+        """A document within the budget is returned unchanged."""
         short_doc = "This is a short document."
-        result = self.chunker._truncate_document(short_doc)
+        result = self.chunker._bounded_document_view(short_doc, 100)
         self.assertEqual(result, short_doc)
 
     def test_no_truncation_at_exact_limit(self):
-        """Test that document at exact limit is not truncated."""
-        exact_doc = "x" * ContextualChunker._MAX_DOCUMENT_LENGTH
-        result = self.chunker._truncate_document(exact_doc)
-        self.assertEqual(len(result), ContextualChunker._MAX_DOCUMENT_LENGTH)
+        """A document exactly at the budget is returned unchanged."""
+        exact_doc = "x" * 1000
+        result = self.chunker._bounded_document_view(exact_doc, 1000)
         self.assertEqual(result, exact_doc)
 
-    def test_truncation_for_long_document(self):
-        """Test that long documents are truncated with [...truncated...] marker."""
-        # Create a document that exceeds the limit
-        long_doc = "a" * ContextualChunker._MAX_DOCUMENT_LENGTH + "b" * 1000
-        result = self.chunker._truncate_document(long_doc)
+    def test_head_tail_marker_split_is_exact(self):
+        """An over-budget document yields head+marker+tail of exactly the budget."""
+        marker_len = len(ContextualChunker._TRUNCATION_MARKER)
+        doc_budget = 10_000
+        long_doc = "a" * 8_000 + "m" * 10_000 + "b" * 8_000
+        result = self.chunker._bounded_document_view(long_doc, doc_budget)
 
-        # Should be truncated
         self.assertIn("[...truncated...]", result)
-        self.assertLess(len(result), len(long_doc))
+        self.assertEqual(len(result), doc_budget)
+        # head + tail + marker == budget, head gets floor(usable/2)
+        usable = doc_budget - marker_len
+        expected_head = usable // 2
+        expected_tail = usable - expected_head
+        self.assertTrue(result.startswith("a" * expected_head))
+        self.assertTrue(result.endswith("b" * expected_tail))
+        self.assertGreaterEqual(expected_tail, 1)
 
-        # Should contain first _TRUNCATE_CHARS and last _TRUNCATE_CHARS
-        self.assertTrue(result.startswith("a" * 50))
-        self.assertTrue(result.endswith("b" * 50))
+    def test_marker_omitted_when_budget_below_marker(self):
+        """A budget smaller than the marker keeps a plain prefix."""
+        doc_budget = 5
+        long_doc = "z" * 500
+        result = self.chunker._bounded_document_view(long_doc, doc_budget)
+        self.assertEqual(result, "zzzzz")
+        self.assertNotIn("[...truncated...]", result)
 
-    def test_truncation_preserves_content_at_boundaries(self):
-        """Test that truncation keeps content from start and end."""
-        # Create a document with identifiable start and end
+    def test_zero_and_negative_budget_yield_empty_view(self):
+        """Non-positive budgets yield an empty document view."""
+        self.assertEqual(self.chunker._bounded_document_view("z" * 500, 0), "")
+        self.assertEqual(self.chunker._bounded_document_view("z" * 500, -3), "")
+
+    def test_boundaries_preserved_in_split(self):
+        """Identifiable start and end content survives the head/tail split."""
         start_marker = "START_MARKER_CONTENT"
         end_marker = "END_MARKER_CONTENT"
-
-        # Build a long document
-        doc = (
-            start_marker
-            + "x" * (ContextualChunker._MAX_DOCUMENT_LENGTH + 50000)
-            + end_marker
-        )
-
-        result = self.chunker._truncate_document(doc)
+        doc = start_marker + "x" * 50_000 + end_marker
+        result = self.chunker._bounded_document_view(doc, 20_000)
         self.assertIn(start_marker, result)
         self.assertIn(end_marker, result)
+
+
+class TestBoundedPromptBudget(unittest.TestCase):
+    """Test the per-chunk prompt budget inside _build_prompt (issue #698).
+
+    The whole prompt — chunk view, document view, and filename view — is
+    bounded by 4 * model_context_tokens characters, measured on the
+    post-escape views.
+    """
+
+    def setUp(self):
+        """Set up test fixtures."""
+        self.mock_llm_client = MagicMock()
+        self.chunker = ContextualChunker(llm_client=self.mock_llm_client)
+
+    def _prompt_chars(self, document_text, chunk_text, filename="test.txt"):
+        messages = self.chunker._build_prompt(
+            document_text=document_text,
+            chunk_text=chunk_text,
+            chunk_index=0,
+            total_chunks=5,
+            source_filename=filename,
+        )
+        return sum(len(m["content"]) for m in messages)
+
+    def test_prompt_bounded_by_model_context(self):
+        """A 60k document at model_context_tokens=4096 fits the 4x4096 bound."""
+        with patch.object(settings, "model_context_tokens", 4096):
+            total = self._prompt_chars("z" * 60_000, "y" * 100)
+        self.assertLessEqual(total, 4 * 4096)
+
+    def test_escape_inflation_stays_bounded(self):
+        """Escape-heavy input on BOTH sides stays inside the bound."""
+        with patch.object(settings, "model_context_tokens", 4096):
+            total = self._prompt_chars("<" * 60_000, "&" * 8_000)
+        self.assertLessEqual(total, 4 * 4096)
+
+    def test_chunk_view_gets_at_most_half_the_remaining(self):
+        """A chunk larger than half the remaining budget is clamped."""
+        with patch.object(settings, "model_context_tokens", 4096):
+            messages = self.chunker._build_prompt(
+                document_text="",
+                chunk_text="y" * 60_000,
+                chunk_index=0,
+                total_chunks=5,
+                source_filename="test.txt",
+            )
+        user = messages[1]["content"]
+        # The chunk appears once in the user message; its escaped form is
+        # clamped well below the raw 60k input.
+        self.assertLess(user.count("y"), 60_000)
+        self.assertLessEqual(sum(len(m["content"]) for m in messages), 4 * 4096)
+
+    def test_tiny_context_degrades_to_fixed_floor(self):
+        """A sub-300-token context drops both views instead of overflowing."""
+        with patch.object(settings, "model_context_tokens", 100):
+            total = self._prompt_chars("z" * 60_000, "y" * 60_000)
+        # No chunk/document payload survives; only scaffolding remains.
+        self.assertLess(total, 2_000)
+
+    def test_filename_view_clamped(self):
+        """A pathological filename cannot consume the budget."""
+        huge_name = "f" * 10_000
+        with patch.object(settings, "model_context_tokens", 4096):
+            total = self._prompt_chars("z" * 60_000, "y" * 100, filename=huge_name)
+        self.assertLessEqual(total, 4 * 4096)
 
 
 class TestBuildPrompt(unittest.TestCase):

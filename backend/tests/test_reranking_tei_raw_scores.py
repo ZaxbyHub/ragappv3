@@ -195,7 +195,7 @@ class TestTEIRawScoreProtocol:
             def __init__(self, model_id):
                 self.model_id = model_id
 
-            def predict(self, pairs):
+            def predict(self, pairs, activation_fn=None):
                 return [2.0, -1.0]
 
         fake_module.CrossEncoder = LocalFakeCrossEncoder

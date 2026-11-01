@@ -32,8 +32,20 @@ _LOCAL_OPT_IN_HINT = (
 
 
 def _local_opt_in_enabled() -> bool:
-    """Read ALLOW_LOCAL_CURATOR=1 at call time so tests can flip it."""
-    return os.environ.get(_LOCAL_OPT_IN_ENV, "").strip() in ("1", "true", "True")
+    """Read the ALLOW_LOCAL_CURATOR opt-in at call time.
+
+    Precedence (issue #726, T1-02-K-12): a key PRESENT in the process
+    environment wins verbatim — that preserves today's dynamic flipping (a
+    test or operator exporting the var after startup) exactly. Only when the
+    key is absent from the environment does the Settings field apply, which
+    pydantic-settings populates from ``.env`` — closing the gap where a bare
+    (non-compose) run with only ``.env`` set was silently ignored.
+    """
+    if _LOCAL_OPT_IN_ENV in os.environ:
+        return os.environ.get(_LOCAL_OPT_IN_ENV, "").strip() in ("1", "true", "True")
+    from app.config import settings as _settings
+
+    return bool(_settings.allow_local_curator)
 
 
 def assert_curator_url_safe(url: str) -> None:
