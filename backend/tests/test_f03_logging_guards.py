@@ -2,145 +2,121 @@
 
 Two runtime guards the frozen set does not carry:
 
-1. Behavioral RequestIdFilter-registration proof. Frozen check C10
-   (test_518_telemetry.py) is a SOURCE pin — it greps lifespan.py for the
-   filter wiring and would stay green even if the runtime path stopped
-   attaching the filter. These guards drive the REAL production startup
-   (app.main.app's lifespan, via TestClient) for BOTH arms documented in
-   lifespan.py — no root handlers (fresh-handler arm) and a pre-existing
-   handler (existing-handler arm) — and assert a RequestIdFilter instance is
-   attached to the live root handler afterwards, plus SensitiveFieldFilter
-   per the documented #981 chain.
+1. Behavioral RequestIdFilter-registration proof, ISOLATED IN A SUBPROCESS.
+   Frozen check C10 (test_518_telemetry.py) is a SOURCE pin — it greps
+   lifespan.py for the filter wiring and would stay green even if the
+   runtime path stopped attaching the filter. These guards drive the REAL
+   production startup (app.main.app's lifespan, via TestClient) for BOTH
+   arms documented in lifespan.py — no root handlers (fresh-handler arm)
+   and a pre-existing handler (existing-handler arm) — and assert a
+   RequestIdFilter instance (plus SensitiveFieldFilter, the #981 chain) is
+   attached to the live root handler. The lifespan entry runs in a child
+   process: entering the real lifespan in-process is the repo's documented
+   xdist worker-killer class (closed-pool cache, loop-bound buses, parked
+   auth executor, root-level leaks), and process isolation contains every
+   one of those globals by construction.
 
-2. Query redaction name-only scoping (#730 plan-critic r1): a mixed-case
-   credential NAME redacts while a benign VALUE merely containing the
-   credential-looking word in mixed case stays intact, and the existing
-   lower-case exact pin keeps its byte shape.
+2. Query redaction name-only case scoping (#730 plan-critic r1): a
+   mixed-case credential NAME redacts while a benign VALUE merely
+   containing the credential-looking word in mixed case stays intact, and
+   the existing lower-case exact pin keeps its byte shape.
 
 Issue-tracer trace 730-731-access-log-truthfulness; this file is NOT part of
 the frozen checkpoint manifest.
 """
 
-import logging
+import json
+import os
+import subprocess
 import sys
-from contextlib import contextmanager
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+_CHILD_DRIVER = r"""
+import json
+import logging
+import sys
 
-@contextmanager
-def _root_logger_snapshot():
-    """Snapshot the root logger's handlers/level and restore on exit."""
-    logger = logging.getLogger()
-    saved_handlers = list(logger.handlers)
-    saved_level = logger.level
-    try:
-        yield logger
-    finally:
-        logger.handlers = saved_handlers
-        logger.setLevel(saved_level)
+sys.path.insert(0, r"{backend_root}")
+
+from unittest.mock import patch
+
+ARM = sys.argv[1]
+
+logger = logging.getLogger()
+if ARM == "fresh":
+    logger.handlers = []
+else:
+    logger.handlers = [logging.StreamHandler()]
+
+from fastapi.testclient import TestClient
+
+from app.main import app
+from app.utils.request_context import RequestIdFilter
+
+with (
+    patch("app.services.embeddings.assert_url_safe"),
+    patch("app.services.llm_client.assert_url_safe"),
+    TestClient(app),
+):
+    pass
+
+filters_attached = [
+    type(f).__name__ for h in logger.handlers for f in h.filters
+]
+print(json.dumps({{
+    "arm": ARM,
+    "request_id_filter": any(n == "RequestIdFilter" for n in filters_attached),
+    "sensitive_field_filter": any(
+        n == "SensitiveFieldFilter" for n in filters_attached
+    ),
+    "filters": filters_attached,
+}}))
+"""
 
 
-def _reset_lifespan_singletons():
-    """Reset the process-global state a real lifespan run leaves behind.
-
-    Known hazard set (the repo's real-lifespan lesson): the DB pool cache
-    holds CLOSED pools after shutdown (second startup dies with
-    "Connection pool has been closed"), the event buses bind to the first
-    event loop, the background processor is a module singleton, and lifespan
-    shutdown parks the auth CPU executor with nothing recreating it.
-    """
-    from app.models import database
-
-    with database._pool_cache_lock:
-        for pool in database._pool_cache.values():
-            try:
-                pool.close_all()
-            except Exception:
-                pass
-        database._pool_cache.clear()
-
-    from concurrent.futures import (
-        ThreadPoolExecutor,  # noqa: E402 (function-local by design)
+def _run_lifespan_arm(arm: str) -> dict:
+    """Run the real lifespan startup+shutdown in a child process and return
+    its JSON report on which filters ended up on the live root handler."""
+    backend_root = str(Path(__file__).resolve().parents[1])
+    env = dict(os.environ)
+    # The child does not run under pytest/conftest, so provision the same
+    # Settings validation env conftest.py sets (backend/tests/conftest.py).
+    env.setdefault("ADMIN_SECRET_TOKEN", "test-admin-key")
+    env.setdefault("USERS_ENABLED", "false")
+    env.setdefault("JWT_SECRET_KEY", "test-jwt-secret-key-for-testing-only")
+    env.setdefault("REDIS_URL", "")
+    env["PYTHONPATH"] = backend_root
+    result = subprocess.run(
+        [sys.executable, "-c", _CHILD_DRIVER.format(backend_root=backend_root), arm],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        env=env,
+        cwd=backend_root,
     )
-
-    import app.services.auth_service as auth_service
-    import app.services.background_tasks as background_tasks
-    import app.services.draft_events as draft_events
-    import app.services.wiki_events as wiki_events
-
-    background_tasks._processor_instance = None
-    wiki_events._bus = None
-    draft_events._bus = None
-    auth_service._auth_executor = ThreadPoolExecutor(
-        max_workers=4, thread_name_prefix="auth-cpu-guard"
+    assert result.returncode == 0, (
+        f"lifespan driver ({arm}) failed rc={result.returncode}: "
+        f"{result.stderr[-2000:]}"
     )
-
-
-def _drive_production_startup():
-    """Run app.main.app's real lifespan startup+shutdown via TestClient.
-
-    The outbound-model SSRF validators are patched (the same seam
-    test_518_telemetry.py patches) so startup does not depend on a live
-    model URL; the logging-setup block under test runs before any of the
-    patched services and is untouched by the patches.
-    """
-    from unittest.mock import patch
-
-    from fastapi.testclient import TestClient
-
-    from app.main import app
-
-    _reset_lifespan_singletons()
-    try:
-        with (
-            patch("app.services.embeddings.assert_url_safe"),
-            patch("app.services.llm_client.assert_url_safe"),
-            TestClient(app),
-        ):
-            pass
-    finally:
-        _reset_lifespan_singletons()
+    line = result.stdout.strip().splitlines()[-1]
+    return json.loads(line)
 
 
 def test_request_id_filter_attached_fresh_handler_arm():
     """Fresh-handler arm: startup installs RequestIdFilter (+ redaction) on
     the handler it creates for an empty root logger."""
-    from app.utils.request_context import RequestIdFilter
-
-    with _root_logger_snapshot() as logger:
-        logger.handlers = []
-        _drive_production_startup()
-        filters_attached = [f for h in logger.handlers for f in h.filters]
-        assert any(
-            isinstance(f, RequestIdFilter) for f in filters_attached
-        ), (
-            "no RequestIdFilter on the root handler after production startup "
-            f"(fresh-handler arm): {[h.filters for h in logger.handlers]}"
-        )
-        assert any(
-            type(f).__name__ == "SensitiveFieldFilter" for f in filters_attached
-        ), (
-            "no SensitiveFieldFilter on the root handler after production "
-            f"startup (fresh-handler arm): {[h.filters for h in logger.handlers]}"
-        )
+    report = _run_lifespan_arm("fresh")
+    assert report["request_id_filter"], report
+    assert report["sensitive_field_filter"], report
 
 
 def test_request_id_filter_attached_existing_handler_arm():
     """Existing-handler arm: startup attaches RequestIdFilter to a handler
     that already exists (the uvicorn/custom-config case in lifespan.py)."""
-    from app.utils.request_context import RequestIdFilter
-
-    with _root_logger_snapshot() as logger:
-        pre = logging.StreamHandler()
-        logger.handlers = [pre]
-        _drive_production_startup()
-        attached = [f for h in logger.handlers for f in h.filters]
-        assert any(isinstance(f, RequestIdFilter) for f in attached), (
-            "RequestIdFilter not attached to the pre-existing root handler "
-            f"after production startup: {[h.filters for h in logger.handlers]}"
-        )
+    report = _run_lifespan_arm("existing")
+    assert report["request_id_filter"], report
 
 
 def test_query_redaction_name_only_case_scoping():
