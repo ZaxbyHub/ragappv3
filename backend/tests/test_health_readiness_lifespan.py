@@ -206,7 +206,11 @@ def test_real_lifespan_stop_is_awaited_on_shutdown():
     # list alone would reinstate the same mutated objects (the leak the
     # reviewer's probe demonstrated).
     saved_handlers = [(h, list(h.filters)) for h in root.handlers]
-    restore = _pin_lifespan_settings(Path(tempfile.TemporaryDirectory(prefix="lifespan-rt-").name))
+    # PRR-012 (delta-review corrected): hold the TemporaryDirectory object
+    # in a local — `.name` alone let the object be GC'd immediately, which
+    # deleted the dir BEFORE the lifespan re-created it untracked.
+    _tmp_cm = tempfile.TemporaryDirectory(prefix="lifespan-rt-")
+    restore = _pin_lifespan_settings(Path(_tmp_cm.name))
     app = FastAPI()
     stop_calls: list[int] = []
     try:
@@ -244,7 +248,8 @@ def test_real_lifespan_fresh_branch_attaches_request_id_filter():
     root = logging.getLogger()
     saved_handlers = list(root.handlers)
     root.handlers.clear()
-    restore = _pin_lifespan_settings(Path(tempfile.TemporaryDirectory(prefix="lifespan-fb-").name))
+    _tmp_cm = tempfile.TemporaryDirectory(prefix="lifespan-fb-")
+    restore = _pin_lifespan_settings(Path(_tmp_cm.name))
     app = FastAPI()
     observed: list[tuple] = []
     try:

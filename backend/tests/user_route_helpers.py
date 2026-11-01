@@ -113,16 +113,31 @@ def setup_test_db(
     foreign keys). The copy is a plain file copy: each test owns an
     independent writable database (proven by test_h07_schema_template_isolation).
 
-    In-memory databases (":memory:" / "file::memory:?...") are populated via
-    sqlite3's backup API instead of a filesystem copy (PRR-010). Any stale
+    In-memory databases (":memory:") are populated via sqlite3's backup API
+    into the returned connection; the "file::memory:" URI form is rejected
+    with a clear error (no caller uses it) (PRR-010). Any stale
     WAL/SHM sidecars at db_path are removed before the copy so a previous
     database's hot WAL frames can never be recovered against the new main
     file (PRR-009).
     """
-    if db_path == ":memory:" or db_path.startswith("file::memory:"):
-        with sqlite3.connect(_template_path()) as src, sqlite3.connect(db_path) as dst:
-            src.backup(dst)
+    if db_path == ":memory:":
+        # PRR-010 (delta-review corrected): open the RETURNED connection
+        # first and back the template into it — the earlier draft backed
+        # into a discarded with-block connection, returning an empty DB.
         conn = sqlite3.connect(db_path)
+        src = sqlite3.connect(_template_path())
+        try:
+            src.backup(conn)
+        finally:
+            src.close()
+    elif db_path.startswith("file::memory:"):
+        # The shared-cache URI form needs uri=True and a named handle to be
+        # usable; no caller uses it — fail with a clear message instead of
+        # an opaque sqlite3.OperationalError.
+        raise ValueError(
+            "setup_test_db does not support the file::memory: URI form; "
+            "use ':memory:' or a filesystem path"
+        )
     else:
         for sidecar in (str(db_path) + "-wal", str(db_path) + "-shm"):
             Path(sidecar).unlink(missing_ok=True)

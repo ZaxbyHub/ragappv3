@@ -82,7 +82,7 @@ superadmin decision was made and shipped by #722.
 ## Guardrails
 
 Eighteen frozen acceptance checks guard this work: the 14 DISCRIMINATING
-checks (9 mutation-kill + 5 structural drift predicates) live in
+checks (7 mutation-kill + 2 schema-parity + 5 structural drift predicates) live in
 `backend/tests/test_h06_mutation_kills.py` and
 `backend/tests/test_h07_fixture_fidelity.py` and run in CI's Backend job on
 every push — mutation-kill checks name a production mutation
