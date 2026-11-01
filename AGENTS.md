@@ -58,8 +58,8 @@ there is no consumer for a routing YAML, and adding one would be unwired
 
 ## CI gates
 
-`.github/workflows/ci.yml` — jobs: **Backend** (ruff + targeted pytest),
-**Frontend** (typecheck, lint `--max-warnings 0`, test, build, subpath build),
+`.github/workflows/ci.yml` — jobs: **Backend** (ruff + full pytest under a step-level 50-min timeout),
+**Frontend** (frontend-toolchain contract nodes, typecheck, lint `--max-warnings 0`, test, build, subpath build),
 **Playwright e2e** (`frontend/e2e/` smoke suite against the production build + stub backend; separate job, issue #573), **Playwright a11y matrix** (`frontend/e2e/a11y-matrix.spec.ts` route x viewport accessibility gate; separate job, issue #778),
 **Quality contracts** (`check_runtime_contract.py`, `check_config_contract.py`, `check_settings_consumers.py`, `check_batch_mock_seq.py`, `check_pr_scope_drift.py`, `check_sast_baseline.py`, `check_secretscan.py`, `check_test_collection_scope.py`, `check_a04_http500_detail_hygiene.py`, `check_b03_upload_migration_timeout.py`, `check_l05_raw_palette.py`, `check_l05_page_headers.py`, `check_l07_a11y_gate_wired.py`, `check_l09_skill_trigger_paths.py`, `check_l09_index_assets.py`, `check_l09_memory_response_fields.py`, `check_n05_draftclaim_nullable.py`),
 **Detect docker scope** + **Docker build smoke** (the smoke builds the images when the docker surface changed),

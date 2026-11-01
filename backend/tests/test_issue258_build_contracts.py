@@ -57,11 +57,15 @@ def _run(argv: list[str], cwd: Path, timeout: int = _SUBPROCESS_TIMEOUT_SECONDS)
 def _node_config_typecheck_argv() -> list[str] | None:
     """Repo-local tsc only (junction-safe).
 
-    The bare-npx fallback ran a GLOBAL tsc without frontend/node_modules on
-    the CI backend runner (which has node on PATH but never installs the
-    frontend deps) and failed on missing vite/vitest types. The dedicated
-    Frontend CI job runs typecheck:contracts; this node needs the repo-local
-    install and skips otherwise.
+    The bare-npx fallback ran a GLOBAL tsc without frontend/node_modules and
+    failed on missing vite/vitest types (vite.config.ts imports from 'vite',
+    so this check needs the repo-local install, not a bare typescript). CI
+    venue since #742: the Frontend job's scoped pytest step runs this node
+    against its own install (the Backend job installs no frontend tree);
+    locally the node runs wherever a frontend install exists and skips
+    otherwise. Note `npm run typecheck:contracts` covers the separate
+    tsconfig.contracts.json surface — it does not substitute for this
+    tsconfig.node.json check, which no npm script invokes.
     """
     local_tsc = FRONTEND / "node_modules" / "typescript" / "bin" / "tsc"
     if _NODE and local_tsc.is_file():

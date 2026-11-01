@@ -29,9 +29,11 @@ RED at base, GREEN after the fix:
 
 Harness mirrors the proven recipe in backend/tests/test_users_routes.py
 (env vars before app imports, pool override, csrf dependency override,
-users.get_pool patch, settings patch, user-agent ""). Tables missing from
-TEST_SCHEMA (security_audit_log, user_sessions) are created locally from the
-backend/app/models/database.py DDL; no shared helper is modified.
+users.get_pool patch, settings patch, user-agent ""). security_audit_log and
+user_sessions used to be created locally because TEST_SCHEMA lacked them;
+since the #744 fixture swap the shared helper builds the production schema
+(init_db + run_migrations), so the local CREATE IF NOT EXISTS DDL blocks below
+are idempotent no-ops kept for this suite's standalone readability.
 """
 
 import os
@@ -58,8 +60,9 @@ from backend.tests.user_route_helpers import create_user, get_token, setup_test_
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-# security_audit_log is not part of TEST_SCHEMA; DDL mirrors
-# backend/app/models/database.py so safe_record_security_event works.
+# Idempotent security_audit_log DDL mirroring
+# backend/app/models/database.py (the #744 production-schema fixture already
+# creates the table; kept so safe_record_security_event works standalone).
 SECURITY_AUDIT_LOG_DDL = """
 CREATE TABLE IF NOT EXISTS security_audit_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -77,8 +80,9 @@ CREATE TABLE IF NOT EXISTS security_audit_log (
 );
 """
 
-# user_sessions is not part of TEST_SCHEMA; DDL mirrors the base table in
-# backend/app/models/database.py (refresh sessions created by /auth/login).
+# Idempotent user_sessions DDL mirroring backend/app/models/database.py
+# (the #744 production-schema fixture already creates the table; refresh
+# sessions here come from /auth/login).
 USER_SESSIONS_DDL = """
 CREATE TABLE IF NOT EXISTS user_sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -123,7 +127,8 @@ def _mutation_env(
     if full_schema:
         # Production schema (init_db) for the vault cascade routes, which
         # touch drafts/files/memories/chat_sessions/document_assets/... tables
-        # that TEST_SCHEMA does not carry.
+        # (the #744 shared fixture now builds this same production schema;
+        # this explicit build stays because this suite predates it).
         from app.models.database import init_db
 
         init_db(db_path)

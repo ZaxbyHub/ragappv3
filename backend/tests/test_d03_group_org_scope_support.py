@@ -50,8 +50,10 @@ def env(monkeypatch):
         _pool_cache.clear()
 
     conn = setup_test_db(db_path)
-    # The vaults router's counts query joins memories/chat_sessions, which
-    # TEST_SCHEMA does not carry.
+    # The vaults router's counts query joins memories/chat_sessions; kept as
+    # an explicit (idempotent) local DDL even though the #744 fixture already
+    # builds the production schema — the join shape is the point of this
+    # helper, not the table source.
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS memories (

@@ -15,7 +15,11 @@
 
 set shell := ["bash", "-cu"]
 
-# Everything CI runs, in workflow order.
+# Everything CI runs, in workflow order (workflow-only steps that need CI
+# provisioning - the Backend 50-min step bound, the #566 outside-tree
+# TypeScript + NODE_PATH, and the #742 Frontend-job venue step running the
+# two issue-258 pytest nodes with a skip-fails gate - are noted here but
+# only executable with the same provisioning).
 ci: backend-verify-locks \
     backend-lint \
     backend-test \

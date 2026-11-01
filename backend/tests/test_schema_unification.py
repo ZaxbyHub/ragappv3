@@ -250,6 +250,78 @@ class TestDatabaseCreation:
         finally:
             conn.close()
 
+    def test_run_migrations_adds_retention_columns_to_legacy_memories(self, tmp_path):
+        """Older databases whose memories table predates the retention columns
+        must gain them with production defaults; the seeded row survives.
+
+        Mirrors test_run_migrations_adds_user_id_to_legacy_chat_sessions: the
+        legacy table is hand-built (init_db's CREATE TABLE IF NOT EXISTS leaves
+        it untouched), so only migrate_add_memory_retention_columns can add
+        importance/expires_at and the idx_memories_expires_at index.
+        """
+        db_path = tmp_path / "legacy_memories.db"
+        conn = sqlite3.connect(db_path)
+        try:
+            # Legacy shape: the production memories columns minus the
+            # retention pair (importance, expires_at). content/category/
+            # vault_id/created_at stay because init_db creates FTS triggers
+            # and indexes that reference them.
+            conn.execute("""
+                CREATE TABLE memories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    vault_id INTEGER,
+                    content TEXT NOT NULL,
+                    category TEXT,
+                    tags TEXT,
+                    source TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.execute(
+                "INSERT INTO memories (vault_id, content, category) VALUES (?, ?, ?)",
+                (1, "legacy memory", "note"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        run_migrations(str(db_path))
+
+        conn = sqlite3.connect(db_path)
+        try:
+            columns = {
+                row[1]: row for row in conn.execute("PRAGMA table_info(memories)")
+            }
+            assert "importance" in columns, (
+                "legacy memories table was not upgraded with the importance column"
+            )
+            assert "expires_at" in columns, (
+                "legacy memories table was not upgraded with the expires_at column"
+            )
+            # Production defaults on the added columns
+            # (migrate_add_memory_retention_columns).
+            assert columns["importance"][4] == "0.5"  # dflt_value
+            assert columns["expires_at"][4] is None
+
+            indexes = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index'"
+                )
+            }
+            assert "idx_memories_expires_at" in indexes
+
+            # The seeded row survived with the backfilled production default.
+            row = conn.execute(
+                "SELECT content, importance, expires_at FROM memories"
+            ).fetchone()
+            assert row[0] == "legacy memory"
+            assert row[1] == 0.5
+            assert row[2] is None
+        finally:
+            conn.close()
+
     def test_init_db_creates_users_table_with_security_columns(self):
         """Fresh database users table must have security columns."""
         conn = sqlite3.connect(":memory:")

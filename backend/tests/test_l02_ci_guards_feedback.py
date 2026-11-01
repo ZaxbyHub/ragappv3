@@ -33,7 +33,14 @@ def _run_guard(
         command.extend(["--root", str(root)])
     environment = os.environ.copy()
     if node_path is not None:
-        environment["NODE_PATH"] = str(node_path)
+        # Issue #742: the Backend CI job no longer installs a frontend tree,
+        # so frontend/node_modules may be absent; the parser then comes from
+        # the outside-tree TypeScript install the Test step exposes via its
+        # own NODE_PATH. When neither location is provisioned the guard fails
+        # loudly (unchanged failure shape) instead of silently skipping.
+        effective = node_path if node_path.is_dir() else Path(os.environ.get("NODE_PATH", ""))
+        if effective.is_dir():
+            environment["NODE_PATH"] = str(effective)
     try:
         return subprocess.run(
             command,
