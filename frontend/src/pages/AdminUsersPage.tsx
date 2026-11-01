@@ -628,7 +628,7 @@ function AdminUsersPageContent({ authOwner, principalGeneration }: { authOwner: 
             table — same row model, same controls via the shared render helpers
             (role select, status toggle, every row action with its permission
             and pending state), plus card-visible loading/error/empty states. */}
-        <div className="space-y-3 sm:hidden" aria-label="Users (compact)">
+        <div role="region" className="space-y-3 sm:hidden" aria-label="Users (compact)">
           {loading ? (
             <Card><CardContent className="p-4"><LoadingSpinner label="Loading users…" /></CardContent></Card>
           ) : usersError ? (
@@ -653,9 +653,9 @@ function AdminUsersPageContent({ authOwner, principalGeneration }: { authOwner: 
                   </div>
                   {renderRoleSelect(user)}
                   {renderStatusToggle(user)}
-                  <div className="flex flex-wrap items-center justify-end gap-1">
-                    {renderRowActions(user)}
-                  </div>
+                  {/* renderRowActions already carries its own flex wrapper
+                      (review EXT-003): no second identical container here. */}
+                  {renderRowActions(user)}
                 </CardContent>
               </Card>
             ))

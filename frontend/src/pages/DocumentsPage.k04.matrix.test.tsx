@@ -559,7 +559,7 @@ describe('DocumentsPage K04 permission matrix (issue #767)', () => {
 
     await renderPage();
 
-    // DocumentCardsList (the sm:hidden mobile list) passes the FILENAME
+    // DocumentCardsList (the md:hidden mobile list, since issue #771 moved the switch to md) passes the FILENAME
     // through onDelete; canDelete follows the admin-level capability.
     const cardDelete = await screen.findByLabelText('Delete card mobile.pdf');
     await act(async () => {

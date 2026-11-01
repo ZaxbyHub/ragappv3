@@ -94,34 +94,44 @@ export default function ChatShell() {
   const isBelowLg = useIsMobile(1024);
 
   // Issue #771 (UI-ENH-05 stage 2): the below-lg evidence sheet gains a
-  // peek<->full snap point. sheetExpanded defaults to peek (the #689 45vh
-  // contract); it resets on EVERY close/breakpoint path — this effect fires
-  // for the Radix onOpenChange close, the Escape handler's closeRightPane,
-  // the details-toggle path, and the lg breakpoint transition, because they
-  // all flip rightPaneOpen or isBelowLg.
+  // peek<->full snap point. sheetExpanded defaults to peek (the #689
+  // contract); it resets on EVERY open/close/breakpoint transition — this
+  // effect runs on rightPaneOpen and isBelowLg flips in EITHER direction, so
+  // a reopened sheet always starts at peek even when a late snap commit from
+  // the previous gesture landed after the close reset (PRR-009: the pointer
+  // handler stays live through the ~300ms Radix exit animation). Only state
+  // is reset here — the gesture/suppress refs clear at their own lifecycle
+  // sites (pointerdown/pointerup/cancel), which keeps the
+  // react-hooks/immutability rule (delta review R1: lint regression) clean.
   const [sheetExpanded, setSheetExpanded] = useState(false);
   useEffect(() => {
-    if (!rightPaneOpen || !isBelowLg) setSheetExpanded(false);
+    setSheetExpanded(false);
   }, [rightPaneOpen, isBelowLg]);
 
-  // Drag gesture lifecycle (plan-critic R1+R3): the handle carries
-  // touch-action none so the browser never converts a handle drag into a
-  // native pan (pointercancel); the snap commits ONLY on a completed
-  // pointerup past a 25%-of-viewport threshold; pointercancel and unexpected
-  // lostpointercapture abort and clean up WITHOUT snapping; the active flag
-  // cleared before commit means the capture loss after pointerup cannot
-  // double-process the gesture.
+  // Drag gesture lifecycle (plan-critic R1+R3, review PRR-009/015): the
+  // handle carries touch-action none so the browser never converts a handle
+  // drag into a native pan (pointercancel); the snap commits ONLY on a
+  // completed pointerup past a 25%-of-viewport threshold WHILE the pane is
+  // still open (a late pointerup after a mid-gesture close must not
+  // resurrect expanded state); pointercancel and unexpected
+  // lostpointercapture abort and clean up WITHOUT snapping; a second
+  // pointerdown while a gesture is live is ignored so the first gesture's
+  // lifecycle stays owned by its own pointerId.
   const sheetGestureRef = useRef<{ active: boolean; startY: number; pointerId: number }>({ active: false, startY: 0, pointerId: -1 });
-  // A completed drag ends with pointerup on the handle, which the browser
-  // also reports as a click; without suppression that click toggles the
-  // just-applied snap straight back.
+  // A completed MOUSE drag ends with pointerup on the handle, which the
+  // browser also reports as a click; without suppression that click toggles
+  // the just-applied snap straight back. Touch/pen drags produce no trailing
+  // click in Chromium, so the flag is mouse-only: arming it for touch left
+  // it stranded (no click ever consumed it) and swallowed the next KEYBOARD
+  // activation (review PRR-006).
   const sheetSuppressClickRef = useRef(false);
   const handleSheetHandlePointerDown = (event: React.PointerEvent<HTMLButtonElement>) => {
     if (event.pointerType === "mouse" && event.button !== 0) return;
-    // Clear at gesture start: a completed touch drag arms the flag but touch
-    // pointerup never produces the trailing click, so the flag must not
-    // survive into the user's NEXT tap (implementation-review R1: the armed
-    // flag swallowed the next tap outright).
+    // PRR-015: a second concurrent pointerdown must not orphan the live
+    // gesture — ignore it and let the first pointerId own the lifecycle.
+    if (sheetGestureRef.current.active) return;
+    // Clear at gesture start: a completed mouse drag arms the flag and its
+    // trailing click consumes it; nothing else may inherit it.
     sheetSuppressClickRef.current = false;
     sheetGestureRef.current = { active: true, startY: event.clientY, pointerId: event.pointerId };
     try { event.currentTarget.setPointerCapture(event.pointerId); } catch { /* capture is best-effort */ }
@@ -130,9 +140,18 @@ export default function ChatShell() {
     const gesture = sheetGestureRef.current;
     if (!gesture.active || gesture.pointerId !== event.pointerId) return;
     sheetGestureRef.current = { active: false, startY: 0, pointerId: -1 };
+    // PRR-009: the pane may have closed mid-gesture (Escape / outside tap
+    // during the Radix exit window). A commit against a closed pane would
+    // strand expanded state that the reopen reset then has to clean up —
+    // and before that reopen the sheet renders at the wrong height. Drop
+    // the gesture instead.
+    if (!rightPaneOpen || !isBelowLg) {
+      try { event.currentTarget.releasePointerCapture(event.pointerId); } catch { /* already released */ }
+      return;
+    }
     try { event.currentTarget.releasePointerCapture(event.pointerId); } catch { /* already released */ }
     const dy = gesture.startY - event.clientY; // positive = dragged upward
-    if (Math.abs(dy) >= 8) sheetSuppressClickRef.current = true;
+    if (Math.abs(dy) >= 8 && event.pointerType === "mouse") sheetSuppressClickRef.current = true;
     const threshold = window.innerHeight * 0.25;
     if (dy >= threshold) setSheetExpanded(true);
     else if (-dy >= threshold) setSheetExpanded(false);
@@ -628,12 +647,13 @@ export default function ChatShell() {
 
       {/* MAIN TRANSCRIPT AREA */}
       <main
-        className="flex flex-1 flex-col min-w-0 bg-background"
+        className="flex flex-1 flex-col min-w-0 bg-background transition-[padding-bottom] duration-200 ease-in-out"
         /* Issue #689 (UI-R4-14): while the bottom evidence sheet is open on
            below-lg viewports, pad the chat column by the sheet height so the
            bottom-docked composer rides ABOVE the non-modal sheet instead of
            underneath it. Keep the 45vh literals in sync with the SheetContent
-           height class below. */
+           height class below. The padding transition (review PRR-014) tracks
+           the sheet's animated height instead of jumping ahead of it. */
         style={{ paddingBottom: isBelowLg && rightPaneOpen ? (sheetExpanded ? "85vh" : "45vh") : undefined }}
       >
         <header className="flex h-14 items-center gap-2 border-b border-border px-4">
@@ -747,6 +767,13 @@ export default function ChatShell() {
                (ChatShell.test.tsx pins that class in the collapsed default);
                expanded snaps to 85vh. */
             className={`flex ${sheetExpanded ? "h-[85vh]" : "h-[45vh]"} flex-col rounded-t-xl p-0 lg:hidden transition-[height] duration-200`}
+            /* Review PRR-016: the sheet's data-state duration variants
+               (500ms open / 300ms closed) out-specify the duration-200
+               utility, so the height snap never ran at its declared speed.
+               An inline transition-duration wins the cascade; the EXIT
+               animation duration (animation-duration, also variant-set) is
+               untouched. */
+            style={{ transitionDuration: "200ms" }}
             aria-describedby="evidence-sources-desc"
           >
             {/* Snap-point handle (issue #771 AC8): touch-action none keeps the

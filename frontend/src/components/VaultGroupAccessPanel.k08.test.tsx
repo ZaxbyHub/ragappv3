@@ -109,5 +109,13 @@ describe('VaultGroupAccessPanel k08 card fallback (issue #771 AC5)', () => {
     );
 
     expect(outermost.length).toBe(1);
+
+    // PRR-011: pin both halves of the AC5 contract (see the VaultMembersPanel
+    // k08 test for the full rationale) — table presence AND a named compact
+    // card container carrying the grant's content, after the metric so the
+    // base leg keeps the frozen failure signature.
+    expect(screen.getByRole('table')).toBeInTheDocument();
+    const compact = screen.getByLabelText('Vault group access (compact)');
+    expect(compact.textContent).toContain('Group Alpha');
   });
 });

@@ -288,8 +288,8 @@ export function GroupTable({
 
       {/* Groups Table */}
       {/* Issue #771 (UI-ENH-05): desktop table — hidden below sm; the card
-          list after it renders the same row model (groups) with the same
-          callback controls. */}
+          list after it renders the same PAGE of groups in the table's sorted
+          order (getRowModel), with the same callback controls. */}
       <div className="rounded-sm border hidden sm:block">
         <Table>
           <TableHeader>
@@ -375,7 +375,7 @@ export function GroupTable({
 
       {/* Issue #771 (UI-ENH-05 stage 2): below-sm card list over the SAME
           groups row model, with card-visible loading/empty states. */}
-      <div className="space-y-3 sm:hidden" aria-label="Groups (compact)">
+      <div role="region" className="space-y-3 sm:hidden" aria-label="Groups (compact)">
         {isLoading ? (
           Array.from({ length: 3 }).map((_, index) => (
             <Card key={`skeleton-${index}`}>
@@ -396,7 +396,9 @@ export function GroupTable({
             </CardContent>
           </Card>
         ) : (
-          groups.map((group) => (
+          table.getRowModel().rows.map((row) => {
+            const group = row.original;
+            return (
             <Card key={`card-${group.id}`}>
               <CardContent className="p-4 space-y-2">
                 <div className="flex flex-wrap items-center justify-between gap-2">
@@ -410,12 +412,13 @@ export function GroupTable({
                     {new Date(group.created_at).toLocaleDateString()}
                   </div>
                 </div>
-                <div className="flex flex-wrap items-center justify-end gap-1">
-                  {renderGroupActions(group)}
-                </div>
+                {/* renderGroupActions already carries its own flex wrapper
+                    (review EXT-002): no second identical container here. */}
+                {renderGroupActions(group)}
               </CardContent>
             </Card>
-          ))
+            );
+          })
         )}
       </div>
 

@@ -22,10 +22,12 @@ PR: (this PR)
 ## Admin and vault tables (#771)
 
 - The five `Table` consumers (AdminUsersPage, GroupTable, OrgsPage members,
-  VaultMembersPanel, VaultGroupAccessPanel) render below-`sm` card lists via
-  shared render helpers — bit-for-bit the same controls, handlers, permission
-  conditions and pending states — with card-visible loading/error/empty
-  states. Colliding test queries are table-scoped.
+  VaultMembersPanel, VaultGroupAccessPanel) render below-`sm` card lists.
+  AdminUsersPage and GroupTable share render helpers between their table and
+  card subtrees; OrgsPage and the two vault panels carry the same controls,
+  handlers, permission conditions and pending states as verified inline
+  copies. All five have card-visible loading/error/empty states. Colliding
+  test queries are table-scoped.
 
 ## Evidence sheet snap (#771)
 

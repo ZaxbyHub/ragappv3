@@ -114,5 +114,15 @@ describe('VaultMembersPanel k08 card fallback (issue #771 AC4)', () => {
     );
 
     expect(outermost.length).toBe(1);
+
+    // PRR-011: the metric above is also satisfied by wrapping the TABLE in a
+    // sm:hidden div with no cards at all, so pin both halves of the AC4
+    // contract: the desktop table still exists, AND a named compact card
+    // container exists carrying the member's content. (Placed after the
+    // metric so the base leg — no compact container — still fails on the
+    // metric with the frozen signature.)
+    expect(screen.getByRole('table')).toBeInTheDocument();
+    const compact = screen.getByLabelText('Vault members (compact)');
+    expect(compact.textContent).toContain('alice');
   });
 });

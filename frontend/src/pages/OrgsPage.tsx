@@ -553,7 +553,7 @@ function OrgsPageContent() {
                   </div>
                   {/* Issue #771 (UI-ENH-05 stage 2): below-sm member card list,
                       with card-visible loading/empty states. */}
-                  <div className="space-y-3 sm:hidden" aria-label="Organization members (compact)">
+                  <div role="region" className="space-y-3 sm:hidden" aria-label="Organization members (compact)">
                     {!org.members ? (
                       <div className="py-4 text-center text-sm text-muted-foreground" role="status" aria-live="polite">Loading members</div>
                     ) : org.members.length === 0 ? (

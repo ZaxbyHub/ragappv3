@@ -190,7 +190,8 @@ const ROUTES: RouteRow[] = [
     // Seeded document row filename — DocumentTable.tsx:268 {doc.filename}.
     // Amendment 5 + review F-18: viewport-stable AND readiness-correct.
     // text=handbook-a11y.pdf matched the desktop table row that is
-    // display:none below sm (mobile card list renders instead); the page h1
+    // display:none below md (issue #771 moved the cards/table switch from
+    // sm to md; the mobile card list renders instead); the page h1
     // is visible at every width but renders while the list skeleton is still
     // up. `>> visible=true` waits for a VISIBLE seeded-row match at either
     // breakpoint, which only exists once the document list has loaded.

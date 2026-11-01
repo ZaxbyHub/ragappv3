@@ -317,7 +317,7 @@ function MemoryPageContent({ activeVaultId }: { activeVaultId: number }) {
               <CardContent className="p-4">
                 <div className="flex items-start justify-between gap-4">
                   <div className="flex-1 space-y-2">
-                    <p className="text-sm whitespace-pre-wrap max-w-[80ch]">{memory.content}</p>
+                    <p className="text-sm whitespace-pre-wrap break-words max-w-[80ch]">{memory.content}</p>
                     <div className="flex flex-wrap items-center gap-2">
                       <Badge variant="outline">{getCategoryFromMetadata(memory.metadata)}</Badge>
                       {getTagsFromMetadata(memory.metadata).map((tag, idx) => (

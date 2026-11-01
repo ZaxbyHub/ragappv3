@@ -315,4 +315,96 @@ test.describe("k08 evidence sheet snap (issue #771)", () => {
     );
     expect(ratio, `reopened sheet height: ${Math.round(ratio * 100)}% (must be peek)`).toBeLessThanOrEqual(0.5);
   });
+
+  // Review PRR-009 (execution-reproduced): Escape closes the pane while a
+  // handle drag is in flight; the handle stays live through the ~300ms Radix
+  // exit window, so its pointerup can commit the snap AFTER the close-reset
+  // ran — stranding sheetExpanded=true, and every later reopen then renders
+  // 85vh instead of the peek this contract requires. RED at the pre-fix head
+  // (repro probe measured 0.85); GREEN after the reopen-reset fix.
+  test("evidence sheet reopens at peek after Escape mid-drag", async ({ page }) => {
+    await page.request.post(`${STUB_ORIGIN}/_e2e/a11y-seed`, { data: {} });
+    await page.setViewportSize({ width: 390, height: 844 });
+    await loginAndSelectVault(page);
+    await openEvidenceSheet(page);
+
+    const sheet = page.locator(SHEET_SELECTOR);
+    const handle = sheet.getByRole("button", { name: /expand|maximize|full/i });
+    await expect(handle).toBeVisible({ timeout: 10_000 });
+
+    // Arm the gesture with a touch pointerdown + upward move, then close the
+    // pane with Escape BEFORE the pointerup lands, and release inside the
+    // ~300ms exit window (the critic's reproduction timing: ~120ms).
+    await handle.evaluate((el) => {
+      const rect = el.getBoundingClientRect();
+      const cx = rect.left + rect.width / 2;
+      const cy = rect.top + rect.height / 2;
+      const opts = (y: number) => ({
+        bubbles: true, cancelable: true, pointerId: 21, pointerType: "touch",
+        clientX: cx, clientY: y, isPrimary: true,
+      });
+      el.dispatchEvent(new PointerEvent("pointerdown", opts(cy)));
+      el.dispatchEvent(new PointerEvent("pointermove", opts(cy - 150)));
+    });
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(120);
+    await handle.evaluate((el) => {
+      const rect = el.getBoundingClientRect();
+      const cx = rect.left + rect.width / 2;
+      const opts = (y: number) => ({
+        bubbles: true, cancelable: true, pointerId: 21, pointerType: "touch",
+        clientX: cx, clientY: y, isPrimary: true,
+      });
+      el.dispatchEvent(new PointerEvent("pointerup", opts(rect.top + rect.height / 2 - 300)));
+    });
+    await expect(sheet).toBeHidden({ timeout: 10_000 });
+
+    // Reopen: the snap contract requires peek, never the stranded full.
+    await page.getByRole("button", { name: /Source S1: handbook\.pdf/i }).first().click();
+    await expect(sheet).toBeVisible({ timeout: 10_000 });
+    await page.waitForTimeout(600);
+    const ratio = await sheet.evaluate(
+      (el) => el.getBoundingClientRect().height / window.innerHeight
+    );
+    expect(ratio, `reopened sheet height after Escape mid-drag: ${Math.round(ratio * 100)}% (must be peek)`).toBeLessThanOrEqual(0.5);
+  });
+
+  // Review PRR-006: a >=8px touch drag arms the click-suppression flag but
+  // touch pointerup emits no trailing click — the armed flag must never
+  // swallow a KEYBOARD activation (Enter on the focused handle). RED at the
+  // pre-fix head (flag armed on any pointer type); GREEN after the
+  // mouse-only arm.
+  test("evidence sheet keyboard activation works after a touch drag", async ({ page }) => {
+    await page.request.post(`${STUB_ORIGIN}/_e2e/a11y-seed`, { data: {} });
+    await page.setViewportSize({ width: 390, height: 844 });
+    await loginAndSelectVault(page);
+    await openEvidenceSheet(page);
+
+    const sheet = page.locator(SHEET_SELECTOR);
+    const handle = sheet.getByRole("button", { name: /expand|maximize|full/i });
+    await expect(handle).toBeVisible({ timeout: 10_000 });
+
+    // Short touch drag: above the 8px arm threshold, below the snap
+    // threshold — no visible change, but (pre-fix) the suppression arms.
+    await handle.evaluate((el) => {
+      const rect = el.getBoundingClientRect();
+      const cx = rect.left + rect.width / 2;
+      const cy = rect.top + rect.height / 2;
+      const opts = (y: number) => ({
+        bubbles: true, cancelable: true, pointerId: 22, pointerType: "touch",
+        clientX: cx, clientY: y, isPrimary: true,
+      });
+      el.dispatchEvent(new PointerEvent("pointerdown", opts(cy)));
+      el.dispatchEvent(new PointerEvent("pointerup", opts(cy - 40)));
+    });
+    await page.waitForTimeout(400);
+
+    // Keyboard activation (no preceding pointerdown) must toggle the sheet.
+    await handle.press("Enter");
+    await page.waitForTimeout(600);
+    const ratio = await sheet.evaluate(
+      (el) => el.getBoundingClientRect().height / window.innerHeight
+    );
+    expect(ratio, `sheet height after keyboard activation post-touch-drag: ${Math.round(ratio * 100)}%`).toBeGreaterThanOrEqual(0.7);
+  });
 });

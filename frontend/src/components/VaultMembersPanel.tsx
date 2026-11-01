@@ -411,7 +411,7 @@ function VaultMembersPanelState({
         </div>
         {/* Issue #771 (UI-ENH-05 stage 2): below-sm card list, with a
             card-visible empty state (loading/error already render above). */}
-        <div className="space-y-3 sm:hidden" aria-label="Vault members (compact)">
+        <div role="region" className="space-y-3 sm:hidden" aria-label="Vault members (compact)">
           {readStatus !== "success" && members.length === 0 ? null : members.length === 0 ? (
             <div className="py-6 text-center text-sm text-muted-foreground" role="status" aria-live="polite">No members yet. Add users to give them access to this vault.</div>
           ) : (

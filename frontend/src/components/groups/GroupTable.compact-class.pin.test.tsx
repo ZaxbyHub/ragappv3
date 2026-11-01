@@ -45,5 +45,13 @@ describe('GroupTable compact/desktop CSS switch (issue #771)', () => {
     const compact = screen.getByLabelText('Groups (compact)');
     expect(compact.className).toMatch(/(^|\s)sm:hidden(\s|$)/);
     expect(screen.getByRole('table')).toBeInTheDocument();
+
+    // PRR-008: pin the pair's OTHER half — the desktop table wrapper must
+    // keep hidden+sm:block, mirroring the AdminUsersPage pin's walk-up.
+    let wrapper: HTMLElement | null = screen.getByRole('table');
+    while (wrapper && !(/(^|\s)hidden(\s|$)/.test(wrapper.className) && /(^|\s)sm:block(\s|$)/.test(wrapper.className))) {
+      wrapper = wrapper.parentElement;
+    }
+    expect(wrapper).not.toBeNull();
   });
 });
