@@ -371,3 +371,52 @@ class TestVaultPathMigration:
         assert (data["vaults_dir"] / "2" / "file2.txt").exists()
         assert "Failed to migrate vault 'Good Vault' (ID 1)" in caplog.text
         assert "simulated rename failure" in caplog.text
+
+    def test_name_id_collision_skips_foreign_dir(self, temp_db_and_vaults, caplog):
+        """
+        Issue #690 collision guard: vault 2's NAME is the decimal string of
+        vault 1's id, so its sanitized legacy name-dir aliases vault 1's
+        id-keyed storage directory. The migration must SKIP vault 2 with a
+        warning instead of renaming/merging vault 1's directory out from
+        under it (the pre-guard behavior would have moved vault 1's data
+        into vaults/2/ or merged it away).
+        """
+        data = temp_db_and_vaults
+
+        # Two vaults where one vault's name equals str() of the other's id.
+        conn = sqlite3.connect(str(data["db_path"]))
+        conn.execute("INSERT INTO vaults (id, name) VALUES (1, 'Default')")
+        conn.execute("INSERT INTO vaults (id, name) VALUES (2, '1')")
+        conn.commit()
+        conn.close()
+
+        # Vault 1's storage lives under its id dir vaults/1/ ...
+        dir_one = data["vaults_dir"] / "1"
+        dir_one.mkdir(parents=True, exist_ok=True)
+        (dir_one / "one.txt").write_text("vault one data")
+        # ... and vault 2 has its own id dir with its own data.
+        dir_two = data["vaults_dir"] / "2"
+        dir_two.mkdir(parents=True, exist_ok=True)
+        (dir_two / "two.txt").write_text("vault two data")
+
+        # Run migration
+        caplog.set_level("WARNING", logger="app.models.database")
+        with patch("app.models.database.settings") as mock_settings:
+            mock_settings.vaults_dir = data["vaults_dir"]
+            migrate_vault_paths(str(data["db_path"]))
+
+        # VERIFY: vault 1's files stay under vaults/1/, untouched.
+        assert (dir_one / "one.txt").read_text() == "vault one data"
+
+        # VERIFY: no data moved between the two vaults.
+        assert (dir_two / "two.txt").read_text() == "vault two data"
+        assert not (dir_one / "two.txt").exists()
+        assert not (dir_two / "one.txt").exists()
+        assert not (data["vaults_dir"] / "Default").exists()
+
+        # VERIFY: the guard SKIPPED vault 2's migration with a warning
+        # (production behavior, see tests/test_b01_vault_path_collision.py).
+        assert (
+            "Vault 2 name '1' resolves to another vault's id-keyed"
+            in caplog.text
+        )
