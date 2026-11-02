@@ -982,23 +982,29 @@ class TestEnvDecoding734:
         """A pathologically deep JSON env value raises ValidationError, not an
         unhandled RecursionError escaping pydantic (PRR-008)."""
         deep = "[" * 4000 + "]" * 4000
-        with patch.dict("os.environ", {"ALLOWED_EXTENSIONS": deep}):
-            with pytest.raises(ValidationError):
-                Settings(_env_file=None)
-        with patch.dict("os.environ", {"IMAP_ALLOWED_MIME_TYPES": deep}):
-            with pytest.raises(ValidationError):
-                Settings(_env_file=None)
+        for env_name in (
+            "ALLOWED_HOSTS",
+            "ALLOWED_EXTENSIONS",
+            "IMAP_ALLOWED_MIME_TYPES",
+        ):
+            with patch.dict("os.environ", {env_name: deep}):
+                with pytest.raises(ValidationError, match="nested too deeply"):
+                    Settings(_env_file=None)
 
     def test_json_list_non_string_elements_rejected(self):
         """Non-string JSON-list elements are rejected, never silently filtered
         (regression pin: the PR's before-validators must not narrow an
         operator-supplied allowlist without an error)."""
-        deep_cases = (
-            {"ALLOWED_HOSTS": '["a.example.com", 7]'},
-            {"ALLOWED_EXTENSIONS": '[".txt", 42]'},
-            {"IMAP_ALLOWED_MIME_TYPES": '["text/plain", null]'},
+        non_string_cases = (
+            ("ALLOWED_HOSTS", "must contain only strings", '["a.example.com", 7]'),
+            ("ALLOWED_EXTENSIONS", "must contain only strings", '[".txt", 42]'),
+            (
+                "IMAP_ALLOWED_MIME_TYPES",
+                "must contain only strings",
+                '["text/plain", null]',
+            ),
         )
-        for env_override in deep_cases:
-            with patch.dict("os.environ", env_override):
-                with pytest.raises(ValidationError):
+        for env_name, expected_message, value in non_string_cases:
+            with patch.dict("os.environ", {env_name: value}):
+                with pytest.raises(ValidationError, match=expected_message):
                     Settings(_env_file=None)
