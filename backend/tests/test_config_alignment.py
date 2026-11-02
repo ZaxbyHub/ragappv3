@@ -988,3 +988,17 @@ class TestEnvDecoding734:
         with patch.dict("os.environ", {"IMAP_ALLOWED_MIME_TYPES": deep}):
             with pytest.raises(ValidationError):
                 Settings(_env_file=None)
+
+    def test_json_list_non_string_elements_rejected(self):
+        """Non-string JSON-list elements are rejected, never silently filtered
+        (regression pin: the PR's before-validators must not narrow an
+        operator-supplied allowlist without an error)."""
+        deep_cases = (
+            {"ALLOWED_HOSTS": '["a.example.com", 7]'},
+            {"ALLOWED_EXTENSIONS": '[".txt", 42]'},
+            {"IMAP_ALLOWED_MIME_TYPES": '["text/plain", null]'},
+        )
+        for env_override in deep_cases:
+            with patch.dict("os.environ", env_override):
+                with pytest.raises(ValidationError):
+                    Settings(_env_file=None)

@@ -14,9 +14,10 @@ Every check imports ``app.config`` in a fresh subprocess with an empty temp
 cwd (never the real backend cwd, so a developer's live ``backend/.env`` can
 mask or pollute the result). The subprocess environment strips any ambient
 ``ALLOWED_HOSTS`` / ``ALLOWED_EXTENSIONS`` / ``IMAP_ALLOWED_MIME_TYPES``
-values (an inherited env value would take precedence over the copied dotenv
-and mask the template leg), then adds the two required secrets plus the
-variable under test.
+values — pydantic-settings evaluates the env source even when the dotenv
+source is the one under test, so a malformed ambient value could fail an
+unrelated leg — then adds the two required secrets plus the variable under
+test.
 """
 
 import ast
@@ -39,8 +40,9 @@ _MASKING_KEYS = ("ALLOWED_HOSTS", "ALLOWED_EXTENSIONS", "IMAP_ALLOWED_MIME_TYPES
 def _run_import_subprocess(code: str, extra_env: dict[str, str], cwd: Path):
     """Run ``python -c <code>`` in a fresh subprocess with a masked env.
 
-    Inherits os.environ, strips the three complex-typed keys (an ambient
-    value would beat the copied .env and mask the leg), then forces a valid
+    Inherits os.environ, strips the three complex-typed keys (the env source
+    is evaluated even when the dotenv source is the one under test, so a
+    malformed ambient value could fail an unrelated leg), then forces a valid
     backend on PYTHONPATH, the two required secrets, and the caller's
     per-test overrides.
     """

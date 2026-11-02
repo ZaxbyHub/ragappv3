@@ -1239,14 +1239,19 @@ class Settings(BaseSettings):
             if value.startswith("["):
                 import json
 
-                parsed = json.loads(value)
+                try:
+                    parsed = json.loads(value)
+                except RecursionError as exc:
+                    raise ValueError(
+                        "allowed_hosts JSON value is nested too deeply"
+                    ) from exc
                 if not isinstance(parsed, list):
                     raise ValueError("allowed_hosts JSON value must be a list")
-                return [
-                    host.strip()
-                    for host in parsed
-                    if isinstance(host, str) and host.strip()
-                ]
+                if any(not isinstance(host, str) for host in parsed):
+                    raise ValueError(
+                        "allowed_hosts JSON value must contain only strings"
+                    )
+                return [host.strip() for host in parsed if host.strip()]
             return [host.strip() for host in value.split(",") if host.strip()]
         return v
 
@@ -1275,11 +1280,11 @@ class Settings(BaseSettings):
                     ) from exc
                 if not isinstance(parsed, list):
                     raise ValueError("allowed_extensions JSON value must be a list")
-                return [
-                    ext.strip()
-                    for ext in parsed
-                    if isinstance(ext, str) and ext.strip()
-                ]
+                if any(not isinstance(ext, str) for ext in parsed):
+                    raise ValueError(
+                        "allowed_extensions JSON value must contain only strings"
+                    )
+                return [ext.strip() for ext in parsed if ext.strip()]
             return [ext.strip() for ext in value.split(",") if ext.strip()]
         return v
 
@@ -1306,11 +1311,11 @@ class Settings(BaseSettings):
                     raise ValueError(
                         "imap_allowed_mime_types JSON value must be a list"
                     )
-                return [
-                    mime.strip()
-                    for mime in parsed
-                    if isinstance(mime, str) and mime.strip()
-                ]
+                if any(not isinstance(mime, str) for mime in parsed):
+                    raise ValueError(
+                        "imap_allowed_mime_types JSON value must contain only strings"
+                    )
+                return [mime.strip() for mime in parsed if mime.strip()]
             return [mime.strip() for mime in value.split(",") if mime.strip()]
         return v
 
