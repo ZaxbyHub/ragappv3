@@ -61,6 +61,11 @@ Repository contract job:
   CI job/script inventory names fewer jobs or scripts than `ci.yml` defines
   (issue #655).
 - `python scripts/check_config_contract.py`
+- `python scripts/check_g06_setup_docs.py --check all` — `.env.example`/setup-doc
+  drift gate (issue #738): no active localhost `REDIS_URL`, `cp` sources tracked,
+  template `ALLOWED_EXTENSIONS` covers the code default, `DATA_DIR` consistent with
+  compose, `DOCUMENT_PARSING_STRATEGY` matches or names the code default, and
+  CONTRIBUTING's env step names `backend/.env`.
 - `python scripts/check_pr_scope_drift.py`
 - `python scripts/check_sast_baseline.py` — fails if the SAST baseline grew on
   the PR (suppresses new findings without `SAST_ALLOW_BASELINE_EXPANSION=1`),
@@ -124,6 +129,7 @@ cd frontend && VITE_APP_BASENAME=/knowledgevault VITE_API_URL=/knowledgevault/ap
 cd backend && ruff check . && pytest --tb=short -v --timeout=300 --timeout-method=thread tests/
 python scripts/check_runtime_contract.py
 python scripts/check_config_contract.py
+python scripts/check_g06_setup_docs.py --check all
 python scripts/check_pr_scope_drift.py
 python scripts/check_sast_baseline.py
 python scripts/check_secretscan.py

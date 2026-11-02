@@ -1014,7 +1014,11 @@ class Settings(BaseSettings):
     # When non-empty, TrustedHostMiddleware rejects requests whose Host header
     # is not in this list. Leave empty to disable (the default — useful for
     # local dev and root deployments accessed by bare IP).
-    allowed_hosts: list[str] = []
+    # NoDecode: pydantic-settings would otherwise JSON-decode the raw env/.env
+    # value before parse_allowed_hosts runs, so the documented empty
+    # (``ALLOWED_HOSTS=``) and comma-separated forms crashed Settings() at
+    # import (#734).
+    allowed_hosts: Annotated[list[str], NoDecode] = []
 
     health_check_api_key: str = ""
     csrf_cookie_secure: bool = False
@@ -1058,7 +1062,10 @@ class Settings(BaseSettings):
 
     # Security settings
     max_file_size_mb: int = 100
-    allowed_extensions: set[str] = {
+    # NoDecode (see allowed_hosts): the shipped .env.example and the compose
+    # ``${ALLOWED_EXTENSIONS:-}`` forward use comma/empty forms, which the
+    # built-in JSON decode rejected before parse_allowed_extensions ran (#734).
+    allowed_extensions: Annotated[set[str], NoDecode] = {
         ".txt",
         ".md",
         ".pdf",
@@ -1102,7 +1109,10 @@ class Settings(BaseSettings):
     imap_mailbox: str = "INBOX"
     imap_poll_interval: int = 60  # seconds
     imap_max_attachment_size: int = 10 * 1024 * 1024  # 10MB
-    imap_allowed_mime_types: set[str] = {
+    # NoDecode (see allowed_hosts): docs/email-ingestion.md documents the
+    # comma-separated form, which the built-in JSON decode rejected before
+    # parse_imap_allowed_mime_types ran (#734).
+    imap_allowed_mime_types: Annotated[set[str], NoDecode] = {
         "application/pdf",
         "text/plain",
         "text/markdown",
@@ -1238,6 +1248,60 @@ class Settings(BaseSettings):
                     if isinstance(host, str) and host.strip()
                 ]
             return [host.strip() for host in value.split(",") if host.strip()]
+        return v
+
+    @field_validator("allowed_extensions", mode="before")
+    @classmethod
+    def parse_allowed_extensions(cls, v):
+        """Support JSON lists and comma-separated env values for allowed extensions.
+
+        A raw empty value (docker-compose forwards ``${ALLOWED_EXTENSIONS:-}``)
+        selects the field's code default — mapping it to an empty set would
+        reject every upload on default deployments. The deliberate empty set
+        remains available as the JSON form ``[]`` (#734).
+        """
+        if isinstance(v, str):
+            value = v.strip()
+            if not value:
+                return set(cls.model_fields["allowed_extensions"].default)
+            if value.startswith("["):
+                import json
+
+                parsed = json.loads(value)
+                if not isinstance(parsed, list):
+                    raise ValueError("allowed_extensions JSON value must be a list")
+                return [
+                    ext.strip()
+                    for ext in parsed
+                    if isinstance(ext, str) and ext.strip()
+                ]
+            return [ext.strip() for ext in value.split(",") if ext.strip()]
+        return v
+
+    @field_validator("imap_allowed_mime_types", mode="before")
+    @classmethod
+    def parse_imap_allowed_mime_types(cls, v):
+        """Support JSON lists and comma-separated env values for allowed MIME
+        types; a raw empty value selects the field's code default (same
+        convention as parse_allowed_extensions, #734)."""
+        if isinstance(v, str):
+            value = v.strip()
+            if not value:
+                return set(cls.model_fields["imap_allowed_mime_types"].default)
+            if value.startswith("["):
+                import json
+
+                parsed = json.loads(value)
+                if not isinstance(parsed, list):
+                    raise ValueError(
+                        "imap_allowed_mime_types JSON value must be a list"
+                    )
+                return [
+                    mime.strip()
+                    for mime in parsed
+                    if isinstance(mime, str) and mime.strip()
+                ]
+            return [mime.strip() for mime in value.split(",") if mime.strip()]
         return v
 
     # Migration validators for backward compatibility

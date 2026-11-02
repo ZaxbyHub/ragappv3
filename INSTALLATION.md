@@ -817,7 +817,7 @@ pip install -r backend/requirements.txt
 cd frontend && npm install && cd ..
 
 # 4. Configuration
-cp backend/.env.example backend/.env
+cp .env.example backend/.env
 # (Edit backend/.env with secure keys)
 
 # 5. Database (optional — uvicorn auto-initializes via the app lifespan)

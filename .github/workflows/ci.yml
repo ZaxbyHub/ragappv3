@@ -184,6 +184,9 @@ jobs:
       - name: Config and env contract check
         run: python scripts/check_config_contract.py
 
+      - name: Setup docs truth check
+        run: python scripts/check_g06_setup_docs.py --check all
+
       - name: Settings consumers check
         run: python scripts/check_settings_consumers.py
 
