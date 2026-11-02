@@ -39,6 +39,7 @@ import { captureAuthOwner, type AuthOwner } from "@/lib/api/auth-lifecycle";
 import { useDebounce } from "@/hooks/useDebounce";
 import { useUploadMonitoring } from "@/hooks/useUploadMonitoring";
 import { useVaultStore } from "@/stores/useVaultStore";
+import { useAuthStore } from "@/stores/useAuthStore";
 import { useSettingsStore } from "@/stores/useSettingsStore";
 import { useUploadStore } from "@/stores/useUploadStore";
 import { VaultSelector } from "@/components/vault/VaultSelector";
@@ -353,7 +354,18 @@ export default function DocumentsPage() {
     activeVaultPermission === "write" || activeVaultPermission === "admin";
   const canAdminActiveVault = activeVaultPermission === "admin";
   const hasSelectedVault = activeVaultId != null && activeVault != null;
+  // Destructive capability (vault ADMIN): mirrors the per-file vault-admin
+  // delete routes (documents.py delete/batch/delete-all). Issue #767.
   const canMutateDocuments = hasSelectedVault && canAdminActiveVault;
+  // Organise capability (vault WRITE): folders, bulk tag/move, row selection,
+  // and wiki compile are all vault-write server-side (folders.py, tags.py,
+  // wiki.py) — the UI must require no more and no less. Issue #767.
+  const canOrganizeDocuments = hasSelectedVault && canWriteActiveVault;
+  // Scan Directory is a GLOBAL-admin route (documents.py -> require_admin_role
+  // accepts only global admin/superadmin); the client gate mirrors the user's
+  // global role, not vault permission. Issue #767 AC5.
+  const globalRole = useAuthStore((s) => s.user?.role);
+  const canScanDirectories = globalRole === "admin" || globalRole === "superadmin";
 
   const {
     documents,
@@ -382,7 +394,7 @@ export default function DocumentsPage() {
   });
 
   const { selectedIds, setSelectedIds, clear: clearSelection, selectMany, selectOne } =
-    useBulkSelection(canMutateDocuments);
+    useBulkSelection(canOrganizeDocuments);
 
   // Live mirror of the active vault for still-current checks inside async
   // continuations (fetch commits, dialog confirms): a ref read at commit time
@@ -406,10 +418,10 @@ export default function DocumentsPage() {
   const confirmVaultGenRef = useRef(0);
 
   useEffect(() => {
-    if (!canMutateDocuments) {
+    if (!canOrganizeDocuments) {
       setSelectedIds(new Set());
     }
-  }, [canMutateDocuments, setSelectedIds]);
+  }, [canOrganizeDocuments, setSelectedIds]);
 
   // Bulk selection is per-vault display state: an admin->admin vault switch
   // never flips canMutateDocuments, so the permission-keyed effect above never
@@ -653,6 +665,11 @@ export default function DocumentsPage() {
       // server just deleted) while retaining the failed rows either way.
       await fetchDocuments();
       setDocuments((prev) => prev.filter((doc) => !deletedIds.has(String(doc.id))));
+      // Optimistic single-field patch FIRST for the immediate render, then
+      // refetch the authoritative stats LAST so the final committed value is
+      // the server's post-delete state — ordering matters: patching after the
+      // refetch would double-subtract deleted_count from the fresh server
+      // total (implementation-review Round 1; issue #768 AC2).
       setStats((prev) =>
         prev
           ? {
@@ -661,6 +678,7 @@ export default function DocumentsPage() {
             }
           : prev
       );
+      await fetchStats();
       fetchFolders();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to delete documents");
@@ -674,6 +692,7 @@ export default function DocumentsPage() {
     setStats,
     clearSelection,
     fetchDocuments,
+    fetchStats,
     fetchFolders,
   ]);
 
@@ -716,13 +735,17 @@ export default function DocumentsPage() {
         // "Showing 0 of N" and a Load-more control pointing at rows that no
         // longer exist.
         await fetchDocuments();
+        // Refetch stats for the same reason (issue #768 AC3): the optimistic
+        // patch above only zeroes total_documents — Chunks/Size/Indexed must
+        // agree with the emptied vault too.
+        await fetchStats();
       }
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to delete documents");
     } finally {
       setIsBulkDeletingAll(false);
     }
-  }, [activeVaultId, canMutateDocuments, setDocuments, setStats, fetchFolders, fetchDocuments]);
+  }, [activeVaultId, canMutateDocuments, setDocuments, setStats, fetchFolders, fetchDocuments, fetchStats]);
 
   const handleDeleteAllInVault = useCallback(() => {
     if (!documents || documents.length === 0) return;
@@ -795,13 +818,24 @@ export default function DocumentsPage() {
   }, []);
 
   const handleScan = async () => {
-    if (!hasSelectedVault || !canWriteActiveVault) {
-      toast.error("Select a vault with write access before scanning");
+    // Mirrors the route: POST /documents/scan depends on the GLOBAL admin
+    // role and scans every vault's upload directory (issue #767 AC5/AC8) —
+    // vault-write never granted scan rights.
+    if (!canScanDirectories) {
+      toast.error("A global admin role is required to scan directories");
       return;
     }
     setIsScanning(true);
     try {
-      const result = await scanDocuments(activeVaultId ?? undefined);
+      const result = await scanDocuments();
+      // PRR-002/K-01: per-directory failures reach the operator, not just the
+      // server log; error strings are vault-relative redactions from the
+      // backend (no absolute paths, no raw exception text).
+      if (result.errors?.length) {
+        toast.warning(
+          `Scan completed with ${result.errors.length} director${result.errors.length > 1 ? "ies" : "y"} unreadable: ${result.errors.join("; ")}`,
+        );
+      }
       toast.success(`Scan complete: ${result.added} new document(s) added, ${result.scanned} scanned`);
       await Promise.all([fetchDocuments(), fetchStats()]);
     } catch (err) {
@@ -811,17 +845,21 @@ export default function DocumentsPage() {
     }
   };
 
-  const handleDeleteDocument = (docId: string) => {
+  const handleDeleteDocument = (docId: string, filename?: string) => {
     if (!canMutateDocuments) {
       toast.error("Select a vault you administer before deleting documents");
       return;
     }
     confirmVaultRef.current = activeVaultId;
     confirmVaultGenRef.current = vaultSwitchGenRef.current;
+    const target = filename ?? `document ${docId}`;
     setConfirmDialog({
       open: true,
       title: "Delete Document",
-      description: "Are you sure you want to delete this document? This will also remove all associated chunks.",
+      // Name the target (issue #768 AC5): the dialog is the only user-facing
+      // identification of what is about to be destroyed.
+      description: `Are you sure you want to delete "${target}"? This will also remove all associated chunks.`,
+      confirmLabel: "Delete",
       onConfirm: () => {
         if (pendingDeleteTimersRef.current.has(docId)) return;
         // Owner at confirm time (review round 1 PRR-015): the flush never
@@ -904,6 +942,10 @@ export default function DocumentsPage() {
     [documents, optimisticallyDeletedIds]
   );
 
+  // Badge count: the matching server total with the loaded-window floor
+  // (issue #768 AC1); memoized so the pluralization/format read stays cheap.
+  const badgeCount = Math.max(total, filteredDocuments.length);
+
   // Header select-all applies ONLY to the visible rows: checking adds the
   // visible ids (selections outside the current view are preserved) and
   // unchecking removes exactly the visible ids.
@@ -941,11 +983,37 @@ export default function DocumentsPage() {
             // action) inline, unlike the copy-only branch it replaces.
             action: <VaultGate />,
           }
-        : hasActiveSearch && totalVaultDocuments > 0
-          ? {
-              title: "No documents match your search",
-              description: "Search checks filename, type, status, source, sender, subject, and document date.",
-            }
+        : (hasActiveSearch || tagFilterId != null || folderFilterId != null) &&
+            totalVaultDocuments > 0
+          ? hasActiveSearch
+            ? {
+                title: "No documents match your search",
+                description: "Search checks filename, type, status, source, sender, subject, and document date.",
+                action: {
+                  label: "Clear filters",
+                  onClick: () => {
+                    // PRR-001: the active search IS a filter in this branch —
+                    // clear it too, or the button is a no-op on a search-only
+                    // miss.
+                    setSearchQuery("");
+                    setTagFilterId(null);
+                    setFolderFilterId(null);
+                  },
+                },
+              }
+            : {
+                // A tag/folder filter with zero matches in a populated vault is
+                // a filter miss, not an empty vault (issue #768 AC4).
+                title: "No documents match your filters",
+                description: "The selected tag or folder does not match any document in this vault.",
+                action: {
+                  label: "Clear filters",
+                  onClick: () => {
+                    setTagFilterId(null);
+                    setFolderFilterId(null);
+                  },
+                },
+              }
           : {
             title: "No documents yet",
             description: canWriteActiveVault
@@ -979,13 +1047,11 @@ export default function DocumentsPage() {
             <VaultSelector />
             <Button
               onClick={handleScan}
-              disabled={isScanning || !hasSelectedVault || !canWriteActiveVault}
+              disabled={isScanning || !canScanDirectories}
               title={
-                !hasSelectedVault
-                  ? "Select a vault to scan documents"
-                  : !canWriteActiveVault
-                    ? "Write access is required to scan this vault"
-                    : "Scan directory"
+                canScanDirectories
+                  ? "Scan every vault's upload directory for new files"
+                  : "A global admin role is required to scan directories"
               }
             >
               {isScanning ? (
@@ -1044,7 +1110,7 @@ export default function DocumentsPage() {
         </div>
         <TagFilter tags={tags} value={tagFilterId} onChange={setTagFilterId} />
         <div className="flex items-center gap-2">
-          {selectedIds.size > 0 && canMutateDocuments && (
+          {selectedIds.size > 0 && canOrganizeDocuments && (
             <>
               <Badge variant="outline">{selectedIds.size} selected</Badge>
               <Button variant="outline" size="sm" onClick={() => setBulkTagOpen(true)}>
@@ -1055,17 +1121,25 @@ export default function DocumentsPage() {
                 <FolderInput className="w-4 h-4 mr-2" />
                 Move
               </Button>
-              <Button variant="destructive" size="sm" onClick={handleBulkDelete} disabled={isBulkDeleting}>
+              {canMutateDocuments && (
+                <Button variant="destructive" size="sm" onClick={handleBulkDelete} disabled={isBulkDeleting}>
                 {isBulkDeleting ? (
                   <Loader2 className="w-4 h-4 mr-2 animate-spin" />
                 ) : (
                   <Trash2 className="w-4 h-4 mr-2" />
                 )}
-                Delete Selected
-              </Button>
+                  Delete Selected
+                </Button>
+              )}
             </>
           )}
-          <Badge variant="secondary">{filteredDocuments.length} documents</Badge>
+          {/* Server total for the current filtered query — the badge must not
+              understate the match set when only the first window is loaded
+              (issue #768 AC1). The floor keeps the badge sane in the
+              optimistic-delete window before the refetch lands. */}
+          <Badge variant="secondary">
+            {badgeCount.toLocaleString()} {badgeCount === 1 ? "document" : "documents"}
+          </Badge>
         </div>
       </div>
 
@@ -1078,7 +1152,7 @@ export default function DocumentsPage() {
             folders={folders}
             selectedFolderId={folderFilterId}
             onSelect={setFolderFilterId}
-            canMutate={canMutateDocuments}
+            canMutate={canOrganizeDocuments}
             onCreate={handleCreateFolder}
             onRename={handleRenameFolder}
             onDelete={handleDeleteFolder}
@@ -1111,6 +1185,7 @@ export default function DocumentsPage() {
           <DocumentTable
             documents={filteredDocuments}
             selectedIds={selectedIds}
+            canOrganizeDocuments={canOrganizeDocuments}
             canMutateDocuments={canMutateDocuments}
             filenameColWidth={filenameColWidth}
             onResizeMouseDown={handleResizeMouseDown}
@@ -1130,6 +1205,7 @@ export default function DocumentsPage() {
           />
           <DocumentCardsList
             documents={filteredDocuments}
+            canOrganizeDocuments={canOrganizeDocuments}
             canMutateDocuments={canMutateDocuments}
             selectedIds={selectedIds}
             onSelectOne={selectOne}

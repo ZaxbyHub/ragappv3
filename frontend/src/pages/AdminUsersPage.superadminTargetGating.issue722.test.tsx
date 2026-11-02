@@ -4,10 +4,13 @@
 // disabled), and the row-level role Select is inert (only the target's
 // current role is offered).
 import { describe, it, expect, vi } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import AdminUsersPage from '@/pages/AdminUsersPage';
 import { roleOptionsFor } from '@/pages/AdminUsersPage/roleOptions';
+
+// #771: table-scoped (below-sm card list duplicates the text)
+const inTable = () => within(screen.getByRole('table'));
 
 vi.mock('@/stores/useAuthStore', () => ({
   useAuthStore: vi.fn((selector: any) => {
@@ -88,7 +91,8 @@ vi.mock('@/components/PageTitleHeader', () => ({
 describe('AdminUsersPage superadmin-target gating (issue #722)', () => {
   it('offers a plain admin no modifying actions on a superadmin row', async () => {
     render(<AdminUsersPage />);
-    await waitFor(() => expect(screen.getByText('root')).toBeInTheDocument());
+    // #771: table-scoped (below-sm card list duplicates the text)
+    await waitFor(() => expect(inTable().getByText('root')).toBeInTheDocument());
 
     expect(screen.queryByLabelText('Edit user root')).not.toBeInTheDocument();
     expect(screen.queryByLabelText('Reset password for root')).not.toBeInTheDocument();
@@ -96,11 +100,14 @@ describe('AdminUsersPage superadmin-target gating (issue #722)', () => {
     expect(screen.queryByLabelText('Manage organizations for root')).not.toBeInTheDocument();
 
     // The same admin still gets the actions on an ordinary member row.
-    expect(screen.getByLabelText('Edit user bob')).toBeInTheDocument();
-    expect(screen.getByLabelText('Reset password for bob')).toBeInTheDocument();
+    // #771: table-scoped (below-sm card list duplicates the text)
+    expect(inTable().getByLabelText('Edit user bob')).toBeInTheDocument();
+    // #771: table-scoped (below-sm card list duplicates the text)
+    expect(inTable().getByLabelText('Reset password for bob')).toBeInTheDocument();
 
     // The active toggle on the superadmin row is disabled for the admin.
-    const toggle = screen.getByRole('switch', { name: /deactivate user root/i });
+    // #771: table-scoped (below-sm card list duplicates the text)
+    const toggle = inTable().getByRole('switch', { name: /deactivate user root/i });
     expect(toggle).toBeDisabled();
 
     // The rendered role Select options (not just the helper): rows render in

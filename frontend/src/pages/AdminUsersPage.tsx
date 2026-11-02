@@ -6,6 +6,7 @@ import apiClient from "@/lib/api";
 import { useTestMode } from "@/fixtures/TestModeContext";
 import { mockAdminUsers } from "@/fixtures/users";
 import { useDebounce } from "@/hooks/useDebounce";
+import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
@@ -412,6 +413,116 @@ function AdminUsersPageContent({ authOwner, principalGeneration }: { authOwner: 
   const canManageUser = (user: User) =>
     user.id !== currentUser?.id && (isSuperAdmin || user.role !== "superadmin");
 
+  // Issue #771 (UI-ENH-05 stage 2): the role select, status toggle and row
+  // actions are shared render helpers so the desktop table cells and the
+  // below-sm card list render BIT-FOR-BIT the same controls — same handlers,
+  // permission conditions and pending/disabled states — by construction.
+  const renderRoleSelect = (user: User) => (
+    <Select
+      value={user.role}
+      onValueChange={(v) => handleRoleChange(user.id, v as UserRole)}
+      disabled={pendingUserIds.has(user.id) || user.id === currentUser?.id}
+    >
+      <SelectTrigger aria-label={`Change role for ${user.username}`}>
+        <SelectValue />
+      </SelectTrigger>
+      <SelectContent>
+        {roleOptionsFor(isSuperAdmin ? "superadmin" : "admin", {
+          mode: "edit",
+          targetRole: user.role,
+        }).map((opt) => (
+          <SelectItem key={opt.value} value={opt.value}>
+            {opt.label}
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
+  );
+  const renderStatusToggle = (user: User) => (
+    <div className="flex items-center gap-2">
+      <button
+        type="button"
+        role="switch"
+        aria-checked={user.is_active}
+        aria-label={`${user.is_active ? "Deactivate" : "Activate"} user ${user.username}`}
+        onClick={() => handleActiveToggle(user.id, !user.is_active)}
+        disabled={pendingUserIds.has(user.id) || user.id === currentUser?.id || (!isSuperAdmin && user.role === "superadmin")}
+        className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 ${
+          user.is_active ? "bg-primary" : "bg-input"
+        }`}
+      >
+        <span
+          className={`inline-block h-5 w-5 rounded-full bg-background shadow transition-transform ${
+            user.is_active ? "translate-x-5" : "translate-x-0.5"
+          }`}
+        />
+      </button>
+      <Badge variant={user.is_active ? "default" : "secondary"}>
+        {user.is_active ? "Active" : "Inactive"}
+      </Badge>
+    </div>
+  );
+  const renderRowActions = (user: User) => (
+                  <div className="flex flex-wrap items-center justify-end gap-1">
+                    {canManageUser(user) && (
+                      <>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-8 w-8"
+                          onClick={() => openOrgsSheet(user)}
+                          aria-label={`Manage organizations for ${user.username}`}
+                          title="Manage Organizations"
+                        >
+                          <Building2 className="w-4 h-4" />
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-8 w-8"
+                          onClick={() => openGroupsSheet(user)}
+                          aria-label={`Manage groups for ${user.username}`}
+                          title="Manage Groups"
+                        >
+                          <Users className="w-4 h-4" />
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-8 w-8"
+                          onClick={() => openEditDialog(user)}
+                          aria-label={`Edit user ${user.username}`}
+                          title="Edit User"
+                        >
+                          <Pencil className="w-4 h-4" />
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-8 w-8"
+                          onClick={() => openPasswordDialog(user)}
+                          aria-label={`Reset password for ${user.username}`}
+                          title="Reset Password"
+                        >
+                          <KeyRound className="w-4 h-4" />
+                        </Button>
+                      </>
+                    )}
+                    {canDeleteUser(user) && (
+                      <Button
+                        variant="destructive"
+                        size="icon"
+                        className="h-8 w-8"
+                        onClick={() => {
+                          openDialog("delete", user);
+                        }}
+                        aria-label={`Delete user ${user.username}`}
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </Button>
+                    )}
+                  </div>
+  );
   return (
     <div className="space-y-6 animate-in fade-in duration-300 pb-12">
       <PageTitleHeader
@@ -440,8 +551,9 @@ function AdminUsersPageContent({ authOwner, principalGeneration }: { authOwner: 
           />
         </div>
 
-        {/* Users Table */}
-        <div className="rounded-sm border">
+        {/* Users Table (desktop: hidden below sm — the card list below
+            carries the full row surface on phones; issue #771 UI-ENH-05) */}
+        <div className="rounded-sm border hidden sm:block">
           <Table>
             <TableCaption className="sr-only">System Users</TableCaption>
             <TableHeader>
@@ -498,117 +610,56 @@ function AdminUsersPageContent({ authOwner, principalGeneration }: { authOwner: 
                     <TableCell className="p-4 font-medium">{user.username}</TableCell>
                     <TableCell className="p-4">{user.full_name}</TableCell>
                     <TableCell className="p-4">
-                      <Select
-                        value={user.role}
-                        onValueChange={(v) => handleRoleChange(user.id, v as UserRole)}
-                        disabled={pendingUserIds.has(user.id) || user.id === currentUser?.id}
-                      >
-                        <SelectTrigger aria-label={`Change role for ${user.username}`}>
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {roleOptionsFor(isSuperAdmin ? "superadmin" : "admin", {
-                            mode: "edit",
-                            targetRole: user.role,
-                          }).map((opt) => (
-                            <SelectItem key={opt.value} value={opt.value}>
-                              {opt.label}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
+                      {renderRoleSelect(user)}
                     </TableCell>
                     <TableCell className="p-4">
-                      <div className="flex items-center gap-2">
-                        <button
-                          type="button"
-                          role="switch"
-                          aria-checked={user.is_active}
-                          aria-label={`${user.is_active ? "Deactivate" : "Activate"} user ${user.username}`}
-                          onClick={() => handleActiveToggle(user.id, !user.is_active)}
-                          disabled={pendingUserIds.has(user.id) || user.id === currentUser?.id || (!isSuperAdmin && user.role === "superadmin")}
-                          className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 ${
-                            user.is_active ? "bg-primary" : "bg-input"
-                          }`}
-                        >
-                          <span
-                            className={`inline-block h-5 w-5 rounded-full bg-background shadow transition-transform ${
-                              user.is_active ? "translate-x-5" : "translate-x-0.5"
-                            }`}
-                          />
-                        </button>
-                        <Badge variant={user.is_active ? "default" : "secondary"}>
-                          {user.is_active ? "Active" : "Inactive"}
-                        </Badge>
-                      </div>
+                      {renderStatusToggle(user)}
                     </TableCell>
                     <TableCell className="p-4 text-muted-foreground">{formatDate(user.created_at)}</TableCell>
-                    <TableCell className="p-4 text-right">
-                      <div className="flex items-center justify-end gap-1">
-                        {canManageUser(user) && (
-                          <>
-                            <Button
-                              variant="ghost"
-                              size="icon"
-                              className="h-8 w-8"
-                              onClick={() => openOrgsSheet(user)}
-                              aria-label={`Manage organizations for ${user.username}`}
-                              title="Manage Organizations"
-                            >
-                              <Building2 className="w-4 h-4" />
-                            </Button>
-                            <Button
-                              variant="ghost"
-                              size="icon"
-                              className="h-8 w-8"
-                              onClick={() => openGroupsSheet(user)}
-                              aria-label={`Manage groups for ${user.username}`}
-                              title="Manage Groups"
-                            >
-                              <Users className="w-4 h-4" />
-                            </Button>
-                            <Button
-                              variant="ghost"
-                              size="icon"
-                              className="h-8 w-8"
-                              onClick={() => openEditDialog(user)}
-                              aria-label={`Edit user ${user.username}`}
-                              title="Edit User"
-                            >
-                              <Pencil className="w-4 h-4" />
-                            </Button>
-                            <Button
-                              variant="ghost"
-                              size="icon"
-                              className="h-8 w-8"
-                              onClick={() => openPasswordDialog(user)}
-                              aria-label={`Reset password for ${user.username}`}
-                              title="Reset Password"
-                            >
-                              <KeyRound className="w-4 h-4" />
-                            </Button>
-                          </>
-                        )}
-                        {canDeleteUser(user) && (
-                          <Button
-                            variant="destructive"
-                            size="icon"
-                            className="h-8 w-8"
-                            onClick={() => {
-                              openDialog("delete", user);
-                            }}
-                            aria-label={`Delete user ${user.username}`}
-                          >
-                            <Trash2 className="w-4 h-4" />
-                          </Button>
-                        )}
-                      </div>
-                    </TableCell>
+                    <TableCell className="p-4 text-right">{renderRowActions(user)}</TableCell>
                   </TableRow>
                 ))
               )}
             </TableBody>
           </Table>
+        </div>
+
+        {/* Issue #771 (UI-ENH-05 stage 2): below-sm card list for the users
+            table — same row model, same controls via the shared render helpers
+            (role select, status toggle, every row action with its permission
+            and pending state), plus card-visible loading/error/empty states. */}
+        <div role="region" className="space-y-3 sm:hidden" aria-label="Users (compact)">
+          {loading ? (
+            <Card><CardContent className="p-4"><LoadingSpinner label="Loading users…" /></CardContent></Card>
+          ) : usersError ? (
+            <Card><CardContent className="p-4 text-center">
+              <div role="alert" className="mb-3 text-sm text-destructive">Failed to load users.</div>
+              <Button variant="outline" onClick={() => { void fetchUsers(); }}>Retry users</Button>
+            </CardContent></Card>
+          ) : users.length === 0 ? (
+            <Card><CardContent className="p-4">
+              <EmptyState icon={Users} title={searchQuery ? "No users match your search" : "No users found"} className="py-0" />
+            </CardContent></Card>
+          ) : (
+            users.map((user) => (
+              <Card key={`card-${user.id}`}>
+                <CardContent className="p-4 space-y-2">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <div className="font-medium">{user.username}</div>
+                      <div className="text-sm text-muted-foreground">{user.full_name}</div>
+                    </div>
+                    <div className="text-xs text-muted-foreground">{formatDate(user.created_at)}</div>
+                  </div>
+                  {renderRoleSelect(user)}
+                  {renderStatusToggle(user)}
+                  {/* renderRowActions already carries its own flex wrapper
+                      (review EXT-003): no second identical container here. */}
+                  {renderRowActions(user)}
+                </CardContent>
+              </Card>
+            ))
+          )}
         </div>
 
         {/* Pagination */}

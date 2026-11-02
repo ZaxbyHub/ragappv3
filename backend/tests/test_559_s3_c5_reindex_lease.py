@@ -361,5 +361,113 @@ class TestReindexInterruptedMappedAway(_ProcessorHarness):
         )
 
 
+class TestReindexWorkerLoopSurvivesSettleException(_ProcessorHarness):
+    """Issue #743 (P02-SK2-13): drive the REAL _reindex_lease_worker_loop.
+
+    Frozen check C5 (tests/test_h06_mutation_kills) replaces the loop body
+    with an early return; only a test that actually runs the loop kills that
+    mutant. The scenario mirrors test_b13_lease_reindex_durability.py (the
+    exception-survival guard the issue text asks for): two pending reindex
+    jobs, the FIRST settlement raises a transient sqlite3.OperationalError,
+    and the worker must survive it and claim the second job. The first job is
+    NOT required to complete — its failed settle deliberately leaves the
+    lease for janitor reclaim (background_tasks janitor path); asserting its
+    completion would assert an impossible state."""
+
+    async def test_worker_survives_settle_exception_and_claims_second_job(self):
+        import sqlite3 as _sqlite3
+        from unittest.mock import patch as _patch
+
+        # Two pending legacy rows; the boot migration opens the claim barrier
+        # the worker loop waits on and lands both as shared-lease jobs.
+        _insert_reindex_job(self.conn, vault_id=None)
+        _insert_reindex_job(self.conn, vault_id=None)
+        await self.processor._run_jobs_migration()  # noqa: SLF001
+        job_ids = [
+            int(r["id"])
+            for r in self.conn.execute(
+                "SELECT id FROM jobs WHERE queue = ? ORDER BY id", (REINDEX_QUEUE,)
+            )
+        ]
+        self.assertEqual(len(job_ids), 2, "both pending jobs must be lease-owned")
+
+        embed_calls: list[int] = []
+
+        async def fake_embed(job_id, vault_id):  # noqa: ARG001
+            embed_calls.append(int(job_id))
+            return ("completed", {}, None)
+
+        original_complete = JobLease.complete
+        complete_calls = {"n": 0}
+
+        def flaky_complete(self_lease, job_id, worker_id, result=None):  # noqa: ARG001
+            complete_calls["n"] += 1
+            if complete_calls["n"] == 1:
+                raise _sqlite3.OperationalError("database is locked")
+            return original_complete(self_lease, job_id, worker_id, result)
+
+        self.processor._reindex_embed_all = fake_embed  # noqa: SLF001
+
+        # CR-1 (implementation review): actually INSTALL the flaky settle for
+        # the duration of the loop task — the b13 pattern. Without this the
+        # settle-exception arm never fires and the test would pass vacuously
+        # while its docstring claims the exception path runs.
+        with _patch.object(JobLease, "complete", flaky_complete):
+            task = asyncio.create_task(
+                self.processor._reindex_lease_worker_loop()  # noqa: SLF001
+            )
+            try:
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + 5.0
+                # Poll the SETTLE state, not just the embed calls: the second
+                # JobLease.complete runs after the embed returns (the run task
+                # crosses pool.connection_async() first), so exiting on
+                # embed_calls == 2 races task.cancel() into the settle window
+                # and the complete_calls assertion below flakes (final-critic
+                # round 1: 8/25 failures). Waiting for complete_calls >= 2
+                # means both settles have executed before we cancel.
+                while (
+                    loop.time() < deadline
+                    and (len(embed_calls) < 2 or complete_calls["n"] < 2)
+                ):
+                    await asyncio.sleep(0.05)
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        self.assertGreaterEqual(
+            complete_calls["n"],
+            2,
+            "the settle-exception path must actually fire: the first "
+            "JobLease.complete raises and a later settle call is recorded",
+        )
+
+        self.assertEqual(
+            len(embed_calls),
+            2,
+            "the worker loop must survive a transient settle exception and "
+            "claim the second pending reindex job",
+        )
+        self.assertEqual(
+            set(embed_calls),
+            set(job_ids),
+            "both lease-owned jobs must be claimed and processed",
+        )
+
+        rows = {
+            int(r["id"]): r["status"]
+            for r in self.conn.execute(
+                "SELECT id, status FROM jobs WHERE queue = ?", (REINDEX_QUEUE,)
+            )
+        }
+        settled = [jid for jid, status in rows.items() if status == "completed"]
+        # The first settle raised; whether that job then re-settles inside the
+        # loop (retry) or waits for janitor reclaim is the worker's business --
+        # the frozen invariant is that the loop never dies and at least the
+        # post-exception job settles (b13 precedent asserts the same shape).
+        self.assertGreaterEqual(
+            len(settled), 1, "at least the post-exception job must settle completed"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

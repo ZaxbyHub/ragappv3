@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import "@testing-library/jest-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import AdminUsersPage from "@/pages/AdminUsersPage";
@@ -6,6 +6,9 @@ import {
   publishAuthPrincipal,
   reserveReplacementAuthOwner,
 } from "@/lib/api/auth-lifecycle";
+
+// #771: table-scoped (below-sm card list duplicates the text)
+const inTable = () => within(screen.getByRole("table"));
 
 type Deferred<T> = {
   promise: Promise<T>;
@@ -291,7 +294,8 @@ describe("AdminUsersPage issue #775 ownership and query races", () => {
     queueGet("/users/2/groups", membershipsA.promise);
     mocks.api.put.mockReturnValueOnce(saveB.promise);
     renderPage();
-    fireEvent.click(await screen.findByRole("button", { name: "Manage groups for target" }));
+    // #771: table-scoped (below-sm card list duplicates the text)
+    fireEvent.click(await inTable().findByRole("button", { name: "Manage groups for target" }));
     await act(async () => {
       groupsA.resolve({ data: { groups: [groupA] } });
       membershipsA.resolve({ data: { groups: [] } });
@@ -307,7 +311,8 @@ describe("AdminUsersPage issue #775 ownership and query races", () => {
 
     queueGet("/groups", groupsB.promise);
     queueGet("/users/2/groups", membershipsB.promise);
-    fireEvent.click(screen.getByRole("button", { name: "Manage groups for target" }));
+    // #771: table-scoped (below-sm card list duplicates the text)
+    fireEvent.click(inTable().getByRole("button", { name: "Manage groups for target" }));
     await act(async () => {
       groupsB.resolve({ data: { groups: [groupB] } });
       membershipsB.resolve({ data: { groups: [] } });

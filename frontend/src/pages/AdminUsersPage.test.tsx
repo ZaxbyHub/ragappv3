@@ -1,7 +1,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, waitFor, act } from '@testing-library/react';
+import { render, screen, waitFor, act , within } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import AdminUsersPage from '@/pages/AdminUsersPage';
+// Issue #771 (UI-ENH-05): the below-sm card list duplicates row
+// text next to the desktop table; scope data queries to the table subtree
+// (a card-only regression still fails these assertions).
+const inTable = () => within(screen.getByRole('table'));
+
 
 // Mock useAuthStore for AdminGuard and user data
 vi.mock('@/stores/useAuthStore', () => ({
@@ -172,9 +177,9 @@ describe('AdminUsersPage', () => {
     });
 
     await waitFor(() => {
-      expect(screen.getByText('admin')).toBeInTheDocument();
-      expect(screen.getByText('john')).toBeInTheDocument();
-      expect(screen.getByText('jane')).toBeInTheDocument();
+      expect(inTable().getByText('admin')).toBeInTheDocument();
+      expect(inTable().getByText('john')).toBeInTheDocument();
+      expect(inTable().getByText('jane')).toBeInTheDocument();
     });
   });
 
@@ -184,9 +189,9 @@ describe('AdminUsersPage', () => {
     });
 
     await waitFor(() => {
-      expect(screen.getByText('Admin User')).toBeInTheDocument();
-      expect(screen.getByText('John Doe')).toBeInTheDocument();
-      expect(screen.getByText('Jane Smith')).toBeInTheDocument();
+      expect(inTable().getByText('Admin User')).toBeInTheDocument();
+      expect(inTable().getByText('John Doe')).toBeInTheDocument();
+      expect(inTable().getByText('Jane Smith')).toBeInTheDocument();
     });
   });
 
@@ -209,7 +214,7 @@ describe('AdminUsersPage', () => {
     await waitFor(() => {
       const activeBadges = screen.getAllByText('Active');
       expect(activeBadges.length).toBeGreaterThan(0);
-      expect(screen.getByText('Inactive')).toBeInTheDocument();
+      expect(inTable().getByText('Inactive')).toBeInTheDocument();
     });
   });
 

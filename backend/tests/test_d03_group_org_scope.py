@@ -8,7 +8,8 @@ invite redeemability). Every test in this module is intentionally failing at
 the pre-fix tree and must turn green once the corresponding production fix
 lands.
 
-Harness: per-test temp SQLite DB (TEST_SCHEMA via backend test helpers) with
+Harness: per-test temp SQLite DB (production schema via the backend test
+helpers' init_db+run_migrations template — #744) with
 ``settings.data_dir`` pointed at the temp dir so every router (users,
 organizations, groups) resolves its pool to the temp DB, plus the repo's
 standard csrf_protect dependency override and ""-fingerprint tokens.
