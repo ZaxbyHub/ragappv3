@@ -121,7 +121,7 @@ def git_tracked_files() -> set[str] | None:
     except (OSError, subprocess.SubprocessError) as exc:
         print(f"git ls-files failed: {exc}", file=sys.stderr)
         return None
-    if proc.returncode != 0:
+    if proc.returncode != 0 or proc.stdout is None:
         print(f"git ls-files failed: {proc.stderr.strip()}", file=sys.stderr)
         return None
     return {line.strip() for line in proc.stdout.splitlines() if line.strip()}
@@ -215,6 +215,12 @@ def check_allowed_extensions() -> list[str]:
     return [
         f"FAIL allowed-extensions: missing {ext}"
         for ext in sorted(code_extensions - template_extensions)
+    ] + [
+        # The template line is ACTIVE: a value the code default does not
+        # include silently widens the effective upload allowlist of every
+        # deployment copying the template, so flag the reverse direction too.
+        f"FAIL allowed-extensions: unexpected {ext}"
+        for ext in sorted(template_extensions - code_extensions)
     ]
 
 
@@ -245,9 +251,16 @@ def check_data_dir() -> list[str]:
 
 def check_parsing_strategy() -> list[str]:
     env_text = read(".env.example")
+    if documented_env_entry(env_text, "DOCUMENT_PARSING_STRATEGY") is None:
+        return [
+            "FAIL parsing-strategy: .env.example has no DOCUMENT_PARSING_STRATEGY "
+            "entry (active or commented) - the key must stay documented; compose "
+            "forwards an empty value for a missing key, which fails startup "
+            "validation"
+        ]
     entry = active_env_entry(env_text, "DOCUMENT_PARSING_STRATEGY")
     if entry is None:
-        return []
+        return []  # commented-out template key passes
     line_no, value = entry
     config_text = read("backend/app/config.py")
     default = re.search(
@@ -276,9 +289,11 @@ def check_parsing_strategy() -> list[str]:
 def check_contributing_env_path() -> list[str]:
     contributing_text = read("CONTRIBUTING.md")
     lines = contributing_text.splitlines()
+    found_paragraph = False
     for index, line in enumerate(lines):
         if "**Environment:**" not in line:
             continue
+        found_paragraph = True
         paragraph: list[str] = []
         cursor = index
         while cursor < len(lines) and lines[cursor].strip():
@@ -287,6 +302,11 @@ def check_contributing_env_path() -> list[str]:
         paragraph_text = "\n".join(paragraph)
         if ".env.example" in paragraph_text and "backend/.env" not in paragraph_text:
             return ["FAIL contributing-env-path"]
+    if not found_paragraph:
+        return [
+            "FAIL contributing-env-path: CONTRIBUTING.md has no **Environment:** "
+            "paragraph - the native-run env-file step must stay documented"
+        ]
     return []
 
 

@@ -12,9 +12,11 @@ RED at the base tree (SettingsError before the fix), GREEN after the fix.
 
 Every check imports ``app.config`` in a fresh subprocess with an empty temp
 cwd (never the real backend cwd, so a developer's live ``backend/.env`` can
-mask or pollute the result) and only the two required secrets plus the
-variable under test in the process environment (inherited from os.environ,
-then overridden).
+mask or pollute the result). The subprocess environment strips any ambient
+``ALLOWED_HOSTS`` / ``ALLOWED_EXTENSIONS`` / ``IMAP_ALLOWED_MIME_TYPES``
+values (an inherited env value would take precedence over the copied dotenv
+and mask the template leg), then adds the two required secrets plus the
+variable under test.
 """
 
 import ast
@@ -29,14 +31,22 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 _SUBPROCESS_TIMEOUT_S = 120
 
+# Complex-typed Settings fields whose ambient values would override the
+# copied dotenv (pydantic-settings source order: env > dotenv).
+_MASKING_KEYS = ("ALLOWED_HOSTS", "ALLOWED_EXTENSIONS", "IMAP_ALLOWED_MIME_TYPES")
+
 
 def _run_import_subprocess(code: str, extra_env: dict[str, str], cwd: Path):
-    """Run ``python -c <code>`` in a fresh subprocess with inherited env.
+    """Run ``python -c <code>`` in a fresh subprocess with a masked env.
 
-    Inherits os.environ, then forces a valid backend on PYTHONPATH, the two
-    required secrets, and the caller's per-test overrides.
+    Inherits os.environ, strips the three complex-typed keys (an ambient
+    value would beat the copied .env and mask the leg), then forces a valid
+    backend on PYTHONPATH, the two required secrets, and the caller's
+    per-test overrides.
     """
     env = dict(os.environ)
+    for key in _MASKING_KEYS:
+        env.pop(key, None)
     env.update(
         {
             "PYTHONPATH": str(BACKEND_DIR),

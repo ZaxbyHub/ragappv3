@@ -26,10 +26,11 @@
   - the deliberate empty set/list remains the JSON form `[]` — distinct from a
     raw empty value;
   - supported env forms are: empty, comma-separated, and JSON list (`[...]`).
-    Any other string is treated as a comma list (a quoted JSON string such as
-    `"a.example.com"` becomes the literal value including quotes) — the
-    same convention the existing `backend_cors_origins`/origins fields already
-    use, and it fails closed (host validation rejects);
+    A `[`-prefixed value is always parsed as JSON and raises on malformed
+    JSON (fail closed); any other non-empty string is treated as a comma
+    list (a quoted JSON string such as `"a.example.com"` becomes the literal
+    value including quotes) — the same convention the existing
+    `backend_cors_origins`/origins fields already use;
   - JSON-list env forms keep working for all three fields; init-kwarg behavior
     is unchanged (`TestAllowedHostsJSONParsing` stays green).
 

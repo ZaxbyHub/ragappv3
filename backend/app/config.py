@@ -1267,7 +1267,12 @@ class Settings(BaseSettings):
             if value.startswith("["):
                 import json
 
-                parsed = json.loads(value)
+                try:
+                    parsed = json.loads(value)
+                except RecursionError as exc:
+                    raise ValueError(
+                        "allowed_extensions JSON value is nested too deeply"
+                    ) from exc
                 if not isinstance(parsed, list):
                     raise ValueError("allowed_extensions JSON value must be a list")
                 return [
@@ -1291,7 +1296,12 @@ class Settings(BaseSettings):
             if value.startswith("["):
                 import json
 
-                parsed = json.loads(value)
+                try:
+                    parsed = json.loads(value)
+                except RecursionError as exc:
+                    raise ValueError(
+                        "imap_allowed_mime_types JSON value is nested too deeply"
+                    ) from exc
                 if not isinstance(parsed, list):
                     raise ValueError(
                         "imap_allowed_mime_types JSON value must be a list"

@@ -14,8 +14,6 @@ Model: ``test_b03_contract_wiring.py`` (issue #692).
 """
 
 import importlib.util
-import re
-import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
@@ -37,12 +35,11 @@ def test_g06_guard_wired_into_ci_and_justfile():
     in_quality_job = False
     found_ci_step = False
     for line in ci_lines:
-        if line.strip().startswith("quality-contracts:"):
+        if line.startswith("  quality-contracts:"):
             in_quality_job = True
             continue
-        if in_quality_job and line.strip() and not line.startswith("      "):
-            if line.strip() and not line.startswith(" "):
-                break
+        if in_quality_job and line.strip() and not line.startswith("    "):
+            break  # a 2-space-indented sibling job key ends the block
         if in_quality_job and not line.lstrip().startswith("#") and COMMAND in line:
             found_ci_step = True
             break
@@ -132,31 +129,102 @@ def test_g06_data_dir_requires_documented_key():
     )
 
 
-def test_g06_allowed_extensions_parser_accepts_annotated_declaration():
-    """The static parser reads the default set from both declaration forms.
+def _synthetic_repo_texts(
+    env_text: str,
+    *,
+    config_text: str = (
+        'document_parsing_strategy: str = "auto"\n'
+        "allowed_extensions: Annotated[set[str], NoDecode] = {\n"
+        '".txt",\n".md",\n".pdf",\n".pptx",\n'
+        "} | set(RASTER_IMAGE_EXTENSIONS)\n"
+    ),
+    compose_text: str = "  - DATA_DIR=/app/data\n",
+    contributing_text: str = (
+        "**Environment:** copy `.env.example` to `backend/.env` (the backend "
+        "reads `.env` from its own working directory) and fill in secrets."
+    ),
+):
+    """Repo-file map driving the gate's `read` for mode-level tests."""
+    return {
+        ".env.example": env_text,
+        "backend/app/config.py": config_text,
+        "backend/app/services/document_artifacts.py": (
+            'RASTER_IMAGE_EXTENSIONS: frozenset[str] = frozenset({".png", ".jpg"})'
+        ),
+        "docker-compose.yml": compose_text,
+        "CONTRIBUTING.md": contributing_text,
+    }
 
-    The plain ``set[str]`` form is the pre-#734 shape; the
-    ``Annotated[set[str], NoDecode]`` form is what #734 ships. Both must yield
-    the same default extension set (plan-critic round 1 finding 1).
+
+def test_g06_modes_fail_on_missing_documented_keys(monkeypatch):
+    """The mode-level missing-documentation FAIL branches actually fire.
+
+    Executes check_redis_url / check_data_dir / check_parsing_strategy /
+    check_contributing_env_path against synthetic repo texts so a deleted
+    guard cannot pass with the suite green (PRR-015).
     """
     gate = _load_gate_module()
-    literal_body = (
-        '".txt",\n".md",\n".pdf",\n".pptx",\n'
+    texts = _synthetic_repo_texts("OTHER=1\n")
+    monkeypatch.setattr(gate, "read", lambda p: texts[p])
+
+    redis_fail = gate.check_redis_url()
+    assert redis_fail and "no REDIS_URL entry" in redis_fail[0]
+    data_fail = gate.check_data_dir()
+    assert data_fail and "no DATA_DIR entry" in data_fail[0]
+    parsing_fail = gate.check_parsing_strategy()
+    assert parsing_fail and "no DOCUMENT_PARSING_STRATEGY entry" in parsing_fail[0]
+
+    # The contributing mode passes here (paragraph names backend/.env), then
+    # fails when the paragraph is missing entirely (PRR-004 fail-open fix).
+    assert gate.check_contributing_env_path() == []
+    texts["CONTRIBUTING.md"] = "Some other section without the env step.\n"
+    missing = gate.check_contributing_env_path()
+    assert missing and "no **Environment:** paragraph" in missing[0]
+
+
+def test_g06_parsing_strategy_active_divergence_still_fails(monkeypatch):
+    """An active non-default value without a default-naming comment fails."""
+    gate = _load_gate_module()
+    texts = _synthetic_repo_texts(
+        'DOCUMENT_PARSING_STRATEGY=fast\n'
     )
-    raster_body = '".png", ".jpg"'
-    for decl in (
-        "allowed_extensions: set[str] = {%s} | set(RASTER_IMAGE_EXTENSIONS)"
+    monkeypatch.setattr(gate, "read", lambda p: texts[p])
+    failures = gate.check_parsing_strategy()
+    assert failures and "fast" in failures[0]
+
+
+def test_g06_allowed_extensions_parser_accepts_annotated_declaration(monkeypatch):
+    """The PRODUCTION parser reads the default set from both declaration forms.
+
+    Exercises scripts/check_g06_setup_docs.py::check_allowed_extensions
+    (via monkeypatched repo reads) rather than re-declaring its regex, so a
+    production parser change can fail this test (PRR-016). The plain
+    ``set[str]`` form is the pre-#734 shape; the
+    ``Annotated[set[str], NoDecode]`` form is what #734 ships.
+    """
+    gate = _load_gate_module()
+    template_value = ".txt,.md,.pdf,.pptx,.png,.jpg"
+    literal_body = '".txt",\n".md",\n".pdf",\n".pptx",\n'
+    for decl_form in (
+        "allowed_extensions: set[str] = {%s}\n| set(RASTER_IMAGE_EXTENSIONS)\n"
         % literal_body,
-        "allowed_extensions: Annotated[set[str], NoDecode] = {%s}"
-        "| set(RASTER_IMAGE_EXTENSIONS)" % literal_body,
+        "allowed_extensions: Annotated[set[str], NoDecode] = {%s}\n"
+        "| set(RASTER_IMAGE_EXTENSIONS)\n" % literal_body,
     ):
-        match = re.search(
-            r"allowed_extensions:\s*(?:Annotated\[set\[str\],\s*NoDecode\]|set\[str\])"
-            r"\s*=\s*\{(.*?)\}\s*\|\s*set\(RASTER_IMAGE_EXTENSIONS\)",
-            decl,
-            re.DOTALL,
+        texts = _synthetic_repo_texts(
+            f"ALLOWED_EXTENSIONS={template_value}\n",
+            config_text=decl_form,
         )
-        assert match is not None, f"parser must accept declaration: {decl[:60]}..."
-        found = set(re.findall(r'"([^"]+)"', match.group(1)))
-        assert found == {".txt", ".md", ".pdf", ".pptx"}
-    assert set(re.findall(r'"([^"]+)"', raster_body)) == {".png", ".jpg"}
+        monkeypatch.setattr(gate, "read", lambda p: texts[p])
+        assert gate.check_allowed_extensions() == [], (
+            f"production parser must accept declaration: {decl_form[:60]}..."
+        )
+
+    # Symmetric direction (PRR-010): a template value the code default does
+    # not include widens the effective allowlist — the gate must flag it.
+    texts = _synthetic_repo_texts(
+        f"ALLOWED_EXTENSIONS={template_value},.exe\n",
+    )
+    monkeypatch.setattr(gate, "read", lambda p: texts[p])
+    failures = gate.check_allowed_extensions()
+    assert failures and any("unexpected .exe" in line for line in failures)

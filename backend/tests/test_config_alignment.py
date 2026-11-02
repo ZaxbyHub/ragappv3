@@ -977,3 +977,14 @@ class TestEnvDecoding734:
             settings = Settings(_env_file=None)
             assert "application/pdf" in settings.imap_allowed_mime_types
             assert "text/plain" in settings.imap_allowed_mime_types
+
+    def test_deep_json_env_value_fails_closed(self):
+        """A pathologically deep JSON env value raises ValidationError, not an
+        unhandled RecursionError escaping pydantic (PRR-008)."""
+        deep = "[" * 4000 + "]" * 4000
+        with patch.dict("os.environ", {"ALLOWED_EXTENSIONS": deep}):
+            with pytest.raises(ValidationError):
+                Settings(_env_file=None)
+        with patch.dict("os.environ", {"IMAP_ALLOWED_MIME_TYPES": deep}):
+            with pytest.raises(ValidationError):
+                Settings(_env_file=None)
