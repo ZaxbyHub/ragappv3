@@ -504,7 +504,11 @@ python -m pytest tests/ --cov=app --cov-report=html
 Every HTTP request is assigned a unique `X-Request-ID` header for distributed tracing:
 
 - **Request:** Client may provide `X-Request-ID` header (optional)
-- **Response:** Server always returns `X-Request-ID` header
+- **Response:** The server returns `X-Request-ID` on every response that
+  reaches the application middleware stack. Responses answered before the
+  stack — CORS preflight OPTIONS, invalid-Host 400s when host validation is
+  enabled, and unhandled 500s — carry no `X-Request-ID` (see the admin
+  guide).
 - **Logs:** All request logs include the `request_id` field
 
 #### Example Usage
@@ -542,7 +546,7 @@ Sensitive fields are automatically redacted in logs:
 | `email` | User email addresses |
 | `username` | User identifiers |
 | `file_path` | Internal file system paths |
-| `ip` | Client IP addresses (privacy) |
+| `client_ip` | Client IP addresses (privacy) — always emitted as `[redacted]` |
 | `session_id` | Session identifiers |
 | `api_key` | API credentials |
 | `authorization` | Auth headers |
@@ -566,7 +570,7 @@ All HTTP requests are logged in structured JSON format:
 
 ```json
 {
-  "ts": "2026-02-06T12:34:56.789Z",
+  "ts": "2026-02-06 12:34:56,789",
   "level": "INFO",
   "logger": "http",
   "message": "http_request",
@@ -579,6 +583,11 @@ All HTTP requests are logged in structured JSON format:
   "duration_ms": 145.32
 }
 ```
+
+The `ts` value is local time with comma milliseconds (logging's default
+`formatTime`); ISO-8601 parsers that require the `T`/`Z` form (e.g. `jq`'s
+`fromdateiso8601`) reject it, while Python's `datetime.fromisoformat`
+parses it.
 
 ### Key Metrics to Monitor
 

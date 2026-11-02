@@ -89,16 +89,18 @@ if (
 
 # Middleware is applied in reverse order of add_middleware calls:
 # last added = outermost (first to see request, last to modify response).
-# CORSMiddleware MUST be outermost so CORS headers are always present,
-# even on error responses from inner middleware. LoggingMiddleware must sit
-# OUTSIDE MaintenanceMiddleware and SlowAPIMiddleware (#731): both can answer
-# a request without calling through (maintenance 503, slowapi's
-# application-level-limit 429), and every response the middleware it wraps
-# produces must carry X-Request-ID and produce an http_request access-log
-# line. (Responses answered OUTSIDE LoggingMiddleware still do not: CORS
-# preflight OPTIONS, invalid-Host 400s, and unhandled 500s — see
-# docs/admin-guide.md.) Effective stack (outermost first):
-# CORS → Logging → SlowAPI → Maintenance.
+# CORSMiddleware MUST be outermost OF THE ALWAYS-REGISTERED CORE so CORS
+# headers are always present on responses that reach the core (two
+# conditional layers may register outside it when enabled: the host-header
+# validator and the telemetry span middleware — see below).
+# LoggingMiddleware must sit OUTSIDE MaintenanceMiddleware and
+# SlowAPIMiddleware (#731): both can answer a request without calling
+# through (maintenance 503, slowapi's application-level-limit 429), and
+# every response the middleware it wraps produces must carry X-Request-ID
+# and produce an http_request access-log line. (Responses answered OUTSIDE
+# LoggingMiddleware still do not: CORS preflight OPTIONS, invalid-Host 400s,
+# and unhandled 500s — see docs/admin-guide.md.) Always-registered core,
+# outermost first: CORS → Logging → SlowAPI → Maintenance.
 # Note: MaintenanceMiddleware is initialized with a lazy getter since
 # maintenance_service is only available after lifespan startup
 app.state._maintenance_service_getter = lambda: getattr(

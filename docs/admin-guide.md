@@ -386,11 +386,12 @@ is the container's access log for requests that reach the application stack,
 including maintenance-window 503s: the access-logging middleware sits outside
 the maintenance and rate-limit middleware, so a maintenance 503 still gets an
 application access line and an `X-Request-ID` header. Still outside its
-reach: CORS preflight OPTIONS responses (the CORS layer, kept outermost,
-answers them itself), invalid-Host 400s (answered by the host-header
-validator in an outer user-middleware layer), and unhandled 500s (converted
-by the server's error middleware outside the application stack) produce no
-application access line.
+reach: CORS preflight OPTIONS responses (the CORS layer, outermost of the
+always-registered core, answers them itself), invalid-Host 400s (answered by
+the host-header validator, which registers outside CORS when allowed_hosts
+is configured), and unhandled 500s (converted by the server's error
+middleware outside the application stack) produce no application access
+line.
 
 ### Viewing Logs
 

@@ -150,10 +150,17 @@ roles, not capacity claims.
   DB-free routes (`/health`, `/api/health`, `/api/healthz`) stay fast and
   pool-free even while the pool is exhausted (issue #549 C02).
 - Exempt POST routes: the admin toggle (`/api/admin/maintenance`) and the
-  auth routes (`/api/auth/login`, `/api/auth/refresh`, `/api/auth/logout`) —
-  a window longer than the access-token lifetime no longer locks every user
-  out (issue #549 C01). Registration stays blocked: a window is a data freeze
-  for account creation too.
+  auth routes (`/api/auth/login`, `/api/auth/refresh`, `/api/auth/logout`,
+  `/api/auth/change-password`) — a window longer than the access-token
+  lifetime no longer locks every user out (issue #549 C01), and a user
+  flagged for a forced password change can complete that change during a
+  window (issue #731). Registration stays blocked: a window is a data freeze
+  for account creation too. Note the freeze exception: change-password
+  writes to `users`, `user_sessions`, and the audit log during a window,
+  and the exemption is route-level (any authenticated user may rotate their
+  own password during a window, not only flagged users — each change still
+  requires the caller's session, CSRF token, current password, and the
+  10/minute rate limit).
 - The flag read on the request path is served from a short in-process TTL
   cache (5 s) filled off the event loop. A `set_flag` toggle is visible to
   the very next request from the same process; a toggle made in another
