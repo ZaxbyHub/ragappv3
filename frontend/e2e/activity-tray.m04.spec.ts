@@ -76,6 +76,14 @@ async function login(page: Page) {
   await page.fill("#login-username", "e2e-user");
   await page.fill("#login-password", "e2e-pass");
   await page.getByRole("button", { name: /sign in/i }).click();
+  // Wait for the POST to land before navigating. goto() tears down the
+  // document and aborts the in-flight login request, so the httpOnly refresh
+  // cookie never gets set and the target route boots anonymous — redirecting
+  // straight back to an empty /login. Same discipline as the waitForURL-based
+  // helpers.
+  await page.waitForURL((url) => !url.pathname.endsWith("/login"), {
+    timeout: 20_000,
+  });
   // "/" redirects to /documents — go there explicitly.
   await page.goto("/documents");
   await expect(page.locator("nav").first()).toBeVisible({ timeout: 20_000 });
