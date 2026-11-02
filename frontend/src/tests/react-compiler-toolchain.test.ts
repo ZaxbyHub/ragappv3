@@ -11,7 +11,8 @@ import { extractActiveConfigSource } from "./helpers/active-config";
  * (CI's tsconfig.node.json standalone typecheck enforces the Options shape —
  * TS2353 on any babel key), and React Compiler is enabled through the native
  * `compiler` option, backed by the optional peer `oxc-transform-react`
- * (pinned ^0.145.0 per plugin-react 6.1.1's peerOptional range). The
+ * (pinned ^0.152.0 per plugin-react 6.1.2's peerOptional range — the caret
+ * on a 0.x version pins the minor, so 0.156.0 would ERESOLVE against it). The
  * babel-plugin-react-compiler package belongs to the v4/v5 babel pipeline and
  * cannot be wired into this toolchain. Fails at HEAD (no compiler option, no
  * engine devDependency).

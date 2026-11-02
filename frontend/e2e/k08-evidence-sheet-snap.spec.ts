@@ -36,6 +36,13 @@ async function loginAndSelectVault(page: Page) {
   await page.fill("#login-username", "e2e-user");
   await page.fill("#login-password", "e2e-pass");
   await page.getByRole("button", { name: /sign in/i }).click();
+  // Wait for the POST to land before navigating. goto() tears down the
+  // document and aborts the in-flight login request, so the httpOnly refresh
+  // cookie never gets set and /chat boots anonymous — redirecting straight back
+  // to an empty /login. Same discipline as the waitForURL-based helpers.
+  await page.waitForURL((url) => !url.pathname.endsWith("/login"), {
+    timeout: 20_000,
+  });
   await page.goto("/chat");
   await expect(page.getByLabel("Message input")).toBeVisible({ timeout: 20_000 });
   // The composer refuses to send without an active vault; a fresh context
