@@ -59,9 +59,11 @@ the application stack (uvicorn's duplicate access log is now disabled).
 
 - **Access-log blind spot.** With uvicorn's access log disabled, the response
   classes answered before the logging middleware runs emit no application
-  access line: maintenance-window 503s, invalid-Host 400s, and unhandled 500s
-  (the logging middleware is the innermost one). uvicorn's own access log
-  covered them before; re-enable it per deployment if those lines are needed.
+  access line: invalid-Host 400s and unhandled 500s.
+  *(Superseded in part by #731: maintenance-window 503s are now
+  access-logged — the middleware registration order changed so the logging
+  middleware wraps the maintenance and rate-limit layers; this blind spot
+  remains for invalid-Host 400s and unhandled 500s only.)*
 
 - The recurrence census (trace `08a`) routes a wider same-class family to
   a follow-up issue: provider bodies composed into raised

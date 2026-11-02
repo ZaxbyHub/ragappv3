@@ -19,6 +19,7 @@ SCRUB_FIELDS = {
     "username",
     "file_path",
     "ip",
+    "client_ip",
     "session_id",
     "api_key",
     "authorization",
@@ -45,17 +46,6 @@ logger = logging.getLogger("http")
 USER_TEXT_PARAMS = frozenset({"q", "query", "search", "tag", "entity"})
 
 
-def _scrub_value(value: str) -> str:
-    """Redact a value if it contains any sensitive keyword.
-
-    Used by :func:`_sanitize_query` for URL query-param *names* (e.g.
-    ``?api_key=...``). Not used for free-text log message bodies.
-    """
-    if not value:
-        return value
-    return "[redacted]" if any(field in value.lower() for field in SCRUB_FIELDS) else value
-
-
 class SensitiveFieldFilter(logging.Filter):
     """Redact sensitive record *attributes* by name.
 
@@ -79,12 +69,17 @@ class SensitiveFieldFilter(logging.Filter):
 
 
 def _sanitize_query(query: str) -> str:
-    """Redact credential-name params and free-text search values (#910).
+    """Redact credential-name params and free-text search values (#910, #730).
 
     Each ``&``-fragment's parameter NAME is percent-decoded before both the
-    :data:`SCRUB_FIELDS` (credential substring) and :data:`USER_TEXT_PARAMS`
-    membership tests, so an encoded spelling (``%71=`` = ``q``) cannot slip a
+    :data:`SCRUB_FIELDS` credential test and the :data:`USER_TEXT_PARAMS`
+    membership test, so an encoded spelling (``%71=`` = ``q``) cannot slip a
     user-derived value past redaction while the route still decodes it. The
+    credential test is case-insensitive on the decoded NAME only (#730: a
+    mixed-case spelling ``API_KEY=`` redacts), while the legacy raw-fragment
+    substring test is kept byte-unchanged so existing catch-all behavior
+    stands; a benign VALUE that merely contains a credential-looking word in
+    mixed case (``note=API_KEY``) stays intact (#730 plan-critic r1). The
     emitted parameter name keeps its raw wire form. Operational parameters
     (pagination ints, enum selectors like ``status``/``mode``/``sort_by``,
     string-encoded id lists) keep ``name=value`` — only user-derived text is
@@ -97,7 +92,7 @@ def _sanitize_query(query: str) -> str:
         raw_name = param.split("=", 1)[0]
         name = unquote(raw_name)
         if any(field in param for field in SCRUB_FIELDS) or any(
-            field in name for field in SCRUB_FIELDS
+            field in name.lower() for field in SCRUB_FIELDS
         ):
             parts.append(f"{raw_name}=[redacted]")
         elif name in USER_TEXT_PARAMS:
@@ -124,7 +119,9 @@ class LoggingMiddleware(BaseHTTPMiddleware):
         request.state.request_id = request_id
         # Propagate request_id to service-layer loggers via contextvar
         token = request_id_var.set(request_id)
-        start = time.time()
+        # Monotonic clock (#730): a wall-clock step backwards (NTP correction)
+        # must never produce a negative duration_ms on the access line.
+        start = time.monotonic()
         try:
             response = await call_next(request)
             # Emit the access record BEFORE the contextvar reset: the
@@ -133,7 +130,7 @@ class LoggingMiddleware(BaseHTTPMiddleware):
             # logging after reset() blanked the field in production
             # (swarm-pr-review PRR-004: the record asserted request_id, the
             # shipped JSON never carried it).
-            duration = time.time() - start
+            duration = time.monotonic() - start
             sanitized_query = _sanitize_query(request.url.query)
             logger.info(
                 "http_request",

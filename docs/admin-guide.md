@@ -382,10 +382,16 @@ Access-log records (`http_request`) carry request_id, method, path,
 status_code, client_ip, duration_ms, and a redacted `query` field
 (free-text search values and credential parameters). The container disables
 uvicorn's duplicate access log (`--no-access-log`), so the middleware record
-is the container's access log for requests that reach the application stack:
-maintenance-window 503s, invalid-Host 400s, and unhandled 500s are answered by
-outer middleware or the server before this middleware runs, so they produce no
-application access line (uvicorn's own access log is what covered them).
+is the container's access log for requests that reach the application stack,
+including maintenance-window 503s: the access-logging middleware sits outside
+the maintenance and rate-limit middleware, so a maintenance 503 still gets an
+application access line and an `X-Request-ID` header. Still outside its
+reach: CORS preflight OPTIONS responses (the CORS layer, outermost of the
+always-registered core, answers them itself), invalid-Host 400s (answered by
+the host-header validator, which registers outside CORS when allowed_hosts
+is configured), and unhandled 500s (converted by the server's error
+middleware outside the application stack) produce no application access
+line.
 
 ### Viewing Logs
 

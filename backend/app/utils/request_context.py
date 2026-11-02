@@ -7,12 +7,12 @@ Also provides logging filters wired onto the root handler at startup:
 
 - :class:`RequestIdFilter` — stamps ``request_id`` onto every record from the
   contextvar so it is available to the formatter.
-- :class:`SensitiveFieldFilter` — scrubs the *value* of any record attribute
-  whose *name* is in :data:`app.middleware.logging.SCRUB_FIELDS` (e.g.
-  ``record.user_input``), replacing it with a redaction marker. This honors
-  the documented field-level redaction contract without over-redacting log
-  *messages* that merely happen to contain a sensitive keyword as a
-  substring.
+- :class:`app.middleware.logging.SensitiveFieldFilter` (defined there, not
+  here) — scrubs the *value* of any record attribute whose *name* is in
+  :data:`app.middleware.logging.SCRUB_FIELDS` (e.g. ``record.user_input``),
+  replacing it with a redaction marker. This honors the documented
+  field-level redaction contract without over-redacting log *messages* that
+  merely happen to contain a sensitive keyword as a substring.
 """
 
 import contextvars

@@ -15,14 +15,19 @@ logger = logging.getLogger(__name__)
 # POST paths exempt from the maintenance block. The admin toggle must stay
 # reachable so a window can be ended over HTTP, and the auth routes must stay
 # reachable so sessions can survive a window longer than the access-token
-# lifetime (issue #549 C01). Registration is deliberately NOT exempt: a
-# maintenance window is a data freeze for account creation too.
+# lifetime (issue #549 C01). change-password is exempt so a flagged user can
+# finish the forced password change during a window — it is the one POST the
+# must_change_password gate leaves open (deps.py exempt_paths; issue #731;
+# the subset is pinned by test_exempt_paths_guard.py). Registration is
+# deliberately NOT exempt: a maintenance window is a data freeze for account
+# creation too.
 _EXEMPT_POST_PATHS = frozenset(
     {
         "/api/admin/maintenance",
         "/api/auth/login",
         "/api/auth/refresh",
         "/api/auth/logout",
+        "/api/auth/change-password",
     }
 )
 
