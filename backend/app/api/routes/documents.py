@@ -2435,6 +2435,7 @@ async def upload_document_root(
         db_pool,
         background_processor,
         vault_id,
+        user,
     )
     await _record_upload_audit(
         response.file_id,
@@ -2476,6 +2477,7 @@ async def upload_document(
         db_pool,
         background_processor,
         vault_id,
+        user,
     )
     await _record_upload_audit(
         response.file_id,
@@ -2610,6 +2612,26 @@ async def _discard_upload_artifacts(file_path: Path, temp_file_path: Path) -> No
                     await asyncio.sleep(0.05)
 
 
+def _log_upload_rejection(
+    reason: str, filename: Optional[str], vault_id: int, user: dict | None
+) -> None:
+    """Emit the single server-side trace for a rejected upload (issue #1041).
+
+    One WARNING line naming the rejection reason, the submitted filename
+    (where present), the vault id, and the requesting user id, so batch
+    400-rejected uploads are diagnosable from logs alone instead of only
+    from the HTTP response body. Carries filenames/metadata only — never
+    file contents (#287/#730 default-log redaction contract).
+    """
+    logger.warning(
+        "Upload rejected: %s; filename=%r vault_id=%s user_id=%s",
+        reason,
+        filename,
+        vault_id,
+        _user_id_str(user),
+    )
+
+
 async def _do_upload(
     request: Request,
     file: Optional[UploadFile],
@@ -2619,13 +2641,18 @@ async def _do_upload(
     db_pool: SQLiteConnectionPool,
     background_processor: BackgroundProcessor,
     vault_id: int,
+    user: dict | None = None,
 ) -> UploadResponse:
     # Validate file is provided
     if file is None:
+        _log_upload_rejection("No file provided", None, vault_id, user)
         raise HTTPException(status_code=400, detail="No file provided")
 
     # Validate filename is not empty
     if not file.filename:
+        _log_upload_rejection(
+            "Filename cannot be empty", file.filename, vault_id, user
+        )
         raise HTTPException(status_code=400, detail="Filename cannot be empty")
 
     # Ensure uploads directory exists
@@ -2645,6 +2672,12 @@ async def _do_upload(
     # Validate file extension
     file_suffix = Path(file_name).suffix.lower()
     if file_suffix not in settings_dep.allowed_extensions:
+        _log_upload_rejection(
+            f"File extension '{file_suffix}' not allowed",
+            file.filename,
+            vault_id,
+            user,
+        )
         raise HTTPException(
             status_code=400,
             detail=f"File extension '{file_suffix}' not allowed. Allowed: {settings_dep.allowed_extensions}",
