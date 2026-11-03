@@ -14,7 +14,10 @@
 // Backoff coverage: a role-less principal (auth still hydrating, or a
 // user-less session shape like single_admin) gets exactly one 403, then the
 // family is skipped until the principal changes; non-403 failures never arm
-// the backoff; a later admin publication overrides an armed backoff.
+// the backoff; a later admin publication overrides an armed backoff. Review
+// round (swarm-pr-review run pr1047-20261103) adds: the server's 403 verdict
+// outranks a stale admin role guess (PRR-001), and a parked 403 from a
+// previous principal never hides the current one (PRR-003).
 //
 // The principal is driven through the REAL auth-lifecycle publication
 // (publishAuthPrincipal) — the same channel useAuthStore feeds in the app —
@@ -259,5 +262,80 @@ describe("useActivityJobs reindex-family visibility (issue #1039)", () => {
     publishAuthPrincipal({ id: 503, role: "admin" });
     await advanceTicks(1100);
     expect(mockListReindexJobs.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  // Review PRR-001 (swarm-pr-review run pr1047-20261102): the role branch used
+  // to return BEFORE the armed backoff was ever read, so a principal whose
+  // client-side role snapshot said admin while the server refused the route
+  // (a mid-session demotion — require_admin_role re-reads users.role per
+  // request — or a proxy 403) kept dispatching the dead request every tick
+  // for the whole session. The server's 403 verdict must outrank the stale
+  // role guess.
+  it("review PRR-001: a known-admin role whose dispatch 403s stops polling after the refusal", async () => {
+    vi.useFakeTimers();
+    publishAuthPrincipal({ id: 504, role: "admin" });
+    // Every dispatch is refused; nothing self-heals because the client role
+    // is republished only on login/init/fetchMe/profile update.
+    mockListReindexJobs.mockRejectedValue(
+      Object.assign(new Error("Admin access required"), { status: 403 })
+    );
+
+    renderHook(() => useActivityJobs({ intervalMs: 1000 }));
+
+    await flushFirstTick();
+    expect(mockListReindexJobs.mock.calls.length).toBe(1);
+
+    await advanceTicks(2300);
+    // Pre-fix this counted 3: the armed backoff was dead state on the
+    // role-known branch, so the guaranteed-403 dispatch repeated every tick.
+    expect(mockListReindexJobs.mock.calls.length).toBe(1);
+    // The sibling families keep their cadence (AC3 holds under this backoff).
+    expect(mockListDocuments.mock.calls.length).toBeGreaterThanOrEqual(3);
+    expect(mockListKMSJobs.mock.calls.length).toBeGreaterThanOrEqual(3);
+  });
+
+  // Review PRR-003: the backoff used to be keyed by the generation current
+  // when the rejection LANDED, so a 403 from a parked request dispatched
+  // under a previous principal hid the new principal without it ever probing.
+  // The arm now records the dispatch generation. The poller is settle-driven
+  // (an in-flight fetch blocks the next tick), so the reachable sequence is:
+  // dispatch under G0 -> principal switch to G1 -> the parked rejection lands
+  // -> the next tick must PROBE rather than treat G1 as already hidden.
+  it("review PRR-003: a parked 403 from a previous principal does not hide the current one", async () => {
+    vi.useFakeTimers();
+    // First dispatch parks in flight under the role-less principal...
+    let rejectParked: (error: unknown) => void = () => {};
+    mockListReindexJobs.mockImplementationOnce(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejectParked = reject;
+        })
+    );
+    // ...and every later dispatch resolves normally.
+    mockListReindexJobs.mockResolvedValue({ jobs: [] });
+
+    renderHook(() => useActivityJobs({ intervalMs: 1000 }));
+    await flushFirstTick();
+    expect(mockListReindexJobs.mock.calls.length).toBe(1);
+
+    // Principal changes while the request is still in flight. No further
+    // dispatch can happen yet: the settle-driven poller is blocked on the
+    // parked promise.
+    publishAuthPrincipal({ id: 103_902, role: "member" });
+    publishAuthPrincipal(null);
+    await advanceTicks(1100);
+    expect(mockListReindexJobs.mock.calls.length).toBe(1);
+
+    // The parked pre-switch rejection lands. Pre-fix it armed the CURRENT
+    // (post-switch) generation's backoff, so the new principal stayed hidden
+    // and the count froze at 1 forever.
+    await act(async () => {
+      rejectParked(Object.assign(new Error("Admin access required"), { status: 403 }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await advanceTicks(1100);
+    // The post-switch generation is probed: the stale verdict did not carry.
+    expect(mockListReindexJobs.mock.calls.length).toBe(2);
   });
 });

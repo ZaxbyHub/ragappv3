@@ -17,13 +17,21 @@ guardrail still finds it) behind a two-layer visibility check:
    `captureAuthPrincipalRole()` in frontend/src/lib/api/auth-lifecycle.ts (the
    same publication channel `useAuthStore` already feeds with
    `publishAuthPrincipal`; no store subscription, no new module graph).
-2. First-403 backoff: when the role is NOT yet known (auth still hydrating, or
-   a user-less session shape like single_admin), the family is fetched once; a
-   403 arms a backoff keyed to the principal generation and later ticks skip the
-   dispatch. A principal change (login-as switch without a reload) clears the
-   backoff, and a later role publication always wins (admin re-opens the family,
-   member keeps it hidden), so the family cannot wedge into the wrong
-   visibility.
+2. First-403 backoff: the family is fetched once per principal generation; a
+   403 arms a backoff and later ticks skip the dispatch, and a principal change
+   (login-as switch without a reload) gives the new principal its own first
+   probe. The backoff records the generation the dispatch was made under, so a
+   rejection from a parked request that lands after a principal switch cannot
+   hide a principal that never probed.
+
+The two layers are combined rather than short-circuited (swarm-pr-review
+PRR-001): the role is only a client-side snapshot, republished at
+login/init/fetchMe/profile update and never revalidated mid-session, while
+`require_admin_role` re-reads `users.role` on every request. The server's 403
+verdict therefore wins over the role guess — an armed backoff hides the family
+for the rest of that principal's session whatever the snapshot says, so a
+demoted admin stops issuing the dead request too. A later principal change
+still re-opens the family for the new principal.
 
 The 403 detection reads both error shapes the API client produces (normalized
 Error with top-level `status`, or raw AxiosError `.response.status`), mirroring
@@ -60,6 +68,13 @@ member sessions simply stop issuing the requests after the frontend updates.
   (the backoff trigger) before the family hides; a member session whose auth
   store hydrates before the tray's first tick issues zero, which is the normal
   case.
+- The client's role snapshot is not revalidated mid-session (no periodic
+  `/auth/me` refresh), so two asymmetric windows exist, both disclosed:
+  a principal promoted to admin while the tab is open keeps the family hidden
+  until a reload or an explicit profile fetch (the issue's Scope In sanctions
+  the role-aware skip, and this matches every other admin-gated surface), and
+  the demoted-admin window is closed by the server-verdict-wins rule above
+  rather than by a role refresh.
 - The backoff is per page session and per principal generation, not persisted:
   a reload of a role-less session re-issues the single probe request.
 - Ingest-family pagination bounds from #784 are unchanged (documents beyond the
