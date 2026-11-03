@@ -48,6 +48,7 @@ import { MAX_INPUT_LENGTH } from "@/hooks/useSendMessage";
 import { useEscapeToStop } from "@/hooks/useEscapeToStop";
 import { toast } from "sonner";
 import { currentDraftGeneration, getDraftKey } from "@/lib/chatDrafts";
+import { normalizeAllowedExtension, serverAcceptsFilename } from "@/lib/uploadLimits";
 
 // =============================================================================
 // Types
@@ -511,16 +512,39 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
   // Paste/drop enqueue through the shared upload store's bounded transfer
   // pool; the returned ids register the files as chat attachments so the
   // chips live in the store (surviving navigation) instead of this mount.
+  // Issue #1052 (AC1/AC3): the extension predicate runs BEFORE enqueue so a
+  // disallowed type is rejected client-side with the Documents dropzone's
+  // message shape, never reaching addUploads' wasted transfer + late 400.
+  // undefined allowlist = settings not loaded → the server still validates
+  // (same gate as UploadDropzone's allowedExtensionsLoaded).
+  const rawAllowedExtensions = useSettingsStore((s) => s.settings?.allowed_extensions);
+  const allowedExtensionsLoaded = rawAllowedExtensions !== undefined;
+  const allowedExtensions = Array.isArray(rawAllowedExtensions)
+    ? rawAllowedExtensions.map(normalizeAllowedExtension)
+    : null;
+  // Returns the number of files actually queued, so callers that must not
+  // consume a user gesture on a rejected attach (the large-text paste path
+  // below — review PRR-001) can tell acceptance from decline.
   const enqueueFiles = useCallback(
-    (files: File[], guard = attachmentGuardRef.current) => {
-      if (files.length === 0 || (inRouter && !guard) || (guard && !guard.isCurrent())) return;
-      const queuedIds = addUploads(files, activeVaultId ?? undefined);
+    (files: File[], guard = attachmentGuardRef.current): number => {
+      if (files.length === 0 || (inRouter && !guard) || (guard && !guard.isCurrent())) return 0;
+      const acceptable = allowedExtensionsLoaded
+        ? files.filter((file) => serverAcceptsFilename(file.name, allowedExtensions ?? []))
+        : files;
+      if (allowedExtensionsLoaded) {
+        files
+          .filter((file) => !serverAcceptsFilename(file.name, allowedExtensions ?? []))
+          .forEach((file) => toast.error(`${file.name} (file type not allowed)`));
+      }
+      if (acceptable.length === 0) return 0;
+      const queuedIds = addUploads(acceptable, activeVaultId ?? undefined);
       for (const id of queuedIds) {
-        if (guard && !guard.isCurrent()) return;
+        if (guard && !guard.isCurrent()) return 0;
         attachToChat(id);
       }
+      return acceptable.length;
     },
-    [activeVaultId, addUploads, attachToChat, inRouter]
+    [activeVaultId, addUploads, attachToChat, inRouter, allowedExtensions, allowedExtensionsLoaded]
   );
 
   const { getRootProps, getInputProps, isDragActive, open: openFilePicker } = useDropzone({
@@ -567,9 +591,18 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
     // the pasted text would be lost — fall through to native inline
     // insertion instead (the send-time vault requirement still applies).
     if (text.length > LARGE_PASTE_THRESHOLD && activeVaultId != null) {
-      e.preventDefault();
       const file = new File([text], `pasted-text-${Date.now()}.txt`, { type: "text/plain" });
-      enqueueFiles([file]);
+      // Decide BEFORE consuming the gesture. preventDefault() suppresses the
+      // browser's native inline insertion, so running it first meant a
+      // deployment whose allowlist omits .txt lost the pasted text entirely
+      // while still being told "Pasted text attached as a file" (review
+      // PRR-001). enqueueFiles already emitted the per-file rejection toast,
+      // so a decline here needs no second message — and the text survives as
+      // an inline paste, exactly the fall-through the no-vault guard above
+      // already relies on.
+      const accepted = enqueueFiles([file]);
+      if (accepted === 0) return;
+      e.preventDefault();
       toast.info("Pasted text attached as a file");
     }
   };
