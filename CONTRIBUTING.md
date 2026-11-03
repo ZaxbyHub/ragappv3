@@ -173,6 +173,15 @@ editing.
 Full setup (including LLM/embedding services and Docker) is documented in
 [`INSTALLATION.md`](INSTALLATION.md) and [`README.md`](README.md). The essentials:
 
+**Environment:** copy `.env.example` to `backend/.env` (the backend reads
+`.env` from its own working directory, and the commands below run it from
+`backend/`) and fill in the required secrets. At minimum set `JWT_SECRET_KEY`
+and `ADMIN_SECRET_TOKEN` — generate each with:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(48))"
+```
+
 **Backend** (from `backend/`):
 
 ```bash
@@ -188,14 +197,6 @@ python -m uvicorn app.main:app --host 0.0.0.0 --port 9090
 ```bash
 npm ci          # or: npm install
 npm run dev
-```
-
-**Environment:** copy `.env.example` to `.env` and fill in the required
-secrets. At minimum set `JWT_SECRET_KEY` and `ADMIN_SECRET_TOKEN` — generate
-each with:
-
-```bash
-python -c "import secrets; print(secrets.token_urlsafe(48))"
 ```
 
 On Windows, `start-services.ps1` / `stop-services.ps1` orchestrate the backend,
@@ -246,6 +247,7 @@ npm run build
 ```bash
 python scripts/check_runtime_contract.py   # runtime pins: Docker/CI/engines/docs parity
 python scripts/check_config_contract.py
+python scripts/check_g06_setup_docs.py --check all   # .env.example/setup docs match code and compose (#738)
 python scripts/check_settings_consumers.py   # every Settings field has a production read site
 python scripts/check_batch_mock_seq.py   # send-path batch mocks mirror the save response contract
 python scripts/check_pr_scope_drift.py

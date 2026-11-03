@@ -786,10 +786,14 @@ class TestConfigAdversarial:
         assert ".pdf" in settings.allowed_extensions
         assert ".md" in settings.allowed_extensions
 
-    def test_allowed_extensions_json_format_required(self):
-        """allowed_extensions via env var requires JSON format (pydantic limitation)."""
-        # BUG: Cannot set allowed_extensions via comma-separated env var
-        # Must use JSON: '["txt","pdf"]' - this is a usability issue
+    def test_allowed_extensions_json_env_parses(self):
+        """allowed_extensions via env var supports the JSON-list form (#734).
+
+        Historically JSON was the ONLY env form that constructed (the raw
+        string was JSON-decoded by pydantic-settings before any validator);
+        #734's NoDecode + splitter keeps it working alongside the new
+        comma/empty forms pinned in TestEnvDecoding734 below.
+        """
         import json
 
         with patch.dict(
@@ -895,3 +899,112 @@ class TestConfigAdversarial:
         # Note: pydantic_settings caches, so we need a fresh instance
         # This test verifies the env var isolation concept
         assert new_settings.port == 9999 or new_settings.port == 9090
+
+
+class TestEnvDecoding734:
+    """Env/dotenv decoding contract for the list/set fields fixed in #734.
+
+    Pins the value-level semantics the frozen g01 checks deliberately leave
+    open (C4 asserts construction only): raw empty selects the code default,
+    comma lists split, JSON lists keep parsing for ALL three fields, and a
+    JSON empty list stays distinct from a raw empty value.
+    """
+
+    def test_allowed_extensions_empty_env_selects_code_default(self):
+        """Raw empty ALLOWED_EXTENSIONS env maps to the code default set."""
+        with patch.dict("os.environ", {"ALLOWED_EXTENSIONS": ""}):
+            settings = Settings(_env_file=None)
+            assert settings.allowed_extensions  # non-empty default
+            assert ".pptx" in settings.allowed_extensions
+            assert ".txt" in settings.allowed_extensions
+
+    def test_allowed_extensions_comma_env_splits(self):
+        """Comma-separated ALLOWED_EXTENSIONS env parses to the exact set."""
+        with patch.dict(
+            "os.environ", {"ALLOWED_EXTENSIONS": ".txt, .md ,.pdf"}
+        ):
+            settings = Settings(_env_file=None)
+            assert settings.allowed_extensions == {".txt", ".md", ".pdf"}
+
+    def test_allowed_extensions_json_empty_is_empty_set(self):
+        """JSON [] remains the deliberate empty set (distinct from raw empty)."""
+        with patch.dict("os.environ", {"ALLOWED_EXTENSIONS": "[]"}):
+            settings = Settings(_env_file=None)
+            assert settings.allowed_extensions == set()
+
+    def test_allowed_hosts_json_env_parses(self):
+        """JSON-list ALLOWED_HOSTS env form keeps working after NoDecode."""
+        with patch.dict(
+            "os.environ", {"ALLOWED_HOSTS": '["a.example.com", "b.example.com"]'}
+        ):
+            settings = Settings(_env_file=None)
+            assert settings.allowed_hosts == ["a.example.com", "b.example.com"]
+
+    def test_allowed_hosts_json_empty_env_is_empty_list(self):
+        """JSON [] for ALLOWED_HOSTS is the deliberate empty list."""
+        with patch.dict("os.environ", {"ALLOWED_HOSTS": "[]"}):
+            settings = Settings(_env_file=None)
+            assert settings.allowed_hosts == []
+
+    def test_imap_mime_types_comma_env_splits(self):
+        """Comma-separated IMAP_ALLOWED_MIME_TYPES (docs form) parses."""
+        with patch.dict(
+            "os.environ",
+            {"IMAP_ALLOWED_MIME_TYPES": "text/plain, application/pdf ,text/html"},
+        ):
+            settings = Settings(_env_file=None)
+            assert settings.imap_allowed_mime_types == {
+                "text/plain",
+                "application/pdf",
+                "text/html",
+            }
+
+    def test_imap_mime_types_json_env_parses(self):
+        """JSON-list IMAP_ALLOWED_MIME_TYPES env form keeps working."""
+        with patch.dict(
+            "os.environ",
+            {"IMAP_ALLOWED_MIME_TYPES": '["text/plain", "application/pdf"]'},
+        ):
+            settings = Settings(_env_file=None)
+            assert settings.imap_allowed_mime_types == {
+                "text/plain",
+                "application/pdf",
+            }
+
+    def test_imap_mime_types_empty_env_selects_code_default(self):
+        """Raw empty IMAP_ALLOWED_MIME_TYPES env maps to the code default set."""
+        with patch.dict("os.environ", {"IMAP_ALLOWED_MIME_TYPES": ""}):
+            settings = Settings(_env_file=None)
+            assert "application/pdf" in settings.imap_allowed_mime_types
+            assert "text/plain" in settings.imap_allowed_mime_types
+
+    def test_deep_json_env_value_fails_closed(self):
+        """A pathologically deep JSON env value raises ValidationError, not an
+        unhandled RecursionError escaping pydantic (PRR-008)."""
+        deep = "[" * 4000 + "]" * 4000
+        for env_name in (
+            "ALLOWED_HOSTS",
+            "ALLOWED_EXTENSIONS",
+            "IMAP_ALLOWED_MIME_TYPES",
+        ):
+            with patch.dict("os.environ", {env_name: deep}):
+                with pytest.raises(ValidationError, match="nested too deeply"):
+                    Settings(_env_file=None)
+
+    def test_json_list_non_string_elements_rejected(self):
+        """Non-string JSON-list elements are rejected, never silently filtered
+        (regression pin: the PR's before-validators must not narrow an
+        operator-supplied allowlist without an error)."""
+        non_string_cases = (
+            ("ALLOWED_HOSTS", "must contain only strings", '["a.example.com", 7]'),
+            ("ALLOWED_EXTENSIONS", "must contain only strings", '[".txt", 42]'),
+            (
+                "IMAP_ALLOWED_MIME_TYPES",
+                "must contain only strings",
+                '["text/plain", null]',
+            ),
+        )
+        for env_name, expected_message, value in non_string_cases:
+            with patch.dict("os.environ", {env_name: value}):
+                with pytest.raises(ValidationError, match=expected_message):
+                    Settings(_env_file=None)

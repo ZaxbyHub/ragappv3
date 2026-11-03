@@ -127,12 +127,15 @@ def test_live_dotenv_parse_failure_preserves_process_and_kv_badges(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     dotenv = tmp_path / ".env"
-    # ``multimodal_allowed_model_origins`` deliberately uses ``NoDecode`` so
-    # malformed values are accepted for its comma-separated compatibility
-    # syntax.  Use an ordinary complex setting to exercise the real Pydantic
+    # ``multimodal_allowed_model_origins`` and (since #734) ``allowed_hosts``
+    # deliberately use ``NoDecode`` so malformed values are accepted for their
+    # comma-separated compatibility syntax.  Use an ordinary complex setting
+    # (``admin_token_scopes``, a plain dict field) to exercise the real Pydantic
     # dotenv parsing failure boundary.
-    dotenv.write_text("ALLOWED_HOSTS=[]\n", encoding="utf-8")
-    monkeypatch.delenv("ALLOWED_HOSTS", raising=False)
+    dotenv.write_text(
+        'ADMIN_TOKEN_SCOPES={"probe-token": ["scope1"]}\n', encoding="utf-8"
+    )
+    monkeypatch.delenv("ADMIN_TOKEN_SCOPES", raising=False)
     loaded = Settings(_env_file=dotenv)
     monkeypatch.setenv("RERANKER_URL", "https://process.example.test")
 
@@ -140,7 +143,7 @@ def test_live_dotenv_parse_failure_preserves_process_and_kv_badges(
     # the next dotenv source inspection encounters an invalid complex setting.
     private_value = "private-not-json"
     dotenv.write_text(
-        f"ALLOWED_HOSTS={private_value}\n",
+        f"ADMIN_TOKEN_SCOPES={private_value}\n",
         encoding="utf-8",
     )
     with pytest.raises(SettingsError):
