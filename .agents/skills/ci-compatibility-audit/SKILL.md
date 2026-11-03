@@ -222,8 +222,9 @@ Second scheduled workflow: `.github/workflows/nightly-quality-gates.yml`
 "Nightly" / job `full-deps` / artifact `parser-bakeoff` in nightly.yml — issue
 #258 ENH-007 owns that tier; keep the names disjoint). Jobs:
 
-- `mutation-backend`: mutmut 3.7 over the seven guard modules
-  (`backend/app/security.py`, `backend/app/api/deps.py`,
+- `mutation-backend`: mutmut 3.7 over the eight guard modules
+  (`backend/app/security/__init__.py`,
+  `backend/app/security/recovery_routes.py`, `backend/app/api/deps.py`,
   `backend/app/middleware/{logging,maintenance,telemetry_span}.py`,
   `backend/app/models/database.py`, `backend/app/services/maintenance.py`),
   per-module stats via `mutmut export-cicd-stats`, and a per-module score

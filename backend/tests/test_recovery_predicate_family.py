@@ -42,6 +42,7 @@ import time  # noqa: E402
 from pathlib import Path  # noqa: E402
 from unittest.mock import AsyncMock, MagicMock  # noqa: E402
 
+import pytest  # noqa: E402
 from starlette.requests import Request  # noqa: E402
 
 from app.api import deps as deps_mod  # noqa: E402
@@ -155,23 +156,13 @@ def test_maintenance_full_exemption_matrix() -> None:
         assert asyncio.run(_dispatch(mw_closed, method, path)) == "allowed"
 
 
-def test_deps_gate_behavioral_wiring() -> None:
-    """Patching deps.is_recovery_exempt (the CONSUMER-BOUND alias) flips the
-    real gate's answer — proof the runtime decision flows through the
-    predicate."""
-    saved = deps_mod.is_recovery_exempt
-    try:
-        deps_mod.is_recovery_exempt = lambda method, path: True
-        # A flagged user hitting a normally-blocked path now passes the gate
-        # (and would 404 at the router): drive the gate logic in isolation.
-        assert deps_mod.is_recovery_exempt("PATCH", "/api/vaults/1") is True
-        deps_mod.is_recovery_exempt = lambda method, path: False
-        assert deps_mod.is_recovery_exempt("POST", "/api/auth/change-password") is False
-    finally:
-        deps_mod.is_recovery_exempt = saved
-    # The unpatched consumer answers through the real predicate
-    assert deps_mod.is_recovery_exempt is is_recovery_exempt
-
+def test_deps_gate_behavioral_wiring_lives_in_test_deps_auth() -> None:
+    """The deps behavioral-wiring leg (sentinel-patched deps.is_recovery_exempt
+    driving the REAL get_current_active_user) lives in
+    tests/test_deps_auth.py::test_gate_consults_recovery_predicate_alias,
+    beside the proven mock_settings_jwt_mode/mock_db harness it reuses
+    (implementation-review R4: the original alias-only assertion here was
+    vacuous — it never drove the dependency)."""
 
 def test_middleware_behavioral_wiring() -> None:
     """Patching maintenance.is_recovery_exempt flips the real dispatch."""
@@ -372,8 +363,10 @@ def test_superadmin_prompt_routes_still_succeed(tmp_path: Path) -> None:
 
 
 def test_add_member_success_and_conflict_ordering(tmp_path: Path) -> None:
-    """The happy path still lands, and the duplicate-membership 409 fires
-    from the IN-TRANSACTION re-read (not just the outer check)."""
+    """The happy path still lands, and the duplicate-membership 409 still
+    refuses (this leg exercises the OUTER duplicate check; the worker's
+    in-transaction duplicate re-read covers the race window and mirrors the
+    same 409 — the AST census pins its presence inside the transaction)."""
     env = _OrgEnv(tmp_path)
     try:
         owner = {"id": 1, "username": "owner1", "role": "admin"}

@@ -299,10 +299,13 @@ def test_httpexception_arm_semantics_via_helper_unit(tmp_path: Path) -> None:
         _pool_cache.clear()
 
 
-def test_baseexception_arm_post_commit_does_not_restore(tmp_path: Path) -> None:
-    """A cancellation arriving when the transaction is already CLOSED (the
-    commit landed) with a non-null purge plan must NOT restore: the bytes
-    belong to deleted drafts (#723 in_transaction gate)."""
+def test_post_commit_cancellation_does_not_restore(tmp_path: Path) -> None:
+    """A cancellation delivered at the COMMIT await (absorbed by
+    drained_commit, re-raised after the mandatory audit tail) with a
+    non-null purge plan must NOT restore: the transaction is already closed,
+    the bytes belong to deleted drafts (#723 in_transaction gate — this leg
+    drives the commit path whose post-commit state the BaseException arm's
+    gate then declines to restore)."""
     env = _VaultEnv(tmp_path)
     try:
         def _is_commit(fn, args):  # noqa: ANN001

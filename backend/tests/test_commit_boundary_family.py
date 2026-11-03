@@ -245,3 +245,54 @@ def test_users_py_tails_census() -> None:
     assert "drained_commit(conn)" in vaults_source, (
         "delete_vault's commit must go through drained_commit"
     )
+
+
+def test_org_worker_privilege_re_reads_are_inside_transaction_context() -> None:
+    """Implementation-review R2: pin the ACTUAL transactionality of the six
+    org routes' privilege re-reads — an AST census that each worker's
+    `_is_org_admin_or_owner(conn, ...)` call node sits lexically inside a
+    `with transaction_context(conn):` block. Catches the partial-fix shape
+    (re-read present but OUTSIDE the transaction — a surviving narrow race
+    between that read and BEGIN IMMEDIATE) that the behavioral frozen check
+    cannot distinguish.
+    """
+    import ast
+    from pathlib import Path
+
+    from app.api.routes import organizations as org_mod
+
+    tree = ast.parse(Path(org_mod.__file__).read_text(encoding="utf-8"))
+    route_workers = {
+        "_add_member", "_create_invite", "_resend_invite",
+        "_revoke_invite", "_set_override", "_clear_override",
+    }
+    found: dict[str, bool] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name in route_workers:
+            in_txn = False
+            for sub in ast.walk(node):
+                if (
+                    isinstance(sub, ast.Call)
+                    and isinstance(sub.func, ast.Name)
+                    and sub.func.id == "_is_org_admin_or_owner"
+                ):
+                    # walk up is unavailable; instead require the enclosing
+                    # function body to contain the with-statement BEFORE the
+                    # call's line, and the call to be nested under it.
+                    for w in ast.walk(node):
+                        if isinstance(w, ast.With):
+                            for item in w.body:
+                                for call in ast.walk(item):
+                                    if call is sub:
+                                        in_txn = True
+                    found[node.name] = in_txn
+        elif isinstance(node, ast.AsyncFunctionDef) and node.name in route_workers:
+            found[node.name] = False
+    assert set(found) == route_workers, (
+        f"expected all six org write workers, found {sorted(found)} — a "
+        "worker was renamed or removed; update the census"
+    )
+    assert all(found.values()), (
+        f"org workers whose privilege re-read is NOT inside "
+        f"transaction_context: {[k for k, v in found.items() if not v]}"
+    )

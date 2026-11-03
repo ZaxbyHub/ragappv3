@@ -454,6 +454,7 @@ class TestMustChangePassword:
         # Use exempt path to bypass must_change_password enforcement
         exempt_request = MagicMock()
         exempt_request.url.path = "/auth/change-password"
+        exempt_request.method = "POST"  # recovery exit is POST-only (issue #1058)
         exempt_request.headers.get.return_value = ""
 
         result = await get_current_active_user(request=exempt_request,
@@ -463,6 +464,136 @@ class TestMustChangePassword:
         )
 
         assert result["must_change_password"] is True
+
+    @pytest.mark.asyncio
+    async def test_must_change_password_wrong_method_on_recovery_path_is_403(
+        self, mock_settings_jwt_mode, mock_db
+    ):
+        """Issue #1058 (dispositioned behavior change): a flagged user
+        issuing a WRONG-METHOD request to a recovery path is refused 403 by
+        the method-aware gate (previously the method-agnostic exemption let
+        it pass the gate and 405 at the router — strictly tighter now)."""
+        from datetime import datetime, timedelta, timezone
+
+        import jwt
+        from fastapi import HTTPException
+
+        from app.api.deps import get_current_active_user
+
+        secret, algorithm = "test-secret-key", "HS256"
+        payload = {
+            "sub": "42",
+            "username": "testuser",
+            "role": "member",
+            "exp": datetime.now(timezone.utc) + timedelta(hours=1),
+            "type": "access",
+            "jti": "test-jti-wrong-method",
+            "fpt": _TEST_FPT_EMPTY,
+        }
+        token = jwt.encode(payload, secret, algorithm=algorithm)
+        mock_conn, mock_cursor = mock_db
+        mock_cursor.fetchone.side_effect = [
+            None,  # jti revocation lookup
+            (42, "testuser", "Test User", "member", 1, 1),  # user row (flagged)
+        ]
+
+        wrong_method_request = MagicMock()
+        wrong_method_request.url.path = "/auth/change-password"
+        wrong_method_request.method = "GET"
+        wrong_method_request.headers.get.return_value = ""
+
+        with pytest.raises(HTTPException) as excinfo:
+            await get_current_active_user(
+                request=wrong_method_request,
+                authorization=f"Bearer {token}",
+                access_token=None,
+                db=mock_conn,
+            )
+        assert excinfo.value.status_code == 403
+        assert excinfo.value.detail == "must_change_password"
+
+    @pytest.mark.asyncio
+    async def test_gate_consults_recovery_predicate_alias(
+        self, mock_settings_jwt_mode, mock_db
+    ):
+        """Issue #1058 behavioral wiring: the REAL gate decision flows
+        through app.security.recovery_routes.is_recovery_exempt (patched at
+        the consumer-bound alias deps.is_recovery_exempt) — a sentinel that
+        records calls must observe the request's real (method, path) and the
+        gate's allow/refuse must follow the sentinel's answer."""
+        from datetime import datetime, timedelta, timezone
+
+        import jwt
+
+        from app.api import deps as deps_mod
+        from app.api.deps import get_current_active_user
+
+        secret, algorithm = "test-secret-key", "HS256"
+        payload = {
+            "sub": "42",
+            "username": "testuser",
+            "role": "member",
+            "exp": datetime.now(timezone.utc) + timedelta(hours=1),
+            "type": "access",
+            "jti": "test-jti-wiring",
+            "fpt": _TEST_FPT_EMPTY,
+        }
+        token = jwt.encode(payload, secret, algorithm=algorithm)
+
+        calls: list[tuple[str, str]] = []
+
+        def _sentinel(method: str, path: str) -> bool:
+            calls.append((method, path))
+            return path.startswith("/api/auth/change-password")
+
+        mock_conn, mock_cursor = mock_db
+        mock_cursor.fetchone.side_effect = [
+            None,
+            (42, "testuser", "Test User", "member", 1, 1),
+        ]
+
+        post_request = MagicMock()
+        post_request.url.path = "/api/auth/change-password"
+        post_request.method = "POST"
+        post_request.headers.get.return_value = ""
+
+        from unittest.mock import patch as _patch
+        with _patch.object(deps_mod, "is_recovery_exempt", _sentinel):
+            result = await get_current_active_user(
+                request=post_request,
+                authorization=f"Bearer {token}",
+                access_token=None,
+                db=mock_conn,
+            )
+        assert result["id"] == 42
+        assert ("POST", "/api/auth/change-password") in calls, (
+            f"the real gate must consult the predicate with the request's "
+            f"method and path; observed: {calls}"
+        )
+
+        from fastapi import HTTPException
+
+        calls.clear()
+        mock_cursor.fetchone.side_effect = [
+            None,
+            (42, "testuser", "Test User", "member", 1, 1),
+        ]
+        vault_request = MagicMock()
+        vault_request.url.path = "/api/vaults/1"
+        vault_request.method = "PATCH"
+        vault_request.headers.get.return_value = ""
+
+        with _patch.object(deps_mod, "is_recovery_exempt", _sentinel):
+            with pytest.raises(HTTPException) as excinfo:
+                await get_current_active_user(
+                    request=vault_request,
+                    authorization=f"Bearer {token}",
+                    access_token=None,
+                    db=mock_conn,
+                )
+        assert excinfo.value.status_code == 403
+        assert excinfo.value.detail == "must_change_password"
+        assert ("PATCH", "/api/vaults/1") in calls
 
     @pytest.mark.asyncio
     async def test_user_with_must_change_password_false(
