@@ -6,6 +6,10 @@ import { listKMSJobs } from "@/lib/api/kms";
 import { listDrafts, listDraftJobs } from "@/lib/api/draftRoom";
 import { documentProgress } from "@/components/documents/documentProgress";
 import { useVaultStore } from "@/stores/useVaultStore";
+import {
+  captureAuthPrincipalGeneration,
+  captureAuthPrincipalRole,
+} from "@/lib/api/auth-lifecycle";
 
 /**
  * Shared job-family contract for background-job polling (issue #783).
@@ -370,13 +374,107 @@ async function fetchReindexRows(): Promise<ActivityJobRow[]> {
   );
 }
 
+// --- Reindex family visibility (issue #1039) -------------------------------
+//
+// GET /documents/reindex/jobs sits behind require_admin_role
+// (backend/app/api/routes/documents.py): for a member/viewer session it can
+// ONLY ever 403. Polling it every tray tick is pure waste the browser still
+// logs as a failed network resource (100+ 403s measured in one member
+// session, 2026-10-28). Two layers keep the family visible exactly where it
+// belongs, without touching the other four families (#1039 AC3):
+//
+//   1. Role-aware skip: when the principal's role is known (the auth store
+//      publishes it to auth-lifecycle), a non-admin never dispatches the
+//      call — zero requests for the whole session.
+//   2. First-403 session backoff: the family is fetched once per principal
+//      generation; a 403 arms a backoff and later ticks skip the dispatch.
+//      A principal change (login-as switch without a reload) gives the new
+//      principal its own first probe.
+//
+// The layers are COMBINED, not short-circuited (review PRR-001): the role is
+// only a client-side snapshot (published at login/init/fetchMe/profile and
+// never revalidated mid-session), while require_admin_role re-reads
+// users.role on every request. A role guess that outranks the server's own
+// 403 verdict would keep dispatching the dead request every tick for a
+// demoted admin — the exact waste this gate exists to remove. So the server
+// verdict always wins: the role guess only decides the FIRST dispatch of a
+// generation, and an armed 403 hides the family for the rest of that
+// principal's session no matter what the snapshot says. A later principal
+// change still re-opens the family for the new principal, and a later role
+// publication on the SAME generation (a re-login into the same identity) is
+// honoured because a fresh publication bumps the generation.
+//
+// Session-wide by design: the tray is remounted on route changes, and a
+// per-mount flag would re-issue the dead request after every navigation.
+const REINDEX_ADMIN_ROLES: ReadonlySet<string> = new Set(["admin", "superadmin"]);
+let reindexHiddenBy403Generation: number | null = null;
+
+function reindexFamilyVisible(): boolean {
+  const generation = captureAuthPrincipalGeneration();
+  if (
+    reindexHiddenBy403Generation !== null &&
+    reindexHiddenBy403Generation !== generation
+  ) {
+    // The 403 belonged to a previous principal: the new one gets a fresh
+    // chance (its own first 403 re-arms the backoff).
+    reindexHiddenBy403Generation = null;
+  }
+  if (reindexHiddenBy403Generation !== null) return false;
+  const role = captureAuthPrincipalRole();
+  return role === null || REINDEX_ADMIN_ROLES.has(role);
+}
+
+/**
+ * HTTP status of a family fetch failure, in either error shape this repo's
+ * API client produces: the response interceptor's normalized Error (top-level
+ * `status`) or a raw AxiosError (`.response.status`). Mirrors the
+ * shape-tolerance convention of `logApiFailure` (core.ts).
+ */
+function httpStatusOf(error: unknown): number | undefined {
+  const candidate = error as {
+    status?: number;
+    response?: { status?: number };
+    originalError?: { response?: { status?: number } };
+  } | null;
+  return (
+    candidate?.status ??
+    candidate?.response?.status ??
+    candidate?.originalError?.response?.status
+  );
+}
+
 async function fetchAllActivityRows(): Promise<ActivityJobRow[]> {
   const results = await Promise.allSettled([
     fetchIngestRows(),
     fetchWikiRows(),
     fetchKmsRows(),
     fetchDraftRoomRows(),
-    fetchReindexRows(),
+    // Adapter stays registered inline (issue #784 family census) but is
+    // dispatched only when the family can be visible to this principal
+    // (issue #1039): the spread keeps the census-visible `fetchReindexRows()`
+    // call while gating it before any network work happens.
+    ...(reindexFamilyVisible()
+      ? [
+          // Key the backoff to the generation THIS dispatch was made under
+          // (review PRR-003), not the one current when the rejection lands:
+          // a 403 from a parked request that arrives after a principal
+          // switch must not hide a principal that never probed.
+          (() => {
+            const dispatchGeneration = captureAuthPrincipalGeneration();
+            return fetchReindexRows().catch((error: unknown) => {
+              // A 403 is the admin gate answering: hide the family for the
+              // rest of this principal's session so later ticks skip the
+              // dispatch, whatever the client role snapshot says (review
+              // PRR-001). Any other failure (network, 5xx) stays an ordinary
+              // one-tick family miss and keeps polling.
+              if (httpStatusOf(error) === 403) {
+                reindexHiddenBy403Generation = dispatchGeneration;
+              }
+              return [];
+            });
+          })(),
+        ]
+      : []),
   ]);
   return results.flatMap((r) => (r.status === "fulfilled" ? r.value : []));
 }
