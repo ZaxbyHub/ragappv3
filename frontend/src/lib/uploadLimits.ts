@@ -29,6 +29,27 @@ export function isUploadTooLarge(
   return file.size > maxFileSizeBytes;
 }
 
+/**
+ * The single rule for turning a server-reported `max_file_size_mb` into the
+ * limit the client enforces: use the server value whenever it is present,
+ * fall back only when settings have not loaded.
+ *
+ * Home of this rule is deliberately here rather than in the upload store:
+ * Draft Room is forbidden from importing `useUploadStore` (pinned by
+ * DraftSourceUpload.test.tsx's architecture guard), but every upload surface
+ * must resolve one server value the same way. Review PRR-004 found the Draft
+ * Room gate had grown a third rule — a positivity guard that substituted the
+ * 100 MB fallback for a server-reported 0 — so Draft Room admitted files the
+ * server 413s while the Composer rejected them. A literal 0 is now applied
+ * literally, matching the server, which computes
+ * `max_file_size_mb * 1024 * 1024` with no fallback.
+ */
+export function resolveUploadLimitMb(
+  serverMaxFileSizeMb: number | null | undefined
+): number {
+  return serverMaxFileSizeMb ?? MAX_UPLOAD_FILE_SIZE_MB;
+}
+
 export function normalizeUploadErrorMessage(
   error: unknown,
   maxFileSizeMb = MAX_UPLOAD_FILE_SIZE_MB
@@ -54,12 +75,18 @@ export function normalizeAllowedExtension(ext: string): string {
 /**
  * Mirror of the server's filename pipeline for client-side acceptance
  * (issue #768 AC8-AC9; backend: upload_validation.secure_filename +
- * documents.py's extension check) — step for step, INCLUDING the allowlist
- * shape: membership is tested against the RAW configured entries, exactly as
- * the server compares Path(file_name).suffix.lower() against
- * settings.allowed_extensions (PRR-004: the client previously normalized
- * entries the server does not, so an uppercase/dotless configured entry
- * accepted client-side and rejected server-side).
+ * documents.py's extension check) — step for step.
+ *
+ * Allowlist shape (review PRR-003, correcting this docstring's earlier claim):
+ * membership is tested against the entries **exactly as the caller supplies
+ * them**. The server compares `Path(file_name).suffix.lower()` against the
+ * RAW `settings.allowed_extensions`, so a caller that pre-normalizes (every
+ * surface here does, following UploadDropzone's precedent) is trading strict
+ * parity for a sane-config contract: an uppercase or dotless configured entry
+ * is accepted client-side and rejected server-side. `allowed_extensions` is
+ * env-only (`config.py` BaseSettings; not mutable through the settings API),
+ * so this is an operator misconfiguration case, disclosed in the release
+ * notes rather than silently claimed as full parity.
  *
  * 1. basename with POSIX semantics: split on "/" only (PRR-003: the server's
  *    os.path.basename on Linux treats backslash as an ordinary character;
@@ -69,13 +96,27 @@ export function normalizeAllowedExtension(ext: string): string {
  * 3. final suffix with Python Path.suffix semantics: the last dot only
  *    when it is at index > 0 AND before the last character (a no-dot name, a
  *    leading-dot-only name (dotfile), or a trailing-dot name has NO suffix)
- * 4. missing suffix -> the server's .txt fallback (K-16: this INCLUDES a
- *    name that sanitizes to empty — the server renames it to
- *    unnamed_file.txt and accepts it iff .txt is allowed; the previous
- *    early false rejected server-accepted uploads)
- * 5. lowercase-suffix membership in the RAW configured set
+ * 4. missing suffix -> `missingSuffixFallback` (see below)
+ * 5. lowercase-suffix membership in the supplied set
+ *
+ * `missingSuffixFallback` exists because the two server pipelines differ here,
+ * and reusing one shared predicate across both was review finding PRR-002:
+ *   * Documents (`documents.py` ~L2637-2643) maps a name that sanitizes to
+ *     empty to `unnamed_file.txt` AND appends `.txt` to any extensionless
+ *     name, so it accepts `README` iff `.txt` is allowed. That is the DEFAULT
+ *     here (K-16), and it is what the Composer and Documents surfaces use.
+ *   * Draft Room (`draft_input_storage.py` ~L148-153) maps empty to
+ *     `unnamed_file` — with NO extension — and applies no extensionless
+ *     fallback at all, so `Path("README").suffix` is `""` and is never a
+ *     member. Pass `null` on that surface, otherwise the client accepts
+ *     `README`/`Makefile`/`.gitignore`, transfers the whole body, and the
+ *     server answers 415 unsupported_input.
  */
-export function serverAcceptsFilename(name: string, allowedExtensions: string[]): boolean {
+export function serverAcceptsFilename(
+  name: string,
+  allowedExtensions: string[],
+  { missingSuffixFallback = ".txt" }: { missingSuffixFallback?: string | null } = {}
+): boolean {
   const allowed = new Set(allowedExtensions);
   // POSIX os.path.basename: keep only the segment after the last "/".
   const base = name.split("/").pop() ?? name;
@@ -97,9 +138,11 @@ export function serverAcceptsFilename(name: string, allowedExtensions: string[])
     suffix = sanitized.slice(lastDot).toLowerCase();
   }
   if (suffix === "") {
-    // The server's missing-suffix fallback: secure_filename('') -> '' ->
-    // 'unnamed_file.txt' -> suffix '.txt'.
-    suffix = ".txt";
+    // Documents pipeline: secure_filename('') -> '' -> 'unnamed_file.txt'
+    // -> suffix '.txt'. Draft Room passes null instead and is then correctly
+    // rejected here, because '' is never a member of the allowlist.
+    if (missingSuffixFallback === null) return false;
+    suffix = missingSuffixFallback;
   }
   return allowed.has(suffix);
 }

@@ -125,6 +125,47 @@ describe("DraftSourceUpload server-configured upload policy (issue #1052)", () =
     expect(screen.queryByText("archive.exe")).not.toBeInTheDocument();
   });
 
+  // Review PRR-002: the shared predicate carried the Documents-only
+  // missing-suffix -> ".txt" fallback. The Draft Room server
+  // (draft_input_storage.py L148-153) applies no such fallback, so on the
+  // SHIPPED DEFAULT allowlist (which includes .txt) these names were called
+  // acceptable client-side, transferred in full, and then 415'd.
+  it("rejects extensionless names the Draft Room server 415s, even with .txt allowlisted", async () => {
+    const user = userEvent.setup();
+    setServerPolicy(100, [".md", ".txt", ".pdf"]);
+    renderComponent();
+
+    const fileInput = screen.getByLabelText(ADD_SOURCE_FILES_CTA);
+    await user.upload(fileInput, sizedFile("README", 12));
+
+    expect(toastError).toHaveBeenCalledTimes(1);
+    expect(toastError).toHaveBeenCalledWith("README (file type not allowed)");
+    await waitFor(() => {
+      expect(mockUploadDraftInput).not.toHaveBeenCalled();
+    });
+    expect(screen.queryByText("README")).not.toBeInTheDocument();
+  });
+
+  // Review PRR-004: this surface used to substitute the 100 MB fallback for a
+  // non-positive server value, so `max_file_size_mb: 0` made the client admit
+  // files the server rejects outright. It now shares
+  // effectiveUploadLimitMb() with the Composer path.
+  it("applies a server-reported 0 limit literally instead of masking it with the fallback", async () => {
+    const user = userEvent.setup();
+    setServerPolicy(0, [".md", ".txt", ".pdf"]);
+    renderComponent();
+
+    const fileInput = screen.getByLabelText(ADD_SOURCE_FILES_CTA);
+    await user.upload(fileInput, sizedFile("notes.md", 3 * MB));
+
+    expect(toastError).toHaveBeenCalledTimes(1);
+    expect(toastError).toHaveBeenCalledWith("notes.md is too large. Max size: 0 MB.");
+    await waitFor(() => {
+      expect(mockUploadDraftInput).not.toHaveBeenCalled();
+    });
+    expect(screen.queryByText("notes.md")).not.toBeInTheDocument();
+  });
+
   it("excludes raster images on the Draft Room surface even when the server allowlist includes them", async () => {
     const user = userEvent.setup();
     // .png is allowlisted for documents, but the Draft Room server path

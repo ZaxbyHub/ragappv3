@@ -24,10 +24,28 @@ client decision cannot drift from the server pipeline again:
   `addFiles` — the single chokepoint shared by the native file input and the
   dropzone drop path — previously had neither a size guard nor an extension
   filter. It now rejects at attach time using `isUploadTooLarge` /
-  `uploadSizeExceededMessage` against `settings.max_file_size_mb` (with the
-  same positivity guard as UploadDropzone: a non-positive server value falls
-  back to the 100 MB client default) and `serverAcceptsFilename` against the
-  allowlist minus raster images.
+  `uploadSizeExceededMessage` against `settings.max_file_size_mb` resolved
+  through the SAME shared rule the Composer/upload store uses
+  (`uploadLimits.resolveUploadLimitMb`, read at call time), and `serverAcceptsFilename`
+  against the allowlist minus raster images.
+- **Draft Room has no missing-suffix fallback** (review PRR-002): the two
+  server pipelines differ here, so the shared predicate is now parameterized.
+  Documents maps an extensionless name to `<name>.txt` and accepts it iff
+  `.txt` is allowed, while `draft_input_storage.stage_upload` computes
+  `Path(secure_filename(name)).suffix.lower()` with no fallback — so `README`,
+  `Makefile` and dotfiles are 415 `unsupported_input` there even on the
+  default allowlist. `serverAcceptsFilename` takes
+  `{ missingSuffixFallback }`; the Composer and Documents surfaces keep the
+  `.txt` default and Draft Room passes `null`. Without this the client called
+  those names acceptable, transferred the whole body, and then got the 415 —
+  the late-rejection class this release note is about.
+- **Large-text paste no longer claims a false success** (review PRR-001):
+  `enqueueFiles` now returns the accepted count, and `handlePaste` calls
+  `preventDefault()` and shows "Pasted text attached as a file" only when the
+  conversion was actually enqueued. Previously it consumed the paste gesture
+  first and toasted success unconditionally, so a deployment whose allowlist
+  omits `.txt` saw a rejection toast and a success toast for one paste while
+  the text was never inserted inline.
 - **Draft Room surface allowlist** (`frontend/src/lib/uploadLimits.ts`): new
   `draftRoomAllowedExtensions()` (+ exported `RASTER_IMAGE_EXTENSIONS`) mirrors
   backend `DRAFT_ROOM_ALLOWED_EXTENSIONS` (`backend/app/api/routes/draft_room.py`):
@@ -37,10 +55,15 @@ client decision cannot drift from the server pipeline again:
   vault allowlist includes them.
 
 While settings have not loaded (`settings.allowed_extensions === undefined`),
-both surfaces keep today's behavior and let the server validate — the same
-`allowedExtensionsLoaded` gate UploadDropzone uses. Both surfaces report each
-rejected file individually and still enqueue the acceptable files of a mixed
-batch.
+both surfaces skip the **extension** check and let the server validate — the
+same `allowedExtensionsLoaded` gate UploadDropzone uses. The **size** half does
+not defer: with no settings loaded `effectiveUploadLimitMb()` yields the 100 MB
+fallback, so a file over 100 MB is rejected at attach time and the toast names
+"Max size: 100 MB." — a number the operator may not have configured. This is
+the upload store's pre-existing behavior for the Composer half, deliberately
+shared rather than re-derived per surface (see the caveat below). Both surfaces
+report each rejected file individually and still enqueue the acceptable files
+of a mixed batch.
 
 ## Why
 
@@ -61,12 +84,33 @@ limit number in the message.
 ## Known caveats
 
 - The Draft Room raster-image exclusion is a client mirror of the backend
-  constant set: if the backend `RASTER_IMAGE_EXTENSIONS` set ever changes,
-  `uploadLimits.RASTER_IMAGE_EXTENSIONS` must change with it (same mirror
-  discipline as `serverAcceptsFilename` vs the server's filename pipeline).
-- `serverAcceptsFilename` membership semantics follow the normalized-entry
-  form UploadDropzone established; a server configured with uppercase/dotless
-  allowlist entries is outside every client surface's sane-config contract.
+  constant set: if the backend `RASTER_IMAGE_EXTENSIONS`
+  (`backend/app/services/document_artifacts.py`) ever changes,
+  `uploadLimits.RASTER_IMAGE_EXTENSIONS` must change with it. Review PRR-005
+  found the original guard for this was tautological — the test built its
+  expected value from the same constant under test, so mutating `.webp` to
+  `.svg` kept it green. It now asserts against a literal copy of the backend
+  set, so a drift fails CI. `scripts/check_config_contract.py` still covers
+  `max_file_size_mb` only; there is no automated backend↔frontend cross-check
+  beyond that test.
+- `serverAcceptsFilename` tests membership against the entries **exactly as
+  the caller supplies them**. Every surface pre-normalizes (following
+  UploadDropzone's precedent), so a server configured with uppercase/dotless
+  allowlist entries is accepted client-side and rejected by the server, which
+  compares the lowercased suffix against the RAW `settings.allowed_extensions`.
+  `allowed_extensions` is env-only and not mutable through the settings API, so
+  this is an operator-misconfiguration case, disclosed rather than silently
+  claimed as parity (review PRR-003; the predicate's own docstring previously
+  asserted raw-entry parity and has been corrected).
+- With settings unloaded, the size half fail-closes at the 100 MB fallback
+  while the extension half defers to the server — the two halves of one gate
+  degrade in opposite directions. Accepted deliberately: the fallback rule is
+  the upload store's pre-existing one, factored into
+  `uploadLimits.resolveUploadLimitMb` so every surface resolves one server
+  value through a single implementation instead of re-deriving it (review
+  PRR-004). A server-reported `max_file_size_mb: 0` is now applied literally
+  (rejects everything) instead of being masked by the fallback, matching the
+  server.
 - Rejections surface as sonner toasts on both paths (consistent with the
   upload store's size-rejection toasts), not the Documents page's
   `RejectedFilesBanner` widget — the message shape is shared, the surface
@@ -85,7 +129,18 @@ limit number in the message.
   inclusive boundary at exactly the limit, mixed-batch partial acceptance, and
   the pre-load passthrough.
 - `frontend/src/lib/uploadLimits.issue1052.test.ts` — `draftRoomAllowedExtensions`
-  unit contract (subtraction, normalization, order, empty set).
+  unit contract (subtraction, normalization, order, empty set), the
+  `missingSuffixFallback` mode for both server pipelines (PRR-002), and a
+  `RASTER_IMAGE_EXTENSIONS` sync check against a literal copy of the backend
+  set so a mirror drift fails CI (PRR-005 — the original check derived its
+  expected value from the constant under test and was mutation-proven unable
+  to fail).
+- Review-round regressions (swarm-pr-review run `pr1053-20261102`):
+  `Composer.issue1052.test.tsx` gains the large-text paste cases — a decline
+  must neither call `preventDefault()` nor fire the success toast (PRR-001) —
+  and `DraftSourceUpload.issue1052.test.tsx` gains the extensionless-name
+  rejection and the literal `max_file_size_mb: 0` guard (PRR-002 / PRR-004).
+  Each was verified to fail against the pre-fix code.
 
 ## Invariant audit (evidence for the PR body)
 
@@ -96,8 +151,21 @@ limit number in the message.
   limit; `grep -c serverAcceptsFilename frontend/src/components/chat
   frontend/src/components/draft-room` is non-zero in both (AC3).
 - Server remains source of truth: no backend validation changed; every guard
-  added client-side mirrors an existing server check (`documents.py` extension
-  check, `draft_room.py` `DRAFT_ROOM_ALLOWED_EXTENSIONS` + `max_file_size_mb`
-  staging limits); unloaded settings defer to server validation.
+  added client-side mirrors an existing server check for **its own** surface
+  (`documents.py` extension check including the `.txt` fallback for the
+  Composer/Documents surfaces; `draft_input_storage.py`'s no-fallback suffix
+  check + `draft_room.py` `DRAFT_ROOM_ALLOWED_EXTENSIONS` for Draft Room;
+  `max_file_size_mb` staging limits on both). The earlier blanket wording
+  here overclaimed uniform mirroring — Draft Room needed its own
+  no-fallback mode to be faithful at all (review PRR-002). Unloaded settings
+  defer to server validation for extensions only; the size half uses the
+  shared fallback (see the caveat above).
+- The Draft Room **cumulative** per-draft input cap
+  (`max_total_input_bytes`, enforced by `draft_store.reserve_input`) is still
+  not mirrored client-side — the component never receives current total bytes.
+  A batch that passes every per-file check and then exceeds the total is
+  uploaded and rejected 413 `limit_exceeded` by the server. Out of this
+  issue's scope (AC2 names `max_file_size_mb` only) and recorded here so the
+  remaining late-rejection surface is not mistaken for closed.
 - No behavior change for accepted files or for the Documents dropzone (its
   tests pass unchanged).

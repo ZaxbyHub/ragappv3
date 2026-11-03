@@ -12,11 +12,70 @@ import {
   RASTER_IMAGE_EXTENSIONS,
   draftRoomAllowedExtensions,
   normalizeAllowedExtension,
+  serverAcceptsFilename,
 } from "./uploadLimits";
+
+/**
+ * Literal copy of backend RASTER_IMAGE_EXTENSIONS
+ * (backend/app/services/document_artifacts.py). Deliberately NOT derived from
+ * the frontend constant: review PRR-005 found the original guard spread
+ * RASTER_IMAGE_EXTENSIONS into its own expected value, so mutating `.webp` to
+ * `.svg` left every test green. Editing the backend set must fail this test.
+ */
+const BACKEND_RASTER_IMAGE_EXTENSIONS = [
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".gif",
+  ".bmp",
+  ".tif",
+  ".tiff",
+  ".webp",
+];
+
+describe("RASTER_IMAGE_EXTENSIONS mirror (issue #1052, review PRR-005)", () => {
+  it("stays in sync with the backend raster set it mirrors", () => {
+    expect([...RASTER_IMAGE_EXTENSIONS].sort()).toEqual(
+      [...BACKEND_RASTER_IMAGE_EXTENSIONS].sort()
+    );
+  });
+});
+
+describe("serverAcceptsFilename missing-suffix mode (review PRR-002)", () => {
+  // The two server pipelines differ on extensionless names, so one shared
+  // predicate cannot serve both with a single hard-coded rule.
+  it("applies the Documents .txt fallback by default (documents.py L2637-2643)", () => {
+    expect(serverAcceptsFilename("README", [".txt", ".pdf"])).toBe(true);
+    expect(serverAcceptsFilename("README", [".pdf"])).toBe(false);
+  });
+
+  it("rejects extensionless names with no fallback, as Draft Room does (draft_input_storage.py L148-153)", () => {
+    // With the shipped default allowlist (which includes .txt) the Draft Room
+    // server still 415s these, so the client must too.
+    for (const name of ["README", "Makefile", "LICENSE", "Dockerfile", ".gitignore"]) {
+      expect(serverAcceptsFilename(name, [".md", ".txt", ".pdf"], {
+        missingSuffixFallback: null,
+      })).toBe(false);
+    }
+  });
+
+  it("still accepts a genuine extension under the no-fallback mode", () => {
+    expect(
+      serverAcceptsFilename("notes.md", [".md", ".txt"], { missingSuffixFallback: null })
+    ).toBe(true);
+  });
+
+  it("never admits a name that sanitizes to empty under the no-fallback mode", () => {
+    // secure_filename('') -> '' -> Draft Room renames to 'unnamed_file'
+    // (no extension) and rejects; Documents renames to 'unnamed_file.txt'.
+    expect(serverAcceptsFilename("???", [".txt"], { missingSuffixFallback: null })).toBe(false);
+    expect(serverAcceptsFilename("???", [".txt"])).toBe(true);
+  });
+});
 
 describe("draftRoomAllowedExtensions (issue #1052)", () => {
   it("subtracts every raster image extension from the server allowlist", () => {
-    const server = [".pdf", ".docx", ".md", ".txt", ...RASTER_IMAGE_EXTENSIONS];
+    const server = [".pdf", ".docx", ".md", ".txt", ...BACKEND_RASTER_IMAGE_EXTENSIONS];
     expect(draftRoomAllowedExtensions(server)).toEqual([".pdf", ".docx", ".md", ".txt"]);
   });
 

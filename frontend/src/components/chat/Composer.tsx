@@ -522,9 +522,12 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
   const allowedExtensions = Array.isArray(rawAllowedExtensions)
     ? rawAllowedExtensions.map(normalizeAllowedExtension)
     : null;
+  // Returns the number of files actually queued, so callers that must not
+  // consume a user gesture on a rejected attach (the large-text paste path
+  // below — review PRR-001) can tell acceptance from decline.
   const enqueueFiles = useCallback(
-    (files: File[], guard = attachmentGuardRef.current) => {
-      if (files.length === 0 || (inRouter && !guard) || (guard && !guard.isCurrent())) return;
+    (files: File[], guard = attachmentGuardRef.current): number => {
+      if (files.length === 0 || (inRouter && !guard) || (guard && !guard.isCurrent())) return 0;
       const acceptable = allowedExtensionsLoaded
         ? files.filter((file) => serverAcceptsFilename(file.name, allowedExtensions ?? []))
         : files;
@@ -533,12 +536,13 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
           .filter((file) => !serverAcceptsFilename(file.name, allowedExtensions ?? []))
           .forEach((file) => toast.error(`${file.name} (file type not allowed)`));
       }
-      if (acceptable.length === 0) return;
+      if (acceptable.length === 0) return 0;
       const queuedIds = addUploads(acceptable, activeVaultId ?? undefined);
       for (const id of queuedIds) {
-        if (guard && !guard.isCurrent()) return;
+        if (guard && !guard.isCurrent()) return 0;
         attachToChat(id);
       }
+      return acceptable.length;
     },
     [activeVaultId, addUploads, attachToChat, inRouter, allowedExtensions, allowedExtensionsLoaded]
   );
@@ -587,9 +591,18 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
     // the pasted text would be lost — fall through to native inline
     // insertion instead (the send-time vault requirement still applies).
     if (text.length > LARGE_PASTE_THRESHOLD && activeVaultId != null) {
-      e.preventDefault();
       const file = new File([text], `pasted-text-${Date.now()}.txt`, { type: "text/plain" });
-      enqueueFiles([file]);
+      // Decide BEFORE consuming the gesture. preventDefault() suppresses the
+      // browser's native inline insertion, so running it first meant a
+      // deployment whose allowlist omits .txt lost the pasted text entirely
+      // while still being told "Pasted text attached as a file" (review
+      // PRR-001). enqueueFiles already emitted the per-file rejection toast,
+      // so a decline here needs no second message — and the text survives as
+      // an inline paste, exactly the fall-through the no-vault guard above
+      // already relies on.
+      const accepted = enqueueFiles([file]);
+      if (accepted === 0) return;
+      e.preventDefault();
       toast.info("Pasted text attached as a file");
     }
   };

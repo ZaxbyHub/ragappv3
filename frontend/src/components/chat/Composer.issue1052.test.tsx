@@ -105,14 +105,28 @@ vi.mock("react-dropzone", () => ({
 }));
 
 const toastError = vi.hoisted(() => vi.fn());
+const toastInfo = vi.hoisted(() => vi.fn());
 vi.mock("sonner", () => ({
   toast: {
     success: vi.fn(),
     error: toastError,
     warning: vi.fn(),
-    info: vi.fn(),
+    info: toastInfo,
   },
 }));
+
+/** Fire a plain-text paste (no clipboard files) on the composer textarea. */
+function pasteText(textarea: Element, text: string) {
+  const clipboardData = {
+    files: [],
+    items: [],
+    types: ["text/plain"],
+    getData: (type: string) => (type === "text/plain" ? text : ""),
+  };
+  const event = createEvent.paste(textarea, { clipboardData });
+  fireEvent(textarea, event);
+  return event;
+}
 
 /** Fire a paste carrying FILES on the composer textarea (the attach path). */
 function pasteFiles(textarea: Element, files: File[]) {
@@ -224,6 +238,44 @@ describe("Composer extension allowlist (issue #1052)", () => {
     // validates (same gate as UploadDropzone's allowedExtensionsLoaded).
     expect(addUploads).toHaveBeenCalledTimes(1);
     expect((addUploads.mock.calls[0][0] as File[]).map((f) => f.name)).toEqual(["early.exe"]);
+    expect(toastError).not.toHaveBeenCalled();
+  });
+
+  // Review PRR-001: the large-text paste-to-file branch used to call
+  // preventDefault() and toast success BEFORE knowing whether the new gate
+  // accepted the synthesized .txt file, so a deployment whose allowlist omits
+  // .txt saw a rejection toast and a success toast for one paste — and the
+  // text was never inserted inline either.
+  it("does not claim success or swallow the paste when the gate declines the synthesized .txt", async () => {
+    const { addUploads } = await stubUploadStore();
+    mockSettingsState.settings = { max_file_size_mb: 100, allowed_extensions: [".pdf"] };
+    render(<Composer onSend={vi.fn()} onStop={vi.fn()} isStreaming={false} />);
+    const textarea = screen.getByLabelText("Message input");
+
+    const event = pasteText(textarea, "x".repeat(4001));
+    await act(async () => {});
+
+    // Declined: nothing enqueued, no false success — and because
+    // preventDefault() was NOT called the browser still inserts the text.
+    expect(addUploads).not.toHaveBeenCalled();
+    expect(toastInfo).not.toHaveBeenCalled();
+    expect(event.defaultPrevented).toBe(false);
+    expect(toastError).toHaveBeenCalledTimes(1);
+    expect(toastError.mock.calls[0][0]).toMatch(/^pasted-text-\d+\.txt \(file type not allowed\)$/);
+  });
+
+  it("attaches and reports success when the allowlist admits .txt", async () => {
+    const { addUploads } = await stubUploadStore();
+    render(<Composer onSend={vi.fn()} onStop={vi.fn()} isStreaming={false} />);
+    const textarea = screen.getByLabelText("Message input");
+
+    const event = pasteText(textarea, "x".repeat(4001));
+    await act(async () => {});
+
+    expect(addUploads).toHaveBeenCalledTimes(1);
+    expect((addUploads.mock.calls[0][0] as File[])[0].name).toMatch(/^pasted-text-\d+\.txt$/);
+    expect(event.defaultPrevented).toBe(true);
+    expect(toastInfo).toHaveBeenCalledWith("Pasted text attached as a file");
     expect(toastError).not.toHaveBeenCalled();
   });
 });

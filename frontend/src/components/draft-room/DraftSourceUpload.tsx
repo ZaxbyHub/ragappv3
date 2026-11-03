@@ -18,9 +18,9 @@ import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import { useSettingsStore } from "@/stores/useSettingsStore";
 import {
-  MAX_UPLOAD_FILE_SIZE_MB,
   draftRoomAllowedExtensions,
   isUploadTooLarge,
+  resolveUploadLimitMb,
   serverAcceptsFilename,
   uploadSizeExceededMessage,
 } from "@/lib/uploadLimits";
@@ -299,15 +299,16 @@ export function DraftSourceUpload({
   // Server-configured upload policy (issue #1052 AC2/AC3): the Draft Room
   // server path stages uploads with the allowlist minus raster images
   // (DRAFT_ROOM_ALLOWED_EXTENSIONS, issue #460) and max_file_size_mb bytes.
-  // Mirrored here so rejects happen at attach time, not after a wasted
-  // upload. Positivity guard per UploadDropzone (PRR-029): a server-reported
-  // 0 falls back rather than rejecting everything.
+  // Mirrored here so rejects happen at attach time, not after a wasted upload.
+  //
+  // The limit is resolved through the SAME shared rule the Composer/upload
+  // store uses (uploadLimits.resolveUploadLimitMb), not a local ternary:
+  // review PRR-004 found this surface had introduced a third resolution rule
+  // for one server value — a positivity guard that substituted the 100 MB
+  // fallback for a server-reported 0 — so `max_file_size_mb: 0` made Draft
+  // Room admit files the server 413s while the Composer rejected them. Read
+  // at call time so it never goes stale behind a settings update.
   const storeMaxFileSizeMb = useSettingsStore((s) => s.settings?.max_file_size_mb);
-  const maxFileSizeMb =
-    typeof storeMaxFileSizeMb === "number" && storeMaxFileSizeMb > 0
-      ? storeMaxFileSizeMb
-      : MAX_UPLOAD_FILE_SIZE_MB;
-  const maxFileSizeBytes = maxFileSizeMb * 1024 * 1024;
   const rawAllowedExtensions = useSettingsStore((s) => s.settings?.allowed_extensions);
   const allowedExtensionsLoaded = rawAllowedExtensions !== undefined;
   const allowedExtensions = Array.isArray(rawAllowedExtensions)
@@ -321,11 +322,21 @@ export function DraftSourceUpload({
       // decision reuses the exact server-acceptance predicate and message
       // helpers so it cannot drift from the server pipeline. An unloaded
       // allowlist skips the extension check (the server still validates).
+      const maxFileSizeMb = resolveUploadLimitMb(storeMaxFileSizeMb);
+      const maxFileSizeBytes = maxFileSizeMb * 1024 * 1024;
       const acceptable: File[] = [];
       for (const file of files) {
         if (
           allowedExtensionsLoaded &&
-          !serverAcceptsFilename(file.name, allowedExtensions ?? [])
+          // Draft Room has NO missing-suffix fallback: stage_upload computes
+          // Path(secure_filename(name)).suffix.lower() and rejects when that
+          // is not a member, so `README` / `.gitignore` / `Makefile` are 415s
+          // there even though the Documents pipeline would accept them as
+          // .txt. Passing null keeps this surface faithful to ITS server
+          // (review PRR-002) while the shared predicate stays one helper.
+          !serverAcceptsFilename(file.name, allowedExtensions ?? [], {
+            missingSuffixFallback: null,
+          })
         ) {
           toast.error(`${file.name} (file type not allowed)`);
           continue;
@@ -355,7 +366,7 @@ export function DraftSourceUpload({
         ),
       ]);
     },
-    [role, authority, asOfDate, allowedExtensions, allowedExtensionsLoaded, maxFileSizeBytes, maxFileSizeMb]
+    [role, authority, asOfDate, allowedExtensions, allowedExtensionsLoaded, storeMaxFileSizeMb]
   );
 
   const handleFileInputChange = useCallback(

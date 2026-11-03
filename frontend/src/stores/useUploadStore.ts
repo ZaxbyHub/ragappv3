@@ -2,9 +2,9 @@ import { create } from "zustand";
 import { uploadDocument } from "@/lib/api";
 import { useSettingsStore } from "@/stores/useSettingsStore";
 import {
-  MAX_UPLOAD_FILE_SIZE_MB,
   isUploadTooLarge,
   normalizeUploadErrorMessage,
+  resolveUploadLimitMb,
   uploadSizeExceededMessage,
 } from "@/lib/uploadLimits";
 import { toast } from "sonner";
@@ -285,7 +285,7 @@ function snapshotToPatch(
  * `max_file_size_mb` once settings have loaded, else the default fallback.
  */
 export function effectiveUploadLimitMb(): number {
-  return useSettingsStore.getState().settings?.max_file_size_mb ?? MAX_UPLOAD_FILE_SIZE_MB;
+  return resolveUploadLimitMb(useSettingsStore.getState().settings?.max_file_size_mb);
 }
 
 // Issue #823: identity-boundary invalidation for asynchronous upload work.
