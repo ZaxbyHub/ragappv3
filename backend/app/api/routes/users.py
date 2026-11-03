@@ -31,7 +31,7 @@ from app.services.draft_deletion import DraftDeletionService
 from app.services.draft_input_storage import DraftInputStorage, DraftInputStorageError
 from app.services.draft_store import DraftStore
 from app.services.security_audit import safe_record_security_event
-from app.services.task_drain import drain_audit, drain_await
+from app.services.task_drain import drain_audit, drain_await, drain_commit_audit
 
 router = APIRouter(prefix="/users", tags=["users"])
 logger = logging.getLogger(__name__)
@@ -240,8 +240,6 @@ async def create_user(
 
         assign_user_to_default_vault(conn, user_id)
 
-        await asyncio.to_thread(conn.commit)
-
         response = {
             "id": row[0],
             "username": row[1],
@@ -250,15 +248,23 @@ async def create_user(
             "is_active": bool(row[4]),
             "created_at": row[5],
         }
-        await drain_audit(safe_record_security_event(
+        # Issue #1043 residual 3: the bare commit await was an un-drained
+        # boundary — a cancellation landing exactly there (after the commit
+        # work completed) skipped the drained audit and lost the
+        # user.created row for an applied mutation. Commit + audit are one
+        # drained unit now.
+        await drain_commit_audit(
             conn,
-            event_type="user.created",
-            actor=user,
-            target_user_id=row[0],
-            target_username=row[1],
-            request=request,
-            metadata={"role": row[3]},
-        ))
+            lambda: safe_record_security_event(
+                conn,
+                event_type="user.created",
+                actor=user,
+                target_user_id=row[0],
+                target_username=row[1],
+                request=request,
+                metadata={"role": row[3]},
+            ),
+        )
         return response
     except HTTPException:
         await asyncio.to_thread(conn.rollback)
@@ -473,21 +479,24 @@ async def update_user(
                   AND accepted_at IS NULL AND revoked_at IS NULL""",
             (body.username.lower(), target_row[1].lower()),
         )
-    await asyncio.to_thread(db.commit)
-
-    invalidate_active_user_cache(user_id)
-    await drain_audit(safe_record_security_event(
+    # Issue #1043 residual 3: commit + cache invalidation + drained audit as
+    # one unit (the bare commit await was an un-drained boundary).
+    await drain_commit_audit(
         db,
-        event_type="user.updated",
-        actor=user,
-        target_user_id=user_id,
-        target_username=body.username or target_row[1],
-        request=request,
-        metadata={
-            "fields": [field.split(" = ")[0] for field in update_fields],
-            "role": body.role,
-        },
-    ))
+        lambda: safe_record_security_event(
+            db,
+            event_type="user.updated",
+            actor=user,
+            target_user_id=user_id,
+            target_username=body.username or target_row[1],
+            request=request,
+            metadata={
+                "fields": [field.split(" = ")[0] for field in update_fields],
+                "role": body.role,
+            },
+        ),
+        after_commit=lambda: invalidate_active_user_cache(user_id),
+    )
 
     # Fetch updated user
     cursor = await asyncio.to_thread(db.execute, "SELECT id, username, full_name, role, is_active, created_at FROM users WHERE id = ?", (user_id,))
@@ -626,17 +635,22 @@ async def update_user_role(
                 )
         else:
             await asyncio.to_thread(cursor.execute, "UPDATE users SET role = ? WHERE id = ?", (body.role, user_id))
-        await asyncio.to_thread(conn.commit)
-
-        invalidate_active_user_cache(user_id)
-        await drain_audit(safe_record_security_event(
+        # Issue #1043 residual 3: commit + cache invalidation + drained
+        # audit as one unit (the bare commit await was an un-drained
+        # boundary — the frozen test_commit_boundary_audit leg drives this
+        # exact site).
+        await drain_commit_audit(
             conn,
-            event_type="user.role_updated",
-            actor=user,
-            target_user_id=user_id,
-            request=request,
-            metadata={"old_role": current_role, "new_role": body.role},
-        ))
+            lambda: safe_record_security_event(
+                conn,
+                event_type="user.role_updated",
+                actor=user,
+                target_user_id=user_id,
+                request=request,
+                metadata={"old_role": current_role, "new_role": body.role},
+            ),
+            after_commit=lambda: invalidate_active_user_cache(user_id),
+        )
 
         return {
             "message": f"User role updated to {body.role}",
@@ -717,19 +731,22 @@ async def update_user_active(
                     )
                 else:
                     raise
-        await asyncio.to_thread(conn.commit)
-
-        invalidate_active_user_cache(user_id)
-
+        # Issue #1043 residual 3: commit + cache invalidation + drained
+        # audit as one unit (the bare commit await was an un-drained
+        # boundary).
         status_str = "activated" if body.is_active else "deactivated"
-        await drain_audit(safe_record_security_event(
+        await drain_commit_audit(
             conn,
-            event_type="user.active_updated",
-            actor=user,
-            target_user_id=user_id,
-            request=request,
-            metadata={"is_active": body.is_active, "old_is_active": currently_active},
-        ))
+            lambda: safe_record_security_event(
+                conn,
+                event_type="user.active_updated",
+                actor=user,
+                target_user_id=user_id,
+                request=request,
+                metadata={"is_active": body.is_active, "old_is_active": currently_active},
+            ),
+            after_commit=lambda: invalidate_active_user_cache(user_id),
+        )
         return {
             "message": f"User {status_str}",
             "user_id": user_id,

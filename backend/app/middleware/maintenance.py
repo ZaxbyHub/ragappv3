@@ -6,28 +6,28 @@ from typing import Callable, Optional
 from fastapi import FastAPI, Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 
+from app.security.recovery_routes import is_recovery_exempt
 from app.services.maintenance import MaintenanceService
 
 # Module logger name is load-bearing: the issue #549 acceptance check for the
 # fail-open path binds on a logger whose name contains "maintenance".
 logger = logging.getLogger(__name__)
 
-# POST paths exempt from the maintenance block. The admin toggle must stay
-# reachable so a window can be ended over HTTP, and the auth routes must stay
-# reachable so sessions can survive a window longer than the access-token
-# lifetime (issue #549 C01). change-password is exempt so a flagged user can
-# finish the forced password change during a window — it is the one POST the
-# must_change_password gate leaves open (deps.py exempt_paths; issue #731;
-# the subset is pinned by test_exempt_paths_guard.py). Registration is
-# deliberately NOT exempt: a maintenance window is a data freeze for account
-# creation too.
-_EXEMPT_POST_PATHS = frozenset(
+# POST paths exempt from the maintenance block for OPERATIONAL (non-recovery)
+# reasons, matched at their mounted runtime spelling. The admin toggle must
+# stay reachable so a window can be ended over HTTP, and token
+# refresh/logout must stay reachable so sessions can outlive a window longer
+# than the access-token lifetime (issue #549 C01). The RECOVERY exemptions
+# (login, change-password) moved to the shared predicate —
+# app.security.recovery_routes.is_recovery_exempt (issue #1058) — consumed
+# above, so this set no longer carries them and the two gates cannot
+# disagree. Registration is deliberately NOT exempt: a maintenance window is
+# a data freeze for account creation too.
+_OPS_EXEMPT_POST_PATHS = frozenset(
     {
         "/api/admin/maintenance",
-        "/api/auth/login",
         "/api/auth/refresh",
         "/api/auth/logout",
-        "/api/auth/change-password",
     }
 )
 
@@ -58,7 +58,15 @@ class MaintenanceMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         method = request.method.upper()
         path = (request.scope.get("path") or "").rstrip("/") or "/"
-        if method == "POST" and path in _EXEMPT_POST_PATHS:
+        # Recovery exemptions route through the SAME shared method-aware
+        # canonicalizing predicate the must_change_password gate consumes
+        # (app/security/recovery_routes.py, issue #1058): whatever the forced
+        # password-change exit needs stays open here by construction — the
+        # two gates can no longer disagree. The ops-only POST set below keeps
+        # the admin toggle and token lifecycle reachable.
+        if is_recovery_exempt(method, path):
+            return await call_next(request)
+        if method == "POST" and path in _OPS_EXEMPT_POST_PATHS:
             return await call_next(request)
         if method not in _BLOCKED_METHODS:
             return await call_next(request)

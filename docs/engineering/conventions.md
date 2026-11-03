@@ -32,7 +32,7 @@ update this doc when a convention genuinely changes.
 | `app/models/database.py` | `SCHEMA` constant, `SQLiteConnectionPool`, `init_db`, `run_migrations`, `migrate_*` functions |
 | `app/config.py` | Pydantic `Settings` (env-var backed); singleton `settings` |
 | `app/migrations/` | Standalone migration scripts invoked from lifespan |
-| `app/middleware/`, `app/utils/`, `app/security.py`, `app/lifespan.py` | Cross-cutting concerns |
+| `app/middleware/`, `app/utils/`, `app/security/`, `app/lifespan.py` | Cross-cutting concerns |
 
 ### Routes
 - Define `router = APIRouter()` per module; register in `app/main.py` with `app.include_router(router, prefix="/api")`.

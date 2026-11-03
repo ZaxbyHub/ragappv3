@@ -39,7 +39,7 @@ from app.services.draft_deletion import DraftDeletionService
 from app.services.draft_input_storage import DraftInputStorage, DraftInputStorageError
 from app.services.draft_store import DraftStore
 from app.services.security_audit import safe_record_security_event
-from app.services.task_drain import drain_audit
+from app.services.task_drain import drain_audit, drain_await, drained_commit
 from app.services.vector_store import VectorStore
 
 logger = logging.getLogger(__name__)
@@ -976,6 +976,58 @@ def _log_vault_dir_rmtree_error(func, path, exc_info):  # noqa: ANN001
     )
 
 
+async def _drained_vault_recovery(
+    conn: sqlite3.Connection,
+    vault_id: int,
+    restore,  # callable(draft_purge_plan); the caller binds the purge-restoration function
+    draft_purge_plan,  # None allowed: rollback only
+) -> None:
+    """Drain delete_vault's rollback(+restore) recovery unit through
+    cancellations (issue #1043 residual 2).
+
+    Outcome contract:
+
+    - Unit completed and a caller cancellation was absorbed: the restore
+      finished, then ``asyncio.CancelledError`` is RAISED HERE — the route
+      task ends cancelled with the tombstoned bytes back at their live
+      paths (the frozen test_vault_delete_restore_drain legs assert exactly
+      this).
+    - Unit's own error (rollback/restore infrastructure failure): logged
+      with the returned exception's traceback, then fall through: today's
+      arms treat a restore failure as log-and-continue while the ORIGINAL
+      arm exception keeps propagating — preserved.
+    - Child task itself cancelled (loop teardown): logged as unrecoverable;
+      fall through so the original arm exception propagates.
+    - Both absorbed-cancel and unit-error: log the error first, then raise
+      ``CancelledError`` — a delivered cancellation never vanishes.
+    """
+    async def _unit() -> None:
+        await asyncio.to_thread(lambda: conn.rollback())
+        if draft_purge_plan is not None:
+            try:
+                await asyncio.to_thread(restore, draft_purge_plan)
+            except Exception as restore_exc:
+                logger.error(
+                    "draft_room_vault_purge_restore_failed vault_id=%s reason=%s",
+                    vault_id,
+                    type(restore_exc).__name__,
+                )
+
+    cancelled, error = await drain_await(asyncio.ensure_future(_unit()))
+    if error is not None:
+        if isinstance(error, asyncio.CancelledError):
+            logger.warning(
+                "vault_recovery_unit_cancelled vault_id=%s restore_not_guaranteed",
+                vault_id,
+            )
+        else:
+            logger.error(
+                "vault_recovery_unit_failed vault_id=%s", vault_id, exc_info=error
+            )
+    if cancelled:
+        raise asyncio.CancelledError
+
+
 @router.delete("/vaults/{vault_id}")
 async def delete_vault(
     vault_id: int,
@@ -1222,31 +1274,25 @@ async def delete_vault(
 
         deleted_vault_rows = await asyncio.to_thread(_delete_vault_row)
 
-        # Commit transaction (durable deletion intent)
-        await asyncio.to_thread(conn.commit)
+        # Commit transaction (durable deletion intent). Issue #1043 residual
+        # 3: the bare commit await was an un-drained boundary — a
+        # cancellation landing exactly there (after the commit work
+        # completed) unwound the handler before the mandatory audit tail
+        # below existed. drained_commit never re-raises: a commit FAILURE is
+        # re-raised manually so the recovery arms still run, and an absorbed
+        # cancellation is deferred until after the mandatory tail.
+        commit_cancelled, commit_error = await drained_commit(conn)
+        if commit_error is not None:
+            raise commit_error
     except HTTPException:
-        await asyncio.to_thread(lambda: conn.rollback())
-        if draft_purge_plan is not None:
-            try:
-                await asyncio.to_thread(draft_deletion.restore_purge, draft_purge_plan)
-            except Exception as restore_exc:
-                logger.error(
-                    "draft_room_vault_purge_restore_failed vault_id=%s reason=%s",
-                    vault_id,
-                    type(restore_exc).__name__,
-                )
+        await _drained_vault_recovery(
+            conn, vault_id, draft_deletion.restore_purge, draft_purge_plan
+        )
         raise
     except (sqlite3.Error, OSError, RuntimeError):
-        await asyncio.to_thread(lambda: conn.rollback())
-        if draft_purge_plan is not None:
-            try:
-                await asyncio.to_thread(draft_deletion.restore_purge, draft_purge_plan)
-            except Exception as restore_exc:
-                logger.error(
-                    "draft_room_vault_purge_restore_failed vault_id=%s reason=%s",
-                    vault_id,
-                    type(restore_exc).__name__,
-                )
+        await _drained_vault_recovery(
+            conn, vault_id, draft_deletion.restore_purge, draft_purge_plan
+        )
         logger.exception("Error deleting vault %d", vault_id)
         raise HTTPException(status_code=500, detail="Failed to delete vault")
     except BaseException:
@@ -1257,20 +1303,12 @@ async def delete_vault(
         # the transaction is open (rollback + restore); after COMMIT it is
         # closed, and restoring bytes that belong to already-deleted drafts
         # would be wrong — those tombstones stay in .trash and are discarded
-        # by the startup reconcile.
+        # by the startup reconcile. The gate is evaluated BEFORE the drained
+        # unit starts, so the unit itself never runs post-commit.
         if conn.in_transaction:
-            await asyncio.to_thread(lambda: conn.rollback())
-            if draft_purge_plan is not None:
-                try:
-                    await asyncio.to_thread(
-                        draft_deletion.restore_purge, draft_purge_plan
-                    )
-                except Exception as restore_exc:
-                    logger.error(
-                        "draft_room_vault_purge_restore_failed vault_id=%s reason=%s",
-                        vault_id,
-                        type(restore_exc).__name__,
-                    )
+            await _drained_vault_recovery(
+                conn, vault_id, draft_deletion.restore_purge, draft_purge_plan
+            )
         raise
 
     # Security-relevant event recorded after the relational delete committed
@@ -1286,6 +1324,11 @@ async def delete_vault(
             request=http_request,
             metadata={"vault_id": vault_id, "name": vault_name},
         ))
+    if commit_cancelled:
+        # The cancellation absorbed at the commit await wins only now, after
+        # the mandatory audit tail — before the best-effort vector
+        # reconciliation below (tombstoned and swept on failure by design).
+        raise asyncio.CancelledError
 
     # -- Post-commit vector reconciliation (W21 / C19). -------------------
     # The relational delete is durable now; destroy the vault's vectors. On
