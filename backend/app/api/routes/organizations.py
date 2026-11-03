@@ -468,62 +468,74 @@ async def update_organization(
         updates.append("updated_at = CURRENT_TIMESTAMP")
         params.append(org_id)
 
-        # One "-2" slug-suffix retry when the renamed org's slug collides —
-        # the update-route mirror of the create route's collision handling.
-        # A description-only update (no slug rewrite) cannot collide on slug
-        # and gets no retry.
-        try:
-            max_attempt = 1 if slug_param_index is not None else 0
-            for attempt in range(max_attempt + 1):
-                attempt_params = params
-                if attempt == 1:
-                    attempt_params = list(params)
-                    attempt_params[slug_param_index] += "-2"
-                try:
-                    await asyncio.to_thread(
-                        conn.execute,
-                        f"UPDATE organizations SET {', '.join(updates)} WHERE id = ?",
-                        attempt_params,
+        # Review PRR-003 (the #1043 stale-caller family, seventh sibling):
+        # the privilege read above ran on autocommit and the UPDATE committed
+        # bare, so a caller demoted between the check and the write still
+        # renamed/re-described the organization. One BEGIN IMMEDIATE now
+        # re-reads caller privilege via the shared helper (first statement),
+        # then performs the slug-retry UPDATE and reads the response row —
+        # every refusal rolls back atomically (mirrors the six sibling
+        # workers converted for #1043).
+        def _update_organization() -> dict:
+            with transaction_context(conn):
+                if not _is_org_admin_or_owner(conn, org_id, user["id"]):
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Insufficient privileges. Organization admin or owner required",
                     )
-                    await asyncio.to_thread(conn.commit)
-                    break
-                except sqlite3.IntegrityError:
-                    await asyncio.to_thread(conn.rollback)
-                    if attempt == max_attempt:
-                        raise
-        except sqlite3.IntegrityError:
-            raise HTTPException(
-                status_code=409,
-                detail="Conflict — could not update organization. Please choose a different name.",
-            )
+                # One "-2" slug-suffix retry when the renamed org's slug
+                # collides — the update-route mirror of the create route's
+                # collision handling. A description-only update (no slug
+                # rewrite) cannot collide on slug and gets no retry. Inside
+                # the open transaction a constraint failure (ON CONFLICT
+                # ABORT) undoes only the failed statement, so the retry
+                # needs no rollback; exhausting the retries raises 409 and
+                # transaction_context rolls the whole update back — the
+                # same observable outcome as the base rollback+409.
+                max_attempt = 1 if slug_param_index is not None else 0
+                for attempt in range(max_attempt + 1):
+                    attempt_params = params
+                    if attempt == 1:
+                        attempt_params = list(params)
+                        attempt_params[slug_param_index] += "-2"
+                    try:
+                        conn.execute(
+                            f"UPDATE organizations SET {', '.join(updates)} WHERE id = ?",
+                            attempt_params,
+                        )
+                        break
+                    except sqlite3.IntegrityError:
+                        if attempt == max_attempt:
+                            raise HTTPException(
+                                status_code=409,
+                                detail="Conflict — could not update organization. Please choose a different name.",
+                            )
+                cursor = conn.execute(
+                    """SELECT o.id, o.name, o.description, o.slug, o.created_at, o.updated_at,
+                              COUNT(DISTINCT om.user_id) as member_count,
+                              COUNT(DISTINCT v.id) as vault_count
+                       FROM organizations o
+                       LEFT JOIN org_members om ON o.id = om.org_id
+                       LEFT JOIN vaults v ON v.org_id = o.id
+                       WHERE o.id = ?
+                       GROUP BY o.id""",
+                    (org_id,),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    raise HTTPException(status_code=404, detail="Organization not found")
+                return {
+                    "id": row[0],
+                    "name": row[1],
+                    "description": row[2] or "",
+                    "slug": row[3],
+                    "created_at": row[4],
+                    "updated_at": row[5],
+                    "member_count": row[6] or 0,
+                    "vault_count": row[7] or 0,
+                }
 
-        # Check if organization still exists after update
-        cursor = await asyncio.to_thread(
-            conn.execute,
-            """SELECT o.id, o.name, o.description, o.slug, o.created_at, o.updated_at,
-                      COUNT(DISTINCT om.user_id) as member_count,
-                      COUNT(DISTINCT v.id) as vault_count
-               FROM organizations o
-               LEFT JOIN org_members om ON o.id = om.org_id
-               LEFT JOIN vaults v ON v.org_id = o.id
-               WHERE o.id = ?
-               GROUP BY o.id""",
-            (org_id,),
-        )
-        row = await asyncio.to_thread(cursor.fetchone)
-        if not row:
-            raise HTTPException(status_code=404, detail="Organization not found")
-
-        return {
-            "id": row[0],
-            "name": row[1],
-            "description": row[2] or "",
-            "slug": row[3],
-            "created_at": row[4],
-            "updated_at": row[5],
-            "member_count": row[6] or 0,
-            "vault_count": row[7] or 0,
-        }
+        return await asyncio.to_thread(_update_organization)
     finally:
         pool.release_connection(conn)
 

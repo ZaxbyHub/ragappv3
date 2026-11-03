@@ -227,15 +227,191 @@ def test_update_user_active_cancel_at_commit_still_audits(tmp_path: Path) -> Non
         env.close()
 
 
-def test_users_py_tails_census() -> None:
-    """EXACTLY the four converted adjacent-pair tails call drain_commit_audit
-    in users.py, and no bare to_thread(conn.commit) remains there."""
-    source = Path(users_mod.__file__).read_text(encoding="utf-8")
-    assert source.count("drain_commit_audit(") == 4, (
-        "users.py must route its four commit->audit tails through "
-        "drain_commit_audit (exactly 4 call sites; the import line carries "
-        "no call paren); a silent reversion of any tail changes this count"
+def test_create_user_cancel_at_commit_still_audits(tmp_path: Path) -> None:
+    """Review PRR-002: the create_user tail gets the same deterministic
+    commit-completes-then-cancel schedule as its siblings — the user row is
+    durable (the commit completed) and the user.created audit row exists
+    even though the route unwinds cancelled."""
+    import asyncio
+    from datetime import datetime, timedelta, timezone
+    from unittest.mock import MagicMock
+
+    import jwt
+    from starlette.requests import Request
+
+    from app.api.routes.users import CreateUserRequest, create_user
+
+    class _PoolFacade:
+        def __init__(self, real_pool):
+            self._real_pool = real_pool
+            self._conn = None
+
+        async def get_connection_async(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            if self._conn is None:
+                self._conn = self._real_pool.get_connection()
+            return self._conn
+
+        def release_connection(self, conn) -> None:  # noqa: ANN001
+            try:
+                if self._conn.in_transaction:
+                    self._conn.rollback()
+            except sqlite3.Error:
+                pass
+
+    _pool_cache.clear()
+    db_path = str(tmp_path / "create-user-boundary.db")
+    init_db(db_path)
+    pool = SQLiteConnectionPool(db_path, max_size=2)
+    facade = _PoolFacade(pool)
+    saved_get_pool = users_mod.get_pool
+    users_mod.get_pool = lambda _p: facade
+    seed = pool.get_connection()
+    try:
+        seed.execute(
+            "INSERT INTO users (id, username, hashed_password, role, is_active) "
+            "VALUES (1, 'root', 'abc123', 'superadmin', 1)"
+        )
+        seed.commit()
+    finally:
+        pool.release_connection(seed)
+
+    def _request() -> Request:
+        return Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "headers": [],
+                "path": "/api/users",
+                "query_string": b"",
+                "client": ("127.0.0.1", 12345),
+                "server": ("testserver", 80),
+                "scheme": "http",
+            }
+        )
+
+    secret, algorithm = "test-secret-key", "HS256"
+    payload = {
+        "sub": "1",
+        "username": "root",
+        "role": "superadmin",
+        "exp": datetime.now(timezone.utc) + timedelta(hours=1),
+        "type": "access",
+        "jti": "test-jti-create-user",
+    }
+    token = jwt.encode(payload, secret, algorithm=algorithm)
+
+    real_to_thread = asyncio.to_thread
+    state = {"fired": False}
+    holder: dict = {"task": None}
+
+    async def scripted(fn, *args, **kwargs):  # noqa: ANN002, ANN003
+        if not state["fired"] and getattr(fn, "__name__", "") == "commit":
+            state["fired"] = True
+            loop = asyncio.get_running_loop()
+
+            def _commit_then_cancel() -> None:
+                fn(*args, **kwargs)
+                loop.call_soon_threadsafe(holder["task"].cancel)
+
+            return await real_to_thread(_commit_then_cancel)
+        return await real_to_thread(fn, *args, **kwargs)
+
+    async def drive() -> str:
+        asyncio.to_thread = scripted
+        try:
+            holder["task"] = asyncio.ensure_future(
+                create_user(
+                    _request(),
+                    CreateUserRequest(
+                        username="newuser", password="Password123x", role="member"
+                    ),
+                    user={
+                        "id": 1,
+                        "username": "root",
+                        "role": "superadmin",
+                    },
+                    _csrf_token="t",
+                )
+            )
+            try:
+                await holder["task"]
+                return "returned"
+            except asyncio.CancelledError:
+                return "cancelled"
+            except Exception as exc:  # noqa: BLE001
+                return f"error:{type(exc).__name__}"
+        finally:
+            asyncio.to_thread = real_to_thread
+
+    try:
+        outcome = asyncio.run(drive())
+    finally:
+        users_mod.get_pool = saved_get_pool
+        if facade._conn is not None:
+            try:
+                pool.release_connection(facade._conn)
+            except Exception:
+                pass
+        pool.close_all()
+        _pool_cache.clear()
+
+    assert state["fired"], "non-vacuity: the commit hook must have fired"
+    assert outcome == "cancelled", f"route must unwind cancelled (got {outcome!r})"
+    check = sqlite3.connect(db_path)
+    try:
+        created = check.execute(
+            "SELECT COUNT(*) FROM users WHERE username = 'newuser'"
+        ).fetchone()[0]
+        audited = check.execute(
+            "SELECT COUNT(*) FROM security_audit_log WHERE event_type = 'user.created'"
+        ).fetchone()[0]
+    finally:
+        check.close()
+    assert created == 1, "precondition: the create commit completed"
+    assert audited == 1, (
+        "the user.created security-audit row was written before the cancel "
+        "re-raised"
     )
+
+
+def test_users_py_tails_census() -> None:
+    """Review PRR-001: the census BINDS each converted tail to its NAMED
+    route function — an AST walk that requires exactly one
+    ``drain_commit_audit(...)`` call lexically inside each of
+    create_user / update_user / update_user_role / update_user_active and
+    NO call inside any other function in users.py. A count-preserving
+    reversion (one tail reverted while an extra call appears elsewhere) or
+    an omitted conversion can no longer hide behind the total. Also: no
+    bare to_thread(conn.commit) remains in users.py, and delete_vault's
+    commit goes through drained_commit."""
+    import ast
+    from pathlib import Path
+
+    tree = ast.parse(Path(users_mod.__file__).read_text(encoding="utf-8"))
+    expected = {
+        "create_user",
+        "update_user",
+        "update_user_role",
+        "update_user_active",
+    }
+    found: dict[str, int] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            calls = sum(
+                1
+                for sub in ast.walk(node)
+                if isinstance(sub, ast.Call)
+                and isinstance(sub.func, ast.Name)
+                and sub.func.id == "drain_commit_audit"
+            )
+            if calls:
+                found[node.name] = calls
+    assert set(found) == expected and all(v == 1 for v in found.values()), (
+        f"users.py drain_commit_audit call-site binding drifted: expected "
+        f"exactly one call inside each of {sorted(expected)}, found {found} "
+        "— a tail was reverted, renamed, or an unbound call appeared"
+    )
+    source = Path(users_mod.__file__).read_text(encoding="utf-8")
     assert 'await asyncio.to_thread(conn.commit)' not in source and "await asyncio.to_thread(db.commit)" not in source, (
         "no bare commit await may remain in users.py (every one is an "
         "un-drained commit boundary)"
@@ -248,14 +424,18 @@ def test_users_py_tails_census() -> None:
 
 
 def test_org_worker_privilege_re_reads_are_inside_transaction_context() -> None:
-    """Implementation-review R2: pin the ACTUAL transactionality of the six
-    org routes' privilege re-reads — an AST census that each worker's
-    `_is_org_admin_or_owner(conn, ...)` call node sits lexically inside a
-    `with transaction_context(conn):` block. Catches the partial-fix shape
-    (re-read present but OUTSIDE the transaction — a surviving narrow race
-    between that read and BEGIN IMMEDIATE) that the behavioral frozen check
-    cannot distinguish.
-    """
+    """Implementation-review R2 + review PRR-005: pin the ACTUAL
+    transactionality AND the deciding-gate shape of the org routes'
+    privilege re-reads — an AST census that, in each write worker, the FIRST
+    statement of the ``with transaction_context(conn):`` body is an ``if
+    not _is_org_admin_or_owner(conn, ...)`` refusal whose call node sits
+    lexically inside that with-block. Catches BOTH partial-fix shapes the
+    behavioral frozen check cannot distinguish: (a) the re-read present but
+    OUTSIDE the transaction (a narrow race between that read and BEGIN
+    IMMEDIATE survives), and (b) a decoy — a deciding check outside plus a
+    result-ignored call inside the block. Covers all SEVEN org write
+    workers (the six #1043 conversions plus update_organization's
+    `_update_organization`, the review-PRR-003 sibling)."""
     import ast
     from pathlib import Path
 
@@ -265,42 +445,48 @@ def test_org_worker_privilege_re_reads_are_inside_transaction_context() -> None:
     route_workers = {
         "_add_member", "_create_invite", "_resend_invite",
         "_revoke_invite", "_set_override", "_clear_override",
+        "_update_organization",
     }
-    found: dict[str, bool] = {}
+    found: dict[str, str] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.name in route_workers:
-            in_txn = False
-            for sub in ast.walk(node):
-                if (
-                    isinstance(sub, ast.Call)
-                    and isinstance(sub.func, ast.Name)
-                    and sub.func.id == "_is_org_admin_or_owner"
-                ):
-                    # walk up is unavailable; instead require the enclosing
-                    # function body to contain the with-statement BEFORE the
-                    # call's line, and the call to be nested under it.
-                    for w in ast.walk(node):
-                        if isinstance(w, ast.With):
-                            opens_txn = any(
-                                isinstance(item.context_expr, ast.Call)
-                                and isinstance(item.context_expr.func, ast.Name)
-                                and item.context_expr.func.id == "transaction_context"
-                                for item in w.items
-                            )
-                            if not opens_txn:
-                                continue
-                            for item in w.body:
-                                for call in ast.walk(item):
-                                    if call is sub:
-                                        in_txn = True
-                    found[node.name] = in_txn
+            verdict = "no-transaction_context-with"
+            for w in ast.walk(node):
+                if not isinstance(w, ast.With):
+                    continue
+                opens_txn = any(
+                    isinstance(item.context_expr, ast.Call)
+                    and isinstance(item.context_expr.func, ast.Name)
+                    and item.context_expr.func.id == "transaction_context"
+                    for item in w.items
+                )
+                if not opens_txn:
+                    continue
+                body = w.body
+                if not body or not isinstance(body[0], ast.If):
+                    verdict = "txn-with-first-statement-not-a-guard-if"
+                    continue
+                test = body[0].test
+                deciding = any(
+                    isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Name)
+                    and call.func.id == "_is_org_admin_or_owner"
+                    for call in ast.walk(test)
+                )
+                if not deciding:
+                    verdict = "guard-if-does-not-call-_is_org_admin_or_owner"
+                    continue
+                verdict = "ok"
+                break
+            found[node.name] = verdict
         elif isinstance(node, ast.AsyncFunctionDef) and node.name in route_workers:
-            found[node.name] = False
+            found[node.name] = "worker-not-a-sync-function"
     assert set(found) == route_workers, (
-        f"expected all six org write workers, found {sorted(found)} — a "
-        "worker was renamed or removed; update the census"
+        f"expected all seven org write workers, found {sorted(found)} — a "
+        "worker was renamed, removed, or added without updating the census; "
+        "update the census"
     )
-    assert all(found.values()), (
-        f"org workers whose privilege re-read is NOT inside "
-        f"transaction_context: {[k for k, v in found.items() if not v]}"
+    assert all(v == "ok" for v in found.values()), (
+        "org workers whose privilege re-read is not the DECIDING first "
+        f"statement inside transaction_context: {found}"
     )

@@ -1123,6 +1123,13 @@ async def delete_vault(
     # vault the way single-document delete already prevents.
     vault_file_ids: List[int] = []
     vault_file_paths: List[str] = []
+    # Initialized here so the recovery arms can honor an absorbed
+    # cancellation even when they are entered by a failure BEFORE the commit
+    # line (mid-transaction cleanup failures never reach drained_commit).
+    # Review PRR-004: without the arm-level checks, a commit failure racing
+    # an absorbed cancellation exits through an arm's 500/re-raise and the
+    # delivered CancelledError vanishes.
+    commit_cancelled = False
 
     try:
         # Start transaction. BEGIN IMMEDIATE acquires the write lock up front
@@ -1288,11 +1295,18 @@ async def delete_vault(
         await _drained_vault_recovery(
             conn, vault_id, draft_deletion.restore_purge, draft_purge_plan
         )
+        if commit_cancelled:
+            # Review PRR-004: an absorbed cancellation wins even when the
+            # arm was entered by a failure — the mandatory recovery above
+            # has completed, so the delivered CancelledError surfaces now.
+            raise asyncio.CancelledError
         raise
     except (sqlite3.Error, OSError, RuntimeError):
         await _drained_vault_recovery(
             conn, vault_id, draft_deletion.restore_purge, draft_purge_plan
         )
+        if commit_cancelled:
+            raise asyncio.CancelledError
         logger.exception("Error deleting vault %d", vault_id)
         raise HTTPException(status_code=500, detail="Failed to delete vault")
     except BaseException:
@@ -1309,6 +1323,8 @@ async def delete_vault(
             await _drained_vault_recovery(
                 conn, vault_id, draft_deletion.restore_purge, draft_purge_plan
             )
+        if commit_cancelled:
+            raise asyncio.CancelledError
         raise
 
     # Security-relevant event recorded after the relational delete committed

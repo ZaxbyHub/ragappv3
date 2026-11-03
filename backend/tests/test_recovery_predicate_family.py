@@ -156,14 +156,6 @@ def test_maintenance_full_exemption_matrix() -> None:
         assert asyncio.run(_dispatch(mw_closed, method, path)) == "allowed"
 
 
-def test_deps_gate_behavioral_wiring_lives_in_test_deps_auth() -> None:
-    """The deps behavioral-wiring leg (sentinel-patched deps.is_recovery_exempt
-    driving the REAL get_current_active_user) lives in
-    tests/test_deps_auth.py::test_gate_consults_recovery_predicate_alias,
-    beside the proven mock_settings_jwt_mode/mock_db harness it reuses
-    (implementation-review R4: the original alias-only assertion here was
-    vacuous — it never drove the dependency)."""
-
 def test_middleware_behavioral_wiring() -> None:
     """Patching maintenance.is_recovery_exempt flips the real dispatch."""
     saved = maintenance_mod.is_recovery_exempt

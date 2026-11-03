@@ -125,12 +125,17 @@ async def drain_commit_audit(
       — then ``CancelledError`` re-raised.
     - audit failure: logged by ``drain_audit``, not re-raised (the
       best-effort audit contract).
+    - compound — unit failure AND an absorbed caller cancellation: the
+      unit's error is logged loudly (``exc_info``) and the delivered
+      cancellation WINS — ``CancelledError`` re-raised after the log (a
+      delivered cancellation never vanishes; the failure is not silently
+      dropped either).
     - the unit task itself cancelled (loop teardown — nothing else cancels
-      it): logged as unrecoverable (no retry, row state unknown); if no
-      caller cancellation was absorbed this helper RETURNS normally after
-      logging; an absorbed caller cancellation still re-raises
-      ``CancelledError`` after the log — a delivered cancellation never
-      vanishes.
+      it): logged as unrecoverable (no retry, row state unverified — the
+      audit may or may not have written depending on where the cancellation
+      landed); if no caller cancellation was absorbed this helper RETURNS
+      normally after logging; an absorbed caller cancellation still
+      re-raises ``CancelledError`` after the log.
     """
 
     async def _unit() -> None:
@@ -143,10 +148,15 @@ async def drain_commit_audit(
     if error is not None:
         if isinstance(error, asyncio.CancelledError):
             logger.warning(
-                "commit_audit_unit_cancelled task_cancelled_during_unit "
-                "row_state_unknown"
+                "commit_audit_unit_cancelled unit_task_cancelled_during_commit_audit "
+                "row_state_unverified"
             )
         else:
-            raise error
+            logger.error(
+                "commit_audit_unit_failed reason=%s", type(error).__name__,
+                exc_info=error,
+            )
+            if not cancelled:
+                raise error
     if cancelled:
         raise asyncio.CancelledError
