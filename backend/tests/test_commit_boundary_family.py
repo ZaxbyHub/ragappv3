@@ -281,6 +281,14 @@ def test_org_worker_privilege_re_reads_are_inside_transaction_context() -> None:
                     # call's line, and the call to be nested under it.
                     for w in ast.walk(node):
                         if isinstance(w, ast.With):
+                            opens_txn = any(
+                                isinstance(item.context_expr, ast.Call)
+                                and isinstance(item.context_expr.func, ast.Name)
+                                and item.context_expr.func.id == "transaction_context"
+                                for item in w.items
+                            )
+                            if not opens_txn:
+                                continue
                             for item in w.body:
                                 for call in ast.walk(item):
                                     if call is sub:
