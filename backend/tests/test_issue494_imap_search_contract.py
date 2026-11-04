@@ -309,9 +309,10 @@ class TestLogoutAbortFailurePath(_EmailHarness):
                     )
 
             fake = GreetingTimeoutLogoutAbortClient()
-            with patch.object(aioimaplib, "IMAP4_SSL",
-                              return_value=fake),                  patch.object(aioimaplib, "IMAP4",
-                              return_value=fake):
+            with (
+                patch.object(aioimaplib, "IMAP4_SSL", return_value=fake),
+                patch.object(aioimaplib, "IMAP4", return_value=fake),
+            ):
                 outcome = await _get_unseen_count(self.service)
             self.assertEqual(outcome, -1)
         finally:

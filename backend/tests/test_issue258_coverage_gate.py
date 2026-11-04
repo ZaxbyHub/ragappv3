@@ -75,9 +75,21 @@ def test_ac11_coverage_thresholds_configured():
 def test_ac11_coverage_evidence_is_comment_aware(tmp_path):
     """Self-check for the #746 AC7 class: a vite.config.ts whose entire
     coverage/thresholds block exists ONLY inside comments must NOT count as
-    evidence (the reviewer probe shape)."""
+    evidence (the reviewer probe shape). The walker resolves typescript via
+    NODE_PATH pointed at the REAL frontend install (PRR-007, feedback round
+    1): repointing FRONTEND at tmp_path without feeding the real
+    node_modules made the walker skip with a false "typescript not
+    resolvable" message on ordinary dev boxes."""
+    import os
+
     import test_issue258_coverage_design as design
 
+    real_node_modules = design.REPO / "frontend" / "node_modules"
+    if not real_node_modules.is_dir():
+        pytest.skip(
+            "no real frontend/node_modules install to resolve typescript "
+            "from — the self-check cannot exercise the walker here"
+        )
     commented = tmp_path / "vite.config.ts"
     commented.write_text(
         "export default defineConfig({\n"
@@ -88,11 +100,17 @@ def test_ac11_coverage_evidence_is_comment_aware(tmp_path):
         encoding="utf-8",
     )
     saved = design.FRONTEND
+    saved_node_path = os.environ.get("NODE_PATH")
     design.FRONTEND = tmp_path
+    os.environ["NODE_PATH"] = str(real_node_modules)
     try:
         evidence = _coverage_config_evidence()
     finally:
         design.FRONTEND = saved
+        if saved_node_path is None:
+            os.environ.pop("NODE_PATH", None)
+        else:
+            os.environ["NODE_PATH"] = saved_node_path
     assert evidence is None, (
         "a fully commented-out coverage block must not be accepted as "
         "coverage evidence (comment-blind scanner class, #746 AC7)"

@@ -73,8 +73,15 @@ jobs:
         # skipped (standard CI stubs unstructured; only THIS job installs
         # the real stack).
         run: |
-          pytest --tb=short -rs -q tests/test_document_artifacts.py::TestRealUnstructuredVocabulary > gate.log 2>&1
+          set +e
+          pytest --tb=short -rs -q --timeout=300 --timeout-method=thread tests/test_document_artifacts.py::TestRealUnstructuredVocabulary > gate.log 2>&1
+          EXIT=$?
+          set -e
           cat gate.log
+          if [ "$EXIT" -ne 0 ]; then
+            echo "::error::the real-unstructured vocabulary gate failed (exit $EXIT)"
+            exit "$EXIT"
+          fi
           if grep -qE "[0-9]+ skipped" gate.log; then
             echo "::error::the real-unstructured vocabulary test SKIPPED in the full-deps tier (venue broken)"
             exit 1

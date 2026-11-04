@@ -390,22 +390,76 @@ def test_imap_fake_has_abort_logout_path():
 # ---------------------------------------------------------------------------
 
 
+def _parse_failed(stdout: str) -> int:
+    match = re.search(r"(\d+) failed", stdout)
+    return int(match.group(1)) if match else 0
+
+
 def _run_llm_health_suites_under_mutation(
     tmp_path: Path, anchor: str, replacement: str
-) -> int:
+) -> "int | None":
     """Copy the repo's backend/ and scripts/ into ``tmp_path`` (ignoring
-    data/, __pycache__, .pytest_cache and .venv), assert ``anchor`` is
+    data/, __pycache__, .pytest_cache, .venv, .swarm and .tmp-*), run the
+    three LLM-health suites UNMUTATED as a control, assert ``anchor`` is
     present in the copied app/services/llm_health.py, apply the mutation, run
-    the three LLM-health suites under the copied tree, and return the number
-    of FAILED tests (0 when the summary line carries no ``N failed``)."""
+    the suites again, and return the number of FAILED tests in the mutant
+    run — or ``None`` when the harness itself is broken (the control run is
+    not clean, or the mutant run errored without a parsable failure
+    summary), so callers never mistake an environmental red for a mutation
+    kill (PRR-006, feedback round 1)."""
     copy_root = tmp_path / "mutation-copy"
     ignore = shutil.ignore_patterns(
-        "data", "__pycache__", ".pytest_cache", ".venv", "*.pyc"
+        "data",
+        "__pycache__",
+        ".pytest_cache",
+        ".venv",
+        "*.pyc",
+        # Gitignored local bulk artifacts (~1 GB / thousands of files on dev
+        # boxes): copying them into tmp_path per run wastes minutes and can
+        # exceed the Windows MAX_PATH limit (PRR-005, feedback round 1; the
+        # sibling h06/h07 harnesses exclude the same set).
+        ".swarm",
+        ".tmp-*",
     )
     started = time.monotonic()
     shutil.copytree(REPO / "backend", copy_root / "backend", ignore=ignore)
     shutil.copytree(REPO / "scripts", copy_root / "scripts")
     copy_seconds = time.monotonic() - started
+
+    def _run_suites() -> "subprocess.CompletedProcess[str]":
+        argv = [
+            sys.executable,
+            "-m",
+            "pytest",
+            *_LLM_HEALTH_SUITES,
+            "-q",
+            "-p",
+            "no:randomly",
+            "-p",
+            "no:cacheprovider",
+            f"--basetemp={tmp_path / 'bt'}",
+        ]
+        env = dict(os.environ)
+        env["PYTHONIOENCODING"] = "utf-8"
+        return subprocess.run(
+            argv,
+            cwd=str(copy_root / "backend"),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+
+    control = _run_suites()
+    control_failed = _parse_failed(control.stdout)
+    print(
+        f"control run (unmutated): exit={control.returncode} "
+        f"failed={control_failed}"
+    )
+    if control.returncode != 0 or control_failed != 0:
+        print(control.stdout[-2000:])
+        print(control.stderr[-2000:])
+        return None
 
     target = copy_root / "backend" / "app" / "services" / "llm_health.py"
     source = target.read_text(encoding="utf-8")
@@ -416,33 +470,17 @@ def _run_llm_health_suites_under_mutation(
     )
     target.write_text(source.replace(anchor, replacement), encoding="utf-8")
 
-    argv = [
-        sys.executable,
-        "-m",
-        "pytest",
-        *_LLM_HEALTH_SUITES,
-        "-q",
-        "-p",
-        "no:randomly",
-        "-p",
-        "no:cacheprovider",
-        f"--basetemp={tmp_path / 'bt'}",
-    ]
-    env = dict(os.environ)
-    env["PYTHONIOENCODING"] = "utf-8"
-    result = subprocess.run(
-        argv,
-        cwd=str(copy_root / "backend"),
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
+    result = _run_suites()
     print(result.stdout[-2000:])
     print(result.stderr[-2000:])
     print(f"mutation copy took {copy_seconds:.1f}s; exit={result.returncode}")
-    match = re.search(r"(\d+) failed", result.stdout)
-    return int(match.group(1)) if match else 0
+    n_failed = _parse_failed(result.stdout)
+    if result.returncode != 0 and n_failed == 0:
+        # Non-zero exit without a "N failed" summary is a collection/runtime
+        # error in the copy, not a clean mutation kill.
+        print("mutant run errored without a parsable failure summary")
+        return None
+    return n_failed
 
 
 def test_check_chat_timeout_mutant_is_killed(tmp_path):
@@ -455,6 +493,11 @@ def test_check_chat_timeout_mutant_is_killed(tmp_path):
         tmp_path,
         anchor="client = LLMClient(timeout=self.timeout)",
         replacement="client = LLMClient(timeout=self.timeout * 60)",
+    )
+    assert n_failed is not None, (
+        "H08-AC7 HARNESS BROKEN: the copied LLM-health suites fail (or error) "
+        "WITHOUT the mutation, so the run cannot attribute a failure to the "
+        "mutant — fix the harness/copy environment before trusting the kill"
     )
     assert n_failed >= 1, (
         "H08-AC7 MUTANT SURVIVES: inflating check_chat's LLMClient timeout "
@@ -472,6 +515,11 @@ def test_probe_client_max_tokens_mutant_is_killed(tmp_path):
         tmp_path,
         anchor="                max_tokens=1,",
         replacement="                max_tokens=4096,",
+    )
+    assert n_failed is not None, (
+        "H08-AC8 HARNESS BROKEN: the copied LLM-health suites fail (or error) "
+        "WITHOUT the mutation, so the run cannot attribute a failure to the "
+        "mutant — fix the harness/copy environment before trusting the kill"
     )
     assert n_failed >= 1, (
         "H08-AC8 MUTANT SURVIVES: changing _probe_client's max_tokens from 1 "
@@ -516,8 +564,16 @@ def test_atom_adapter_has_real_unstructured_vocabulary_test():
             # its own predicate.
             continue
         src = path.read_text(encoding="utf-8")
-        if "unstructured.documents.elements" in src and (
+        # PRR-008 (feedback round 1): require an actual import edge, not a
+        # text occurrence — the dotted marker previously appeared only in a
+        # docstring, so replacing the real import with a fake kept the guard
+        # green.
+        if (
             "parse_elements_to_atoms" in src
+            and (
+                "from unstructured.documents import" in src
+                or "import unstructured.documents" in src
+            )
         ):
             matches.append(str(path.relative_to(REPO)))
     assert len(matches) >= 1, (

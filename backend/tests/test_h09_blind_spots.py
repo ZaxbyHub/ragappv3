@@ -249,9 +249,16 @@ def test_timeout_guardrail_catches_positional_and_qualified_calls():
 
 
 def _junction(target: Path, link: Path) -> None:
-    """Best-effort Windows directory junction (no privilege needed); used
-    only when the loaded design-pin module needs the frontend's real
-    node_modules (e.g. a typescript-compiler-based rewrite)."""
+    """Best-effort directory link so a fake frontend tree resolves the real
+    node_modules: POSIX gets ``os.symlink``; Windows gets a ``_winapi``
+    junction with a cmd/mklink fallback (PRR-001, feedback round 1 — the
+    previous version shelled out to ``cmd`` unguarded, which does not exist
+    on POSIX)."""
+    import os
+
+    if os.name != "nt":
+        os.symlink(str(target), str(link), target_is_directory=True)
+        return
     try:
         import _winapi
 
@@ -261,11 +268,17 @@ def _junction(target: Path, link: Path) -> None:
         pass
     import subprocess
 
-    subprocess.run(
-        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
-        check=False,
-        capture_output=True,
-    )
+    try:
+        subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            check=False,
+            capture_output=True,
+        )
+    except OSError:
+        # cmd missing/unspawnable: the node_modules link is best-effort;
+        # the probe below still exercises the loaded module (and a skip it
+        # cannot resolve surfaces as a probe failure, never a silent pass).
+        pass
 
 
 def test_coverage_design_pin_is_comment_aware(tmp_path):
@@ -319,8 +332,13 @@ def test_coverage_design_pin_is_comment_aware(tmp_path):
             called += 1
             try:
                 getattr(design, name)()
-            except AssertionError as exc:
-                failures.append(f"{name}: {exc}")
+            except KeyboardInterrupt:
+                raise
+            except BaseException as exc:  # noqa: BLE001 — pytest.skip derives
+                # from BaseException: a skip here would silently drop the
+                # AC7 proof, so ANY non-pass outcome (assertion OR skip) is
+                # a probe failure (PRR-007, feedback round 1).
+                failures.append(f"{name}: {type(exc).__name__}: {exc}")
     assert called >= 1, (
         "H09-AC7 HARNESS DRIFT: test_issue258_coverage_design.py defines no "
         "test_ac11_design_* functions to call"

@@ -101,8 +101,16 @@ console.log(JSON.stringify(out));
 def _coverage_ast() -> tuple[str, dict] | None:
     """(filename, walker facts) for the first config declaring a coverage
     block, parsed by the real TypeScript compiler. Skips LOUDLY when
-    typescript is unresolvable (bare local env); Backend CI provisions it
-    via NODE_PATH (ci.yml) and any frontend dev box has node_modules."""
+    node or typescript is unresolvable (bare local env); Backend CI
+    provisions typescript via NODE_PATH (ci.yml) and any frontend dev box
+    has node_modules. The guard lives HERE (not only on the design tests'
+    skipif markers) because test_issue258_coverage_gate.py imports this
+    helper without its own marker (Copilot round-1 note)."""
+    if _NODE is None:
+        pytest.skip(
+            "node is not available — the TypeScript parser cannot run; the "
+            "coverage design pin does NOT silently pass without the parser"
+        )
     for name in _VITEST_CONFIG_CANDIDATES:
         path = FRONTEND / name
         if not path.is_file():

@@ -615,10 +615,12 @@ describe('MemoryPage', () => {
     it('asserts the exact updateMemory payload through a real edit interaction', async () => {
       // #745 AC12 (T1-02-K-08): the edit flow must be exercised for real —
       // open the dialog on a seeded memory, mutate content (asserting the
-      // trim), clear category (explicit null), save — and the exact payload
-      // passed to updateMemory is asserted: id, trimmed content, cleared
-      // category/tags/source as explicit nulls, and the
-      // optimistic-concurrency token from the loaded row.
+      // trim), clear category, tags AND source (each as an explicit null —
+      // the editTags.trim() || null fallback is exercised for real after
+      // the PRR-002 feedback fix), save — and the exact payload passed to
+      // updateMemory is asserted: id, trimmed content, the three cleared
+      // fields as explicit nulls, and the optimistic-concurrency token
+      // from the loaded row.
       const mockMemories = [
         {
           id: '42',
@@ -679,7 +681,7 @@ describe('MemoryPage', () => {
         fireEvent.change(contentBox, { target: { value: '  Trimmed edited content  ' } });
         fireEvent.change(categoryBox, { target: { value: '' } });
         fireEvent.change(sourceBox, { target: { value: '  ' } });
-        fireEvent.change(tagsBox, { target: { value: 'beta' } });
+        fireEvent.change(tagsBox, { target: { value: '  ' } });
       });
 
       await act(async () => {
@@ -692,7 +694,7 @@ describe('MemoryPage', () => {
       expect(mockUpdateMemory).toHaveBeenCalledWith('42', {
         content: 'Trimmed edited content',
         category: null,
-        tags: 'beta',
+        tags: null,
         source: null,
         expected_updated_at: '2026-01-02T03:04:05.678Z',
       });
