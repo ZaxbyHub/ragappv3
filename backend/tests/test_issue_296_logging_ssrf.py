@@ -55,6 +55,78 @@ class TestRAGTraceLogRedaction(unittest.TestCase):
         # The redacted length/hash form IS present.
         self.assertIn("redacted", joined)
 
+    def test_log_redacts_every_user_derived_field_and_keeps_safe_fields(self):
+        """#745 AC11 (T1-02-K-08): every str/List[str] RAGTrace field is
+        seeded with a classification-aware sentinel. The seven
+        _REDACTED_FIELDS get per-field SECRET markers that must NOT appear
+        in the log output (to_log_dict summarizes them); the thirteen
+        log-safe str/List[str] fields get benign unique values that MUST
+        survive in to_log_dict verbatim (model:
+        test_no_query_text_in_default_logs.py)."""
+        # Every field is seeded with an EXPLICIT kwarg (the #745 AC11
+        # shape): the 7 _REDACTED_FIELDS carry SECRET markers that must
+        # never reach the default INFO log; the 13 log-safe str/List[str]
+        # fields carry benign unique values that must survive to_log_dict
+        # verbatim.
+        t = RAGTrace(
+            original_query="SECRETMARK_orig_query_745",
+            transformed_queries=["SECRETMARK_transformed_745"],
+            variants_dropped=["SECRETMARK_dropped_745"],
+            wiki_query="SECRETMARK_wiki_query_745",
+            followup_rewrite="SECRETMARK_followup_745",
+            query_plan="SECRETMARK_query_plan_745",
+            unverifiable_claims=["SECRETMARK_unverifiable_745"],
+            fts_status="ok-745",
+            rerank_status="applied-745",
+            final_sources=["src-745"],
+            final_memories=["mem-745"],
+            cited_sources=["cited-src-745"],
+            cited_memories=["cited-mem-745"],
+            invalid_citations=["invalid-745"],
+            wiki_cited=["wiki-cited-745"],
+            wiki_filtered=["wiki-filtered-745"],
+            answer_source_mode="documents-745",
+            ab_variant="control-745",
+            prompt_version="v745",
+            finish_reason="stop-745",
+        )
+        secret_markers = [
+            "SECRETMARK_orig_query_745",
+            "SECRETMARK_transformed_745",
+            "SECRETMARK_dropped_745",
+            "SECRETMARK_wiki_query_745",
+            "SECRETMARK_followup_745",
+            "SECRETMARK_query_plan_745",
+            "SECRETMARK_unverifiable_745",
+        ]
+
+        # Redacted class: no SECRET marker may reach the default INFO log.
+        with self.assertLogs("app.services.rag_trace", level="INFO") as cm:
+            t.log()
+        joined = "\n".join(cm.output)
+        for marker in secret_markers:
+            self.assertNotIn(marker, joined)
+        self.assertIn("redacted", joined)
+
+        # Log-safe class: the benign values survive to_log_dict verbatim.
+        d = t.to_log_dict()
+        for field, value in (
+            ("fts_status", "ok-745"),
+            ("rerank_status", "applied-745"),
+            ("final_sources", ["src-745"]),
+            ("final_memories", ["mem-745"]),
+            ("cited_sources", ["cited-src-745"]),
+            ("cited_memories", ["cited-mem-745"]),
+            ("invalid_citations", ["invalid-745"]),
+            ("wiki_cited", ["wiki-cited-745"]),
+            ("wiki_filtered", ["wiki-filtered-745"]),
+            ("answer_source_mode", "documents-745"),
+            ("ab_variant", "control-745"),
+            ("prompt_version", "v745"),
+            ("finish_reason", "stop-745"),
+        ):
+            self.assertEqual(d[field], value, f"{field} must survive to_log_dict")
+
     def test_to_log_dict_preserves_other_fields(self):
         t = RAGTrace(original_query="q", fused_hits=7, rerank_status="applied")
         d = t.to_log_dict()

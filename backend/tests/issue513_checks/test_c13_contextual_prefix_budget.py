@@ -94,6 +94,36 @@ def main() -> int:
         )
         return 1
 
+    # Qwen auto-prefix oracle leg (#745 AC9 / T1-25-KR-08): derive the
+    # effective doc prefix for a QWEN-FAMILY model name through the
+    # product's own EmbeddingService.embedding_doc_prefix property — an
+    # independent derivation path from the raw settings read above — and
+    # require the documented Qwen3 default. If resolve_effective_prefixes
+    # loses the Qwen auto-prefix rule, the property resolves to "" and this
+    # leg fails instead of the whole check passing vacuously.
+    from app.services.embeddings import EmbeddingService as _ES
+
+    _saved_model = settings.embedding_model
+    _saved_doc_prefix = settings.embedding_doc_prefix
+    settings.embedding_model = "Qwen3-Embedding-8B"
+    settings.embedding_doc_prefix = ""
+    try:
+        service = _ES.__new__(_ES)  # property-only access; no client build
+        qwen_doc_prefix = service.embedding_doc_prefix
+    finally:
+        settings.embedding_model = _saved_model
+        settings.embedding_doc_prefix = _saved_doc_prefix
+    expected_qwen_prefix = (
+        "Instruct: Represent this technical documentation passage for retrieval.\n"
+        "Document: "
+    )
+    if qwen_doc_prefix != expected_qwen_prefix:
+        print(
+            "C13 CHECK: FAIL: qwen-family model did not resolve the "
+            f"documented Qwen3 auto doc prefix (got {qwen_doc_prefix!r})"
+        )
+        return 1
+
     print("C13 CHECK: PASS")
     return 0
 

@@ -40,20 +40,16 @@ _VITEST_CONFIG_CANDIDATES = (
 )
 
 
-def _coverage_config_evidence() -> tuple[str, str] | None:
-    """(file, text) of the first config that declares coverage thresholds."""
-    for name in _VITEST_CONFIG_CANDIDATES:
-        path = FRONTEND / name
-        if path.is_file():
-            text = path.read_text(encoding="utf-8")
-            if "coverage" in text and "thresholds" in text:
-                return name, text
-    vite_config = FRONTEND / "vite.config.ts"
-    if vite_config.is_file():
-        text = vite_config.read_text(encoding="utf-8")
-        if "coverage" in text and "thresholds" in text:
-            return "vite.config.ts", text
-    return None
+def _coverage_config_evidence() -> tuple[str, dict] | None:
+    """(file, TS-AST facts) of the first config that declares coverage
+    thresholds. #746 AC7 family (implementation-review revision 3): the
+    previous raw-text scan was comment-blind — a fully commented-out
+    coverage block still satisfied it (reviewer probe). It now reuses the
+    TypeScript-compiler walker from test_issue258_coverage_design, so only
+    real AST nodes count."""
+    from test_issue258_coverage_design import _coverage_ast
+
+    return _coverage_ast()
 
 
 def test_ac11_coverage_thresholds_configured():
@@ -65,12 +61,60 @@ def test_ac11_coverage_thresholds_configured():
             "(vitest.config.* or test.coverage in vite.config.ts) — ENH-006: "
             "the frontend has zero coverage configuration today"
         )
-        name, text = evidence
-        assert "thresholds" in text, f"{name} mentions coverage but no thresholds"
+        name, facts = evidence
+        assert facts["hasThresholds"], (
+            f"{name} mentions coverage but has no thresholds block in the AST "
+            "(a commented-out block does not count — #746 AC7)"
+        )
     except Exception:
         print("AC11 CHECK: FAIL")
         raise
     print("AC11 CHECK: PASS")
+
+
+def test_ac11_coverage_evidence_is_comment_aware(tmp_path):
+    """Self-check for the #746 AC7 class: a vite.config.ts whose entire
+    coverage/thresholds block exists ONLY inside comments must NOT count as
+    evidence (the reviewer probe shape). The walker resolves typescript via
+    NODE_PATH pointed at the REAL frontend install (PRR-007, feedback round
+    1): repointing FRONTEND at tmp_path without feeding the real
+    node_modules made the walker skip with a false "typescript not
+    resolvable" message on ordinary dev boxes."""
+    import os
+
+    import test_issue258_coverage_design as design
+
+    real_node_modules = design.REPO / "frontend" / "node_modules"
+    if not real_node_modules.is_dir():
+        pytest.skip(
+            "no real frontend/node_modules install to resolve typescript "
+            "from — the self-check cannot exercise the walker here"
+        )
+    commented = tmp_path / "vite.config.ts"
+    commented.write_text(
+        "export default defineConfig({\n"
+        "  // coverage: {\n"
+        "  //   thresholds: { lines: 80, branches: 70 }\n"
+        "  // }\n"
+        "});\n",
+        encoding="utf-8",
+    )
+    saved = design.FRONTEND
+    saved_node_path = os.environ.get("NODE_PATH")
+    design.FRONTEND = tmp_path
+    os.environ["NODE_PATH"] = str(real_node_modules)
+    try:
+        evidence = _coverage_config_evidence()
+    finally:
+        design.FRONTEND = saved
+        if saved_node_path is None:
+            os.environ.pop("NODE_PATH", None)
+        else:
+            os.environ["NODE_PATH"] = saved_node_path
+    assert evidence is None, (
+        "a fully commented-out coverage block must not be accepted as "
+        "coverage evidence (comment-blind scanner class, #746 AC7)"
+    )
 
 
 @pytest.mark.skipif(

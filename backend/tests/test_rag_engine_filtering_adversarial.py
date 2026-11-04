@@ -124,8 +124,8 @@ class TestFilterRelevantAdversarial:
     async def test_missing_distance_key(self, engine):
         """Attack: Missing _distance key should use score fallback."""
         results = [
-            {"score": 0.1, "text": "doc1", "file_id": "f1"},
-            {"score": 0.8, "text": "doc2", "file_id": "f2"},
+            {"_score": 0.1, "text": "doc1", "file_id": "f1"},
+            {"_score": 0.8, "text": "doc2", "file_id": "f2"},
         ]
         result = await engine._filter_relevant(results)
         assert isinstance(result, list)
@@ -289,6 +289,15 @@ class TestFilterRelevantAdversarial:
     # ATTACK VECTOR 6: Legacy Score Mode (higher=better)
     # =========================================================================
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "#745 AC4: fixtures now carry the real LanceDB FTS key "
+            "`_score`; the product still reads the legacy `score` key "
+            "and 1.0-floors this branch, flipping the outcome — owned "
+            "by #1070; remove this marker when #1070 lands"
+        ),
+    )
     async def test_legacy_score_mode_high_threshold(self, engine):
         """Attack: Legacy score mode with high threshold.
 
@@ -299,8 +308,8 @@ class TestFilterRelevantAdversarial:
         engine.max_distance_threshold = None
         engine.relevance_threshold = 0.9
         results = [
-            {"score": 0.5, "text": "doc1", "file_id": "f1"},
-            {"score": 0.6, "text": "doc2", "file_id": "f2"},
+            {"_score": 0.5, "text": "doc1", "file_id": "f1"},
+            {"_score": 0.6, "text": "doc2", "file_id": "f2"},
         ]
         # engine.max_distance_threshold = None, engine.relevance_threshold = 0.9
         # has_distance=False, distance=0.5 and 0.6, threshold=0.9
@@ -322,8 +331,8 @@ class TestFilterRelevantAdversarial:
         engine.max_distance_threshold = None
         engine.relevance_threshold = 0.1
         results = [
-            {"score": 0.5, "text": "doc1", "file_id": "f1"},
-            {"score": 0.6, "text": "doc2", "file_id": "f2"},
+            {"_score": 0.5, "text": "doc1", "file_id": "f1"},
+            {"_score": 0.6, "text": "doc2", "file_id": "f2"},
         ]
         result = await engine._filter_relevant(results)
         # Both scores > 0.1 should pass
@@ -334,8 +343,8 @@ class TestFilterRelevantAdversarial:
         engine.max_distance_threshold = None
         engine.relevance_threshold = 0.0
         results = [
-            {"score": -0.5, "text": "doc1", "file_id": "f1"},
-            {"score": 0.6, "text": "doc2", "file_id": "f2"},
+            {"_score": -0.5, "text": "doc1", "file_id": "f1"},
+            {"_score": 0.6, "text": "doc2", "file_id": "f2"},
         ]
         result = await engine._filter_relevant(results)
         # -0.5 < 0.0 should be filtered

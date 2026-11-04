@@ -66,6 +66,28 @@ jobs:
         # class lives in, and nothing else bounds this step.
         run: pytest --tb=short -v -s --timeout=300 --timeout-method=thread tests/test_real_docs_parsing.py tests/test_lifespan_fts_validation.py
 
+      - name: Real-unstructured vocabulary gate (no-skip proof, #745 AC10)
+        # The full-suite step below cannot fail on a SKIP, so the real
+        # element-to-atom mapping test added by #745 needs its own venue
+        # proof: run the named node with -rs and fail if pytest reports it
+        # skipped (standard CI stubs unstructured; only THIS job installs
+        # the real stack).
+        run: |
+          set +e
+          pytest --tb=short -rs -q --timeout=300 --timeout-method=thread tests/test_document_artifacts.py::TestRealUnstructuredVocabulary > gate.log 2>&1
+          EXIT=$?
+          set -e
+          cat gate.log
+          if [ "$EXIT" -ne 0 ]; then
+            echo "::error::the real-unstructured vocabulary gate failed (exit $EXIT)"
+            exit "$EXIT"
+          fi
+          if grep -qE "[0-9]+ skipped" gate.log; then
+            echo "::error::the real-unstructured vocabulary test SKIPPED in the full-deps tier (venue broken)"
+            exit 1
+          fi
+          grep -qE "[0-9]+ passed" gate.log || { echo "::error::no passing run recorded"; exit 1; }
+
       - name: Full backend suite (plain full run = cross-file isolation check)
         # --timeout-method=thread: same hang-class coverage as the CI Backend
         # job's Test step (#1021) — the signal method cannot fire on a

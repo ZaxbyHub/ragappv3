@@ -8,7 +8,10 @@ These are pure unit tests with no DB/vector/filesystem side effects.
 from __future__ import annotations
 
 import sys
+from contextlib import contextmanager
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -58,6 +61,73 @@ def _sample_elements():
         _Element("ListItem", "- a list item", section="sec", page_number=2),
         _Element("TotallyUnknown", "mystery", page_number=2),
     ]
+
+
+@contextmanager
+def _real_unstructured_graph():
+    """Yield with the REAL unstructured importable, evicting the conftest
+    stub graph (mirrors test_real_docs_parsing.py's eviction/restoration:
+    an unconditional import would bind the synthetic conftest graph and
+    prove nothing about the real category vocabulary)."""
+    stub = {
+        name: mod
+        for name, mod in sys.modules.items()
+        if name == "unstructured" or name.startswith("unstructured.")
+    }
+    for name in stub:
+        del sys.modules[name]
+    try:
+        import unstructured as real_unstructured
+        from unstructured.documents import elements as real_elements  # noqa: F401
+
+        if not getattr(real_unstructured, "__file__", None):
+            raise ModuleNotFoundError("only a synthetic test stub is present")
+        yield real_elements
+    finally:
+        for name in [
+            n for n in sys.modules if n == "unstructured" or n.startswith("unstructured.")
+        ]:
+            del sys.modules[name]
+        sys.modules.update(stub)
+
+
+class TestRealUnstructuredVocabulary:
+    """#745 AC10 (T1-25-KR-08): feed REAL unstructured.documents.elements
+    classes (not hand-built _Element fakes) to parse_elements_to_atoms and
+    assert the real category strings map to the documented atom kinds.
+    Standard CI installs no unstructured (conftest stubs it) so this skips
+    there; the nightly full-dependency job installs unstructured[all-docs]
+    and runs it for real (nightly.yml full-deps job), with a no-skip gate
+    step proving the run happened."""
+
+    def test_real_element_categories_map_to_atom_kinds(self):
+        try:
+            with _real_unstructured_graph() as elements:
+                Title = elements.Title
+                NarrativeText = elements.NarrativeText
+                ListItem = elements.ListItem
+        except ImportError as exc:  # pragma: no cover - standard CI tier
+            pytest.skip(
+                "real unstructured not installed in this tier; the nightly "
+                f"full-deps job runs this test for real ({type(exc).__name__}: {exc})"
+            )
+        real_els = [
+            Title("Real Heading"),
+            NarrativeText("Real body text."),
+            ListItem("real list item"),
+        ]
+        atoms = parse_elements_to_atoms(
+            real_els, file_id=1, generation_hash="g", parser_fingerprint="p"
+        )
+        assert [a.kind for a in atoms] == [
+            AtomKind.TITLE,
+            AtomKind.TEXT,
+            AtomKind.LIST,
+        ], (
+            "the REAL unstructured category vocabulary no longer maps onto "
+            "the adapter's atom kinds — update the adapter (and its "
+            "hand-built-fake sibling tests) to the real contract"
+        )
 
 
 class TestAdapter:

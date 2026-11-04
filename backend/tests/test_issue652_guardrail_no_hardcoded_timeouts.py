@@ -88,23 +88,64 @@ def test_guardrail_detector_flags_literal_call_sites():
     assert _literal_timeout_call_sites(ast.parse(snippet)) == ["line 2"]
     assert _literal_timeout_call_sites(ast.parse("LLMClient(timeout=None)\n")) == []
 
+    # #746 AC6 widened shapes: positional, attribute-qualified, signed.
+    assert _literal_timeout_call_sites(
+        ast.parse("LLMClient(300.0, base_url='x')\n")
+    ) == ["line 1"]
+    assert _literal_timeout_call_sites(
+        ast.parse("services.llm_client.LLMClient(timeout=300.0)\n")
+    ) == ["line 1"]
+    assert _literal_timeout_call_sites(
+        ast.parse("LLMClient(timeout=-5.0)\n")
+    ) == ["line 1"]
+    # Safe controls: dynamic timeout, no timeout argument, non-LLMClient.
+    assert _literal_timeout_call_sites(
+        ast.parse("LLMClient(timeout=settings.timeout)\n")
+    ) == []
+    assert _literal_timeout_call_sites(ast.parse("LLMClient(base_url='x')\n")) == []
+    assert _literal_timeout_call_sites(ast.parse("OtherClient(300.0)\n")) == []
+    assert _literal_timeout_call_sites(ast.parse("OtherClient(timeout=300.0)\n")) == []
+
+
+def _numeric_literal(node: ast.AST) -> bool:
+    """True for a numeric literal, including explicitly signed forms
+    (``-5.0`` is UnaryOp(USub, Constant)); dynamic expressions
+    (``settings.timeout``, names, calls) are NOT literals."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return True
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        return _numeric_literal(node.operand)
+    return False
+
 
 def _literal_timeout_call_sites(tree):
-    """Return 'line N' entries for LLMClient(...) calls whose ``timeout=``
-    keyword is a numeric constant."""
+    """Return 'line N' entries for LLMClient(...) calls with a HARDCODED
+    numeric timeout, in any of the three shapes the #652 class can use:
+
+    - keyword: ``LLMClient(timeout=300.0)`` (including signed ``-5.0``)
+    - positional: ``LLMClient(300.0, ...)`` — ``timeout`` is ``__init__``'s
+      first positional parameter (llm_client.py)
+    - attribute-qualified callee: ``services.llm_client.LLMClient(timeout=300.0)``
+
+    NOT flagged (safe): a dynamic timeout (``timeout=settings.timeout``), a
+    call with no timeout argument, and non-LLMClient calls with numeric
+    arguments (#746 AC6 / TQ-sibling-batch-01-04)."""
     hits = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         func = node.func
-        if not (isinstance(func, ast.Name) and func.id == "LLMClient"):
+        is_llmclient_call = (isinstance(func, ast.Name) and func.id == "LLMClient") or (
+            isinstance(func, ast.Attribute) and func.attr == "LLMClient"
+        )
+        if not is_llmclient_call:
             continue
         for keyword in node.keywords:
-            if (
-                keyword.arg == "timeout"
-                and isinstance(keyword.value, ast.Constant)
-                and isinstance(keyword.value.value, (int, float))
-            ):
+            if keyword.arg == "timeout" and _numeric_literal(keyword.value):
+                hits.append(f"line {node.lineno}")
+                break
+        else:
+            if node.args and _numeric_literal(node.args[0]):
                 hits.append(f"line {node.lineno}")
     return hits
 

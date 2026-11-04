@@ -64,7 +64,11 @@ NODE_MAJOR_PATTERNS = (
 PYTHON_MENTION_RE = re.compile(r"(?i)\bpython[^\d\n]{0,4}(\d+\.\d+)")
 PYTHON_TABLE_RE = re.compile(r"(?m)^\|\s*Python\s*\|\s*(\d+\.\d+)\+")
 
-CHAT_MODEL_RE = re.compile(r"(?m)^\s*(?:-\s*)?(?:CHAT_MODEL|INSTANT_CHAT_MODEL)=(\S+)")
+# #746 AC3 (T1-29-KR-09): commented example lines (`# CHAT_MODEL=x`) are
+# the values the doc INSTRUCTS the operator to configure, so they are
+# evaluated like active assignments (the optional leading `#` joins the
+# existing optional `- ` list-item prefix).
+CHAT_MODEL_RE = re.compile(r"(?m)^\s*(?:#\s*)?(?:-\s*)?(?:CHAT_MODEL|INSTANT_CHAT_MODEL)=(\S+)")
 OLLAMA_PULL_RE = re.compile(r"\bollama pull (\S+)")
 
 PYTHON_C_RE = re.compile(r'python(?:\d(?:\.\d+)?)?\s+-c\s+"([^"\n]+)"')
@@ -337,16 +341,27 @@ def model_pull_findings(doc: str) -> list[str]:
     )
     pulled = set(OLLAMA_PULL_RE.findall(active_doc))
     findings: list[str] = []
+    evaluated = 0
     for match in CHAT_MODEL_RE.finditer(doc):
         model = match.group(1)
         if model.startswith("${"):
             continue
+        evaluated += 1
         if model not in pulled:
             findings.append(
                 f"INSTALLATION.md:{line_of(doc, match.start())}: configured model "
                 f"{model!r} is never pulled by any `ollama pull` instruction "
                 f"(pulled: {sorted(pulled)})"
             )
+    # #746 AC3 non-vacuity: the check must evaluate at least one CONCRETE
+    # model assignment (excluding compose `${...}` placeholders) — an empty
+    # evaluation passes vacuously and hides every unpullable model.
+    if evaluated == 0:
+        findings.append(
+            "INSTALLATION.md: DOC-003b evaluated zero concrete chat-model "
+            "assignments (only ${...} placeholders or none at all) — the "
+            "model-pull check is vacuous"
+        )
     return findings
 
 

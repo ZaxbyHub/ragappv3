@@ -240,3 +240,119 @@ class TestAC2HealthProbeBypassesCache(unittest.IsolatedAsyncioTestCase):
             "health probe must issue a live HTTP request, not serve the warm "
             "'ping' cache entry",
         )
+
+
+class TestChatProbeHonorsTimeoutAndMaxTokens(unittest.IsolatedAsyncioTestCase):
+    """#745 AC7/AC8 (T1-27-K-12): the chat-side probes must honor the
+    checker timeout and the minimal max_tokens budget, mirroring the AC3
+    embeddings harness above. Kills the plan-critic's named mutants: a
+    ``LLMClient(timeout=self.timeout * 60)`` construction (AC7) and a
+    ``max_tokens=4096`` probe (AC8) both fail these tests."""
+
+    async def test_check_chat_honors_checker_timeout(self):
+        # Slow chat server: accepts the request, responds after 5.5s — far
+        # beyond the 2.0s checker timeout (and far below httpx defaults).
+        server_delay = 5.5
+
+        async def handle(reader, writer):
+            try:
+                await reader.read(65536)
+                await asyncio.sleep(server_delay)
+                # OpenAI-compatible shape (chat_completion requires
+                # data["choices"]); under the unmutated 2.0s timeout this
+                # body is never reached — the request times out first.
+                body = b'{"choices": [{"message": {"content": "pong"}}]}'
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                    b"Content-Length: " + str(len(body)).encode() +
+                    b"\r\nConnection: close\r\n\r\n" + body
+                )
+                await writer.drain()
+            except (ConnectionError, asyncio.CancelledError):
+                pass
+            finally:
+                with contextlib.suppress(Exception):
+                    writer.close()
+
+        server = await asyncio.start_server(handle, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+
+        async def _close_server():
+            server.close()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(server.wait_closed(), timeout=2)
+
+        self.addAsyncCleanup(_close_server)
+
+        loopback = f"http://127.0.0.1:{port}"
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+
+        def _chat_settings():
+            mock = MagicMock()
+            mock.ollama_chat_url = loopback
+            mock.chat_model = "test-model"
+            mock.llm_provider = "ollama"
+            mock.llm_api_key = None
+            # start() builds httpx.Limits from these — they must be real
+            # ints or the client construction raises inside check_chat's
+            # try (a fast ok=False that would pass for the wrong reason).
+            mock.llm_max_keepalive_connections = 4
+            mock.llm_max_connections = 8
+            return mock
+
+        stack.enter_context(
+            patch("app.services.llm_health.settings", _chat_settings())
+        )
+        stack.enter_context(
+            patch("app.services.llm_client.settings", _chat_settings())
+        )
+        stack.enter_context(patch("app.services.llm_client.assert_url_safe"))
+        stack.enter_context(
+            patch(
+                "app.services.ssrf_transport.SSRFSafeTransport",
+                _PassthroughTransport,
+            )
+        )
+
+        from app.services.llm_health import LLMHealthChecker as _Checker
+
+        checker = _Checker(timeout=2.0)
+        started = time.monotonic()
+        result = await checker.check_chat()
+        elapsed = time.monotonic() - started
+
+        self.assertFalse(
+            result["ok"],
+            f"a chat provider slower than the health timeout must report "
+            f"ok=False, got {result} after {elapsed:.2f}s",
+        )
+        self.assertLess(
+            elapsed,
+            4.0,
+            f"check_chat(timeout=2.0) must return within ~2s, took "
+            f"{elapsed:.2f}s (the locally-built LLMClient ignored the "
+            f"checker timeout — the #652/#745 hardcoded-timeout class)",
+        )
+
+    async def test_probe_client_sends_max_tokens_one(self):
+        """_probe_client must send the minimal max_tokens=1 budget (a full
+        completion as a health ping would burn provider quota)."""
+        from app.services.llm_health import LLMHealthChecker as _Checker
+
+        recorded = {}
+
+        class _RecordingClient:
+            async def chat_completion(self, messages, **kwargs):
+                recorded["messages"] = messages
+                recorded["kwargs"] = kwargs
+                return "pong"
+
+        checker = _Checker(timeout=2.0)
+        ok = await checker._probe_client(_RecordingClient())
+        self.assertTrue(ok)
+        self.assertEqual(recorded["kwargs"].get("max_tokens"), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

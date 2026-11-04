@@ -70,6 +70,7 @@ except ImportError:
     sys.modules['unstructured.partition.auto'] = _unstructured.partition.auto
 
 import aioimaplib  # noqa: E402
+import pytest  # noqa: E402
 from pydantic import SecretStr  # noqa: E402
 
 from app.config import Settings  # noqa: E402
@@ -267,6 +268,53 @@ class TestUnseenCountWithRealResponses(_EmailHarness):
                 f"checked via .result)",
             )
             self.assertTrue(fake.logged_out, "client must be logged out")
+        finally:
+            self._teardown_service()
+
+
+class TestLogoutAbortFailurePath(_EmailHarness):
+    """#745 AC6 (T1-01-K-14): a fake whose greeting times out AND whose
+    logout() raises ``aioimaplib.Abort`` — the real aioimaplib failure
+    shape when the connection never reached NONAUTH (locked 2.0.3 raises
+    ``Abort("command LOGOUT illegal in state STARTED")``; wheel-verified).
+    The documented contract of ``_get_unseen_count`` is "-1 if connection
+    fails". The product currently catches only (asyncio.TimeoutError,
+    OSError, ConnectionError) around both the body and the logout finally
+    (app/api/routes/email.py), so the Abort propagates to the bare status
+    route — owned by open #797 AC4; xfail(strict) until #797 lands."""
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "#745 AC6 rebuilds the fake faithfully; the product fix (catch "
+            "aioimaplib.Abort around logout in _get_unseen_count) is owned "
+            "by open #797 AC4 — remove this marker when #797 lands"
+        ),
+    )
+    async def test_unseen_count_returns_minus_one_when_logout_aborts(self):
+        self._make_service()
+        try:
+            from app.api.routes.email import _get_unseen_count
+
+            # The greeting leg raises TimeoutError (the realistic failed-
+            # connection entry into the except clause); the finally logout
+            # then raises Abort — the exact #797 AC4 probe shape.
+            class GreetingTimeoutLogoutAbortClient:
+                async def wait_hello_from_server(self):
+                    raise asyncio.TimeoutError("greeting timed out")
+
+                async def logout(self):
+                    raise aioimaplib.Abort(
+                        "command LOGOUT illegal in state STARTED"
+                    )
+
+            fake = GreetingTimeoutLogoutAbortClient()
+            with (
+                patch.object(aioimaplib, "IMAP4_SSL", return_value=fake),
+                patch.object(aioimaplib, "IMAP4", return_value=fake),
+            ):
+                outcome = await _get_unseen_count(self.service)
+            self.assertEqual(outcome, -1)
         finally:
             self._teardown_service()
 

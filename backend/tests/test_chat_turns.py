@@ -213,10 +213,11 @@ async def test_batch_rolls_back_completely_on_mid_batch_failure(tmp_path):
         conn.close()
 
 
-# Windows sqlite3 can access-violate when two connections take and block on the
-# writer lock from interleaved worker threads; CI (Linux) exercises the real
-# concurrency path, Windows runs the rest of the suite.
-@pytest.mark.skipif(sys.platform == "win32", reason="sqlite3 multithread crash on win32")
+# The historical win32 skip (sqlite3 access-violation rationale from #519,
+# commit 1f7e842d) was removed per #746 AC4/AC5: the crash does not
+# reproduce on Windows 11 / Python 3.11 — independently verified twice on a
+# real Windows host (tracer: 1 passed isolated / 24 passed full-file;
+# plan critic: 1 passed / 24 passed).
 @pytest.mark.asyncio
 async def test_concurrent_batches_assign_unique_monotonic_seq(tmp_path):
     """Two concurrent batch saves to one session must serialize on SQLite's

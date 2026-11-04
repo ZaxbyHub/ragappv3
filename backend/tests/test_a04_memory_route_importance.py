@@ -171,3 +171,33 @@ def test_zero_importance_round_trips_on_list(env):
     ]
     assert matches, "created memory must appear in the list"
     assert matches[0]["importance"] == 0.0
+
+
+def test_zero_importance_round_trips_on_update(env):
+    """#745 plan 10b (plan-critic r2/r3): the UPDATE route must round-trip
+    importance 0.0 — a PUT setting importance to 0.0 (with edited content)
+    lists back as 0.0, not the 0.5 default. The mapper None-guards that
+    make this work landed with #686; nothing pinned the PUT leg."""
+    created = env.client.post(
+        "/api/memories",
+        json={"content": "before edit", "vault_id": 1, "importance": 0.7},
+    )
+    assert created.status_code == 200, created.text
+    memory_id = int(created.json()["id"])
+
+    updated = env.client.put(
+        f"/api/memories/{memory_id}",
+        json={"content": "after edit", "importance": 0.0},
+    )
+    assert updated.status_code == 200, updated.text
+
+    resp = env.client.get("/api/memories?vault_id=1")
+    assert resp.status_code == 200
+    matches = [
+        m for m in resp.json()["memories"] if m["id"] == str(memory_id)
+    ]
+    assert matches, "updated memory must appear in the list"
+    assert matches[0]["importance"] == 0.0, (
+        "PUT importance=0.0 must round-trip as 0.0, not the 0.5 default"
+    )
+    assert matches[0]["content"] == "after edit"
