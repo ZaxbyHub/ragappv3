@@ -75,7 +75,7 @@ jobs:
         run: |
           pytest --tb=short -rs -q tests/test_document_artifacts.py::TestRealUnstructuredVocabulary > gate.log 2>&1
           cat gate.log
-          if grep -qE "(^| )1 skipped|skipped [0-9]+ (of|out)" gate.log; then
+          if grep -qE "[0-9]+ skipped" gate.log; then
             echo "::error::the real-unstructured vocabulary test SKIPPED in the full-deps tier (venue broken)"
             exit 1
           fi
