@@ -84,7 +84,7 @@ backend/app/
 ├── main.py                 # FastAPI entry point
 ├── lifespan.py             # Application lifecycle management
 ├── config.py               # Configuration settings
-├── security.py             # Authentication & authorization
+├── security/               # Authentication & authorization (package)
 ├── limiter.py              # Rate limiting
 │
 ├── api/                    # REST API routes

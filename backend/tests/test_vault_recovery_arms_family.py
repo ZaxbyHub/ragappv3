@@ -299,6 +299,61 @@ def test_httpexception_arm_semantics_via_helper_unit(tmp_path: Path) -> None:
         _pool_cache.clear()
 
 
+class _CommitFailConn:
+    """Delegates everything to the real connection; commit() always raises
+    sqlite3.OperationalError (the transaction stays open — the failure is
+    the commit itself)."""
+
+    def __init__(self, inner: sqlite3.Connection) -> None:
+        self._inner = inner
+
+    def commit(self) -> None:
+        raise sqlite3.OperationalError("scripted commit failure (compound)")
+
+    def __getattr__(self, name):  # noqa: ANN001
+        return getattr(self._inner, name)
+
+
+def test_commit_failure_with_absorbed_cancellation_ends_cancelled(
+    tmp_path: Path,
+) -> None:
+    """Review PRR-004 arm-level reachability: a commit failure racing an
+    absorbed caller cancellation must end the route CANCELLED — the tuple
+    arm runs the drained recovery (rollback + restore) and then the
+    delivered CancelledError wins; the pre-fix shape translated the
+    compound into HTTP 500 and the delivered cancellation vanished."""
+    env = _VaultEnv(tmp_path)
+    env.conn = _CommitFailConn(env.conn)
+    try:
+        def _is_commit(fn, args):  # noqa: ANN001
+            return getattr(fn, "__name__", "") == "commit"
+
+        outcome, state = _drive(env, _is_commit)
+        assert state["fired"], "non-vacuity: the commit hook fired"
+        assert outcome == "cancelled", (
+            "the delivered cancellation must win in the compound — the "
+            f"pre-fix shape leaked a 500 instead (got {outcome!r})"
+        )
+        assert env.storage.exists(env.input_relpath), (
+            "the drained recovery must still have restored the tombstoned "
+            "Draft Room bytes before the cancellation surfaced"
+        )
+        assert env.trash_entries() == []
+        check = sqlite3.connect(env.db_path)
+        try:
+            rows = check.execute(
+                "SELECT COUNT(*) FROM vaults WHERE id = ?", (VAULT_ID,)
+            ).fetchone()[0]
+        finally:
+            check.close()
+        assert rows == 1, (
+            "the failed commit must have been rolled back — the vault row "
+            "survives"
+        )
+    finally:
+        env.close()
+
+
 def test_post_commit_cancellation_does_not_restore(tmp_path: Path) -> None:
     """A cancellation delivered at the COMMIT await (absorbed by
     drained_commit, re-raised after the mandatory audit tail) with a

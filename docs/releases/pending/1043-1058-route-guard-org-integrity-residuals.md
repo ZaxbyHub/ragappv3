@@ -44,13 +44,14 @@ restore bytes that belong to deleted drafts.
 `await asyncio.to_thread(conn.commit)` was an un-drained boundary: a
 cancellation landing exactly there — after the commit work completed — unwound
 the handler before the audit coroutine existed, losing the row for an applied
-mutation. Two new `task_drain` helpers close the class:
+mutation. Two new `task_drain` helpers convert the sites named below (the wider worker-owned family is tracked in issue #1068):
 
 - `drain_commit_audit(conn, audit_factory, *, after_commit=None)` — commit +
   optional post-commit callback (cache invalidation) + drained audit as ONE
   shielded unit; the four users.py tails (create_user, update_user,
-  update_user_role, activation) and delete_vault's commit boundary were
-  converted;
+  update_user_role, activation) were converted (delete_vault uses the
+  second helper below, because its commit must stay structurally last so a
+  commit failure still reaches the recovery arms);
 - `drained_commit(conn)` — drains only the commit await for delete_vault,
   whose commit must stay last-in-try so a commit failure still falls into the
   recovery arms; an absorbed cancellation is deferred until after the

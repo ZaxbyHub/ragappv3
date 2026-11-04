@@ -4,7 +4,7 @@
 
 ### Admin tokens no longer persist in audit columns
 - `POST /api/prompts` now records a non-secret scope fingerprint
-  (`admin_scope_fingerprint` in `backend/app/security.py`, the same formula
+  (`admin_scope_fingerprint` in `backend/app/security/__init__.py`, the same formula
   the service-accounts route already used) instead of the verified token,
   which previously landed in the durable `prompt_versions.created_by` column
   and was echoed back by three prompts GET routes.

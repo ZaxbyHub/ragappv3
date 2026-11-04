@@ -71,7 +71,7 @@
 Revert the PR, or set `JWT_ALGORITHM=HS256` in the environment — the algorithm
 is read fresh on every token operation, so no restart-specific migration state
 exists. The CSRF declaration mechanism is test-only and cannot affect production
-enforcement (`security.py` requires `PYTEST_CURRENT_TEST` for the bypass).
+enforcement (`security/__init__.py` requires `PYTEST_CURRENT_TEST` for the bypass).
 
 ## Known limitations
 
