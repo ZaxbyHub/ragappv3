@@ -324,6 +324,7 @@ def test_coverage_design_pin_is_comment_aware(tmp_path):
     design.FRONTEND = fake_frontend
 
     failures = []
+    proof_absent = []
     called = 0
     for name in sorted(vars(design)):
         if name.startswith("test_ac11_design_") and callable(
@@ -332,16 +333,30 @@ def test_coverage_design_pin_is_comment_aware(tmp_path):
             called += 1
             try:
                 getattr(design, name)()
+            except AssertionError as exc:
+                # The ONLY valid AC7 evidence: the design pin asserting on
+                # the comment-mutated config.
+                failures.append(f"{name}: {exc}")
             except KeyboardInterrupt:
                 raise
             except BaseException as exc:  # noqa: BLE001 — pytest.skip derives
-                # from BaseException: a skip here would silently drop the
-                # AC7 proof, so ANY non-pass outcome (assertion OR skip) is
-                # a probe failure (PRR-007, feedback round 1).
-                failures.append(f"{name}: {type(exc).__name__}: {exc}")
+                # from BaseException: a skip (parser unresolvable) or harness
+                # error means the AC7 proof is ABSENT — the parser never ran.
+                # Recorded separately and failed below; NEVER conflated with
+                # the intended comment-blind AssertionError evidence (the
+                # delta-round inversion the implementation reviewer and final
+                # critic both executed: a single-list version let a missing
+                # compiler satisfy the probe).
+                proof_absent.append(f"{name}: {type(exc).__name__}: {exc}")
     assert called >= 1, (
         "H09-AC7 HARNESS DRIFT: test_issue258_coverage_design.py defines no "
         "test_ac11_design_* functions to call"
+    )
+    assert not proof_absent, (
+        "H09-AC7 PROOF ABSENT: one or more test_ac11_design_* checks skipped "
+        "or errored instead of asserting — the TypeScript parser could not "
+        "run or crashed, so the comment-blind coverage proof was NOT executed "
+        f"(fail the venue, never pass vacuously): {proof_absent}"
     )
     assert len(failures) >= 1, (
         "H09-AC7 COVERAGE DESIGN PIN IS COMMENT BLIND: with "
