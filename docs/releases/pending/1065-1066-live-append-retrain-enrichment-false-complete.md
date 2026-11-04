@@ -15,8 +15,10 @@ Collated closure of the two ingestion hot-path issues:
   un-indexed fragments. Full retrains still happen at the first create
   (≥256 rows, no index) and at delete churn ≥ `index_rebuild_delta`; the
   search path keeps its rebuild/retry semantics, so a failed churn rebuild
-  still retries on the next search (pinned by
-  `test_default_call_rebuilds_when_bookkeeping_is_stale`). Known trade-offs
+  still retries on the next search (the default-call retry leg
+  `test_default_call_rebuilds_when_bookkeeping_is_stale` plus the
+  caller-wiring guard
+  `test_search_caller_keeps_default_accept_existing_wiring`). Known trade-offs
   (disclosed): (1) if a churn rebuild fails and an append interleaves before
   the next search, the append's accept subsumes that retry until the next
   churn-qualifying event; (2) an enrichment swap whose DELETE-side churn

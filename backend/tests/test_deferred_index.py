@@ -203,8 +203,7 @@ class TestMaybeCreateVectorIndex(unittest.IsolatedAsyncioTestCase):
         default (accept_existing=False) call. With an existing IvfPq index and
         stale bookkeeping, the default call MUST still run create_index with
         replace=True — only the append path (accept_existing=True) accepts an
-        existing index. A regression that flips the search call to
-        accept_existing=True fails here.
+        existing index. A global/default flip to accepting fails here.
         """
         existing_index = MagicMock()
         existing_index.name = "embedding_idx"
@@ -235,6 +234,29 @@ class TestMaybeCreateVectorIndex(unittest.IsolatedAsyncioTestCase):
         mock_table.create_index.assert_awaited_once()
         self.assertIs(mock_table.create_index.await_args.kwargs.get("replace"), True)
         self.assertEqual(self.store._last_index_build_generation, 7)
+
+    def test_search_caller_keeps_default_accept_existing_wiring(self):
+        """Caller-wiring guard for the same retry contract: the search path
+        (vector_store.py's search() → `_maybe_create_vector_index()`) must
+        stay on the DEFAULT call — only the append tail may pass
+        accept_existing=True. A behavior test cannot see which caller passed
+        which kwarg (the reviewer's mutation probe: flipping the search call
+        to accept_existing=True left every behavioral test green), so pin the
+        wiring by source inspection, the repo's established pattern for
+        caller-ordering claims (test_lifespan_pool_seeding_order.py).
+        """
+        source_path = Path(__file__).resolve().parents[1] / "app" / "services" / "vector_store.py"
+        source = source_path.read_text(encoding="utf-8")
+        self.assertEqual(
+            source.count("_maybe_create_vector_index(accept_existing=True)"),
+            1,
+            "exactly one accept_existing=True caller allowed: the append tail",
+        )
+        self.assertEqual(
+            source.count("await self._maybe_create_vector_index()"),
+            1,
+            "the search-path call must stay the bare default call",
+        )
 
     async def test_skips_when_embedding_idx_already_exists(self):
         """
