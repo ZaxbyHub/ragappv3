@@ -57,7 +57,7 @@ filterwarnings = [
 # keeps the strict pytest config (addopts/-W/filterwarnings) active inside
 # mutant test runs.
 [tool.mutmut]
-source_paths = ["app/security.py"]
+source_paths = ["app/security/__init__.py", "app/security/recovery_routes.py"]
 # Must be a LIST: mutmut 3.7 concatenates this value onto a list of args, so
 # the string form raises `TypeError: can only concatenate list (not "str") to
 # list` inside `mutmut run` before any mutant is tested (PR #1045 feedback,

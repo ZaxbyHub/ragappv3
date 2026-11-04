@@ -468,62 +468,74 @@ async def update_organization(
         updates.append("updated_at = CURRENT_TIMESTAMP")
         params.append(org_id)
 
-        # One "-2" slug-suffix retry when the renamed org's slug collides —
-        # the update-route mirror of the create route's collision handling.
-        # A description-only update (no slug rewrite) cannot collide on slug
-        # and gets no retry.
-        try:
-            max_attempt = 1 if slug_param_index is not None else 0
-            for attempt in range(max_attempt + 1):
-                attempt_params = params
-                if attempt == 1:
-                    attempt_params = list(params)
-                    attempt_params[slug_param_index] += "-2"
-                try:
-                    await asyncio.to_thread(
-                        conn.execute,
-                        f"UPDATE organizations SET {', '.join(updates)} WHERE id = ?",
-                        attempt_params,
+        # Review PRR-003 (the #1043 stale-caller family, seventh sibling):
+        # the privilege read above ran on autocommit and the UPDATE committed
+        # bare, so a caller demoted between the check and the write still
+        # renamed/re-described the organization. One BEGIN IMMEDIATE now
+        # re-reads caller privilege via the shared helper (first statement),
+        # then performs the slug-retry UPDATE and reads the response row —
+        # every refusal rolls back atomically (mirrors the six sibling
+        # workers converted for #1043).
+        def _update_organization() -> dict:
+            with transaction_context(conn):
+                if not _is_org_admin_or_owner(conn, org_id, user["id"]):
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Insufficient privileges. Organization admin or owner required",
                     )
-                    await asyncio.to_thread(conn.commit)
-                    break
-                except sqlite3.IntegrityError:
-                    await asyncio.to_thread(conn.rollback)
-                    if attempt == max_attempt:
-                        raise
-        except sqlite3.IntegrityError:
-            raise HTTPException(
-                status_code=409,
-                detail="Conflict — could not update organization. Please choose a different name.",
-            )
+                # One "-2" slug-suffix retry when the renamed org's slug
+                # collides — the update-route mirror of the create route's
+                # collision handling. A description-only update (no slug
+                # rewrite) cannot collide on slug and gets no retry. Inside
+                # the open transaction a constraint failure (ON CONFLICT
+                # ABORT) undoes only the failed statement, so the retry
+                # needs no rollback; exhausting the retries raises 409 and
+                # transaction_context rolls the whole update back — the
+                # same observable outcome as the base rollback+409.
+                max_attempt = 1 if slug_param_index is not None else 0
+                for attempt in range(max_attempt + 1):
+                    attempt_params = params
+                    if attempt == 1:
+                        attempt_params = list(params)
+                        attempt_params[slug_param_index] += "-2"
+                    try:
+                        conn.execute(
+                            f"UPDATE organizations SET {', '.join(updates)} WHERE id = ?",
+                            attempt_params,
+                        )
+                        break
+                    except sqlite3.IntegrityError:
+                        if attempt == max_attempt:
+                            raise HTTPException(
+                                status_code=409,
+                                detail="Conflict — could not update organization. Please choose a different name.",
+                            )
+                cursor = conn.execute(
+                    """SELECT o.id, o.name, o.description, o.slug, o.created_at, o.updated_at,
+                              COUNT(DISTINCT om.user_id) as member_count,
+                              COUNT(DISTINCT v.id) as vault_count
+                       FROM organizations o
+                       LEFT JOIN org_members om ON o.id = om.org_id
+                       LEFT JOIN vaults v ON v.org_id = o.id
+                       WHERE o.id = ?
+                       GROUP BY o.id""",
+                    (org_id,),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    raise HTTPException(status_code=404, detail="Organization not found")
+                return {
+                    "id": row[0],
+                    "name": row[1],
+                    "description": row[2] or "",
+                    "slug": row[3],
+                    "created_at": row[4],
+                    "updated_at": row[5],
+                    "member_count": row[6] or 0,
+                    "vault_count": row[7] or 0,
+                }
 
-        # Check if organization still exists after update
-        cursor = await asyncio.to_thread(
-            conn.execute,
-            """SELECT o.id, o.name, o.description, o.slug, o.created_at, o.updated_at,
-                      COUNT(DISTINCT om.user_id) as member_count,
-                      COUNT(DISTINCT v.id) as vault_count
-               FROM organizations o
-               LEFT JOIN org_members om ON o.id = om.org_id
-               LEFT JOIN vaults v ON v.org_id = o.id
-               WHERE o.id = ?
-               GROUP BY o.id""",
-            (org_id,),
-        )
-        row = await asyncio.to_thread(cursor.fetchone)
-        if not row:
-            raise HTTPException(status_code=404, detail="Organization not found")
-
-        return {
-            "id": row[0],
-            "name": row[1],
-            "description": row[2] or "",
-            "slug": row[3],
-            "created_at": row[4],
-            "updated_at": row[5],
-            "member_count": row[6] or 0,
-            "vault_count": row[7] or 0,
-        }
+        return await asyncio.to_thread(_update_organization)
     finally:
         pool.release_connection(conn)
 
@@ -651,30 +663,68 @@ async def add_org_member(
                 detail="User is already a member of this organization",
             )
 
-        # Insert member
-        cursor = await asyncio.to_thread(
-            conn.execute,
-            "INSERT INTO org_members (org_id, user_id, role) VALUES (?, ?, ?)",
-            (org_id, req.user_id, req.role),
-        )
-        await asyncio.to_thread(conn.commit)
+        # Issue #1043 residual 1: every precondition above (caller privilege,
+        # owner-assignment right, target identity, duplicate membership) was
+        # read on autocommit and the INSERT committed with no re-read — a
+        # caller demoted between the outer check and the write still landed
+        # their mutation. One BEGIN IMMEDIATE now re-reads caller privilege
+        # (first statement), the owner-assignment right, target identity and
+        # duplicate membership, then INSERTs and reads the response row —
+        # every refusal rolls back atomically (mirrors the #1042 pattern on
+        # update_org_member_role / remove_org_member / transfer_ownership).
+        def _add_member() -> dict:
+            with transaction_context(conn):
+                if not _is_org_admin_or_owner(conn, org_id, user["id"]):
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Insufficient privileges. Organization admin or owner required",
+                    )
+                target = conn.execute(
+                    "SELECT id FROM users WHERE id = ? AND is_active = 1",
+                    (req.user_id,),
+                ).fetchone()
+                if not target:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="User not found or inactive",
+                    )
+                if req.role == "owner":
+                    caller_role_row = conn.execute(
+                        "SELECT role FROM org_members WHERE org_id = ? AND user_id = ?",
+                        (org_id, user["id"]),
+                    ).fetchone()
+                    if not caller_role_row or caller_role_row[0] != "owner":
+                        raise HTTPException(
+                            status_code=403,
+                            detail="Only organization owners can assign the owner role",
+                        )
+                if conn.execute(
+                    "SELECT 1 FROM org_members WHERE org_id = ? AND user_id = ?",
+                    (org_id, req.user_id),
+                ).fetchone():
+                    raise HTTPException(
+                        status_code=409,
+                        detail="User is already a member of this organization",
+                    )
+                conn.execute(
+                    "INSERT INTO org_members (org_id, user_id, role) VALUES (?, ?, ?)",
+                    (org_id, req.user_id, req.role),
+                )
+                row = conn.execute(
+                    """SELECT u.id, u.username, u.full_name, om.role, om.joined_at
+                       FROM org_members om JOIN users u ON om.user_id = u.id
+                       WHERE om.org_id = ? AND om.user_id = ?""",
+                    (org_id, req.user_id),
+                ).fetchone()
+                return {
+                    "user_id": row[0],
+                    "username": row[1],
+                    "full_name": row[2] or "",
+                    "role": row[3],
+                    "joined_at": row[4],
+                }
 
-        # Fetch member details
-        cursor = await asyncio.to_thread(
-            conn.execute,
-            """SELECT u.id, u.username, u.full_name, om.role, om.joined_at
-               FROM org_members om JOIN users u ON om.user_id = u.id
-               WHERE om.org_id = ? AND om.user_id = ?""",
-            (org_id, req.user_id),
-        )
-        row = await asyncio.to_thread(cursor.fetchone)
-        return {
-            "user_id": row[0],
-            "username": row[1],
-            "full_name": row[2] or "",
-            "role": row[3],
-            "joined_at": row[4],
-        }
+        return await asyncio.to_thread(_add_member)
     finally:
         pool.release_connection(conn)
 
@@ -748,37 +798,46 @@ async def create_org_invite(
         # exact checks resend re-asserts.
         await asyncio.to_thread(_assert_invite_redeemable, conn, req.email)
 
-        # Generate token
-        raw_token, token_hash = _generate_invite_token()
-        now = datetime.now(timezone.utc)
-        expires_at = now + timedelta(days=req.expires_in_days)
+        # Issue #1043 residual 1: the invite INSERT above committed on
+        # autocommit reads — a caller demoted between the outer privilege
+        # check and the write still minted the invite. One BEGIN IMMEDIATE
+        # now re-reads caller privilege and invitee redeemability, then
+        # INSERTs (mirrors the #1042 pattern).
+        def _create_invite() -> dict:
+            with transaction_context(conn):
+                if not _is_org_admin_or_owner(conn, org_id, user["id"]):
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Insufficient privileges. Organization admin or owner required",
+                    )
+                _assert_invite_redeemable(conn, req.email)
+                raw_token, token_hash = _generate_invite_token()
+                now = datetime.now(timezone.utc)
+                expires_at = now + timedelta(days=req.expires_in_days)
+                cursor = conn.execute(
+                    """INSERT INTO org_invites
+                       (org_id, email, token_hash, role, expires_at, created_at, created_by_user_id)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        org_id,
+                        req.email.lower(),
+                        token_hash,
+                        req.role,
+                        expires_at.isoformat(),
+                        now.isoformat(),
+                        user["id"],
+                    ),
+                )
+                invite_id = cursor.lastrowid
+                return {
+                    "invite_id": invite_id,
+                    "email": req.email.lower(),
+                    "role": req.role,
+                    "expires_at": expires_at.isoformat(),
+                    "token": raw_token,
+                }
 
-        # Insert invite
-        cursor = await asyncio.to_thread(
-            conn.execute,
-            """INSERT INTO org_invites
-               (org_id, email, token_hash, role, expires_at, created_at, created_by_user_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (
-                org_id,
-                req.email.lower(),
-                token_hash,
-                req.role,
-                expires_at.isoformat(),
-                now.isoformat(),
-                user["id"],
-            ),
-        )
-        await asyncio.to_thread(conn.commit)
-        invite_id = cursor.lastrowid
-
-        return {
-            "invite_id": invite_id,
-            "email": req.email.lower(),
-            "role": req.role,
-            "expires_at": expires_at.isoformat(),
-            "token": raw_token,
-        }
+        return await asyncio.to_thread(_create_invite)
     finally:
         pool.release_connection(conn)
 
@@ -832,28 +891,51 @@ async def resend_org_invite(
         # (e.g. global role dropped below member) must not be re-minted.
         await asyncio.to_thread(_assert_invite_redeemable, conn, invite[1])
 
-        # Generate new token
-        raw_token, token_hash = _generate_invite_token()
-        now = datetime.now(timezone.utc)
-        # Default 7-day expiry on resend
-        expires_at = now + timedelta(days=7)
+        # Issue #1043 residual 1: the token re-mint UPDATE committed on
+        # autocommit reads — a caller demoted after the outer check still
+        # re-minted. One BEGIN IMMEDIATE re-reads caller privilege, the
+        # invite's state and redeemability, then UPDATEs (mirrors #1042).
+        def _resend_invite() -> dict:
+            with transaction_context(conn):
+                if not _is_org_admin_or_owner(conn, org_id, user["id"]):
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Insufficient privileges. Organization admin or owner required",
+                    )
+                current = conn.execute(
+                    """SELECT id, email, role, revoked_at, accepted_at
+                       FROM org_invites WHERE id = ? AND org_id = ?""",
+                    (invite_id, org_id),
+                ).fetchone()
+                if not current:
+                    raise HTTPException(status_code=404, detail="Invite not found")
+                if current[3]:  # revoked_at
+                    raise HTTPException(
+                        status_code=400, detail="Invite has been revoked"
+                    )
+                if current[4]:  # accepted_at
+                    raise HTTPException(
+                        status_code=400, detail="Invite has already been accepted"
+                    )
+                _assert_invite_redeemable(conn, current[1])
+                raw_token, token_hash = _generate_invite_token()
+                now = datetime.now(timezone.utc)
+                expires_at = now + timedelta(days=7)
+                conn.execute(
+                    """UPDATE org_invites
+                       SET token_hash = ?, expires_at = ?, created_at = ?, created_by_user_id = ?
+                       WHERE id = ?""",
+                    (token_hash, expires_at.isoformat(), now.isoformat(), user["id"], invite_id),
+                )
+                return {
+                    "invite_id": invite_id,
+                    "email": current[1],
+                    "role": current[2],
+                    "expires_at": expires_at.isoformat(),
+                    "token": raw_token,
+                }
 
-        await asyncio.to_thread(
-            conn.execute,
-            """UPDATE org_invites
-               SET token_hash = ?, expires_at = ?, created_at = ?, created_by_user_id = ?
-               WHERE id = ?""",
-            (token_hash, expires_at.isoformat(), now.isoformat(), user["id"], invite_id),
-        )
-        await asyncio.to_thread(conn.commit)
-
-        return {
-            "invite_id": invite_id,
-            "email": invite[1],
-            "role": invite[2],
-            "expires_at": expires_at.isoformat(),
-            "token": raw_token,
-        }
+        return await asyncio.to_thread(_resend_invite)
     finally:
         pool.release_connection(conn)
 
@@ -898,15 +980,35 @@ async def revoke_org_invite(
         if invite[1]:  # already revoked
             raise HTTPException(status_code=400, detail="Invite has already been revoked")
 
-        now = datetime.now(timezone.utc).isoformat()
-        await asyncio.to_thread(
-            conn.execute,
-            "UPDATE org_invites SET revoked_at = ? WHERE id = ?",
-            (now, invite_id),
-        )
-        await asyncio.to_thread(conn.commit)
+        # Issue #1043 residual 1: the revoke UPDATE committed on autocommit
+        # reads — a caller demoted after the outer check still revoked. One
+        # BEGIN IMMEDIATE re-reads caller privilege and the invite's state,
+        # then UPDATEs (mirrors #1042).
+        def _revoke_invite() -> dict:
+            with transaction_context(conn):
+                if not _is_org_admin_or_owner(conn, org_id, user["id"]):
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Insufficient privileges. Organization admin or owner required",
+                    )
+                current = conn.execute(
+                    "SELECT id, revoked_at FROM org_invites WHERE id = ? AND org_id = ?",
+                    (invite_id, org_id),
+                ).fetchone()
+                if not current:
+                    raise HTTPException(status_code=404, detail="Invite not found")
+                if current[1]:  # already revoked
+                    raise HTTPException(
+                        status_code=400, detail="Invite has already been revoked"
+                    )
+                now = datetime.now(timezone.utc).isoformat()
+                conn.execute(
+                    "UPDATE org_invites SET revoked_at = ? WHERE id = ?",
+                    (now, invite_id),
+                )
+                return {"message": "Invite revoked", "invite_id": invite_id}
 
-        return {"message": "Invite revoked", "invite_id": invite_id}
+        return await asyncio.to_thread(_revoke_invite)
     finally:
         pool.release_connection(conn)
 
@@ -1564,14 +1666,32 @@ async def set_prompt_override(
 
         from app.services.prompt_store import PromptVersionStore
 
-        store = PromptVersionStore(conn)
-        try:
-            await asyncio.to_thread(
-                store.set_org_override, org_id, req.version, str(user["id"])
-            )
-        except ValueError as e:
-            raise HTTPException(status_code=404, detail=str(e))
+        # Issue #1043 residual 1: the override upsert used to run on
+        # autocommit reads — a caller demoted after the outer check still
+        # landed their override. One BEGIN IMMEDIATE re-reads caller
+        # privilege (superadmin bypass preserved, as the outer check) and
+        # upserts with the store's caller-owned-transaction mode (commit=
+        # False: the route's transaction owns durability) — mirrors #1042.
+        def _set_override() -> None:
+            with transaction_context(conn):
+                if user.get("role") != "superadmin" and not _is_org_admin_or_owner(
+                    conn, org_id, user["id"]
+                ):
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Insufficient privileges. Organization admin or owner required",
+                    )
+                store = PromptVersionStore(conn)
+                try:
+                    store.set_org_override(
+                        org_id, req.version, str(user["id"]), commit=False
+                    )
+                except ValueError as e:
+                    raise HTTPException(status_code=404, detail=str(e))
 
+        await asyncio.to_thread(_set_override)
+
+        store = PromptVersionStore(conn)
         # Return the effective version
         effective = await asyncio.to_thread(store.resolve_for_org, org_id)
         is_override = (await asyncio.to_thread(store.get_for_org, org_id)) is not None
@@ -1620,9 +1740,22 @@ async def clear_prompt_override(
 
         from app.services.prompt_store import PromptVersionStore
 
-        store = PromptVersionStore(conn)
-        await asyncio.to_thread(store.clear_org_override, org_id)
+        # Issue #1043 residual 1: same in-transaction re-validation as
+        # set_prompt_override — the DELETE used to run on autocommit reads.
+        def _clear_override() -> None:
+            with transaction_context(conn):
+                if user.get("role") != "superadmin" and not _is_org_admin_or_owner(
+                    conn, org_id, user["id"]
+                ):
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Insufficient privileges. Organization admin or owner required",
+                    )
+                PromptVersionStore(conn).clear_org_override(org_id, commit=False)
 
+        await asyncio.to_thread(_clear_override)
+
+        store = PromptVersionStore(conn)
         # Return the effective version (now the global active)
         effective = await asyncio.to_thread(store.resolve_for_org, org_id)
         if effective is None:

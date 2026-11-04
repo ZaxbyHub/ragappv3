@@ -194,7 +194,7 @@ def test_mutation_score_step_accepts_module_path_lines(tmp_path):
     module = "app.security"
     stats = {"killed": 2, "survived": 1, "total": 3}  # 66.7% >= floor 30
     backend_dir = tmp_path / "backend"
-    _write_lf(backend_dir / "mutation_modules.txt", f"{module} backend/app/security.py\n")
+    _write_lf(backend_dir / "mutation_modules.txt", f"{module} backend/app/security/__init__.py\n")
     (backend_dir / "mutation-stats").mkdir(parents=True, exist_ok=True)
     (backend_dir / "mutation-stats" / f"{module}.json").write_text(
         json.dumps(stats), encoding="utf-8"

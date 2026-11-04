@@ -78,3 +78,85 @@ async def drain_audit(audit_coro: Coroutine) -> None:
             )
     if cancelled:
         raise asyncio.CancelledError
+
+
+async def drained_commit(conn) -> tuple[bool, BaseException | None]:
+    """Drain ONLY the commit await (issue #1043 residual 3).
+
+    Returns ``(cancelled, error)`` and never re-raises — the caller decides:
+    ``delete_vault`` re-raises ``error`` so its recovery arms still run, and
+    defers the absorbed ``CancelledError`` until after its mandatory
+    post-commit bookkeeping. A cancellation delivered at the commit await
+    after the commit work already completed (the executor finished; the route
+    task had not resumed) is absorbed until the commit is durable, then
+    reported via ``cancelled``.
+    """
+    return await drain_await(asyncio.ensure_future(asyncio.to_thread(conn.commit)))
+
+
+async def drain_commit_audit(
+    conn,
+    audit_factory,
+    *,
+    after_commit=None,
+) -> None:
+    """Commit + optional post-commit callback + drained audit as ONE unit
+    (issue #1043 residual 3).
+
+    Unit: ``to_thread(conn.commit)`` -> ``after_commit()`` (if given) ->
+    ``drain_audit(audit_factory())``. The audit coroutine is created lazily
+    by ``audit_factory`` so it only exists once the commit has completed
+    (record-after-real-mutation ordering preserved). ``after_commit`` exists
+    so cache invalidations that today sit BETWEEN the commit and the audit
+    (e.g. ``invalidate_active_user_cache`` in users.py) stay inside the
+    drained unit instead of widening the stale-cache window.
+
+    Outcome contract:
+
+    - commit failure: the unit fails, the error is re-raised;
+      ``after_commit`` NOT run; the audit NOT created (the mutation was not
+      applied — the same ordering as today's non-cancel error path).
+    - ``after_commit`` failure: re-raised; audit not created (today's
+      ordering — whatever sits between commit and audit could already skip
+      it on error — preserved).
+    - cancellation of the caller at any point (including exactly at the
+      commit await after the commit work completed): absorbed until the
+      whole unit completes — commit durable, callback run, audit row written
+      — then ``CancelledError`` re-raised.
+    - audit failure: logged by ``drain_audit``, not re-raised (the
+      best-effort audit contract).
+    - compound — unit failure AND an absorbed caller cancellation: the
+      unit's error is logged loudly (``exc_info``) and the delivered
+      cancellation WINS — ``CancelledError`` re-raised after the log (a
+      delivered cancellation never vanishes; the failure is not silently
+      dropped either).
+    - the unit task itself cancelled (loop teardown — nothing else cancels
+      it): logged as unrecoverable (no retry, row state unverified — the
+      audit may or may not have written depending on where the cancellation
+      landed); if no caller cancellation was absorbed this helper RETURNS
+      normally after logging; an absorbed caller cancellation still
+      re-raises ``CancelledError`` after the log.
+    """
+
+    async def _unit() -> None:
+        await asyncio.to_thread(conn.commit)
+        if after_commit is not None:
+            after_commit()
+        await drain_audit(audit_factory())
+
+    cancelled, error = await drain_await(asyncio.ensure_future(_unit()))
+    if error is not None:
+        if isinstance(error, asyncio.CancelledError):
+            logger.warning(
+                "commit_audit_unit_cancelled unit_task_cancelled_during_commit_audit "
+                "row_state_unverified"
+            )
+        else:
+            logger.error(
+                "commit_audit_unit_failed reason=%s", type(error).__name__,
+                exc_info=error,
+            )
+            if not cancelled:
+                raise error
+    if cancelled:
+        raise asyncio.CancelledError

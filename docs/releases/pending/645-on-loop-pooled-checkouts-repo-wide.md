@@ -20,7 +20,7 @@
     production 30000 busy timeout.
 - A-class checkouts (14 sites) converted from `pool.get_connection()` to
   `await pool.get_connection_async()`: `api/deps.py`
-  (`require_health_probe_auth`, `evaluate_policy`), `security.py`
+  (`require_health_probe_auth`, `evaluate_policy`), `security/__init__.py`
   (service-account dependency), `services/document_processor.py` (7 sites:
   `_write_session`, chunk-retry, `process_file`, `process_existing_file`),
   `services/email_service.py` (`_resolve_vault_id`), `services/file_watcher.py`

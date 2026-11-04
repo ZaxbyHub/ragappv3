@@ -71,7 +71,8 @@ jobs:
           # file path is the diff-intersection key in PR-diff mode; the
           # module name is what mutmut scopes on.
           guard_modules = [
-              ("app.security", "backend/app/security.py"),
+              ("app.security", "backend/app/security/__init__.py"),
+              ("app.security.recovery_routes", "backend/app/security/recovery_routes.py"),
               ("app.api.deps", "backend/app/api/deps.py"),
               ("app.middleware.logging", "backend/app/middleware/logging.py"),
               ("app.middleware.maintenance", "backend/app/middleware/maintenance.py"),
@@ -205,7 +206,7 @@ jobs:
       - name: Boot the app test instance
         # Disposable fuzzer instance only: RAGAPP_CSRF_TEST_BYPASS=1 plus a
         # PYTEST_CURRENT_TEST sentinel are BOTH required by the CSRF bypass
-        # check (app/security.py), which deliberately narrows CSRF for this
+        # check (app/security/), which deliberately narrows CSRF for this
         # run so mutating routes stay reachable for stateful link chains.
         env:
           ADMIN_SECRET_TOKEN: "nightly-schemathesis-admin-token-0123456789abcdef0123456789abcdef0123"

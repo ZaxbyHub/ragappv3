@@ -22,6 +22,7 @@ from app.models.database import (
     lookup_service_account,
 )
 from app.security import constant_time_equals, get_csrf_manager  # noqa: F401
+from app.security.recovery_routes import is_recovery_exempt
 from app.services.auth_service import (
     TokenExpiredError,
     TokenInvalidError,
@@ -501,29 +502,16 @@ async def _resolve_active_user(
     # Enforce must_change_password: flagged users can only access explicit
     # auth recovery routes. Include both router-local and mounted runtime paths.
     if user.get("must_change_password"):
-        # Base paths always included (no prefix)
+        # The exemption decision is ONE shared method-aware canonicalizing
+        # predicate (issue #1058): the same table and spelling rules the
+        # maintenance middleware's write-block exemption consumes, so the two
+        # gates can no longer disagree (a flagged user authenticating during a
+        # maintenance window always has a working exit). GET /auth/me stays
+        # exempt there (SPA rehydration read); every other method on /auth/me
+        # stays blocked so the forced-change flow is the only way out.
         # Note: request.url.path does NOT include root_path (FastAPI strips it before routing),
         # so prefixed paths like /meridian/api/... are never seen here — only /api/...
-        exempt_paths = {
-            "/auth/change-password",
-            "/auth/login",
-            "/api/auth/change-password",
-            "/api/auth/login",
-        }
-        # GET /auth/me is exempt so the SPA can rehydrate the current user and
-        # detect the flag on reload — it is a read-only view of the caller's own
-        # identity (no other data, no mutation). Without it, the client's init()
-        # fetchMe() 403s, the user is logged out, and is bounced to login instead
-        # of the forced change-password screen. Only GET is exempt: PATCH /auth/me
-        # (update_me) mutates the profile/password and must stay blocked so the
-        # forced-change flow is the only way out.
-        me_read_paths = {"/auth/me", "/api/auth/me"}
-        # Normalize path to prevent bypass via trailing slash variants
-        normalized_path = request.url.path.rstrip("/") or "/"
-        is_exempt = normalized_path in exempt_paths or (
-            request.method.upper() == "GET" and normalized_path in me_read_paths
-        )
-        if not is_exempt:
+        if not is_recovery_exempt(request.method, request.url.path):
             raise HTTPException(
                 status_code=403,
                 detail="must_change_password",

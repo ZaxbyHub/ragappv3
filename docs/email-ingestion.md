@@ -741,7 +741,7 @@ subject = "Valid text ERROR: Fake error message More valid text"
 **Authentication Required:** Yes
 - Header: `Authorization: Bearer <admin_secret_token>`
 
-> Scopes are derived server-side from `settings.admin_token_scopes` keyed on the verified token. The `X-Scopes` HTTP header is intentionally ignored. See `backend/app/security.py:require_scope` and the CHANGELOG `### Security` section for issue #209.
+> Scopes are derived server-side from `settings.admin_token_scopes` keyed on the verified token. The `X-Scopes` HTTP header is intentionally ignored. See `backend/app/security/__init__.py:require_scope` and the CHANGELOG `### Security` section for issue #209.
 
 ### Response Schema
 

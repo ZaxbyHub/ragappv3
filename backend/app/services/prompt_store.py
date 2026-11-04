@@ -94,11 +94,17 @@ class PromptVersionStore:
         org_id: int,
         version: str,
         set_by: Optional[str] = None,
+        *,
+        commit: bool = True,
     ) -> PromptVersion:
         """Set (upsert) an org's prompt version override.
 
         Validates that ``version`` exists in prompt_versions before writing.
-        Returns the overridden PromptVersion.
+        Returns the overridden PromptVersion. With ``commit=False`` the write
+        joins the CALLER's open transaction (issue #1043: the prompt-override
+        routes re-validate caller privilege inside their own BEGIN IMMEDIATE
+        and own durability there); the default commits as before for every
+        existing caller.
         """
         # Validate version exists
         pv = self.get_version(version)
@@ -114,17 +120,23 @@ class PromptVersionStore:
                    set_by = excluded.set_by""",
             (org_id, version, set_by),
         )
-        self._db.commit()
+        if commit:
+            self._db.commit()
         # Return the version row (not the override row)
         return pv
 
-    def clear_org_override(self, org_id: int) -> None:
-        """Delete the org's prompt override, if any. Idempotent."""
+    def clear_org_override(self, org_id: int, *, commit: bool = True) -> None:
+        """Delete the org's prompt override, if any. Idempotent.
+
+        With ``commit=False`` the delete joins the caller's open transaction
+        (issue #1043); the default commits as before.
+        """
         self._db.execute(
             "DELETE FROM prompt_org_overrides WHERE org_id = ?",
             (org_id,),
         )
-        self._db.commit()
+        if commit:
+            self._db.commit()
 
     # ------------------------------------------------------------------
     # Mutations

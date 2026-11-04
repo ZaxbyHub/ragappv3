@@ -106,7 +106,7 @@ def test_score_step_fails_on_nonzero_mutmut_rc(tmp_path):
 
     module = "app.security"
     backend_dir = tmp_path / "backend"
-    _write_lf(backend_dir / "mutation_modules.txt", f"{module} backend/app/security.py\n")
+    _write_lf(backend_dir / "mutation_modules.txt", f"{module} backend/app/security/__init__.py\n")
     # The crash leg: mutmut exited 2, yet export still wrote parseable stats
     # (100% above any floor — only the .rc can catch this masquerade).
     _seed_stats(backend_dir, module, killed=3, survived=0)
@@ -142,7 +142,7 @@ def test_score_step_passes_when_rc_absent(tmp_path):
 
     module = "app.security"
     backend_dir = tmp_path / "backend"
-    _write_lf(backend_dir / "mutation_modules.txt", f"{module} backend/app/security.py\n")
+    _write_lf(backend_dir / "mutation_modules.txt", f"{module} backend/app/security/__init__.py\n")
     _seed_stats(backend_dir, module, killed=2, survived=1)
     (tmp_path / "scripts").mkdir(parents=True, exist_ok=True)
     shutil.copy(SCRIPTS / "mutation_score.py", tmp_path / "scripts" / "mutation_score.py")
@@ -174,9 +174,9 @@ def test_run_step_copies_mutmut_written_stats_file(tmp_path):
 
     backend_dir = tmp_path / "backend"
     module = "app.security"
-    _write_lf(backend_dir / "mutation_modules.txt", f"{module} backend/app/security.py\n")
+    _write_lf(backend_dir / "mutation_modules.txt", f"{module} backend/app/security/__init__.py\n")
     # The run step's heredoc rewrites pyproject.toml — it must exist.
-    _write_lf(backend_dir / "pyproject.toml", "[tool.mutmut]\nsource_paths = [\"app/security.py\"]\n")
+    _write_lf(backend_dir / "pyproject.toml", "[tool.mutmut]\nsource_paths = [\"app/security/__init__.py\"]\n")
     (tmp_path / "scripts").mkdir(parents=True, exist_ok=True)
     shutil.copy(SCRIPTS / "mutation_score.py", tmp_path / "scripts" / "mutation_score.py")
 

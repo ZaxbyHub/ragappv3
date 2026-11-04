@@ -29,14 +29,14 @@
     },
     "_totals": {
       "CONFIDENCE.HIGH": 34,
-      "CONFIDENCE.LOW": 25,
-      "CONFIDENCE.MEDIUM": 66,
+      "CONFIDENCE.LOW": 24,
+      "CONFIDENCE.MEDIUM": 67,
       "CONFIDENCE.UNDEFINED": 0,
       "SEVERITY.HIGH": 6,
       "SEVERITY.LOW": 59,
       "SEVERITY.MEDIUM": 60,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 95247,
+      "loc": 95595,
       "nosec": 0,
       "skipped_tests": 71
     },
@@ -62,7 +62,7 @@
       "SEVERITY.LOW": 2,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 718,
+      "loc": 708,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -127,7 +127,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 14,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 3001,
+      "loc": 3031,
       "nosec": 0,
       "skipped_tests": 4
     },
@@ -250,14 +250,14 @@
     },
     "backend/app/api/routes/organizations.py": {
       "CONFIDENCE.HIGH": 0,
-      "CONFIDENCE.LOW": 1,
-      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 1,
       "CONFIDENCE.UNDEFINED": 0,
       "SEVERITY.HIGH": 0,
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 1,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1366,
+      "loc": 1464,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -348,7 +348,7 @@
       "SEVERITY.LOW": 3,
       "SEVERITY.MEDIUM": 5,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1332,
+      "loc": 1340,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -374,7 +374,7 @@
       "SEVERITY.LOW": 4,
       "SEVERITY.MEDIUM": 2,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1284,
+      "loc": 1319,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -400,7 +400,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1673,
+      "loc": 1737,
       "nosec": 0,
       "skipped_tests": 2
     },
@@ -465,7 +465,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 62,
+      "loc": 63,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -547,7 +547,7 @@
       "nosec": 0,
       "skipped_tests": 0
     },
-    "backend/app/security.py": {
+    "backend/app/security/__init__.py": {
       "CONFIDENCE.HIGH": 0,
       "CONFIDENCE.LOW": 0,
       "CONFIDENCE.MEDIUM": 0,
@@ -557,6 +557,19 @@
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
       "loc": 555,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
+    "backend/app/security/recovery_routes.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 39,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1427,7 +1440,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 164,
+      "loc": 175,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1622,7 +1635,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 65,
+      "loc": 137,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1954,7 +1967,7 @@
   },
   "results": [
     {
-      "code": "361     if not settings.users_enabled:\n362         DEFAULT_TOKEN = \"admin-secret-token\"\n363 \n",
+      "code": "362     if not settings.users_enabled:\n363         DEFAULT_TOKEN = \"admin-secret-token\"\n364 \n",
       "col_offset": 24,
       "end_col_offset": 44,
       "filename": "backend/app/api/deps.py",
@@ -1965,16 +1978,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'admin-secret-token'",
-      "line_number": 362,
+      "line_number": 363,
       "line_range": [
-        362
+        363
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "380             \"is_active\": True,\n381             \"must_change_password\": False,\n382         }\n383 \n384     # User authentication enabled - validate JWT token\n385     try:\n386         payload = decode_access_token(token)\n387     except TokenExpiredError:\n388         raise HTTPException(\n389             status_code=401,\n",
+      "code": "381             \"is_active\": True,\n382             \"must_change_password\": False,\n383         }\n384 \n385     # User authentication enabled - validate JWT token\n386     try:\n387         payload = decode_access_token(token)\n388     except TokenExpiredError:\n389         raise HTTPException(\n390             status_code=401,\n",
       "col_offset": 12,
       "end_col_offset": 34,
       "filename": "backend/app/api/deps.py",
@@ -1985,16 +1998,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'False'",
-      "line_number": 381,
+      "line_number": 382,
       "line_range": [
-        375,
         376,
         377,
         378,
         379,
         380,
         381,
-        382
+        382,
+        383
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
@@ -2901,27 +2914,27 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "484                         conn.execute,\n485                         f\"UPDATE organizations SET {', '.join(updates)} WHERE id = ?\",\n486                         attempt_params,\n",
-      "col_offset": 24,
-      "end_col_offset": 85,
+      "code": "502                         conn.execute(\n503                             f\"UPDATE organizations SET {', '.join(updates)} WHERE id = ?\",\n504                             attempt_params,\n",
+      "col_offset": 28,
+      "end_col_offset": 89,
       "filename": "backend/app/api/routes/organizations.py",
-      "issue_confidence": "LOW",
+      "issue_confidence": "MEDIUM",
       "issue_cwe": {
         "id": 89,
         "link": "https://cwe.mitre.org/data/definitions/89.html"
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 485,
+      "line_number": 503,
       "line_range": [
-        485
+        503
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "436     update_values.append(user_id)\n437     sql = f\"UPDATE users SET {', '.join(update_fields)} WHERE id = ?\"\n438     if demotes_last_superadmin:\n",
+      "code": "442     update_values.append(user_id)\n443     sql = f\"UPDATE users SET {', '.join(update_fields)} WHERE id = ?\"\n444     if demotes_last_superadmin:\n",
       "col_offset": 10,
       "end_col_offset": 69,
       "filename": "backend/app/api/routes/users.py",
@@ -2932,16 +2945,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 437,
+      "line_number": 443,
       "line_range": [
-        437
+        443
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "569                 db.execute(\"ROLLBACK\")\n570             except Exception:\n571                 pass\n572             raise\n",
+      "code": "578                 db.execute(\"ROLLBACK\")\n579             except Exception:\n580                 pass\n581             raise\n",
       "col_offset": 12,
       "end_col_offset": 20,
       "filename": "backend/app/api/routes/users.py",
@@ -2952,17 +2965,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 570,
+      "line_number": 579,
       "line_range": [
-        570,
-        571
+        579,
+        580
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "582         request=request,\n583         metadata={\"must_change_password\": True, \"sessions_revoked\": sessions_revoked},\n584     ))\n",
+      "code": "591         request=request,\n592         metadata={\"must_change_password\": True, \"sessions_revoked\": sessions_revoked},\n593     ))\n",
       "col_offset": 18,
       "end_col_offset": 40,
       "filename": "backend/app/api/routes/users.py",
@@ -2973,16 +2986,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'True'",
-      "line_number": 583,
+      "line_number": 592,
       "line_range": [
-        583
+        592
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "587         \"message\": \"Password reset successfully\",\n588         \"must_change_password\": True,\n589     }\n590 \n591 \n592 @router.patch(\"/{user_id}/role\")\n",
+      "code": "596         \"message\": \"Password reset successfully\",\n597         \"must_change_password\": True,\n598     }\n599 \n600 \n601 @router.patch(\"/{user_id}/role\")\n",
       "col_offset": 8,
       "end_col_offset": 30,
       "filename": "backend/app/api/routes/users.py",
@@ -2993,19 +3006,19 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'True'",
-      "line_number": 588,
+      "line_number": 597,
       "line_range": [
-        586,
-        587,
-        588,
-        589
+        595,
+        596,
+        597,
+        598
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "1394             cursor = conn.execute(\n1395                 f\"SELECT id FROM organizations WHERE id IN ({placeholders})\",\n1396                 tuple(org_ids),\n",
+      "code": "1411             cursor = conn.execute(\n1412                 f\"SELECT id FROM organizations WHERE id IN ({placeholders})\",\n1413                 tuple(org_ids),\n",
       "col_offset": 16,
       "end_col_offset": 76,
       "filename": "backend/app/api/routes/users.py",
@@ -3016,16 +3029,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 1395,
+      "line_number": 1412,
       "line_range": [
-        1395
+        1412
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1671                     conn.execute(\n1672                         f\"\"\"DELETE FROM group_members\n1673                             WHERE user_id = ?\n1674                               AND group_id IN (\n1675                                   SELECT id FROM groups WHERE org_id IN ({placeholders})\n1676                               )\"\"\",\n1677                         (user_id, *caller_orgs),\n",
+      "code": "1688                     conn.execute(\n1689                         f\"\"\"DELETE FROM group_members\n1690                             WHERE user_id = ?\n1691                               AND group_id IN (\n1692                                   SELECT id FROM groups WHERE org_id IN ({placeholders})\n1693                               )\"\"\",\n1694                         (user_id, *caller_orgs),\n",
       "col_offset": 24,
       "end_col_offset": 34,
       "filename": "backend/app/api/routes/users.py",
@@ -3036,20 +3049,20 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 1672,
+      "line_number": 1689,
       "line_range": [
-        1672,
-        1673,
-        1674,
-        1675,
-        1676
+        1689,
+        1690,
+        1691,
+        1692,
+        1693
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1711         cursor.execute(\n1712             f\"SELECT id, org_id FROM groups WHERE id IN ({placeholders})\",\n1713             tuple(body.group_ids),\n",
+      "code": "1728         cursor.execute(\n1729             f\"SELECT id, org_id FROM groups WHERE id IN ({placeholders})\",\n1730             tuple(body.group_ids),\n",
       "col_offset": 12,
       "end_col_offset": 73,
       "filename": "backend/app/api/routes/users.py",
@@ -3060,16 +3073,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 1712,
+      "line_number": 1729,
       "line_range": [
-        1712
+        1729
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1762                 cursor.execute(\n1763                     f\"\"\"DELETE FROM group_members\n1764                         WHERE user_id = ?\n1765                           AND group_id IN (\n1766                               SELECT id FROM groups WHERE org_id IN ({placeholders})\n1767                               )\"\"\",\n1768                     (user_id, *caller_orgs),\n",
+      "code": "1779                 cursor.execute(\n1780                     f\"\"\"DELETE FROM group_members\n1781                         WHERE user_id = ?\n1782                           AND group_id IN (\n1783                               SELECT id FROM groups WHERE org_id IN ({placeholders})\n1784                               )\"\"\",\n1785                     (user_id, *caller_orgs),\n",
       "col_offset": 20,
       "end_col_offset": 34,
       "filename": "backend/app/api/routes/users.py",
@@ -3080,13 +3093,13 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 1763,
+      "line_number": 1780,
       "line_range": [
-        1763,
-        1764,
-        1765,
-        1766,
-        1767
+        1780,
+        1781,
+        1782,
+        1783,
+        1784
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
@@ -3201,7 +3214,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1684                 group_rows = conn.execute(\n1685                     f\"\"\"\n1686                     SELECT id, org_id FROM groups\n1687                     WHERE id IN ({placeholders})\n1688                     \"\"\",\n1689                     tuple(group_ids),\n",
+      "code": "1743                 group_rows = conn.execute(\n1744                     f\"\"\"\n1745                     SELECT id, org_id FROM groups\n1746                     WHERE id IN ({placeholders})\n1747                     \"\"\",\n1748                     tuple(group_ids),\n",
       "col_offset": 20,
       "end_col_offset": 23,
       "filename": "backend/app/api/routes/vaults.py",
@@ -3212,12 +3225,12 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 1685,
+      "line_number": 1744,
       "line_range": [
-        1685,
-        1686,
-        1687,
-        1688
+        1744,
+        1745,
+        1746,
+        1747
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",

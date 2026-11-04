@@ -155,7 +155,7 @@ class TestMustChangePasswordEnforcement:
             42, "testuser", "Test User", "member", 1, 1  # must_change_password=1
         )
 
-        mock_request = _mock_request("/auth/change-password")
+        mock_request = _mock_request("/auth/change-password", method="POST")
 
         result = await get_current_active_user(
             request=mock_request,
@@ -188,7 +188,7 @@ class TestMustChangePasswordEnforcement:
             42, "testuser", "Test User", "member", 1, 1  # must_change_password=1
         )
 
-        mock_request = _mock_request("/api/auth/change-password")
+        mock_request = _mock_request("/api/auth/change-password", method="POST")
 
         result = await get_current_active_user(
             request=mock_request,
@@ -220,7 +220,7 @@ class TestMustChangePasswordEnforcement:
             42, "testuser", "Test User", "member", 1, 1  # must_change_password=1
         )
 
-        mock_request = _mock_request("/auth/login")
+        mock_request = _mock_request("/auth/login", method="POST")
 
         result = await get_current_active_user(
             request=mock_request,
@@ -493,7 +493,7 @@ class TestMustChangePasswordEnforcement:
             42, "testuser", "Test User", "member", 1, 1
         )
 
-        mock_request = _mock_request("/auth/change-password")
+        mock_request = _mock_request("/auth/change-password", method="POST")
 
         result = await get_current_active_user(
             request=mock_request,

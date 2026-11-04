@@ -87,7 +87,8 @@ def main() -> int:
         paths,
         (
             "backend/app/api/routes/auth.py",
-            "backend/app/security.py",
+            "backend/app/security/__init__.py",
+            "backend/app/security/recovery_routes.py",
             # Prefix, not directory: also covers auth_service.py and
             # authz_policy.py (issue #740 — the two dead entries below were
             # removed because no repository path starts with them; the real
