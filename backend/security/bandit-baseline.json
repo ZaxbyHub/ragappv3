@@ -29,14 +29,14 @@
     },
     "_totals": {
       "CONFIDENCE.HIGH": 34,
-      "CONFIDENCE.LOW": 25,
-      "CONFIDENCE.MEDIUM": 66,
+      "CONFIDENCE.LOW": 24,
+      "CONFIDENCE.MEDIUM": 67,
       "CONFIDENCE.UNDEFINED": 0,
       "SEVERITY.HIGH": 6,
       "SEVERITY.LOW": 59,
       "SEVERITY.MEDIUM": 60,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 95577,
+      "loc": 95595,
       "nosec": 0,
       "skipped_tests": 71
     },
@@ -250,14 +250,14 @@
     },
     "backend/app/api/routes/organizations.py": {
       "CONFIDENCE.HIGH": 0,
-      "CONFIDENCE.LOW": 1,
-      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 1,
       "CONFIDENCE.UNDEFINED": 0,
       "SEVERITY.HIGH": 0,
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 1,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1463,
+      "loc": 1464,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -374,7 +374,7 @@
       "SEVERITY.LOW": 4,
       "SEVERITY.MEDIUM": 2,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1312,
+      "loc": 1319,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1635,7 +1635,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 127,
+      "loc": 137,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -2914,20 +2914,20 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "484                         conn.execute,\n485                         f\"UPDATE organizations SET {', '.join(updates)} WHERE id = ?\",\n486                         attempt_params,\n",
-      "col_offset": 24,
-      "end_col_offset": 85,
+      "code": "502                         conn.execute(\n503                             f\"UPDATE organizations SET {', '.join(updates)} WHERE id = ?\",\n504                             attempt_params,\n",
+      "col_offset": 28,
+      "end_col_offset": 89,
       "filename": "backend/app/api/routes/organizations.py",
-      "issue_confidence": "LOW",
+      "issue_confidence": "MEDIUM",
       "issue_cwe": {
         "id": 89,
         "link": "https://cwe.mitre.org/data/definitions/89.html"
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 485,
+      "line_number": 503,
       "line_range": [
-        485
+        503
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
@@ -3214,7 +3214,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1727                 group_rows = conn.execute(\n1728                     f\"\"\"\n1729                     SELECT id, org_id FROM groups\n1730                     WHERE id IN ({placeholders})\n1731                     \"\"\",\n1732                     tuple(group_ids),\n",
+      "code": "1743                 group_rows = conn.execute(\n1744                     f\"\"\"\n1745                     SELECT id, org_id FROM groups\n1746                     WHERE id IN ({placeholders})\n1747                     \"\"\",\n1748                     tuple(group_ids),\n",
       "col_offset": 20,
       "end_col_offset": 23,
       "filename": "backend/app/api/routes/vaults.py",
@@ -3225,12 +3225,12 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 1728,
+      "line_number": 1744,
       "line_range": [
-        1728,
-        1729,
-        1730,
-        1731
+        1744,
+        1745,
+        1746,
+        1747
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",

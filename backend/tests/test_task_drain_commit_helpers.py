@@ -143,7 +143,6 @@ def test_cancel_after_commit_completes_writes_row_then_reraises(tmp_path: Path) 
 
         def _commit_and_arm() -> None:
             original_commit()
-            import threading
 
             threading.Thread(target=_commit_then_cancel_soon, daemon=True).start()
 
