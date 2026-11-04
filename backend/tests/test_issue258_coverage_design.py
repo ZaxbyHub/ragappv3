@@ -130,10 +130,18 @@ def _coverage_ast() -> tuple[str, dict] | None:
                 "provisions it outside the tree; see ci.yml). The coverage "
                 "design pin does NOT silently pass without the parser."
             )
-        assert proc.returncode == 0, (
-            f"DESIGN CHECK: FAIL — TypeScript walker failed on {name}: "
-            f"{proc.stderr.strip()}"
-        )
+        if proc.returncode != 0:
+            # pytest.fail (Failed: BaseException), NOT assert: a walker crash
+            # is a HARNESS error, not design evidence. The h09 AC7 probe only
+            # counts AssertionError from the mutated config as proof; a
+            # crashing compiler must land in its proof_absent arm and FAIL
+            # the probe (reviewer Round 4 Finding 1 falsifier: a fake node
+            # exiting 2 previously left the probe green with the parser never
+            # running).
+            pytest.fail(
+                f"DESIGN CHECK: FAIL — TypeScript walker failed on {name}: "
+                f"{proc.stderr.strip()}"
+            )
         facts = json.loads(proc.stdout)
         if facts["hasCoverage"]:
             return name, facts
