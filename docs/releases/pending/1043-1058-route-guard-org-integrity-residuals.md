@@ -5,10 +5,14 @@ PR: (filled at publication)
 
 ## What changed
 
-### Six org routes re-validate caller privilege inside the write transaction (#1043)
+### Seven org routes re-validate caller privilege inside the write transaction (#1043 + review PRR-003)
 
-`add_org_member`, `create_org_invite`, `resend_org_invite`, `revoke_org_invite`,
-`set_prompt_override` and `clear_prompt_override` previously read the caller's
+The #1043 six — `add_org_member`, `create_org_invite`, `resend_org_invite`,
+`revoke_org_invite`, `set_prompt_override` and `clear_prompt_override` — plus
+`update_organization` (the review's seventh same-shaped sibling, found by the
+PR's own swarm review: it read the caller's role with an INLINE autocommit
+query, invisible to the `_is_org_admin_or_owner` census) previously read
+the caller's
 `_is_org_admin_or_owner` privilege on autocommit and then wrote with a bare
 execute+commit (or via `PromptVersionStore`) — a caller demoted by a concurrent
 committed transaction between the check and the write still landed their
