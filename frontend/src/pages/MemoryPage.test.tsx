@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, waitFor, act } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, act } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import MemoryPage from '@/pages/MemoryPage';
 import { MemoryRouter } from 'react-router-dom';
@@ -45,14 +45,17 @@ vi.mock('@/hooks/useMemorySearch', () => ({
   useMemorySearch: mockUseMemorySearch,
 }));
 
-// Mock useMemoryCrud
-vi.mock('@/hooks/useMemoryCrud', () => ({
-  useMemoryCrud: mockUseMemoryCrud,
-  getCategoryFromMetadata: vi.fn(() => 'Uncategorized'),
-  getTagsFromMetadata: vi.fn(() => []),
-  getSourceFromMetadata: vi.fn(() => ''),
-  MAX_MEMORY_CONTENT_LENGTH: 10000,
-}));
+// Mock useMemoryCrud — the HOOK only; the metadata helpers stay REAL
+// (#745 AC12: the edit-prefill path must run the product's own
+// getCategoryFromMetadata/getTagsFromMetadata/getSourceFromMetadata so the
+// asserted payload reflects the real prefill + trim + explicit-null flow).
+vi.mock('@/hooks/useMemoryCrud', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/hooks/useMemoryCrud')>();
+  return {
+    ...actual,
+    useMemoryCrud: mockUseMemoryCrud,
+  };
+});
 
 // Mock @/lib/api
 vi.mock('@/lib/api', () => ({
@@ -606,6 +609,92 @@ describe('MemoryPage', () => {
       await waitFor(() => {
         expect(screen.getByText('Test memory content')).toBeInTheDocument();
         expect(screen.getByText('Another memory')).toBeInTheDocument();
+      });
+    });
+
+    it('asserts the exact updateMemory payload through a real edit interaction', async () => {
+      // #745 AC12 (T1-02-K-08): the edit flow must be exercised for real —
+      // open the dialog on a seeded memory, mutate content (asserting the
+      // trim), clear category (explicit null), save — and the exact payload
+      // passed to updateMemory is asserted: id, trimmed content, cleared
+      // category/tags/source as explicit nulls, and the
+      // optimistic-concurrency token from the loaded row.
+      const mockMemories = [
+        {
+          id: '42',
+          content: 'Original memory content',
+          metadata: { category: 'notes', tags: ['alpha'], source: 'manual' },
+          updated_at: '2026-01-02T03:04:05.678Z',
+        },
+      ];
+
+      const { useVaultStore } = await import('@/stores/useVaultStore');
+      vi.mocked(useVaultStore).mockImplementation((selector: any) => {
+        const state = {
+          activeVaultId: 1,
+          vaults: [{ id: 1, name: 'My Vault' }],
+          loading: false,
+          error: null,
+          fetchVaults: mockFetchVaults,
+          setActiveVault: mockSetActiveVault,
+          getActiveVault: () => state.vaults.find((vault) => vault.id === state.activeVaultId),
+        };
+        if (typeof selector === 'function') {
+          return selector(state);
+        }
+        return state;
+      });
+
+      mockUseMemorySearch.mockReturnValue({
+        memories: mockMemories,
+        searchQuery: '',
+        setSearchQuery: vi.fn(),
+        loading: false,
+        handleSearch: vi.fn(),
+      });
+
+      await act(async () => {
+        render(
+        <MemoryRouter>
+          <MemoryPage />
+        </MemoryRouter>
+      );
+      });
+
+      const editButton = await screen.findByLabelText('Edit memory');
+      await act(async () => {
+        fireEvent.click(editButton);
+      });
+
+      const contentBox = await screen.findByLabelText('Content *');
+      const categoryBox = screen.getByLabelText('Category');
+      const sourceBox = screen.getByLabelText('Source');
+      const tagsBox = screen.getByLabelText('Tags (comma-separated)');
+
+      // Prefill came from the seeded row.
+      expect((contentBox as HTMLTextAreaElement).value).toBe('Original memory content');
+      expect((categoryBox as HTMLInputElement).value).toBe('notes');
+
+      await act(async () => {
+        fireEvent.change(contentBox, { target: { value: '  Trimmed edited content  ' } });
+        fireEvent.change(categoryBox, { target: { value: '' } });
+        fireEvent.change(sourceBox, { target: { value: '  ' } });
+        fireEvent.change(tagsBox, { target: { value: 'beta' } });
+      });
+
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: /Save Changes/i }));
+      });
+
+      await waitFor(() => {
+        expect(mockUpdateMemory).toHaveBeenCalledTimes(1);
+      });
+      expect(mockUpdateMemory).toHaveBeenCalledWith('42', {
+        content: 'Trimmed edited content',
+        category: null,
+        tags: 'beta',
+        source: null,
+        expected_updated_at: '2026-01-02T03:04:05.678Z',
       });
     });
   });

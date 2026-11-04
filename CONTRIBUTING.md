@@ -319,6 +319,14 @@ are the known places where a Windows shell behaves differently (issue #567):
   Prefix the command with `MSYS_NO_PATHCONV=1` (see
   `docs/engineering/testing.md` and the `ci-compatibility-audit` skill), or
   run it from PowerShell.
+- **python-magic can load Git's msys-magic-1.dll and hang collection.**
+  With Git Bash's `usr/bin` on `PATH`, the `python-magic` loader resolves
+  `find_library('magic')` to `msys-magic-1.dll`, which crashes or hangs
+  the `unstructured` import probe in `test_real_docs_parsing.py` at
+  collection time with no timeout (16 xdist workers spinning at ~700 CPU-s
+  each). With `usr/bin` stripped from `PATH` the module collects in ~4.5s
+  (audit RT-S4-01, #746 AC8). Workaround: strip Git's `usr/bin` from
+  `PATH` for backend test runs on Windows, or run them from PowerShell.
 - **Backend lockfiles are universal.** `pip install -r
   backend/requirements-lock*.txt` works on Windows and Linux alike
   (`docs/engineering/lockfiles.md`); the `justfile` at the repo root mirrors

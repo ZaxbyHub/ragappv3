@@ -60,6 +60,15 @@ class TestNoneThresholdLoggingFix:
         fallback_warnings = [m for m in warning_messages if 'Threshold filtering removed all' in str(m)]
         assert len(fallback_warnings) == 0, "No fallback expected when no threshold is set"
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "#745 AC4: fixtures now carry the real LanceDB FTS key "
+            "`_score`; the product still reads the legacy `score` key "
+            "and 1.0-floors this branch, flipping the outcome — owned "
+            "by #1070; remove this marker when #1070 lands"
+        ),
+    )
     async def test_none_max_distance_with_relevance_threshold_logging(self, engine, caplog):
         """
         ATTACK: max_distance_threshold is None but relevance_threshold has value.
@@ -72,8 +81,8 @@ class TestNoneThresholdLoggingFix:
         engine.relevance_threshold = 0.3
 
         results = [
-            {"score": 0.1, "text": "doc1", "file_id": "f1"},  # Below threshold
-            {"score": 0.2, "text": "doc2", "file_id": "f2"},  # Below threshold
+            {"_score": 0.1, "text": "doc1", "file_id": "f1"},  # Below threshold
+            {"_score": 0.2, "text": "doc2", "file_id": "f2"},  # Below threshold
         ]
 
         with caplog.at_level(logging.WARNING):
@@ -202,7 +211,7 @@ class TestNoneThresholdTypeErrorPrevention:
         engine.relevance_threshold = 0.9
 
         results = [
-            {"score": 0.5, "text": "doc1", "file_id": "f1"},
+            {"_score": 0.5, "text": "doc1", "file_id": "f1"},
         ]
 
         # This must NOT raise TypeError

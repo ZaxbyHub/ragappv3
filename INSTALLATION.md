@@ -504,6 +504,7 @@ that host first, for example:
 ```bash
 # Example: serving chat locally with Ollama
 ollama pull gemma4:26b
+ollama pull minicpm5-2b
 # then set in .env:
 #   OLLAMA_CHAT_URL=http://localhost:11434
 #   CHAT_MODEL=gemma4:26b

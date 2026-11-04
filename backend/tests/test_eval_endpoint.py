@@ -7,7 +7,9 @@ Tests cover:
 - Pydantic validation: min_length=1 on query and contexts
 """
 
+import math
 import os
+import random
 import sys
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -414,6 +416,38 @@ class TestCalculateAnswerSimilarity(unittest.IsolatedAsyncioTestCase):
         """Identical embeddings should return 1.0."""
         mock_service = MagicMock()
         mock_service.embed_single = AsyncMock(return_value=[1.0, 0.0, 0.0])
+
+        result = await _calculate_answer_similarity("answer", "answer", mock_service)
+
+        self.assertEqual(result, 1.0)
+
+    async def test_realistic_768d_identical_embeddings_clamped_to_one(self):
+        """#745 AC5 (T1-01-K-13): a realistic 768-dimensional normalized
+        vector pair, not the exact basis vector. Real normalized embeddings
+        overshoot 1.0 in binary floating point for ~half of identical pairs
+        (audit probe: 508 of 1000), so the RAW cosine is asserted > 1.0
+        FIRST — a deterministic precondition (fixed seed, computed with the
+        same float ops the route uses) — and the public result is then
+        asserted to be clamped to exactly 1.0 (eval.py's
+        ``max(-1.0, min(1.0, similarity))`` bound)."""
+        rng = random.Random(745)
+        vec = [rng.uniform(-1.0, 1.0) for _ in range(768)]
+        vec_norm = math.sqrt(sum(x * x for x in vec))
+        vec = [x / vec_norm for x in vec]
+
+        # Deterministic precondition: this seeded pair's raw cosine
+        # overshoots 1.0 in float arithmetic (same ops as the route).
+        dot = sum(a * b for a, b in zip(vec, vec))
+        recomputed_norm = math.sqrt(sum(x * x for x in vec))
+        raw_cosine = dot / (recomputed_norm * recomputed_norm)
+        self.assertGreater(
+            raw_cosine,
+            1.0,
+            f"seeded 768-d pair must overshoot (raw={raw_cosine!r})",
+        )
+
+        mock_service = MagicMock()
+        mock_service.embed_single = AsyncMock(return_value=list(vec))
 
         result = await _calculate_answer_similarity("answer", "answer", mock_service)
 
