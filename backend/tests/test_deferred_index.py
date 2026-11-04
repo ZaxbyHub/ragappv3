@@ -196,6 +196,46 @@ class TestMaybeCreateVectorIndex(unittest.IsolatedAsyncioTestCase):
 
         # No exception means success (early return)
 
+    async def test_default_call_rebuilds_when_bookkeeping_is_stale(self):
+        """Search-path retry guard (issue #1065, plan-critic F1): a FAILED
+        churn rebuild deliberately leaves the bookkeeping generation behind
+        (the rebuild exception path) so the NEXT search rebuilds through the
+        default (accept_existing=False) call. With an existing IvfPq index and
+        stale bookkeeping, the default call MUST still run create_index with
+        replace=True — only the append path (accept_existing=True) accepts an
+        existing index. A regression that flips the search call to
+        accept_existing=True fails here.
+        """
+        existing_index = MagicMock()
+        existing_index.name = "embedding_idx"
+        existing_index.columns = ["embedding"]
+        existing_index.index_type = "IvfPq"
+
+        mock_table = MagicMock()
+        mock_table.list_indices = AsyncMock(return_value=[existing_index])
+        mock_table.count_rows = AsyncMock(return_value=300)
+        mock_table.create_index = AsyncMock()
+
+        self.store.table = mock_table
+        self.store._embedding_dim = self.embedding_dim
+        # Fresh row count, STALE generation: exactly the post-failed-rebuild
+        # state the #718 safeguard preserves for the search-time retry.
+        self.store._last_index_build_row_count = 300
+        self.store._last_index_build_generation = 4
+        self.store._index_mutation_generation = 7
+
+        with patch("app.services.vector_store.settings") as mock_settings, \
+             patch("app.services.vector_store.IvfPq") as mock_ivfpq:
+            mock_settings.embedding_dim = self.embedding_dim
+            mock_settings.vector_metric = "cosine"
+            mock_ivfpq.return_value = MagicMock()
+
+            await self.store._maybe_create_vector_index()
+
+        mock_table.create_index.assert_awaited_once()
+        self.assertIs(mock_table.create_index.await_args.kwargs.get("replace"), True)
+        self.assertEqual(self.store._last_index_build_generation, 7)
+
     async def test_skips_when_embedding_idx_already_exists(self):
         """
         Test that _maybe_create_vector_index skips when 'embedding_idx' is fresh.

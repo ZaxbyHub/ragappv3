@@ -15,9 +15,14 @@ Collated closure of the two ingestion hot-path issues:
   un-indexed fragments. Full retrains still happen at the first create
   (≥256 rows, no index) and at delete churn ≥ `index_rebuild_delta`; the
   search path keeps its rebuild/retry semantics, so a failed churn rebuild
-  still retries on the next search. Known trade-off (disclosed): if a churn
-  rebuild fails and an append interleaves before the next search, the
-  append's accept subsumes that retry until the next churn-qualifying event.
+  still retries on the next search (pinned by
+  `test_default_call_rebuilds_when_bookkeeping_is_stale`). Known trade-offs
+  (disclosed): (1) if a churn rebuild fails and an append interleaves before
+  the next search, the append's accept subsumes that retry until the next
+  churn-qualifying event; (2) an enrichment swap whose DELETE-side churn
+  C/(table+file rows) ≥ `index_rebuild_delta` (a large file relative to the
+  table) still pays ONE full retrain through the preserved delete-churn floor
+  — the pre-fix code paid two for the same swap.
 - **Failed or truncated enrichment is never stored as complete (#1066).** A
   curator response whose JSON does not parse, whose completion stopped at the
   512-token cap (`finish_reason=length`, including a cut-but-closed JSON
@@ -48,6 +53,16 @@ Collated closure of the two ingestion hot-path issues:
   vector record) and the superseded-failure currency leg.
 - `backend/tests/test_llm_metrics_sink.py`: the real client's per-call sink
   mirror (stop/length, provider token counts, per-call isolation).
+- `backend/tests/test_deferred_index.py` gains the search-retry guard
+  (`test_default_call_rebuilds_when_bookkeeping_is_stale`): stale bookkeeping
+  + existing IvfPq index + the DEFAULT `_maybe_create_vector_index()` call
+  must still rebuild with `replace=True` — only the append path accepts an
+  existing index.
+
+Persisted-shape note (additive): `ChunkEnrichment.to_dict()` now includes an
+`"error"` key (None on success) in the enrichment metadata stored on enriched
+vector rows; no consumer asserts an exact shape, and successful rows simply
+carry `error: null` alongside the existing fields.
 - Retargeted: `test_existing_embedding_index_is_refreshed_after_new_rows`,
   `test_delete_then_add_same_row_count_still_refreshes_existing_index`
   (test_ingestion_integrity.py) and the `await_count` assertion in
