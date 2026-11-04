@@ -2588,6 +2588,31 @@ class DocumentProcessor:
             enrichments = await enrichment_service.enrich_chunks(
                 chunk_dicts, document_title=source_filename
             )
+            # Issue #1066: a failed or truncated generation must never be
+            # stored as ``complete``. Any failed candidate fails the file's
+            # enrichment status (a mixed batch included); successful
+            # siblings keep their already-searchable base rows because the
+            # swap is skipped. Currency-guarded exactly like the swap-tail
+            # check below: a superseded attempt marks stale instead of
+            # overwriting the newer job's status.
+            failed_enrichments = [
+                enrichment
+                for enrichment in enrichments
+                if getattr(enrichment, "error", None)
+            ]
+            if failed_enrichments:
+                if not self._is_enrichment_job_current(file_id, file_hash):
+                    await self._mark_enrichment_stale_if_current_job(
+                        file_id, processing_started_at
+                    )
+                    return
+                await self.set_enrichment_status(
+                    file_id,
+                    "error",
+                    format_ingest_error(INGEST_ERROR_ENRICHMENT_FAILED)
+                    + f" ({len(failed_enrichments)} of {len(enrichments)} chunks)",
+                )
+                return
             enrichment_by_uid = {
                 enrichment.chunk_id: enrichment
                 for enrichment in enrichments

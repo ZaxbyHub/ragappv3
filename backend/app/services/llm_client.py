@@ -552,6 +552,7 @@ class LLMClient:
         response_format: Optional[Dict[str, Any]] = None,
         reasoning_effort: object = _KEEP_REASONING,
         chat_template_kwargs: object = _KEEP_TEMPLATE_KWARGS,
+        metrics_sink: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         Send a chat completion request and return the full response.
@@ -572,6 +573,15 @@ class LLMClient:
                 as ``reasoning_effort`` — omit to keep the client default,
                 pass a dict to override for this call, pass ``None`` to drop
                 the field.
+            metrics_sink: optional per-call mirror of this call's success
+                metrics (issue #1066). The client's ``last_metrics`` is a
+                single shared slot, so a caller running concurrent calls
+                through one client cannot read it after ``await`` returns
+                without racing sibling calls. Pass your own dict and the
+                success path populates it (finish_reason, status, token
+                counts) before returning — that block is synchronous, so the
+                sink is isolated per call. Unset on failure paths (they raise
+                ``LLMError`` instead of returning).
 
         Returns:
             The generated content string
@@ -723,7 +733,7 @@ class LLMClient:
             usage = data.get("usage") or {}
             provider_prompt_tokens = usage.get("prompt_tokens")
             provider_completion_tokens = usage.get("completion_tokens")
-            self.last_metrics = {
+            metrics = {
                 "provider_url": self.base_url,
                 "model": self.model,
                 "latency_ms": round((time.perf_counter() - started_at) * 1000, 2),
@@ -733,9 +743,15 @@ class LLMClient:
                 "status": "ok",
             }
             if provider_prompt_tokens is not None:
-                self.last_metrics["prompt_tokens"] = provider_prompt_tokens
+                metrics["prompt_tokens"] = provider_prompt_tokens
             if provider_completion_tokens is not None:
-                self.last_metrics["completion_tokens"] = provider_completion_tokens
+                metrics["completion_tokens"] = provider_completion_tokens
+            self.last_metrics = metrics
+            if metrics_sink is not None:
+                # Issue #1066: synchronous mirror for concurrent callers —
+                # no await between building the dict and this update, so each
+                # caller's sink holds only its own call's values.
+                metrics_sink.update(metrics)
             return content
         except CircuitBreakerError as e:
             self.last_metrics = {"provider_url": self.base_url, "model": self.model, "status": "circuit_open"}

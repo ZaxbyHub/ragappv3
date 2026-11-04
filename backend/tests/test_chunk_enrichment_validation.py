@@ -41,7 +41,7 @@ class FakeLLMClient:
         self._response = response
         self.calls: list = []
 
-    async def chat_completion(self, messages, max_tokens=None, temperature=None, response_format=None):
+    async def chat_completion(self, messages, max_tokens=None, temperature=None, response_format=None, metrics_sink=None):
         self.calls.append(
             {"messages": messages, "max_tokens": max_tokens, "temperature": temperature}
         )
@@ -221,19 +221,23 @@ class TestWellFormedUnchanged:
 @pytest.mark.asyncio
 class TestErrorPathsPreserved:
     async def test_invalid_json_returns_empty_enrichment(self):
+        """Unparsable curator JSON signals failure (#1066), not empty success."""
         service, _ = _service("this is not json at all")
 
         results = await service.enrich_chunks([_chunk()], "Doc Title")
 
         assert len(results) == 1
-        assert results[0] == ChunkEnrichment(chunk_id="c1", section_breadcrumb="Doc Title")
+        assert results[0].error == "enrichment JSON failed to parse"
+        assert results[0].summary == ""
 
     async def test_non_dict_json_returns_empty_enrichment(self):
+        """A valid non-object JSON payload is a parse failure (#1066), not a no-op."""
         service, _ = _service(json.dumps(["a", "list"]))
 
         results = await service.enrich_chunks([_chunk()], "Doc Title")
 
         assert len(results) == 1
+        assert results[0].error == "enrichment JSON failed to parse"
         assert results[0].summary == ""
         assert results[0].questions == []
 

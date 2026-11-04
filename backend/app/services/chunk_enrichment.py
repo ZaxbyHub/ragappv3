@@ -91,7 +91,15 @@ def _header_escape(value: str) -> str:
 
 @dataclass
 class ChunkEnrichment:
-    """Auxiliary metadata generated for a chunk by the curator."""
+    """Auxiliary metadata generated for a chunk by the curator.
+
+    ``error`` (issue #1066) is the failure signal for the enrichment job's
+    status decision: a candidate whose model call raised, whose JSON did not
+    parse, or whose completion was cut by the token cap carries a non-empty
+    ``error`` and empty content fields. A successful (possibly empty-object)
+    generation leaves ``error`` None — an empty object is a legitimate no-op,
+    not a failure.
+    """
 
     chunk_id: str
     summary: str = ""
@@ -99,6 +107,7 @@ class ChunkEnrichment:
     entities: List[str] = field(default_factory=list)
     aliases: List[str] = field(default_factory=list)
     section_breadcrumb: str = ""
+    error: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -108,6 +117,7 @@ class ChunkEnrichment:
             "entities": self.entities,
             "aliases": self.aliases,
             "section_breadcrumb": self.section_breadcrumb,
+            "error": self.error,
         }
 
     @classmethod
@@ -177,8 +187,14 @@ class ChunkEnrichmentService:
                     chunk_id, text, document_title, section
                 )
             except (LLMError, Exception) as e:
+                # Issue #1066: the failure must reach the job's status
+                # decision — an empty object is indistinguishable from
+                # success there. Keep the raw detail in the server log only.
                 logger.warning("Enrichment failed for chunk %s: %s", chunk_id, e)
-                return ChunkEnrichment(chunk_id=chunk_id)
+                return ChunkEnrichment(
+                    chunk_id=chunk_id,
+                    error=f"enrichment call failed: {type(e).__name__}",
+                )
 
     async def _generate_enrichment(
         self,
@@ -220,6 +236,12 @@ class ChunkEnrichmentService:
             {"role": "user", "content": user_prompt},
         ]
 
+        # Issue #1066: the shared client's ``last_metrics`` slot is unsafe to
+        # read after ``await`` returns when concurrent candidates share one
+        # client (concurrency default 5), so mirror this call's finish_reason
+        # into a per-call sink — the client populates it synchronously before
+        # returning.
+        metrics: Dict[str, Any] = {}
         response = await self._llm_client.chat_completion(
             messages,
             max_tokens=512,
@@ -235,12 +257,28 @@ class ChunkEnrichmentService:
                     "schema": self._response_schema(),
                 },
             },
+            metrics_sink=metrics,
         )
 
         enrichment = ChunkEnrichment(
             chunk_id=chunk_id,
             section_breadcrumb=breadcrumb,
         )
+
+        # Issue #1066: the 512-token cap is the truncation trigger. A
+        # completion that stopped because of the cap is a failure even when
+        # the cut text happens to form a closed JSON object — the tail fields
+        # were never generated. Stored as an error, never ``complete``.
+        if metrics.get("finish_reason") == "length":
+            logger.warning(
+                "Enrichment for chunk %s cut by the max_tokens cap "
+                "(finish_reason=length)",
+                chunk_id,
+            )
+            enrichment.error = (
+                "curator response cut by the max_tokens cap (finish_reason=length)"
+            )
+            return enrichment
 
         try:
             # Try to parse JSON from response (handle markdown code blocks)
@@ -279,6 +317,12 @@ class ChunkEnrichmentService:
             logger.warning(
                 "Failed to parse enrichment JSON for chunk %s: %s", chunk_id, e
             )
+            # Issue #1066: a parse failure must reach the job's status
+            # decision as a failure, not collapse into an empty success
+            # object (which the job would store as ``complete``). The parse
+            # detail stays in the server log; the stored error is the fixed
+            # sentence.
+            enrichment.error = "enrichment JSON failed to parse"
 
         return enrichment
 

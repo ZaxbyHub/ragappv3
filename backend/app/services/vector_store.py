@@ -1002,17 +1002,27 @@ class VectorStore:
             return False  # confidently fresh — safe to skip the write lock
         return True
 
-    async def _maybe_create_vector_index(self) -> None:
+    async def _maybe_create_vector_index(self, *, accept_existing: bool = False) -> None:
         """Conditionally create vector ANN index if conditions are met.
 
         Checks:
         1. Skip if row count < VECTOR_INDEX_MIN_ROWS (256)
-        2. Skip only when embedding_idx exists and was built for the current row count
+        2. Skip when embedding_idx exists and was built for the current row count
+           and generation (the three-conjunct freshness skip); with
+           ``accept_existing=True`` an existing index is accepted unconditionally
+           (issue #1065): appended rows are served by LanceDB's brute-force scan
+           over un-indexed fragments, so a live append must not retrain the whole
+           column with ``replace=True``. Full retrains still happen at the first
+           create (>= 256 rows, no index) and at delete churn >=
+           ``settings.index_rebuild_delta``.
         3. Create index with num_partitions=256, num_sub_vectors=embedding_dim//8
 
         This method re-validates freshness under the write lock, so it is the
         authoritative decision point even when a lock-free probe
         (``_vector_index_needs_creation``) reported that creation may be needed.
+        ``accept_existing`` is passed only by the append path; the search path
+        keeps the default so a failed churn rebuild still retries through here
+        (issue #718's stale-index invariant).
         """
         if self.table is None:
             return
@@ -1037,6 +1047,21 @@ class VectorStore:
             has_embedding_idx = await has_index(self.table, "embedding", "IvfPq")
         except (OSError, RuntimeError, ValueError) as e:
             logger.debug("Could not check existing indices: %s", e)
+
+        if accept_existing and has_embedding_idx:
+            # Issue #1065: the append path accepts an already-built index the
+            # same way the below-threshold delete branch does — record the
+            # decision so the next search() does not rebuild solely because
+            # the mutation generation changed.
+            self._last_index_build_row_count = row_count
+            self._last_index_build_generation = self._index_mutation_generation
+            logger.debug(
+                "Vector index accepted for %d rows at generation %d (live append; "
+                "appended rows served by brute-force delta scan)",
+                row_count,
+                self._index_mutation_generation,
+            )
+            return
 
         if (
             has_embedding_idx
@@ -1489,8 +1514,10 @@ class VectorStore:
                     self._optimize_counter = 0
         # optimize_mode == "manual": never optimize during ingestion
 
-        # Check if we should create the vector index after adding chunks
-        await self._maybe_create_vector_index()
+        # Check if we should create the vector index after adding chunks.
+        # Issue #1065: the append path accepts an already-built index instead
+        # of retraining it with replace=True on every live write.
+        await self._maybe_create_vector_index(accept_existing=True)
         return timings
 
     async def flush_optimize(self) -> None:
