@@ -146,6 +146,32 @@ def _hash_rotate_mutation(db_path, file_id):
     return mutate
 
 
+def _newer_terminal_write_then_raise(db_path, file_id):
+    """Embed-side mutation for the ASK leg: a newer re-ingest (hash rotated)
+    whose own enrichment has ALREADY reached its terminal 'complete' — then
+    this attempt's embed fails. The except-handler's terminal write must not
+    clobber the newer row."""
+
+    async def failing_embed(texts, fail_fast=False):
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            """
+            UPDATE files
+            SET file_hash = 'newerhash654321',
+                enrichment_status = 'complete',
+                enrichment_error = NULL,
+                enrichment_updated_at = '2030-01-02T00:00:00+00:00'
+            WHERE id = ?
+            """,
+            (file_id,),
+        )
+        conn.commit()
+        conn.close()
+        raise RuntimeError("embed boom")
+
+    return failing_embed
+
+
 class _EnrichmentJobHarness:
     """Real DocumentProcessor + temp sqlite DB wired for run_enrichment_job."""
 
@@ -396,6 +422,35 @@ class TestEnrichmentSuccessContract(unittest.TestCase):
         self.assertEqual(restored.error, "enrichment JSON failed to parse")
         ok = ChunkEnrichment(chunk_id="c2")
         self.assertIsNone(ChunkEnrichment.from_dict(ok.to_dict()).error)
+
+    def test_except_handler_write_does_not_clobber_a_newer_terminal_row(self):
+        """User-approved ASK fix: the except Exception handler's terminal
+        write is currency-guarded like the failed-candidate block — a
+        superseded attempt whose embed fails AFTER a newer job's own
+        enrichment already completed must not clobber the newer row."""
+        h = _EnrichmentJobHarness(file_id=306, file_hash="abcdef012345")
+        fake = FakeLLMClient(
+            '{"summary": "fine content", "questions": [], "entities": [], "aliases": []}',
+            finish_reason="stop",
+        )
+        h.attach_client(fake)
+        h.processor.embedding_service.embed_batch = AsyncMock(
+            side_effect=_newer_terminal_write_then_raise(h.db_path, 306)
+        )
+        try:
+            h.run()
+            row = h.row()
+        finally:
+            h.close()
+
+        self.assertEqual(fake.calls, 1, "candidates generated, then embed failed")
+        self.assertEqual(
+            row["enrichment_status"], "complete",
+            "the newer job's terminal state must survive the old attempt's failure",
+        )
+        self.assertIsNone(row["enrichment_error"])
+        self.assertNotIn("ENRICHMENT_FAILED", row["enrichment_error"] or "")
+        self.assertEqual(h.swapped_records, [])
 
 
 if __name__ == "__main__":

@@ -2692,6 +2692,16 @@ class DocumentProcessor:
             logger.warning(
                 "Post-index enrichment failed for file_id=%s: %s", file_id, e
             )
+            # PR #1073 review ASK (user-approved): the terminal write is
+            # currency-guarded like the failed-candidate block and the swap
+            # tail — a superseded attempt (a newer job re-ingested and wrote
+            # its own terminal state mid-flight) must never clobber the newer
+            # job's enrichment row.
+            if not self._is_enrichment_job_current(file_id, file_hash):
+                await self._mark_enrichment_stale_if_current_job(
+                    file_id, processing_started_at
+                )
+                return
             await self.set_enrichment_status(
                 file_id, "error", format_ingest_error(INGEST_ERROR_ENRICHMENT_FAILED)
             )
