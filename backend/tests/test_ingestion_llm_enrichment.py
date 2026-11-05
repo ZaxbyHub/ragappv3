@@ -76,7 +76,8 @@ class TestChunkEnrichmentLimits(unittest.TestCase):
                 self.calls = []
 
             async def chat_completion(
-                self, messages, max_tokens, temperature, response_format=None
+                self, messages, max_tokens, temperature, response_format=None,
+                metrics_sink=None,
             ):
                 self.calls.append(
                     {
@@ -120,7 +121,8 @@ class TestChunkEnrichmentInjectionDefense(unittest.TestCase):
                 self.messages = None
 
             async def chat_completion(
-                self, messages, max_tokens, temperature, response_format=None
+                self, messages, max_tokens, temperature, response_format=None,
+                metrics_sink=None,
             ):
                 self.messages = messages
                 return '{"summary":"short","questions":[],"entities":[],"aliases":[]}'

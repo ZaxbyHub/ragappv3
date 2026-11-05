@@ -223,7 +223,12 @@ class TestAddChunksCallsOptimize:
 
     @pytest.mark.asyncio
     async def test_existing_embedding_index_is_refreshed_after_new_rows(self):
-        """Existing embedding_idx must not skip freshness handling after inserts."""
+        """A live append onto an existing IvfPq index accepts it instead of retraining (#1065).
+
+        RED at base (the append ran create_index(replace=True)); GREEN after
+        the fix: no create_index call, and the accept decision is recorded so
+        the next search does not rebuild solely because the generation moved.
+        """
         store = VectorStore(db_path=Path("/tmp/opt_test"))
         mock_table = _make_mock_table(row_count=300, has_ivfpq=True)
         store.table = mock_table
@@ -247,12 +252,18 @@ class TestAddChunksCallsOptimize:
 
             await store.add_chunks(records)
 
-        mock_table.create_index.assert_awaited_once()
+        mock_table.create_index.assert_not_awaited()
         assert store._last_index_build_row_count == 300
+        assert store._last_index_build_generation == store._index_mutation_generation
 
     @pytest.mark.asyncio
     async def test_delete_then_add_same_row_count_still_refreshes_existing_index(self):
-        """Row count alone must not prove ANN freshness after content changes."""
+        """Below-delta delete + add accepts the existing index without retraining (#1065).
+
+        RED at base (the add-path retrain fired); GREEN after the fix: the
+        delete records its below-threshold decision and the add accepts the
+        existing index — no create_index on the add, bookkeeping left fresh.
+        """
         store = VectorStore(db_path=Path("/tmp/opt_test"))
         store.db = MagicMock()
         store._embedding_dim = 4
@@ -306,7 +317,7 @@ class TestAddChunksCallsOptimize:
 
         assert deleted == 10
         assert row_state["total"] == 300
-        mock_table.create_index.assert_awaited_once()
+        mock_table.create_index.assert_not_awaited()
         assert store._last_index_build_row_count == 300
         assert store._last_index_build_generation == store._index_mutation_generation
 

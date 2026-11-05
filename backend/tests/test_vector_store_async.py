@@ -371,7 +371,10 @@ class TestVectorStoreAddChunks(TestVectorStoreAsync):
                 )
 
             self.assertIn("doc_b_0", [row["id"] for row in results])
-            self.assertEqual(table.create_index.await_count, 2)
+            # Issue #1065: only the FIRST create (256-row threshold crossing)
+            # builds the index; the doc_b append must accept the existing
+            # index instead of retraining it with replace=True.
+            self.assertEqual(table.create_index.await_count, 1)
 
         asyncio.run(run_test())
 
