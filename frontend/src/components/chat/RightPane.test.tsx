@@ -397,6 +397,15 @@ describe("RightPane", () => {
       const densePreview = await screen.findByTestId("tab-content-preview");
       expect(densePreview).toHaveTextContent(/dense\.pdf/i);
       expect(densePreview).toHaveTextContent("Highly Relevant");
+
+      // Restore the file-wide default shell-store mock so later tests keep
+      // the unselected default (mockClear does not remove implementations).
+      (mockUseChatShellStore as ReturnType<typeof vi.fn>).mockReturnValue({
+        selectedEvidenceSource: null,
+        setSelectedEvidenceSource: vi.fn(),
+        activeRightTab: "evidence",
+        setActiveRightTab: vi.fn(),
+      });
     });
 
     it("should NOT render a relevance label for synthesized sources", () => {
