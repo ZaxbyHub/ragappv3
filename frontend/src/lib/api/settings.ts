@@ -12,6 +12,11 @@ export interface SettingsResponse {
   // Model config
   embedding_model: string;
   chat_model: string;
+  // Live-message cap (issue #991): the composer derives its client-side
+  // bound from this value. Absent only against a pre-exposure backend
+  // (mixed-version deploy) — the client treats absence as unknown and
+  // blocks sends rather than guessing the bound.
+  chat_message_max_chars?: number | null;
 
   // Instant mode (LM Studio)
   instant_chat_url?: string;

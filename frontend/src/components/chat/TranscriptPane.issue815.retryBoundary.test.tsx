@@ -46,6 +46,7 @@ const mockNavigate = vi.hoisted(() => vi.fn());
 const mockGetActiveVault = vi.hoisted(() => vi.fn());
 
 vi.mock("@/lib/api", () => ({
+  getSettings: async () => ({ chat_message_max_chars: 20000 }),
   createChatSession: createChatSessionMock,
   addChatMessagesBatch: addChatMessagesBatchMock,
   addChatMessagesBatchKeepalive: vi.fn(),

@@ -1,7 +1,7 @@
 // Composer — extracted from TranscriptPane for maintainability.
 // Handles draft persistence, auto-grow, slash commands, IME guard, file attachments.
 
-import { useRef, useEffect, useLayoutEffect, useState, useCallback, useMemo } from "react";
+import { useRef, useEffect, useLayoutEffect, useState, useCallback, useMemo, useSyncExternalStore } from "react";
 import { flushSync } from "react-dom";
 import { useInRouterContext, useLocation } from "react-router-dom";
 import { useCommandPaletteAction, type CommandPaletteActionGuard } from "@/lib/commandPaletteActions";
@@ -44,7 +44,12 @@ import { useUploadStore } from "@/stores/useUploadStore";
 import type { UploadFile } from "@/stores/useUploadStore";
 import { useUploadMonitoring } from "@/hooks/useUploadMonitoring";
 import { computeEffectiveChatMode } from "@/lib/chatMode";
-import { MAX_INPUT_LENGTH } from "@/hooks/useSendMessage";
+import {
+  MAX_INPUT_LENGTH,
+  CHAT_INPUT_CAP_ADVISORY,
+  subscribeChatInputCap,
+  getChatInputCapSnapshot,
+} from "@/hooks/useSendMessage";
 import { useEscapeToStop } from "@/hooks/useEscapeToStop";
 import { toast } from "sonner";
 import { currentDraftGeneration, getDraftKey } from "@/lib/chatDrafts";
@@ -104,7 +109,7 @@ function attachmentChipStatus(upload: UploadFile): AttachmentChipStatus {
 }
 
 interface ComposerProps {
-  onSend: () => void;
+  onSend: () => Promise<"sent" | "blocked">;
   onStop: () => void;
   isStreaming: boolean;
   className?: string;
@@ -203,6 +208,24 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
   const draftPrincipalId = useAuthStore((s) => s.user?.id ?? null);
   const inputError = useChatStore((s) => s.inputError);
   const setInputError = useChatStore((s) => s.setInputError);
+  // Issue #991: the effective cap is the server's chat_message_max_chars,
+  // reactively subscribed (the loader fetches on first subscription and on
+  // auth-owner replacement). While unresolved (pending/failed/legacy-
+  // absent) the ADVISORY default drives display + change feedback only —
+  // the awaited send gate blocks on unknown.
+  const resolvedChatInputCap = useSyncExternalStore(subscribeChatInputCap, getChatInputCapSnapshot);
+  const effectiveCap = resolvedChatInputCap ?? CHAT_INPUT_CAP_ADVISORY;
+  // Re-validate the inline feedback when the bound changes at runtime (a
+  // late settings arrival must re-flag an over-bound draft, never wipe it).
+  useEffect(() => {
+    if (input.length > effectiveCap) {
+      setInputError?.(`Input exceeds maximum length of ${effectiveCap} characters`);
+    } else if (inputError !== null) {
+      setInputError?.(null);
+    }
+    // Bounded to cap transitions: input changes re-validate in handleChange.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [effectiveCap]);
   const activeChatId = useChatStore((s) => s.activeChatId);
   const storedChatMode = useChatModeStore((s) => s.chatMode);
   const setStoredChatMode = useChatModeStore((s) => s.setChatMode);
@@ -431,6 +454,14 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
     const value = e.target.value;
     setInput(value);
     persistDraft(value);
+    // Issue #991: change feedback against the effective cap (the awaited
+    // send gate is the authority; this is advisory display feedback — raw
+    // number, locale-independent, matching the useSendMessage strings).
+    if (value.length > effectiveCap) {
+      setInputError?.(`Input exceeds maximum length of ${effectiveCap} characters`);
+    } else {
+      setInputError?.(null);
+    }
 
     // Slash-menu detection reads only the last line (issue #616): a full
     // value.split("\n") allocated the entire input on every keystroke.
@@ -463,9 +494,11 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
     if (!input.trim() || isStreaming) return;
     // Over the inline cap: surface the reason instead of silently no-op'ing
     // (issue #616 — the silent block trapped oversized drafts). Raw number,
-    // locale-independent, matching the useSendMessage error strings.
-    if (input.length > MAX_INPUT_LENGTH) {
-      setInputError?.(`Input exceeds maximum length of ${MAX_INPUT_LENGTH} characters`);
+    // locale-independent, matching the useSendMessage error strings. Issue
+    // #991: the gate reads the reactive effective cap (server bound, or the
+    // advisory default while unresolved).
+    if (input.length > effectiveCap) {
+      setInputError?.(`Input exceeds maximum length of ${effectiveCap} characters`);
       return;
     }
     // Hard-block sending while uploads are still transferring — there is
@@ -486,23 +519,38 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
         action: {
           label: "Send without these files",
           onClick: () => {
-            indexingIds.forEach((id) => detachFromChat(id));
-            clearDraftNow();
-            closeSlashMenu();
-            onSend();
+            void runAdmittedSend([...indexingIds]);
           },
         },
       });
       return;
     }
-    clearDraftNow();
+    void runAdmittedSend();
+  };
+
+  /**
+   * Issue #991: BOTH send closures (normal submit and "Send without these
+   * files") route through this ONE awaited-admission helper. Draft clearing
+   * and attachment detachment happen ONLY after the send pipeline reports
+   * the content was admitted — a blocked send (unknown/over server cap)
+   * leaves the draft, input, and attachment associations intact so the user
+   * can shorten and resend. `detachIds` optionally names indexing chips the
+   * user explicitly chose to exclude.
+   */
+  const runAdmittedSend = async (detachIds?: string[] | Set<string>) => {
+    const result = await onSend();
     closeSlashMenu();
-    onSend();
-    // Keep attachments in the tray after send only if they failed —
-    // fully indexed files have been used and empty-state chips add noise.
-    attachmentChips
-      .filter((c) => c.status !== "error")
-      .forEach((c) => detachFromChat(c.upload.id));
+    if (result !== "sent") return;
+    clearDraftNow();
+    if (detachIds) {
+      for (const id of detachIds) detachFromChat(id);
+    } else {
+      // Keep attachments in the tray after send only if they failed —
+      // fully indexed files have been used and empty-state chips add noise.
+      attachmentChips
+        .filter((c) => c.status !== "error")
+        .forEach((c) => detachFromChat(c.upload.id));
+    }
   };
 
   // =============================================================================
@@ -1055,7 +1103,7 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
               <Button
                 size="sm"
                 onClick={handleSubmit}
-                disabled={!input.trim() || input.length > MAX_INPUT_LENGTH || hasUploading}
+                disabled={!input.trim() || input.length > effectiveCap || hasUploading}
                 className="h-8 w-8 shrink-0 rounded-full p-0 shadow-xs active:scale-95"
                 aria-label="Send message"
               >
@@ -1066,15 +1114,15 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
         </div>
 
         {/* Character count */}
-        {input.length > MAX_INPUT_LENGTH * 0.75 && (
+        {input.length > effectiveCap * 0.75 && (
           <div
             className={cn(
               "mt-1 text-right text-[11px]",
-              input.length > MAX_INPUT_LENGTH ? "text-destructive" : "text-muted-foreground"
+              input.length > effectiveCap ? "text-destructive" : "text-muted-foreground"
             )}
             aria-live="polite"
           >
-            {input.length}/{MAX_INPUT_LENGTH}
+            {input.length}/{effectiveCap}
           </div>
         )}
       </div>

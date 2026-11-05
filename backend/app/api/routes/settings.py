@@ -997,6 +997,9 @@ class SettingsResponse(BaseModel):
     # Model config
     embedding_model: str
     chat_model: str
+    # Live-message cap (issue #991): the composer derives its client-side
+    # bound from this value; not infra-sensitive, so members receive it too.
+    chat_message_max_chars: int
 
     # Instant mode (operator-configured; no shipped default, issue #570)
     instant_chat_url: str = ""
@@ -1168,6 +1171,9 @@ def _build_settings_dict() -> dict:
         "ollama_chat_url": settings.ollama_chat_url,
         "embedding_model": settings.embedding_model,
         "chat_model": settings.chat_model,
+        # Live-message cap (issue #991): exposed so the composer can derive
+        # its client-side bound; not redacted for members.
+        "chat_message_max_chars": settings.chat_message_max_chars,
         # Instant mode (LM Studio)
         "instant_chat_url": settings.instant_chat_url,
         "instant_chat_model": settings.instant_chat_model,

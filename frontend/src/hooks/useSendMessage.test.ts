@@ -17,6 +17,7 @@ const apiMocks = vi.hoisted(() => ({
 }));
 
 vi.mock("@/lib/api", () => ({
+  getSettings: async () => ({ chat_message_max_chars: 20000 }),
   createChatSession: (...args: unknown[]) => apiMocks.createChatSession(...args),
   addChatMessage: (...args: unknown[]) => apiMocks.addChatMessage(...args),
   addChatMessagesBatch: (...args: unknown[]) => apiMocks.addChatMessagesBatch(...args),
@@ -494,13 +495,16 @@ describe("useSendMessage", () => {
 
       const { result } = renderHook(() => useSendMessage(7, refreshHistory));
 
-      // Don't await — observe store state immediately after kicking off the send.
-      act(() => {
+      // Issue #991: the send first awaits the server-cap admission (a
+      // microtask chain), so the flip is observed after that flush — still
+      // before any stream events have fired.
+      await act(async () => {
         void result.current.handleSend();
+        await vi.waitFor(() => {
+          expect(useChatStore.getState().isStreaming).toBe(true);
+        });
       });
 
-      // isStreaming must be true right after the send call returns, before any
-      // stream events have fired. This guards the immediate flip behavior.
       expect(useChatStore.getState().isStreaming).toBe(true);
     });
 
@@ -828,6 +832,15 @@ describe("useSendMessage", () => {
       let sendPromise = Promise.resolve();
       act(() => {
         sendPromise = result.current.handleSend();
+      });
+
+      // Issue #991: the cap admission is awaited BEFORE session creation
+      // starts; flush it so the creation race window (what UI-003 guards) is
+      // the one under test.
+      await act(async () => {
+        await vi.waitFor(() => {
+          expect(apiMocks.createChatSession).toHaveBeenCalled();
+        });
       });
 
       // Stop while the session is still being created — no stream to abort yet.

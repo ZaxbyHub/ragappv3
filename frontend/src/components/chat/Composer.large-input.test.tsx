@@ -21,7 +21,7 @@
  * counter tests use) instead of relying on change-driven re-renders.
  */
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
-import { render, screen, fireEvent, act, createEvent } from "@testing-library/react";
+import { render, screen, fireEvent, act, createEvent, waitFor } from "@testing-library/react";
 import { Composer, LARGE_PASTE_THRESHOLD } from "./Composer";
 import { MAX_INPUT_LENGTH } from "@/hooks/useSendMessage";
 
@@ -84,6 +84,7 @@ vi.mock("@/stores/useVaultStore", () => ({
 }));
 
 vi.mock("@/lib/api", () => ({
+  getSettings: async () => ({ chat_message_max_chars: 20000 }),
   API_BASE_URL: "/api",
   attachCsrfInterceptor: vi.fn(),
   uploadDocument: vi.fn(),
@@ -302,7 +303,9 @@ describe("Composer large-input handling (issue #616)", () => {
     expect(MAX_INPUT_LENGTH).toBe(100_000);
     expect(screen.getByLabelText("Send message")).toBeEnabled();
 
-    mockChatState.input = "x".repeat(100_001);
+    // Issue #991: the effective gate is the server cap (20_000 in this
+    // suite's getSettings mock), not the legacy 100_000 ceiling.
+    mockChatState.input = "x".repeat(20_001);
     rerender(<Composer onSend={onSend} onStop={vi.fn()} isStreaming={false} />);
     const sendButton = screen.getByLabelText("Send message");
     expect(sendButton).toBeDisabled();
@@ -314,7 +317,7 @@ describe("Composer large-input handling (issue #616)", () => {
     expect(onSend).not.toHaveBeenCalled();
     // The block is not silent: the store records the over-cap error.
     expect(mockChatState.setInputError).toHaveBeenCalledWith(
-      expect.stringMatching(/exceeds maximum length of 100000/i)
+      expect.stringMatching(/exceeds maximum length of 20000/i)
     );
   });
 
@@ -343,9 +346,10 @@ describe("Composer large-input handling (issue #616)", () => {
     expect(storage.get(draftKey("7"))).toBe("new-session-1");
   });
 
-  it("sending clears the persisted draft synchronously", () => {
-    const onSend = vi.fn(() => {
+  it("sending clears the persisted draft once the send is admitted (issue #991: cleanup defers to admission)", async () => {
+    const onSend = vi.fn(async () => {
       mockChatState.input = "";
+      return "sent" as const;
     });
     const { rerender } = render(
       <Composer onSend={onSend} onStop={vi.fn()} isStreaming={false} />
@@ -359,6 +363,15 @@ describe("Composer large-input handling (issue #616)", () => {
     // handler's closure sees the changed input.
     rerender(<Composer onSend={onSend} onStop={vi.fn()} isStreaming={false} />);
     fireEvent.click(screen.getByLabelText("Send message"));
+    // This suite runs fake timers for the debounce legs; waitFor polls on
+    // real intervals and would hang — flush the admission microtask chain
+    // instead (the deferred cleanup is microtask-scheduled, not timed).
+    await act(async () => {
+      await Promise.resolve();
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
     expect(storage.has(draftKey("42"))).toBe(false);
     expect(onSend).toHaveBeenCalledTimes(1);
   });

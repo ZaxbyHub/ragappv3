@@ -24,6 +24,7 @@ const refreshHistoryMock = vi.hoisted(() => vi.fn(async () => {}));
 const truncateMock = vi.hoisted(() => vi.fn(async () => ({})));
 
 vi.mock("@/lib/api", () => ({
+  getSettings: async () => ({ chat_message_max_chars: 20000 }),
   forkChatSession: vi.fn(async () => ({ id: 99, messages: [] })),
   truncateChatSession: truncateMock,
   getChatSession: vi.fn(),
@@ -32,6 +33,11 @@ vi.mock("@/hooks/useChatHistory", () => ({
   useChatHistory: () => ({ refreshHistory: refreshHistoryMock }),
 }));
 vi.mock("@/hooks/useSendMessage", () => ({
+  CHAT_INPUT_CAP_ADVISORY: 20_000,
+  subscribeChatInputCap: () => () => {},
+  getChatInputCapSnapshot: () => 20_000,
+  checkSendAdmissionAsync: async () => ({ ok: true, cap: 20_000 }),
+  chatInputAdvisoryBlocked: () => null,
   useSendMessage: () => ({
     handleSend: handleSendMock,
     handleStop: vi.fn(),

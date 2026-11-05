@@ -4,6 +4,7 @@ import {
   createChatSession,
   addChatMessagesBatch,
   addChatMessagesBatchKeepalive,
+  getSettings,
   type ChatMessage,
   type AddMessageRequest,
   type ChatMetadataFilter,
@@ -11,6 +12,11 @@ import {
   type WikiReference,
   type KMSReference,
 } from "@/lib/api";
+import {
+  captureAuthOwner,
+  onAuthOwnerReplacement,
+  type AuthOwner,
+} from "@/lib/api/auth-lifecycle";
 import { toast } from "sonner";
 import { useChatStore, type Message } from "@/stores/useChatStore";
 import { useVaultStore } from "@/stores/useVaultStore";
@@ -28,7 +34,151 @@ import useCoalescedAppend from "./useCoalescedAppend";
 // only: 100k keeps a bound on the SSE payload while covering long-form
 // RAG prompts; larger paste-sized input is routed to attachments by the
 // Composer instead (LARGE_PASTE_THRESHOLD).
+// Issue #991: the SEND bound is now the server's `chat_message_max_chars`
+// (see the cap loader below); this constant remains the fixed draft-STORAGE
+// ceiling (decoupled from the cap) and the legacy pre-fetch advisory floor.
 export const MAX_INPUT_LENGTH = 100_000;
+
+// Issue #991: advisory display bound while the authoritative server cap is
+// unresolved (pending, failed, or legacy-absent). Display/change-feedback
+// ONLY — it never authorizes a send.
+export const CHAT_INPUT_CAP_ADVISORY = 20_000;
+
+/**
+ * Issue #991 cap loader — the SOLE authority for the chat input cap.
+ * A per-owner memo resolved by its OWN `getSettings()` fetch; it does not
+ * read or write the shared settings store for the cap (PageShell's fill and
+ * the store's stale-write guard stay untouched for their existing
+ * consumers, and a replacement owner's value can always supersede an older
+ * one). Subscribes to auth-owner replacement: the prior owner's in-flight
+ * result is discarded and the memo re-arms with an IMMEDIATE refetch for the
+ * replacement owner (no send required).
+ *
+ * Value semantics (four states):
+ *  1. fetch fails            -> acquisition failure (sends block);
+ *  2. field ABSENT (`undefined`) -> legacy mixed-version server, cap
+ *     unknowable (sends block — absence cannot authoritatively mean the
+ *     default: a pre-exposure server configured below default also omits
+ *     the field);
+ *  3. present but null / non-integer / non-finite / < 1 -> failure (block);
+ *  4. valid integer >= 1     -> authoritative cap, no ceiling clamp.
+ */
+interface ChatInputCapMemo {
+  owner: AuthOwner;
+  promise: Promise<number | null>;
+  resolved: number | null;
+}
+let chatInputCapMemo: ChatInputCapMemo | null = null;
+const chatInputCapListeners = new Set<() => void>();
+
+function validateChatInputCap(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+    return null;
+  }
+  return value;
+}
+
+async function fetchChatInputCap(): Promise<number | null> {
+  const settings = await getSettings();
+  // `undefined` (field absent) and `null` both leave the cap unknown.
+  return validateChatInputCap(settings?.chat_message_max_chars);
+}
+
+export function ensureChatInputCapLoaded(): Promise<number | null> {
+  const owner = captureAuthOwner();
+  if (chatInputCapMemo && chatInputCapMemo.owner === owner) {
+    return chatInputCapMemo.promise;
+  }
+  const memo: ChatInputCapMemo = { owner, promise: null as unknown as Promise<number | null>, resolved: null };
+  memo.promise = fetchChatInputCap().catch(() => null);
+  memo.promise.then((value) => {
+    // Late resolution against a replaced owner: discard (a fresh memo for
+    // the replacement owner was already armed by the replacement listener).
+    if (chatInputCapMemo === memo) {
+      memo.resolved = value;
+      for (const listener of [...chatInputCapListeners]) listener();
+    }
+  });
+  chatInputCapMemo = memo;
+  return memo.promise;
+}
+
+/** Sync read of the loader's per-owner value; null while pending/failed/absent. */
+export function resolveChatInputCap(): number | null {
+  return chatInputCapMemo?.resolved ?? null;
+}
+
+/** Display bound: the resolved cap, or the advisory default while unknown. */
+export function chatInputDisplayCap(): number {
+  return resolveChatInputCap() ?? CHAT_INPUT_CAP_ADVISORY;
+}
+
+export function subscribeChatInputCap(listener: () => void): () => void {
+  chatInputCapListeners.add(listener);
+  // First subscription arms the per-owner fetch so the counter/gates show
+  // the real bound without waiting for a send.
+  void ensureChatInputCapLoaded();
+  return () => chatInputCapListeners.delete(listener);
+}
+
+export function getChatInputCapSnapshot(): number | null {
+  return resolveChatInputCap();
+}
+
+/**
+ * Awaited send admission (issue #991). Every send path — composer submit,
+ * retry, regenerate/continue via sendDirect — resolves this BEFORE any
+ * destructive or observable action. Blocking is fail-closed: unknown cap
+ * (pending, failed, legacy-absent) or over-cap content never reaches the
+ * transport, and the message names the bound (or the unavailability).
+ */
+export async function checkSendAdmissionAsync(
+  content: string,
+): Promise<{ ok: true; cap: number } | { ok: false; message: string }> {
+  const cap = await ensureChatInputCapLoaded();
+  if (cap === null) {
+    return {
+      ok: false,
+      message: `Message limit unavailable — couldn't read the server setting. Try again.`,
+    };
+  }
+  if (content.length > cap) {
+    return {
+      ok: false,
+      message: `Input exceeds maximum length of ${cap} characters`,
+    };
+  }
+  return { ok: true, cap };
+}
+
+/** Sync advisory feedback bound for change handlers (display-only). */
+export function chatInputAdvisoryBlocked(content: string): string | null {
+  const bound = chatInputDisplayCap();
+  if (content.length > bound) {
+    return `Input exceeds maximum length of ${bound} characters`;
+  }
+  return null;
+}
+
+// Owner replacement: discard the prior memo and immediately refetch for the
+// replacement owner (the resolved value notifies subscribers).
+if (typeof window !== "undefined") {
+  onAuthOwnerReplacement(() => {
+    chatInputCapMemo = null;
+    for (const listener of [...chatInputCapListeners]) listener();
+    void ensureChatInputCapLoaded().then((value) => {
+      if (value !== null) {
+        for (const listener of [...chatInputCapListeners]) listener();
+      }
+    });
+  });
+}
+
+/** Test seam: clear the per-owner memo WITHOUT fetching (order-independence). */
+export function __resetChatInputCapForTests(): void {
+  chatInputCapMemo = null;
+  for (const listener of [...chatInputCapListeners]) listener();
+}
 
 // Issue #685 (PRR-001): the in-flight turn's persistence handle lives at
 // MODULE scope, not only on the hook instance. The first send from /chat
@@ -42,7 +192,7 @@ let activeStreamToken: symbol | null = null;
 let stoppingStreamToken: symbol | null = null;
 
 export interface UseSendMessageReturn {
-  handleSend: () => Promise<void>;
+  handleSend: () => Promise<"sent" | "blocked">;
   handleStop: () => void;
   handleKeyDown: (e: React.KeyboardEvent) => void;
   handleInputChange: (e: React.ChangeEvent<HTMLTextAreaElement>) => void;
@@ -978,19 +1128,30 @@ export function useSendMessage(
     ]
   );
 
-  /** Normal send — reads content from the Zustand input field. */
-  const handleSend = useCallback(async () => {
+  /**
+   * Normal send — reads content from the Zustand input field. Returns the
+   * admission result (issue #991): "blocked" leaves the composer input,
+   * draft, and attachments untouched (the Composer defers its cleanup until
+   * "sent"), "sent" means the content passed the awaited server-cap gate
+   * and was handed to the send pipeline.
+   */
+  const handleSend = useCallback(async (): Promise<"sent" | "blocked"> => {
     const { input: currentInput, isStreaming: currentIsStreaming } =
       useChatStore.getState();
-    if (!currentInput.trim() || currentIsStreaming || sendingRef.current) return;
-    if (currentInput.length > MAX_INPUT_LENGTH) {
-      setInputError(`Input exceeds maximum length of ${MAX_INPUT_LENGTH} characters`);
-      return;
+    if (!currentInput.trim() || currentIsStreaming || sendingRef.current) {
+      return "blocked";
+    }
+    // Issue #991: await the AUTHORITATIVE server cap before any side effect.
+    const admission = await checkSendAdmissionAsync(currentInput);
+    if (!admission.ok) {
+      setInputError(admission.message);
+      return "blocked";
     }
     const content = currentInput.trim();
     const { messageIds, messagesById } = useChatStore.getState();
     const history = messageIds.map((id) => messagesById[id]);
     await sendCore(content, history, true);
+    return "sent";
   }, [setInputError, sendCore]);
 
   /**
@@ -1005,9 +1166,17 @@ export function useSendMessage(
     ) => {
       const { isStreaming: currentIsStreaming } = useChatStore.getState();
       if (currentIsStreaming || sendingRef.current) return;
+      // Issue #991 backstop gate: the retry/edit entries validate before any
+      // destructive step, but sendDirect itself must never carry over-cap
+      // content to the transport.
+      const admission = await checkSendAdmissionAsync(content);
+      if (!admission.ok) {
+        setInputError(admission.message);
+        return;
+      }
       await sendCore(content, historyMessages, false, opts);
     },
-    [sendCore]
+    [setInputError, sendCore]
   );
 
   const handleStop = useCallback(() => {
@@ -1043,8 +1212,13 @@ export function useSendMessage(
     (e: React.ChangeEvent<HTMLTextAreaElement>) => {
       const value = e.target.value;
       setInput(value);
-      if (value.length > MAX_INPUT_LENGTH) {
-        setInputError(`Input exceeds maximum length of ${MAX_INPUT_LENGTH} characters`);
+      // Issue #991: advisory change feedback against the display bound (the
+      // resolved server cap, or the advisory default while unknown). This
+      // hook member has no production caller (the Composer handles input
+      // changes itself) — kept as an inert backstop on the same bound source.
+      const blocked = chatInputAdvisoryBlocked(value);
+      if (blocked !== null) {
+        setInputError(blocked);
       } else {
         setInputError(null);
       }

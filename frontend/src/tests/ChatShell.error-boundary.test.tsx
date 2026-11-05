@@ -113,6 +113,11 @@ vi.mock("@/stores/useChatStore", () => ({
 }));
 
 vi.mock("@/hooks/useSendMessage", () => ({
+  CHAT_INPUT_CAP_ADVISORY: 20_000,
+  subscribeChatInputCap: () => () => {},
+  getChatInputCapSnapshot: () => 20_000,
+  checkSendAdmissionAsync: async () => ({ ok: true, cap: 20_000 }),
+  chatInputAdvisoryBlocked: () => null,
   useSendMessage: vi.fn(() => ({
     handleSend: vi.fn(),
     handleStop: vi.fn(),

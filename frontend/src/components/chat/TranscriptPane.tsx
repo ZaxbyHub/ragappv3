@@ -33,7 +33,7 @@ import {
 import { useVaultStore } from "@/stores/useVaultStore";
 import { useAuthStore } from "@/stores/useAuthStore";
 import { useChatShellStore } from "@/stores/useChatShellStore";
-import { useSendMessage } from "@/hooks/useSendMessage";
+import { useSendMessage, checkSendAdmissionAsync, chatInputAdvisoryBlocked } from "@/hooks/useSendMessage";
 import { useChatHistory } from "@/hooks/useChatHistory";
 import { forkChatSession, getChatSession, truncateChatSession } from "@/lib/api";
 import { mapSessionMessage } from "@/lib/chatMessageMapper";
@@ -697,6 +697,18 @@ export function TranscriptPane({ className, onSessionCreated }: TranscriptPanePr
       }
       if (lastUserIdx < 0) return;
 
+      // Issue #991: validate against the AUTHORITATIVE server cap BEFORE
+      // any destructive revision step — an over-cap persisted turn must
+      // never lose its server history or local rows to a retry that cannot
+      // send. Awaits cap readiness, so a pending settings fetch delays the
+      // truncate, never skips the gate.
+      const userContent = messagesById[ids[lastUserIdx]].content;
+      const admission = await checkSendAdmissionAsync(userContent);
+      if (!admission.ok) {
+        toast.error(admission.message);
+        return;
+      }
+
       // Issue #684 (T1-13-S-08): snapshot the rows this revision removes so
       // an admission-rejected replacement (which writes nothing server-side)
       // can restore them instead of losing the original Q&A.
@@ -725,7 +737,6 @@ export function TranscriptPane({ className, onSessionCreated }: TranscriptPanePr
         }
       }
 
-      const userContent = messagesById[ids[lastUserIdx]].content;
       const history = ids.slice(0, lastUserIdx).map((id) => messagesById[id]);
       removeMessagesFrom(lastUserIdx);
       sendDirect(userContent, history, restoreRows ? { restoreRows } : undefined);
@@ -799,6 +810,14 @@ export function TranscriptPane({ className, onSessionCreated }: TranscriptPanePr
       clearEditVersionsFrom?.(idx + 1);
       removeMessagesFrom(idx);
       setInput(content);
+      // Issue #991: edit is the RECOVERY path for an over-cap persisted
+      // turn — surface the bound feedback at load so the user knows to
+      // shorten before resubmitting (the gated composer refuses the resend
+      // otherwise). Nothing is lost: the content lives in the composer.
+      const blocked = chatInputAdvisoryBlocked(content);
+      if (blocked !== null) {
+        useChatStore.getState().setInputError?.(blocked);
+      }
       composerRef.current?.focus();
     } finally {
       revisionInFlightRef.current = false;

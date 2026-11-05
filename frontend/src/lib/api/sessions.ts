@@ -513,6 +513,26 @@ export function chatStream(
 
         if (!isCurrent()) return;
         if (!response.ok) {
+          // Issue #991: a JSON error body with a NON-EMPTY string `detail`
+          // (the server's named rejection, e.g. the chat cap message) is
+          // surfaced to onError instead of an opaque status line. Every
+          // other shape — non-JSON body, body-read failure, missing/empty/
+          // non-string detail — keeps today's exact status-only message.
+          let detailMessage: string | null = null;
+          try {
+            const body: unknown = await response.json();
+            const detail = (body as { detail?: unknown } | null)?.detail;
+            if (typeof detail === "string" && detail.length > 0) {
+              detailMessage = detail;
+            }
+          } catch {
+            // Non-JSON body or the read failed: fall back to status-only.
+          }
+          if (detailMessage !== null) {
+            const detailError = new Error(detailMessage);
+            (detailError as Error & { status?: number }).status = response.status;
+            throw detailError;
+          }
           throw new Error(`HTTP error! status: ${response.status}`);
         }
 

@@ -43,6 +43,7 @@ const { mockListAccessibleVaults, mockGetVault, mockListFolders, mockListTags } 
 // on mount — never opened or interacted with here, so Radix Select does not
 // need the jsdom pointer-capture workaround the components' own tests use.
 vi.mock("@/lib/api", () => ({
+  getSettings: async () => ({ chat_message_max_chars: 20000 }),
   // API_BASE_URL is read by useAuthStore (imported via DraftAssignmentForm
   // for the principal-scoped brief-template gate, issue #1036 AC2).
   API_BASE_URL: "/api",

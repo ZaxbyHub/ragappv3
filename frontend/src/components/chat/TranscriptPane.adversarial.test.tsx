@@ -76,7 +76,24 @@ vi.mock("@/stores/useChatStore", () => ({
 }));
 vi.mock("@/stores/useVaultStore");
 vi.mock("@/hooks/useSendMessage");
+import {
+  checkSendAdmissionAsync,
+  chatInputAdvisoryBlocked,
+  subscribeChatInputCap,
+  getChatInputCapSnapshot,
+} from "@/hooks/useSendMessage";
+
+// Issue #991: the cap-loader seam exports (auto-mocked below) get explicit
+// shapes so the admission gate and the reactive cap behave deterministically.
+vi.mocked(subscribeChatInputCap).mockImplementation(() => () => {});
+vi.mocked(getChatInputCapSnapshot).mockReturnValue(20_000);
+vi.mocked(checkSendAdmissionAsync).mockResolvedValue({ ok: true, cap: 20_000 } as never);
+vi.mocked(chatInputAdvisoryBlocked).mockReturnValue(null);
+
 vi.mock("@/hooks/useChatHistory");
+vi.mock("@/lib/api/settings", () => ({
+  getSettings: async () => ({ chat_message_max_chars: 20000 }),
+}));
 vi.mock("@/lib/api");
 vi.mock("react-router-dom", () => ({
   useNavigate: () => vi.fn(),
@@ -547,14 +564,15 @@ describe("TranscriptPane ADVERSARIAL TESTS", () => {
       const { rerender } = render(<TranscriptPane />);
 
       // Below the 75% trigger the counter stays hidden.
-      expect(screen.queryByText(/\d+\/100000/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/\d+\/20000/)).not.toBeInTheDocument();
 
       setMockChatState({ messages: [], input: "A".repeat(100_001), isStreaming: false, inputError: null });
       rerender(<TranscriptPane />);
 
-      // Character count warning appears once over the cap
+      // Character count warning appears once over the cap (issue #991: the
+      // effective cap in this suite's hook mock is 20,000)
       await waitFor(() => {
-        expect(screen.getByText(/100001\/100000/)).toBeInTheDocument();
+        expect(screen.getByText(/100001\/20000/)).toBeInTheDocument();
       });
     });
 
