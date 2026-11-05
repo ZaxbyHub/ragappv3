@@ -330,6 +330,54 @@ describe("RightPane", () => {
       expect(screen.getByText("Relevant")).toBeInTheDocument();
     });
 
+    it("suppresses the relevance badge for fts sources in the source list (issue #1070)", () => {
+      const sources = [
+        createMockSource({ id: "src-1", filename: "ftsdoc.pdf", score: 0.55, score_type: "fts" }),
+      ];
+
+      mockUseChatStore.mockReturnValue({
+        messages: [
+          createMockMessage({ role: "user", content: "test" }),
+          createMockMessage({ role: "assistant", content: "response", sources }),
+        ],
+        expandedSources: new Set(),
+      });
+
+      render(<RightPane />);
+
+      // The fts source renders with NO relevance label (uncalibrated kind);
+      // dense-badge rendering is covered by the tests above this one.
+      expect(screen.queryAllByText("ftsdoc.pdf").length).toBeGreaterThan(0);
+      expect(screen.queryByText("Highly Relevant")).not.toBeInTheDocument();
+      expect(screen.queryByText("Relevant")).not.toBeInTheDocument();
+      expect(screen.queryByText("Related")).not.toBeInTheDocument();
+      expect(screen.queryByText("Tangential")).not.toBeInTheDocument();
+    });
+
+    it("suppresses the relevance badge for the selected fts source detail (issue #1070)", () => {
+      const sources = [
+        createMockSource({ id: "src-1", filename: "ftsdoc.pdf", score: 0.55, score_type: "fts" }),
+      ];
+
+      mockUseChatStore.mockReturnValue({
+        messages: [
+          createMockMessage({ role: "user", content: "test" }),
+          createMockMessage({ role: "assistant", content: "response", sources }),
+        ],
+        expandedSources: new Set(["src-1"]),
+      });
+
+      render(<RightPane />);
+
+      // Expanded/selected source detail must render the filename without any
+      // band label or color deref for the uncalibrated fts kind.
+      expect(screen.queryAllByText("ftsdoc.pdf").length).toBeGreaterThan(0);
+      expect(screen.queryByText("Highly Relevant")).not.toBeInTheDocument();
+      expect(screen.queryByText("Relevant")).not.toBeInTheDocument();
+      expect(screen.queryByText("Related")).not.toBeInTheDocument();
+      expect(screen.queryByText("Tangential")).not.toBeInTheDocument();
+    });
+
     it("should NOT render a relevance label for synthesized sources", () => {
       // Even if a synthesized source somehow carries a score, the synthesized
       // flag must suppress the (misleading) relevance label in the source list.

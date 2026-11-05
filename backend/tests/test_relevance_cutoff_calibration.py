@@ -72,12 +72,10 @@ def test_distance_filter_explicit_05_still_drops():
 
 def _fallback_score_record(score):
     """A record with NO `_distance`, keyed `_score` — the real LanceDB FTS
-    row shape (#745 AC4). NOTE: since #1070 landed the product ignores
-    `_score` on this branch (1.0 floor), so the floor assertions below are
-    currently vacuous-but-green; they become discriminating again exactly
-    when #1070 makes the product read the real value. Original docstring:
-    the similarity-score fallback branch (higher-is-better score, compared
-    against FALLBACK_SCORE_FLOOR).
+    row shape (#745 AC4). Since #1070 landed, the product reads the real
+    `_score` on this branch, so the floor assertions below are
+    discriminating (a below-floor `_score` is dropped). The branch keeps
+    higher-is-better semantics against FALLBACK_SCORE_FLOOR.
     This is the branch the CI round-4 regression hit — raising the shared
     constant to 0.75 silently dropped a 0.7-score fixture record in
     test_rag_engine_vault_isolation."""
