@@ -222,6 +222,8 @@ function SourceListItem({
   const isSynthesized = Boolean(
     (source.metadata as Record<string, unknown> | undefined)?.synthesized
   );
+  // Null for the uncalibrated per-source "fts" kind (issue #1070) — the
+  // relevance row below is suppressed rather than guessed.
   const relevance =
     !isSynthesized && source.score !== undefined
       ? getRelevanceLabel(source.score, scoreType)
@@ -402,6 +404,13 @@ function SourcePreview({ source, query, onJumpToAnswer }: SourcePreviewProps) {
       ? { state: "unavailable", unavailableReason: "context-unavailable" }
       : undefined
   );
+  // Null-guarded relevance (issue #1070): the uncalibrated per-source "fts"
+  // kind yields NO label — the renderer must not dereference .color/.text on
+  // it. Synthesized sources never carry a meaningful score either.
+  const selectedRelevance =
+    !isSynthesized && source.score !== undefined && source.score_type
+      ? getRelevanceLabel(source.score, source.score_type)
+      : null;
 
   useEffect(() => {
     let cancelled = false;
@@ -596,11 +605,11 @@ function SourcePreview({ source, query, onJumpToAnswer }: SourcePreviewProps) {
         </div>
       )}
 
-      {!isSynthesized && source.score !== undefined && source.score_type && (
+      {selectedRelevance && (
         <div className="flex items-center gap-2 text-sm shrink-0">
           <span className="text-muted-foreground">Relevance:</span>
-          <span className={getRelevanceLabel(source.score, source.score_type).color}>
-            {getRelevanceLabel(source.score, source.score_type).text}
+          <span className={selectedRelevance.color}>
+            {selectedRelevance.text}
           </span>
         </div>
       )}

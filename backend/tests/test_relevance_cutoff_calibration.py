@@ -72,7 +72,7 @@ def test_distance_filter_explicit_05_still_drops():
 
 def _fallback_score_record(score):
     """A record with NO `_distance`, keyed `_score` — the real LanceDB FTS
-    row shape (#745 AC4). NOTE: until #1070 lands the product ignores
+    row shape (#745 AC4). NOTE: since #1070 landed the product ignores
     `_score` on this branch (1.0 floor), so the floor assertions below are
     currently vacuous-but-green; they become discriminating again exactly
     when #1070 makes the product read the real value. Original docstring:
@@ -117,14 +117,6 @@ def test_fallback_score_floor_exact_boundary_is_kept():
     assert kept[0].file_id == "f3"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        chr(35) + '745 AC4: fixtures now carry the real LanceDB FTS key _score; '
-        'the product 1.0-floors this branch so the below-floor drop flips — '
-        'owned by ' + chr(35) + '1070; remove this marker when ' + chr(35) + '1070 lands'
-    ),
-)
 def test_fallback_score_floor_still_drops_below_legacy_floor():
     # Contrast arm: the decoupled floor keeps its legacy drop behavior —
     # a 0.4-score fallback record is below 0.5 and is dropped with no_match.

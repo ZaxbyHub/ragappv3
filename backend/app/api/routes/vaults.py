@@ -39,7 +39,12 @@ from app.services.draft_deletion import DraftDeletionService
 from app.services.draft_input_storage import DraftInputStorage, DraftInputStorageError
 from app.services.draft_store import DraftStore
 from app.services.security_audit import safe_record_security_event
-from app.services.task_drain import drain_audit, drain_await, drained_commit
+from app.services.task_drain import (
+    drain_audit,
+    drain_await,
+    drained_commit,
+    drained_unit,
+)
 from app.services.vector_store import VectorStore
 
 logger = logging.getLogger(__name__)
@@ -883,59 +888,70 @@ async def update_vault(
             """
             conn.execute(sql, [*bind, vault_id])
 
-    try:
-        await asyncio.to_thread(_apply_vault_update)
-    except sqlite3.IntegrityError:
-        raise HTTPException(
-            status_code=409, detail=f"Vault with name '{request.name}' already exists"
-        )
+    # Issue #1068: the _apply_vault_update helper's transaction_context
+    # commit and BOTH conditional audit tails form ONE drained unit — a
+    # cancellation delivered exactly at the commit await (after the commit
+    # work completed) is absorbed until every tail this request owes
+    # (vault.org_id_updated gated on adoption_applied AND
+    # vault.visibility_updated gated on the request carrying a visibility)
+    # is written, then re-raised. The IntegrityError translation stays
+    # verbatim INSIDE the unit.
+    async def _unit() -> None:
+        try:
+            await asyncio.to_thread(_apply_vault_update)
+        except sqlite3.IntegrityError:
+            raise HTTPException(
+                status_code=409, detail=f"Vault with name '{request.name}' already exists"
+            )
 
-    if adoption_applied:
-        # Access-CHANGE event, recorded after the adoption transaction commits
-        # (the helper commits itself). Not labeled widening: for a public
-        # org-less vault, adoption NARROWS global reads to the org's members.
-        # old_org_id/old_visibility carry the pre-change values from the
-        # IN-TRANSACTION re-read (F-005), and new_visibility records the
-        # visibility this same request persisted (request.visibility when
-        # set, else the in-txn pre-adoption value) — the same metadata
-        # convention as vault.visibility_updated (issue #1003, ML-P-1).
-        await drain_audit(safe_record_security_event(
-            conn,
-            event_type="vault.org_id_updated",
-            actor=user,
-            request=http_request,
-            metadata={
-                "vault_id": vault_id,
-                "old_org_id": txn_current_org_id,
-                "new_org_id": request.org_id,
-                "old_visibility": txn_current_visibility,
-                "new_visibility": (
-                    request.visibility
-                    if request.visibility is not None
-                    else txn_current_visibility
-                ),
-            },
-        ))
+        if adoption_applied:
+            # Access-CHANGE event, recorded after the adoption transaction commits
+            # (the helper commits itself). Not labeled widening: for a public
+            # org-less vault, adoption NARROWS global reads to the org's members.
+            # old_org_id/old_visibility carry the pre-change values from the
+            # IN-TRANSACTION re-read (F-005), and new_visibility records the
+            # visibility this same request persisted (request.visibility when
+            # set, else the in-txn pre-adoption value) — the same metadata
+            # convention as vault.visibility_updated (issue #1003, ML-P-1).
+            await drain_audit(safe_record_security_event(
+                conn,
+                event_type="vault.org_id_updated",
+                actor=user,
+                request=http_request,
+                metadata={
+                    "vault_id": vault_id,
+                    "old_org_id": txn_current_org_id,
+                    "new_org_id": request.org_id,
+                    "old_visibility": txn_current_visibility,
+                    "new_visibility": (
+                        request.visibility
+                        if request.visibility is not None
+                        else txn_current_visibility
+                    ),
+                },
+            ))
 
-    if request.visibility is not None:
-        # Visibility-carrying updates are security-relevant events (issue
-        # #722 AC1): visibility widens or narrows who can read the vault.
-        # Recorded after the commit via the standard tamper-evident helper;
-        # the metadata carries old and new values even when equal. The old
-        # value is the in-transaction re-read (F-005) — identical to the
-        # outer read except under a concurrent visibility flip, where the
-        # transactional value is the authoritative pre-image of THIS update.
-        await drain_audit(safe_record_security_event(
-            conn,
-            event_type="vault.visibility_updated",
-            actor=user,
-            request=http_request,
-            metadata={
-                "vault_id": vault_id,
-                "old_visibility": txn_current_visibility,
-                "new_visibility": request.visibility,
-            },
-        ))
+        if request.visibility is not None:
+            # Visibility-carrying updates are security-relevant events (issue
+            # #722 AC1): visibility widens or narrows who can read the vault.
+            # Recorded after the commit via the standard tamper-evident helper;
+            # the metadata carries old and new values even when equal. The old
+            # value is the in-transaction re-read (F-005) — identical to the
+            # outer read except under a concurrent visibility flip, where the
+            # transactional value is the authoritative pre-image of THIS update.
+            await drain_audit(safe_record_security_event(
+                conn,
+                event_type="vault.visibility_updated",
+                actor=user,
+                request=http_request,
+                metadata={
+                    "vault_id": vault_id,
+                    "old_visibility": txn_current_visibility,
+                    "new_visibility": request.visibility,
+                },
+            ))
+
+    await drained_unit(_unit())
 
     # Rename vault folder if name changed
     if request.name is not None:
@@ -1819,24 +1835,32 @@ async def update_vault_groups(
                     ),
                 )
 
-    await asyncio.to_thread(_replace_access)
+    # Issue #1068: the _replace_access helper's transaction_context commit and
+    # the vault.group_access_replaced audit tail form ONE drained unit — a
+    # cancellation delivered exactly at the commit await (after the commit
+    # work completed) is absorbed until the audit row is written, then
+    # re-raised.
+    async def _unit() -> None:
+        await asyncio.to_thread(_replace_access)
 
-    # Security-relevant event on every replace path, recorded after the commit
-    # (issue #722 AC1) — clearing all group access is the most
-    # security-relevant form of this mutation. group_ids names the DEDUPED
-    # persisted rows (L1-6): a duplicated id in the request body is inserted
-    # once, and the event must not claim a grant that was never persisted
-    # ([] on the empty-clear path, where no rows survive).
-    await drain_audit(safe_record_security_event(
-        conn,
-        event_type="vault.group_access_replaced",
-        actor=user,
-        request=http_request,
-        metadata={
-            "vault_id": vault_id,
-            "group_ids": [item.group_id for item in deduped_items],
-        },
-    ))
+        # Security-relevant event on every replace path, recorded after the commit
+        # (issue #722 AC1) — clearing all group access is the most
+        # security-relevant form of this mutation. group_ids names the DEDUPED
+        # persisted rows (L1-6): a duplicated id in the request body is inserted
+        # once, and the event must not claim a grant that was never persisted
+        # ([] on the empty-clear path, where no rows survive).
+        await drain_audit(safe_record_security_event(
+            conn,
+            event_type="vault.group_access_replaced",
+            actor=user,
+            request=http_request,
+            metadata={
+                "vault_id": vault_id,
+                "group_ids": [item.group_id for item in deduped_items],
+            },
+        ))
+
+    await drained_unit(_unit())
 
     # If no access items were provided, all access is now cleared.
     if not access_items:

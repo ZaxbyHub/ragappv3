@@ -60,15 +60,6 @@ class TestNoneThresholdLoggingFix:
         fallback_warnings = [m for m in warning_messages if 'Threshold filtering removed all' in str(m)]
         assert len(fallback_warnings) == 0, "No fallback expected when no threshold is set"
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "#745 AC4: fixtures now carry the real LanceDB FTS key "
-            "`_score`; the product still reads the legacy `score` key "
-            "and 1.0-floors this branch, flipping the outcome — owned "
-            "by #1070; remove this marker when #1070 lands"
-        ),
-    )
     async def test_none_max_distance_with_relevance_threshold_logging(self, engine, caplog):
         """
         ATTACK: max_distance_threshold is None but relevance_threshold has value.
@@ -205,7 +196,8 @@ class TestNoneThresholdTypeErrorPrevention:
         """
         ATTACK: Legacy score mode with None max_distance_threshold.
 
-        Uses 'score' key instead of '_distance' to trigger legacy mode.
+        Uses the real LanceDB FTS `_score` key (no `_distance`) to trigger the
+        no-distance similarity-score branch under legacy mode.
         """
         engine.max_distance_threshold = None
         engine.relevance_threshold = 0.9

@@ -289,15 +289,6 @@ class TestFilterRelevantAdversarial:
     # ATTACK VECTOR 6: Legacy Score Mode (higher=better)
     # =========================================================================
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "#745 AC4: fixtures now carry the real LanceDB FTS key "
-            "`_score`; the product still reads the legacy `score` key "
-            "and 1.0-floors this branch, flipping the outcome — owned "
-            "by #1070; remove this marker when #1070 lands"
-        ),
-    )
     async def test_legacy_score_mode_high_threshold(self, engine):
         """Attack: Legacy score mode with high threshold.
 

@@ -34,10 +34,24 @@ function rowPhaseTone(row: ActivityJobRow): string {
   return "text-muted-foreground";
 }
 
-/** HTTP status of an action failure, when the error carries one. */
+/**
+ * HTTP status of an action failure, in either error shape this repo's API
+ * client produces: the response interceptor's normalized Error (top-level
+ * `status`, original error under `originalError`) or a raw AxiosError
+ * (`.response.status`). Mirrors the shape-tolerance convention of
+ * `logApiFailure` (core.ts) and `httpStatusOf` (useJobStatus.ts).
+ */
 function errorStatus(e: unknown): number | undefined {
-  const response = (e as { response?: { status?: number } } | null)?.response;
-  return response?.status;
+  const candidate = e as {
+    status?: number;
+    response?: { status?: number };
+    originalError?: { response?: { status?: number } };
+  } | null;
+  return (
+    candidate?.status ??
+    candidate?.response?.status ??
+    candidate?.originalError?.response?.status
+  );
 }
 
 export function ActivityTray() {

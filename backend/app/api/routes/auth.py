@@ -40,7 +40,7 @@ from app.services.security_audit import (
     _request_ip,
     safe_record_security_event,
 )
-from app.services.task_drain import drain_audit
+from app.services.task_drain import drain_audit, drained_unit
 from app.utils.paths import csrf_cookie_path, refresh_cookie_path
 
 logger = logging.getLogger(__name__)
@@ -308,94 +308,111 @@ async def register(
     expires_at = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_MAX_AGE_DAYS)
     ip_address = _request_ip(request)
 
-    try:
-        def _register_db():
-            try:
-                # Defense in depth: a prior DML statement can leave an implicit
-                # transaction open (a plain SELECT cannot under
-                # isolation_level=""), and an open transaction would make the
-                # BEGIN IMMEDIATE below fail.
-                if db.in_transaction:
-                    db.rollback()
-                db.execute("BEGIN IMMEDIATE")
-                # F-2.1: uniqueness check INSIDE the write lock so concurrent
-                # registrations cannot both pass the check before either
-                # acquires BEGIN IMMEDIATE.
-                existing = db.execute(
-                    "SELECT id FROM users WHERE username = ? COLLATE NOCASE",
-                    (body.username,),
-                ).fetchone()
-                if existing:
-                    db.rollback()
-                    raise HTTPException(status_code=409, detail="Username already exists")
-                # Atomic: count read and insert are in the same transaction
-                user_count = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-                role = "superadmin" if user_count == 0 else "member"
+    # Bound by the drained unit below; pre-initialized purely so the unit's
+    # `nonlocal` targets exist (the unit either assigns all three or raises).
+    user_id = 0
+    role = "member"
+    access_token = None
+
+    # Issue #1068: the _register_db worker's commit and the mandatory
+    # user.register audit tail form ONE drained unit — a cancellation
+    # delivered exactly at the commit await (after the commit work completed)
+    # is absorbed until the audit row is written, then re-raised. The worker's
+    # exception translation stays verbatim INSIDE the unit so a worker failure
+    # still answers 409/500 while a post-commit token/cookie failure keeps
+    # its original propagation and skips the audit.
+    async def _unit() -> None:
+        nonlocal user_id, role, access_token
+        try:
+            def _register_db():
                 try:
-                    user_id = db.execute(
-                        "INSERT INTO users (username, hashed_password, full_name, role, is_active) VALUES (?, ?, ?, ?, 1)",
-                        (body.username, hashed_pw, body.full_name, role),
-                    ).lastrowid
-                except sqlite3.IntegrityError:
-                    # F-2.1 defense-in-depth: a concurrent INSERT that landed
-                    # between our in-txn SELECT and INSERT (cannot happen
-                    # under a single BEGIN IMMEDIATE writer, but cheap
-                    # insurance). Narrow to the user INSERT only so vault /
-                    # session IntegrityErrors are not mislabeled.
-                    db.rollback()
-                    raise HTTPException(status_code=409, detail="Username already exists")
-                assign_user_to_default_vault(db, user_id)
-                # F-2.3: session INSERT in the SAME transaction as the user
-                # INSERT so a crash between cannot leave a registered user
-                # with no login session.
-                db.execute(
-                    "INSERT INTO user_sessions (user_id, refresh_token_hash, expires_at, ip_address, user_agent) VALUES (?, ?, ?, ?, ?)",
-                    (user_id, refresh_token_hash, expires_at.isoformat(), ip_address, user_agent),
-                )
-                db.commit()
-                return user_id, role
-            except HTTPException:
-                raise
-            except Exception:
-                try:
-                    db.rollback()
+                    # Defense in depth: a prior DML statement can leave an implicit
+                    # transaction open (a plain SELECT cannot under
+                    # isolation_level=""), and an open transaction would make the
+                    # BEGIN IMMEDIATE below fail.
+                    if db.in_transaction:
+                        db.rollback()
+                    db.execute("BEGIN IMMEDIATE")
+                    # F-2.1: uniqueness check INSIDE the write lock so concurrent
+                    # registrations cannot both pass the check before either
+                    # acquires BEGIN IMMEDIATE.
+                    existing = db.execute(
+                        "SELECT id FROM users WHERE username = ? COLLATE NOCASE",
+                        (body.username,),
+                    ).fetchone()
+                    if existing:
+                        db.rollback()
+                        raise HTTPException(status_code=409, detail="Username already exists")
+                    # Atomic: count read and insert are in the same transaction
+                    user_count = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+                    role = "superadmin" if user_count == 0 else "member"
+                    try:
+                        user_id = db.execute(
+                            "INSERT INTO users (username, hashed_password, full_name, role, is_active) VALUES (?, ?, ?, ?, 1)",
+                            (body.username, hashed_pw, body.full_name, role),
+                        ).lastrowid
+                    except sqlite3.IntegrityError:
+                        # F-2.1 defense-in-depth: a concurrent INSERT that landed
+                        # between our in-txn SELECT and INSERT (cannot happen
+                        # under a single BEGIN IMMEDIATE writer, but cheap
+                        # insurance). Narrow to the user INSERT only so vault /
+                        # session IntegrityErrors are not mislabeled.
+                        db.rollback()
+                        raise HTTPException(status_code=409, detail="Username already exists")
+                    assign_user_to_default_vault(db, user_id)
+                    # F-2.3: session INSERT in the SAME transaction as the user
+                    # INSERT so a crash between cannot leave a registered user
+                    # with no login session.
+                    db.execute(
+                        "INSERT INTO user_sessions (user_id, refresh_token_hash, expires_at, ip_address, user_agent) VALUES (?, ?, ?, ?, ?)",
+                        (user_id, refresh_token_hash, expires_at.isoformat(), ip_address, user_agent),
+                    )
+                    db.commit()
+                    return user_id, role
+                except HTTPException:
+                    raise
                 except Exception:
-                    pass
-                raise
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
+                    raise
 
-        user_id, role = await asyncio.to_thread(_register_db)
-    except HTTPException:
-        # F-2.1: let the 409 from _register_db propagate unchanged. Without
-        # this branch the broad `except Exception` below would convert the
-        # 409 into a 500 (HTTPException is a subclass of Exception).
-        raise
-    except Exception:
-        logger.error("Failed to create user with default assignments", exc_info=True)
-        raise HTTPException(status_code=500, detail="An internal error occurred. Please try again later.")
+            user_id, role = await asyncio.to_thread(_register_db)
+        except HTTPException:
+            # F-2.1: let the 409 from _register_db propagate unchanged. Without
+            # this branch the broad `except Exception` below would convert the
+            # 409 into a 500 (HTTPException is a subclass of Exception).
+            raise
+        except Exception:
+            logger.error("Failed to create user with default assignments", exc_info=True)
+            raise HTTPException(status_code=500, detail="An internal error occurred. Please try again later.")
 
-    # Create access token for auto-login (depends on user_id/role from above).
-    access_token = create_access_token(
-        user_id, body.username, role, client_fingerprint=compute_client_fingerprint(user_agent)
-    )
+        # Create access token for auto-login (depends on user_id/role from above).
+        access_token = create_access_token(
+            user_id, body.username, role, client_fingerprint=compute_client_fingerprint(user_agent)
+        )
 
-    # Set refresh token cookie
-    response.set_cookie(
-        key=REFRESH_TOKEN_COOKIE_NAME,
-        value=refresh_token_raw,
-        httponly=True,
-        secure=_is_secure_request(request),
-        samesite="lax",
-        max_age=REFRESH_TOKEN_MAX_AGE_DAYS * 24 * 60 * 60,
-        path=refresh_cookie_path(),
-    )
-    await drain_audit(safe_record_security_event(
-        db,
-        event_type="user.register",
-        target_user_id=user_id,
-        target_username=body.username,
-        request=request,
-        metadata={"role": role},
-    ))
+        # Set refresh token cookie
+        response.set_cookie(
+            key=REFRESH_TOKEN_COOKIE_NAME,
+            value=refresh_token_raw,
+            httponly=True,
+            secure=_is_secure_request(request),
+            samesite="lax",
+            max_age=REFRESH_TOKEN_MAX_AGE_DAYS * 24 * 60 * 60,
+            path=refresh_cookie_path(),
+        )
+        await drain_audit(safe_record_security_event(
+            db,
+            event_type="user.register",
+            target_user_id=user_id,
+            target_username=body.username,
+            request=request,
+            metadata={"role": role},
+        ))
+
+    await drained_unit(_unit())
 
     try:
         csrf_manager = get_csrf_manager(request)
@@ -498,20 +515,30 @@ async def login(
         # ``failed_attempts`` snapshot read before any lock cannot be trusted
         # under concurrency — using it could return 401 for the very request
         # that trips the lockout (DB counter already at 5).
-        fresh_failed_attempts = await asyncio.to_thread(
-            _record_failed_attempt_db, db, user_id
-        )
-        await drain_audit(safe_record_security_event(
-            db,
-            event_type="auth.login_failed",
-            target_user_id=user_id,
-            target_username=db_username,
-            request=request,
-            metadata={
-                "reason": "bad_password",
-                "failed_attempts": fresh_failed_attempts,
-            },
-        ))
+        fresh_failed_attempts = 0
+
+        # Issue #1068: the counter/lockout commit (BEGIN IMMEDIATE inside
+        # _record_failed_attempt_db) and the auth.login_failed audit tail
+        # form ONE drained unit — a cancellation landing exactly at the
+        # commit await must not lose the lockout-counter audit row.
+        async def _unit() -> None:
+            nonlocal fresh_failed_attempts
+            fresh_failed_attempts = await asyncio.to_thread(
+                _record_failed_attempt_db, db, user_id
+            )
+            await drain_audit(safe_record_security_event(
+                db,
+                event_type="auth.login_failed",
+                target_user_id=user_id,
+                target_username=db_username,
+                request=request,
+                metadata={
+                    "reason": "bad_password",
+                    "failed_attempts": fresh_failed_attempts,
+                },
+            ))
+
+        await drained_unit(_unit())
         if fresh_failed_attempts >= 5:
             raise HTTPException(
                 status_code=423,
@@ -539,77 +566,87 @@ async def login(
     expires_at = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_MAX_AGE_DAYS)
     ip_address = _request_ip(request)
 
-    try:
-        def _login_create_session():
-            try:
-                db.execute(
-                    "INSERT INTO user_sessions (user_id, refresh_token_hash, expires_at, ip_address, user_agent) VALUES (?, ?, ?, ?, ?)",
-                    (
-                        user_id,
-                        refresh_token_hash,
-                        expires_at.isoformat(),
-                        ip_address,
-                        user_agent,
-                    ),
-                )
-                # Opportunistic expiry purge, mirroring the access-token
-                # denylist's purge-on-use: remove THIS user's already-expired
-                # session rows without their cookies ever being presented
-                # (issue #722 AC10). Strict '<' never touches unexpired rows.
-                db.execute(
-                    "DELETE FROM user_sessions WHERE user_id = ? AND expires_at < ?",
-                    (user_id, datetime.now(timezone.utc).isoformat()),
-                )
-                if new_hashed_password:
-                    db.execute(
-                        "UPDATE users SET failed_attempts = 0, locked_until = NULL, last_login_at = ?, hashed_password = ? WHERE id = ?",
-                        (datetime.now(timezone.utc).isoformat(), new_hashed_password, user_id),
-                    )
-                else:
-                    db.execute(
-                        "UPDATE users SET failed_attempts = 0, locked_until = NULL, last_login_at = ? WHERE id = ?",
-                        (datetime.now(timezone.utc).isoformat(), user_id),
-                    )
-                db.commit()
-            except Exception:
+    # Issue #1068: the _login_create_session worker's commit and the
+    # auth.login_success audit tail form ONE drained unit — a cancellation
+    # delivered exactly at the commit await (after the commit work completed)
+    # is absorbed until the audit row is written, then re-raised. The
+    # worker's exception translation and the best-effort CSRF issuance stay
+    # verbatim INSIDE the unit (errors keep their current translation /
+    # best-effort semantics).
+    async def _unit() -> None:
+        try:
+            def _login_create_session():
                 try:
-                    db.rollback()
+                    db.execute(
+                        "INSERT INTO user_sessions (user_id, refresh_token_hash, expires_at, ip_address, user_agent) VALUES (?, ?, ?, ?, ?)",
+                        (
+                            user_id,
+                            refresh_token_hash,
+                            expires_at.isoformat(),
+                            ip_address,
+                            user_agent,
+                        ),
+                    )
+                    # Opportunistic expiry purge, mirroring the access-token
+                    # denylist's purge-on-use: remove THIS user's already-expired
+                    # session rows without their cookies ever being presented
+                    # (issue #722 AC10). Strict '<' never touches unexpired rows.
+                    db.execute(
+                        "DELETE FROM user_sessions WHERE user_id = ? AND expires_at < ?",
+                        (user_id, datetime.now(timezone.utc).isoformat()),
+                    )
+                    if new_hashed_password:
+                        db.execute(
+                            "UPDATE users SET failed_attempts = 0, locked_until = NULL, last_login_at = ?, hashed_password = ? WHERE id = ?",
+                            (datetime.now(timezone.utc).isoformat(), new_hashed_password, user_id),
+                        )
+                    else:
+                        db.execute(
+                            "UPDATE users SET failed_attempts = 0, locked_until = NULL, last_login_at = ? WHERE id = ?",
+                            (datetime.now(timezone.utc).isoformat(), user_id),
+                        )
+                    db.commit()
                 except Exception:
-                    pass
-                raise
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
+                    raise
 
-        await asyncio.to_thread(_login_create_session)
-    except Exception:
-        logger.error("Failed to create session", exc_info=True)
-        raise HTTPException(status_code=500, detail="An internal error occurred. Please try again later.")
+            await asyncio.to_thread(_login_create_session)
+        except Exception:
+            logger.error("Failed to create session", exc_info=True)
+            raise HTTPException(status_code=500, detail="An internal error occurred. Please try again later.")
 
-    # Set httpOnly refresh cookie
-    response.set_cookie(
-        key=REFRESH_TOKEN_COOKIE_NAME,
-        value=refresh_token_raw,
-        httponly=True,
-        secure=_is_secure_request(request),
-        samesite="lax",
-        max_age=REFRESH_TOKEN_MAX_AGE_DAYS * 24 * 60 * 60,
-        path=refresh_cookie_path(),
-    )
+        # Set httpOnly refresh cookie
+        response.set_cookie(
+            key=REFRESH_TOKEN_COOKIE_NAME,
+            value=refresh_token_raw,
+            httponly=True,
+            secure=_is_secure_request(request),
+            samesite="lax",
+            max_age=REFRESH_TOKEN_MAX_AGE_DAYS * 24 * 60 * 60,
+            path=refresh_cookie_path(),
+        )
 
-    try:
-        csrf_manager = get_csrf_manager(request)
-        issue_csrf_token(response, csrf_manager)
-    except Exception:
-        # Issue #724 (S02-SK2-11): a client getting 200 with no CSRF cookie
-        # was previously indistinguishable from success in the logs.
-        logger.warning("csrf_token_issuance_failed", exc_info=True)
-    await drain_audit(safe_record_security_event(
-        db,
-        event_type="auth.login_success",
-        actor={"id": user_id, "username": db_username},
-        target_user_id=user_id,
-        target_username=db_username,
-        request=request,
-        metadata={"role": role},
-    ))
+        try:
+            csrf_manager = get_csrf_manager(request)
+            issue_csrf_token(response, csrf_manager)
+        except Exception:
+            # Issue #724 (S02-SK2-11): a client getting 200 with no CSRF cookie
+            # was previously indistinguishable from success in the logs.
+            logger.warning("csrf_token_issuance_failed", exc_info=True)
+        await drain_audit(safe_record_security_event(
+            db,
+            event_type="auth.login_success",
+            actor={"id": user_id, "username": db_username},
+            target_user_id=user_id,
+            target_username=db_username,
+            request=request,
+            metadata={"role": role},
+        ))
+
+    await drained_unit(_unit())
 
     return {
         "access_token": access_token,
@@ -724,65 +761,77 @@ async def logout(
 ):
     """Logout and revoke refresh token and current access token."""
     audit_user = None
-    # Deny the current access token if present (extract from Bearer token)
-    if authorization and authorization.lower().startswith("bearer "):
-        access_token_str = authorization.split(" ", 1)[1].strip()
-        if access_token_str:
-            try:
-                token_payload = decode_access_token(access_token_str)
-                jti = token_payload.get("jti")
-                user_id = int(token_payload.get("sub", 0))
-                exp = token_payload.get("exp")
-                if jti and user_id:
-                    # exp is an int Unix timestamp; store in SQLite-native format
-                    if exp:
-                        from datetime import datetime, timezone
 
-                        expires_at = datetime.fromtimestamp(exp, tz=timezone.utc).strftime(
-                            "%Y-%m-%d %H:%M:%S"
-                        )
-                        deny_access_token(db, jti, user_id, expires_at)
-                        purge_expired_denied_tokens(db)
-            except Exception:
-                # Best-effort: deny only — do not fail logout if token decode fails
-                pass
-    if refresh_token:
-        token_hash = hashlib.sha256(refresh_token.encode()).hexdigest()
-        row = await asyncio.to_thread(
-            lambda: db.execute(
-                """SELECT u.id, u.username
-                   FROM user_sessions s JOIN users u ON s.user_id = u.id
-                   WHERE s.refresh_token_hash = ?""",
-                (token_hash,),
-            ).fetchone()
-        )
-        if row:
-            audit_user = {"id": row[0], "username": row[1]}
-        try:
-            def _logout_db(db_ref, token):
+    # Issue #1068: the Bearer denial commits, the _logout_db session-delete
+    # commit, and the auth.logout audit tail form ONE drained unit — a
+    # cancellation delivered exactly at the session-delete commit await
+    # (after the denial mutations are already durable) is absorbed until the
+    # audit row is written, then re-raised. The try/except around _logout_db
+    # stays verbatim INSIDE the unit, preserving logout's site-specific
+    # commit-failure-still-audits behavior.
+    async def _unit() -> None:
+        nonlocal audit_user
+        # Deny the current access token if present (extract from Bearer token)
+        if authorization and authorization.lower().startswith("bearer "):
+            access_token_str = authorization.split(" ", 1)[1].strip()
+            if access_token_str:
                 try:
-                    db_ref.execute(
-                        "DELETE FROM user_sessions WHERE refresh_token_hash = ?", (token,)
-                    )
-                    db_ref.commit()
-                except Exception:
-                    try:
-                        db_ref.rollback()
-                    except Exception:
-                        pass
-                    raise
+                    token_payload = decode_access_token(access_token_str)
+                    jti = token_payload.get("jti")
+                    user_id = int(token_payload.get("sub", 0))
+                    exp = token_payload.get("exp")
+                    if jti and user_id:
+                        # exp is an int Unix timestamp; store in SQLite-native format
+                        if exp:
+                            from datetime import datetime, timezone
 
-            await asyncio.to_thread(_logout_db, db, token_hash)
-        except Exception:
-            logger.error("Failed to delete session during logout", exc_info=True)
-    await drain_audit(safe_record_security_event(
-        db,
-        event_type="auth.logout",
-        actor=audit_user,
-        target_user_id=audit_user.get("id") if audit_user else None,
-        target_username=audit_user.get("username") if audit_user else None,
-        request=request,
-    ))
+                            expires_at = datetime.fromtimestamp(exp, tz=timezone.utc).strftime(
+                                "%Y-%m-%d %H:%M:%S"
+                            )
+                            deny_access_token(db, jti, user_id, expires_at)
+                            purge_expired_denied_tokens(db)
+                except Exception:
+                    # Best-effort: deny only — do not fail logout if token decode fails
+                    pass
+        if refresh_token:
+            token_hash = hashlib.sha256(refresh_token.encode()).hexdigest()
+            row = await asyncio.to_thread(
+                lambda: db.execute(
+                    """SELECT u.id, u.username
+                       FROM user_sessions s JOIN users u ON s.user_id = u.id
+                       WHERE s.refresh_token_hash = ?""",
+                    (token_hash,),
+                ).fetchone()
+            )
+            if row:
+                audit_user = {"id": row[0], "username": row[1]}
+            try:
+                def _logout_db(db_ref, token):
+                    try:
+                        db_ref.execute(
+                            "DELETE FROM user_sessions WHERE refresh_token_hash = ?", (token,)
+                        )
+                        db_ref.commit()
+                    except Exception:
+                        try:
+                            db_ref.rollback()
+                        except Exception:
+                            pass
+                        raise
+
+                await asyncio.to_thread(_logout_db, db, token_hash)
+            except Exception:
+                logger.error("Failed to delete session during logout", exc_info=True)
+        await drain_audit(safe_record_security_event(
+            db,
+            event_type="auth.logout",
+            actor=audit_user,
+            target_user_id=audit_user.get("id") if audit_user else None,
+            target_username=audit_user.get("username") if audit_user else None,
+            request=request,
+        ))
+
+    await drained_unit(_unit())
 
     response.delete_cookie(key=REFRESH_TOKEN_COOKIE_NAME, path=refresh_cookie_path())
     response.delete_cookie(key=CSRF_COOKIE_NAME, path=csrf_cookie_path())
@@ -926,58 +975,68 @@ async def change_password(
 
     # Update password, clear must_change_password, bump password_changed_at epoch (FR-007)
     # and revoke all sessions in a transaction
-    try:
-        def _change_password_db():
-            try:
-                db.execute(
-                    "UPDATE users SET hashed_password = ?, must_change_password = 0, password_changed_at = ? WHERE id = ?",
-                    (new_hashed_pw, new_epoch, user_id),
-                )
-                db.execute(
-                    "DELETE FROM user_sessions WHERE user_id = ?",
-                    (user_id,),
-                )
-                # F-2.2: new-session INSERT in the SAME transaction as the
-                # password UPDATE + old-session DELETE, so a crash between
-                # cannot leave the user with a changed password and no valid
-                # session (old sessions deleted, new one never committed).
-                # Include ip_address/user_agent for audit-trail parity with
-                # the register and login session INSERTs (PRR-005).
-                db.execute(
-                    "INSERT INTO user_sessions (user_id, refresh_token_hash, expires_at, ip_address, user_agent) VALUES (?, ?, ?, ?, ?)",
-                    (user_id, refresh_token_hash, expires_at.isoformat(), ip_address, user_agent),
-                )
-                db.commit()
-            except HTTPException:
-                raise
-            except Exception:
+    # Issue #1068: the _change_password_db worker's commit, the post-commit
+    # cache invalidation, and the auth.password_changed audit tail form ONE
+    # drained unit — a cancellation delivered exactly at the commit await
+    # (after the commit work completed) is absorbed until the audit row is
+    # written, then re-raised. The worker's exception translation stays
+    # verbatim INSIDE the unit, while an invalidate_active_user_cache failure
+    # keeps its original propagation and skips the audit.
+    async def _unit() -> None:
+        try:
+            def _change_password_db():
                 try:
-                    db.rollback()
+                    db.execute(
+                        "UPDATE users SET hashed_password = ?, must_change_password = 0, password_changed_at = ? WHERE id = ?",
+                        (new_hashed_pw, new_epoch, user_id),
+                    )
+                    db.execute(
+                        "DELETE FROM user_sessions WHERE user_id = ?",
+                        (user_id,),
+                    )
+                    # F-2.2: new-session INSERT in the SAME transaction as the
+                    # password UPDATE + old-session DELETE, so a crash between
+                    # cannot leave the user with a changed password and no valid
+                    # session (old sessions deleted, new one never committed).
+                    # Include ip_address/user_agent for audit-trail parity with
+                    # the register and login session INSERTs (PRR-005).
+                    db.execute(
+                        "INSERT INTO user_sessions (user_id, refresh_token_hash, expires_at, ip_address, user_agent) VALUES (?, ?, ?, ?, ?)",
+                        (user_id, refresh_token_hash, expires_at.isoformat(), ip_address, user_agent),
+                    )
+                    db.commit()
+                except HTTPException:
+                    raise
                 except Exception:
-                    pass
-                raise
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
+                    raise
 
-        await asyncio.to_thread(_change_password_db)
-    except HTTPException:
-        # PRR-003: let any HTTPException from inside _change_password_db
-        # propagate unchanged, mirroring the register handler's F-2.1 shim.
-        # Without this branch the broad `except Exception` below would
-        # convert it to 500 (HTTPException is a subclass of Exception).
-        raise
-    except Exception:
-        logger.error("Failed to change password", exc_info=True)
-        raise HTTPException(status_code=500, detail="An internal error occurred. Please try again later.")
+            await asyncio.to_thread(_change_password_db)
+        except HTTPException:
+            # PRR-003: let any HTTPException from inside _change_password_db
+            # propagate unchanged, mirroring the register handler's F-2.1 shim.
+            # Without this branch the broad `except Exception` below would
+            # convert it to 500 (HTTPException is a subclass of Exception).
+            raise
+        except Exception:
+            logger.error("Failed to change password", exc_info=True)
+            raise HTTPException(status_code=500, detail="An internal error occurred. Please try again later.")
 
-    invalidate_active_user_cache(user_id)
-    await drain_audit(safe_record_security_event(
-        db,
-        event_type="auth.password_changed",
-        actor=user,
-        target_user_id=user_id,
-        target_username=username,
-        request=request,
-        metadata={"sessions_revoked": True},
-    ))
+        invalidate_active_user_cache(user_id)
+        await drain_audit(safe_record_security_event(
+            db,
+            event_type="auth.password_changed",
+            actor=user,
+            target_user_id=user_id,
+            target_username=username,
+            request=request,
+            metadata={"sessions_revoked": True},
+        ))
+
+    await drained_unit(_unit())
 
     # Generate new access token (username/role/user_id already in scope).
     access_token = create_access_token(
@@ -1076,34 +1135,41 @@ async def revoke_session(
         raise HTTPException(status_code=404, detail="Session not found")
 
     # Delete the session
-    try:
-        def _revoke_session_db():
-            try:
-                db.execute(
-                    "DELETE FROM user_sessions WHERE id = ?",
-                    (session_id,),
-                )
-                db.commit()
-            except Exception:
+    # Issue #1068: the _revoke_session_db worker's commit and the
+    # auth.session_revoked audit tail form ONE drained unit — a cancellation
+    # delivered exactly at the commit await (after the commit work completed)
+    # is absorbed until the audit row is written, then re-raised.
+    async def _unit() -> None:
+        try:
+            def _revoke_session_db():
                 try:
-                    db.rollback()
+                    db.execute(
+                        "DELETE FROM user_sessions WHERE id = ?",
+                        (session_id,),
+                    )
+                    db.commit()
                 except Exception:
-                    pass
-                raise
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
+                    raise
 
-        await asyncio.to_thread(_revoke_session_db)
-    except Exception:
-        logger.error("Failed to revoke session", exc_info=True)
-        raise HTTPException(status_code=500, detail="An internal error occurred. Please try again later.")
-    await drain_audit(safe_record_security_event(
-        db,
-        event_type="auth.session_revoked",
-        actor=user,
-        target_user_id=user.get("id"),
-        target_username=user.get("username"),
-        request=request,
-        metadata={"session_id": session_id},
-    ))
+            await asyncio.to_thread(_revoke_session_db)
+        except Exception:
+            logger.error("Failed to revoke session", exc_info=True)
+            raise HTTPException(status_code=500, detail="An internal error occurred. Please try again later.")
+        await drain_audit(safe_record_security_event(
+            db,
+            event_type="auth.session_revoked",
+            actor=user,
+            target_user_id=user.get("id"),
+            target_username=user.get("username"),
+            request=request,
+            metadata={"session_id": session_id},
+        ))
+
+    await drained_unit(_unit())
 
     return Response(status_code=204)
 
@@ -1146,45 +1212,60 @@ async def revoke_all_sessions(
         days=REFRESH_TOKEN_MAX_AGE_DAYS
     )
 
-    try:
-        def _revoke_all_sessions_db():
-            try:
-                db.execute(
-                    "DELETE FROM user_sessions WHERE user_id = ? AND id != ?",
-                    (user["id"], current_session_id),
-                )
-                db.execute(
-                    "UPDATE user_sessions SET refresh_token_hash = ?, expires_at = ? WHERE id = ?",
-                    (new_refresh_token_hash, new_expires_at.isoformat(), current_session_id),
-                )
-                db.commit()
-            except Exception:
+    # Bound by the drained unit below; pre-initialized purely so the unit's
+    # `nonlocal` target exists (the unit either assigns it or raises).
+    access_token = None
+
+    # Issue #1068: the _revoke_all_sessions_db worker's commit, the
+    # post-commit access-token creation, and the auth.sessions_revoked audit
+    # tail form ONE drained unit — a cancellation delivered exactly at the
+    # commit await (after the commit work completed) is absorbed until the
+    # audit row is written, then re-raised. The worker's exception
+    # translation stays verbatim INSIDE the unit, while a token-creation
+    # failure keeps its original propagation and skips the audit.
+    async def _unit() -> None:
+        nonlocal access_token
+        try:
+            def _revoke_all_sessions_db():
                 try:
-                    db.rollback()
+                    db.execute(
+                        "DELETE FROM user_sessions WHERE user_id = ? AND id != ?",
+                        (user["id"], current_session_id),
+                    )
+                    db.execute(
+                        "UPDATE user_sessions SET refresh_token_hash = ?, expires_at = ? WHERE id = ?",
+                        (new_refresh_token_hash, new_expires_at.isoformat(), current_session_id),
+                    )
+                    db.commit()
                 except Exception:
-                    pass
-                raise
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
+                    raise
 
-        await asyncio.to_thread(_revoke_all_sessions_db)
-    except Exception:
-        logger.error("Failed to revoke all sessions", exc_info=True)
-        raise HTTPException(status_code=500, detail="An internal error occurred. Please try again later.")
+            await asyncio.to_thread(_revoke_all_sessions_db)
+        except Exception:
+            logger.error("Failed to revoke all sessions", exc_info=True)
+            raise HTTPException(status_code=500, detail="An internal error occurred. Please try again later.")
 
-    # Generate new access token
-    user_agent = request.headers.get("user-agent", "")
-    access_token = create_access_token(
-        user["id"], user["username"], user["role"],
-        client_fingerprint=compute_client_fingerprint(user_agent),
-    )
-    await drain_audit(safe_record_security_event(
-        db,
-        event_type="auth.sessions_revoked",
-        actor=user,
-        target_user_id=user.get("id"),
-        target_username=user.get("username"),
-        request=request,
-        metadata={"kept_session_id": current_session_id},
-    ))
+        # Generate new access token
+        user_agent = request.headers.get("user-agent", "")
+        access_token = create_access_token(
+            user["id"], user["username"], user["role"],
+            client_fingerprint=compute_client_fingerprint(user_agent),
+        )
+        await drain_audit(safe_record_security_event(
+            db,
+            event_type="auth.sessions_revoked",
+            actor=user,
+            target_user_id=user.get("id"),
+            target_username=user.get("username"),
+            request=request,
+            metadata={"kept_session_id": current_session_id},
+        ))
+
+    await drained_unit(_unit())
 
     # Set new refresh cookie
     response.set_cookie(

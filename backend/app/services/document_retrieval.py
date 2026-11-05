@@ -8,7 +8,7 @@ import logging
 import math
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 # Matches the 8-hex-char hash produced by reupload_safe_order ID scheme.
 # Requires at least one [a-f] letter so a purely numeric legacy chunk-scale
@@ -299,6 +299,28 @@ def artifact_fields_from_metadata(metadata: Any) -> Dict[str, Any]:
     }
 
 
+def _no_distance_row_score(record: Dict[str, Any]) -> Tuple[Any, bool]:
+    """Resolve the score tier for a retrieval row with no usable ``_distance``.
+
+    Issue #1070 widened read, shared by every no-``_distance`` consumer in
+    this module (``filter_relevant``, ``expand_window``, the debug-log
+    reader): the real LanceDB FTS key ``_score`` — the only score key
+    FTS-only rows carry after ``rrf_fuse`` — outranks the legacy ``score``
+    key, which no production producer writes on retrieval rows. A
+    present-but-None key falls THROUGH to the next tier instead of shadowing
+    a usable value, and a numeric 0/0.0 IS a value.
+
+    Returns ``(value, fts_sourced)``: ``value`` is None when neither key
+    carries a usable number (callers apply their own default), and
+    ``fts_sourced`` is True exactly when the winning value came from
+    ``_score`` — the per-source "fts" score kind is set only then.
+    """
+    raw = record.get("_score")
+    if raw is not None:
+        return raw, True
+    return record.get("score"), False
+
+
 @dataclass
 class RAGSource:
     """Represents a retrieved document source."""
@@ -323,6 +345,14 @@ class RAGSource:
     # Validated query-conditioned observation (internal ONLY — never serialized to
     # source JSON / SSE / history). Feeds the prompt and support-text scoring.
     vision_observation: Optional[str] = None
+    # Per-source score semantic (issue #1070): "fts" exactly when ``score``
+    # came from the LanceDB FTS ``_score`` key on the no-``_distance`` path —
+    # a higher-is-better BM25 value that must never be misread through the
+    # lower-is-better distance polarity. Dense ``_distance`` rows and valid
+    # ``_rerank_score`` overrides carry NO per-source kind: the global
+    # pipeline score_type ("distance"/"rerank") already types them, so the
+    # per-source kind only ever names a divergence from it.
+    score_type: Optional[str] = None
 
     def artifact_identity_key(self) -> tuple:
         """Identity key for a RAGSource — artifact-aware (issue #462).
@@ -415,7 +445,12 @@ class DocumentRetrievalService:
             self.max_distance_threshold,
         )
         if results:
-            first_distances = [r.get("_distance", r.get("score")) for r in results[:5]]
+            first_distances = [
+                r.get("_distance")
+                if r.get("_distance") is not None
+                else _no_distance_row_score(r)[0]
+                for r in results[:5]
+            ]
             logger.debug("First few _distance values: %s", first_distances)
 
         # When reranking has been applied, skip distance threshold — the reranker
@@ -435,11 +470,14 @@ class DocumentRetrievalService:
 
             has_distance = "_distance" in record
             distance = record.get("_distance")
+            fts_sourced = False
             if distance is None:
-                score = record.get("score")
-                if score is None:
-                    score = 1.0
-                distance = score
+                # Issue #1070 widened read: the real LanceDB FTS ``_score``
+                # outranks the legacy ``score`` key, which outranks the
+                # historical 1.0 default (see _no_distance_row_score).
+                distance, fts_sourced = _no_distance_row_score(record)
+                if distance is None:
+                    distance = 1.0
 
             distances.append(distance)
 
@@ -471,10 +509,17 @@ class DocumentRetrievalService:
 
             # Use sigmoid-normalized _rerank_score when reranked, otherwise fall back to distance
             source_score = distance  # default
+            # Per-source score kind (issue #1070): only an FTS-``_score``-sourced
+            # value diverges from the global pipeline typing.
+            source_score_type: Optional[str] = "fts" if fts_sourced else None
             if reranked and "_rerank_score" in record:
                 raw_score = record["_rerank_score"]
                 if isinstance(raw_score, (int, float)) and 0.0 <= float(raw_score) <= 1.0:
                     source_score = float(raw_score)
+                    # The reported value is the reranker's, not the FTS
+                    # ``_score`` — the per-source kind reverts to the global
+                    # "rerank" typing.
+                    source_score_type = None
                 else:
                     logger.warning(
                         "Invalid _rerank_score value %r for chunk %s, falling back to distance",
@@ -493,6 +538,7 @@ class DocumentRetrievalService:
                     file_id=record.get("file_id", ""),
                     score=source_score,
                     metadata=raw_meta,
+                    score_type=source_score_type,
                     # Multi-modal artifact identity (issue #462) — lifted from the
                     # proxy metadata so identity survives retrieval as first-class
                     # fields. vision_status stays None here (only the vision run
@@ -707,11 +753,19 @@ class DocumentRetrievalService:
                     chunk = adjacent_lookup[chunk_uid]
 
                     distance = chunk.get("_distance")
+                    adjacent_score_type: Optional[str] = None
                     if distance is None:
-                        score = chunk.get("score")
-                        if score is None:
-                            score = 1.0
-                        distance = score
+                        # Issue #1070 widened read — same tier precedence as
+                        # filter_relevant (_no_distance_row_score). Production
+                        # adjacent rows (get_chunks_by_uid fetches) carry
+                        # neither score key, so the 1.0 default stays the
+                        # effective behavior there; a row that DOES carry the
+                        # FTS ``_score`` gets its real value and kind.
+                        distance, fts_sourced = _no_distance_row_score(chunk)
+                        if distance is None:
+                            distance = 1.0
+                        if fts_sourced:
+                            adjacent_score_type = "fts"
 
                     metadata = self._normalize_metadata(chunk.get("metadata"))
                     if chunk_scale:
@@ -732,6 +786,7 @@ class DocumentRetrievalService:
                         file_id=record_file_id,
                         score=distance,
                         metadata=metadata,
+                        score_type=adjacent_score_type,
                     )
                     expanded_sources.append(expanded_source)
                     seen_uids.add(_normalize_uid_for_dedup(chunk_uid))
@@ -846,6 +901,15 @@ class DocumentRetrievalService:
             # user. See ``whitelist_metadata_for_wire``.
             "metadata": whitelist_metadata_for_wire(chunk.metadata),
         }
+        # Per-source score kind (issue #1070): emit only when the source
+        # carries one. The kind can only be "fts", which never matches the
+        # global pipeline score_type ("distance"/"rerank"), so this fires
+        # exactly when the per-source type DIVERGES from the global one and
+        # clients must not read the score through the distance/rerank
+        # polarity. Sources without a per-source kind keep relying on the
+        # done-payload's global score_type.
+        if chunk.score_type:
+            result["score_type"] = chunk.score_type
         # Multi-modal artifact presentation (issue #462): emit first-class
         # optional artifact fields ONLY for artifact sources, and never when the
         # query-time vision run did not set a status (V5 feature-off parity).

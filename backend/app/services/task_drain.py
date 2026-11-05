@@ -11,6 +11,13 @@ coroutine created at the CALL SITE: the route module's (possibly decorated)
 `safe_record_security_event` reference is resolved when the coroutine is
 created, so the audit still records through a cancellation delivered to the
 route task, and the cancellation is re-raised only after the row is written.
+
+`drained_unit` (issue #1068) extends the same one-unit guarantee to handlers
+whose commit lives INSIDE a worker/store/helper call: the caller's whole
+commit-to-audit sequence runs as one drained unit, so a cancellation landing
+exactly at the inner commit await can no longer unwind the handler before the
+audit coroutine exists. Its terminal settlement is shared with
+`drain_commit_audit` via `_settle_drained`.
 """
 
 from __future__ import annotations
@@ -94,6 +101,45 @@ async def drained_commit(conn) -> tuple[bool, BaseException | None]:
     return await drain_await(asyncio.ensure_future(asyncio.to_thread(conn.commit)))
 
 
+async def _settle_drained(
+    cancelled: bool, error: BaseException | None, *, context: str
+) -> None:
+    """Settle one drained unit's terminal outcome (shared settlement).
+
+    ``drain_commit_audit`` and ``drained_unit`` both reduce to
+    ``drain_await`` over one unit task plus this settlement:
+
+    - compound — the unit failed AND a caller cancellation was absorbed:
+      the unit's error is logged loudly (``exc_info``) and the delivered
+      cancellation WINS (``CancelledError`` re-raised after the log);
+    - unit failure alone: re-raised with its original type;
+    - the unit task itself cancelled (loop teardown — nothing else
+      cancels it): logged as unrecoverable (no retry, row state
+      unverified); with no absorbed caller cancellation the helper
+      RETURNS normally after logging;
+    - absorbed caller cancellation: ``CancelledError`` re-raised.
+    """
+    if error is not None:
+        if isinstance(error, asyncio.CancelledError):
+            logger.warning(
+                "%s_unit_cancelled unit_task_cancelled_during_%s "
+                "row_state_unverified",
+                context,
+                context,
+            )
+        else:
+            logger.error(
+                "%s_unit_failed reason=%s",
+                context,
+                type(error).__name__,
+                exc_info=error,
+            )
+            if not cancelled:
+                raise error
+    if cancelled:
+        raise asyncio.CancelledError
+
+
 async def drain_commit_audit(
     conn,
     audit_factory,
@@ -145,18 +191,32 @@ async def drain_commit_audit(
         await drain_audit(audit_factory())
 
     cancelled, error = await drain_await(asyncio.ensure_future(_unit()))
-    if error is not None:
-        if isinstance(error, asyncio.CancelledError):
-            logger.warning(
-                "commit_audit_unit_cancelled unit_task_cancelled_during_commit_audit "
-                "row_state_unverified"
-            )
-        else:
-            logger.error(
-                "commit_audit_unit_failed reason=%s", type(error).__name__,
-                exc_info=error,
-            )
-            if not cancelled:
-                raise error
-    if cancelled:
-        raise asyncio.CancelledError
+    await _settle_drained(cancelled, error, context="commit_audit")
+
+
+async def drained_unit(unit: Coroutine) -> None:
+    """Commit-bearing unit + mandatory audit tail as ONE drained unit, for
+    handlers whose commit lives INSIDE a worker/store/helper call (the
+    handler never owns the connection at commit time, so
+    ``drain_commit_audit``'s ``conn`` shape cannot apply).
+
+    ``unit`` is the caller's existing commit-to-audit sequence as one
+    async closure. Outcome contract (``_settle_drained``):
+
+    - a caller cancellation delivered while the unit runs (including
+      exactly at the inner commit await, after the commit work
+      completed) is absorbed until the unit settles, then
+      ``CancelledError`` re-raised;
+    - a cancellation BEFORE the unit starts needs no audit: no mutation
+      ran, so the handler unwinds without ever creating the unit;
+    - an ordinary unit failure AFTER the commit (a post-commit step such
+      as token creation, cookie setting, or cache invalidation)
+      propagates with its original type and SKIPS the audit — exact
+      ``drain_commit_audit`` parity for whatever sits between the commit
+      and the audit tail;
+    - an audit-write failure inside the unit is logged, never raised
+      (``drain_audit`` best-effort);
+    - an inner-unit cancellation (loop teardown): loud warning + return.
+    """
+    cancelled, error = await drain_await(asyncio.ensure_future(unit))
+    await _settle_drained(cancelled, error, context="drained_unit")

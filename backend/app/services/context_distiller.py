@@ -414,6 +414,11 @@ class ContextDistiller:
                     bbox=source.bbox,
                     description=source.description,
                     vision_status=source.vision_status,
+                    # Per-source score kind (issue #1070): distillation is
+                    # default-on (config.context_distillation_enabled) and runs
+                    # BEFORE serialization, so the FTS "fts" kind must survive
+                    # this field-by-field reconstruction to reach the wire.
+                    score_type=source.score_type,
                 )
             )
             surviving_indices.add(src_idx)

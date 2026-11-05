@@ -832,10 +832,15 @@ export interface Source {
   page_number?: number | null;
   snippet?: string;
   score?: number;
-  // Verified producer contract (issue #36): the chat pipeline emits only
-  // "distance" or "rerank" for sources. The memory channel carries its own
-  // score_type vocabulary (rrf/fts/dense) under UsedMemory/WikiReference.
-  score_type?: "distance" | "rerank";
+  // Verified producer contract (issue #36, extended by #1070): the chat
+  // pipeline's GLOBAL score_type is "distance" or "rerank", and a source may
+  // additionally carry its OWN score_type when its score diverges from the
+  // global typing — currently only "fts", the per-source kind for a real
+  // LanceDB BM25 `_score` on the no-`_distance` path (higher-is-better,
+  // uncalibrated: relevance labels are suppressed for it). The memory channel
+  // carries its own score_type vocabulary (rrf/fts/dense) under
+  // UsedMemory/WikiReference.
+  score_type?: "distance" | "rerank" | "fts";
   /**
    * Multi-modal artifact presentation (issue #462). These are first-class safe
    * fields: they NEVER carry paths, bytes, or base64 — artifact bytes are fetched

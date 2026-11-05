@@ -1,4 +1,4 @@
-export type ScoreType = "distance" | "rerank";
+export type ScoreType = "distance" | "rerank" | "fts";
 
 export interface RelevanceLabel {
   text: string;
@@ -20,12 +20,22 @@ export interface RelevanceLabel {
  *   = better. Bands kept at 0.7/0.4/0.2 — held-out agreement tied-best with
  *   the best data-derived candidate (85.0% vs 84.1%); the Tangential floor
  *   matches the no-answer distribution's q95 (0.181).
- * The backend chat pipeline emits only "distance" or "rerank" for sources;
- * the memory channel carries its own score_type vocabulary (rrf/fts/dense)
- * which is rendered without relevance labels. Unknown or missing score_type
- * falls back to distance semantics.
+ * The backend chat pipeline's global score_type is only "distance" or
+ * "rerank"; the memory channel carries its own score_type vocabulary
+ * (rrf/fts/dense) which is rendered without relevance labels. Unknown or
+ * missing score_type falls back to distance semantics.
+ *
+ * "fts" (issue #1070) is a PER-SOURCE kind for a real LanceDB BM25 `_score`
+ * on the no-`_distance` path: higher-is-better, but never part of the 2026-09
+ * calibration — no honest band exists for it, so it returns null and every
+ * caller must null-guard before dereferencing .color/.text (the label is
+ * suppressed, not guessed).
  */
-export function getRelevanceLabel(score: number, scoreType?: ScoreType): RelevanceLabel {
+export function getRelevanceLabel(score: number, scoreType?: ScoreType): RelevanceLabel | null {
+  if (scoreType === "fts") {
+    // Uncalibrated per-source kind (issue #1070): no relevance label.
+    return null;
+  }
   if (!scoreType || scoreType === "distance") {
     // Distance: 0=identical; calibrated bands (higher = less relevant)
     if (score <= 0.56) return { text: "Highly Relevant", color: "text-success" };

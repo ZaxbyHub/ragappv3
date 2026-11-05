@@ -156,7 +156,7 @@ from app.services.draft_store import (
 from app.services.folder_store import FolderStore
 from app.services.security_audit import safe_record_security_event
 from app.services.tag_store import TagStore
-from app.services.task_drain import drain_audit
+from app.services.task_drain import drain_audit, drained_unit
 from app.services.upload_validation import secure_filename
 
 logger = logging.getLogger(__name__)
@@ -2822,34 +2822,42 @@ async def delete_draft(
     # Ownership check first: a draft owned by someone else is 404, never 403.
     await _run_store(lambda: store.get_draft(draft_id, owner_id))
     deletion = DraftDeletionService(storage)
-    try:
-        await asyncio.to_thread(
-            deletion.delete_draft, store, draft_id=draft_id, owner_id=owner_id
-        )
-    except DraftStoreError as exc:
-        raise _map_store_error(exc) from exc
-    except DraftInputStorageError as exc:
-        # delete_draft tombstones every input before dropping the rows, so a
-        # filesystem fault surfaces here as well. Mapped like delete_draft_input
-        # does, rather than escaping as an unhandled 500.
-        raise _map_storage_error(exc) from exc
-    # Recorded through the global HMAC audit log (not draft_events, which
-    # cascade-deletes) only once deletion has actually succeeded — writing
-    # it earlier would leave a signed, tamper-evident row asserting a
-    # deletion that a guard check (e.g. DraftConflictError code='active_job'
-    # -> 409) rejected. `security_audit_log` has no foreign key on drafts
-    # (app/models/database.py) and this event's metadata is just the
-    # `draft_id`, so nothing about the record depends on the draft's rows
-    # still existing — recording after the cascade loses no information
-    # while guaranteeing the record only ever reflects a real deletion
-    # (SPEC section 9.3).
-    await drain_audit(safe_record_security_event(
-        db,
-        event_type="draft_deleted",
-        actor=user,
-        request=request,
-        metadata={"draft_id": draft_id},
-    ))
+    # Issue #1068: the deletion service's store-internal commits and the
+    # draft_deleted audit tail form ONE drained unit — a cancellation
+    # delivered exactly at the commit await (after the commit work completed)
+    # is absorbed until the audit row is written, then re-raised. The store /
+    # storage error mapping stays verbatim INSIDE the unit.
+    async def _unit() -> None:
+        try:
+            await asyncio.to_thread(
+                deletion.delete_draft, store, draft_id=draft_id, owner_id=owner_id
+            )
+        except DraftStoreError as exc:
+            raise _map_store_error(exc) from exc
+        except DraftInputStorageError as exc:
+            # delete_draft tombstones every input before dropping the rows, so a
+            # filesystem fault surfaces here as well. Mapped like delete_draft_input
+            # does, rather than escaping as an unhandled 500.
+            raise _map_storage_error(exc) from exc
+        # Recorded through the global HMAC audit log (not draft_events, which
+        # cascade-deletes) only once deletion has actually succeeded — writing
+        # it earlier would leave a signed, tamper-evident row asserting a
+        # deletion that a guard check (e.g. DraftConflictError code='active_job'
+        # -> 409) rejected. `security_audit_log` has no foreign key on drafts
+        # (app/models/database.py) and this event's metadata is just the
+        # `draft_id`, so nothing about the record depends on the draft's rows
+        # still existing — recording after the cascade loses no information
+        # while guaranteeing the record only ever reflects a real deletion
+        # (SPEC section 9.3).
+        await drain_audit(safe_record_security_event(
+            db,
+            event_type="draft_deleted",
+            actor=user,
+            request=request,
+            metadata={"draft_id": draft_id},
+        ))
+
+    await drained_unit(_unit())
 
 
 # ── inputs ───────────────────────────────────────────────────────────────────
@@ -3234,23 +3242,35 @@ async def cancel_draft_job(
     only reduces private processing, it does not expose vault-derived content)."""
     owner_id = int(user["id"])
     store = DraftStore(db)
-    job = await _run_store(
-        lambda: store.request_job_cancel(
-            draft_id=draft_id, owner_id=owner_id, job_id=job_id
+    # Bound by the drained unit below; pre-initialized purely so the unit's
+    # `nonlocal` target exists (the unit either assigns it or raises).
+    job: Optional[DraftJobRecord] = None
+
+    # Issue #1068: request_job_cancel's store-internal commit and the
+    # draft_job_cancelled audit tail form ONE drained unit — a cancellation
+    # delivered exactly at the commit await (after the commit work completed)
+    # is absorbed until the audit row is written, then re-raised.
+    async def _unit() -> None:
+        nonlocal job
+        job = await _run_store(
+            lambda: store.request_job_cancel(
+                draft_id=draft_id, owner_id=owner_id, job_id=job_id
+            )
         )
-    )
-    await drain_audit(safe_record_security_event(
-        db,
-        event_type="draft_job_cancelled",
-        actor=user,
-        request=request,
-        metadata={
-            "draft_id": draft_id,
-            "job_id": job_id,
-            "job_type": job.job_type,
-            "status": job.status,
-        },
-    ))
+        await drain_audit(safe_record_security_event(
+            db,
+            event_type="draft_job_cancelled",
+            actor=user,
+            request=request,
+            metadata={
+                "draft_id": draft_id,
+                "job_id": job_id,
+                "job_type": job.job_type,
+                "status": job.status,
+            },
+        ))
+
+    await drained_unit(_unit())
     return _to_job(job)
 
 
@@ -3340,42 +3360,55 @@ async def retry_draft_job(
         parent_job_id=job_id,
         input_snapshot=prepared["input_snapshot"],
     )
-    new_job_id, created = await _run_store(
-        lambda: _sync_enqueue_compile(
-            db,
-            draft_id=draft_id,
-            owner_id=owner_id,
-            lock_version=draft.lock_version,
-            base_revision_id=base_revision_id,
-            requested_start_stage=requested,
-            normalized_start_stage=prepared["normalized"],
-            idempotency_key=idempotency_key,
-            request_fingerprint=fingerprint,
-            compile_fingerprint=prepared["compile_fingerprint"],
-            input_snapshot=prepared["input_snapshot"],
-            parent_job_id=job_id,
-            attempt_no=parent.attempt_no + 1,
+    # Bound by the drained unit below; pre-initialized purely so the unit's
+    # `nonlocal` target exists (the unit either assigns it or raises).
+    job: Optional[DraftJobRecord] = None
+
+    # Issue #1068: _sync_enqueue_compile's commit, the post-commit job read
+    # that feeds the gate, and the gated draft_job_retried audit tail form ONE
+    # drained unit — a cancellation delivered exactly at the commit await
+    # (after the commit work completed) is absorbed until the audit row is
+    # written, then re-raised.
+    async def _unit() -> None:
+        nonlocal job
+        new_job_id, created = await _run_store(
+            lambda: _sync_enqueue_compile(
+                db,
+                draft_id=draft_id,
+                owner_id=owner_id,
+                lock_version=draft.lock_version,
+                base_revision_id=base_revision_id,
+                requested_start_stage=requested,
+                normalized_start_stage=prepared["normalized"],
+                idempotency_key=idempotency_key,
+                request_fingerprint=fingerprint,
+                compile_fingerprint=prepared["compile_fingerprint"],
+                input_snapshot=prepared["input_snapshot"],
+                parent_job_id=job_id,
+                attempt_no=parent.attempt_no + 1,
+            )
         )
-    )
-    job = await _run_store(
-        lambda: store.get_job(draft_id=draft_id, owner_id=owner_id, job_id=new_job_id)
-    )
-    if created:
-        await drain_audit(safe_record_security_event(
-            db,
-            event_type="draft_job_retried",
-            actor=user,
-            request=request,
-            metadata={
-                "draft_id": draft_id,
-                "job_id": new_job_id,
-                "parent_job_id": job_id,
-                "start_stage": prepared["normalized"],
-                "requested_start_stage": requested,
-                "compile_input_sha256": prepared["compile_fingerprint"],
-                "prompt_bundle_version": PROMPT_BUNDLE_VERSION,
-            },
-        ))
+        job = await _run_store(
+            lambda: store.get_job(draft_id=draft_id, owner_id=owner_id, job_id=new_job_id)
+        )
+        if created:
+            await drain_audit(safe_record_security_event(
+                db,
+                event_type="draft_job_retried",
+                actor=user,
+                request=request,
+                metadata={
+                    "draft_id": draft_id,
+                    "job_id": new_job_id,
+                    "parent_job_id": job_id,
+                    "start_stage": prepared["normalized"],
+                    "requested_start_stage": requested,
+                    "compile_input_sha256": prepared["compile_fingerprint"],
+                    "prompt_bundle_version": PROMPT_BUNDLE_VERSION,
+                },
+            ))
+
+    await drained_unit(_unit())
     return _to_job(job)
 
 
@@ -3438,63 +3471,79 @@ async def compile_draft(
         parent_job_id=None,
         input_snapshot=prepared["input_snapshot"],
     )
-    job_id, created = await _run_store(
-        lambda: _sync_enqueue_compile(
-            db,
-            draft_id=draft_id,
-            owner_id=owner_id,
-            lock_version=body.lock_version,
-            base_revision_id=body.base_revision_id,
-            requested_start_stage=body.start_stage,
-            normalized_start_stage=prepared["normalized"],
-            idempotency_key=idempotency_key,
-            request_fingerprint=fingerprint,
-            compile_fingerprint=prepared["compile_fingerprint"],
-            input_snapshot=prepared["input_snapshot"],
-            parent_job_id=None,
-            attempt_no=1,
+    # Bound by the drained unit below; pre-initialized purely so the unit's
+    # `nonlocal` target exists (the unit either assigns it or raises).
+    job: Optional[DraftJobRecord] = None
+
+    # Issue #1068: _sync_enqueue_compile's commit, the post-commit job read,
+    # and the created-branch draft_compile_requested audit tail form ONE
+    # drained unit — a cancellation delivered exactly at the commit await
+    # (after the commit work completed) is absorbed until the audit row is
+    # written, then re-raised. The idempotent-replay else arm shares the same
+    # `if created:` gate (its created=False exits are rollback-preceded — no
+    # applied mutation, per the #1068 census classification), so it rides
+    # along inside the unit unchanged.
+    async def _unit() -> None:
+        nonlocal job
+        job_id, created = await _run_store(
+            lambda: _sync_enqueue_compile(
+                db,
+                draft_id=draft_id,
+                owner_id=owner_id,
+                lock_version=body.lock_version,
+                base_revision_id=body.base_revision_id,
+                requested_start_stage=body.start_stage,
+                normalized_start_stage=prepared["normalized"],
+                idempotency_key=idempotency_key,
+                request_fingerprint=fingerprint,
+                compile_fingerprint=prepared["compile_fingerprint"],
+                input_snapshot=prepared["input_snapshot"],
+                parent_job_id=None,
+                attempt_no=1,
+            )
         )
-    )
-    job = await _run_store(
-        lambda: store.get_job(draft_id=draft_id, owner_id=owner_id, job_id=job_id)
-    )
-    if created:
-        await drain_audit(safe_record_security_event(
-            db,
-            event_type="draft_compile_requested",
-            actor=user,
-            request=request,
-            metadata={
-                "draft_id": draft_id,
-                "job_id": job_id,
-                "start_stage": prepared["normalized"],
-                "requested_start_stage": body.start_stage,
-                "base_revision_id": body.base_revision_id,
-                "compile_input_sha256": prepared["compile_fingerprint"],
-                "prompt_bundle_version": PROMPT_BUNDLE_VERSION,
-                "tier": draft.tier,
-                "idempotent_replay": False,
-            },
-        ))
-    else:
-        # Idempotent replay. The job's request snapshot is a large body, so it
-        # is fetched explicitly through the store's dedicated accessor rather
-        # than being carried on the DraftJob summary (SPEC section 8.2).
-        stored = await _run_store(
-            lambda: store.get_job_json_field(job_id=job_id, field="input_json")
+        job = await _run_store(
+            lambda: store.get_job(draft_id=draft_id, owner_id=owner_id, job_id=job_id)
         )
-        await drain_audit(safe_record_security_event(
-            db,
-            event_type="draft_compile_requested",
-            actor=user,
-            request=request,
-            metadata={
-                "draft_id": draft_id,
-                "job_id": job_id,
-                "start_stage": stored.get("normalized_start_stage"),
-                "idempotent_replay": True,
-            },
-        ))
+        if created:
+            await drain_audit(safe_record_security_event(
+                db,
+                event_type="draft_compile_requested",
+                actor=user,
+                request=request,
+                metadata={
+                    "draft_id": draft_id,
+                    "job_id": job_id,
+                    "start_stage": prepared["normalized"],
+                    "requested_start_stage": body.start_stage,
+                    "base_revision_id": body.base_revision_id,
+                    "compile_input_sha256": prepared["compile_fingerprint"],
+                    "prompt_bundle_version": PROMPT_BUNDLE_VERSION,
+                    "tier": draft.tier,
+                    "idempotent_replay": False,
+                },
+            ))
+        else:
+            # Idempotent replay. The job's request snapshot is a large body, so it
+            # is fetched explicitly through the store's dedicated accessor rather
+            # than being carried on the DraftJob summary (SPEC section 8.2).
+            stored = await _run_store(
+                lambda: store.get_job_json_field(job_id=job_id, field="input_json")
+            )
+            await drain_audit(safe_record_security_event(
+                db,
+                event_type="draft_compile_requested",
+                actor=user,
+                request=request,
+                metadata={
+                    "draft_id": draft_id,
+                    "job_id": job_id,
+                    "start_stage": stored.get("normalized_start_stage"),
+                    "idempotent_replay": True,
+                },
+            ))
+
+    await drained_unit(_unit())
     return _to_job(job)
 
 
@@ -3683,23 +3732,30 @@ async def mark_revision_ready(
     store = DraftStore(db)
     draft = await _run_store(lambda: store.get_draft(draft_id, owner_id))
     await _require_vault_read(evaluate, user, draft.vault_id)
-    audit = await _run_store(
-        lambda: _sync_mark_ready(
-            db,
-            draft_id=draft_id,
-            owner_id=owner_id,
-            revision_id=revision_id,
-            lock_version=body.lock_version,
-            acknowledge_source_only=body.acknowledge_source_only,
+    # Issue #1068: _sync_mark_ready's store-internal commit and the
+    # draft_ready_marked audit tail form ONE drained unit — a cancellation
+    # delivered exactly at the commit await (after the commit work completed)
+    # is absorbed until the audit row is written, then re-raised.
+    async def _unit() -> None:
+        audit = await _run_store(
+            lambda: _sync_mark_ready(
+                db,
+                draft_id=draft_id,
+                owner_id=owner_id,
+                revision_id=revision_id,
+                lock_version=body.lock_version,
+                acknowledge_source_only=body.acknowledge_source_only,
+            )
         )
-    )
-    await drain_audit(safe_record_security_event(
-        db,
-        event_type="draft_ready_marked",
-        actor=user,
-        request=request,
-        metadata={"draft_id": draft_id, **audit},
-    ))
+        await drain_audit(safe_record_security_event(
+            db,
+            event_type="draft_ready_marked",
+            actor=user,
+            request=request,
+            metadata={"draft_id": draft_id, **audit},
+        ))
+
+    await drained_unit(_unit())
     updated = await _run_store(lambda: store.get_draft(draft_id, owner_id))
     return await _build_summary(db, store, updated, evaluate, user)
 
@@ -3781,37 +3837,44 @@ async def export_draft_revision(
     )
 
     filename = _export_filename(draft.title, revision.revision_no, tag)
-    await _run_store(
-        lambda: store.record_event(
-            draft_id=draft_id,
-            owner_id=owner_id,
-            event_type="exported",
-            actor_user_id=owner_id,
-            revision_id=revision.id,
-            payload={
+    # Issue #1068: record_event("exported")'s store-internal commit and the
+    # draft_exported audit tail form ONE drained unit — a cancellation
+    # delivered exactly at the commit await (after the commit work completed)
+    # is absorbed until the audit row is written, then re-raised.
+    async def _unit() -> None:
+        await _run_store(
+            lambda: store.record_event(
+                draft_id=draft_id,
+                owner_id=owner_id,
+                event_type="exported",
+                actor_user_id=owner_id,
+                revision_id=revision.id,
+                payload={
+                    "format": "md",
+                    "fact_status": fact_status,
+                    "approval_status": approval_status,
+                    "content_sha256": revision.content_sha256,
+                    "open_blockers": open_blockers,
+                    "acknowledged_not_fact_checked": bool(acknowledge_not_fact_checked),
+                },
+            )
+        )
+        await drain_audit(safe_record_security_event(
+            db,
+            event_type="draft_exported",
+            actor=user,
+            request=request,
+            metadata={
+                "draft_id": draft_id,
+                "revision_id": revision.id,
                 "format": "md",
                 "fact_status": fact_status,
                 "approval_status": approval_status,
                 "content_sha256": revision.content_sha256,
-                "open_blockers": open_blockers,
-                "acknowledged_not_fact_checked": bool(acknowledge_not_fact_checked),
             },
-        )
-    )
-    await drain_audit(safe_record_security_event(
-        db,
-        event_type="draft_exported",
-        actor=user,
-        request=request,
-        metadata={
-            "draft_id": draft_id,
-            "revision_id": revision.id,
-            "format": "md",
-            "fact_status": fact_status,
-            "approval_status": approval_status,
-            "content_sha256": revision.content_sha256,
-        },
-    ))
+        ))
+
+    await drained_unit(_unit())
     # RFC 6266: the ASCII-safe ``filename`` parameter stays for legacy
     # clients, and the additive ``filename*`` parameter carries the raw title
     # (percent-encoded, ``safe=""`` so a title's own ``/`` never passes
@@ -4051,157 +4114,171 @@ async def promote_draft_source(
 
     revision_fact_status: Optional[str] = None
     was_ready_revision: Optional[bool] = None
+    # Bound by the drained unit below; pre-initialized purely so the unit's
+    # `nonlocal` target exists (the unit either assigns it or raises).
+    result = None
 
-    if body.source_type == "input":
-        input_record = await _run_store(
-            lambda: store.get_input(
-                draft_id=draft_id, owner_id=owner_id, input_id=body.source_id
+    # Issue #1068: the promotion service's files-row registration commit (via
+    # _run_promotion, BOTH the input and the revision arm), the post-commit
+    # organization assignment, the draft_events row, and the draft_promoted
+    # audit tail form ONE drained unit — a cancellation delivered exactly at
+    # the commit await (after the commit work completed) is absorbed until
+    # the audit row is written, then re-raised. The three BaseException
+    # guards keep their semantics verbatim INSIDE the unit.
+    async def _unit() -> None:
+        nonlocal result, revision_fact_status, was_ready_revision
+        if body.source_type == "input":
+            input_record = await _run_store(
+                lambda: store.get_input(
+                    draft_id=draft_id, owner_id=owner_id, input_id=body.source_id
+                )
             )
-        )
-        if input_record.parse_status != "ready":
-            raise DraftRoomHTTPError(
-                409, "input is not ready for promotion", "input_not_ready"
+            if input_record.parse_status != "ready":
+                raise DraftRoomHTTPError(
+                    409, "input is not ready for promotion", "input_not_ready"
+                )
+            result = await _run_promotion(
+                promote_input(
+                    storage=storage,
+                    db_pool=db_pool,
+                    background_processor=background_processor,
+                    draft_id=draft_id,
+                    vault_id=draft.vault_id,
+                    title=body.title,
+                    promoted_by=owner_id,
+                    input_record=input_record,
+                ),
+                db=db,
+                request=request,
+                user=user,
+                draft_id=draft_id,
             )
-        result = await _run_promotion(
-            promote_input(
-                storage=storage,
-                db_pool=db_pool,
-                background_processor=background_processor,
-                draft_id=draft_id,
-                vault_id=draft.vault_id,
-                title=body.title,
-                promoted_by=owner_id,
-                input_record=input_record,
-            ),
-            db=db,
-            request=request,
-            user=user,
-            draft_id=draft_id,
-        )
-    else:
-        revision_record = await _run_store(
-            lambda: store.get_revision(
-                draft_id=draft_id,
-                owner_id=owner_id,
-                revision_id=body.source_id,
-                include_content=True,
+        else:
+            revision_record = await _run_store(
+                lambda: store.get_revision(
+                    draft_id=draft_id,
+                    owner_id=owner_id,
+                    revision_id=body.source_id,
+                    include_content=True,
+                )
             )
-        )
-        revision_fact_status = revision_record.fact_status
-        was_ready_revision = bool(draft.ready_revision_id == revision_record.id)
-        result = await _run_promotion(
-            promote_revision(
-                storage=storage,
-                db_pool=db_pool,
-                background_processor=background_processor,
+            revision_fact_status = revision_record.fact_status
+            was_ready_revision = bool(draft.ready_revision_id == revision_record.id)
+            result = await _run_promotion(
+                promote_revision(
+                    storage=storage,
+                    db_pool=db_pool,
+                    background_processor=background_processor,
+                    draft_id=draft_id,
+                    vault_id=draft.vault_id,
+                    title=body.title,
+                    promoted_by=owner_id,
+                    revision_record=revision_record,
+                ),
+                db=db,
+                request=request,
+                user=user,
                 draft_id=draft_id,
-                vault_id=draft.vault_id,
-                title=body.title,
-                promoted_by=owner_id,
-                revision_record=revision_record,
-            ),
-            db=db,
-            request=request,
-            user=user,
-            draft_id=draft_id,
-        )
+            )
 
-    # The promotion itself has now genuinely happened (`files` and
-    # `draft_promotions` rows exist, ingestion is enqueued) — organization
-    # (folder/tags) was already validated to exist in this vault above, but a
-    # race (e.g. concurrent delete) could still make the assignment itself
-    # fail. That must never be reported as a promotion failure: the document
-    # exists and a client retry would create a duplicate. Record it in the
-    # audit payload instead of raising.
-    organization_error: Optional[str] = None
-    if body.folder_id is not None or body.tag_ids:
+        # The promotion itself has now genuinely happened (`files` and
+        # `draft_promotions` rows exist, ingestion is enqueued) — organization
+        # (folder/tags) was already validated to exist in this vault above, but a
+        # race (e.g. concurrent delete) could still make the assignment itself
+        # fail. That must never be reported as a promotion failure: the document
+        # exists and a client retry would create a duplicate. Record it in the
+        # audit payload instead of raising.
+        organization_error: Optional[str] = None
+        if body.folder_id is not None or body.tag_ids:
+            try:
+                await asyncio.to_thread(
+                    _apply_promotion_organization,
+                    db,
+                    vault_id=draft.vault_id,
+                    file_id=result.file_id,
+                    folder_id=body.folder_id,
+                    tag_ids=body.tag_ids,
+                )
+            except BaseException as exc:  # noqa: BLE001 — must not turn a real success into a reported failure; includes cancellation, which must not skip the audit write below either
+                organization_error = str(exc)
+                logger.warning(
+                    "draft_room: promotion organization step failed after promotion "
+                    "succeeded (draft_id=%s file_id=%s): %s",
+                    draft_id,
+                    result.file_id,
+                    exc,
+                )
+
+        # The promotion has genuinely happened (files/draft_promotions rows
+        # exist, ingestion is enqueued) -- exactly like `organization_error`
+        # above, nothing from this point on may turn the response into a
+        # failure. `record_event` starts with `DraftStore.get_draft`, which 404s
+        # if the draft was deleted between enqueue and here; that must be
+        # recorded and logged, never allowed to make the client believe the
+        # promotion it can already see evidence of (a real, enqueued document)
+        # never happened.
+        draft_event_error: Optional[str] = None
         try:
-            await asyncio.to_thread(
-                _apply_promotion_organization,
-                db,
-                vault_id=draft.vault_id,
-                file_id=result.file_id,
-                folder_id=body.folder_id,
-                tag_ids=body.tag_ids,
+            await _run_store(
+                lambda: store.record_event(
+                    draft_id=draft_id,
+                    owner_id=owner_id,
+                    event_type="promoted",
+                    actor_user_id=owner_id,
+                    revision_id=result.source_id if body.source_type == "revision" else None,
+                    payload={
+                        "source_type": result.source_type,
+                        "source_id": result.source_id,
+                        "vault_id": result.vault_id,
+                        "file_id": result.file_id,
+                    },
+                )
             )
         except BaseException as exc:  # noqa: BLE001 — must not turn a real success into a reported failure; includes cancellation, which must not skip the audit write below either
-            organization_error = str(exc)
+            draft_event_error = str(exc)
             logger.warning(
-                "draft_room: promotion organization step failed after promotion "
+                "draft_room: failed to record draft_events row after promotion "
                 "succeeded (draft_id=%s file_id=%s): %s",
                 draft_id,
                 result.file_id,
                 exc,
             )
 
-    # The promotion has genuinely happened (files/draft_promotions rows
-    # exist, ingestion is enqueued) -- exactly like `organization_error`
-    # above, nothing from this point on may turn the response into a
-    # failure. `record_event` starts with `DraftStore.get_draft`, which 404s
-    # if the draft was deleted between enqueue and here; that must be
-    # recorded and logged, never allowed to make the client believe the
-    # promotion it can already see evidence of (a real, enqueued document)
-    # never happened.
-    draft_event_error: Optional[str] = None
-    try:
-        await _run_store(
-            lambda: store.record_event(
-                draft_id=draft_id,
-                owner_id=owner_id,
-                event_type="promoted",
-                actor_user_id=owner_id,
-                revision_id=result.source_id if body.source_type == "revision" else None,
-                payload={
+        # The very last thing that may be skipped, and even this must not
+        # prevent the 202 response: nothing before this point can propagate
+        # past it any more (both guards above now catch BaseException), so this
+        # is deliberately the final opportunity to record provenance for a
+        # promotion that has already, irreversibly, happened.
+        try:
+            await drain_audit(safe_record_security_event(
+                db,
+                event_type="draft_promoted",
+                actor=user,
+                request=request,
+                metadata={
+                    "draft_id": draft_id,
                     "source_type": result.source_type,
                     "source_id": result.source_id,
+                    "source_sha256": result.source_sha256,
                     "vault_id": result.vault_id,
                     "file_id": result.file_id,
+                    "filename": result.filename,
+                    "revision_fact_status": revision_fact_status,
+                    "was_ready_revision": was_ready_revision,
+                    "organization_error": organization_error,
+                    "draft_event_error": draft_event_error,
                 },
+            ))
+        except BaseException as exc:  # noqa: BLE001 — the promotion already succeeded; this must not prevent the response either
+            logger.warning(
+                "draft_room: failed to record draft_promoted security audit "
+                "event (draft_id=%s file_id=%s): %s",
+                draft_id,
+                result.file_id,
+                exc,
             )
-        )
-    except BaseException as exc:  # noqa: BLE001 — must not turn a real success into a reported failure; includes cancellation, which must not skip the audit write below either
-        draft_event_error = str(exc)
-        logger.warning(
-            "draft_room: failed to record draft_events row after promotion "
-            "succeeded (draft_id=%s file_id=%s): %s",
-            draft_id,
-            result.file_id,
-            exc,
-        )
 
-    # The very last thing that may be skipped, and even this must not
-    # prevent the 202 response: nothing before this point can propagate
-    # past it any more (both guards above now catch BaseException), so this
-    # is deliberately the final opportunity to record provenance for a
-    # promotion that has already, irreversibly, happened.
-    try:
-        await drain_audit(safe_record_security_event(
-            db,
-            event_type="draft_promoted",
-            actor=user,
-            request=request,
-            metadata={
-                "draft_id": draft_id,
-                "source_type": result.source_type,
-                "source_id": result.source_id,
-                "source_sha256": result.source_sha256,
-                "vault_id": result.vault_id,
-                "file_id": result.file_id,
-                "filename": result.filename,
-                "revision_fact_status": revision_fact_status,
-                "was_ready_revision": was_ready_revision,
-                "organization_error": organization_error,
-                "draft_event_error": draft_event_error,
-            },
-        ))
-    except BaseException as exc:  # noqa: BLE001 — the promotion already succeeded; this must not prevent the response either
-        logger.warning(
-            "draft_room: failed to record draft_promoted security audit "
-            "event (draft_id=%s file_id=%s): %s",
-            draft_id,
-            result.file_id,
-            exc,
-        )
+    await drained_unit(_unit())
 
     return PromoteResponse(
         promotion_id=result.promotion_id,
@@ -4474,86 +4551,99 @@ async def dispose_draft_finding(
         )
 
     new_revision: Optional[DraftRevisionRecord] = None
-    if body.action == "apply":
-        revision_id = await _run_store(
-            lambda: _sync_apply_finding(
-                db,
-                draft_id=draft_id,
-                owner_id=owner_id,
-                finding_id=finding_id,
-                lock_version=body.lock_version,
-                base_revision_id=body.base_revision_id,
-                note=body.note,
-            )
-        )
-        new_revision = await _run_store(
-            lambda: store.get_revision(
-                draft_id=draft_id,
-                owner_id=owner_id,
-                revision_id=revision_id,
-                include_content=False,
-            )
-        )
-        response.status_code = 201
-    elif body.action == "dismiss":
-        if finding.severity == "blocker":
-            raise _conflict(
-                "a blocker cannot be dismissed; resolve it with a revision or a "
-                "valid waiver",
-                "blocker_not_dismissable",
-            )
-        await _run_store(
-            lambda: store.dismiss_finding(
-                draft_id=draft_id,
-                finding_id=finding_id,
-                resolved_by=owner_id,
-                resolution_note=body.note,
-                lock_version=body.lock_version,
-            )
-        )
-    else:
-        if not (body.note or "").strip():
-            raise DraftRoomHTTPError(
-                422, "waiving a finding requires a non-empty note", "waiver_reason_required"
-            )
-        if not finding.waivable:
-            raise _conflict("this finding is not waivable", "finding_not_waivable")
-        await _assert_waiver_text_unchanged(store, draft_id, owner_id, finding)
-        await _run_store(
-            lambda: store.waive_finding(
-                draft_id=draft_id,
-                finding_id=finding_id,
-                resolved_by=owner_id,
-                resolution_note=str(body.note),
-                # SPEC section 8.2: a waiver pins the rule version and the exact
-                # text it was granted against, so a later edit invalidates it.
-                waiver_rule_version=finding.rule_version,
-                waiver_text_sha256=finding.span_text_sha256,
-                lock_version=body.lock_version,
-            )
-        )
 
-    # No route-tail event: each disposition writes exactly one audit row
-    # inside its own transaction — apply's has existed there all along, and
-    # dismiss/waive moved theirs into DraftStore with the same guards (issue
-    # #788 / T1-08-K-02). The note text stays in
-    # ``draft_findings.resolution_note``; payloads carry IDs and codes only.
-    await drain_audit(safe_record_security_event(
-        db,
-        event_type=f"draft_finding_{body.action}",
-        actor=user,
-        request=request,
-        metadata={
-            "draft_id": draft_id,
-            "finding_id": finding_id,
-            "action": body.action,
-            "rule_id": finding.rule_id,
-            "rule_version": finding.rule_version,
-            "severity": finding.severity,
-            "span_text_sha256": finding.span_text_sha256,
-            "revision_id": new_revision.id if new_revision else finding.revision_id,
-        },
-    ))
+    # Issue #1068: the disposition's store-internal commit (whichever of the
+    # three arms ran — _sync_apply_finding's splice transaction,
+    # dismiss_finding's, or waive_finding's guarded transaction) and the
+    # draft_finding_{action} audit tail form ONE drained unit — a cancellation
+    # delivered exactly at the commit await (after the commit work completed)
+    # is absorbed until the audit row is written, then re-raised. The
+    # post-commit revision read (apply arm) stays inside the unit with the
+    # audit that consumes it.
+    async def _unit() -> None:
+        nonlocal new_revision
+        if body.action == "apply":
+            revision_id = await _run_store(
+                lambda: _sync_apply_finding(
+                    db,
+                    draft_id=draft_id,
+                    owner_id=owner_id,
+                    finding_id=finding_id,
+                    lock_version=body.lock_version,
+                    base_revision_id=body.base_revision_id,
+                    note=body.note,
+                )
+            )
+            new_revision = await _run_store(
+                lambda: store.get_revision(
+                    draft_id=draft_id,
+                    owner_id=owner_id,
+                    revision_id=revision_id,
+                    include_content=False,
+                )
+            )
+            response.status_code = 201
+        elif body.action == "dismiss":
+            if finding.severity == "blocker":
+                raise _conflict(
+                    "a blocker cannot be dismissed; resolve it with a revision or a "
+                    "valid waiver",
+                    "blocker_not_dismissable",
+                )
+            await _run_store(
+                lambda: store.dismiss_finding(
+                    draft_id=draft_id,
+                    finding_id=finding_id,
+                    resolved_by=owner_id,
+                    resolution_note=body.note,
+                    lock_version=body.lock_version,
+                )
+            )
+        else:
+            if not (body.note or "").strip():
+                raise DraftRoomHTTPError(
+                    422, "waiving a finding requires a non-empty note", "waiver_reason_required"
+                )
+            if not finding.waivable:
+                raise _conflict("this finding is not waivable", "finding_not_waivable")
+            await _assert_waiver_text_unchanged(store, draft_id, owner_id, finding)
+            await _run_store(
+                lambda: store.waive_finding(
+                    draft_id=draft_id,
+                    finding_id=finding_id,
+                    resolved_by=owner_id,
+                    resolution_note=str(body.note),
+                    # SPEC section 8.2: a waiver pins the rule version and the exact
+                    # text it was granted against, so a later edit invalidates it.
+                    waiver_rule_version=finding.rule_version,
+                    waiver_text_sha256=finding.span_text_sha256,
+                    lock_version=body.lock_version,
+                )
+            )
+
+        # No route-tail event: each disposition writes exactly one audit row
+        # inside its own transaction — apply's has existed there all along, and
+        # dismiss/waive moved theirs into DraftStore with the same guards (issue
+        # #788 / T1-08-K-02). The note text stays in
+        # ``draft_findings.resolution_note``; payloads carry IDs and codes only.
+        await drain_audit(safe_record_security_event(
+            db,
+            event_type=f"draft_finding_{body.action}",
+            actor=user,
+            request=request,
+            metadata={
+                "draft_id": draft_id,
+                "finding_id": finding_id,
+                "action": body.action,
+                "rule_id": finding.rule_id,
+                "rule_version": finding.rule_version,
+                "severity": finding.severity,
+                "span_text_sha256": finding.span_text_sha256,
+                "revision_id": new_revision.id if new_revision else finding.revision_id,
+            },
+        ))
+
+    await drained_unit(_unit())
     updated = await _run_store(
         lambda: _sync_get_finding(
             db, draft_id=draft_id, owner_id=owner_id, finding_id=finding_id

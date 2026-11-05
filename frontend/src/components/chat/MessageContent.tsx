@@ -3,7 +3,7 @@
 import { useState, useCallback } from "react";
 import { Check, Copy } from "lucide-react";
 import { MarkdownMessage } from "./MarkdownMessage";
-import { getRelevanceLabel, type ScoreType } from "@/lib/relevance";
+import { getRelevanceLabel } from "@/lib/relevance";
 import { cn } from "@/lib/utils";
 import type { Source } from "@/lib/api";
 
@@ -48,8 +48,10 @@ export function MessageContent({ content, sources, isStreaming }: MessageContent
           <p className="text-xs font-medium text-muted-foreground mb-2">Sources</p>
           <ul className="space-y-1.5">
             {sources.map((source, i) => {
+              // Null for the uncalibrated per-source "fts" kind (issue #1070)
+              // — the guard below suppresses the label rather than guessing.
               const relevance = source.score !== undefined
-                ? getRelevanceLabel(source.score, source.score_type as ScoreType)
+                ? getRelevanceLabel(source.score, source.score_type)
                 : null;
               return (
                 <li key={source.id} className="text-xs">
