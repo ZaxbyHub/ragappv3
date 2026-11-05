@@ -36,7 +36,7 @@
       "SEVERITY.LOW": 59,
       "SEVERITY.MEDIUM": 60,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 95751,
+      "loc": 95841,
       "nosec": 0,
       "skipped_tests": 71
     },
@@ -751,7 +751,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 251,
+      "loc": 277,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -868,7 +868,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 1,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 4451,
+      "loc": 4474,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1297,7 +1297,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1191,
+      "loc": 1206,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1713,7 +1713,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 3185,
+      "loc": 3211,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -4480,7 +4480,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "4043         # Create a deterministic seed from the text\n4044         seed_value = int(hashlib.md5(text.encode(\"utf-8\")).hexdigest(), 16) % (2**32)\n4045         random.seed(seed_value)\n",
+      "code": "4077         # Create a deterministic seed from the text\n4078         seed_value = int(hashlib.md5(text.encode(\"utf-8\")).hexdigest(), 16) % (2**32)\n4079         random.seed(seed_value)\n",
       "col_offset": 25,
       "end_col_offset": 58,
       "filename": "backend/app/services/vector_store.py",
@@ -4491,9 +4491,9 @@
       },
       "issue_severity": "HIGH",
       "issue_text": "Use of weak MD5 hash for security. Consider usedforsecurity=False",
-      "line_number": 4044,
+      "line_number": 4078,
       "line_range": [
-        4044
+        4078
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b324_hashlib.html",
       "test_id": "B324",
