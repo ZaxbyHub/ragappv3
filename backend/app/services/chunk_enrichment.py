@@ -129,6 +129,7 @@ class ChunkEnrichment:
             entities=data.get("entities", []),
             aliases=data.get("aliases", []),
             section_breadcrumb=data.get("section_breadcrumb", ""),
+            error=data.get("error"),
         )
 
 

@@ -578,10 +578,11 @@ class LLMClient:
                 single shared slot, so a caller running concurrent calls
                 through one client cannot read it after ``await`` returns
                 without racing sibling calls. Pass your own dict and the
-                success path populates it (finish_reason, status, token
-                counts) before returning — that block is synchronous, so the
-                sink is isolated per call. Unset on failure paths (they raise
-                ``LLMError`` instead of returning).
+                success path REPLACES its contents with this call's metrics
+                (finish_reason, status, token counts) before returning — that
+                block is synchronous, so the sink is isolated per call even
+                when a caller reuses one dict across calls. Unset on failure
+                paths (they raise ``LLMError`` instead of returning).
 
         Returns:
             The generated content string
@@ -750,7 +751,10 @@ class LLMClient:
             if metrics_sink is not None:
                 # Issue #1066: synchronous mirror for concurrent callers —
                 # no await between building the dict and this update, so each
-                # caller's sink holds only its own call's values.
+                # caller's sink holds only its own call's values. REPLACE
+                # semantics: a caller reusing one dict across calls must not
+                # see the previous call's keys linger (review EXT-001).
+                metrics_sink.clear()
                 metrics_sink.update(metrics)
             return content
         except CircuitBreakerError as e:

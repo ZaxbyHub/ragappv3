@@ -1,14 +1,13 @@
-"""Success-contract and stale-guard tests for the #1066 enrichment status flow.
+"""Success-contract and currency-guard tests for the #1066 enrichment status flow.
 
 Complements the frozen failure specs (tests/test_enrichment_false_success.py)
 with the SUCCESS leg through the REAL ChunkEnrichmentService and REAL
-DocumentProcessor.run_enrichment_job — the frozen C5 floor pins record
-rendering only and cannot see a plumbing break that silently fails every real
-generation (plan-critic round 1, finding 2) — plus the currency-guard leg for
-a superseded failed attempt (plan-critic round 1, finding 4).
-
-RED at base for the stale leg is not required: the guard is new-surface with
-the #1066 fix; the success leg is GREEN at base and must stay GREEN.
+DocumentProcessor.run_enrichment_job, the failure-block currency legs through
+the REAL _is_enrichment_job_current / _mark_enrichment_stale_if_current_job
+(review PRR-002: the earlier leg patched those methods out, so its oracle
+could not see a terminal clobber), the mixed-batch no-swap pin (review
+PRR-001), and the persisted-code pin (review PRR-013). All legs drive the
+real service/job/store methods — no production-method patching.
 """
 
 import asyncio
@@ -22,26 +21,35 @@ from unittest.mock import AsyncMock, MagicMock
 
 from app.config import settings
 from app.models.database import SQLiteConnectionPool, init_db, run_migrations
-from app.services.chunk_enrichment import ChunkEnrichmentService
+from app.services.chunk_enrichment import (
+    ChunkEnrichment,
+    ChunkEnrichmentService,
+)
 from app.services.chunking import ProcessedChunk
 from app.services.document_processor import DocumentProcessor
+from app.services.llm_client import LLMError
 
 
 class FakeLLMClient:
     """Mirrors the real client contract: str return + finish_reason metrics.
 
     finish_reason lands on ``last_metrics`` (llm_client.py success path) and
-    on the optional per-call ``metrics_sink`` kwarg, so the fake stays faithful
-    whichever way the service reads it.
+    on the optional per-call ``metrics_sink`` kwarg (replace semantics, like
+    the real client), so the fake stays faithful whichever way the service
+    reads it.
     """
 
-    def __init__(self, content, finish_reason="stop"):
+    def __init__(self, content, finish_reason="stop", on_call=None):
         self.content = content
         self.finish_reason = finish_reason
         self.calls = 0
+        self.last_metrics = {}
+        self.on_call = on_call
 
     async def chat_completion(self, messages, **kwargs):
         self.calls += 1
+        if self.on_call is not None:
+            self.on_call()
         metrics = {
             "provider_url": "fake",
             "model": "fake",
@@ -54,6 +62,88 @@ class FakeLLMClient:
             sink.clear()
             sink.update(metrics)
         return self.content
+
+
+class RaisedLLMClient:
+    """Model call raises LLMError (the review PRR-002/PRR-013 failure arm)."""
+
+    def __init__(self, on_call=None):
+        self.calls = 0
+        self.on_call = on_call
+
+    async def chat_completion(self, messages, **kwargs):
+        self.calls += 1
+        if self.on_call is not None:
+            self.on_call()
+        raise LLMError("provider down")
+
+
+class MultiFakeLLMClient:
+    """One behavior per candidate, in call order (review PRR-001 mixed batch)."""
+
+    def __init__(self, behaviors):
+        # behaviors: list of ("ok", content, finish_reason) or ("raise", msg)
+        self._behaviors = list(behaviors)
+        self.calls = 0
+
+    async def chat_completion(self, messages, **kwargs):
+        idx = self.calls
+        self.calls += 1
+        behavior = self._behaviors[idx]
+        if behavior[0] == "raise":
+            raise LLMError(behavior[1])
+        _, content, finish_reason = behavior
+        metrics = {
+            "provider_url": "fake",
+            "model": "fake",
+            "finish_reason": finish_reason,
+            "status": "ok",
+        }
+        sink = kwargs.get("metrics_sink")
+        if isinstance(sink, dict):
+            sink.clear()
+            sink.update(metrics)
+        return content
+
+
+def _newer_job_mutation(db_path, file_id):
+    """Simulate a newer job having re-ingested and written its own status
+    mid-flight: hash rotated, enrichment columns moved to a newer attempt."""
+
+    def mutate():
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            """
+            UPDATE files
+            SET file_hash = 'newerhash654321',
+                enrichment_status = 'processing',
+                enrichment_error = 'newer job in flight',
+                enrichment_updated_at = '2030-01-02T00:00:00+00:00'
+            WHERE id = ?
+            """,
+            (file_id,),
+        )
+        conn.commit()
+        conn.close()
+
+    return mutate
+
+
+def _hash_rotate_mutation(db_path, file_id):
+    """Simulate a newer re-ingest registering a new hash BEFORE its own
+    enrichment has touched the enrichment columns (they still hold this
+    attempt's 'processing' write)."""
+
+    def mutate():
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "UPDATE files SET file_hash = 'newerhash654321' WHERE id = ?",
+            (file_id,),
+        )
+        conn.commit()
+        conn.close()
+
+    return mutate
 
 
 class _EnrichmentJobHarness:
@@ -158,6 +248,21 @@ class _EnrichmentJobHarness:
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
 
+def _two_chunks():
+    return [
+        ProcessedChunk(
+            text="first chunk with plenty of text to enrich",
+            metadata={"chunk_scale": "default", "total_chunks": 2},
+            chunk_index=0,
+        ),
+        ProcessedChunk(
+            text="second chunk with plenty of text to enrich",
+            metadata={"chunk_scale": "default", "total_chunks": 2},
+            chunk_index=1,
+        ),
+    ]
+
+
 class TestEnrichmentSuccessContract(unittest.TestCase):
     def test_closed_json_with_stop_finish_stores_complete_and_summary(self):
         """Real service + real job: valid closed JSON, finish stop → complete."""
@@ -182,53 +287,115 @@ class TestEnrichmentSuccessContract(unittest.TestCase):
         self.assertIn("a trustworthy summary", swapped["text"])
         self.assertIn("contract leg text long enough to enrich", swapped["text"])
 
-    def test_superseded_failed_attempt_marks_stale_without_clobbering(self):
-        """A failed candidate on a superseded attempt must not overwrite a newer status.
-
-        Currency-guard leg for the #1066 failure write: the file hash changes
-        while the (failing) generation is in flight; the attempt may only mark
-        itself stale — never write a terminal error over the newer job's row.
-        """
-        h = _EnrichmentJobHarness(file_id=302, file_hash="oldhash012345")
-        fake = FakeLLMClient('{"summary": "trunc', finish_reason="stop")
+    def test_mixed_batch_failure_never_swaps_successful_sibling(self):
+        """Review PRR-001: one failed candidate must fail the file BEFORE the
+        vector swap, so the successful sibling keeps its already-searchable
+        base rows. A swap-then-error reorder flips this assertion (the frozen
+        failure specs cannot observe the swap — their harness disables the
+        vector store)."""
+        h = _EnrichmentJobHarness(file_id=303, chunks=_two_chunks())
+        fake = MultiFakeLLMClient(
+            [
+                ("ok", '{"summary": "good sibling summary"}', "stop"),
+                ("raise", "provider down"),
+            ]
+        )
         h.attach_client(fake)
-
-        original_is_current = DocumentProcessor._is_enrichment_job_current
-        original_mark_stale = DocumentProcessor._mark_enrichment_stale_if_current_job
-
-        is_current_calls: list = []
-
-        def fake_is_current(self, file_id, file_hash):
-            # Sync by contract. The first call is the job-entry currency check
-            # (must pass so the attempt actually runs); the second is the
-            # failure-block guard, which must see the attempt as superseded.
-            is_current_calls.append(file_id)
-            return len(is_current_calls) == 1
-
-        stale_calls: list = []
-
-        async def fake_mark_stale(self, file_id, processing_started_at):
-            stale_calls.append((file_id, processing_started_at))
-
         try:
-            DocumentProcessor._is_enrichment_job_current = fake_is_current
-            DocumentProcessor._mark_enrichment_stale_if_current_job = fake_mark_stale
             h.run()
             row = h.row()
         finally:
-            DocumentProcessor._is_enrichment_job_current = original_is_current
-            DocumentProcessor._mark_enrichment_stale_if_current_job = original_mark_stale
             h.close()
 
-        self.assertEqual(len(stale_calls), 1, "the superseded attempt must mark stale once")
+        self.assertEqual(fake.calls, 2, "both candidates were generated")
+        self.assertEqual(row["enrichment_status"], "error")
+        self.assertIn("ENRICHMENT_FAILED", row["enrichment_error"] or "")
         self.assertEqual(
-            len(is_current_calls), 2,
-            "entry check passes, failure-block guard sees superseded",
+            h.swapped_records,
+            [],
+            "a failed batch must never swap — not even the successful sibling",
         )
-        # No terminal error written by the superseded attempt: the row keeps
-        # whatever the newer job set (here 'processing', the pre-run state).
-        self.assertNotEqual(row["enrichment_status"], "complete")
-        self.assertEqual(h.swapped_records, [], "a failed/superseded attempt must not swap")
+
+    def test_newer_job_write_survives_a_superseded_failure(self):
+        """Review PRR-002 (no-clobber, real methods): a newer attempt's row
+        state must survive this attempt's failure. The mid-flight mutation
+        rotates the hash (this attempt is genuinely superseded) and the newer
+        job has already written its own enrichment columns, so the real
+        _mark_enrichment_stale_if_current_job CAS must NOT match — no
+        terminal error may land on the newer row."""
+        h = _EnrichmentJobHarness(file_id=302, file_hash="abcdef012345")
+        fake = RaisedLLMClient(on_call=_newer_job_mutation(h.db_path, 302))
+        h.attach_client(fake)
+        try:
+            h.run()
+            row = h.row()
+        finally:
+            h.close()
+
+        self.assertEqual(fake.calls, 1, "the model was called once, then failed")
+        self.assertEqual(
+            row["enrichment_status"], "processing",
+            "the newer attempt's status must survive untouched",
+        )
+        self.assertEqual(
+            row["enrichment_error"], "newer job in flight",
+            "the newer attempt's error text must survive untouched",
+        )
+        self.assertNotIn("ENRICHMENT_FAILED", row["enrichment_error"] or "")
+        self.assertEqual(h.swapped_records, [])
+
+    def test_stale_marker_write_is_distinguishable_from_terminal_error(self):
+        """Review PRR-002 (stale-mark arm, real methods): when the attempt is
+        superseded mid-flight and NO newer write has landed yet, the real
+        stale-marker must fire with its OWN message — distinguishable from
+        the ENRICHMENT_FAILED terminal write."""
+        h = _EnrichmentJobHarness(file_id=304, file_hash="abcdef012345")
+        fake = RaisedLLMClient(on_call=_hash_rotate_mutation(h.db_path, 304))
+        h.attach_client(fake)
+        try:
+            h.run()
+            row = h.row()
+        finally:
+            h.close()
+
+        self.assertEqual(fake.calls, 1)
+        self.assertEqual(row["enrichment_status"], "error")
+        self.assertEqual(
+            row["enrichment_error"],
+            "Enrichment job became stale before completion; base index remains available",
+            "the stale-marker message, not the ENRICHMENT_FAILED terminal write",
+        )
+        self.assertEqual(h.swapped_records, [])
+
+    def test_failed_batch_persists_stable_code_with_count(self):
+        """Review PRR-013: the failure block's persisted error is the stable
+        #562 code + fixed reason plus the failed/total count — not a raw
+        exception string."""
+        h = _EnrichmentJobHarness(file_id=305)
+        fake = RaisedLLMClient()
+        h.attach_client(fake)
+        try:
+            h.run()
+            row = h.row()
+        finally:
+            h.close()
+
+        self.assertEqual(
+            row["enrichment_error"],
+            "ENRICHMENT_FAILED: content enrichment failed; the indexed document is unaffected (1 of 1 chunks)",
+        )
+
+    def test_enrichment_round_trip_preserves_error_signal(self):
+        """Review PRR-010: to_dict → from_dict must round-trip the failure
+        signal (the pre-fix from_dict dropped the new key)."""
+        failed = ChunkEnrichment(
+            chunk_id="c1",
+            error="enrichment JSON failed to parse",
+        )
+        restored = ChunkEnrichment.from_dict(failed.to_dict())
+        self.assertEqual(restored.error, "enrichment JSON failed to parse")
+        ok = ChunkEnrichment(chunk_id="c2")
+        self.assertIsNone(ChunkEnrichment.from_dict(ok.to_dict()).error)
 
 
 if __name__ == "__main__":

@@ -21,10 +21,23 @@ Collated closure of the two ingestion hot-path issues:
   `test_search_caller_keeps_default_accept_existing_wiring`). Known trade-offs
   (disclosed): (1) if a churn rebuild fails and an append interleaves before
   the next search, the append's accept subsumes that retry until the next
-  churn-qualifying event; (2) an enrichment swap whose DELETE-side churn
-  C/(table+file rows) ≥ `index_rebuild_delta` (a large file relative to the
-  table) still pays ONE full retrain through the preserved delete-churn floor
-  — the pre-fix code paid two for the same swap.
+  churn-qualifying event, and the accept also makes the post-append row count
+  the #13 churn denominator — appended-but-never-indexed rows lower the
+  effective churn ratio for the same delete count, so the floor fires later
+  than the configured percentage in append-dominant corpora; (2) an
+  enrichment swap whose DELETE-side churn C/(table+file rows) ≥
+  `index_rebuild_delta` (a large file relative to the table) still pays ONE
+  full retrain through the preserved delete-churn floor — the pre-fix code
+  paid two for the same swap; (3) a failed enrichment is terminal for the
+  file until an operator acts: the failure write returns normally, so the
+  background exception-keyed retry does not fire — recovery is re-ingest or
+  the admin retry path; (4) providers that omit `finish_reason` are not
+  length-detected (the repo pins None-when-absent as a valid shape): a
+  cap-cut reply from such a provider that still forms a closed JSON object
+  stores complete with its generated-but-possibly-tail-incomplete fields —
+  missing tail fields are FULL-ENH-05's designed tolerance, and the
+  fail-closed alternative would flip #1066 AC2 and error-storm such
+  providers, so it is listed for maintainer approval rather than shipped.
 - **Failed or truncated enrichment is never stored as complete (#1066).** A
   curator response whose JSON does not parse, whose completion stopped at the
   512-token cap (`finish_reason=length`, including a cut-but-closed JSON

@@ -34,13 +34,20 @@ class FakeResponse:
 
 
 class FakeAsyncHTTP:
-    """Exposes exactly the surface the non-stream path uses: async post."""
+    """Exposes exactly the surface the non-stream path uses: async post.
+
+    ``post`` is a REAL coroutine that yields to the loop at a checkpoint, so
+    two concurrent calls genuinely interleave (the pre-fix version completed
+    synchronously, so an interleaved-drive test could not actually overlap
+    the calls — review PRR-011).
+    """
 
     def __init__(self, payloads):
         # A list so interleaved calls can be answered in order.
         self._payloads = list(payloads)
 
     async def post(self, url, json=None):
+        await asyncio.sleep(0)
         return FakeResponse(self._payloads.pop(0))
 
 
@@ -133,14 +140,18 @@ class TestMetricsSink(unittest.TestCase):
         sink_b: dict = {}
 
         async def run_both():
-            # Sequentially awaited here; the invariant under test is that the
-            # sink is populated inside its own call, so a later call can never
-            # overwrite an earlier sink (the last_metrics slot does move).
-            await client.chat_completion(
-                [{"role": "user", "content": "a"}], metrics_sink=sink_a
-            )
-            await client.chat_completion(
-                [{"role": "user", "content": "b"}], metrics_sink=sink_b
+            # Genuinely concurrent: FakeAsyncHTTP.post yields to the loop, so
+            # the two calls overlap at that checkpoint. The invariant under
+            # test is that each sink is populated synchronously inside its
+            # own call's success block, so interleaving cannot cross-fill a
+            # sibling's sink (the shared last_metrics slot does move).
+            await asyncio.gather(
+                client.chat_completion(
+                    [{"role": "user", "content": "a"}], metrics_sink=sink_a
+                ),
+                client.chat_completion(
+                    [{"role": "user", "content": "b"}], metrics_sink=sink_b
+                ),
             )
 
         asyncio.run(run_both())
@@ -151,6 +162,37 @@ class TestMetricsSink(unittest.TestCase):
             client.last_metrics.get("finish_reason"), "length",
             "the shared slot reflects the LAST call while sinks do not",
         )
+
+    def test_reused_sink_sees_only_the_latest_call(self):
+        """Replace semantics (review EXT-001): a caller reusing one dict
+        across calls must not see the previous call's keys linger."""
+        fake = FakeAsyncHTTP(
+            [
+                _payload("stop", "with usage", usage={"prompt_tokens": 5}),
+                _payload("stop", "no usage"),
+            ]
+        )
+        client = _client(fake)
+        client._ensure_started = _EnsureStartedShim._ensure_started.__get__(client)
+        reused: dict = {}
+
+        async def run_twice():
+            await client.chat_completion(
+                [{"role": "user", "content": "a"}], metrics_sink=reused
+            )
+            self.assertIn("prompt_tokens", reused)
+            await client.chat_completion(
+                [{"role": "user", "content": "b"}], metrics_sink=reused
+            )
+
+        asyncio.run(run_twice())
+
+        self.assertEqual(reused.get("finish_reason"), "stop")
+        self.assertNotIn(
+            "prompt_tokens", reused,
+            "stale per-call keys must not survive a sink reuse",
+        )
+        self.assertEqual(client.last_metrics.get("finish_reason"), "stop")
 
     def test_no_sink_leaves_behavior_unchanged(self):
         fake = FakeAsyncHTTP([_payload("stop", "plain")])

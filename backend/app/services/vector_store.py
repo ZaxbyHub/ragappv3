@@ -1022,7 +1022,14 @@ class VectorStore:
         (``_vector_index_needs_creation``) reported that creation may be needed.
         ``accept_existing`` is passed only by the append path; the search path
         keeps the default so a failed churn rebuild still retries through here
-        (issue #718's stale-index invariant).
+        (issue #718's stale-index invariant). Known interleaving (disclosed,
+        issue #1065): an append that lands AFTER a failed churn rebuild but
+        BEFORE the next search accepts-and-records in this method, refreshing
+        the bookkeeping the failed rebuild deliberately left stale — the
+        search-time retry is subsumed until the next churn-qualifying event,
+        and the recorded row count also becomes the churn denominator for the
+        #13 floor (appended-but-never-indexed rows lower the effective churn
+        ratio for the same delete count).
         """
         if self.table is None:
             return
