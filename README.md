@@ -221,10 +221,14 @@ On first launch, you'll be redirected to the **Setup Wizard** (`/setup`) to crea
 
 > **Startup order:** `knowledgevault` waits for the `harrier-embed` container
 > to report healthy before starting (so the strict embedding-model check runs
-> against a ready service). The embedder's healthcheck has a 120 s start
-> period on first boot — model download can take longer. If `up` seems to
-> hang, check `docker compose ps` / `docker compose logs harrier-embed`; the
-> app starts as soon as the embedder is healthy.
+> against a ready service). First boot downloads the embedder model; the
+> healthcheck budget is roughly 120 s of download grace plus 5 probes at
+> 30 s intervals (~270 s total). If the embedder is not healthy within that
+> budget, compose ABORTS with `dependency failed to start` and
+> `knowledgevault` is NOT started — its restart policy does not cover a
+> dependency that never came up, so this does not recover by itself. Fix the
+> embedder (check `docker compose logs harrier-embed`; a slow first download
+> is the usual cause) and re-run `docker compose up -d`.
 
 ## CPU-only hosts
 
@@ -570,9 +574,11 @@ curl -H "X-API-Key: ${HEALTH_CHECK_API_KEY:?set HEALTH_CHECK_API_KEY}" \
 > database is unreadable/corrupt during repair detection (restore `app.db` from your
 > backup); **7** — neither the `--lancedb-path` nor the `--sqlite-path` exists (wrong
 > paths — typically container-side DATA_DIR paths used from the host);
-> **8** — the SQLite file is missing or has no `files` table on a run whose
-> reset/wipe would execute (without the application database the wipe would
-> destroy vectors with no rollback source). Pass `--force` to override exits 3
+> **8** — the SQLite file is unusable for a reset/wipe (dry runs included):
+> missing, no `files` table, a `files` table without the reset contract's
+> core columns (`id`, `status`), or an obvious backup copy such as `app.db.bak` (without the live
+> application database the wipe would destroy vectors with no usable
+> rollback source). Pass `--force` to override exits 3
 > and 4 only; the lock/corruption/wrong-path refusals (5, 6, 7 and 8) always
 > stop the run.
 

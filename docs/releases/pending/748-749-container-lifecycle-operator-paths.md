@@ -32,11 +32,13 @@ collated per maintainer authorization. Frontier-audit provenance (run
 ### #749 — operator startup paths and the migration tool refuse instead of failing silently
 
 - **Data-directory preflight** (TQ-differential-e-03): startup now checks the
-  data directory's writability BEFORE any database work and, when it exists
-  but is not writable (the root-owned bind mount the daemon creates),
-  fails with one actionable message naming the directory, the current uid,
-  the owner uid, and the exact `mkdir -p` + `chown 1000:1000` fix — replacing
-  the bare sqlite/LanceDB tracebacks this state previously produced. A
+  data directory's write AND search permission BEFORE any database work and,
+  when the existing directory lacks either (the root-owned bind mount the
+  daemon creates), fails with one actionable message naming the directory,
+  the current uid, and the owner uid, and describing the HOST-side fix in
+  prose (the bind-mount source compose maps to the reported container path;
+  `mkdir -p` + `chown -R 1000:1000`, quoting the host path) — replacing the
+  bare sqlite/LanceDB tracebacks this state previously produced. A
   nonexistent directory still passes (fresh starts create it as before).
   Disclosed: this takes the acceptance criterion's explicit
   "fail with a message naming the directory/owner/uid" arm; under
@@ -50,16 +52,20 @@ collated per maintainer authorization. Frontier-audit provenance (run
   - exit **7** when neither `--lancedb-path` nor `--sqlite-path` exists
     (previously a silent "Nothing to migrate" exit 0 told the operator the
     migration had run);
-  - exit **8** when the application database is missing or has no `files`
-    table on a run whose reset/wipe would execute — previously the status
-    reset silently skipped and the LanceDB wipe STILL ran, destroying
-    vectors with no rollback source (audit probe reproduced the loss);
+  - exit **8** when the application database is unusable for a reset/wipe
+    (dry runs included): missing, no `files` table, a `files` table without
+    the reset contract's core columns (`id`/`status`), or an obvious
+    backup copy such as `app.db.bak` — previously the status reset silently
+    skipped (or hit the wrong database) and the LanceDB wipe STILL ran,
+    destroying vectors with no usable rollback source (audit probe reproduced
+    the loss);
   - `--dry-run` and `--force` are subject to both refusals (wrong paths are
     wrong paths; `--force` still overrides only exits 3/4); lock and
     corruption semantics (exits 5/6) are unchanged, with the
     `OperationalError`-before-`DatabaseError` ordering the sibling probes
-    use, so a live writer still gets stop-the-app advice, never
-    restore-from-backup advice.
+    use — writer locks still get stop-the-app advice, while other open
+    failures (permission/read-only) now get a distinct not-a-lock diagnostic
+    instead of the lock advice.
 - **The stale-embeddings health hint is now runnable** (T1-29-K-02): it
   names the actual command — `python scripts/migrate_embeddings.py
   --lancedb-path ./data/lancedb --sqlite-path ./data/app.db` (the real

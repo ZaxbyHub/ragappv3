@@ -16,11 +16,13 @@
 # Digest pinning: the shipped GPU images in docker-compose.yml are digest-
 # pinned (issue #404). This override intentionally uses the floating
 # `cpu-latest` tag because it is an operator opt-in; before relying on it in
-# production, pin the digest yourself, e.g.:
-#   docker manifest inspect \
-#     ghcr.io/huggingface/text-embeddings-inference:cpu-latest > /dev/null \
-#     && docker compose -f docker-compose.yml -f docker-compose.cpu.yml pull
-# (or copy the digest your registry reports into the image: lines below).
+# production, resolve and pin the digest yourself — this command PRINTS it:
+#   docker buildx imagetools inspect \
+#     ghcr.io/huggingface/text-embeddings-inference:cpu-latest | grep -m1 '^Digest:'
+# then replace BOTH image: lines below with
+#   ghcr.io/huggingface/text-embeddings-inference@sha256:<paste the digest>
+# (note: `docker compose pull` does NOT pin anything — it re-resolves the
+# floating tag at pull time).
 services:
   harrier-embed:
     image: ghcr.io/huggingface/text-embeddings-inference:cpu-latest

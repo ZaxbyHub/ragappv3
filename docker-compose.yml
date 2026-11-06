@@ -253,9 +253,12 @@ services:
       # ..._compose_literal_values.py).
       # ------------------------------------------------------------------
       - EVAL_ENABLED
-      # Concurrency: forwarded so the health module's worker guard
-      # (health.py _warn_multi_worker_cache) is live on scale-out
-      # deployments — default 1 keeps the single-worker default silent.
+      # Concurrency: INERT in the shipped container — the image CMD pins
+      # `--workers 1` (issue #748), and uvicorn reads this env only when
+      # --workers is absent, so the container always runs a single worker
+      # and the health module's multi-worker cache guard never fires here.
+      # The knob stays forwarded for bare-metal/native runs that start
+      # uvicorn without that flag.
       - WEB_CONCURRENCY=${WEB_CONCURRENCY:-1}
       # Shared inference admission + telemetry (issue #518, E3). Budgets
       # default generous (see .env.example); ADMISSION_STORE_URL empty =

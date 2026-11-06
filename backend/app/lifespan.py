@@ -618,23 +618,33 @@ async def lifespan(app: FastAPI):
     # down with bare sqlite/LanceDB tracebacks. Fail HERE instead with one
     # actionable message naming the directory, the current uid, and the owner
     # uid — the criterion's explicitly permitted "fail with a message naming
-    # the directory/owner and uid" arm. A NONEXISTENT directory passes: fresh
-    # starts rely on the DB layer creating parents, and that flow is untouched.
+    # the directory/owner and uid" arm. W_OK|X_OK: creating children requires
+    # the search bit too, so a write-but-not-searchable directory must fail
+    # HERE with the named remedy rather than later as a generic migration
+    # error. A NONEXISTENT directory passes: fresh starts rely on the DB layer
+    # creating parents, and that flow is untouched. The message reports the
+    # CONTAINER-side path as the observed condition and describes the host
+    # remediation in prose — it deliberately does NOT print a runnable host
+    # command for the container path (the host bind source is not knowable
+    # from inside the container), and the path is never interpolated into
+    # shell syntax.
     _data_dir = settings.data_dir
-    if _data_dir.exists() and not os.access(_data_dir, os.W_OK):
+    if _data_dir.exists() and not os.access(_data_dir, os.W_OK | os.X_OK):
         _st = _data_dir.stat()
         _owner_uid = getattr(_st, "st_uid", None)
         _current_uid = getattr(os, "getuid", lambda: None)()
         raise RuntimeError(
-            f"Data directory is not writable: {_data_dir}\n"
+            f"Data directory is not writable/searchable: {_data_dir}\n"
             f"  current uid : {_current_uid}\n"
             f"  owner uid   : {_owner_uid}\n"
-            "The application stores its database and vector index under this "
-            "directory and cannot start without write access.\n"
-            "Fix the ownership and re-run, e.g.:\n"
-            f"  mkdir -p {_data_dir} && sudo chown -R 1000:1000 {_data_dir}\n"
-            "(the container runs as uid 1000; use the same host path you "
-            "configured as HOST_DATA_DIR)"
+            "The application stores its database and vector index under this\n"
+            "directory and cannot start without write and search permission.\n"
+            "This path is as seen INSIDE the container; the directory to fix\n"
+            "is the bind-mount SOURCE on the host that maps to it (compose\n"
+            "maps ${HOST_DATA_DIR:-./data} to this location). On the HOST:\n"
+            "create that directory (mkdir -p) and hand it to uid 1000\n"
+            "(sudo chown -R 1000:1000, quoting the host path if it contains\n"
+            "spaces) — see the README first-run steps — then re-run."
         )
     try:
         run_migrations(str(settings.sqlite_path))

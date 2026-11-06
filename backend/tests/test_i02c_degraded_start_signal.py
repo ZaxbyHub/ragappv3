@@ -3,19 +3,30 @@ GREEN after the fix). Drives the REAL lifespan with the pinning harness from
 test_health_readiness_lifespan.py (settings paths → temp dir, sacrificial
 auth executor, singleton resets, root-level restore).
 
-Legs (plan-critic round 3, finding 1):
+Legs (plan-critic round 3, finding 1; feedback round hardened per the
+pr1081-20261106 review):
   A — unwritable data dir: startup FAILS by raising RuntimeError whose own
       message names the directory, the current-uid token, the owner-uid
-      token, and the chown remediation (the criterion's explicitly permitted
-      second arm). Kills the flag-only and preflight-deleted mutants.
+      token, and the chown remediation. The access fake ASSERTS the preflight
+      requested W_OK|X_OK (the mode-blind fake the review caught could not
+      distinguish W_OK from R_OK); a second leg exercises a REAL POSIX
+      write-but-not-searchable directory mode (skipped on Windows, where
+      directory modes do not carry the semantics).
   B — fresh start (absent data dir): the preflight passes and startup
       proceeds normally (migrations_ok stays True) — guards the
       no-fresh-start regression the critic flagged (init_db creates parents).
   C — settings-load-only failure, ISOLATED: real migrations run against a
       good temp DB, then `_load_persisted_settings` alone fails — startup
-      COMPLETES degraded with migrations_ok False and /api/healthz answers
-      503. The isolation is what kills the degraded-flag-elision mutant
-      (whole-DB corruption would fail migrations first and mask it).
+      COMPLETES degraded with migrations_ok False. The healthz half seeds
+      HEALTHY app state and asserts the flag-caused differential (503 with
+      the flag False, 200 with the flag True), so removing the readiness
+      gate fails the leg instead of passing for the wrong reason.
+
+Every leg that enters the real lifespan snapshots and restores the ROOT
+handler list AND each handler's filter list (the lifespan's existing-handler
+branch addFilter()s handler objects in place — the copied harness the review
+caught omitted exactly this restore), and leg C snapshots/restores every
+shared app.state attribute it touches.
 """
 
 import asyncio
@@ -110,6 +121,30 @@ def _fresh_tmp_dir(prefix: str) -> Path:
     return tmp
 
 
+def _snapshot_root_handlers():
+    """Snapshot the root handler list AND each handler's filter list (the
+    lifespan's existing-handler branch addFilter()s handler OBJECTS in place,
+    including pytest's session-reused capture handlers — restoring the list
+    alone would reinstate the mutated objects)."""
+    root = logging.getLogger()
+    return root, [(h, list(h.filters)) for h in root.handlers]
+
+
+def _restore_root_handlers(root, saved):
+    root.handlers = [h for h, _ in saved]
+    for handler, filters in saved:
+        handler.filters = list(filters)
+
+
+class _HealthyVectorStore:
+    """Minimal healthy vector-store stand-in for the healthz differential
+    (truthy .table + explicit _ready=True; mirrors test_health_readiness)."""
+
+    def __init__(self):
+        self.table = object()
+        self._ready = True
+
+
 class TestUnwritableDataDirFailsWithNamedMessage(unittest.TestCase):
     """Leg A: the preflight raises with directory/uid/owner/remediation."""
 
@@ -121,12 +156,15 @@ class TestUnwritableDataDirFailsWithNamedMessage(unittest.TestCase):
         tmp = _fresh_tmp_dir("i02c-legA-")
         restore = _pin_lifespan_settings(tmp)
         tmp.mkdir(exist_ok=True)  # exists; access will be monkeypatched False
+        root, saved_handlers = _snapshot_root_handlers()
 
         real_access = os.access
+        modes_seen: list[int] = []
 
         def fake_access(path, mode):
             try:
                 if Path(path) == tmp:
+                    modes_seen.append(mode)
                     return False
             except (TypeError, ValueError):
                 pass
@@ -147,6 +185,7 @@ class TestUnwritableDataDirFailsWithNamedMessage(unittest.TestCase):
                 raised = exc
         finally:
             os.access = real_access
+            _restore_root_handlers(root, saved_handlers)
             restore()
 
         self.assertIsNotNone(raised, "unwritable data dir must fail startup")
@@ -155,6 +194,54 @@ class TestUnwritableDataDirFailsWithNamedMessage(unittest.TestCase):
         self.assertIn("uid", message, "must name the current uid")
         self.assertIn("owner", message, "must name the owner uid")
         self.assertIn("chown", message, "must carry the ownership remediation")
+        # The preflight must require WRITE *and* SEARCH permission: requiring
+        # the W_OK|X_OK combination among the probed modes kills the
+        # W_OK-only and R_OK-only mutants the mode-blind fake could not
+        # distinguish (pr1081-20261106 PRR-003). Other processes may probe
+        # the same path with other modes, so this is a membership assertion.
+        self.assertIn(
+            os.W_OK | os.X_OK,
+            modes_seen,
+            "preflight must test os.access(dir, W_OK | X_OK)",
+        )
+
+    @unittest.skipIf(os.name == "nt", "POSIX directory mode semantics")
+    def test_real_write_only_dir_mode_raises(self):
+        from fastapi import FastAPI
+
+        from app.lifespan import lifespan
+
+        parent = _fresh_tmp_dir("i02c-legA2-")
+        tmp = parent / "data"
+        tmp.mkdir()
+        tmp.chmod(0o200)  # write-only: no search bit for child creation
+        restore = _pin_lifespan_settings(tmp)
+        if os.access(tmp, os.W_OK | os.X_OK):
+            tmp.chmod(0o700)
+            restore()
+            self.skipTest("permission checks not effective for this uid (root?)")
+        root, saved_handlers = _snapshot_root_handlers()
+        app = FastAPI()
+        raised = None
+        try:
+
+            async def scenario():
+                async with lifespan(app):
+                    raise AssertionError("startup must not complete")
+
+            try:
+                asyncio.run(scenario())
+            except RuntimeError as exc:
+                raised = exc
+        finally:
+            tmp.chmod(0o700)  # allow the atexit rmtree to succeed
+            _restore_root_handlers(root, saved_handlers)
+            restore()
+
+        self.assertIsNotNone(
+            raised, "write-but-not-searchable dir must fail the preflight"
+        )
+        self.assertIn(str(tmp), str(raised))
 
 
 class TestFreshStartPassesPreflight(unittest.TestCase):
@@ -167,6 +254,7 @@ class TestFreshStartPassesPreflight(unittest.TestCase):
 
         tmp = _fresh_tmp_dir("i02c-legB-") / "data"  # does NOT exist yet
         restore = _pin_lifespan_settings(tmp)
+        root, saved_handlers = _snapshot_root_handlers()
         app = FastAPI()
         migrations_ok = None
         try:
@@ -178,6 +266,7 @@ class TestFreshStartPassesPreflight(unittest.TestCase):
 
             asyncio.run(scenario())
         finally:
+            _restore_root_handlers(root, saved_handlers)
             restore()
 
         self.assertTrue(
@@ -186,7 +275,7 @@ class TestFreshStartPassesPreflight(unittest.TestCase):
 
 
 class TestSettingsLoadFailureDegradesTo503(unittest.TestCase):
-    """Leg C: ONLY the settings call fails → degraded start, healthz 503."""
+    """Leg C: ONLY the settings call fails → degraded start, flag-caused 503."""
 
     def test_isolated_settings_failure_sets_flag_and_serves_503(self):
         from fastapi import FastAPI
@@ -197,6 +286,7 @@ class TestSettingsLoadFailureDegradesTo503(unittest.TestCase):
 
         tmp = _fresh_tmp_dir("i02c-legC-")
         restore = _pin_lifespan_settings(tmp)
+        root, saved_handlers = _snapshot_root_handlers()
         app = FastAPI()
         saved_loader = lifespan_module._load_persisted_settings
 
@@ -213,6 +303,7 @@ class TestSettingsLoadFailureDegradesTo503(unittest.TestCase):
             migrations_ok = asyncio.run(scenario())
         finally:
             lifespan_module._load_persisted_settings = saved_loader  # noqa: SLF001
+            _restore_root_handlers(root, saved_handlers)
             restore()
 
         # ISOLATED failure: migrations ran fine on the good temp DB, so the
@@ -221,19 +312,60 @@ class TestSettingsLoadFailureDegradesTo503(unittest.TestCase):
             migrations_ok,
             "settings-load failure must set migrations_ok False (degraded)",
         )
-        # The real HTTP route reads the flag the lifespan recorded (no
-        # lifespan on this client — same no-startup pattern as
-        # test_health_readiness.py; app.state carries the scenario's values).
+
+        # The healthz differential is FLAG-CAUSED: seed every other readiness
+        # input healthy, then assert 503 with the flag False and 200 with the
+        # flag True. Under a readiness-gate-removal mutant the first call
+        # would answer 200 and fail the leg (the shared app.main app carries
+        # no real startup state, so the seed is what makes the flag the only
+        # 503 source — the pr1081-20261106 review's gate-removal probe).
         from app.main import app as real_app
 
-        real_app.state.migrations_ok = False
-        client = TestClient(real_app)
-        response = client.get("/api/healthz")
-        self.assertEqual(
-            response.status_code,
-            503,
-            "healthz must answer 503 while migrations_ok is False",
+        attrs = (
+            "db_pool",
+            "vector_store",
+            "embedding_service",
+            "maintenance_service",
+            "migrations_ok",
         )
+        snapshot = {
+            name: (hasattr(real_app.state, name), getattr(real_app.state, name, None))
+            for name in attrs
+        }
+        client = TestClient(real_app)
+        try:
+            real_app.state.db_pool = object()  # presence = healthy (no saturation)
+            real_app.state.vector_store = _HealthyVectorStore()
+            real_app.state.embedding_service = object()
+            real_app.state.maintenance_service = None
+
+            real_app.state.migrations_ok = False
+            degraded = client.get("/api/healthz")
+            self.assertEqual(
+                degraded.status_code,
+                503,
+                "healthz must answer 503 while migrations_ok is False",
+            )
+            self.assertIn(
+                "migration",
+                degraded.text.lower(),
+                "the 503 issues must name the startup migration failure",
+            )
+
+            real_app.state.migrations_ok = True
+            healthy = client.get("/api/healthz")
+            self.assertEqual(
+                healthy.status_code,
+                200,
+                "the seeded state must be healthy with the flag True "
+                "(proves the 503 above is flag-caused, not state-caused)",
+            )
+        finally:
+            for name, (present, value) in snapshot.items():
+                if present:
+                    setattr(real_app.state, name, value)
+                elif hasattr(real_app.state, name):
+                    delattr(real_app.state, name)
 
 
 if __name__ == "__main__":

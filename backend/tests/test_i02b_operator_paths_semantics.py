@@ -165,6 +165,105 @@ class TestExitEightSentinelSurvival(unittest.TestCase):
             self.assertEqual(ctx.exception.code, 8)
 
 
+class TestApplicationDatabaseIdentity(unittest.TestCase):
+    """The exit-8 guard must establish application identity, not just a
+    table named ``files`` (pr1081-20261106 PRR-005): an unrelated database
+    with a stub ``files`` table, a table without the application's core
+    columns, and a backup copy such as ``app.db.bak`` are each refused before
+    any reset/wipe, with the LanceDB sentinel surviving every refusal."""
+
+    def _mk(self, tmp: Path) -> Path:
+        lance = tmp / "lancedb"
+        lance.mkdir()
+        (lance / "sentinel.keep").write_text("do-not-delete", encoding="utf-8")
+        return lance
+
+    def _refusal_stdout(self, callable_):
+        import contextlib
+        import io
+
+        err = io.StringIO()
+        code = None
+        with contextlib.redirect_stdout(err):
+            try:
+                callable_()
+            except SystemExit as exc:
+                code = exc.code
+        return code, err.getvalue()
+
+    def test_unrelated_files_table_refused_before_wipe(self):
+        import tempfile
+
+        mod = _load_migrate_module()
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            lance = self._mk(tmp)
+            unrelated = tmp / "unrelated.db"
+            conn = sqlite3.connect(str(unrelated))
+            conn.execute("CREATE TABLE files (id INTEGER PRIMARY KEY)")
+            conn.commit()
+            conn.close()
+            code, out = self._refusal_stdout(
+                lambda: mod.run_migration(lance, unrelated, force=True)
+            )
+            self.assertEqual(code, 8, "stub files table must be refused with exit 8")
+            self.assertIn("core columns", out)
+            self.assertTrue((lance / "sentinel.keep").exists())
+
+    def test_backup_copy_refused_before_wipe(self):
+        import tempfile
+
+        mod = _load_migrate_module()
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            lance = self._mk(tmp)
+            backup = tmp / "app.db.bak"  # README's own backup layout
+            conn = sqlite3.connect(str(backup))
+            conn.execute(
+                "CREATE TABLE files (id INTEGER PRIMARY KEY, vault_id INTEGER, "
+                "status TEXT)"
+            )
+            conn.commit()
+            conn.close()
+            code, out = self._refusal_stdout(
+                lambda: mod.run_migration(lance, backup, force=True)
+            )
+            self.assertEqual(
+                code, 8, "a backup copy must be refused with exit 8 even "
+                "when the schema looks like the application database"
+            )
+            self.assertIn("BACKUP", out)
+            self.assertTrue((lance / "sentinel.keep").exists())
+
+    def test_full_app_schema_passes_the_identity_guard(self):
+        """A schema-valid application database must NOT be refused by the
+        identity guard: the destructive path RUNS (force=True proceeds past
+        the guard and wipes the payload directory — no SystemExit, sentinel
+        gone). The refusals above are the discriminating half; this is the
+        pass-through half of the same contract."""
+        import tempfile
+
+        mod = _load_migrate_module()
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            lance = self._mk(tmp)
+            app_db = tmp / "app.db"
+            conn = sqlite3.connect(str(app_db))
+            conn.execute(
+                "CREATE TABLE files (id INTEGER PRIMARY KEY, vault_id INTEGER, "
+                "status TEXT)"
+            )
+            conn.commit()
+            conn.close()
+            outcome = mod.run_migration(lance, app_db, force=True)
+            self.assertEqual(outcome, 0, "schema-valid DB: destructive run completes")
+            self.assertFalse(
+                (lance / "sentinel.keep").exists(),
+                "the wipe must have proceeded past the identity guard "
+                "(guard pass-through, not a refusal)",
+            )
+
+
 class TestCorruptDatabaseKeepsExitFive(unittest.TestCase):
     """The new helper must not reclassify corruption (round-3 finding 3).
 
@@ -254,6 +353,36 @@ class TestRunnableHealthHint(unittest.TestCase):
         self.assertEqual(tokens[1], "scripts/migrate_embeddings.py")
         self.assertIn("--lancedb-path", tokens)
         self.assertIn("--sqlite-path", tokens)
+
+    def test_hint_lives_in_the_health_response_not_only_the_logger(self):
+        """The OPERATOR-facing carrier is the /api/health JSON payload
+        (stale_embeddings_detail), not the server-side log line. The
+        whole-file scan above is satisfied by the logger literal alone, so
+        this assertion scopes to the response-field block: the command text
+        must appear BETWEEN the stale_embeddings_detail assignment and the
+        following logger call (pr1081-20261106 PRR-009 — reverting only the
+        response literal left the whole-file checks green)."""
+        source = (BACKEND / "app" / "api" / "routes" / "health.py").read_text(
+            encoding="utf-8"
+        )
+        response_start = source.find('vector_status["stale_embeddings_detail"] = (')
+        self.assertGreater(
+            response_start, -1, "response-field detail assignment must exist"
+        )
+        next_logger = source.find("logger.warning", response_start)
+        self.assertGreater(next_logger, -1, "logger arm expected after the response")
+        response_block = source[response_start:next_logger]
+        self.assertIn(
+            "Run: python scripts/migrate_embeddings.py",
+            re.sub(r"\s+", " ", response_block),
+            "the /health response field itself must carry the runnable command "
+            "(not only the logger literal)",
+        )
+        self.assertIn(
+            "--sqlite-path",
+            response_block,
+            "the response-field command must carry the sqlite path flag",
+        )
 
 
 class TestPerDocumentOwnershipSteps(unittest.TestCase):
