@@ -88,10 +88,10 @@ collated per maintainer authorization. Frontier-audit provenance (run
 ## Verification
 
 - 14 frozen acceptance checks (anchor receipt published on both issues
-  pre-implementation): the 10 discriminating checks flipped RED→GREEN; the
-  4 preserving pins (stop-grace, TEI strict-check contract, compose
-  forwarding/build contracts, migrate no-op contracts, health-readiness
-  contract) stayed green.
+  pre-implementation): the 9 discriminating checks flipped RED→GREEN; the
+  5 preserving pins stayed green (stop-grace period, TEI strict-check
+  contract, compose forwarding/build contracts, migrate no-op contracts,
+  health-readiness contract).
 - New non-frozen suites: `test_i02b_operator_paths_semantics.py` (per-document
   ownership steps, exit-7/8 shapes incl. force/dry-run and the lock-vs-
   corruption taxonomy, runnable-hint command form, CPU override structure +

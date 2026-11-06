@@ -238,8 +238,9 @@ async def _collect_deep_state(app_state, llm_checker, model_checker) -> dict:
                         "Stale embedding dimensions detected: stored=%d, configured=%d. "
                         "Documents will not be searchable until re-embedded. "
                         "Run: python scripts/migrate_embeddings.py --lancedb-path "
-                        "./data/lancedb --sqlite-path ./data/app.db (from the "
-                        "repo root; adjust for your HOST_DATA_DIR).",
+                        "./data/lancedb --sqlite-path ./data/app.db (from the repo "
+                        "root; adjust the paths to your data directory if you "
+                        "changed HOST_DATA_DIR — see the script's --help).",
                         stored_dim,
                         configured_dim,
                     )
