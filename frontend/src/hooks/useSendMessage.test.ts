@@ -389,11 +389,19 @@ describe("useSendMessage", () => {
       });
 
       // The streaming guard drops the resend; the truncated original turn is
-      // restored instead of being lost silently.
+      // re-appended server-side and mirrored locally with the server ids
+      // (reload-surviving restore).
       expect(apiMocks.chatStream).not.toHaveBeenCalled();
+      expect(apiMocks.addChatMessagesBatch).toHaveBeenCalledWith(
+        42,
+        expect.arrayContaining([
+          expect.objectContaining({ role: "user", content: "original question" }),
+          expect.objectContaining({ role: "assistant", content: "original answer" }),
+        ]),
+      );
       const { messageIds, messagesById } = useChatStore.getState();
-      expect(messageIds).toEqual(["1", "2"]);
-      expect(messagesById["1"]?.content).toBe("original question");
+      expect(messageIds).toEqual(["100", "101"]);
+      expect(messagesById["100"]?.content).toBe("original question");
       expect(useChatStore.getState().inputError).toBeNull();
     });
   });

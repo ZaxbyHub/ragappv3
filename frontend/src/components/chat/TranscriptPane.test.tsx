@@ -201,6 +201,13 @@ describe("TranscriptPane", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     (useChatStore as unknown as { getState: ReturnType<typeof vi.fn> }).getState = vi.fn(() => mockChatState);
+    // The retry revision raises the streaming flag through setState
+    // (issue #991 review PRR-003(b)); stub it like getState.
+    (useChatStore as unknown as {
+      setState: (partial: Partial<typeof mockChatState>) => void;
+    }).setState = (partial) => {
+      Object.assign(mockChatState, partial);
+    };
 
     // Reset shared mock state
     mockChatState.messageIds = [];

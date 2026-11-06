@@ -209,11 +209,16 @@ export interface UseSendMessageReturn {
    * input state. `opts.restoreRows` (issue #684 / T1-13-S-08) carries the
    * original turn rows a revision already truncated, restored server-side if
    * the replacement is admission-rejected before any content.
+   * `opts.revisionDispatch` (issue #991 review PRR-003(b)) marks the retry
+   * handoff: the revision raised the store's streaming flag across the
+   * destructive window and verified no foreign send synchronously right
+   * before dispatching, so the flag must not refuse this dispatch — only a
+   * genuinely in-flight sendCore (sendingRef) may.
    */
   sendDirect: (
     content: string,
     historyMessages: Message[],
-    opts?: { restoreRows?: Message[] }
+    opts?: { restoreRows?: Message[]; revisionDispatch?: boolean }
   ) => Promise<void>;
   /** Current pipeline stage (Searching/Reading/Drafting) before content streams, or null. */
   currentStage: string | null;
@@ -1193,7 +1198,7 @@ export function useSendMessage(
     async (
       content: string,
       historyMessages: Message[],
-      opts?: { restoreRows?: Message[] }
+      opts?: { restoreRows?: Message[]; revisionDispatch?: boolean }
     ) => {
       const restoreDroppedRevision = async () => {
         if (!opts?.restoreRows?.length) return;
@@ -1217,7 +1222,14 @@ export function useSendMessage(
           tailIds.forEach((localId, i) => {
             const save = saved[i];
             if (save) {
-              useChatStore.getState().replaceMessageId?.(localId, save);
+              // String server id + saved metadata (same shape as migrateId —
+              // passing the save object itself breaks the store's id keys).
+              useChatStore
+                .getState()
+                .replaceMessageId(localId, String(save.id), {
+                  saveState: "saved",
+                  seq: save.seq,
+                });
             }
           });
           await refreshHistory(true);
@@ -1228,7 +1240,12 @@ export function useSendMessage(
         }
       };
       const { isStreaming: currentIsStreaming } = useChatStore.getState();
-      if (currentIsStreaming || sendingRef.current) {
+      // A revision dispatch crosses this guard with the streaming flag still
+      // raised (the revision's own window protection — TranscriptPane
+      // PRR-003(b)); its synchronous foreign-send check already ran, so only
+      // sendingRef may refuse it. A plain dispatch keeps today's guard.
+      const flagBlocks = opts?.revisionDispatch ? false : currentIsStreaming;
+      if (flagBlocks || sendingRef.current) {
         // Issue #991 review PRR-003: a revision already truncated the server
         // history and removed the rows; a dropped resend must restore the
         // original turn server-side, never silently drop it.
@@ -1240,6 +1257,10 @@ export function useSendMessage(
       // content to the transport.
       const admission = await checkSendAdmissionAsync(content);
       if (!admission.ok) {
+        // A revision dispatch owns the raised flag until sendCore takes it;
+        // this exit never reaches sendCore, so release it here (a no-op for
+        // plain dispatches, whose flag is already false).
+        if (opts?.revisionDispatch) useChatStore.setState({ isStreaming: false });
         await restoreDroppedRevision();
         setInputError(admission.message);
         return;

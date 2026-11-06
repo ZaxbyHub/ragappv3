@@ -229,8 +229,15 @@ describe("TranscriptPane double activation (issue #684)", () => {
     mockChatState.updateMessage = vi.fn();
     mockChatState.stopStreaming = vi.fn();
     mockChatState.newChat = vi.fn();
-    // The revision handlers read fresh state through getState().
+    // The revision handlers read fresh state through getState(); setState is
+    // stubbed the same way — the retry revision raises the streaming flag
+    // through it (issue #991 review PRR-003(b)).
     (useChatStore as unknown as { getState: () => typeof mockChatState }).getState = () => mockChatState;
+    (useChatStore as unknown as {
+      setState: (partial: Partial<typeof mockChatState>) => void;
+    }).setState = (partial) => {
+      Object.assign(mockChatState, partial);
+    };
 
     // removeMessagesFrom MUTATES the mock store (mirrors the revision suite).
     mockChatState.removeMessagesFrom = vi.fn((index: number) => {

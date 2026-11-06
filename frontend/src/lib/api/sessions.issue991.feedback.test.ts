@@ -43,7 +43,19 @@ function errorResponse(
     ok: false,
     status,
     statusText: `HTTP ${status}`,
-    json: () => Promise.resolve(body),
+    json: (() => {
+      // Real Response semantics: the body can be read ONCE. A second json()
+      // rejects with "body already used" — this is what makes the F-07 leg
+      // below discriminating for the retained-parse reuse.
+      let consumed = false;
+      return () => {
+        if (consumed) {
+          return Promise.reject(new TypeError("body already used"));
+        }
+        consumed = true;
+        return Promise.resolve(body);
+      };
+    })(),
     text: () => Promise.resolve(text),
   };
 }
@@ -117,9 +129,13 @@ describe("chatStream detail surfacing — feedback pins (issue #991)", () => {
       await until(() => onError.mock.calls.length > 0);
       const delivered = onError.mock.calls[0]?.[0] as Error & { status?: number };
       // The retained parse surfaces the server detail (with status attached),
-      // not the "body already used" status-only fallback.
+      // not the "body already used" status-only fallback. Removing the
+      // errorBody reuse makes the second json() reject on this consumed-body
+      // stub, so this leg fails — it pins the F-07 mechanism itself.
       expect(delivered.message).toContain("token_invalid");
       expect(delivered.status).toBe(401);
+      // token_invalid is not retryable: the silent-refresh path must not run.
+      expect(coreMocks.refreshAccessToken).not.toHaveBeenCalled();
     } finally {
       dispose?.();
     }

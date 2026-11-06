@@ -35,7 +35,13 @@ import { useAuthStore } from "@/stores/useAuthStore";
 import { useChatShellStore } from "@/stores/useChatShellStore";
 import { useSendMessage, checkSendAdmissionAsync, chatInputAdvisoryBlocked } from "@/hooks/useSendMessage";
 import { useChatHistory } from "@/hooks/useChatHistory";
-import { forkChatSession, getChatSession, truncateChatSession } from "@/lib/api";
+import {
+  forkChatSession,
+  getChatSession,
+  truncateChatSession,
+  addChatMessagesBatch,
+  type AddMessageRequest,
+} from "@/lib/api";
 import { mapSessionMessage } from "@/lib/chatMessageMapper";
 import { toast } from "sonner";
 import type { Message } from "@/stores/useChatStore";
@@ -692,7 +698,18 @@ export function TranscriptPane({ className, onSessionCreated }: TranscriptPanePr
     // strands the guard.
     if (isStreaming || revisionInFlightRef.current) return;
     revisionInFlightRef.current = true;
+    // Issue #991 review PRR-003(b) delta: raise the store's streaming flag
+    // across the destructive window so a composer submit admitted during the
+    // truncate→resend span is refused at handleSend's entry guard, rather
+    // than winning sendingRef mid-revision and racing the row removal. The
+    // flag is restored in the finally whenever this revision (not a real
+    // send) still owns it.
+    let revisionOwnsStreamingFlag = false;
+    let dispatched = false;
+    let foreignSendAdmitted = false;
     try {
+      useChatStore.setState({ isStreaming: true });
+      revisionOwnsStreamingFlag = true;
       await awaitPendingPersist();
       const { messageIds: ids, messagesById, activeChatId } = useChatStore.getState();
       let lastUserIdx = -1;
@@ -714,8 +731,8 @@ export function TranscriptPane({ className, onSessionCreated }: TranscriptPanePr
       }
 
       // Issue #991 review PRR-003(b): snapshot the transcript identity so a
-      // composer submit admitted during the truncate await (isStreaming flips
-      // true inside sendCore; newer rows append) is detected after the await —
+      // submit already in flight when the revision started (its guard read
+      // predates the raised flag) is detected after the truncate await —
       // this revision must not delete a concurrently admitted newer turn.
       const idsBeforeTruncate = ids.slice();
 
@@ -747,26 +764,64 @@ export function TranscriptPane({ className, onSessionCreated }: TranscriptPanePr
         }
       }
 
-      // Issue #991 review PRR-003(b): post-truncate re-read — if a composer
-      // submit was admitted while the truncate was in flight (isStreaming
-      // flipped true inside sendCore, or newer rows appended), abort this
-      // revision: removing rows at the stale index would delete the newer
-      // turn. The original turn stays visible; the user can retry after the
-      // newer send settles.
+      // Issue #991 review PRR-003(b): post-truncate re-read — if a submit
+      // that predates the raised flag was admitted while the truncate was in
+      // flight, abort this revision. A foreign sendCore in flight is detected
+      // via streamingMessageId (set only inside sendCore — this revision's
+      // raised isStreaming flag does not set it); appended rows are caught by
+      // the identity compare. The truncate has already removed the original
+      // turn server-side, so re-append the restore rows (server-side) before
+      // returning — the original Q&A survives reload.
       const postTruncate = useChatStore.getState();
       if (
-        postTruncate.isStreaming ||
+        postTruncate.streamingMessageId !== null ||
         postTruncate.messageIds.join("\n") !== idsBeforeTruncate.join("\n")
       ) {
-        toast.error("Retry cancelled — a newer message was sent.");
+        foreignSendAdmitted = true;
+        if (restoreRows?.length && activeChatId) {
+          try {
+            const payload: AddMessageRequest[] = restoreRows.map((m) => ({
+              role: m.role === "assistant" ? "assistant" : "user",
+              content: typeof m.content === "string" ? m.content : "",
+            }));
+            const saved = await addChatMessagesBatch(parseInt(activeChatId), payload);
+            toast.error("Retry cancelled — a newer message was sent. Your original turn was kept.");
+            // Server state reconciled; local rows are untouched by this
+            // branch (the removal never ran), and the next reload refetches
+            // the re-appended history.
+            void saved;
+          } catch (err) {
+            console.error("Failed to re-append the cancelled revision's rows:", err);
+            toast.error("Retry cancelled — a newer message was sent.");
+          }
+        } else {
+          toast.error("Retry cancelled — a newer message was sent.");
+        }
         return;
       }
 
       const history = ids.slice(0, lastUserIdx).map((id) => messagesById[id]);
       removeMessagesFrom(lastUserIdx);
-      sendDirect(userContent, history, restoreRows ? { restoreRows } : undefined);
+      dispatched = true;
+      // revisionDispatch tells sendDirect the raised streaming flag is this
+      // revision's own window protection (not a foreign send) — the
+      // synchronous guard above already proved no foreign send is in flight.
+      sendDirect(
+        userContent,
+        history,
+        restoreRows ? { restoreRows, revisionDispatch: true } : { revisionDispatch: true },
+      );
     } finally {
       revisionInFlightRef.current = false;
+      // Restore the raised flag only when this revision still owns it: a
+      // dispatched send hands flag ownership to sendCore's terminal
+      // callbacks; an admitted foreign send owns it the same way. Every
+      // other exit (blocked admission, cancelled revision, truncate
+      // failure) leaves no send in flight, so the pre-revision false is
+      // restored.
+      if (revisionOwnsStreamingFlag && !dispatched && !foreignSendAdmitted) {
+        useChatStore.setState({ isStreaming: false });
+      }
     }
   }, [isStreaming, removeMessagesFrom, sendDirect, awaitPendingPersist, reloadAfterStaleRefusal]);
 
