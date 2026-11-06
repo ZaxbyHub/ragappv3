@@ -36,11 +36,8 @@ import { useChatShellStore } from "@/stores/useChatShellStore";
 import { useSendMessage, checkSendAdmissionAsync, chatInputAdvisoryBlocked } from "@/hooks/useSendMessage";
 import { useChatHistory } from "@/hooks/useChatHistory";
 import {
-  forkChatSession,
-  getChatSession,
-  truncateChatSession,
-  addChatMessagesBatch,
-  type AddMessageRequest,
+  forkChatSession, getChatSession, truncateChatSession,
+  addChatMessagesBatch, type AddMessageRequest,
 } from "@/lib/api";
 import { mapSessionMessage } from "@/lib/chatMessageMapper";
 import { toast } from "sonner";
