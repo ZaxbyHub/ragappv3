@@ -5,9 +5,13 @@
  *
  * - C05: the surfaced detail error carries the HTTP status (`.status`).
  * - F-07: a 401 whose body was already consumed by the token-refresh probe
- *   still surfaces its detail (the retained errorBody parse is reused).
+ *   still surfaces its detail via the retained errorBody parse (exercised
+ *   with a non-null JWT so the 401 probe arm runs, then a non-retryable
+ *   `token_invalid` detail falls through to the !response.ok arm).
  */
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+let jwtAccessToken: string | null = null;
 
 const coreMocks = vi.hoisted(() => ({
   ensureCsrfToken: vi.fn(async () => "csrf"),
@@ -19,7 +23,7 @@ vi.mock("./core", () => ({
   apiClient: { get: vi.fn(), post: vi.fn(), put: vi.fn(), patch: vi.fn(), delete: vi.fn() },
   API_BASE_URL: "/api",
   get _jwtAccessToken(): string | null {
-    return null;
+    return jwtAccessToken;
   },
   getCsrfCookie: () => null,
   getCsrfToken: () => null,
@@ -53,7 +57,12 @@ async function until(predicate: () => boolean, timeoutMs = 2_000): Promise<void>
 }
 
 describe("chatStream detail surfacing — feedback pins (issue #991)", () => {
+  beforeEach(() => {
+    jwtAccessToken = null;
+  });
+
   afterEach(() => {
+    jwtAccessToken = null;
     vi.unstubAllGlobals();
     vi.clearAllMocks();
   });
@@ -81,6 +90,36 @@ describe("chatStream detail surfacing — feedback pins (issue #991)", () => {
       const delivered = onError.mock.calls[0]?.[0] as Error & { status?: number };
       expect(delivered.message).toContain("chat_message_max_chars");
       expect(delivered.status).toBe(422);
+    } finally {
+      dispose?.();
+    }
+  });
+
+  it("F-07: a 401 whose body the refresh probe consumed still surfaces the retained detail", async () => {
+    // Non-null JWT makes the 401 probe arm run and consume the body; the
+    // detail is `token_invalid` (not retryable), so the flow falls through
+    // to the !response.ok arm with errorBody already parsed.
+    jwtAccessToken = "expired-token";
+    const fetchMock = vi.fn(() =>
+      Promise.resolve(
+        errorResponse(401, { detail: "token_invalid: please sign in again" }),
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const onError = vi.fn();
+    let dispose: (() => void) | undefined;
+    try {
+      dispose = chatStream(
+        [{ role: "user", content: "hello" }] as never,
+        { onError } as never,
+        7,
+      );
+      await until(() => onError.mock.calls.length > 0);
+      const delivered = onError.mock.calls[0]?.[0] as Error & { status?: number };
+      // The retained parse surfaces the server detail (with status attached),
+      // not the "body already used" status-only fallback.
+      expect(delivered.message).toContain("token_invalid");
+      expect(delivered.status).toBe(401);
     } finally {
       dispose?.();
     }

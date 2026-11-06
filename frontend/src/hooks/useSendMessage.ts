@@ -1195,18 +1195,44 @@ export function useSendMessage(
       historyMessages: Message[],
       opts?: { restoreRows?: Message[] }
     ) => {
-      const restoreDroppedRevision = () => {
+      const restoreDroppedRevision = async () => {
         if (!opts?.restoreRows?.length) return;
-        const { addMessage } = useChatStore.getState();
-        for (const row of opts.restoreRows) addMessage(row);
-        toast.error("Couldn't resend the message — your original turn was restored.");
+        try {
+          // Issue #991 review delta: the server truncate already succeeded, so
+          // a local-only restore dies on reload. Re-append the rows server-side
+          // (same batch shape as restoreRevisedTurn) and mirror locally; the
+          // client rows keep their local ids until the next reload reconciles.
+          const activeChat = useChatStore.getState().activeChatId;
+          const sessionId = activeChat ? parseInt(activeChat) : NaN;
+          if (Number.isNaN(sessionId)) throw new Error("no active session");
+          const payload: AddMessageRequest[] = opts.restoreRows.map((m) => ({
+            role: m.role === "assistant" ? "assistant" : "user",
+            content: typeof m.content === "string" ? m.content : "",
+          }));
+          const saved = await addChatMessagesBatch(sessionId, payload);
+          for (const row of opts.restoreRows) {
+            useChatStore.getState().addMessage({ ...row, saveState: "saving" });
+          }
+          const tailIds = useChatStore.getState().messageIds.slice(-opts.restoreRows.length);
+          tailIds.forEach((localId, i) => {
+            const save = saved[i];
+            if (save) {
+              useChatStore.getState().replaceMessageId?.(localId, save);
+            }
+          });
+          await refreshHistory(true);
+          toast.error("Couldn't resend the message — your original turn was restored.");
+        } catch (err) {
+          console.error("Failed to restore the dropped revision:", err);
+          toast.error("Couldn't restore the original turn after the failed retry.");
+        }
       };
       const { isStreaming: currentIsStreaming } = useChatStore.getState();
       if (currentIsStreaming || sendingRef.current) {
         // Issue #991 review PRR-003: a revision already truncated the server
         // history and removed the rows; a dropped resend must restore the
-        // original turn, never silently drop it.
-        restoreDroppedRevision();
+        // original turn server-side, never silently drop it.
+        await restoreDroppedRevision();
         return;
       }
       // Issue #991 backstop gate: the retry/edit entries validate before any
@@ -1214,14 +1240,14 @@ export function useSendMessage(
       // content to the transport.
       const admission = await checkSendAdmissionAsync(content);
       if (!admission.ok) {
-        restoreDroppedRevision();
+        await restoreDroppedRevision();
         setInputError(admission.message);
         return;
       }
       const admitted = await sendCore(content, historyMessages, false, opts);
-      if (!admitted) restoreDroppedRevision();
+      if (!admitted) await restoreDroppedRevision();
     },
-    [setInputError, sendCore]
+    [setInputError, sendCore, refreshHistory]
   );
 
   const handleStop = useCallback(() => {

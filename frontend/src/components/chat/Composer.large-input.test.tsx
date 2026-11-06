@@ -292,7 +292,7 @@ describe("Composer large-input handling (issue #616)", () => {
     expect(storage.has(draftKey("42"))).toBe(false);
   });
 
-  it("accepts 20,000-char input for send and visibly rejects 100,001", () => {
+  it("accepts a 20,000-char input for send and visibly rejects 20,001", () => {
     const onSend = vi.fn();
     // Render-output assertions pre-set input (the mocked store does not
     // subscribe, so change events alone do not re-render).

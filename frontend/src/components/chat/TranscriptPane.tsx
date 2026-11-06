@@ -713,6 +713,12 @@ export function TranscriptPane({ className, onSessionCreated }: TranscriptPanePr
         return;
       }
 
+      // Issue #991 review PRR-003(b): snapshot the transcript identity so a
+      // composer submit admitted during the truncate await (isStreaming flips
+      // true inside sendCore; newer rows append) is detected after the await —
+      // this revision must not delete a concurrently admitted newer turn.
+      const idsBeforeTruncate = ids.slice();
+
       // Issue #684 (T1-13-S-08): snapshot the rows this revision removes so
       // an admission-rejected replacement (which writes nothing server-side)
       // can restore them instead of losing the original Q&A.
@@ -739,6 +745,21 @@ export function TranscriptPane({ className, onSessionCreated }: TranscriptPanePr
           }
           return;
         }
+      }
+
+      // Issue #991 review PRR-003(b): post-truncate re-read — if a composer
+      // submit was admitted while the truncate was in flight (isStreaming
+      // flipped true inside sendCore, or newer rows appended), abort this
+      // revision: removing rows at the stale index would delete the newer
+      // turn. The original turn stays visible; the user can retry after the
+      // newer send settles.
+      const postTruncate = useChatStore.getState();
+      if (
+        postTruncate.isStreaming ||
+        postTruncate.messageIds.join("\n") !== idsBeforeTruncate.join("\n")
+      ) {
+        toast.error("Retry cancelled — a newer message was sent.");
+        return;
       }
 
       const history = ids.slice(0, lastUserIdx).map((id) => messagesById[id]);
