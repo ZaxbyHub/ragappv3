@@ -329,9 +329,8 @@ describe("TranscriptPane cancel-restore (issue #991 review PRR-003(b))", () => {
       await new Promise((r) => setTimeout(r, 0));
     });
     useChatStore.setState({ input: "foreign question" });
-    let foreignP: Promise<unknown> | null = null;
     await act(async () => {
-      foreignP = hook.result.current.handleSend();
+      hook.result.current.handleSend();
     });
     await act(async () => {
       await new Promise((r) => setTimeout(r, 0));
@@ -389,7 +388,6 @@ describe("TranscriptPane cancel-restore (issue #991 review PRR-003(b))", () => {
       expect(useChatStore.getState().isStreaming).toBe(false);
     });
     expect(apiMocks.chatStream).toHaveBeenCalledTimes(1);
-    void foreignP;
   });
 
   it("Leg B: a second Retry during a prior retry's restore cancels and STILL lowers the streaming flag (no live send)", async () => {
