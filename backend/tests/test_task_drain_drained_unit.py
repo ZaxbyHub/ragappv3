@@ -343,7 +343,9 @@ def test_expected_client_error_logs_info_without_traceback(tmp_path: Path) -> No
         f"expected client errors must log at INFO, never ERROR; levels: "
         f"{[r.levelname for r in client_recs]}"
     )
-    assert not any("Traceback" in rec.getMessage() for rec in client_recs)
+    assert all(r.exc_info is None for r in client_recs), (
+        "the INFO client-error branch must NOT carry exc_info"
+    )
 
 
 def test_unexpected_error_logs_error_with_traceback(tmp_path: Path) -> None:

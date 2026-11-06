@@ -444,7 +444,9 @@ class DocumentRetrievalService:
 
         sources: List[RAGSource] = []
         distances: List[float] = []
-        score_distances: List[float] = []
+        distance_kind: List[float] = []
+        score_kind: List[float] = []
+        fts_count = 0
         # Drop-site attribution for the no_match diagnostic (PR #1077 review
         # PRR-015): FTS ``_score`` rows are gated by the score FLOOR, not by
         # ``max_distance_threshold`` — the log must name the gate that fired.
@@ -490,7 +492,9 @@ class DocumentRetrievalService:
             # FTS ``_score`` by distance polarity (latent inversion flagged
             # by both swarm-review shards on PR #1077 — no current producer
             # emits that shape, but the polarity would silently invert if
-            # one ever did).
+            # one ever did). With the value-None key AND no score keys the
+            # record resolves through the 1.0 default and is kept — identical
+            # to the neither-key shape (delta-review r2, intent confirmed).
             has_distance = distance is not None
             if not has_distance:
                 # Issue #1070 widened read: the real LanceDB FTS ``_score``
@@ -501,12 +505,18 @@ class DocumentRetrievalService:
                     distance = 1.0
 
             distances.append(distance)
-            if fts_sourced:
-                # PRR-015 (PR #1077 review): FTS ``_score`` values are BM25
-                # magnitudes on a different scale than cosine distances —
-                # the summary below reports the two kinds separately so the
-                # min/max/mean stays unit-consistent.
-                score_distances.append(distance)
+            if has_distance:
+                distance_kind.append(distance)
+            else:
+                # PRR-015 (PR #1077 review): the score tier (FTS ``_score``
+                # BM25 magnitudes, legacy ``score``, or the 1.0 default) is a
+                # different scale than cosine distances — the summary reports
+                # the two kinds separately so min/max/mean stays
+                # unit-consistent. ``fts_sourced`` splits the score tier's
+                # own count out in the message.
+                score_kind.append(distance)
+                if fts_sourced:
+                    fts_count += 1
 
             threshold = self.max_distance_threshold
             legacy_mode = False
@@ -582,35 +592,52 @@ class DocumentRetrievalService:
         if distances:
             initial_count = len(distances)
             filtered_count = len(sources)
-            min_dist = min(distances)
-            max_dist = max(distances)
-            mean_dist = sum(distances) / len(distances)
 
-            if score_distances:
-                # Distance-kind rows and FTS ``_score`` rows report separate
-                # stats: one min/max/mean over both scales reads as a single
-                # distribution when it is two (PR #1077 review PRR-015).
-                score_min = min(score_distances)
-                score_max = max(score_distances)
-                score_mean = sum(score_distances) / len(score_distances)
+            def _stats(values: List[float]) -> Tuple[float, float, float]:
+                return min(values), max(values), sum(values) / len(values)
+
+            if distance_kind and score_kind:
+                d_min, d_max, d_mean = _stats(distance_kind)
+                s_min, s_max, s_mean = _stats(score_kind)
                 logger.info(
                     "Vector search: initial=%d, filtered=%d, "
                     "distance min=%.3f, max=%.3f, mean=%.3f (n=%d), "
-                    "fts_score min=%.3f, max=%.3f, mean=%.3f (n=%d), "
+                    "score min=%.3f, max=%.3f, mean=%.3f (n=%d, fts=%d), "
                     "max_distance_threshold=%.3f",
                     initial_count,
                     filtered_count,
-                    min_dist,
-                    max_dist,
-                    mean_dist,
-                    initial_count - len(score_distances),
-                    score_min,
-                    score_max,
-                    score_mean,
-                    len(score_distances),
+                    d_min,
+                    d_max,
+                    d_mean,
+                    len(distance_kind),
+                    s_min,
+                    s_max,
+                    s_mean,
+                    len(score_kind),
+                    fts_count,
+                    self.max_distance_threshold,
+                )
+            elif score_kind:
+                # Score-tier rows only (FTS/legacy/1.0): a distance-kind
+                # statistic over them would mislabel the scale (PRR-015).
+                s_min, s_max, s_mean = _stats(score_kind)
+                logger.info(
+                    "Vector search: initial=%d, filtered=%d, "
+                    "score min=%.3f, max=%.3f, mean=%.3f (n=%d, fts=%d), "
+                    "max_distance_threshold=%.3f",
+                    initial_count,
+                    filtered_count,
+                    s_min,
+                    s_max,
+                    s_mean,
+                    len(score_kind),
+                    fts_count,
                     self.max_distance_threshold,
                 )
             else:
+                min_dist = min(distance_kind)
+                max_dist = max(distance_kind)
+                mean_dist = sum(distance_kind) / len(distance_kind)
                 logger.info(
                     "Vector search: initial=%d, filtered=%d, min=%.3f, max=%.3f, mean=%.3f, threshold=%.3f",
                     initial_count,

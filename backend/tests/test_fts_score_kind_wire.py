@@ -219,3 +219,50 @@ async def test_score_gated_no_match_names_the_floor(caplog) -> None:
     assert "exceeded max_distance_threshold" not in msg, (
         f"the distance-gate wording must not fire for score-only drops; got: {msg!r}"
     )
+
+
+async def test_summary_reports_kinds_separately(caplog) -> None:
+    """PRR-015 r2: the INFO summary must never fold score-tier values into a
+    distance-kind statistic — mixed pools report both kinds separately, and
+    score-only pools print no distance-kind numbers at all."""
+    import logging as _logging
+
+    svc = DocumentRetrievalService(
+        vector_store=None,
+        max_distance_threshold=0.75,
+        retrieval_top_k=5,
+        retrieval_window=0,
+    )
+    with caplog.at_level(_logging.INFO, logger="app.services.document_retrieval"):
+        await svc.filter_relevant(
+            [
+                {"_distance": 0.2, "text": "dense", "file_id": "f1"},
+                {"_score": 1.87, "text": "fts", "file_id": "f2"},
+            ]
+        )
+    mixed = [r for r in caplog.records if "distance min=" in r.getMessage()]
+    assert mixed, f"mixed-pool summary line missing; records: {[r.getMessage() for r in caplog.records]}"
+    msg = mixed[-1].getMessage()
+    assert "(n=1, fts=1)" in msg, f"score bucket must be n=1 with fts=1; got: {msg!r}"
+    # The distance bucket must be distance-ONLY: its max is the dense value,
+    # not the larger FTS magnitude (the r2 fold-the-scales defect).
+    assert "distance min=0.200, max=0.200, mean=0.200 (n=1)" in msg, f"got: {msg!r}"
+
+    caplog.clear()
+    svc2 = DocumentRetrievalService(
+        vector_store=None,
+        max_distance_threshold=0.75,
+        retrieval_top_k=5,
+        retrieval_window=0,
+    )
+    with caplog.at_level(_logging.INFO, logger="app.services.document_retrieval"):
+        await svc2.filter_relevant(
+            [{"_score": 1.87, "text": "fts-only", "file_id": "f3"}]
+        )
+    score_only = [r for r in caplog.records if "Vector search" in r.getMessage()]
+    assert score_only, "score-only summary line missing"
+    msg2 = score_only[-1].getMessage()
+    assert "distance min" not in msg2, (
+        f"score-only pool must not print distance-kind stats; got: {msg2!r}"
+    )
+    assert "score min=" in msg2 and "(n=1" in msg2, f"got: {msg2!r}"
