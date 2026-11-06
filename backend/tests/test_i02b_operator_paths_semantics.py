@@ -315,6 +315,38 @@ class TestCorruptDatabaseKeepsExitFive(unittest.TestCase):
             finally:
                 mod.sqlite3.connect = real_connect  # type: ignore[attr-defined]
 
+    def test_non_lock_open_failure_gets_not_a_lock_message(self):
+        """A non-lock OperationalError (permission/read-only open failure)
+        keeps the underlying error but must NOT be advised as a writer lock
+        (pr1081-20261106 PRR-006; the delta reviewer's revert-probe nit)."""
+        import tempfile
+
+        mod = _load_migrate_module()
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            lance = self._mk(tmp)
+            app_db = tmp / "app.db"
+            conn = sqlite3.connect(str(app_db))
+            conn.execute("CREATE TABLE files (id INTEGER PRIMARY KEY)")
+            conn.commit()
+            conn.close()
+
+            real_connect = sqlite3.connect
+
+            def denied_connect(*args, **kwargs):
+                raise sqlite3.OperationalError("unable to open database file")
+
+            mod.sqlite3.connect = denied_connect  # type: ignore[attr-defined]
+            try:
+                with self.assertRaises(mod.MigrationRefused) as ctx:
+                    mod.run_migration(lance, app_db, force=True)
+                message = str(ctx.exception)
+                self.assertIn("not a writer lock", message)
+                self.assertIn("unable to open database file", message)
+                self.assertNotIn("write lock", message)
+            finally:
+                mod.sqlite3.connect = real_connect  # type: ignore[attr-defined]
+
     def _mk(self, tmp: Path) -> Path:
         lance = tmp / "lancedb"
         lance.mkdir()

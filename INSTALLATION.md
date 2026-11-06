@@ -402,8 +402,9 @@ sudo chown -R 1000:1000 /path/to/your/data
 ```
 
 Skip this and startup fails with a message naming the directory, the current
-uid, and the owner uid, together with this exact fix. Hosts without an NVIDIA
-GPU: see [CPU-only hosts](README.md#cpu-only-hosts) for the compose override.
+uid, and the owner uid, together with the ownership remediation. Hosts without
+an NVIDIA GPU: see [CPU-only hosts](README.md#cpu-only-hosts) for the compose
+override.
 
 #### Step 4: Start the Stack
 

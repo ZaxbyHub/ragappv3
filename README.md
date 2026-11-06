@@ -187,7 +187,7 @@ sudo chown -R 1000:1000 /path/to/your/data
 ```
 
 Skip this and startup fails with a message naming the directory, the current
-uid, and the owner uid, with this exact fix in hand.
+uid, and the owner uid, together with the ownership remediation.
 
 ### 2. Start Your Inference Endpoint
 

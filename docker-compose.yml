@@ -253,12 +253,13 @@ services:
       # ..._compose_literal_values.py).
       # ------------------------------------------------------------------
       - EVAL_ENABLED
-      # Concurrency: INERT in the shipped container — the image CMD pins
-      # `--workers 1` (issue #748), and uvicorn reads this env only when
-      # --workers is absent, so the container always runs a single worker
-      # and the health module's multi-worker cache guard never fires here.
-      # The knob stays forwarded for bare-metal/native runs that start
-      # uvicorn without that flag.
+      # Concurrency: the image CMD pins `--workers 1` (issue #748) and
+      # uvicorn reads this env only when --workers is absent, so the
+      # container always runs a single worker. The health module's
+      # multi-worker cache guard still keys on this env (a value != 1 emits
+      # the per-worker-cache warning even in the single-worker container).
+      # Compose forwarding cannot reach bare-metal/native uvicorn runs —
+      # set the env in the process environment for those.
       - WEB_CONCURRENCY=${WEB_CONCURRENCY:-1}
       # Shared inference admission + telemetry (issue #518, E3). Budgets
       # default generous (see .env.example); ADMISSION_STORE_URL empty =
