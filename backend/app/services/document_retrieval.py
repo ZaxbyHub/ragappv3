@@ -444,6 +444,7 @@ class DocumentRetrievalService:
 
         sources: List[RAGSource] = []
         distances: List[float] = []
+        score_distances: List[float] = []
         # Drop-site attribution for the no_match diagnostic (PR #1077 review
         # PRR-015): FTS ``_score`` rows are gated by the score FLOOR, not by
         # ``max_distance_threshold`` — the log must name the gate that fired.
@@ -500,6 +501,12 @@ class DocumentRetrievalService:
                     distance = 1.0
 
             distances.append(distance)
+            if fts_sourced:
+                # PRR-015 (PR #1077 review): FTS ``_score`` values are BM25
+                # magnitudes on a different scale than cosine distances —
+                # the summary below reports the two kinds separately so the
+                # min/max/mean stays unit-consistent.
+                score_distances.append(distance)
 
             threshold = self.max_distance_threshold
             legacy_mode = False
@@ -579,15 +586,40 @@ class DocumentRetrievalService:
             max_dist = max(distances)
             mean_dist = sum(distances) / len(distances)
 
-            logger.info(
-                "Vector search: initial=%d, filtered=%d, min=%.3f, max=%.3f, mean=%.3f, threshold=%.3f",
-                initial_count,
-                filtered_count,
-                min_dist,
-                max_dist,
-                mean_dist,
-                self.max_distance_threshold,
-            )
+            if score_distances:
+                # Distance-kind rows and FTS ``_score`` rows report separate
+                # stats: one min/max/mean over both scales reads as a single
+                # distribution when it is two (PR #1077 review PRR-015).
+                score_min = min(score_distances)
+                score_max = max(score_distances)
+                score_mean = sum(score_distances) / len(score_distances)
+                logger.info(
+                    "Vector search: initial=%d, filtered=%d, "
+                    "distance min=%.3f, max=%.3f, mean=%.3f (n=%d), "
+                    "fts_score min=%.3f, max=%.3f, mean=%.3f (n=%d), "
+                    "max_distance_threshold=%.3f",
+                    initial_count,
+                    filtered_count,
+                    min_dist,
+                    max_dist,
+                    mean_dist,
+                    initial_count - len(score_distances),
+                    score_min,
+                    score_max,
+                    score_mean,
+                    len(score_distances),
+                    self.max_distance_threshold,
+                )
+            else:
+                logger.info(
+                    "Vector search: initial=%d, filtered=%d, min=%.3f, max=%.3f, mean=%.3f, threshold=%.3f",
+                    initial_count,
+                    filtered_count,
+                    min_dist,
+                    max_dist,
+                    mean_dist,
+                    self.max_distance_threshold,
+                )
 
         # Apply group-aware dedup before window expansion (Issue #12)
         if settings.new_dedup_policy and sources:

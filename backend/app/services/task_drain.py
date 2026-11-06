@@ -209,8 +209,11 @@ async def drain_commit_audit(
       it): logged as unrecoverable (no retry, row state unverified — the
       audit may or may not have written depending on where the cancellation
       landed); if no caller cancellation was absorbed this helper RETURNS
-      normally after logging; an absorbed caller cancellation still
-      re-raises ``CancelledError`` after the log.
+      normally after logging; if the caller itself carries a pending
+      cancellation request (the simultaneous-teardown race, PRR-006) the
+      pending cancellation is re-raised so a delivered cancellation never
+      vanishes; an absorbed caller cancellation still re-raises
+      ``CancelledError`` after the log.
     """
 
     async def _unit() -> None:
@@ -245,7 +248,10 @@ async def drained_unit(unit: Coroutine) -> None:
       and the audit tail;
     - an audit-write failure inside the unit is logged, never raised
       (``drain_audit`` best-effort);
-    - an inner-unit cancellation (loop teardown): loud warning + return.
+    - an inner-unit cancellation (loop teardown): loud warning + return —
+      except the simultaneous-teardown race (the caller carries a pending
+      cancellation request), where the caller's cancellation is re-raised
+      (PRR-006).
     """
     cancelled, error = await drain_await(asyncio.ensure_future(unit))
     await _settle_drained(cancelled, error, context="drained_unit")

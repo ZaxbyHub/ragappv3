@@ -191,3 +191,31 @@ async def test_present_but_none_distance_resolves_by_score_polarity() -> None:
         f"the kept source must carry the per-source fts kind (got {kept[0].score_type!r})"
     )
     assert kept[0].score == pytest.approx(0.8)
+
+
+async def test_score_gated_no_match_names_the_floor(caplog) -> None:
+    """PRR-015 (PR #1077 review): when every drop came through the score
+    floor, the no_match log must name THAT gate — not
+    ``max_distance_threshold`` (wrong constant, wrong polarity)."""
+    import logging as _logging
+
+    svc = DocumentRetrievalService(
+        vector_store=None,
+        max_distance_threshold=0.75,
+        retrieval_top_k=5,
+        retrieval_window=0,
+    )
+    with caplog.at_level(_logging.INFO, logger="app.services.document_retrieval"):
+        out = await svc.filter_relevant(
+            [{"_score": 0.1, "text": "weak", "file_id": "f1"}]
+        )
+    assert out == [] and svc.no_match is True
+    no_match_recs = [r for r in caplog.records if "no_match flag" in r.getMessage()]
+    assert no_match_recs, f"the no_match line must fire; records: {[r.getMessage() for r in caplog.records]}"
+    msg = no_match_recs[-1].getMessage()
+    assert "score floor" in msg and "floor=0.500" in msg, (
+        f"the score-gated no_match line must name the score floor; got: {msg!r}"
+    )
+    assert "exceeded max_distance_threshold" not in msg, (
+        f"the distance-gate wording must not fire for score-only drops; got: {msg!r}"
+    )

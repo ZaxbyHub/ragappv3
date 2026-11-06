@@ -36,9 +36,11 @@ os.environ["ADMIN_SECRET_TOKEN"] = (
     "test-admin-secret-token-0123456789abcdef0123456789abcdef"
 )
 
+import logging  # noqa: E402
 import sqlite3  # noqa: E402
 from contextlib import contextmanager  # noqa: E402
 from pathlib import Path  # noqa: E402
+from typing import Any  # noqa: E402
 
 from app.services.task_drain import drain_audit, drained_unit  # noqa: E402
 
@@ -304,6 +306,78 @@ def test_simultaneous_teardown_race_caller_cancel_wins(tmp_path: Path) -> None:
     )
 
 
+
+
+def test_expected_client_error_logs_info_without_traceback(tmp_path: Path) -> None:
+    """PRR-003 (PR #1077 review): a unit failure shaped like an expected
+    client error (a ``status_code`` < 500, e.g. a duplicate-username 409)
+    logs at INFO WITHOUT a stack trace — never at alert grade."""
+    fastapi_exc: Any = None
+    try:
+        from fastapi import HTTPException as _FastAPIHTTPException
+
+        fastapi_exc = _FastAPIHTTPException
+    except ImportError:  # pragma: no cover - fastapi is a hard dep in app
+        fastapi_exc = None
+    assert fastapi_exc is not None, "fastapi must be importable in app tests"
+
+    async def go() -> str:
+        async def _unit() -> None:
+            raise fastapi_exc(status_code=409, detail="username taken")
+
+        try:
+            await drained_unit(_unit())
+            return "returned"
+        except fastapi_exc:
+            return "raised"
+
+    with self_caplog() as records:
+        outcome = _run(go())
+    assert outcome == "raised", f"the 409 must propagate (got {outcome!r})"
+    client_recs = [r for r in records if "unit_client_error" in r.getMessage()]
+    assert client_recs, (
+        f"the client-error branch must log unit_client_error; "
+        f"records: {[r.getMessage() for r in records]}"
+    )
+    assert all(r.levelno == logging.INFO for r in client_recs), (
+        f"expected client errors must log at INFO, never ERROR; levels: "
+        f"{[r.levelname for r in client_recs]}"
+    )
+    assert not any("Traceback" in rec.getMessage() for rec in client_recs)
+
+
+def test_unexpected_error_logs_error_with_traceback(tmp_path: Path) -> None:
+    """PRR-003 control: a NON-client error (no status_code, e.g. a
+    RuntimeError) logs at ERROR WITH exc_info — the alert-grade channel is
+    reserved for genuinely unexpected failures."""
+    boom = _Boom("unit blew up unexpectedly")
+
+    async def go() -> str:
+        async def _unit() -> None:
+            raise boom
+
+        try:
+            await drained_unit(_unit())
+            return "returned"
+        except _Boom:
+            return "raised"
+
+    with self_caplog() as records:
+        outcome = _run(go())
+    assert outcome == "raised"
+    error_recs = [r for r in records if "unit_failed" in r.getMessage()]
+    assert error_recs, (
+        f"the unexpected-error branch must log unit_failed; "
+        f"records: {[r.getMessage() for r in records]}"
+    )
+    assert all(r.levelno == logging.ERROR for r in error_recs), (
+        f"unexpected errors must log at ERROR; levels: "
+        f"{[r.levelname for r in error_recs]}"
+    )
+    assert any(r.exc_info for r in error_recs), (
+        "the ERROR branch must carry exc_info (the traceback is the "
+        "operator's diagnostic)"
+    )
 
 
 class _Boom(RuntimeError):
