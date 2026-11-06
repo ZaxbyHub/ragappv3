@@ -240,6 +240,71 @@ def test_inner_unit_cancellation_logged_returns_normally(tmp_path: Path) -> None
         f"row_state_unverified; records: {[r.getMessage() for r in records]}"
     )
 
+def test_simultaneous_teardown_race_caller_cancel_wins(tmp_path: Path) -> None:
+    """The unit task's own cancellation lands while the CALLER task also
+    carries a pending (not yet delivered) cancellation request: the caller's
+    cancellation must WIN — re-raised, never swallowed into a normal return
+    (PR #1077 review PRR-006; the pre-fix settle returned normally and every
+    converted handler would have run post-unit code on pre-initialized
+    values)."""
+    real_ensure_future = asyncio.ensure_future
+
+    async def go() -> str:
+        started = asyncio.Event()
+        state: dict = {"unit_task": None}
+
+        async def _unit() -> None:
+            started.set()
+            await asyncio.Event().wait()  # suspend forever
+
+        def _capturing_ensure_future(coro):
+            task = real_ensure_future(coro)
+            if coro.__name__ == "_unit_body":
+                state["unit_task"] = task
+            return task
+
+        async def go_inner() -> str:
+            caller = asyncio.current_task()
+            assert caller is not None
+
+            async def _unit_body() -> None:
+                started.set()
+                await asyncio.Event().wait()
+
+            async def _cancel_both_soon() -> None:
+                await started.wait()
+                # Tick 1: cancel the UNIT task (its own CancelledError will
+                # settle the drained unit through the error path).
+                unit_task = state["unit_task"]
+                assert unit_task is not None
+                unit_task.cancel()
+                await asyncio.sleep(0)
+                # Tick 2: arm the CALLER's cancellation in the same window —
+                # pending (cancelling() > 0) but not yet delivered when the
+                # unit's CancelledError reaches _settle_drained.
+                caller.cancel()
+                await asyncio.sleep(0)
+
+            real_ensure_future(_cancel_both_soon())
+            asyncio.ensure_future = _capturing_ensure_future
+            try:
+                await drained_unit(_unit_body())
+                return "returned"
+            except asyncio.CancelledError:
+                return "cancelled"
+            finally:
+                asyncio.ensure_future = real_ensure_future
+
+        return await go_inner()
+
+    outcome = _run(go())
+    assert outcome == "cancelled", (
+        "simultaneous-teardown race: the CALLER's pending cancellation must "
+        f"be re-raised, never swallowed into a normal return (got {outcome!r})"
+    )
+
+
+
 
 class _Boom(RuntimeError):
     pass

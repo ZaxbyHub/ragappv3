@@ -110,14 +110,26 @@ async def _settle_drained(
     ``drain_await`` over one unit task plus this settlement:
 
     - compound — the unit failed AND a caller cancellation was absorbed:
-      the unit's error is logged loudly (``exc_info``) and the delivered
+      the unit's error is logged at its own severity (expected client
+      errors with a ``status_code`` < 500 at INFO without a traceback;
+      everything else at ERROR with ``exc_info``) and the delivered
       cancellation WINS (``CancelledError`` re-raised after the log);
     - unit failure alone: re-raised with its original type;
     - the unit task itself cancelled (loop teardown — nothing else
       cancels it): logged as unrecoverable (no retry, row state
       unverified); with no absorbed caller cancellation the helper
-      RETURNS normally after logging;
+      RETURNS normally after logging — unless the caller itself carries
+      a pending cancellation request (the simultaneous-teardown race),
+      in which case the pending cancellation is re-raised so a delivered
+      cancellation never vanishes;
     - absorbed caller cancellation: ``CancelledError`` re-raised.
+
+    Expected client errors (an HTTPException-shaped failure whose
+    ``status_code`` is < 500 — duplicate-username 409s, vault rename
+    409s, draft-room conflict 409s) are logged at INFO WITHOUT a stack
+    trace: they are routine request outcomes, not alert-grade failures
+    (swarm review PRR-003 on PR #1077 — at ERROR with ``exc_info`` they
+    inflated error dashboards for every routine conflict).
     """
     if error is not None:
         if isinstance(error, asyncio.CancelledError):
@@ -127,13 +139,30 @@ async def _settle_drained(
                 context,
                 context,
             )
+            # Simultaneous-teardown race (swarm review PRR-006 on PR
+            # #1077): the caller's cancellation was requested but never
+            # DELIVERED to drain_await before the unit task's own
+            # cancellation won — re-raise it so a delivered cancellation
+            # never vanishes into a normal return.
+            pending = asyncio.current_task().cancelling()
+            if pending or cancelled:
+                raise asyncio.CancelledError
         else:
-            logger.error(
-                "%s_unit_failed reason=%s",
-                context,
-                type(error).__name__,
-                exc_info=error,
-            )
+            status_code = getattr(error, "status_code", None)
+            if isinstance(status_code, int) and status_code < 500:
+                logger.info(
+                    "%s_unit_client_error reason=%s status=%s",
+                    context,
+                    type(error).__name__,
+                    status_code,
+                )
+            else:
+                logger.error(
+                    "%s_unit_failed reason=%s",
+                    context,
+                    type(error).__name__,
+                    exc_info=error,
+                )
             if not cancelled:
                 raise error
     if cancelled:

@@ -157,3 +157,37 @@ async def test_valid_rerank_score_override_reverts_to_global_typing() -> None:
     )
     wire = svc.to_source_metadata(kept[0], source_index=1)
     assert "score_type" not in wire
+
+
+async def test_present_but_none_distance_resolves_by_score_polarity() -> None:
+    """A record with ``_distance: None`` AND a real ``_score`` must resolve
+    through the higher-is-better score tier, never gated by distance
+    polarity (both swarm-review shards on PR #1077 flagged the latent
+    inversion: no current producer emits the shape, but the polarity would
+    silently invert if one ever did)."""
+    svc = DocumentRetrievalService(
+        vector_store=None,
+        max_distance_threshold=0.75,
+        retrieval_top_k=5,
+        retrieval_window=0,
+    )
+    # _score 0.1 is BELOW the 0.5 fallback floor: score polarity DROPS it
+    # (distance polarity would have KEPT it — 0.1 < 0.75 is not >).
+    dropped = await svc.filter_relevant(
+        [{"_distance": None, "_score": 0.1, "text": "weak", "file_id": "f1"}]
+    )
+    assert dropped == [], (
+        "a present-but-None _distance must gate the FTS _score by the SCORE "
+        f"floor, not by distance polarity (kept: {dropped!r})"
+    )
+    assert svc.no_match is True
+
+    # _score 0.8 is ABOVE the floor: kept, and its per-source kind rides.
+    kept = await svc.filter_relevant(
+        [{"_distance": None, "_score": 0.8, "text": "strong", "file_id": "f2"}]
+    )
+    assert len(kept) == 1, f"an above-floor _score must be kept (got {kept!r})"
+    assert kept[0].score_type == "fts", (
+        f"the kept source must carry the per-source fts kind (got {kept[0].score_type!r})"
+    )
+    assert kept[0].score == pytest.approx(0.8)

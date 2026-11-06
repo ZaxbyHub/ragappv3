@@ -314,6 +314,13 @@ def _no_distance_row_score(record: Dict[str, Any]) -> Tuple[Any, bool]:
     carries a usable number (callers apply their own default), and
     ``fts_sourced`` is True exactly when the winning value came from
     ``_score`` — the per-source "fts" score kind is set only then.
+
+    Tier contract: the first PRESENT (non-None) key wins, unchanged —
+    a numeric 0/0.0 IS a value, and a present-but-None key falls through
+    to the next tier. The only production producer (LanceDB 0.40 FTS)
+    emits a Python ``float`` ``_score``; the read itself is deliberately
+    validation-free (any non-None value is returned as-is, exactly like
+    the legacy ``score`` read it replaced).
     """
     raw = record.get("_score")
     if raw is not None:
@@ -437,6 +444,12 @@ class DocumentRetrievalService:
 
         sources: List[RAGSource] = []
         distances: List[float] = []
+        # Drop-site attribution for the no_match diagnostic (PR #1077 review
+        # PRR-015): FTS ``_score`` rows are gated by the score FLOOR, not by
+        # ``max_distance_threshold`` — the log must name the gate that fired.
+        score_gated_drops = 0
+        distance_gated_drops = 0
+        last_score_floor = FALLBACK_SCORE_FLOOR
 
         input_count = len(results)
         logger.debug(
@@ -468,10 +481,17 @@ class DocumentRetrievalService:
                     )
                     continue
 
-            has_distance = "_distance" in record
             distance = record.get("_distance")
             fts_sourced = False
-            if distance is None:
+            # A PRESENT-but-None ``_distance`` is treated as no-distance so
+            # the value resolves through the higher-is-better score tier:
+            # keying ``has_distance`` on key presence alone would gate an
+            # FTS ``_score`` by distance polarity (latent inversion flagged
+            # by both swarm-review shards on PR #1077 — no current producer
+            # emits that shape, but the polarity would silently invert if
+            # one ever did).
+            has_distance = distance is not None
+            if not has_distance:
                 # Issue #1070 widened read: the real LanceDB FTS ``_score``
                 # outranks the legacy ``score`` key, which outranks the
                 # historical 1.0 default (see _no_distance_row_score).
@@ -495,6 +515,8 @@ class DocumentRetrievalService:
                     # Cosine-distance semantics: max threshold (issue #36
                     # calibration, 0.75 for the Harrier scale).
                     should_skip = distance > threshold
+                    if should_skip:
+                        distance_gated_drops += 1
                 else:
                     # Similarity-score fallback (higher = better). Default mode
                     # uses the dedicated floor — NOT the distance max; see
@@ -503,6 +525,9 @@ class DocumentRetrievalService:
                     # resolving the floor from relevance_threshold.
                     score_floor = threshold if legacy_mode else FALLBACK_SCORE_FLOOR
                     should_skip = distance < score_floor
+                    if should_skip:
+                        score_gated_drops += 1
+                        last_score_floor = score_floor
 
             if should_skip:
                 continue
@@ -587,12 +612,27 @@ class DocumentRetrievalService:
 
         # When all results exceed threshold, signal no_match instead of returning top-k
         if input_count > 0 and len(sources) == 0:
-            logger.info(
-                "All %d results exceeded max_distance_threshold=%.3f. "
-                "Returning empty list with no_match flag.",
-                input_count,
-                self.max_distance_threshold,
-            )
+            if score_gated_drops and not distance_gated_drops:
+                # Every drop came through the higher-is-better score floor
+                # (FTS ``_score`` tier): naming ``max_distance_threshold``
+                # here would report the wrong constant and the wrong
+                # polarity (PR #1077 review PRR-015).
+                logger.info(
+                    "All %d results fell below the score floor "
+                    "(floor=%.3f). Returning empty list with no_match flag.",
+                    input_count,
+                    last_score_floor,
+                )
+            else:
+                logger.info(
+                    "All %d results exceeded max_distance_threshold=%.3f "
+                    "(distance_gated=%d, score_gated=%d). Returning empty "
+                    "list with no_match flag.",
+                    input_count,
+                    self.max_distance_threshold,
+                    distance_gated_drops,
+                    score_gated_drops,
+                )
             self.no_match = True
 
         # Issue #258 (TEST-001): an EXPLICITLY-passed top_k is a hard cap on

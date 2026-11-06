@@ -193,9 +193,13 @@ class ChatResponse(BaseModel):
     # emits a Dict[str, float]; a scalar must still round-trip untouched).
     citation_confidence: Optional[Union[Dict[str, Any], float, int]] = None
     unverifiable_claims: Optional[List[str]] = None
-    # Score contract (issue #36, verified against backend producers): chat
-    # sources carry "distance" or "rerank" — how the client interprets `score`
-    # (polarity + thresholds). The memory/UsedMemory channel has its own
+    # Score contract (issue #36, extended by issue #1070): the payload-level
+    # `score_type` is "distance" or "rerank" (how the client interprets
+    # `score` polarity + thresholds), and an individual source may carry its
+    # OWN per-source `score_type`="fts" (a raw BM25 `_score`; consumers
+    # suppress the relevance label for it — see
+    # docs/engineering/source-score-citation-schema.md). The memory/UsedMemory
+    # channel has its own
     # score_type vocabulary (rrf/fts/dense) and is rendered without relevance
     # labels. Default "distance" keeps older clients on the safe path if the
     # engine omits it.

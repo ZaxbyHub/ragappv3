@@ -648,20 +648,56 @@ def test_draft_room_audit_census_classification() -> None:
     assert false_returns, (
         "census drift: _sync_enqueue_compile must expose created=False exits"
     )
-    for ret in false_returns:
-        branch_has_rollback = any(
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "rollback"
-            and node.lineno < ret.lineno
-            for node in ast.walk(enqueue)
-        )
-        assert branch_has_rollback, (
-            "census drift: a created=False exit of _sync_enqueue_compile is "
-            "no longer preceded by a rollback — the replay branch's "
-            "no-applied-mutation classification would be stale"
-        )
 
+
+    def _parents(fn: ast.AST) -> dict:
+        out: dict = {}
+        for parent in ast.walk(fn):
+            for child in ast.iter_child_nodes(parent):
+                out[child] = parent
+        return out
+
+    def _if_chain(fn: ast.AST, parents: dict, node: ast.AST) -> set:
+        """Ids of every enclosing If INSIDE fn, from nearest outward (empty
+        set = function-body level)."""
+        chain: set = set()
+        cur = parents.get(node)
+        while cur is not None and cur is not fn:
+            if isinstance(cur, ast.If):
+                chain.add(id(cur))
+            cur = parents.get(cur)
+        return chain
+
+    def _branch_has_rollback(fn: ast.AST, parents: dict, ret: ast.Return) -> bool:
+        """Dominance-aware containment (PR #1077 review PRR-005c): the
+        rollback must DOMINATE the return — its enclosing If must sit on the
+        return's own If-chain (the same branch or a protecting outer branch
+        of it), textually before it. A rollback in a SIBLING branch (the
+        pre-PRR-005c any-preceding scan's hole) satisfies nothing."""
+        ret_chain = _if_chain(fn, parents, ret)
+        for node in ast.walk(fn):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "rollback"
+            ):
+                continue
+            if node.lineno > ret.lineno:
+                continue
+            rollback_if = _if_chain(fn, parents, node)
+            if rollback_if <= ret_chain:
+                return True
+        return False
+
+    enqueue_parents = _parents(enqueue)
+    for ret in false_returns:
+        assert _branch_has_rollback(enqueue, enqueue_parents, ret), (
+            "census drift: a created=False exit of _sync_enqueue_compile no "
+            "longer has a rollback in its OWN branch — the replay branch's "
+            "no-applied-mutation classification would be stale (PR #1077 "
+            "review PRR-005c: an unrelated earlier branch's rollback must "
+            "not satisfy this exit)"
+        )
     # The dispose site's event type is computed (f"draft_finding_{action}"),
     # so the constant-keyword census above cannot see it: pin its admitted
     # membership structurally — dispose_draft_finding carries an audit call
