@@ -131,7 +131,7 @@ describe("useSendMessage m01 (issue-trace 781-vaultgate-first-run-baseline)", ()
 
     // Issue #991 review PRR-004: the negative assertion alone passes vacuously
     // when the send never proceeds (admission blocked → vault path skipped).
-    // Prove the send WAS admitted: the sole vault auto-picked (vault_id 7),
+    // Prove the send WAS admitted: the sole vault auto-picked (vault_id 1),
     // the session created, and the transport initiated.
     expect(apiMocks.createChatSession).toHaveBeenCalledWith({ vault_id: 1 });
     expect(apiMocks.chatStream).toHaveBeenCalledTimes(1);

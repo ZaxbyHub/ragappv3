@@ -706,7 +706,6 @@ export function TranscriptPane({ className, onSessionCreated }: TranscriptPanePr
     // send) still owns it.
     let revisionOwnsStreamingFlag = false;
     let dispatched = false;
-    let foreignSendAdmitted = false;
     try {
       useChatStore.setState({ isStreaming: true });
       revisionOwnsStreamingFlag = true;
@@ -777,7 +776,6 @@ export function TranscriptPane({ className, onSessionCreated }: TranscriptPanePr
         postTruncate.streamingMessageId !== null ||
         postTruncate.messageIds.join("\n") !== idsBeforeTruncate.join("\n")
       ) {
-        foreignSendAdmitted = true;
         if (restoreRows?.length && activeChatId) {
           try {
             const payload: AddMessageRequest[] = restoreRows.map((m) => ({
@@ -813,13 +811,15 @@ export function TranscriptPane({ className, onSessionCreated }: TranscriptPanePr
       );
     } finally {
       revisionInFlightRef.current = false;
-      // Restore the raised flag only when this revision still owns it: a
-      // dispatched send hands flag ownership to sendCore's terminal
-      // callbacks; an admitted foreign send owns it the same way. Every
-      // other exit (blocked admission, cancelled revision, truncate
-      // failure) leaves no send in flight, so the pre-revision false is
-      // restored.
-      if (revisionOwnsStreamingFlag && !dispatched && !foreignSendAdmitted) {
+      // Lower the raised flag only when no send owns it. A dispatched send,
+      // or a foreign sendCore admitted during the window, hands ownership to
+      // that send's terminal callbacks (which lower the flag themselves).
+      // A cancel tripped by a NON-sendCore mutation — a prior retry's
+      // restore appending rows mid-window — has no live owner, so nobody
+      // else will lower the flag and this revision must.
+      const liveOwner =
+        dispatched || useChatStore.getState().streamingMessageId !== null;
+      if (revisionOwnsStreamingFlag && !liveOwner) {
         useChatStore.setState({ isStreaming: false });
       }
     }
