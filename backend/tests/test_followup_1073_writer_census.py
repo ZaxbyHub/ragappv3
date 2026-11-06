@@ -91,16 +91,6 @@ class TestEnrichmentWriterCensus(unittest.TestCase):
         'partial')`` (hash-only guard), OR re-assigning ``where`` after the
         guarded construction (override), must turn this RED.
         """
-        m = re.search(
-            r"require_file_hash is not None:(.*?)try:", self.dp, re.S
-        )
-        self.assertIsNotNone(m, "require_file_hash WHERE construction not found")
-        guarded = m.group(1)
-        self.assertIn("AND file_hash = ?", guarded)
-        self.assertIn("AND status IN ('indexed', 'partial')", guarded)
-        # Final-assignment semantics, scoped to the method body: the LAST
-        # `where = ` assignment in set_enrichment_status must be the guarded
-        # construction (an override would silently drop the guard).
         method = re.search(
             r"async def set_enrichment_status(.*?)(?=\n    (?:async )?def )",
             self.dp,
@@ -108,14 +98,31 @@ class TestEnrichmentWriterCensus(unittest.TestCase):
         )
         self.assertIsNotNone(method, "set_enrichment_status body not found")
         body = method.group(1)
+        m = re.search(r"require_file_hash is not None:(.*?)try:", body, re.S)
+        self.assertIsNotNone(
+            m,
+            "require_file_hash WHERE construction not found inside "
+            "set_enrichment_status (method-scoped, not file-wide)",
+        )
+        guarded = m.group(1)
+        self.assertIn("AND file_hash = ?", guarded)
+        self.assertIn("AND status IN ('indexed', 'partial')", guarded)
+        # Final-assignment semantics: the LAST `where = ` assignment in the
+        # method must carry BOTH halves — an override dropping either the
+        # hash half or the status half is rejected (round-3 review finding).
         last_where = body.rfind("where = ")
         guarded_at = body.find("require_file_hash is not None:")
+        self.assertGreaterEqual(
+            guarded_at, 0, "guard construct moved out of the method"
+        )
         self.assertGreater(
             last_where, guarded_at,
             "where is reassigned after the guarded construction — the full "
             "predicate is not the final value used by the UPDATE",
         )
-        self.assertIn("AND status IN ('indexed', 'partial')", body[last_where:])
+        final_where = body[last_where:]
+        self.assertIn("AND file_hash = ?", final_where)
+        self.assertIn("AND status IN ('indexed', 'partial')", final_where)
 
     def test_complete_write_is_one_statement_not_read_then_write(self):
         """The complete branch's CASE feeds the UPDATE in the SAME statement,
@@ -126,24 +133,31 @@ class TestEnrichmentWriterCensus(unittest.TestCase):
         aggregate, must turn this RED — the atomicity claim is precisely that
         there is no Python seam between the aggregate decision and the write.
         """
+        # The counted window spans from the initial assignment ALL THE WAY to
+        # the UPDATE f-string, so an override placed between the guard and the
+        # execute is inside the count (round-3 review finding).
         m = re.search(
-            r'status_sql = "\?"(.*?)if require_file_hash is not None:',
+            r'status_sql = "\?"(.*?)conn\.execute\(\s*f"""\s*UPDATE files',
             self.dp,
             re.S,
         )
-        self.assertIsNotNone(m, "complete-branch status_sql construction missing")
+        self.assertIsNotNone(
+            m, "complete-branch construction through the UPDATE not found"
+        )
         branch = m.group(1)
         self.assertIn('status == "complete"', self.dp)
         self.assertIn('status_sql = "(" + aggregate_status_case_sql() + ")"', branch)
-        # Exactly one status_sql assignment in the branch, and no read of the
-        # aggregate into a local that could be spliced in later.
         self.assertEqual(
             branch.count("status_sql ="), 1,
-            "status_sql is assigned more than once — a later assignment can "
-            "override the inline CASE (read-then-write seam)",
+            "status_sql is assigned more than once between the initial value "
+            "and the UPDATE — a later assignment can override the inline CASE "
+            "(read-then-write seam), wherever it is placed",
         )
-        self.assertNotIn("SELECT " + "aggregate", branch.replace('aggregate_status_case_sql() + ")"', ""))
-        self.assertNotIn("SELECT enrichment_status", branch)
+        self.assertNotIn("SELECT", branch)
+        self.assertIn(
+            "enrichment_status = {status_sql}", self.dp,
+            "the UPDATE must SET the CASE variable inline",
+        )
 
     def test_cancel_cas_pins_both_predicate_halves(self):
         """The stale/cancel CAS WHERE carries status AND timestamp, verbatim.
