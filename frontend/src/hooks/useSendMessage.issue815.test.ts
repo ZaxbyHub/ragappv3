@@ -51,6 +51,7 @@ const apiMocks = vi.hoisted(() => ({
 }));
 
 vi.mock("@/lib/api", () => ({
+  getSettings: async () => ({ chat_message_max_chars: 20000 }),
   createChatSession: (...args: unknown[]) => apiMocks.createChatSession(...args),
   addChatMessagesBatch: (...args: unknown[]) => apiMocks.addChatMessagesBatch(...args),
   addChatMessagesBatchKeepalive: (...args: unknown[]) =>

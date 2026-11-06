@@ -93,6 +93,11 @@ vi.mock("@/stores/useChatShellStore", () => ({
   }),
 }));
 vi.mock("@/hooks/useSendMessage", () => ({
+  CHAT_INPUT_CAP_ADVISORY: 20_000,
+  subscribeChatInputCap: () => () => {},
+  getChatInputCapSnapshot: () => 20_000,
+  checkSendAdmissionAsync: async () => ({ ok: true, cap: 20_000 }),
+  chatInputAdvisoryBlocked: () => null,
   useSendMessage: () => ({
     handleSend: vi.fn(),
     handleStop: vi.fn(),
@@ -110,6 +115,7 @@ vi.mock("@/hooks/useChatHistory", () => ({
   }),
 }));
 vi.mock("@/lib/api", () => ({
+  getSettings: async () => ({ chat_message_max_chars: 20000 }),
   truncateChatSession: vi.fn(),
   forkChatSession: vi.fn(),
 }));
@@ -209,8 +215,15 @@ describe("TranscriptPane revision flows (persisted session, issue #507)", () => 
     mockChatState.updateMessage = vi.fn();
     mockChatState.stopStreaming = vi.fn();
     mockChatState.newChat = vi.fn();
-    // The revision handlers read fresh state through getState().
+    // The revision handlers read fresh state through getState(); setState is
+    // stubbed the same way — the retry revision raises the streaming flag
+    // through it (issue #991 review PRR-003(b)).
     (useChatStore as unknown as { getState: () => typeof mockChatState }).getState = () => mockChatState;
+    (useChatStore as unknown as {
+      setState: (partial: Partial<typeof mockChatState>) => void;
+    }).setState = (partial) => {
+      Object.assign(mockChatState, partial);
+    };
 
     // removeMessagesFrom MUTATES the mock store so tests can assert the trim
     // actually happened (and WHEN it happened relative to the truncate call).
@@ -489,6 +502,11 @@ describe("TranscriptPane persisted terminal status banner (issue #507)", () => {
     mockChatState.removeMessagesFrom = vi.fn();
     mockChatState.loadChat = vi.fn();
     (useChatStore as unknown as { getState: () => typeof mockChatState }).getState = () => mockChatState;
+    (useChatStore as unknown as {
+      setState: (partial: Partial<typeof mockChatState>) => void;
+    }).setState = (partial) => {
+      Object.assign(mockChatState, partial);
+    };
     (useVaultStore as unknown as ReturnType<typeof vi.fn>).mockImplementation((selector) => {
       const state = {
         vaults: [{ id: 1, name: "Test Vault", file_count: 5 }],

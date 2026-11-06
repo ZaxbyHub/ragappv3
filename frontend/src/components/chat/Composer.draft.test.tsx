@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { Composer } from "./Composer";
 
 const mockChatState = vi.hoisted(() => ({
@@ -59,6 +59,7 @@ vi.mock("@/stores/useVaultStore", () => ({
 }));
 
 vi.mock("@/lib/api", () => ({
+  getSettings: async () => ({ chat_message_max_chars: 20000 }),
   API_BASE_URL: "/api",
   attachCsrfInterceptor: vi.fn(),
   uploadDocument: vi.fn(),
@@ -111,10 +112,13 @@ describe("Composer draft persistence", () => {
     expect(mockChatState.setInput).toHaveBeenCalledWith("unsent new-chat draft");
   });
 
-  it("saves and clears the active session draft", () => {
+  it("saves and clears the active session draft", async () => {
     mockChatState.activeChatId = "42";
-    const onSend = vi.fn(() => {
+    // Issue #991: the Composer defers draft cleanup until the send pipeline
+    // reports admission, so the mock reports the admitted result.
+    const onSend = vi.fn(async () => {
       mockChatState.input = "";
+      return "sent" as const;
     });
     const { rerender } = render(<Composer onSend={onSend} onStop={vi.fn()} isStreaming={false} />);
     const textarea = screen.getByLabelText("Message input");
@@ -124,7 +128,9 @@ describe("Composer draft persistence", () => {
 
     rerender(<Composer onSend={onSend} onStop={vi.fn()} isStreaming={false} />);
     fireEvent.click(screen.getByLabelText("Send message"));
-    expect(storage.has("ragapp_chat_draft_11:42")).toBe(false);
+    await waitFor(() => {
+      expect(storage.has("ragapp_chat_draft_11:42")).toBe(false);
+    });
     expect(onSend).toHaveBeenCalledTimes(1);
   });
 

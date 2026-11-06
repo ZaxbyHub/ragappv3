@@ -33,9 +33,12 @@ import {
 import { useVaultStore } from "@/stores/useVaultStore";
 import { useAuthStore } from "@/stores/useAuthStore";
 import { useChatShellStore } from "@/stores/useChatShellStore";
-import { useSendMessage } from "@/hooks/useSendMessage";
+import { useSendMessage, checkSendAdmissionAsync, chatInputAdvisoryBlocked } from "@/hooks/useSendMessage";
 import { useChatHistory } from "@/hooks/useChatHistory";
-import { forkChatSession, getChatSession, truncateChatSession } from "@/lib/api";
+import {
+  forkChatSession, getChatSession, truncateChatSession,
+  addChatMessagesBatch, type AddMessageRequest,
+} from "@/lib/api";
 import { mapSessionMessage } from "@/lib/chatMessageMapper";
 import { toast } from "sonner";
 import type { Message } from "@/stores/useChatStore";
@@ -600,6 +603,10 @@ export function TranscriptPane({ className, onSessionCreated }: TranscriptPanePr
 
   const handlePromptClick = (prompt: string) => {
     setInput(prompt);
+    // Issue #991 review PRR-012: a programmatic input replacement must not
+    // inherit a stale over-cap error from a prior edit-load (the new prompt
+    // is short; the composer's change feedback re-fires on the next edit).
+    useChatStore.getState().setInputError?.(null);
     setTimeout(() => composerRef.current?.focus(), 0);
   };
 
@@ -688,7 +695,17 @@ export function TranscriptPane({ className, onSessionCreated }: TranscriptPanePr
     // strands the guard.
     if (isStreaming || revisionInFlightRef.current) return;
     revisionInFlightRef.current = true;
+    // Issue #991 review PRR-003(b) delta: raise the store's streaming flag
+    // across the destructive window so a composer submit admitted during the
+    // truncate→resend span is refused at handleSend's entry guard, rather
+    // than winning sendingRef mid-revision and racing the row removal. The
+    // flag is restored in the finally whenever this revision (not a real
+    // send) still owns it.
+    let revisionOwnsStreamingFlag = false;
+    let dispatched = false;
     try {
+      useChatStore.setState({ isStreaming: true });
+      revisionOwnsStreamingFlag = true;
       await awaitPendingPersist();
       const { messageIds: ids, messagesById, activeChatId } = useChatStore.getState();
       let lastUserIdx = -1;
@@ -696,6 +713,24 @@ export function TranscriptPane({ className, onSessionCreated }: TranscriptPanePr
         if (messagesById[ids[i]]?.role === "user") { lastUserIdx = i; break; }
       }
       if (lastUserIdx < 0) return;
+
+      // Issue #991: validate against the AUTHORITATIVE server cap BEFORE
+      // any destructive revision step — an over-cap persisted turn must
+      // never lose its server history or local rows to a retry that cannot
+      // send. Awaits cap readiness, so a pending settings fetch delays the
+      // truncate, never skips the gate.
+      const userContent = messagesById[ids[lastUserIdx]].content;
+      const admission = await checkSendAdmissionAsync(userContent);
+      if (!admission.ok) {
+        toast.error(admission.message);
+        return;
+      }
+
+      // Issue #991 review PRR-003(b): snapshot the transcript identity so a
+      // submit already in flight when the revision started (its guard read
+      // predates the raised flag) is detected after the truncate await —
+      // this revision must not delete a concurrently admitted newer turn.
+      const idsBeforeTruncate = ids.slice();
 
       // Issue #684 (T1-13-S-08): snapshot the rows this revision removes so
       // an admission-rejected replacement (which writes nothing server-side)
@@ -725,12 +760,65 @@ export function TranscriptPane({ className, onSessionCreated }: TranscriptPanePr
         }
       }
 
-      const userContent = messagesById[ids[lastUserIdx]].content;
+      // Issue #991 review PRR-003(b): post-truncate re-read — if a submit
+      // that predates the raised flag was admitted while the truncate was in
+      // flight, abort this revision. A foreign sendCore in flight is detected
+      // via streamingMessageId (set only inside sendCore — this revision's
+      // raised isStreaming flag does not set it); appended rows are caught by
+      // the identity compare. The truncate has already removed the original
+      // turn server-side, so re-append the restore rows (server-side) before
+      // returning — the original Q&A survives reload.
+      const postTruncate = useChatStore.getState();
+      if (
+        postTruncate.streamingMessageId !== null ||
+        postTruncate.messageIds.join("\n") !== idsBeforeTruncate.join("\n")
+      ) {
+        if (restoreRows?.length && activeChatId) {
+          try {
+            const payload: AddMessageRequest[] = restoreRows.map((m) => ({
+              role: m.role === "assistant" ? "assistant" : "user",
+              content: typeof m.content === "string" ? m.content : "",
+            }));
+            const saved = await addChatMessagesBatch(parseInt(activeChatId), payload);
+            toast.error("Retry cancelled — a newer message was sent. Your original turn was kept.");
+            // Server state reconciled; local rows are untouched by this
+            // branch (the removal never ran), and the next reload refetches
+            // the re-appended history.
+            void saved;
+          } catch (err) {
+            console.error("Failed to re-append the cancelled revision's rows:", err);
+            toast.error("Retry cancelled — a newer message was sent.");
+          }
+        } else {
+          toast.error("Retry cancelled — a newer message was sent.");
+        }
+        return;
+      }
+
       const history = ids.slice(0, lastUserIdx).map((id) => messagesById[id]);
       removeMessagesFrom(lastUserIdx);
-      sendDirect(userContent, history, restoreRows ? { restoreRows } : undefined);
+      dispatched = true;
+      // revisionDispatch tells sendDirect the raised streaming flag is this
+      // revision's own window protection (not a foreign send) — the
+      // synchronous guard above already proved no foreign send is in flight.
+      sendDirect(
+        userContent,
+        history,
+        restoreRows ? { restoreRows, revisionDispatch: true } : { revisionDispatch: true },
+      );
     } finally {
       revisionInFlightRef.current = false;
+      // Lower the raised flag only when no send owns it. A dispatched send,
+      // or a foreign sendCore admitted during the window, hands ownership to
+      // that send's terminal callbacks (which lower the flag themselves).
+      // A cancel tripped by a NON-sendCore mutation — a prior retry's
+      // restore appending rows mid-window — has no live owner, so nobody
+      // else will lower the flag and this revision must.
+      const liveOwner =
+        dispatched || useChatStore.getState().streamingMessageId !== null;
+      if (revisionOwnsStreamingFlag && !liveOwner) {
+        useChatStore.setState({ isStreaming: false });
+      }
     }
   }, [isStreaming, removeMessagesFrom, sendDirect, awaitPendingPersist, reloadAfterStaleRefusal]);
 
@@ -799,6 +887,14 @@ export function TranscriptPane({ className, onSessionCreated }: TranscriptPanePr
       clearEditVersionsFrom?.(idx + 1);
       removeMessagesFrom(idx);
       setInput(content);
+      // Issue #991: edit is the RECOVERY path for an over-cap persisted
+      // turn — surface the bound feedback at load so the user knows to
+      // shorten before resubmitting (the gated composer refuses the resend
+      // otherwise). Nothing is lost: the content lives in the composer.
+      const blocked = chatInputAdvisoryBlocked(content);
+      if (blocked !== null) {
+        useChatStore.getState().setInputError?.(blocked);
+      }
       composerRef.current?.focus();
     } finally {
       revisionInFlightRef.current = false;

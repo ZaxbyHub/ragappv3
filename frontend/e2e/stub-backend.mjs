@@ -296,6 +296,10 @@ const SETTINGS_FIXTURE = {
   ollama_chat_url: "http://localhost:11434",
   embedding_model: "nomic-embed-text",
   chat_model: "llama3.1",
+  // Issue #991: the composer derives its send bound from this field; without
+  // it the client treats the cap as UNKNOWABLE (legacy mixed-version server)
+  // and blocks every send — which is exactly what the chat smoke specs drive.
+  chat_message_max_chars: 20000,
   chat_configured: true,
   instant_configured: true,
   default_chat_mode: "thinking",

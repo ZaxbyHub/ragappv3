@@ -85,8 +85,23 @@ vi.mock("@/stores/useChatShellStore", () => ({
   }),
 }));
 vi.mock("@/hooks/useSendMessage");
+import {
+  checkSendAdmissionAsync,
+  chatInputAdvisoryBlocked,
+  subscribeChatInputCap,
+  getChatInputCapSnapshot,
+} from "@/hooks/useSendMessage";
+
+// Issue #991: the cap-loader seam exports (auto-mocked below) get explicit
+// shapes so the admission gate and the reactive cap behave deterministically.
+vi.mocked(subscribeChatInputCap).mockImplementation(() => () => {});
+vi.mocked(getChatInputCapSnapshot).mockReturnValue(20_000);
+vi.mocked(checkSendAdmissionAsync).mockResolvedValue({ ok: true, cap: 20_000 } as never);
+vi.mocked(chatInputAdvisoryBlocked).mockReturnValue(null);
+
 vi.mock("@/hooks/useChatHistory");
 vi.mock("@/lib/api", () => ({
+  getSettings: async () => ({ chat_message_max_chars: 20000 }),
   forkChatSession: vi.fn(),
   truncateChatSession: vi.fn(),
   getChatSession: vi.fn(),
@@ -186,6 +201,13 @@ describe("TranscriptPane", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     (useChatStore as unknown as { getState: ReturnType<typeof vi.fn> }).getState = vi.fn(() => mockChatState);
+    // The retry revision raises the streaming flag through setState
+    // (issue #991 review PRR-003(b)); stub it like getState.
+    (useChatStore as unknown as {
+      setState: (partial: Partial<typeof mockChatState>) => void;
+    }).setState = (partial) => {
+      Object.assign(mockChatState, partial);
+    };
 
     // Reset shared mock state
     mockChatState.messageIds = [];
@@ -1040,14 +1062,15 @@ describe("TranscriptPane", () => {
     });
 
     it("character count shows warning when input is near max length", () => {
-      // 75,001 > 75% of the 100,000 inline cap (issue #616) → counter
-      // renders without the destructive class.
-      const longInput = "a".repeat(75_001);
+      // Issue #991: the counter tracks the effective cap (20_000 in this
+      // suite's hook mock); 15,001 > 75% of it → counter renders without
+      // the destructive class.
+      const longInput = "a".repeat(15_001);
       mockChatState.input = longInput;
 
       const { rerender } = renderComposerWithProviders({ onSend: mockHandleSend, onStop: mockHandleStop, isStreaming: false });
 
-      const charCount = screen.getByText(/75001\/100000/);
+      const charCount = screen.getByText(/15001\/20000/);
       expect(charCount).toBeInTheDocument();
       expect(charCount).not.toHaveClass(/destructive/);
 
@@ -1058,18 +1081,18 @@ describe("TranscriptPane", () => {
           <Composer onSend={mockHandleSend} onStop={mockHandleStop} isStreaming={false} />
         </TooltipProvider>
       );
-      expect(screen.queryByText(/\d+\/100000/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/\d+\/20000/)).not.toBeInTheDocument();
     });
 
     it("character count shows destructive color when over max", () => {
-      // 100,001 > the 100,000 inline cap (issue #616) → counter renders
-      // with the destructive class.
-      const overMaxInput = "a".repeat(100_001);
+      // Issue #991: 20,001 > the effective 20,000 cap (this suite's hook
+      // mock) → counter renders with the destructive class.
+      const overMaxInput = "a".repeat(20_001);
       mockChatState.input = overMaxInput;
 
       renderComposerWithProviders({ onSend: mockHandleSend, onStop: mockHandleStop, isStreaming: false });
 
-      const charCount = screen.getByText(/100001\/100000/);
+      const charCount = screen.getByText(/20001\/20000/);
       expect(charCount).toHaveClass(/destructive/);
     });
 

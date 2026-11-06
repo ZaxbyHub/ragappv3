@@ -49,6 +49,7 @@ vi.mock("@/lib/api", async () => {
     listChatSessions: vi.fn(async () => ({ sessions: [] })),
     listAccessibleVaults: vi.fn(async () => ({ vaults: [] })),
     getLlmModeHealth: vi.fn(async () => ({ thinking: true, instant: true })),
+    getSettings: vi.fn(async () => ({ chat_message_max_chars: 20000 })),
   };
 });
 

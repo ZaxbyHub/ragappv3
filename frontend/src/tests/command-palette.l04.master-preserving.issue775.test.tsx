@@ -42,6 +42,10 @@ const authState = vi.hoisted(() => ({
   user: { id: 1, username: "alice", role: "member" },
 }));
 
+vi.mock("@/lib/api/settings", () => ({
+  getSettings: async () => ({ chat_message_max_chars: 20000 }),
+}));
+
 vi.mock("@/stores/useAuthStore", () => ({
   useAuthStore: (selector: (state: Record<string, unknown>) => unknown) =>
     selector({

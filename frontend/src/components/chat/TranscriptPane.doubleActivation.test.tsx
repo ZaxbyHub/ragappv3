@@ -101,6 +101,11 @@ vi.mock("@/stores/useChatShellStore", () => ({
   }),
 }));
 vi.mock("@/hooks/useSendMessage", () => ({
+  CHAT_INPUT_CAP_ADVISORY: 20_000,
+  subscribeChatInputCap: () => () => {},
+  getChatInputCapSnapshot: () => 20_000,
+  checkSendAdmissionAsync: async () => ({ ok: true, cap: 20_000 }),
+  chatInputAdvisoryBlocked: () => null,
   useSendMessage: () => ({
     handleSend: vi.fn(),
     handleStop: vi.fn(),
@@ -118,6 +123,7 @@ vi.mock("@/hooks/useChatHistory", () => ({
   }),
 }));
 vi.mock("@/lib/api", () => ({
+  getSettings: async () => ({ chat_message_max_chars: 20000 }),
   truncateChatSession: vi.fn(),
   forkChatSession: vi.fn(),
   getChatSession: vi.fn(),
@@ -223,8 +229,15 @@ describe("TranscriptPane double activation (issue #684)", () => {
     mockChatState.updateMessage = vi.fn();
     mockChatState.stopStreaming = vi.fn();
     mockChatState.newChat = vi.fn();
-    // The revision handlers read fresh state through getState().
+    // The revision handlers read fresh state through getState(); setState is
+    // stubbed the same way — the retry revision raises the streaming flag
+    // through it (issue #991 review PRR-003(b)).
     (useChatStore as unknown as { getState: () => typeof mockChatState }).getState = () => mockChatState;
+    (useChatStore as unknown as {
+      setState: (partial: Partial<typeof mockChatState>) => void;
+    }).setState = (partial) => {
+      Object.assign(mockChatState, partial);
+    };
 
     // removeMessagesFrom MUTATES the mock store (mirrors the revision suite).
     mockChatState.removeMessagesFrom = vi.fn((index: number) => {

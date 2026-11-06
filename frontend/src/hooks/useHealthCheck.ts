@@ -17,6 +17,26 @@ interface UseHealthCheckOptions {
 const DEEP_RECHECK_INTERVAL = 90_000;
 const FAILURE_THRESHOLD = 2;
 
+/**
+ * HTTP status of a rejection, in either error shape this repo's API client
+ * produces: the response interceptor's normalized Error (top-level `status`)
+ * or a raw AxiosError (`.response.status`). Mirrors the shape-tolerance
+ * convention of `httpStatusOf` (useJobStatus.ts) and `logApiFailure`
+ * (core.ts) — issue #1040 routes session-expiry 401s as auth events.
+ */
+function httpStatusOf(error: unknown): number | undefined {
+  const candidate = error as
+    | { status?: unknown; response?: { status?: unknown }; originalError?: { response?: { status?: unknown } } }
+    | null
+    | undefined;
+  if (typeof candidate?.status === "number") return candidate.status;
+  const viaOriginal = candidate?.originalError?.response?.status;
+  if (typeof viaOriginal === "number") return viaOriginal;
+  const viaResponse = candidate?.response?.status;
+  if (typeof viaResponse === "number") return viaResponse;
+  return undefined;
+}
+
 type HealthContext = {
   owner: AuthOwner;
   principalGeneration: number;
@@ -61,6 +81,14 @@ type HealthOutcomeState = {
 type HealthOutcomeAction =
   | { type: "reset"; lifetime: HealthLifetime; isCurrent: () => boolean }
   | {
+      type: "auth_unknown";
+      lifetime: HealthLifetime;
+      sequence: number;
+      wasLatest: boolean;
+      lastChecked: Date;
+      isCurrent: () => boolean;
+    }
+  | {
       type: "failure";
       lifetime: HealthLifetime;
       sequence: number;
@@ -103,6 +131,27 @@ function healthOutcomeReducer(
   }
   if (!action.isCurrent() || state.lifetime !== action.lifetime || action.sequence < state.lastPublishedSequence) {
     return state;
+  }
+  if (action.type === "auth_unknown") {
+    // Issue #1040 review PRR-009: a superseded read must not publish — the
+    // arm honors wasLatest like its failure sibling, so a slow 401 whose read
+    // has been overtaken by a newer probe cannot reset the failure streak or
+    // flip the UI back to "checking" from stale data.
+    if (!action.wasLatest) return state;
+    // Issue #1040: a session-expiry 401 on the auth-gated deep probe is an
+    // AUTH event, not a services fact. Publish the UNKNOWN state per the
+    // repo's UNKNOWN-not-DOWN convention: retain the last real service
+    // booleans, hold loading ("checking"), stamp lastChecked, advance the
+    // publish sequence (a stale later outcome cannot clobber), and RESET the
+    // failure streak — a 401 must not pre-charge a later single network
+    // failure over the down threshold.
+    return {
+      health: { ...state.health, loading: true, lastChecked: action.lastChecked },
+      lifetime: state.lifetime,
+      lastPublishedSequence: action.sequence,
+      failureStreak: 0,
+      hadSuccess: state.hadSuccess,
+    };
   }
   if (action.type === "success") {
     return {
@@ -259,10 +308,35 @@ export function useHealthCheck(options?: UseHealthCheckOptions): HealthStatus {
         if (services !== undefined && (services === null || typeof services !== "object")) {
           throw new Error("Malformed health services");
         }
-      } catch {
+      } catch (error) {
         if (!isCurrentLifetime(context, lifetime)) return;
         if (deepStartedAt !== null && isCurrentRead(read) && deepWasFirstCheck) {
           lifetime.isFirstCheck = true;
+        }
+        // Issue #1040: a 401 from the auth-gated deep probe means the session
+        // expired, not that services died. Only the #774 refresh-transport
+        // residual reaches this catch with a 401 (refresh-able tokens are
+        // retried by the interceptor; invalid tokens log out and redirect),
+        // and the interceptor's normalizer delivers the status at the TOP
+        // LEVEL of the rejection. Read both tiers tolerantly (the
+        // httpStatusOf convention: useJobStatus.ts / canvas.ts /
+        // draftRoom.ts) and route auth signals away from the failure streak.
+        const status = httpStatusOf(error);
+        if (status === 401) {
+          dispatchHealth({
+            type: "auth_unknown",
+            lifetime,
+            sequence: read.sequence,
+            wasLatest: latestReadRef.current === read,
+            lastChecked: new Date(),
+            isCurrent: () => isCurrentLifetime(context, lifetime),
+          });
+          // Silent refresh/re-auth through the canonical store action: a
+          // resolved-null outcome clears the session on the store's own
+          // terms; a transport failure keeps it (warn + next poll retries).
+          void useAuthStore.getState().refreshToken();
+          if (activeReadRef.current === read) activeReadRef.current = null;
+          return;
         }
         dispatchHealth({
           type: "failure",

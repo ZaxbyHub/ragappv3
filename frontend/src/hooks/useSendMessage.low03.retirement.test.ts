@@ -11,6 +11,7 @@ const api = vi.hoisted(() => ({
   getLlmModeHealth: vi.fn(),
 }));
 vi.mock("@/lib/api", () => ({
+  getSettings: async () => ({ chat_message_max_chars: 20000 }),
   createChatSession: (...a: unknown[]) => api.createChatSession(...a),
   addChatMessagesBatch: (...a: unknown[]) => api.addChatMessagesBatch(...a),
   addChatMessagesBatchKeepalive: (...a: unknown[]) => api.addChatMessagesBatchKeepalive(...a),

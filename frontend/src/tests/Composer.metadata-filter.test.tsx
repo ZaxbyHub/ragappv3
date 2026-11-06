@@ -40,6 +40,10 @@ Object.defineProperty(document, "cookie", {
 
 // Mocked stores must stay callable AND expose getState(): useSendMessage
 // reads them via getState() at send time while the Composer subscribes.
+vi.mock("@/lib/api/settings", () => ({
+  getSettings: async () => ({ chat_message_max_chars: 20000 }),
+}));
+
 vi.mock("@/stores/useLlmHealthStore", () => {
   const state = {
     thinking: true,

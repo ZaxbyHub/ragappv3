@@ -46,6 +46,9 @@ const sessionsApiMocks = vi.hoisted(() => ({
   listChatSessions: vi.fn(),
 }));
 
+vi.mock("@/lib/api/settings", () => ({
+  getSettings: async () => ({ chat_message_max_chars: 20000 }),
+}));
 vi.mock("@/lib/api/sessions", () => ({
   parseSSEStream: vi.fn(),
   chatStream: (...args: unknown[]) => sessionsApiMocks.chatStream(...args),

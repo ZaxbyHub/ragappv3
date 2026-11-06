@@ -84,6 +84,11 @@ vi.mock("@/stores/useChatShellStore", () => ({
   }),
 }));
 vi.mock("@/hooks/useSendMessage", () => ({
+  CHAT_INPUT_CAP_ADVISORY: 20_000,
+  subscribeChatInputCap: () => () => {},
+  getChatInputCapSnapshot: () => 20_000,
+  checkSendAdmissionAsync: async () => ({ ok: true, cap: 20_000 }),
+  chatInputAdvisoryBlocked: () => null,
   useSendMessage: () => ({
     handleSend: vi.fn(),
     handleStop: vi.fn(),
@@ -101,6 +106,7 @@ vi.mock("@/hooks/useChatHistory", () => ({
   }),
 }));
 vi.mock("@/lib/api", () => ({
+  getSettings: async () => ({ chat_message_max_chars: 20000 }),
   truncateChatSession: vi.fn(),
   forkChatSession: vi.fn(),
   getChatSession: vi.fn(),

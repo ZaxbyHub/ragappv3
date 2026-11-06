@@ -26,6 +26,7 @@ vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
   return {
     ...actual,
+    getSettings: async () => ({ chat_message_max_chars: 20000 }),
     uploadDocument: uploadDocumentMock,
     getDocumentStatuses: getDocumentStatusesMock,
     getDocumentStatus: getDocumentStatusMock,

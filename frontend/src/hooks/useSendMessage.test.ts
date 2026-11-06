@@ -1,12 +1,16 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { useSendMessage } from "./useSendMessage";
+// Optional-guard: the cap-loader reset seam ships with the fix (issue #991);
+// at suites running against pre-fix trees the guarded call is a no-op.
+import * as useSendMessageModule from "./useSendMessage";
 import { useChatStore } from "@/stores/useChatStore";
 import { useChatModeStore } from "@/stores/useChatModeStore";
 import { useChatShellStore } from "@/stores/useChatShellStore";
 import { useLlmHealthStore } from "@/stores/useLlmHealthStore";
 import { useVaultStore } from "@/stores/useVaultStore";
 import type { Vault } from "@/lib/api";
+import type { Message } from "@/stores/useChatStore";
 
 const apiMocks = vi.hoisted(() => ({
   createChatSession: vi.fn(),
@@ -14,9 +18,11 @@ const apiMocks = vi.hoisted(() => ({
   addChatMessagesBatch: vi.fn(),
   chatStream: vi.fn(),
   getLlmModeHealth: vi.fn(),
+  getSettings: vi.fn(async () => ({ chat_message_max_chars: 20000 })),
 }));
 
 vi.mock("@/lib/api", () => ({
+  getSettings: (...args: unknown[]) => apiMocks.getSettings(...(args as [])),
   createChatSession: (...args: unknown[]) => apiMocks.createChatSession(...args),
   addChatMessage: (...args: unknown[]) => apiMocks.addChatMessage(...args),
   addChatMessagesBatch: (...args: unknown[]) => apiMocks.addChatMessagesBatch(...args),
@@ -87,6 +93,10 @@ function installCapturingStreamMock(): { trigger: { error: (e: Error) => void; c
 describe("useSendMessage", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // Issue #991: clear the per-owner cap memo between cases (order
+    // independence; no-op on pre-fix trees).
+    (useSendMessageModule as { __resetChatInputCapForTests?: () => void })
+      .__resetChatInputCapForTests?.();
     useChatStore.setState({
       messageIds: [],
       messagesById: {},
@@ -266,6 +276,134 @@ describe("useSendMessage", () => {
     });
     expect(apiMocks.createChatSession).not.toHaveBeenCalled();
     expect(useChatShellStore.getState().sessionListRefreshToken).toBe(1);
+  });
+
+  it("re-arms the cap loader after a failed acquisition — the second attempt refetches (review round 1)", async () => {
+    // First acquisition fails (transient /settings error), second resolves.
+    apiMocks.getSettings
+      .mockRejectedValueOnce(new Error("network down"))
+      .mockResolvedValueOnce({ chat_message_max_chars: 20_000 });
+    const refreshHistory = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ activeChatId: "42", input: "Try again" });
+
+    const { result } = renderHook(() => useSendMessage(7, refreshHistory));
+
+    // First send: blocked with the limit-unavailable error, nothing sent.
+    let outcome: "sent" | "blocked" = "sent";
+    await act(async () => {
+      outcome = await result.current.handleSend();
+    });
+    expect(outcome).toBe("blocked");
+    expect(apiMocks.chatStream).not.toHaveBeenCalled();
+    expect(useChatStore.getState().inputError).toMatch(/unavailable|try again/i);
+
+    // Second send: the loader REFETCHED (2 getSettings calls) and admits.
+    await act(async () => {
+      outcome = await result.current.handleSend();
+    });
+    expect(outcome).toBe("sent");
+    expect(apiMocks.getSettings).toHaveBeenCalledTimes(2);
+    await waitFor(() => {
+      expect(apiMocks.chatStream).toHaveBeenCalled();
+    });
+  });
+
+  // Issue #991 feedback round (PRR-005/007 + F-03/F-04): the awaited admission
+  // window and the admitted/dropped result — regression pins for the review
+  // fixes, kept in this UNFROZEN suite.
+  describe("awaited admission semantics (issue #991 feedback)", () => {
+    it("the awaited server-cap gate refuses an over-cap submit even without the composer inline check (PRR-005)", async () => {
+      apiMocks.getSettings.mockResolvedValue({ chat_message_max_chars: 20_000 });
+      const refreshHistory = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ activeChatId: "42", input: "x".repeat(25_000) });
+
+      const { result } = renderHook(() => useSendMessage(7, refreshHistory));
+
+      let outcome: "sent" | "blocked" = "sent";
+      await act(async () => {
+        outcome = await result.current.handleSend();
+      });
+      expect(outcome).toBe("blocked");
+      expect(apiMocks.chatStream).not.toHaveBeenCalled();
+      expect(apiMocks.createChatSession).not.toHaveBeenCalled();
+      expect(useChatStore.getState().inputError).toMatch(/exceeds maximum length of 20000/i);
+    });
+
+    it("text typed during the pending admission window is retained and the stale snapshot is not sent (PRR-001/F-02)", async () => {
+      let release!: () => void;
+      const gate = new Promise<void>((r) => { release = r; });
+      apiMocks.getSettings.mockImplementation(() => gate.then(() => ({ chat_message_max_chars: 20_000 })));
+      const refreshHistory = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ activeChatId: "42", input: "OLD-TEXT" });
+
+      const { result } = renderHook(() => useSendMessage(7, refreshHistory));
+
+      let outcome: "sent" | "blocked" = "sent";
+      await act(async () => {
+        const pending = result.current.handleSend();
+        useChatStore.setState({ input: "NEWER-TEXT" });
+        release();
+        outcome = await pending;
+      });
+
+      expect(outcome).toBe("blocked");
+      expect(apiMocks.chatStream).not.toHaveBeenCalled();
+      expect(apiMocks.createChatSession).not.toHaveBeenCalled();
+      // The newer text survives in the composer for the user's next gesture.
+      expect(useChatStore.getState().input).toBe("NEWER-TEXT");
+    });
+
+    it("a chat switch during the pending admission window blocks the stale send (F-04)", async () => {
+      let release!: () => void;
+      const gate = new Promise<void>((r) => { release = r; });
+      apiMocks.getSettings.mockImplementation(() => gate.then(() => ({ chat_message_max_chars: 20_000 })));
+      const refreshHistory = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ activeChatId: "42", input: "for chat 42" });
+
+      const { result } = renderHook(() => useSendMessage(7, refreshHistory));
+
+      let outcome: "sent" | "blocked" = "sent";
+      await act(async () => {
+        const pending = result.current.handleSend();
+        useChatStore.setState({ activeChatId: "99" });
+        release();
+        outcome = await pending;
+      });
+
+      expect(outcome).toBe("blocked");
+      expect(apiMocks.chatStream).not.toHaveBeenCalled();
+    });
+
+    it("sendDirect restores the original turn rows when the send is dropped mid-revision (PRR-003)", async () => {
+      const refreshHistory = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ activeChatId: "42", input: "", isStreaming: true });
+      const restoreRows: Message[] = [
+        { id: "1", role: "user", content: "original question" },
+        { id: "2", role: "assistant", content: "original answer" },
+      ];
+
+      const { result } = renderHook(() => useSendMessage(7, refreshHistory));
+
+      await act(async () => {
+        await result.current.sendDirect("replacement", [], { restoreRows });
+      });
+
+      // The streaming guard drops the resend; the truncated original turn is
+      // re-appended server-side and mirrored locally with the server ids
+      // (reload-surviving restore).
+      expect(apiMocks.chatStream).not.toHaveBeenCalled();
+      expect(apiMocks.addChatMessagesBatch).toHaveBeenCalledWith(
+        42,
+        expect.arrayContaining([
+          expect.objectContaining({ role: "user", content: "original question" }),
+          expect.objectContaining({ role: "assistant", content: "original answer" }),
+        ]),
+      );
+      const { messageIds, messagesById } = useChatStore.getState();
+      expect(messageIds).toEqual(["100", "101"]);
+      expect(messagesById["100"]?.content).toBe("original question");
+      expect(useChatStore.getState().inputError).toBeNull();
+    });
   });
 
   describe("vault null guard", () => {
@@ -494,13 +632,16 @@ describe("useSendMessage", () => {
 
       const { result } = renderHook(() => useSendMessage(7, refreshHistory));
 
-      // Don't await — observe store state immediately after kicking off the send.
-      act(() => {
+      // Issue #991: the send first awaits the server-cap admission (a
+      // microtask chain), so the flip is observed after that flush — still
+      // before any stream events have fired.
+      await act(async () => {
         void result.current.handleSend();
+        await vi.waitFor(() => {
+          expect(useChatStore.getState().isStreaming).toBe(true);
+        });
       });
 
-      // isStreaming must be true right after the send call returns, before any
-      // stream events have fired. This guards the immediate flip behavior.
       expect(useChatStore.getState().isStreaming).toBe(true);
     });
 
@@ -828,6 +969,15 @@ describe("useSendMessage", () => {
       let sendPromise = Promise.resolve();
       act(() => {
         sendPromise = result.current.handleSend();
+      });
+
+      // Issue #991: the cap admission is awaited BEFORE session creation
+      // starts; flush it so the creation race window (what UI-003 guards) is
+      // the one under test.
+      await act(async () => {
+        await vi.waitFor(() => {
+          expect(apiMocks.createChatSession).toHaveBeenCalled();
+        });
       });
 
       // Stop while the session is still being created — no stream to abort yet.

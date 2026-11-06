@@ -25,6 +25,11 @@ vi.mock("@/hooks/useChatHistory", () => ({
   useChatHistory: () => ({ refreshHistory: refreshHistoryMock }),
 }));
 vi.mock("@/hooks/useSendMessage", () => ({
+  CHAT_INPUT_CAP_ADVISORY: 20_000,
+  subscribeChatInputCap: () => () => {},
+  getChatInputCapSnapshot: () => 20_000,
+  checkSendAdmissionAsync: async () => ({ ok: true, cap: 20_000 }),
+  chatInputAdvisoryBlocked: () => null,
   useSendMessage: () => ({
     handleSend: handleSendMock,
     handleStop: vi.fn(),
