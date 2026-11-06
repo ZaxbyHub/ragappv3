@@ -8,7 +8,7 @@ import logging
 import math
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 # Matches the 8-hex-char hash produced by reupload_safe_order ID scheme.
 # Requires at least one [a-f] letter so a purely numeric legacy chunk-scale
@@ -299,6 +299,35 @@ def artifact_fields_from_metadata(metadata: Any) -> Dict[str, Any]:
     }
 
 
+def _no_distance_row_score(record: Dict[str, Any]) -> Tuple[Any, bool]:
+    """Resolve the score tier for a retrieval row with no usable ``_distance``.
+
+    Issue #1070 widened read, shared by every no-``_distance`` consumer in
+    this module (``filter_relevant``, ``expand_window``, the debug-log
+    reader): the real LanceDB FTS key ``_score`` — the only score key
+    FTS-only rows carry after ``rrf_fuse`` — outranks the legacy ``score``
+    key, which no production producer writes on retrieval rows. A
+    present-but-None key falls THROUGH to the next tier instead of shadowing
+    a usable value, and a numeric 0/0.0 IS a value.
+
+    Returns ``(value, fts_sourced)``: ``value`` is None when neither key
+    carries a usable number (callers apply their own default), and
+    ``fts_sourced`` is True exactly when the winning value came from
+    ``_score`` — the per-source "fts" score kind is set only then.
+
+    Tier contract: the first PRESENT (non-None) key wins, unchanged —
+    a numeric 0/0.0 IS a value, and a present-but-None key falls through
+    to the next tier. The only production producer (LanceDB 0.40 FTS)
+    emits a Python ``float`` ``_score``; the read itself is deliberately
+    validation-free (any non-None value is returned as-is, exactly like
+    the legacy ``score`` read it replaced).
+    """
+    raw = record.get("_score")
+    if raw is not None:
+        return raw, True
+    return record.get("score"), False
+
+
 @dataclass
 class RAGSource:
     """Represents a retrieved document source."""
@@ -323,6 +352,14 @@ class RAGSource:
     # Validated query-conditioned observation (internal ONLY — never serialized to
     # source JSON / SSE / history). Feeds the prompt and support-text scoring.
     vision_observation: Optional[str] = None
+    # Per-source score semantic (issue #1070): "fts" exactly when ``score``
+    # came from the LanceDB FTS ``_score`` key on the no-``_distance`` path —
+    # a higher-is-better BM25 value that must never be misread through the
+    # lower-is-better distance polarity. Dense ``_distance`` rows and valid
+    # ``_rerank_score`` overrides carry NO per-source kind: the global
+    # pipeline score_type ("distance"/"rerank") already types them, so the
+    # per-source kind only ever names a divergence from it.
+    score_type: Optional[str] = None
 
     def artifact_identity_key(self) -> tuple:
         """Identity key for a RAGSource — artifact-aware (issue #462).
@@ -407,6 +444,15 @@ class DocumentRetrievalService:
 
         sources: List[RAGSource] = []
         distances: List[float] = []
+        distance_kind: List[float] = []
+        score_kind: List[float] = []
+        fts_count = 0
+        # Drop-site attribution for the no_match diagnostic (PR #1077 review
+        # PRR-015): FTS ``_score`` rows are gated by the score FLOOR, not by
+        # ``max_distance_threshold`` — the log must name the gate that fired.
+        score_gated_drops = 0
+        distance_gated_drops = 0
+        last_score_floor = FALLBACK_SCORE_FLOOR
 
         input_count = len(results)
         logger.debug(
@@ -415,7 +461,12 @@ class DocumentRetrievalService:
             self.max_distance_threshold,
         )
         if results:
-            first_distances = [r.get("_distance", r.get("score")) for r in results[:5]]
+            first_distances = [
+                r.get("_distance")
+                if r.get("_distance") is not None
+                else _no_distance_row_score(r)[0]
+                for r in results[:5]
+            ]
             logger.debug("First few _distance values: %s", first_distances)
 
         # When reranking has been applied, skip distance threshold — the reranker
@@ -433,15 +484,39 @@ class DocumentRetrievalService:
                     )
                     continue
 
-            has_distance = "_distance" in record
             distance = record.get("_distance")
-            if distance is None:
-                score = record.get("score")
-                if score is None:
-                    score = 1.0
-                distance = score
+            fts_sourced = False
+            # A PRESENT-but-None ``_distance`` is treated as no-distance so
+            # the value resolves through the higher-is-better score tier:
+            # keying ``has_distance`` on key presence alone would gate an
+            # FTS ``_score`` by distance polarity (latent inversion flagged
+            # by both swarm-review shards on PR #1077 — no current producer
+            # emits that shape, but the polarity would silently invert if
+            # one ever did). With the value-None key AND no score keys the
+            # record resolves through the 1.0 default and is kept — identical
+            # to the neither-key shape (delta-review r2, intent confirmed).
+            has_distance = distance is not None
+            if not has_distance:
+                # Issue #1070 widened read: the real LanceDB FTS ``_score``
+                # outranks the legacy ``score`` key, which outranks the
+                # historical 1.0 default (see _no_distance_row_score).
+                distance, fts_sourced = _no_distance_row_score(record)
+                if distance is None:
+                    distance = 1.0
 
             distances.append(distance)
+            if has_distance:
+                distance_kind.append(distance)
+            else:
+                # PRR-015 (PR #1077 review): the score tier (FTS ``_score``
+                # BM25 magnitudes, legacy ``score``, or the 1.0 default) is a
+                # different scale than cosine distances — the summary reports
+                # the two kinds separately so min/max/mean stays
+                # unit-consistent. ``fts_sourced`` splits the score tier's
+                # own count out in the message.
+                score_kind.append(distance)
+                if fts_sourced:
+                    fts_count += 1
 
             threshold = self.max_distance_threshold
             legacy_mode = False
@@ -457,6 +532,8 @@ class DocumentRetrievalService:
                     # Cosine-distance semantics: max threshold (issue #36
                     # calibration, 0.75 for the Harrier scale).
                     should_skip = distance > threshold
+                    if should_skip:
+                        distance_gated_drops += 1
                 else:
                     # Similarity-score fallback (higher = better). Default mode
                     # uses the dedicated floor — NOT the distance max; see
@@ -465,16 +542,26 @@ class DocumentRetrievalService:
                     # resolving the floor from relevance_threshold.
                     score_floor = threshold if legacy_mode else FALLBACK_SCORE_FLOOR
                     should_skip = distance < score_floor
+                    if should_skip:
+                        score_gated_drops += 1
+                        last_score_floor = score_floor
 
             if should_skip:
                 continue
 
             # Use sigmoid-normalized _rerank_score when reranked, otherwise fall back to distance
             source_score = distance  # default
+            # Per-source score kind (issue #1070): only an FTS-``_score``-sourced
+            # value diverges from the global pipeline typing.
+            source_score_type: Optional[str] = "fts" if fts_sourced else None
             if reranked and "_rerank_score" in record:
                 raw_score = record["_rerank_score"]
                 if isinstance(raw_score, (int, float)) and 0.0 <= float(raw_score) <= 1.0:
                     source_score = float(raw_score)
+                    # The reported value is the reranker's, not the FTS
+                    # ``_score`` — the per-source kind reverts to the global
+                    # "rerank" typing.
+                    source_score_type = None
                 else:
                     logger.warning(
                         "Invalid _rerank_score value %r for chunk %s, falling back to distance",
@@ -493,6 +580,7 @@ class DocumentRetrievalService:
                     file_id=record.get("file_id", ""),
                     score=source_score,
                     metadata=raw_meta,
+                    score_type=source_score_type,
                     # Multi-modal artifact identity (issue #462) — lifted from the
                     # proxy metadata so identity survives retrieval as first-class
                     # fields. vision_status stays None here (only the vision run
@@ -504,19 +592,61 @@ class DocumentRetrievalService:
         if distances:
             initial_count = len(distances)
             filtered_count = len(sources)
-            min_dist = min(distances)
-            max_dist = max(distances)
-            mean_dist = sum(distances) / len(distances)
 
-            logger.info(
-                "Vector search: initial=%d, filtered=%d, min=%.3f, max=%.3f, mean=%.3f, threshold=%.3f",
-                initial_count,
-                filtered_count,
-                min_dist,
-                max_dist,
-                mean_dist,
-                self.max_distance_threshold,
-            )
+            def _stats(values: List[float]) -> Tuple[float, float, float]:
+                return min(values), max(values), sum(values) / len(values)
+
+            if distance_kind and score_kind:
+                d_min, d_max, d_mean = _stats(distance_kind)
+                s_min, s_max, s_mean = _stats(score_kind)
+                logger.info(
+                    "Vector search: initial=%d, filtered=%d, "
+                    "distance min=%.3f, max=%.3f, mean=%.3f (n=%d), "
+                    "score min=%.3f, max=%.3f, mean=%.3f (n=%d, fts=%d), "
+                    "max_distance_threshold=%.3f",
+                    initial_count,
+                    filtered_count,
+                    d_min,
+                    d_max,
+                    d_mean,
+                    len(distance_kind),
+                    s_min,
+                    s_max,
+                    s_mean,
+                    len(score_kind),
+                    fts_count,
+                    self.max_distance_threshold,
+                )
+            elif score_kind:
+                # Score-tier rows only (FTS/legacy/1.0): a distance-kind
+                # statistic over them would mislabel the scale (PRR-015).
+                s_min, s_max, s_mean = _stats(score_kind)
+                logger.info(
+                    "Vector search: initial=%d, filtered=%d, "
+                    "score min=%.3f, max=%.3f, mean=%.3f (n=%d, fts=%d), "
+                    "max_distance_threshold=%.3f",
+                    initial_count,
+                    filtered_count,
+                    s_min,
+                    s_max,
+                    s_mean,
+                    len(score_kind),
+                    fts_count,
+                    self.max_distance_threshold,
+                )
+            else:
+                min_dist = min(distance_kind)
+                max_dist = max(distance_kind)
+                mean_dist = sum(distance_kind) / len(distance_kind)
+                logger.info(
+                    "Vector search: initial=%d, filtered=%d, min=%.3f, max=%.3f, mean=%.3f, threshold=%.3f",
+                    initial_count,
+                    filtered_count,
+                    min_dist,
+                    max_dist,
+                    mean_dist,
+                    self.max_distance_threshold,
+                )
 
         # Apply group-aware dedup before window expansion (Issue #12)
         if settings.new_dedup_policy and sources:
@@ -541,12 +671,27 @@ class DocumentRetrievalService:
 
         # When all results exceed threshold, signal no_match instead of returning top-k
         if input_count > 0 and len(sources) == 0:
-            logger.info(
-                "All %d results exceeded max_distance_threshold=%.3f. "
-                "Returning empty list with no_match flag.",
-                input_count,
-                self.max_distance_threshold,
-            )
+            if score_gated_drops and not distance_gated_drops:
+                # Every drop came through the higher-is-better score floor
+                # (FTS ``_score`` tier): naming ``max_distance_threshold``
+                # here would report the wrong constant and the wrong
+                # polarity (PR #1077 review PRR-015).
+                logger.info(
+                    "All %d results fell below the score floor "
+                    "(floor=%.3f). Returning empty list with no_match flag.",
+                    input_count,
+                    last_score_floor,
+                )
+            else:
+                logger.info(
+                    "All %d results exceeded max_distance_threshold=%.3f "
+                    "(distance_gated=%d, score_gated=%d). Returning empty "
+                    "list with no_match flag.",
+                    input_count,
+                    self.max_distance_threshold,
+                    distance_gated_drops,
+                    score_gated_drops,
+                )
             self.no_match = True
 
         # Issue #258 (TEST-001): an EXPLICITLY-passed top_k is a hard cap on
@@ -707,11 +852,19 @@ class DocumentRetrievalService:
                     chunk = adjacent_lookup[chunk_uid]
 
                     distance = chunk.get("_distance")
+                    adjacent_score_type: Optional[str] = None
                     if distance is None:
-                        score = chunk.get("score")
-                        if score is None:
-                            score = 1.0
-                        distance = score
+                        # Issue #1070 widened read — same tier precedence as
+                        # filter_relevant (_no_distance_row_score). Production
+                        # adjacent rows (get_chunks_by_uid fetches) carry
+                        # neither score key, so the 1.0 default stays the
+                        # effective behavior there; a row that DOES carry the
+                        # FTS ``_score`` gets its real value and kind.
+                        distance, fts_sourced = _no_distance_row_score(chunk)
+                        if distance is None:
+                            distance = 1.0
+                        if fts_sourced:
+                            adjacent_score_type = "fts"
 
                     metadata = self._normalize_metadata(chunk.get("metadata"))
                     if chunk_scale:
@@ -732,6 +885,7 @@ class DocumentRetrievalService:
                         file_id=record_file_id,
                         score=distance,
                         metadata=metadata,
+                        score_type=adjacent_score_type,
                     )
                     expanded_sources.append(expanded_source)
                     seen_uids.add(_normalize_uid_for_dedup(chunk_uid))
@@ -846,6 +1000,15 @@ class DocumentRetrievalService:
             # user. See ``whitelist_metadata_for_wire``.
             "metadata": whitelist_metadata_for_wire(chunk.metadata),
         }
+        # Per-source score kind (issue #1070): emit only when the source
+        # carries one. The kind can only be "fts", which never matches the
+        # global pipeline score_type ("distance"/"rerank"), so this fires
+        # exactly when the per-source type DIVERGES from the global one and
+        # clients must not read the score through the distance/rerank
+        # polarity. Sources without a per-source kind keep relying on the
+        # done-payload's global score_type.
+        if chunk.score_type:
+            result["score_type"] = chunk.score_type
         # Multi-modal artifact presentation (issue #462): emit first-class
         # optional artifact fields ONLY for artifact sources, and never when the
         # query-time vision run did not set a status (V5 feature-off parity).

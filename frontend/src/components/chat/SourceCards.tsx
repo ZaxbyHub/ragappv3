@@ -4,7 +4,7 @@ import { ChevronDown, ChevronUp, ExternalLink } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-import { getRelevanceLabel, type ScoreType } from "@/lib/relevance";
+import { getRelevanceLabel } from "@/lib/relevance";
 import { resolveCitedState } from "@/lib/evidence";
 import type { Source } from "@/lib/api";
 
@@ -40,8 +40,11 @@ function SourceCard({ source, fallbackIndex, validCitationLabels, onClick }: Sou
     (source.metadata as Record<string, unknown> | undefined)?.synthesized
   );
 
+  // Relevance badge: suppressed for synthesized sources AND for the
+  // uncalibrated per-source "fts" kind (issue #1070 — getRelevanceLabel
+  // returns null for it, so the guard below skips the badge).
   const relevance = !isSynthesized && source.score !== undefined
-    ? getRelevanceLabel(source.score, source.score_type as ScoreType)
+    ? getRelevanceLabel(source.score, source.score_type)
     : null;
 
   const snippet = source.snippet ?? "";

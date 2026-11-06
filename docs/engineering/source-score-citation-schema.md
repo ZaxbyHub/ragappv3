@@ -44,6 +44,21 @@ source list. Wiki evidence uses `W#`, KMS `K#`, memories `M#`.
 | `distance` | vector distance (cosine or L2 per `vector_metric`) | lower = better |
 | `rerank` | reranker relevance score | higher = better |
 | `rrf` | reciprocal-rank fusion score (hybrid) | higher = better |
+| `fts` | per-source override: raw LanceDB/tantivy BM25 `_score` on an FTS-only hit (issue #1070) | higher = better (BM25 magnitude — uncalibrated against the distance/rerank thresholds; consumers suppress the relevance label instead of banding it) |
+
+**Per-source override:** the payload-level `score_type` types the pipeline
+(`distance`/`rerank`). An individual `sources[]` entry may carry its OWN
+`score_type` (currently only `"fts"`, emitted by
+`DocumentRetrievalService.to_source_metadata` when the source's score came
+from the FTS `_score` tier): a per-source value, when present, describes
+that entry's `score` and takes precedence over the payload-level value for
+that entry. Consumers that band scores by payload-level semantics must
+null-guard the label for `fts` (it has no calibrated band) rather than
+reusing the payload-level polarity — see the frontend
+`getRelevanceLabel` contract (relevance.ts), which returns `null` for it.
+A source WITHOUT a per-source `score_type` keeps the payload-level
+interpretation unchanged (older payloads deserialize identically — the
+field is additive and optional).
 
 `vector_metric` (default `cosine`) is applied explicitly on **every** dense
 query — flat scans as well as ANN — so distance semantics agree with the ANN

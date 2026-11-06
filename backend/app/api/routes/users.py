@@ -31,7 +31,12 @@ from app.services.draft_deletion import DraftDeletionService
 from app.services.draft_input_storage import DraftInputStorage, DraftInputStorageError
 from app.services.draft_store import DraftStore
 from app.services.security_audit import safe_record_security_event
-from app.services.task_drain import drain_audit, drain_await, drain_commit_audit
+from app.services.task_drain import (
+    drain_audit,
+    drain_await,
+    drain_commit_audit,
+    drained_unit,
+)
 
 router = APIRouter(prefix="/users", tags=["users"])
 logger = logging.getLogger(__name__)
@@ -580,17 +585,26 @@ async def admin_reset_password(
                 pass
             raise
 
-    await asyncio.to_thread(_admin_reset_password_db)
+    # Issue #1068: the BEGIN-EXCLUSIVE worker's inline COMMIT, the post-commit
+    # cache invalidation, and the user.password_reset audit tail form ONE
+    # drained unit — a cancellation delivered exactly at the commit await
+    # (after the commit work completed) is absorbed until the audit row is
+    # written, then re-raised. An invalidate_active_user_cache failure keeps
+    # its original propagation and skips the audit.
+    async def _unit() -> None:
+        await asyncio.to_thread(_admin_reset_password_db)
 
-    invalidate_active_user_cache(user_id)
-    await drain_audit(safe_record_security_event(
-        db,
-        event_type="user.password_reset",
-        actor=user,
-        target_user_id=user_id,
-        request=request,
-        metadata={"must_change_password": True, "sessions_revoked": sessions_revoked},
-    ))
+        invalidate_active_user_cache(user_id)
+        await drain_audit(safe_record_security_event(
+            db,
+            event_type="user.password_reset",
+            actor=user,
+            target_user_id=user_id,
+            request=request,
+            metadata={"must_change_password": True, "sessions_revoked": sessions_revoked},
+        ))
+
+    await drained_unit(_unit())
 
     return {
         "message": "Password reset successfully",
@@ -1550,7 +1564,17 @@ async def update_user_organizations(
             })
         return {"organizations": orgs}
 
-    try:
+    # Bound by the drained unit below; pre-initialized purely so the unit's
+    # `nonlocal` target exists (the unit either assigns it or raises).
+    result = None
+
+    # Issue #1068: the _update_orgs worker's transaction_context commit and
+    # the membership.organizations_replaced audit tail form ONE drained unit —
+    # a cancellation delivered exactly at the commit await (after the commit
+    # work completed) is absorbed until the audit row is written, then
+    # re-raised.
+    async def _unit() -> None:
+        nonlocal result
         result = await asyncio.to_thread(_update_orgs)
         await drain_audit(safe_record_security_event(
             conn,
@@ -1565,6 +1589,9 @@ async def update_user_organizations(
                 ]
             },
         ))
+
+    try:
+        await drained_unit(_unit())
         return result
     finally:
         pool.release_connection(conn)
@@ -1836,7 +1863,17 @@ async def update_user_groups(
 
         return groups
 
-    try:
+    # Bound by the drained unit below; pre-initialized purely so the unit's
+    # `nonlocal` target exists (the unit either assigns it or raises).
+    groups = None
+
+    # Issue #1068: the _update_groups worker's transaction_context commit and
+    # the membership.groups_replaced audit tail form ONE drained unit — a
+    # cancellation delivered exactly at the commit await (after the commit
+    # work completed) is absorbed until the audit row is written, then
+    # re-raised.
+    async def _unit() -> None:
+        nonlocal groups
         groups = await asyncio.to_thread(_update_groups)
         await drain_audit(safe_record_security_event(
             conn,
@@ -1846,6 +1883,9 @@ async def update_user_groups(
             request=request,
             metadata={"group_ids": list(body.group_ids)},
         ))
+
+    try:
+        await drained_unit(_unit())
         return {"groups": groups}
     finally:
         pool.release_connection(conn)

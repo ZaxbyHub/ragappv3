@@ -17,6 +17,17 @@ describe("getRelevanceLabel", () => {
   // ============================================
   // Distance score type (0=identical, higher=worse; calibrated 2026-09)
   // ============================================
+  describe("fts score type (issue #1070)", () => {
+    it("test_fts_returns_null — getRelevanceLabel(0.4, 'fts') is null (uncalibrated kind suppresses the label)", () => {
+      expect(getRelevanceLabel(0.4, "fts")).toBeNull();
+    });
+
+    it("test_fts_null_at_any_score — no band is guessed for fts regardless of value", () => {
+      expect(getRelevanceLabel(0.0, "fts")).toBeNull();
+      expect(getRelevanceLabel(7.3, "fts")).toBeNull();
+    });
+  });
+
   describe("distance score type", () => {
     it("test_distance_highly_relevant — getRelevanceLabel(0.3, 'distance').text === 'Highly Relevant'", () => {
       const result = getRelevanceLabel(0.3, "distance");

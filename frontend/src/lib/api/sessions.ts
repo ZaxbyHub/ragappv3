@@ -193,9 +193,14 @@ export async function parseSSEStream(
           if (Array.isArray(parsed.sources) && parsed.sources.length > 0) {
             const scoreType = ((parsed as { score_type?: Source["score_type"] }).score_type
               ?? "distance") as Source["score_type"];
+            // Issue #1070: a source may carry its OWN score_type (currently
+            // only "fts", the per-source kind for a real BM25 `_score`) that
+            // diverges from the payload's global typing. The source's own
+            // kind wins; sources without one keep the global default so the
+            // historical behavior is unchanged for dense/rerank rows.
             const enrichedSources = parsed.sources.map((s: Source) => ({
               ...s,
-              score_type: scoreType,
+              score_type: s.score_type ?? scoreType,
             }));
             callbacks.onSources?.(enrichedSources);
           }

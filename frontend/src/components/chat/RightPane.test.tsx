@@ -330,6 +330,84 @@ describe("RightPane", () => {
       expect(screen.getByText("Relevant")).toBeInTheDocument();
     });
 
+    it("suppresses the relevance badge for fts sources in the source list (issue #1070)", () => {
+      const sources = [
+        createMockSource({ id: "src-1", filename: "ftsdoc.pdf", score: 0.55, score_type: "fts" }),
+      ];
+
+      mockUseChatStore.mockReturnValue({
+        messages: [
+          createMockMessage({ role: "user", content: "test" }),
+          createMockMessage({ role: "assistant", content: "response", sources }),
+        ],
+        expandedSources: new Set(),
+      });
+
+      render(<RightPane />);
+
+      // The fts source renders with NO relevance label (uncalibrated kind);
+      // dense-badge rendering is covered by the tests above this one.
+      expect(screen.queryAllByText("ftsdoc.pdf").length).toBeGreaterThan(0);
+      expect(screen.queryByText("Highly Relevant")).not.toBeInTheDocument();
+      expect(screen.queryByText("Relevant")).not.toBeInTheDocument();
+      expect(screen.queryByText("Related")).not.toBeInTheDocument();
+      expect(screen.queryByText("Tangential")).not.toBeInTheDocument();
+    });
+
+    it("suppresses the relevance badge for the selected fts source detail (issue #1070)", async () => {
+      const ftsSource = createMockSource({ id: "src-1", filename: "ftsdoc.pdf", score: 0.55, score_type: "fts" });
+      const denseSource = createMockSource({ id: "src-2", filename: "dense.pdf", score: 0.55, score_type: "distance" });
+
+      mockUseChatStore.mockReturnValue({
+        messages: [
+          createMockMessage({ role: "user", content: "test" }),
+          createMockMessage({ role: "assistant", content: "response", sources: [ftsSource, denseSource] }),
+        ],
+        expandedSources: new Set(),
+      });
+
+      // Select the FTS source through the shell store (the same path
+      // handleSourceClick / evidence-pane selection drives) so the real
+      // SourcePreview detail renderer runs for it.
+      (mockUseChatShellStore as ReturnType<typeof vi.fn>).mockReturnValue({
+        selectedEvidenceSource: ftsSource,
+        setSelectedEvidenceSource: vi.fn(),
+        activeRightTab: "evidence",
+        setActiveRightTab: vi.fn(),
+      });
+
+      const { rerender } = render(<RightPane />);
+      const ftsPreview = await screen.findByTestId("tab-content-preview");
+      expect(ftsPreview).toHaveTextContent(/ftsdoc\.pdf/i);
+      // Uncalibrated fts kind: NO band label anywhere in the detail pane.
+      expect(ftsPreview).not.toHaveTextContent("Highly Relevant");
+      expect(ftsPreview).not.toHaveTextContent("Relevant");
+      expect(ftsPreview).not.toHaveTextContent("Related");
+      expect(ftsPreview).not.toHaveTextContent("Tangential");
+
+      // Dense positive control through the SAME renderer: the preview for a
+      // distance-typed source does carry its calibrated band label.
+      (mockUseChatShellStore as ReturnType<typeof vi.fn>).mockReturnValue({
+        selectedEvidenceSource: denseSource,
+        setSelectedEvidenceSource: vi.fn(),
+        activeRightTab: "evidence",
+        setActiveRightTab: vi.fn(),
+      });
+      rerender(<RightPane />);
+      const densePreview = await screen.findByTestId("tab-content-preview");
+      expect(densePreview).toHaveTextContent(/dense\.pdf/i);
+      expect(densePreview).toHaveTextContent("Highly Relevant");
+
+      // Restore the file-wide default shell-store mock so later tests keep
+      // the unselected default (mockClear does not remove implementations).
+      (mockUseChatShellStore as ReturnType<typeof vi.fn>).mockReturnValue({
+        selectedEvidenceSource: null,
+        setSelectedEvidenceSource: vi.fn(),
+        activeRightTab: "evidence",
+        setActiveRightTab: vi.fn(),
+      });
+    });
+
     it("should NOT render a relevance label for synthesized sources", () => {
       // Even if a synthesized source somehow carries a score, the synthesized
       // flag must suppress the (misleading) relevance label in the source list.
