@@ -2968,7 +2968,9 @@ class BackgroundProcessor:
         the UPDATE, so decision and write cannot interleave), and the
         ``enrichment_error IS NULL`` predicate is the currency guard: every
         chunk-pipeline failure/stale/cancel/recovery writer sets a NON-NULL
-        error, while this sync is the only writer that clears it, so a
+        error, while this sync is the only aggregate writer that clears it (the chunk
+        pipeline's own terminal writes clear it too, but those are the states
+        the guard protects), so a
         settled atom batch can never overwrite a chunk-pipeline terminal
         failure for the same file row. A zero-row result (row absent, or a
         chunk failure present) skips the write.

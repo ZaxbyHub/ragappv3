@@ -105,5 +105,109 @@ class TestPostStampNotCurrentFallback(unittest.IsolatedAsyncioTestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class _ContentService:
+    """Enrichment service returning real content for the success-tail arm."""
+
+    async def enrich_chunks(self, chunk_dicts, document_title: str = ""):
+        from app.services.chunk_enrichment import ChunkEnrichment
+
+        return [
+            ChunkEnrichment(
+                chunk_id=c["chunk_uid"],
+                summary="s",
+                questions=["q"],
+                entities=["e"],
+            )
+            for c in chunk_dicts
+        ]
+
+
+class TestSuccessTailNotCurrentFallback(unittest.IsolatedAsyncioTestCase):
+    async def test_success_tail_hash_rotated_in_swap_seam_marks_stale(self):
+        """The success-tail complete arm, superseded in the swap seam, marks stale.
+
+        Flow: the job stamps 'processing', the enrichment returns real content,
+        and the file hash is rotated inside the vector-swap seam (a newer
+        ingest owns the row between the swap-tail currency check and the
+        terminal complete write). The guarded complete write matches zero rows
+        (NOT_CURRENT) and the success tail must fall back to the stale marker
+        — 'error' + the stale message, never a stuck 'processing' row (the
+        #704-style leak the fallback prevents). Deleting the fallback block
+        turns this RED (implementation-review Finding B).
+        """
+        tmp = Path(__file__).parent / ".rag-poststamp" / uuid.uuid4().hex
+        tmp.mkdir(parents=True)
+        try:
+            db_path, file_id, vault_id = _make_db(
+                tmp, enrichment_status="pending", enrichment_error=None
+            )
+            pool = SQLiteConnectionPool(db_path)
+            import types
+
+            stub = types.SimpleNamespace(
+                pool=pool,
+                _write_semaphore=asyncio.Semaphore(1),
+                _detached_status_tasks=set(),
+            )
+            stub.set_enrichment_status = lambda *a, **k: DocumentProcessor.set_enrichment_status(stub, *a, **k)
+            stub._mark_enrichment_stale_if_current_job = lambda *a, **k: DocumentProcessor._mark_enrichment_stale_if_current_job(stub, *a, **k)
+            stub._is_enrichment_job_current = lambda *a, **k: DocumentProcessor._is_enrichment_job_current(stub, *a, **k)
+
+            def rotate_hash():
+                import sqlite3
+
+                conn = sqlite3.connect(db_path)
+                conn.execute(
+                    "UPDATE files SET file_hash = 'rotated-newer' WHERE id = ?",
+                    (file_id,),
+                )
+                conn.commit()
+                conn.close()
+
+            async def swap(records, old_ids):
+                rotate_hash()
+
+            async def verify(file_id_arg):
+                rotate_hash()
+
+            stub._swap_in_enriched_vector_records = swap
+            stub._verify_vector_rows_visible = verify
+            # Embedding/swap collaborators the success tail needs as no-ops.
+            async def embed_with_cache(texts):
+                return [[0.0] for _ in texts]
+
+            stub._embed_with_cache = embed_with_cache
+            stub._validate_chunk_sizes = lambda texts, name: None
+            stub._build_vector_record = lambda **kw: {"id": "f1_0"}
+            stub._build_chunk_uid = lambda file_id, chunk: "f1_0"
+            stub._search_text_with_enrichment = lambda chunk, enrichment: chunk.text
+            stub._enrichment_has_content = lambda enrichment: True
+
+            chunk = types.SimpleNamespace(
+                text="a chunk body with real content",
+                metadata={"chunk_scale": "default", "total_chunks": 1},
+            )
+            stub._candidate_chunks_for_enrichment = lambda file_id, chunks: [(chunk, "f1_0")]
+            stub._get_chunk_enrichment_service = lambda vault_id, file_id: _ContentService()
+
+            await DocumentProcessor.run_enrichment_job(
+                stub,
+                file_id=file_id,
+                file_path="/x/a.png",
+                vault_id=vault_id,
+                file_hash="hash1",
+                chunks=[chunk],
+                document_text="a chunk body with real content",
+            )
+            row = _enrichment_row(pool, file_id)
+            pool.close_all()
+            self.assertEqual(row["enrichment_status"], "error")
+            self.assertIn("became stale", row["enrichment_error"] or "")
+        finally:
+            import shutil
+
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()

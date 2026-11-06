@@ -57,11 +57,13 @@ class TestEnrichmentWriterCensus(unittest.TestCase):
         self.bt = _src(BT)
 
     def test_set_enrichment_status_call_roster_is_pinned(self):
-        """Exactly the 8 sanctioned production call sites, no drift."""
-        dp_sites = _call_sites(self.dp, "set_enrichment_status")
-        bt_sites = _call_sites(self.bt, "set_enrichment_status")
-        self.assertEqual(len(dp_sites), 7, f"document_processor sites: {dp_sites}")
-        self.assertEqual(len(bt_sites), 1, f"background_tasks sites: {bt_sites}")
+        """Exactly the 8 sanctioned production call sites repo-wide, no drift."""
+        total = 0
+        for path in APP_ROOT.rglob("*.py"):
+            sites = _call_sites(_src(path), "set_enrichment_status")
+            if sites:
+                total += len(sites)
+        self.assertEqual(total, 8, "set_enrichment_status roster drifted")
 
     def test_six_terminal_writers_carry_the_hash_currency_guard(self):
         """All four ``complete`` + both ``error`` writers pass require_file_hash.
@@ -80,6 +82,64 @@ class TestEnrichmentWriterCensus(unittest.TestCase):
             len(guarded), 6, f"expected 6 guarded terminal writers: {guarded}"
         )
         self.assertEqual(len(entry), 1, f"expected 1 entry stamp: {entry}")
+
+    def test_guarded_update_carries_the_full_currency_predicate(self):
+        """The guarded WHERE is the FULL hash/status predicate, verbatim.
+
+        Killing mutation: dropping only ``AND status IN ('indexed','partial')``
+        (hash-only guard) must turn this RED — it differs from
+        ``_is_enrichment_job_current`` exactly by that half.
+        """
+        m = re.search(
+            r'require_file_hash is not None:(.*?)try:', self.dp, re.S
+        )
+        self.assertIsNotNone(m, "require_file_hash WHERE construction not found")
+        self.assertIn("AND file_hash = ?", m.group(1))
+        self.assertIn("AND status IN ('indexed', 'partial')", m.group(1))
+
+    def test_complete_write_is_one_statement_not_read_then_write(self):
+        """The complete branch's CASE feeds the UPDATE in the SAME statement.
+
+        Killing mutation: splitting into a separate SELECT ... CASE ... then a
+        literal-status UPDATE keeps ``aggregate_status_case_sql()`` in the
+        file but must turn this RED — the atomicity claim is precisely that
+        there is no Python seam between the aggregate decision and the write.
+        """
+        m = re.search(
+            r'status_sql = "\?"(.*?)if require_file_hash is not None:',
+            self.dp,
+            re.S,
+        )
+        self.assertIsNotNone(m, "complete-branch status_sql construction missing")
+        branch = m.group(1)
+        self.assertIn('status == "complete"', self.dp)
+        self.assertIn(
+            'status_sql = "(" + aggregate_status_case_sql() + ")"', branch,
+            "complete must SET the CASE inline — a separate read-then-write "
+            "split loses single-statement atomicity",
+        )
+        # The CASE feeds conn.execute, not a separate SELECT: no second
+        # execute of the aggregate exists between decision and write.
+        self.assertNotIn(
+            "SELECT enrichment_status", branch,
+            "read-then-write split detected",
+        )
+
+    def test_cancel_cas_pins_both_predicate_halves(self):
+        """The stale/cancel CAS WHERE carries status AND timestamp, verbatim.
+
+        Killing mutation: dropping only ``AND enrichment_status =
+        'processing'`` (timestamp-only CAS) must turn this RED.
+        """
+        m = re.search(
+            r"async def _mark_enrichment_stale_if_current_job(.*?)except sqlite3\.Error",
+            self.dp,
+            re.S,
+        )
+        self.assertIsNotNone(m, "stale/cancel CAS not found")
+        body = m.group(1)
+        self.assertIn("AND enrichment_status = 'processing'", body)
+        self.assertIn("AND enrichment_updated_at = ?", body)
 
     def test_atom_sync_update_carries_the_chunk_failure_predicate(self):
         """``_sync_file_enrichment_status`` skips rows with a chunk failure."""
