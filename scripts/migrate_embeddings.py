@@ -40,9 +40,14 @@ Properties
   exit code 5 = another process holds a write lock on the SQLite database
   (stop the application first) or the database is unreadable/corrupt,
   exit code 6 = the SQLite database is unreadable/corrupt during repair
-  detection (restore it from your backup).
-  ``--force`` overrides exits 3 and 4 only; the lock/corruption refusals
-  (5 and 6) always stop the run.
+  detection (restore it from your backup),
+  exit code 7 = neither the LanceDB path nor the SQLite path exists (wrong
+  paths — for example container-side DATA_DIR paths used from the host),
+  exit code 8 = the application SQLite database is missing or has no
+  ``files`` table on a path where a reset/wipe would run (without it the
+  wipe would destroy vectors with no rollback source).
+  ``--force`` overrides exits 3 and 4 only; the lock/corruption/wrong-path
+  refusals (5, 6, 7 and 8) always stop the run.
 
 Usage
 -----
@@ -261,6 +266,69 @@ def _assert_no_active_writer(sqlite_path: Path) -> None:
         conn.close()
 
 
+def _assert_application_database(sqlite_path: Path, lancedb_path: Path) -> None:
+    """Refuse destructive steps without a readable application database (#749).
+
+    A reset/wipe driven from a MISSING SQLite path (or a present file that is
+    not the application database — no ``files`` table) destroys the LanceDB
+    index with no rollback source: the reset step would silently skip (its
+    missing-file arm logs a warning and returns 0) and the wipe follows it
+    unconditionally. Exit 8 refuses that state up front, naming both paths.
+
+    Exception taxonomy deliberately mirrors the sibling probes
+    (``_count_rows_claiming_vectors`` / ``_assert_no_active_writer``): a lock
+    (``sqlite3.OperationalError`` is a SUBCLASS of ``sqlite3.DatabaseError``,
+    so it must be caught first) stays a stop-the-writer ``MigrationRefused``
+    (exit 5 via ``main()``); other ``DatabaseError`` is corruption, also exit 5.
+    """
+    if not sqlite_path.exists():
+        print(
+            "ERROR: the application SQLite database does not exist, so a\n"
+            "reset/wipe would destroy the LanceDB index with NO rollback\n"
+            "source (the status reset would skip and the wipe still runs):\n"
+            f"  SQLite path : {sqlite_path} (missing)\n"
+            f"  LanceDB path: {lancedb_path}\n"
+            "Point --sqlite-path at the application database (as seen from\n"
+            "where you run the script) and re-run. Nothing was migrated.\n"
+        )
+        raise SystemExit(8)
+    conn = None
+    try:
+        conn = sqlite3.connect(str(sqlite_path), timeout=2.0, isolation_level=None)
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='files'"
+        )
+        has_files_table = cursor.fetchone() is not None
+    except sqlite3.OperationalError as exc:
+        raise MigrationRefused(
+            f"Another process appears to hold a write lock on the SQLite "
+            f"database ({exc}): {sqlite_path}\n"
+            "Is the application still running? Stop it first, e.g.:\n"
+            "  docker compose stop knowledgevault\n"
+            "Then re-run this migration."
+        ) from exc
+    except sqlite3.DatabaseError as exc:
+        raise MigrationRefused(
+            f"The SQLite database is unreadable or corrupt ({exc}): "
+            f"{sqlite_path}\n"
+            "Repair or restore it (from your backup) before re-running."
+        ) from exc
+    finally:
+        if conn is not None:
+            conn.close()
+    if not has_files_table:
+        print(
+            "ERROR: the SQLite file exists but has no 'files' table, so it is\n"
+            "not the application database — a reset/wipe would destroy the\n"
+            "LanceDB index with NO rollback source:\n"
+            f"  SQLite path : {sqlite_path} (no 'files' table)\n"
+            f"  LanceDB path: {lancedb_path}\n"
+            "Point --sqlite-path at the application database and re-run.\n"
+            "Nothing was migrated.\n"
+        )
+        raise SystemExit(8)
+
+
 def _reset_file_statuses(sqlite_path: Path, dry_run: bool) -> int:
     """Reset all indexed/partial files to pending. Returns the count of affected rows.
 
@@ -390,7 +458,9 @@ def run_migration(
             non-empty index without ``--force``; code 4 when the configured
             dimension is unreadable (settings load failure) without
             ``--force``; code 6 when the SQLite database is unreadable or
-            corrupt during repair detection.
+            corrupt during repair detection; code 7 when neither path
+            exists; code 8 when the application database is missing or has
+            no ``files`` table where a reset/wipe would run.
         MigrationRefused: another process holds a write lock on the SQLite
             database, or the database is unreadable/corrupt at the writer
             probe (``main()`` maps this to exit code 5).
@@ -404,6 +474,24 @@ def run_migration(
     print(f"  Dry run      : {dry_run}")
     print("=" * 60)
     print()
+
+    # Issue #749 (T1-29-K-02): refusing BOTH-missing paths is the first check.
+    # A run pointed at a LanceDB path AND a SQLite path that both do not exist
+    # is almost always wrong paths (for example container-side DATA_DIR paths
+    # run from the host), and the old behavior — a silent "Nothing to migrate"
+    # exit 0 — told the operator the migration had run. Applies to --dry-run
+    # and --force alike: wrong paths are wrong paths (7 joins 5/6 in the
+    # always-stop family; --force overrides 3/4 only).
+    if not lancedb_path.exists() and not sqlite_path.exists():
+        print(
+            "ERROR: neither path exists — refusing to continue:\n"
+            f"  LanceDB path: {lancedb_path} (exists: {lancedb_path.exists()})\n"
+            f"  SQLite path : {sqlite_path} (exists: {sqlite_path.exists()})\n"
+            "This usually means the paths are wrong (for example container-side\n"
+            "DATA_DIR paths used from the host). Pass the paths as seen from\n"
+            "where you run the script. Nothing was migrated.\n"
+        )
+        raise SystemExit(7)
 
     # ── Step 1: Detect dimension mismatch ──────────────────────────────────
     stored_dim = _detect_stored_dim(lancedb_path)
@@ -523,9 +611,19 @@ def run_migration(
             "WARNING: This will permanently delete all LanceDB vectors.\n"
             "         Back up /your/data/lancedb before continuing.\n"
         )
+        # Issue #749: the destructive path requires the application database —
+        # without it the reset skips and the wipe still runs (no rollback
+        # source). Checked BEFORE the writer probe so a missing/empty DB is
+        # refused first; locks and corruption keep the writer probe's
+        # exit-5 semantics wherever the database exists.
+        _assert_application_database(sqlite_path, lancedb_path)
         # Issue #694: refuse to race a live writer. Probe BEFORE the first
         # destructive step (the SQLite reset — the wipe follows it).
         _assert_no_active_writer(sqlite_path)
+    else:
+        # Dry-run reports what WOULD change; over wrong paths that report is
+        # the misleading success the refusals exist for (issue #749).
+        _assert_application_database(sqlite_path, lancedb_path)
 
     # ── Step 2: Reset file statuses ────────────────────────────────────────
     # The reset runs FIRST (issue #694): if it fails (locked DB, crash), the

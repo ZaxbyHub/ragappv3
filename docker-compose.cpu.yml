@@ -1,0 +1,37 @@
+# CPU-only host override (issue #749, RT-S3-03 / T1-04-S2-10 follow-up).
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.cpu.yml up -d
+#
+# What this changes relative to docker-compose.yml:
+#   * harrier-embed and reranker run the CPU build of text-embeddings-inference
+#     instead of the CUDA build. Expect meaningfully slower embedding/rerank
+#     throughput; correctness is unchanged (same model ids, same ports, same
+#     healthchecks, so the knowledgevault service_healthy dependency in the
+#     base file keeps gating startup the same way).
+#   * The NVIDIA GPU reservations are removed. Compose merge semantics require
+#     `!reset []` here: a plain `devices: []` would RETAIN the base services'
+#     nvidia device reservations (verified with Docker Compose v5.5.1).
+#
+# Digest pinning: the shipped GPU images in docker-compose.yml are digest-
+# pinned (issue #404). This override intentionally uses the floating
+# `cpu-latest` tag because it is an operator opt-in; before relying on it in
+# production, pin the digest yourself, e.g.:
+#   docker manifest inspect \
+#     ghcr.io/huggingface/text-embeddings-inference:cpu-latest > /dev/null \
+#     && docker compose -f docker-compose.yml -f docker-compose.cpu.yml pull
+# (or copy the digest your registry reports into the image: lines below).
+services:
+  harrier-embed:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-latest
+    deploy:
+      resources:
+        reservations:
+          devices: !reset []
+
+  reranker:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-latest
+    deploy:
+      resources:
+        reservations:
+          devices: !reset []

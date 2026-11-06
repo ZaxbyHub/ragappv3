@@ -116,11 +116,14 @@ def _get_today_stats(pool) -> tuple[int, int]:
     Returns:
         Tuple of (processed_today, failed_today) counts
     """
-    from datetime import date
+    from datetime import datetime, timezone
 
     conn = pool.get_connection()
     try:
-        today = date.today().isoformat()
+        # files.created_at is stamped in UTC (issue #749, T1-01-S2-05): anchor
+        # the "today" window to the same UTC day the writer used, not the
+        # host-local date (a host behind/ahead of UTC counts the wrong day).
+        today = datetime.now(timezone.utc).date().isoformat()
 
         # Get processed count (all emails added today)
         cursor = conn.execute(

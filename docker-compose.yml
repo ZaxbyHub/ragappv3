@@ -339,6 +339,15 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      # Wait for the embedder the strict TEI model validation probes (issue
+      # #748, T1-04-S2-07): without this, a fresh `up` can start the app before
+      # harrier-embed is ready and the strict check silently self-skips (its
+      # except arm re-raises only its own RuntimeError). start_period
+      # grace-marks early probe failures but is NOT a wait deadline — an
+      # embedder that never reports healthy leaves this service waiting
+      # (README Troubleshooting; CPU-only hosts use docker-compose.cpu.yml).
+      harrier-embed:
+        condition: service_healthy
     healthcheck:
       # Readiness probe (/api/healthz) instead of the always-200 liveness
       # route (/health): the backend healthcheck now fails on a failed startup

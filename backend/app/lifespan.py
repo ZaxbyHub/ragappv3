@@ -5,6 +5,7 @@ Lifespan context manager for FastAPI application startup and shutdown.
 import asyncio
 import json
 import logging
+import os
 import sqlite3
 import time
 from contextlib import asynccontextmanager
@@ -612,6 +613,29 @@ async def lifespan(app: FastAPI):
     # startup migration without a per-request pooled DB read (issues #550,
     # #549 C02): in-memory flag, written where the migration already runs.
     app.state.migrations_ok = True
+    # Data-directory writability preflight (issue #749, TQ-differential-e-03):
+    # a bind mount the Docker daemon created root-owned aborts startup further
+    # down with bare sqlite/LanceDB tracebacks. Fail HERE instead with one
+    # actionable message naming the directory, the current uid, and the owner
+    # uid — the criterion's explicitly permitted "fail with a message naming
+    # the directory/owner and uid" arm. A NONEXISTENT directory passes: fresh
+    # starts rely on the DB layer creating parents, and that flow is untouched.
+    _data_dir = settings.data_dir
+    if _data_dir.exists() and not os.access(_data_dir, os.W_OK):
+        _st = _data_dir.stat()
+        _owner_uid = getattr(_st, "st_uid", None)
+        _current_uid = getattr(os, "getuid", lambda: None)()
+        raise RuntimeError(
+            f"Data directory is not writable: {_data_dir}\n"
+            f"  current uid : {_current_uid}\n"
+            f"  owner uid   : {_owner_uid}\n"
+            "The application stores its database and vector index under this "
+            "directory and cannot start without write access.\n"
+            "Fix the ownership and re-run, e.g.:\n"
+            f"  mkdir -p {_data_dir} && sudo chown -R 1000:1000 {_data_dir}\n"
+            "(the container runs as uid 1000; use the same host path you "
+            "configured as HOST_DATA_DIR)"
+        )
     try:
         run_migrations(str(settings.sqlite_path))
     except Exception as e:
@@ -656,7 +680,18 @@ async def lifespan(app: FastAPI):
             )
     except Exception as e:  # pragma: no cover - journal is best-effort
         logger.debug("Could not read migration journal at startup: %s", e)
-    _load_persisted_settings(str(settings.sqlite_path))
+    # Guarded like the migration step above (issue #749, TQ-differential-e-03):
+    # an unopenable settings database (e.g. a root-owned bind mount) must not
+    # abort startup with a bare sqlite traceback — it routes into the same
+    # degraded-start signal so /api/healthz reports 503 (issues #550, #749).
+    try:
+        _load_persisted_settings(str(settings.sqlite_path))
+    except Exception as e:
+        app.state.migrations_ok = False
+        logger.error(
+            "Persisted settings load failed: %s — app will start with degraded database state",
+            e,
+        )
 
     # Seed the application DB pool BEFORE any other get_pool() caller can run.
     # get_pool() is a first-call-wins singleton keyed on the sqlite_path, so a

@@ -147,6 +147,9 @@ backend/app/
 - Docker and Docker Compose installed
 - Ollama installed and running (see Ollama Setup below)
 - At least 8GB RAM (16GB+ recommended)
+- An NVIDIA GPU reserved by the bundled embedding and reranker containers —
+  CPU-only hosts run the CPU image override instead (see
+  [CPU-only hosts](#cpu-only-hosts))
 
 ### 1. Clone and Configure
 
@@ -167,6 +170,24 @@ HOST_DATA_DIR=/path/to/your/data
 OLLAMA_CHAT_URL=http://192.168.1.50:11434
 CHAT_MODEL=gemma4:26b   # example — use the model YOUR endpoint serves
 ```
+
+**Native Linux, before the first start:** the app container runs as uid 1000
+and the Docker daemon creates a missing bind-mount source root-owned, so
+create the data directory yourself and hand it to uid 1000 — using the same
+path you configured above:
+
+```bash
+# default data directory (HOST_DATA_DIR unset):
+mkdir -p data
+sudo chown -R 1000:1000 data
+
+# or, for a custom path such as HOST_DATA_DIR=/path/to/your/data:
+mkdir -p /path/to/your/data
+sudo chown -R 1000:1000 /path/to/your/data
+```
+
+Skip this and startup fails with a message naming the directory, the current
+uid, and the owner uid, with this exact fix in hand.
 
 ### 2. Start Your Inference Endpoint
 
@@ -197,6 +218,31 @@ Open your browser to: `http://localhost:9090`
 On first launch, you'll be redirected to the **Setup Wizard** (`/setup`) to create the initial superadmin account. After setup, log in with your credentials.
 
 > **Security:** In production, set `JWT_SECRET_KEY` to a random value and change the default admin password immediately.
+
+> **Startup order:** `knowledgevault` waits for the `harrier-embed` container
+> to report healthy before starting (so the strict embedding-model check runs
+> against a ready service). The embedder's healthcheck has a 120 s start
+> period on first boot — model download can take longer. If `up` seems to
+> hang, check `docker compose ps` / `docker compose logs harrier-embed`; the
+> app starts as soon as the embedder is healthy.
+
+## CPU-only hosts
+
+The bundled `harrier-embed` and `reranker` containers run CUDA builds and
+reserve an NVIDIA GPU. On a host without one, start with the CPU override:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.cpu.yml up -d
+```
+
+The override swaps both services to the CPU build of text-embeddings-inference
+(`cpu-latest`) and removes the GPU reservations (`!reset []` — required under
+compose merge semantics; a plain empty list would keep the inherited devices).
+Models, ports, and healthchecks are unchanged, so startup gating and the app
+behave identically. Expect meaningfully slower embedding/rerank throughput on
+CPU. Before relying on this in production, pin the CPU image digest the same
+way the shipped CUDA images are pinned (see the comments in
+`docker-compose.cpu.yml`).
 
 ## Environment Setup
 
@@ -473,14 +519,18 @@ cp /your/data/dir/app.db /your/data/dir/app.db.bak
 docker compose stop knowledgevault
 
 # 3. Run the migration script to clear stale embeddings
-#    (dry-run first to see what will change)
-python scripts/migrate_embeddings.py --dry-run
+#    (dry-run first to see what will change). Pass the paths as seen from
+#    the host — with the default HOST_DATA_DIR unset that is ./data/...;
+#    adjust if you configured a custom HOST_DATA_DIR.
+python scripts/migrate_embeddings.py --dry-run \
+    --lancedb-path ./data/lancedb --sqlite-path ./data/app.db
 
 # 4. Run the actual migration — this resets file statuses to pending,
 #    then wipes the LanceDB index (the reset runs first so a crash or a
 #    locked database leaves the old vectors intact instead of stranding
 #    'indexed' rows over an empty index)
-python scripts/migrate_embeddings.py
+python scripts/migrate_embeddings.py \
+    --lancedb-path ./data/lancedb --sqlite-path ./data/app.db
 
 # 5. Start the application — the background processor will re-index all files
 docker compose start knowledgevault
@@ -518,8 +568,13 @@ curl -H "X-API-Key: ${HEALTH_CHECK_API_KEY:?set HEALTH_CHECK_API_KEY}" \
 > configured `EMBEDDING_DIM` cannot be loaded; **5** — another process holds the
 > database, or the database is unreadable/corrupt at the writer probe; **6** — the
 > database is unreadable/corrupt during repair detection (restore `app.db` from your
-> backup). Pass `--force` to override exits 3 and 4 only; the lock/corruption refusals
-> (5 and 6) always stop the run.
+> backup); **7** — neither the `--lancedb-path` nor the `--sqlite-path` exists (wrong
+> paths — typically container-side DATA_DIR paths used from the host);
+> **8** — the SQLite file is missing or has no `files` table on a run whose
+> reset/wipe would execute (without the application database the wipe would
+> destroy vectors with no rollback source). Pass `--force` to override exits 3
+> and 4 only; the lock/corruption/wrong-path refusals (5, 6, 7 and 8) always
+> stop the run.
 
 ---
 

@@ -228,12 +228,18 @@ async def _collect_deep_state(app_state, llm_checker, model_checker) -> dict:
                     vector_status["stale_embeddings_detail"] = (
                         f"LanceDB index was built with {stored_dim}-dim embeddings but "
                         f"EMBEDDING_DIM is now {configured_dim}. "
-                        f"Run scripts/migrate_embeddings.py to re-index."
+                        "Run: python scripts/migrate_embeddings.py --lancedb-path "
+                        "./data/lancedb --sqlite-path ./data/app.db "
+                        "(from the repo root; adjust the paths to your data "
+                        "directory if you changed HOST_DATA_DIR — see the "
+                        "script's --help)."
                     )
                     logger.warning(
                         "Stale embedding dimensions detected: stored=%d, configured=%d. "
                         "Documents will not be searchable until re-embedded. "
-                        "Run scripts/migrate_embeddings.py.",
+                        "Run: python scripts/migrate_embeddings.py --lancedb-path "
+                        "./data/lancedb --sqlite-path ./data/app.db (from the "
+                        "repo root; adjust for your HOST_DATA_DIR).",
                         stored_dim,
                         configured_dim,
                     )
