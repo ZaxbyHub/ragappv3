@@ -10,6 +10,7 @@ import { useChatShellStore } from "@/stores/useChatShellStore";
 import { useLlmHealthStore } from "@/stores/useLlmHealthStore";
 import { useVaultStore } from "@/stores/useVaultStore";
 import type { Vault } from "@/lib/api";
+import type { Message } from "@/stores/useChatStore";
 
 const apiMocks = vi.hoisted(() => ({
   createChatSession: vi.fn(),
@@ -304,6 +305,96 @@ describe("useSendMessage", () => {
     expect(apiMocks.getSettings).toHaveBeenCalledTimes(2);
     await waitFor(() => {
       expect(apiMocks.chatStream).toHaveBeenCalled();
+    });
+  });
+
+  // Issue #991 feedback round (PRR-005/007 + F-03/F-04): the awaited admission
+  // window and the admitted/dropped result — regression pins for the review
+  // fixes, kept in this UNFROZEN suite.
+  describe("awaited admission semantics (issue #991 feedback)", () => {
+    it("the awaited server-cap gate refuses an over-cap submit even without the composer inline check (PRR-005)", async () => {
+      apiMocks.getSettings.mockResolvedValue({ chat_message_max_chars: 20_000 });
+      const refreshHistory = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ activeChatId: "42", input: "x".repeat(25_000) });
+
+      const { result } = renderHook(() => useSendMessage(7, refreshHistory));
+
+      let outcome: "sent" | "blocked" = "sent";
+      await act(async () => {
+        outcome = await result.current.handleSend();
+      });
+      expect(outcome).toBe("blocked");
+      expect(apiMocks.chatStream).not.toHaveBeenCalled();
+      expect(apiMocks.createChatSession).not.toHaveBeenCalled();
+      expect(useChatStore.getState().inputError).toMatch(/exceeds maximum length of 20000/i);
+    });
+
+    it("text typed during the pending admission window is retained and the stale snapshot is not sent (PRR-001/F-02)", async () => {
+      let release!: () => void;
+      const gate = new Promise<void>((r) => { release = r; });
+      apiMocks.getSettings.mockImplementation(() => gate.then(() => ({ chat_message_max_chars: 20_000 })));
+      const refreshHistory = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ activeChatId: "42", input: "OLD-TEXT" });
+
+      const { result } = renderHook(() => useSendMessage(7, refreshHistory));
+
+      let outcome: "sent" | "blocked" = "sent";
+      await act(async () => {
+        const pending = result.current.handleSend();
+        useChatStore.setState({ input: "NEWER-TEXT" });
+        release();
+        outcome = await pending;
+      });
+
+      expect(outcome).toBe("blocked");
+      expect(apiMocks.chatStream).not.toHaveBeenCalled();
+      expect(apiMocks.createChatSession).not.toHaveBeenCalled();
+      // The newer text survives in the composer for the user's next gesture.
+      expect(useChatStore.getState().input).toBe("NEWER-TEXT");
+    });
+
+    it("a chat switch during the pending admission window blocks the stale send (F-04)", async () => {
+      let release!: () => void;
+      const gate = new Promise<void>((r) => { release = r; });
+      apiMocks.getSettings.mockImplementation(() => gate.then(() => ({ chat_message_max_chars: 20_000 })));
+      const refreshHistory = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ activeChatId: "42", input: "for chat 42" });
+
+      const { result } = renderHook(() => useSendMessage(7, refreshHistory));
+
+      let outcome: "sent" | "blocked" = "sent";
+      await act(async () => {
+        const pending = result.current.handleSend();
+        useChatStore.setState({ activeChatId: "99" });
+        release();
+        outcome = await pending;
+      });
+
+      expect(outcome).toBe("blocked");
+      expect(apiMocks.chatStream).not.toHaveBeenCalled();
+    });
+
+    it("sendDirect restores the original turn rows when the send is dropped mid-revision (PRR-003)", async () => {
+      const refreshHistory = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ activeChatId: "42", input: "", isStreaming: true });
+      const restoreRows: Message[] = [
+        { id: "1", role: "user", content: "original question" },
+        { id: "2", role: "assistant", content: "original answer" },
+      ];
+
+      const { result } = renderHook(() => useSendMessage(7, refreshHistory));
+
+      await act(async () => {
+        await result.current.sendDirect("replacement", [], { restoreRows });
+      });
+
+      // The streaming guard drops the resend; the truncated original turn is
+      // restored instead of being lost silently.
+      expect(apiMocks.chatStream).not.toHaveBeenCalled();
+      const { messageIds, messagesById } = useChatStore.getState();
+      expect(messageIds).toEqual(["1", "2"]);
+      expect(messagesById["1"]?.content).toBe("original question");
+      expect(useChatStore.getState().inputError).toBeNull();
     });
   });
 

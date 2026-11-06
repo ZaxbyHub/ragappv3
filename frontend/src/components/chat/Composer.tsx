@@ -47,6 +47,7 @@ import { computeEffectiveChatMode } from "@/lib/chatMode";
 import {
   MAX_INPUT_LENGTH,
   CHAT_INPUT_CAP_ADVISORY,
+  chatInputAdvisoryBlocked,
   subscribeChatInputCap,
   getChatInputCapSnapshot,
 } from "@/hooks/useSendMessage";
@@ -318,7 +319,13 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
     if (lastLoadedRef.current === key) return;
     lastLoadedRef.current = key;
     try {
-      setInput(localStorage.getItem(key) ?? "");
+      const restored = localStorage.getItem(key) ?? "";
+      setInput(restored);
+      // Issue #991 review PRR-012: the restore replaces input programmatically —
+      // clear any stale error, then re-flag when the restored draft itself is
+      // over the advisory bound (named-bound feedback on restore).
+      const restoredBlocked = chatInputAdvisoryBlocked(restored);
+      setInputError?.(restoredBlocked);
     } catch { /* private mode */ }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeChatId, draftPrincipalId]);
@@ -461,9 +468,11 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
     // Issue #991: change feedback against the effective cap (the awaited
     // send gate is the authority; this is advisory display feedback — raw
     // number, locale-independent, matching the useSendMessage strings).
+    // Clear only this feature's own bound message — foreign errors (vault
+    // gate, session-create failure) are owned by their flows (F-06).
     if (value.length > effectiveCap) {
       setInputError?.(`Input exceeds maximum length of ${effectiveCap} characters`);
-    } else {
+    } else if (inputError !== null && /exceeds maximum length/i.test(inputError)) {
       setInputError?.(null);
     }
 
@@ -1110,6 +1119,7 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
                 disabled={!input.trim() || input.length > effectiveCap || hasUploading}
                 className="h-8 w-8 shrink-0 rounded-full p-0 shadow-xs active:scale-95"
                 aria-label="Send message"
+                aria-describedby={inputError ? "input-error composer-help" : "composer-help"}
               >
                 <Send className="h-3.5 w-3.5" />
               </Button>

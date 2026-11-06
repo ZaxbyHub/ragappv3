@@ -133,6 +133,11 @@ function healthOutcomeReducer(
     return state;
   }
   if (action.type === "auth_unknown") {
+    // Issue #1040 review PRR-009: a superseded read must not publish — the
+    // arm honors wasLatest like its failure sibling, so a slow 401 whose read
+    // has been overtaken by a newer probe cannot reset the failure streak or
+    // flip the UI back to "checking" from stale data.
+    if (!action.wasLatest) return state;
     // Issue #1040: a session-expiry 401 on the auth-gated deep probe is an
     // AUTH event, not a services fact. Publish the UNKNOWN state per the
     // repo's UNKNOWN-not-DOWN convention: retain the last real service

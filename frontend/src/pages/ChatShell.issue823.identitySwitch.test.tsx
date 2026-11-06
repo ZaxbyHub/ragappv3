@@ -56,6 +56,7 @@ vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
   return {
     ...actual,
+    getSettings: async () => ({ chat_message_max_chars: 20000 }),
     chatStream: vi.fn(() => vi.fn()),
     getChatSession: getChatSessionMock,
     truncateChatSession: vi.fn(async () => ({ remaining_count: 0, tail_seq: 0 })),

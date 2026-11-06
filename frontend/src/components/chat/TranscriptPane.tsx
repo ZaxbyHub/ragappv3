@@ -600,6 +600,10 @@ export function TranscriptPane({ className, onSessionCreated }: TranscriptPanePr
 
   const handlePromptClick = (prompt: string) => {
     setInput(prompt);
+    // Issue #991 review PRR-012: a programmatic input replacement must not
+    // inherit a stale over-cap error from a prior edit-load (the new prompt
+    // is short; the composer's change feedback re-fires on the next edit).
+    useChatStore.getState().setInputError?.(null);
     setTimeout(() => composerRef.current?.focus(), 0);
   };
 

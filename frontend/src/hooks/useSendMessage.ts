@@ -292,8 +292,12 @@ export function useSendMessage(
       historyMessages: Message[],
       clearInput: boolean,
       revisionOpts?: { restoreRows?: Message[] }
-    ) => {
-      if (sendingRef.current) return;
+    ): Promise<boolean> => {
+      // Returns whether the send was admitted and started. Every dropped /
+      // failed setup path returns false so callers (handleSend → the
+      // Composer's deferred cleanup, issue #991 review PRR-001) never run
+      // "sent" cleanup for a message that never went out.
+      if (sendingRef.current) return false;
       sendingRef.current = true;
       setIsStreaming(true);
       const gen = ++sendGenRef.current;
@@ -376,7 +380,7 @@ export function useSendMessage(
           setIsStreaming(false);
           setAbortFn(null);
           sendingRef.current = false;
-          return;
+          return false;
         }
         try {
           const newSession = await createChatSession({ vault_id: sendVaultId });
@@ -394,14 +398,14 @@ export function useSendMessage(
           setIsStreaming(false);
           setAbortFn(null);
           sendingRef.current = false;
-          return;
+          return false;
         }
       }
 
       if (sendGenRef.current !== gen) {
         // Cancelled while the session was being created — do not stream,
         // do not append any message (no dangling assistant bubble).
-        return;
+        return false;
       }
 
       // Issue #685: a newly created session must be bound across ALL identity
@@ -1105,7 +1109,12 @@ export function useSendMessage(
       // navigation would leave sendingRef stuck true and block the next send.
       // Stop-path candidate clearing lives in stopStreaming, which owns the
       // message write in that flow.
-      if (activeStreamToken !== streamToken || sendGenRef.current !== gen) return;
+      // A stale-generation exit here means a newer send superseded this one
+      // mid-setup (issue #991 review PRR-001 adjudication): the transport was
+      // already initiated and the newer generation owns the flow, so the
+      // caller still reports the send as admitted — reporting "blocked" would
+      // run "sent"-class cleanup for a stream that is live.
+      if (activeStreamToken !== streamToken || sendGenRef.current !== gen) return true;
       setAbortFn(() => {
         const ownsActive = activeStreamToken === streamToken && sendGenRef.current === gen;
         const ownsStop = stoppingStreamToken === streamToken;
@@ -1116,6 +1125,10 @@ export function useSendMessage(
         clearTurnPersistence();
         sendingRef.current = false;
       });
+      // The stream lifecycle is callback-driven from here; the synchronous
+      // setup (session binding, row pre-write, transport initiation) has
+      // completed, so the send is admitted.
+      return true;
     },
     [
       setInput,
@@ -1144,22 +1157,32 @@ export function useSendMessage(
    * and was handed to the send pipeline.
    */
   const handleSend = useCallback(async (): Promise<"sent" | "blocked"> => {
-    const { input: currentInput, isStreaming: currentIsStreaming } =
+    const { input: currentInput, isStreaming: currentIsStreaming, activeChatId: currentChatId } =
       useChatStore.getState();
     if (!currentInput.trim() || currentIsStreaming || sendingRef.current) {
       return "blocked";
     }
+    // Issue #991 (PRR-008): trim once — the awaited gate measures exactly the
+    // string the transport will send (the server caps the trimmed payload).
+    const content = currentInput.trim();
     // Issue #991: await the AUTHORITATIVE server cap before any side effect.
-    const admission = await checkSendAdmissionAsync(currentInput);
+    const admission = await checkSendAdmissionAsync(content);
     if (!admission.ok) {
       setInputError(admission.message);
       return "blocked";
     }
-    const content = currentInput.trim();
-    const { messageIds, messagesById } = useChatStore.getState();
+    // Issue #991 review PRR-001: the composer stayed editable across the
+    // admission await. A newer draft or a chat switch invalidates this
+    // submission — return "blocked" leaving the newer text (and the draft it
+    // will re-persist) fully intact for the user's next gesture.
+    const latest = useChatStore.getState();
+    if (latest.input !== currentInput || latest.activeChatId !== currentChatId) {
+      return "blocked";
+    }
+    const { messageIds, messagesById } = latest;
     const history = messageIds.map((id) => messagesById[id]);
-    await sendCore(content, history, true);
-    return "sent";
+    const admitted = await sendCore(content, history, true);
+    return admitted ? "sent" : "blocked";
   }, [setInputError, sendCore]);
 
   /**
@@ -1172,17 +1195,31 @@ export function useSendMessage(
       historyMessages: Message[],
       opts?: { restoreRows?: Message[] }
     ) => {
+      const restoreDroppedRevision = () => {
+        if (!opts?.restoreRows?.length) return;
+        const { addMessage } = useChatStore.getState();
+        for (const row of opts.restoreRows) addMessage(row);
+        toast.error("Couldn't resend the message — your original turn was restored.");
+      };
       const { isStreaming: currentIsStreaming } = useChatStore.getState();
-      if (currentIsStreaming || sendingRef.current) return;
+      if (currentIsStreaming || sendingRef.current) {
+        // Issue #991 review PRR-003: a revision already truncated the server
+        // history and removed the rows; a dropped resend must restore the
+        // original turn, never silently drop it.
+        restoreDroppedRevision();
+        return;
+      }
       // Issue #991 backstop gate: the retry/edit entries validate before any
       // destructive step, but sendDirect itself must never carry over-cap
       // content to the transport.
       const admission = await checkSendAdmissionAsync(content);
       if (!admission.ok) {
+        restoreDroppedRevision();
         setInputError(admission.message);
         return;
       }
-      await sendCore(content, historyMessages, false, opts);
+      const admitted = await sendCore(content, historyMessages, false, opts);
+      if (!admitted) restoreDroppedRevision();
     },
     [setInputError, sendCore]
   );

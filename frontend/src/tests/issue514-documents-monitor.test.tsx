@@ -36,6 +36,7 @@ vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
   return {
     ...actual,
+    getSettings: async () => ({ chat_message_max_chars: 20000 }),
     listDocuments: vi.fn().mockResolvedValue({
       documents: [
         { id: "1", filename: "test.pdf", size: 1024, created_at: "2024-01-01", metadata: { status: "processed", chunk_count: 5 } },

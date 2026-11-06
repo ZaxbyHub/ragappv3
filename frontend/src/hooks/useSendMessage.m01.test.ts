@@ -27,9 +27,14 @@ const apiMocks = vi.hoisted(() => ({
   addChatMessagesBatch: vi.fn(),
   chatStream: vi.fn(),
   getLlmModeHealth: vi.fn(),
+  // Issue #991 review PRR-004: the hook imports getSettings from this barrel;
+  // without it the cap admission fails and every send is refused before the
+  // vault-guard path this suite exists to exercise.
+  getSettings: vi.fn(async () => ({ chat_message_max_chars: 20000 })),
 }));
 
 vi.mock("@/lib/api", () => ({
+  getSettings: (...args: unknown[]) => apiMocks.getSettings(...(args as [])),
   createChatSession: (...args: unknown[]) => apiMocks.createChatSession(...args),
   addChatMessage: (...args: unknown[]) => apiMocks.addChatMessage(...args),
   addChatMessagesBatch: (...args: unknown[]) => apiMocks.addChatMessagesBatch(...args),

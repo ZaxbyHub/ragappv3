@@ -467,10 +467,14 @@ export function chatStream(
           signal: abortController.signal,
         });
 
+        let errorBody: { detail?: unknown } | null = null;
         if (!isCurrent()) return;
         if (!response.ok && response.status === 401 && _jwtAccessToken) {
-          // Check error detail — only retry on token_expired, skip token_invalid/user_inactive
-          const errorBody = await response.json().catch(() => null);
+          // Check error detail — only retry on token_expired, skip token_invalid/user_inactive.
+          // The parsed body is retained (issue #991 review F-07): this read consumes the
+          // response, so the !response.ok detail arm below reuses it instead of a second
+          // json() that would throw "body already used" and silently fall back.
+          errorBody = await response.json().catch(() => null);
           if (!isCurrent()) return;
           const detail = errorBody?.detail;
           const isTokenExpired = typeof detail === "string" && detail.includes("token_expired");
@@ -501,6 +505,9 @@ export function chatStream(
             if (!isCurrent()) return;
             if (newToken) {
               headers["Authorization"] = `Bearer ${newToken}`;
+              // The retry's response is unread — drop the stale parse so the
+              // !response.ok arm reads the retry's own body (F-07).
+              errorBody = null;
               response = await fetch(`${API_BASE_URL}/chat/stream`, {
                 method: "POST",
                 headers,
@@ -518,9 +525,16 @@ export function chatStream(
           // surfaced to onError instead of an opaque status line. Every
           // other shape — non-JSON body, body-read failure, missing/empty/
           // non-string detail — keeps today's exact status-only message.
+          // If the 401-refresh arm above already consumed and parsed the
+          // body (F-07), reuse that parse instead of a second json() call.
           let detailMessage: string | null = null;
           try {
-            const body: unknown = await response.json();
+            let body: unknown;
+            if (errorBody !== null) {
+              body = errorBody;
+            } else {
+              body = await response.json();
+            }
             const detail = (body as { detail?: unknown } | null)?.detail;
             if (typeof detail === "string" && detail.length > 0) {
               detailMessage = detail;
