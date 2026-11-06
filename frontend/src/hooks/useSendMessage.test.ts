@@ -1,6 +1,9 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { useSendMessage } from "./useSendMessage";
+// Optional-guard: the cap-loader reset seam ships with the fix (issue #991);
+// at suites running against pre-fix trees the guarded call is a no-op.
+import * as useSendMessageModule from "./useSendMessage";
 import { useChatStore } from "@/stores/useChatStore";
 import { useChatModeStore } from "@/stores/useChatModeStore";
 import { useChatShellStore } from "@/stores/useChatShellStore";
@@ -14,10 +17,11 @@ const apiMocks = vi.hoisted(() => ({
   addChatMessagesBatch: vi.fn(),
   chatStream: vi.fn(),
   getLlmModeHealth: vi.fn(),
+  getSettings: vi.fn(async () => ({ chat_message_max_chars: 20000 })),
 }));
 
 vi.mock("@/lib/api", () => ({
-  getSettings: async () => ({ chat_message_max_chars: 20000 }),
+  getSettings: (...args: unknown[]) => apiMocks.getSettings(...(args as [])),
   createChatSession: (...args: unknown[]) => apiMocks.createChatSession(...args),
   addChatMessage: (...args: unknown[]) => apiMocks.addChatMessage(...args),
   addChatMessagesBatch: (...args: unknown[]) => apiMocks.addChatMessagesBatch(...args),
@@ -88,6 +92,10 @@ function installCapturingStreamMock(): { trigger: { error: (e: Error) => void; c
 describe("useSendMessage", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // Issue #991: clear the per-owner cap memo between cases (order
+    // independence; no-op on pre-fix trees).
+    (useSendMessageModule as { __resetChatInputCapForTests?: () => void })
+      .__resetChatInputCapForTests?.();
     useChatStore.setState({
       messageIds: [],
       messagesById: {},
@@ -267,6 +275,36 @@ describe("useSendMessage", () => {
     });
     expect(apiMocks.createChatSession).not.toHaveBeenCalled();
     expect(useChatShellStore.getState().sessionListRefreshToken).toBe(1);
+  });
+
+  it("re-arms the cap loader after a failed acquisition — the second attempt refetches (review round 1)", async () => {
+    // First acquisition fails (transient /settings error), second resolves.
+    apiMocks.getSettings
+      .mockRejectedValueOnce(new Error("network down"))
+      .mockResolvedValueOnce({ chat_message_max_chars: 20_000 });
+    const refreshHistory = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ activeChatId: "42", input: "Try again" });
+
+    const { result } = renderHook(() => useSendMessage(7, refreshHistory));
+
+    // First send: blocked with the limit-unavailable error, nothing sent.
+    let outcome: "sent" | "blocked" = "sent";
+    await act(async () => {
+      outcome = await result.current.handleSend();
+    });
+    expect(outcome).toBe("blocked");
+    expect(apiMocks.chatStream).not.toHaveBeenCalled();
+    expect(useChatStore.getState().inputError).toMatch(/unavailable|try again/i);
+
+    // Second send: the loader REFETCHED (2 getSettings calls) and admits.
+    await act(async () => {
+      outcome = await result.current.handleSend();
+    });
+    expect(outcome).toBe("sent");
+    expect(apiMocks.getSettings).toHaveBeenCalledTimes(2);
+    await waitFor(() => {
+      expect(apiMocks.chatStream).toHaveBeenCalled();
+    });
   });
 
   describe("vault null guard", () => {

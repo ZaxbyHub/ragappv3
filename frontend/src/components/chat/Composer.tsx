@@ -217,10 +217,12 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
   const effectiveCap = resolvedChatInputCap ?? CHAT_INPUT_CAP_ADVISORY;
   // Re-validate the inline feedback when the bound changes at runtime (a
   // late settings arrival must re-flag an over-bound draft, never wipe it).
+  // Foreign errors (session-create 403, vault gate) are NOT cleared on cap
+  // transitions — only this feature's own bound messages are (review round 1).
   useEffect(() => {
     if (input.length > effectiveCap) {
       setInputError?.(`Input exceeds maximum length of ${effectiveCap} characters`);
-    } else if (inputError !== null) {
+    } else if (inputError !== null && /exceeds maximum length/i.test(inputError)) {
       setInputError?.(null);
     }
     // Bounded to cap transitions: input changes re-validate in handleChange.
@@ -396,8 +398,10 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
     }, DRAFT_DEBOUNCE_MS);
   }, [activeChatId, draftPrincipalId, writeDraftNow, flushPendingDraft]);
 
-  // Synchronous clear used by the send path: the draft must be gone from
-  // localStorage before onSend() runs, not 400ms later.
+  // Synchronous clear used by the send path (issue #991: invoked only AFTER
+  // the send pipeline reports admission — a blocked send keeps the draft):
+  // once called, the draft must be gone from localStorage immediately, not
+  // 400ms later.
   const clearDraftNow = useCallback(() => {
     if (typeof window === "undefined") return;
     if (draftTimerRef.current !== null) {

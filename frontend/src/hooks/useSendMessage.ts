@@ -96,6 +96,14 @@ export function ensureChatInputCapLoaded(): Promise<number | null> {
     // the replacement owner was already armed by the replacement listener).
     if (chatInputCapMemo === memo) {
       memo.resolved = value;
+      if (value === null) {
+        // Acquisition failed for THIS owner (fetch error, legacy-absent
+        // field, or malformed value): re-arm so the NEXT attempt refetches —
+        // the "Try again" message must be true (review round 1: the memo
+        // previously settled null forever and wedged every send until an
+        // owner replacement).
+        chatInputCapMemo = null;
+      }
       for (const listener of [...chatInputCapListeners]) listener();
     }
   });

@@ -30,11 +30,13 @@ Network and 5xx failures keep today's failure-streak behavior exactly.
   no ceiling clamp. The 20_000 advisory value is display/change-feedback only
   while unresolved.
 - Every send path awaits admission (`checkSendAdmissionAsync`) BEFORE any
-  side effect: `handleSend`, `sendDirect` (backstop), and — critically — the
-  TranscriptPane retry entry, which now validates BEFORE `awaitPendingPersist`,
-  the server truncate, or row removal (an over-cap persisted turn keeps its
-  history and rows; edit remains the recovery path and surfaces the bound at
-  load). No session is created for a blocked send.
+  destructive or observable step: `handleSend`, `sendDirect` (backstop), and —
+  critically — the TranscriptPane retry entry, which validates before the
+  server truncate and any row removal (after the non-destructive
+  persist-wait; an over-cap persisted turn keeps its history and rows; edit
+  remains the recovery path and surfaces the bound at load). No session is
+  created for a blocked send. A failed acquisition re-arms the loader, so the
+  next attempt genuinely retries the fetch.
 - Composer change feedback, the submit gate, the disabled state, and the
   character counter read the effective cap reactively; draft STORAGE keeps the
   fixed legacy 100_000 ceiling, decoupled from the cap. Both send closures
