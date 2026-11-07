@@ -236,12 +236,14 @@ class TestApplicationDatabaseIdentity(unittest.TestCase):
             self.assertIn("BACKUP", out)
             self.assertTrue((lance / "sentinel.keep").exists())
 
-    def test_zero_claim_db_refused_before_wipe(self):
+    def test_zero_claim_db_warns_before_wipe(self):
         """A schema-valid database that holds NO rows claiming vectors
-        (indexed/partial) must be refused before the wipe: nothing in it
-        accounts for the non-empty index, which is the wrong-database shape
-        (pr1081-20261106 batch-2 — the OOB review's executed archived-row
-        probe and Multi-Stage HIGH)."""
+        (indexed/partial) gets the loud wrong-database WARNING before the
+        wipe and the destructive run completes: that state is
+        indistinguishable from the documented reset-then-crash repair re-run
+        and a fresh boot's empty chunks table, so a hard refusal broke both
+        contracts (delta review executed probe) — the demotion to WARNING is
+        the reviewed resolution."""
         import tempfile
 
         mod = _load_migrate_module()
@@ -264,13 +266,18 @@ class TestApplicationDatabaseIdentity(unittest.TestCase):
             code, out = self._refusal_stdout(
                 lambda: mod.run_migration(lance, app_db, force=True)
             )
-            self.assertEqual(code, 8, "zero-claim DB must be refused with exit 8")
+            self.assertIsNone(
+                code, "zero-claim DB: destructive run completes (no SystemExit)"
+            )
             self.assertIn(
                 "NO rows claiming",
                 re.sub(r"\s+", " ", out),
-                "the refusal must state the zero-claims evidence",
+                "the wrong-database warning must state the zero-claims evidence",
             )
-            self.assertTrue((lance / "sentinel.keep").exists())
+            self.assertFalse(
+                (lance / "sentinel.keep").exists(),
+                "the wipe proceeds after the warning (documented repair re-run)",
+            )
 
     @unittest.skipIf(os.name == "nt", "symlink creation needs privilege on Windows")
     def test_symlinked_live_name_to_backup_refused(self):

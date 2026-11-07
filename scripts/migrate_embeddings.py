@@ -45,11 +45,11 @@ Properties
   paths — for example container-side DATA_DIR paths used from the host),
   exit code 8 = the application SQLite database is unusable for a reset/wipe
   (dry runs included): missing, no ``files`` table, a ``files`` table without
-  the application's core columns, an obvious backup copy (a path that
-  RESOLVES to one included), or — on a non-empty index — a database where
-  NO rows claim vectors, so nothing accounts for the index being wiped.
-  Without the live application database the wipe would destroy vectors
-  with no usable rollback source.
+  the application's core columns, or an obvious backup copy (a path that
+  RESOLVES to one included) — without the live application database the
+  wipe would destroy vectors with no usable rollback source. A database
+  where NO rows claim vectors gets a loud WARNING instead: that state is
+  indistinguishable from the documented reset-then-crash repair re-run.
   ``--force`` overrides exits 3 and 4 only; the lock/corruption/wrong-path
   refusals (5, 6, 7 and 8) always stop the run.
 
@@ -563,7 +563,8 @@ def run_migration(
             exists; code 8 when the application database is unusable for a
             reset/wipe (dry runs included): missing, no ``files`` table, a
             ``files`` table without the application's core columns, or an
-            obvious backup copy.
+            obvious backup copy. A database with no vector-claiming rows
+            gets a loud wrong-database WARNING on the destructive path.
         MigrationRefused: another process holds a write lock on the SQLite
             database, or the database is unreadable/corrupt at the writer
             probe (``main()`` maps this to exit code 5).
@@ -720,28 +721,29 @@ def run_migration(
         # refused first; locks and corruption keep the writer probe's
         # exit-5 semantics wherever the database exists.
         _assert_application_database(sqlite_path, lancedb_path)
-        # Issue #749 (batch-2 review): the reset/wipe pair is only coherent
-        # when THIS database accounts for the index being wiped — a files
-        # table with zero rows claiming vectors (indexed/partial) next to a
-        # non-empty LanceDB directory is the wrong-database shape, and wiping
-        # it leaves a corpus no database row can re-index. Refuse instead
-        # (after the writer probe so lock failures keep their exit-5
-        # semantics; dry-run still reports its plan).
+        # Issue #749 (batch-2 review): warn loudly when THIS database holds
+        # no rows claiming vectors (indexed/partial) while a non-empty
+        # LanceDB index is about to be wiped — that is the wrong-database
+        # shape the executed exploit used. It is a WARNING, not a refusal:
+        # the identical state is also the script's own documented
+        # reset-then-crash repair re-run (the reset commits before the wipe),
+        # and a fresh boot creates an empty chunks table before any ingest,
+        # so the script cannot distinguish wrong-database from repair and a
+        # hard refusal broke both contracts (delta-review executed probe).
         if lancedb_path.exists() and any(lancedb_path.iterdir()):
             claims = _count_rows_claiming_vectors(sqlite_path)
             if claims == 0:
                 print(
-                    "ERROR: the application database holds NO rows claiming\n"
+                    "WARNING: the application database holds NO rows claiming\n"
                     "vectors ('indexed'/'partial'), so nothing in it accounts\n"
-                    "for the LanceDB index at:\n"
+                    "for the LanceDB index about to be wiped:\n"
                     f"  {lancedb_path}\n"
-                    "This is almost always the WRONG database (for example a\n"
-                    "backup copy, a fresh database, or the wrong deployment).\n"
-                    "Wiping would destroy an index nothing can re-index.\n"
-                    "Point --sqlite-path at the live application database and\n"
-                    "re-run. Nothing was migrated.\n"
+                    "If this database is not the live application database\n"
+                    "(backup copy, fresh database, wrong deployment), STOP —\n"
+                    "wiping leaves a corpus nothing in it re-indexes. If this\n"
+                    "IS the re-run after an interrupted migration (reset done,\n"
+                    "wipe pending), proceeding is the documented repair.\n"
                 )
-                raise SystemExit(8)
         # Issue #694: refuse to race a live writer. Probe BEFORE the first
         # destructive step (the SQLite reset — the wipe follows it).
         _assert_no_active_writer(sqlite_path)
@@ -749,6 +751,14 @@ def run_migration(
         # Dry-run reports what WOULD change; over wrong paths that report is
         # the misleading success the refusals exist for (issue #749).
         _assert_application_database(sqlite_path, lancedb_path)
+        if lancedb_path.exists() and any(lancedb_path.iterdir()):
+            if _count_rows_claiming_vectors(sqlite_path) == 0:
+                print(
+                    "WARNING: the application database holds NO rows claiming\n"
+                    "vectors ('indexed'/'partial') for the LanceDB index that\n"
+                    "would be wiped. If this is not the live application\n"
+                    "database, STOP.\n"
+                )
 
     # ── Step 2: Reset file statuses ────────────────────────────────────────
     # The reset runs FIRST (issue #694): if it fails (locked DB, crash), the

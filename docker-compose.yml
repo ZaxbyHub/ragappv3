@@ -344,7 +344,7 @@ services:
       redis:
         condition: service_healthy
       # Wait for the embedder the strict TEI model validation probes (issue
-      # Issue #748, T1-04-S2-07): without this, a fresh `up` can start the app before
+      # #748, T1-04-S2-07): without this, a fresh `up` can start the app before
       # harrier-embed is ready and the strict check silently self-skips (its
       # except arm re-raises only its own RuntimeError). start_period
       # grace-marks early probe failures but is NOT a wait deadline — an
