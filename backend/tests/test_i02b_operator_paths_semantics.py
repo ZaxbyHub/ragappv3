@@ -279,6 +279,56 @@ class TestApplicationDatabaseIdentity(unittest.TestCase):
                 "the wipe proceeds after the warning (documented repair re-run)",
             )
 
+    def test_zero_claim_db_dry_run_warns_and_wipes_nothing(self):
+        """Dry-run twin (batch-3 review): the zero-claim WARNING also prints
+        on the dry-run branch — with the repair-re-run sentence — and the
+        dry run still wipes nothing (sentinel intact, sentinel file present)."""
+        import tempfile
+
+        mod = _load_migrate_module()
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            lance = self._mk(tmp)
+            app_db = tmp / "app.db"
+            conn = sqlite3.connect(str(app_db))
+            conn.execute(
+                "CREATE TABLE files (id INTEGER PRIMARY KEY, vault_id INTEGER, "
+                "status TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO files (id, vault_id, status) VALUES (1, 1, 'archived')"
+            )
+            conn.commit()
+            conn.close()
+            code, out = self._refusal_stdout(
+                # force=True: the sentinel-only index has no detectable
+                # stored dimension (exit 3) — --force overrides it so the
+                # run reaches the dry-run warning branch under test.
+                lambda: mod.run_migration(lance, app_db, dry_run=True, force=True)
+            )
+            self.assertIsNone(code, "dry run completes (no SystemExit)")
+            flattened = re.sub(r"\s+", " ", out)
+            self.assertIn(
+                "NO rows claiming",
+                flattened,
+                "the dry-run plan must carry the wrong-database warning",
+            )
+            self.assertIn(
+                "documented repair",
+                flattened,
+                "the dry-run warning carries the repair-re-run sentence",
+            )
+            self.assertTrue(
+                (lance / "sentinel.keep").exists(),
+                "dry run must wipe nothing",
+            )
+            conn = sqlite3.connect(str(app_db))
+            status = conn.execute(
+                "SELECT status FROM files WHERE id = 1"
+            ).fetchone()[0]
+            conn.close()
+            self.assertEqual(status, "archived", "dry run resets nothing")
+
     @unittest.skipIf(os.name == "nt", "symlink creation needs privilege on Windows")
     def test_symlinked_live_name_to_backup_refused(self):
         """A live-looking path that RESOLVES to a backup must be refused:

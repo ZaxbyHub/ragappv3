@@ -48,8 +48,9 @@ Properties
   the application's core columns, or an obvious backup copy (a path that
   RESOLVES to one included) — without the live application database the
   wipe would destroy vectors with no usable rollback source. A database
-  where NO rows claim vectors gets a loud WARNING instead: that state is
-  indistinguishable from the documented reset-then-crash repair re-run.
+  where NO rows claim vectors gets a loud WARNING instead (live run and
+  dry-run): that state is indistinguishable from the documented
+  reset-then-crash repair re-run.
   ``--force`` overrides exits 3 and 4 only; the lock/corruption/wrong-path
   refusals (5, 6, 7 and 8) always stop the run.
 
@@ -564,7 +565,8 @@ def run_migration(
             reset/wipe (dry runs included): missing, no ``files`` table, a
             ``files`` table without the application's core columns, or an
             obvious backup copy. A database with no vector-claiming rows
-            gets a loud wrong-database WARNING on the destructive path.
+            gets a loud wrong-database WARNING on the destructive path and
+            dry-run.
         MigrationRefused: another process holds a write lock on the SQLite
             database, or the database is unreadable/corrupt at the writer
             probe (``main()`` maps this to exit code 5).
@@ -757,7 +759,10 @@ def run_migration(
                     "WARNING: the application database holds NO rows claiming\n"
                     "vectors ('indexed'/'partial') for the LanceDB index that\n"
                     "would be wiped. If this is not the live application\n"
-                    "database, STOP.\n"
+                    "database, STOP — wiping leaves a corpus nothing in it\n"
+                    "re-indexes. If this IS the re-run after an interrupted\n"
+                    "migration (reset done, wipe pending), proceeding is the\n"
+                    "documented repair.\n"
                 )
 
     # ── Step 2: Reset file statuses ────────────────────────────────────────
