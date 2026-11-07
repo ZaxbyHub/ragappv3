@@ -88,13 +88,20 @@ def _assert_clean_refusal_naming_both_paths(out, raised, db_path, lancedb_dir):
         "output carries no refusal-indicating phrase (#1080); output tail="
         + repr(out[-400:])
     )
-    # (c) the output names BOTH the sqlite path and the LanceDB path —
-    # in a refusal message, not just the startup banner.
-    assert str(db_path) in out, (
-        f"output does not name the sqlite path (#1080): {str(db_path)!r}"
+    # (c) the REFUSAL BLOCK itself names BOTH the sqlite path and the LanceDB
+    # path — scoped to the output AFTER the "ERROR:" line so the startup
+    # banner (which prints both paths before any check runs) cannot satisfy
+    # the assertion on its own (implementation-review round 1, M4 probe).
+    refusal_block = out.split("ERROR:", 1)[-1] if "ERROR:" in out else ""
+    assert refusal_block, (
+        "no ERROR refusal block in the output (#1080); output tail="
+        + repr(out[-400:])
     )
-    assert str(lancedb_dir) in out, (
-        f"output does not name the LanceDB path (#1080): {str(lancedb_dir)!r}"
+    assert str(db_path) in refusal_block, (
+        f"the refusal block does not name the sqlite path (#1080): {str(db_path)!r}"
+    )
+    assert str(lancedb_dir) in refusal_block, (
+        f"the refusal block does not name the LanceDB path (#1080): {str(lancedb_dir)!r}"
     )
 
 

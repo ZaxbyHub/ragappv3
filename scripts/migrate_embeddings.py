@@ -924,7 +924,7 @@ def run_migration(
         else:
             # Repair detection is scoped to a PRESENT-but-empty index
             # (issue #694 AC2 wording): that is exactly the directory state
-            # `_wipe_lancedb` leaves behind (rmtree + mkdir). An ABSENT
+            # `_wipe_lancedb` leaves behind (an empty recreated directory). An ABSENT
             # directory is indistinguishable from a wrong --lancedb-path or
             # a never-indexed deployment, so it keeps the clean no-op.
             stranded = (

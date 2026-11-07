@@ -478,6 +478,53 @@ def test_reset_empty_index_dir_creates_no_rollback(tmp_path, monkeypatch):
     assert not any(re.fullmatch(_ROLLBACK_RE, p.name) for p in tmp_path.iterdir())
 
 
+def test_reset_rollback_name_collision_uses_suffix(tmp_path, monkeypatch):
+    """Reset-side twin of the migrate collision leg (implementation-review
+    round 1: the plan promised rename mechanics for BOTH scripts)."""
+    db_path = tmp_path / "app.db"
+    _make_files_db(db_path, [(1, "doc.txt", "indexed", 5, None, None)])
+    lancedb_dir = tmp_path / "lancedb"
+    lancedb_dir.mkdir()
+    marker = lancedb_dir / "sentinel.marker"
+    marker.write_text("x", encoding="utf-8")
+    stamp = datetime(2026, 11, 7, 12, 0, 0)
+    with patch.object(rst, "datetime", _FixedClock(stamp)):
+        (tmp_path / "lancedb.rollback-20261107-120000").mkdir()  # collide
+        out, raised = _run_reset(monkeypatch, db_path, lancedb_dir)
+    assert raised is None, f"reset crashed on collision: {raised!r}"
+    assert (tmp_path / "lancedb.rollback-20261107-120000-1" / "sentinel.marker").exists(), (
+        "collision suffix not used on the reset side"
+    )
+    assert lancedb_dir.exists() and not any(lancedb_dir.iterdir())
+
+
+def test_reset_recreation_failure_names_preserved_rollback(tmp_path, monkeypatch):
+    """Reset-side twin of the migrate recreation-failure leg: the rollback
+    name is printed before the failing mkdir, the run refuses without a
+    success summary, and the previous index survives in the rollback."""
+    db_path = tmp_path / "app.db"
+    _make_files_db(db_path, [(1, "doc.txt", "indexed", 5, None, None)])
+    lancedb_dir = tmp_path / "lancedb"
+    lancedb_dir.mkdir()
+    marker = lancedb_dir / "sentinel.marker"
+    marker.write_text("x", encoding="utf-8")
+
+    def broken_mkdir(self, parents=False, exist_ok=False):
+        raise OSError("disk full")
+
+    with patch.object(Path, "mkdir", broken_mkdir):
+        out, raised = _run_reset(monkeypatch, db_path, lancedb_dir)
+
+    assert isinstance(raised, SystemExit) and raised.code == 8, f"raised={raised!r}"
+    assert "PRESERVED at" in out
+    assert "[3/3] Migration complete" not in out, "success summary printed on refusal"
+    rollbacks = [p for p in tmp_path.iterdir() if re.fullmatch(_ROLLBACK_RE, p.name)]
+    assert rollbacks and (rollbacks[0] / "sentinel.marker").exists(), (
+        "previous index not preserved on recreation failure"
+    )
+    assert not lancedb_dir.exists(), "live dir absent after failed recreation"
+
+
 # ---------------------------------------------------------------------------
 # Group 6 — 4.2 source-contract guardrail (subordinate tripwire)
 # ---------------------------------------------------------------------------
@@ -493,11 +540,33 @@ def test_no_rmtree_in_operator_wipe_scripts():
 
 
 def test_reset_preflight_runs_before_any_connection():
-    """Structural pin: the refusal must fire BEFORE get_db_connection can
-    materialize a stray database file (order matters, not just presence)."""
+    """Structural pin: inside reset_all_embeddings's body, the preflight CALL
+    must precede the first get_db_connection — the refusal fires before a
+    stray database file can be materialized. Scoped to the function's own
+    source slice so the preflight DEFINITION (which always sorts first)
+    cannot satisfy the order pin (implementation-review round 1, M3b)."""
+    import ast
+
     source = (_REPO_ROOT / "scripts" / "reset_embeddings.py").read_text(encoding="utf-8")
-    assert "_assert_application_database(" in source
-    assert "conn = get_db_connection(" in source
-    assert source.index("_assert_application_database(") < source.index(
-        "conn = get_db_connection("
-    ), "preflight must precede the first connection"
+    tree = ast.parse(source)
+    fn = next(
+        n for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == "reset_all_embeddings"
+    )
+    positions = {"preflight_call": None, "first_connection": None}
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Call):
+            continue
+        name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+        if name == "_assert_application_database" and positions["preflight_call"] is None:
+            positions["preflight_call"] = node.lineno
+        if name == "get_db_connection" and positions["first_connection"] is None:
+            positions["first_connection"] = node.lineno
+    assert positions["preflight_call"] is not None, (
+        "reset_all_embeddings no longer CALLS _assert_application_database "
+        "(the preflight was deleted or unwired)"
+    )
+    assert positions["first_connection"] is not None, "no get_db_connection call found"
+    assert positions["preflight_call"] < positions["first_connection"], (
+        "preflight must precede the first connection"
+    )
