@@ -5,7 +5,9 @@ Lifespan context manager for FastAPI application startup and shutdown.
 import asyncio
 import json
 import logging
+import os
 import sqlite3
+import stat
 import time
 from contextlib import asynccontextmanager
 from contextlib import suppress as contextlib_suppress
@@ -612,6 +614,57 @@ async def lifespan(app: FastAPI):
     # startup migration without a per-request pooled DB read (issues #550,
     # #549 C02): in-memory flag, written where the migration already runs.
     app.state.migrations_ok = True
+    # Data-directory writability preflight (issue #749, TQ-differential-e-03):
+    # a bind mount the Docker daemon created root-owned aborts startup further
+    # down with bare sqlite/LanceDB tracebacks. Fail HERE instead with one
+    # actionable message naming the directory, the current uid, and the owner
+    # uid — the criterion's explicitly permitted "fail with a message naming
+    # the directory/owner and uid" arm. W_OK|X_OK: creating children requires
+    # the search bit too, so a write-but-not-searchable directory must fail
+    # HERE with the named remedy rather than later as a generic migration
+    # error. A NONEXISTENT directory passes: fresh starts rely on the DB layer
+    # creating parents, and that flow is untouched. The message reports the
+    # CONTAINER-side path as the observed condition and describes the host
+    # remediation in prose — it deliberately does NOT print a runnable host
+    # command for the container path (the host bind source is not knowable
+    # from inside the container), and the path is never interpolated into
+    # shell syntax. The existence gate is an explicit stat(), not
+    # Path.exists(): exists() raises a bare PermissionError on 3.11 and
+    # returns False on 3.12+ when the PARENT is unsearchable, either of which
+    # skips the named message (batch-5 review). Only FileNotFoundError means
+    # "fresh start"; any other stat failure is itself the unusable-directory
+    # evidence.
+    _data_dir = settings.data_dir
+    _owner_uid = None
+    _dd_unusable = False
+    try:
+        _dd_stat = _data_dir.stat()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        _dd_unusable = True
+    else:
+        _owner_uid = getattr(_dd_stat, "st_uid", None)
+        # A regular FILE with W/X bits would pass os.access and fail later
+        # with a bare NotADirectoryError under it (batch-7 review).
+        _dd_unusable = not stat.S_ISDIR(_dd_stat.st_mode) or not os.access(
+            _data_dir, os.W_OK | os.X_OK
+        )
+    if _dd_unusable:
+        _current_uid = getattr(os, "getuid", lambda: None)()
+        raise RuntimeError(
+            f"Data directory is not a writable/searchable directory: {_data_dir}\n"
+            f"  current uid : {_current_uid}\n"
+            f"  owner uid   : {_owner_uid}\n"
+            "The application stores its database and vector index under this\n"
+            "directory and cannot start without write and search permission.\n"
+            "This path is as seen INSIDE the container; the directory to fix\n"
+            "is the bind-mount SOURCE on the host that maps to it (compose\n"
+            "maps ${HOST_DATA_DIR:-./data} to this location). On the HOST:\n"
+            "create that directory (mkdir -p) and hand it to uid 1000\n"
+            "(sudo chown -R 1000:1000, quoting the host path if it contains\n"
+            "spaces) — see the README first-run steps — then re-run."
+        )
     try:
         run_migrations(str(settings.sqlite_path))
     except Exception as e:
@@ -656,7 +709,24 @@ async def lifespan(app: FastAPI):
             )
     except Exception as e:  # pragma: no cover - journal is best-effort
         logger.debug("Could not read migration journal at startup: %s", e)
-    _load_persisted_settings(str(settings.sqlite_path))
+    # Guarded like the migration step above (issue #749, TQ-differential-e-03):
+    # an unopenable settings database (e.g. a root-owned bind mount) must not
+    # abort startup with a bare sqlite traceback — it routes into the same
+    # degraded-start signal so /api/healthz reports 503 (issues #550, #749).
+    try:
+        _load_persisted_settings(str(settings.sqlite_path))
+    except RuntimeError:
+        # The persisted-schema drift guard raises RuntimeError by contract
+        # (issue #494 CONFIG-003): a drift must ABORT startup, not boot
+        # degraded with a silently reverted settings surface (batch-2 review
+        # F-06). Only unexpected load failures degrade.
+        raise
+    except Exception as e:
+        app.state.migrations_ok = False
+        logger.error(
+            "Persisted settings load failed: %s — app will start with degraded database state",
+            e,
+        )
 
     # Seed the application DB pool BEFORE any other get_pool() caller can run.
     # get_pool() is a first-call-wins singleton keyed on the sqlite_path, so a
