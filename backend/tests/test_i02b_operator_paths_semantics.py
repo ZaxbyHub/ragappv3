@@ -864,6 +864,14 @@ class TestRunnableHealthHint(unittest.TestCase):
             response_block,
             "the response-field command must carry the sqlite path flag",
         )
+        # The prerequisite must live in the RESPONSE itself (batch-8 review;
+        # batch-8 delta review: a whole-file scan stays green on the logger
+        # copy when only the response loses it).
+        self.assertIn(
+            "backend/requirements-lock.txt",
+            response_block,
+            "the /health response must name the backend-deps prerequisite",
+        )
 
 
 class TestPerDocumentOwnershipSteps(unittest.TestCase):
