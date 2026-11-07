@@ -627,17 +627,24 @@ async def lifespan(app: FastAPI):
     # remediation in prose — it deliberately does NOT print a runnable host
     # command for the container path (the host bind source is not knowable
     # from inside the container), and the path is never interpolated into
-    # shell syntax.
+    # shell syntax. The existence gate is an explicit stat(), not
+    # Path.exists(): exists() raises a bare PermissionError on 3.11 and
+    # returns False on 3.12+ when the PARENT is unsearchable, either of which
+    # skips the named message (batch-5 review). Only FileNotFoundError means
+    # "fresh start"; any other stat failure is itself the unusable-directory
+    # evidence.
     _data_dir = settings.data_dir
-    if _data_dir.exists() and not os.access(_data_dir, os.W_OK | os.X_OK):
-        try:
-            _st = _data_dir.stat()
-            _owner_uid = getattr(_st, "st_uid", None)
-        except OSError:
-            # stat() itself failing is its own evidence the directory is
-            # unusable — keep the actionable named-failure instead of a bare
-            # traceback (batch-2 review).
-            _owner_uid = None
+    _owner_uid = None
+    _dd_unusable = False
+    try:
+        _owner_uid = getattr(_data_dir.stat(), "st_uid", None)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        _dd_unusable = True
+    else:
+        _dd_unusable = not os.access(_data_dir, os.W_OK | os.X_OK)
+    if _dd_unusable:
         _current_uid = getattr(os, "getuid", lambda: None)()
         raise RuntimeError(
             f"Data directory is not writable/searchable: {_data_dir}\n"

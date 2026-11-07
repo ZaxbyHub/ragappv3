@@ -45,9 +45,12 @@ Properties
   paths — for example container-side DATA_DIR paths used from the host),
   exit code 8 = the application SQLite database is unusable for a reset/wipe
   (dry runs included): missing, no ``files`` table, a ``files`` table without
-  the application's core columns, or an obvious backup copy (a path that
-  RESOLVES to one included) — without the live application database the
-  wipe would destroy vectors with no usable rollback source. A database
+  the application's core columns, an obvious backup copy (a path that
+  RESOLVES to one included), or a database whose vector-claiming rows share
+  no file id with a non-empty index's chunks — each would let the wipe
+  destroy vectors with no usable rollback source. A byte-identical copy of
+  the live database under a live-looking name cannot be told apart by
+  content; point --sqlite-path at the live file. A database
   where NO rows claim vectors gets a loud WARNING instead (live run and
   dry-run): that state is indistinguishable from the documented
   reset-then-crash repair re-run.
@@ -158,6 +161,37 @@ def _detect_stored_dim(lancedb_path: Path) -> int | None:
         logger.debug("Could not read stored embedding dim via pyarrow: %s", exc)
 
     return None
+
+
+def _lancedb_file_ids(lancedb_path: Path) -> set[str] | None:
+    """Distinct ``file_id`` values in the LanceDB chunks table, or None.
+
+    None means "no identity evidence" (no chunks table, no ``file_id``
+    column, an empty table, or an index the installed lancedb cannot read)
+    — the caller must then NOT refuse on identity grounds. Only the
+    ``file_id`` column is selected, so the embedding vectors are never
+    materialised.
+    """
+    if not (lancedb_path / "chunks.lance").exists():
+        return None
+    try:
+        import lancedb as _ldb  # type: ignore
+
+        db = _ldb.connect(str(lancedb_path))
+        if "chunks" not in db.table_names():
+            return None
+        tbl = db.open_table("chunks")
+        total = tbl.count_rows()
+        if not total:
+            return None
+        column = (
+            tbl.search().select(["file_id"]).limit(total).to_arrow().column("file_id")
+        )
+        ids = {str(value) for value in column.to_pylist() if value is not None}
+        return ids or None
+    except Exception as exc:
+        logger.debug("Could not read chunk file ids via lancedb: %s", exc)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -283,7 +317,10 @@ def _assert_application_database(sqlite_path: Path, lancedb_path: Path) -> None:
     paths. Schema identity requires the reset contract's core ``files``
     columns (``id``/``status`` — the pivot of the whole reset/wipe flow),
     so an unrelated database that merely carries a table named ``files`` is
-    refused too.
+    refused too. A schema-valid database whose vector-claiming rows share no
+    file id with a non-empty index's chunks is refused as describing a
+    different index. A byte-identical copy of the live database under a
+    live-looking name shares every id and is NOT detectable by content.
 
     Exception taxonomy deliberately mirrors the sibling probes
     (``_count_rows_claiming_vectors`` / ``_assert_no_active_writer``): a writer
@@ -386,6 +423,14 @@ def _assert_application_database(sqlite_path: Path, lancedb_path: Path) -> None:
             row[1]
             for row in conn.execute("PRAGMA table_info(files)").fetchall()
         }
+        claimed_ids: set[str] = set()
+        if {"id", "status"}.issubset(columns):
+            claimed_ids = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT id FROM files WHERE status IN ('indexed', 'partial')"
+                ).fetchall()
+            }
     except sqlite3.OperationalError as exc:
         if "lock" in str(exc).lower() or "busy" in str(exc).lower():
             raise MigrationRefused(
@@ -423,6 +468,32 @@ def _assert_application_database(sqlite_path: Path, lancedb_path: Path) -> None:
             "re-run. Nothing was migrated.\n"
         )
         raise SystemExit(8)
+    # Cross-store identity (pr1081-20261106 batch-5 review): rows that claim
+    # vectors ('indexed'/'partial') must have chunks in THIS index. When the
+    # index's chunks carry file ids and NONE of the claimed rows appear among
+    # them, the database does not describe this index (unrelated or foreign
+    # deployment's database) — the reset would hit the wrong rows while the
+    # live index is wiped. Zero claims (fresh boot, reset-then-crash repair
+    # re-run) and an index without readable file ids carry no evidence and
+    # fall through to the WARNING path in run_migration. A byte-identical
+    # copy of the live database shares every id and cannot be told apart by
+    # content — the backup-name check above is the only guard for that.
+    if claimed_ids:
+        index_ids = _lancedb_file_ids(lancedb_path)
+        if index_ids is not None and not (claimed_ids & index_ids):
+            print(
+                "ERROR: none of the database's rows that claim vectors\n"
+                "('indexed'/'partial') have chunks in this LanceDB index, so\n"
+                "the database does not describe the index about to be wiped:\n"
+                f"  SQLite path : {sqlite_path} "
+                f"({len(claimed_ids)} claiming row(s))\n"
+                f"  LanceDB path: {lancedb_path} "
+                f"({len(index_ids)} distinct file id(s), none shared)\n"
+                "Point --sqlite-path at the database that produced this index\n"
+                "(and --lancedb-path at its index) and re-run. Nothing was\n"
+                "migrated.\n"
+            )
+            raise SystemExit(8)
 
 
 def _reset_file_statuses(sqlite_path: Path, dry_run: bool) -> int:
@@ -563,8 +634,10 @@ def run_migration(
             corrupt during repair detection; code 7 when neither path
             exists; code 8 when the application database is unusable for a
             reset/wipe (dry runs included): missing, no ``files`` table, a
-            ``files`` table without the application's core columns, or an
-            obvious backup copy. A database with no vector-claiming rows
+            ``files`` table without the application's core columns, an
+            obvious backup copy, or vector-claiming rows that share no file
+            id with a non-empty index's chunks. A database with no
+            vector-claiming rows
             gets a loud wrong-database WARNING on the destructive path and
             dry-run.
         MigrationRefused: another process holds a write lock on the SQLite

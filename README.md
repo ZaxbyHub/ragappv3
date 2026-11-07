@@ -586,8 +586,12 @@ curl -H "X-API-Key: ${HEALTH_CHECK_API_KEY:?set HEALTH_CHECK_API_KEY}" \
 > **8** — the SQLite file is unusable for a reset/wipe (dry runs included):
 > missing, no `files` table, a `files` table without the reset contract's
 > core columns (`id`, `status`), an obvious backup copy such as `app.db.bak`
-> (a path that resolves to one included) — without the live application
-> database the wipe would destroy vectors with no usable rollback source.
+> (a path that resolves to one included), or rows claiming vectors that
+> share no file id with the index's chunks (a database that does not
+> describe this index) — each would let the wipe destroy vectors with no
+> usable rollback source. A byte-identical copy of the live database under
+> a live-looking name cannot be detected by content: always point
+> `--sqlite-path` at the live file.
 > A database where NO rows claim vectors gets a loud WARNING (live run
 > and dry-run) instead (that state is indistinguishable from the
 > documented re-run after an interrupted migration). Pass `--force` to

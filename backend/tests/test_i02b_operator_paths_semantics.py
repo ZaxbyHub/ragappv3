@@ -428,6 +428,112 @@ class TestApplicationDatabaseIdentity(unittest.TestCase):
             conn.close()
             self.assertEqual(status, "pending", "reset ran before the wipe")
 
+    def _mk_index(self, tmp: Path, file_ids):
+        """A REAL lancedb chunks table carrying ``file_ids`` (needs lancedb)."""
+        try:
+            import lancedb
+        except ImportError:  # pragma: no cover - backend dep, present in CI
+            self.skipTest("lancedb not installed")
+        lance = tmp / "lancedb"
+        lance.mkdir()
+        db = lancedb.connect(str(lance))
+        db.create_table(
+            "chunks",
+            data=[
+                {"id": f"c{i}", "file_id": fid, "embedding": [0.1, 0.2]}
+                for i, fid in enumerate(file_ids)
+            ],
+        )
+        return lance
+
+    def _mk_claiming_db(self, tmp: Path) -> Path:
+        app_db = tmp / "app.db"
+        conn = sqlite3.connect(str(app_db))
+        conn.execute("CREATE TABLE files (id INTEGER PRIMARY KEY, status TEXT)")
+        conn.execute("INSERT INTO files (id, status) VALUES (1, 'indexed')")
+        conn.commit()
+        conn.close()
+        return app_db
+
+    def test_claims_sharing_no_ids_with_index_refused(self):
+        """Batch-5 review (hermes HIGH): a schema-valid database whose
+        vector-claiming rows have NO chunks in a non-empty index does not
+        describe that index — refused with exit 8 (live AND dry run) before
+        the reset or the wipe."""
+        import tempfile
+
+        mod = _load_migrate_module()
+        for dry_run in (False, True):
+            with self.subTest(dry_run=dry_run), tempfile.TemporaryDirectory() as td:
+                tmp = Path(td)
+                lance = self._mk_index(tmp, ["999", "1000"])
+                app_db = self._mk_claiming_db(tmp)
+                code, out = self._refusal_stdout(
+                    lambda: mod.run_migration(
+                        lance, app_db, dry_run=dry_run, force=True
+                    )
+                )
+                self.assertEqual(code, 8, "foreign database must be refused")
+                self.assertIn("does not describe the index", " ".join(out.split()))
+                self.assertTrue(
+                    (lance / "chunks.lance").exists(), "index survives the refusal"
+                )
+                conn = sqlite3.connect(str(app_db))
+                status = conn.execute("SELECT status FROM files").fetchone()[0]
+                conn.close()
+                self.assertEqual(status, "indexed", "no reset on refusal")
+
+    def test_claims_sharing_ids_with_index_passes_and_wipes(self):
+        """The pass-through half of the cross-store check: claimed rows that
+        DO have chunks in the index pass and the migration completes."""
+        import tempfile
+
+        mod = _load_migrate_module()
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            lance = self._mk_index(tmp, ["1", "1"])
+            app_db = self._mk_claiming_db(tmp)
+            outcome = mod.run_migration(lance, app_db, force=True)
+            self.assertEqual(outcome, 1, "matching database: run completes")
+            self.assertFalse((lance / "chunks.lance").exists(), "index wiped")
+            conn = sqlite3.connect(str(app_db))
+            status = conn.execute("SELECT status FROM files").fetchone()[0]
+            conn.close()
+            self.assertEqual(status, "pending")
+
+
+class TestContainerCmdSemantics(unittest.TestCase):
+    """Argv-level companion to the frozen lifecycle checks (batch-5 review):
+    the frozen C-checks accept any exec'd program and search the whole CMD
+    text for ``--workers 1``. Parse the CMD instead: the shell must exec
+    uvicorn itself, as the only command, with ``--workers 1`` in uvicorn's
+    own argv."""
+
+    def test_cmd_execs_uvicorn_with_single_worker(self):
+        import json
+
+        cmd_lines = [
+            line
+            for line in (REPO / "Dockerfile").read_text(encoding="utf-8").splitlines()
+            if line.startswith("CMD ")
+        ]
+        self.assertTrue(cmd_lines, "Dockerfile must declare a CMD")
+        argv = json.loads(cmd_lines[-1][len("CMD ") :])
+        self.assertEqual(argv[:2], ["sh", "-c"], "exec-form sh -c wrapper expected")
+        self.assertEqual(len(argv), 3, "one shell script argument")
+        tokens = shlex.split(argv[2])
+        for separator in (";", "&&", "||", "&", "|"):
+            self.assertNotIn(separator, tokens, "a single command, nothing after it")
+        self.assertEqual(tokens[0], "exec", "the shell must exec, not fork")
+        self.assertEqual(tokens[1], "uvicorn", "uvicorn itself replaces the shell")
+        uvicorn_argv = tokens[2:]
+        self.assertIn("--workers", uvicorn_argv)
+        self.assertEqual(
+            uvicorn_argv[uvicorn_argv.index("--workers") + 1],
+            "1",
+            "--workers 1 must be uvicorn's own argument",
+        )
+
 
 class TestCorruptDatabaseKeepsExitFive(unittest.TestCase):
     """The new helper must not reclassify corruption (round-3 finding 3).
@@ -550,6 +656,33 @@ class TestRunnableHealthHint(unittest.TestCase):
         self.assertEqual(tokens[1], "scripts/migrate_embeddings.py")
         self.assertIn("--lancedb-path", tokens)
         self.assertIn("--sqlite-path", tokens)
+        # The advertised command must be the SAFE preview: the response is an
+        # operator instruction for a destructive script, and the documented
+        # procedure is dry-run first (batch-5 review).
+        self.assertIn("--dry-run", tokens, "the hint must lead with the dry run")
+        self.assertIn("without --dry-run", re.sub(r'[\'"]', "", source))
+        # Feed the extracted argv through the script's REAL argument parser
+        # (main()) with run_migration stubbed — tokenizing alone proved
+        # nothing about the flags the script accepts.
+        mod = _load_migrate_module()
+        captured = {}
+
+        def fake_run_migration(**kwargs):
+            captured.update(kwargs)
+            return 0
+
+        saved_argv = sys.argv
+        saved_run = mod.run_migration
+        try:
+            sys.argv = tokens[1:]
+            mod.run_migration = fake_run_migration
+            mod.main()
+        finally:
+            sys.argv = saved_argv
+            mod.run_migration = saved_run
+        self.assertTrue(captured.get("dry_run"), "parsed command must be a dry run")
+        self.assertEqual(captured.get("lancedb_path"), Path("./data/lancedb"))
+        self.assertEqual(captured.get("sqlite_path"), Path("./data/app.db"))
 
     def test_hint_lives_in_the_health_response_not_only_the_logger(self):
         """The OPERATOR-facing carrier is the /api/health JSON payload

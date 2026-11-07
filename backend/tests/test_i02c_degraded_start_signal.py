@@ -68,6 +68,22 @@ def _pin_lifespan_settings(tmp_path: Path):
     _draft_events._bus = None  # noqa: SLF001
     _background_tasks._processor_instance = None  # noqa: SLF001
 
+    def _reset_lifecycle_globals():
+        # Pools, buses and the processor singleton bind to the loop the real
+        # lifespan ran on; reset them on BOTH sides so nothing bound to a
+        # dead loop leaks into the next test on this xdist worker
+        # (batch-5 review).
+        with _pool_cache_lock:
+            for pool in list(_pool_cache.values()):
+                try:
+                    pool.close_all()
+                except Exception:  # noqa: BLE001 - already-closed pool is fine
+                    pass
+            _pool_cache.clear()
+        _wiki_events._bus = None  # noqa: SLF001
+        _draft_events._bus = None  # noqa: SLF001
+        _background_tasks._processor_instance = None  # noqa: SLF001
+
     from app.services import auth_service as _auth_service
 
     saved_auth_executor = _auth_service._auth_executor
@@ -100,6 +116,8 @@ def _pin_lifespan_settings(tmp_path: Path):
 
         with contextlib.suppress(Exception):
             root_logger.setLevel(saved_root_level)
+        with contextlib.suppress(Exception):
+            _reset_lifecycle_globals()
         for key, value in saved.items():
             with contextlib.suppress(Exception):
                 setattr(settings, key, value)
@@ -241,6 +259,48 @@ class TestUnwritableDataDirFailsWithNamedMessage(unittest.TestCase):
         self.assertIsNotNone(
             raised, "write-but-not-searchable dir must fail the preflight"
         )
+        self.assertIn(str(tmp), str(raised))
+
+    def test_stat_permission_error_raises_named_message(self):
+        """Leg A3 (batch-5 review): an existing directory whose stat() fails
+        with PermissionError (unsearchable PARENT) must hit the named
+        message. Path.exists() raises a bare PermissionError on 3.11 and
+        returns False on 3.12+ — either skipped the preflight before the
+        explicit-stat gate."""
+        from fastapi import FastAPI
+
+        from app.lifespan import lifespan
+
+        tmp = _fresh_tmp_dir("i02c-legA3-")
+        restore = _pin_lifespan_settings(tmp)
+        root, saved_handlers = _snapshot_root_handlers()
+        real_stat = Path.stat
+
+        def fake_stat(self, *args, **kwargs):
+            if self == tmp:
+                raise PermissionError(13, "Permission denied", str(self))
+            return real_stat(self, *args, **kwargs)
+
+        app = FastAPI()
+        raised = None
+        try:
+            Path.stat = fake_stat  # type: ignore[method-assign]
+
+            async def scenario():
+                async with lifespan(app):
+                    raise AssertionError("startup must not complete")
+
+            try:
+                asyncio.run(scenario())
+            except RuntimeError as exc:
+                raised = exc
+        finally:
+            Path.stat = real_stat  # type: ignore[method-assign]
+            _restore_root_handlers(root, saved_handlers)
+            restore()
+
+        self.assertIsNotNone(raised, "stat-denied data dir must fail startup")
+        self.assertIn("Data directory is not writable/searchable", str(raised))
         self.assertIn(str(tmp), str(raised))
 
 

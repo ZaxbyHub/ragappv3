@@ -228,19 +228,25 @@ async def _collect_deep_state(app_state, llm_checker, model_checker) -> dict:
                     vector_status["stale_embeddings_detail"] = (
                         f"LanceDB index was built with {stored_dim}-dim embeddings but "
                         f"EMBEDDING_DIM is now {configured_dim}. "
-                        "Run: python scripts/migrate_embeddings.py --lancedb-path "
-                        "./data/lancedb --sqlite-path ./data/app.db "
+                        "Back up the data directory and stop the application, "
+                        "then preview the migration. "
+                        "Run: python scripts/migrate_embeddings.py --dry-run "
+                        "--lancedb-path ./data/lancedb --sqlite-path ./data/app.db "
                         "(from the repo root; adjust the paths to your data "
                         "directory if you changed HOST_DATA_DIR — see the "
-                        "script's --help)."
+                        "script's --help). Inspect its output, then re-run the "
+                        "same command without --dry-run to apply it."
                     )
                     logger.warning(
                         "Stale embedding dimensions detected: stored=%d, configured=%d. "
                         "Documents will not be searchable until re-embedded. "
-                        "Run: python scripts/migrate_embeddings.py --lancedb-path "
+                        "Back up the data directory and stop the application, then "
+                        "preview the migration. "
+                        "Run: python scripts/migrate_embeddings.py --dry-run --lancedb-path "
                         "./data/lancedb --sqlite-path ./data/app.db (from the repo "
                         "root; adjust the paths to your data directory if you "
-                        "changed HOST_DATA_DIR — see the script's --help).",
+                        "changed HOST_DATA_DIR — see the script's --help). Inspect "
+                        "its output, then re-run without --dry-run to apply it.",
                         stored_dim,
                         configured_dim,
                     )
