@@ -12,6 +12,10 @@
 #   * The NVIDIA GPU reservations are removed. Compose merge semantics require
 #     `!reset []` here: a plain `devices: []` would RETAIN the base services'
 #     nvidia device reservations (verified with Docker Compose v5.5.1).
+#   * Requires Docker Compose v2.19 or newer: `!reset` handling of the
+#     `services` map landed in compose-go v1.14.0, first vendored by Compose
+#     v2.19.0 (v2.18.x ships compose-go v1.13.5). Older releases reject or
+#     mis-merge this file — check with `docker compose version`.
 #
 # Digest pinning: the shipped GPU images in docker-compose.yml are digest-
 # pinned (issue #404). This override intentionally uses the floating

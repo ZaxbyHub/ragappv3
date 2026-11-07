@@ -245,6 +245,8 @@ docker compose -f docker-compose.yml -f docker-compose.cpu.yml up -d
 The override swaps both services to the CPU build of text-embeddings-inference
 (`cpu-latest`) and removes the GPU reservations (`!reset []` — required under
 compose merge semantics; a plain empty list would keep the inherited devices).
+The `!reset` tag needs **Docker Compose v2.19 or newer** (check with
+`docker compose version`); older releases reject or mis-merge the file.
 Models, ports, and healthchecks are unchanged, so startup gating and the app
 behave identically. Expect meaningfully slower embedding/rerank throughput on
 CPU. Before relying on this in production, pin the CPU image digest the same

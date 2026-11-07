@@ -572,16 +572,22 @@ class TestApplicationDatabaseIdentity(unittest.TestCase):
             )
         )
         saved_mod = sys.modules.get("lancedb")
-        saved_batch = mod._ID_PROBE_BATCH
+        closed = []
+
+        def batches():
+            try:
+                for i in ("1", "2", "3", "4"):
+                    yield [i]
+            finally:
+                closed.append(True)
+
         try:
             sys.modules["lancedb"] = fake
-            mod._ID_PROBE_BATCH = 1
             with tempfile.TemporaryDirectory() as td:
                 lance = Path(td)
                 (lance / "chunks.lance").mkdir()
-                result = mod._index_shares_claimed_ids(lance, {"1", "2", "3", "4"})
+                result = mod._index_shares_claimed_ids(lance, batches())
         finally:
-            mod._ID_PROBE_BATCH = saved_batch
             if saved_mod is None:
                 sys.modules.pop("lancedb", None)
             else:
@@ -592,23 +598,44 @@ class TestApplicationDatabaseIdentity(unittest.TestCase):
             ["file_id IN ('1')", "file_id IN ('2')"],
             "one bounded batch per query, stopping at the first hit",
         )
+        self.assertEqual(closed, [True], "the batch stream is closed on early return")
 
-    def test_identity_probe_multi_batch_real_index(self):
-        """Real lancedb, batch size 1: the only shared id sits in the LAST
-        batch (pass-through), and with no shared id every batch misses
-        (refusal)."""
+    def test_claimed_ids_stream_from_sqlite_in_bounded_batches(self):
+        """Batch-9 review: the SQLite side is streamed with fetchmany in
+        _ID_PROBE_BATCH-sized batches (claiming rows only, id order) instead
+        of being collected into one set."""
         import tempfile
 
         mod = _load_migrate_module()
         saved_batch = mod._ID_PROBE_BATCH
         try:
-            mod._ID_PROBE_BATCH = 1
+            mod._ID_PROBE_BATCH = 2
             with tempfile.TemporaryDirectory() as td:
-                lance = self._mk_index(Path(td), ["3", "3"])
-                self.assertIs(mod._index_shares_claimed_ids(lance, {"1", "2", "3"}), True)
-                self.assertIs(mod._index_shares_claimed_ids(lance, {"1", "2"}), False)
+                app_db = Path(td) / "app.db"
+                conn = sqlite3.connect(str(app_db))
+                conn.execute("CREATE TABLE files (id INTEGER PRIMARY KEY, status TEXT)")
+                conn.executemany(
+                    "INSERT INTO files (id, status) VALUES (?, ?)",
+                    [(5, "indexed"), (1, "partial"), (3, "indexed"), (2, "pending"),
+                     (4, "indexed"), (9, "indexed")],
+                )
+                conn.commit()
+                conn.close()
+                got = list(mod._iter_claimed_id_batches(app_db))
         finally:
             mod._ID_PROBE_BATCH = saved_batch
+        self.assertEqual(got, [["1", "3"], ["4", "5"], ["9"]])
+
+    def test_identity_probe_multi_batch_real_index(self):
+        """Real lancedb: the only shared id sits in the LAST batch
+        (pass-through), and with no shared id every batch misses (refusal)."""
+        import tempfile
+
+        mod = _load_migrate_module()
+        with tempfile.TemporaryDirectory() as td:
+            lance = self._mk_index(Path(td), ["3", "3"])
+            self.assertIs(mod._index_shares_claimed_ids(lance, [["1"], ["2"], ["3"]]), True)
+            self.assertIs(mod._index_shares_claimed_ids(lance, [["1"], ["2"]]), False)
 
     def test_identity_probe_all_null_ids_is_no_evidence(self):
         """An index whose file_id values are all NULL carries no identity
@@ -630,7 +657,7 @@ class TestApplicationDatabaseIdentity(unittest.TestCase):
                 "chunks",
                 data=pa.table({"id": ["c0", "c1"], "file_id": [None, None]}, schema=schema),
             )
-            self.assertIsNone(mod._index_shares_claimed_ids(lance, {"1"}))
+            self.assertIsNone(mod._index_shares_claimed_ids(lance, [["1"]]))
 
     def test_identity_probe_escapes_quotes_in_ids(self):
         """Ids reach the IN literal as text (SQLite affinity can store any
@@ -641,9 +668,9 @@ class TestApplicationDatabaseIdentity(unittest.TestCase):
         mod = _load_migrate_module()
         with tempfile.TemporaryDirectory() as td:
             lance = self._mk_index(Path(td), ["o'brien", "7"])
-            self.assertIs(mod._index_shares_claimed_ids(lance, {"o'brien"}), True)
+            self.assertIs(mod._index_shares_claimed_ids(lance, [["o'brien"]]), True)
             self.assertIs(
-                mod._index_shares_claimed_ids(lance, {"zzz' OR '1'='1", "zzz') OR ('1'='1"}),
+                mod._index_shares_claimed_ids(lance, [["zzz' OR '1'='1", "zzz') OR ('1'='1"]]),
                 False,
             )
 

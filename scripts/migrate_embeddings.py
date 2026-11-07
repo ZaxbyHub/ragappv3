@@ -99,6 +99,7 @@ import re
 import shutil
 import sqlite3
 import sys
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 
 logging.basicConfig(
@@ -185,54 +186,87 @@ def _looks_like_backup(lower_name: str) -> bool:
     return any(tok in _BACKUP_TOKENS for tok in re.split(r"[.\-_~\s]+", lower_name))
 
 
-#: Claimed ids probed per LanceDB filter query (bounded memory; batch-7 review).
+#: Claimed ids probed per LanceDB filter query and fetched per SQLite
+#: ``fetchmany`` (bounded memory on BOTH stores; batch-7/batch-9 reviews).
 _ID_PROBE_BATCH = 500
 
+_CLAIMED_IDS_SQL = (
+    "SELECT id FROM files WHERE status IN ('indexed', 'partial') ORDER BY id"
+)
 
-def _index_shares_claimed_ids(lancedb_path: Path, claimed_ids: set[str]) -> bool | None:
+
+def _iter_claimed_id_batches(sqlite_path: Path) -> Iterator[list[str]]:
+    """Stream the claiming rows' ids in ``_ID_PROBE_BATCH``-sized batches.
+
+    The cursor is read with ``fetchmany`` so the SQLite side is never
+    materialised either (batch-9 review); the connection closes when the
+    generator is exhausted or closed early.
+    """
+    conn = sqlite3.connect(str(sqlite_path), timeout=2.0, isolation_level=None)
+    try:
+        cursor = conn.execute(_CLAIMED_IDS_SQL)
+        while True:
+            rows = cursor.fetchmany(_ID_PROBE_BATCH)
+            if not rows:
+                return
+            yield [str(row[0]) for row in rows]
+    finally:
+        conn.close()
+
+
+def _index_shares_claimed_ids(
+    lancedb_path: Path, id_batches: Iterable[list[str]]
+) -> bool | None:
     """Whether ANY claimed file id has chunks in the LanceDB index, or None.
 
     None means "no identity evidence" (no chunks table, no ``file_id``
     column, an empty table or one whose ``file_id`` values are all NULL, or
     an index the installed lancedb cannot read)
-    — the caller must then NOT refuse on identity grounds. The index is
-    never materialised: claimed ids are probed in bounded batches with a
-    ``file_id IN (...)`` filter selecting at most one row, and the scan stops
-    at the first batch that matches (pr1081-20261106 batch-7 review).
+    — the caller must then NOT refuse on identity grounds. Neither store is
+    materialised: ``id_batches`` arrive pre-bounded (streamed from SQLite),
+    each is probed with a ``file_id IN (...)`` filter selecting at most one
+    row, and the scan stops at the first batch that matches
+    (pr1081-20261106 batch-7/batch-9 reviews). The batch iterator is always
+    closed, so a streaming SQLite cursor is released on an early return.
     """
-    if not (lancedb_path / "chunks.lance").exists():
-        return None
     try:
-        import lancedb as _ldb  # type: ignore
+        if not (lancedb_path / "chunks.lance").exists():
+            return None
+        try:
+            import lancedb as _ldb  # type: ignore
 
-        db = _ldb.connect(str(lancedb_path))
-        if "chunks" not in db.table_names():
+            db = _ldb.connect(str(lancedb_path))
+            if "chunks" not in db.table_names():
+                return None
+            tbl = db.open_table("chunks")
+            # An empty table, or one whose file_id values are all NULL,
+            # carries no identity evidence (batch-7 delta review: all-NULL
+            # must not read as a mismatch).
+            if "file_id" not in tbl.schema.names or not tbl.count_rows(
+                "file_id IS NOT NULL"
+            ):
+                return None
+            for batch in id_batches:
+                if not batch:
+                    continue
+                literals = ", ".join("'" + i.replace("'", "''") + "'" for i in batch)
+                hit = (
+                    tbl.search()
+                    .where(f"file_id IN ({literals})")
+                    .select(["file_id"])
+                    .limit(1)
+                    .to_arrow()
+                )
+                if hit.num_rows:
+                    return True
+            return False
+        except Exception as exc:
+            logger.debug("Could not probe chunk file ids via lancedb: %s", exc)
             return None
-        tbl = db.open_table("chunks")
-        # An empty table, or one whose file_id values are all NULL, carries
-        # no identity evidence (batch-7 delta review: all-NULL must not read
-        # as a mismatch).
-        if "file_id" not in tbl.schema.names or not tbl.count_rows(
-            "file_id IS NOT NULL"
-        ):
-            return None
-        ordered = sorted(claimed_ids)
-        for start in range(0, len(ordered), _ID_PROBE_BATCH):
-            batch = ordered[start : start + _ID_PROBE_BATCH]
-            literals = ", ".join("'" + i.replace("'", "''") + "'" for i in batch)
-            hit = (
-                tbl.search()
-                .where(f"file_id IN ({literals})")
-                .select(["file_id"])
-                .limit(1)
-                .to_arrow()
-            )
-            if hit.num_rows:
-                return True
-        return False
-    except Exception as exc:
-        logger.debug("Could not probe chunk file ids via lancedb: %s", exc)
-        return None
+    finally:
+        close = getattr(id_batches, "close", None)
+        if close is not None:
+            close()
 
 
 # ---------------------------------------------------------------------------
@@ -461,14 +495,15 @@ def _assert_application_database(sqlite_path: Path, lancedb_path: Path) -> None:
             row[1]
             for row in conn.execute("PRAGMA table_info(files)").fetchall()
         }
-        claimed_ids: set[str] = set()
+        claimed_count = 0
         if {"id", "status"}.issubset(columns):
-            claimed_ids = {
-                str(row[0])
-                for row in conn.execute(
-                    "SELECT id FROM files WHERE status IN ('indexed', 'partial')"
-                ).fetchall()
-            }
+            # A COUNT, not the id list: the ids themselves are streamed in
+            # bounded batches only if the cross-store probe runs (batch-9).
+            claimed_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM files WHERE status IN ('indexed', 'partial')"
+                ).fetchone()[0]
+            )
     except sqlite3.OperationalError as exc:
         if "lock" in str(exc).lower() or "busy" in str(exc).lower():
             raise MigrationRefused(
@@ -517,15 +552,17 @@ def _assert_application_database(sqlite_path: Path, lancedb_path: Path) -> None:
     # check proves only DISJOINTNESS — a byte-identical live copy, or a
     # foreign deployment's database whose autoincrement ids overlap the
     # index's, passes; the backup-name check above is the only other guard.
-    if claimed_ids:
-        shares = _index_shares_claimed_ids(lancedb_path, claimed_ids)
+    if claimed_count:
+        shares = _index_shares_claimed_ids(
+            lancedb_path, _iter_claimed_id_batches(sqlite_path)
+        )
         if shares is False:
             print(
                 "ERROR: none of the database's rows that claim vectors\n"
                 "('indexed'/'partial') have chunks in this LanceDB index, so\n"
                 "the database does not describe the index about to be wiped:\n"
                 f"  SQLite path : {sqlite_path} "
-                f"({len(claimed_ids)} claiming row(s))\n"
+                f"({claimed_count} claiming row(s))\n"
                 f"  LanceDB path: {lancedb_path} (non-empty, none shared)\n"
                 "Point --sqlite-path at the database that produced this index\n"
                 "(and --lancedb-path at its index) and re-run. Nothing was\n"
