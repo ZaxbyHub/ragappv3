@@ -509,12 +509,21 @@ class TestApplicationDatabaseIdentity(unittest.TestCase):
         import tempfile
 
         mod = _load_migrate_module()
-        for name in ("app.db.bak.1", "app.db.backup-2024", "app_backup.db", "app.db~"):
+        for name in (
+            "app.db.bak.1",
+            "app.db.backup-2024",
+            "app_backup.db",
+            "app.db~",
+            "app.db.copy",  # batch-11 review
+            "backups/app.db",  # batch-11 review: backup PARENT directory
+            "db-backup/app.db",
+        ):
             for dry_run in (False, True):
                 with self.subTest(name=name, dry_run=dry_run), tempfile.TemporaryDirectory() as td:
                     tmp = Path(td)
                     lance = self._mk(tmp)
                     backup = tmp / name
+                    backup.parent.mkdir(parents=True, exist_ok=True)
                     conn = sqlite3.connect(str(backup))
                     conn.execute("CREATE TABLE files (id INTEGER PRIMARY KEY, status TEXT)")
                     conn.execute("INSERT INTO files (id, status) VALUES (1, 'indexed')")
@@ -532,6 +541,10 @@ class TestApplicationDatabaseIdentity(unittest.TestCase):
         for name in ("app.db", "knowledge.db", "bakery.db", "original_corpus.db", "app.db-wal"):
             with self.subTest(name=name):
                 self.assertFalse(mod._looks_like_backup(name), name)
+        # Live data-directory names must not read as backup locations.
+        for dirname in ("data", "app", "knowledgevault", "tmpab12cd_x", "bakery", "originals", "copy", ""):
+            with self.subTest(dirname=dirname):
+                self.assertFalse(mod._dir_looks_like_backup(dirname), dirname)
 
     def test_identity_probe_is_batched_and_stops_at_first_hit(self):
         """Batch-7 review: the identity check must not materialise the index.

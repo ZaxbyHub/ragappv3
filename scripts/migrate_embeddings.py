@@ -45,8 +45,9 @@ Properties
   paths — for example container-side DATA_DIR paths used from the host),
   exit code 8 = the application SQLite database is unusable for a reset/wipe
   (dry runs included): missing, no ``files`` table, a ``files`` table without
-  the application's core columns, an obvious backup copy (rotated names such
-  as ``app.db.bak.1`` and a path that RESOLVES to one included), or a
+  the application's core columns, an obvious backup copy (rotated and
+  ``.copy`` names such as ``app.db.bak.1``, a file inside a ``backups/``
+  directory, and a path that RESOLVES to one included), or a
   database whose vector-claiming rows share
   no file id with a non-empty index's chunks — each would let the wipe
   destroy vectors with no usable rollback source. These are heuristics,
@@ -169,7 +170,13 @@ def _detect_stored_dim(lancedb_path: Path) -> int | None:
 
 
 #: Name tokens that mark a backup copy (split on . - _ ~ and whitespace).
-_BACKUP_TOKENS = frozenset({"bak", "backup", "orig"})
+_BACKUP_TOKENS = frozenset({"bak", "backup", "orig", "copy"})
+
+#: Parent-directory tokens that mark a backup location. Deliberately narrower
+#: than the file-name set (no ``bak``/``orig``/``copy``): a live data
+#: directory's name must not trip it, and short tokens could collide with
+#: generated directory names (batch-11 review).
+_BACKUP_DIR_TOKENS = frozenset({"backup", "backups"})
 
 
 def _looks_like_backup(lower_name: str) -> bool:
@@ -177,13 +184,23 @@ def _looks_like_backup(lower_name: str) -> bool:
 
     Token-based so rotated and stamped forms are caught too — ``app.db.bak``,
     ``app.db.bak.1``, ``app.db.backup-2024``, ``app_backup.db``,
-    ``app.db.orig~`` (pr1081-20261106 batch-7 review: exact-suffix matching
-    let rotated names through) — plus the ``backup``/``copy of`` prefixes
-    and editor ``~`` copies.
+    ``app.db.copy``, ``app.db.orig~`` (pr1081-20261106 batch-7/batch-11
+    reviews: exact-suffix matching let rotated names through) — plus the
+    ``backup``/``copy of`` prefixes and editor ``~`` copies.
     """
     if lower_name.startswith(("backup", "copy of")) or lower_name.endswith("~"):
         return True
     return any(tok in _BACKUP_TOKENS for tok in re.split(r"[.\-_~\s]+", lower_name))
+
+
+def _dir_looks_like_backup(lower_dir_name: str) -> bool:
+    """Whether the database's IMMEDIATE parent directory is a backup location
+    (``backups/app.db``, ``db-backup/app.db``; batch-11 review)."""
+    if lower_dir_name.startswith("backup"):
+        return True
+    return any(
+        tok in _BACKUP_DIR_TOKENS for tok in re.split(r"[.\-_~\s]+", lower_dir_name)
+    )
 
 
 #: Claimed ids probed per LanceDB filter query and fetched per SQLite
@@ -426,7 +443,12 @@ def _assert_application_database(sqlite_path: Path, lancedb_path: Path) -> None:
     except OSError:  # pragma: no cover - unresolvable path cannot be opened below
         _resolved = sqlite_path
     _resolved_name = _resolved.name.lower()
-    if _looks_like_backup(_lower_name) or _looks_like_backup(_resolved_name):
+    if (
+        _looks_like_backup(_lower_name)
+        or _looks_like_backup(_resolved_name)
+        or _dir_looks_like_backup(sqlite_path.parent.name.lower())
+        or _dir_looks_like_backup(_resolved.parent.name.lower())
+    ):
         print(
             "ERROR: the SQLite path looks like a BACKUP copy, not the live\n"
             "application database:\n"
