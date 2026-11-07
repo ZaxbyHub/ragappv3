@@ -68,14 +68,16 @@ files table). Collated by explicit user instruction.
 
 ## Tests
 
-Frozen acceptance checks (arm's-length authored, anchor v2 published on both
-issues): `backend/tests/test_migrate_embeddings_rollback.py` (rollback
+Frozen acceptance checks (arm's-length authored; anchor receipts published on both
+issues — v1/v2 pre-implementation, superseded by v3 after the reviewer-sanctioned
+wave-2 check amendment): `backend/tests/test_migrate_embeddings_rollback.py` (rollback
 preservation with exact naming + preserved-content markers; probe-failure
 refusal with a disjoint-DB exit-8 control leg) and
 `backend/tests/test_reset_embeddings_refusal.py` (clean `SystemExit(8)`
 refusals naming both paths, no sqlite traceback, no stray database file,
 index survives). Supplementary `backend/tests/test_operator_wipe_rollback_hardening.py`
-(18 legs): R3 recoverability, minimal-schema reset, core-column refusal,
+(20 legs, including the reset-side same-second-collision and recreation-failure twins
+added in the implementation-review round): R3 recoverability, minimal-schema reset, core-column refusal,
 preflight taxonomy (directory/corrupt/lock), D2 boundary legs (mid-stream
 no-hit, `DatabaseError`, CLI exit 5, iterator closure, lance-side `None`
 control), rename collision/rename-failure/recreation-failure for both
