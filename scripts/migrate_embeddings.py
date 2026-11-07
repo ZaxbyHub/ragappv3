@@ -40,9 +40,26 @@ Properties
   exit code 5 = another process holds a write lock on the SQLite database
   (stop the application first) or the database is unreadable/corrupt,
   exit code 6 = the SQLite database is unreadable/corrupt during repair
-  detection (restore it from your backup).
-  ``--force`` overrides exits 3 and 4 only; the lock/corruption refusals
-  (5 and 6) always stop the run.
+  detection (restore it from your backup),
+  exit code 7 = neither the LanceDB path nor the SQLite path exists (wrong
+  paths — for example container-side DATA_DIR paths used from the host),
+  exit code 8 = the application SQLite database is unusable for a reset/wipe
+  (dry runs included): missing, no ``files`` table, a ``files`` table without
+  the application's core columns, an obvious backup copy (rotated and
+  ``.copy`` names such as ``app.db.bak.1``, a file directly inside a ``backups/``
+  directory, and a path that RESOLVES to one included), or a
+  database whose vector-claiming rows share
+  no file id with a non-empty index's chunks — each would let the wipe
+  destroy vectors with no usable rollback source. These are heuristics,
+  not proof of identity: a byte-identical copy of the live database under
+  a live-looking name, and another deployment's database whose
+  autoincrement file ids overlap this index's (both number files from 1),
+  pass them — point --sqlite-path at the live file. A database
+  where NO rows claim vectors gets a loud WARNING instead (live run and
+  dry-run): that state is indistinguishable from the documented
+  reset-then-crash repair re-run.
+  ``--force`` overrides exits 3 and 4 only; the lock/corruption/wrong-path
+  refusals (5, 6, 7 and 8) always stop the run.
 
 Usage
 -----
@@ -79,9 +96,11 @@ incomplete: re-run with ``--force`` to finish it.
 
 import argparse
 import logging
+import re
 import shutil
 import sqlite3
 import sys
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 
 logging.basicConfig(
@@ -148,6 +167,123 @@ def _detect_stored_dim(lancedb_path: Path) -> int | None:
         logger.debug("Could not read stored embedding dim via pyarrow: %s", exc)
 
     return None
+
+
+#: Name tokens that mark a backup copy (split on . - _ ~ and whitespace).
+_BACKUP_TOKENS = frozenset({"bak", "backup", "orig", "copy"})
+
+#: Parent-directory tokens that mark a backup location. Deliberately narrower
+#: than the file-name set (no ``bak``/``orig``/``copy``): a live data
+#: directory's name must not trip it, and short tokens could collide with
+#: generated directory names (batch-11 review).
+_BACKUP_DIR_TOKENS = frozenset({"backup", "backups"})
+
+
+def _looks_like_backup(lower_name: str) -> bool:
+    """Whether a lower-cased file name looks like a backup copy.
+
+    Token-based so rotated and stamped forms are caught too — ``app.db.bak``,
+    ``app.db.bak.1``, ``app.db.backup-2024``, ``app_backup.db``,
+    ``app.db.copy``, ``app.db.orig~`` (pr1081-20261106 batch-7/batch-11
+    reviews: exact-suffix matching let rotated names through) — plus the
+    ``backup``/``copy of`` prefixes and editor ``~`` copies.
+    """
+    if lower_name.startswith(("backup", "copy of")) or lower_name.endswith("~"):
+        return True
+    return any(tok in _BACKUP_TOKENS for tok in re.split(r"[.\-_~\s]+", lower_name))
+
+
+def _dir_looks_like_backup(lower_dir_name: str) -> bool:
+    """Whether the database's IMMEDIATE parent directory is a backup location
+    (``backups/app.db``, ``db-backup/app.db``; batch-11 review)."""
+    if lower_dir_name.startswith("backup"):
+        return True
+    return any(
+        tok in _BACKUP_DIR_TOKENS for tok in re.split(r"[.\-_~\s]+", lower_dir_name)
+    )
+
+
+#: Claimed ids probed per LanceDB filter query and fetched per SQLite
+#: ``fetchmany`` (bounded memory on BOTH stores; batch-7/batch-9 reviews).
+_ID_PROBE_BATCH = 500
+
+_CLAIMED_IDS_SQL = (
+    "SELECT id FROM files WHERE status IN ('indexed', 'partial') ORDER BY id"
+)
+
+
+def _iter_claimed_id_batches(sqlite_path: Path) -> Iterator[list[str]]:
+    """Stream the claiming rows' ids in ``_ID_PROBE_BATCH``-sized batches.
+
+    The cursor is read with ``fetchmany`` so the SQLite side is never
+    materialised either (batch-9 review); the connection closes when the
+    generator is exhausted or closed early.
+    """
+    conn = sqlite3.connect(str(sqlite_path), timeout=2.0, isolation_level=None)
+    try:
+        cursor = conn.execute(_CLAIMED_IDS_SQL)
+        while True:
+            rows = cursor.fetchmany(_ID_PROBE_BATCH)
+            if not rows:
+                return
+            yield [str(row[0]) for row in rows]
+    finally:
+        conn.close()
+
+
+def _index_shares_claimed_ids(
+    lancedb_path: Path, id_batches: Iterable[list[str]]
+) -> bool | None:
+    """Whether ANY claimed file id has chunks in the LanceDB index, or None.
+
+    None means "no identity evidence" (no chunks table, no ``file_id``
+    column, an empty table or one whose ``file_id`` values are all NULL, or
+    an index the installed lancedb cannot read)
+    — the caller must then NOT refuse on identity grounds. Neither store is
+    materialised: ``id_batches`` arrive pre-bounded (streamed from SQLite),
+    each is probed with a ``file_id IN (...)`` filter selecting at most one
+    row, and the scan stops at the first batch that matches
+    (pr1081-20261106 batch-7/batch-9 reviews). The batch iterator is always
+    closed, so a streaming SQLite cursor is released on an early return.
+    """
+    try:
+        if not (lancedb_path / "chunks.lance").exists():
+            return None
+        try:
+            import lancedb as _ldb  # type: ignore
+
+            db = _ldb.connect(str(lancedb_path))
+            if "chunks" not in db.table_names():
+                return None
+            tbl = db.open_table("chunks")
+            # An empty table, or one whose file_id values are all NULL,
+            # carries no identity evidence (batch-7 delta review: all-NULL
+            # must not read as a mismatch).
+            if "file_id" not in tbl.schema.names or not tbl.count_rows(
+                "file_id IS NOT NULL"
+            ):
+                return None
+            for batch in id_batches:
+                if not batch:
+                    continue
+                literals = ", ".join("'" + i.replace("'", "''") + "'" for i in batch)
+                hit = (
+                    tbl.search()
+                    .where(f"file_id IN ({literals})")
+                    .select(["file_id"])
+                    .limit(1)
+                    .to_arrow()
+                )
+                if hit.num_rows:
+                    return True
+            return False
+        except Exception as exc:
+            logger.debug("Could not probe chunk file ids via lancedb: %s", exc)
+            return None
+    finally:
+        close = getattr(id_batches, "close", None)
+        if close is not None:
+            close()
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +397,202 @@ def _assert_no_active_writer(sqlite_path: Path) -> None:
         conn.close()
 
 
+def _assert_application_database(sqlite_path: Path, lancedb_path: Path) -> None:
+    """Refuse destructive steps without a readable application database (#749).
+
+    A reset/wipe driven from a MISSING SQLite path (or a present file that is
+    not the application database — no ``files`` table, an unrelated ``files``
+    table without the application columns, or a backup copy of the database
+    such as ``app.db.bak``) destroys the LanceDB index with no usable rollback
+    source: the reset step would hit the wrong database and the wipe still
+    follows it. Exit 8 refuses each of those states up front, naming both
+    paths. Schema identity requires the reset contract's core ``files``
+    columns (``id``/``status`` — the pivot of the whole reset/wipe flow),
+    so an unrelated database that merely carries a table named ``files`` is
+    refused too. A schema-valid database whose vector-claiming rows share no
+    file id with a non-empty index's chunks is refused as describing a
+    different index. Heuristics, not identity: a byte-identical copy of the
+    live database under a live-looking name, and a foreign deployment's
+    database whose autoincrement ids overlap the index's, are NOT
+    detectable by content.
+
+    Exception taxonomy deliberately mirrors the sibling probes
+    (``_count_rows_claiming_vectors`` / ``_assert_no_active_writer``): a writer
+    lock (``sqlite3.OperationalError`` is a SUBCLASS of ``sqlite3.DatabaseError``,
+    so it must be caught first) stays a stop-the-writer ``MigrationRefused``
+    (exit 5 via ``main()``); other ``OperationalError`` (permission/read-only
+    I/O failures) gets its own open-failure diagnostic instead of the lock
+    advice; other ``DatabaseError`` is corruption, also exit 5.
+    """
+    if not sqlite_path.exists():
+        print(
+            "ERROR: the application SQLite database does not exist, so a\n"
+            "reset/wipe would destroy the LanceDB index with NO rollback\n"
+            "source (the status reset would skip and the wipe still runs):\n"
+            f"  SQLite path : {sqlite_path} (missing)\n"
+            f"  LanceDB path: {lancedb_path}\n"
+            "Point --sqlite-path at the application database (as seen from\n"
+            "where you run the script) and re-run. Nothing was migrated.\n"
+        )
+        raise SystemExit(8)
+    _lower_name = sqlite_path.name.lower()
+    # Symlink resolution (pr1081-20261106 batch-2): a live-looking name can
+    # point AT a backup, so the refusal checks the RESOLVED target's name too.
+    try:
+        _resolved = sqlite_path.resolve()
+    except OSError:  # pragma: no cover - unresolvable path cannot be opened below
+        _resolved = sqlite_path
+    _resolved_name = _resolved.name.lower()
+    if (
+        _looks_like_backup(_lower_name)
+        or _looks_like_backup(_resolved_name)
+        or _dir_looks_like_backup(sqlite_path.parent.name.lower())
+        or _dir_looks_like_backup(_resolved.parent.name.lower())
+    ):
+        print(
+            "ERROR: the SQLite path looks like a BACKUP copy, not the live\n"
+            "application database:\n"
+            f"  SQLite path : {sqlite_path}\n"
+            + (
+                f"  resolves to : {_resolved}\n"
+                if _resolved != sqlite_path
+                else ""
+            )
+            + f"  LanceDB path: {lancedb_path}\n"
+            "Migrating against a backup resets the COPY's rows while the live\n"
+            "LanceDB index is still wiped — the live database keeps recording\n"
+            "'indexed' and the corpus becomes silently unsearchable. Point\n"
+            "--sqlite-path at the live application database and re-run.\n"
+            "Nothing was migrated.\n"
+        )
+        raise SystemExit(8)
+    conn = None
+    try:
+        conn = sqlite3.connect(str(sqlite_path), timeout=2.0, isolation_level=None)
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='files'"
+        )
+        has_files_table = cursor.fetchone() is not None
+    except sqlite3.OperationalError as exc:
+        if "lock" in str(exc).lower() or "busy" in str(exc).lower():
+            raise MigrationRefused(
+                f"Another process appears to hold a write lock on the SQLite "
+                f"database ({exc}): {sqlite_path}\n"
+                "Is the application still running? Stop it first, e.g.:\n"
+                "  docker compose stop knowledgevault\n"
+                "Then re-run this migration."
+            ) from exc
+        raise MigrationRefused(
+            f"The SQLite database could not be opened ({exc}): {sqlite_path}\n"
+            "This is not a writer lock — check the file's permission and\n"
+            "ownership (read-only mount, unreadable file) before re-running."
+        ) from exc
+    except sqlite3.DatabaseError as exc:
+        raise MigrationRefused(
+            f"The SQLite database is unreadable or corrupt ({exc}): "
+            f"{sqlite_path}\n"
+            "Repair or restore it (from your backup) before re-running."
+        ) from exc
+    finally:
+        if conn is not None:
+            conn.close()
+    if not has_files_table:
+        print(
+            "ERROR: the SQLite file exists but has no 'files' table, so it is\n"
+            "not the application database — a reset/wipe would destroy the\n"
+            "LanceDB index with NO rollback source:\n"
+            f"  SQLite path : {sqlite_path} (no 'files' table)\n"
+            f"  LanceDB path: {lancedb_path}\n"
+            "Point --sqlite-path at the application database and re-run.\n"
+            "Nothing was migrated.\n"
+        )
+        raise SystemExit(8)
+    conn = None
+    try:
+        # Inside the taxonomy like the first connection (batch-2 review): a
+        # failure here must surface as MigrationRefused guidance, not a
+        # bare traceback.
+        conn = sqlite3.connect(str(sqlite_path), timeout=2.0, isolation_level=None)
+        columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(files)").fetchall()
+        }
+        claimed_count = 0
+        if {"id", "status"}.issubset(columns):
+            # A COUNT, not the id list: the ids themselves are streamed in
+            # bounded batches only if the cross-store probe runs (batch-9).
+            claimed_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM files WHERE status IN ('indexed', 'partial')"
+                ).fetchone()[0]
+            )
+    except sqlite3.OperationalError as exc:
+        if "lock" in str(exc).lower() or "busy" in str(exc).lower():
+            raise MigrationRefused(
+                f"Another process appears to hold a write lock on the SQLite "
+                f"database ({exc}): {sqlite_path}\n"
+                "Is the application still running? Stop it first, e.g.:\n"
+                "  docker compose stop knowledgevault\n"
+                "Then re-run this migration."
+            ) from exc
+        raise MigrationRefused(
+            f"The SQLite database could not be opened ({exc}): {sqlite_path}\n"
+            "This is not a writer lock — check the file's permission and\n"
+            "ownership (read-only mount, unreadable file) before re-running."
+        ) from exc
+    except sqlite3.DatabaseError as exc:
+        raise MigrationRefused(
+            f"The SQLite database is unreadable or corrupt ({exc}): "
+            f"{sqlite_path}\n"
+            "Repair or restore it (from your backup) before re-running."
+        ) from exc
+    finally:
+        if conn is not None:
+            conn.close()
+    if not {"id", "status"}.issubset(columns):
+        print(
+            "ERROR: the SQLite file has a 'files' table without the\n"
+            "application's core columns (id, status), so it is not\n"
+            "the application database — a reset/wipe would destroy the\n"
+            "LanceDB index with NO rollback source:\n"
+            f"  SQLite path : {sqlite_path} (files columns: "
+            f"{sorted(columns) or 'none'})\n"
+            f"  LanceDB path: {lancedb_path}\n"
+            "Point --sqlite-path at the application database (start the\n"
+            "application once so its migrations create the schema) and\n"
+            "re-run. Nothing was migrated.\n"
+        )
+        raise SystemExit(8)
+    # Cross-store identity (pr1081-20261106 batch-5 review): rows that claim
+    # vectors ('indexed'/'partial') must have chunks in THIS index. When the
+    # index's chunks carry file ids and NONE of the claimed rows appear among
+    # them, the database does not describe this index (unrelated or foreign
+    # deployment's database) — the reset would hit the wrong rows while the
+    # live index is wiped. Zero claims (fresh boot, reset-then-crash repair
+    # re-run) and an index without readable file ids carry no evidence:
+    # the run proceeds (zero claims still get run_migration's WARNING). The
+    # check proves only DISJOINTNESS — a byte-identical live copy, or a
+    # foreign deployment's database whose autoincrement ids overlap the
+    # index's, passes; the backup-name check above is the only other guard.
+    if claimed_count:
+        shares = _index_shares_claimed_ids(
+            lancedb_path, _iter_claimed_id_batches(sqlite_path)
+        )
+        if shares is False:
+            print(
+                "ERROR: none of the database's rows that claim vectors\n"
+                "('indexed'/'partial') have chunks in this LanceDB index, so\n"
+                "the database does not describe the index about to be wiped:\n"
+                f"  SQLite path : {sqlite_path} "
+                f"({claimed_count} claiming row(s))\n"
+                f"  LanceDB path: {lancedb_path} (non-empty, none shared)\n"
+                "Point --sqlite-path at the database that produced this index\n"
+                "(and --lancedb-path at its index) and re-run. Nothing was\n"
+                "migrated.\n"
+            )
+            raise SystemExit(8)
+
+
 def _reset_file_statuses(sqlite_path: Path, dry_run: bool) -> int:
     """Reset all indexed/partial files to pending. Returns the count of affected rows.
 
@@ -309,14 +641,20 @@ def _reset_file_statuses(sqlite_path: Path, dry_run: bool) -> int:
             return resettable_count
 
         # Column fragments are literal SQL (no interpolated values), assembled
-        # per the schema that actually exists on this database.
+        # per the schema that actually exists on this database. EVERY column
+        # beyond ``status`` is guarded (batch-2: minimal-schema application
+        # databases reset cleanly — the old unconditional ``chunk_count = 0``
+        # broke them).
+        columns = _table_columns(conn, "files")
         set_fragments = [
             "status = 'pending'",
-            "chunk_count = 0",
-            "processed_at = NULL",
-            "modified_at = CURRENT_TIMESTAMP",
         ]
-        columns = _table_columns(conn, "files")
+        if "chunk_count" in columns:
+            set_fragments.append("chunk_count = 0")
+        if "processed_at" in columns:
+            set_fragments.append("processed_at = NULL")
+        if "modified_at" in columns:
+            set_fragments.append("modified_at = CURRENT_TIMESTAMP")
         if "phase" in columns:
             # Restore the queue signal both recovery modes match: the lease-mode
             # boot enqueue takes any non-error phase, the legacy sweep needs
@@ -390,7 +728,18 @@ def run_migration(
             non-empty index without ``--force``; code 4 when the configured
             dimension is unreadable (settings load failure) without
             ``--force``; code 6 when the SQLite database is unreadable or
-            corrupt during repair detection.
+            corrupt during repair detection; code 7 when neither path
+            exists; code 8 when the application database is unusable for a
+            reset/wipe (dry runs included): missing, no ``files`` table, a
+            ``files`` table without the application's core columns, an
+            obvious backup copy, or vector-claiming rows that share no file
+            id with a non-empty index's chunks. These are heuristics,
+            not identity: a byte-identical copy of the live database, or a
+            foreign deployment's database whose autoincrement ids overlap
+            the index's, passes them. A database with no
+            vector-claiming rows
+            gets a loud wrong-database WARNING on the destructive path and
+            dry-run.
         MigrationRefused: another process holds a write lock on the SQLite
             database, or the database is unreadable/corrupt at the writer
             probe (``main()`` maps this to exit code 5).
@@ -404,6 +753,24 @@ def run_migration(
     print(f"  Dry run      : {dry_run}")
     print("=" * 60)
     print()
+
+    # Issue #749 (T1-29-K-02): refusing BOTH-missing paths is the first check.
+    # A run pointed at a LanceDB path AND a SQLite path that both do not exist
+    # is almost always wrong paths (for example container-side DATA_DIR paths
+    # run from the host), and the old behavior — a silent "Nothing to migrate"
+    # exit 0 — told the operator the migration had run. Applies to --dry-run
+    # and --force alike: wrong paths are wrong paths (7 joins 5/6 in the
+    # always-stop family; --force overrides 3/4 only).
+    if not lancedb_path.exists() and not sqlite_path.exists():
+        print(
+            "ERROR: neither path exists — refusing to continue:\n"
+            f"  LanceDB path: {lancedb_path} (exists: {lancedb_path.exists()})\n"
+            f"  SQLite path : {sqlite_path} (exists: {sqlite_path.exists()})\n"
+            "This usually means the paths are wrong (for example container-side\n"
+            "DATA_DIR paths used from the host). Pass the paths as seen from\n"
+            "where you run the script. Nothing was migrated.\n"
+        )
+        raise SystemExit(7)
 
     # ── Step 1: Detect dimension mismatch ──────────────────────────────────
     stored_dim = _detect_stored_dim(lancedb_path)
@@ -523,9 +890,53 @@ def run_migration(
             "WARNING: This will permanently delete all LanceDB vectors.\n"
             "         Back up /your/data/lancedb before continuing.\n"
         )
+        # Issue #749: the destructive path requires the application database —
+        # without it the reset skips and the wipe still runs (no rollback
+        # source). Checked BEFORE the writer probe so a missing/empty DB is
+        # refused first; locks and corruption keep the writer probe's
+        # exit-5 semantics wherever the database exists.
+        _assert_application_database(sqlite_path, lancedb_path)
+        # Issue #749 (batch-2 review): warn loudly when THIS database holds
+        # no rows claiming vectors (indexed/partial) while a non-empty
+        # LanceDB index is about to be wiped — that is the wrong-database
+        # shape the executed exploit used. It is a WARNING, not a refusal:
+        # the identical state is also the script's own documented
+        # reset-then-crash repair re-run (the reset commits before the wipe),
+        # and a fresh boot creates an empty chunks table before any ingest,
+        # so the script cannot distinguish wrong-database from repair and a
+        # hard refusal broke both contracts (delta-review executed probe).
+        if lancedb_path.exists() and any(lancedb_path.iterdir()):
+            claims = _count_rows_claiming_vectors(sqlite_path)
+            if claims == 0:
+                print(
+                    "WARNING: the application database holds NO rows claiming\n"
+                    "vectors ('indexed'/'partial'), so nothing in it accounts\n"
+                    "for the LanceDB index about to be wiped:\n"
+                    f"  {lancedb_path}\n"
+                    "If this database is not the live application database\n"
+                    "(backup copy, fresh database, wrong deployment), STOP —\n"
+                    "wiping leaves a corpus nothing in it re-indexes. If this\n"
+                    "IS the re-run after an interrupted migration (reset done,\n"
+                    "wipe pending), proceeding is the documented repair.\n"
+                )
         # Issue #694: refuse to race a live writer. Probe BEFORE the first
         # destructive step (the SQLite reset — the wipe follows it).
         _assert_no_active_writer(sqlite_path)
+    else:
+        # Dry-run reports what WOULD change; over wrong paths that report is
+        # the misleading success the refusals exist for (issue #749).
+        _assert_application_database(sqlite_path, lancedb_path)
+        if lancedb_path.exists() and any(lancedb_path.iterdir()):
+            if _count_rows_claiming_vectors(sqlite_path) == 0:
+                print(
+                    "WARNING: the application database holds NO rows claiming\n"
+                    "vectors ('indexed'/'partial') for the LanceDB index that\n"
+                    "would be wiped. If this is not the live application\n"
+                    "database, STOP — wiping leaves a corpus nothing in it\n"
+                    "re-indexes. If this IS the re-run after an interrupted\n"
+                    "migration (reset done, wipe pending), proceeding is the\n"
+                    "documented repair.\n"
+                )
 
     # ── Step 2: Reset file statuses ────────────────────────────────────────
     # The reset runs FIRST (issue #694): if it fails (locked DB, crash), the

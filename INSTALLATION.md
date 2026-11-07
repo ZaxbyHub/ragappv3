@@ -387,6 +387,25 @@ cp .env.example .env
 # generate each with: python -c "import secrets; print(secrets.token_urlsafe(48))"
 ```
 
+On native Linux, also prepare the data directory before the first start — the
+app container runs as uid 1000 and the Docker daemon creates a missing
+bind-mount source root-owned:
+
+```bash
+# default data directory (HOST_DATA_DIR unset):
+mkdir -p data
+sudo chown -R 1000:1000 data
+
+# or, for a custom path such as HOST_DATA_DIR=/path/to/your/data:
+mkdir -p /path/to/your/data
+sudo chown -R 1000:1000 /path/to/your/data
+```
+
+Skip this and startup fails with a message naming the directory, the current
+uid, and the owner uid, together with the ownership remediation. Hosts without
+an NVIDIA GPU: see [CPU-only hosts](README.md#cpu-only-hosts) for the compose
+override.
+
 #### Step 4: Start the Stack
 
 ```bash
@@ -463,6 +482,8 @@ services:
       - JWT_SECRET_KEY=${JWT_SECRET_KEY}
     depends_on:
       redis:
+        condition: service_healthy
+      harrier-embed:
         condition: service_healthy
     # ... healthcheck + further environment defaults (see docker-compose.yml)
 

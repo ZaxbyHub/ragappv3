@@ -253,9 +253,13 @@ services:
       # ..._compose_literal_values.py).
       # ------------------------------------------------------------------
       - EVAL_ENABLED
-      # Concurrency: forwarded so the health module's worker guard
-      # (health.py _warn_multi_worker_cache) is live on scale-out
-      # deployments — default 1 keeps the single-worker default silent.
+      # Concurrency: the image CMD pins `--workers 1` (issue #748) and
+      # uvicorn reads this env only when --workers is absent, so the
+      # container always runs a single worker. The health module's
+      # multi-worker cache guard still keys on this env (a value != 1 emits
+      # the per-worker-cache warning even in the single-worker container).
+      # Compose forwarding cannot reach bare-metal/native uvicorn runs —
+      # set the env in the process environment for those.
       - WEB_CONCURRENCY=${WEB_CONCURRENCY:-1}
       # Shared inference admission + telemetry (issue #518, E3). Budgets
       # default generous (see .env.example); ADMISSION_STORE_URL empty =
@@ -338,6 +342,15 @@ services:
       - "host.docker.internal:host-gateway"
     depends_on:
       redis:
+        condition: service_healthy
+      # Wait for the embedder the strict TEI model validation probes (issue
+      # #748, T1-04-S2-07): without this, a fresh `up` can start the app before
+      # harrier-embed is ready and the strict check silently self-skips (its
+      # except arm re-raises only its own RuntimeError). start_period
+      # grace-marks early probe failures but is NOT a wait deadline — an
+      # embedder that never reports healthy leaves this service waiting
+      # (README Troubleshooting; CPU-only hosts use docker-compose.cpu.yml).
+      harrier-embed:
         condition: service_healthy
     healthcheck:
       # Readiness probe (/api/healthz) instead of the always-200 liveness
