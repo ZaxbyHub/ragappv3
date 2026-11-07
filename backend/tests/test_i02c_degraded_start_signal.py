@@ -300,7 +300,7 @@ class TestUnwritableDataDirFailsWithNamedMessage(unittest.TestCase):
             restore()
 
         self.assertIsNotNone(raised, "stat-denied data dir must fail startup")
-        self.assertIn("Data directory is not writable/searchable", str(raised))
+        self.assertIn("Data directory is not a writable/searchable directory", str(raised))
         self.assertIn(str(tmp), str(raised))
 
     def test_regular_file_data_dir_raises_named_message(self):
@@ -335,7 +335,7 @@ class TestUnwritableDataDirFailsWithNamedMessage(unittest.TestCase):
             restore()
 
         self.assertIsNotNone(raised, "a regular file at the data-dir path must fail")
-        self.assertIn("Data directory is not writable/searchable", str(raised))
+        self.assertIn("Data directory is not a writable/searchable directory", str(raised))
         self.assertIn(str(not_a_dir), str(raised))
 
 

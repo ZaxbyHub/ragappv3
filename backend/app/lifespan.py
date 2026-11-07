@@ -653,7 +653,7 @@ async def lifespan(app: FastAPI):
     if _dd_unusable:
         _current_uid = getattr(os, "getuid", lambda: None)()
         raise RuntimeError(
-            f"Data directory is not writable/searchable: {_data_dir}\n"
+            f"Data directory is not a writable/searchable directory: {_data_dir}\n"
             f"  current uid : {_current_uid}\n"
             f"  owner uid   : {_owner_uid}\n"
             "The application stores its database and vector index under this\n"

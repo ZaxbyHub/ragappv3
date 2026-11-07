@@ -193,7 +193,8 @@ def _index_shares_claimed_ids(lancedb_path: Path, claimed_ids: set[str]) -> bool
     """Whether ANY claimed file id has chunks in the LanceDB index, or None.
 
     None means "no identity evidence" (no chunks table, no ``file_id``
-    column, an empty table, or an index the installed lancedb cannot read)
+    column, an empty table or one whose ``file_id`` values are all NULL, or
+    an index the installed lancedb cannot read)
     — the caller must then NOT refuse on identity grounds. The index is
     never materialised: claimed ids are probed in bounded batches with a
     ``file_id IN (...)`` filter selecting at most one row, and the scan stops
@@ -208,7 +209,12 @@ def _index_shares_claimed_ids(lancedb_path: Path, claimed_ids: set[str]) -> bool
         if "chunks" not in db.table_names():
             return None
         tbl = db.open_table("chunks")
-        if "file_id" not in tbl.schema.names or not tbl.count_rows():
+        # An empty table, or one whose file_id values are all NULL, carries
+        # no identity evidence (batch-7 delta review: all-NULL must not read
+        # as a mismatch).
+        if "file_id" not in tbl.schema.names or not tbl.count_rows(
+            "file_id IS NOT NULL"
+        ):
             return None
         ordered = sorted(claimed_ids)
         for start in range(0, len(ordered), _ID_PROBE_BATCH):

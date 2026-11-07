@@ -563,7 +563,7 @@ class TestApplicationDatabaseIdentity(unittest.TestCase):
 
         table = types.SimpleNamespace(
             schema=types.SimpleNamespace(names=["id", "file_id", "embedding"]),
-            count_rows=lambda: 1_000_000,
+            count_rows=lambda _filter=None: 1_000_000,
             search=_Query,
         )
         fake = types.SimpleNamespace(
@@ -609,6 +609,43 @@ class TestApplicationDatabaseIdentity(unittest.TestCase):
                 self.assertIs(mod._index_shares_claimed_ids(lance, {"1", "2"}), False)
         finally:
             mod._ID_PROBE_BATCH = saved_batch
+
+    def test_identity_probe_all_null_ids_is_no_evidence(self):
+        """An index whose file_id values are all NULL carries no identity
+        evidence (None), not a mismatch (batch-7 delta review)."""
+        import tempfile
+
+        import pyarrow as pa
+
+        try:
+            import lancedb
+        except ImportError:  # pragma: no cover - backend dep, present in CI
+            self.skipTest("lancedb not installed")
+        mod = _load_migrate_module()
+        with tempfile.TemporaryDirectory() as td:
+            lance = Path(td) / "lancedb"
+            lance.mkdir()
+            schema = pa.schema([("id", pa.string()), ("file_id", pa.string())])
+            lancedb.connect(str(lance)).create_table(
+                "chunks",
+                data=pa.table({"id": ["c0", "c1"], "file_id": [None, None]}, schema=schema),
+            )
+            self.assertIsNone(mod._index_shares_claimed_ids(lance, {"1"}))
+
+    def test_identity_probe_escapes_quotes_in_ids(self):
+        """Ids reach the IN literal as text (SQLite affinity can store any
+        string in files.id): a quoted id matches only itself and an
+        injection-shaped id matches nothing."""
+        import tempfile
+
+        mod = _load_migrate_module()
+        with tempfile.TemporaryDirectory() as td:
+            lance = self._mk_index(Path(td), ["o'brien", "7"])
+            self.assertIs(mod._index_shares_claimed_ids(lance, {"o'brien"}), True)
+            self.assertIs(
+                mod._index_shares_claimed_ids(lance, {"zzz' OR '1'='1", "zzz') OR ('1'='1"}),
+                False,
+            )
 
 
 class TestContainerCmdSemantics(unittest.TestCase):
@@ -772,6 +809,9 @@ class TestRunnableHealthHint(unittest.TestCase):
         # procedure is dry-run first (batch-5 review).
         self.assertIn("--dry-run", tokens, "the hint must lead with the dry run")
         self.assertIn("without --dry-run", re.sub(r'[\'"]', "", source))
+        # The standalone /health response must name the runtime prerequisite
+        # (batch-8 review): the script needs lancedb from the backend deps.
+        self.assertIn("backend/requirements-lock.txt", re.sub(r"\s+", " ", source))
         # Feed the extracted argv through the script's REAL argument parser
         # (main()) with run_migration stubbed — tokenizing alone proved
         # nothing about the flags the script accepts.
