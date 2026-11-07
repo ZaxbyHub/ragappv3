@@ -641,7 +641,11 @@ async def edit_canvas_range(
     # Issue #1076: providers report the cap under different tokens
     # (length / max_tokens / max_length) — one shared vocabulary set.
     finish_reason = (getattr(client, "last_metrics", None) or {}).get("finish_reason")
-    if finish_reason in TRUNCATION_FINISH_REASONS:
+    # Provider JSON is unvalidated: an isinstance guard keeps a non-string
+    # value non-truncating (the pre-#1076 literal-comparison semantics)
+    # instead of raising TypeError on unhashable set membership outside the
+    # LLMError handler (PR #1093 review).
+    if isinstance(finish_reason, str) and finish_reason in TRUNCATION_FINISH_REASONS:
         logger.info(
             "canvas: edit-range reply truncated uid=%s finish_reason=%s",
             artifact_uid,

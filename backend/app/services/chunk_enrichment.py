@@ -273,7 +273,11 @@ class ChunkEnrichmentService:
         # Issue #1076: providers report the cap under different tokens
         # (length / max_tokens / max_length) — one shared vocabulary set.
         finish_reason = metrics.get("finish_reason")
-        if finish_reason in TRUNCATION_FINISH_REASONS:
+        # The provider JSON is unvalidated: guard with isinstance so a
+        # non-string (dict/list) finish_reason is treated as non-truncation
+        # (base `== "length"` semantics) instead of raising on unhashable
+        # set membership (PR #1093 review).
+        if isinstance(finish_reason, str) and finish_reason in TRUNCATION_FINISH_REASONS:
             logger.warning(
                 "Enrichment for chunk %s cut by the max_tokens cap "
                 "(finish_reason=%s)",

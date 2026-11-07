@@ -5,10 +5,20 @@ WRITER ROSTER and the GUARD SHAPES so any future terminal
 ``files.enrichment_status`` write (or truncation-token literal comparison)
 must be consciously dispositioned before it can land.
 
-Named mutations that turn this RED (proven in Phase 4 evidence):
-- drop ``enrichment_error IS NULL`` from the atom-sync UPDATE;
-- drop ``require_file_hash`` from writer 8's call;
-- revert chunk_enrichment's finish_reason guard to ``== "length"``.
+Named mutations this file itself kills (its assertions are source-text pins;
+the behavioral killers for the same mutations live in the behavioral suites —
+see 08-test-results.md for the probe record):
+- drop ``require_file_hash`` from writer 8's call (guard-shape census RED);
+- revert chunk_enrichment's finish_reason guard to ``== "length"`` (token
+  census RED).
+The atom-sync predicate is asserted on the SQL statement text EXCLUDING the
+method docstring (PR #1093 review: a docstring-mention previously satisfied
+the assertion); its behavioral killer is
+``test_atom_sync_does_not_clobber_chunk_failure`` in
+``test_followup_1073_status_clobber.py``, and the guard-identity
+discriminator (a status-keyed guard must fail) is
+``test_feedback_atom_sync_lands_aggregate_on_error_null_row`` in
+``test_followup_1093_feedback_pins.py``.
 """
 
 import ast
@@ -176,14 +186,23 @@ class TestEnrichmentWriterCensus(unittest.TestCase):
         self.assertIn("AND enrichment_updated_at = ?", body)
 
     def test_atom_sync_update_carries_the_chunk_failure_predicate(self):
-        """``_sync_file_enrichment_status`` skips rows with a chunk failure."""
+        """``_sync_file_enrichment_status`` skips rows with a chunk failure.
+
+        PR #1093 review (F-004a): the assertion window EXCLUDES the method
+        docstring — a previous window starting at the ``def`` line was
+        satisfied by the docstring's own mention of the predicate, so the
+        named mutation (dropping the SQL predicate) left this census GREEN.
+        """
         m = re.search(
             r"def _sync_file_enrichment_status(.*?)conn\.commit\(\)",
             self.bt,
             re.S,
         )
         self.assertIsNotNone(m, "atom sync body not found")
-        sql = m.group(1)
+        # Drop everything through the closing docstring quotes so prose can
+        # never satisfy the SQL-text assertions below.
+        parts = m.group(1).split('"""')
+        sql = parts[2] if len(parts) >= 3 else m.group(1)
         self.assertIn("enrichment_error IS NULL", sql)
         self.assertIn("aggregate_status_case_sql()", sql)
         # Single statement: decision (CASE) and write are one UPDATE.
@@ -192,8 +211,16 @@ class TestEnrichmentWriterCensus(unittest.TestCase):
     def test_complete_branch_uses_the_shared_case_in_the_same_statement(self):
         """``set_enrichment_status`` computes 'complete' via the shared CASE."""
         self.assertIn("aggregate_status_case_sql()", self.dp)
+        method = re.search(
+            r"async def set_enrichment_status(.*?)(?=\n    (?:async )?def )",
+            self.dp,
+            re.S,
+        )
+        self.assertIsNotNone(method, "set_enrichment_status body not found")
         self.assertIn(
-            "status == \"complete\"", self.dp, "complete branch dispatch missing"
+            'status == "complete"',
+            method.group(1),
+            "complete branch dispatch missing",
         )
 
     def test_cancel_handler_uses_the_attempt_stamp_cas(self):
@@ -232,7 +259,11 @@ class TestTruncationTokenCensus(unittest.TestCase):
         offenders = []
         for path in APP_ROOT.rglob("*.py"):
             src = _src(path)
-            for m in re.finditer(r"finish_reason[^\n]*==\s*[\"']", src):
+            # Covers both `== "token"` and tuple-membership `in ("a", "b")`
+            # spellings of a literal truncation comparison.
+            for m in re.finditer(
+                r"finish_reason[^\n]*(==\s*[\"']|in\s*\(\s*[\"'])", src
+            ):
                 offenders.append(f"{path.relative_to(APP_ROOT)}:{src[:m.start()].count(chr(10))+1}")
         self.assertEqual(offenders, [], f"literal finish_reason comparisons: {offenders}")
 

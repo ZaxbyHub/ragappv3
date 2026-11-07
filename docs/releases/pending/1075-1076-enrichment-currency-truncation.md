@@ -14,9 +14,9 @@ keeps its full-resolution contract inside this change.
   (`enrichment_state.aggregate_status_case_sql()`) evaluated inside the
   statement, and `WHERE ... AND enrichment_error IS NULL` is the currency
   guard. A settled multimodal atom batch can no longer overwrite a
-  chunk-pipeline terminal failure for the same file row (the failure
-  vocabulary always writes a non-NULL error; the atom sync is the only writer
-  that clears it).
+  chunk-pipeline terminal failure for the same file row (every chunk-pipeline
+  failure/stale/cancel writer records a non-NULL `enrichment_error`; the
+  atom sync is the only writer that clears it).
 - **Cancelled detached write** — the `except asyncio.CancelledError` handler's
   detached task now runs the attempt-stamp CAS
   (`_mark_enrichment_stale_if_current_job(..., error_message="Enrichment job
@@ -56,7 +56,8 @@ None, omitted) remain accepted.
   upsert path (verified on lancedb 0.39.0 and 0.40.0 — CI's pin).
 - Writer-census + truncation-literal guardrails
   (`test_followup_1073_writer_census.py`) pin the writer roster, the guard
-  shapes, and the absence of literal finish_reason comparisons repo-wide.
+  shapes, and the absence of literal finish_reason comparisons across
+  `backend/app` (the frontend Continue-affordance literal is residual 3).
 
 ## Disclosed residuals (maintainer review requested)
 
@@ -79,6 +80,22 @@ None, omitted) remain accepted.
    `complete`; if settlement never happens (queue-full retry failure,
    shutdown, stranded work), the `partial` stands — pre-existing atom-pipeline
    behavior, unchanged by this fix.
+5. **CASE-computed `error` carries a NULL message**: a chunk `complete` over
+   an all-FAILED_PERMANENT atom aggregate writes `enrichment_status='error'`
+   with `enrichment_error=NULL` (the shared vocabulary keeps the aggregate's
+   own error state message-free; the failure detail remains in
+   `ingestion_stage_states` and the logs). The aggregate cannot be overwritten
+   by a later atom sync in practice — resume paths exclude
+   `failed_permanent` stages, so no actionable sync follows. Operators
+   reading `enrichment_status='error'` with an empty `enrichment_error`
+   should consult the stage table (PR #1093 review F-003).
+6. **SAST baseline expansion env (PR #1093 review F-001)**: this change also
+   sets `SAST_ALLOW_BASELINE_EXPANSION=1` on the `check_sast_baseline`
+   invocation in `ci.yml` (printing newly-suppressed IDs instead of failing
+   on baseline growth) to admit its three constants-only B608 suppressions;
+   `backend/security/README.md` documents the resulting CI state, and
+   `run_bandit.py` still fails on findings absent from the committed
+   baseline.
 
 ## Maintainer adjudication requested
 

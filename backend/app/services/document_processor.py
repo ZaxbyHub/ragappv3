@@ -1667,12 +1667,18 @@ class DocumentProcessor:
 
         The write lands only while THIS attempt still owns the row
         (``processing`` + this attempt's own ``enrichment_updated_at`` stamp),
-        so a superseded attempt can never clobber a newer job's terminal
-        state (issues #1075/#1076). ``error_message`` parameterizes the
-        marker text: the stale marker by default, and the cancellation
-        marker from the ``except asyncio.CancelledError`` handler — the
-        detached task keeps its #704 survival (the write outlives the
-        cancelled coroutine) while gaining the same currency guarantee.
+        so the cancellation/stale write cannot clobber a newer job's terminal
+        state while that ownership holds (issues #1075/#1076). Scope note
+        (PR #1093 review): the guarantee covers THIS CAS only — the unguarded
+        ``processing`` entry stamp itself (predates this change) and the
+        synchronous pre-stamp window are outside it, and an atom sync
+        interleaved before the cancel takes the row (pinned by the
+        ``test_cancelled_write_yields_to_interleaved_atom_aggregate``
+        residual). ``error_message`` parameterizes the marker text: the
+        stale marker by default, and the cancellation marker from the
+        ``except asyncio.CancelledError`` handler — the detached task keeps
+        its #704 survival (the write outlives the cancelled coroutine) while
+        gaining the same currency guarantee.
         """
         if self.pool is None or processing_started_at is None:
             return
