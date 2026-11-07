@@ -541,9 +541,11 @@ python scripts/migrate_embeddings.py --dry-run \
     --lancedb-path ./data/lancedb --sqlite-path ./data/app.db
 
 # 4. Run the actual migration — this resets file statuses to pending,
-#    then wipes the LanceDB index (the reset runs first so a crash or a
-#    locked database leaves the old vectors intact instead of stranding
-#    'indexed' rows over an empty index)
+#    then replaces the LanceDB index: the previous index is preserved as a
+#    timestamped rollback directory next to the live one (see the run
+#    summary) and the live directory is recreated empty. The reset runs
+#    first so a crash or a locked database leaves the old vectors intact
+#    instead of stranding 'indexed' rows over an empty index.
 python scripts/migrate_embeddings.py \
     --lancedb-path ./data/lancedb --sqlite-path ./data/app.db
 
@@ -554,12 +556,22 @@ docker compose start knowledgevault
 The background processor automatically re-embeds all files with `status='pending'`.
 Depending on the number of documents and your hardware, this may take several minutes.
 
+Rollback directories (`lancedb.rollback-YYYYMMDD-HHMMSS`) accumulate next to
+the live index until you remove them manually once the rebuilt index is
+verified (`scripts/cleanup_backups.py` does not manage them), and rebuilding
+temporarily needs space for BOTH indexes.
+
 If a migration run is interrupted (crash, Ctrl-C, lock error), re-run the
 script **before** restarting the application: after the status reset, an app
 boot against the still-old-dimension index would fail every re-embed and
-leave files in `error`/retry states that no recovery sweep picks up. If that
-re-run itself refuses with exit code 3, the index deletion is incomplete
-(the interruption landed mid-wipe) — re-run with `--force` to finish it.
+leave files in `error`/retry states that no recovery sweep picks up. Because
+the replacement renames (rather than deletes) the index, there is no
+partially-deleted state: the previous index survives under its live name or
+its rollback name. If the interruption landed between the rename and the
+recreation, the rollback directory printed by that run is the recovery copy —
+recreate the live directory (or rename the rollback directory back) and
+re-run; renaming the rollback directory back restores the index only, so
+re-running the script afterwards is the documented completion path.
 
 **Health check after migration:**
 
@@ -581,7 +593,9 @@ curl -H "X-API-Key: ${HEALTH_CHECK_API_KEY:?set HEALTH_CHECK_API_KEY}" \
 > The script refuses (instead of destroying data) with these exit codes:
 > **3** — the stored dimension cannot be read on a non-empty index; **4** — the
 > configured `EMBEDDING_DIM` cannot be loaded; **5** — another process holds the
-> database, or the database is unreadable/corrupt at the writer probe; **6** — the
+> database, the database is unreadable/corrupt at the writer probe, or the
+> claimed-id identity probe itself could not read the SQLite database (a probe
+> failure is a refusal, never a pass); **6** — the
 > database is unreadable/corrupt during repair detection (restore `app.db` from your
 > backup); **7** — neither the `--lancedb-path` nor the `--sqlite-path` exists (wrong
 > paths — typically container-side DATA_DIR paths used from the host);
@@ -592,12 +606,14 @@ curl -H "X-API-Key: ${HEALTH_CHECK_API_KEY:?set HEALTH_CHECK_API_KEY}" \
 > `backups/` directory, and a path that resolves to one
 > included), or rows claiming vectors that
 > share no file id with the index's chunks (a database that does not
-> describe this index) — each would let the wipe destroy vectors with no
-> usable rollback source. These are heuristics, not proof of identity: a
+> describe this index). These are heuristics, not proof of identity: a
 > byte-identical copy of the live database under a live-looking name, or
 > another deployment's database whose file ids happen to overlap this
 > index's (ids number from 1 in every deployment), passes them — always
-> point `--sqlite-path` at the live file.
+> point `--sqlite-path` at the live file. When the migration does run, the
+> wipe preserves the previous index as a timestamped rollback directory, so
+> even a passed-heuristic wrong database leaves a recoverable copy instead
+> of destroying the index.
 > A database where NO rows claim vectors gets a loud WARNING (live run
 > and dry-run) instead (that state is indistinguishable from the
 > documented re-run after an interrupted migration). Pass `--force` to

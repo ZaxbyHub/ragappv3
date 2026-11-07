@@ -12,12 +12,16 @@ What this script does
 2. Resets all ``indexed``/``partial`` files in SQLite to ``pending`` (with
    ``phase='queued'`` so every recovery sweep re-adopts them) so the
    background processor will re-embed them on next startup.
-3. Wipes the LanceDB directory (irreversible without a backup — see ``--dry-run``).
+3. Replaces the LanceDB index: the previous index directory is PRESERVED as a
+   timestamped rollback sibling (``<name>.rollback-YYYYMMDD-HHMMSS``) and the
+   live directory is recreated empty (issue #1094).
 
-The SQLite reset runs BEFORE the LanceDB wipe (issue #694): the wipe is the
-only irreversible step, so a crash or lock failure before it leaves the old
-vectors intact as the rollback source instead of stranding ``indexed`` rows
-over an empty index.
+The SQLite reset runs BEFORE the LanceDB replacement (issue #694): a crash or
+lock failure before it leaves everything untouched, and the replacement itself
+preserves the old vectors as the rollback directory instead of deleting them.
+Rollback directories accumulate next to the live index until you remove them
+(``scripts/cleanup_backups.py`` does NOT manage them); rebuilding temporarily
+needs space for BOTH indexes.
 
 Properties
 ----------
@@ -33,12 +37,20 @@ Properties
   index no longer has, so it neither loads settings (the exit-4 refusal does
   not apply) nor consults ``--force`` — it only resets rows.
 - **Dry-run mode**: ``--dry-run`` reports what would change without modifying data.
-- **Irreversible**: deletes the LanceDB directory.  Back up first if you need rollback.
+- **Recoverable by default** (issue #1094): the destructive step preserves the
+  previous index as a ``<name>.rollback-YYYYMMDD-HHMMSS`` sibling instead of
+  deleting it. If the rename itself fails (locked files, permissions), the run
+  REFUSES: the SQLite status reset has already committed at that point, but the
+  index is intact — free the lock and re-run (the run is the documented
+  interrupted-run repair). The rename does not make concurrent application
+  writes safe: stop the application first, as shown under Usage.
 - **Refuses instead of destroying** when it cannot prove a migration is safe:
   exit code 3 = stored dimension undetectable on a non-empty index,
   exit code 4 = configured dimension unreadable (settings load failed),
   exit code 5 = another process holds a write lock on the SQLite database
-  (stop the application first) or the database is unreadable/corrupt,
+  (stop the application first), the database is unreadable/corrupt, or the
+  claimed-id identity probe itself could not read the SQLite database
+  (a probe failure is a refusal, never a pass),
   exit code 6 = the SQLite database is unreadable/corrupt during repair
   detection (restore it from your backup),
   exit code 7 = neither the LanceDB path nor the SQLite path exists (wrong
@@ -89,18 +101,23 @@ If a migration run is interrupted, re-run THIS SCRIPT before restarting the
 application: after the status reset, an app boot against the still-old-dim
 index would fail every re-embed (the vector store rejects mismatched
 dimensions) and leave files in ``error``/retry states no recovery sweep
-re-adopts. If the re-run itself refuses with exit code 3 (a partially
-deleted index — e.g. the interruption landed mid-wipe), the deletion is
-incomplete: re-run with ``--force`` to finish it.
+re-adopts. Because the replacement renames (rather than deletes) the index,
+there is no partially-deleted state: the previous index survives either under
+its live name or under its rollback name. If the interruption landed between
+the rename and the recreation, the rollback directory printed by that run is
+the recovery copy — recreate the live directory (or rename the rollback
+directory back) and re-run. Renaming the rollback directory back restores the
+INDEX only; the SQLite rows were already reset, so re-running this script
+afterwards is the documented completion path.
 """
 
 import argparse
 import logging
 import re
-import shutil
 import sqlite3
 import sys
 from collections.abc import Iterable, Iterator
+from datetime import datetime
 from pathlib import Path
 
 logging.basicConfig(
@@ -239,7 +256,12 @@ def _index_shares_claimed_ids(
     None means "no identity evidence" (no chunks table, no ``file_id``
     column, an empty table or one whose ``file_id`` values are all NULL, or
     an index the installed lancedb cannot read)
-    — the caller must then NOT refuse on identity grounds. Neither store is
+    — the caller must then NOT refuse on identity grounds. A SQLite-layer
+    failure of the id stream itself (lock, unreadable file, open failure)
+    is NOT "no evidence": it raises ``MigrationRefused`` (exit 5 via
+    ``main()``) so the destructive path cannot proceed on a skipped check
+    (issue #1094 — the old lance-scoped ``except Exception`` swallowed these
+    into None, which the caller treated as a pass). Neither store is
     materialised: ``id_batches`` arrive pre-bounded (streamed from SQLite),
     each is probed with a ``file_id IN (...)`` filter selecting at most one
     row, and the scan stops at the first batch that matches
@@ -263,23 +285,42 @@ def _index_shares_claimed_ids(
                 "file_id IS NOT NULL"
             ):
                 return None
+        except Exception as exc:
+            logger.debug("Could not probe chunk file ids via lancedb: %s", exc)
+            return None
+        # The batch loop sits OUTSIDE the lance-side handler (issue #1094):
+        # lance query failures keep their documented None, while a SQLite
+        # error raised by the stream is a refusal.
+        try:
             for batch in id_batches:
                 if not batch:
                     continue
                 literals = ", ".join("'" + i.replace("'", "''") + "'" for i in batch)
-                hit = (
-                    tbl.search()
-                    .where(f"file_id IN ({literals})")
-                    .select(["file_id"])
-                    .limit(1)
-                    .to_arrow()
-                )
+                try:
+                    hit = (
+                        tbl.search()
+                        .where(f"file_id IN ({literals})")
+                        .select(["file_id"])
+                        .limit(1)
+                        .to_arrow()
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "Could not probe chunk file ids via lancedb: %s", exc
+                    )
+                    return None
                 if hit.num_rows:
                     return True
             return False
-        except Exception as exc:
-            logger.debug("Could not probe chunk file ids via lancedb: %s", exc)
-            return None
+        except sqlite3.Error as exc:
+            raise MigrationRefused(
+                f"The claimed-id identity probe could not read the SQLite "
+                f"database ({exc}).\n"
+                "A failed identity check must not read as a pass, so the "
+                "migration refuses before any reset or wipe. Stop the "
+                "application (e.g. docker compose stop knowledgevault) or "
+                "repair the database's permissions, then re-run."
+            ) from exc
     finally:
         close = getattr(id_batches, "close", None)
         if close is not None:
@@ -290,20 +331,95 @@ def _index_shares_claimed_ids(
 # Migration steps
 # ---------------------------------------------------------------------------
 
-def _wipe_lancedb(lancedb_path: Path, dry_run: bool) -> bool:
-    """Delete the LanceDB directory. Returns True if action was (or would be) taken."""
+#: Collision suffix budget for rollback directory names (issue #1094): a
+#: same-second re-run appends ``-1``..``-5`` before refusing.
+_ROLLBACK_NAME_ATTEMPTS = 6
+
+
+def _preserve_as_rollback(lancedb_path: Path) -> Path:
+    """Rename the index directory to a timestamped rollback sibling and return it.
+
+    The rollback name is printed by the caller BEFORE the live directory is
+    recreated, so a recreation failure still leaves the recovery location
+    operator-visible. Rename failure (locked handles, permissions) refuses
+    with ``MigrationRefused`` — never falls back to deleting the index.
+    """
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    base = f"{lancedb_path.name}.rollback-{stamp}"
+    for attempt in range(_ROLLBACK_NAME_ATTEMPTS):
+        candidate = (
+            lancedb_path.parent / base
+            if attempt == 0
+            else lancedb_path.parent / f"{base}-{attempt}"
+        )
+        if candidate.exists():
+            continue
+        try:
+            lancedb_path.rename(candidate)
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise MigrationRefused(
+                f"Could not preserve the LanceDB index as a rollback "
+                f"directory ({exc}): {lancedb_path}\n"
+                "The SQLite status reset has ALREADY committed, but the "
+                "index itself is INTACT and untouched. Free the lock "
+                "(stop any process holding the index files open) or fix "
+                "the directory permissions, then re-run this script — the "
+                "re-run is the documented interrupted-run repair."
+            ) from exc
+        return candidate
+    raise MigrationRefused(
+        f"Could not find a free rollback directory name for: {lancedb_path}\n"
+        f"Remove stale {lancedb_path.name}.rollback-* directories (they are "
+        "manual-delete only) and re-run. Nothing was wiped."
+    )
+
+
+def _wipe_lancedb(lancedb_path: Path, dry_run: bool) -> Path | None:
+    """Replace the LanceDB index with an empty directory, preserving the
+    previous index as a timestamped rollback sibling (issue #1094).
+
+    Returns the rollback directory when one was preserved, else None. An
+    empty index directory is left as-is: there is nothing to preserve and
+    nothing to delete.
+    """
     if not lancedb_path.exists():
         logger.info("LanceDB directory does not exist — nothing to wipe: %s", lancedb_path)
-        return False
+        return None
+
+    if not any(lancedb_path.iterdir()):
+        logger.info("LanceDB directory is empty — left as-is: %s", lancedb_path)
+        return None
 
     if dry_run:
-        logger.info("[DRY RUN] Would delete LanceDB directory: %s", lancedb_path)
-        return True
+        logger.info(
+            "[DRY RUN] Would preserve the LanceDB directory as a timestamped "
+            "rollback sibling and recreate it empty: %s",
+            lancedb_path,
+        )
+        return None
 
-    shutil.rmtree(lancedb_path)
-    lancedb_path.mkdir(parents=True, exist_ok=True)
-    logger.info("Deleted and recreated LanceDB directory: %s", lancedb_path)
-    return True
+    rollback = _preserve_as_rollback(lancedb_path)
+    # Printed BEFORE the recreation: if recreation fails, the recovery
+    # location is already operator-visible.
+    logger.info(
+        "Previous LanceDB index preserved as rollback directory: %s "
+        "(remove it manually once the rebuilt index is verified)",
+        rollback,
+    )
+    try:
+        lancedb_path.mkdir(parents=True)
+    except OSError as exc:
+        raise MigrationRefused(
+            f"Could not recreate the empty LanceDB directory ({exc}): "
+            f"{lancedb_path}\n"
+            f"The previous index is PRESERVED at: {rollback}\n"
+            "Fix the directory permissions and re-run this script — the "
+            "re-run is the documented interrupted-run repair."
+        ) from exc
+    logger.info("Recreated empty LanceDB directory: %s", lancedb_path)
+    return rollback
 
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -741,8 +857,12 @@ def run_migration(
             gets a loud wrong-database WARNING on the destructive path and
             dry-run.
         MigrationRefused: another process holds a write lock on the SQLite
-            database, or the database is unreadable/corrupt at the writer
-            probe (``main()`` maps this to exit code 5).
+            database, the database is unreadable/corrupt at the writer
+            probe, the claimed-id identity probe could not read the SQLite
+            database (a probe failure is a refusal, never a pass — issue
+            #1094), or the rollback-preserving index replacement itself
+            failed (rename/recreation; the message names the recovery
+            state) (``main()`` maps this to exit code 5).
     """
     print()
     print("=" * 60)
@@ -887,8 +1007,10 @@ def run_migration(
 
     if not dry_run:
         print(
-            "WARNING: This will permanently delete all LanceDB vectors.\n"
-            "         Back up /your/data/lancedb before continuing.\n"
+            "WARNING: This will replace the LanceDB index.\n"
+            "         The previous index is preserved as a timestamped rollback\n"
+            "         directory next to it (see the run summary); rebuilding\n"
+            "         temporarily needs space for BOTH indexes.\n"
         )
         # Issue #749: the destructive path requires the application database —
         # without it the reset skips and the wipe still runs (no rollback
@@ -946,16 +1068,16 @@ def run_migration(
     print("[1/2] Resetting file statuses to 'pending'...")
     reset_count = _reset_file_statuses(sqlite_path, dry_run=dry_run)
 
-    # ── Step 3: Wipe LanceDB ───────────────────────────────────────────────
-    print("[2/2] Wiping LanceDB vector index...")
-    _wipe_lancedb(lancedb_path, dry_run=dry_run)
+    # ── Step 3: Replace the LanceDB index ──────────────────────────────────
+    print("[2/2] Replacing LanceDB vector index (previous index preserved)...")
+    rollback_dir = _wipe_lancedb(lancedb_path, dry_run=dry_run)
 
     # ── Summary ────────────────────────────────────────────────────────────
     print()
     if dry_run:
         print(
             f"[DRY RUN] Migration summary:\n"
-            f"  LanceDB wipe         : {'yes' if lancedb_path.exists() else 'no (already empty)'}\n"
+            f"  LanceDB replacement  : {'yes' if lancedb_path.exists() else 'no (already empty)'}\n"
             f"  Files to reset       : {reset_count}\n"
             f"\nRe-run without --dry-run to apply changes."
         )
@@ -963,8 +1085,13 @@ def run_migration(
         print(
             f"Migration complete:\n"
             f"  Files reset          : {reset_count}\n"
-            f"  LanceDB wiped        : yes\n"
-            f"\nNext step: start the application to begin re-indexing.\n"
+            f"  LanceDB replaced     : yes\n"
+            + (
+                f"  Previous index at    : {rollback_dir}\n"
+                if rollback_dir is not None
+                else ""
+            )
+            + "\nNext step: start the application to begin re-indexing.\n"
             f"  docker compose start knowledgevault\n"
             f"\nThe background processor will re-embed all {reset_count} file(s) automatically."
         )
