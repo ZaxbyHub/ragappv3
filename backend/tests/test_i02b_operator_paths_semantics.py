@@ -586,7 +586,11 @@ class TestApplicationDatabaseIdentity(unittest.TestCase):
             with tempfile.TemporaryDirectory() as td:
                 lance = Path(td)
                 (lance / "chunks.lance").mkdir()
-                result = mod._index_shares_claimed_ids(lance, batches())
+                # Keep a live reference so refcount GC cannot close the
+                # generator for us — only the helper's explicit close() can.
+                stream = batches()
+                result = mod._index_shares_claimed_ids(lance, stream)
+                closed_while_referenced = list(closed)
         finally:
             if saved_mod is None:
                 sys.modules.pop("lancedb", None)
@@ -598,7 +602,12 @@ class TestApplicationDatabaseIdentity(unittest.TestCase):
             ["file_id IN ('1')", "file_id IN ('2')"],
             "one bounded batch per query, stopping at the first hit",
         )
-        self.assertEqual(closed, [True], "the batch stream is closed on early return")
+        self.assertEqual(
+            closed_while_referenced,
+            [True],
+            "the helper closes the batch stream on early return",
+        )
+        del stream
 
     def test_claimed_ids_stream_from_sqlite_in_bounded_batches(self):
         """Batch-9 review: the SQLite side is streamed with fetchmany in
