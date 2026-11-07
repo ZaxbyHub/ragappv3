@@ -2961,29 +2961,41 @@ class BackgroundProcessor:
             )
 
     def _sync_file_enrichment_status(self, item: AtomEnrichmentTaskItem) -> None:
-        """Map atom-stage aggregates onto files.enrichment_status (distinct from base)."""
+        """Map atom-stage aggregates onto files.enrichment_status (distinct from base).
+
+        Issues #1075/#1076: one atomic statement — the aggregate decision is
+        the shared correlated CASE from ``enrichment_state`` (evaluated inside
+        the UPDATE, so decision and write cannot interleave), and the
+        ``enrichment_error IS NULL`` predicate is the currency guard: every
+        chunk-pipeline failure/stale/cancel/recovery writer sets a NON-NULL
+        error, while this sync is the only aggregate writer that clears it (the chunk
+        pipeline's own terminal writes clear it too, but those are the states
+        the guard protects), so a
+        settled atom batch can never overwrite a chunk-pipeline terminal
+        failure for the same file row. A zero-row result (row absent, or a
+        chunk failure present) skips the write.
+        """
         try:
             from . import enrichment_state as est
 
             with self.processor.pool.connection() as conn:
-                counts = est.aggregate_stage_status(
-                    conn, file_id=item.file_id, stage=est.ENRICH_STAGE
-                )
-                total = sum(counts.values())
-                if total == 0:
-                    status = "complete"
-                elif counts[est.FAILED_PERMANENT] == total:
-                    status = "error"
-                elif counts[est.SUCCEEDED] == total:
-                    status = "complete"
-                else:
-                    status = "partial"
-                conn.execute(
-                    "UPDATE files SET enrichment_status = ?, enrichment_error = NULL, "
-                    "enrichment_updated_at = ? WHERE id = ?",
-                    (status, datetime.now(UTC).isoformat(), item.file_id),
+                # The concatenated fragment is the module-level CASE
+                # expression; every value is a bound parameter
+                # (issues #1075/#1076).
+                cursor = conn.execute(
+                    "UPDATE files SET enrichment_status = ("
+                    + est.aggregate_status_case_sql()
+                    + "), enrichment_error = NULL, enrichment_updated_at = ? "
+                    "WHERE id = ? AND enrichment_error IS NULL",
+                    (datetime.now(UTC).isoformat(), item.file_id),
                 )
                 conn.commit()
+                if cursor.rowcount == 0:
+                    logger.info(
+                        "Atom enrichment sync skipped for file_id=%s "
+                        "(row absent or carries a chunk-pipeline enrichment_error)",
+                        item.file_id,
+                    )
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("Could not sync atom enrichment status: %s", exc)
 
