@@ -48,9 +48,11 @@ Properties
   the application's core columns, an obvious backup copy (a path that
   RESOLVES to one included), or a database whose vector-claiming rows share
   no file id with a non-empty index's chunks — each would let the wipe
-  destroy vectors with no usable rollback source. A byte-identical copy of
-  the live database under a live-looking name cannot be told apart by
-  content; point --sqlite-path at the live file. A database
+  destroy vectors with no usable rollback source. These are heuristics,
+  not proof of identity: a byte-identical copy of the live database under
+  a live-looking name, and another deployment's database whose
+  autoincrement file ids overlap this index's (both number files from 1),
+  pass them — point --sqlite-path at the live file. A database
   where NO rows claim vectors gets a loud WARNING instead (live run and
   dry-run): that state is indistinguishable from the documented
   reset-then-crash repair re-run.
@@ -319,8 +321,10 @@ def _assert_application_database(sqlite_path: Path, lancedb_path: Path) -> None:
     so an unrelated database that merely carries a table named ``files`` is
     refused too. A schema-valid database whose vector-claiming rows share no
     file id with a non-empty index's chunks is refused as describing a
-    different index. A byte-identical copy of the live database under a
-    live-looking name shares every id and is NOT detectable by content.
+    different index. Heuristics, not identity: a byte-identical copy of the
+    live database under a live-looking name, and a foreign deployment's
+    database whose autoincrement ids overlap the index's, are NOT
+    detectable by content.
 
     Exception taxonomy deliberately mirrors the sibling probes
     (``_count_rows_claiming_vectors`` / ``_assert_no_active_writer``): a writer
@@ -474,10 +478,11 @@ def _assert_application_database(sqlite_path: Path, lancedb_path: Path) -> None:
     # them, the database does not describe this index (unrelated or foreign
     # deployment's database) — the reset would hit the wrong rows while the
     # live index is wiped. Zero claims (fresh boot, reset-then-crash repair
-    # re-run) and an index without readable file ids carry no evidence and
-    # fall through to the WARNING path in run_migration. A byte-identical
-    # copy of the live database shares every id and cannot be told apart by
-    # content — the backup-name check above is the only guard for that.
+    # re-run) and an index without readable file ids carry no evidence:
+    # the run proceeds (zero claims still get run_migration's WARNING). The
+    # check proves only DISJOINTNESS — a byte-identical live copy, or a
+    # foreign deployment's database whose autoincrement ids overlap the
+    # index's, passes; the backup-name check above is the only other guard.
     if claimed_ids:
         index_ids = _lancedb_file_ids(lancedb_path)
         if index_ids is not None and not (claimed_ids & index_ids):

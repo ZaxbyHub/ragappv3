@@ -507,7 +507,9 @@ class TestContainerCmdSemantics(unittest.TestCase):
     the frozen C-checks accept any exec'd program and search the whole CMD
     text for ``--workers 1``. Parse the CMD instead: the shell must exec
     uvicorn itself, as the only command, with ``--workers 1`` in uvicorn's
-    own argv."""
+    own argv. This pins the SHIPPED ``sh -c`` form: moving to an init
+    wrapper (tini/dumb-init) is a deliberate topology change that must
+    update this test alongside the frozen C-checks."""
 
     def test_cmd_execs_uvicorn_with_single_worker(self):
         import json

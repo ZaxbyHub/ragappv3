@@ -589,9 +589,11 @@ curl -H "X-API-Key: ${HEALTH_CHECK_API_KEY:?set HEALTH_CHECK_API_KEY}" \
 > (a path that resolves to one included), or rows claiming vectors that
 > share no file id with the index's chunks (a database that does not
 > describe this index) — each would let the wipe destroy vectors with no
-> usable rollback source. A byte-identical copy of the live database under
-> a live-looking name cannot be detected by content: always point
-> `--sqlite-path` at the live file.
+> usable rollback source. These are heuristics, not proof of identity: a
+> byte-identical copy of the live database under a live-looking name, or
+> another deployment's database whose file ids happen to overlap this
+> index's (ids number from 1 in every deployment), passes them — always
+> point `--sqlite-path` at the live file.
 > A database where NO rows claim vectors gets a loud WARNING (live run
 > and dry-run) instead (that state is indistinguishable from the
 > documented re-run after an interrupted migration). Pass `--force` to

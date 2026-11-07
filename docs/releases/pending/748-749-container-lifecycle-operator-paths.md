@@ -60,8 +60,9 @@ collated per maintainer authorization. Frontier-audit provenance (run
     skipped (or hit the wrong database) and the LanceDB wipe STILL ran,
     destroying vectors with no usable rollback source (audit probe reproduced
     the loss). The checks are heuristics, not proof of identity: a
-    byte-identical copy of the live database under a live-looking name is
-    not detectable;
+    byte-identical copy of the live database under a live-looking name, or
+    another deployment's database whose autoincrement file ids overlap the
+    index's, is not detectable;
   - `--dry-run` and `--force` are subject to both refusals (wrong paths are
     wrong paths; `--force` still overrides only exits 3/4); lock and
     corruption semantics (exits 5/6) are unchanged, with the
