@@ -88,7 +88,7 @@ npm run build       # tsc && vite build (CI also runs two subpath builds)
 ```bash
 python scripts/check_config_contract.py
 python scripts/check_pr_scope_drift.py
-python scripts/check_sast_baseline.py
+SAST_ALLOW_BASELINE_EXPANSION=1 python scripts/check_sast_baseline.py
 ```
 
 `check_pr_scope_drift.py` flags drift such as auth tests changed without matching

@@ -14,9 +14,11 @@ keeps its full-resolution contract inside this change.
   (`enrichment_state.aggregate_status_case_sql()`) evaluated inside the
   statement, and `WHERE ... AND enrichment_error IS NULL` is the currency
   guard. A settled multimodal atom batch can no longer overwrite a
-  chunk-pipeline terminal failure for the same file row (every chunk-pipeline
-  failure/stale/cancel writer records a non-NULL `enrichment_error`; the
-  atom sync is the only writer that clears it).
+  chunk-pipeline terminal failure for the same file row: every chunk-pipeline
+  failure/stale/cancel writer records a non-NULL `enrichment_error`, and the
+  atom sync — the one writer that writes NULL — only lands behind that guard
+  (a NULL error on the row means no chunk-failure vocabulary state is being
+  erased; see residual 5 for the CASE-computed `error`/NULL pairing).
 - **Cancelled detached write** — the `except asyncio.CancelledError` handler's
   detached task now runs the attempt-stamp CAS
   (`_mark_enrichment_stale_if_current_job(..., error_message="Enrichment job

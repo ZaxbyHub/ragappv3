@@ -209,7 +209,14 @@ class TestEnrichmentWriterCensus(unittest.TestCase):
         self.assertIn("UPDATE files", sql)
 
     def test_complete_branch_uses_the_shared_case_in_the_same_statement(self):
-        """``set_enrichment_status`` computes 'complete' via the shared CASE."""
+        """``set_enrichment_status`` computes 'complete' via the shared CASE.
+
+        PR #1093 review: the dispatch assertion runs on the method body
+        EXCLUDING the docstring (the docstring names ``status ==
+        "complete"`` and previously satisfied this assertion with prose);
+        the behavioral killers for the underlying mutation live in the
+        status_clobber ext2/ext3 suites.
+        """
         self.assertIn("aggregate_status_case_sql()", self.dp)
         method = re.search(
             r"async def set_enrichment_status(.*?)(?=\n    (?:async )?def )",
@@ -217,9 +224,11 @@ class TestEnrichmentWriterCensus(unittest.TestCase):
             re.S,
         )
         self.assertIsNotNone(method, "set_enrichment_status body not found")
+        parts = method.group(1).split('"""')
+        body = parts[2] if len(parts) >= 3 else method.group(1)
         self.assertIn(
             'status == "complete"',
-            method.group(1),
+            body,
             "complete branch dispatch missing",
         )
 
