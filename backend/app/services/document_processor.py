@@ -1604,11 +1604,14 @@ class DocumentProcessor:
         * ``require_file_hash`` adds the currency predicate
           ``AND file_hash = ? AND status IN ('indexed', 'partial')`` — the
           same check :meth:`_is_enrichment_job_current` performs, but
-          atomic with the write. A guarded write that matches zero rows
-          returns the :data:`ENRICHMENT_WRITE_NOT_CURRENT` sentinel so
-          callers can react (stale marker / silent skip); ``None`` keeps
-          its pre-existing meaning (sqlite error or no pool) and callers
-          must NOT treat it as no-match.
+          atomic with the write. ANY write that matches zero rows (guarded
+          no-match, or an unguarded write against an absent row) returns the
+          :data:`ENRICHMENT_WRITE_NOT_CURRENT` sentinel so callers can react
+          (stale marker / silent skip); ``None`` keeps its pre-existing
+          meaning (sqlite error or no pool) and callers must NOT treat it as
+          no-match. The unguarded processing-stamp caller may therefore
+          receive the sentinel when its row is absent — harmless, because a
+          CAS keyed on the sentinel can never match a real row.
         """
         if self.pool is None:
             return None
