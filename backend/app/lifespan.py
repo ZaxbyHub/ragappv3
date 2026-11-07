@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import sqlite3
+import stat
 import time
 from contextlib import asynccontextmanager
 from contextlib import suppress as contextlib_suppress
@@ -637,13 +638,18 @@ async def lifespan(app: FastAPI):
     _owner_uid = None
     _dd_unusable = False
     try:
-        _owner_uid = getattr(_data_dir.stat(), "st_uid", None)
+        _dd_stat = _data_dir.stat()
     except FileNotFoundError:
         pass
     except OSError:
         _dd_unusable = True
     else:
-        _dd_unusable = not os.access(_data_dir, os.W_OK | os.X_OK)
+        _owner_uid = getattr(_dd_stat, "st_uid", None)
+        # A regular FILE with W/X bits would pass os.access and fail later
+        # with a bare NotADirectoryError under it (batch-7 review).
+        _dd_unusable = not stat.S_ISDIR(_dd_stat.st_mode) or not os.access(
+            _data_dir, os.W_OK | os.X_OK
+        )
     if _dd_unusable:
         _current_uid = getattr(os, "getuid", lambda: None)()
         raise RuntimeError(

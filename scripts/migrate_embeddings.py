@@ -45,8 +45,9 @@ Properties
   paths — for example container-side DATA_DIR paths used from the host),
   exit code 8 = the application SQLite database is unusable for a reset/wipe
   (dry runs included): missing, no ``files`` table, a ``files`` table without
-  the application's core columns, an obvious backup copy (a path that
-  RESOLVES to one included), or a database whose vector-claiming rows share
+  the application's core columns, an obvious backup copy (rotated names such
+  as ``app.db.bak.1`` and a path that RESOLVES to one included), or a
+  database whose vector-claiming rows share
   no file id with a non-empty index's chunks — each would let the wipe
   destroy vectors with no usable rollback source. These are heuristics,
   not proof of identity: a byte-identical copy of the live database under
@@ -94,6 +95,7 @@ incomplete: re-run with ``--force`` to finish it.
 
 import argparse
 import logging
+import re
 import shutil
 import sqlite3
 import sys
@@ -165,14 +167,37 @@ def _detect_stored_dim(lancedb_path: Path) -> int | None:
     return None
 
 
-def _lancedb_file_ids(lancedb_path: Path) -> set[str] | None:
-    """Distinct ``file_id`` values in the LanceDB chunks table, or None.
+#: Name tokens that mark a backup copy (split on . - _ ~ and whitespace).
+_BACKUP_TOKENS = frozenset({"bak", "backup", "orig"})
+
+
+def _looks_like_backup(lower_name: str) -> bool:
+    """Whether a lower-cased file name looks like a backup copy.
+
+    Token-based so rotated and stamped forms are caught too — ``app.db.bak``,
+    ``app.db.bak.1``, ``app.db.backup-2024``, ``app_backup.db``,
+    ``app.db.orig~`` (pr1081-20261106 batch-7 review: exact-suffix matching
+    let rotated names through) — plus the ``backup``/``copy of`` prefixes
+    and editor ``~`` copies.
+    """
+    if lower_name.startswith(("backup", "copy of")) or lower_name.endswith("~"):
+        return True
+    return any(tok in _BACKUP_TOKENS for tok in re.split(r"[.\-_~\s]+", lower_name))
+
+
+#: Claimed ids probed per LanceDB filter query (bounded memory; batch-7 review).
+_ID_PROBE_BATCH = 500
+
+
+def _index_shares_claimed_ids(lancedb_path: Path, claimed_ids: set[str]) -> bool | None:
+    """Whether ANY claimed file id has chunks in the LanceDB index, or None.
 
     None means "no identity evidence" (no chunks table, no ``file_id``
     column, an empty table, or an index the installed lancedb cannot read)
-    — the caller must then NOT refuse on identity grounds. Only the
-    ``file_id`` column is selected, so the embedding vectors are never
-    materialised.
+    — the caller must then NOT refuse on identity grounds. The index is
+    never materialised: claimed ids are probed in bounded batches with a
+    ``file_id IN (...)`` filter selecting at most one row, and the scan stops
+    at the first batch that matches (pr1081-20261106 batch-7 review).
     """
     if not (lancedb_path / "chunks.lance").exists():
         return None
@@ -183,16 +208,24 @@ def _lancedb_file_ids(lancedb_path: Path) -> set[str] | None:
         if "chunks" not in db.table_names():
             return None
         tbl = db.open_table("chunks")
-        total = tbl.count_rows()
-        if not total:
+        if "file_id" not in tbl.schema.names or not tbl.count_rows():
             return None
-        column = (
-            tbl.search().select(["file_id"]).limit(total).to_arrow().column("file_id")
-        )
-        ids = {str(value) for value in column.to_pylist() if value is not None}
-        return ids or None
+        ordered = sorted(claimed_ids)
+        for start in range(0, len(ordered), _ID_PROBE_BATCH):
+            batch = ordered[start : start + _ID_PROBE_BATCH]
+            literals = ", ".join("'" + i.replace("'", "''") + "'" for i in batch)
+            hit = (
+                tbl.search()
+                .where(f"file_id IN ({literals})")
+                .select(["file_id"])
+                .limit(1)
+                .to_arrow()
+            )
+            if hit.num_rows:
+                return True
+        return False
     except Exception as exc:
-        logger.debug("Could not read chunk file ids via lancedb: %s", exc)
+        logger.debug("Could not probe chunk file ids via lancedb: %s", exc)
         return None
 
 
@@ -353,12 +386,7 @@ def _assert_application_database(sqlite_path: Path, lancedb_path: Path) -> None:
     except OSError:  # pragma: no cover - unresolvable path cannot be opened below
         _resolved = sqlite_path
     _resolved_name = _resolved.name.lower()
-    if (
-        _lower_name.endswith((".bak", ".backup", ".orig"))
-        or _lower_name.startswith(("backup", "copy of"))
-        or _resolved_name.endswith((".bak", ".backup", ".orig"))
-        or _resolved_name.startswith(("backup", "copy of"))
-    ):
+    if _looks_like_backup(_lower_name) or _looks_like_backup(_resolved_name):
         print(
             "ERROR: the SQLite path looks like a BACKUP copy, not the live\n"
             "application database:\n"
@@ -484,16 +512,15 @@ def _assert_application_database(sqlite_path: Path, lancedb_path: Path) -> None:
     # foreign deployment's database whose autoincrement ids overlap the
     # index's, passes; the backup-name check above is the only other guard.
     if claimed_ids:
-        index_ids = _lancedb_file_ids(lancedb_path)
-        if index_ids is not None and not (claimed_ids & index_ids):
+        shares = _index_shares_claimed_ids(lancedb_path, claimed_ids)
+        if shares is False:
             print(
                 "ERROR: none of the database's rows that claim vectors\n"
                 "('indexed'/'partial') have chunks in this LanceDB index, so\n"
                 "the database does not describe the index about to be wiped:\n"
                 f"  SQLite path : {sqlite_path} "
                 f"({len(claimed_ids)} claiming row(s))\n"
-                f"  LanceDB path: {lancedb_path} "
-                f"({len(index_ids)} distinct file id(s), none shared)\n"
+                f"  LanceDB path: {lancedb_path} (non-empty, none shared)\n"
                 "Point --sqlite-path at the database that produced this index\n"
                 "(and --lancedb-path at its index) and re-run. Nothing was\n"
                 "migrated.\n"

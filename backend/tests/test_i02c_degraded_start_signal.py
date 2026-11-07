@@ -303,6 +303,41 @@ class TestUnwritableDataDirFailsWithNamedMessage(unittest.TestCase):
         self.assertIn("Data directory is not writable/searchable", str(raised))
         self.assertIn(str(tmp), str(raised))
 
+    def test_regular_file_data_dir_raises_named_message(self):
+        """Leg A4 (batch-7 review): a regular FILE at the data-dir path
+        passes os.access(W_OK|X_OK) when its mode bits allow it, then fails
+        later with a bare NotADirectoryError — the preflight must refuse it
+        with the named message."""
+        from fastapi import FastAPI
+
+        from app.lifespan import lifespan
+
+        parent = _fresh_tmp_dir("i02c-legA4-")
+        not_a_dir = parent / "data"
+        not_a_dir.write_text("not a directory", encoding="utf-8")
+        not_a_dir.chmod(0o755)
+        restore = _pin_lifespan_settings(not_a_dir)
+        root, saved_handlers = _snapshot_root_handlers()
+        app = FastAPI()
+        raised = None
+        try:
+
+            async def scenario():
+                async with lifespan(app):
+                    raise AssertionError("startup must not complete")
+
+            try:
+                asyncio.run(scenario())
+            except RuntimeError as exc:
+                raised = exc
+        finally:
+            _restore_root_handlers(root, saved_handlers)
+            restore()
+
+        self.assertIsNotNone(raised, "a regular file at the data-dir path must fail")
+        self.assertIn("Data directory is not writable/searchable", str(raised))
+        self.assertIn(str(not_a_dir), str(raised))
+
 
 class TestFreshStartPassesPreflight(unittest.TestCase):
     """Leg B: an absent data dir is NOT treated as unwritable."""

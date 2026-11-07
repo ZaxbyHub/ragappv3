@@ -501,6 +501,115 @@ class TestApplicationDatabaseIdentity(unittest.TestCase):
             conn.close()
             self.assertEqual(status, "pending")
 
+    def test_rotated_backup_names_refused_live_and_dry_run(self):
+        """Batch-7 review: rotated/stamped backup names (``app.db.bak.1``,
+        ``app.db.backup-2024``, ``app_backup.db``) were let through by the
+        exact-suffix match. Each is refused with exit 8 before any reset or
+        wipe, live and dry run, and the sentinel survives."""
+        import tempfile
+
+        mod = _load_migrate_module()
+        for name in ("app.db.bak.1", "app.db.backup-2024", "app_backup.db", "app.db~"):
+            for dry_run in (False, True):
+                with self.subTest(name=name, dry_run=dry_run), tempfile.TemporaryDirectory() as td:
+                    tmp = Path(td)
+                    lance = self._mk(tmp)
+                    backup = tmp / name
+                    conn = sqlite3.connect(str(backup))
+                    conn.execute("CREATE TABLE files (id INTEGER PRIMARY KEY, status TEXT)")
+                    conn.execute("INSERT INTO files (id, status) VALUES (1, 'indexed')")
+                    conn.commit()
+                    conn.close()
+                    code, out = self._refusal_stdout(
+                        lambda: mod.run_migration(lance, backup, dry_run=dry_run, force=True)
+                    )
+                    self.assertEqual(code, 8, f"{name} must be refused")
+                    self.assertIn("BACKUP", out)
+                    self.assertTrue((lance / "sentinel.keep").exists())
+
+    def test_live_looking_names_are_not_backups(self):
+        mod = _load_migrate_module()
+        for name in ("app.db", "knowledge.db", "bakery.db", "original_corpus.db", "app.db-wal"):
+            with self.subTest(name=name):
+                self.assertFalse(mod._looks_like_backup(name), name)
+
+    def test_identity_probe_is_batched_and_stops_at_first_hit(self):
+        """Batch-7 review: the identity check must not materialise the index.
+        A counting stand-in for lancedb proves the claimed ids are probed in
+        bounded batches and the scan stops at the first matching batch."""
+        import tempfile
+        import types
+
+        mod = _load_migrate_module()
+        filters = []
+
+        class _Query:
+            def __init__(self):
+                self._filter = ""
+
+            def where(self, clause):
+                self._filter = clause
+                filters.append(clause)
+                return self
+
+            def select(self, _cols):
+                return self
+
+            def limit(self, _n):
+                return self
+
+            def to_arrow(self):
+                return types.SimpleNamespace(num_rows=1 if "'2'" in self._filter else 0)
+
+        table = types.SimpleNamespace(
+            schema=types.SimpleNamespace(names=["id", "file_id", "embedding"]),
+            count_rows=lambda: 1_000_000,
+            search=_Query,
+        )
+        fake = types.SimpleNamespace(
+            connect=lambda _p: types.SimpleNamespace(
+                table_names=lambda: ["chunks"], open_table=lambda _n: table
+            )
+        )
+        saved_mod = sys.modules.get("lancedb")
+        saved_batch = mod._ID_PROBE_BATCH
+        try:
+            sys.modules["lancedb"] = fake
+            mod._ID_PROBE_BATCH = 1
+            with tempfile.TemporaryDirectory() as td:
+                lance = Path(td)
+                (lance / "chunks.lance").mkdir()
+                result = mod._index_shares_claimed_ids(lance, {"1", "2", "3", "4"})
+        finally:
+            mod._ID_PROBE_BATCH = saved_batch
+            if saved_mod is None:
+                sys.modules.pop("lancedb", None)
+            else:
+                sys.modules["lancedb"] = saved_mod
+        self.assertIs(result, True)
+        self.assertEqual(
+            filters,
+            ["file_id IN ('1')", "file_id IN ('2')"],
+            "one bounded batch per query, stopping at the first hit",
+        )
+
+    def test_identity_probe_multi_batch_real_index(self):
+        """Real lancedb, batch size 1: the only shared id sits in the LAST
+        batch (pass-through), and with no shared id every batch misses
+        (refusal)."""
+        import tempfile
+
+        mod = _load_migrate_module()
+        saved_batch = mod._ID_PROBE_BATCH
+        try:
+            mod._ID_PROBE_BATCH = 1
+            with tempfile.TemporaryDirectory() as td:
+                lance = self._mk_index(Path(td), ["3", "3"])
+                self.assertIs(mod._index_shares_claimed_ids(lance, {"1", "2", "3"}), True)
+                self.assertIs(mod._index_shares_claimed_ids(lance, {"1", "2"}), False)
+        finally:
+            mod._ID_PROBE_BATCH = saved_batch
+
 
 class TestContainerCmdSemantics(unittest.TestCase):
     """Argv-level companion to the frozen lifecycle checks (batch-5 review):
