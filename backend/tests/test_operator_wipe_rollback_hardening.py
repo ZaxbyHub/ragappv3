@@ -553,15 +553,17 @@ def test_reset_preflight_runs_before_any_connection():
         n for n in tree.body
         if isinstance(n, ast.FunctionDef) and n.name == "reset_all_embeddings"
     )
-    positions = {"preflight_call": None, "first_connection": None}
+    linenos = {"_assert_application_database": [], "get_db_connection": []}
     for node in ast.walk(fn):
         if not isinstance(node, ast.Call):
             continue
         name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
-        if name == "_assert_application_database" and positions["preflight_call"] is None:
-            positions["preflight_call"] = node.lineno
-        if name == "get_db_connection" and positions["first_connection"] is None:
-            positions["first_connection"] = node.lineno
+        if name in linenos:
+            linenos[name].append(node.lineno)
+    positions = {
+        "preflight_call": min(linenos["_assert_application_database"], default=None),
+        "first_connection": min(linenos["get_db_connection"], default=None),
+    }
     assert positions["preflight_call"] is not None, (
         "reset_all_embeddings no longer CALLS _assert_application_database "
         "(the preflight was deleted or unwired)"
