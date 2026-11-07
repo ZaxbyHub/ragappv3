@@ -588,7 +588,7 @@ curl -H "X-API-Key: ${HEALTH_CHECK_API_KEY:?set HEALTH_CHECK_API_KEY}" \
 > **8** — the SQLite file is unusable for a reset/wipe (dry runs included):
 > missing, no `files` table, a `files` table without the reset contract's
 > core columns (`id`, `status`), an obvious backup copy such as `app.db.bak`
-> (rotated and `.copy` names like `app.db.bak.1`, a file inside a
+> (rotated and `.copy` names like `app.db.bak.1`, a file directly inside a
 > `backups/` directory, and a path that resolves to one
 > included), or rows claiming vectors that
 > share no file id with the index's chunks (a database that does not

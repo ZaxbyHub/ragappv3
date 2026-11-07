@@ -46,7 +46,7 @@ Properties
   exit code 8 = the application SQLite database is unusable for a reset/wipe
   (dry runs included): missing, no ``files`` table, a ``files`` table without
   the application's core columns, an obvious backup copy (rotated and
-  ``.copy`` names such as ``app.db.bak.1``, a file inside a ``backups/``
+  ``.copy`` names such as ``app.db.bak.1``, a file directly inside a ``backups/``
   directory, and a path that RESOLVES to one included), or a
   database whose vector-claiming rows share
   no file id with a non-empty index's chunks — each would let the wipe

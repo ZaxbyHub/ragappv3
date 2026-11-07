@@ -56,7 +56,7 @@ collated per maintainer authorization. Frontier-audit provenance (run
     (dry runs included): missing, no `files` table, a `files` table without
     the reset contract's core columns (`id`/`status`), an obvious
     backup copy such as `app.db.bak` (rotated and `.copy` names like
-    `app.db.bak.1`, and a file inside a `backups/` directory,
+    `app.db.bak.1`, and a file directly inside a `backups/` directory,
     included), or vector-claiming rows that share no
     file id with the index's chunks — previously the status reset silently
     skipped (or hit the wrong database) and the LanceDB wipe STILL ran,
