@@ -228,7 +228,10 @@ On first launch, you'll be redirected to the **Setup Wizard** (`/setup`) to crea
 > `knowledgevault` is NOT started — its restart policy does not cover a
 > dependency that never came up, so this does not recover by itself. Fix the
 > embedder (check `docker compose logs harrier-embed`; a slow first download
-> is the usual cause) and re-run `docker compose up -d`.
+> is the usual cause) and re-run `docker compose up -d`. Operators pointing
+`OLLAMA_EMBEDDING_URL` at an external embedding endpoint (not the bundled
+containers) can start the app without that gate:
+`docker compose up -d knowledgevault --no-deps`.
 
 ## CPU-only hosts
 
@@ -511,6 +514,12 @@ dimension-incompatible.
 **Symptom:** Chat returns no document results or the `/api/health?deep=true` response
 includes `"stale_embeddings": true` in the `vector_store` section.
 
+**Prerequisites:** run these from the repo root with the backend
+dependencies installed — the script needs the `lancedb` package to read
+the index (`pip install -r backend/requirements-lock.txt`). On a fresh
+deployment where neither path exists yet the script exits 7 (nothing to
+migrate) — that is expected.
+
 **Required steps:**
 
 ```bash
@@ -576,9 +585,11 @@ curl -H "X-API-Key: ${HEALTH_CHECK_API_KEY:?set HEALTH_CHECK_API_KEY}" \
 > paths — typically container-side DATA_DIR paths used from the host);
 > **8** — the SQLite file is unusable for a reset/wipe (dry runs included):
 > missing, no `files` table, a `files` table without the reset contract's
-> core columns (`id`, `status`), or an obvious backup copy such as `app.db.bak` (without the live
-> application database the wipe would destroy vectors with no usable
-> rollback source). Pass `--force` to override exits 3
+> core columns (`id`, `status`), an obvious backup copy such as `app.db.bak`
+> (a path that resolves to one included), or — on a non-empty index — a
+> database where NO rows claim vectors, so nothing accounts for the index
+> being wiped (without the live application database the wipe would destroy
+> vectors with no usable rollback source). Pass `--force` to override exits 3
 > and 4 only; the lock/corruption/wrong-path refusals (5, 6, 7 and 8) always
 > stop the run.
 

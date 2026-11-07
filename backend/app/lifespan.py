@@ -630,8 +630,14 @@ async def lifespan(app: FastAPI):
     # shell syntax.
     _data_dir = settings.data_dir
     if _data_dir.exists() and not os.access(_data_dir, os.W_OK | os.X_OK):
-        _st = _data_dir.stat()
-        _owner_uid = getattr(_st, "st_uid", None)
+        try:
+            _st = _data_dir.stat()
+            _owner_uid = getattr(_st, "st_uid", None)
+        except OSError:
+            # stat() itself failing is its own evidence the directory is
+            # unusable — keep the actionable named-failure instead of a bare
+            # traceback (batch-2 review).
+            _owner_uid = None
         _current_uid = getattr(os, "getuid", lambda: None)()
         raise RuntimeError(
             f"Data directory is not writable/searchable: {_data_dir}\n"
@@ -696,6 +702,12 @@ async def lifespan(app: FastAPI):
     # degraded-start signal so /api/healthz reports 503 (issues #550, #749).
     try:
         _load_persisted_settings(str(settings.sqlite_path))
+    except RuntimeError:
+        # The persisted-schema drift guard raises RuntimeError by contract
+        # (issue #494 CONFIG-003): a drift must ABORT startup, not boot
+        # degraded with a silently reverted settings surface (batch-2 review
+        # F-06). Only unexpected load failures degrade.
+        raise
     except Exception as e:
         app.state.migrations_ok = False
         logger.error(

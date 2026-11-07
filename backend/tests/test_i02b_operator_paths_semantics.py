@@ -6,6 +6,7 @@ message shape and taxonomy, the runnable hint command, and the CPU override's
 merged configuration).
 """
 
+import os
 import re
 import shlex
 import shutil
@@ -235,12 +236,12 @@ class TestApplicationDatabaseIdentity(unittest.TestCase):
             self.assertIn("BACKUP", out)
             self.assertTrue((lance / "sentinel.keep").exists())
 
-    def test_full_app_schema_passes_the_identity_guard(self):
-        """A schema-valid application database must NOT be refused by the
-        identity guard: the destructive path RUNS (force=True proceeds past
-        the guard and wipes the payload directory — no SystemExit, sentinel
-        gone). The refusals above are the discriminating half; this is the
-        pass-through half of the same contract."""
+    def test_zero_claim_db_refused_before_wipe(self):
+        """A schema-valid database that holds NO rows claiming vectors
+        (indexed/partial) must be refused before the wipe: nothing in it
+        accounts for the non-empty index, which is the wrong-database shape
+        (pr1081-20261106 batch-2 — the OOB review's executed archived-row
+        probe and Multi-Stage HIGH)."""
         import tempfile
 
         mod = _load_migrate_module()
@@ -253,15 +254,122 @@ class TestApplicationDatabaseIdentity(unittest.TestCase):
                 "CREATE TABLE files (id INTEGER PRIMARY KEY, vault_id INTEGER, "
                 "status TEXT)"
             )
+            # one row with a NON-claiming status: the guard's column check
+            # passes, but nothing accounts for the index
+            conn.execute(
+                "INSERT INTO files (id, vault_id, status) VALUES (1, 1, 'archived')"
+            )
+            conn.commit()
+            conn.close()
+            code, out = self._refusal_stdout(
+                lambda: mod.run_migration(lance, app_db, force=True)
+            )
+            self.assertEqual(code, 8, "zero-claim DB must be refused with exit 8")
+            self.assertIn(
+                "NO rows claiming",
+                re.sub(r"\s+", " ", out),
+                "the refusal must state the zero-claims evidence",
+            )
+            self.assertTrue((lance / "sentinel.keep").exists())
+
+    @unittest.skipIf(os.name == "nt", "symlink creation needs privilege on Windows")
+    def test_symlinked_live_name_to_backup_refused(self):
+        """A live-looking path that RESOLVES to a backup must be refused:
+        the backup-name check runs on the resolved target's name too
+        (Multi-Stage batch-2 symlink bypass)."""
+        import tempfile
+
+        mod = _load_migrate_module()
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            lance = self._mk(tmp)
+            backup = tmp / "app.db.bak"
+            conn = sqlite3.connect(str(backup))
+            conn.execute(
+                "CREATE TABLE files (id INTEGER PRIMARY KEY, status TEXT)"
+            )
+            conn.commit()
+            conn.close()
+            live_link = tmp / "app.db"
+            live_link.symlink_to(backup)
+            code, out = self._refusal_stdout(
+                lambda: mod.run_migration(lance, live_link, force=True)
+            )
+            self.assertEqual(
+                code, 8, "live name resolving to a backup must be refused"
+            )
+            self.assertIn("BACKUP", out)
+            self.assertTrue((lance / "sentinel.keep").exists())
+
+    def test_second_connection_failure_is_migration_refused(self):
+        """A failure raised by the SECOND connection (the identity PRAGMA)
+        must surface as MigrationRefused guidance, not a bare traceback
+        (Multi-Stage batch-2 MEDIUM)."""
+        import tempfile
+
+        mod = _load_migrate_module()
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            lance = self._mk(tmp)
+            app_db = tmp / "app.db"
+            conn = sqlite3.connect(str(app_db))
+            conn.execute("CREATE TABLE files (id INTEGER PRIMARY KEY, status TEXT)")
+            conn.commit()
+            conn.close()
+
+            real_connect = sqlite3.connect
+            calls = {"n": 0}
+
+            def flaky_connect(*args, **kwargs):
+                calls["n"] += 1
+                if calls["n"] >= 2:  # fail only the SECOND connection
+                    raise sqlite3.OperationalError("unable to open database file")
+                return real_connect(*args, **kwargs)
+
+            mod.sqlite3.connect = flaky_connect  # type: ignore[attr-defined]
+            try:
+                with self.assertRaises(mod.MigrationRefused) as ctx:
+                    mod.run_migration(lance, app_db, force=True)
+                message = str(ctx.exception)
+                self.assertIn("not a writer lock", message)
+                self.assertIn("unable to open database file", message)
+            finally:
+                mod.sqlite3.connect = real_connect  # type: ignore[attr-defined]
+
+    def test_claims_evidence_passes_guard_and_wipes(self):
+        """The pass-through half: a schema-valid database whose rows DO claim
+        vectors (indexed) passes every refusal and the destructive run
+        completes (the reset flips the row to pending)."""
+        import tempfile
+
+        mod = _load_migrate_module()
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            lance = self._mk(tmp)
+            app_db = tmp / "app.db"
+            conn = sqlite3.connect(str(app_db))
+            conn.execute(
+                "CREATE TABLE files (id INTEGER PRIMARY KEY, status TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO files (id, status) VALUES (1, 'indexed')"
+            )
             conn.commit()
             conn.close()
             outcome = mod.run_migration(lance, app_db, force=True)
-            self.assertEqual(outcome, 0, "schema-valid DB: destructive run completes")
+            self.assertEqual(
+                outcome, 1, "claiming DB: destructive run completes (ret 1)"
+            )
             self.assertFalse(
                 (lance / "sentinel.keep").exists(),
-                "the wipe must have proceeded past the identity guard "
-                "(guard pass-through, not a refusal)",
+                "the wipe must have proceeded past every refusal",
             )
+            conn = sqlite3.connect(str(app_db))
+            status = conn.execute(
+                "SELECT status FROM files WHERE id = 1"
+            ).fetchone()[0]
+            conn.close()
+            self.assertEqual(status, "pending", "reset ran before the wipe")
 
 
 class TestCorruptDatabaseKeepsExitFive(unittest.TestCase):

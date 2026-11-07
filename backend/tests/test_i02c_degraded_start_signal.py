@@ -368,5 +368,51 @@ class TestSettingsLoadFailureDegradesTo503(unittest.TestCase):
                     delattr(real_app.state, name)
 
 
+class TestDriftGuardRuntimeErrorPropagates(unittest.TestCase):
+    """Leg D: the persisted-schema drift guard's RuntimeError must ABORT
+    startup, not boot degraded (batch-2 review F-06 — the settings-load
+    catch-all would otherwise swallow the drift contract's abort)."""
+
+    def test_runtime_error_from_loader_propagates(self):
+        from fastapi import FastAPI
+
+        import app.lifespan as lifespan_module
+        from app.lifespan import lifespan
+
+        tmp = _fresh_tmp_dir("i02c-legD-")
+        restore = _pin_lifespan_settings(tmp)
+        root, saved_handlers = _snapshot_root_handlers()
+        app = FastAPI()
+        saved_loader = lifespan_module._load_persisted_settings
+
+        def drift_guard_failure(_path: str) -> None:
+            raise RuntimeError(
+                "Persisted settings schema drift detected — refusing to load"
+            )
+
+        lifespan_module._load_persisted_settings = drift_guard_failure  # noqa: SLF001
+        aborted = False
+        try:
+
+            async def scenario():
+                async with lifespan(app):
+                    raise AssertionError("startup must not complete past drift")
+
+            try:
+                asyncio.run(scenario())
+            except RuntimeError as exc:
+                aborted = "drift" in str(exc)
+        finally:
+            lifespan_module._load_persisted_settings = saved_loader  # noqa: SLF001
+            _restore_root_handlers(root, saved_handlers)
+            restore()
+
+        self.assertTrue(
+            aborted,
+            "drift-guard RuntimeError must propagate and abort startup "
+            "(not be swallowed into degraded start)",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
