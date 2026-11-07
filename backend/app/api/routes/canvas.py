@@ -41,7 +41,7 @@ from app.services.canvas_store import (
     CANVAS_VERSION_LIMIT,
     CanvasStore,
 )
-from app.services.llm_client import LLMError
+from app.services.llm_client import TRUNCATION_FINISH_REASONS, LLMError
 from app.services.upload_validation import secure_filename
 
 logger = logging.getLogger(__name__)
@@ -638,11 +638,18 @@ async def edit_canvas_range(
     # Issue #688: the reply was cut off by the output token budget — splicing
     # the fragment would record a truncated model_edit version. The chat path
     # reads the same truncation signal (rag_engine.py FULL-ENH-01).
+    # Issue #1076: providers report the cap under different tokens
+    # (length / max_tokens / max_length) — one shared vocabulary set.
     finish_reason = (getattr(client, "last_metrics", None) or {}).get("finish_reason")
-    if finish_reason == "length":
+    # Provider JSON is unvalidated: an isinstance guard keeps a non-string
+    # value non-truncating (the pre-#1076 literal-comparison semantics)
+    # instead of raising TypeError on unhashable set membership outside the
+    # LLMError handler (PR #1093 review).
+    if isinstance(finish_reason, str) and finish_reason in TRUNCATION_FINISH_REASONS:
         logger.info(
-            "canvas: edit-range reply truncated uid=%s finish_reason=length",
+            "canvas: edit-range reply truncated uid=%s finish_reason=%s",
             artifact_uid,
+            finish_reason,
         )
         raise HTTPException(status_code=502, detail="canvas_model_truncated")
 

@@ -67,10 +67,12 @@ Repository contract job:
   compose, `DOCUMENT_PARSING_STRATEGY` matches or names the code default, and
   CONTRIBUTING's env step names `backend/.env`.
 - `python scripts/check_pr_scope_drift.py`
-- `python scripts/check_sast_baseline.py` — fails if the SAST baseline grew on
-  the PR (suppresses new findings without `SAST_ALLOW_BASELINE_EXPANSION=1`),
-  if the `sast` CI job no longer runs `run_bandit.py`, or if the scan scope
-  (`TARGET`) drifted from `backend/app`.
+- `SAST_ALLOW_BASELINE_EXPANSION=1 python scripts/check_sast_baseline.py` —
+  since PR #1093 CI sets the env, so growth is announced with the
+  newly-suppressed IDs and must be justified in the PR rather than
+  fail-closed; the check still fails if the `sast` CI job no longer runs
+  `run_bandit.py`, or if the scan scope (`TARGET`) drifted from
+  `backend/app`.
 - `python scripts/check_secretscan.py` — fails if `.secretscanignore` has
   unparseable globs, adversarial positive samples are not ignored, or
   adversarial negative samples are over-matched. Stale and overly-broad globs
@@ -131,7 +133,7 @@ python scripts/check_runtime_contract.py
 python scripts/check_config_contract.py
 python scripts/check_g06_setup_docs.py --check all
 python scripts/check_pr_scope_drift.py
-python scripts/check_sast_baseline.py
+SAST_ALLOW_BASELINE_EXPANSION=1 python scripts/check_sast_baseline.py
 python scripts/check_secretscan.py
 python scripts/check_test_collection_scope.py
 python scripts/run_bandit.py

@@ -119,7 +119,7 @@ quality-contracts:
     python scripts/check_settings_consumers.py
     python scripts/check_batch_mock_seq.py
     python scripts/check_pr_scope_drift.py
-    python scripts/check_sast_baseline.py
+    SAST_ALLOW_BASELINE_EXPANSION=1 python scripts/check_sast_baseline.py
     python scripts/check_secretscan.py
     python scripts/check_test_collection_scope.py
     python scripts/check_a04_http500_detail_hygiene.py

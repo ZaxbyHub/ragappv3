@@ -222,7 +222,7 @@ class TestAddChunksCallsOptimize:
         mock_table.add.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_existing_embedding_index_is_refreshed_after_new_rows(self):
+    async def test_existing_embedding_index_is_accepted_without_retrain_after_new_rows(self):
         """A live append onto an existing IvfPq index accepts it instead of retraining (#1065).
 
         RED at base (the append ran create_index(replace=True)); GREEN after
@@ -257,7 +257,7 @@ class TestAddChunksCallsOptimize:
         assert store._last_index_build_generation == store._index_mutation_generation
 
     @pytest.mark.asyncio
-    async def test_delete_then_add_same_row_count_still_refreshes_existing_index(self):
+    async def test_delete_then_add_same_row_count_accepts_existing_index(self):
         """Below-delta delete + add accepts the existing index without retraining (#1065).
 
         RED at base (the add-path retrain fired); GREEN after the fix: the
