@@ -2979,6 +2979,9 @@ class BackgroundProcessor:
             from . import enrichment_state as est
 
             with self.processor.pool.connection() as conn:
+                # The concatenated fragment is the module-level CASE
+                # expression; every value is a bound parameter
+                # (issues #1075/#1076).
                 cursor = conn.execute(
                     "UPDATE files SET enrichment_status = ("
                     + est.aggregate_status_case_sql()

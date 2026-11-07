@@ -1632,6 +1632,9 @@ class DocumentProcessor:
             params = params + [require_file_hash]
         try:
             async with write_session(self.pool, self._write_semaphore) as conn:
+                # The only interpolated fragments are the module-level CASE
+                # expression and the literal WHERE shapes; every value is a
+                # bound parameter (issues #1075/#1076).
                 cursor = conn.execute(
                     f"""
                     UPDATE files

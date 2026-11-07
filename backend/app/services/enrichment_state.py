@@ -444,6 +444,10 @@ def aggregate_status_case_sql() -> str:
     Correlates on ``files.id`` — the expression is evaluated per outer row of
     an ``UPDATE files ... SET enrichment_status = (<case>)`` statement and
     must never aggregate another file's stage rows.
+
+    The only interpolated fragments are the module-level
+    ENRICH_STAGE/SUCCEEDED/FAILED_PERMANENT literals; no value is dynamic
+    (issues #1075/#1076).
     """
     return f"""
 CASE

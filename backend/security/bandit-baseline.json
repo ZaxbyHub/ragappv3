@@ -36,7 +36,7 @@
       "SEVERITY.LOW": 59,
       "SEVERITY.MEDIUM": 63,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 96070,
+      "loc": 96073,
       "nosec": 0,
       "skipped_tests": 71
     },
@@ -1102,7 +1102,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 1,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 504,
+      "loc": 507,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -3584,7 +3584,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "2982                 cursor = conn.execute(\n2983                     \"UPDATE files SET enrichment_status = (\"\n2984                     + est.aggregate_status_case_sql()\n2985                     + \"), enrichment_error = NULL, enrichment_updated_at = ? \"\n",
+      "code": "2985                 cursor = conn.execute(\n2986                     \"UPDATE files SET enrichment_status = (\"\n2987                     + est.aggregate_status_case_sql()\n2988                     + \"), enrichment_error = NULL, enrichment_updated_at = ? \"\n",
       "col_offset": 20,
       "end_col_offset": 60,
       "filename": "backend/app/services/background_tasks.py",
@@ -3595,17 +3595,17 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 2983,
+      "line_number": 2986,
       "line_range": [
-        2983,
-        2984
+        2986,
+        2987
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1635                 cursor = conn.execute(\n1636                     f\"\"\"\n1637                     UPDATE files\n1638                     SET enrichment_status = {status_sql},\n1639                         enrichment_error = ?,\n1640                         enrichment_updated_at = ?\n1641                     {where}\n1642                     \"\"\",\n1643                     params,\n",
+      "code": "1638                 cursor = conn.execute(\n1639                     f\"\"\"\n1640                     UPDATE files\n1641                     SET enrichment_status = {status_sql},\n1642                         enrichment_error = ?,\n1643                         enrichment_updated_at = ?\n1644                     {where}\n1645                     \"\"\",\n1646                     params,\n",
       "col_offset": 20,
       "end_col_offset": 23,
       "filename": "backend/app/services/document_processor.py",
@@ -3616,22 +3616,22 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 1636,
+      "line_number": 1639,
       "line_range": [
-        1636,
-        1637,
-        1638,
         1639,
         1640,
         1641,
-        1642
+        1642,
+        1643,
+        1644,
+        1645
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "2417                     conn.execute(\n2418                         f\"DELETE FROM failed_chunks WHERE id IN ({placeholders})\",\n2419                         clear_ids,\n",
+      "code": "2420                     conn.execute(\n2421                         f\"DELETE FROM failed_chunks WHERE id IN ({placeholders})\",\n2422                         clear_ids,\n",
       "col_offset": 24,
       "end_col_offset": 81,
       "filename": "backend/app/services/document_processor.py",
@@ -3642,9 +3642,9 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 2418,
+      "line_number": 2421,
       "line_range": [
-        2418
+        2421
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
@@ -3772,7 +3772,7 @@
       "test_name": "try_except_pass"
     },
     {
-      "code": "447     \"\"\"\n448     return f\"\"\"\n449 CASE\n450   WHEN (SELECT COUNT(*) FROM ingestion_stage_states s\n451         WHERE s.file_id = files.id AND s.stage = '{ENRICH_STAGE}'\n452           AND s.atom_id IS NOT NULL) = 0\n453     THEN 'complete'\n454   WHEN (SELECT COUNT(*) FROM ingestion_stage_states s\n455         WHERE s.file_id = files.id AND s.stage = '{ENRICH_STAGE}'\n456           AND s.atom_id IS NOT NULL AND s.status = '{SUCCEEDED}')\n457      = (SELECT COUNT(*) FROM ingestion_stage_states s\n458         WHERE s.file_id = files.id AND s.stage = '{ENRICH_STAGE}'\n459           AND s.atom_id IS NOT NULL)\n460     THEN 'complete'\n461   WHEN (SELECT COUNT(*) FROM ingestion_stage_states s\n462         WHERE s.file_id = files.id AND s.stage = '{ENRICH_STAGE}'\n463           AND s.atom_id IS NOT NULL AND s.status = '{FAILED_PERMANENT}')\n464      = (SELECT COUNT(*) FROM ingestion_stage_states s\n465         WHERE s.file_id = files.id AND s.stage = '{ENRICH_STAGE}'\n466           AND s.atom_id IS NOT NULL)\n467     THEN 'error'\n468   ELSE 'partial'\n469 END\n470 \"\"\"\n471 \n",
+      "code": "451     \"\"\"\n452     return f\"\"\"\n453 CASE\n454   WHEN (SELECT COUNT(*) FROM ingestion_stage_states s\n455         WHERE s.file_id = files.id AND s.stage = '{ENRICH_STAGE}'\n456           AND s.atom_id IS NOT NULL) = 0\n457     THEN 'complete'\n458   WHEN (SELECT COUNT(*) FROM ingestion_stage_states s\n459         WHERE s.file_id = files.id AND s.stage = '{ENRICH_STAGE}'\n460           AND s.atom_id IS NOT NULL AND s.status = '{SUCCEEDED}')\n461      = (SELECT COUNT(*) FROM ingestion_stage_states s\n462         WHERE s.file_id = files.id AND s.stage = '{ENRICH_STAGE}'\n463           AND s.atom_id IS NOT NULL)\n464     THEN 'complete'\n465   WHEN (SELECT COUNT(*) FROM ingestion_stage_states s\n466         WHERE s.file_id = files.id AND s.stage = '{ENRICH_STAGE}'\n467           AND s.atom_id IS NOT NULL AND s.status = '{FAILED_PERMANENT}')\n468      = (SELECT COUNT(*) FROM ingestion_stage_states s\n469         WHERE s.file_id = files.id AND s.stage = '{ENRICH_STAGE}'\n470           AND s.atom_id IS NOT NULL)\n471     THEN 'error'\n472   ELSE 'partial'\n473 END\n474 \"\"\"\n475 \n",
       "col_offset": 11,
       "end_col_offset": 3,
       "filename": "backend/app/services/enrichment_state.py",
@@ -3783,12 +3783,8 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 448,
+      "line_number": 452,
       "line_range": [
-        448,
-        449,
-        450,
-        451,
         452,
         453,
         454,
@@ -3807,7 +3803,11 @@
         467,
         468,
         469,
-        470
+        470,
+        471,
+        472,
+        473,
+        474
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
@@ -4005,46 +4005,6 @@
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
-    },
-    {
-      "code": "205         }, sort_keys=True)\n206         return f\"query_transform:{hashlib.md5(key_data.encode()).hexdigest()}\"\n207 \n",
-      "col_offset": 34,
-      "end_col_offset": 64,
-      "filename": "backend/app/services/query_transformer.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 327,
-        "link": "https://cwe.mitre.org/data/definitions/327.html"
-      },
-      "issue_severity": "HIGH",
-      "issue_text": "Use of weak MD5 hash for security. Consider usedforsecurity=False",
-      "line_number": 206,
-      "line_range": [
-        206
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b324_hashlib.html",
-      "test_id": "B324",
-      "test_name": "hashlib"
-    },
-    {
-      "code": "585         )\n586         return f\"query_plan:{hashlib.md5(key_data.encode()).hexdigest()}\"\n587 \n",
-      "col_offset": 29,
-      "end_col_offset": 59,
-      "filename": "backend/app/services/query_transformer.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 327,
-        "link": "https://cwe.mitre.org/data/definitions/327.html"
-      },
-      "issue_severity": "HIGH",
-      "issue_text": "Use of weak MD5 hash for security. Consider usedforsecurity=False",
-      "line_number": 586,
-      "line_range": [
-        586
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b324_hashlib.html",
-      "test_id": "B324",
-      "test_name": "hashlib"
     },
     {
       "code": "1668         token_pack_stats: Dict[str, int] = {\n1669             \"token_pack_included\": 0,\n1670             \"token_pack_skipped\": 0,\n1671             \"token_pack_truncated\": 0,\n1672         }\n1673         # ------------------------------------------------------------------\n1674         # FR-002 part 2: Multi-sub-query orchestration \u2014 fan out independent\n",
@@ -4522,26 +4482,6 @@
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
-    },
-    {
-      "code": "176         # specific query without persisting the query text itself.\n177         query_hash = hashlib.sha1(query.encode(\"utf-8\")).hexdigest()[:12]\n178         data[\"original_query\"] = f\"<redacted len={len(query)} hash={query_hash}>\"\n",
-      "col_offset": 21,
-      "end_col_offset": 56,
-      "filename": "backend/app/services/rag_trace.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 327,
-        "link": "https://cwe.mitre.org/data/definitions/327.html"
-      },
-      "issue_severity": "HIGH",
-      "issue_text": "Use of weak SHA1 hash for security. Consider usedforsecurity=False",
-      "line_number": 177,
-      "line_range": [
-        177
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b324_hashlib.html",
-      "test_id": "B324",
-      "test_name": "hashlib"
     },
     {
       "code": "25     rows = db.execute(\n26         f\"SELECT id FROM files WHERE vault_id = ? AND id IN ({placeholders})\",\n27         (vault_id, *file_ids),\n",
