@@ -641,7 +641,10 @@ def run_migration(
             reset/wipe (dry runs included): missing, no ``files`` table, a
             ``files`` table without the application's core columns, an
             obvious backup copy, or vector-claiming rows that share no file
-            id with a non-empty index's chunks. A database with no
+            id with a non-empty index's chunks. These are heuristics,
+            not identity: a byte-identical copy of the live database, or a
+            foreign deployment's database whose autoincrement ids overlap
+            the index's, passes them. A database with no
             vector-claiming rows
             gets a loud wrong-database WARNING on the destructive path and
             dry-run.
