@@ -10,7 +10,8 @@ files table). Collated by explicit user instruction.
 - **`scripts/migrate_embeddings.py` — the wipe preserves the previous index
   (AC1, #1094).** `_wipe_lancedb` no longer `shutil.rmtree`s the LanceDB
   directory: `_preserve_as_rollback` renames it to a timestamped sibling
-  (`lancedb.rollback-YYYYMMDD-HHMMSS`), the rollback path is logged BEFORE the
+  (`<index-dir-name>.rollback-YYYYMMDD-HHMMSS`), the rollback path is logged
+  BEFORE the
   live directory is recreated (so a recreation failure still names the
   recovery location) and printed in the run summary, and a same-second name
   collision appends `-1`..`-5` before refusing. An empty index directory is
@@ -35,10 +36,14 @@ files table). Collated by explicit user instruction.
 - **`scripts/reset_embeddings.py` — preflight refusal taxonomy (AC1+AC2,
   #1080).** New `_assert_application_database` runs before
   `get_db_connection` (a bare `sqlite3.connect` CREATES a missing file) and
-  before any wipe, mirroring the migrate guard's exit-8 taxonomy: missing
-  file, directory-as-path, lock-shaped `OperationalError` (stop-the-app
-  guidance), other open failures (permissions/corrupt header), `DatabaseError`
-  (restore guidance), no `files` table, and a `files` table without the core
+  before any wipe, mirroring the migrate guard's exit-8 database-shape
+  taxonomy: missing file, directory-as-path, backup-named paths (the same
+  name/parent tokens migrate refuses), lock-shaped or permission
+  `OperationalError` while OPENING the database (stop-the-app /
+  check-permissions guidance — a live writer already holding the database
+  surfaces at the reset step as a locked error, with the index untouched),
+  corruption, `DatabaseError` (restore guidance), no `files` table, and a
+  `files` table without the core
   `id`/`status` columns — each refused with `SystemExit(8)` naming both the
   database path and the LanceDB path. Executed Phase-2 probes FALSIFIED the
   issue's stated wipe mechanism at master (no-table/missing-DB legs crashed at
@@ -57,6 +62,18 @@ files table). Collated by explicit user instruction.
   same shape as #1094's migrate case) reset its wrong rows and wiped the live
   index with "[3/3] Migration complete" at master; it now leaves a recoverable
   rollback sibling. Recoverability, not detection.
+- **Both scripts — feedback-round guard additions.** Reset's preflight also
+  refuses backup-named database paths; both scripts refuse a
+  symlinked/junctioned index path BEFORE the reset commits (the rename would
+  move the link, not the index); an unreadable index directory is refused
+  with the state-aware message instead of crashing with a raw
+  `PermissionError` after the reset; and the migrate run summary states the
+  replacement truthfully when the index directory is absent or already
+  empty. Exit 8 is dual-use on reset (preflight refusals AND post-reset
+  preservation failures); migrate's equivalent preservation failures exit 5.
+  Rollback directories hold the previous index's full contents (including
+  all document chunk text), are NOT covered by in-app document/vault
+  deletion, and accumulate one full-size copy per run.
 - **Docs.** Migrate module docstring and README: the "irreversible /
   mid-wipe / `--force` to finish deletion" language is replaced by the
   rename/recreate failure and recovery semantics; exit 5 now includes the
@@ -76,8 +93,12 @@ refusal with a disjoint-DB exit-8 control leg) and
 `backend/tests/test_reset_embeddings_refusal.py` (clean `SystemExit(8)`
 refusals naming both paths, no sqlite traceback, no stray database file,
 index survives). Supplementary `backend/tests/test_operator_wipe_rollback_hardening.py`
-(20 legs, including the reset-side same-second-collision and recreation-failure twins
-added in the implementation-review round): R3 recoverability, minimal-schema reset, core-column refusal,
+(33 legs at the feedback head; the feedback round added 13: backup-path,
+link + dry-run-link, index-inspection guards, truthful summary, exhaustion,
+re-run/rename-back recovery, permission arm, close-tracking stream,
+non-sqlite-stream boundary, and the lance-query inner handler; the
+implementation-review round added the reset-side same-second-collision and
+recreation-failure twins): R3 recoverability, minimal-schema reset, core-column refusal,
 preflight taxonomy (directory/corrupt/lock), D2 boundary legs (mid-stream
 no-hit, `DatabaseError`, CLI exit 5, iterator closure, lance-side `None`
 control), rename collision/rename-failure/recreation-failure for both

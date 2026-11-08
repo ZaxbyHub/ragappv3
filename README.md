@@ -503,7 +503,8 @@ re-index requirement.)
 One caveat: the job only re-embeds files whose status is `indexed` or `error`.
 A store with no such rows reports `completed` with `"processed": 0` **without**
 recording an identity, so the 503 persists and re-running changes nothing — in
-that case use the offline migration script below, which wipes the index (the
+that case use the offline migration script below, which replaces the index
+(keeping a timestamped rollback copy of the previous one — see below; the
 next start records the identity on the fresh table).
 
 ### Embedding Dimension Change (Harrier Migration)
@@ -556,10 +557,15 @@ docker compose start knowledgevault
 The background processor automatically re-embeds all files with `status='pending'`.
 Depending on the number of documents and your hardware, this may take several minutes.
 
-Rollback directories (`lancedb.rollback-YYYYMMDD-HHMMSS`) accumulate next to
-the live index until you remove them manually once the rebuilt index is
-verified (`scripts/cleanup_backups.py` does not manage them), and rebuilding
-temporarily needs space for BOTH indexes.
+Rollback directories (`<index-dir-name>.rollback-YYYYMMDD-HHMMSS` — e.g.
+`lancedb.rollback-...` when the directory is named `lancedb`) accumulate next
+to the live index until you remove them manually once the rebuilt index is
+verified (`scripts/cleanup_backups.py` does not manage them). A rollback
+directory holds the previous index's full contents — including all document
+chunk text — is NOT covered by in-app document/vault deletion, and each
+migration/reset run leaves one more full-size copy, so rebuilding temporarily
+needs space for BOTH indexes and repeated runs grow the volume until you
+delete the rollback directories yourself.
 
 If a migration run is interrupted (crash, Ctrl-C, lock error), re-run the
 script **before** restarting the application: after the status reset, an app
@@ -619,6 +625,20 @@ curl -H "X-API-Key: ${HEALTH_CHECK_API_KEY:?set HEALTH_CHECK_API_KEY}" \
 > documented re-run after an interrupted migration). Pass `--force` to
 > override exits 3 and 4 only; the lock/corruption/wrong-path refusals
 > (5, 6, 7 and 8) always stop the run.
+>
+> `scripts/reset_embeddings.py` (configured via `DATA_DIR`; no CLI flags)
+> refuses with **exit 8** — naming both the SQLite path and the LanceDB
+> path — when the configured database cannot be the application database:
+> missing, a directory, an obvious backup copy (`app.db.bak`, a
+> `backups/` parent — the same tokens migrate refuses), a lock-shaped or
+> permission failure while opening it, corruption, no `files` table, or a
+> `files` table without the core `id`/`status` columns. A live writer
+> that already holds the database is NOT caught at the door: it surfaces
+> at the reset step as a locked error (raw traceback, exit 1) with the
+> index untouched — stop the application first. Exit 8 is dual-use: after
+> the reset commits, a rollback preservation failure (rename/recreate)
+> also exits 8 and names the rollback copy; migrate's equivalent
+> preservation failures exit 5 through `main()`.
 
 ---
 

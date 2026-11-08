@@ -5,21 +5,30 @@ Unfrozen companion to the frozen checks (test_migrate_embeddings_rollback.py,
 test_reset_embeddings_refusal.py): this module pins the plan-approved
 semantics beyond the issue ACs (plan-critic round 1) — rename mechanics,
 reset preflight taxonomy, D2 probe boundary legs, the R3 recoverability
-window, and the 4.2 source-contract guardrail. All legs are RED at the
-pre-fix tree and GREEN after the fix unless noted.
+window, and the 4.2 source-contract guardrail. Most legs are RED at the
+pre-fix tree and GREEN after the fix; THREE legs are GREEN AT BOTH ENDS
+by design (controls, verified by a base-worktree run at 01084c06:
+30 failed / 3 passed): test_probe_lance_side_unreadable_is_still_no_evidence,
+test_migrate_empty_index_dir_creates_no_rollback, and
+test_probe_lance_query_failure_is_no_evidence (the pre-fix outer handler
+also returned the documented None). Most Group-7 legs pin contracts that
+only exist at the fixed tree; the issues' RED-at-base certification lives
+in the frozen check files.
 """
 
 import importlib.util
 import io
 import logging
+import os
 import re
 import sqlite3
+import subprocess
 import sys
 import types
 from contextlib import redirect_stdout
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -203,7 +212,10 @@ def test_reset_missing_core_column_refuses(tmp_path, monkeypatch):
     out, raised = _run_reset(monkeypatch, db_path, lancedb_dir)
 
     assert isinstance(raised, SystemExit) and raised.code == 8, f"raised={raised!r}"
-    assert "ERROR" in out and str(db_path) in out and str(lancedb_dir) in out
+    refusal_block = out.split("ERROR:", 1)[-1] if "ERROR:" in out else ""
+    assert str(db_path) in refusal_block and str(lancedb_dir) in refusal_block, (
+        "the refusal block itself must name both paths, not the startup banner"
+    )
     assert marker.exists()
 
 
@@ -223,7 +235,10 @@ def test_reset_directory_as_database_refuses(tmp_path, monkeypatch):
     out, raised = _run_reset(monkeypatch, db_path, lancedb_dir)
 
     assert isinstance(raised, SystemExit) and raised.code == 8, f"raised={raised!r}"
-    assert "ERROR" in out and str(db_path) in out and str(lancedb_dir) in out
+    refusal_block = out.split("ERROR:", 1)[-1] if "ERROR:" in out else ""
+    assert str(db_path) in refusal_block and str(lancedb_dir) in refusal_block, (
+        "the refusal block itself must name both paths, not the startup banner"
+    )
     assert marker.exists()
 
 
@@ -238,7 +253,10 @@ def test_reset_corrupt_database_refuses(tmp_path, monkeypatch):
     out, raised = _run_reset(monkeypatch, db_path, lancedb_dir)
 
     assert isinstance(raised, SystemExit) and raised.code == 8, f"raised={raised!r}"
-    assert "ERROR" in out
+    refusal_block = out.split("ERROR:", 1)[-1] if "ERROR:" in out else ""
+    assert str(db_path) in refusal_block and str(lancedb_dir) in refusal_block, (
+        "the refusal block itself must name both paths, not the startup banner"
+    )
     assert marker.exists()
 
 
@@ -287,22 +305,58 @@ def _broken_stream(raise_after=None, exc=sqlite3.OperationalError("database is l
 
 def test_probe_midstream_sqlite_failure_after_misses_refuses(tmp_path):
     """A stream that misses on batch 1 then dies on batch 2 must REFUSE (the
-    pre-fix code swallowed this into None -> pass)."""
+    pre-fix code swallowed this into None -> pass). The stream is a plain
+    object the TEST never closes, so only production's ``finally`` can
+    record the close — the earlier generator fixture's own ``finally`` made
+    the close assertion vacuous (implementation-review round 1)."""
     _require_real_engine()
     lance = tmp_path / "lancedb"
     _make_chunks_index(lance, range(1, 101))
-    gen = _broken_stream(raise_after=1)
-    closed = []
 
-    def tracking_gen(p):
-        try:
-            yield from gen(p)
-        finally:
-            closed.append(True)
+    class _CloseTrackingStream:
+        """Batches ["901"], ["902"], then a SQLite-layer failure. close()
+        is ONLY called by production's finally."""
 
+        def __init__(self):
+            self.close_calls = []
+            self._it = iter([["901"], ["902"]])
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            try:
+                return next(self._it)
+            except StopIteration:
+                raise sqlite3.OperationalError("database is locked") from None
+
+        def close(self):
+            self.close_calls.append(True)
+
+    stream = _CloseTrackingStream()
     with pytest.raises(mig.MigrationRefused):
-        mig._index_shares_claimed_ids(lance, tracking_gen(tmp_path / "app.db"))
-    assert closed == [True], "batch iterator not closed on refusal"
+        mig._index_shares_claimed_ids(lance, stream)
+    assert stream.close_calls == [True], (
+        "production's finally did not close the batch iterator on refusal"
+    )
+
+
+def test_probe_non_sqlite_stream_error_propagates(tmp_path):
+    """A NON-sqlite error from the id stream is a programming error: it
+    propagates (never swallowed into the documented None, never converted
+    to MigrationRefused) — pins the outer handler's boundary (bot-review
+    F-10 mutation-survivor: widening except sqlite3.Error to Exception
+    would fail this leg)."""
+    _require_real_engine()
+    lance = tmp_path / "lancedb"
+    _make_chunks_index(lance, range(1, 101))
+
+    def bad_stream(_sqlite_path):
+        raise ValueError("not a sqlite failure")
+        yield  # pragma: no cover - makes this a generator function
+
+    with pytest.raises(ValueError):
+        mig._index_shares_claimed_ids(lance, bad_stream(tmp_path / "app.db"))
 
 
 def test_probe_database_error_from_stream_refuses(tmp_path):
@@ -320,6 +374,7 @@ def test_probe_database_error_from_stream_refuses(tmp_path):
 def test_probe_lance_side_unreadable_is_still_no_evidence(tmp_path):
     """The other half of the AC2 contract: an index the installed lancedb
     cannot read keeps its documented None (never a refusal)."""
+    _require_real_engine()
     lance = tmp_path / "lancedb"
     lance.mkdir()
     (lance / "chunks.lance").write_bytes(b"garbage")  # unreadable lance dir
@@ -517,6 +572,9 @@ def test_reset_recreation_failure_names_preserved_rollback(tmp_path, monkeypatch
 
     assert isinstance(raised, SystemExit) and raised.code == 8, f"raised={raised!r}"
     assert "PRESERVED at" in out
+    assert out.index("Preserved previous index as rollback directory") < out.index(
+        "ERROR:"
+    ), "rollback name printed after the refusal (print-before-mkdir unpinned)"
     assert "[3/3] Migration complete" not in out, "success summary printed on refusal"
     rollbacks = [p for p in tmp_path.iterdir() if re.fullmatch(_ROLLBACK_RE, p.name)]
     assert rollbacks and (rollbacks[0] / "sentinel.marker").exists(), (
@@ -532,11 +590,16 @@ def test_reset_recreation_failure_names_preserved_rollback(tmp_path, monkeypatch
 
 def test_no_rmtree_in_operator_wipe_scripts():
     """The destructive path must preserve, not delete: neither operator wipe
-    script may use shutil.rmtree (RED at the pre-fix tree)."""
+    script may use shutil.rmtree in ANY import form (RED at the pre-fix
+    tree; the import-form pin closes the `from shutil import rmtree`
+    bypass, bot-review F-11)."""
     for script in ("migrate_embeddings.py", "reset_embeddings.py"):
         source = (_REPO_ROOT / "scripts" / script).read_text(encoding="utf-8")
         assert "shutil.rmtree" not in source, f"{script} still deletes via rmtree"
         assert "import shutil" not in source, f"{script} still imports shutil"
+        assert "from shutil import" not in source, (
+            f"{script} imports from shutil (bypasses the module-import pin)"
+        )
 
 
 def test_reset_preflight_runs_before_any_connection():
@@ -572,3 +635,329 @@ def test_reset_preflight_runs_before_any_connection():
     assert positions["preflight_call"] < positions["first_connection"], (
         "preflight must precede the first connection"
     )
+
+
+# ---------------------------------------------------------------------------
+# Group 7 — feedback round (pr1095-20261107): guards + truthful messages
+#
+# Several legs below pin contracts that only exist at the FIXED tree (the
+# pre-fix tree could not even reach these states — base raised unhandled
+# errors or lacked the guards entirely); the RED-at-base certification for
+# the issues' ACs lives in the frozen check files, replayed by repro-check.
+# ---------------------------------------------------------------------------
+
+
+def _make_link(target: Path, link: Path) -> bool:
+    """Create a directory link: a junction on Windows (no privilege needed),
+    a symlink elsewhere. Returns False when neither is creatable."""
+    if sys.platform == "win32":
+        proc = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            capture_output=True,
+        )
+        return proc.returncode == 0
+    try:
+        os.symlink(target, link)
+        return True
+    except OSError:
+        return False
+
+
+def test_reset_backup_named_database_refuses(tmp_path, monkeypatch):
+    """PRR-002: a backup-named database (app.db.bak) is refused with the
+    migrate guard's taxonomy BEFORE any reset or wipe (the base script had
+    no backup guard at all)."""
+    db_path = tmp_path / "app.db.bak"
+    _make_files_db(db_path, [(1, "doc.txt", "indexed", 5, None, None)])
+    lancedb_dir = tmp_path / "lancedb"
+    lancedb_dir.mkdir()
+    marker = lancedb_dir / "sentinel.marker"
+    marker.write_text("x", encoding="utf-8")
+
+    out, raised = _run_reset(monkeypatch, db_path, lancedb_dir)
+
+    assert isinstance(raised, SystemExit) and raised.code == 8, f"raised={raised!r}"
+    refusal_block = out.split("ERROR:", 1)[-1] if "ERROR:" in out else ""
+    assert "BACKUP copy" in refusal_block
+    assert str(db_path) in refusal_block and str(lancedb_dir) in refusal_block
+    assert marker.exists(), "index not preserved across the refusal"
+    assert _files_rows(db_path) == [(1, "indexed", 5)], "backup rows were reset"
+    assert not any(
+        re.fullmatch(_ROLLBACK_RE, p.name) for p in tmp_path.iterdir()
+    ), "rollback artifact created despite the refusal"
+
+
+def test_migrate_link_guard_refuses_before_reset(tmp_path):
+    """PRR-015: a symlinked/junctioned index path is refused BEFORE the
+    SQLite reset commits (the rename would move the LINK, not the index;
+    base's rmtree refused links the same way)."""
+    real_dir = tmp_path / "real-index"
+    real_dir.mkdir()
+    (real_dir / "chunks.lance").mkdir()
+    link = tmp_path / "lancedb"
+    if not _make_link(real_dir, link):
+        pytest.skip("cannot create a symlink/junction on this host")
+    db_path = tmp_path / "app.db"
+    _make_files_db(db_path, [(1, "doc.txt", "indexed", 5, None, None)])
+
+    ret, out, exc = _capture_migrate(
+        lancedb_path=link, sqlite_path=db_path, dry_run=False, force=True)
+
+    assert isinstance(exc, SystemExit) and exc.code == 8, f"exc={exc!r}"
+    assert "symlink or junction" in out and "Nothing was migrated" in out
+    assert _files_rows(db_path) == [(1, "indexed", 5)], "rows reset despite the refusal"
+    assert real_dir.exists() and (real_dir / "chunks.lance").exists(), "target disturbed"
+    assert not any(
+        re.fullmatch(r"lancedb\.rollback-\d{8}-\d{6}.*", p.name)
+        for p in tmp_path.iterdir()
+    ), "rollback artifact created despite the refusal"
+
+
+def test_reset_link_guard_refuses_before_reset(tmp_path, monkeypatch):
+    """PRR-015 (reset twin): the link refusal fires BEFORE the status
+    reset — rows keep claiming vectors."""
+    real_dir = tmp_path / "real-index"
+    real_dir.mkdir()
+    marker = real_dir / "chunks.marker"
+    marker.write_text("x", encoding="utf-8")
+    link = tmp_path / "lancedb"
+    if not _make_link(real_dir, link):
+        pytest.skip("cannot create a symlink/junction on this host")
+    db_path = tmp_path / "app.db"
+    _make_files_db(db_path, [(1, "doc.txt", "indexed", 5, None, None)])
+
+    out, raised = _run_reset(monkeypatch, db_path, link)
+
+    assert isinstance(raised, SystemExit) and raised.code == 8, f"raised={raised!r}"
+    assert "symlink or junction" in out and "Nothing was reset or renamed" in out
+    assert _files_rows(db_path) == [(1, "indexed", 5)], "rows reset despite the refusal"
+    assert marker.exists(), "link target disturbed"
+
+
+def test_migrate_iterdir_permission_refuses(tmp_path):
+    """Copilot 4504200757: an unreadable index directory must refuse with
+    the state-aware message, not crash with a raw PermissionError after the
+    reset committed."""
+    _require_real_engine()
+    lance = tmp_path / "lancedb"
+    _make_chunks_index(lance, [1])
+    db_path = tmp_path / "app.db"
+    _make_files_db(db_path, [(1, "doc.txt", "indexed", 5, None, None)])
+    original_iterdir = Path.iterdir
+
+    def denied_iterdir(self):
+        if self == lance:
+            raise PermissionError("access denied")
+        return original_iterdir(self)
+
+    with patch.object(Path, "iterdir", denied_iterdir):
+        ret, out, exc = _capture_migrate(
+            lancedb_path=lance, sqlite_path=db_path, dry_run=False, force=True)
+    # The probe fires at the pre-reset warning site: NOTHING has changed.
+    assert isinstance(exc, SystemExit) and exc.code == 8, f"exc={exc!r}"
+    assert "could not inspect" in out and "Nothing was migrated" in out
+    assert _files_rows(db_path) == [(1, "indexed", 5)], "rows reset despite the refusal"
+    assert (lance / "chunks.lance").exists(), "index disturbed"
+
+
+def test_reset_iterdir_permission_refuses(tmp_path, monkeypatch):
+    """Copilot 4504200778 (reset twin)."""
+    db_path = tmp_path / "app.db"
+    _make_files_db(db_path, [(1, "doc.txt", "indexed", 5, None, None)])
+    lancedb_dir = tmp_path / "lancedb"
+    lancedb_dir.mkdir()
+    marker = lancedb_dir / "sentinel.marker"
+    marker.write_text("x", encoding="utf-8")
+    monkeypatch.setattr(
+        rst, "settings", types.SimpleNamespace(
+            sqlite_path=str(db_path), lancedb_path=str(lancedb_dir))
+    )
+    original_iterdir = Path.iterdir
+
+    def denied_iterdir(self):
+        if self == lancedb_dir:
+            raise PermissionError("access denied")
+        return original_iterdir(self)
+
+    buf = io.StringIO()
+    raised = None
+    with patch.object(Path, "iterdir", denied_iterdir):
+        try:
+            with redirect_stdout(buf):
+                rst.reset_all_embeddings()
+        except BaseException as exc:  # noqa: BLE001 - probe captures everything
+            raised = exc
+    assert isinstance(raised, SystemExit) and raised.code == 8, f"raised={raised!r}"
+    assert "could not inspect" in buf.getvalue()
+    assert marker.exists(), "index disturbed"
+
+
+def test_migrate_summary_truthful_on_empty_dir(tmp_path):
+    """PRR-011: the run summary never claims a replacement that did not
+    happen (empty index directory is left as-is)."""
+    lance = tmp_path / "lancedb"
+    lance.mkdir()  # exists, empty
+    db_path = tmp_path / "app.db"
+    _make_files_db(db_path, [(1, "doc.txt", "indexed", 5, None, None)])
+    ret, out, exc = _capture_migrate(
+        lancedb_path=lance, sqlite_path=db_path, dry_run=False, force=True)
+    assert exc is None
+    assert "no (index directory absent or already empty)" in out, out[-600:]
+    assert "replaced     : yes" not in out
+
+
+
+
+def test_migrate_exhaustion_refusal_discloses_reset(tmp_path):
+    """PRR-009: when all six rollback names are taken, the refusal carries
+    the committed-reset disclosure (the sibling arms have it)."""
+    _require_real_engine()
+    lance = tmp_path / "lancedb"
+    _make_chunks_index(lance, [1])
+    db_path = tmp_path / "app.db"
+    _make_files_db(db_path, [(1, "doc.txt", "indexed", 5, None, None)])
+    stamp = datetime(2026, 11, 7, 12, 0, 0)
+    with patch.object(mig, "datetime", _FixedClock(stamp)):
+        for suffix in ("", "-1", "-2", "-3", "-4", "-5"):
+            (tmp_path / ("lancedb.rollback-20261107-120000" + suffix)).mkdir()
+        ret, out, exc = _capture_migrate(
+            lancedb_path=lance, sqlite_path=db_path, dry_run=False, force=True)
+    assert isinstance(exc, mig.MigrationRefused), f"exc={exc!r}"
+    assert "ALREADY committed" in str(exc)
+    assert (lance / "chunks.lance").exists(), "index disturbed"
+
+
+def test_migrate_rerun_after_recreate_failure_is_noop(tmp_path):
+    """PRR-001: pins the truthful outcome the recreation-failure refusal now
+    describes — a plain re-run does NOT repair the state (live dir stays
+    absent; the rollback copy is the recovery)."""
+    _require_real_engine()
+    lance = tmp_path / "lancedb"
+    _make_chunks_index(lance, [1])
+    db_path = tmp_path / "app.db"
+    _make_files_db(db_path, [(1, "doc.txt", "indexed", 5, None, None)])
+
+    def broken_mkdir(self, parents=False, exist_ok=False):
+        raise OSError("disk full")
+
+    with patch.object(Path, "mkdir", broken_mkdir):
+        ret, out, exc = _capture_migrate(
+            lancedb_path=lance, sqlite_path=db_path, dry_run=False, force=True)
+    assert isinstance(exc, mig.MigrationRefused)
+    assert "A plain re-run WITHOUT restoring the directory" in str(exc)
+    rollbacks = [p for p in tmp_path.iterdir() if re.fullmatch(_ROLLBACK_RE, p.name)]
+    assert rollbacks, "no rollback sibling after the recreate failure"
+
+    ret2, out2, exc2 = _capture_migrate(
+        lancedb_path=lance, sqlite_path=db_path, dry_run=False, force=True)
+    assert exc2 is None and ret2 == 0, f"re-run: ret={ret2!r} exc={exc2!r}"
+    assert not lance.exists(), "re-run silently restored the directory"
+    assert rollbacks[0].exists(), "rollback copy disturbed by the re-run"
+
+
+def test_migrate_rename_back_then_rerun_repairs(tmp_path):
+    """PRR-001's documented recovery: rename the rollback directory back,
+    then re-run — the migration completes for real."""
+    _require_real_engine()
+    lance = tmp_path / "lancedb"
+    _make_chunks_index(lance, [1])
+    db_path = tmp_path / "app.db"
+    _make_files_db(db_path, [(1, "doc.txt", "indexed", 5, None, None)])
+
+    def broken_mkdir(self, parents=False, exist_ok=False):
+        raise OSError("disk full")
+
+    with patch.object(Path, "mkdir", broken_mkdir):
+        ret, out, exc = _capture_migrate(
+            lancedb_path=lance, sqlite_path=db_path, dry_run=False, force=True)
+    assert isinstance(exc, mig.MigrationRefused)
+    rollbacks = [p for p in tmp_path.iterdir() if re.fullmatch(_ROLLBACK_RE, p.name)]
+    rollbacks[0].rename(lance)  # the documented recovery step
+
+    ret2, out2, exc2 = _capture_migrate(
+        lancedb_path=lance, sqlite_path=db_path, dry_run=False, force=True)
+    assert exc2 is None, f"re-run: ret={ret2!r} exc={exc2!r}"
+    assert "Migration complete" in out2
+    assert "replaced     : yes" in out2, out2[-600:]
+    assert lance.exists() and not (lance / "chunks.lance").exists(), "live dir not recreated"
+
+
+def test_reset_permission_arm_gives_permission_remedy(tmp_path, monkeypatch):
+    """PRR-008: a NON-lock open failure routes to the permission remedy, not
+    the stop-the-app advice."""
+    db_path = tmp_path / "app.db"
+    _make_files_db(db_path, [(1, "doc.txt", "indexed", 5, None, None)])
+    lancedb_dir = tmp_path / "lancedb"
+    lancedb_dir.mkdir()
+    real_connect = sqlite3.connect
+
+    def denied_connect(*args, **kwargs):
+        if args and str(args[0]) == str(db_path):
+            raise sqlite3.OperationalError("attempt to write a readonly database")
+        return real_connect(*args, **kwargs)
+
+    with patch.object(rst.sqlite3, "connect", denied_connect):
+        out, raised = _run_reset(monkeypatch, db_path, lancedb_dir)
+    assert isinstance(raised, SystemExit) and raised.code == 8, f"raised={raised!r}"
+    refusal_block = out.split("ERROR:", 1)[-1]
+    assert "not a writer lock" in refusal_block
+    assert "stop knowledgevault" not in refusal_block
+
+
+def test_probe_lance_query_failure_is_no_evidence(tmp_path):
+    """bot-review F-10: the lance QUERY handler (inner) keeps its documented
+    None even when connect/table checks succeed but the search itself
+    fails — the outer connect handler is tested by
+    test_probe_lance_side_unreadable_is_still_no_evidence."""
+    lance = tmp_path / "lancedb"
+    (lance / "chunks.lance").mkdir(parents=True)
+
+    fake_ldb = MagicMock()
+    fake_db = fake_ldb.connect.return_value
+    fake_db.table_names.return_value = ["chunks"]
+    fake_tbl = fake_db.open_table.return_value
+    fake_tbl.schema.names = ["file_id"]
+    fake_tbl.count_rows.return_value = 1
+    fake_tbl.search.return_value.where.return_value.select.return_value.\
+        limit.return_value.to_arrow.side_effect = RuntimeError("lance boom")
+
+    def gen(_p):
+        yield ["1"]
+
+    saved = sys.modules.get("lancedb")
+    sys.modules["lancedb"] = fake_ldb
+    try:
+        result = mig._index_shares_claimed_ids(lance, gen(None))
+    finally:
+        if saved is None:
+            sys.modules.pop("lancedb", None)
+        else:
+            sys.modules["lancedb"] = saved
+    assert result is None
+    assert fake_tbl.search.called, (
+        "the leg must reach the lance QUERY (the inner handler), not return "
+        "at the table-names check"
+    )
+
+
+def test_migrate_dry_run_over_link_refuses(tmp_path):
+    """Delta-review R2: a --dry-run over a symlinked/junctioned index path
+    must refuse like the live run — a dry run that predicts a replacement
+    the live run would refuse is the misleading report the preflight
+    refusals exist to prevent."""
+    real_dir = tmp_path / "real-index"
+    real_dir.mkdir()
+    (real_dir / "chunks.lance").mkdir()
+    link = tmp_path / "lancedb"
+    if not _make_link(real_dir, link):
+        pytest.skip("cannot create a symlink/junction on this host")
+    db_path = tmp_path / "app.db"
+    _make_files_db(db_path, [(1, "doc.txt", "indexed", 5, None, None)])
+
+    ret, out, exc = _capture_migrate(
+        lancedb_path=link, sqlite_path=db_path, dry_run=True, force=True)
+
+    assert isinstance(exc, SystemExit) and exc.code == 8, f"exc={exc!r}"
+    assert "symlink or junction" in out and "Nothing was migrated" in out
+    assert "Would preserve" not in out, "dry-run predicted a refused replacement"
+    assert real_dir.exists() and (real_dir / "chunks.lance").exists()
