@@ -50,12 +50,14 @@ def _requirepass_token() -> str:
     assert "--requirepass" in cmd, "redis command must carry --requirepass"
     token = cmd[cmd.index("--requirepass") + 1]
     assert token, "--requirepass value must be present"
-    # ${VAR} bare resolves empty when unset (crash-loops redis); ${VAR:-x}
-    # must carry a non-empty default x.
-    m = re.fullmatch(r"\$\{[A-Z][A-Z0-9_]*(?::-([^}]*))?\}", token)
-    if m:
-        default = m.group(1)
-        assert default, "--requirepass default must be non-empty (an empty value crash-loops redis)"
+    # STRICT FORM: every credential site must use ${VAR:-nonempty-default}.
+    # Rejected: ${VAR} bare and unbraced $VAR (resolve empty when unset ->
+    # crash-loop redis), ${VAR-default} (single dash resolves empty the same
+    # way), and empty defaults.
+    assert re.fullmatch(r"\$\{[A-Z][A-Z0-9_]*:-[^}]+\}", token), (
+        "--requirepass must use the ${VAR:-nonempty} form "
+        f"(got {token!r}; unset-empty forms crash-loop redis)"
+    )
     return token
 
 

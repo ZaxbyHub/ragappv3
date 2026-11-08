@@ -423,16 +423,26 @@ fi
 # explicitly, e.g. `export REDIS_URL=redis://localhost:6379/0` — the
 # credential-bearing default below only fits the bundled compose stack.
 
-# Load the project .env when present (compose reads the same file).
+# Load the project .env when present (compose reads the same file). Both the
+# credential and a configured endpoint come from it. Note: values must be
+# UNQUOTED in .env for this probe (compose strips quotes; a plain shell
+# export does not).
 if [ -z "${REDIS_URL:-}" ] && [ -f .env ]; then
+    REDIS_URL_LINE="$(grep -E '^REDIS_URL=' .env | tail -1)"
+    [ -n "$REDIS_URL_LINE" ] && export "${REDIS_URL_LINE?}"
+fi
+if [ -z "${REDIS_PASSWORD:-}" ] && [ -f .env ]; then
     REDIS_PASSWORD_LINE="$(grep -E '^REDIS_PASSWORD=' .env | tail -1)"
     [ -n "$REDIS_PASSWORD_LINE" ] && export "${REDIS_PASSWORD_LINE?}"
 fi
 REDIS_URL="${REDIS_URL:-redis://:${REDIS_PASSWORD:-knowledgevault-local-redis}@localhost:6379/0}"
 
-# Never echo the credential: print the host:port/db only.
-hostport=$(printf '%s' "$REDIS_URL" | sed -E 's|redis://([^@]*@)?([^/]+).*|\2|')
-echo "Testing Redis at ${hostport}..."
+# Never echo the credential: print the scheme + host:port/db only. The
+# sanitizer is scheme-agnostic (redis://, rediss:// TLS, ...): strip any
+# userinfo, then everything after the host:port.
+hostport=$(printf '%s' "$REDIS_URL" | sed -E 's|^[A-Za-z][A-Za-z0-9+.-]*://([^@]*@)?([^/?]+).*|\2|')
+scheme=$(printf '%s' "$REDIS_URL" | sed -nE 's|^([A-Za-z][A-Za-z0-9+.-]*)://.*|\1|p')
+echo "Testing Redis (${scheme}) at ${hostport}..."
 
 # redis-cli -u takes the URL verbatim (credentials included);
 # --no-auth-warning silences the password-on-command-line advisory.
