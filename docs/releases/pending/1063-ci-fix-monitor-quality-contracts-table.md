@@ -18,6 +18,14 @@ names. The row previously named a stale five-script subset
 change; `.agents/skills/` is the canonical home per
 `docs/engineering/skill-conventions.md`.
 
+The refresh is pinned by a new regression test,
+`backend/tests/test_1063_ci_fix_monitor_gate_table.py`: it asserts that
+every `scripts/check_*.py` name appearing in `.github/workflows/ci.yml`
+also appears in the canonical skill (the #1063 AC1 discriminating
+predicate), plus a guard that the `| **Quality contracts** |` table row
+itself exists. The test fails at the pre-fix skill content (13 gates
+missing) and passes at head.
+
 ## Why
 
 The skill is what an operator loads when triaging red CI on a PR. A table
@@ -31,8 +39,9 @@ flagged the drift when gates were added.
 
 ## Migration steps
 
-None — documentation-only change. No behavior, config, or CI workflow
-surfaces changed.
+None — no runtime behavior, config, or CI workflow surfaces changed. The
+only added code is a file-reading regression test under
+`backend/tests/`.
 
 ## Known caveats
 
@@ -40,10 +49,11 @@ surfaces changed.
   intentionally unchanged: it still governs only
   `docs/engineering/testing.md` and `docs/engineering/conventions.md`.
   Extending inventory enforcement to skill tables is a separate product
-  decision (out of scope per #1063), so the refreshed table can drift
-  again the next time a contract script is added — re-run the #1063
-  discriminating check (diff of `scripts/check_*.py` mentions between
-  `.github/workflows/ci.yml` and the SKILL.md) when adding a gate.
+  decision (out of scope per #1063). The new regression test closes the
+  specific ci-fix-monitor drift gap that decision left open: adding a
+  contract script to ci.yml without refreshing the skill table now
+  fails `tests/test_1063_ci_fix_monitor_gate_table.py` in the Backend
+  job.
 - The one-line purposes are mirrors of the ci.yml step names, not
   full operator runbooks; `ci-compatibility-audit` remains the local
   reproduction path for each gate.
