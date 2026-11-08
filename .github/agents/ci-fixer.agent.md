@@ -45,7 +45,7 @@ backend           (Python 3.11)
 quality-contracts (Python 3.11)
   ├─ python scripts/check_config_contract.py
   ├─ python scripts/check_pr_scope_drift.py
-  └─ SAST_ALLOW_BASELINE_EXPANSION=1 python scripts/check_sast_baseline.py   (SAST baseline/scope/workflow integrity)
+  └─ python scripts/check_sast_baseline.py   (SAST baseline/scope/workflow integrity)
 
 sast              (Python 3.11)
   └─ python scripts/run_bandit.py  (bandit; fails on new findings vs baseline)
