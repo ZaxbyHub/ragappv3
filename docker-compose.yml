@@ -306,7 +306,10 @@ services:
       # Document processing & retrieval
       - CHUNK_SIZE_CHARS
       - CHUNK_OVERLAP_CHARS
-      - DOCUMENT_PARSING_STRATEGY=${DOCUMENT_PARSING_STRATEGY:-}
+      # Short pass-through form (#1061): an unset key is omitted entirely so
+      # Settings keeps its code default; the ${VAR:-} empty-default form
+      # crash-looped the container (enum-strict validator rejects "").
+      - DOCUMENT_PARSING_STRATEGY
       - RETRIEVAL_TOP_K
       - MAX_DISTANCE_THRESHOLD
       - VECTOR_METRIC=${VECTOR_METRIC:-}

@@ -115,14 +115,15 @@ COPY backend/app ./app
 # Copy built frontend
 COPY --from=frontend-builder /app/frontend/dist ./static
 
-# Create data directory
-RUN mkdir -p /data/knowledgevault
+# Create the data directory the compose stack pins (DATA_DIR=/app/data; the
+# host bind ${HOST_DATA_DIR:-./data} mounts here)
+RUN mkdir -p /app/data
 
 # Create non-root runtime user
 RUN adduser --disabled-password --gecos '' appuser
 
-# Set ownership for runtime user
-RUN chown -R appuser:appuser /app /data
+# Set ownership for runtime user (recursive over /app covers /app/data)
+RUN chown -R appuser:appuser /app
 
 # Switch to non-root user
 USER appuser

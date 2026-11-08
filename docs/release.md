@@ -63,9 +63,9 @@ Before deploying KnowledgeVault to production, ensure the following:
 
 ### Infrastructure Requirements
 
-- [ ] SQLite database directory (`/data/knowledgevault`) with appropriate permissions
+- [ ] SQLite database directory (`./data` — the host-side default bind; the container sees it at `/app/data`) with appropriate permissions
 - [ ] LanceDB vector store directory with write access
-- [ ] Vault directories (`/data/knowledgevault/vaults/{vault_id}/uploads/`) with sufficient disk space for each vault
+- [ ] Vault directories (`./data/vaults/{vault_id}/uploads/`) with sufficient disk space for each vault
 - [ ] Redis instance running for CSRF token storage, embedding L2 cache, and shared rate-limit counters (native code default: `redis://localhost:6379/0`; the bundled compose default is authenticated — see REDIS_PASSWORD in `.env.example`. Note: the compose redis uses an `allkeys-lru` eviction policy, which can evict CSRF tokens under memory pressure and force re-challenges, not auth failures)
 - [ ] Ollama or OpenAI-compatible embedding service accessible
 - [ ] LLM chat service accessible (Ollama, OpenAI, or compatible API)
@@ -75,7 +75,8 @@ Before deploying KnowledgeVault to production, ensure the following:
 - [ ] Environment variables configured in `.env` file:
   ```bash
   # Required settings
-  DATA_DIR=/data/knowledgevault
+  # Host-side data bind; compose pins the in-container DATA_DIR=/app/data
+  HOST_DATA_DIR=./data
   OLLAMA_EMBEDDING_URL=http://harrier-embed:8080/v1/embeddings
   # Set to your inference endpoint (no default ships):
   OLLAMA_CHAT_URL=http://192.168.1.50:11434
@@ -127,8 +128,8 @@ Before deploying KnowledgeVault to production, ensure the following:
 
 KnowledgeVault requires backing up two primary data stores:
 
-1. **SQLite Database** (`/data/knowledgevault/app.db`)
-2. **LanceDB Vector Store** (`/data/knowledgevault/lancedb/`)
+1. **SQLite Database** (`./data/app.db`)
+2. **LanceDB Vector Store** (`./data/lancedb/`)
 
 #### Automated Backup Script
 
@@ -138,7 +139,7 @@ KnowledgeVault requires backing up two primary data stores:
 
 BACKUP_DIR="/backup/knowledgevault"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-DATA_DIR="/data/knowledgevault"
+DATA_DIR="./data"
 ENCRYPTION_KEY_FILE="/secure/backup-key.pub"
 
 # Create backup directory
@@ -176,7 +177,7 @@ echo "Backup completed: $TIMESTAMP"
 # restore-knowledgevault.sh
 
 BACKUP_DIR="/backup/knowledgevault"
-DATA_DIR="/data/knowledgevault"
+DATA_DIR="./data"
 TIMESTAMP=$1  # Pass timestamp as argument
 
 if [ -z "$TIMESTAMP" ]; then
@@ -213,12 +214,12 @@ echo "Restore completed from: $TIMESTAMP"
 
 1. Check database integrity:
    ```bash
-   sqlite3 /data/knowledgevault/app.db "PRAGMA integrity_check;"
+   sqlite3 ./data/app.db "PRAGMA integrity_check;"
    ```
 
 2. Verify document count matches expected:
    ```bash
-   sqlite3 /data/knowledgevault/app.db "SELECT COUNT(*) FROM files;"
+   sqlite3 ./data/app.db "SELECT COUNT(*) FROM files;"
    ```
 
 3. Test search functionality via API:
@@ -312,11 +313,11 @@ Run the following tests to verify all external dependencies:
 # test-database.sh
 
 echo "Testing SQLite database..."
-sqlite3 /data/knowledgevault/app.db "SELECT 1;" && echo "✓ Database OK" || echo "✗ Database FAILED"
+sqlite3 ./data/app.db "SELECT 1;" && echo "✓ Database OK" || echo "✗ Database FAILED"
 
 echo "Testing required tables..."
 for table in files chunks memories document_actions admin_toggles system_flags; do
-    sqlite3 /data/knowledgevault/app.db "SELECT COUNT(*) FROM $table;" > /dev/null 2>&1
+    sqlite3 ./data/app.db "SELECT COUNT(*) FROM $table;" > /dev/null 2>&1
     if [ $? -eq 0 ]; then
         echo "✓ Table $table exists"
     else
