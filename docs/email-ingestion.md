@@ -170,7 +170,7 @@ IMAP_POLL_INTERVAL=60
 IMAP_MAX_ATTACHMENT_SIZE=10485760
 
 # Allowed MIME types (whitelist). NOTE: setting IMAP_ALLOWED_MIME_TYPES
-# OVERRIDES the shipped default (17 MIME types) — the example value below
+# overrides the shipped default (17 MIME types) — the example value below
 # narrows it to these 4. Omit the key to keep the shipped allowlist.
 IMAP_ALLOWED_MIME_TYPES=application/pdf,text/plain,text/markdown,application/vnd.openxmlformats-officedocument.wordprocessingml.document
 ```
