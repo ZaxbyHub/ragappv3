@@ -69,13 +69,21 @@ services:
     image: redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
     container_name: knowledgevault_redis
     restart: unless-stopped
+    # Loopback-bound publish (#1061): local debugging keeps host access via
+    # 127.0.0.1:6379 while the port is no longer reachable from other
+    # interfaces. The bundled Redis also requires authentication — the same
+    # REDIS_PASSWORD value is interpolated into the command, the healthcheck,
+    # and the backend REDIS_URL default below.
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
-    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    # maxmemory-policy caveat (#1061): allkeys-lru may evict csrf:* keys under
+    # memory pressure. CSRF tokens are 900s existence-only double-submit
+    # values, so eviction forces a re-challenge, not an auth bypass.
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru --requirepass ${REDIS_PASSWORD:-knowledgevault-local-redis}
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "--no-auth-warning", "-a", "${REDIS_PASSWORD:-knowledgevault-local-redis}", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -203,7 +211,11 @@ services:
       - INITIAL_RETRIEVAL_TOP_K=${INITIAL_RETRIEVAL_TOP_K:-20}
       - HYBRID_SEARCH_ENABLED=${HYBRID_SEARCH_ENABLED:-true}
       - HYBRID_ALPHA=${HYBRID_ALPHA:-0.6}
-      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      # Bundled Redis requires authentication (#1061): the default URL carries
+      # the same REDIS_PASSWORD as the redis service. A non-empty operator
+      # REDIS_URL wins verbatim (and must carry credentials if it targets the
+      # bundled instance); an empty value falls back to this default.
+      - REDIS_URL=${REDIS_URL:-redis://:${REDIS_PASSWORD:-knowledgevault-local-redis}@redis:6379/0}
       # REQUIRED — no default, backend rejects empty values
       - ADMIN_SECRET_TOKEN=${ADMIN_SECRET_TOKEN}
       # REQUIRED — generate with: python -c "import secrets; print(secrets.token_urlsafe(48))"

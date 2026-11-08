@@ -66,7 +66,7 @@ Before deploying KnowledgeVault to production, ensure the following:
 - [ ] SQLite database directory (`/data/knowledgevault`) with appropriate permissions
 - [ ] LanceDB vector store directory with write access
 - [ ] Vault directories (`/data/knowledgevault/vaults/{vault_id}/uploads/`) with sufficient disk space for each vault
-- [ ] Redis instance running for CSRF token storage, embedding L2 cache, and shared rate-limit counters (default: `redis://localhost:6379/0`)
+- [ ] Redis instance running for CSRF token storage, embedding L2 cache, and shared rate-limit counters (native code default: `redis://localhost:6379/0`; the bundled compose default is authenticated — see REDIS_PASSWORD in `.env.example`. Note: the compose redis uses an `allkeys-lru` eviction policy, which can evict CSRF tokens under memory pressure and force re-challenges, not auth failures)
 - [ ] Ollama or OpenAI-compatible embedding service accessible
 - [ ] LLM chat service accessible (Ollama, OpenAI, or compatible API)
 
@@ -410,16 +410,17 @@ fi
 ```bash
 #!/bin/bash
 # test-redis.sh
+# redis-cli -u reads the full URL (host, port, AND password), so the same
+# script works for the authenticated bundled compose Redis and for a native
+# unauthenticated instance (#1061).
 
-REDIS_URL="${REDIS_URL:-redis://localhost:6379/0}"
+REDIS_URL="${REDIS_URL:-redis://:${REDIS_PASSWORD:-knowledgevault-local-redis}@localhost:6379/0}"
 
 echo "Testing Redis at $REDIS_URL..."
 
-# Extract host and port from URL
-redis_host=$(echo "$REDIS_URL" | sed -E 's|redis://([^:]+):.*|\1|')
-redis_port=$(echo "$REDIS_URL" | sed -E 's|redis://[^:]+:([0-9]+).*|\1|')
-
-if redis-cli -h "$redis_host" -p "$redis_port" ping | grep -q "PONG"; then
+# -u takes the URL verbatim (credentials included); --no-auth-warning
+# silences the password-on-command-line advisory for this test probe.
+if redis-cli --no-auth-warning -u "$REDIS_URL" ping | grep -q "PONG"; then
     echo "✓ Redis OK"
 else
     echo "✗ Redis FAILED"
