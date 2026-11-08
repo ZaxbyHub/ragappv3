@@ -258,7 +258,11 @@ services:
       #   - `- KEY=${KEY:-}` for str keys pinned by check_config_contract
       #     (APP_ROOT_PATH, MULTIMODAL_*): "" is their documented default.
       # Empty-string values remain MEANINGFUL in Settings (REDIS_URL="" →
-      # in-memory limiter) — do NOT add env_ignore_empty=True.
+      # in-memory limiter) — do NOT add env_ignore_empty=True. (Settings-layer
+      # statement: this interpolation's ${VAR:-} default substitutes for an
+      # empty REDIS_URL too, so an operator's empty override resolves to the
+      # bundled default HERE, not to "" — the in-memory-limiter meaning only
+      # applies to natively-set environments.)
       # Secrets (ADMIN_SECRET_TOKEN, JWT_SECRET_KEY) stay explicit above.
       # Keep in sync with .env.example (guarded by
       # backend/tests/test_issue494_compose_env_forwarding.py and

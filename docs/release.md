@@ -410,17 +410,32 @@ fi
 
 ```bash
 #!/bin/bash
-# test-redis.sh
-# redis-cli -u reads the full URL (host, port, AND password), so the same
-# script works for the authenticated bundled compose Redis and for a native
-# unauthenticated instance (#1061).
+# test-redis.sh — verifies the Redis the deployment actually uses (#1061).
+#
+# The bundled compose Redis requires the REDIS_PASSWORD from the project .env
+# (compose interpolates it into the redis command, the healthcheck, and the
+# backend REDIS_URL). This script reads the SAME file so it authenticates
+# with the credential the running stack uses — exporting REDIS_URL alone
+# (with the default password) would false-fail a deployment that overrode
+# REDIS_PASSWORD.
+#
+# Native deployments (no compose): export a credential-free REDIS_URL
+# explicitly, e.g. `export REDIS_URL=redis://localhost:6379/0` — the
+# credential-bearing default below only fits the bundled compose stack.
 
+# Load the project .env when present (compose reads the same file).
+if [ -z "${REDIS_URL:-}" ] && [ -f .env ]; then
+    REDIS_PASSWORD_LINE="$(grep -E '^REDIS_PASSWORD=' .env | tail -1)"
+    [ -n "$REDIS_PASSWORD_LINE" ] && export "${REDIS_PASSWORD_LINE?}"
+fi
 REDIS_URL="${REDIS_URL:-redis://:${REDIS_PASSWORD:-knowledgevault-local-redis}@localhost:6379/0}"
 
-echo "Testing Redis at $REDIS_URL..."
+# Never echo the credential: print the host:port/db only.
+hostport=$(printf '%s' "$REDIS_URL" | sed -E 's|redis://([^@]*@)?([^/]+).*|\2|')
+echo "Testing Redis at ${hostport}..."
 
-# -u takes the URL verbatim (credentials included); --no-auth-warning
-# silences the password-on-command-line advisory for this test probe.
+# redis-cli -u takes the URL verbatim (credentials included);
+# --no-auth-warning silences the password-on-command-line advisory.
 if redis-cli --no-auth-warning -u "$REDIS_URL" ping | grep -q "PONG"; then
     echo "✓ Redis OK"
 else
