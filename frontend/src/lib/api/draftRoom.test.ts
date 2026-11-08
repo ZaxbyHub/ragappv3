@@ -7,15 +7,22 @@ const { mockGet, mockPost, mockPatch, mockDelete } = vi.hoisted(() => ({
   mockDelete: vi.fn(),
 }));
 
-vi.mock("./core", () => ({
-  apiClient: {
-    get: mockGet,
-    post: mockPost,
-    patch: mockPatch,
-    delete: mockDelete,
-  },
-  API_BASE_URL: "/api",
-}));
+// Issue #1078: the factory spreads the REAL core exports (importOriginal)
+// so parseDraftRoomError runs the production httpStatusOf — only the axios
+// instance and base URL are faked.
+vi.mock("./core", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./core")>();
+  return {
+    ...actual,
+    apiClient: {
+      get: mockGet,
+      post: mockPost,
+      patch: mockPatch,
+      delete: mockDelete,
+    },
+    API_BASE_URL: "/api",
+  };
+});
 
 import {
   archiveDraft,
@@ -571,6 +578,37 @@ describe("parseDraftRoomError", () => {
       code: "unknown",
       context: {},
       status: 500,
+    });
+  });
+
+  // Issue #1078: the status read is the three-tier walk (status →
+  // response.status → originalError.response.status). Before #1078 only the
+  // normalized top-level tier was read, so a raw axios error reaching this
+  // parser surfaced NO status (and callers' status gates went dead).
+  it("extracts the status from a RAW axios error that reaches the parser (issue #1078)", () => {
+    const error = { response: { status: 409 } };
+    expect(parseDraftRoomError(error)).toEqual({
+      detail: "An unexpected error occurred",
+      code: "unknown",
+      context: {},
+      status: 409,
+    });
+  });
+
+  it("extracts the status when it only survives under originalError.response.status (re-wrapped tier, issue #1078)", () => {
+    const error = Object.assign(new Error("draft busy"), {
+      originalError: {
+        response: {
+          status: 409,
+          data: { detail: "draft busy", code: "conflict" },
+        },
+      },
+    });
+    expect(parseDraftRoomError(error)).toEqual({
+      detail: "draft busy",
+      code: "conflict",
+      context: {},
+      status: 409,
     });
   });
 });
