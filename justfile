@@ -119,7 +119,7 @@ quality-contracts:
     python scripts/check_settings_consumers.py
     python scripts/check_batch_mock_seq.py
     python scripts/check_pr_scope_drift.py
-    SAST_ALLOW_BASELINE_EXPANSION=1 python scripts/check_sast_baseline.py
+    python scripts/check_sast_baseline.py
     python scripts/check_secretscan.py
     python scripts/check_test_collection_scope.py
     python scripts/check_a04_http500_detail_hygiene.py
@@ -135,3 +135,17 @@ quality-contracts:
 # SAST job (CI installs backend/requirements-dev.txt first)
 sast:
     python scripts/run_bandit.py
+
+# Re-anchor the bandit baseline at the current tree and re-run the gate.
+# Run AFTER all content edits are in the working tree and BEFORE committing:
+#   1. --update-baseline regenerates the baseline from this exact tree
+#   2. the gated scan must PASS (exit 0)
+#   3. review the printed baseline diff and commit it together with the
+#      edits that shifted lines. For genuine count GROWTH (new suppressions),
+#      justify every ID in the PR; growth also needs
+#      SAST_ALLOW_BASELINE_EXPANSION=1 on the check_sast_baseline run (see
+#      backend/security/README.md).
+sast-regate:
+    python scripts/run_bandit.py --update-baseline
+    python scripts/run_bandit.py
+    git --no-pager diff --stat -- backend/security/bandit-baseline.json

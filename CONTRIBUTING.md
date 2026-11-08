@@ -251,7 +251,7 @@ python scripts/check_g06_setup_docs.py --check all   # .env.example/setup docs m
 python scripts/check_settings_consumers.py   # every Settings field has a production read site
 python scripts/check_batch_mock_seq.py   # send-path batch mocks mirror the save response contract
 python scripts/check_pr_scope_drift.py
-SAST_ALLOW_BASELINE_EXPANSION=1 python scripts/check_sast_baseline.py   # SAST baseline/scope/workflow integrity (env since PR #1093: growth announced, not fail-closed)
+python scripts/check_sast_baseline.py   # SAST baseline/scope/workflow integrity
 python scripts/check_secretscan.py      # .secretscanignore validity
 python scripts/check_test_collection_scope.py   # all pytest files live under backend/tests/
 python scripts/check_a04_http500_detail_hygiene.py   # no raw-exception 500 details

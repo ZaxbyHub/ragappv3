@@ -67,21 +67,22 @@ Because the suppressed set is reviewable in this committed file and the
 regeneration prints its diff, baseline "rot" is auditable: every bump is a
 reviewable change to `bandit-baseline.json`.
 
-### Baseline expansion is announced, not CI-enforced (since PR #1093)
+### Baseline expansion is CI-enforced
 
-Baseline growth *suppresses* findings. `scripts/check_sast_baseline.py` (run
-in the **Quality contracts** CI job) detects growth and prints the
-newly-suppressed IDs; since PR #1093 the CI invocation sets
-`SAST_ALLOW_BASELINE_EXPANSION=1`, so growth is **announced in the job log
-and must be justified in the PR** rather than failing the build. Two controls
-still fail closed: the separate `sast` job's `run_bandit.py` gate fails on
-any finding **absent** from the committed baseline (a new finding must be
-added to `bandit-baseline.json` to pass — a reviewable, diff-visible edit),
-and dead `# nosec` markers fail the same gate. Reverting the env prefix on
-the ci.yml `check_sast_baseline` line restores fail-closed growth gating.
-The same check also asserts the `sast` CI job still runs `run_bandit.py` and
-that the scan scope (`TARGET`) is still `backend/app`, so the gate cannot be
-silently weakened by editing one constant or replacing one command.
+Baseline growth *suppresses* findings, so it is gated, not just documented.
+`scripts/check_sast_baseline.py` (run in the **Quality contracts** CI job) fails
+the build when `bandit-baseline.json`'s finding count **increases** on a PR,
+printing the newly-suppressed IDs. To accept an intentional expansion (e.g.
+recording new pre-existing debt), set `SAST_ALLOW_BASELINE_EXPANSION=1` and
+justify each newly-suppressed ID in the PR. The same check also asserts the
+`sast` CI job still runs `run_bandit.py` and that the scan scope (`TARGET`) is
+still `backend/app`, so the gate cannot be silently weakened by editing one
+constant or replacing one command.
+
+> Note (PR #1093, restored by the SAST gate-restore PR): PR #1093 briefly set
+> the env permanently in ci.yml to admit three constants-only B608
+> suppressions; that override was reverted once master's baseline contained
+> them, restoring fail-closed growth gating for later PRs.
 
 ## Cross-platform note
 
