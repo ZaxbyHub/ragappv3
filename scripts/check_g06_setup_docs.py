@@ -300,7 +300,11 @@ def check_contributing_env_path() -> list[str]:
             paragraph.append(lines[cursor])
             cursor += 1
         paragraph_text = "\n".join(paragraph)
-        if ".env.example" in paragraph_text and "backend/.env" not in paragraph_text:
+        # The paragraph must name `backend/.env` unconditionally (#738 AC15):
+        # it fails both when it points at `.env.example` without the backend
+        # destination AND when it names neither file (the pre-#1062 gate
+        # failed open on the names-neither drift).
+        if "backend/.env" not in paragraph_text:
             return ["FAIL contributing-env-path"]
     if not found_paragraph:
         return [

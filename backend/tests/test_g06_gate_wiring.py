@@ -182,6 +182,39 @@ def test_g06_modes_fail_on_missing_documented_keys(monkeypatch):
     assert missing and "no **Environment:** paragraph" in missing[0]
 
 
+def test_g06_contributing_env_path_requires_backend_env_name(monkeypatch):
+    """An **Environment:** paragraph naming neither env file fails the mode.
+
+    Pins the #1062 fail-open fix: a paragraph that exists but names neither
+    `.env.example` nor `backend/.env` used to return [] (the FAIL required
+    `.env.example` to be named), so the setup doc could silently lose the
+    backend/.env pointer that #738 AC15 guarantees. The names-both pass and
+    missing-paragraph FAIL branches are pinned separately by
+    test_g06_modes_fail_on_missing_documented_keys.
+    """
+    gate = _load_gate_module()
+    texts = _synthetic_repo_texts("OTHER=1\n")
+    monkeypatch.setattr(gate, "read", lambda p: texts[p])
+
+    texts["CONTRIBUTING.md"] = (
+        "## Local setup\n\n"
+        "**Environment:** install dependencies and run the backend.\n"
+    )
+    neither = gate.check_contributing_env_path()
+    assert neither and "FAIL contributing-env-path" in neither[0]
+
+    # Pre-#1062 branch still fires: naming `.env.example` without
+    # `backend/.env` (the directory-less copy drift) fails as before.
+    texts["CONTRIBUTING.md"] = "**Environment:** copy `.env.example` only.\n"
+    example_only = gate.check_contributing_env_path()
+    assert example_only and "FAIL contributing-env-path" in example_only[0]
+
+    texts["CONTRIBUTING.md"] = (
+        "**Environment:** copy `.env.example` to `backend/.env`.\n"
+    )
+    assert gate.check_contributing_env_path() == []
+
+
 def test_g06_parsing_strategy_active_divergence_still_fails(monkeypatch):
     """An active non-default value without a default-naming comment fails."""
     gate = _load_gate_module()
