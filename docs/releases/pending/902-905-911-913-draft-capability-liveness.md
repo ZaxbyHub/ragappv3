@@ -61,8 +61,10 @@
   cancels are absorbed and counted, never restarting the clock) inside an
   anyio shielded scope, then re-raises — the upload is never left
   half-committed (row+bytes+job all present or all absent) and shutdown still
-  unwinds. On drain timeout the detached task remains the sole owner of the
-  outcome and the request answers 503 `commit_pending`.
+  unwinds. On drain timeout of a LIVE (uncancelled) request the detached task
+  remains the sole owner of the outcome and the request answers 503
+  `commit_pending`; a cancelled request is drained under the same budget and
+  the cancellation re-raises (no response).
 - Compensation (unlink + row delete) runs shielded with a 30s bound, catches
   `CancelledError` per step separately from `Exception`, records it, runs
   both steps anyway, then re-raises — a native cancel during the unlink await

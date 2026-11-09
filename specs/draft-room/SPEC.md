@@ -705,7 +705,7 @@ Export always returns the exact stored revision bytes and both `X-Draft-Fact-Sta
 - `422`: request shape or brief validation fails.
 - `429`: compile/upload rate limit.
 - `503`: configured model/retrieval service unavailable before enqueue, or no live Draft Room worker can claim the enqueue (`worker_unavailable`; a genuine `Idempotency-Key` replay still returns its original job).
-- `503 commit_pending`: a cancelled upload request waited out the commit drain budget; the detached commit task still owns the outcome (it will commit or compensate) — the client should check the inputs list rather than blindly re-upload.
+- `503 commit_pending`: a live (uncancelled) upload request whose commit task did not settle within the commit drain budget; the detached commit task still owns the outcome (it will commit or compensate) — the client should check the inputs list rather than blindly re-upload. A cancelled request is drained under the same budget and the cancellation is re-raised (no response is sent).
 
 Draft Room custom errors preserve the repository's string `detail` while adding stable machine-readable fields: `{"detail":"lowercase message","code":"snake_case_code","context":{}}`. `context` is omitted when empty and may contain only documented non-secret scalar identifiers. Duplicate upload is exactly `409 {"detail":"input content already exists in this draft","code":"duplicate_input","context":{"existing_input_id":123}}`. Framework-generated validation errors retain FastAPI's standard `422` shape. Durable job failures additionally use stable `error_code` values such as `permission_revoked`, `input_parse_failed`, `retrieval_unavailable`, `model_unavailable`, `model_budget_exceeded`, `job_timeout`, `invalid_stage_output`, and `internal_error`.
 

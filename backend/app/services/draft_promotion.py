@@ -672,7 +672,7 @@ async def _compensate(
     ``files`` row (only ever one this attempt itself inserted), and the copied
     bytes.
 
-    Never raises. Each step is independently guarded so a failure in one
+    Never raises except a recorded asyncio.CancelledError, which is re-raised after every step has run (issue #913's class: a mid-compensation cancel must not skip the remaining cleanup). Each step is independently guarded so a failure in one
     does not stop the others from running, and nothing here can replace or
     mask the exception the caller is already handling — that guard is
     layered on top of ``_delete_file_row``/``_delete_promotion_row``
