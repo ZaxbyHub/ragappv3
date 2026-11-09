@@ -1656,8 +1656,10 @@ async def _compensate_upload_enrollment(
 
     Each step catches ``CancelledError`` separately from ``Exception``: a
     native ``task.cancel()`` delivered at an await is recorded and RE-RAISED
-    after both steps have run, so it can never skip the row rollback and is
-    never swallowed. There is deliberately NO inner ``CancelScope`` here: the
+    after both steps have run, so a cancel landing on the unlink cannot skip
+    the row rollback and no cancel is ever swallowed (a cancel landing on the
+    row delete's own await abandons that delete; the row is then left for
+    startup recovery). There is deliberately NO inner ``CancelScope`` here: the
     caller's ``move_on_after(_UPLOAD_COMPENSATE_TIMEOUT_SECONDS, shield=True)``
     is the bound, and an inner shield would block that deadline from ever
     being delivered (review PRR-004 — the sibling ``draft_promotion``
@@ -3268,13 +3270,13 @@ async def upload_draft_input(
                 )
             if isinstance(exc, asyncio.CancelledError):
                 raise
-            if late_cancel is not None:
-                raise late_cancel
             logger.error(
                 "draft_room: failed to finalize staged upload draft_id=%s input_id=%s",
                 draft_id,
                 input_record.id,
             )
+            if late_cancel is not None:
+                raise late_cancel
             raise DraftRoomHTTPError(
                 500, "failed to store uploaded file", "internal_error"
             ) from exc

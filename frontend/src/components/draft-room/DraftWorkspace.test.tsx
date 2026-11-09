@@ -961,6 +961,34 @@ describe("DraftWorkspace", () => {
     ).toBeInTheDocument();
   });
 
+  it("associates the disabled Promote control with its reason", async () => {
+    // Review PRR-016: a disabled button is unfocusable, so its explanation
+    // must be programmatically associated (same contract as compile/retry).
+    renderWorkspace({
+      capabilities: makeCapabilities({ promote_available: false }),
+    });
+
+    const promoteBtn = await screen.findByRole("button", {
+      name: "Promote to vault",
+    });
+    expect(promoteBtn).toBeDisabled();
+    const describedBy = promoteBtn.getAttribute("aria-describedby");
+    const reason = describedBy ? document.getElementById(describedBy) : null;
+    expect(reason).toHaveTextContent("Promotion is currently unavailable.");
+  });
+
+  it("adds no description attribute to Promote while it is available", async () => {
+    renderWorkspace({
+      capabilities: makeCapabilities({ promote_available: true }),
+    });
+
+    const promoteBtn = await screen.findByRole("button", {
+      name: "Promote to vault",
+    });
+    expect(promoteBtn).toBeEnabled();
+    expect(promoteBtn.getAttribute("aria-describedby")).toBeNull();
+  });
+
   it("offers Archive for an active project", async () => {
     renderWorkspace();
     expect(
