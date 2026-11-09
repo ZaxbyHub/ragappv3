@@ -467,6 +467,8 @@ case "$rest" in
     *)   userinfo="";          hostport="$rest" ;;
 esac
 hostport="${hostport%%/*}"
+db="${rest#*${hostport}}"
+db="${db#/}"
 
 # Everything below FAILS CLOSED: any REDIS_URL the probe cannot fully
 # represent is redacted and exits nonzero, never echoed. Supported form:
@@ -511,7 +513,17 @@ host="${hostport%%:*}"
 port="${hostport#*:}"
 [ "$port" = "$host" ] && port=6379
 
-if redis-cli --no-auth-warning -h "$host" -p "$port" ping | grep -q "PONG"; then
+# -n selects the configured database — a redis://host:6379/3 deployment must
+# be verified against database 3, not 0 (a bare PING would false-OK). The db
+# segment must be numeric; anything else is rejected fail-closed above the
+# connection attempt. Unquoted $dbopt is safe: the value is validated digits.
+case "$db" in
+    "") dbopt="" ;;
+    *[!0-9]*) echo "Testing Redis (<non-numeric /db — redacted>)..."; echo "✗ Redis FAILED"; exit 1 ;;
+    *) dbopt="-n $db" ;;
+esac
+# shellcheck disable=SC2086 — $dbopt is validated digits or empty
+if redis-cli --no-auth-warning -h "$host" -p "$port" $dbopt ping | grep -q "PONG"; then
     echo "✓ Redis OK"
     exit 0
 else
