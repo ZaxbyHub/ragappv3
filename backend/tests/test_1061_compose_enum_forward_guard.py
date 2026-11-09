@@ -117,7 +117,6 @@ class TestComposeEmptyForwardStartupTolerance:
         :- separator cannot match it, so without the SINGLE_DASH_EMPTY pattern
         the form would silently evade the guard. Executed on a synthetic
         compose doc (the shipped file has 0 single-dash entries today)."""
-        import yaml as _yaml
         synthetic = tmp_path / "compose-synthetic.yml"
         synthetic.write_text(
             'services:\n'
@@ -127,8 +126,7 @@ class TestComposeEmptyForwardStartupTolerance:
             '      - BAR=${QUX:-realdefault}\n',
             encoding="utf-8",
         )
-        original = type(self).__dict__.get("_compose_backup")
-        doc = _yaml.safe_load(synthetic.read_text(encoding="utf-8"))
+        doc = yaml.safe_load(synthetic.read_text(encoding="utf-8"))
         env = doc["services"]["knowledgevault"]["environment"]
         singles = [e for e in env if "${" in e and ":-" not in e and "-}" in e]
         assert singles == ["FOO=${BAZ-}"], "fixture must carry exactly one ${VAR-} entry"
