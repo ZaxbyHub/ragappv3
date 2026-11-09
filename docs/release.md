@@ -455,9 +455,16 @@ REDIS_URL="${REDIS_URL:-redis://:${REDIS_PASSWORD:-knowledgevault-local-redis}@l
 # Parse the URL into scheme, userinfo (credential), and host:port. The
 # sanitizer prints scheme + host:port/db ONLY and fails closed: a URL it
 # cannot parse is printed redacted, never echoed (no credential leak).
-scheme=$(printf '%s' "$REDIS_URL" | sed -nE 's|^([A-Za-z][A-Za-z0-9+.-]*)://.*|\1|p')
-userinfo=$(printf '%s' "$REDIS_URL" | sed -nE 's|^[A-Za-z][A-Za-z0-9+.-]*://([^@]*)@.*|\1|p')
-hostport=$(printf '%s' "$REDIS_URL" | sed -E 's|^[A-Za-z][A-Za-z0-9+.-]*://([^@]*@)?([^/?]+).*|\2|')
+# Parse with POSIX parameter expansion (exact: split at the LAST '@', the
+# same semantics urlsplit/redis-py use — an earlier first-'@' sed truncated
+# credentials containing '@' and echoed a fragment of them).
+scheme="${REDIS_URL%%://*}"
+rest="${REDIS_URL#*://}"
+case "$rest" in
+    *@*) userinfo="${rest%@*}"; hostport="${rest##*@}" ;;
+    *)   userinfo="";          hostport="$rest" ;;
+esac
+hostport="${hostport%%/*}"
 
 # Everything below FAILS CLOSED: any REDIS_URL the probe cannot fully
 # represent is redacted and exits nonzero, never echoed. Supported form:
@@ -477,12 +484,12 @@ fi
 if [ "$scheme" != "redis" ]; then reject; fi
 case "$userinfo" in *:*) [ -n "${userinfo%%:*}" ] && reject ;; esac
 case "$hostport" in *\[*|*:*:*) reject ;; esac
-# The credential is the userinfo's password segment (after the separator
-# colon); characters outside the documented REDIS_PASSWORD alphabet cannot be
-# represented safely by the env-var auth form, so the probe refuses.
-password="${userinfo##*:}"
-if printf '%s' "$password" | grep -Eq '[^A-Za-z0-9._~-]'; then reject; fi
-if [ -n "${REDIS_PASSWORD:-}" ] && printf '%s' "$REDIS_PASSWORD" | grep -Eq '[^A-Za-z0-9._~-]'; then reject; fi
+# The credential is the userinfo minus one leading separator colon; the
+# alphabet check runs on the FULL credential, so a ':' or '@' inside it is
+# refused, never truncated past.
+credential="${userinfo#:}"
+case "$credential" in *[!A-Za-z0-9._~-]*) reject ;; esac
+case "${REDIS_PASSWORD:-}" in *[!A-Za-z0-9._~-]*) reject ;; esac
 echo "Testing Redis (${scheme}) at ${hostport}..."
 
 # Authenticate via the REDISCLI_AUTH environment variable (redis-cli reads it
