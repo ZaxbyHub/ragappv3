@@ -78,3 +78,18 @@ class TestReleaseProbeCredentialContract:
             "out-of-alphabet credentials"
         )
         assert "REDISCLI_AUTH" in block  # auth form stays env-based
+
+    def test_parses_last_at_and_requires_separator(self):
+        """The URL parse must split userinfo/host at the LAST '@' (urlsplit
+        semantics — the first-'@' form truncated '@'-containing credentials
+        and echoed fragments) and must REQUIRE the '://' separator (a bare
+        'redis' string false-passed as host 'redis' against a passwordless
+        service of that name)."""
+        block = probe_block()
+        assert 'userinfo="${rest%@*}"; hostport="${rest##*@}"' in block, (
+            "userinfo/hostport must split at the LAST '@' (parameter expansion)"
+        )
+        assert 'case "$REDIS_URL" in' in block and '*://*)' in block and '*)     scheme=""' in block, (
+            "the probe must require the '://' separator and redact-fail a "
+            "REDIS_URL without one"
+        )

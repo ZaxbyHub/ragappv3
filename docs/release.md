@@ -458,8 +458,10 @@ REDIS_URL="${REDIS_URL:-redis://:${REDIS_PASSWORD:-knowledgevault-local-redis}@l
 # Parse with POSIX parameter expansion (exact: split at the LAST '@', the
 # same semantics urlsplit/redis-py use — an earlier first-'@' sed truncated
 # credentials containing '@' and echoed a fragment of them).
-scheme="${REDIS_URL%%://*}"
-rest="${REDIS_URL#*://}"
+case "$REDIS_URL" in
+    *://*) scheme="${REDIS_URL%%://*}"; rest="${REDIS_URL#*://}" ;;
+    *)     scheme=""; rest="" ;;
+esac
 case "$rest" in
     *@*) userinfo="${rest%@*}"; hostport="${rest##*@}" ;;
     *)   userinfo="";          hostport="$rest" ;;
