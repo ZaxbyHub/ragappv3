@@ -128,7 +128,7 @@ const OPEN_FINDINGS_LOOKUP_PAGE_SIZE = 100;
 const CAPABILITY_BLOCK_REASON_ID = "draft-capability-block-reason";
 const PROMOTE_BLOCK_REASON_ID = "draft-promote-block-reason";
 const COMPILE_WORKER_OFFLINE_MESSAGE =
-  "The Draft Room worker is offline; compiling is paused until it restarts.";
+  "The Draft Room worker is offline; compiling and retries are paused until it restarts.";
 
 const FACT_CURRENT = new Set<string>(FACT_CURRENT_STATUSES);
 

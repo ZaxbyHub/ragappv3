@@ -309,11 +309,14 @@ class TestN05EOrphanInputReconcile(DraftInputStorageTestBase):
         import platform
         import subprocess
 
-        link_parent = self.root / "7" / "3" / "inputs" / "10"
+        # The INPUT DIRECTORY itself is the junction (inputs/10 -> inputs/11):
+        # the sweep enumerates inputs/<id>/<name>, so only a junction at the
+        # <id> level turns inputs/10/live.txt into a lexical candidate whose
+        # bytes are the row-backed inputs/11/live.txt (a junction one level
+        # deeper is skipped by the is_file() check even pre-fix).
         real_dir = self.root / "7" / "3" / "inputs" / "11"
         real_dir.mkdir(parents=True, exist_ok=True)
-        link_parent.mkdir(parents=True, exist_ok=True)
-        link = link_parent / "alias"
+        link = self.root / "7" / "3" / "inputs" / "10"
         if platform.system() == "Windows":
             dest = subprocess.list2cmdline([str(link)])
             src = subprocess.list2cmdline([str(real_dir)])
@@ -336,12 +339,21 @@ class TestN05EOrphanInputReconcile(DraftInputStorageTestBase):
         canonical = self._write_finalized_file(
             "7/3/inputs/11/live.txt", b"owed by a live row"
         )
-        # The junction dir must not carry its own candidate files.
         try:
-            self.storage.reconcile(
+            self.assertTrue(
+                (link / "live.txt").is_file(),
+                "precondition: the junction must expose the live file as the "
+                "lexical candidate inputs/10/live.txt",
+            )
+            counts = self.storage.reconcile(
                 {LIVE_PAIR},
                 max_age_seconds=3600,
                 valid_input_relpaths={canonical},
+            )
+            self.assertEqual(
+                counts.get("orphan_files_removed", 0),
+                0,
+                f"no file may be reaped through the junction, got {counts}",
             )
             self.assertTrue(
                 live.is_file(),

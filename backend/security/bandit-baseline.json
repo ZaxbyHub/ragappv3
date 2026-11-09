@@ -36,7 +36,7 @@
       "SEVERITY.LOW": 59,
       "SEVERITY.MEDIUM": 63,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 96709,
+      "loc": 96702,
       "nosec": 0,
       "skipped_tests": 71
     },
@@ -62,7 +62,7 @@
       "SEVERITY.LOW": 2,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 728,
+      "loc": 718,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -140,7 +140,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 4193,
+      "loc": 4196,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1967,7 +1967,7 @@
   },
   "results": [
     {
-      "code": "376     if not settings.users_enabled:\n377         DEFAULT_TOKEN = \"admin-secret-token\"\n378 \n",
+      "code": "375     if not settings.users_enabled:\n376         DEFAULT_TOKEN = \"admin-secret-token\"\n377 \n",
       "col_offset": 24,
       "end_col_offset": 44,
       "filename": "backend/app/api/deps.py",
@@ -1978,16 +1978,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'admin-secret-token'",
-      "line_number": 377,
+      "line_number": 376,
       "line_range": [
-        377
+        376
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "395             \"is_active\": True,\n396             \"must_change_password\": False,\n397         }\n398 \n399     # User authentication enabled - validate JWT token\n400     try:\n401         payload = decode_access_token(token)\n402     except TokenExpiredError:\n403         raise HTTPException(\n404             status_code=401,\n",
+      "code": "394             \"is_active\": True,\n395             \"must_change_password\": False,\n396         }\n397 \n398     # User authentication enabled - validate JWT token\n399     try:\n400         payload = decode_access_token(token)\n401     except TokenExpiredError:\n402         raise HTTPException(\n403             status_code=401,\n",
       "col_offset": 12,
       "end_col_offset": 34,
       "filename": "backend/app/api/deps.py",
@@ -1998,16 +1998,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'False'",
-      "line_number": 396,
+      "line_number": 395,
       "line_range": [
+        389,
         390,
         391,
         392,
         393,
         394,
         395,
-        396,
-        397
+        396
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",

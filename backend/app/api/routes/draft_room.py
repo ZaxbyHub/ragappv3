@@ -1623,6 +1623,13 @@ def _consume_upload_commit(
     """
     _INFLIGHT_UPLOAD_COMMITS.discard(task)
     if task.cancelled():
+        # Review BOT-02: a commit cancelled mid-flight (loop shutdown) has
+        # already run its shielded cleanup; leave one operator record.
+        logger.warning(
+            "draft_room: upload commit task cancelled (draft_id=%s input_id=%s)",
+            draft_id,
+            input_id,
+        )
         return
     exc = task.exception()
     if exc is not None:
@@ -3676,11 +3683,11 @@ async def retry_draft_job(
 
     if parent.job_type != "compile":
         # Precedence parity with the compile branch (review PRR-006): the
-        # invalid-state 409 fires before the worker-gate 503.
+        # invalid-state 409 fires before the worker-gate 503. The code stays
+        # the store's ``conflict`` (what this branch answered at base) so only
+        # the ordering changes, not the client-visible contract.
         if parent.status not in ("failed", "cancelled"):
-            raise _conflict(
-                "only a failed or cancelled job can be retried", "invalid_state"
-            )
+            raise _conflict("only a failed or cancelled job can be retried", "conflict")
         # Issue #911: a parse retry enqueues onto the same DraftJobProcessor
         # poll loop as uploads — refuse it when no live worker can claim it
         # (after the ownership fetch above, before any new row).

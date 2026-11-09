@@ -67,16 +67,18 @@ class TestN05ICommitPending(CompileRouteTestBase):
                 ) as client:
                     task = asyncio.create_task(client.post(**request))
                     loop = asyncio.get_running_loop()
-                    if not await loop.run_in_executor(None, entered.wait, 30):
+                    try:
+                        if not await loop.run_in_executor(None, entered.wait, 30):
+                            raise AssertionError("finalize was never entered")
+                        # No cancellation: the request must time out on its
+                        # own while finalize is still parked. Bounded so a
+                        # regression fails fast instead of hanging.
+                        response = await asyncio.wait_for(task, timeout=15)
+                        outcome["status"] = response.status_code
+                        outcome["body"] = response.json()
+                        outcome["finalize_still_parked"] = not finished.is_set()
+                    finally:
                         release.set()
-                        raise AssertionError("finalize was never entered")
-                    # No cancellation: the request must time out on its own
-                    # while finalize is still parked.
-                    response = await task
-                    outcome["status"] = response.status_code
-                    outcome["body"] = response.json()
-                    outcome["finalize_still_parked"] = not finished.is_set()
-                    release.set()
                     await loop.run_in_executor(None, finished.wait, 60)
                     await _drain_pending_tasks()
 

@@ -902,7 +902,7 @@ describe("DraftWorkspace", () => {
     const describedBy = compileBtn.getAttribute("aria-describedby");
     const reason = describedBy ? document.getElementById(describedBy) : null;
     expect(reason).toHaveTextContent(
-      "The Draft Room worker is offline; compiling is paused until it restarts.",
+      "The Draft Room worker is offline; compiling and retries are paused until it restarts.",
     );
     expect(reason).not.toHaveTextContent(DRAFT_ROOM_DISABLED_MESSAGE);
   });
