@@ -34,6 +34,7 @@ seeds a *failed* job/draft pair directly instead of going through cancel to
 stay independent of this gap.
 """
 
+import asyncio
 import json
 import os
 import shutil
@@ -42,7 +43,7 @@ import sys
 import tempfile
 import threading
 import unittest
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from queue import Empty, Queue
 from unittest.mock import AsyncMock, MagicMock
@@ -115,6 +116,22 @@ class _PoolWithConnectionCM:
     @contextmanager
     def connection(self):
         conn = self.get_connection()
+        try:
+            yield conn
+        finally:
+            self.release_connection(conn)
+
+    async def get_connection_async(
+        self, max_wait_attempts: int = 3
+    ) -> sqlite3.Connection:
+        # #645: the upload commit task and compensation check out through
+        # the pool's async surface (review PRR-001); mirror the production
+        # off-loop contract like test_draft_routes.py's copy.
+        return await asyncio.to_thread(self.get_connection)
+
+    @asynccontextmanager
+    async def connection_async(self, max_wait_attempts: int = 3):
+        conn = await self.get_connection_async(max_wait_attempts)
         try:
             yield conn
         finally:

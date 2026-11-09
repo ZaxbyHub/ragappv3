@@ -101,12 +101,16 @@ now hashes differs from what the old formula hashed: a compile whose
 **requested** start stage differs from the normalized one (anything other than
 the default `research`, whose old and new formulas hash identically), and a
 retry whose draft has since gained a new current revision or whose requested
-stage normalizes backward to a different stage (unreachable from the shipped
-client, which sends no retry key — see #905). Those replays
+stage normalizes backward to a different stage (previously unreachable from the shipped client — [superseded by
+#905/#911/#913: the shipped client now sends a per-identity retry key,
+and the enqueue routes gate on worker liveness]). Those replays
 return 409 `idempotency_key_conflict` instead of the original job; every other
 pre-upgrade key still replays to its original job. Keys are scoped to a single
 request attempt and the frontend generates a fresh key per dialog, so no
-supported flow crosses the upgrade.
+supported flow crosses the upgrade. [Key lifetime revised by #905/#911/#913:
+the shipped client now keys a retry to its identity (draft + parent job +
+stage), so the key persists across settlements of the same attempt rather
+than per dialog.]
 The stale-lock error *code* changes from `conflict` to `stale_lock_version`
 on the compile/apply-finding/mark-ready/update/archive/restore/manual-revision
 paths (status and semantics unchanged; clients matching the precise new code
@@ -117,10 +121,15 @@ unchanged.
 
 ## Caveats
 
-- A raw API client can still enqueue a compile while the worker is down (see
+- A raw API client can still enqueue a compile while the worker is down
+  [superseded by #902/#905/#911/#913: the enqueue routes now answer 503
+  worker_unavailable before any side effect; a genuine Idempotency-Key
+  replay still returns its original job] (see
   above); the honest capability flag is the in-scope remedy, the enqueue-path
   503 would change acceptance behavior.
 - `retryDraftJob` on the frontend still sends no `Idempotency-Key`
+  [superseded by #905/#911/#913: the shipped client now sends a
+  per-identity key on every retry]
   (pre-existing; the backend replay contract is now correct and pinned
   regardless) — declared out of scope by the issue; tracked as #905.
 - The ASCII `filename` parameter still ASCII-folds non-ASCII titles by
@@ -149,8 +158,9 @@ is bidirectional, annotation-spelling agnostic, fails closed on structural
 drift, and has its own wiring test.
 
 Follow-ups filed for what stays out of scope: **#911** (worker-liveness honesty
-beyond compile — upload/parse is still ungated), **#912** (parity-gate scope
+beyond compile — upload/parse is still ungated) [implemented by
+#902/#905/#911/#913], **#912** (parity-gate scope
 beyond the nullability contract — its nullability ACs are closed here, so it
 narrows to whatever remains after merge), **#913** (compensation cancellation safety
-and unreaped orphan bytes), **#914** (the local CI-mirror skill drifting behind
+and unreaped orphan bytes) [implemented by #902/#905/#911/#913], **#914** (the local CI-mirror skill drifting behind
 `ci.yml`).

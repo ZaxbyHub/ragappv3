@@ -106,6 +106,11 @@ function explainUploadError(info: DraftRoomErrorInfo): {
     case "unsupported_input":
     case "limit_exceeded":
       return { message: info.detail, canRetry: false };
+    case "commit_pending":
+      // PRR-013: the server asked the client to check the inputs list
+      // instead of blind-retrying — the detached commit may still land and
+      // a re-upload of the same bytes would hit 409 duplicate_input.
+      return { message: info.detail, canRetry: false };
     default:
       return { message: info.detail, canRetry: true };
   }

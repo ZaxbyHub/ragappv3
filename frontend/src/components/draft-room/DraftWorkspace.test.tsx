@@ -885,6 +885,28 @@ describe("DraftWorkspace", () => {
     expect(retryTrigger.getAttribute("aria-describedby")).toBe(describedBy);
   });
 
+  it("names the offline worker, not a disabled room, when only compile is unavailable", async () => {
+    // Review PRR-010: enabled room + compile_available=false is the #902
+    // worker-down state; the reason must not claim the Draft Room is off.
+    renderWorkspace({
+      capabilities: makeCapabilities({
+        enabled: true,
+        compile_available: false,
+      }),
+    });
+
+    const compileBtn = await screen.findByRole("button", {
+      name: "Create draft",
+    });
+    expect(compileBtn).toBeDisabled();
+    const describedBy = compileBtn.getAttribute("aria-describedby");
+    const reason = describedBy ? document.getElementById(describedBy) : null;
+    expect(reason).toHaveTextContent(
+      "The Draft Room worker is offline; compiling is paused until it restarts.",
+    );
+    expect(reason).not.toHaveTextContent(DRAFT_ROOM_DISABLED_MESSAGE);
+  });
+
   it("adds no description attribute to compile while it is available", async () => {
     renderWorkspace({
       capabilities: makeCapabilities({ compile_available: true }),

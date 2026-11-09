@@ -119,7 +119,6 @@ def invalidate_active_user_cache(user_id: int) -> None:
         _ACTIVE_USER_CACHE.pop(cache_key, None)
 
 
-
 # Lazy imports — services are only loaded when their getter is actually called.
 # This prevents heavy imports (unstructured, aioimaplib, torch, etc.) from
 # blocking every request handler import chain.
@@ -189,7 +188,9 @@ def get_vector_store(request: Request) -> VectorStore:
     return request.app.state.vector_store
 
 
-def require_model_ready(vector_store: VectorStore = Depends(get_vector_store)) -> VectorStore:
+def require_model_ready(
+    vector_store: VectorStore = Depends(get_vector_store),
+) -> VectorStore:
     """Return the vector store only if it is initialized and ready.
 
     Raises HTTPException 503 if the vector store is None (not initialized) or
@@ -206,8 +207,8 @@ def require_model_ready(vector_store: VectorStore = Depends(get_vector_store)) -
             status_code=503,
             detail="Vector store is not initialized.",
         )
-    if getattr(vector_store, '_ready', True) is False:
-        if getattr(vector_store, 'rebuild_in_progress', False) is True:
+    if getattr(vector_store, "_ready", True) is False:
+        if getattr(vector_store, "rebuild_in_progress", False) is True:
             # Serving the previous generation while a staged rebuild builds
             # the next one (issue #696) — not an outage.
             return vector_store
@@ -246,6 +247,19 @@ def get_secret_manager(request: Request) -> SecretManager:
 def get_background_processor(request: Request) -> BackgroundProcessor:
     """Return the background processor from app state."""
     return request.app.state.background_processor
+
+
+def get_draft_job_processor(request: Request):
+    """Return the Draft Room job processor from app state (``None`` when absent).
+
+    Reads through ``scope.get("app")`` rather than ``Request.app`` so direct
+    handler invocations whose scope carries no ``app`` key (the
+    commit-boundary harness) resolve ``None`` instead of raising — review
+    PRR-002. Production ASGI servers always set ``scope["app"]``.
+    """
+    app = request.scope.get("app")
+    state = getattr(app, "state", None) if app is not None else None
+    return getattr(state, "draft_job_processor", None)
 
 
 def get_maintenance_service(request: Request) -> MaintenanceService:
@@ -457,9 +471,7 @@ async def _resolve_active_user(
                     _ACTIVE_USER_CACHE.pop(cache_key, None)
 
     if cached_user is None:
-        row = await asyncio.to_thread(
-            lambda: _fetch_user_row_with_pwc(conn, user_id)
-        )
+        row = await asyncio.to_thread(lambda: _fetch_user_row_with_pwc(conn, user_id))
 
         if not row:
             raise HTTPException(
@@ -479,7 +491,9 @@ async def _resolve_active_user(
             else False,
             # password_changed_at may not exist on test schemas without the column;
             # treat missing/None as 0 (epoch never bumped).
-            "password_changed_at": float(row[6]) if len(row) > 6 and row[6] is not None else 0.0,
+            "password_changed_at": float(row[6])
+            if len(row) > 6 and row[6] is not None
+            else 0.0,
         }
 
         if ttl > 0:
@@ -617,9 +631,7 @@ async def get_current_user_or_service_account(
     # _resolve_active_user's _fetch_user_row_with_pwc + asyncio.to_thread pattern.
     # Issue #724 (T1-01-S-09): the shared lookup carries the rotation grace —
     # the previous key stays valid here exactly as on require_service_account.
-    row, _via_previous = await asyncio.to_thread(
-        lookup_service_account, db, key_hash
-    )
+    row, _via_previous = await asyncio.to_thread(lookup_service_account, db, key_hash)
     if not row:
         raise HTTPException(status_code=401, detail="Not authenticated")
     sa_id, sa_name, sa_scopes_str, revoked_at = row
@@ -627,7 +639,9 @@ async def get_current_user_or_service_account(
         raise HTTPException(status_code=401, detail="Not authenticated")
 
     # Check required scope
-    sa_scopes = {s.strip().lower() for s in (sa_scopes_str or "").split(",") if s.strip()}
+    sa_scopes = {
+        s.strip().lower() for s in (sa_scopes_str or "").split(",") if s.strip()
+    }
     if "documents:read" not in sa_scopes:
         raise HTTPException(status_code=403, detail="Missing required scope")
 
@@ -853,7 +867,9 @@ async def get_user_accessible_vault_ids(user: dict, db) -> list:
     if user_role in ("superadmin", "admin"):
         return []  # Empty list means "all vaults"
 
-    rows = await asyncio.to_thread(lambda: db.execute("SELECT id FROM vaults").fetchall())
+    rows = await asyncio.to_thread(
+        lambda: db.execute("SELECT id FROM vaults").fetchall()
+    )
     vault_ids = [row[0] for row in rows]
     permissions = await get_effective_vault_permissions(db, user, vault_ids)
     return [
@@ -927,13 +943,19 @@ def assign_user_to_default_vault(db: sqlite3.Connection, user_id: int) -> None:
                 "INSERT OR IGNORE INTO vaults (name, description) VALUES (?, ?)",
                 ("Default", "Default vault for all users"),
             )
-            vault_id = cursor.lastrowid or db.execute(
-                "SELECT id FROM vaults WHERE name = ?", ("Default",)
-            ).fetchone()[0]
+            vault_id = (
+                cursor.lastrowid
+                or db.execute(
+                    "SELECT id FROM vaults WHERE name = ?", ("Default",)
+                ).fetchone()[0]
+            )
         db.execute(
             "INSERT OR IGNORE INTO vault_members (vault_id, user_id, permission) VALUES (?, ?, ?)",
             (vault_id, user_id, "read"),
         )
     except sqlite3.OperationalError:
         # vaults or vault_members table doesn't exist yet (pre-migration)
-        logger.warning("Could not assign user %d to Default vault (tables may not exist yet)", user_id)
+        logger.warning(
+            "Could not assign user %d to Default vault (tables may not exist yet)",
+            user_id,
+        )

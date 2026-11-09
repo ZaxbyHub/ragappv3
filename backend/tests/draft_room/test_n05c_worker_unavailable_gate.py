@@ -410,8 +410,14 @@ class TestN05CWorkerUnavailableGate(CompileRouteTestBase):
 
         from app.config import settings
 
-        # setUp set draft_room_enabled=True and tearDown restores the
-        # original value, so a plain assignment here is cleanup-safe.
+        # PRR-003: snapshot and restore HERE so this module carries its own
+        # restore evidence for the settings-singleton census (a restore living
+        # only in the base-class tearDown is invisible to the module-wide
+        # scan); the base-class restore stays underneath.
+        previous_enabled = settings.draft_room_enabled
+        self.addCleanup(
+            lambda: setattr(settings, "draft_room_enabled", previous_enabled)
+        )
         settings.draft_room_enabled = False
         restore = set_app_state("draft_job_processor", None)
         try:

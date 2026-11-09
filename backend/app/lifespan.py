@@ -1252,6 +1252,18 @@ async def lifespan(app: FastAPI):
         app.state.vector_store.close()
     except Exception:
         pass
+    # Review PRR-020: let detached upload commit tasks settle (bounded)
+    # before the pool closes, so every commit/compensation decides its
+    # outcome instead of racing pool closure.
+    try:
+        from app.api.routes.draft_room import drain_inflight_upload_commits
+
+        await drain_inflight_upload_commits()
+    except Exception as exc:
+        # Shutdown must still close the pool; record why the drain failed.
+        logger.warning(
+            "Upload commit drain failed during shutdown: %s", type(exc).__name__
+        )
     try:
         app.state.db_pool.close_all()
     except Exception:

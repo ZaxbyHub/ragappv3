@@ -294,6 +294,74 @@ class TestN05EOrphanInputReconcile(DraftInputStorageTestBase):
         finally:
             _shutil.rmtree(outside_dir, ignore_errors=True)
 
+    def test_internal_junction_alias_is_skipped_and_row_backed_file_survives(
+        self,
+    ):
+        """Review PRR-005 (CHECK_WRONG amendment): an INTERNAL junction
+        ``inputs/10 -> inputs/11`` (both inside the storage root) must not
+        turn the lexical candidate ``inputs/10/<name>`` into a deletion of
+        the row-backed live file at ``inputs/11/<name>``. RED at the pre-fix
+        review head (the sweep deleted the row-backed file through the
+        junction and logged a false "reaped" count), GREEN after the fix
+        (reparse candidates are skipped via the lstat reparse tag and a
+        resolved-path identity check). Uses a Windows junction
+        (``cmd /c mklink /J``); skips when the platform cannot create one."""
+        import platform
+        import subprocess
+
+        link_parent = self.root / "7" / "3" / "inputs" / "10"
+        real_dir = self.root / "7" / "3" / "inputs" / "11"
+        real_dir.mkdir(parents=True, exist_ok=True)
+        link_parent.mkdir(parents=True, exist_ok=True)
+        link = link_parent / "alias"
+        if platform.system() == "Windows":
+            dest = subprocess.list2cmdline([str(link)])
+            src = subprocess.list2cmdline([str(real_dir)])
+            made = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", dest, src],
+                capture_output=True,
+            )
+            if made.returncode != 0:
+                self.skipTest(
+                    f"junction creation unavailable on this platform: {made.stderr!r}"
+                )
+        else:
+            self.skipTest(
+                "the deletion-through-internal-junction shape is "
+                "Windows-specific (mklink /J); CI's ubuntu leg exercises the "
+                "symlink-skip arms instead"
+            )
+        live = real_dir / "live.txt"
+        live.write_bytes(b"owed by a live row")
+        canonical = self._write_finalized_file(
+            "7/3/inputs/11/live.txt", b"owed by a live row"
+        )
+        # The junction dir must not carry its own candidate files.
+        try:
+            self.storage.reconcile(
+                {LIVE_PAIR},
+                max_age_seconds=3600,
+                valid_input_relpaths={canonical},
+            )
+            self.assertTrue(
+                live.is_file(),
+                "PRR-005: the sweep must not delete the row-backed live file "
+                "through an internal junction alias — the lexical candidate "
+                "inputs/10/live.txt resolves to a different file than the "
+                "valid inputs/11/live.txt",
+            )
+            self.assertEqual(
+                live.read_bytes(),
+                b"owed by a live row",
+                "the row-backed file's bytes must be unchanged",
+            )
+        finally:
+            # Remove the LINK only (never recurse through it).
+            subprocess.run(
+                ["cmd", "/c", "rmdir", subprocess.list2cmdline([str(link)])],
+                capture_output=True,
+            )
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

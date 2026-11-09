@@ -33,6 +33,10 @@ from app.services.upload_validation import (
 
 logger = logging.getLogger(__name__)
 
+#: Wall-clock budget for the startup orphan-input sweep (review PRR-021):
+#: a huge or slow tree must not overrun the startup recovery window.
+_ORPHAN_SWEEP_BUDGET_SECONDS = 5.0
+
 _INCOMING_DIR = ".incoming"
 _TRASH_DIR = ".trash"
 _STREAM_CHUNK_BYTES = 1024 * 1024
@@ -481,11 +485,19 @@ class DraftInputStorage:
         normalized relpath is absent from the valid set. Identity is compared
         on ``os.path.normcase``-normalized, forward-slash relpaths (folds
         case on case-insensitive filesystems, identity on POSIX — matching
-        what a same-named lookup would find on each platform). Symlinks and
-        reparse points are skipped, never followed; anything outside the
+        what a same-named lookup would find on each platform). Reparse points
+        (symlinks AND Windows junctions/mount points, whose ``is_symlink()``
+        is False) are skipped via the ``lstat`` reparse tag and a
+        resolved-path identity check, never followed — a candidate whose
+        resolved location differs from its lexical path is aliasing and is
+        left alone (review PRR-005: an internal junction must not turn the
+        lexical candidate into a live file's deletion). Anything outside the
         exact shape is untouched. Startup reconcile runs before HTTP traffic
         and workers in the shipped single-process deployment, so no upload
-        can race this sweep.
+        can race this sweep; the sweep is wall-clock bounded
+        (``_ORPHAN_SWEEP_BUDGET_SECONDS``, review PRR-021) so a huge or slow
+        tree cannot overrun startup recovery — remaining orphans are reaped
+        on the next restart.
         """
         if valid_input_relpaths is None:
             return 0
@@ -495,25 +507,73 @@ class DraftInputStorage:
         def _norm(relpath: str) -> str:
             return os.path.normcase(relpath.replace(chr(92), "/"))
 
+        def _is_reparse(entry: Path) -> bool:
+            # Windows junctions and mount points report is_symlink() == False;
+            # the lstat reparse tag is the reliable signal. An entry that
+            # cannot be lstat'ed is treated as reparse (skip, never follow).
+            try:
+                return getattr(os.lstat(entry), "st_reparse_tag", 0) != 0
+            except OSError:
+                return True
+
         valid = {_norm(v) for v in valid_input_relpaths}
         resolved_root = self._root.resolve()
         removed = 0
+        removed_partial = False
+        sweep_deadline = time.monotonic() + _ORPHAN_SWEEP_BUDGET_SECONDS
         for owner_id, draft_id in valid_owner_draft_pairs:
+            if time.monotonic() > sweep_deadline:
+                removed_partial = True
+                break
             inputs_dir = self._root / str(owner_id) / str(draft_id) / "inputs"
-            if not inputs_dir.is_dir():
+            try:
+                input_entries = list(inputs_dir.iterdir())
+            except OSError:
+                # F-16: an unreadable project dir must not abort the sweep
+                # for the remaining projects.
+                logger.warning(
+                    "draft_input_storage: orphan sweep could not list "
+                    "owner_id=%s draft_id=%s",
+                    owner_id,
+                    draft_id,
+                )
                 continue
-            for input_entry in inputs_dir.iterdir():
-                if not input_entry.is_dir() or input_entry.is_symlink():
+            for input_entry in input_entries:
+                if time.monotonic() > sweep_deadline:
+                    removed_partial = True
+                    break
+                try:
+                    if (
+                        not input_entry.is_dir()
+                        or input_entry.is_symlink()
+                        or _is_reparse(input_entry)
+                    ):
+                        continue
+                except OSError:
                     continue
-                for file_entry in input_entry.iterdir():
+                try:
+                    file_entries = list(input_entry.iterdir())
+                except OSError:
+                    continue
+                for file_entry in file_entries:
                     try:
-                        if file_entry.is_symlink() or not file_entry.is_file():
+                        if (
+                            file_entry.is_symlink()
+                            or _is_reparse(file_entry)
+                            or not file_entry.is_file()
+                        ):
+                            continue
+                        resolved_entry = file_entry.resolve()
+                        if os.path.normcase(str(resolved_entry)) != os.path.normcase(
+                            str(file_entry)
+                        ):
+                            # Resolved identity differs from the lexical path:
+                            # aliasing — skip, never follow (review PRR-005).
                             continue
                         rel = file_entry.relative_to(self._root).as_posix()
                         if _norm(rel) in valid:
                             continue
-                        resolved_parent = file_entry.parent.resolve()
-                        resolved_parent.relative_to(resolved_root)
+                        resolved_entry.relative_to(resolved_root)
                     except (OSError, ValueError):
                         continue
                     try:
@@ -533,6 +593,13 @@ class DraftInputStorage:
                         input_entry.rmdir()
                     except OSError:
                         pass
+        if removed_partial:
+            logger.warning(
+                "draft_input_storage: orphan sweep hit its %ss budget; "
+                "remaining row-less files are reaped on the next restart "
+                "(review PRR-021)",
+                _ORPHAN_SWEEP_BUDGET_SECONDS,
+            )
         if removed:
             logger.warning(
                 "draft_input_storage: reaped %d row-less finalized input "

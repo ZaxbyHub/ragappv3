@@ -11,13 +11,14 @@ Harness mirrors ``test_draft_routes.py`` (itself copied from
 ``test_tags_routes.py``, DD pattern).
 """
 
+import asyncio
 import os
 import shutil
 import sqlite3
 import sys
 import tempfile
 import unittest
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from queue import Empty, Queue
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -84,6 +85,22 @@ class _PoolWithConnectionCM:
     @contextmanager
     def connection(self):
         conn = self.get_connection()
+        try:
+            yield conn
+        finally:
+            self.release_connection(conn)
+
+    async def get_connection_async(
+        self, max_wait_attempts: int = 3
+    ) -> sqlite3.Connection:
+        # #645 off-loop checkout, mirroring the production pool.
+        return await asyncio.to_thread(self.get_connection)
+
+    @asynccontextmanager
+    async def connection_async(self, max_wait_attempts: int = 3):
+        # Review PRR-001: the upload commit task and its compensation check
+        # out through the async surface (mirrors test_draft_routes.py).
+        conn = await self.get_connection_async(max_wait_attempts)
         try:
             yield conn
         finally:

@@ -126,6 +126,9 @@ const OPEN_FINDINGS_LOOKUP_PAGE_SIZE = 100;
 /** id of the paragraph explaining why compile/retry are disabled; the disabled
  *  controls reference it with aria-describedby (issue #789 review F-010). */
 const CAPABILITY_BLOCK_REASON_ID = "draft-capability-block-reason";
+const PROMOTE_BLOCK_REASON_ID = "draft-promote-block-reason";
+const COMPILE_WORKER_OFFLINE_MESSAGE =
+  "The Draft Room worker is offline; compiling is paused until it restarts.";
 
 const FACT_CURRENT = new Set<string>(FACT_CURRENT_STATUSES);
 
@@ -641,11 +644,12 @@ export const DraftWorkspace = forwardRef<
   // ---- Compile --------------------------------------------------------------
   function compileBlockedReason(): string | null {
     if (!capabilities) return "Loading Draft Room capabilities…";
-    if (
-      capabilities.enabled === false ||
-      capabilities.compile_available === false
-    ) {
-      return DRAFT_ROOM_DISABLED_MESSAGE;
+    if (capabilities.enabled === false) return DRAFT_ROOM_DISABLED_MESSAGE;
+    // Review PRR-010: with the room enabled, compile_available === false
+    // means the job worker is down (#902) — say so instead of claiming the
+    // whole Draft Room is disabled.
+    if (capabilities.compile_available === false) {
+      return COMPILE_WORKER_OFFLINE_MESSAGE;
     }
     if (archived)
       return "This project is archived. Restore it before compiling.";
@@ -1259,6 +1263,11 @@ export const DraftWorkspace = forwardRef<
             variant="outline"
             onClick={() => setPromoteDialogOpen(true)}
             disabled={promoteDisabled}
+            aria-describedby={
+              promoteDisabled && promoteUnavailableReason != null
+                ? PROMOTE_BLOCK_REASON_ID
+                : undefined
+            }
           >
             {PROMOTE_TO_VAULT_CTA}
           </Button>
@@ -1288,7 +1297,10 @@ export const DraftWorkspace = forwardRef<
         <p className="text-sm text-muted-foreground">{archiveBlockedReason}</p>
       )}
       {canPromote && promoteUnavailableReason != null && (
-        <p className="text-sm text-muted-foreground">
+        <p
+          id={PROMOTE_BLOCK_REASON_ID}
+          className="text-sm text-muted-foreground"
+        >
           {promoteUnavailableReason}
         </p>
       )}

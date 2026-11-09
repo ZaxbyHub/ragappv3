@@ -68,7 +68,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 import sqlite3
 import time
 from pathlib import Path
@@ -97,6 +96,7 @@ from app.api.deps import (
     get_current_active_user,
     get_db,
     get_db_pool,
+    get_draft_job_processor,
     get_evaluate_policy,
     log_db_released,
 )
@@ -1592,6 +1592,26 @@ _UPLOAD_COMPENSATE_TIMEOUT_SECONDS = 30.0
 _INFLIGHT_UPLOAD_COMMITS: set["asyncio.Task[Any]"] = set()
 
 
+async def drain_inflight_upload_commits(timeout: float = 10.0) -> None:
+    """Shutdown drain for detached upload commit tasks (review PRR-020).
+
+    Waits (bounded) for in-flight commit tasks to settle so lifespan closes
+    the pool only after every commit/compensation decided its outcome; tasks
+    still pending at the deadline are left to loop teardown + startup
+    recovery, and the abandonment is logged for operators.
+    """
+    if not _INFLIGHT_UPLOAD_COMMITS:
+        return
+    _done, pending = await asyncio.wait(set(_INFLIGHT_UPLOAD_COMMITS), timeout=timeout)
+    if pending:
+        logger.error(
+            "draft_room: %d upload commit task(s) still in flight at "
+            "shutdown after %ss — their outcomes belong to startup recovery",
+            len(pending),
+            timeout,
+        )
+
+
 def _consume_upload_commit(
     task: "asyncio.Task[Any]", *, draft_id: int, input_id: int
 ) -> None:
@@ -1622,51 +1642,65 @@ async def _compensate_upload_enrollment(
     owner_id: int,
     input_id: int,
     relpath: str,
+    conn: Optional[sqlite3.Connection] = None,
 ) -> None:
     """Roll back a failed upload commit: unlink the finalized bytes and the
     reserved input row (#913).
 
-    Runs shielded from cancellation with a bounded timeout, and each step
-    catches ``CancelledError`` separately from ``Exception``: a native
-    ``task.cancel()`` delivered at an await is recorded and RE-RAISED after
-    both steps have run, so it can never skip the row rollback and is never
-    swallowed. The row delete uses its own POOL connection — never the
-    request's — because this may run after the request dependency released
-    its connection (plan R2a).
+    Each step catches ``CancelledError`` separately from ``Exception``: a
+    native ``task.cancel()`` delivered at an await is recorded and RE-RAISED
+    after both steps have run, so it can never skip the row rollback and is
+    never swallowed. There is deliberately NO inner ``CancelScope`` here: the
+    caller's ``move_on_after(_UPLOAD_COMPENSATE_TIMEOUT_SECONDS, shield=True)``
+    is the bound, and an inner shield would block that deadline from ever
+    being delivered (review PRR-004 — the sibling ``draft_promotion``
+    compensation correctly carries the bound on its own wrapper only).
+
+    The row delete reuses ``conn`` — the commit task's still-open pooled
+    connection — when provided (review PRR-019: a failing upload must not
+    stack a third pool checkout on top of the two already held); otherwise it
+    checks out its own ASYNC pooled connection (review PRR-001: never a
+    synchronous on-loop checkout, never the request's connection).
     """
     cancelled: Optional[BaseException] = None
-    with anyio.CancelScope(shield=True):
-        try:
-            await asyncio.to_thread(
-                lambda: storage.resolve(relpath).unlink(missing_ok=True)
+    try:
+        await asyncio.to_thread(
+            lambda: storage.resolve(relpath).unlink(missing_ok=True)
+        )
+    except asyncio.CancelledError as exc:
+        cancelled = exc
+    except Exception:
+        logger.error(
+            "draft_room: upload commit rollback unlink failed draft_id=%s input_id=%s",
+            draft_id,
+            input_id,
+        )
+    try:
+        if conn is not None:
+            await _delete_input_row_best_effort(
+                DraftStore(conn),
+                draft_id=draft_id,
+                owner_id=owner_id,
+                input_id=input_id,
             )
-        except asyncio.CancelledError as exc:
-            cancelled = exc
-        except Exception:
-            logger.error(
-                "draft_room: upload commit rollback unlink failed draft_id=%s "
-                "input_id=%s",
-                draft_id,
-                input_id,
-            )
-        try:
-            with db_pool.connection() as conn:
+        else:
+            async with db_pool.connection_async() as rollback_conn:
                 await _delete_input_row_best_effort(
-                    DraftStore(conn),
+                    DraftStore(rollback_conn),
                     draft_id=draft_id,
                     owner_id=owner_id,
                     input_id=input_id,
                 )
-        except asyncio.CancelledError as exc:
-            if cancelled is None:
-                cancelled = exc
-        except Exception:
-            logger.error(
-                "draft_room: upload commit rollback input-row delete failed "
-                "draft_id=%s input_id=%s",
-                draft_id,
-                input_id,
-            )
+    except asyncio.CancelledError as exc:
+        if cancelled is None:
+            cancelled = exc
+    except Exception:
+        logger.error(
+            "draft_room: upload commit rollback input-row delete failed "
+            "draft_id=%s input_id=%s",
+            draft_id,
+            input_id,
+        )
     if cancelled is not None:
         raise cancelled
 
@@ -1679,6 +1713,7 @@ async def _compensate_upload_enrollment_shielded(
     owner_id: int,
     input_id: int,
     relpath: str,
+    conn: Optional[sqlite3.Connection] = None,
 ) -> None:
     """Bounded wrapper around :func:`_compensate_upload_enrollment`.
 
@@ -1696,6 +1731,7 @@ async def _compensate_upload_enrollment_shielded(
             owner_id=owner_id,
             input_id=input_id,
             relpath=relpath,
+            conn=conn,
         )
         return
     logger.warning(
@@ -1705,9 +1741,6 @@ async def _compensate_upload_enrollment_shielded(
         draft_id,
         input_id,
     )
-
-
-_EXPORT_TITLE_SEPARATOR_RE = re.compile(r"[/\\]")
 
 
 def _export_filename(title: str, revision_no: int, tag: str) -> str:
@@ -3093,6 +3126,7 @@ async def upload_draft_input(
     evaluate: Callable = Depends(get_evaluate_policy),
     storage: DraftInputStorage = Depends(get_draft_input_storage),
     db_pool: SQLiteConnectionPool = Depends(get_db_pool),
+    draft_worker: Any = Depends(get_draft_job_processor),
     _csrf_token: str = Depends(csrf_protect),
 ) -> DraftInputUploadResponse:
     _require_enabled()
@@ -3118,7 +3152,7 @@ async def upload_draft_input(
     # row when no live worker can claim the parse job it would enqueue (a
     # stale capabilities cache or raw API client would otherwise enqueue a
     # job nothing ever claims and the upload polls forever).
-    _require_draft_worker(getattr(request.app.state, "draft_job_processor", None))
+    _require_draft_worker(draft_worker)
 
     # Cheap pre-check on count before streaming bytes (SPEC section 6.2); the
     # byte-total limit is re-checked atomically inside reserve_input once the
@@ -3190,51 +3224,26 @@ async def upload_draft_input(
             await asyncio.to_thread(
                 storage.finalize, staged, input_record.storage_relpath
             )
-        except Exception as exc:
+        except BaseException as exc:
             # SPEC 6.1: "Delete partial files on any error." The staged
             # `.part` under `.incoming` is discarded here (the compensation
             # below unlinks the FINAL path, which never came to exist), so a
             # failed finalize leaves no bytes behind at all.
-            await asyncio.to_thread(storage.discard, staged)
-            await _compensate_upload_enrollment_shielded(
-                db_pool,
-                storage,
-                draft_id=draft_id,
-                owner_id=owner_id,
-                input_id=input_record.id,
-                relpath=input_record.storage_relpath,
-            )
-            logger.error(
-                "draft_room: failed to finalize staged upload draft_id=%s input_id=%s",
-                draft_id,
-                input_record.id,
-            )
-            raise DraftRoomHTTPError(
-                500, "failed to store uploaded file", "internal_error"
-            ) from exc
-        with db_pool.connection() as commit_conn:
-            commit_store = DraftStore(commit_conn)
-            try:
-                return await _run_store(
-                    lambda: commit_store.enqueue_parse_job(
-                        draft_id=draft_id,
-                        owner_id=owner_id,
-                        input_id=input_record.id,
-                        timeout_seconds=settings.draft_parse_timeout_seconds,
+            # BOT-01: CancelledError derives from BaseException — a
+            # cancellation delivered at the finalize await (loop shutdown
+            # cancels this detached task) must run the same cleanup before
+            # propagating, so both best-effort steps run under a shield and
+            # the original exception is re-raised afterwards.
+            with anyio.CancelScope(shield=True):
+                try:
+                    await asyncio.to_thread(storage.discard, staged)
+                except Exception:
+                    logger.error(
+                        "draft_room: finalize-failure staged discard failed "
+                        "draft_id=%s input_id=%s",
+                        draft_id,
+                        input_record.id,
                     )
-                )
-            except BaseException:
-                # A translated domain error AND a raw infrastructure error
-                # must both roll the upload back (row + finalized bytes), and
-                # a fault inside the compensation must never replace the
-                # original error (issues #516/#789/#913). CancelledError is
-                # deliberately caught here too: the commit task itself is
-                # cancelled only at loop shutdown, and compensation still has
-                # to run before it propagates.
-                # No log here: the done-callback's sanitized outcome record
-                # (_consume_upload_commit) is the single ERROR line for this
-                # failure — a second record would duplicate the operator
-                # signal without adding information.
                 await _compensate_upload_enrollment_shielded(
                     db_pool,
                     storage,
@@ -3243,7 +3252,71 @@ async def upload_draft_input(
                     input_id=input_record.id,
                     relpath=input_record.storage_relpath,
                 )
+            if isinstance(exc, asyncio.CancelledError):
                 raise
+            logger.error(
+                "draft_room: failed to finalize staged upload draft_id=%s input_id=%s",
+                draft_id,
+                input_record.id,
+            )
+            raise DraftRoomHTTPError(
+                500, "failed to store uploaded file", "internal_error"
+            ) from exc
+        compensated = False
+        try:
+            # PRR-001: the async checkout variant runs the blocking pool wait
+            # on the pool's dedicated checkout executor (#645) — the compliant
+            # pattern this module's SSE route already models.
+            async with db_pool.connection_async() as commit_conn:
+                commit_store = DraftStore(commit_conn)
+                try:
+                    return await _run_store(
+                        lambda: commit_store.enqueue_parse_job(
+                            draft_id=draft_id,
+                            owner_id=owner_id,
+                            input_id=input_record.id,
+                            timeout_seconds=settings.draft_parse_timeout_seconds,
+                        )
+                    )
+                except BaseException:
+                    # A translated domain error AND a raw infrastructure error
+                    # must both roll the upload back (row + finalized bytes),
+                    # and a fault inside the compensation must never replace
+                    # the original error (issues #516/#789/#913).
+                    # PRR-019: the connection is still open here — reuse it
+                    # for the row delete instead of stacking a third checkout.
+                    compensated = True
+                    # No log here: the done-callback's sanitized outcome
+                    # record (_consume_upload_commit) is the single ERROR line
+                    # for this failure — a second record would duplicate the
+                    # operator signal without adding information.
+                    await _compensate_upload_enrollment_shielded(
+                        db_pool,
+                        storage,
+                        draft_id=draft_id,
+                        owner_id=owner_id,
+                        input_id=input_record.id,
+                        relpath=input_record.storage_relpath,
+                        conn=commit_conn,
+                    )
+                    raise
+        except BaseException:
+            # PRR-018: a checkout failure (pool exhausted / closed) raises
+            # from the async-with header — INSIDE this compensating try — so
+            # the rollback runs even though there is no commit connection to
+            # reuse (the compensation's own checkout failing is logged and
+            # startup recovery re-enqueues the row).
+            if not compensated:
+                compensated = True
+                await _compensate_upload_enrollment_shielded(
+                    db_pool,
+                    storage,
+                    draft_id=draft_id,
+                    owner_id=owner_id,
+                    input_id=input_record.id,
+                    relpath=input_record.storage_relpath,
+                )
+            raise
 
     commit_task = asyncio.create_task(_commit_upload())
     _INFLIGHT_UPLOAD_COMMITS.add(commit_task)
@@ -3581,6 +3654,7 @@ async def retry_draft_job(
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
     evaluate: Callable = Depends(get_evaluate_policy),
+    draft_worker: Any = Depends(get_draft_job_processor),
     _csrf_token: str = Depends(csrf_protect),
 ) -> DraftJob:
     """Retry a failed/cancelled job.
@@ -3601,10 +3675,16 @@ async def retry_draft_job(
     )
 
     if parent.job_type != "compile":
+        # Precedence parity with the compile branch (review PRR-006): the
+        # invalid-state 409 fires before the worker-gate 503.
+        if parent.status not in ("failed", "cancelled"):
+            raise _conflict(
+                "only a failed or cancelled job can be retried", "invalid_state"
+            )
         # Issue #911: a parse retry enqueues onto the same DraftJobProcessor
         # poll loop as uploads — refuse it when no live worker can claim it
         # (after the ownership fetch above, before any new row).
-        _require_draft_worker(getattr(request.app.state, "draft_job_processor", None))
+        _require_draft_worker(draft_worker)
         job = await _run_store(
             lambda: store.retry_parse_job(
                 draft_id=draft_id,
@@ -3623,9 +3703,7 @@ async def retry_draft_job(
     # Evaluated in the route (not inside the thread unit) so the read is a
     # single fresh observation per request; the thread function enforces it
     # after replay/guards, before the first mutation (issue #911).
-    worker_ok = _worker_available(
-        getattr(request.app.state, "draft_job_processor", None)
-    )
+    worker_ok = _worker_available(draft_worker)
 
     requested = (body.start_stage if body else None) or _RETRY_STAGE_NORMALIZATION.get(
         parent.active_stage or "", parent.active_stage or _DEFAULT_START_STAGE
@@ -3738,6 +3816,7 @@ async def compile_draft(
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
     evaluate: Callable = Depends(get_evaluate_policy),
+    draft_worker: Any = Depends(get_draft_job_processor),
     _csrf_token: str = Depends(csrf_protect),
 ) -> DraftJob:
     """Enqueue one compile job (SPEC section 8.2).
@@ -3760,9 +3839,7 @@ async def compile_draft(
     # Evaluated in the route (not inside the thread unit) so the read is a
     # single fresh observation per request; the thread function enforces it
     # after replay/guards, before the first mutation (issue #911).
-    worker_ok = _worker_available(
-        getattr(request.app.state, "draft_job_processor", None)
-    )
+    worker_ok = _worker_available(draft_worker)
 
     idempotency_key = _validate_idempotency_key(
         request.headers.get(_IDEMPOTENCY_HEADER)
@@ -4230,7 +4307,7 @@ async def export_draft_revision(
     # (percent-encoded, ``safe=""`` so a title's own ``/`` never passes
     # through) so non-ASCII titles survive end-to-end for modern clients
     # (issue #789 — the ASCII name deliberately ASCII-folds them).
-    raw_name = _EXPORT_TITLE_SEPARATOR_RE.sub("_", draft.title or "draft")
+    raw_name = fold_title_separators(draft.title or "draft")
     disposition = (
         f'attachment; filename="{filename}"; '
         f"filename*=UTF-8''{quote(raw_name, safe='')}-rev{revision.revision_no}"

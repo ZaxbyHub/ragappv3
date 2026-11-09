@@ -42,7 +42,8 @@
 ## Retry Idempotency-Key bound to retry identity (#905)
 
 - `retryDraftJob(draftId, jobId, data, idempotencyKey?)` forwards the header
-  (same shape as compile). DraftWorkspace and ActivityTray mint one key per
+  (same shape as compile; compile retries only — parse retries keep their
+  base behavior, review F-04). DraftWorkspace and ActivityTray mint one key per
   retry IDENTITY (draft + parent job + requested stage): an accidental
   double-submit — including a second click after the first attempt settled
   but before the job list refreshed — replays the SAME key and gets the
@@ -61,8 +62,11 @@
   cancels are absorbed and counted, never restarting the clock) inside an
   anyio shielded scope, then re-raises — the upload is never left
   half-committed (row+bytes+job all present or all absent) and shutdown still
-  unwinds. On drain timeout of a LIVE (uncancelled) request the detached task
-  remains the sole owner of the outcome and the request answers 503
+  unwinds: a cancellation delivered at the FINALIZE await also runs the
+  staged discard + compensation before propagating (review BOT-01), and
+  lifespan drains in-flight commit tasks before closing the pool (review
+  PRR-020). On drain timeout of a LIVE (uncancelled) request the detached
+  task remains the sole owner of the outcome and the request answers 503
   `commit_pending`; a cancelled request is drained under the same budget and
   the cancellation re-raises (no response).
 - Compensation (unlink + row delete) runs shielded with a 30s bound, catches
@@ -72,7 +76,11 @@
   swallowed.
 - In-flight commit tasks are strong-referenced in `_INFLIGHT_UPLOAD_COMMITS`;
   a done-callback detaches the reference and consumes/logs the outcome
-  (draft id, input id, exception class only).
+  (draft id, input id, exception class only), and lifespan drains the set
+  (bounded) before closing the pool at shutdown (review PRR-020).
+- The startup orphan-input sweep is wall-clock bounded
+  (`_ORPHAN_SWEEP_BUDGET_SECONDS`); on overrun it logs and defers the
+  remainder to the next restart (review PRR-021).
 
 ## Orphan finalized-input reaping (#913)
 
