@@ -32,10 +32,15 @@ class TestReleaseProbeCredentialContract:
             "the probe must pass the credential through the REDISCLI_AUTH "
             "environment variable (never argv)"
         )
-        assert not re.search(r"redis-cli[^\n]*-u\b", block), (
+        assert not re.search(r"redis-cli[^\n]*\s-u\b", block), (
             "the probe must not pass a credential-bearing URL via redis-cli -u: "
             "the empty-username form sends a two-arg AUTH the server rejects, "
             "and -u places the credential in argv"
+        )
+        assert not re.search(r"redis-cli[^\n]*\s(-a\b|--pass\b)", block), (
+            "the probe must not pass the credential via redis-cli -a/--pass "
+            "either — the same argv exposure; REDISCLI_AUTH is the only "
+            "sanctioned channel"
         )
 
     def test_exits_nonzero_on_failure(self):
