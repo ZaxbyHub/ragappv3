@@ -3191,6 +3191,11 @@ async def upload_draft_input(
                 storage.finalize, staged, input_record.storage_relpath
             )
         except Exception as exc:
+            # SPEC 6.1: "Delete partial files on any error." The staged
+            # `.part` under `.incoming` is discarded here (the compensation
+            # below unlinks the FINAL path, which never came to exist), so a
+            # failed finalize leaves no bytes behind at all.
+            await asyncio.to_thread(storage.discard, staged)
             await _compensate_upload_enrollment_shielded(
                 db_pool,
                 storage,

@@ -224,6 +224,10 @@ describe("DraftWorkspace upload availability (C12)", () => {
       upload,
       "the upload CTA must be disabled when capabilities report upload_available: false (enabled stays true)"
     ).toHaveTextContent("disabled:true");
+    expect(
+      upload,
+      "a worker-off upload disable must explain itself — the disabled reason must be the exact offline-worker message"
+    ).toHaveTextContent("reason:Uploads are unavailable while the Draft Room worker is offline.");
     // Only upload is blocked: editing a stored source / input metadata does
     // not need the parse worker, so those actions must stay enabled.
     const list = await screen.findByTestId("source-list");
@@ -237,5 +241,6 @@ describe("DraftWorkspace upload availability (C12)", () => {
     renderWorkspace({ ...makeCapabilities(), upload_available: true } as DraftRoomCapabilities);
     const upload = await screen.findByTestId("source-upload");
     expect(upload).toHaveTextContent("disabled:false");
+    expect(upload).toHaveTextContent("reason:none");
   });
 });

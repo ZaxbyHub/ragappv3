@@ -1051,7 +1051,9 @@ export const DraftWorkspace = forwardRef<
                 ? "Loading Draft Room capabilities…"
                 : capabilities.enabled === false
                   ? DRAFT_ROOM_DISABLED_MESSAGE
-                  : undefined
+                  : capabilities.upload_available === false
+                    ? "Uploads are unavailable while the Draft Room worker is offline."
+                    : undefined
         }
         maxInputs={draftMaxInputs(capabilities)}
         currentInputCount={detail.inputs.length}
