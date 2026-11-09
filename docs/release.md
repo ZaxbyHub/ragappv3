@@ -66,7 +66,7 @@ Before deploying KnowledgeVault to production, ensure the following:
 - [ ] SQLite database directory (`./data` — the host-side default bind; the container sees it at `/app/data`) with appropriate permissions
 - [ ] LanceDB vector store directory with write access
 - [ ] Vault directories (`./data/vaults/{vault_id}/uploads/`) with sufficient disk space for each vault
-- [ ] Redis instance running for CSRF token storage, embedding L2 cache, and shared rate-limit counters (native code default: `redis://localhost:6379/0`; the bundled compose default is authenticated — see REDIS_PASSWORD in `.env.example`. Note: the compose redis uses an `allkeys-lru` eviction policy, which can evict CSRF tokens under memory pressure and force re-challenges, not auth failures)
+- [ ] Redis instance running for CSRF token storage, embedding L2 cache, and shared rate-limit counters (native code default: `redis://localhost:6379/0`; the bundled compose default is authenticated — see REDIS_PASSWORD in `.env.example`. Note: the compose redis uses an `allkeys-lru` eviction policy, which under memory pressure can evict CSRF tokens (forcing re-challenges, not auth failures) AND rate-limit counters/admission state (silently resetting a client's window allowance), so size `--maxmemory` for the embedding cache workload)
 - [ ] Ollama or OpenAI-compatible embedding service accessible
 - [ ] LLM chat service accessible (Ollama, OpenAI, or compatible API)
 
@@ -415,41 +415,70 @@ fi
 # The bundled compose Redis requires the REDIS_PASSWORD from the project .env
 # (compose interpolates it into the redis command, the healthcheck, and the
 # backend REDIS_URL). This script reads the SAME file so it authenticates
-# with the credential the running stack uses — exporting REDIS_URL alone
-# (with the default password) would false-fail a deployment that overrode
-# REDIS_PASSWORD.
+# with the credential the running stack uses. The password is passed to
+# redis-cli through the REDISCLI_AUTH environment variable — never argv — and
+# the script exits NONZERO on failure so automation can gate on it.
+#
+# .env handling matches compose: values may be quoted (matching quotes are
+# stripped), CRLF line endings are tolerated, and `export `-prefixed lines
+# are accepted. A value that still cannot be parsed is REDACTED, never
+# echoed: the probe must not leak a credential it failed to understand.
 #
 # Native deployments (no compose): export a credential-free REDIS_URL
 # explicitly, e.g. `export REDIS_URL=redis://localhost:6379/0` — the
 # credential-bearing default below only fits the bundled compose stack.
 
 # Load the project .env when present (compose reads the same file). Both the
-# credential and a configured endpoint come from it. Note: values must be
-# UNQUOTED in .env for this probe (compose strips quotes; a plain shell
-# export does not).
+# credential and a configured endpoint come from it.
+strip_env_value() {
+    # strip an optional `export ` prefix, trailing CR, and one layer of
+    # matching surrounding quotes (compose strips the same quotes).
+    printf '%s' "$1" \
+        | sed -E 's/^[[:space:]]*(export[[:space:]]+)?//' \
+        | tr -d '\r' \
+        | sed -E "s/^\"(.*)\"$/\1/; s/^'(.*)'$/\1/"
+}
 if [ -z "${REDIS_URL:-}" ] && [ -f .env ]; then
-    REDIS_URL_LINE="$(grep -E '^REDIS_URL=' .env | tail -1)"
-    [ -n "$REDIS_URL_LINE" ] && export "${REDIS_URL_LINE?}"
+    REDIS_URL_VALUE="$(grep -E '^[[:space:]]*(export[[:space:]]+)?REDIS_URL=' .env | tail -1)"
+    [ -n "$REDIS_URL_VALUE" ] && export REDIS_URL="$(strip_env_value "$REDIS_URL_VALUE")"
 fi
 if [ -z "${REDIS_PASSWORD:-}" ] && [ -f .env ]; then
-    REDIS_PASSWORD_LINE="$(grep -E '^REDIS_PASSWORD=' .env | tail -1)"
-    [ -n "$REDIS_PASSWORD_LINE" ] && export "${REDIS_PASSWORD_LINE?}"
+    REDIS_PASSWORD_VALUE="$(grep -E '^[[:space:]]*(export[[:space:]]+)?REDIS_PASSWORD=' .env | tail -1)"
+    [ -n "$REDIS_PASSWORD_VALUE" ] && export REDIS_PASSWORD="$(strip_env_value "$REDIS_PASSWORD_VALUE")"
 fi
 REDIS_URL="${REDIS_URL:-redis://:${REDIS_PASSWORD:-knowledgevault-local-redis}@localhost:6379/0}"
 
-# Never echo the credential: print the scheme + host:port/db only. The
-# sanitizer is scheme-agnostic (redis://, rediss:// TLS, ...): strip any
-# userinfo, then everything after the host:port.
-hostport=$(printf '%s' "$REDIS_URL" | sed -E 's|^[A-Za-z][A-Za-z0-9+.-]*://([^@]*@)?([^/?]+).*|\2|')
+# Parse the URL into scheme, userinfo (credential), and host:port. The
+# sanitizer prints scheme + host:port/db ONLY and fails closed: a URL it
+# cannot parse is printed redacted, never echoed (no credential leak).
 scheme=$(printf '%s' "$REDIS_URL" | sed -nE 's|^([A-Za-z][A-Za-z0-9+.-]*)://.*|\1|p')
+userinfo=$(printf '%s' "$REDIS_URL" | sed -nE 's|^[A-Za-z][A-Za-z0-9+.-]*://([^@]*)@.*|\1|p')
+hostport=$(printf '%s' "$REDIS_URL" | sed -E 's|^[A-Za-z][A-Za-z0-9+.-]*://([^@]*@)?([^/?]+).*|\2|')
+if [ -z "$scheme" ] || [ -z "$hostport" ]; then
+    echo "Testing Redis (<unparseable REDIS_URL — redacted>)..."
+    echo "✗ Redis FAILED"
+    exit 1
+fi
 echo "Testing Redis (${scheme}) at ${hostport}..."
 
-# redis-cli -u takes the URL verbatim (credentials included);
-# --no-auth-warning silences the password-on-command-line advisory.
-if redis-cli --no-auth-warning -u "$REDIS_URL" ping | grep -q "PONG"; then
+# Authenticate via the REDISCLI_AUTH environment variable (redis-cli reads it
+# natively): the credential never appears in argv or process listings. The
+# password is the userinfo's password segment (after the last colon; a
+# credential-free URL authenticates without it against a native instance).
+if [ -n "$userinfo" ]; then
+    REDISCLI_AUTH="${userinfo##*:}"
+    export REDISCLI_AUTH
+fi
+host="${hostport%%:*}"
+port="${hostport#*:}"
+[ "$port" = "$host" ] && port=6379
+
+if redis-cli --no-auth-warning -h "$host" -p "$port" ping | grep -q "PONG"; then
     echo "✓ Redis OK"
+    exit 0
 else
     echo "✗ Redis FAILED"
+    exit 1
 fi
 ```
 

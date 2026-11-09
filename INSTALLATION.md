@@ -455,10 +455,10 @@ services:
       - "127.0.0.1:6379:6379"   # loopback-only publish (#1061)
     volumes:
       - redis_data:/data
-    command: redis-server --appendonly yes --maxmemory 256mb
-      --maxmemory-policy allkeys-lru
-      --requirepass ${REDIS_PASSWORD:-knowledgevault-local-redis}
-    # ... auth-coordinated healthcheck (see docker-compose.yml)
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb",
+      "--maxmemory-policy", "allkeys-lru",
+      "--requirepass", "${REDIS_PASSWORD:-knowledgevault-local-redis}"]
+    # ... auth-coordinated PONG-grep healthcheck (see docker-compose.yml)
 
   # KnowledgeVault (backend + frontend, combined image)
   knowledgevault:

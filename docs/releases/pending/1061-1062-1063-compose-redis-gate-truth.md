@@ -14,6 +14,13 @@
 
 Collated follow-ups from PR #1059's closeout (user-authorized multi-issue collation). The empty enum forward was a deploy-blocking crash with a green CI signal; the Redis posture was an unauthenticated host-published store holding raw CSRF tokens; the doc/gate drift class repeatedly misled operators and automated reviewers (a PR #1081 reviewer was misled by the stale paths).
 
+## Migration steps
+
+- **Deployments whose `.env` pins `REDIS_URL` at the bundled Redis** (the value base `.env.example` recommended for Docker): the bundled Redis now requires the `REDIS_PASSWORD` credential. Either remove the pin (the compose default carries `REDIS_PASSWORD` automatically) or set both `REDIS_PASSWORD=<your password>` and `REDIS_URL=redis://:<your password>@redis:6379/0`. A credential-free pin silently loses the shared CSRF store, rate-limit counters, and embedding cache (each falls back to a local/per-process mode).
+- **`ADMISSION_STORE_URL` pointed at the bundled instance** needs the same credentials (see the `REDIS_PASSWORD` note in `.env.example`).
+- **Cross-host consumers of the bundled Redis**: the host port publish is loopback-only (`127.0.0.1:6379`). Use an SSH tunnel for remote access, or override the publish — changing it away from loopback is a deliberate, reviewed decision.
+- **The release runbook's Redis probe** now authenticates via `REDISCLI_AUTH` (the credential never appears in argv) and exits nonzero on failure.
+
 ## Known limitations
 
 - The four remaining #750-owned empty-default forwards (`JWT_ALGORITHM`, `ADMIN_RATE_LIMIT`, `VECTOR_METRIC`, `IMAP_MAILBOX`) pass Settings construction but have consumer-level breakage; they stay with #750 (this PR fixes only `DOCUMENT_PARSING_STRATEGY`, one of its five keys).

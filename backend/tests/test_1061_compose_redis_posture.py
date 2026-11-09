@@ -45,6 +45,15 @@ def _redis_command() -> list:
     return cmd.split() if isinstance(cmd, str) else list(cmd)
 
 
+def _healthcheck_shell() -> str:
+    test = _services()["redis"]["healthcheck"]["test"]
+    if isinstance(test, list):
+        # CMD-SHELL carries the whole shell line as one element; join so the
+        # token/pipe assertions work for both list and plain-string shapes.
+        return " ".join(str(part) for part in test)
+    return str(test)
+
+
 def _requirepass_token() -> str:
     cmd = _redis_command()
     assert "--requirepass" in cmd, "redis command must carry --requirepass"
@@ -62,14 +71,33 @@ def _requirepass_token() -> str:
 
 
 class TestRedisRequiresAuthentication:
+    def test_command_is_list_form(self):
+        cmd = _services()["redis"]["command"]
+        assert isinstance(cmd, list), (
+            "redis command must be a LIST (compose passes lists to the "
+            "container without a shell; a string command would shell-parse an "
+            "operator password and can truncate the --requirepass value)"
+        )
+
     def test_requirepass_with_nonempty_default(self):
         assert _requirepass_token()
 
     def test_healthcheck_uses_same_credential_token(self):
         token = _requirepass_token()
-        test = _services()["redis"]["healthcheck"]["test"]
-        assert "-a" in test, "healthcheck must authenticate (bare redis-cli ping NOAUTHs under requirepass)"
-        assert test[test.index("-a") + 1] == token, "healthcheck credential must match requirepass"
+        shell = _healthcheck_shell()
+        m = re.search(r"-a\s+'?([^'\s]+)'?\s+ping", shell)
+        assert m, "healthcheck must authenticate (bare redis-cli ping NOAUTHs under requirepass)"
+        assert m.group(1) == token, "healthcheck credential must match requirepass"
+
+    def test_healthcheck_greps_pong(self):
+        """redis-cli exits 0 even on a WRONG password (AUTH failed), so only a
+        PONG grep fails the healthcheck on a credential mismatch."""
+        shell = _healthcheck_shell()
+        assert "grep -q PONG" in shell, (
+            "healthcheck must pipe ping through 'grep -q PONG' — the bare "
+            "command exits 0 on WRONGPASS and cannot detect a credential "
+            "mismatch"
+        )
 
     def test_backend_redis_url_carries_same_credential_token(self):
         token = _requirepass_token()

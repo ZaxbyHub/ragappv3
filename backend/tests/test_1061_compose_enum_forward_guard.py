@@ -47,15 +47,21 @@ COMPOSE = ROOT / "docker-compose.yml"
 # design, so they are not part of the tolerance census.
 REQUIRED_BARE_FORWARDS = {"ADMIN_SECRET_TOKEN", "JWT_SECRET_KEY"}
 
-ENV_ENTRY = re.compile(r"^\s*([A-Z][A-Z0-9_]*)=\$\{([A-Z][A-Z0-9_]*)(?::-?|-?)\}\s*$")
-EMPTY_DEFAULT = re.compile(r"^\s*([A-Z][A-Z0-9_]*)=\$\{[A-Z][A-Z0-9_]*(?::-|-\}|)\}\s*$")
+# One pattern for every interpolation entry form the file uses:
+#   KEY=${VAR:-default} | KEY=${VAR-} | KEY=${VAR}
+# group(2) captures the default text ("" for the empty-default forms, None
+# for the bare ${VAR} form whose unset resolution is also empty).
+INTERP_ENTRY = re.compile(r"^\s*([A-Z][A-Z0-9_]*)=\$\{([A-Z][A-Z0-9_]*)(?::-([^}]*))?\}\s*$")
 
 
 def backend_empty_default_forwards() -> dict[str, str]:
     """Return {ENV_KEY: env_key} for backend env entries whose unset value resolves to "".
 
-    Covers ``${VAR:-}``, ``${VAR-}``, and bare ``${VAR}`` forms in the
-    knowledgevault (backend) service's environment list.
+    Covers ``${VAR:-default}``, ``${VAR:-}``, ``${VAR-}``, and bare ``${VAR}``
+    forms in the knowledgevault (backend) service's environment list — every
+    entry whose value resolves to "" when the variable is unset. Mapping-style
+    environment entries (explicit KEY: value) and non-interpolation values are
+    out of this census by construction (they carry their value verbatim).
     """
     doc = yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))
     env = doc["services"]["knowledgevault"].get("environment") or []
@@ -63,8 +69,11 @@ def backend_empty_default_forwards() -> dict[str, str]:
     for entry in env:
         if not isinstance(entry, str):
             continue  # mapping-style entries carry explicit values
-        m = EMPTY_DEFAULT.match(entry) or ENV_ENTRY.match(entry)
+        m = INTERP_ENTRY.match(entry)
         if not m:
+            continue
+        default = m.group(3)
+        if default:  # non-empty default (e.g. ${VAR:-thinking}) resolves non-empty
             continue
         key = m.group(1)
         if key in REQUIRED_BARE_FORWARDS:

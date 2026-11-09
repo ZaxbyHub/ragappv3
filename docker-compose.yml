@@ -78,12 +78,20 @@ services:
       - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
-    # maxmemory-policy caveat (#1061): allkeys-lru may evict csrf:* keys under
-    # memory pressure. CSRF tokens are 900s existence-only double-submit
-    # values, so eviction forces a re-challenge, not an auth bypass.
-    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru --requirepass ${REDIS_PASSWORD:-knowledgevault-local-redis}
+    # maxmemory-policy caveat (#1061): allkeys-lru may evict csrf:* tokens AND
+    # rate-limit counters / admission-state hashes under memory pressure.
+    # CSRF eviction forces a re-challenge (not an auth bypass); evicted
+    # rate-limit counters reset that client's window allowance.
+    # List-form command (#1061 review round): NOT shell-parsed, so an operator
+    # password containing shell metacharacters cannot truncate the
+    # --requirepass value the way a string command would.
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru", "--requirepass", "${REDIS_PASSWORD:-knowledgevault-local-redis}"]
     healthcheck:
-      test: ["CMD", "redis-cli", "--no-auth-warning", "-a", "${REDIS_PASSWORD:-knowledgevault-local-redis}", "ping"]
+      # PONG-grep form (#1061 review round): redis-cli exits 0 even on a WRONG
+      # password (AUTH failed), so an exit-code-only check cannot detect a
+      # credential mismatch; piping through grep -q PONG fails the healthcheck
+      # when authentication does not actually succeed.
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a '${REDIS_PASSWORD:-knowledgevault-local-redis}' ping | grep -q PONG"]
       interval: 10s
       timeout: 5s
       retries: 5

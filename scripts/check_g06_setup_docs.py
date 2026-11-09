@@ -300,9 +300,17 @@ def check_contributing_env_path() -> list[str]:
             paragraph.append(lines[cursor])
             cursor += 1
         paragraph_text = "\n".join(paragraph)
-        if ".env.example" in paragraph_text and "backend/.env" not in paragraph_text:
-            return ["FAIL contributing-env-path"]
-        if "backend/.env" not in paragraph_text:
+        # Path-token match (#1062 review round): a bare substring would let a
+        # near-miss name like backend/.env.example or backend/.environment
+        # satisfy the gate, so match whole path tokens only.
+        tokens = set(re.findall(r"[A-Za-z0-9_./-]+", paragraph_text))
+        if ".env.example" in tokens and "backend/.env" not in tokens:
+            return [
+                "FAIL contributing-env-path: the **Environment:** paragraph "
+                "names .env.example but not backend/.env - the native-run "
+                "env-file step must stay documented"
+            ]
+        if "backend/.env" not in tokens:
             return [
                 "FAIL contributing-env-path: **Environment:** paragraph must "
                 "name backend/.env - the native-run env-file step must stay "
