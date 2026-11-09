@@ -470,7 +470,9 @@ hostport="${hostport%%/*}"
 
 # Everything below FAILS CLOSED: any REDIS_URL the probe cannot fully
 # represent is redacted and exits nonzero, never echoed. Supported form:
-#   redis://[:password@]host[:port][/db]  (default-user; plaintext redis://)
+#   redis://[:password@]host[:port][/db]  (default-user; plaintext redis://;
+#                                         a bare password@host userinfo is
+#                                         also accepted as the password)
 # TLS (rediss://), IPv6 literals, and ACL usernames (user:pass userinfo) need
 # a hand-run redis-cli invocation (--tls / -h <bracketed> / --user).
 reject() {
@@ -496,11 +498,14 @@ echo "Testing Redis (${scheme}) at ${hostport}..."
 
 # Authenticate via the REDISCLI_AUTH environment variable (redis-cli reads it
 # natively): the credential never appears in argv or process listings. The
-# password is the userinfo's password segment (after the last colon; a
-# credential-free URL authenticates without it against a native instance).
+# password is the userinfo's password segment; a credential-free URL UNSETS
+# REDISCLI_AUTH first — an ambient shell credential must not authenticate the
+# probe against a deployment whose URL carries none (false all-clear).
 if [ -n "$userinfo" ]; then
     REDISCLI_AUTH="${userinfo##*:}"
     export REDISCLI_AUTH
+else
+    unset REDISCLI_AUTH
 fi
 host="${hostport%%:*}"
 port="${hostport#*:}"

@@ -78,6 +78,11 @@ class TestReleaseProbeCredentialContract:
             "out-of-alphabet credentials"
         )
         assert "REDISCLI_AUTH" in block  # auth form stays env-based
+        assert "unset REDISCLI_AUTH" in block, (
+            "the probe must UNSET REDISCLI_AUTH for a credential-free URL — "
+            "an ambient shell credential must not authenticate the probe "
+            "against a deployment whose URL carries none (false all-clear)"
+        )
 
     def test_parses_last_at_and_requires_separator(self):
         """The URL parse must split userinfo/host at the LAST '@' (urlsplit

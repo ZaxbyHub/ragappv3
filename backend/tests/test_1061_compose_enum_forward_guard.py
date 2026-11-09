@@ -47,11 +47,18 @@ COMPOSE = ROOT / "docker-compose.yml"
 # design, so they are not part of the tolerance census.
 REQUIRED_BARE_FORWARDS = {"ADMIN_SECRET_TOKEN", "JWT_SECRET_KEY"}
 
-# One pattern for every interpolation entry form the file uses:
-#   KEY=${VAR:-default} | KEY=${VAR-} | KEY=${VAR}
-# group(2) captures the default text ("" for the empty-default forms, None
-# for the bare ${VAR} form whose unset resolution is also empty).
+# Patterns for the interpolation entry forms:
+#   KEY=${VAR:-default} | KEY=${VAR}   (INTERP_ENTRY; group(3) = default text,
+#                                       "" or missing = resolves empty)
+#   KEY=${VAR-}                        (SINGLE_DASH_EMPTY; POSIX unset-empty
+#                                       form — INTERP_ENTRY's `:-` cannot
+#                                       match it, and compose has 0 such
+#                                       entries today, but the census must
+#                                       not silently evade the form)
+# KEY=${VAR-default} (non-empty single-dash default) resolves non-empty and is
+# excluded, matching compose semantics.
 INTERP_ENTRY = re.compile(r"^\s*([A-Z][A-Z0-9_]*)=\$\{([A-Z][A-Z0-9_]*)(?::-([^}]*))?\}\s*$")
+SINGLE_DASH_EMPTY = re.compile(r"^\s*([A-Z][A-Z0-9_]*)=\$\{[A-Z][A-Z0-9_]*-\}\s*$")
 
 
 def backend_empty_default_forwards() -> dict[str, str]:
@@ -59,7 +66,9 @@ def backend_empty_default_forwards() -> dict[str, str]:
 
     Covers ``${VAR:-default}``, ``${VAR:-}``, ``${VAR-}``, and bare ``${VAR}``
     forms in the knowledgevault (backend) service's environment list — every
-    entry whose value resolves to "" when the variable is unset. Mapping-style
+    entry whose value resolves to "" when the variable is unset (the
+    single-dash empty form ``${VAR-}`` is matched by SINGLE_DASH_EMPTY because
+    INTERP_ENTRY's ``:-`` separator cannot). Mapping-style
     environment entries (explicit KEY: value) and non-interpolation values are
     out of this census by construction (they carry their value verbatim).
     """
@@ -69,7 +78,7 @@ def backend_empty_default_forwards() -> dict[str, str]:
     for entry in env:
         if not isinstance(entry, str):
             continue  # mapping-style entries carry explicit values
-        m = INTERP_ENTRY.match(entry)
+        m = INTERP_ENTRY.match(entry) or SINGLE_DASH_EMPTY.match(entry)
         if not m:
             continue
         default = m.group(3)
