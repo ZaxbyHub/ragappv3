@@ -13,6 +13,7 @@
 """
 
 import asyncio
+import contextlib
 import logging
 import os
 import sys
@@ -67,16 +68,39 @@ class _ReviewFollowupBase(CompileRouteTestBase):
 
 
 class TestCommitTaskCancellationAtFinalize(_ReviewFollowupBase):
-    def test_cancelling_the_commit_task_at_finalize_leaves_nothing_behind(self):
+    def _run_cancel_at_finalize(self, *, second_cancel_at_discard):
+        """Park finalize, cancel the COMMIT TASK (loop-shutdown shape, not
+        the request task); optionally park the cleanup's staged discard and
+        deliver a SECOND native cancel there. Returns (draft_id, outcome,
+        log records)."""
+        from unittest.mock import patch
+
+        from app.services.draft_input_storage import DraftInputStorage
+
         draft_id = self._create_draft(title="N05J commit-task cancel").json()["id"]
         entered = threading.Event()
         release = threading.Event()
         finished = threading.Event()
+        discard_entered = threading.Event()
+        discard_release = threading.Event()
+        real_discard = DraftInputStorage.discard
+
+        def _parked_discard(storage_self, staged):
+            discard_entered.set()
+            if not discard_release.wait(timeout=60):
+                raise AssertionError("the parked discard was never released")
+            return real_discard(storage_self, staged)
+
+        discard_patch = (
+            patch.object(DraftInputStorage, "discard", _parked_discard)
+            if second_cancel_at_discard
+            else contextlib.nullcontext()
+        )
         request = _request(draft_id, dict(self._owner_headers()))
         outcome: dict = {}
 
         async def _drive():
-            with _parking_finalize_patch(entered, release, finished):
+            with _parking_finalize_patch(entered, release, finished), discard_patch:
                 transport = httpx.ASGITransport(app=app)
                 async with httpx.AsyncClient(
                     transport=transport, base_url="http://testserver"
@@ -88,20 +112,31 @@ class TestCommitTaskCancellationAtFinalize(_ReviewFollowupBase):
                             raise AssertionError("finalize was never entered")
                         inflight = list(draft_room_module._INFLIGHT_UPLOAD_COMMITS)
                         outcome["inflight_at_park"] = len(inflight)
-                        # Cancel the COMMIT TASK itself (loop-shutdown shape),
-                        # not the request task.
                         for commit_task in inflight:
                             commit_task.cancel()
-                        outcome.update(await _settle_request_task(task))
+                        if second_cancel_at_discard:
+                            if not await loop.run_in_executor(
+                                None, discard_entered.wait, 30
+                            ):
+                                raise AssertionError("the discard was never entered")
+                            for commit_task in inflight:
+                                commit_task.cancel()
+                            discard_release.set()
+                        outcome.update(
+                            await asyncio.wait_for(_settle_request_task(task), 30)
+                        )
                     finally:
-                        # The parked finalize thread is released only after
-                        # the cleanup ran; its staged file is already gone.
+                        # Parked threads are released only after the cleanup
+                        # ran; the staged file is already gone by then.
+                        discard_release.set()
                         release.set()
                     await _drain_pending_tasks()
 
         with self.assertLogs("app.api.routes.draft_room", level="WARNING") as logs:
             asyncio.run(_drive())
+        return draft_id, outcome, logs.records
 
+    def _assert_nothing_left(self, draft_id, outcome):
         self.assertEqual(outcome["inflight_at_park"], 1, outcome)
         self.assertNotEqual(
             outcome.get("status"),
@@ -128,9 +163,15 @@ class TestCommitTaskCancellationAtFinalize(_ReviewFollowupBase):
             "no staged or finalized bytes may remain under the inputs dir",
         )
         self.assertFalse(draft_room_module._INFLIGHT_UPLOAD_COMMITS)
+
+    def test_cancelling_the_commit_task_at_finalize_leaves_nothing_behind(self):
+        draft_id, outcome, records = self._run_cancel_at_finalize(
+            second_cancel_at_discard=False
+        )
+        self._assert_nothing_left(draft_id, outcome)
         cancelled_records = [
             r
-            for r in logs.records
+            for r in records
             if r.levelno == logging.WARNING
             and "upload commit task cancelled" in r.getMessage()
         ]
@@ -138,11 +179,20 @@ class TestCommitTaskCancellationAtFinalize(_ReviewFollowupBase):
             len(cancelled_records),
             1,
             "BOT-02: exactly one operator record for the cancelled commit, got "
-            f"{[r.getMessage() for r in logs.records]}",
+            f"{[r.getMessage() for r in records]}",
         )
         message = cancelled_records[0].getMessage()
         self.assertIn(f"draft_id={draft_id}", message)
         self.assertIn("input_id=", message)
+
+    def test_a_second_cancel_at_the_cleanup_discard_still_rolls_the_row_back(self):
+        """Review r2: the anyio shield does not absorb a native cancel, so a
+        second ``task.cancel()`` landing on the staged discard must still let
+        the enrollment compensation run before propagating."""
+        draft_id, outcome, _records = self._run_cancel_at_finalize(
+            second_cancel_at_discard=True
+        )
+        self._assert_nothing_left(draft_id, outcome)
 
 
 class TestRetryInvalidStatePrecedesWorkerGate(_ReviewFollowupBase):

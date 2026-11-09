@@ -3240,10 +3240,17 @@ async def upload_draft_input(
             # cancellation delivered at the finalize await (loop shutdown
             # cancels this detached task) must run the same cleanup before
             # propagating, so both best-effort steps run under a shield and
-            # the original exception is re-raised afterwards.
+            # the original exception is re-raised afterwards. The anyio
+            # shield does NOT absorb a native task.cancel() (it is delivered
+            # at the next await — review r2 probe), so a cancel landing on
+            # the discard is recorded and re-raised only after the row
+            # rollback has run, mirroring _compensate_upload_enrollment.
+            late_cancel: Optional[BaseException] = None
             with anyio.CancelScope(shield=True):
                 try:
                     await asyncio.to_thread(storage.discard, staged)
+                except asyncio.CancelledError as discard_cancel:
+                    late_cancel = discard_cancel
                 except Exception:
                     logger.error(
                         "draft_room: finalize-failure staged discard failed "
@@ -3261,6 +3268,8 @@ async def upload_draft_input(
                 )
             if isinstance(exc, asyncio.CancelledError):
                 raise
+            if late_cancel is not None:
+                raise late_cancel
             logger.error(
                 "draft_room: failed to finalize staged upload draft_id=%s input_id=%s",
                 draft_id,
