@@ -1018,6 +1018,22 @@ class RAGEngine:
             try:
                 from app.services.agentic_tools import RetrievalTool, SynthesisTool
 
+                # Resolve the effective prompt per-query through the SAME
+                # A/B-aware entrypoint the standard pipeline uses (org
+                # override > global active > built-in; A/B variant above
+                # both) so an admin-activated version is served on the
+                # agentic path too (#884). Resolution failures degrade to
+                # None (the tool's built-in tier), exactly like the
+                # standard path's fallback.
+                (
+                    agentic_prompt_override,
+                    agentic_ab_eid,
+                    agentic_ab_var,
+                    agentic_p_version,
+                ) = await asyncio.to_thread(
+                    self._resolve_prompt_with_ab_sync, vault_id, user_id
+                )
+
                 registry = ToolRegistry()
                 retrieval_tool = RetrievalTool(
                     retrieval_top_k=self.retrieval_top_k,
@@ -1028,6 +1044,7 @@ class RAGEngine:
                 synthesis_tool = SynthesisTool(
                     llm_client=self.llm_client,
                     citation_mode=active_citation_mode,
+                    system_prompt=agentic_prompt_override,
                 )
                 registry.register(retrieval_tool)
                 registry.register(synthesis_tool)
@@ -1048,6 +1065,14 @@ class RAGEngine:
                     "memories_used": [],
                     "answer_source_mode": "agentic",
                 }
+                # Parity metadata (#884): surface the same prompt-version /
+                # A-B fields the standard pipeline's done event carries, so
+                # clients can see WHICH effective prompt served the answer.
+                if agentic_p_version is not None:
+                    agentic_done["prompt_version"] = agentic_p_version
+                if agentic_ab_eid is not None:
+                    agentic_done["ab_experiment_id"] = agentic_ab_eid
+                    agentic_done["ab_variant"] = agentic_ab_var
                 # Honesty-field parity on the agentic path (issue #510
                 # UI-004/AC-17, reviewer finding): currency warnings and
                 # citation enforcement surface here exactly like the standard

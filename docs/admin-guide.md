@@ -840,6 +840,15 @@ All prompt versions are stored in the `prompt_versions` table. The effective pro
 org override > global active > built-in
 ```
 
+> The **built-in** tier differs per pipeline: the standard chat pipeline uses
+> the built-in default prompt below, while the agentic RAG pipeline (when
+> `AGENTIC_RAG_ENABLED=true`) serves its own built-in synthesis prompt. Both
+> pipelines resolve stored versions and org overrides identically. When an
+> active version omits a needed wrapper-tag declaration from its SECURITY
+> BOUNDARY clause, a `prompt-declaration-audit` warning is logged at
+> activation and when the standard pipeline serves it (the agentic pipeline
+> instead auto-completes the missing declaration on the served prompt).
+
 **Admin Endpoints:**
 
 | Method | Endpoint | Description |
