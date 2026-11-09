@@ -56,6 +56,12 @@ class TestContributingEnvPathNearMissesFail:
 
 
 class TestContributingEnvPathAcceptsDocumentedParagraphs:
+    def test_sentence_final_period_passes(self):
+        """A plain sentence ending in the required path is valid prose — the
+        token match must not bind sentence-final punctuation to the path."""
+        result = _mode_with("**Environment:** create backend/.env.\n")
+        assert result == []
+
     def test_names_both_paths_passes(self):
         result = _mode_with(
             "**Environment:** copy .env.example and create backend/.env\n"

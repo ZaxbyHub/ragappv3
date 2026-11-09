@@ -58,7 +58,23 @@ class TestReleaseProbeCredentialContract:
             "the .env loader must accept compose-style `export `-prefixed lines"
         )
         assert "tr -d '\\r'" in block, "the .env loader must strip CRLF carriage returns"
-        assert "strip_env_value" in block, (
-            "the .env loader must normalize values (matching surrounding "
-            "quotes stripped — compose strips the same quotes)"
+        # KEY= prefix stripped BEFORE the quote expressions (a quoted value
+        # containing '=' must survive; the quotes-then-key order truncated
+        # base64-padded values to '=').
+        key_strip = block.find("s/^[^=]*=//")
+        quote_strip = block.find('s/^"(.*)"$/')
+        assert key_strip != -1 and quote_strip != -1 and key_strip < quote_strip, (
+            "the .env loader must strip the KEY= prefix before stripping quotes"
         )
+
+    def test_unsupported_url_forms_rejected_redacted(self):
+        """rediss:// TLS, IPv6 literals, ACL usernames, and out-of-alphabet
+        credentials are refused redacted with a nonzero exit — never
+        mis-reported as OK over the wrong connection kind."""
+        block = probe_block()
+        assert "not supported by this probe" in block, (
+            "the probe must fail closed (redacted) on REDIS_URL forms it "
+            "cannot represent: non-redis schemes, IPv6, ACL users, "
+            "out-of-alphabet credentials"
+        )
+        assert "REDISCLI_AUTH" in block  # auth form stays env-based

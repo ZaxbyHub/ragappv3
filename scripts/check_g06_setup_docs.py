@@ -303,7 +303,9 @@ def check_contributing_env_path() -> list[str]:
         # Path-token match (#1062 review round): a bare substring would let a
         # near-miss name like backend/.env.example or backend/.environment
         # satisfy the gate, so match whole path tokens only.
-        tokens = set(re.findall(r"[A-Za-z0-9_./-]+", paragraph_text))
+        # Sentence-final punctuation must not bind to a path token (a plain
+        # "create backend/.env." sentence is valid prose).
+        tokens = {tok.rstrip(".,;:!?") for tok in re.findall(r"[A-Za-z0-9_./-]+", paragraph_text)}
         if ".env.example" in tokens and "backend/.env" not in tokens:
             return [
                 "FAIL contributing-env-path: the **Environment:** paragraph "

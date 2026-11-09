@@ -432,15 +432,15 @@ fi
 # credential and a configured endpoint come from it.
 strip_env_value() {
     # Return the VALUE from a .env line: strip an optional `export ` prefix,
-    # trailing CR, one layer of matching surrounding quotes around the value
-    # (compose strips the same quotes), and the `KEY=` prefix itself. Two
-    # plain quote expressions — busybox (musl) ERE has no pattern
-    # backreferences, so the busybox redis image needs the split form.
+    # trailing CR, the `KEY=` prefix, then one layer of matching quotes
+    # (compose strips the same quotes, so quoted values containing `=` work).
+    # Plain single-group expressions — busybox (musl) ERE mishandles a quoted
+    # literal inside a preceding group.
     printf '%s' "$1" \
         | sed -E 's/^[[:space:]]*(export[[:space:]]+)?//' \
         | tr -d '\r' \
-        | sed -E -e 's/^[A-Za-z_][A-Za-z0-9_]*="(.*)"$/\1/' -e "s/^[A-Za-z_][A-Za-z0-9_]*='(.*)'$/\1/" \
-        | sed -E 's/^[A-Za-z_][A-Za-z0-9_]*=//'
+        | sed -E 's/^[^=]*=//' \
+        | sed -E -e 's/^"(.*)"$/\1/' -e "s/^'(.*)'$/\1/"
 }
 if [ -z "${REDIS_URL:-}" ] && [ -f .env ]; then
     REDIS_URL_VALUE="$(grep -E '^[[:space:]]*(export[[:space:]]+)?REDIS_URL=' .env | tail -1)"
@@ -458,11 +458,31 @@ REDIS_URL="${REDIS_URL:-redis://:${REDIS_PASSWORD:-knowledgevault-local-redis}@l
 scheme=$(printf '%s' "$REDIS_URL" | sed -nE 's|^([A-Za-z][A-Za-z0-9+.-]*)://.*|\1|p')
 userinfo=$(printf '%s' "$REDIS_URL" | sed -nE 's|^[A-Za-z][A-Za-z0-9+.-]*://([^@]*)@.*|\1|p')
 hostport=$(printf '%s' "$REDIS_URL" | sed -E 's|^[A-Za-z][A-Za-z0-9+.-]*://([^@]*@)?([^/?]+).*|\2|')
+
+# Everything below FAILS CLOSED: any REDIS_URL the probe cannot fully
+# represent is redacted and exits nonzero, never echoed. Supported form:
+#   redis://[:password@]host[:port][/db]  (default-user; plaintext redis://)
+# TLS (rediss://), IPv6 literals, and ACL usernames (user:pass userinfo) need
+# a hand-run redis-cli invocation (--tls / -h <bracketed> / --user).
+reject() {
+    echo "Testing Redis (<REDIS_URL not supported by this probe — redacted>)..."
+    echo "✗ Redis FAILED"
+    exit 1
+}
 if [ -z "$scheme" ] || [ -z "$hostport" ]; then
     echo "Testing Redis (<unparseable REDIS_URL — redacted>)..."
     echo "✗ Redis FAILED"
     exit 1
 fi
+if [ "$scheme" != "redis" ]; then reject; fi
+case "$userinfo" in *:*) [ -n "${userinfo%%:*}" ] && reject ;; esac
+case "$hostport" in *\[*|*:*:*) reject ;; esac
+# The credential is the userinfo's password segment (after the separator
+# colon); characters outside the documented REDIS_PASSWORD alphabet cannot be
+# represented safely by the env-var auth form, so the probe refuses.
+password="${userinfo##*:}"
+if printf '%s' "$password" | grep -Eq '[^A-Za-z0-9._~-]'; then reject; fi
+if [ -n "${REDIS_PASSWORD:-}" ] && printf '%s' "$REDIS_PASSWORD" | grep -Eq '[^A-Za-z0-9._~-]'; then reject; fi
 echo "Testing Redis (${scheme}) at ${hostport}..."
 
 # Authenticate via the REDISCLI_AUTH environment variable (redis-cli reads it
