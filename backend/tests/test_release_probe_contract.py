@@ -83,7 +83,7 @@ class TestReleaseProbeCredentialContract:
             "out-of-alphabet credentials"
         )
         assert "REDISCLI_AUTH" in block  # auth form stays env-based
-        assert 'db_args=(-n "$db")' in block, (
+        assert 'dbopt="-n $db"' in block, (
             "the probe must SELECT the configured database (-n $db): a bare "
             "PING against database 0 false-OKs a redis://host:6379/3 deployment"
         )
