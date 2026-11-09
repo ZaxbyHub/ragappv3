@@ -1,5 +1,10 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { render as rtlRender, screen, waitFor, within } from "@testing-library/react";
+import {
+  render as rtlRender,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -30,7 +35,8 @@ class MockResizeObserver {
 }
 global.ResizeObserver = MockResizeObserver as unknown as typeof ResizeObserver;
 
-const render: typeof rtlRender = (ui, options) => rtlRender(ui, { wrapper: MemoryRouter, ...options });
+const render: typeof rtlRender = (ui, options) =>
+  rtlRender(ui, { wrapper: MemoryRouter, ...options });
 
 vi.mock("sonner", () => ({
   toast: { success: vi.fn(), error: vi.fn(), info: vi.fn() },
@@ -40,11 +46,15 @@ vi.mock("sonner", () => ({
 // own wiring/logic, per the shell's test guidance. Each stub exposes the props
 // that matter for assertions.
 vi.mock("./DraftAssignmentForm", async () => {
-  const actual = await vi.importActual<typeof import("./DraftAssignmentForm")>("./DraftAssignmentForm");
+  const actual = await vi.importActual<typeof import("./DraftAssignmentForm")>(
+    "./DraftAssignmentForm",
+  );
   return {
     ...actual,
     DraftAssignmentForm: (props: { inputs?: unknown[] }) => (
-      <div data-testid="assignment-form">inputs:{props.inputs?.length ?? "none"}</div>
+      <div data-testid="assignment-form">
+        inputs:{props.inputs?.length ?? "none"}
+      </div>
     ),
   };
 });
@@ -56,15 +66,22 @@ vi.mock("./DraftSourceUpload", () => ({
     currentInputCount: number;
   }) => (
     <div data-testid="source-upload">
-      disabled:{String(props.disabled)}|reason:{props.disabledReason ?? "none"}|max:{props.maxInputs}|count:
+      disabled:{String(props.disabled)}|reason:{props.disabledReason ?? "none"}
+      |max:{props.maxInputs}|count:
       {props.currentInputCount}
     </div>
   ),
 }));
 vi.mock("./DraftSourceList", () => ({
-  DraftSourceList: (props: { locked: boolean; canEdit: boolean; lockedReason?: string; inputs: unknown[] }) => (
+  DraftSourceList: (props: {
+    locked: boolean;
+    canEdit: boolean;
+    lockedReason?: string;
+    inputs: unknown[];
+  }) => (
     <div data-testid="source-list">
-      locked:{String(props.locked)}|canEdit:{String(props.canEdit)}|count:{props.inputs.length}
+      locked:{String(props.locked)}|canEdit:{String(props.canEdit)}|count:
+      {props.inputs.length}
     </div>
   ),
 }));
@@ -87,8 +104,12 @@ vi.mock("./DraftEditor", () => ({
     </div>
   ),
 }));
-vi.mock("./DraftPreview", () => ({ DraftPreview: () => <div data-testid="preview" /> }));
-vi.mock("./DraftRevisionDiff", () => ({ DraftRevisionDiff: () => <div data-testid="revision-diff" /> }));
+vi.mock("./DraftPreview", () => ({
+  DraftPreview: () => <div data-testid="preview" />,
+}));
+vi.mock("./DraftRevisionDiff", () => ({
+  DraftRevisionDiff: () => <div data-testid="revision-diff" />,
+}));
 vi.mock("./DraftStageArtifact", () => ({
   DraftStageArtifact: (props: { stage: DraftStage | null }) => (
     <div data-testid="stage-artifact">{props.stage?.stage ?? "none"}</div>
@@ -105,7 +126,11 @@ vi.mock("./DraftStageRail", () => ({
       <span>jobStatus:{props.jobStatus ?? "none"}</span>
       <span>selected:{props.selectedStage ?? "none"}</span>
       {props.stageOrder.map((stage) => (
-        <button key={stage} type="button" onClick={() => props.onSelectStage(stage)}>
+        <button
+          key={stage}
+          type="button"
+          onClick={() => props.onSelectStage(stage)}
+        >
           select-{stage}
         </button>
       ))}
@@ -121,23 +146,33 @@ vi.mock("./DraftInspector", () => ({
     tier: string;
   }) => (
     <div data-testid="inspector">
-      stage:{props.stage?.stage ?? "none"}|revision:{String(props.revisionId)}|job:{String(props.jobId)}|
-      canDispose:{String(props.canDispose)}|tier:{props.tier}
+      stage:{props.stage?.stage ?? "none"}|revision:{String(props.revisionId)}
+      |job:{String(props.jobId)}| canDispose:{String(props.canDispose)}|tier:
+      {props.tier}
     </div>
   ),
 }));
 vi.mock("./DraftReadyDialog", () => ({
-  DraftReadyDialog: (props: { open: boolean; eligibility: { ok: boolean; blockers: string[] } }) =>
+  DraftReadyDialog: (props: {
+    open: boolean;
+    eligibility: { ok: boolean; blockers: string[] };
+  }) =>
     props.open ? (
-      <div data-testid="ready-dialog">ok:{String(props.eligibility.ok)}|blockers:{props.eligibility.blockers.join(",")}</div>
+      <div data-testid="ready-dialog">
+        ok:{String(props.eligibility.ok)}|blockers:
+        {props.eligibility.blockers.join(",")}
+      </div>
     ) : null,
 }));
 vi.mock("./DraftExportDialog", () => ({
-  DraftExportDialog: (props: { open: boolean }) => (props.open ? <div data-testid="export-dialog" /> : null),
+  DraftExportDialog: (props: { open: boolean }) =>
+    props.open ? <div data-testid="export-dialog" /> : null,
 }));
 vi.mock("./DraftPromoteDialog", () => ({
   DraftPromoteDialog: (props: { open: boolean; canWrite: boolean }) =>
-    props.open ? <div data-testid="promote-dialog">canWrite:{String(props.canWrite)}</div> : null,
+    props.open ? (
+      <div data-testid="promote-dialog">canWrite:{String(props.canWrite)}</div>
+    ) : null,
 }));
 
 // The only real `ui/select` consumer left in DraftWorkspace itself (every
@@ -149,8 +184,13 @@ vi.mock("@/components/ui/select", async () => {
   const React = await import("react");
   const Ctx = React.createContext<(value: string) => void>(() => {});
   return {
-    Select: ({ onValueChange, children }: { onValueChange: (v: string) => void; children: React.ReactNode }) =>
-      React.createElement(Ctx.Provider, { value: onValueChange }, children),
+    Select: ({
+      onValueChange,
+      children,
+    }: {
+      onValueChange: (v: string) => void;
+      children: React.ReactNode;
+    }) => React.createElement(Ctx.Provider, { value: onValueChange }, children),
     SelectTrigger: ({
       children,
       id,
@@ -166,10 +206,21 @@ vi.mock("@/components/ui/select", async () => {
         children,
       ),
     SelectValue: () => null,
-    SelectContent: ({ children }: { children: React.ReactNode }) => React.createElement("div", null, children),
-    SelectItem: ({ value, children }: { value: string; children: React.ReactNode }) => {
+    SelectContent: ({ children }: { children: React.ReactNode }) =>
+      React.createElement("div", null, children),
+    SelectItem: ({
+      value,
+      children,
+    }: {
+      value: string;
+      children: React.ReactNode;
+    }) => {
       const onValueChange = React.useContext(Ctx);
-      return React.createElement("button", { type: "button", onClick: () => onValueChange(value) }, children);
+      return React.createElement(
+        "button",
+        { type: "button", onClick: () => onValueChange(value) },
+        children,
+      );
     },
   };
 });
@@ -205,7 +256,9 @@ const {
 }));
 
 vi.mock("@/lib/api/draftRoom", async () => {
-  const actual = await vi.importActual<typeof import("@/lib/api/draftRoom")>("@/lib/api/draftRoom");
+  const actual = await vi.importActual<typeof import("@/lib/api/draftRoom")>(
+    "@/lib/api/draftRoom",
+  );
   return {
     ...actual,
     listDraftJobs: mockListDraftJobs,
@@ -307,7 +360,9 @@ function makeDetail(overrides: Partial<DraftDetail> = {}): DraftDetail {
   };
 }
 
-function makeCapabilities(overrides: Partial<DraftRoomCapabilities> = {}): DraftRoomCapabilities {
+function makeCapabilities(
+  overrides: Partial<DraftRoomCapabilities> = {},
+): DraftRoomCapabilities {
   return {
     enabled: true,
     modes: ["rewrite", "compose"],
@@ -318,11 +373,30 @@ function makeCapabilities(overrides: Partial<DraftRoomCapabilities> = {}): Draft
     export_formats: ["md"],
     logical_model_modes: ["default"],
     default_logical_mode: "default",
-    compile_start_stages: ["research", "outline", "draft", "lint", "copy", "standards", "fact"],
-    compile_stage_order: ["intake", "research", "outline", "draft", "lint", "copy", "standards", "fact", "assemble"],
+    compile_start_stages: [
+      "research",
+      "outline",
+      "draft",
+      "lint",
+      "copy",
+      "standards",
+      "fact",
+    ],
+    compile_stage_order: [
+      "intake",
+      "research",
+      "outline",
+      "draft",
+      "lint",
+      "copy",
+      "standards",
+      "fact",
+      "assemble",
+    ],
     prompt_bundle_version: "v1",
     editorial_gates_installed: true,
     compile_available: true,
+    upload_available: true,
     findings_available: true,
     claims_available: true,
     evidence_available: true,
@@ -362,8 +436,12 @@ function makeJob(overrides: Partial<DraftJob> = {}): DraftJob {
 
 const initialUiState = useDraftRoomUiStore.getState();
 
-function renderWorkspace(props: Partial<React.ComponentProps<typeof DraftWorkspace>> = {}) {
-  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+function renderWorkspace(
+  props: Partial<React.ComponentProps<typeof DraftWorkspace>> = {},
+) {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
   const detail = props.detail ?? makeDetail();
   const draft = props.draft ?? detail.summary;
   const utils = render(
@@ -376,14 +454,16 @@ function renderWorkspace(props: Partial<React.ComponentProps<typeof DraftWorkspa
         vaultAccess="write"
         {...props}
       />
-    </QueryClientProvider>
+    </QueryClientProvider>,
   );
   return { ...utils, queryClient };
 }
 
 beforeEach(() => {
   useDraftRoomUiStore.setState(initialUiState, true);
-  mockListDraftJobs.mockReset().mockResolvedValue({ items: [makeJob()], total: 1, page: 1, per_page: 10 });
+  mockListDraftJobs
+    .mockReset()
+    .mockResolvedValue({ items: [makeJob()], total: 1, page: 1, per_page: 10 });
   mockGetDraftStages.mockReset().mockResolvedValue({
     items: [
       {
@@ -452,7 +532,9 @@ beforeEach(() => {
     citations: [],
     qa_summary: {},
   });
-  mockListDraftFindings.mockReset().mockResolvedValue({ items: [], total: 0, page: 1, per_page: 100 });
+  mockListDraftFindings
+    .mockReset()
+    .mockResolvedValue({ items: [], total: 0, page: 1, per_page: 100 });
   mockUpdateDraft.mockReset();
   mockCompileDraft.mockReset();
   mockCancelDraftJob.mockReset();
@@ -470,7 +552,9 @@ describe("DraftWorkspace", () => {
   it("disables compile with the exact reason when the project has no ready inputs (draft with no inputs)", async () => {
     renderWorkspace({ detail: makeDetail({ inputs: [] }) });
     expect(
-      await screen.findByText("Add at least one parsed, ready source file before compiling.")
+      await screen.findByText(
+        "Add at least one parsed, ready source file before compiling.",
+      ),
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Create draft" })).toBeDisabled();
   });
@@ -480,21 +564,32 @@ describe("DraftWorkspace", () => {
     mockCompileDraft.mockResolvedValue(makeJob({ status: "pending" }));
     renderWorkspace();
 
-    await user.click(await screen.findByRole("button", { name: "Create draft" }));
+    await user.click(
+      await screen.findByRole("button", { name: "Create draft" }),
+    );
 
     const dialog = await screen.findByRole("dialog");
     expect(within(dialog).getByText("Standard")).toBeInTheDocument();
     expect(within(dialog).getByText(/1 \(1 Manuscript\)/)).toBeInTheDocument();
     expect(within(dialog).getByText("9")).toBeInTheDocument(); // 9 stages in compile_stage_order
     expect(within(dialog).getByText("40")).toBeInTheDocument(); // max_model_calls
-    expect(within(dialog).getAllByText(/human review/i).length).toBeGreaterThan(0);
+    expect(within(dialog).getAllByText(/human review/i).length).toBeGreaterThan(
+      0,
+    );
 
-    await user.click(within(dialog).getByRole("button", { name: "Create draft" }));
+    await user.click(
+      within(dialog).getByRole("button", { name: "Create draft" }),
+    );
 
     await waitFor(() => expect(mockCompileDraft).toHaveBeenCalledTimes(1));
-    const [draftIdArg, request, idempotencyKey] = mockCompileDraft.mock.calls[0];
+    const [draftIdArg, request, idempotencyKey] =
+      mockCompileDraft.mock.calls[0];
     expect(draftIdArg).toBe(42);
-    expect(request).toEqual({ base_revision_id: 100, lock_version: 3, start_stage: undefined });
+    expect(request).toEqual({
+      base_revision_id: 100,
+      lock_version: 3,
+      start_stage: undefined,
+    });
     expect(typeof idempotencyKey).toBe("string");
     expect(idempotencyKey.length).toBeGreaterThan(0);
   });
@@ -503,11 +598,15 @@ describe("DraftWorkspace", () => {
     const user = userEvent.setup();
     renderWorkspace();
 
-    await user.click(await screen.findByRole("button", { name: "Create draft" }));
+    await user.click(
+      await screen.findByRole("button", { name: "Create draft" }),
+    );
     const dialog = await screen.findByRole("dialog");
 
     await waitFor(() => {
-      expect(document.activeElement).toBe(within(dialog).getByRole("heading", { name: "Create draft" }));
+      expect(document.activeElement).toBe(
+        within(dialog).getByRole("heading", { name: "Create draft" }),
+      );
     });
   });
 
@@ -516,7 +615,11 @@ describe("DraftWorkspace", () => {
     mockCancelDraftJob.mockResolvedValue(makeJob({ status: "cancelled" }));
     renderWorkspace({
       detail: makeDetail({
-        active_compile_job: makeJob({ id: 55, status: "running", active_stage: "research" }),
+        active_compile_job: makeJob({
+          id: 55,
+          status: "running",
+          active_stage: "research",
+        }),
       }),
     });
 
@@ -524,15 +627,23 @@ describe("DraftWorkspace", () => {
     const dialog = await screen.findByRole("dialog");
     expect(within(dialog).getByText(CANCEL_CONSEQUENCE)).toBeInTheDocument();
 
-    await user.click(within(dialog).getByRole("button", { name: "Cancel run" }));
-    await waitFor(() => expect(mockCancelDraftJob).toHaveBeenCalledWith(42, 55));
+    await user.click(
+      within(dialog).getByRole("button", { name: "Cancel run" }),
+    );
+    await waitFor(() =>
+      expect(mockCancelDraftJob).toHaveBeenCalledWith(42, 55),
+    );
   });
 
   it("focuses the cancel confirmation's heading on open, not the Keep running button", async () => {
     const user = userEvent.setup();
     renderWorkspace({
       detail: makeDetail({
-        active_compile_job: makeJob({ id: 55, status: "running", active_stage: "research" }),
+        active_compile_job: makeJob({
+          id: 55,
+          status: "running",
+          active_stage: "research",
+        }),
       }),
     });
 
@@ -540,7 +651,9 @@ describe("DraftWorkspace", () => {
     const dialog = await screen.findByRole("dialog");
 
     await waitFor(() => {
-      expect(document.activeElement).toBe(within(dialog).getByRole("heading", { name: "Cancel this run?" }));
+      expect(document.activeElement).toBe(
+        within(dialog).getByRole("heading", { name: "Cancel this run?" }),
+      );
     });
   });
 
@@ -557,15 +670,30 @@ describe("DraftWorkspace", () => {
     renderWorkspace({ detail: makeDetail({ current_revision_summary: null }) });
 
     await screen.findByRole("group", { name: "Retry from" });
-    expect(screen.queryByRole("button", { name: "Assemble" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Intake" })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Assemble" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Intake" }),
+    ).not.toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "Outline" }));
     await user.click(screen.getByRole("button", { name: "Retry" }));
 
-    await waitFor(() => expect(mockRetryDraftJob).toHaveBeenCalledWith(42, 9, { start_stage: "outline" }));
     await waitFor(() =>
-      expect(toast.info).toHaveBeenCalledWith(expect.stringContaining("Research"))
+      expect(mockRetryDraftJob).toHaveBeenCalledWith(
+        42,
+        9,
+        {
+          start_stage: "outline",
+        },
+        expect.any(String),
+      ),
+    );
+    await waitFor(() =>
+      expect(toast.info).toHaveBeenCalledWith(
+        expect.stringContaining("Research"),
+      ),
     );
   });
 
@@ -582,11 +710,17 @@ describe("DraftWorkspace", () => {
 
     await user.click(screen.getByRole("button", { name: "Save new revision" }));
     const dialog = await screen.findByRole("dialog");
-    await user.click(within(dialog).getByRole("button", { name: "Save new revision" }));
+    await user.click(
+      within(dialog).getByRole("button", { name: "Save new revision" }),
+    );
 
     expect(await within(dialog).findByText("Conflict")).toBeInTheDocument();
-    expect(within(dialog).getByRole("button", { name: "Reload" })).toBeInTheDocument();
-    expect(within(dialog).getByRole("button", { name: "Compare" })).toBeInTheDocument();
+    expect(
+      within(dialog).getByRole("button", { name: "Reload" }),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).getByRole("button", { name: "Compare" }),
+    ).toBeInTheDocument();
     expect(mockCreateDraftRevision).toHaveBeenCalledTimes(1);
   });
 
@@ -603,7 +737,7 @@ describe("DraftWorkspace", () => {
 
     await waitFor(() => {
       expect(document.activeElement).toBe(
-        within(dialog).getByRole("heading", { name: "Save a new revision?" })
+        within(dialog).getByRole("heading", { name: "Save a new revision?" }),
       );
     });
   });
@@ -612,12 +746,14 @@ describe("DraftWorkspace", () => {
     const user = userEvent.setup();
     renderWorkspace();
 
-    await user.click(await screen.findByRole("button", { name: "Delete project" }));
+    await user.click(
+      await screen.findByRole("button", { name: "Delete project" }),
+    );
     const dialog = await screen.findByRole("dialog");
 
     await waitFor(() => {
       expect(document.activeElement).toBe(
-        within(dialog).getByRole("heading", { name: "Delete this project?" })
+        within(dialog).getByRole("heading", { name: "Delete this project?" }),
       );
     });
   });
@@ -626,20 +762,33 @@ describe("DraftWorkspace", () => {
     useDraftRoomUiStore.setState({ workspaceTab: "sources" });
     renderWorkspace({
       vaultAccess: "revoked",
-      detail: makeDetail({ active_compile_job: makeJob({ id: 77, status: "running" }) }),
+      detail: makeDetail({
+        active_compile_job: makeJob({ id: 77, status: "running" }),
+      }),
     });
 
     // The revoked-access reason gates content actions across surfaces —
     // pin presence, not count (the exact panel set is an implementation
     // detail).
     expect(
-      (await screen.findAllByText(READY_BLOCKER_LABELS.vault_access_revoked)).length
+      (await screen.findAllByText(READY_BLOCKER_LABELS.vault_access_revoked))
+        .length,
     ).toBeGreaterThan(0);
-    expect(screen.queryByRole("button", { name: "Export" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Promote to vault" })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Cancel run" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Delete project" })).toBeEnabled();
-    expect(screen.getByTestId("source-upload")).toHaveTextContent("disabled:true");
+    expect(
+      screen.queryByRole("button", { name: "Export" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Promote to vault" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Cancel run" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Delete project" }),
+    ).toBeEnabled();
+    expect(screen.getByTestId("source-upload")).toHaveTextContent(
+      "disabled:true",
+    );
   });
 
   it("offers compile, retry and Mark Ready with read-only vault access, but not Promote to vault (backend gates only promote on vault write)", async () => {
@@ -651,11 +800,15 @@ describe("DraftWorkspace", () => {
     });
     renderWorkspace({ vaultAccess: "read" });
 
-    expect(await screen.findByRole("button", { name: "Create draft" })).toBeEnabled();
+    expect(
+      await screen.findByRole("button", { name: "Create draft" }),
+    ).toBeEnabled();
     await screen.findByRole("group", { name: "Retry from" });
     expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Mark Ready" })).toBeEnabled();
-    expect(screen.queryByRole("button", { name: "Promote to vault" })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Promote to vault" }),
+    ).not.toBeInTheDocument();
   });
 
   it("offers compile, retry, Mark Ready and Promote to vault with vault write access", async () => {
@@ -667,11 +820,15 @@ describe("DraftWorkspace", () => {
     });
     renderWorkspace({ vaultAccess: "write" });
 
-    expect(await screen.findByRole("button", { name: "Create draft" })).toBeEnabled();
+    expect(
+      await screen.findByRole("button", { name: "Create draft" }),
+    ).toBeEnabled();
     await screen.findByRole("group", { name: "Retry from" });
     expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Mark Ready" })).toBeEnabled();
-    expect(screen.getByRole("button", { name: "Promote to vault" })).toBeEnabled();
+    expect(
+      screen.getByRole("button", { name: "Promote to vault" }),
+    ).toBeEnabled();
   });
 
   it("offers no submittable Retry when the capability is disabled, even with a failed job", async () => {
@@ -681,7 +838,12 @@ describe("DraftWorkspace", () => {
       page: 1,
       per_page: 10,
     });
-    renderWorkspace({ capabilities: makeCapabilities({ enabled: false, compile_available: false }) });
+    renderWorkspace({
+      capabilities: makeCapabilities({
+        enabled: false,
+        compile_available: false,
+      }),
+    });
 
     await screen.findByRole("group", { name: "Retry from" });
     expect(screen.getByRole("button", { name: "Retry" })).toBeDisabled();
@@ -698,9 +860,16 @@ describe("DraftWorkspace", () => {
       page: 1,
       per_page: 10,
     });
-    renderWorkspace({ capabilities: makeCapabilities({ enabled: false, compile_available: false }) });
+    renderWorkspace({
+      capabilities: makeCapabilities({
+        enabled: false,
+        compile_available: false,
+      }),
+    });
 
-    const compileBtn = await screen.findByRole("button", { name: "Create draft" });
+    const compileBtn = await screen.findByRole("button", {
+      name: "Create draft",
+    });
     expect(compileBtn).toBeDisabled();
     const describedBy = compileBtn.getAttribute("aria-describedby");
     expect(describedBy).toBeTruthy();
@@ -710,58 +879,98 @@ describe("DraftWorkspace", () => {
 
     const retryBtn = await screen.findByRole("button", { name: "Retry" });
     expect(retryBtn.getAttribute("aria-describedby")).toBe(describedBy);
-    const retryTrigger = await screen.findByRole("group", { name: "Retry from" });
+    const retryTrigger = await screen.findByRole("group", {
+      name: "Retry from",
+    });
     expect(retryTrigger.getAttribute("aria-describedby")).toBe(describedBy);
   });
 
   it("adds no description attribute to compile while it is available", async () => {
-    renderWorkspace({ capabilities: makeCapabilities({ compile_available: true }) });
+    renderWorkspace({
+      capabilities: makeCapabilities({ compile_available: true }),
+    });
 
-    const compileBtn = await screen.findByRole("button", { name: "Create draft" });
+    const compileBtn = await screen.findByRole("button", {
+      name: "Create draft",
+    });
     expect(compileBtn).toBeEnabled();
     expect(compileBtn.getAttribute("aria-describedby")).toBeNull();
   });
 
   it("shows Restore for an authorized archived project and blocks compile with the archived reason", async () => {
-    renderWorkspace({ draft: makeDraft({ status: "archived" }), detail: makeDetail({ summary: makeDraft({ status: "archived" }) }) });
+    renderWorkspace({
+      draft: makeDraft({ status: "archived" }),
+      detail: makeDetail({ summary: makeDraft({ status: "archived" }) }),
+    });
 
-    expect(await screen.findByText("This project is archived. Restore it before compiling.")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Restore project" })).toBeInTheDocument();
+    expect(
+      await screen.findByText(
+        "This project is archived. Restore it before compiling.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Restore project" }),
+    ).toBeInTheDocument();
   });
 
   it("enables Promote when the caller has vault write and the server reports promotion available", async () => {
-    renderWorkspace({ capabilities: makeCapabilities({ promote_available: true }) });
+    renderWorkspace({
+      capabilities: makeCapabilities({ promote_available: true }),
+    });
 
-    expect(await screen.findByRole("button", { name: "Promote to vault" })).toBeEnabled();
-    expect(screen.queryByText("Promotion is currently unavailable.")).not.toBeInTheDocument();
+    expect(
+      await screen.findByRole("button", { name: "Promote to vault" }),
+    ).toBeEnabled();
+    expect(
+      screen.queryByText("Promotion is currently unavailable."),
+    ).not.toBeInTheDocument();
   });
 
   it("disables Promote with a reason when the server reports promotion unavailable, even with vault write", async () => {
-    renderWorkspace({ capabilities: makeCapabilities({ promote_available: false }) });
+    renderWorkspace({
+      capabilities: makeCapabilities({ promote_available: false }),
+    });
 
-    expect(await screen.findByRole("button", { name: "Promote to vault" })).toBeDisabled();
-    expect(screen.getByText("Promotion is currently unavailable.")).toBeInTheDocument();
+    expect(
+      await screen.findByRole("button", { name: "Promote to vault" }),
+    ).toBeDisabled();
+    expect(
+      screen.getByText("Promotion is currently unavailable."),
+    ).toBeInTheDocument();
   });
 
   it("offers Archive for an active project", async () => {
     renderWorkspace();
-    expect(await screen.findByRole("button", { name: "Archive project" })).toBeEnabled();
+    expect(
+      await screen.findByRole("button", { name: "Archive project" }),
+    ).toBeEnabled();
   });
 
   it("does not offer Archive for an already-archived project", async () => {
-    renderWorkspace({ draft: makeDraft({ status: "archived" }), detail: makeDetail({ summary: makeDraft({ status: "archived" }) }) });
+    renderWorkspace({
+      draft: makeDraft({ status: "archived" }),
+      detail: makeDetail({ summary: makeDraft({ status: "archived" }) }),
+    });
     await screen.findByRole("button", { name: "Restore project" });
-    expect(screen.queryByRole("button", { name: "Archive project" })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Archive project" }),
+    ).not.toBeInTheDocument();
   });
 
   it("disables Archive with a stated reason while a job is active", async () => {
     renderWorkspace({
-      detail: makeDetail({ active_compile_job: makeJob({ id: 77, status: "running" }) }),
+      detail: makeDetail({
+        active_compile_job: makeJob({ id: 77, status: "running" }),
+      }),
     });
 
-    expect(await screen.findByRole("button", { name: "Archive project" })).toBeDisabled();
     expect(
-      screen.getByText("Archiving is unavailable while a newsroom run is active.")
+      await screen.findByRole("button", { name: "Archive project" }),
+    ).toBeDisabled();
+    expect(
+      screen.getByText(
+        "Archiving is unavailable while a newsroom run is active.",
+      ),
     ).toBeInTheDocument();
   });
 
@@ -769,12 +978,14 @@ describe("DraftWorkspace", () => {
     const user = userEvent.setup();
     renderWorkspace();
 
-    await user.click(await screen.findByRole("button", { name: "Archive project" }));
+    await user.click(
+      await screen.findByRole("button", { name: "Archive project" }),
+    );
     const dialog = await screen.findByRole("dialog");
 
     await waitFor(() => {
       expect(document.activeElement).toBe(
-        within(dialog).getByRole("heading", { name: "Archive this project?" })
+        within(dialog).getByRole("heading", { name: "Archive this project?" }),
       );
     });
   });
@@ -785,16 +996,26 @@ describe("DraftWorkspace", () => {
     const { queryClient } = renderWorkspace();
     const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
 
-    await user.click(await screen.findByRole("button", { name: "Archive project" }));
+    await user.click(
+      await screen.findByRole("button", { name: "Archive project" }),
+    );
     expect(mockArchiveDraft).not.toHaveBeenCalled();
 
     const dialog = await screen.findByRole("dialog");
-    expect(within(dialog).getByText(/read-only until it is restored/i)).toBeInTheDocument();
-    await user.click(within(dialog).getByRole("button", { name: "Archive project" }));
+    expect(
+      within(dialog).getByText(/read-only until it is restored/i),
+    ).toBeInTheDocument();
+    await user.click(
+      within(dialog).getByRole("button", { name: "Archive project" }),
+    );
 
     await waitFor(() => expect(mockArchiveDraft).toHaveBeenCalledWith(42, 3));
-    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: draftRoomKeys.detail(42) });
-    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: draftRoomKeys.lists() });
+    expect(invalidateSpy).toHaveBeenCalledWith({
+      queryKey: draftRoomKeys.detail(42),
+    });
+    expect(invalidateSpy).toHaveBeenCalledWith({
+      queryKey: draftRoomKeys.lists(),
+    });
   });
 
   it("surfaces the server detail via toast on a 409 while archiving", async () => {
@@ -803,19 +1024,28 @@ describe("DraftWorkspace", () => {
       status: 409,
       originalError: {
         response: {
-          data: { detail: "A newsroom run is already active for this project.", code: "active_job" },
+          data: {
+            detail: "A newsroom run is already active for this project.",
+            code: "active_job",
+          },
         },
       },
     });
     mockArchiveDraft.mockRejectedValue(conflictError);
     renderWorkspace();
 
-    await user.click(await screen.findByRole("button", { name: "Archive project" }));
+    await user.click(
+      await screen.findByRole("button", { name: "Archive project" }),
+    );
     const dialog = await screen.findByRole("dialog");
-    await user.click(within(dialog).getByRole("button", { name: "Archive project" }));
+    await user.click(
+      within(dialog).getByRole("button", { name: "Archive project" }),
+    );
 
     await waitFor(() =>
-      expect(toast.error).toHaveBeenCalledWith("A newsroom run is already active for this project.")
+      expect(toast.error).toHaveBeenCalledWith(
+        "A newsroom run is already active for this project.",
+      ),
     );
   });
 
@@ -838,19 +1068,34 @@ describe("DraftWorkspace", () => {
     renderWorkspace();
 
     const textarea = await screen.findByLabelText("Draft content");
-    expect(screen.getByRole("button", { name: "Save new revision" })).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: "Save new revision" }),
+    ).toBeDisabled();
 
     await user.type(textarea, " More.");
-    await waitFor(() => expect(screen.getByRole("button", { name: "Save new revision" })).toBeEnabled());
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Save new revision" }),
+      ).toBeEnabled(),
+    );
   });
 
   it("keeps Export/Delete available and explains the disabled reason when the capability is off", async () => {
-    renderWorkspace({ capabilities: makeCapabilities({ enabled: false, compile_available: false }) });
+    renderWorkspace({
+      capabilities: makeCapabilities({
+        enabled: false,
+        compile_available: false,
+      }),
+    });
 
-    expect(await screen.findByText(DRAFT_ROOM_DISABLED_MESSAGE)).toBeInTheDocument();
+    expect(
+      await screen.findByText(DRAFT_ROOM_DISABLED_MESSAGE),
+    ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Create draft" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Export" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Delete project" })).toBeEnabled();
+    expect(
+      screen.getByRole("button", { name: "Delete project" }),
+    ).toBeEnabled();
   });
 
   it("reports source-only, retrieval-partial, and evidence-invalidated flags to the caller for its status banner", async () => {
@@ -909,7 +1154,7 @@ describe("DraftWorkspace", () => {
         sourceOnly: true,
         retrievalPartial: true,
         evidenceInvalidated: true,
-      })
+      }),
     );
   });
 
@@ -939,12 +1184,21 @@ describe("DraftWorkspace", () => {
     });
 
     const message = await screen.findByTestId("ready-approval");
-    expect(message).toHaveTextContent("Approved by a user who no longer has an account on");
+    expect(message).toHaveTextContent(
+      "Approved by a user who no longer has an account on",
+    );
     expect(message).not.toHaveTextContent(/\b5\b/);
   });
 
   it("shows no approval message for a draft that has never been marked Ready", async () => {
-    renderWorkspace({ draft: makeDraft({ status: "draft", ready_at: null, ready_by: null, ready_by_username: null }) });
+    renderWorkspace({
+      draft: makeDraft({
+        status: "draft",
+        ready_at: null,
+        ready_by: null,
+        ready_by_username: null,
+      }),
+    });
     await screen.findByTestId("stage-rail");
     expect(screen.queryByTestId("ready-approval")).not.toBeInTheDocument();
   });

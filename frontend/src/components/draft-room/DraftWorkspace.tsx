@@ -29,7 +29,12 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import {
+  Sheet,
+  SheetContent,
+  SheetHeader,
+  SheetTitle,
+} from "@/components/ui/sheet";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 import {
@@ -80,13 +85,13 @@ import {
   draftRoomKeys,
   getDraftRevision,
   getDraftStages,
+  isDraftRoomErrorCode,
   listDraftFindings,
   listDraftJobs,
   listDraftRevisions,
   parseDraftRoomError,
   restoreDraft,
   retryDraftJob,
-  updateDraft,
   type CompileRequest,
   type DraftCompileStartStage,
   type DraftDetail,
@@ -100,8 +105,13 @@ import {
   type DraftUpdateRequest,
   type DraftVaultAccess,
   type PromoteResponse,
+  updateDraft,
 } from "@/lib/api/draftRoom";
-import { useDraftRoomUiStore, type EditorTab, type WorkspaceTab } from "@/stores/useDraftRoomUiStore";
+import {
+  useDraftRoomUiStore,
+  type EditorTab,
+  type WorkspaceTab,
+} from "@/stores/useDraftRoomUiStore";
 
 // ---------------------------------------------------------------------------
 // Bounded, best-effort lookups (mirrors the pattern in DraftClaimsPanel.tsx —
@@ -120,28 +130,40 @@ const CAPABILITY_BLOCK_REASON_ID = "draft-capability-block-reason";
 const FACT_CURRENT = new Set<string>(FACT_CURRENT_STATUSES);
 
 export const DEFAULT_DRAFT_MAX_INPUTS = 10;
-export const ZERO_READY_INPUTS_BLOCKER = "Add at least one parsed, ready source file before compiling.";
-export const INCOMPLETE_INPUTS_BLOCKER = "Every source file must be parsed and ready before compiling.";
+export const ZERO_READY_INPUTS_BLOCKER =
+  "Add at least one parsed, ready source file before compiling.";
+export const INCOMPLETE_INPUTS_BLOCKER =
+  "Every source file must be parsed and ready before compiling.";
 
 /** Keep the client compile gate aligned with the server's all-input rule. */
 export function draftCompileInputBlocker(
   inputs: Array<Pick<DraftInput, "parse_status">>,
 ): string | null {
-  const readyInputCount = inputs.filter((input) => input.parse_status === "ready").length;
+  const readyInputCount = inputs.filter(
+    (input) => input.parse_status === "ready",
+  ).length;
   if (readyInputCount === 0) return ZERO_READY_INPUTS_BLOCKER;
-  if (inputs.some((input) => input.parse_status !== "ready")) return INCOMPLETE_INPUTS_BLOCKER;
+  if (inputs.some((input) => input.parse_status !== "ready"))
+    return INCOMPLETE_INPUTS_BLOCKER;
   return null;
 }
 
 /** Use the shipped server default while capability discovery is unresolved. */
-export function draftMaxInputs(capabilities: DraftRoomCapabilities | undefined): number {
+export function draftMaxInputs(
+  capabilities: DraftRoomCapabilities | undefined,
+): number {
   const maxInputs = capabilities?.limits?.max_inputs;
-  return typeof maxInputs === "number" && Number.isFinite(maxInputs) && maxInputs > 0
+  return typeof maxInputs === "number" &&
+    Number.isFinite(maxInputs) &&
+    maxInputs > 0
     ? maxInputs
     : DEFAULT_DRAFT_MAX_INPUTS;
 }
 
-const WORKSPACE_TAB_ITEMS: ReadonlyArray<{ value: WorkspaceTab; label: string }> = [
+const WORKSPACE_TAB_ITEMS: ReadonlyArray<{
+  value: WorkspaceTab;
+  label: string;
+}> = [
   { value: "assignment", label: "Assignment" },
   { value: "sources", label: "Sources" },
   { value: "research", label: STAGE_LABELS.research },
@@ -152,9 +174,18 @@ const WORKSPACE_TAB_ITEMS: ReadonlyArray<{ value: WorkspaceTab; label: string }>
   { value: "fact", label: STAGE_LABELS.fact },
 ];
 
-const STAGE_VIEW_TABS = new Set<WorkspaceTab>(["research", "outline", "copy", "standards", "fact"]);
+const STAGE_VIEW_TABS = new Set<WorkspaceTab>([
+  "research",
+  "outline",
+  "copy",
+  "standards",
+  "fact",
+]);
 
-function findLatestStage(stages: DraftStage[], name: string | null): DraftStage | null {
+function findLatestStage(
+  stages: DraftStage[],
+  name: string | null,
+): DraftStage | null {
   if (!name) return null;
   let latest: DraftStage | null = null;
   for (const entry of stages) {
@@ -170,24 +201,41 @@ function findLatestStage(stages: DraftStage[], name: string | null): DraftStage 
  * DraftStageArtifact.tsx's own defensive readers) — without claiming
  * anything about a stage that never completed.
  */
-function readResearchFlags(researchStage: DraftStage | null): { sourceOnly: boolean; retrievalPartial: boolean } {
+function readResearchFlags(researchStage: DraftStage | null): {
+  sourceOnly: boolean;
+  retrievalPartial: boolean;
+} {
   if (!researchStage || researchStage.status !== "completed") {
     return { sourceOnly: false, retrievalPartial: false };
   }
   const artifact = researchStage.artifact;
-  if (typeof artifact !== "object" || artifact === null) return { sourceOnly: false, retrievalPartial: false };
+  if (typeof artifact !== "object" || artifact === null)
+    return { sourceOnly: false, retrievalPartial: false };
   const record = artifact as Record<string, unknown>;
-  return { sourceOnly: record.source_only === true, retrievalPartial: record.retrieval_status === "partial" };
+  return {
+    sourceOnly: record.source_only === true,
+    retrievalPartial: record.retrieval_status === "partial",
+  };
 }
 
-function toFormValue(draft: DraftSummary, brief: DraftDetail["brief"]): DraftAssignmentFormValue {
-  return { title: draft.title, vault_id: draft.vault_id, mode: draft.mode, tier: draft.tier, brief };
+function toFormValue(
+  draft: DraftSummary,
+  brief: DraftDetail["brief"],
+): DraftAssignmentFormValue {
+  return {
+    title: draft.title,
+    vault_id: draft.vault_id,
+    mode: draft.mode,
+    tier: draft.tier,
+    brief,
+  };
 }
 
 function summarizeRoles(inputs: DraftInput[]): string {
   if (inputs.length === 0) return "No source files";
   const counts = new Map<string, number>();
-  for (const input of inputs) counts.set(input.role, (counts.get(input.role) ?? 0) + 1);
+  for (const input of inputs)
+    counts.set(input.role, (counts.get(input.role) ?? 0) + 1);
   return Array.from(counts.entries())
     .map(([role, count]) => `${count} ${INPUT_ROLE_LABELS[role] ?? role}`)
     .join(", ");
@@ -204,15 +252,22 @@ function summarizeRoles(inputs: DraftInput[]): string {
  */
 function readyApprovalText(draft: DraftSummary): string | null {
   if (draft.status !== "ready") return null;
-  const when = draft.ready_at ? new Date(draft.ready_at).toLocaleString() : null;
+  const when = draft.ready_at
+    ? new Date(draft.ready_at).toLocaleString()
+    : null;
   const suffix = when ? ` on ${when}` : "";
-  if (draft.ready_by_username) return `Approved by ${draft.ready_by_username}${suffix}`;
-  if (draft.ready_by != null) return `Approved by a user who no longer has an account${suffix}`;
+  if (draft.ready_by_username)
+    return `Approved by ${draft.ready_by_username}${suffix}`;
+  if (draft.ready_by != null)
+    return `Approved by a user who no longer has an account${suffix}`;
   return `Approved${suffix}`;
 }
 
 function generateIdempotencyKey(): string {
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+  if (
+    typeof crypto !== "undefined" &&
+    typeof crypto.randomUUID === "function"
+  ) {
     return crypto.randomUUID();
   }
   return `draft-compile-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -252,9 +307,12 @@ export interface DraftWorkspaceHandle {
  * Owns the compile / cancel / retry / save-revision mutations and the Ready /
  * Export / Promote dialog triggers.
  */
-export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspaceProps>(function DraftWorkspace(
+export const DraftWorkspace = forwardRef<
+  DraftWorkspaceHandle,
+  DraftWorkspaceProps
+>(function DraftWorkspace(
   { draftId, draft, detail, capabilities, vaultAccess, onDerivedStatus },
-  ref
+  ref,
 ) {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
@@ -266,7 +324,9 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
   const selectedStage = useDraftRoomUiStore((s) => s.selectedStage);
   const setSelectedStage = useDraftRoomUiStore((s) => s.setSelectedStage);
   const setInspectorTab = useDraftRoomUiStore((s) => s.setInspectorTab);
-  const compareFromRevisionId = useDraftRoomUiStore((s) => s.compareFromRevisionId);
+  const compareFromRevisionId = useDraftRoomUiStore(
+    (s) => s.compareFromRevisionId,
+  );
   const compareToRevisionId = useDraftRoomUiStore((s) => s.compareToRevisionId);
   const setCompareRevisions = useDraftRoomUiStore((s) => s.setCompareRevisions);
   const sourcesSheetOpen = useDraftRoomUiStore((s) => s.sourcesSheetOpen);
@@ -297,14 +357,18 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
   const hasActiveJob = activeJob != null;
   const canManageContent = !archived && !vaultRevoked;
   const canPromote = canManageContent && vaultAccess === "write";
-  // Upload is a mutating capability. Fail closed until the capability response
-  // is hydrated, and keep the server's explicit deployment switch authoritative.
-  const uploadCapabilityBlocked = capabilities == null || capabilities.enabled === false;
   // Editing and deleting a stored source are mutations too: PATCH input and
   // DELETE .../inputs/{input_id} both answer 503 while the room is disabled.
-  // Gate their affordances on the same flag so the UI never offers a control
-  // that can only fail.
-  const editSourceCapabilityBlocked = uploadCapabilityBlocked;
+  // Gate their affordances so the UI never offers a control that can only
+  // fail.
+  const editSourceCapabilityBlocked =
+    capabilities == null || capabilities.enabled === false;
+  // Upload is a mutating capability that ALSO enqueues a parse job onto the
+  // Draft Room worker: fail closed until the capability response is hydrated,
+  // keep the server's deployment switch authoritative, and stop offering the
+  // control when the worker cannot claim the job (#911).
+  const uploadCapabilityBlocked =
+    editSourceCapabilityBlocked || capabilities?.upload_available === false;
 
   // ---- Job / stage lookups -------------------------------------------------
   const jobsQuery = useQuery({
@@ -313,9 +377,13 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
   });
 
   const latestCompileJob = useMemo<DraftJob | null>(() => {
-    const jobs = (jobsQuery.data?.items ?? []).filter((job) => job.job_type === "compile");
+    const jobs = (jobsQuery.data?.items ?? []).filter(
+      (job) => job.job_type === "compile",
+    );
     if (jobs.length === 0) return null;
-    return jobs.reduce((latest, job) => (job.created_at > latest.created_at ? job : latest));
+    return jobs.reduce((latest, job) =>
+      job.created_at > latest.created_at ? job : latest,
+    );
   }, [jobsQuery.data]);
 
   // Execution inspection binds to the active or latest compile job — the run
@@ -323,20 +391,34 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
   // the older job that produced the current revision). The current revision
   // remains the editor/claim context; its job_id is only the last-resort
   // fallback (issue #516 UI-021).
-  const relevantJobId = activeJob?.id ?? latestCompileJob?.id ?? detail.current_revision_summary?.job_id ?? null;
-  const relevantJobStatus = activeJob?.status ?? latestCompileJob?.status ?? null;
+  const relevantJobId =
+    activeJob?.id ??
+    latestCompileJob?.id ??
+    detail.current_revision_summary?.job_id ??
+    null;
+  const relevantJobStatus =
+    activeJob?.status ?? latestCompileJob?.status ?? null;
   const relevantJobActiveStage = activeJob?.active_stage ?? null;
 
   const stagesQuery = useQuery({
     queryKey: draftRoomKeys.stages(draftId, relevantJobId ?? -1, false),
-    queryFn: () => getDraftStages(draftId, relevantJobId as number, { per_page: STAGES_LOOKUP_PAGE_SIZE }),
+    queryFn: () =>
+      getDraftStages(draftId, relevantJobId as number, {
+        per_page: STAGES_LOOKUP_PAGE_SIZE,
+      }),
     enabled: relevantJobId != null,
   });
-  const stages = useMemo(() => stagesQuery.data?.items ?? [], [stagesQuery.data]);
+  const stages = useMemo(
+    () => stagesQuery.data?.items ?? [],
+    [stagesQuery.data],
+  );
 
   const revisionsQuery = useQuery({
-    queryKey: draftRoomKeys.revisions(draftId, { per_page: REVISIONS_LOOKUP_PAGE_SIZE }),
-    queryFn: () => listDraftRevisions(draftId, { per_page: REVISIONS_LOOKUP_PAGE_SIZE }),
+    queryKey: draftRoomKeys.revisions(draftId, {
+      per_page: REVISIONS_LOOKUP_PAGE_SIZE,
+    }),
+    queryFn: () =>
+      listDraftRevisions(draftId, { per_page: REVISIONS_LOOKUP_PAGE_SIZE }),
   });
   const revisions = revisionsQuery.data?.items ?? [];
   const currentRevisionId = detail.current_revision_summary?.id ?? null;
@@ -348,7 +430,8 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
   });
   const baselineContent = currentRevisionDetailQuery.data?.content_md ?? "";
   const editorValue = storedDraftText ?? baselineContent;
-  const isDirty = storedDraftText != null && storedDraftText !== baselineContent;
+  const isDirty =
+    storedDraftText != null && storedDraftText !== baselineContent;
   // Every check the inspector lists was computed against the last SAVED
   // revision, so unsaved editor edits make those checks stale (issue #517
   // AC15). Same predicate as `isDirty`, named for what it means downstream.
@@ -368,7 +451,9 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
   // Row that must receive focus once the inspector's findings tab has
   // remounted it — activation switches the inspector away from findings, so
   // the row is unmounted at "Back to findings" click time.
-  const [returnFocusFindingId, setReturnFocusFindingId] = useState<number | null>(null);
+  const [returnFocusFindingId, setReturnFocusFindingId] = useState<
+    number | null
+  >(null);
 
   function handleFindingSpanSelect(finding: DraftFinding) {
     // A new activation supersedes any pending focus return (PRR feedback:
@@ -477,8 +562,10 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
     const blockers: Record<string, number> = {};
     const warnings: Record<string, number> = {};
     for (const finding of openFindingsQuery.data?.items ?? []) {
-      if (finding.severity === "blocker") blockers[finding.stage] = (blockers[finding.stage] ?? 0) + 1;
-      else if (finding.severity === "warning") warnings[finding.stage] = (warnings[finding.stage] ?? 0) + 1;
+      if (finding.severity === "blocker")
+        blockers[finding.stage] = (blockers[finding.stage] ?? 0) + 1;
+      else if (finding.severity === "warning")
+        warnings[finding.stage] = (warnings[finding.stage] ?? 0) + 1;
     }
     return { blockerCountsByStage: blockers, warningCountsByStage: warnings };
   }, [openFindingsQuery.data]);
@@ -491,18 +578,22 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
   const inspectorJobId = relevantJobId;
 
   // ---- Status derived for the caller's DraftStatusBanner -------------------
-  const { sourceOnly, retrievalPartial } = readResearchFlags(findLatestStage(stages, "research"));
-  const evidenceInvalidated = detail.current_revision_summary?.fact_status === "invalidated";
+  const { sourceOnly, retrievalPartial } = readResearchFlags(
+    findLatestStage(stages, "research"),
+  );
+  const evidenceInvalidated =
+    detail.current_revision_summary?.fact_status === "invalidated";
 
   useEffect(() => {
     onDerivedStatus?.({ sourceOnly, retrievalPartial, evidenceInvalidated });
   }, [sourceOnly, retrievalPartial, evidenceInvalidated, onDerivedStatus]);
 
   // ---- Assignment (brief) editing -----------------------------------------
-  const [assignmentDraft, setAssignmentDraft] = useState<DraftAssignmentFormValue>(() =>
-    toFormValue(draft, detail.brief)
-  );
-  const [assignmentErrors, setAssignmentErrors] = useState<Record<string, string>>({});
+  const [assignmentDraft, setAssignmentDraft] =
+    useState<DraftAssignmentFormValue>(() => toFormValue(draft, detail.brief));
+  const [assignmentErrors, setAssignmentErrors] = useState<
+    Record<string, string>
+  >({});
   const assignmentFormRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -517,12 +608,16 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
     mutationFn: (payload: DraftUpdateRequest) => updateDraft(draftId, payload),
     onSuccess: () => {
       toast.success("Project updated.");
-      queryClient.invalidateQueries({ queryKey: draftRoomKeys.detail(draftId) });
+      queryClient.invalidateQueries({
+        queryKey: draftRoomKeys.detail(draftId),
+      });
     },
     onError: (err) => {
       const info = parseDraftRoomError(err);
       if (info.status === 409) {
-        toast.error("This project changed elsewhere. Reload the page and try again.");
+        toast.error(
+          "This project changed elsewhere. Reload the page and try again.",
+        );
         return;
       }
       toast.error(info.detail);
@@ -546,16 +641,26 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
   // ---- Compile --------------------------------------------------------------
   function compileBlockedReason(): string | null {
     if (!capabilities) return "Loading Draft Room capabilities…";
-    if (capabilities.enabled === false || capabilities.compile_available === false) {
+    if (
+      capabilities.enabled === false ||
+      capabilities.compile_available === false
+    ) {
       return DRAFT_ROOM_DISABLED_MESSAGE;
     }
-    if (archived) return "This project is archived. Restore it before compiling.";
+    if (archived)
+      return "This project is archived. Restore it before compiling.";
     if (vaultRevoked) return READY_BLOCKER_LABELS.vault_access_revoked;
-    if (hasActiveJob) return "A newsroom run is already active for this project.";
+    if (hasActiveJob)
+      return "A newsroom run is already active for this project.";
     const inputBlocker = draftCompileInputBlocker(detail.inputs);
     if (inputBlocker) return inputBlocker;
-    const briefErrors = validateDraftAssignmentForm(toFormValue(draft, detail.brief), "edit");
-    const firstInvalidKey = DRAFT_ASSIGNMENT_FIELD_ORDER.find((key) => key in briefErrors);
+    const briefErrors = validateDraftAssignmentForm(
+      toFormValue(draft, detail.brief),
+      "edit",
+    );
+    const firstInvalidKey = DRAFT_ASSIGNMENT_FIELD_ORDER.find(
+      (key) => key in briefErrors,
+    );
     if (firstInvalidKey) return briefErrors[firstInvalidKey];
     return null;
   }
@@ -579,10 +684,15 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
     onSuccess: () => {
       toast.success("Compile started.");
       setCompileDialog(null);
-      queryClient.invalidateQueries({ queryKey: draftRoomKeys.detail(draftId) });
+      queryClient.invalidateQueries({
+        queryKey: draftRoomKeys.detail(draftId),
+      });
       queryClient.invalidateQueries({ queryKey: draftRoomKeys.jobs(draftId) });
     },
-    onError: (err) => toast.error(parseDraftRoomError(err).detail),
+    onError: (err) => {
+      invalidateCapabilitiesOnWorkerError(err);
+      toast.error(parseDraftRoomError(err).detail);
+    },
   });
 
   function submitCompile() {
@@ -592,7 +702,10 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
       lock_version: draft.lock_version,
       start_stage: compileDialog.startStage,
     };
-    compileMutation.mutate({ request, idempotencyKey: compileDialog.idempotencyKey });
+    compileMutation.mutate({
+      request,
+      idempotencyKey: compileDialog.idempotencyKey,
+    });
   }
 
   const stageOrder = capabilities?.compile_stage_order ?? [];
@@ -615,7 +728,9 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
     onSuccess: () => {
       toast.success("Cancellation requested.");
       setCancelConfirmOpen(false);
-      queryClient.invalidateQueries({ queryKey: draftRoomKeys.detail(draftId) });
+      queryClient.invalidateQueries({
+        queryKey: draftRoomKeys.detail(draftId),
+      });
       queryClient.invalidateQueries({ queryKey: draftRoomKeys.jobs(draftId) });
     },
     onError: (err) => toast.error(parseDraftRoomError(err).detail),
@@ -628,7 +743,10 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
   // constraint without a manual filter.
   const [retryStage, setRetryStage] = useState<DraftCompileStartStage | "">("");
   const retryOptions = capabilities?.compile_start_stages ?? [];
-  const canRetry = latestCompileJob != null && latestCompileJob.status === "failed" && canManageContent;
+  const canRetry =
+    latestCompileJob != null &&
+    latestCompileJob.status === "failed" &&
+    canManageContent;
   // Retry hits the same `_require_enabled` gate as compile server-side, so it
   // must not be submittable when the capability is off — the detail page
   // stays reachable in that state (direct URLs must render an honest view),
@@ -636,24 +754,64 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
   // deterministically 503s. `blockedReason` already renders
   // `DRAFT_ROOM_DISABLED_MESSAGE` in this same control block, so disabling
   // here doesn't need its own duplicate reason text.
-  const retryCapabilityBlocked = capabilities?.enabled === false || capabilities?.compile_available === false;
+  const retryCapabilityBlocked =
+    capabilities?.enabled === false ||
+    capabilities?.compile_available === false;
+
+  // #905: the retry's Idempotency-Key is bound to the retry IDENTITY
+  // (draft + parent job + requested stage), not to request settlement: an
+  // accidental double-submit — including a second click after the first
+  // attempt settled but before the job list refreshed — replays the SAME
+  // key and gets the original job back, while a genuinely new attempt
+  // (different stage, or the failed child as the new parent) rotates it.
+  const retryKeyRef = useRef<{ identity: string; key: string } | null>(null);
+
+  function retryKeyFor(identity: string): string {
+    if (retryKeyRef.current?.identity !== identity) {
+      retryKeyRef.current = { identity, key: generateIdempotencyKey() };
+    }
+    return retryKeyRef.current.key;
+  }
+
+  function invalidateCapabilitiesOnWorkerError(err: unknown) {
+    // #911: a worker_unavailable rejection means the server-side liveness
+    // read just changed — refetch capabilities now instead of waiting out
+    // the stale window. Other 503s (e.g. model_unavailable) say nothing
+    // about worker liveness and must not trigger the refetch.
+    if (isDraftRoomErrorCode(err, "worker_unavailable")) {
+      queryClient.invalidateQueries({ queryKey: draftRoomKeys.capabilities() });
+    }
+  }
 
   const retryMutation = useMutation({
     mutationFn: (startStage: DraftCompileStartStage) =>
-      retryDraftJob(draftId, (latestCompileJob as DraftJob).id, { start_stage: startStage }),
+      retryDraftJob(
+        draftId,
+        (latestCompileJob as DraftJob).id,
+        { start_stage: startStage },
+        retryKeyFor(
+          `${draftId}:${(latestCompileJob as DraftJob).id}:${startStage}`,
+        ),
+      ),
     onSuccess: (job, startStage) => {
       toast.success("Retry started.");
       if (job.start_stage && job.start_stage !== startStage) {
-        const normalizedLabel = STAGE_LABELS[job.start_stage] ?? job.start_stage;
+        const normalizedLabel =
+          STAGE_LABELS[job.start_stage] ?? job.start_stage;
         toast.info(
-          `The server started from an earlier stage (${normalizedLabel}) because a dependency needed to be recomputed.`
+          `The server started from an earlier stage (${normalizedLabel}) because a dependency needed to be recomputed.`,
         );
       }
       setRetryStage("");
-      queryClient.invalidateQueries({ queryKey: draftRoomKeys.detail(draftId) });
+      queryClient.invalidateQueries({
+        queryKey: draftRoomKeys.detail(draftId),
+      });
       queryClient.invalidateQueries({ queryKey: draftRoomKeys.jobs(draftId) });
     },
-    onError: (err) => toast.error(parseDraftRoomError(err).detail),
+    onError: (err) => {
+      invalidateCapabilitiesOnWorkerError(err);
+      toast.error(parseDraftRoomError(err).detail);
+    },
   });
 
   // ---- Save revision -------------------------------------------------------
@@ -684,9 +842,15 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
       if (liveBuffer === submittedContentMd) {
         clearDraftTextStore(draftId);
       }
-      queryClient.invalidateQueries({ queryKey: draftRoomKeys.detail(draftId) });
-      queryClient.invalidateQueries({ queryKey: draftRoomKeys.revisions(draftId) });
-      queryClient.invalidateQueries({ queryKey: draftRoomKeys.revision(draftId, revisionDetail.summary.id) });
+      queryClient.invalidateQueries({
+        queryKey: draftRoomKeys.detail(draftId),
+      });
+      queryClient.invalidateQueries({
+        queryKey: draftRoomKeys.revisions(draftId),
+      });
+      queryClient.invalidateQueries({
+        queryKey: draftRoomKeys.revision(draftId, revisionDetail.summary.id),
+      });
     },
     onError: (err) => {
       const info = parseDraftRoomError(err);
@@ -702,7 +866,9 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
     setSaveConflict(false);
     setSaveConfirmOpen(false);
     queryClient.invalidateQueries({ queryKey: draftRoomKeys.detail(draftId) });
-    queryClient.invalidateQueries({ queryKey: draftRoomKeys.revisions(draftId) });
+    queryClient.invalidateQueries({
+      queryKey: draftRoomKeys.revisions(draftId),
+    });
   }
 
   function handleCompareAfterConflict() {
@@ -711,7 +877,9 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
     setSaveConflict(false);
     setSaveConfirmOpen(false);
     queryClient.invalidateQueries({ queryKey: draftRoomKeys.detail(draftId) });
-    queryClient.invalidateQueries({ queryKey: draftRoomKeys.revisions(draftId) });
+    queryClient.invalidateQueries({
+      queryKey: draftRoomKeys.revisions(draftId),
+    });
   }
 
   // ---- Ready / Export / Promote ---------------------------------------------
@@ -728,15 +896,22 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
   // states `DRAFT_ROOM_DISABLED_MESSAGE`; this reason is only for the
   // promote-specific capability so the two don't duplicate the same text.
   const promoteDisabled =
-    !capabilities || capabilities.enabled === false || capabilities.promote_available === false;
+    !capabilities ||
+    capabilities.enabled === false ||
+    capabilities.promote_available === false;
   const promoteUnavailableReason =
-    capabilities && capabilities.enabled !== false && capabilities.promote_available === false
+    capabilities &&
+    capabilities.enabled !== false &&
+    capabilities.promote_available === false
       ? "Promotion is currently unavailable."
       : null;
 
   const currentRevisionSummary = detail.current_revision_summary;
-  const factStatusCurrent = currentRevisionSummary != null && FACT_CURRENT.has(currentRevisionSummary.fact_status);
-  const isReadyRevision = draft.status === "ready" && currentRevisionSummary != null;
+  const factStatusCurrent =
+    currentRevisionSummary != null &&
+    FACT_CURRENT.has(currentRevisionSummary.fact_status);
+  const isReadyRevision =
+    draft.status === "ready" && currentRevisionSummary != null;
 
   const eligibility: ReadyEligibility = useMemo(() => {
     const blockers = new Set<string>();
@@ -746,13 +921,15 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
     // same client-side blocker as "no current fact-check" rather than
     // inventing a code the server (and DraftReadyDialog's checklist) doesn't
     // recognise.
-    if (!factStatusCurrent || retrievalPartial) blockers.add("fact_not_current");
+    if (!factStatusCurrent || retrievalPartial)
+      blockers.add("fact_not_current");
     const blockingClaimCount = BLOCKING_CLAIM_STATUSES.reduce(
       (sum, status) => sum + (detail.claim_counts_by_status[status] ?? 0),
-      0
+      0,
     );
     if (blockingClaimCount > 0) blockers.add("unresolved_claim_blocker");
-    if ((detail.finding_counts_by_severity.blocker ?? 0) > 0) blockers.add("unresolved_blocker");
+    if ((detail.finding_counts_by_severity.blocker ?? 0) > 0)
+      blockers.add("unresolved_blocker");
     if (evidenceInvalidated) blockers.add("evidence_changed");
     if (vaultRevoked) blockers.add("vault_access_revoked");
     const blockersArray = Array.from(blockers);
@@ -783,7 +960,9 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
     mutationFn: () => restoreDraft(draftId, draft.lock_version),
     onSuccess: () => {
       toast.success("Project restored.");
-      queryClient.invalidateQueries({ queryKey: draftRoomKeys.detail(draftId) });
+      queryClient.invalidateQueries({
+        queryKey: draftRoomKeys.detail(draftId),
+      });
     },
     onError: (err) => toast.error(parseDraftRoomError(err).detail),
   });
@@ -798,7 +977,9 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
     onSuccess: () => {
       toast.success("Project archived.");
       setArchiveConfirmOpen(false);
-      queryClient.invalidateQueries({ queryKey: draftRoomKeys.detail(draftId) });
+      queryClient.invalidateQueries({
+        queryKey: draftRoomKeys.detail(draftId),
+      });
       queryClient.invalidateQueries({ queryKey: draftRoomKeys.lists() });
     },
     onError: (err) => toast.error(parseDraftRoomError(err).detail),
@@ -825,15 +1006,29 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
           <AlertTitle>No source files yet</AlertTitle>
           <AlertDescription className="flex flex-wrap items-center justify-between gap-2">
             <span>Add at least one source file before compiling.</span>
-            <Button type="button" size="sm" variant="outline" onClick={() => setWorkspaceTab("sources")}>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              onClick={() => setWorkspaceTab("sources")}
+            >
               Go to Sources
             </Button>
           </AlertDescription>
         </Alert>
       )}
       {canManageContent && (
-        <Button type="button" onClick={handleSaveAssignment} disabled={updateBriefMutation.isPending}>
-          {updateBriefMutation.isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" aria-hidden="true" />}
+        <Button
+          type="button"
+          onClick={handleSaveAssignment}
+          disabled={updateBriefMutation.isPending}
+        >
+          {updateBriefMutation.isPending && (
+            <Loader2
+              className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none"
+              aria-hidden="true"
+            />
+          )}
           Save brief
         </Button>
       )}
@@ -865,7 +1060,9 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
         draftId={draftId}
         inputs={detail.inputs}
         locked={hasActiveJob}
-        lockedReason={activeJob ? STAGE_LABELS[activeJob.active_stage ?? ""] : undefined}
+        lockedReason={
+          activeJob ? STAGE_LABELS[activeJob.active_stage ?? ""] : undefined
+        }
         canEdit={canManageContent}
         editCapabilityBlocked={editSourceCapabilityBlocked}
       />
@@ -876,24 +1073,41 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
     if (tab === "assignment") return assignmentPanel;
     if (tab === "sources") return sourcesPanel;
     if (STAGE_VIEW_TABS.has(tab)) {
-      return <DraftStageArtifact stage={findLatestStage(stages, tab as DraftStageName)} />;
+      return (
+        <DraftStageArtifact
+          stage={findLatestStage(stages, tab as DraftStageName)}
+        />
+      );
     }
     // tab === "draft": the manuscript editor / preview / compare area.
     return (
       <div className="space-y-4">
         {showBackToFindings && activeFinding != null && (
           <div className="flex flex-wrap items-center gap-2">
-            <Button type="button" variant="outline" size="sm" onClick={handleBackToFindings}>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={handleBackToFindings}
+            >
               {FINDINGS_BACK_LABEL}
             </Button>
             {canCompareFindingRevision && (
-              <Button type="button" variant="outline" size="sm" onClick={handleCompareFindingRevision}>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={handleCompareFindingRevision}
+              >
                 {compareFindingRevisionLabel()}
               </Button>
             )}
           </div>
         )}
-        <Tabs value={editorTab} onValueChange={(value) => setEditorTab(value as EditorTab)}>
+        <Tabs
+          value={editorTab}
+          onValueChange={(value) => setEditorTab(value as EditorTab)}
+        >
           <TabsList>
             <TabsTrigger value="editor">Editor</TabsTrigger>
             <TabsTrigger value="preview">Preview</TabsTrigger>
@@ -917,7 +1131,11 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
             />
             {canManageContent && (
               <div className="mt-3 space-y-2">
-                {isDirty && <p className="text-xs text-muted-foreground">{SAVE_REVISION_CONSEQUENCE}</p>}
+                {isDirty && (
+                  <p className="text-xs text-muted-foreground">
+                    {SAVE_REVISION_CONSEQUENCE}
+                  </p>
+                )}
                 <Button
                   type="button"
                   onClick={() => setSaveConfirmOpen(true)}
@@ -926,7 +1144,9 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
                   {SAVE_REVISION_CTA}
                 </Button>
                 {isDirty && capabilities?.enabled === false && (
-                  <p className="text-xs text-muted-foreground">{DRAFT_ROOM_DISABLED_MESSAGE}</p>
+                  <p className="text-xs text-muted-foreground">
+                    {DRAFT_ROOM_DISABLED_MESSAGE}
+                  </p>
                 )}
               </div>
             )}
@@ -939,8 +1159,12 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
               revisions={revisions}
               fromRevisionId={compareFromRevisionId}
               toRevisionId={compareToRevisionId}
-              onSelectFrom={(id) => setCompareRevisions(id, compareToRevisionId)}
-              onSelectTo={(id) => setCompareRevisions(compareFromRevisionId, id)}
+              onSelectFrom={(id) =>
+                setCompareRevisions(id, compareToRevisionId)
+              }
+              onSelectTo={(id) =>
+                setCompareRevisions(compareFromRevisionId, id)
+              }
               fromContent={compareFromQuery.data?.content_md ?? null}
               toContent={compareToQuery.data?.content_md ?? null}
               loading={compareFromQuery.isFetching || compareToQuery.isFetching}
@@ -957,7 +1181,8 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
     <div className="flex flex-col gap-2 rounded-md border border-border p-3">
       {readyApprovalMessage && currentRevisionSummary && (
         <p className="text-sm text-success" data-testid="ready-approval">
-          {readyApprovalMessage} &middot; Revision {currentRevisionSummary.revision_no} &middot;{" "}
+          {readyApprovalMessage} &middot; Revision{" "}
+          {currentRevisionSummary.revision_no} &middot;{" "}
           {currentRevisionSummary.content_sha256.slice(0, 12)}
         </p>
       )}
@@ -966,18 +1191,34 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
           type="button"
           onClick={() => openCompileDialog(undefined)}
           disabled={blockedReason != null}
-          aria-describedby={blockedReason != null ? CAPABILITY_BLOCK_REASON_ID : undefined}
+          aria-describedby={
+            blockedReason != null ? CAPABILITY_BLOCK_REASON_ID : undefined
+          }
         >
           {compileCtaLabel(draft.mode)}
         </Button>
         {hasActiveJob && (
-          <Button type="button" variant="outline" onClick={() => setCancelConfirmOpen(true)}>
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => setCancelConfirmOpen(true)}
+          >
             Cancel run
           </Button>
         )}
         {archived && vaultAccess === "write" && (
-          <Button type="button" variant="outline" onClick={() => restoreMutation.mutate()} disabled={restoreMutation.isPending}>
-            {restoreMutation.isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" aria-hidden="true" />}
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => restoreMutation.mutate()}
+            disabled={restoreMutation.isPending}
+          >
+            {restoreMutation.isPending && (
+              <Loader2
+                className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none"
+                aria-hidden="true"
+              />
+            )}
             Restore project
           </Button>
         )}
@@ -1002,7 +1243,11 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
           </Button>
         )}
         {currentRevisionSummary && !vaultRevoked && (
-          <Button type="button" variant="outline" onClick={() => setExportDialogOpen(true)}>
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => setExportDialogOpen(true)}
+          >
             {EXPORT_CTA}
           </Button>
         )}
@@ -1016,7 +1261,11 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
             {PROMOTE_TO_VAULT_CTA}
           </Button>
         )}
-        <Button type="button" variant="destructive" onClick={() => setDeleteConfirmOpen(true)}>
+        <Button
+          type="button"
+          variant="destructive"
+          onClick={() => setDeleteConfirmOpen(true)}
+        >
           Delete project
         </Button>
       </div>
@@ -1037,7 +1286,9 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
         <p className="text-sm text-muted-foreground">{archiveBlockedReason}</p>
       )}
       {canPromote && promoteUnavailableReason != null && (
-        <p className="text-sm text-muted-foreground">{promoteUnavailableReason}</p>
+        <p className="text-sm text-muted-foreground">
+          {promoteUnavailableReason}
+        </p>
       )}
 
       {canRetry && (
@@ -1047,7 +1298,9 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
           </Label>
           <Select
             value={retryStage}
-            onValueChange={(value) => setRetryStage(value as DraftCompileStartStage)}
+            onValueChange={(value) =>
+              setRetryStage(value as DraftCompileStartStage)
+            }
             disabled={retryCapabilityBlocked}
           >
             <SelectTrigger
@@ -1073,14 +1326,21 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
             type="button"
             size="sm"
             onClick={() => retryStage && retryMutation.mutate(retryStage)}
-            disabled={!retryStage || retryMutation.isPending || retryCapabilityBlocked}
+            disabled={
+              !retryStage || retryMutation.isPending || retryCapabilityBlocked
+            }
             aria-describedby={
               retryCapabilityBlocked && blockedReason != null
                 ? CAPABILITY_BLOCK_REASON_ID
                 : undefined
             }
           >
-            {retryMutation.isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" aria-hidden="true" />}
+            {retryMutation.isPending && (
+              <Loader2
+                className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none"
+                aria-hidden="true"
+              />
+            )}
             Retry
           </Button>
         </div>
@@ -1113,12 +1373,21 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
               scroll put the right-most tabs past the 320px viewport); at lg+,
               where the tabs fit, it keeps the original single-row scroll. */}
           <nav aria-label="Draft sections">
-            <Tabs value={workspaceTab} onValueChange={(value) => setWorkspaceTab(value as WorkspaceTab)}>
+            <Tabs
+              value={workspaceTab}
+              onValueChange={(value) => setWorkspaceTab(value as WorkspaceTab)}
+            >
               <TabsList className="h-auto w-full flex-wrap justify-start gap-1 lg:flex-nowrap lg:overflow-x-auto">
                 {WORKSPACE_TAB_ITEMS.map((item) => (
-                  <TabsTrigger key={item.value} value={item.value} className="shrink-0">
+                  <TabsTrigger
+                    key={item.value}
+                    value={item.value}
+                    className="shrink-0"
+                  >
                     {item.label}
-                    {item.value === "sources" && detail.inputs.length > 0 ? ` (${detail.inputs.length})` : ""}
+                    {item.value === "sources" && detail.inputs.length > 0
+                      ? ` (${detail.inputs.length})`
+                      : ""}
                   </TabsTrigger>
                 ))}
               </TabsList>
@@ -1134,7 +1403,11 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
               small screens don't have to scroll the tab bar and the inspector
               to reach either. */}
           <div className="flex gap-2 sm:hidden">
-            <Button type="button" variant="outline" onClick={() => setSourcesSheetOpen(true)}>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setSourcesSheetOpen(true)}
+            >
               Add sources
             </Button>
             <Button
@@ -1149,7 +1422,10 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
             </Button>
           </div>
           <Sheet open={sourcesSheetOpen} onOpenChange={setSourcesSheetOpen}>
-            <SheetContent side="bottom" className="h-full w-full overflow-y-auto sm:max-w-full">
+            <SheetContent
+              side="bottom"
+              className="h-full w-full overflow-y-auto sm:max-w-full"
+            >
               <SheetHeader>
                 <SheetTitle>Sources</SheetTitle>
               </SheetHeader>
@@ -1157,7 +1433,10 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
             </SheetContent>
           </Sheet>
           <Sheet open={evidenceSheetOpen} onOpenChange={setEvidenceSheetOpen}>
-            <SheetContent side="bottom" className="h-full w-full overflow-y-auto sm:max-w-full">
+            <SheetContent
+              side="bottom"
+              className="h-full w-full overflow-y-auto sm:max-w-full"
+            >
               <SheetHeader>
                 <SheetTitle>Evidence</SheetTitle>
               </SheetHeader>
@@ -1174,7 +1453,9 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
           jobId={inspectorJobId}
           stage={selectedStageEntry}
           lockVersion={draft.lock_version}
-          canDispose={canManageContent && !hasActiveJob && capabilities?.enabled !== false}
+          canDispose={
+            canManageContent && !hasActiveJob && capabilities?.enabled !== false
+          }
           tier={draft.tier}
           onSelectSpan={handleFindingSpanSelect}
           onOpenEvidence={handleFindingEvidenceOpen}
@@ -1183,7 +1464,10 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
       </div>
 
       {/* ---- Compile confirmation ---- */}
-      <Dialog open={compileDialog != null} onOpenChange={(open) => !open && setCompileDialog(null)}>
+      <Dialog
+        open={compileDialog != null}
+        onOpenChange={(open) => !open && setCompileDialog(null)}
+      >
         <DialogContent
           aria-describedby="draft-compile-description"
           onOpenAutoFocus={(event) => {
@@ -1195,7 +1479,9 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
             <DialogTitle ref={compileHeadingRef} tabIndex={-1}>
               {compileCtaLabel(draft.mode)}
             </DialogTitle>
-            <DialogDescription id="draft-compile-description">{PROVIDER_DISCLOSURE}</DialogDescription>
+            <DialogDescription id="draft-compile-description">
+              {PROVIDER_DISCLOSURE}
+            </DialogDescription>
           </DialogHeader>
           <dl className="grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
             <dt className="text-muted-foreground">Mode</dt>
@@ -1215,12 +1501,23 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
             This result requires human review before it can be marked Ready.
           </p>
           <DialogFooter>
-            <Button type="button" variant="outline" onClick={() => setCompileDialog(null)}>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setCompileDialog(null)}
+            >
               Cancel
             </Button>
-            <Button type="button" onClick={submitCompile} disabled={compileMutation.isPending}>
+            <Button
+              type="button"
+              onClick={submitCompile}
+              disabled={compileMutation.isPending}
+            >
               {compileMutation.isPending && (
-                <Loader2 className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" aria-hidden="true" />
+                <Loader2
+                  className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none"
+                  aria-hidden="true"
+                />
               )}
               {compileCtaLabel(draft.mode)}
             </Button>
@@ -1243,7 +1540,11 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
             <DialogDescription>{CANCEL_CONSEQUENCE}</DialogDescription>
           </DialogHeader>
           <DialogFooter>
-            <Button type="button" variant="ghost" onClick={() => setCancelConfirmOpen(false)}>
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={() => setCancelConfirmOpen(false)}
+            >
               Keep running
             </Button>
             <Button
@@ -1253,7 +1554,10 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
               disabled={cancelMutation.isPending}
             >
               {cancelMutation.isPending && (
-                <Loader2 className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" aria-hidden="true" />
+                <Loader2
+                  className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none"
+                  aria-hidden="true"
+                />
               )}
               Cancel run
             </Button>
@@ -1287,11 +1591,24 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
               <AlertDescription className="space-y-2">
                 <p>{READY_BLOCKER_LABELS.conflict}</p>
                 <div className="flex gap-2">
-                  <Button type="button" size="sm" variant="outline" onClick={handleReloadAfterConflict}>
-                    <RotateCcw className="mr-1 h-3.5 w-3.5" aria-hidden="true" />
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    onClick={handleReloadAfterConflict}
+                  >
+                    <RotateCcw
+                      className="mr-1 h-3.5 w-3.5"
+                      aria-hidden="true"
+                    />
                     Reload
                   </Button>
-                  <Button type="button" size="sm" variant="outline" onClick={handleCompareAfterConflict}>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    onClick={handleCompareAfterConflict}
+                  >
                     Compare
                   </Button>
                 </div>
@@ -1299,7 +1616,11 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
             </Alert>
           ) : (
             <DialogFooter>
-              <Button type="button" variant="outline" onClick={() => setSaveConfirmOpen(false)}>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => setSaveConfirmOpen(false)}
+              >
                 Cancel
               </Button>
               <Button
@@ -1308,7 +1629,10 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
                 disabled={saveRevisionMutation.isPending}
               >
                 {saveRevisionMutation.isPending && (
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" aria-hidden="true" />
+                  <Loader2
+                    className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none"
+                    aria-hidden="true"
+                  />
                 )}
                 {SAVE_REVISION_CTA}
               </Button>
@@ -1330,11 +1654,16 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
               Delete this project?
             </DialogTitle>
             <DialogDescription>
-              This permanently deletes the project, its sources, and its revisions. This cannot be undone.
+              This permanently deletes the project, its sources, and its
+              revisions. This cannot be undone.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
-            <Button type="button" variant="ghost" onClick={() => setDeleteConfirmOpen(false)}>
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={() => setDeleteConfirmOpen(false)}
+            >
               Cancel
             </Button>
             <Button
@@ -1343,7 +1672,12 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
               onClick={() => deleteMutation.mutate()}
               disabled={deleteMutation.isPending}
             >
-              {deleteMutation.isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" aria-hidden="true" />}
+              {deleteMutation.isPending && (
+                <Loader2
+                  className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none"
+                  aria-hidden="true"
+                />
+              )}
               Delete project
             </Button>
           </DialogFooter>
@@ -1363,12 +1697,16 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
               Archive this project?
             </DialogTitle>
             <DialogDescription>
-              Archiving makes this project read-only until it is restored. Its sources and revisions
-              are kept.
+              Archiving makes this project read-only until it is restored. Its
+              sources and revisions are kept.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
-            <Button type="button" variant="ghost" onClick={() => setArchiveConfirmOpen(false)}>
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={() => setArchiveConfirmOpen(false)}
+            >
               Cancel
             </Button>
             <Button
@@ -1378,7 +1716,10 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
               disabled={archiveMutation.isPending}
             >
               {archiveMutation.isPending && (
-                <Loader2 className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" aria-hidden="true" />
+                <Loader2
+                  className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none"
+                  aria-hidden="true"
+                />
               )}
               Archive project
             </Button>
@@ -1395,7 +1736,9 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
           eligibility={eligibility}
           requiresSourceOnlyAck={sourceOnly}
           onReady={() => {
-            queryClient.invalidateQueries({ queryKey: draftRoomKeys.detail(draftId) });
+            queryClient.invalidateQueries({
+              queryKey: draftRoomKeys.detail(draftId),
+            });
           }}
         />
       )}

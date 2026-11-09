@@ -157,9 +157,7 @@ class Issue517RouteBase(unittest.TestCase):
         settings.draft_allowed_model_origins = ["http://127.0.0.1:11434"]
         os.environ["ALLOW_LOCAL_SERVICES"] = "1"
 
-        self._db_path = str(
-            __import__("pathlib").Path(self._temp_dir) / "app.db"
-        )
+        self._db_path = str(__import__("pathlib").Path(self._temp_dir) / "app.db")
 
         from app.models.database import _pool_cache, _pool_cache_lock
 
@@ -195,6 +193,16 @@ class Issue517RouteBase(unittest.TestCase):
         self._mock_vector_store.delete_by_file = AsyncMock(return_value=1)
         app.dependency_overrides[get_vector_store] = lambda: self._mock_vector_store
 
+        # Worker liveness stubs (issues #902/#911): the enqueue routes gate on
+        # a live worker and capabilities derive availability from it; these
+        # tests never run lifespan, so stand in for started processors
+        # (presence is the liveness contract — test_draft_routes.py
+        # precedent). addCleanup restores whatever was mounted before.
+        self._prev_djp = getattr(app.state, "draft_job_processor", None)
+        self._had_djp = hasattr(app.state, "draft_job_processor")
+        app.state.draft_job_processor = object()
+        self.addCleanup(self._restore_worker_stubs)
+
         conn = self._connection_pool.get_connection()
         try:
             conn.execute("PRAGMA foreign_keys = ON")
@@ -215,6 +223,12 @@ class Issue517RouteBase(unittest.TestCase):
             conn.commit()
         finally:
             self._connection_pool.release_connection(conn)
+
+    def _restore_worker_stubs(self) -> None:
+        if self._had_djp:
+            app.state.draft_job_processor = self._prev_djp
+        elif hasattr(app.state, "draft_job_processor"):
+            del app.state.draft_job_processor
 
     def tearDown(self):
         from app.models.database import _pool_cache, _pool_cache_lock
@@ -278,7 +292,13 @@ class Issue517RouteBase(unittest.TestCase):
         upload = self.client.post(
             f"/api/draft-room/drafts/{draft_id}/inputs",
             data={"role": "manuscript", "authority": "primary"},
-            files={"file": ("m.txt", b"Hello world. This is the manuscript body.", "text/plain")},
+            files={
+                "file": (
+                    "m.txt",
+                    b"Hello world. This is the manuscript body.",
+                    "text/plain",
+                )
+            },
             headers=self._owner_headers(),
         )
         self.assertIn(upload.status_code, (200, 201, 202), upload.text)
@@ -318,8 +338,9 @@ class Issue517RouteBase(unittest.TestCase):
         finally:
             self._connection_pool.release_connection(conn)
 
-    def _seed_current_revision(self, draft_id, *, job_id, content_md,
-                               fact_status="passed"):
+    def _seed_current_revision(
+        self, draft_id, *, job_id, content_md, fact_status="passed"
+    ):
         conn = self._connection_pool.get_connection()
         try:
             conn.execute(
@@ -338,8 +359,13 @@ class Issue517RouteBase(unittest.TestCase):
                 "content_md, content_sha256, fact_status, is_current, created_by) "
                 "VALUES (?, ?, ?, 'pipeline', ?, ?, ?, 1, ?)",
                 (
-                    draft_id, job_id, next_no, content_md,
-                    sha256_text(content_md), fact_status, self.OWNER_ID,
+                    draft_id,
+                    job_id,
+                    next_no,
+                    content_md,
+                    sha256_text(content_md),
+                    fact_status,
+                    self.OWNER_ID,
                 ),
             )
             conn.commit()
@@ -429,8 +455,7 @@ class TestFindingsListingAtScale(Issue517RouteBase):
 
     def test_total_is_exact_and_last_page_is_reachable(self):
         resp = self.client.get(
-            f"/api/draft-room/drafts/{self.draft_id}/findings"
-            "?per_page=100&page=1",
+            f"/api/draft-room/drafts/{self.draft_id}/findings?per_page=100&page=1",
             headers=self._owner_headers(),
         )
         self.assertEqual(resp.status_code, 200, resp.text)
@@ -444,15 +469,13 @@ class TestFindingsListingAtScale(Issue517RouteBase):
         )
 
         last_page = self.client.get(
-            f"/api/draft-room/drafts/{self.draft_id}/findings"
-            f"?per_page=100&page=21",
+            f"/api/draft-room/drafts/{self.draft_id}/findings?per_page=100&page=21",
             headers=self._owner_headers(),
         )
         self.assertEqual(last_page.status_code, 200, last_page.text)
         self.assertTrue(
             last_page.json()["items"],
-            "the last page (2050 rows at per_page=100 -> page 21) must be "
-            "non-empty",
+            "the last page (2050 rows at per_page=100 -> page 21) must be non-empty",
         )
 
     def test_filters_find_rows_older_than_the_scan_window(self):

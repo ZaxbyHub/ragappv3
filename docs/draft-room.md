@@ -362,6 +362,7 @@ Stable error codes an operator or user is most likely to see, and what they mean
 | Code | HTTP status | Meaning |
 |---|---:|---|
 | `draft_room_disabled` | 503 | `DRAFT_ROOM_ENABLED=false`. See [Enabling Draft Room](#enabling-draft-room) for what still works. |
+| `worker_unavailable` | 503 | The Draft Room worker that would claim the job (compile/retry/parse, upload's parse job, or the ingestion worker behind promotion) is not live — it failed to start, its poll loop died, or the ingestion processor is stopped. The enqueue is refused before any side effect; an `Idempotency-Key` replay still returns its original job. Retry once the worker is healthy (check startup logs for `DraftJobProcessor` / `Background processor` lines). |
 | `vault_access_revoked` | 403 | The draft owner no longer has `read` (or `write`, for promotion) on the draft's vault. |
 | `limit_exceeded` | 413 | `DRAFT_MAX_INPUTS` or `DRAFT_MAX_TOTAL_INPUT_MB` was hit for this project. |
 | `input_too_large` | 413 | A single upload exceeded the global `MAX_FILE_SIZE_MB` cap. |

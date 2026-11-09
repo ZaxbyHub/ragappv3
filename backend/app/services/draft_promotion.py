@@ -79,7 +79,7 @@ from app.services.document_progress import PHASE_QUEUED, set_phase
 from app.services.draft_input_storage import DraftInputStorage
 from app.services.draft_store import DraftInputRecord, DraftRevisionRecord
 from app.services.upload_path import UploadPathProvider
-from app.services.upload_validation import secure_filename
+from app.services.upload_validation import fold_title_separators, secure_filename
 from app.utils.file_utils import compute_file_hash
 
 logger = logging.getLogger(__name__)
@@ -172,7 +172,10 @@ class DraftPromotionResult:
 
 
 def _destination_filename(title: str, extension: str) -> str:
-    stem = secure_filename(title) or _FALLBACK_STEM
+    # The draft TITLE is content, not a client path: fold separators before
+    # sanitizing so "Q3/Q4 plan" keeps its "Q3" (issue #902; the same fold
+    # #789 shipped for draft export filenames).
+    stem = secure_filename(fold_title_separators(title)) or _FALLBACK_STEM
     stem = stem[:_MAX_FILENAME_STEM_CHARS] or _FALLBACK_STEM
     return f"{stem}{extension}"
 

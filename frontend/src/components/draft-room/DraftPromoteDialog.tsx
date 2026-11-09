@@ -26,6 +26,7 @@ import {
 } from "@/components/ui/select";
 import { getVault, listFolders, listTags } from "@/lib/api";
 import {
+  isDraftRoomErrorCode,
   draftRoomKeys,
   parseDraftRoomError,
   promoteDraftSource,
@@ -35,7 +36,11 @@ import {
   type DraftSummary,
   type PromoteResponse,
 } from "@/lib/api/draftRoom";
-import { FACT_STATUS_LABELS, PROMOTE_CONSEQUENCE, PROMOTE_TO_VAULT_CTA } from "@/components/draft-room/labels";
+import {
+  FACT_STATUS_LABELS,
+  PROMOTE_CONSEQUENCE,
+  PROMOTE_TO_VAULT_CTA,
+} from "@/components/draft-room/labels";
 
 export interface DraftPromoteDialogProps {
   open: boolean;
@@ -51,8 +56,10 @@ export interface DraftPromoteDialogProps {
 const TITLE_MAX_LENGTH = 300;
 
 const PROMOTE_ERROR_MESSAGES: Record<string, string> = {
-  duplicate_document: "This exact content has already been promoted to this vault.",
-  vault_access_revoked: "You no longer have write access to this project's vault.",
+  duplicate_document:
+    "This exact content has already been promoted to this vault.",
+  vault_access_revoked:
+    "You no longer have write access to this project's vault.",
 };
 
 export function DraftPromoteDialog({
@@ -77,7 +84,7 @@ export function DraftPromoteDialog({
       : null;
 
   const [sourceType, setSourceType] = useState<DraftPromoteSourceType>(
-    readyInputs.length > 0 ? "input" : "revision"
+    readyInputs.length > 0 ? "input" : "revision",
   );
   const [sourceId, setSourceId] = useState<number | null>(null);
   const [title, setTitle] = useState(draft.title);
@@ -124,7 +131,8 @@ export function DraftPromoteDialog({
     if (!open) return;
     if (sourceType === "revision") {
       const defaultId =
-        currentRevisionId != null && revisions.some((r) => r.id === currentRevisionId)
+        currentRevisionId != null &&
+        revisions.some((r) => r.id === currentRevisionId)
           ? currentRevisionId
           : (revisions[0]?.id ?? null);
       setSourceId(defaultId);
@@ -181,9 +189,18 @@ export function DraftPromoteDialog({
       // DocumentsPage does not use React Query, so there is no documents cache to
       // invalidate here. The promoted file is surfaced by link instead, and its
       // ingestion status is read from the documents API on that page's own load.
-      queryClient.invalidateQueries({ queryKey: draftRoomKeys.detail(draft.id) });
+      queryClient.invalidateQueries({
+        queryKey: draftRoomKeys.detail(draft.id),
+      });
       onPromoted(response);
     } catch (err) {
+      if (isDraftRoomErrorCode(err, "worker_unavailable")) {
+        // #902/#911: the ingestion worker cannot consume the promotion —
+        // refetch capabilities so the promote affordance reflects it.
+        queryClient.invalidateQueries({
+          queryKey: draftRoomKeys.capabilities(),
+        });
+      }
       const info = parseDraftRoomError(err);
       setError(PROMOTE_ERROR_MESSAGES[info.code] ?? info.detail);
     } finally {
@@ -204,7 +221,9 @@ export function DraftPromoteDialog({
           <DialogTitle ref={headingRef} tabIndex={-1}>
             {PROMOTE_TO_VAULT_CTA}
           </DialogTitle>
-          <DialogDescription id="draft-promote-description">{PROMOTE_CONSEQUENCE}</DialogDescription>
+          <DialogDescription id="draft-promote-description">
+            {PROMOTE_CONSEQUENCE}
+          </DialogDescription>
         </DialogHeader>
 
         {result ? (
@@ -212,11 +231,14 @@ export function DraftPromoteDialog({
             <Alert variant="success">
               <AlertDescription>
                 Promoted as{" "}
-                <Link to={`/documents/${result.file_id}`} className="font-medium underline">
+                <Link
+                  to={`/documents/${result.file_id}`}
+                  className="font-medium underline"
+                >
                   {result.filename}
                 </Link>{" "}
-                (document #{result.file_id}). The new document is queued for indexing — it is not
-                indexed yet.
+                (document #{result.file_id}). The new document is queued for
+                indexing — it is not indexed yet.
               </AlertDescription>
             </Alert>
             <DialogFooter>
@@ -239,7 +261,9 @@ export function DraftPromoteDialog({
                 <RadioGroup
                   orientation="vertical"
                   value={sourceType}
-                  onValueChange={(value) => setSourceType(value as DraftPromoteSourceType)}
+                  onValueChange={(value) =>
+                    setSourceType(value as DraftPromoteSourceType)
+                  }
                   name="promote-source-type"
                 >
                   <div className="flex items-center gap-2">
@@ -247,14 +271,24 @@ export function DraftPromoteDialog({
                       id="promote-source-type-input"
                       value="input"
                       disabled={readyInputs.length === 0}
-                      aria-describedby={noReadyInputsReason ? "promote-source-type-input-reason" : undefined}
+                      aria-describedby={
+                        noReadyInputsReason
+                          ? "promote-source-type-input-reason"
+                          : undefined
+                      }
                     />
-                    <Label htmlFor="promote-source-type-input" className="mb-0 font-normal">
+                    <Label
+                      htmlFor="promote-source-type-input"
+                      className="mb-0 font-normal"
+                    >
                       A source file
                     </Label>
                   </div>
                   {noReadyInputsReason ? (
-                    <p id="promote-source-type-input-reason" className="ml-6 text-sm text-muted-foreground">
+                    <p
+                      id="promote-source-type-input-reason"
+                      className="ml-6 text-sm text-muted-foreground"
+                    >
                       {noReadyInputsReason}
                     </p>
                   ) : null}
@@ -264,7 +298,10 @@ export function DraftPromoteDialog({
                       value="revision"
                       disabled={revisions.length === 0}
                     />
-                    <Label htmlFor="promote-source-type-revision" className="mb-0 font-normal">
+                    <Label
+                      htmlFor="promote-source-type-revision"
+                      className="mb-0 font-normal"
+                    >
                       A draft revision
                     </Label>
                   </div>
@@ -290,10 +327,17 @@ export function DraftPromoteDialog({
                           </SelectItem>
                         ))
                       : revisions.map((revision) => (
-                          <SelectItem key={revision.id} value={String(revision.id)}>
+                          <SelectItem
+                            key={revision.id}
+                            value={String(revision.id)}
+                          >
                             Revision {revision.revision_no}
-                            {revision.id === currentRevisionId ? " (current)" : ""} ·{" "}
-                            {FACT_STATUS_LABELS[revision.fact_status] ?? revision.fact_status}
+                            {revision.id === currentRevisionId
+                              ? " (current)"
+                              : ""}{" "}
+                            ·{" "}
+                            {FACT_STATUS_LABELS[revision.fact_status] ??
+                              revision.fact_status}
                           </SelectItem>
                         ))}
                   </SelectContent>
@@ -308,7 +352,9 @@ export function DraftPromoteDialog({
               </div>
 
               <div className="space-y-2">
-                <Label htmlFor="promote-destination-vault">Destination vault</Label>
+                <Label htmlFor="promote-destination-vault">
+                  Destination vault
+                </Label>
                 <Input
                   id="promote-destination-vault"
                   value={vault?.name ?? `Vault #${draft.vault_id}`}
@@ -329,10 +375,15 @@ export function DraftPromoteDialog({
                   }}
                   maxLength={TITLE_MAX_LENGTH}
                   aria-invalid={titleError != null}
-                  aria-describedby={titleError ? "promote-title-error" : undefined}
+                  aria-describedby={
+                    titleError ? "promote-title-error" : undefined
+                  }
                 />
                 {titleError ? (
-                  <p id="promote-title-error" className="text-sm text-destructive">
+                  <p
+                    id="promote-title-error"
+                    className="text-sm text-destructive"
+                  >
                     {titleError}
                   </p>
                 ) : null}
@@ -342,7 +393,9 @@ export function DraftPromoteDialog({
                 <Label htmlFor="promote-folder">Folder (optional)</Label>
                 <Select
                   value={folderId != null ? String(folderId) : "none"}
-                  onValueChange={(value) => setFolderId(value === "none" ? null : Number(value))}
+                  onValueChange={(value) =>
+                    setFolderId(value === "none" ? null : Number(value))
+                  }
                 >
                   <SelectTrigger id="promote-folder">
                     <SelectValue />
@@ -360,9 +413,15 @@ export function DraftPromoteDialog({
 
               <div className="space-y-2">
                 <Label id="promote-tags-label">Tags (optional)</Label>
-                <div className="flex flex-wrap gap-x-4 gap-y-2" role="group" aria-labelledby="promote-tags-label">
+                <div
+                  className="flex flex-wrap gap-x-4 gap-y-2"
+                  role="group"
+                  aria-labelledby="promote-tags-label"
+                >
                   {(tags ?? []).length === 0 ? (
-                    <p className="text-sm text-muted-foreground">No tags in this vault yet.</p>
+                    <p className="text-sm text-muted-foreground">
+                      No tags in this vault yet.
+                    </p>
                   ) : (
                     (tags ?? []).map((tag) => (
                       <div key={tag.id} className="flex items-center gap-1.5">
@@ -371,11 +430,16 @@ export function DraftPromoteDialog({
                           checked={tagIds.includes(tag.id)}
                           onCheckedChange={(checked) =>
                             setTagIds((prev) =>
-                              checked === true ? [...prev, tag.id] : prev.filter((id) => id !== tag.id)
+                              checked === true
+                                ? [...prev, tag.id]
+                                : prev.filter((id) => id !== tag.id),
                             )
                           }
                         />
-                        <Label htmlFor={`promote-tag-${tag.id}`} className="mb-0 font-normal">
+                        <Label
+                          htmlFor={`promote-tag-${tag.id}`}
+                          className="mb-0 font-normal"
+                        >
                           {tag.name}
                         </Label>
                       </div>
@@ -404,13 +468,25 @@ export function DraftPromoteDialog({
             ) : null}
 
             <DialogFooter>
-              <Button type="button" variant="outline" onClick={() => onOpenChange(false)} disabled={submitting}>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => onOpenChange(false)}
+                disabled={submitting}
+              >
                 Cancel
               </Button>
-              <Button type="button" onClick={handleSubmit} disabled={!canSubmit}>
+              <Button
+                type="button"
+                onClick={handleSubmit}
+                disabled={!canSubmit}
+              >
                 {submitting ? (
                   <>
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" aria-hidden="true" />
+                    <Loader2
+                      className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none"
+                      aria-hidden="true"
+                    />
                     {PROMOTE_TO_VAULT_CTA}
                   </>
                 ) : (

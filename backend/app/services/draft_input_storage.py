@@ -320,6 +320,7 @@ class DraftInputStorage:
             "trash_removed": 0,
             "trash_restored": 0,
             "orphan_dirs_removed": 0,
+            "orphan_files_removed": 0,
         }
         if not self._root.is_dir():
             return counts
@@ -339,6 +340,9 @@ class DraftInputStorage:
         )
         counts["orphan_dirs_removed"] = self._reconcile_orphan_projects(
             valid_owner_draft_pairs
+        )
+        counts["orphan_files_removed"] = self._reconcile_orphan_inputs(
+            valid_owner_draft_pairs, valid_input_relpaths
         )
         return counts
 
@@ -419,9 +423,7 @@ class DraftInputStorage:
                 else:
                     entry.unlink(missing_ok=True)
                 if sidecar_suffix:
-                    entry.with_name(entry.name + sidecar_suffix).unlink(
-                        missing_ok=True
-                    )
+                    entry.with_name(entry.name + sidecar_suffix).unlink(missing_ok=True)
                 removed += 1
             except OSError:
                 logger.warning("draft_room_reconcile: failed to remove stale entry")
@@ -455,6 +457,88 @@ class DraftInputStorage:
 
                 shutil.rmtree(resolved_entry, ignore_errors=True)
                 removed += 1
+        return removed
+
+    def _reconcile_orphan_inputs(
+        self,
+        valid_owner_draft_pairs: set[tuple[int, int]],
+        valid_input_relpaths: Optional[set[str]],
+    ) -> int:
+        """Remove row-less finalized input files inside LIVE project dirs (#913).
+
+        Issue #913: when the upload commit's compensation unlink fails (e.g. a
+        Windows sharing violation), the reserved ``draft_inputs`` row is
+        deleted but the finalized bytes stay inside a still-live
+        ``<owner_id>/<draft_id>/inputs/<input_id>/<name>`` directory that no
+        other reconcile step touches (age sweeps cover only ``.incoming``/
+        ``.trash``; whole-dir removal only covers pairs absent from the DB).
+
+        Runs ONLY on the production call shape (``valid_input_relpaths`` is
+        the DB-derived set of live ``draft_inputs.storage_relpath`` values;
+        the legacy pairs-only shape removes nothing, preserving the coarse
+        fallback's contract). Candidates are exactly files of the shape
+        ``inputs/<input_id>/<name>`` inside a LIVE pair's project dir whose
+        normalized relpath is absent from the valid set. Identity is compared
+        on ``os.path.normcase``-normalized, forward-slash relpaths (folds
+        case on case-insensitive filesystems, identity on POSIX — matching
+        what a same-named lookup would find on each platform). Symlinks and
+        reparse points are skipped, never followed; anything outside the
+        exact shape is untouched. Startup reconcile runs before HTTP traffic
+        and workers in the shipped single-process deployment, so no upload
+        can race this sweep.
+        """
+        if valid_input_relpaths is None:
+            return 0
+        if not self._root.is_dir():
+            return 0
+
+        def _norm(relpath: str) -> str:
+            return os.path.normcase(relpath.replace(chr(92), "/"))
+
+        valid = {_norm(v) for v in valid_input_relpaths}
+        resolved_root = self._root.resolve()
+        removed = 0
+        for owner_id, draft_id in valid_owner_draft_pairs:
+            inputs_dir = self._root / str(owner_id) / str(draft_id) / "inputs"
+            if not inputs_dir.is_dir():
+                continue
+            for input_entry in inputs_dir.iterdir():
+                if not input_entry.is_dir() or input_entry.is_symlink():
+                    continue
+                for file_entry in input_entry.iterdir():
+                    try:
+                        if file_entry.is_symlink() or not file_entry.is_file():
+                            continue
+                        rel = file_entry.relative_to(self._root).as_posix()
+                        if _norm(rel) in valid:
+                            continue
+                        resolved_parent = file_entry.parent.resolve()
+                        resolved_parent.relative_to(resolved_root)
+                    except (OSError, ValueError):
+                        continue
+                    try:
+                        file_entry.unlink()
+                        removed += 1
+                    except OSError:
+                        logger.warning(
+                            "draft_input_storage: orphan input reaping failed "
+                            "for one file under owner_id=%s draft_id=%s "
+                            "input_id=%s",
+                            owner_id,
+                            draft_id,
+                            input_entry.name,
+                        )
+                        continue
+                    try:
+                        input_entry.rmdir()
+                    except OSError:
+                        pass
+        if removed:
+            logger.warning(
+                "draft_input_storage: reaped %d row-less finalized input "
+                "file(s) from live project directories (issue #913)",
+                removed,
+            )
         return removed
 
 

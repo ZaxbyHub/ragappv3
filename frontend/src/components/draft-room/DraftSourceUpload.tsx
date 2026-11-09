@@ -2,7 +2,15 @@ import { useCallback, useEffect, useId, useRef, useState } from "react";
 import type { ChangeEvent } from "react";
 import { useDropzone } from "react-dropzone";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Upload, Loader2, CheckCircle2, XCircle, Clock, RotateCcw, X } from "lucide-react";
+import {
+  Upload,
+  Loader2,
+  CheckCircle2,
+  XCircle,
+  Clock,
+  RotateCcw,
+  X,
+} from "lucide-react";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
@@ -24,10 +32,15 @@ import {
   serverAcceptsFilename,
   uploadSizeExceededMessage,
 } from "@/lib/uploadLimits";
-import { ADD_SOURCE_FILES_CTA, INPUT_AUTHORITY_LABELS, INPUT_ROLE_LABELS } from "./labels";
+import {
+  ADD_SOURCE_FILES_CTA,
+  INPUT_AUTHORITY_LABELS,
+  INPUT_ROLE_LABELS,
+} from "./labels";
 import {
   DRAFT_INPUT_AUTHORITIES,
   DRAFT_INPUT_ROLES,
+  isDraftRoomErrorCode,
   draftRoomKeys,
   getDraftRoomPollIntervalMs,
   getDraft,
@@ -71,11 +84,16 @@ function nextUploadItemId(): string {
   return `draft-source-${uploadItemSeq}`;
 }
 
-function explainUploadError(info: DraftRoomErrorInfo): { message: string; canRetry: boolean } {
+function explainUploadError(info: DraftRoomErrorInfo): {
+  message: string;
+  canRetry: boolean;
+} {
   switch (info.code) {
     case "duplicate_input": {
       const existingId =
-        typeof info.context.existing_input_id === "number" ? info.context.existing_input_id : null;
+        typeof info.context.existing_input_id === "number"
+          ? info.context.existing_input_id
+          : null;
       return {
         message:
           existingId != null
@@ -108,14 +126,20 @@ function StatusIndicator({ status }: { status: UploadItemStatus }) {
     case "uploading":
       return (
         <span className="flex items-center gap-1 text-xs text-muted-foreground">
-          <Loader2 className="h-3.5 w-3.5 animate-spin motion-reduce:animate-none" aria-hidden="true" />
+          <Loader2
+            className="h-3.5 w-3.5 animate-spin motion-reduce:animate-none"
+            aria-hidden="true"
+          />
           Uploading
         </span>
       );
     case "parsing":
       return (
         <span className="flex items-center gap-1 text-xs text-muted-foreground">
-          <Loader2 className="h-3.5 w-3.5 animate-spin motion-reduce:animate-none" aria-hidden="true" />
+          <Loader2
+            className="h-3.5 w-3.5 animate-spin motion-reduce:animate-none"
+            aria-hidden="true"
+          />
           Parsing
         </span>
       );
@@ -157,7 +181,9 @@ export function DraftSourceUpload({
   // every progress tick or poll — mirroring DraftEditor's dirty-state and
   // DraftStageRail's stage-transition live regions.
   const [statusAnnouncement, setStatusAnnouncement] = useState("");
-  const lastTerminalStatusRef = useRef<Map<string, UploadItemStatus>>(new Map());
+  const lastTerminalStatusRef = useRef<Map<string, UploadItemStatus>>(
+    new Map(),
+  );
   useEffect(() => {
     const lastTerminalStatus = lastTerminalStatusRef.current;
     const messages: string[] = [];
@@ -166,7 +192,9 @@ export function DraftSourceUpload({
       if (isTerminal && lastTerminalStatus.get(item.id) !== item.status) {
         lastTerminalStatus.set(item.id, item.status);
         messages.push(
-          item.status === "ready" ? `${item.file.name}: parsed.` : `${item.file.name}: parse failed.`
+          item.status === "ready"
+            ? `${item.file.name}: parsed.`
+            : `${item.file.name}: parse failed.`,
         );
       }
     }
@@ -183,7 +211,7 @@ export function DraftSourceUpload({
   // already populated it (matches useDraftRoomEvents' fallback poll); this
   // never triggers its own capabilities fetch.
   const cachedCapabilities = queryClient.getQueryData<DraftRoomCapabilities>(
-    draftRoomKeys.capabilities()
+    draftRoomKeys.capabilities(),
   );
   const rawPollSeconds = cachedCapabilities?.limits?.poll_interval_seconds;
   const pollIntervalMs = getDraftRoomPollIntervalMs(rawPollSeconds);
@@ -208,16 +236,25 @@ export function DraftSourceUpload({
       let changed = false;
       const next = prev.map((it): UploadItem => {
         if (it.status !== "parsing" || it.inputId == null) return it;
-        const match = detail.inputs.find((candidate) => candidate.id === it.inputId);
-        if (!match || match.parse_status === "pending" || match.parse_status === "parsing") {
+        const match = detail.inputs.find(
+          (candidate) => candidate.id === it.inputId,
+        );
+        if (
+          !match ||
+          match.parse_status === "pending" ||
+          match.parse_status === "parsing"
+        ) {
           return it;
         }
         changed = true;
-        const failed = match.parse_status === "failed" || match.parse_status === "cancelled";
+        const failed =
+          match.parse_status === "failed" || match.parse_status === "cancelled";
         return {
           ...it,
           status: failed ? "failed" : "ready",
-          errorDetail: failed ? (match.parse_error ?? PARSE_FAILED_GUIDANCE) : null,
+          errorDetail: failed
+            ? (match.parse_error ?? PARSE_FAILED_GUIDANCE)
+            : null,
           canRetry: false,
         };
       });
@@ -233,7 +270,9 @@ export function DraftSourceUpload({
   const startUpload = useCallback(
     async (item: UploadItem) => {
       setItems((prev) =>
-        prev.map((it) => (it.id === item.id ? { ...it, status: "uploading", progress: 0 } : it))
+        prev.map((it) =>
+          it.id === item.id ? { ...it, status: "uploading", progress: 0 } : it,
+        ),
       );
       try {
         const response = await uploadDraftInput(
@@ -245,14 +284,22 @@ export function DraftSourceUpload({
             as_of_date: item.asOfDate || undefined,
           },
           (percent) => {
-            setItems((prev) => prev.map((it) => (it.id === item.id ? { ...it, progress: percent } : it)));
-          }
+            setItems((prev) =>
+              prev.map((it) =>
+                it.id === item.id ? { ...it, progress: percent } : it,
+              ),
+            );
+          },
         );
         onUploaded?.(response);
         invalidateDraft();
         const parseStatus = response.input.parse_status;
         const nextStatus: UploadItemStatus =
-          parseStatus === "ready" ? "ready" : parseStatus === "failed" || parseStatus === "cancelled" ? "failed" : "parsing";
+          parseStatus === "ready"
+            ? "ready"
+            : parseStatus === "failed" || parseStatus === "cancelled"
+              ? "failed"
+              : "parsing";
         setItems((prev) =>
           prev.map((it) =>
             it.id === item.id
@@ -261,13 +308,21 @@ export function DraftSourceUpload({
                   inputId: response.input.id,
                   status: nextStatus,
                   progress: 100,
-                  errorDetail: nextStatus === "failed" ? PARSE_FAILED_GUIDANCE : null,
+                  errorDetail:
+                    nextStatus === "failed" ? PARSE_FAILED_GUIDANCE : null,
                   canRetry: false,
                 }
-              : it
-          )
+              : it,
+          ),
         );
       } catch (err) {
+        if (isDraftRoomErrorCode(err, "worker_unavailable")) {
+          // #911: the server's liveness read just changed — refetch
+          // capabilities instead of waiting out the stale window.
+          queryClient.invalidateQueries({
+            queryKey: draftRoomKeys.capabilities(),
+          });
+        }
         const info = parseDraftRoomError(err);
         const explanation = explainUploadError(info);
         setItems((prev) =>
@@ -280,12 +335,12 @@ export function DraftSourceUpload({
                   errorDetail: explanation.message,
                   canRetry: explanation.canRetry,
                 }
-              : it
-          )
+              : it,
+          ),
         );
       }
     },
-    [draftId, invalidateDraft, onUploaded]
+    [draftId, invalidateDraft, onUploaded, queryClient],
   );
 
   useEffect(() => {
@@ -308,8 +363,12 @@ export function DraftSourceUpload({
   // fallback for a server-reported 0 — so `max_file_size_mb: 0` made Draft
   // Room admit files the server 413s while the Composer rejected them. Read
   // at call time so it never goes stale behind a settings update.
-  const storeMaxFileSizeMb = useSettingsStore((s) => s.settings?.max_file_size_mb);
-  const rawAllowedExtensions = useSettingsStore((s) => s.settings?.allowed_extensions);
+  const storeMaxFileSizeMb = useSettingsStore(
+    (s) => s.settings?.max_file_size_mb,
+  );
+  const rawAllowedExtensions = useSettingsStore(
+    (s) => s.settings?.allowed_extensions,
+  );
   const allowedExtensionsLoaded = rawAllowedExtensions !== undefined;
   const allowedExtensions = Array.isArray(rawAllowedExtensions)
     ? draftRoomAllowedExtensions(rawAllowedExtensions)
@@ -350,23 +409,28 @@ export function DraftSourceUpload({
       if (acceptable.length === 0) return;
       setItems((prev) => [
         ...prev,
-        ...acceptable.map(
-          (file): UploadItem => ({
-            id: nextUploadItemId(),
-            file,
-            role,
-            authority,
-            asOfDate,
-            status: "queued",
-            progress: 0,
-            inputId: null,
-            errorDetail: null,
-            canRetry: false,
-          })
-        ),
+        ...acceptable.map((file): UploadItem => ({
+          id: nextUploadItemId(),
+          file,
+          role,
+          authority,
+          asOfDate,
+          status: "queued",
+          progress: 0,
+          inputId: null,
+          errorDetail: null,
+          canRetry: false,
+        })),
       ]);
     },
-    [role, authority, asOfDate, allowedExtensions, allowedExtensionsLoaded, storeMaxFileSizeMb]
+    [
+      role,
+      authority,
+      asOfDate,
+      allowedExtensions,
+      allowedExtensionsLoaded,
+      storeMaxFileSizeMb,
+    ],
   );
 
   const handleFileInputChange = useCallback(
@@ -375,14 +439,16 @@ export function DraftSourceUpload({
       addFiles(files);
       event.target.value = "";
     },
-    [addFiles]
+    [addFiles],
   );
 
   const retryItem = useCallback((itemId: string) => {
     setItems((prev) =>
       prev.map((it) =>
-        it.id === itemId ? { ...it, status: "queued", progress: 0, errorDetail: null } : it
-      )
+        it.id === itemId
+          ? { ...it, status: "queued", progress: 0, errorDetail: null }
+          : it,
+      ),
     );
   }, []);
 
@@ -407,8 +473,16 @@ export function DraftSourceUpload({
       <div className="flex flex-wrap items-end gap-4">
         <div className="space-y-1">
           <Label htmlFor={`${idPrefix}-role`}>Role</Label>
-          <Select value={role} onValueChange={(value) => setRole(value as DraftInputRole)} disabled={isUploadDisabled}>
-            <SelectTrigger id={`${idPrefix}-role`} className="w-44" aria-label="Role">
+          <Select
+            value={role}
+            onValueChange={(value) => setRole(value as DraftInputRole)}
+            disabled={isUploadDisabled}
+          >
+            <SelectTrigger
+              id={`${idPrefix}-role`}
+              className="w-44"
+              aria-label="Role"
+            >
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -424,10 +498,16 @@ export function DraftSourceUpload({
           <Label htmlFor={`${idPrefix}-authority`}>Authority</Label>
           <Select
             value={authority}
-            onValueChange={(value) => setAuthority(value as DraftInputAuthority)}
+            onValueChange={(value) =>
+              setAuthority(value as DraftInputAuthority)
+            }
             disabled={isUploadDisabled}
           >
-            <SelectTrigger id={`${idPrefix}-authority`} className="w-44" aria-label="Authority">
+            <SelectTrigger
+              id={`${idPrefix}-authority`}
+              className="w-44"
+              aria-label="Authority"
+            >
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -457,11 +537,16 @@ export function DraftSourceUpload({
         className={cn(
           "rounded-md border-2 border-dashed p-6 text-center transition-colors",
           isDragActive ? "border-primary bg-primary/5" : "border-border",
-          isUploadDisabled && "opacity-60"
+          isUploadDisabled && "opacity-60",
         )}
       >
-        <Upload className="mx-auto mb-2 h-8 w-8 text-muted-foreground" aria-hidden="true" />
-        <p className="mb-3 text-sm text-muted-foreground">Drag and drop files here, or</p>
+        <Upload
+          className="mx-auto mb-2 h-8 w-8 text-muted-foreground"
+          aria-hidden="true"
+        />
+        <p className="mb-3 text-sm text-muted-foreground">
+          Drag and drop files here, or
+        </p>
         <input
           id={fileInputId}
           type="file"
@@ -475,7 +560,7 @@ export function DraftSourceUpload({
           className={cn(
             buttonVariants({ variant: "outline" }),
             "cursor-pointer",
-            isUploadDisabled && "pointer-events-none opacity-50"
+            isUploadDisabled && "pointer-events-none opacity-50",
           )}
         >
           {ADD_SOURCE_FILES_CTA}
@@ -500,9 +585,14 @@ export function DraftSourceUpload({
       {items.length > 0 && (
         <ul className="space-y-2">
           {items.map((item) => (
-            <li key={item.id} className="min-w-0 rounded-md border border-border p-3">
+            <li
+              key={item.id}
+              className="min-w-0 rounded-md border border-border p-3"
+            >
               <div className="flex min-w-0 items-center justify-between gap-2">
-                <span className="min-w-0 flex-1 truncate text-sm font-medium">{item.file.name}</span>
+                <span className="min-w-0 flex-1 truncate text-sm font-medium">
+                  {item.file.name}
+                </span>
                 <StatusIndicator status={item.status} />
               </div>
               {item.status === "uploading" && (
@@ -517,12 +607,25 @@ export function DraftSourceUpload({
                   <p className="text-sm text-destructive">{item.errorDetail}</p>
                   <div className="flex gap-2">
                     {item.canRetry && (
-                      <Button type="button" size="sm" variant="outline" onClick={() => retryItem(item.id)}>
-                        <RotateCcw className="mr-1 h-3.5 w-3.5" aria-hidden="true" />
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        onClick={() => retryItem(item.id)}
+                      >
+                        <RotateCcw
+                          className="mr-1 h-3.5 w-3.5"
+                          aria-hidden="true"
+                        />
                         Retry
                       </Button>
                     )}
-                    <Button type="button" size="sm" variant="ghost" onClick={() => removeItem(item.id)}>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => removeItem(item.id)}
+                    >
                       <X className="mr-1 h-3.5 w-3.5" aria-hidden="true" />
                       Remove
                     </Button>

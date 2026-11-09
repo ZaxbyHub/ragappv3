@@ -70,10 +70,12 @@ import json
 import logging
 import re
 import sqlite3
+import time
 from pathlib import Path
 from typing import Annotated, Any, Callable, Generic, Optional, TypeVar
 from urllib.parse import quote
 
+import anyio
 from fastapi import (
     APIRouter,
     Depends,
@@ -157,7 +159,7 @@ from app.services.folder_store import FolderStore
 from app.services.security_audit import safe_record_security_event
 from app.services.tag_store import TagStore
 from app.services.task_drain import drain_audit, drained_unit
-from app.services.upload_validation import secure_filename
+from app.services.upload_validation import fold_title_separators, secure_filename
 
 logger = logging.getLogger(__name__)
 
@@ -357,6 +359,42 @@ async def _run_store(func: Callable[[], T]) -> T:
         return await asyncio.to_thread(func)
     except DraftStoreError as exc:
         raise _map_store_error(exc) from exc
+
+
+def _worker_available(worker: Any) -> bool:
+    """Honest worker availability for Draft Room capability flags and gates.
+
+    Presence remains the baseline (the #789 guardrail installs a bare
+    ``object()`` stub as a live worker), and when the worker exposes task
+    liveness (``is_alive``) that read is AND-ed in: a processor whose
+    ``start()`` was swallowed by lifespan's ``_safe_await`` — mounted with
+    ``_running=False`` — or whose poll loop died after a successful start is
+    NOT available, because nothing will claim the jobs these routes enqueue
+    (issues #902/#911). Task liveness, not proof of forward progress.
+    """
+    if worker is None:
+        return False
+    is_alive = getattr(worker, "is_alive", None)
+    if is_alive is None:
+        return True
+    # Both shapes ship: ``is_alive`` is a property on the real processors
+    # (plain bool) and a method on stub doubles — accept either.
+    return bool(is_alive() if callable(is_alive) else is_alive)
+
+
+def _require_draft_worker(worker: Any) -> None:
+    """Refuse fresh Draft Room enqueues when no live worker can claim them.
+
+    Answers 503 ``worker_unavailable`` (SPEC section 8.3's unavailable-before-
+    enqueue class). Callers place this AFTER authentication, ownership and
+    idempotency-replay resolution and BEFORE the first side effect, so a
+    genuine replay still returns its original job and a refusal leaves
+    nothing to undo (issues #902/#911).
+    """
+    if not _worker_available(worker):
+        raise DraftRoomHTTPError(
+            503, "draft room worker is unavailable", "worker_unavailable"
+        )
 
 
 def _require_enabled() -> None:
@@ -933,6 +971,7 @@ class DraftRoomCapabilities(BaseModel):
     prompt_bundle_version: str
     editorial_gates_installed: bool
     compile_available: bool
+    upload_available: bool
     findings_available: bool
     claims_available: bool
     evidence_available: bool
@@ -1176,7 +1215,10 @@ def _to_finding(
             and record.span_end is not None
             and record.revision_id is not None
             and record.revision_id == current_revision_id
-            and (draft_status is None or draft_status in _APPLY_FINDING_ALLOWED_PRIOR_STATUSES)
+            and (
+                draft_status is None
+                or draft_status in _APPLY_FINDING_ALLOWED_PRIOR_STATUSES
+            )
             and not has_active_compile
         ),
         # SPEC section 8.2: dismiss is allowed only for non-blockers; the
@@ -1313,7 +1355,9 @@ def _sync_ledger_counts(
     }
 
 
-def _sync_resolve_username(conn: sqlite3.Connection, user_id: Optional[int]) -> Optional[str]:
+def _sync_resolve_username(
+    conn: sqlite3.Connection, user_id: Optional[int]
+) -> Optional[str]:
     """Best-effort ``users.id -> users.username`` lookup for display only.
 
     Returns ``None`` when ``user_id`` is ``None`` (nothing to resolve) or when
@@ -1466,9 +1510,7 @@ async def _build_detail(
     )
 
 
-def _validate_locked_spans(
-    spans: list[LockedSpan], parsed_text: Optional[str]
-) -> str:
+def _validate_locked_spans(spans: list[LockedSpan], parsed_text: Optional[str]) -> str:
     """Validate bounds/non-overlap/hash equality against the input's parsed text.
 
     Raises:
@@ -1535,6 +1577,136 @@ async def _delete_input_row_best_effort(
         )
 
 
+#: Upper bound on how long a cancelled upload request waits for its detached
+#: commit task to settle (finalize → enqueue → compensation) before
+#: propagating the cancellation anyway. The deadline is anchored at the FIRST
+#: cancellation and never restarted by repeated cancels (issue #913, plan R2b).
+_UPLOAD_COMMIT_DRAIN_SECONDS = 30.0
+
+#: Upper bound on the compensation's own runtime once shielded (mirrors
+#: ``draft_promotion._COMPENSATION_TIMEOUT_SECONDS``).
+_UPLOAD_COMPENSATE_TIMEOUT_SECONDS = 30.0
+
+#: Strong references to in-flight detached upload commit tasks so CPython
+#: cannot garbage-collect them mid-flight (plan R2b / check C21).
+_INFLIGHT_UPLOAD_COMMITS: set["asyncio.Task[Any]"] = set()
+
+
+def _consume_upload_commit(
+    task: "asyncio.Task[Any]", *, draft_id: int, input_id: int
+) -> None:
+    """Detach the strong reference and consume the outcome (plan R2b).
+
+    Retrieving the exception here (class name only — never payload text,
+    paths, or manuscript content) is what prevents "Task exception was never
+    retrieved" for failures that outlive the request.
+    """
+    _INFLIGHT_UPLOAD_COMMITS.discard(task)
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error(
+            "draft_room: upload commit task failed: %s (draft_id=%s input_id=%s)",
+            type(exc).__name__,
+            draft_id,
+            input_id,
+        )
+
+
+async def _compensate_upload_enrollment(
+    db_pool: SQLiteConnectionPool,
+    storage: "DraftInputStorage",
+    *,
+    draft_id: int,
+    owner_id: int,
+    input_id: int,
+    relpath: str,
+) -> None:
+    """Roll back a failed upload commit: unlink the finalized bytes and the
+    reserved input row (#913).
+
+    Runs shielded from cancellation with a bounded timeout, and each step
+    catches ``CancelledError`` separately from ``Exception``: a native
+    ``task.cancel()`` delivered at an await is recorded and RE-RAISED after
+    both steps have run, so it can never skip the row rollback and is never
+    swallowed. The row delete uses its own POOL connection — never the
+    request's — because this may run after the request dependency released
+    its connection (plan R2a).
+    """
+    cancelled: Optional[BaseException] = None
+    with anyio.CancelScope(shield=True):
+        try:
+            await asyncio.to_thread(
+                lambda: storage.resolve(relpath).unlink(missing_ok=True)
+            )
+        except asyncio.CancelledError as exc:
+            cancelled = exc
+        except Exception:
+            logger.error(
+                "draft_room: upload commit rollback unlink failed draft_id=%s "
+                "input_id=%s",
+                draft_id,
+                input_id,
+            )
+        try:
+            with db_pool.connection() as conn:
+                await _delete_input_row_best_effort(
+                    DraftStore(conn),
+                    draft_id=draft_id,
+                    owner_id=owner_id,
+                    input_id=input_id,
+                )
+        except asyncio.CancelledError as exc:
+            if cancelled is None:
+                cancelled = exc
+        except Exception:
+            logger.error(
+                "draft_room: upload commit rollback input-row delete failed "
+                "draft_id=%s input_id=%s",
+                draft_id,
+                input_id,
+            )
+    if cancelled is not None:
+        raise cancelled
+
+
+async def _compensate_upload_enrollment_shielded(
+    db_pool: SQLiteConnectionPool,
+    storage: "DraftInputStorage",
+    *,
+    draft_id: int,
+    owner_id: int,
+    input_id: int,
+    relpath: str,
+) -> None:
+    """Bounded wrapper around :func:`_compensate_upload_enrollment`.
+
+    ``anyio.CancelScope(shield=True)`` is the primitive that actually
+    protects a block from an already-cancelled outer scope (Starlette
+    delivers a dropped connection as anyio task-group cancellation, which
+    re-raises at the next checkpoint regardless of ``asyncio.shield``) — the
+    same reason ``draft_promotion`` shields its own compensation.
+    """
+    with anyio.move_on_after(_UPLOAD_COMPENSATE_TIMEOUT_SECONDS, shield=True):
+        await _compensate_upload_enrollment(
+            db_pool,
+            storage,
+            draft_id=draft_id,
+            owner_id=owner_id,
+            input_id=input_id,
+            relpath=relpath,
+        )
+        return
+    logger.warning(
+        "draft_room: upload commit rollback timed out after %ss "
+        "(draft_id=%s input_id=%s) — an orphan may exist",
+        _UPLOAD_COMPENSATE_TIMEOUT_SECONDS,
+        draft_id,
+        input_id,
+    )
+
+
 _EXPORT_TITLE_SEPARATOR_RE = re.compile(r"[/\\]")
 
 
@@ -1548,7 +1720,7 @@ def _export_filename(title: str, revision_no: int, tag: str) -> str:
     not a path, so it is rewritten to an underscore before sanitizing; the
     ASCII-safe name itself is unchanged for pure-ASCII separator-free titles.
     """
-    folded = _EXPORT_TITLE_SEPARATOR_RE.sub("_", title)
+    folded = fold_title_separators(title)
     safe_title = secure_filename(folded.replace(" ", "_")) or "draft"
     base = f"{safe_title}-rev{revision_no}"
     if tag:
@@ -1737,9 +1909,7 @@ def _model_snapshot() -> dict[str, Any]:
         "logical_modes": {
             "thinking": settings.chat_model or "unconfigured",
             "instant": (
-                settings.instant_chat_model
-                or settings.chat_model
-                or "unconfigured"
+                settings.instant_chat_model or settings.chat_model or "unconfigured"
             ),
         },
         "default_logical_mode": settings.draft_default_logical_mode,
@@ -1827,12 +1997,19 @@ def _sync_enqueue_compile(
     input_snapshot: list[list[Any]],
     parent_job_id: Optional[int],
     attempt_no: int,
+    worker_available: bool = True,
 ) -> tuple[int, bool]:
     """Create one ``compile`` job atomically. Returns ``(job_id, created)``.
 
     ``created=False`` means an ``Idempotency-Key`` replay matched an existing
     job with an identical request fingerprint and that job is returned
     unchanged. A key reused with a *different* fingerprint raises 409.
+
+    ``worker_available=False`` refuses FRESH enqueues with 503
+    ``worker_unavailable`` after replay resolution and the state guards and
+    before the first mutation (issues #911/#902): a genuine replay still
+    returns its original job even while the worker is down, and a refusal
+    leaves Ready state, events and rows exactly as they were.
     """
     store = DraftStore(conn)
     conn.execute("BEGIN IMMEDIATE")
@@ -1911,6 +2088,16 @@ def _sync_enqueue_compile(
             raise _conflict(
                 "base_revision_id does not match the draft's current revision",
                 "stale_base_revision",
+            )
+
+        # Issues #911/#902: fresh enqueue needs a live claimer. Placement is
+        # load-bearing: AFTER the replay resolution above (a replayed key
+        # returns its original job even while the worker is down) and AFTER
+        # the state guards (so 404/409 precedence is unchanged), BEFORE the
+        # Ready invalidation below (a refusal must leave no mutation behind).
+        if not worker_available:
+            raise DraftRoomHTTPError(
+                503, "draft room worker is unavailable", "worker_unavailable"
             )
 
         # SPEC section 8.2: "a Ready draft is invalidated first". Ready ->
@@ -2579,9 +2766,10 @@ async def _assert_waiver_text_unchanged(
     )
     content = revision.content_md or ""
     span_start, span_end = int(finding.span_start), int(finding.span_end)
-    if not (0 <= span_start < span_end <= len(content)) or sha256_text(
-        content[span_start:span_end]
-    ) != finding.span_text_sha256:
+    if (
+        not (0 <= span_start < span_end <= len(content))
+        or sha256_text(content[span_start:span_end]) != finding.span_text_sha256
+    ):
         raise _conflict(
             "the text this finding refers to has changed since it was raised",
             "stale_span",
@@ -2639,18 +2827,29 @@ async def get_capabilities(
         # installed in the orchestrator's canonical order, so no compile can
         # reach Assemble without them.
         editorial_gates_installed=all(
-            gate in COMPILE_STAGE_ORDER for gate in ("lint", "copy", "standards", "fact")
+            gate in COMPILE_STAGE_ORDER
+            for gate in ("lint", "copy", "standards", "fact")
         ),
         # Honest capability reporting (SPEC section 8.2). Each flag below is
         # True because the feature is reachable end to end: the route exists
         # here, its store accessors shipped in draft_store, and the compile
         # orchestrator that populates the ledgers shipped in draft_pipeline —
-        # except ``compile_available``, which is derived from the live worker:
-        # startup continues with ``app.state.draft_job_processor = None`` when
-        # DraftJobProcessor fails to start, and advertising compile as
-        # available then would promise jobs nothing will ever claim (#789).
-        compile_available=(
-            getattr(request.app.state, "draft_job_processor", None) is not None
+        # except the worker-backed flags, which are derived from task
+        # liveness: startup continues with ``app.state.draft_job_processor =
+        # None`` when DraftJobProcessor fails to construct, lifespan's
+        # ``_safe_await`` swallows a failed ``start()`` leaving the object
+        # mounted but not running, and a poll-loop death after a successful
+        # start leaves the object present with no claimer. Advertising work
+        # nothing will claim is the "promise jobs nothing will ever claim"
+        # condition #789 condemned for compile; parse/upload (one processor
+        # unit claims both job types) and promotion (the shared ingestion
+        # worker) get the same honesty here, and the enqueue routes enforce
+        # the same read server-side (issues #902/#911).
+        compile_available=_worker_available(
+            getattr(request.app.state, "draft_job_processor", None)
+        ),
+        upload_available=_worker_available(
+            getattr(request.app.state, "draft_job_processor", None)
         ),
         findings_available=True,
         claims_available=True,
@@ -2658,8 +2857,12 @@ async def get_capabilities(
         ready_available=True,
         # Promotion (issue #437 / SPEC PR 4) is reachable end to end:
         # POST /drafts/{id}/promote exists in this module and calls
-        # app.services.draft_promotion, the shared internal ingestion seam.
-        promote_available=True,
+        # app.services.draft_promotion, the shared internal ingestion seam —
+        # but only when the ingestion worker can actually consume the
+        # enqueued job (#902).
+        promote_available=_worker_available(
+            getattr(request.app.state, "background_processor", None)
+        ),
     )
 
 
@@ -2707,13 +2910,19 @@ async def list_drafts(
     store = DraftStore(db)
     drafts, total = await _run_store(
         lambda: store.list_drafts(
-            owner_id=owner_id, vault_id=vault_id, status=status, page=page, per_page=per_page
+            owner_id=owner_id,
+            vault_id=vault_id,
+            status=status,
+            page=page,
+            per_page=per_page,
         )
     )
     # Rows whose vault access was revoked are intentionally included (never
     # suppressed) so the owner can still find and delete them (SPEC 9.1).
     items = [await _build_summary(db, store, d, evaluate, user) for d in drafts]
-    return PaginatedResponse[DraftSummary](items=items, total=total, page=page, per_page=per_page)
+    return PaginatedResponse[DraftSummary](
+        items=items, total=total, page=page, per_page=per_page
+    )
 
 
 @router.get("/drafts/{draft_id}", response_model=DraftDetail)
@@ -2822,6 +3031,7 @@ async def delete_draft(
     # Ownership check first: a draft owned by someone else is 404, never 403.
     await _run_store(lambda: store.get_draft(draft_id, owner_id))
     deletion = DraftDeletionService(storage)
+
     # Issue #1068: the deletion service's store-internal commits and the
     # draft_deleted audit tail form ONE drained unit — a cancellation
     # delivered exactly at the commit await (after the commit work completed)
@@ -2849,13 +3059,15 @@ async def delete_draft(
         # still existing — recording after the cascade loses no information
         # while guaranteeing the record only ever reflects a real deletion
         # (SPEC section 9.3).
-        await drain_audit(safe_record_security_event(
-            db,
-            event_type="draft_deleted",
-            actor=user,
-            request=request,
-            metadata={"draft_id": draft_id},
-        ))
+        await drain_audit(
+            safe_record_security_event(
+                db,
+                event_type="draft_deleted",
+                actor=user,
+                request=request,
+                metadata={"draft_id": draft_id},
+            )
+        )
 
     await drained_unit(_unit())
 
@@ -2863,7 +3075,11 @@ async def delete_draft(
 # ── inputs ───────────────────────────────────────────────────────────────────
 
 
-@router.post("/drafts/{draft_id}/inputs", status_code=202, response_model=DraftInputUploadResponse)
+@router.post(
+    "/drafts/{draft_id}/inputs",
+    status_code=202,
+    response_model=DraftInputUploadResponse,
+)
 @limiter.limit(settings.draft_upload_rate_limit)
 async def upload_draft_input(
     request: Request,
@@ -2876,6 +3092,7 @@ async def upload_draft_input(
     user: dict = Depends(get_current_active_user),
     evaluate: Callable = Depends(get_evaluate_policy),
     storage: DraftInputStorage = Depends(get_draft_input_storage),
+    db_pool: SQLiteConnectionPool = Depends(get_db_pool),
     _csrf_token: str = Depends(csrf_protect),
 ) -> DraftInputUploadResponse:
     _require_enabled()
@@ -2885,7 +3102,9 @@ async def upload_draft_input(
         )
     if authority not in INPUT_AUTHORITIES:
         raise DraftRoomHTTPError(
-            422, f"authority must be one of {sorted(INPUT_AUTHORITIES)}", "validation_failed"
+            422,
+            f"authority must be one of {sorted(INPUT_AUTHORITIES)}",
+            "validation_failed",
         )
     if file is None or not file.filename:
         raise DraftRoomHTTPError(400, "file is required", "missing_file")
@@ -2894,6 +3113,12 @@ async def upload_draft_input(
     store = DraftStore(db)
     draft = await _run_store(lambda: store.get_draft(draft_id, owner_id))
     await _require_vault_read(evaluate, user, draft.vault_id)
+
+    # Issue #911: refuse the upload BEFORE staging any bytes or reserving any
+    # row when no live worker can claim the parse job it would enqueue (a
+    # stale capabilities cache or raw API client would otherwise enqueue a
+    # job nothing ever claims and the upload polls forever).
+    _require_draft_worker(getattr(request.app.state, "draft_job_processor", None))
 
     # Cheap pre-check on count before streaming bytes (SPEC section 6.2); the
     # byte-total limit is re-checked atomically inside reserve_input once the
@@ -2949,81 +3174,144 @@ async def upload_draft_input(
         await asyncio.to_thread(storage.discard, staged)
         raise
 
-    try:
-        await asyncio.to_thread(storage.finalize, staged, input_record.storage_relpath)
-    except Exception as exc:
-        await asyncio.to_thread(storage.discard, staged)
-        await _delete_input_row_best_effort(
-            store, draft_id=draft_id, owner_id=owner_id, input_id=input_record.id
-        )
-        logger.error(
-            "draft_room: failed to finalize staged upload draft_id=%s input_id=%s",
-            draft_id,
-            input_record.id,
-        )
-        raise DraftRoomHTTPError(500, "failed to store uploaded file", "internal_error") from exc
+    async def _commit_upload() -> Any:
+        """Finalize + enqueue as ONE cancellation-atomic unit (#913, R2).
 
-    async def _compensate_enqueue_phase() -> None:
-        """DRAFT-024 (issue #516): never-raises rollback for an infrastructure
-        failure in the enqueue phase. ``_run_store`` translates only
-        ``DraftStoreError``; a raw ``sqlite3``/``OSError`` propagates
-        untranslated, and an untranslated error must strand neither the
-        finalized bytes nor the reserved input row (a stranded row 409s every
-        retry on ``UNIQUE(draft_id, content_sha256)`` until restart recovery).
-        Each step is guarded and logged individually so a failure in one
-        cannot skip the other — and cannot mask the original error the caller
-        re-raises."""
+        Runs as its own task owning a POOL connection for every DB step: the
+        request dependency releases its connection at teardown, and this
+        continuation may legitimately outlive the request (a cancelled upload
+        is drained, not abandoned), so it must never touch the request's
+        ``DraftStore`` past that point (plan R2a). On failure the compensation
+        runs under the same ownership. The stored staged handle is moved to
+        its final path before the job row exists; every failure path leaves
+        either (row + final bytes + parse job) or (no row + no bytes).
+        """
         try:
             await asyncio.to_thread(
-                lambda: storage.resolve(
-                    input_record.storage_relpath
-                ).unlink(missing_ok=True)
+                storage.finalize, staged, input_record.storage_relpath
             )
-        except Exception:
-            logger.error(
-                "draft_room: enqueue-phase rollback unlink failed draft_id=%s "
-                "input_id=%s",
-                draft_id,
-                input_record.id,
-            )
-        try:
-            await _delete_input_row_best_effort(
-                store, draft_id=draft_id, owner_id=owner_id, input_id=input_record.id
-            )
-        except Exception:
-            logger.error(
-                "draft_room: enqueue-phase rollback input-row delete failed "
-                "draft_id=%s input_id=%s",
-                draft_id,
-                input_record.id,
-            )
-
-    try:
-        job = await _run_store(
-            lambda: store.enqueue_parse_job(
+        except Exception as exc:
+            await _compensate_upload_enrollment_shielded(
+                db_pool,
+                storage,
                 draft_id=draft_id,
                 owner_id=owner_id,
                 input_id=input_record.id,
-                timeout_seconds=settings.draft_parse_timeout_seconds,
+                relpath=input_record.storage_relpath,
             )
+            logger.error(
+                "draft_room: failed to finalize staged upload draft_id=%s input_id=%s",
+                draft_id,
+                input_record.id,
+            )
+            raise DraftRoomHTTPError(
+                500, "failed to store uploaded file", "internal_error"
+            ) from exc
+        with db_pool.connection() as commit_conn:
+            commit_store = DraftStore(commit_conn)
+            try:
+                return await _run_store(
+                    lambda: commit_store.enqueue_parse_job(
+                        draft_id=draft_id,
+                        owner_id=owner_id,
+                        input_id=input_record.id,
+                        timeout_seconds=settings.draft_parse_timeout_seconds,
+                    )
+                )
+            except BaseException:
+                # A translated domain error AND a raw infrastructure error
+                # must both roll the upload back (row + finalized bytes), and
+                # a fault inside the compensation must never replace the
+                # original error (issues #516/#789/#913). CancelledError is
+                # deliberately caught here too: the commit task itself is
+                # cancelled only at loop shutdown, and compensation still has
+                # to run before it propagates.
+                # No log here: the done-callback's sanitized outcome record
+                # (_consume_upload_commit) is the single ERROR line for this
+                # failure — a second record would duplicate the operator
+                # signal without adding information.
+                await _compensate_upload_enrollment_shielded(
+                    db_pool,
+                    storage,
+                    draft_id=draft_id,
+                    owner_id=owner_id,
+                    input_id=input_record.id,
+                    relpath=input_record.storage_relpath,
+                )
+                raise
+
+    commit_task = asyncio.create_task(_commit_upload())
+    _INFLIGHT_UPLOAD_COMMITS.add(commit_task)
+    commit_task.add_done_callback(
+        lambda task, _d=draft_id, _i=input_record.id: _consume_upload_commit(
+            task, draft_id=_d, input_id=_i
         )
-    except DraftRoomHTTPError:
-        # Same guarded compensation as the generic branch below: a translated
-        # domain error must still roll back BOTH the staged bytes and the input
-        # row, and a fault inside the compensation itself (e.g. an OSError from
-        # unlink on a Windows sharing violation) must neither skip the row
-        # rollback nor replace the domain error the client sees (issue #789).
-        await _compensate_enqueue_phase()
-        raise
-    except Exception:
-        # Same compensation as the translated-domain-error branch above, but
-        # guarded: an infrastructure error (raw sqlite3.OperationalError,
-        # OSError, ...) must roll the upload back just like a domain conflict,
-        # and a fault inside the compensation itself must never replace the
-        # original error. The original exception is re-raised untranslated —
-        # the generic 500 handler renders it.
-        await _compensate_enqueue_phase()
-        raise
+    )
+
+    try:
+        # ``wait_for`` around ``shield``: the shield keeps the detached commit
+        # task running no matter what happens to this await, while the
+        # timeout bounds a wedged finalize/enqueue on the UNCANCELLED path.
+        # Both cancellation shapes — native ``task.cancel()`` and an anyio
+        # client-disconnect scope — raise CancelledError at this await
+        # immediately (an anyio shield around it would absorb a native cancel
+        # until its own timeout instead, probe-verified), handing control to
+        # the drain below.
+        job = await asyncio.wait_for(
+            asyncio.shield(commit_task), timeout=_UPLOAD_COMMIT_DRAIN_SECONDS
+        )
+    except asyncio.TimeoutError:
+        # No cancellation — the commit itself exceeded the drain bound on a
+        # wedged pool/filesystem. The detached task still owns the outcome
+        # and will commit or compensate when its threads return.
+        logger.error(
+            "draft_room: upload commit did not settle within %ss "
+            "(draft_id=%s input_id=%s) — the detached task owns the outcome",
+            _UPLOAD_COMMIT_DRAIN_SECONDS,
+            draft_id,
+            input_record.id,
+        )
+        raise DraftRoomHTTPError(
+            503,
+            "upload is still being processed; check the draft inputs list "
+            "before retrying",
+            "commit_pending",
+        )
+    except asyncio.CancelledError as first_cancel:
+        # Drain the commit task under ONE monotonic deadline (anchored at
+        # this first cancellation; repeated cancels are absorbed and counted,
+        # never restart the clock) inside a shielded scope so an outer anyio
+        # cancellation cannot cut the drain short. Shutdown still unwinds:
+        # the original cancellation is re-raised once the outcome settles or
+        # the deadline passes, and the detached task remains the sole owner
+        # of a still-pending outcome (plan R2b).
+        cancels = 1
+        with anyio.CancelScope(shield=True):
+            deadline = time.monotonic() + _UPLOAD_COMMIT_DRAIN_SECONDS
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    done, _pending = await asyncio.wait(
+                        {commit_task}, timeout=remaining
+                    )
+                except asyncio.CancelledError:
+                    cancels += 1
+                    continue
+                if done:
+                    break
+        if not commit_task.done():
+            logger.error(
+                "draft_room: upload commit drain timed out after %ss "
+                "(draft_id=%s input_id=%s cancels=%d) — the detached task "
+                "owns the outcome",
+                _UPLOAD_COMMIT_DRAIN_SECONDS,
+                draft_id,
+                input_record.id,
+                cancels,
+            )
+        raise first_cancel
 
     return DraftInputUploadResponse(
         input=_to_draft_input(input_record, job.id, job.id),
@@ -3257,24 +3545,28 @@ async def cancel_draft_job(
                 draft_id=draft_id, owner_id=owner_id, job_id=job_id
             )
         )
-        await drain_audit(safe_record_security_event(
-            db,
-            event_type="draft_job_cancelled",
-            actor=user,
-            request=request,
-            metadata={
-                "draft_id": draft_id,
-                "job_id": job_id,
-                "job_type": job.job_type,
-                "status": job.status,
-            },
-        ))
+        await drain_audit(
+            safe_record_security_event(
+                db,
+                event_type="draft_job_cancelled",
+                actor=user,
+                request=request,
+                metadata={
+                    "draft_id": draft_id,
+                    "job_id": job_id,
+                    "job_type": job.job_type,
+                    "status": job.status,
+                },
+            )
+        )
 
     await drained_unit(_unit())
     return _to_job(job)
 
 
-@router.post("/drafts/{draft_id}/jobs/{job_id}/retry", status_code=202, response_model=DraftJob)
+@router.post(
+    "/drafts/{draft_id}/jobs/{job_id}/retry", status_code=202, response_model=DraftJob
+)
 @limiter.limit(settings.draft_compile_rate_limit)
 async def retry_draft_job(
     request: Request,
@@ -3304,6 +3596,10 @@ async def retry_draft_job(
     )
 
     if parent.job_type != "compile":
+        # Issue #911: a parse retry enqueues onto the same DraftJobProcessor
+        # poll loop as uploads — refuse it when no live worker can claim it
+        # (after the ownership fetch above, before any new row).
+        _require_draft_worker(getattr(request.app.state, "draft_job_processor", None))
         job = await _run_store(
             lambda: store.retry_parse_job(
                 draft_id=draft_id,
@@ -3319,6 +3615,12 @@ async def retry_draft_job(
             "only a failed or cancelled job can be retried", "invalid_state"
         )
     _assert_provider_policy(sensitive=draft.tier == "sensitive")
+    # Evaluated in the route (not inside the thread unit) so the read is a
+    # single fresh observation per request; the thread function enforces it
+    # after replay/guards, before the first mutation (issue #911).
+    worker_ok = _worker_available(
+        getattr(request.app.state, "draft_job_processor", None)
+    )
 
     requested = (body.start_stage if body else None) or _RETRY_STAGE_NORMALIZATION.get(
         parent.active_stage or "", parent.active_stage or _DEFAULT_START_STAGE
@@ -3327,7 +3629,9 @@ async def retry_draft_job(
     if requested not in _START_STAGES:
         requested = _DEFAULT_START_STAGE
 
-    idempotency_key = _validate_idempotency_key(request.headers.get(_IDEMPOTENCY_HEADER))
+    idempotency_key = _validate_idempotency_key(
+        request.headers.get(_IDEMPOTENCY_HEADER)
+    )
 
     def _prepare_retry() -> dict[str, Any]:
         # The *compile* fingerprint hashes the NORMALIZED stage (SPEC section
@@ -3386,27 +3690,32 @@ async def retry_draft_job(
                 input_snapshot=prepared["input_snapshot"],
                 parent_job_id=job_id,
                 attempt_no=parent.attempt_no + 1,
+                worker_available=worker_ok,
             )
         )
         job = await _run_store(
-            lambda: store.get_job(draft_id=draft_id, owner_id=owner_id, job_id=new_job_id)
+            lambda: store.get_job(
+                draft_id=draft_id, owner_id=owner_id, job_id=new_job_id
+            )
         )
         if created:
-            await drain_audit(safe_record_security_event(
-                db,
-                event_type="draft_job_retried",
-                actor=user,
-                request=request,
-                metadata={
-                    "draft_id": draft_id,
-                    "job_id": new_job_id,
-                    "parent_job_id": job_id,
-                    "start_stage": prepared["normalized"],
-                    "requested_start_stage": requested,
-                    "compile_input_sha256": prepared["compile_fingerprint"],
-                    "prompt_bundle_version": PROMPT_BUNDLE_VERSION,
-                },
-            ))
+            await drain_audit(
+                safe_record_security_event(
+                    db,
+                    event_type="draft_job_retried",
+                    actor=user,
+                    request=request,
+                    metadata={
+                        "draft_id": draft_id,
+                        "job_id": new_job_id,
+                        "parent_job_id": job_id,
+                        "start_stage": prepared["normalized"],
+                        "requested_start_stage": requested,
+                        "compile_input_sha256": prepared["compile_fingerprint"],
+                        "prompt_bundle_version": PROMPT_BUNDLE_VERSION,
+                    },
+                )
+            )
 
     await drained_unit(_unit())
     return _to_job(job)
@@ -3443,8 +3752,16 @@ async def compile_draft(
     draft = await _run_store(lambda: store.get_draft(draft_id, owner_id))
     await _require_vault_read(evaluate, user, draft.vault_id)
     _assert_provider_policy(sensitive=draft.tier == "sensitive")
+    # Evaluated in the route (not inside the thread unit) so the read is a
+    # single fresh observation per request; the thread function enforces it
+    # after replay/guards, before the first mutation (issue #911).
+    worker_ok = _worker_available(
+        getattr(request.app.state, "draft_job_processor", None)
+    )
 
-    idempotency_key = _validate_idempotency_key(request.headers.get(_IDEMPOTENCY_HEADER))
+    idempotency_key = _validate_idempotency_key(
+        request.headers.get(_IDEMPOTENCY_HEADER)
+    )
 
     def _prepare_compile() -> dict[str, Any]:
         # The *compile* fingerprint hashes the NORMALIZED stage (SPEC section
@@ -3500,29 +3817,32 @@ async def compile_draft(
                 input_snapshot=prepared["input_snapshot"],
                 parent_job_id=None,
                 attempt_no=1,
+                worker_available=worker_ok,
             )
         )
         job = await _run_store(
             lambda: store.get_job(draft_id=draft_id, owner_id=owner_id, job_id=job_id)
         )
         if created:
-            await drain_audit(safe_record_security_event(
-                db,
-                event_type="draft_compile_requested",
-                actor=user,
-                request=request,
-                metadata={
-                    "draft_id": draft_id,
-                    "job_id": job_id,
-                    "start_stage": prepared["normalized"],
-                    "requested_start_stage": body.start_stage,
-                    "base_revision_id": body.base_revision_id,
-                    "compile_input_sha256": prepared["compile_fingerprint"],
-                    "prompt_bundle_version": PROMPT_BUNDLE_VERSION,
-                    "tier": draft.tier,
-                    "idempotent_replay": False,
-                },
-            ))
+            await drain_audit(
+                safe_record_security_event(
+                    db,
+                    event_type="draft_compile_requested",
+                    actor=user,
+                    request=request,
+                    metadata={
+                        "draft_id": draft_id,
+                        "job_id": job_id,
+                        "start_stage": prepared["normalized"],
+                        "requested_start_stage": body.start_stage,
+                        "base_revision_id": body.base_revision_id,
+                        "compile_input_sha256": prepared["compile_fingerprint"],
+                        "prompt_bundle_version": PROMPT_BUNDLE_VERSION,
+                        "tier": draft.tier,
+                        "idempotent_replay": False,
+                    },
+                )
+            )
         else:
             # Idempotent replay. The job's request snapshot is a large body, so it
             # is fetched explicitly through the store's dedicated accessor rather
@@ -3530,18 +3850,20 @@ async def compile_draft(
             stored = await _run_store(
                 lambda: store.get_job_json_field(job_id=job_id, field="input_json")
             )
-            await drain_audit(safe_record_security_event(
-                db,
-                event_type="draft_compile_requested",
-                actor=user,
-                request=request,
-                metadata={
-                    "draft_id": draft_id,
-                    "job_id": job_id,
-                    "start_stage": stored.get("normalized_start_stage"),
-                    "idempotent_replay": True,
-                },
-            ))
+            await drain_audit(
+                safe_record_security_event(
+                    db,
+                    event_type="draft_compile_requested",
+                    actor=user,
+                    request=request,
+                    metadata={
+                        "draft_id": draft_id,
+                        "job_id": job_id,
+                        "start_stage": stored.get("normalized_start_stage"),
+                        "idempotent_replay": True,
+                    },
+                )
+            )
 
     await drained_unit(_unit())
     return _to_job(job)
@@ -3551,7 +3873,9 @@ async def compile_draft(
 
 
 @router.get("/drafts/{draft_id}/events")
-async def draft_room_events_stream(request: Request, draft_id: int) -> StreamingResponse:
+async def draft_room_events_stream(
+    request: Request, draft_id: int
+) -> StreamingResponse:
     """Authenticated notification stream (SPEC section 8.4).
 
     Auth and the vault read-permission check run against a short-lived pooled
@@ -3619,7 +3943,8 @@ async def draft_room_events_stream(request: Request, draft_id: int) -> Streaming
 
 
 @router.get(
-    "/drafts/{draft_id}/revisions", response_model=PaginatedResponse[DraftRevisionSummary]
+    "/drafts/{draft_id}/revisions",
+    response_model=PaginatedResponse[DraftRevisionSummary],
 )
 async def list_draft_revisions(
     draft_id: int,
@@ -3646,7 +3971,9 @@ async def list_draft_revisions(
     )
 
 
-@router.get("/drafts/{draft_id}/revisions/{revision_id}", response_model=DraftRevisionDetail)
+@router.get(
+    "/drafts/{draft_id}/revisions/{revision_id}", response_model=DraftRevisionDetail
+)
 async def get_draft_revision(
     draft_id: int,
     revision_id: int,
@@ -3660,13 +3987,18 @@ async def get_draft_revision(
     await _require_vault_read(evaluate, user, draft.vault_id)
     revision = await _run_store(
         lambda: store.get_revision(
-            draft_id=draft_id, owner_id=owner_id, revision_id=revision_id, include_content=True
+            draft_id=draft_id,
+            owner_id=owner_id,
+            revision_id=revision_id,
+            include_content=True,
         )
     )
     return _to_revision_detail(revision)
 
 
-@router.post("/drafts/{draft_id}/revisions", status_code=201, response_model=DraftRevisionDetail)
+@router.post(
+    "/drafts/{draft_id}/revisions", status_code=201, response_model=DraftRevisionDetail
+)
 async def create_draft_revision(
     draft_id: int,
     body: RevisionCreateRequest,
@@ -3692,7 +4024,9 @@ async def create_draft_revision(
     return _to_revision_detail(revision)
 
 
-@router.post("/drafts/{draft_id}/revisions/{revision_id}/ready", response_model=DraftSummary)
+@router.post(
+    "/drafts/{draft_id}/revisions/{revision_id}/ready", response_model=DraftSummary
+)
 async def mark_revision_ready(
     request: Request,
     draft_id: int,
@@ -3732,6 +4066,7 @@ async def mark_revision_ready(
     store = DraftStore(db)
     draft = await _run_store(lambda: store.get_draft(draft_id, owner_id))
     await _require_vault_read(evaluate, user, draft.vault_id)
+
     # Issue #1068: _sync_mark_ready's store-internal commit and the
     # draft_ready_marked audit tail form ONE drained unit — a cancellation
     # delivered exactly at the commit await (after the commit work completed)
@@ -3747,13 +4082,15 @@ async def mark_revision_ready(
                 acknowledge_source_only=body.acknowledge_source_only,
             )
         )
-        await drain_audit(safe_record_security_event(
-            db,
-            event_type="draft_ready_marked",
-            actor=user,
-            request=request,
-            metadata={"draft_id": draft_id, **audit},
-        ))
+        await drain_audit(
+            safe_record_security_event(
+                db,
+                event_type="draft_ready_marked",
+                actor=user,
+                request=request,
+                metadata={"draft_id": draft_id, **audit},
+            )
+        )
 
     await drained_unit(_unit())
     updated = await _run_store(lambda: store.get_draft(draft_id, owner_id))
@@ -3795,14 +4132,19 @@ async def export_draft_revision(
     recipient cannot miss unresolved issues the body itself does not show.
     """
     if format != "md":
-        raise DraftRoomHTTPError(422, "unsupported export format", "unsupported_export_format")
+        raise DraftRoomHTTPError(
+            422, "unsupported export format", "unsupported_export_format"
+        )
     owner_id = int(user["id"])
     store = DraftStore(db)
     draft = await _run_store(lambda: store.get_draft(draft_id, owner_id))
     await _require_vault_read(evaluate, user, draft.vault_id)
     revision = await _run_store(
         lambda: store.get_revision(
-            draft_id=draft_id, owner_id=owner_id, revision_id=revision_id, include_content=True
+            draft_id=draft_id,
+            owner_id=owner_id,
+            revision_id=revision_id,
+            include_content=True,
         )
     )
 
@@ -3837,6 +4179,7 @@ async def export_draft_revision(
     )
 
     filename = _export_filename(draft.title, revision.revision_no, tag)
+
     # Issue #1068: record_event("exported")'s store-internal commit and the
     # draft_exported audit tail form ONE drained unit — a cancellation
     # delivered exactly at the commit await (after the commit work completed)
@@ -3859,20 +4202,22 @@ async def export_draft_revision(
                 },
             )
         )
-        await drain_audit(safe_record_security_event(
-            db,
-            event_type="draft_exported",
-            actor=user,
-            request=request,
-            metadata={
-                "draft_id": draft_id,
-                "revision_id": revision.id,
-                "format": "md",
-                "fact_status": fact_status,
-                "approval_status": approval_status,
-                "content_sha256": revision.content_sha256,
-            },
-        ))
+        await drain_audit(
+            safe_record_security_event(
+                db,
+                event_type="draft_exported",
+                actor=user,
+                request=request,
+                metadata={
+                    "draft_id": draft_id,
+                    "revision_id": revision.id,
+                    "format": "md",
+                    "fact_status": fact_status,
+                    "approval_status": approval_status,
+                    "content_sha256": revision.content_sha256,
+                },
+            )
+        )
 
     await drained_unit(_unit())
     # RFC 6266: the ASCII-safe ``filename`` parameter stays for legacy
@@ -4018,13 +4363,15 @@ async def _record_promotion_cleanup_failure(
     ``draft_promotions`` row, or on-disk file may still exist. Distinct
     ``event_type`` from ``draft_promoted`` so operators can search for it
     specifically."""
-    await drain_audit(safe_record_security_event(
-        db,
-        event_type="draft_promotion_cleanup_failed",
-        actor=user,
-        request=request,
-        metadata={"draft_id": draft_id, "detail": str(exc)},
-    ))
+    await drain_audit(
+        safe_record_security_event(
+            db,
+            event_type="draft_promotion_cleanup_failed",
+            actor=user,
+            request=request,
+            metadata={"draft_id": draft_id, "detail": str(exc)},
+        )
+    )
 
 
 def _apply_promotion_organization(
@@ -4099,6 +4446,15 @@ async def promote_draft_source(
         raise DraftRoomHTTPError(
             409, "an archived draft cannot be promoted", "invalid_state"
         )
+
+    # Issue #902: promotion enqueues normal ingestion through the shared
+    # background processor — refuse it BEFORE copying any bytes or creating
+    # any `files`/`draft_promotions` row when that worker cannot consume the
+    # job (a None processor today answers a post-compensation 500
+    # `promotion_failed_incomplete_cleanup`; a mounted-but-not-running one
+    # answers 202 for a job nobody claims). The gate reads the INJECTED
+    # processor (the same object this route uses to enqueue).
+    _require_draft_worker(background_processor)
 
     # Validate the organization target(s) up front, before any promotion side
     # effect (copied bytes, `files` row, `draft_promotions` row, enqueue) —
@@ -4225,7 +4581,9 @@ async def promote_draft_source(
                     owner_id=owner_id,
                     event_type="promoted",
                     actor_user_id=owner_id,
-                    revision_id=result.source_id if body.source_type == "revision" else None,
+                    revision_id=result.source_id
+                    if body.source_type == "revision"
+                    else None,
                     payload={
                         "source_type": result.source_type,
                         "source_id": result.source_id,
@@ -4250,25 +4608,27 @@ async def promote_draft_source(
         # is deliberately the final opportunity to record provenance for a
         # promotion that has already, irreversibly, happened.
         try:
-            await drain_audit(safe_record_security_event(
-                db,
-                event_type="draft_promoted",
-                actor=user,
-                request=request,
-                metadata={
-                    "draft_id": draft_id,
-                    "source_type": result.source_type,
-                    "source_id": result.source_id,
-                    "source_sha256": result.source_sha256,
-                    "vault_id": result.vault_id,
-                    "file_id": result.file_id,
-                    "filename": result.filename,
-                    "revision_fact_status": revision_fact_status,
-                    "was_ready_revision": was_ready_revision,
-                    "organization_error": organization_error,
-                    "draft_event_error": draft_event_error,
-                },
-            ))
+            await drain_audit(
+                safe_record_security_event(
+                    db,
+                    event_type="draft_promoted",
+                    actor=user,
+                    request=request,
+                    metadata={
+                        "draft_id": draft_id,
+                        "source_type": result.source_type,
+                        "source_id": result.source_id,
+                        "source_sha256": result.source_sha256,
+                        "vault_id": result.vault_id,
+                        "file_id": result.file_id,
+                        "filename": result.filename,
+                        "revision_fact_status": revision_fact_status,
+                        "was_ready_revision": was_ready_revision,
+                        "organization_error": organization_error,
+                        "draft_event_error": draft_event_error,
+                    },
+                )
+            )
         except BaseException as exc:  # noqa: BLE001 — the promotion already succeeded; this must not prevent the response either
             logger.warning(
                 "draft_room: failed to record draft_promoted security audit "
@@ -4602,7 +4962,9 @@ async def dispose_draft_finding(
         else:
             if not (body.note or "").strip():
                 raise DraftRoomHTTPError(
-                    422, "waiving a finding requires a non-empty note", "waiver_reason_required"
+                    422,
+                    "waiving a finding requires a non-empty note",
+                    "waiver_reason_required",
                 )
             if not finding.waivable:
                 raise _conflict("this finding is not waivable", "finding_not_waivable")
@@ -4626,22 +4988,26 @@ async def dispose_draft_finding(
         # dismiss/waive moved theirs into DraftStore with the same guards (issue
         # #788 / T1-08-K-02). The note text stays in
         # ``draft_findings.resolution_note``; payloads carry IDs and codes only.
-        await drain_audit(safe_record_security_event(
-            db,
-            event_type=f"draft_finding_{body.action}",
-            actor=user,
-            request=request,
-            metadata={
-                "draft_id": draft_id,
-                "finding_id": finding_id,
-                "action": body.action,
-                "rule_id": finding.rule_id,
-                "rule_version": finding.rule_version,
-                "severity": finding.severity,
-                "span_text_sha256": finding.span_text_sha256,
-                "revision_id": new_revision.id if new_revision else finding.revision_id,
-            },
-        ))
+        await drain_audit(
+            safe_record_security_event(
+                db,
+                event_type=f"draft_finding_{body.action}",
+                actor=user,
+                request=request,
+                metadata={
+                    "draft_id": draft_id,
+                    "finding_id": finding_id,
+                    "action": body.action,
+                    "rule_id": finding.rule_id,
+                    "rule_version": finding.rule_version,
+                    "severity": finding.severity,
+                    "span_text_sha256": finding.span_text_sha256,
+                    "revision_id": new_revision.id
+                    if new_revision
+                    else finding.revision_id,
+                },
+            )
+        )
 
     await drained_unit(_unit())
     updated = await _run_store(

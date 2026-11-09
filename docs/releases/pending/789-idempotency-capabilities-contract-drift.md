@@ -42,7 +42,10 @@ T1-08-K-06, T1-08-S2-08, T1-08-K-03, T1-08-K-07, T1-08-K-05, T1-08-K-11.
   unavailable. The frontend already disabled the compile/retry CTAs on this
   flag. Disclosed residual: a raw API client bypassing capabilities can still
   202 a compile onto a dead worker (changing that would alter what the route
-  accepts, which this PR forbids).
+  accepts, which this PR forbids). [Superseded by #902/#905/#911/#913 — the
+  enqueue routes now refuse fresh work with 503 `worker_unavailable` when no
+  live worker can claim it, while a genuine replay still returns its original
+  job; and the flag now reads task liveness, not mere object presence.]
 
 **Promotion 500s are observable and leak nothing (draft_room.py)**
 - The generic promotion-failure branch logs at ERROR with the exception

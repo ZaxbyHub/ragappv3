@@ -162,7 +162,9 @@ class DraftSecurityTestBase(unittest.TestCase):
         # environment, so CSRFManager falls back to its in-memory store — needed
         # by TestCSRFEnforcement, which removes the csrf_protect override to
         # exercise the real dependency.
-        app.state.csrf_manager = CSRFManager(redis_url="redis://localhost:6379/0", ttl=900)
+        app.state.csrf_manager = CSRFManager(
+            redis_url="redis://localhost:6379/0", ttl=900
+        )
 
         self._mock_vector_store = MagicMock()
         self._mock_vector_store.db = MagicMock()
@@ -170,6 +172,16 @@ class DraftSecurityTestBase(unittest.TestCase):
         self._mock_vector_store.db.open_table = AsyncMock(return_value=MagicMock())
         self._mock_vector_store.delete_by_file = AsyncMock(return_value=1)
         app.dependency_overrides[get_vector_store] = lambda: self._mock_vector_store
+
+        # Worker liveness stubs (issues #902/#911): the enqueue routes gate on
+        # a live worker and capabilities derive availability from it; these
+        # tests never run lifespan, so stand in for started processors
+        # (presence is the liveness contract — test_draft_routes.py
+        # precedent). addCleanup restores whatever was mounted before.
+        self._prev_djp = getattr(app.state, "draft_job_processor", None)
+        self._had_djp = hasattr(app.state, "draft_job_processor")
+        app.state.draft_job_processor = object()
+        self.addCleanup(self._restore_worker_stubs)
 
         conn = self._connection_pool.get_connection()
         try:
@@ -198,6 +210,12 @@ class DraftSecurityTestBase(unittest.TestCase):
             conn.commit()
         finally:
             self._connection_pool.release_connection(conn)
+
+    def _restore_worker_stubs(self) -> None:
+        if self._had_djp:
+            app.state.draft_job_processor = self._prev_djp
+        elif hasattr(app.state, "draft_job_processor"):
+            del app.state.draft_job_processor
 
     def tearDown(self):
         from app.models.database import _pool_cache, _pool_cache_lock
@@ -248,7 +266,9 @@ class DraftSecurityTestBase(unittest.TestCase):
         )
         return resp
 
-    def _upload_input(self, draft_id, *, headers=None, content=b"manuscript body", filename="a.txt"):
+    def _upload_input(
+        self, draft_id, *, headers=None, content=b"manuscript body", filename="a.txt"
+    ):
         headers = headers or self._owner_headers()
         return self.client.post(
             f"/api/draft-room/drafts/{draft_id}/inputs",
@@ -264,7 +284,9 @@ class DraftSecurityTestBase(unittest.TestCase):
         production; simulated here via direct SQL for test setup."""
         conn = self._connection_pool.get_connection()
         try:
-            conn.execute("UPDATE drafts SET status = 'running' WHERE id = ?", (draft_id,))
+            conn.execute(
+                "UPDATE drafts SET status = 'running' WHERE id = ?", (draft_id,)
+            )
             conn.commit()
         finally:
             self._connection_pool.release_connection(conn)
@@ -337,7 +359,9 @@ class TestNonOwnerIsolation(DraftSecurityTestBase):
             json_body = case[2] if len(case) > 2 else None
             resp = self.client.request(method, path, json=json_body, headers=other)
             self.assertEqual(
-                resp.status_code, 404, f"{method} {path} -> {resp.status_code}: {resp.text}"
+                resp.status_code,
+                404,
+                f"{method} {path} -> {resp.status_code}: {resp.text}",
             )
 
     def test_non_owner_upload_returns_404(self):
@@ -435,14 +459,48 @@ class TestCSRFEnforcement(DraftSecurityTestBase):
         try:
             headers = self._owner_headers()
             mutations = [
-                ("POST", "/api/draft-room/drafts", {"vault_id": self.READ_VAULT_ID, "title": "x", "mode": "rewrite", "tier": "standard", "brief": _default_brief()}),
-                ("PATCH", f"/api/draft-room/drafts/{draft_id}", {"lock_version": 1, "title": "x"}),
-                ("POST", f"/api/draft-room/drafts/{draft_id}/archive", {"lock_version": 1}),
+                (
+                    "POST",
+                    "/api/draft-room/drafts",
+                    {
+                        "vault_id": self.READ_VAULT_ID,
+                        "title": "x",
+                        "mode": "rewrite",
+                        "tier": "standard",
+                        "brief": _default_brief(),
+                    },
+                ),
+                (
+                    "PATCH",
+                    f"/api/draft-room/drafts/{draft_id}",
+                    {"lock_version": 1, "title": "x"},
+                ),
+                (
+                    "POST",
+                    f"/api/draft-room/drafts/{draft_id}/archive",
+                    {"lock_version": 1},
+                ),
                 ("DELETE", f"/api/draft-room/drafts/{draft_id}", None),
-                ("PATCH", f"/api/draft-room/drafts/{draft_id}/inputs/{input_id}", {"role": "reference"}),
-                ("DELETE", f"/api/draft-room/drafts/{draft_id}/inputs/{input_id}", None),
-                ("POST", f"/api/draft-room/drafts/{draft_id}/jobs/{job_id}/cancel", None),
-                ("POST", f"/api/draft-room/drafts/{draft_id}/jobs/{job_id}/retry", None),
+                (
+                    "PATCH",
+                    f"/api/draft-room/drafts/{draft_id}/inputs/{input_id}",
+                    {"role": "reference"},
+                ),
+                (
+                    "DELETE",
+                    f"/api/draft-room/drafts/{draft_id}/inputs/{input_id}",
+                    None,
+                ),
+                (
+                    "POST",
+                    f"/api/draft-room/drafts/{draft_id}/jobs/{job_id}/cancel",
+                    None,
+                ),
+                (
+                    "POST",
+                    f"/api/draft-room/drafts/{draft_id}/jobs/{job_id}/retry",
+                    None,
+                ),
                 (
                     "POST",
                     f"/api/draft-room/drafts/{draft_id}/revisions",
@@ -452,7 +510,9 @@ class TestCSRFEnforcement(DraftSecurityTestBase):
             for method, path, body in mutations:
                 resp = self.client.request(method, path, json=body, headers=headers)
                 self.assertEqual(
-                    resp.status_code, 403, f"{method} {path} -> {resp.status_code}: {resp.text}"
+                    resp.status_code,
+                    403,
+                    f"{method} {path} -> {resp.status_code}: {resp.text}",
                 )
         finally:
             app.dependency_overrides[csrf_protect] = lambda: "test-csrf"
@@ -505,7 +565,9 @@ class TestDisabledGate(DraftSecurityTestBase):
         settings.draft_room_enabled = False
 
         # Capabilities still works and reports disabled.
-        resp = self.client.get("/api/draft-room/capabilities", headers=self._owner_headers())
+        resp = self.client.get(
+            "/api/draft-room/capabilities", headers=self._owner_headers()
+        )
         self.assertEqual(resp.status_code, 200)
         self.assertFalse(resp.json()["enabled"])
 
@@ -528,7 +590,11 @@ class TestDisabledGate(DraftSecurityTestBase):
 
         resp = self.client.post(
             f"/api/draft-room/drafts/{draft_id}/revisions",
-            json={"base_revision_id": revision_id, "lock_version": 2, "content_md": "v2"},
+            json={
+                "base_revision_id": revision_id,
+                "lock_version": 2,
+                "content_md": "v2",
+            },
             headers=self._owner_headers(),
         )
         self.assertEqual(resp.status_code, 503)
@@ -670,7 +736,9 @@ class TestDeleteAuditOrdering(DraftSecurityTestBase):
             ).fetchone()
         finally:
             self._connection_pool.release_connection(conn)
-        self.assertEqual(row[0], 0, "draft_deleted audit row written for a rejected delete")
+        self.assertEqual(
+            row[0], 0, "draft_deleted audit row written for a rejected delete"
+        )
 
 
 if __name__ == "__main__":
