@@ -9,8 +9,10 @@ needed, so this runs in the ordinary Backend CI job. The source file uses
 string-form commands, list-form environment entries, and ``${VAR:-default}``
 interpolation. Compose substitutes the SAME expression text into every site,
 so the credential-coordination assertions compare the raw expression tokens
-(exact by construction); non-emptiness additionally requires the expression's
-own default (after ``:-``) to be non-empty:
+(exact by construction); the healthcheck reads the credential from the
+service's runtime environment ($$-escaped) rather than from a composed shell
+string, and non-emptiness additionally requires the expression's own default
+(after ``:-``) to be non-empty:
 - the redis service command carries ``--requirepass`` with a value whose
   unset-default is non-empty;
 - the healthcheck probe authenticates with the SAME token;
@@ -102,12 +104,14 @@ class TestRedisRequiresAuthentication:
                         if isinstance(e, str) and e.startswith("REDIS_PASSWORD=")), None)
         token = _requirepass_token()
         assert raw is not None, "redis service must export REDIS_PASSWORD to the container env"
-        assert re.fullmatch(r"\$\{[A-Z][A-Z0-9_]*:-[^}]+\}", str(raw)), (
-            "REDIS_PASSWORD env must use the same ${VAR:-nonempty} token form"
-        )
-        default = re.fullmatch(r"\$\{[A-Z][A-Z0-9_]*:-(.*)\}", str(raw)).group(1)
-        assert default == token[2:-1].replace(chr(125), "") or default, (
-            "env default must be non-empty"
+        # The REAL agreement invariant: the env token expression must EQUAL the
+        # --requirepass token expression (the M3 mutant — a divergent env
+        # default — breaks the deployed stack's healthcheck whenever the host
+        # var is unset, while every CI gate stays green).
+        assert raw == token, (
+            f"service env REDIS_PASSWORD token {raw!r} must equal the "
+            f"--requirepass token {token!r} (divergence breaks the healthcheck "
+            "when the host var is unset)"
         )
 
     def test_backend_redis_url_override_wins_by_construction(self):

@@ -72,8 +72,8 @@ services:
     # Loopback-bound publish (#1061): local debugging keeps host access via
     # 127.0.0.1:6379 while the port is no longer reachable from other
     # interfaces. The bundled Redis also requires authentication — the same
-    # REDIS_PASSWORD value is interpolated into the command, the healthcheck,
-    # and the backend REDIS_URL default below.
+    # REDIS_PASSWORD token drives the command, the service env (which the
+    # healthcheck reads at runtime), and the backend REDIS_URL default below.
     ports:
       - "127.0.0.1:6379:6379"
     volumes:
