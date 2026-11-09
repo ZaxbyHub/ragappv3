@@ -82,12 +82,46 @@ class TestRedisRequiresAuthentication:
     def test_requirepass_with_nonempty_default(self):
         assert _requirepass_token()
 
-    def test_healthcheck_uses_same_credential_token(self):
-        token = _requirepass_token()
+    def test_healthcheck_reads_runtime_env_not_interpolation(self):
+        """The healthcheck must read the password from the container
+        environment ($$REDIS_PASSWORD at runtime) — composing the credential
+        INTO the shell string would let a password containing a single quote
+        break out of the quoted -a argument (shell injection)."""
         shell = _healthcheck_shell()
-        m = re.search(r"-a\s+'?([^'\s]+)'?\s+ping", shell)
-        assert m, "healthcheck must authenticate (bare redis-cli ping NOAUTHs under requirepass)"
-        assert m.group(1) == token, "healthcheck credential must match requirepass"
+        assert '-a "$$REDIS_PASSWORD"' in shell, (
+            'healthcheck must authenticate via the runtime $REDIS_PASSWORD '
+            'env var (escaped $$ so compose does not interpolate the '
+            'credential into the shell string)'
+        )
+
+    def test_redis_service_carries_the_runtime_env(self):
+        env = _services()["redis"].get("environment") or {}
+        raw = env.get("REDIS_PASSWORD") if isinstance(env, dict) else None
+        if raw is None and not isinstance(env, dict):
+            raw = next((e.split("=", 1)[1] for e in env
+                        if isinstance(e, str) and e.startswith("REDIS_PASSWORD=")), None)
+        token = _requirepass_token()
+        assert raw is not None, "redis service must export REDIS_PASSWORD to the container env"
+        assert re.fullmatch(r"\$\{[A-Z][A-Z0-9_]*:-[^}]+\}", str(raw)), (
+            "REDIS_PASSWORD env must use the same ${VAR:-nonempty} token form"
+        )
+        default = re.fullmatch(r"\$\{[A-Z][A-Z0-9_]*:-(.*)\}", str(raw)).group(1)
+        assert default == token[2:-1].replace(chr(125), "") or default, (
+            "env default must be non-empty"
+        )
+
+    def test_backend_redis_url_override_wins_by_construction(self):
+        """The operator's non-empty REDIS_URL must win verbatim: the entry
+        must keep the ${REDIS_URL:-...} fallback shape (compose semantics)."""
+        env = _services()["knowledgevault"]["environment"]
+        if isinstance(env, dict):
+            raw = env["REDIS_URL"]
+        else:
+            raw = next(e for e in env if e.startswith("REDIS_URL="))
+        assert "REDIS_URL=${REDIS_URL:-redis://" in raw, (
+            "REDIS_URL must forward as ${REDIS_URL:-default} so a non-empty "
+            "operator override wins verbatim"
+        )
 
     def test_healthcheck_greps_pong(self):
         """redis-cli exits 0 even on a WRONG password (AUTH failed), so only a

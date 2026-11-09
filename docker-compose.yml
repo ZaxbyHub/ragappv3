@@ -86,12 +86,19 @@ services:
     # password containing shell metacharacters cannot truncate the
     # --requirepass value the way a string command would.
     command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru", "--requirepass", "${REDIS_PASSWORD:-knowledgevault-local-redis}"]
+    environment:
+      # Runtime env form (#1061 review round 2): the healthcheck reads the
+      # password from the container environment at runtime ($$ escapes compose
+      # interpolation), so no operator credential is ever interpolated into a
+      # shell string — a password containing a single quote cannot break out
+      # of the healthcheck command the way a '-quoted interpolation could.
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-knowledgevault-local-redis}
     healthcheck:
       # PONG-grep form (#1061 review round): redis-cli exits 0 even on a WRONG
       # password (AUTH failed), so an exit-code-only check cannot detect a
       # credential mismatch; piping through grep -q PONG fails the healthcheck
       # when authentication does not actually succeed.
-      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a '${REDIS_PASSWORD:-knowledgevault-local-redis}' ping | grep -q PONG"]
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
       interval: 10s
       timeout: 5s
       retries: 5

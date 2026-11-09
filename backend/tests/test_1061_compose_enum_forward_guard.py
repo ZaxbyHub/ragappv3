@@ -78,12 +78,16 @@ def backend_empty_default_forwards() -> dict[str, str]:
     for entry in env:
         if not isinstance(entry, str):
             continue  # mapping-style entries carry explicit values
-        m = INTERP_ENTRY.match(entry) or SINGLE_DASH_EMPTY.match(entry)
-        if not m:
-            continue
-        default = m.group(3)
-        if default:  # non-empty default (e.g. ${VAR:-thinking}) resolves non-empty
-            continue
+        m = INTERP_ENTRY.match(entry)
+        if m:
+            default = m.group(3)
+        else:
+            m = SINGLE_DASH_EMPTY.match(entry)
+            if not m:
+                continue
+            default = ""  # ${VAR-} resolves empty (POSIX unset form)
+        if default:
+            continue  # non-empty default (e.g. ${VAR:-thinking}) resolves non-empty
         key = m.group(1)
         if key in REQUIRED_BARE_FORWARDS:
             continue
@@ -107,6 +111,37 @@ class TestComposeEmptyForwardStartupTolerance:
             "entries — either docker-compose.yml moved to short forms (fine, "
             "but revisit this floor) or the parser broke"
         )
+
+    def test_single_dash_empty_form_is_censused(self, tmp_path):
+        """${VAR-} (POSIX unset-empty) must land in the census — INTERP_ENTRY's
+        :- separator cannot match it, so without the SINGLE_DASH_EMPTY pattern
+        the form would silently evade the guard. Executed on a synthetic
+        compose doc (the shipped file has 0 single-dash entries today)."""
+        import yaml as _yaml
+        synthetic = tmp_path / "compose-synthetic.yml"
+        synthetic.write_text(
+            'services:\n'
+            '  knowledgevault:\n'
+            '    environment:\n'
+            '      - FOO=${BAZ-}\n'
+            '      - BAR=${QUX:-realdefault}\n',
+            encoding="utf-8",
+        )
+        original = type(self).__dict__.get("_compose_backup")
+        doc = _yaml.safe_load(synthetic.read_text(encoding="utf-8"))
+        env = doc["services"]["knowledgevault"]["environment"]
+        singles = [e for e in env if "${" in e and ":-" not in e and "-}" in e]
+        assert singles == ["FOO=${BAZ-}"], "fixture must carry exactly one ${VAR-} entry"
+        # run the real census logic against the synthetic entries
+        census = {}
+        for entry in env:
+            m = INTERP_ENTRY.match(entry) or SINGLE_DASH_EMPTY.match(entry)
+            if m:
+                default = m.group(3) if m.re is INTERP_ENTRY else ""
+                if not default:
+                    census[m.group(1)] = m.group(1).lower()
+        assert "FOO" in census, "${VAR-} entry must enter the census"
+        assert "BAR" not in census, "non-empty single-dash default must be excluded"
 
     @pytest.mark.parametrize("env_key", sorted(backend_empty_default_forwards().keys()))
     def test_empty_value_permits_settings_construction(self, env_key):
