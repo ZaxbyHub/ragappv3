@@ -452,10 +452,13 @@ services:
   redis:
     image: redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"   # loopback-only publish (#1061)
     volumes:
       - redis_data:/data
-    # ... healthcheck (see docker-compose.yml)
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb",
+      "--maxmemory-policy", "allkeys-lru",
+      "--requirepass", "${REDIS_PASSWORD:-knowledgevault-local-redis}"]
+    # ... auth-coordinated PONG-grep healthcheck (see docker-compose.yml)
 
   # KnowledgeVault (backend + frontend, combined image)
   knowledgevault:
@@ -469,7 +472,7 @@ services:
     environment:
       - OLLAMA_EMBEDDING_URL=${OLLAMA_EMBEDDING_URL:-http://harrier-embed:8080/v1/embeddings}
       - RERANKER_URL=${RERANKER_URL:-http://reranker:8081}
-      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      - REDIS_URL=${REDIS_URL:-redis://:${REDIS_PASSWORD:-knowledgevault-local-redis}@redis:6379/0}
       - EMBEDDING_MODEL=${EMBEDDING_MODEL:-microsoft/harrier-oss-v1-0.6b}
       # Chat endpoints ship EMPTY — set them in .env (any OpenAI-compatible
       # server: Ollama, LM Studio, vLLM, or a remote API):

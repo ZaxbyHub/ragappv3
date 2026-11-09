@@ -169,7 +169,9 @@ IMAP_POLL_INTERVAL=60
 # Attachment size limit (10MB = 10485760 bytes)
 IMAP_MAX_ATTACHMENT_SIZE=10485760
 
-# Allowed MIME types (whitelist)
+# Allowed MIME types (whitelist). NOTE: setting IMAP_ALLOWED_MIME_TYPES
+# overrides the shipped default (17 MIME types) — the example value below
+# narrows it to these 4. Omit the key to keep the shipped allowlist.
 IMAP_ALLOWED_MIME_TYPES=application/pdf,text/plain,text/markdown,application/vnd.openxmlformats-officedocument.wordprocessingml.document
 ```
 
@@ -995,7 +997,7 @@ grep IMAP_MAX_ATTACHMENT_SIZE .env
 docker compose logs knowledgevault | grep -i "skipping attachment"
 
 # 4. Verify file was enqueued
-sqlite3 /data/knowledgevault/app.db "SELECT id, filename, source, status FROM files WHERE source='email' ORDER BY created_at DESC LIMIT 10;"
+sqlite3 ./data/app.db "SELECT id, filename, source, status FROM files WHERE source='email' ORDER BY created_at DESC LIMIT 10;"
 ```
 
 ---
@@ -1022,10 +1024,10 @@ sqlite3 /data/knowledgevault/app.db "SELECT id, filename, source, status FROM fi
 **Troubleshooting Steps:**
 ```bash
 # 1. List all vaults
-sqlite3 /data/knowledgevault/app.db "SELECT id, name FROM vaults;"
+sqlite3 ./data/app.db "SELECT id, name FROM vaults;"
 
 # 2. Check recent email uploads
-sqlite3 /data/knowledgevault/app.db "SELECT id, filename, vault_id, email_subject FROM files WHERE source='email' ORDER BY created_at DESC LIMIT 5;"
+sqlite3 ./data/app.db "SELECT id, filename, vault_id, email_subject FROM files WHERE source='email' ORDER BY created_at DESC LIMIT 5;"
 
 # 3. Look for vault resolution warnings
 docker compose logs knowledgevault | grep -i "vault.*not found"
@@ -1074,7 +1076,7 @@ curl -s -H "Authorization: Bearer <token>" \
 # server log only (issue #562; DIMENSION_CHANGED since issue #691;
 # PARSE_TIMEOUT since issue #703; EMBEDDING_FAILED / VECTOR_STORE_FAILED
 # since issue #704).
-sqlite3 /data/knowledgevault/app.db "SELECT id, filename, error_message FROM files WHERE status='error' AND source='email' ORDER BY created_at DESC LIMIT 10;"
+sqlite3 ./data/app.db "SELECT id, filename, error_message FROM files WHERE status='error' AND source='email' ORDER BY created_at DESC LIMIT 10;"
 
 # 3. Review error logs
 docker compose logs knowledgevault | grep -i "error" | grep -i email | tail -20

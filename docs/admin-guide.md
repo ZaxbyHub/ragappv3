@@ -42,7 +42,7 @@ Create a backup script for regular backups:
 
 # Configuration
 BACKUP_DIR="/backups/knowledgevault"
-DATA_DIR="/data/knowledgevault"
+DATA_DIR="./data"
 DATE=$(date +%Y%m%d_%H%M%S)
 BACKUP_NAME="knowledgevault_backup_${DATE}"
 
@@ -169,7 +169,7 @@ python scripts/restore.py "${BACKUP_DIR}/${BACKUP_NAME}" --dest "${DATA_DIR}"
 
 3. Restore data (from project root):
    ```bash
-   cp -r knowledgevault_backup_*/data/* /data/knowledgevault/
+   cp -r knowledgevault_backup_*/data/* ./data/
    cp knowledgevault_backup_*/.env ./
    ```
 
@@ -185,7 +185,7 @@ python scripts/restore.py "${BACKUP_DIR}/${BACKUP_NAME}" --dest "${DATA_DIR}"
 ### Default Directory Structure
 
 ```
-/data/knowledgevault/
+./data/
 ├── uploads/                  # [LEGACY] Flat uploads directory (deprecated, auto-migrated)
 ├── vaults/                   # Vault-specific directories
 │   ├── 1/                    # Vault 1 (first vault)
@@ -204,7 +204,7 @@ python scripts/restore.py "${BACKUP_DIR}/${BACKUP_NAME}" --dest "${DATA_DIR}"
 └── ...                       # (no logs/ dir — see "Log Files" below)
 ```
 
-**Note:** The system now stores uploads in vault-specific directories (`/data/knowledgevault/vaults/{vault_id}/uploads/`). On first startup, the system automatically migrates files from the legacy flat `uploads/` directory to the appropriate vault-specific directories. Files are renamed with `.migrated` suffix to create a safe backup. If a file cannot be associated with a specific vault, the migration logs a warning and skips the file — vault_id must always be explicit.
+**Note:** The system now stores uploads in vault-specific directories under the data directory (`./data/vaults/{vault_id}/uploads/` host-side; `/app/data/vaults/...` inside the container). On first startup, the system automatically migrates files from the legacy flat `uploads/` directory to the appropriate vault-specific directories. Files are renamed with `.migrated` suffix to create a safe backup. If a file cannot be associated with a specific vault, the migration logs a warning and skips the file — vault_id must always be explicit.
 
 ### Changing Data Location
 
@@ -237,10 +237,10 @@ Monitor disk usage:
 df -h
 
 # Check KnowledgeVault data usage
-du -sh /data/knowledgevault/*
+du -sh ./data/*
 
 # Find largest files
-find /data/knowledgevault -type f -exec ls -lh {} \; | sort -k5 -hr | head -20
+find ./data -type f -exec ls -lh {} \; | sort -k5 -hr | head -20
 ```
 
 **Recommended minimums:**
@@ -340,13 +340,13 @@ Expected response:
 **Database:**
 ```bash
 # Check SQLite
-docker compose exec knowledgevault sqlite3 /data/knowledgevault/app.db ".tables"
+docker compose exec knowledgevault sqlite3 /app/data/app.db ".tables"
 ```
 
 **Vector Store:**
 ```bash
 # Check LanceDB
-docker compose exec knowledgevault python -c "import lancedb; db = lancedb.connect('/data/knowledgevault/lancedb'); print(db.table_names())"
+docker compose exec knowledgevault python -c "import lancedb; db = lancedb.connect('/app/data/lancedb'); print(db.table_names())"
 ```
 
 **LLM Connection:**
@@ -551,10 +551,10 @@ Lower values reduce Redis memory usage but increase duplicate embedding requests
 **SQLite:**
 ```bash
 # Optimize database
-docker compose exec knowledgevault sqlite3 /data/knowledgevault/app.db "VACUUM;"
+docker compose exec knowledgevault sqlite3 /app/data/app.db "VACUUM;"
 
 # Analyze for query optimization
-docker compose exec knowledgevault sqlite3 /data/knowledgevault/app.db "ANALYZE;"
+docker compose exec knowledgevault sqlite3 /app/data/app.db "ANALYZE;"
 ```
 
 **LanceDB:**
@@ -562,7 +562,7 @@ docker compose exec knowledgevault sqlite3 /data/knowledgevault/app.db "ANALYZE;
 # Compact vector database
 docker compose exec knowledgevault python -c "
 import lancedb
-db = lancedb.connect('/data/knowledgevault/lancedb')
+db = lancedb.connect('/app/data/lancedb')
 table = db.open_table('chunks')
 table.compact_files()
 "
@@ -1463,7 +1463,7 @@ docker compose logs --tail 50
 ```bash
 docker compose exec knowledgevault python -c "
 import lancedb
-db = lancedb.connect('/data/knowledgevault/lancedb')
+db = lancedb.connect('/app/data/lancedb')
 print('Tables:', db.table_names())
 table = db.open_table('chunks')
 print('Rows:', len(table))
@@ -1505,7 +1505,7 @@ OLLAMA_CHAT_URL=http://192.168.1.100:11434
 docker compose down
 
 # Remove all data
-rm -rf /data/knowledgevault/*
+rm -rf ./data/*
 
 # Start fresh
 docker compose up -d
@@ -1534,7 +1534,7 @@ docker compose logs -f
 curl http://localhost:9090/health
 
 # Backup
-tar -czf backup.tar.gz /data/knowledgevault .env
+tar -czf backup.tar.gz ./data .env
 
 # Update
 docker compose pull && docker compose up -d

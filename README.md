@@ -326,25 +326,24 @@ way the shipped CUDA images are pinned (see the comments in
 ### Data Directory Structure
 
 ```
-data/
-├── knowledgevault/       # Root data directory
-│   ├── uploads/          # [LEGACY] Legacy flat uploads directory (deprecated)
-│   ├── vaults/           # Vault-specific data directories
-│   │   ├── 1/            # Vault directory (ID-based)
-│   │   │   └── uploads/  # Per-vault upload directory
-│   │   ├── 2/            # Vault 2
-│   │   │   └── uploads/  # Uploads for vault 2
-│   │   └── ...           # Additional vaults
-│   ├── documents/        # Documents (legacy, kept for compatibility)
-│   ├── library/          # Library files
-│   ├── lancedb/          # Vector database
-│   │   └── chunks.lance/
-│   └── app.db            # SQLite database
+data/                    # Host-side default (./data; compose binds it at /app/data)
+├── uploads/              # [LEGACY] Legacy flat uploads directory (deprecated)
+├── vaults/               # Vault-specific data directories
+│   ├── 1/                # Vault directory (ID-based)
+│   │   └── uploads/      # Per-vault upload directory
+│   ├── 2/                # Vault 2
+│   │   └── uploads/      # Uploads for vault 2
+│   └── ...               # Additional vaults
+├── documents/            # Documents (legacy, kept for compatibility)
+├── library/              # Library files
+├── lancedb/              # Vector database
+│   └── chunks.lance/
+└── app.db                # SQLite database
 ```
 
 > **Logs:** the application writes structured JSON logs to **stdout** (there is no log file on disk). Docker captures them via the default `json-file` driver; retrieve them with `docker compose logs knowledgevault` (or `docker logs <container>`). Configure a Docker logging driver or redirect output if you need file-based persistence.
 
-**Note:** The system stores uploads in vault-specific directories (`/data/knowledgevault/vaults/{vault_id}/uploads/`). On first startup, the system automatically migrates files from the legacy flat `uploads/` directory to vault-specific directories. Files are renamed with `.migrated` suffix to create a safe backup. If a file cannot be associated with a specific vault, the migration logs a warning and skips the file — vault_id must always be explicit.
+**Note:** The system stores uploads in vault-specific directories under the configured data directory (`./data/vaults/{vault_id}/uploads/` host-side; `/app/data/vaults/{vault_id}/uploads/` inside the container). On first startup, the system automatically migrates files from the legacy flat `uploads/` directory to vault-specific directories. Files are renamed with `.migrated` suffix to create a safe backup. If a file cannot be associated with a specific vault, the migration logs a warning and skips the file — vault_id must always be explicit.
 
 ## Ollama Models
 
@@ -898,7 +897,7 @@ The chat interface provides a three-zone workspace layout:
 3. Files are automatically processed and indexed
 
 **Method 2: Direct File Placement**
-1. Place files in `data/knowledgevault/vaults/{vault_id}/uploads/` (e.g., `data/knowledgevault/vaults/1/uploads/`)
+1. Place files in `data/vaults/{vault_id}/uploads/` (e.g., `data/vaults/1/uploads/`)
 2. Click "Scan Directory" on Documents page
 3. Or wait for auto-scan (if enabled)
 

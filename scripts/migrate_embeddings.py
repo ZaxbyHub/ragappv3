@@ -98,8 +98,8 @@ the database)::
 
     # Specify paths manually (if running outside Docker)
     python scripts/migrate_embeddings.py \\
-        --lancedb-path /data/knowledgevault/lancedb \\
-        --sqlite-path  /data/knowledgevault/app.db
+        --lancedb-path ./data/lancedb \\
+        --sqlite-path  ./data/app.db
 
 After running
 -------------
