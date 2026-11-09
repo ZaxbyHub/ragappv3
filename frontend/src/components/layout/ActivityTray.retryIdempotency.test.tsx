@@ -42,7 +42,11 @@ vi.mock("@/lib/api/wiki", () => ({
   retryWikiJob: mockRetryWikiJob,
 }));
 
-vi.mock("@/lib/api/draftRoom", () => ({
+// Spread the real module so the tray's other imports from it (draftRoomKeys,
+// isDraftRoomErrorCode) stay defined; only the two network calls are stubbed
+// (Copilot review on PR #1103).
+vi.mock("@/lib/api/draftRoom", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/api/draftRoom")>()),
   cancelDraftJob: mockCancelDraftJob,
   retryDraftJob: mockRetryDraftJob,
 }));
