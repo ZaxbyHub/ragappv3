@@ -431,12 +431,16 @@ fi
 # Load the project .env when present (compose reads the same file). Both the
 # credential and a configured endpoint come from it.
 strip_env_value() {
-    # strip an optional `export ` prefix, trailing CR, and one layer of
-    # matching surrounding quotes (compose strips the same quotes).
+    # Return the VALUE from a .env line: strip an optional `export ` prefix,
+    # trailing CR, one layer of matching surrounding quotes around the value
+    # (compose strips the same quotes), and the `KEY=` prefix itself. Two
+    # plain quote expressions — busybox (musl) ERE has no pattern
+    # backreferences, so the busybox redis image needs the split form.
     printf '%s' "$1" \
         | sed -E 's/^[[:space:]]*(export[[:space:]]+)?//' \
         | tr -d '\r' \
-        | sed -E "s/^\"(.*)\"$/\1/; s/^'(.*)'$/\1/"
+        | sed -E -e 's/^[A-Za-z_][A-Za-z0-9_]*="(.*)"$/\1/' -e "s/^[A-Za-z_][A-Za-z0-9_]*='(.*)'$/\1/" \
+        | sed -E 's/^[A-Za-z_][A-Za-z0-9_]*=//'
 }
 if [ -z "${REDIS_URL:-}" ] && [ -f .env ]; then
     REDIS_URL_VALUE="$(grep -E '^[[:space:]]*(export[[:space:]]+)?REDIS_URL=' .env | tail -1)"
