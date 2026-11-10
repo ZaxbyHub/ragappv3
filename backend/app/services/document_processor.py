@@ -5644,12 +5644,15 @@ class DocumentProcessor:
             # lease fence mid-embed. Same restoration contract as the
             # cancellation arm above — vector/atom writes were suppressed by
             # the embed-stage guard, and the row must never strand in
-            # 'processing': undisturbed restores the prior selectable status;
-            # a disturbed reindex attempt settles to the selectable
+            # 'processing': undisturbed restores the prior selectable status
+            # (indexed/partial, and 'error' — the reindex selection includes
+            # error rows, whose truthful pre-attempt state is selectable
+            # again); a disturbed reindex attempt settles to the selectable
             # interrupted 'error' the next pass re-selects.
             if not prior_generation_disturbed and pre_ingest_status in (
                 "indexed",
                 "partial",
+                "error",
             ):
                 async with self._write_session() as conn:
                     conn.execute(
@@ -5685,8 +5688,25 @@ class DocumentProcessor:
             logger.exception("Existing-file ingestion failed for file_id=%s", file_id)
             if progress_cb is not None and bool(getattr(progress_cb, "lost", False)):
                 # Issue #1020 precedence: a lost lease fence outranks a
-                # provider/batch failure — the loss-restoration arm above (not
-                # per-file failure handling) owns the row's final state.
+                # provider/batch failure — the restoration contract of the
+                # dedicated arm above (not per-file failure handling) owns
+                # the row's final state. This belt path is reachable only
+                # through a non-raising double that returned normally while
+                # its callback recorded loss; run the same undisturbed
+                # restore inline before raising so the row cannot strand in
+                # 'processing' here either.
+                if not prior_generation_disturbed and pre_ingest_status in (
+                    "indexed",
+                    "partial",
+                    "error",
+                ):
+                    async with self._write_session() as conn:
+                        conn.execute(
+                            "UPDATE files SET status = ? WHERE id = ? "
+                            "AND status = 'processing'",
+                            (pre_ingest_status, file_id),
+                        )
+                        conn.commit()
                 raise EmbeddingProgressLost(
                     "embedding stage lost its progress fence "
                     "(issue #1020); provider error suppressed"

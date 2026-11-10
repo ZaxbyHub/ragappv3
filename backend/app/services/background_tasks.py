@@ -73,8 +73,7 @@ class _ReindexBatchProgressCallback:
 
     Contract (plan-critic rounds 1-3): NON-RAISING. A fenced stamp that
     matches zero rows (lost lease fence) or an ordinary stamp exception
-    records loss — ``lost`` on this object and the mirror
-    ``BackgroundProcessor._batch_progress_lost`` — and stops stamping; it
+    records loss — ``lost`` on this object — and stops stamping; it
     never raises into the batch gather (that would be misrouted into
     failed-batch semantics). ``CancelledError`` propagates. The batch wrapper
     in ``embed_batch`` consults ``lost`` before dispatching each queued batch
@@ -95,7 +94,6 @@ class _ReindexBatchProgressCallback:
             raise
         except Exception:  # noqa: BLE001 — conservative loss-stop
             self.lost = True
-            self._processor._batch_progress_lost = True
             logger.warning(
                 "Reindex batch watermark stamp raised; treating the lease "
                 "fence as lost and stopping the attempt (issue #1020)"
@@ -103,7 +101,6 @@ class _ReindexBatchProgressCallback:
             return
         if not ok:
             self.lost = True
-            self._processor._batch_progress_lost = True
             logger.warning(
                 "Reindex batch watermark stamp matched zero rows; lease "
                 "fence lost mid-batch, stopping the attempt (issue #1020)"
@@ -4290,12 +4287,12 @@ class BackgroundProcessor:
         watermark age passes the stall budget while the row is still ours,
         OR when the row no longer belongs to this attempt. Release is
         therefore budget-bounded from above, but poll latency and the
-        bounded per-file granularity (the watermark advances on file
-        COMPLETION — one very large file on a slow embedder can legitimately
-        exceed the budget; raise ``jobs_stall_timeout_seconds`` for such
-        workloads, or see the per-batch refresh follow-up) mean the release
-        can land after the nominal budget: the janitor's heartbeat-age arm
-        stays the crash backstop either way.
+        bounded batch granularity (issue #1020: the watermark advances
+        after every dispatched embedding batch, so a large file on a slow
+        embedder stays fresh as long as its batches progress; a genuinely
+        wedged attempt — no batch completing — still trips the budget) mean
+        the release can land after the nominal budget: the janitor's
+        heartbeat-age arm stays the crash backstop either way.
         """
         budget = self._reindex_stall_budget()
         if budget is None:
@@ -4510,10 +4507,6 @@ class BackgroundProcessor:
         # exit is inert (watermark writes are fenced by id+worker+status).
         self._active_progress = (job_id, worker_id)
         self._stall_retry_file_ids = []
-        # Issue #1020: per-attempt reset of the batch-progress loss mirror
-        # (re-armed at every entry, so a stale value left by an exceptional
-        # exit is inert — watermark writes are fenced by id+worker+status).
-        self._batch_progress_lost = False
         if not await self._stamp_progress_watermark():
             self._active_progress = None
             logger.warning(
@@ -5117,8 +5110,7 @@ class BackgroundProcessor:
                             # Issue #1020: fresh per-file batch-progress
                             # callback (None when no attempt is armed — the
                             # legacy transport — so the embed call keeps its
-                            # historical shape) and a fresh loss mirror.
-                            self._batch_progress_lost = False
+                            # historical shape).
                             progress_cb = (
                                 _ReindexBatchProgressCallback(self)
                                 if self._active_progress is not None
