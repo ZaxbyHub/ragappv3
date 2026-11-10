@@ -34,6 +34,7 @@ seeds a *failed* job/draft pair directly instead of going through cancel to
 stay independent of this gap.
 """
 
+import asyncio
 import json
 import os
 import shutil
@@ -42,7 +43,7 @@ import sys
 import tempfile
 import threading
 import unittest
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from queue import Empty, Queue
 from unittest.mock import AsyncMock, MagicMock
@@ -120,6 +121,22 @@ class _PoolWithConnectionCM:
         finally:
             self.release_connection(conn)
 
+    async def get_connection_async(
+        self, max_wait_attempts: int = 3
+    ) -> sqlite3.Connection:
+        # #645: the upload commit task and compensation check out through
+        # the pool's async surface (review PRR-001); mirror the production
+        # off-loop contract like test_draft_routes.py's copy.
+        return await asyncio.to_thread(self.get_connection)
+
+    @asynccontextmanager
+    async def connection_async(self, max_wait_attempts: int = 3):
+        conn = await self.get_connection_async(max_wait_attempts)
+        try:
+            yield conn
+        finally:
+            self.release_connection(conn)
+
 
 def _default_brief(**overrides) -> dict:
     brief = {
@@ -163,7 +180,9 @@ class CompileRouteTestBase(unittest.TestCase):
         self._original_draft_room_enabled = settings.draft_room_enabled
         self._original_ollama_chat_url = settings.ollama_chat_url
         self._original_instant_chat_url = settings.instant_chat_url
-        self._original_draft_allowed_model_origins = settings.draft_allowed_model_origins
+        self._original_draft_allowed_model_origins = (
+            settings.draft_allowed_model_origins
+        )
         self._original_allow_local_services = os.environ.get("ALLOW_LOCAL_SERVICES")
 
         settings.data_dir = __import__("pathlib").Path(self._temp_dir)
@@ -204,7 +223,9 @@ class CompileRouteTestBase(unittest.TestCase):
         app.dependency_overrides[get_db] = override_get_db
         app.dependency_overrides[csrf_protect] = lambda: "test-csrf"
         app.state.db_pool = self._connection_pool
-        app.state.csrf_manager = CSRFManager(redis_url="redis://localhost:6379/0", ttl=900)
+        app.state.csrf_manager = CSRFManager(
+            redis_url="redis://localhost:6379/0", ttl=900
+        )
 
         self._mock_vector_store = MagicMock()
         self._mock_vector_store.db = MagicMock()
@@ -212,6 +233,22 @@ class CompileRouteTestBase(unittest.TestCase):
         self._mock_vector_store.db.open_table = AsyncMock(return_value=MagicMock())
         self._mock_vector_store.delete_by_file = AsyncMock(return_value=1)
         app.dependency_overrides[get_vector_store] = lambda: self._mock_vector_store
+
+        # Worker liveness stubs (issues #902/#911): the enqueue routes gate on
+        # a live worker and capabilities derive availability from it; these
+        # tests never run lifespan, so stand in for started processors
+        # (presence is the liveness contract — test_draft_routes.py
+        # precedent). addCleanup restores whatever was mounted before.
+        self._prev_djp = getattr(app.state, "draft_job_processor", None)
+        self._had_djp = hasattr(app.state, "draft_job_processor")
+        app.state.draft_job_processor = object()
+        self._prev_bp = getattr(app.state, "background_processor", None)
+        self._had_bp = hasattr(app.state, "background_processor")
+        # Promote availability derives from the ingestion worker (#902):
+        # a bare object() stands in for a live processor (presence is the
+        # liveness contract for stubs).
+        app.state.background_processor = object()
+        self.addCleanup(self._restore_worker_stubs)
 
         conn = self._connection_pool.get_connection()
         try:
@@ -241,6 +278,16 @@ class CompileRouteTestBase(unittest.TestCase):
         finally:
             self._connection_pool.release_connection(conn)
 
+    def _restore_worker_stubs(self) -> None:
+        if self._had_djp:
+            app.state.draft_job_processor = self._prev_djp
+        elif hasattr(app.state, "draft_job_processor"):
+            del app.state.draft_job_processor
+        if getattr(self, "_had_bp", False):
+            app.state.background_processor = self._prev_bp
+        elif hasattr(app.state, "background_processor") and hasattr(self, "_prev_bp"):
+            del app.state.background_processor
+
     def tearDown(self):
         from app.models.database import _pool_cache, _pool_cache_lock
 
@@ -255,7 +302,9 @@ class CompileRouteTestBase(unittest.TestCase):
         settings.draft_room_enabled = self._original_draft_room_enabled
         settings.ollama_chat_url = self._original_ollama_chat_url
         settings.instant_chat_url = self._original_instant_chat_url
-        settings.draft_allowed_model_origins = self._original_draft_allowed_model_origins
+        settings.draft_allowed_model_origins = (
+            self._original_draft_allowed_model_origins
+        )
         if self._original_allow_local_services is None:
             os.environ.pop("ALLOW_LOCAL_SERVICES", None)
         else:
@@ -286,7 +335,9 @@ class CompileRouteTestBase(unittest.TestCase):
 
     # -- draft/input fixtures via the real API --
 
-    def _create_draft(self, *, headers=None, vault_id=READ_VAULT_ID, title="Compile Draft", brief=None):
+    def _create_draft(
+        self, *, headers=None, vault_id=READ_VAULT_ID, title="Compile Draft", brief=None
+    ):
         headers = headers or self._owner_headers()
         resp = self.client.post(
             "/api/draft-room/drafts",
@@ -301,8 +352,14 @@ class CompileRouteTestBase(unittest.TestCase):
         )
         return resp
 
-    def _upload_input(self, draft_id, *, headers=None, filename="manuscript.txt",
-                       content=b"Hello world. This is the manuscript body."):
+    def _upload_input(
+        self,
+        draft_id,
+        *,
+        headers=None,
+        filename="manuscript.txt",
+        content=b"Hello world. This is the manuscript body.",
+    ):
         headers = headers or self._owner_headers()
         resp = self.client.post(
             f"/api/draft-room/drafts/{draft_id}/inputs",
@@ -342,20 +399,37 @@ class CompileRouteTestBase(unittest.TestCase):
 
     def _lock_version(self, draft_id, headers=None):
         resp = self.client.get(
-            f"/api/draft-room/drafts/{draft_id}", headers=headers or self._owner_headers()
+            f"/api/draft-room/drafts/{draft_id}",
+            headers=headers or self._owner_headers(),
         )
         return resp.json()["summary"]["lock_version"]
 
-    def _compile(self, draft_id, *, start_stage="research", idempotency_key=None,
-                 lock_version=None, headers=None, base_revision_id=0):
+    def _compile(
+        self,
+        draft_id,
+        *,
+        start_stage="research",
+        idempotency_key=None,
+        lock_version=None,
+        headers=None,
+        base_revision_id=0,
+    ):
         headers = dict(headers or self._owner_headers())
         if idempotency_key is not None:
             headers["Idempotency-Key"] = idempotency_key
-        lv = lock_version if lock_version is not None else self._lock_version(draft_id, headers)
+        lv = (
+            lock_version
+            if lock_version is not None
+            else self._lock_version(draft_id, headers)
+        )
         base = None if base_revision_id == 0 else base_revision_id
         return self.client.post(
             f"/api/draft-room/drafts/{draft_id}/compile",
-            json={"base_revision_id": base, "lock_version": lv, "start_stage": start_stage},
+            json={
+                "base_revision_id": base,
+                "lock_version": lv,
+                "start_stage": start_stage,
+            },
             headers=headers,
         )
 
@@ -387,12 +461,14 @@ class CompileRouteTestBase(unittest.TestCase):
         finally:
             self._connection_pool.release_connection(conn)
 
-    def _seed_current_revision(self, draft_id, *, job_id, content_md,
-                                fact_status="passed", source="pipeline"):
+    def _seed_current_revision(
+        self, draft_id, *, job_id, content_md, fact_status="passed", source="pipeline"
+    ):
         conn = self._connection_pool.get_connection()
         try:
             conn.execute(
-                "UPDATE draft_revisions SET is_current = 0 WHERE draft_id = ?", (draft_id,)
+                "UPDATE draft_revisions SET is_current = 0 WHERE draft_id = ?",
+                (draft_id,),
             )
             next_no = int(
                 conn.execute(
@@ -406,8 +482,14 @@ class CompileRouteTestBase(unittest.TestCase):
                 "content_md, content_sha256, fact_status, is_current, created_by) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)",
                 (
-                    draft_id, job_id, next_no, source, content_md,
-                    sha256_text(content_md), fact_status, self.OWNER_ID,
+                    draft_id,
+                    job_id,
+                    next_no,
+                    source,
+                    content_md,
+                    sha256_text(content_md),
+                    fact_status,
+                    self.OWNER_ID,
                 ),
             )
             conn.commit()
@@ -431,7 +513,9 @@ class CompileRouteTestBase(unittest.TestCase):
     def _set_draft_status(self, draft_id, status):
         conn = self._connection_pool.get_connection()
         try:
-            conn.execute("UPDATE drafts SET status = ? WHERE id = ?", (status, draft_id))
+            conn.execute(
+                "UPDATE drafts SET status = ? WHERE id = ?", (status, draft_id)
+            )
             conn.commit()
         finally:
             self._connection_pool.release_connection(conn)
@@ -448,12 +532,17 @@ class CompileRouteTestBase(unittest.TestCase):
         self._set_draft_status(draft_id, "needs_review")
         return draft_id, job_id, revision_id
 
-    def _mark_ready(self, draft_id, revision_id, *, acknowledge_source_only=False, headers=None):
+    def _mark_ready(
+        self, draft_id, revision_id, *, acknowledge_source_only=False, headers=None
+    ):
         headers = headers or self._owner_headers()
         lv = self._lock_version(draft_id, headers)
         return self.client.post(
             f"/api/draft-room/drafts/{draft_id}/revisions/{revision_id}/ready",
-            json={"lock_version": lv, "acknowledge_source_only": acknowledge_source_only},
+            json={
+                "lock_version": lv,
+                "acknowledge_source_only": acknowledge_source_only,
+            },
             headers=headers,
         )
 
@@ -505,12 +594,18 @@ class TestCompileIdempotency(CompileRouteTestBase):
         the requested-stage dimension."""
         draft_id = self._draft_with_ready_input()
         first = self._compile(
-            draft_id, idempotency_key="dup-key", start_stage="research", base_revision_id=None
+            draft_id,
+            idempotency_key="dup-key",
+            start_stage="research",
+            base_revision_id=None,
         )
         self.assertEqual(first.status_code, 202, first.text)
 
         second = self._compile(
-            draft_id, idempotency_key="dup-key", start_stage="research", base_revision_id=999999
+            draft_id,
+            idempotency_key="dup-key",
+            start_stage="research",
+            base_revision_id=999999,
         )
         self.assertEqual(second.status_code, 409, second.text)
         self.assertEqual(second.json()["code"], "idempotency_key_conflict")
@@ -538,7 +633,11 @@ class TestCompileIdempotency(CompileRouteTestBase):
         headers["Idempotency-Key"] = "café".encode("utf-8")
         resp = self.client.post(
             f"/api/draft-room/drafts/{draft_id}/compile",
-            json={"base_revision_id": None, "lock_version": lv, "start_stage": "research"},
+            json={
+                "base_revision_id": None,
+                "lock_version": lv,
+                "start_stage": "research",
+            },
             headers=headers,
         )
         self.assertEqual(resp.status_code, 422, resp.text)
@@ -561,10 +660,13 @@ class TestStartStageAcceptance(CompileRouteTestBase):
         resp = self._compile(draft_id, start_stage="intake")
         self.assertEqual(resp.status_code, 422, resp.text)
 
-    def test_every_allowed_start_stage_is_accepted_and_still_reaches_fact_and_assemble(self):
+    def test_every_allowed_start_stage_is_accepted_and_still_reaches_fact_and_assemble(
+        self,
+    ):
         allowed = ("research", "outline", "draft", "lint", "copy", "standards", "fact")
         self.assertEqual(
-            allowed, tuple(s for s in COMPILE_STAGE_ORDER if s not in ("intake", "assemble"))
+            allowed,
+            tuple(s for s in COMPILE_STAGE_ORDER if s not in ("intake", "assemble")),
         )
         for stage in allowed:
             with self.subTest(stage=stage):
@@ -604,7 +706,11 @@ class TestConcurrentCompile(CompileRouteTestBase):
             barrier.wait(timeout=5)
             resp = self.client.post(
                 f"/api/draft-room/drafts/{draft_id}/compile",
-                json={"base_revision_id": None, "lock_version": lv, "start_stage": "research"},
+                json={
+                    "base_revision_id": None,
+                    "lock_version": lv,
+                    "start_stage": "research",
+                },
                 headers=headers,
             )
             results.append(resp)
@@ -659,24 +765,47 @@ class TestChildRouteAuthorization(CompileRouteTestBase):
     def test_non_owner_gets_404_never_403_on_every_new_route(self):
         other = self._other_headers()
         checks = [
-            ("post", f"/api/draft-room/drafts/{self.draft_id}/compile",
-             {"base_revision_id": None, "lock_version": 1, "start_stage": "research"}),
-            ("get", f"/api/draft-room/drafts/{self.draft_id}/jobs/{self.job_id}/stages", None),
+            (
+                "post",
+                f"/api/draft-room/drafts/{self.draft_id}/compile",
+                {
+                    "base_revision_id": None,
+                    "lock_version": 1,
+                    "start_stage": "research",
+                },
+            ),
+            (
+                "get",
+                f"/api/draft-room/drafts/{self.draft_id}/jobs/{self.job_id}/stages",
+                None,
+            ),
             ("get", f"/api/draft-room/drafts/{self.draft_id}/evidence", None),
             ("get", f"/api/draft-room/drafts/{self.draft_id}/claims", None),
             ("get", f"/api/draft-room/drafts/{self.draft_id}/findings", None),
-            ("post", f"/api/draft-room/drafts/{self.draft_id}/findings/999/disposition",
-             {"action": "dismiss", "base_revision_id": None, "lock_version": 1}),
-            ("post", f"/api/draft-room/drafts/{self.draft_id}/revisions/{self.revision_id}/ready",
-             {"lock_version": 1}),
-            ("post", f"/api/draft-room/drafts/{self.draft_id}/revisions/{self.revision_id}/export",
-             None),
+            (
+                "post",
+                f"/api/draft-room/drafts/{self.draft_id}/findings/999/disposition",
+                {"action": "dismiss", "base_revision_id": None, "lock_version": 1},
+            ),
+            (
+                "post",
+                f"/api/draft-room/drafts/{self.draft_id}/revisions/{self.revision_id}/ready",
+                {"lock_version": 1},
+            ),
+            (
+                "post",
+                f"/api/draft-room/drafts/{self.draft_id}/revisions/{self.revision_id}/export",
+                None,
+            ),
         ]
         for method, path, body in checks:
             with self.subTest(path=path):
                 fn = getattr(self.client, method)
-                resp = fn(path, json=body, headers=other) if body is not None or method == "post" \
+                resp = (
+                    fn(path, json=body, headers=other)
+                    if body is not None or method == "post"
                     else fn(path, headers=other)
+                )
                 self.assertEqual(resp.status_code, 404, resp.text)
                 self.assertNotEqual(resp.status_code, 403)
 
@@ -698,7 +827,10 @@ class TestChildRouteAuthorization(CompileRouteTestBase):
             ("get", f"/api/draft-room/drafts/{self.draft_id}/evidence"),
             ("get", f"/api/draft-room/drafts/{self.draft_id}/claims"),
             ("get", f"/api/draft-room/drafts/{self.draft_id}/findings"),
-            ("get", f"/api/draft-room/drafts/{self.draft_id}/jobs/{self.job_id}/stages"),
+            (
+                "get",
+                f"/api/draft-room/drafts/{self.draft_id}/jobs/{self.job_id}/stages",
+            ),
         ]:
             with self.subTest(path=path):
                 resp = getattr(self.client, method)(path, headers=owner)
@@ -721,7 +853,9 @@ class TestChildRouteAuthorization(CompileRouteTestBase):
             conn.commit()
         finally:
             self._connection_pool.release_connection(conn)
-        resp = self.client.get(f"/api/draft-room/drafts/{self.draft_id}/evidence", headers=owner)
+        resp = self.client.get(
+            f"/api/draft-room/drafts/{self.draft_id}/evidence", headers=owner
+        )
         self.assertEqual(resp.status_code, 200, resp.text)
 
 
@@ -742,8 +876,11 @@ class TestLedgerPaging(CompileRouteTestBase):
         conn, store = self._store()
         try:
             store.insert_evidence(
-                job_id=self.job_id, label="S1", source_kind="draft_input",
-                title="Manuscript", passage="the review window is thirty days",
+                job_id=self.job_id,
+                label="S1",
+                source_kind="draft_input",
+                title="Manuscript",
+                passage="the review window is thirty days",
                 source_content_sha256=sha256_text("x"),
                 draft_input_id=input_id,
             )
@@ -794,28 +931,40 @@ class TestLedgerPaging(CompileRouteTestBase):
         conn, store = self._store()
         try:
             store.insert_claim(
-                revision_id=self.revision_id, ordinal=1,
+                revision_id=self.revision_id,
+                ordinal=1,
                 claim_text="the review window is thirty days",
-                span_start=13, span_end=46,
-                claim_type="factual", status="supported", severity="info",
+                span_start=13,
+                span_end=46,
+                claim_type="factual",
+                status="supported",
+                severity="info",
             )
             store.insert_finding(
-                draft_id=self.draft_id, stage="standards", rule_id="rv-1",
-                rule_version="1", category="style", severity="warning",
-                message="passive voice", revision_id=self.revision_id, job_id=self.job_id,
+                draft_id=self.draft_id,
+                stage="standards",
+                rule_id="rv-1",
+                rule_version="1",
+                category="style",
+                severity="warning",
+                message="passive voice",
+                revision_id=self.revision_id,
+                job_id=self.job_id,
             )
         finally:
             self._release(conn)
 
         claims = self.client.get(
-            f"/api/draft-room/drafts/{self.draft_id}/claims", headers=self._owner_headers()
+            f"/api/draft-room/drafts/{self.draft_id}/claims",
+            headers=self._owner_headers(),
         )
         self.assertEqual(claims.status_code, 200, claims.text)
         self.assertEqual(claims.json()["page"], 1)
         self.assertEqual(len(claims.json()["items"]), 1)
 
         findings = self.client.get(
-            f"/api/draft-room/drafts/{self.draft_id}/findings", headers=self._owner_headers()
+            f"/api/draft-room/drafts/{self.draft_id}/findings",
+            headers=self._owner_headers(),
         )
         self.assertEqual(findings.status_code, 200, findings.text)
         self.assertEqual(findings.json()["page"], 1)
@@ -850,15 +999,25 @@ class TestFindingDisposition(CompileRouteTestBase):
         self.span_start = self.CONTENT.index("a fix")
         self.span_end = self.span_start + len("a fix")
 
-    def _insert_finding(self, *, severity="warning", waivable=True, suggestion="a correction"):
+    def _insert_finding(
+        self, *, severity="warning", waivable=True, suggestion="a correction"
+    ):
         conn, store = self._store()
         try:
             return store.insert_finding(
-                draft_id=self.draft_id, stage="standards", rule_id="rule-x",
-                rule_version="1", category="style", severity=severity,
-                message="needs a fix", revision_id=self.revision_id, job_id=self.job_id,
-                waivable=waivable, suggestion=suggestion,
-                span_start=self.span_start, span_end=self.span_end,
+                draft_id=self.draft_id,
+                stage="standards",
+                rule_id="rule-x",
+                rule_version="1",
+                category="style",
+                severity=severity,
+                message="needs a fix",
+                revision_id=self.revision_id,
+                job_id=self.job_id,
+                waivable=waivable,
+                suggestion=suggestion,
+                span_start=self.span_start,
+                span_end=self.span_end,
             )
         finally:
             self._release(conn)
@@ -868,11 +1027,18 @@ class TestFindingDisposition(CompileRouteTestBase):
         base = base_revision_id if base_revision_id is not None else self.revision_id
         return self.client.post(
             f"/api/draft-room/drafts/{self.draft_id}/findings/{finding_id}/disposition",
-            json={"action": action, "base_revision_id": base, "lock_version": lv, "note": note},
+            json={
+                "action": action,
+                "base_revision_id": base,
+                "lock_version": lv,
+                "note": note,
+            },
             headers=self._owner_headers(),
         )
 
-    def test_apply_creates_immutable_manual_revision_and_invalidates_fact_and_ready(self):
+    def test_apply_creates_immutable_manual_revision_and_invalidates_fact_and_ready(
+        self,
+    ):
         # First mark the draft Ready so we can prove apply invalidates it.
         ready = self._mark_ready(self.draft_id, self.revision_id)
         self.assertEqual(ready.status_code, 200, ready.text)
@@ -915,15 +1081,19 @@ class TestFindingDisposition(CompileRouteTestBase):
         lv = self._lock_version(self.draft_id)
         edit = self.client.post(
             f"/api/draft-room/drafts/{self.draft_id}/revisions",
-            json={"base_revision_id": self.revision_id, "lock_version": lv,
-                  "content_md": "# Heading\n\nCompletely different body now."},
+            json={
+                "base_revision_id": self.revision_id,
+                "lock_version": lv,
+                "content_md": "# Heading\n\nCompletely different body now.",
+            },
             headers=self._owner_headers(),
         )
         self.assertEqual(edit.status_code, 201, edit.text)
         new_current_id = edit.json()["summary"]["id"]
 
-        resp = self._dispose(finding_id, "apply", note="stale now",
-                              base_revision_id=new_current_id)
+        resp = self._dispose(
+            finding_id, "apply", note="stale now", base_revision_id=new_current_id
+        )
         self.assertEqual(resp.status_code, 409, resp.text)
         self.assertIn(resp.json()["code"], ("stale_span", "finding_revision_stale"))
 
@@ -932,7 +1102,9 @@ class TestFindingDisposition(CompileRouteTestBase):
             f"/api/draft-room/drafts/{self.draft_id}/revisions/{new_current_id}",
             headers=self._owner_headers(),
         ).json()
-        self.assertEqual(current["content_md"], "# Heading\n\nCompletely different body now.")
+        self.assertEqual(
+            current["content_md"], "# Heading\n\nCompletely different body now."
+        )
 
     def test_dismiss_is_refused_for_a_blocker(self):
         finding_id = self._insert_finding(severity="blocker")
@@ -1005,7 +1177,8 @@ class TestFindingDisposition(CompileRouteTestBase):
         conn = self._connection_pool.get_connection()
         try:
             conn.execute(
-                "UPDATE draft_findings SET rule_version = '2' WHERE id = ?", (finding_id,)
+                "UPDATE draft_findings SET rule_version = '2' WHERE id = ?",
+                (finding_id,),
             )
             conn.commit()
         finally:
@@ -1023,7 +1196,9 @@ class TestReadyEligibility(CompileRouteTestBase):
     def test_no_current_revision_is_refused(self):
         draft_id, job_id, revision_id = self._seed_ready_eligible_draft()
         # Make it not-current by inserting a newer current revision.
-        self._seed_current_revision(draft_id, job_id=job_id, content_md="# Newer\n\nbody")
+        self._seed_current_revision(
+            draft_id, job_id=job_id, content_md="# Newer\n\nbody"
+        )
         resp = self._mark_ready(draft_id, revision_id)
         self.assertEqual(resp.status_code, 409, resp.text)
         self.assertEqual(resp.json()["code"], "not_current_revision")
@@ -1072,9 +1247,15 @@ class TestReadyEligibility(CompileRouteTestBase):
         conn, store = self._store()
         try:
             store.insert_finding(
-                draft_id=draft_id, stage="fact", rule_id="unsupported-claim",
-                rule_version="1", category="factuality", severity="blocker",
-                message="unsupported claim", revision_id=revision_id, job_id=job_id,
+                draft_id=draft_id,
+                stage="fact",
+                rule_id="unsupported-claim",
+                rule_version="1",
+                category="factuality",
+                severity="blocker",
+                message="unsupported claim",
+                revision_id=revision_id,
+                job_id=job_id,
                 waivable=False,
             )
         finally:
@@ -1085,7 +1266,9 @@ class TestReadyEligibility(CompileRouteTestBase):
 
     def test_stale_evidence_is_refused(self):
         content_md = "# A\n\nthe review window is thirty days"
-        draft_id, job_id, revision_id = self._seed_ready_eligible_draft(content_md=content_md)
+        draft_id, job_id, revision_id = self._seed_ready_eligible_draft(
+            content_md=content_md
+        )
         # Insert evidence pointing at the draft's own manuscript input but
         # with a source_content_sha256 that does not match the input's live
         # parsed-text hash -- exactly what SPEC 12.6 re-resolution catches.
@@ -1095,8 +1278,11 @@ class TestReadyEligibility(CompileRouteTestBase):
         conn, store = self._store()
         try:
             store.insert_evidence(
-                job_id=job_id, label="D1", source_kind="draft_input",
-                title="Manuscript", passage="the review window is thirty days",
+                job_id=job_id,
+                label="D1",
+                source_kind="draft_input",
+                title="Manuscript",
+                passage="the review window is thirty days",
                 source_content_sha256="not-the-real-hash",
                 draft_input_id=input_id,
             )
@@ -1115,7 +1301,9 @@ class TestReadyEligibility(CompileRouteTestBase):
 
     def test_missing_source_only_acknowledgement_is_refused(self):
         content_md = "# A\n\nsource-only body"
-        draft_id, job_id, revision_id = self._seed_ready_eligible_draft(content_md=content_md)
+        draft_id, job_id, revision_id = self._seed_ready_eligible_draft(
+            content_md=content_md
+        )
         conn = self._connection_pool.get_connection()
         try:
             conn.execute(
@@ -1339,8 +1527,12 @@ class TestExportMatrix(CompileRouteTestBase):
         self.assertEqual(resp.headers["X-Draft-Approval-Status"], "ready")
 
     def test_export_bytes_are_byte_exact_including_trailing_whitespace(self):
-        content_md = "# Title\r\n\r\nBody with trailing spaces   \nand a final newline\n"
-        draft_id, job_id, revision_id = self._seed_ready_eligible_draft(content_md=content_md)
+        content_md = (
+            "# Title\r\n\r\nBody with trailing spaces   \nand a final newline\n"
+        )
+        draft_id, job_id, revision_id = self._seed_ready_eligible_draft(
+            content_md=content_md
+        )
         resp = self._export(draft_id, revision_id, ack=False)
         self.assertEqual(resp.status_code, 200, resp.text)
         self.assertEqual(resp.text, content_md)
@@ -1360,7 +1552,9 @@ class TestCapabilitiesHonesty(CompileRouteTestBase):
         ``tests/draft_room/test_draft_promote.py`` for the promotion route's
         own behavior coverage.
         """
-        resp = self.client.get("/api/draft-room/capabilities", headers=self._owner_headers())
+        resp = self.client.get(
+            "/api/draft-room/capabilities", headers=self._owner_headers()
+        )
         self.assertEqual(resp.status_code, 200, resp.text)
         self.assertTrue(resp.json()["promote_available"])
 
@@ -1379,21 +1573,28 @@ class TestCapabilitiesHonesty(CompileRouteTestBase):
 
 class TestAuditMetadataNoContent(CompileRouteTestBase):
     FORBIDDEN_SUBSTRINGS = (
-        "manuscript body", "SECRET SECTION TEXT", "the review window is thirty days",
-        "Traceback", "raise ", "Exception:",
+        "manuscript body",
+        "SECRET SECTION TEXT",
+        "the review window is thirty days",
+        "Traceback",
+        "raise ",
+        "Exception:",
     )
 
     def _assert_metadata_clean(self, metadata_list):
         for metadata in metadata_list:
             blob = json.dumps(metadata)
             for forbidden in self.FORBIDDEN_SUBSTRINGS:
-                self.assertNotIn(forbidden, blob, f"leaked content in audit metadata: {blob!r}")
+                self.assertNotIn(
+                    forbidden, blob, f"leaked content in audit metadata: {blob!r}"
+                )
             # Every value must be a short scalar identifier/hash/version --
             # never an embedded document body.
             for key, value in metadata.items():
                 if isinstance(value, str):
                     self.assertLess(
-                        len(value), 200,
+                        len(value),
+                        200,
                         f"suspiciously long string in audit metadata field {key!r}",
                     )
 
@@ -1430,7 +1631,9 @@ class TestAuditMetadataNoContent(CompileRouteTestBase):
                 "WHERE id = ?",
                 (job_id,),
             )
-            conn.execute("UPDATE drafts SET status = 'failed' WHERE id = ?", (draft_id,))
+            conn.execute(
+                "UPDATE drafts SET status = 'failed' WHERE id = ?", (draft_id,)
+            )
             conn.commit()
         finally:
             self._connection_pool.release_connection(conn)
@@ -1443,28 +1646,54 @@ class TestAuditMetadataNoContent(CompileRouteTestBase):
 
     def test_apply_dismiss_waive_ready_export_audit_have_no_content(self):
         content_md = "# Heading\n\nthis needs a fix here and stays fine elsewhere."
-        draft_id, job_id, revision_id = self._seed_ready_eligible_draft(content_md=content_md)
+        draft_id, job_id, revision_id = self._seed_ready_eligible_draft(
+            content_md=content_md
+        )
         span_start = content_md.index("a fix")
         span_end = span_start + len("a fix")
 
         conn, store = self._store()
         try:
             applyable = store.insert_finding(
-                draft_id=draft_id, stage="standards", rule_id="rule-a", rule_version="1",
-                category="style", severity="warning", message="needs a fix",
-                revision_id=revision_id, job_id=job_id, waivable=True,
-                suggestion="a correction", span_start=span_start, span_end=span_end,
+                draft_id=draft_id,
+                stage="standards",
+                rule_id="rule-a",
+                rule_version="1",
+                category="style",
+                severity="warning",
+                message="needs a fix",
+                revision_id=revision_id,
+                job_id=job_id,
+                waivable=True,
+                suggestion="a correction",
+                span_start=span_start,
+                span_end=span_end,
             )
             dismissable = store.insert_finding(
-                draft_id=draft_id, stage="standards", rule_id="rule-b", rule_version="1",
-                category="style", severity="info", message="minor style note",
-                revision_id=revision_id, job_id=job_id, waivable=True,
+                draft_id=draft_id,
+                stage="standards",
+                rule_id="rule-b",
+                rule_version="1",
+                category="style",
+                severity="info",
+                message="minor style note",
+                revision_id=revision_id,
+                job_id=job_id,
+                waivable=True,
             )
             waivable = store.insert_finding(
-                draft_id=draft_id, stage="standards", rule_id="rule-c", rule_version="1",
-                category="boilerplate", severity="blocker", message="boilerplate phrase",
-                revision_id=revision_id, job_id=job_id, waivable=True,
-                span_start=span_start, span_end=span_end,
+                draft_id=draft_id,
+                stage="standards",
+                rule_id="rule-c",
+                rule_version="1",
+                category="boilerplate",
+                severity="blocker",
+                message="boilerplate phrase",
+                revision_id=revision_id,
+                job_id=job_id,
+                waivable=True,
+                span_start=span_start,
+                span_end=span_end,
             )
         finally:
             self._release(conn)
@@ -1472,22 +1701,34 @@ class TestAuditMetadataNoContent(CompileRouteTestBase):
         lv = self._lock_version(draft_id)
         self.client.post(
             f"/api/draft-room/drafts/{draft_id}/findings/{dismissable}/disposition",
-            json={"action": "dismiss", "base_revision_id": revision_id, "lock_version": lv,
-                  "note": "ok"},
+            json={
+                "action": "dismiss",
+                "base_revision_id": revision_id,
+                "lock_version": lv,
+                "note": "ok",
+            },
             headers=self._owner_headers(),
         )
         lv = self._lock_version(draft_id)
         self.client.post(
             f"/api/draft-room/drafts/{draft_id}/findings/{waivable}/disposition",
-            json={"action": "waive", "base_revision_id": revision_id, "lock_version": lv,
-                  "note": "accepted risk"},
+            json={
+                "action": "waive",
+                "base_revision_id": revision_id,
+                "lock_version": lv,
+                "note": "accepted risk",
+            },
             headers=self._owner_headers(),
         )
         lv = self._lock_version(draft_id)
         apply_resp = self.client.post(
             f"/api/draft-room/drafts/{draft_id}/findings/{applyable}/disposition",
-            json={"action": "apply", "base_revision_id": revision_id, "lock_version": lv,
-                  "note": "applying"},
+            json={
+                "action": "apply",
+                "base_revision_id": revision_id,
+                "lock_version": lv,
+                "note": "applying",
+            },
             headers=self._owner_headers(),
         )
         self.assertEqual(apply_resp.status_code, 201, apply_resp.text)
@@ -1592,9 +1833,7 @@ class TestCompileFingerprintParity(CompileRouteTestBase):
                 route = self._route_fingerprint(draft_id, stage)
                 pipeline = self._pipeline_context(draft_id, job_id).compile_fingerprint
                 self.assertEqual(route, pipeline)
-                self.assertNotIn(
-                    route, seen, "start_stage must change the fingerprint"
-                )
+                self.assertNotIn(route, seen, "start_stage must change the fingerprint")
                 seen.add(route)
 
     def test_changing_the_model_identity_changes_both_and_blocks_resume(self):

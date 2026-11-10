@@ -98,7 +98,9 @@ class _PoolWithConnectionCM:
         finally:
             self.release_connection(conn)
 
-    async def get_connection_async(self, max_wait_attempts: int = 3) -> sqlite3.Connection:
+    async def get_connection_async(
+        self, max_wait_attempts: int = 3
+    ) -> sqlite3.Connection:
         # #645: async callers (the SSE stream auth, set_phase) check out
         # through the pool's async surface; delegate to the sync checkout on
         # a worker thread to match the production off-loop contract.
@@ -201,11 +203,27 @@ class DraftRoomTestBase(unittest.TestCase):
         # environment, so CSRFManager falls back to its in-memory store — needed
         # by tests that remove the csrf_protect override to exercise the real
         # dependency.
-        app.state.csrf_manager = CSRFManager(redis_url="redis://localhost:6379/0", ttl=900)
+        app.state.csrf_manager = CSRFManager(
+            redis_url="redis://localhost:6379/0", ttl=900
+        )
         # get_capabilities derives compile_available from the live worker
         # (#789); these tests never run lifespan, so stand in for a started
         # DraftJobProcessor (presence is the liveness contract).
         app.state.draft_job_processor = object()
+        # Promote availability derives from the ingestion worker (#902);
+        # presence is the liveness contract for stubs. Restored via
+        # addCleanup so the original setUp flow below stays contiguous.
+        self._prev_bp = getattr(app.state, "background_processor", None)
+        self._had_bp = hasattr(app.state, "background_processor")
+        app.state.background_processor = object()
+
+        def _restore_bp() -> None:
+            if self._had_bp:
+                app.state.background_processor = self._prev_bp
+            elif hasattr(app.state, "background_processor"):
+                del app.state.background_processor
+
+        self.addCleanup(_restore_bp)
 
         self._mock_vector_store = MagicMock()
         self._mock_vector_store.db = MagicMock()
@@ -289,7 +307,13 @@ class DraftRoomTestBase(unittest.TestCase):
             self._connection_pool.release_connection(conn)
 
     def _create_draft(
-        self, *, headers=None, vault_id=READ_VAULT_ID, mode="rewrite", title="My Draft", brief=None
+        self,
+        *,
+        headers=None,
+        vault_id=READ_VAULT_ID,
+        mode="rewrite",
+        title="My Draft",
+        brief=None,
     ):
         headers = headers or self._owner_headers()
         resp = self.client.post(
@@ -363,7 +387,9 @@ class TestDraftLifecycle(DraftRoomTestBase):
         self.assertNotIn("parsed_text", resp.text)
 
         # Detail
-        resp = self.client.get(f"/api/draft-room/drafts/{draft_id}", headers=self._owner_headers())
+        resp = self.client.get(
+            f"/api/draft-room/drafts/{draft_id}", headers=self._owner_headers()
+        )
         self.assertEqual(resp.status_code, 200)
         detail = resp.json()
         self.assertEqual(detail["summary"]["id"], draft_id)
@@ -539,7 +565,11 @@ class TestManualRevisions(DraftRoomTestBase):
         # Stale lock_version -> 409
         resp = self.client.post(
             f"/api/draft-room/drafts/{draft_id}/revisions",
-            json={"base_revision_id": rev1_id, "lock_version": lock_version + 99, "content_md": "v2-bad-lock"},
+            json={
+                "base_revision_id": rev1_id,
+                "lock_version": lock_version + 99,
+                "content_md": "v2-bad-lock",
+            },
             headers=self._owner_headers(),
         )
         self.assertEqual(resp.status_code, 409, resp.text)
@@ -547,7 +577,11 @@ class TestManualRevisions(DraftRoomTestBase):
         # Wrong base_revision_id -> 409
         resp = self.client.post(
             f"/api/draft-room/drafts/{draft_id}/revisions",
-            json={"base_revision_id": 999999, "lock_version": lock_version, "content_md": "v2-bad-base"},
+            json={
+                "base_revision_id": 999999,
+                "lock_version": lock_version,
+                "content_md": "v2-bad-base",
+            },
             headers=self._owner_headers(),
         )
         self.assertEqual(resp.status_code, 409, resp.text)
@@ -555,7 +589,11 @@ class TestManualRevisions(DraftRoomTestBase):
         # Correct base + lock_version -> new revision 2
         resp = self.client.post(
             f"/api/draft-room/drafts/{draft_id}/revisions",
-            json={"base_revision_id": rev1_id, "lock_version": lock_version, "content_md": "v2"},
+            json={
+                "base_revision_id": rev1_id,
+                "lock_version": lock_version,
+                "content_md": "v2",
+            },
             headers=self._owner_headers(),
         )
         self.assertEqual(resp.status_code, 201, resp.text)
@@ -565,7 +603,8 @@ class TestManualRevisions(DraftRoomTestBase):
 
         # rev1 unchanged
         resp = self.client.get(
-            f"/api/draft-room/drafts/{draft_id}/revisions/{rev1_id}", headers=self._owner_headers()
+            f"/api/draft-room/drafts/{draft_id}/revisions/{rev1_id}",
+            headers=self._owner_headers(),
         )
         self.assertEqual(resp.json()["content_md"], "v1")
         self.assertFalse(resp.json()["summary"]["is_current"])
@@ -583,7 +622,8 @@ class TestManualRevisions(DraftRoomTestBase):
 
         # Revision list is newest-first, never carries Markdown bodies.
         resp = self.client.get(
-            f"/api/draft-room/drafts/{draft_id}/revisions", headers=self._owner_headers()
+            f"/api/draft-room/drafts/{draft_id}/revisions",
+            headers=self._owner_headers(),
         )
         self.assertEqual(resp.status_code, 200)
         items = resp.json()["items"]
@@ -613,7 +653,10 @@ class TestUploadValidation(DraftRoomTestBase):
     def test_disallowed_extension_returns_415(self):
         draft_id = self._create_draft().json()["id"]
         resp = self._upload_input(
-            draft_id, filename="virus.exe", content=b"MZ\x90\x00", content_type="application/octet-stream"
+            draft_id,
+            filename="virus.exe",
+            content=b"MZ\x90\x00",
+            content_type="application/octet-stream",
         )
         self.assertEqual(resp.status_code, 415, resp.text)
         self.assertEqual(resp.json()["code"], "unsupported_input")
@@ -621,7 +664,10 @@ class TestUploadValidation(DraftRoomTestBase):
     def test_bad_signature_returns_415(self):
         draft_id = self._create_draft().json()["id"]
         resp = self._upload_input(
-            draft_id, filename="fake.pdf", content=b"not a real pdf", content_type="application/pdf"
+            draft_id,
+            filename="fake.pdf",
+            content=b"not a real pdf",
+            content_type="application/pdf",
         )
         self.assertEqual(resp.status_code, 415, resp.text)
         self.assertEqual(resp.json()["code"], "unsupported_input")
@@ -668,7 +714,9 @@ class TestUploadValidation(DraftRoomTestBase):
         draft_id = self._create_draft().json()["id"]
         first = self._upload_input(draft_id, content=b"x" * 900_000, filename="one.txt")
         self.assertEqual(first.status_code, 202, first.text)
-        second = self._upload_input(draft_id, content=b"y" * 900_000, filename="two.txt")
+        second = self._upload_input(
+            draft_id, content=b"y" * 900_000, filename="two.txt"
+        )
         self.assertEqual(second.status_code, 413, second.text)
 
 
@@ -687,7 +735,9 @@ class TestCapabilitiesAndPagination(DraftRoomTestBase):
         be the dishonest answer. The assertion is therefore inverted for all
         six, and NOT weakened: each flag is still asserted explicitly.
         """
-        resp = self.client.get("/api/draft-room/capabilities", headers=self._owner_headers())
+        resp = self.client.get(
+            "/api/draft-room/capabilities", headers=self._owner_headers()
+        )
         self.assertEqual(resp.status_code, 200, resp.text)
         caps = resp.json()
         self.assertTrue(caps["enabled"])
@@ -712,7 +762,9 @@ class TestCapabilitiesAndPagination(DraftRoomTestBase):
             for method in getattr(route, "methods", set())
         }
         self.assertIn(("POST", "/draft-room/drafts/{draft_id}/compile"), routes)
-        self.assertIn(("GET", "/draft-room/drafts/{draft_id}/jobs/{job_id}/stages"), routes)
+        self.assertIn(
+            ("GET", "/draft-room/drafts/{draft_id}/jobs/{job_id}/stages"), routes
+        )
         self.assertIn(("GET", "/draft-room/drafts/{draft_id}/evidence"), routes)
         self.assertIn(("GET", "/draft-room/drafts/{draft_id}/claims"), routes)
         self.assertIn(("GET", "/draft-room/drafts/{draft_id}/findings"), routes)
@@ -856,7 +908,10 @@ class TestSSE(DraftRoomTestBase):
         draft_id = self._create_draft().json()["id"]
 
         token = create_access_token(
-            self.OWNER_ID, "owner", "member", client_fingerprint=compute_client_fingerprint("")
+            self.OWNER_ID,
+            "owner",
+            "member",
+            client_fingerprint=compute_client_fingerprint(""),
         )
         fake_request = MagicMock()
         fake_request.app.state.db_pool = self._connection_pool

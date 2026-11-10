@@ -36,7 +36,7 @@
       "SEVERITY.LOW": 59,
       "SEVERITY.MEDIUM": 63,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 96136,
+      "loc": 96709,
       "nosec": 0,
       "skipped_tests": 71
     },
@@ -62,7 +62,7 @@
       "SEVERITY.LOW": 2,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 708,
+      "loc": 718,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -140,7 +140,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 3854,
+      "loc": 4203,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -413,7 +413,7 @@
       "SEVERITY.LOW": 7,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 933,
+      "loc": 940,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -725,7 +725,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 1,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 4530,
+      "loc": 4534,
       "nosec": 0,
       "skipped_tests": 6
     },
@@ -946,7 +946,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 393,
+      "loc": 528,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -959,7 +959,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 956,
+      "loc": 984,
       "nosec": 0,
       "skipped_tests": 1
     },
@@ -985,7 +985,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 785,
+      "loc": 814,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1700,7 +1700,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 196,
+      "loc": 207,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1967,7 +1967,7 @@
   },
   "results": [
     {
-      "code": "362     if not settings.users_enabled:\n363         DEFAULT_TOKEN = \"admin-secret-token\"\n364 \n",
+      "code": "375     if not settings.users_enabled:\n376         DEFAULT_TOKEN = \"admin-secret-token\"\n377 \n",
       "col_offset": 24,
       "end_col_offset": 44,
       "filename": "backend/app/api/deps.py",
@@ -1978,16 +1978,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'admin-secret-token'",
-      "line_number": 363,
+      "line_number": 376,
       "line_range": [
-        363
+        376
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "381             \"is_active\": True,\n382             \"must_change_password\": False,\n383         }\n384 \n385     # User authentication enabled - validate JWT token\n386     try:\n387         payload = decode_access_token(token)\n388     except TokenExpiredError:\n389         raise HTTPException(\n390             status_code=401,\n",
+      "code": "394             \"is_active\": True,\n395             \"must_change_password\": False,\n396         }\n397 \n398     # User authentication enabled - validate JWT token\n399     try:\n400         payload = decode_access_token(token)\n401     except TokenExpiredError:\n402         raise HTTPException(\n403             status_code=401,\n",
       "col_offset": 12,
       "end_col_offset": 34,
       "filename": "backend/app/api/deps.py",
@@ -1998,16 +1998,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'False'",
-      "line_number": 382,
+      "line_number": 395,
       "line_range": [
-        376,
-        377,
-        378,
-        379,
-        380,
-        381,
-        382,
-        383
+        389,
+        390,
+        391,
+        392,
+        393,
+        394,
+        395,
+        396
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
@@ -3321,7 +3321,7 @@
       "test_name": "try_except_pass"
     },
     {
-      "code": "1252         app.state.vector_store.close()\n1253     except Exception:\n1254         pass\n1255     try:\n",
+      "code": "1252         app.state.vector_store.close()\n1253     except Exception:\n1254         pass\n1255     # Review PRR-020: let detached upload commit tasks settle (bounded)\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3342,7 +3342,7 @@
       "test_name": "try_except_pass"
     },
     {
-      "code": "1256         app.state.db_pool.close_all()\n1257     except Exception:\n1258         pass\n1259     try:\n",
+      "code": "1268         app.state.db_pool.close_all()\n1269     except Exception:\n1270         pass\n1271     try:\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3353,17 +3353,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1257,
+      "line_number": 1269,
       "line_range": [
-        1257,
-        1258
+        1269,
+        1270
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "1261         _auth_executor.shutdown(wait=False)\n1262     except Exception:\n1263         pass\n1264     with contextlib_suppress(Exception):\n",
+      "code": "1273         _auth_executor.shutdown(wait=False)\n1274     except Exception:\n1275         pass\n1276     with contextlib_suppress(Exception):\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3374,10 +3374,10 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1262,
+      "line_number": 1274,
       "line_range": [
-        1262,
-        1263
+        1274,
+        1275
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
@@ -3584,7 +3584,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "2985                 cursor = conn.execute(\n2986                     \"UPDATE files SET enrichment_status = (\"\n2987                     + est.aggregate_status_case_sql()\n2988                     + \"), enrichment_error = NULL, enrichment_updated_at = ? \"\n",
+      "code": "2984                 cursor = conn.execute(\n2985                     \"UPDATE files SET enrichment_status = (\"\n2986                     + est.aggregate_status_case_sql()\n2987                     + \"), enrichment_error = NULL, enrichment_updated_at = ? \"\n",
       "col_offset": 20,
       "end_col_offset": 60,
       "filename": "backend/app/services/background_tasks.py",
@@ -3595,10 +3595,10 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 2986,
+      "line_number": 2985,
       "line_range": [
-        2986,
-        2987
+        2985,
+        2986
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",

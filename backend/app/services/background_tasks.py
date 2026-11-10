@@ -75,9 +75,7 @@ _REINDEX_DETAIL_SHAPE = re.compile(r"^(file_id=\d+: )(.*)$", re.DOTALL)
 # (``ParseDeadlineError.ingest_error_code``) and
 # ``ENRICHMENT_FAILED`` — so the invariant cannot drift from the
 # vocabulary it protects.
-_REINDEX_DETAIL_STABLE_PREFIXES = tuple(
-    f"{code}:" for code in _INGEST_ERROR_REASONS
-)
+_REINDEX_DETAIL_STABLE_PREFIXES = tuple(f"{code}:" for code in _INGEST_ERROR_REASONS)
 
 
 def _redact_reindex_message_part(message: str) -> str:
@@ -258,8 +256,7 @@ class _LeaseProgressLost(Exception):
 # no-progress release with (registered in job_lease's stable-prefix
 # vocabulary; never raw exception text).
 LEASE_STALL_REASON = (
-    "lease_stall_reclaimed: no per-file progress within "
-    "jobs_stall_timeout_seconds"
+    "lease_stall_reclaimed: no per-file progress within jobs_stall_timeout_seconds"
 )
 
 
@@ -288,7 +285,9 @@ def _stall_watermark_age_seconds(value: str) -> Optional[float]:
             continue
     if parsed is None:
         return None
-    return (datetime.now(timezone.utc) - parsed.replace(tzinfo=timezone.utc)).total_seconds()
+    return (
+        datetime.now(timezone.utc) - parsed.replace(tzinfo=timezone.utc)
+    ).total_seconds()
 
 
 @dataclass
@@ -4231,11 +4230,10 @@ class BackgroundProcessor:
             return
         try:
             while not run_task.done():
-                await asyncio.sleep(
-                    max(0.25, min(budget / 4.0, 5.0))
-                )
+                await asyncio.sleep(max(0.25, min(budget / 4.0, 5.0)))
                 if run_task.done():
                     return
+
                 # Refresh the deadline from the durable watermark and check
                 # ownership in one read.
                 def _probe():
@@ -4272,9 +4270,7 @@ class BackgroundProcessor:
                     heartbeat_task.cancel()
                     return
                 watermark = (
-                    probe["progress_at"]
-                    or probe["started_at"]
-                    or probe["created_at"]
+                    probe["progress_at"] or probe["started_at"] or probe["created_at"]
                 )
                 if watermark is None:
                     continue
@@ -4649,7 +4645,11 @@ class BackgroundProcessor:
                     async with self.processor.pool.connection_async() as conn:
                         conn.execute(
                             "UPDATE document_reindex_jobs SET status = 'failed', completed_at = ?, error = ? WHERE id = ?",
-                            (datetime.now(UTC).isoformat(), _redact_reindex_error(error), job_id),
+                            (
+                                datetime.now(UTC).isoformat(),
+                                _redact_reindex_error(error),
+                                job_id,
+                            ),
                         )
                         conn.commit()
                 else:
@@ -4663,8 +4663,7 @@ class BackgroundProcessor:
                     details = result.get("details")
                     if isinstance(details, list):
                         result["details"] = [
-                            _redact_reindex_detail_entry(entry)
-                            for entry in details
+                            _redact_reindex_detail_entry(entry) for entry in details
                         ]
                     async with self.processor.pool.connection_async() as conn:
                         conn.execute(
@@ -4914,9 +4913,7 @@ class BackgroundProcessor:
                     hash_fn = getattr(
                         vector_store, "_compute_embedding_prefix_hash", None
                     )
-                    snapshot_prefix_hash = (
-                        hash_fn() if callable(hash_fn) else None
-                    )
+                    snapshot_prefix_hash = hash_fn() if callable(hash_fn) else None
                     if not isinstance(snapshot_prefix_hash, str):
                         snapshot_prefix_hash = None
                     job_identity_snapshot = {
@@ -4931,9 +4928,7 @@ class BackgroundProcessor:
                         # store's admission-condition lock — no write-lock or
                         # begin/commit/abort calls here.
                         post_live_dim = await vector_store.get_live_embedding_dim()
-                        post_identity = await _embedding_identity_changed(
-                            vector_store
-                        )
+                        post_identity = await _embedding_identity_changed(vector_store)
                         return not (
                             (
                                 probe_dim is not None
@@ -5074,7 +5069,7 @@ class BackgroundProcessor:
                                     + [
                                         int(fid)
                                         for fid in ordered_file_ids[
-                                            max(total_files - 1, 0):
+                                            max(total_files - 1, 0) :
                                         ]
                                     ]
                                 )
@@ -5564,8 +5559,7 @@ class BackgroundProcessor:
 
         if task.attempt < self.max_retries or (
             isinstance(error, BaseException)
-            and classify_ingest_error(error)
-            == INGEST_ERROR_VECTOR_STORE_LOCK_TIMEOUT
+            and classify_ingest_error(error) == INGEST_ERROR_VECTOR_STORE_LOCK_TIMEOUT
         ):
             # Calculate exponential backoff delay (exponent bounded so a
             # long contention sequence cannot overflow).
@@ -5623,6 +5617,7 @@ class BackgroundProcessor:
                     # transfer happens; the wrapper's settle cleanup
                     # releases the active-file reservation.
                     if task.file_id is not None:
+
                         def _mark_sweep_eligible():
                             with self.processor.pool.connection() as conn:
                                 conn.execute(
@@ -5704,6 +5699,19 @@ class BackgroundProcessor:
     @property
     def is_running(self) -> bool:
         return self._running
+
+    @property
+    def is_alive(self) -> bool:
+        """Task liveness of this processor (issues #902/#911).
+
+        Distinguishes a mounted-but-not-running object from one with live
+        ingestion consumers: lifespan's ``_safe_await`` swallows ``start()``
+        failures and timeouts, which leaves the object mounted with
+        ``_running=False`` and no worker tasks (while ``enqueue`` still
+        accepts work nobody will consume). Task liveness, not forward
+        progress — a live-but-wedged worker task still reports True.
+        """
+        return self._running and any(not task.done() for task in self._worker_tasks)
 
     @property
     def queue_size(self) -> int:

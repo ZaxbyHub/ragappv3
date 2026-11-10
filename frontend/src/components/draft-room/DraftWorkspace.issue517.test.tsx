@@ -6,7 +6,13 @@
 // draftRoom API, ui store reset), except DraftInspector is left REAL so the
 // real DraftFindingsPanel renders inside it.
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
-import { render as rtlRender, screen, waitFor, fireEvent, cleanup } from "@testing-library/react";
+import {
+  render as rtlRender,
+  screen,
+  waitFor,
+  fireEvent,
+  cleanup,
+} from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { toast } from "sonner";
@@ -39,7 +45,9 @@ vi.mock("sonner", () => ({
 
 // ---- Leaf-component stubs (DraftInspector deliberately NOT mocked) -------
 vi.mock("./DraftAssignmentForm", async () => {
-  const actual = await vi.importActual<typeof import("./DraftAssignmentForm")>("./DraftAssignmentForm");
+  const actual = await vi.importActual<typeof import("./DraftAssignmentForm")>(
+    "./DraftAssignmentForm",
+  );
   return {
     ...actual,
     DraftAssignmentForm: () => <div data-testid="assignment-form" />,
@@ -70,8 +78,12 @@ vi.mock("./DraftEditor", () => ({
     </div>
   ),
 }));
-vi.mock("./DraftPreview", () => ({ DraftPreview: () => <div data-testid="preview" /> }));
-vi.mock("./DraftRevisionDiff", () => ({ DraftRevisionDiff: () => <div data-testid="revision-diff" /> }));
+vi.mock("./DraftPreview", () => ({
+  DraftPreview: () => <div data-testid="preview" />,
+}));
+vi.mock("./DraftRevisionDiff", () => ({
+  DraftRevisionDiff: () => <div data-testid="revision-diff" />,
+}));
 vi.mock("./DraftStageArtifact", () => ({
   DraftStageArtifact: (props: { stage: DraftStage | null }) => (
     <div data-testid="stage-artifact">stage:{props.stage?.stage ?? "none"}</div>
@@ -96,16 +108,41 @@ vi.mock("@/components/ui/select", async () => {
   const React = await import("react");
   const Ctx = React.createContext<(value: string) => void>(() => {});
   return {
-    Select: ({ onValueChange, children }: { onValueChange: (v: string) => void; children: React.ReactNode }) =>
-      React.createElement(Ctx.Provider, { value: onValueChange }, children),
-    SelectTrigger: ({ children, id }: { children: React.ReactNode; id?: string }) =>
-      React.createElement("div", { role: "group", "aria-label": "Retry from", id }, children),
+    Select: ({
+      onValueChange,
+      children,
+    }: {
+      onValueChange: (v: string) => void;
+      children: React.ReactNode;
+    }) => React.createElement(Ctx.Provider, { value: onValueChange }, children),
+    SelectTrigger: ({
+      children,
+      id,
+    }: {
+      children: React.ReactNode;
+      id?: string;
+    }) =>
+      React.createElement(
+        "div",
+        { role: "group", "aria-label": "Retry from", id },
+        children,
+      ),
     SelectValue: () => null,
     SelectContent: ({ children }: { children: React.ReactNode }) =>
       React.createElement("div", null, children),
-    SelectItem: ({ value, children }: { value: string; children: React.ReactNode }) => {
+    SelectItem: ({
+      value,
+      children,
+    }: {
+      value: string;
+      children: React.ReactNode;
+    }) => {
       const onValueChange = React.useContext(Ctx);
-      return React.createElement("button", { type: "button", onClick: () => onValueChange(value) }, children);
+      return React.createElement(
+        "button",
+        { type: "button", onClick: () => onValueChange(value) },
+        children,
+      );
     },
   };
 });
@@ -145,7 +182,9 @@ const {
 }));
 
 vi.mock("@/lib/api/draftRoom", async () => {
-  const actual = await vi.importActual<typeof import("@/lib/api/draftRoom")>("@/lib/api/draftRoom");
+  const actual = await vi.importActual<typeof import("@/lib/api/draftRoom")>(
+    "@/lib/api/draftRoom",
+  );
   return {
     ...actual,
     listDraftJobs: mockListDraftJobs,
@@ -228,7 +267,9 @@ function makeDetail(overrides: Partial<DraftDetail> = {}): DraftDetail {
   };
 }
 
-function makeCapabilities(overrides: Partial<DraftRoomCapabilities> = {}): DraftRoomCapabilities {
+function makeCapabilities(
+  overrides: Partial<DraftRoomCapabilities> = {},
+): DraftRoomCapabilities {
   return {
     enabled: true,
     modes: ["rewrite", "compose"],
@@ -240,10 +281,21 @@ function makeCapabilities(overrides: Partial<DraftRoomCapabilities> = {}): Draft
     logical_model_modes: ["default"],
     default_logical_mode: "default",
     compile_start_stages: ["research"],
-    compile_stage_order: ["intake", "research", "outline", "draft", "lint", "copy", "standards", "fact", "assemble"],
+    compile_stage_order: [
+      "intake",
+      "research",
+      "outline",
+      "draft",
+      "lint",
+      "copy",
+      "standards",
+      "fact",
+      "assemble",
+    ],
     prompt_bundle_version: "v1",
     editorial_gates_installed: true,
     compile_available: true,
+    upload_available: true,
     findings_available: true,
     claims_available: true,
     evidence_available: true,
@@ -296,7 +348,9 @@ function makeRevisionSummary() {
   };
 }
 
-function makeRevisionDetail(overrides: Partial<DraftRevisionDetail> = {}): DraftRevisionDetail {
+function makeRevisionDetail(
+  overrides: Partial<DraftRevisionDetail> = {},
+): DraftRevisionDetail {
   return {
     summary: {
       id: 100,
@@ -320,8 +374,12 @@ function makeRevisionDetail(overrides: Partial<DraftRevisionDetail> = {}): Draft
 
 const initialUiState = useDraftRoomUiStore.getState();
 
-function renderWorkspace(props: Partial<React.ComponentProps<typeof DraftWorkspace>> = {}) {
-  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+function renderWorkspace(
+  props: Partial<React.ComponentProps<typeof DraftWorkspace>> = {},
+) {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
   const detail = props.detail ?? makeDetail();
   const draft = props.draft ?? detail.summary;
   const utils = render(
@@ -334,15 +392,19 @@ function renderWorkspace(props: Partial<React.ComponentProps<typeof DraftWorkspa
         vaultAccess="write"
         {...props}
       />
-    </QueryClientProvider>
+    </QueryClientProvider>,
   );
   return { ...utils, queryClient };
 }
 
 beforeEach(() => {
   useDraftRoomUiStore.setState(initialUiState, true);
-  mockListDraftJobs.mockReset().mockResolvedValue({ items: [makeJob()], total: 1, page: 1, per_page: 10 });
-  mockGetDraftStages.mockReset().mockResolvedValue({ items: [], total: 0, page: 1, per_page: 100 });
+  mockListDraftJobs
+    .mockReset()
+    .mockResolvedValue({ items: [makeJob()], total: 1, page: 1, per_page: 10 });
+  mockGetDraftStages
+    .mockReset()
+    .mockResolvedValue({ items: [], total: 0, page: 1, per_page: 100 });
   mockListDraftRevisions.mockReset().mockResolvedValue({
     items: [makeRevisionSummary()],
     total: 1,
@@ -350,9 +412,15 @@ beforeEach(() => {
     per_page: 50,
   });
   mockGetDraftRevision.mockReset().mockResolvedValue(makeRevisionDetail());
-  mockListDraftFindings.mockReset().mockResolvedValue({ items: [], total: 0, page: 1, per_page: 20 });
-  mockListDraftClaims.mockReset().mockResolvedValue({ items: [], total: 0, page: 1, per_page: 50 });
-  mockListDraftEvidence.mockReset().mockResolvedValue({ items: [], total: 0, page: 1, per_page: 50 });
+  mockListDraftFindings
+    .mockReset()
+    .mockResolvedValue({ items: [], total: 0, page: 1, per_page: 20 });
+  mockListDraftClaims
+    .mockReset()
+    .mockResolvedValue({ items: [], total: 0, page: 1, per_page: 50 });
+  mockListDraftEvidence
+    .mockReset()
+    .mockResolvedValue({ items: [], total: 0, page: 1, per_page: 50 });
   mockUpdateDraft.mockReset();
   mockCompileDraft.mockReset();
   mockCancelDraftJob.mockReset();
@@ -373,16 +441,20 @@ describe("DraftWorkspace (issue #517)", () => {
     renderWorkspace();
 
     const textarea = await screen.findByLabelText("Draft content");
-    await waitFor(() => expect(textarea).toHaveValue("Original saved revision text."));
+    await waitFor(() =>
+      expect(textarea).toHaveValue("Original saved revision text."),
+    );
 
     // Fixture sanity: the real inspector's findings panel is rendered.
     expect(await screen.findByText(/no findings match/i)).toBeInTheDocument();
 
     console.log("AC15 CHECK: FAIL");
-    fireEvent.change(textarea, { target: { value: "Edited text with unsaved changes." } });
+    fireEvent.change(textarea, {
+      target: { value: "Edited text with unsaved changes." },
+    });
 
     expect(
-      await screen.findByText(/reflect the last saved revision/i)
+      await screen.findByText(/reflect the last saved revision/i),
     ).toBeInTheDocument();
   });
 });

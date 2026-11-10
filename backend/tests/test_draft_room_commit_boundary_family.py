@@ -55,6 +55,7 @@ contract), and the site's security-audit row exists in
 import ast
 import asyncio
 import os
+from types import SimpleNamespace
 
 os.environ["JWT_SECRET_KEY"] = (
     "test-jwt-secret-key-for-testing-only-12345678901234567890"
@@ -237,7 +238,9 @@ class _DraftWorld:
             self.pool.release_connection(conn)
 
     def lock_version(self, draft_id: int) -> int:
-        return int(self.scalar("SELECT lock_version FROM drafts WHERE id = ?", (draft_id,)))
+        return int(
+            self.scalar("SELECT lock_version FROM drafts WHERE id = ?", (draft_id,))
+        )
 
     def seed_ready_input(self, draft_id: int) -> None:
         """One manuscript input moved straight to parse_status='ready' (the
@@ -344,12 +347,16 @@ class _DraftWorld:
     def set_draft_status(self, draft_id: int, status: str) -> None:
         conn = self._seed_conn()
         try:
-            conn.execute("UPDATE drafts SET status = ? WHERE id = ?", (status, draft_id))
+            conn.execute(
+                "UPDATE drafts SET status = ? WHERE id = ?", (status, draft_id)
+            )
             conn.commit()
         finally:
             self.pool.release_connection(conn)
 
-    def seed_ready_eligible_draft(self, content_md: str = "# Body\n\nSome article text.") -> tuple:
+    def seed_ready_eligible_draft(
+        self, content_md: str = "# Body\n\nSome article text."
+    ) -> tuple:
         """A draft with exactly one clean, Fact-current, needs_review
         revision — the minimum state the Ready route accepts."""
         draft_id = self.create_draft()
@@ -473,6 +480,12 @@ class _DraftWorld:
 
 
 def _request_for(method: str, path: str) -> Request:
+    # Review PRR-002/F-01b: the compile/retry routes read the Draft Room
+    # worker from app.state (via get_draft_job_processor's scope-safe read),
+    # so the harness scope must carry an app whose state mounts a live
+    # processor — these legs exercise cancel-at-commit audit ordering,
+    # not the worker gate.
+    scope_app = SimpleNamespace(state=SimpleNamespace(draft_job_processor=object()))
     return Request(
         {
             "type": "http",
@@ -483,6 +496,7 @@ def _request_for(method: str, path: str) -> Request:
             "client": ("127.0.0.1", 12345),
             "server": ("testserver", 80),
             "scheme": "http",
+            "app": scope_app,
         }
     )
 
@@ -572,12 +586,13 @@ def test_draft_room_audit_census_classification() -> None:
     # Admitted shape: a mutation-bearing store call lexically precedes the
     # audit tail inside each admitted handler.
     for fn in ast.walk(tree):
-        if not isinstance(fn, ast.AsyncFunctionDef) or fn.name not in _ADMITTED_HANDLER_EVENTS:
+        if (
+            not isinstance(fn, ast.AsyncFunctionDef)
+            or fn.name not in _ADMITTED_HANDLER_EVENTS
+        ):
             continue
         audit_nodes = [
-            node
-            for name, _event, node in _audit_event_calls(tree)
-            if name == fn.name
+            node for name, _event, node in _audit_event_calls(tree) if name == fn.name
         ]
         assert audit_nodes, f"census drift: no audit call left in {fn.name}"
         mutation_lines = [
@@ -585,7 +600,10 @@ def test_draft_room_audit_census_classification() -> None:
             for node in ast.walk(fn)
             if isinstance(node, ast.Call)
             and (
-                (isinstance(node.func, ast.Name) and node.func.id in _MUTATION_CALL_NAMES)
+                (
+                    isinstance(node.func, ast.Name)
+                    and node.func.id in _MUTATION_CALL_NAMES
+                )
                 or (
                     isinstance(node.func, ast.Attribute)
                     and node.func.attr == "to_thread"
@@ -624,7 +642,9 @@ def test_draft_room_audit_census_classification() -> None:
         "census drift: compile_draft must gate its two audits on `if created:`"
     )
     gate = created_ifs[0]
-    in_if = [n for n in compile_audits if any(n in ast.walk(stmt) for stmt in gate.body)]
+    in_if = [
+        n for n in compile_audits if any(n in ast.walk(stmt) for stmt in gate.body)
+    ]
     in_else = [
         n for n in compile_audits if any(n in ast.walk(stmt) for stmt in gate.orelse)
     ]
@@ -648,7 +668,6 @@ def test_draft_room_audit_census_classification() -> None:
     assert false_returns, (
         "census drift: _sync_enqueue_compile must expose created=False exits"
     )
-
 
     def _parents(fn: ast.AST) -> dict:
         out: dict = {}
@@ -741,7 +760,10 @@ def test_draft_room_audit_census_classification() -> None:
 
 def _fn_by_name(tree: ast.AST, name: str):  # noqa: ANN202
     for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == name
+        ):
             return node
     return None
 
@@ -798,7 +820,9 @@ def test_cancel_draft_job_cancel_at_commit_still_audits(tmp_path: Path) -> None:
         outcome, state = _drive(
             world,
             lambda conn: cancel_draft_job(
-                _request_for("POST", f"/api/draft-room/drafts/{draft_id}/jobs/{job_id}/cancel"),
+                _request_for(
+                    "POST", f"/api/draft-room/drafts/{draft_id}/jobs/{job_id}/cancel"
+                ),
                 draft_id,
                 job_id,
                 db=conn,
@@ -834,7 +858,9 @@ def test_retry_draft_job_cancel_at_commit_still_audits(tmp_path: Path) -> None:
         outcome, state = _drive(
             world,
             lambda conn: retry_draft_job(
-                _request_for("POST", f"/api/draft-room/drafts/{draft_id}/jobs/{job_id}/retry"),
+                _request_for(
+                    "POST", f"/api/draft-room/drafts/{draft_id}/jobs/{job_id}/retry"
+                ),
                 draft_id,
                 job_id,
                 db=conn,
@@ -879,7 +905,9 @@ def test_compile_draft_created_branch_cancel_at_commit_still_audits(
                 _request_for("POST", f"/api/draft-room/drafts/{draft_id}/compile"),
                 draft_id,
                 CompileRequest(
-                    base_revision_id=None, lock_version=lock_version, start_stage="research"
+                    base_revision_id=None,
+                    lock_version=lock_version,
+                    start_stage="research",
                 ),
                 db=conn,
                 user=dict(_OWNER),
@@ -923,7 +951,10 @@ def test_mark_revision_ready_cancel_at_commit_still_audits(tmp_path: Path) -> No
         outcome, state = _drive(
             world,
             lambda conn: mark_revision_ready(
-                _request_for("POST", f"/api/draft-room/drafts/{draft_id}/revisions/{revision_id}/ready"),
+                _request_for(
+                    "POST",
+                    f"/api/draft-room/drafts/{draft_id}/revisions/{revision_id}/ready",
+                ),
                 draft_id,
                 revision_id,
                 ReadyRequest(lock_version=lock_version),
@@ -936,7 +967,8 @@ def test_mark_revision_ready_cancel_at_commit_still_audits(tmp_path: Path) -> No
         assert state["fired"], "non-vacuity: the commit hook must have fired"
         assert outcome == "cancelled", f"route must unwind cancelled (got {outcome!r})"
         assert (
-            world.scalar("SELECT status FROM drafts WHERE id = ?", (draft_id,)) == "ready"
+            world.scalar("SELECT status FROM drafts WHERE id = ?", (draft_id,))
+            == "ready"
         ), "precondition: the Ready commit completed"
         assert world.audit_rows("draft_ready_marked") == 1, (
             "commit-boundary audit loss: the revision was marked ready (the "
@@ -957,7 +989,10 @@ def test_export_draft_revision_cancel_at_commit_still_audits(tmp_path: Path) -> 
         outcome, state = _drive(
             world,
             lambda conn: export_draft_revision(
-                _request_for("POST", f"/api/draft-room/drafts/{draft_id}/revisions/{revision_id}/export"),
+                _request_for(
+                    "POST",
+                    f"/api/draft-room/drafts/{draft_id}/revisions/{revision_id}/export",
+                ),
                 draft_id,
                 revision_id,
                 format="md",
@@ -1004,7 +1039,9 @@ def test_promote_draft_source_cancel_at_commit_still_audits(tmp_path: Path) -> N
             lambda conn: promote_draft_source(
                 _request_for("POST", f"/api/draft-room/drafts/{draft_id}/promote"),
                 draft_id,
-                PromoteRequest(source_type="revision", source_id=revision_id, title="Promoted Doc"),
+                PromoteRequest(
+                    source_type="revision", source_id=revision_id, title="Promoted Doc"
+                ),
                 db=conn,
                 db_pool=world.pool_facade,
                 background_processor=processor,
@@ -1057,7 +1094,9 @@ def test_promote_draft_source_input_cancel_at_commit_still_audits(
             lambda conn: promote_draft_source(
                 _request_for("POST", f"/api/draft-room/drafts/{draft_id}/promote"),
                 draft_id,
-                PromoteRequest(source_type="input", source_id=input_id, title="Promoted Input"),
+                PromoteRequest(
+                    source_type="input", source_id=input_id, title="Promoted Input"
+                ),
                 db=conn,
                 db_pool=world.pool_facade,
                 background_processor=processor,
@@ -1100,12 +1139,17 @@ def test_dispose_draft_finding_cancel_at_commit_still_audits(tmp_path: Path) -> 
         outcome, state = _drive(
             world,
             lambda conn: dispose_draft_finding(
-                _request_for("POST", f"/api/draft-room/drafts/{draft_id}/findings/{finding_id}/disposition"),
+                _request_for(
+                    "POST",
+                    f"/api/draft-room/drafts/{draft_id}/findings/{finding_id}/disposition",
+                ),
                 Response(),
                 draft_id,
                 finding_id,
                 FindingDispositionRequest(
-                    action="dismiss", base_revision_id=revision_id, lock_version=lock_version
+                    action="dismiss",
+                    base_revision_id=revision_id,
+                    lock_version=lock_version,
                 ),
                 db=conn,
                 user=dict(_OWNER),
@@ -1116,7 +1160,9 @@ def test_dispose_draft_finding_cancel_at_commit_still_audits(tmp_path: Path) -> 
         assert state["fired"], "non-vacuity: the commit hook must have fired"
         assert outcome == "cancelled", f"route must unwind cancelled (got {outcome!r})"
         assert (
-            world.scalar("SELECT status FROM draft_findings WHERE id = ?", (finding_id,))
+            world.scalar(
+                "SELECT status FROM draft_findings WHERE id = ?", (finding_id,)
+            )
             == "dismissed"
         ), "precondition: the disposition commit completed"
         assert world.audit_rows("draft_finding_dismiss") == 1, (
@@ -1138,18 +1184,25 @@ def test_dispose_draft_finding_apply_cancel_at_commit_still_audits(
     row."""
     world = _DraftWorld(tmp_path, "draft-finding-apply.db")
     draft_id, job_id, revision_id = world.seed_ready_eligible_draft()
-    finding_id = world.seed_applicable_finding(draft_id, job_id, revision_id, "# Body\n\nSome article text.")
+    finding_id = world.seed_applicable_finding(
+        draft_id, job_id, revision_id, "# Body\n\nSome article text."
+    )
     lock_version = world.lock_version(draft_id)
     try:
         outcome, state = _drive(
             world,
             lambda conn: dispose_draft_finding(
-                _request_for("POST", f"/api/draft-room/drafts/{draft_id}/findings/{finding_id}/disposition"),
+                _request_for(
+                    "POST",
+                    f"/api/draft-room/drafts/{draft_id}/findings/{finding_id}/disposition",
+                ),
                 Response(),
                 draft_id,
                 finding_id,
                 FindingDispositionRequest(
-                    action="apply", base_revision_id=revision_id, lock_version=lock_version
+                    action="apply",
+                    base_revision_id=revision_id,
+                    lock_version=lock_version,
                 ),
                 db=conn,
                 user=dict(_OWNER),
@@ -1160,7 +1213,9 @@ def test_dispose_draft_finding_apply_cancel_at_commit_still_audits(
         assert state["fired"], "non-vacuity: the commit hook must have fired"
         assert outcome == "cancelled", f"route must unwind cancelled (got {outcome!r})"
         assert (
-            world.scalar("SELECT status FROM draft_findings WHERE id = ?", (finding_id,))
+            world.scalar(
+                "SELECT status FROM draft_findings WHERE id = ?", (finding_id,)
+            )
             == "applied"
         ), "precondition: the apply transaction committed (finding applied)"
         assert (
@@ -1196,7 +1251,10 @@ def test_dispose_draft_finding_waive_cancel_at_commit_still_audits(
         outcome, state = _drive(
             world,
             lambda conn: dispose_draft_finding(
-                _request_for("POST", f"/api/draft-room/drafts/{draft_id}/findings/{finding_id}/disposition"),
+                _request_for(
+                    "POST",
+                    f"/api/draft-room/drafts/{draft_id}/findings/{finding_id}/disposition",
+                ),
                 Response(),
                 draft_id,
                 finding_id,
@@ -1215,7 +1273,9 @@ def test_dispose_draft_finding_waive_cancel_at_commit_still_audits(
         assert state["fired"], "non-vacuity: the commit hook must have fired"
         assert outcome == "cancelled", f"route must unwind cancelled (got {outcome!r})"
         assert (
-            world.scalar("SELECT status FROM draft_findings WHERE id = ?", (finding_id,))
+            world.scalar(
+                "SELECT status FROM draft_findings WHERE id = ?", (finding_id,)
+            )
             == "waived"
         ), "precondition: the waiver commit completed (finding waived)"
         assert world.audit_rows("draft_finding_waive") == 1, (
