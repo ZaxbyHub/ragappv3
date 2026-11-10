@@ -5611,6 +5611,10 @@ class DocumentProcessor:
             if not prior_generation_disturbed and pre_ingest_status in (
                 "indexed",
                 "partial",
+                # Issue #963 review (08b round-2 residual): the reindex
+                # selection includes error rows, whose truthful pre-attempt
+                # state is selectable again — restore them too.
+                "error",
             ):
                 async with self._write_session() as conn:
                     conn.execute(
