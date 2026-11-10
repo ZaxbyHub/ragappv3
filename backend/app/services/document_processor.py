@@ -71,7 +71,7 @@ from .embedding_cache import (
 from .embedding_cache import (
     store as embedding_cache_store,
 )
-from .embeddings import EmbeddingError, EmbeddingService
+from .embeddings import EmbeddingError, EmbeddingProgressLost, EmbeddingService
 from .enrichment_state import aggregate_status_case_sql
 from .image_processor import ImageProcessingResult, _process_image_sync
 from .image_search import build_searchable_text
@@ -2860,8 +2860,9 @@ class DocumentProcessor:
         Check for any existing file with this hash in any non-terminal state.
 
         Used by the async upload route to collapse two concurrent uploads of the
-        same content to a single ingestion. ``_check_duplicate`` only matches
-        ``status='indexed'`` (its legacy semantic for synchronous callers); the
+        same content to a single ingestion. ``_check_duplicate`` matches
+        ``status IN ('indexed', 'partial')`` — the #693-widened semantics
+        ('partial' is a content-available state that owns its slot); the
         async route inserts rows with ``status='pending'`` first, so it needs to
         reject duplicates at every stage of the pipeline, not just indexed.
 
@@ -4981,6 +4982,7 @@ class DocumentProcessor:
         file_hash: Optional[str] = None,
         vector_target: object | None = None,
         retry_context: str = "upload",
+        progress_cb: Optional[object] = None,
     ) -> ProcessedDocument:
         """Process a file whose `files` row already exists.
 
@@ -4990,6 +4992,16 @@ class DocumentProcessor:
         retryable and never write status='error') vs "reindex" (the reindex
         job path, where a disturbed attempt may truthfully settle to a
         selectable 'error' the next reindex pass re-selects).
+
+        ``progress_cb`` (issue #1020, reindex callers only) is a non-raising
+        per-embedding-batch progress callback object exposing a ``lost``
+        attribute: when the fenced watermark refresh records a lost lease
+        fence mid-batch, ``embed_batch`` raises ``EmbeddingProgressLost``
+        and the guard below stops the file BEFORE any vector/atom write,
+        restoring the row's pre-ingest status exactly like a cancellation —
+        the file never strands in ``processing``. The default call to
+        ``embed_batch`` stays exactly ``embed_batch(texts, fail_fast=False)``
+        when no callback is supplied (existing doubles keep working).
 
         Used by the async upload path: the route inserts the `files` row
         with status='pending' / phase='queued' and a duplicate-hash check
@@ -5264,9 +5276,33 @@ class DocumentProcessor:
                         percent=0.0,
                     )
                     stage_started_at = time.monotonic()
-                    embeddings_result = await self.embedding_service.embed_batch(
-                        texts, fail_fast=False
-                    )
+                    # Issue #1020: the reindex path passes a per-batch
+                    # progress callback; the call stays byte-identical for
+                    # every other caller (upload path, doubles).
+                    if progress_cb is not None:
+                        embeddings_result = (
+                            await self.embedding_service.embed_batch(
+                                texts, fail_fast=False, progress_cb=progress_cb
+                            )
+                        )
+                    else:
+                        embeddings_result = (
+                            await self.embedding_service.embed_batch(
+                                texts, fail_fast=False
+                            )
+                        )
+                    # Belt-and-braces guard (issue #1020): embed_batch raises
+                    # EmbeddingProgressLost on a lost fence, but if a
+                    # non-raising double returned normally while the callback
+                    # recorded loss, stop HERE — before any vector write, atom
+                    # publication, or partial-failure bookkeeping below.
+                    if progress_cb is not None and bool(
+                        getattr(progress_cb, "lost", False)
+                    ):
+                        raise EmbeddingProgressLost(
+                            "embedding stage lost its progress fence "
+                            "(issue #1020); no vectors written"
+                        )
                     _add_elapsed_ms(stage_timings, "embedding_ms", stage_started_at)
                     batch_embeddings, failed_batch_indices = embeddings_result
 
@@ -5603,10 +5639,58 @@ class DocumentProcessor:
                 prior_generation_disturbed,
             )
             raise
+        except EmbeddingProgressLost:
+            # Issue #1020: the per-batch watermark refresh recorded a lost
+            # lease fence mid-embed. Same restoration contract as the
+            # cancellation arm above — vector/atom writes were suppressed by
+            # the embed-stage guard, and the row must never strand in
+            # 'processing': undisturbed restores the prior selectable status;
+            # a disturbed reindex attempt settles to the selectable
+            # interrupted 'error' the next pass re-selects.
+            if not prior_generation_disturbed and pre_ingest_status in (
+                "indexed",
+                "partial",
+            ):
+                async with self._write_session() as conn:
+                    conn.execute(
+                        "UPDATE files SET status = ? WHERE id = ? "
+                        "AND status = 'processing'",
+                        (pre_ingest_status, file_id),
+                    )
+                    conn.commit()
+            elif prior_generation_disturbed and retry_context == "reindex":
+                async with self._write_session() as conn:
+                    self._update_status(
+                        file_id,
+                        "error",
+                        conn,
+                        error_message=format_ingest_error(
+                            INGEST_ERROR_REINDEX_INTERRUPTED
+                        ),
+                    )
+                    conn.commit()
+            logger.info(
+                "Existing-file embedding stopped for file_id=%s: the reindex "
+                "attempt lost its progress fence mid-batch (retry_context="
+                "%s, disturbed=%s); row restored to a selectable state "
+                "(issue #1020)",
+                file_id,
+                retry_context,
+                prior_generation_disturbed,
+            )
+            raise
         except Exception as e:
             # Raw exception stays in the server log; persisted fields are
             # user-facing (issue #562).
             logger.exception("Existing-file ingestion failed for file_id=%s", file_id)
+            if progress_cb is not None and bool(getattr(progress_cb, "lost", False)):
+                # Issue #1020 precedence: a lost lease fence outranks a
+                # provider/batch failure — the loss-restoration arm above (not
+                # per-file failure handling) owns the row's final state.
+                raise EmbeddingProgressLost(
+                    "embedding stage lost its progress fence "
+                    "(issue #1020); provider error suppressed"
+                ) from e
             if self.is_cancel_requested(file_id):
                 # issue #783: the failure raced a user cancel; the terminal
                 # 'cancelled' must not be clobbered with 'error'.

@@ -4053,9 +4053,15 @@ class RAGEngine:
                 with pool.connection() as conn:
 
                     placeholders = ",".join("?" * len(file_ids))
+                    # Issue #963 (site 5): 'partial' is a content-available
+                    # state (#693/#793 semantics) — a truthfully-partial newer
+                    # version exists and holds retrievable content, so the
+                    # currency warning surfaces it exactly like an indexed
+                    # successor. Indexed-only was pre-#693 drift, not design.
                     sql = (
                         f"SELECT file_name FROM files "
-                        f"WHERE supersedes_file_id IN ({placeholders}) AND status='indexed'"
+                        f"WHERE supersedes_file_id IN ({placeholders}) "
+                        f"AND status IN ('indexed', 'partial')"
                     )
                     rows = conn.execute(sql, file_ids).fetchall()
                     return rows
