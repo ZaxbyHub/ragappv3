@@ -63,10 +63,10 @@ Before deploying KnowledgeVault to production, ensure the following:
 
 ### Infrastructure Requirements
 
-- [ ] SQLite database directory (`/data/knowledgevault`) with appropriate permissions
+- [ ] SQLite database directory (`./data` — the host-side default bind; the container sees it at `/app/data`) with appropriate permissions
 - [ ] LanceDB vector store directory with write access
-- [ ] Vault directories (`/data/knowledgevault/vaults/{vault_id}/uploads/`) with sufficient disk space for each vault
-- [ ] Redis instance running for CSRF token storage, embedding L2 cache, and shared rate-limit counters (default: `redis://localhost:6379/0`)
+- [ ] Vault directories (`./data/vaults/{vault_id}/uploads/`) with sufficient disk space for each vault
+- [ ] Redis instance running for CSRF token storage, embedding L2 cache, and shared rate-limit counters (native code default: `redis://localhost:6379/0`; the bundled compose default is authenticated — see REDIS_PASSWORD in `.env.example`. Note: the compose redis uses an `allkeys-lru` eviction policy, which under memory pressure can evict CSRF tokens (forcing re-challenges, not auth failures) AND rate-limit counters/admission state (silently resetting a client's window allowance), so size `--maxmemory` for the embedding cache workload)
 - [ ] Ollama or OpenAI-compatible embedding service accessible
 - [ ] LLM chat service accessible (Ollama, OpenAI, or compatible API)
 
@@ -75,7 +75,8 @@ Before deploying KnowledgeVault to production, ensure the following:
 - [ ] Environment variables configured in `.env` file:
   ```bash
   # Required settings
-  DATA_DIR=/data/knowledgevault
+  # Host-side data bind; compose pins the in-container DATA_DIR=/app/data
+  HOST_DATA_DIR=./data
   OLLAMA_EMBEDDING_URL=http://harrier-embed:8080/v1/embeddings
   # Set to your inference endpoint (no default ships):
   OLLAMA_CHAT_URL=http://192.168.1.50:11434
@@ -127,8 +128,8 @@ Before deploying KnowledgeVault to production, ensure the following:
 
 KnowledgeVault requires backing up two primary data stores:
 
-1. **SQLite Database** (`/data/knowledgevault/app.db`)
-2. **LanceDB Vector Store** (`/data/knowledgevault/lancedb/`)
+1. **SQLite Database** (`./data/app.db`)
+2. **LanceDB Vector Store** (`./data/lancedb/`)
 
 #### Automated Backup Script
 
@@ -138,7 +139,7 @@ KnowledgeVault requires backing up two primary data stores:
 
 BACKUP_DIR="/backup/knowledgevault"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-DATA_DIR="/data/knowledgevault"
+DATA_DIR="./data"
 ENCRYPTION_KEY_FILE="/secure/backup-key.pub"
 
 # Create backup directory
@@ -176,7 +177,7 @@ echo "Backup completed: $TIMESTAMP"
 # restore-knowledgevault.sh
 
 BACKUP_DIR="/backup/knowledgevault"
-DATA_DIR="/data/knowledgevault"
+DATA_DIR="./data"
 TIMESTAMP=$1  # Pass timestamp as argument
 
 if [ -z "$TIMESTAMP" ]; then
@@ -213,12 +214,12 @@ echo "Restore completed from: $TIMESTAMP"
 
 1. Check database integrity:
    ```bash
-   sqlite3 /data/knowledgevault/app.db "PRAGMA integrity_check;"
+   sqlite3 ./data/app.db "PRAGMA integrity_check;"
    ```
 
 2. Verify document count matches expected:
    ```bash
-   sqlite3 /data/knowledgevault/app.db "SELECT COUNT(*) FROM files;"
+   sqlite3 ./data/app.db "SELECT COUNT(*) FROM files;"
    ```
 
 3. Test search functionality via API:
@@ -312,11 +313,11 @@ Run the following tests to verify all external dependencies:
 # test-database.sh
 
 echo "Testing SQLite database..."
-sqlite3 /data/knowledgevault/app.db "SELECT 1;" && echo "✓ Database OK" || echo "✗ Database FAILED"
+sqlite3 ./data/app.db "SELECT 1;" && echo "✓ Database OK" || echo "✗ Database FAILED"
 
 echo "Testing required tables..."
 for table in files chunks memories document_actions admin_toggles system_flags; do
-    sqlite3 /data/knowledgevault/app.db "SELECT COUNT(*) FROM $table;" > /dev/null 2>&1
+    sqlite3 ./data/app.db "SELECT COUNT(*) FROM $table;" > /dev/null 2>&1
     if [ $? -eq 0 ]; then
         echo "✓ Table $table exists"
     else
@@ -409,20 +410,125 @@ fi
 
 ```bash
 #!/bin/bash
-# test-redis.sh
+# test-redis.sh — verifies the Redis the deployment actually uses (#1061).
+#
+# The bundled compose Redis requires the REDIS_PASSWORD from the project .env
+# (compose interpolates it into the redis command, the healthcheck, and the
+# backend REDIS_URL). This script reads the SAME file so it authenticates
+# with the credential the running stack uses. The password is passed to
+# redis-cli through the REDISCLI_AUTH environment variable — never argv — and
+# the script exits NONZERO on failure so automation can gate on it.
+#
+# .env handling matches compose: values may be quoted (matching quotes are
+# stripped), CRLF line endings are tolerated, and `export `-prefixed lines
+# are accepted. A value that still cannot be parsed is REDACTED, never
+# echoed: the probe must not leak a credential it failed to understand.
+#
+# Native deployments (no compose): export a credential-free REDIS_URL
+# explicitly, e.g. `export REDIS_URL=redis://localhost:6379/0` — the
+# credential-bearing default below only fits the bundled compose stack.
 
-REDIS_URL="${REDIS_URL:-redis://localhost:6379/0}"
+# Load the project .env when present (compose reads the same file). Both the
+# credential and a configured endpoint come from it.
+strip_env_value() {
+    # Return the VALUE from a .env line: strip an optional `export ` prefix,
+    # trailing CR, the `KEY=` prefix, then one layer of matching quotes
+    # (compose strips the same quotes, so quoted values containing `=` work).
+    # Plain single-group expressions — busybox (musl) ERE mishandles a quoted
+    # literal inside a preceding group.
+    printf '%s' "$1" \
+        | sed -E 's/^[[:space:]]*(export[[:space:]]+)?//' \
+        | tr -d '\r' \
+        | sed -E 's/^[^=]*=//' \
+        | sed -E -e 's/^"(.*)"$/\1/' -e "s/^'(.*)'$/\1/"
+}
+if [ -z "${REDIS_URL:-}" ] && [ -f .env ]; then
+    REDIS_URL_VALUE="$(grep -E '^[[:space:]]*(export[[:space:]]+)?REDIS_URL=' .env | tail -1)"
+    [ -n "$REDIS_URL_VALUE" ] && export REDIS_URL="$(strip_env_value "$REDIS_URL_VALUE")"
+fi
+if [ -z "${REDIS_PASSWORD:-}" ] && [ -f .env ]; then
+    REDIS_PASSWORD_VALUE="$(grep -E '^[[:space:]]*(export[[:space:]]+)?REDIS_PASSWORD=' .env | tail -1)"
+    [ -n "$REDIS_PASSWORD_VALUE" ] && export REDIS_PASSWORD="$(strip_env_value "$REDIS_PASSWORD_VALUE")"
+fi
+REDIS_URL="${REDIS_URL:-redis://:${REDIS_PASSWORD:-knowledgevault-local-redis}@localhost:6379/0}"
 
-echo "Testing Redis at $REDIS_URL..."
+# Parse the URL into scheme, userinfo (credential), and host:port. The
+# sanitizer prints scheme + host:port/db ONLY and fails closed: a URL it
+# cannot parse is printed redacted, never echoed (no credential leak).
+# Parse with POSIX parameter expansion (exact: split at the LAST '@', the
+# same semantics urlsplit/redis-py use — an earlier first-'@' sed truncated
+# credentials containing '@' and echoed a fragment of them).
+case "$REDIS_URL" in
+    *://*) scheme="${REDIS_URL%%://*}"; rest="${REDIS_URL#*://}" ;;
+    *)     scheme=""; rest="" ;;
+esac
+case "$rest" in
+    *@*) userinfo="${rest%@*}"; hostport="${rest##*@}" ;;
+    *)   userinfo="";          hostport="$rest" ;;
+esac
+hostport="${hostport%%/*}"
+db="${rest#*${hostport}}"
+db="${db#/}"
 
-# Extract host and port from URL
-redis_host=$(echo "$REDIS_URL" | sed -E 's|redis://([^:]+):.*|\1|')
-redis_port=$(echo "$REDIS_URL" | sed -E 's|redis://[^:]+:([0-9]+).*|\1|')
+# Everything below FAILS CLOSED: any REDIS_URL the probe cannot fully
+# represent is redacted and exits nonzero, never echoed. Supported form:
+#   redis://[:password@]host[:port][/db]  (default-user; plaintext redis://;
+#                                         a bare password@host userinfo is
+#                                         also accepted as the password)
+# TLS (rediss://), IPv6 literals, and ACL usernames (user:pass userinfo) need
+# a hand-run redis-cli invocation (--tls / -h <bracketed> / --user).
+reject() {
+    echo "Testing Redis (<REDIS_URL not supported by this probe — redacted>)..."
+    echo "✗ Redis FAILED"
+    exit 1
+}
+if [ -z "$scheme" ] || [ -z "$hostport" ]; then
+    echo "Testing Redis (<unparseable REDIS_URL — redacted>)..."
+    echo "✗ Redis FAILED"
+    exit 1
+fi
+if [ "$scheme" != "redis" ]; then reject; fi
+case "$userinfo" in *:*) [ -n "${userinfo%%:*}" ] && reject ;; esac
+case "$hostport" in *\[*|*:*:*) reject ;; esac
+# The credential is the userinfo minus one leading separator colon; the
+# alphabet check runs on the FULL credential, so a ':' or '@' inside it is
+# refused, never truncated past.
+credential="${userinfo#:}"
+case "$credential" in *[!A-Za-z0-9._~-]*) reject ;; esac
+case "${REDIS_PASSWORD:-}" in *[!A-Za-z0-9._~-]*) reject ;; esac
+echo "Testing Redis (${scheme}) at ${hostport}..."
 
-if redis-cli -h "$redis_host" -p "$redis_port" ping | grep -q "PONG"; then
+# Authenticate via the REDISCLI_AUTH environment variable (redis-cli reads it
+# natively): the credential never appears in argv or process listings. The
+# password is the userinfo's password segment; a credential-free URL UNSETS
+# REDISCLI_AUTH first — an ambient shell credential must not authenticate the
+# probe against a deployment whose URL carries none (false all-clear).
+if [ -n "$userinfo" ]; then
+    REDISCLI_AUTH="${userinfo##*:}"
+    export REDISCLI_AUTH
+else
+    unset REDISCLI_AUTH
+fi
+host="${hostport%%:*}"
+port="${hostport#*:}"
+[ "$port" = "$host" ] && port=6379
+
+# -n selects the configured database — a redis://host:6379/3 deployment must
+# be verified against database 3, not 0 (a bare PING would false-OK). The db
+# segment must be numeric; anything else is rejected fail-closed above the
+# connection attempt. Unquoted $dbopt is safe: the value is validated digits.
+case "$db" in
+    "") dbopt="" ;;
+    *[!0-9]*) echo "Testing Redis (<non-numeric /db — redacted>)..."; echo "✗ Redis FAILED"; exit 1 ;;
+    *) dbopt="-n $db" ;;
+esac
+# shellcheck disable=SC2086 — $dbopt is validated digits or empty
+if redis-cli --no-auth-warning -h "$host" -p "$port" $dbopt ping | grep -q "PONG"; then
     echo "✓ Redis OK"
+    exit 0
 else
     echo "✗ Redis FAILED"
+    exit 1
 fi
 ```
 

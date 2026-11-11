@@ -21,7 +21,7 @@ import sys
 import tempfile
 import threading
 import unittest
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from queue import Empty, Queue
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -71,7 +71,9 @@ class _PoolWithConnectionCM:
         except Empty:
             return self._create_connection()
 
-    async def get_connection_async(self, max_wait_attempts: int = 3) -> sqlite3.Connection:
+    async def get_connection_async(
+        self, max_wait_attempts: int = 3
+    ) -> sqlite3.Connection:
         # #645: async helpers (set_phase) check out through the pool's async
         # surface; delegate to the sync checkout on a worker thread to match
         # the production off-loop contract.
@@ -103,6 +105,16 @@ class _PoolWithConnectionCM:
     @contextmanager
     def connection(self):
         conn = self.get_connection()
+        try:
+            yield conn
+        finally:
+            self.release_connection(conn)
+
+    @asynccontextmanager
+    async def connection_async(self, max_wait_attempts: int = 3):
+        # Review PRR-001: the upload commit task and its compensation check
+        # out through the async surface (mirrors test_draft_routes.py).
+        conn = await self.get_connection_async(max_wait_attempts)
         try:
             yield conn
         finally:
@@ -179,7 +191,9 @@ class DraftRoomTestBase(unittest.TestCase):
         app.dependency_overrides[get_db] = override_get_db
         app.dependency_overrides[csrf_protect] = lambda: "test-csrf"
         app.state.db_pool = self._connection_pool
-        app.state.csrf_manager = CSRFManager(redis_url="redis://localhost:6379/0", ttl=900)
+        app.state.csrf_manager = CSRFManager(
+            redis_url="redis://localhost:6379/0", ttl=900
+        )
 
         self._mock_vector_store = MagicMock()
         self._mock_vector_store.db = MagicMock()
@@ -194,9 +208,26 @@ class DraftRoomTestBase(unittest.TestCase):
         # directly like `get_vector_store` above.
         self._mock_background_processor = MagicMock()
         self._mock_background_processor.enqueue = AsyncMock(return_value=None)
-        app.dependency_overrides[get_background_processor] = (
-            lambda: self._mock_background_processor
+        app.dependency_overrides[get_background_processor] = lambda: (
+            self._mock_background_processor
         )
+
+        # Issues #902/#911: promote availability and the promote gate read the
+        # background processor; mount the same mock the dependency returns so
+        # capabilities report promote_available for these tests.
+        self._prev_bp = getattr(app.state, "background_processor", None)
+        self._had_bp = hasattr(app.state, "background_processor")
+        app.state.background_processor = self._mock_background_processor
+
+        # Worker liveness stubs (issues #902/#911): the enqueue routes gate on
+        # a live worker and capabilities derive availability from it; these
+        # tests never run lifespan, so stand in for started processors
+        # (presence is the liveness contract — test_draft_routes.py
+        # precedent). addCleanup restores whatever was mounted before.
+        self._prev_djp = getattr(app.state, "draft_job_processor", None)
+        self._had_djp = hasattr(app.state, "draft_job_processor")
+        app.state.draft_job_processor = object()
+        self.addCleanup(self._restore_worker_stubs)
 
         conn = self._connection_pool.get_connection()
         try:
@@ -225,6 +256,16 @@ class DraftRoomTestBase(unittest.TestCase):
             conn.commit()
         finally:
             self._connection_pool.release_connection(conn)
+
+    def _restore_worker_stubs(self) -> None:
+        if self._had_djp:
+            app.state.draft_job_processor = self._prev_djp
+        elif hasattr(app.state, "draft_job_processor"):
+            del app.state.draft_job_processor
+        if getattr(self, "_had_bp", False):
+            app.state.background_processor = self._prev_bp
+        elif hasattr(app.state, "background_processor") and hasattr(self, "_prev_bp"):
+            del app.state.background_processor
 
     def tearDown(self):
         from app.models.database import _pool_cache, _pool_cache_lock
@@ -265,7 +306,13 @@ class DraftRoomTestBase(unittest.TestCase):
         return self._headers(self.OTHER_ID, "other")
 
     def _create_draft(
-        self, *, headers=None, vault_id=READ_VAULT_ID, mode="rewrite", title="My Draft", brief=None
+        self,
+        *,
+        headers=None,
+        vault_id=READ_VAULT_ID,
+        mode="rewrite",
+        title="My Draft",
+        brief=None,
     ):
         headers = headers or self._owner_headers()
         resp = self.client.post(
@@ -317,7 +364,9 @@ class DraftPromoteTestBase(DraftRoomTestBase):
         finally:
             self._connection_pool.release_connection(conn)
 
-    def _create_revision(self, draft_id, *, content_md="# Body\n\nPromotable content.", lock_version=1):
+    def _create_revision(
+        self, draft_id, *, content_md="# Body\n\nPromotable content.", lock_version=1
+    ):
         return self.client.post(
             f"/api/draft-room/drafts/{draft_id}/revisions",
             json={
@@ -428,12 +477,16 @@ class TestPromoteInput(DraftPromoteTestBase):
     def test_promote_input_succeeds(self):
         content = b"Original manuscript bytes for promotion."
         draft_id = self._create_draft().json()["id"]
-        upload = self._upload_input(draft_id, content=content, filename="manuscript.txt")
+        upload = self._upload_input(
+            draft_id, content=content, filename="manuscript.txt"
+        )
         self.assertEqual(upload.status_code, 202, upload.text)
         input_id = upload.json()["input"]["id"]
         self._mark_input_ready(input_id)
 
-        resp = self._promote(draft_id, source_type="input", source_id=input_id, title="My Title")
+        resp = self._promote(
+            draft_id, source_type="input", source_id=input_id, title="My Title"
+        )
         self.assertEqual(resp.status_code, 202, resp.text)
         body = resp.json()
         self.assertEqual(body["draft_id"], draft_id)
@@ -567,7 +620,10 @@ class TestPromoteAuthorization(DraftPromoteTestBase):
         self._mark_input_ready(input_id)
 
         resp = self._promote(
-            draft_id, source_type="input", source_id=input_id, headers=self._other_headers()
+            draft_id,
+            source_type="input",
+            source_id=input_id,
+            headers=self._other_headers(),
         )
         self.assertEqual(resp.status_code, 404, resp.text)
 
@@ -603,9 +659,7 @@ class TestPromoteDisabled(DraftPromoteTestBase):
             with self.assertLogs(
                 "app.api.routes.draft_room", level="WARNING"
             ) as captured:
-                resp = self._promote(
-                    draft_id, source_type="input", source_id=input_id
-                )
+                resp = self._promote(draft_id, source_type="input", source_id=input_id)
         finally:
             settings.draft_room_enabled = True
 
@@ -631,12 +685,8 @@ class TestPromoteDisabled(DraftPromoteTestBase):
         self._mock_background_processor.enqueue = AsyncMock(
             side_effect=RuntimeError("queue unavailable")
         )
-        with self.assertLogs(
-            "app.api.routes.draft_room", level="ERROR"
-        ) as captured:
-            resp = self._promote(
-                draft_id, source_type="input", source_id=input_id
-            )
+        with self.assertLogs("app.api.routes.draft_room", level="ERROR") as captured:
+            resp = self._promote(draft_id, source_type="input", source_id=input_id)
 
         self.assertEqual(resp.status_code, 500, resp.text)
         self.assertTrue(
@@ -845,8 +895,12 @@ class TestPromoteConcurrentDuplicateContent(DraftPromoteTestBase):
         successes = [r for kind, r in outcomes if kind == "ok"]
         errors = [r for kind, r in outcomes if kind == "error"]
 
-        self.assertEqual(len(successes), 1, f"expected exactly one success, got {outcomes}")
-        self.assertEqual(len(errors), 1, f"expected exactly one rejection, got {outcomes}")
+        self.assertEqual(
+            len(successes), 1, f"expected exactly one success, got {outcomes}"
+        )
+        self.assertEqual(
+            len(errors), 1, f"expected exactly one rejection, got {outcomes}"
+        )
 
         winner = successes[0]
         loser = errors[0]
@@ -854,7 +908,9 @@ class TestPromoteConcurrentDuplicateContent(DraftPromoteTestBase):
         self.assertEqual(loser.existing_file_id, winner.file_id)
 
         self.assertEqual(len(self._files_rows()), 1)
-        self.assertEqual(len(self._promotion_rows(draft_1) + self._promotion_rows(draft_2)), 1)
+        self.assertEqual(
+            len(self._promotion_rows(draft_1) + self._promotion_rows(draft_2)), 1
+        )
         shared_processor.enqueue.assert_awaited_once()
 
 
@@ -1141,7 +1197,9 @@ class TestPromoteAtomicity(DraftPromoteTestBase):
         input_id = self._ready_input(draft_id)
 
         with patch.object(
-            draft_promotion_module, "set_phase", side_effect=RuntimeError("db unavailable")
+            draft_promotion_module,
+            "set_phase",
+            side_effect=RuntimeError("db unavailable"),
         ):
             resp = self._promote(draft_id, source_type="input", source_id=input_id)
 
@@ -1162,7 +1220,9 @@ class TestPromoteAtomicity(DraftPromoteTestBase):
         real_register_file = draft_promotion_module._register_file
 
         def _register_then_delete_draft(db_pool, dest_path, file_hash, vault_id):
-            created_file_id = real_register_file(db_pool, dest_path, file_hash, vault_id)
+            created_file_id = real_register_file(
+                db_pool, dest_path, file_hash, vault_id
+            )
             conn = self._connection_pool.get_connection()
             try:
                 conn.execute("DELETE FROM drafts WHERE id = ?", (draft_id,))
@@ -1172,7 +1232,9 @@ class TestPromoteAtomicity(DraftPromoteTestBase):
             return created_file_id
 
         with patch.object(
-            draft_promotion_module, "_register_file", side_effect=_register_then_delete_draft
+            draft_promotion_module,
+            "_register_file",
+            side_effect=_register_then_delete_draft,
         ):
             resp = self._promote(draft_id, source_type="input", source_id=input_id)
 
@@ -1197,12 +1259,14 @@ class TestPromoteRevisionSizeLimit(DraftPromoteTestBase):
         # to promote in the first place.
         settings.draft_max_total_parsed_chars = len(content_md) + 10
         try:
-            revision_id = self._create_revision(
-                draft_id, content_md=content_md
-            ).json()["summary"]["id"]
+            revision_id = self._create_revision(draft_id, content_md=content_md).json()[
+                "summary"
+            ]["id"]
 
             settings.max_file_size_mb = 1
-            resp = self._promote(draft_id, source_type="revision", source_id=revision_id)
+            resp = self._promote(
+                draft_id, source_type="revision", source_id=revision_id
+            )
         finally:
             settings.draft_max_total_parsed_chars = original_max_chars
             settings.max_file_size_mb = original_limit
@@ -1352,7 +1416,9 @@ class TestPromoteNeverAdoptsAnExistingFileRow(DraftPromoteTestBase):
             )
             conn.commit()
             before = dict(
-                conn.execute("SELECT * FROM files WHERE id = ?", (victim_id,)).fetchone()
+                conn.execute(
+                    "SELECT * FROM files WHERE id = ?", (victim_id,)
+                ).fetchone()
             )
         finally:
             self._connection_pool.release_connection(conn)
@@ -1382,7 +1448,9 @@ class TestPromoteNeverAdoptsAnExistingFileRow(DraftPromoteTestBase):
         conn = self._connection_pool.get_connection()
         try:
             after = dict(
-                conn.execute("SELECT * FROM files WHERE id = ?", (victim_id,)).fetchone()
+                conn.execute(
+                    "SELECT * FROM files WHERE id = ?", (victim_id,)
+                ).fetchone()
             )
             chunk_count = conn.execute(
                 "SELECT COUNT(*) c FROM failed_chunks WHERE file_id = ?", (victim_id,)
@@ -1443,7 +1511,9 @@ class TestPromoteCleanupFailureIsRecorded(DraftPromoteTestBase):
         self._mock_background_processor.enqueue = AsyncMock(
             side_effect=RuntimeError("queue unavailable")
         )
-        with patch.object(draft_promotion_module, "_delete_file_row", return_value=False):
+        with patch.object(
+            draft_promotion_module, "_delete_file_row", return_value=False
+        ):
             resp = self._promote(draft_id, source_type="input", source_id=input_id)
 
         self.assertEqual(resp.status_code, 500, resp.text)
@@ -1557,6 +1627,7 @@ class TestPromoteCancellation(DraftPromoteTestBase):
 
         async def _run():
             async with anyio.create_task_group() as tg:
+
                 async def _killer():
                     await anyio.sleep(0.05)
                     tg.cancel_scope.cancel()
@@ -1670,7 +1741,9 @@ class TestPromoteCorrelatedPoolExhaustion(DraftPromoteTestBase):
             return real_get()
 
         with (
-            patch.object(draft_promotion_module, "_register_file", side_effect=_register_then_arm),
+            patch.object(
+                draft_promotion_module, "_register_file", side_effect=_register_then_arm
+            ),
             patch.object(pool, "get_connection", side_effect=_gated_get),
         ):
             try:
@@ -1696,7 +1769,11 @@ class TestPromoteCorrelatedPoolExhaustion(DraftPromoteTestBase):
         self.assertNotIn("Could not obtain a connection", body["detail"])
 
         files = self._files_rows()
-        self.assertEqual(len(files), 1, "the orphan is real -- the pool genuinely could not clean it up")
+        self.assertEqual(
+            len(files),
+            1,
+            "the orphan is real -- the pool genuinely could not clean it up",
+        )
 
         cleanup_events = self._security_audit_rows("draft_promotion_cleanup_failed")
         self.assertEqual(

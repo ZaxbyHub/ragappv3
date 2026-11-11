@@ -212,3 +212,16 @@ def test_all_redis_write_references_live_in_one_helper_called_from_three_defs():
         f"the shared write helper must be called from at least 3 call sites "
         f"(transform step-back, HyDE, planner); found {call_sites}"
     )
+
+
+def test_prompt_version_is_v3_for_the_884_925_round():
+    """Review pr1105-20261109 PRR-002: the planner prompt changed and cached
+    payload semantics changed (values unescaped before use), so v2 entries
+    must stop serving. Pins the exact current version so a silent revert to
+    "v2" fails."""
+    assert PROMPT_VERSION == "v3", (
+        "PROMPT_VERSION must stay at v3 for the #884/#925 round (planner "
+        "SECURITY BOUNDARY clause + unescaped cached payloads). If you are "
+        "bumping for a NEW prompt change, advance past v3 and update this "
+        "pin."
+    )

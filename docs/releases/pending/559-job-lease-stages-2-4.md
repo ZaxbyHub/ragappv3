@@ -67,7 +67,10 @@
   `failed` with error `lease_attempt_cap_exceeded` (janitor-settled) or
   `attempt_cap_exceeded` (worker-settled) means the job exceeded
   `JOBS_MAX_ATTEMPTS` across crash/reclaim cycles — re-trigger the work or
-  raise the cap. Draft reclaims use the same cap; a draft job that keeps
+  raise the cap. On the ingestion queue, `failed` with error
+  `DIMENSION_CHANGED: ...` (#820) settles terminally on the first attempt —
+  run the admin reindex job to migrate the index, then re-ingest (re-uploading
+  or raising the cap cannot succeed). Draft reclaims use the same cap; a draft job that keeps
   crashing now settles `failed` instead of being resurrected on every
   restart.
 - Rollback: set the relevant switch(es) to `false` and restart. The legacy

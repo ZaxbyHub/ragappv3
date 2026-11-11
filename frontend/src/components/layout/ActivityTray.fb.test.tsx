@@ -14,6 +14,7 @@
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -119,7 +120,12 @@ beforeEach(() => {
 describe("ActivityTray feedback-round assertions (853-20261005)", () => {
   it("offers no Cancel on kms/reindex rows and no Retry on live ingest rows", () => {
     hookRows = [
-      makeRow({ family: "kms", key: "kms-11", title: "KMS recompile", status: "running" }),
+      makeRow({
+        family: "kms",
+        key: "kms-11",
+        title: "KMS recompile",
+        status: "running",
+      }),
       makeRow({
         family: "reindex",
         key: "reindex-21",
@@ -135,13 +141,31 @@ describe("ActivityTray feedback-round assertions (853-20261005)", () => {
         fileId: "42",
       }),
     ];
-    render(<ActivityTray />);
+    render(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <ActivityTray />
+      </QueryClientProvider>,
+    );
 
-    expect(within(rowByFamily("kms")).queryByRole("button", { name: /cancel/i })).toBeNull();
-    expect(within(rowByFamily("kms")).queryByRole("button", { name: /retry/i })).toBeNull();
-    expect(within(rowByFamily("reindex")).queryByRole("button", { name: /cancel/i })).toBeNull();
-    expect(within(rowByFamily("ingest")).queryByRole("button", { name: /retry/i })).toBeNull();
-    expect(within(rowByFamily("ingest")).getByRole("button", { name: /cancel/i })).toBeDefined();
+    expect(
+      within(rowByFamily("kms")).queryByRole("button", { name: /cancel/i }),
+    ).toBeNull();
+    expect(
+      within(rowByFamily("kms")).queryByRole("button", { name: /retry/i }),
+    ).toBeNull();
+    expect(
+      within(rowByFamily("reindex")).queryByRole("button", { name: /cancel/i }),
+    ).toBeNull();
+    expect(
+      within(rowByFamily("ingest")).queryByRole("button", { name: /retry/i }),
+    ).toBeNull();
+    expect(
+      within(rowByFamily("ingest")).getByRole("button", { name: /cancel/i }),
+    ).toBeDefined();
   });
 
   it("asserts family labels row-scoped (each family text inside its own listitem)", () => {
@@ -152,18 +176,36 @@ describe("ActivityTray feedback-round assertions (853-20261005)", () => {
       makeRow({ family: "kms", key: "k-1", title: "KMS recompile" }),
       makeRow({ family: "reindex", key: "r-1", title: "Embedding reindex" }),
     ];
-    render(<ActivityTray />);
+    render(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <ActivityTray />
+      </QueryClientProvider>,
+    );
 
     for (const family of ["ingest", "wiki", "draft-room", "kms", "reindex"]) {
       const row = rowByFamily(family);
-      expect(within(row).getAllByText(new RegExp(family, "i")).length).toBeGreaterThan(0);
+      expect(
+        within(row).getAllByText(new RegExp(family, "i")).length,
+      ).toBeGreaterThan(0);
     }
   });
 
   it("collapses the list via Hide and keeps the count visible while collapsed", async () => {
     const user = userEvent.setup();
     hookRows = [makeRow({ family: "wiki", key: "w-1", title: "Wiki compile" })];
-    render(<ActivityTray />);
+    render(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <ActivityTray />
+      </QueryClientProvider>,
+    );
 
     expect(screen.getAllByRole("listitem")).toHaveLength(1);
     await user.click(screen.getByRole("button", { name: /hide/i }));
@@ -182,7 +224,7 @@ describe("ActivityTray feedback-round assertions (853-20261005)", () => {
       () =>
         new Promise((resolve) => {
           release = () => resolve({ job_id: 7, status: "cancelled" });
-        })
+        }),
     );
     hookRows = [
       makeRow({
@@ -194,9 +236,19 @@ describe("ActivityTray feedback-round assertions (853-20261005)", () => {
         vaultId: 3,
       }),
     ];
-    render(<ActivityTray />);
+    render(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <ActivityTray />
+      </QueryClientProvider>,
+    );
 
-    const cancel = within(rowByFamily("wiki")).getByRole("button", { name: /cancel/i });
+    const cancel = within(rowByFamily("wiki")).getByRole("button", {
+      name: /cancel/i,
+    });
     await user.click(cancel);
     expect(cancel).toBeDisabled();
 
@@ -211,7 +263,7 @@ describe("ActivityTray feedback-round assertions (853-20261005)", () => {
     mockCancelWikiJob.mockRejectedValue(
       Object.assign(new Error("Insufficient vault permissions"), {
         response: { status: 403 },
-      })
+      }),
     );
     hookRows = [
       makeRow({
@@ -223,13 +275,25 @@ describe("ActivityTray feedback-round assertions (853-20261005)", () => {
         vaultId: 3,
       }),
     ];
-    render(<ActivityTray />);
+    render(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <ActivityTray />
+      </QueryClientProvider>,
+    );
 
-    const cancel = within(rowByFamily("wiki")).getByRole("button", { name: /cancel/i });
+    const cancel = within(rowByFamily("wiki")).getByRole("button", {
+      name: /cancel/i,
+    });
     await user.click(cancel);
 
     await waitFor(() => {
-      expect(within(rowByFamily("wiki")).queryByRole("button", { name: /cancel/i })).toBeNull();
+      expect(
+        within(rowByFamily("wiki")).queryByRole("button", { name: /cancel/i }),
+      ).toBeNull();
     });
   });
 
@@ -238,7 +302,7 @@ describe("ActivityTray feedback-round assertions (853-20261005)", () => {
     mockRetryWikiJob.mockRejectedValue(
       Object.assign(new Error("Insufficient vault permissions"), {
         response: { status: 403 },
-      })
+      }),
     );
     hookRows = [
       makeRow({
@@ -253,12 +317,24 @@ describe("ActivityTray feedback-round assertions (853-20261005)", () => {
         vaultId: 3,
       }),
     ];
-    render(<ActivityTray />);
+    render(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <ActivityTray />
+      </QueryClientProvider>,
+    );
 
-    await user.click(within(rowByFamily("wiki")).getByRole("button", { name: /retry/i }));
+    await user.click(
+      within(rowByFamily("wiki")).getByRole("button", { name: /retry/i }),
+    );
 
     await waitFor(() => {
-      expect(within(rowByFamily("wiki")).queryByRole("button", { name: /retry/i })).toBeNull();
+      expect(
+        within(rowByFamily("wiki")).queryByRole("button", { name: /retry/i }),
+      ).toBeNull();
     });
   });
 
@@ -275,15 +351,27 @@ describe("ActivityTray feedback-round assertions (853-20261005)", () => {
         vaultId: 3,
       }),
     ];
-    render(<ActivityTray />);
+    render(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <ActivityTray />
+      </QueryClientProvider>,
+    );
 
-    await user.click(within(rowByFamily("wiki")).getByRole("button", { name: /cancel/i }));
+    await user.click(
+      within(rowByFamily("wiki")).getByRole("button", { name: /cancel/i }),
+    );
 
     await waitFor(() => {
       expect(mockToastError).toHaveBeenCalledWith("network down");
     });
     // A non-403 failure does NOT remove the affordance.
-    expect(within(rowByFamily("wiki")).queryByRole("button", { name: /cancel/i })).not.toBeNull();
+    expect(
+      within(rowByFamily("wiki")).queryByRole("button", { name: /cancel/i }),
+    ).not.toBeNull();
   });
 
   it("triggers the hook refresh after an action settles (finally-refresh is asserted, not decorative)", async () => {
@@ -304,9 +392,19 @@ describe("ActivityTray feedback-round assertions (853-20261005)", () => {
       refresh: mockRefresh,
     }));
     mockCancelWikiJob.mockResolvedValue({ job_id: 7, status: "cancelled" });
-    render(<ActivityTray />);
+    render(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <ActivityTray />
+      </QueryClientProvider>,
+    );
 
-    await user.click(within(rowByFamily("wiki")).getByRole("button", { name: /cancel/i }));
+    await user.click(
+      within(rowByFamily("wiki")).getByRole("button", { name: /cancel/i }),
+    );
 
     await waitFor(() => {
       expect(mockRefresh).toHaveBeenCalledTimes(1);
@@ -326,23 +424,43 @@ describe("ActivityTray feedback-round assertions (853-20261005)", () => {
       }),
       makeRow({ family: "kms", key: "kms-11", title: "KMS recompile" }),
     ];
-    const { rerender } = render(<ActivityTray />);
+    const { rerender } = render(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <ActivityTray />
+      </QueryClientProvider>,
+    );
 
     // Focus a control inside the focused row (negative fixture first: focus
     // OUTSIDE the tray must never be stolen by the guard).
-    await user.click(within(rowByFamily("wiki")).getByRole("button", { name: /cancel/i }));
+    await user.click(
+      within(rowByFamily("wiki")).getByRole("button", { name: /cancel/i }),
+    );
     // Resolve the click's async continuation so the button is re-enabled
     // (mockCancelWikiJob resolves in beforeEach) and focus sits on it.
     await waitFor(() => {
       expect(
-        document.activeElement?.closest('[aria-label="Activity"]')
+        document.activeElement?.closest('[aria-label="Activity"]'),
       ).not.toBeNull();
     });
 
     // Poll tick: the focused row vanishes (cancelled rows drop from the
     // pending/processing windows the adapters poll).
-    hookRows = [makeRow({ family: "kms", key: "kms-11", title: "KMS recompile" })];
-    rerender(<ActivityTray />);
+    hookRows = [
+      makeRow({ family: "kms", key: "kms-11", title: "KMS recompile" }),
+    ];
+    rerender(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <ActivityTray />
+      </QueryClientProvider>,
+    );
 
     const header = screen.getByRole("button", { name: /activity/i });
     await waitFor(() => {
@@ -356,15 +474,26 @@ describe("ActivityTray feedback-round assertions (853-20261005)", () => {
     document.body.appendChild(bodyTarget);
     bodyTarget.focus();
     hookRows = [];
-    rerender(<ActivityTray />);
+    rerender(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <ActivityTray />
+      </QueryClientProvider>,
+    );
     expect(document.activeElement).toBe(bodyTarget);
     bodyTarget.remove();
   });
 
   it("never imports the client upload store (server-sourced constraint tripwire)", () => {
     const traySource = readFileSync(
-      path.join(path.dirname(fileURLToPath(import.meta.url)), "ActivityTray.tsx"),
-      "utf8"
+      path.join(
+        path.dirname(fileURLToPath(import.meta.url)),
+        "ActivityTray.tsx",
+      ),
+      "utf8",
     );
     expect(traySource).not.toMatch(/useUploadStore|stores\/useUploadStore/);
   });

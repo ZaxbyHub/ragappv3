@@ -102,6 +102,18 @@ class LRUCache:
         self._misses = 0
 
 
+class EmbeddingProgressLost(Exception):
+    """The embedding stage lost its job-progress fence mid-batch (issue #1020).
+
+    Raised by :meth:`EmbeddingService.embed_batch` after the batch gather when
+    the caller-supplied ``progress_cb`` recorded a lost fence (its fenced
+    watermark stamp matched zero rows — the lease no longer belongs to this
+    attempt). This is control flow, not an embedding failure: no vector writes
+    should follow it, and the reindex per-file loop converts it to the
+    lease-stop path. Never raised when no ``progress_cb`` was supplied.
+    """
+
+
 class EmbeddingError(Exception):
     """Exception raised for embedding service errors."""
 
@@ -1274,7 +1286,12 @@ class EmbeddingService:
         return True
 
     async def embed_batch(
-        self, texts: List[str], batch_size: int | None = None, fail_fast: bool = True
+        self,
+        texts: List[str],
+        batch_size: int | None = None,
+        fail_fast: bool = True,
+        *,
+        progress_cb: Optional[Callable[[], Awaitable[None]]] = None,
     ) -> List[List[float]] | tuple[List[Optional[List[float]]], List[int]]:
         """
         Generate embeddings for a batch of texts using true API batching.
@@ -1378,18 +1395,61 @@ class EmbeddingService:
         all_embeddings: List[List[float]] = []
         sem = asyncio.Semaphore(settings.embedding_concurrent_batches)
 
+        class _BatchProgressLost(Exception):
+            """Internal: this batch was skipped because the fence was lost."""
+
+        def _progress_lost() -> bool:
+            return progress_cb is not None and bool(
+                getattr(progress_cb, "lost", False)
+            )
+
         async def _process_batch(batch_texts: List[str]) -> List[List[float]]:
-            if config.mode == "ollama" and config.ollama_style == "legacy":
-                # Legacy fan-out: the per-call semaphore bounds the fan-out as
-                # one unit; each per-item request acquires the process-wide
-                # batch admission semaphore inside _embed_legacy_batch. The
-                # parent must NOT hold a global slot here — the items take
-                # their own, and asyncio.Semaphore is not reentrant.
+            # Issue #1020 (batch-level stop): a queued wrapper whose fenced
+            # watermark refresh recorded a lost lease fence must not dispatch
+            # to the provider. The check runs before the semaphores AND after
+            # acquiring them — a wrapper can acquire long after the loss was
+            # recorded by an earlier batch. Batches already inside a provider
+            # call when the loss fires still complete (disclosed).
+            if _progress_lost():
+                raise _BatchProgressLost()
+            dispatched = False
+            try:
+                if config.mode == "ollama" and config.ollama_style == "legacy":
+                    # Legacy fan-out: the per-call semaphore bounds the
+                    # fan-out as one unit; each per-item request acquires the
+                    # process-wide batch admission semaphore inside
+                    # _embed_legacy_batch. The parent must NOT hold a global
+                    # slot here — the items take their own, and
+                    # asyncio.Semaphore is not reentrant.
+                    async with sem:
+                        if _progress_lost():
+                            raise _BatchProgressLost()
+                        dispatched = True
+                        return await self._embed_batch_api(batch_texts, config)
                 async with sem:
-                    return await self._embed_batch_api(batch_texts, config)
-            async with sem:
-                async with self._get_global_batch_semaphore():
-                    return await self._embed_batch_api(batch_texts, config)
+                    async with self._get_global_batch_semaphore():
+                        if _progress_lost():
+                            raise _BatchProgressLost()
+                        dispatched = True
+                        return await self._embed_batch_api(batch_texts, config)
+            finally:
+                # Per-batch progress: refresh the caller's watermark after
+                # every dispatched batch (success OR provider failure — a
+                # failing batch still advanced the work). The callback is
+                # contractually non-raising; the belt guards against a
+                # misbehaving double corrupting failed-batch semantics.
+                if dispatched and progress_cb is not None:
+                    try:
+                        await progress_cb()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:  # noqa: BLE001 — callback contract
+                        logger.debug(
+                            "progress callback raised (contract violation); "
+                            "ignored to protect failed-batch semantics "
+                            "(issue #1020)",
+                            exc_info=True,
+                        )
 
         # Token-cost-bounded batching (issue #513 W23 / RC-21e): in addition
         # to the per-batch count limit, a batch is closed BEFORE adding a
@@ -1419,6 +1479,15 @@ class EmbeddingService:
         batch_tasks = [_process_batch(batch) for _start, batch in batches]
 
         batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+
+        if progress_cb is not None and _progress_lost():
+            # Issue #1020: the attempt lost its progress fence mid-batch —
+            # control flow, not an embedding failure. Raise before any result
+            # processing so no vector writes follow a lost lease.
+            raise EmbeddingProgressLost(
+                "embedding stage lost its progress fence mid-batch "
+                "(issue #1020); no batch results are returned"
+            )
 
         if fail_fast:
             for result in batch_results:

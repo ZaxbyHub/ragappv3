@@ -10,7 +10,10 @@ import {
   EXPORT_REVIEW_EXPLANATION,
   EXPORT_UNVERIFIED_EXPLANATION,
 } from "./labels";
-import type { DraftRevisionSummary, DraftRoomCapabilities } from "@/lib/api/draftRoom";
+import type {
+  DraftRevisionSummary,
+  DraftRoomCapabilities,
+} from "@/lib/api/draftRoom";
 
 // jsdom has no ResizeObserver; Radix's Checkbox and Select need it.
 class MockResizeObserver {
@@ -30,7 +33,9 @@ vi.mock("sonner", () => ({
 }));
 
 vi.mock("@/lib/api/draftRoom", async () => {
-  const actual = await vi.importActual<typeof import("@/lib/api/draftRoom")>("@/lib/api/draftRoom");
+  const actual = await vi.importActual<typeof import("@/lib/api/draftRoom")>(
+    "@/lib/api/draftRoom",
+  );
   return {
     ...actual,
     exportDraftRevision: mockExportDraftRevision,
@@ -38,7 +43,9 @@ vi.mock("@/lib/api/draftRoom", async () => {
   };
 });
 
-function makeCapabilities(overrides: Partial<DraftRoomCapabilities> = {}): DraftRoomCapabilities {
+function makeCapabilities(
+  overrides: Partial<DraftRoomCapabilities> = {},
+): DraftRoomCapabilities {
   return {
     enabled: true,
     modes: ["compose", "rewrite"],
@@ -50,10 +57,21 @@ function makeCapabilities(overrides: Partial<DraftRoomCapabilities> = {}): Draft
     logical_model_modes: ["instant", "thinking"],
     default_logical_mode: "instant",
     compile_start_stages: ["research"],
-    compile_stage_order: ["intake", "research", "outline", "draft", "lint", "copy", "standards", "fact", "assemble"],
+    compile_stage_order: [
+      "intake",
+      "research",
+      "outline",
+      "draft",
+      "lint",
+      "copy",
+      "standards",
+      "fact",
+      "assemble",
+    ],
     prompt_bundle_version: "v1",
     editorial_gates_installed: true,
     compile_available: true,
+    upload_available: true,
     findings_available: true,
     claims_available: true,
     evidence_available: true,
@@ -63,7 +81,9 @@ function makeCapabilities(overrides: Partial<DraftRoomCapabilities> = {}): Draft
   };
 }
 
-function makeRevision(overrides: Partial<DraftRevisionSummary> = {}): DraftRevisionSummary {
+function makeRevision(
+  overrides: Partial<DraftRevisionSummary> = {},
+): DraftRevisionSummary {
   return {
     id: 501,
     revision_no: 3,
@@ -79,8 +99,12 @@ function makeRevision(overrides: Partial<DraftRevisionSummary> = {}): DraftRevis
   };
 }
 
-function renderDialog(props: Partial<React.ComponentProps<typeof DraftExportDialog>> = {}) {
-  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+function renderDialog(
+  props: Partial<React.ComponentProps<typeof DraftExportDialog>> = {},
+) {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
   const onOpenChange = vi.fn();
   const utils = render(
     <QueryClientProvider client={queryClient}>
@@ -92,7 +116,7 @@ function renderDialog(props: Partial<React.ComponentProps<typeof DraftExportDial
         isReadyRevision={false}
         {...props}
       />
-    </QueryClientProvider>
+    </QueryClientProvider>,
   );
   return { ...utils, onOpenChange };
 }
@@ -114,7 +138,9 @@ describe("DraftExportDialog", () => {
   it("focuses the dialog heading on open, not the format select", async () => {
     renderDialog();
     await waitFor(() => {
-      expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Export" }));
+      expect(document.activeElement).toBe(
+        screen.getByRole("heading", { name: "Export" }),
+      );
     });
   });
 
@@ -134,7 +160,9 @@ describe("DraftExportDialog", () => {
     try {
       renderDialog();
       await waitFor(() => {
-        expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Export" }));
+        expect(document.activeElement).toBe(
+          screen.getByRole("heading", { name: "Export" }),
+        );
       });
       expect(focusedTags[0]).toBe("H2:Export");
       expect(focusedTags).toHaveLength(1);
@@ -148,7 +176,9 @@ describe("DraftExportDialog", () => {
       revision: makeRevision({ fact_status: "findings" }),
       isReadyRevision: false,
     });
-    expect(await screen.findByText("Fact-checked with findings")).toBeInTheDocument();
+    expect(
+      await screen.findByText("Fact-checked with findings"),
+    ).toBeInTheDocument();
     expect(screen.getByText("Not ready")).toBeInTheDocument();
     expect(mockExportDraftRevision).not.toHaveBeenCalled();
   });
@@ -160,7 +190,7 @@ describe("DraftExportDialog", () => {
       await screen.findByText(EXPORT_UNVERIFIED_EXPLANATION);
       expect(screen.getByText(EXPORT_ACK_LABEL)).toBeInTheDocument();
       expect(screen.getByRole("button", { name: "Export" })).toBeDisabled();
-    }
+    },
   );
 
   it.each(["passed", "findings"] as const)(
@@ -170,17 +200,27 @@ describe("DraftExportDialog", () => {
       await waitFor(() => expect(mockGetCapabilities).toHaveBeenCalled());
       expect(screen.queryByText(EXPORT_ACK_LABEL)).not.toBeInTheDocument();
       expect(screen.getByRole("button", { name: "Export" })).toBeEnabled();
-    }
+    },
   );
 
   it("shows the REVIEW explanation for a fact-current, not-yet-Ready revision", async () => {
-    renderDialog({ revision: makeRevision({ fact_status: "passed" }), isReadyRevision: false });
-    expect(await screen.findByText(EXPORT_REVIEW_EXPLANATION)).toBeInTheDocument();
+    renderDialog({
+      revision: makeRevision({ fact_status: "passed" }),
+      isReadyRevision: false,
+    });
+    expect(
+      await screen.findByText(EXPORT_REVIEW_EXPLANATION),
+    ).toBeInTheDocument();
   });
 
   it("shows the ordinary-filename explanation for the current Ready revision", async () => {
-    renderDialog({ revision: makeRevision({ fact_status: "passed" }), isReadyRevision: true });
-    expect(await screen.findByText(EXPORT_READY_EXPLANATION)).toBeInTheDocument();
+    renderDialog({
+      revision: makeRevision({ fact_status: "passed" }),
+      isReadyRevision: true,
+    });
+    expect(
+      await screen.findByText(EXPORT_READY_EXPLANATION),
+    ).toBeInTheDocument();
   });
 
   it("downloads using the server-provided filename and the exact blob, then revokes the object URL", async () => {
@@ -196,24 +236,34 @@ describe("DraftExportDialog", () => {
 
     let capturedAnchor: HTMLAnchorElement | null = null;
     const originalCreateElement = document.createElement.bind(document);
-    vi.spyOn(document, "createElement").mockImplementation((tagName: string) => {
-      const el = originalCreateElement(tagName);
-      if (tagName.toLowerCase() === "a") capturedAnchor = el as HTMLAnchorElement;
-      return el;
-    });
+    vi.spyOn(document, "createElement").mockImplementation(
+      (tagName: string) => {
+        const el = originalCreateElement(tagName);
+        if (tagName.toLowerCase() === "a")
+          capturedAnchor = el as HTMLAnchorElement;
+        return el;
+      },
+    );
 
-    renderDialog({ revision: makeRevision({ fact_status: "passed" }), isReadyRevision: false });
+    renderDialog({
+      revision: makeRevision({ fact_status: "passed" }),
+      isReadyRevision: false,
+    });
     await screen.findByText(EXPORT_REVIEW_EXPLANATION);
 
     await user.click(screen.getByRole("button", { name: "Export" }));
 
-    await waitFor(() => expect(mockExportDraftRevision).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(mockExportDraftRevision).toHaveBeenCalledTimes(1),
+    );
     expect(mockExportDraftRevision).toHaveBeenCalledWith(42, 501, {
       format: "md",
       acknowledge_not_fact_checked: false,
     });
 
-    await waitFor(() => expect(global.URL.createObjectURL).toHaveBeenCalledWith(blob));
+    await waitFor(() =>
+      expect(global.URL.createObjectURL).toHaveBeenCalledWith(blob),
+    );
     expect(capturedAnchor?.download).toBe("q3-release-rev3-REVIEW.md");
     expect(global.URL.revokeObjectURL).toHaveBeenCalledWith("blob:mock-url");
   });
@@ -234,10 +284,13 @@ describe("DraftExportDialog", () => {
     await user.click(screen.getByRole("checkbox"));
     await user.click(screen.getByRole("button", { name: "Export" }));
 
-    await waitFor(() => expect(global.URL.createObjectURL).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(global.URL.createObjectURL).toHaveBeenCalledTimes(1),
+    );
     // The exact same Blob reference reaches the download call — nothing wraps or rewrites it.
     expect(global.URL.createObjectURL).toHaveBeenCalledWith(blob);
-    const passedBlob = (global.URL.createObjectURL as ReturnType<typeof vi.fn>).mock.calls[0][0] as Blob;
+    const passedBlob = (global.URL.createObjectURL as ReturnType<typeof vi.fn>)
+      .mock.calls[0][0] as Blob;
     expect(passedBlob.size).toBe(blob.size);
   });
 
@@ -260,7 +313,7 @@ describe("DraftExportDialog", () => {
       expect(mockExportDraftRevision).toHaveBeenCalledWith(42, 501, {
         format: "md",
         acknowledge_not_fact_checked: true,
-      })
+      }),
     );
   });
 });

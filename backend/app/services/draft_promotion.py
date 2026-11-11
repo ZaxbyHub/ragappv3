@@ -79,7 +79,7 @@ from app.services.document_progress import PHASE_QUEUED, set_phase
 from app.services.draft_input_storage import DraftInputStorage
 from app.services.draft_store import DraftInputRecord, DraftRevisionRecord
 from app.services.upload_path import UploadPathProvider
-from app.services.upload_validation import secure_filename
+from app.services.upload_validation import fold_title_separators, secure_filename
 from app.utils.file_utils import compute_file_hash
 
 logger = logging.getLogger(__name__)
@@ -172,7 +172,10 @@ class DraftPromotionResult:
 
 
 def _destination_filename(title: str, extension: str) -> str:
-    stem = secure_filename(title) or _FALLBACK_STEM
+    # The draft TITLE is content, not a client path: fold separators before
+    # sanitizing so "Q3/Q4 plan" keeps its "Q3" (issue #902; the same fold
+    # #789 shipped for draft export filenames).
+    stem = secure_filename(fold_title_separators(title)) or _FALLBACK_STEM
     stem = stem[:_MAX_FILENAME_STEM_CHARS] or _FALLBACK_STEM
     return f"{stem}{extension}"
 
@@ -205,7 +208,9 @@ def _reserve_destination_path(upload_dir: Path, file_name: str) -> Path:
             if exc.errno != errno.EEXIST:
                 raise
             counter += 1
-            file_path = upload_dir / f"{original_path.stem}_{counter}{original_path.suffix}"
+            file_path = (
+                upload_dir / f"{original_path.stem}_{counter}{original_path.suffix}"
+            )
 
     # Defense-in-depth containment re-check (documents.py:1673-1685). The
     # collision loop only ever appends inside `upload_dir`, so no traversal
@@ -216,12 +221,16 @@ def _reserve_destination_path(upload_dir: Path, file_name: str) -> Path:
         resolved_upload_dir = upload_dir.resolve()
         if not str(resolved_path).startswith(str(resolved_upload_dir)):
             file_path.unlink(missing_ok=True)
-            raise DraftPromotionError("resolved destination path escapes the upload directory")
+            raise DraftPromotionError(
+                "resolved destination path escapes the upload directory"
+            )
     except DraftPromotionError:
         raise
     except (OSError, ValueError) as exc:
         file_path.unlink(missing_ok=True)
-        raise DraftPromotionError("failed to validate destination path containment") from exc
+        raise DraftPromotionError(
+            "failed to validate destination path containment"
+        ) from exc
 
     return file_path
 
@@ -256,6 +265,7 @@ def _reap_detached_temp(temp: Path, worker_done: threading.Event) -> None:
     survivor is a canonical ``.part`` that ``FileWatcher`` skips, never
     ingestable bytes.
     """
+
     async def _reap() -> None:
         for _ in range(600):  # bounded: ~60s at 100ms for the worker to end
             if worker_done.is_set():
@@ -332,7 +342,9 @@ async def _write_bytes_via_temp(write_bytes, dest: Path) -> None:
         raise
 
 
-def _copy_input_bytes(storage: DraftInputStorage, input_record: DraftInputRecord, dest: Path) -> None:
+def _copy_input_bytes(
+    storage: DraftInputStorage, input_record: DraftInputRecord, dest: Path
+) -> None:
     source_path = storage.resolve(input_record.storage_relpath)
     shutil.copy2(source_path, dest)
 
@@ -357,7 +369,9 @@ def _enforce_size_limit(dest_path: Path) -> None:
         )
 
 
-def _register_file(db_pool: SQLiteConnectionPool, dest_path: Path, file_hash: str, vault_id: int) -> int:
+def _register_file(
+    db_pool: SQLiteConnectionPool, dest_path: Path, file_hash: str, vault_id: int
+) -> int:
     """Promotion's own exclusive ``files`` row registration: the
     duplicate-content check, the path-conflict check, and the insert all run
     inside one ``BEGIN IMMEDIATE`` transaction on one connection.
@@ -443,7 +457,9 @@ def _register_file(db_pool: SQLiteConnectionPool, dest_path: Path, file_hash: st
             )
             new_file_id = cursor.lastrowid
             if new_file_id is None:
-                raise DraftPromotionError("failed to insert files row: lastrowid is None")
+                raise DraftPromotionError(
+                    "failed to insert files row: lastrowid is None"
+                )
             conn.commit()
             return int(new_file_id)
         except BaseException:
@@ -656,7 +672,7 @@ async def _compensate(
     ``files`` row (only ever one this attempt itself inserted), and the copied
     bytes.
 
-    Never raises. Each step is independently guarded so a failure in one
+    Never raises except a recorded asyncio.CancelledError, which is re-raised after every step has run (issue #913's class: a mid-compensation cancel must not skip the remaining cleanup). Each step is independently guarded so a failure in one
     does not stop the others from running, and nothing here can replace or
     mask the exception the caller is already handling — that guard is
     layered on top of ``_delete_file_row``/``_delete_promotion_row``
@@ -665,6 +681,7 @@ async def _compensate(
     succeeded; ``False`` means an orphan may genuinely still exist somewhere.
     """
     cleanup_ok = True
+    cancelled: dict[str, BaseException] = {}
     if enqueued_file_id is not None:
         # DRAFT-023 (issue #516): the enqueue try-step may have durably
         # queued an ingestion job before the failure landed (e.g. a
@@ -689,6 +706,8 @@ async def _compensate(
                 await cancel_async(file_id=enqueued_file_id)
             else:
                 background_processor.cancel_pending_jobs(file_id=enqueued_file_id)
+        except asyncio.CancelledError as exc:
+            cancelled["exc"] = exc
         except Exception:
             cleanup_ok = False
             logger.warning(
@@ -699,8 +718,12 @@ async def _compensate(
             )
     if promotion_id is not None:
         try:
-            if not await asyncio.to_thread(_delete_promotion_row, db_pool, promotion_id):
+            if not await asyncio.to_thread(
+                _delete_promotion_row, db_pool, promotion_id
+            ):
                 cleanup_ok = False
+        except asyncio.CancelledError as exc:
+            cancelled["exc"] = exc
         except Exception:
             cleanup_ok = False
             logger.warning(
@@ -712,6 +735,8 @@ async def _compensate(
         try:
             if not await asyncio.to_thread(_delete_file_row, db_pool, file_id):
                 cleanup_ok = False
+        except asyncio.CancelledError as exc:
+            cancelled["exc"] = exc
         except Exception:
             cleanup_ok = False
             logger.warning(
@@ -722,6 +747,8 @@ async def _compensate(
     try:
         if not await asyncio.to_thread(_discard_safe, dest_path):
             cleanup_ok = False
+    except asyncio.CancelledError as exc:
+        cancelled["exc"] = exc
     except Exception:
         cleanup_ok = False
         logger.warning(
@@ -729,6 +756,12 @@ async def _compensate(
             "unexpectedly for %s",
             dest_path,
         )
+    if "exc" in cancelled:
+        # A native task.cancel() delivered mid-step must not skip the
+        # remaining cleanup steps (issue #913's class): every step ran, and
+        # the cancellation is re-raised so shutdown still unwinds.
+        raise cancelled["exc"]
+
     return cleanup_ok
 
 
@@ -858,7 +891,9 @@ async def _promote(
         await _write_bytes_via_temp(write_bytes, dest_path)
         await asyncio.to_thread(_enforce_size_limit, dest_path)
         source_sha256 = await asyncio.to_thread(compute_file_hash, str(dest_path))
-        file_id = await asyncio.to_thread(_register_file, db_pool, dest_path, source_sha256, vault_id)
+        file_id = await asyncio.to_thread(
+            _register_file, db_pool, dest_path, source_sha256, vault_id
+        )
         promotion_id, created_at = await asyncio.to_thread(
             _insert_promotion_row,
             db_pool,
@@ -888,7 +923,9 @@ async def _promote(
         # Cancellation/interrupt must unwind as itself, never be reported as
         # a promotion failure — but compensation still runs first, shielded
         # so it cannot itself be cut short by the same cancellation.
-        is_control_flow = isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit))
+        is_control_flow = isinstance(
+            exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)
+        )
 
         cleanup_ok = await _compensate_shielded(
             db_pool,
