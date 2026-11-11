@@ -1393,6 +1393,23 @@ class RAGEngine:
         # memory latency with the expensive vector search + rerank + CRAG phase
         # instead of paying it sequentially afterward.
         memory_task: Optional[asyncio.Task] = None
+        kms_task: Optional[asyncio.Task] = None
+
+        def _cancel_overlap_tasks() -> None:
+            """Cancel in-flight overlap tasks on early exits (RAG-DEEP-03).
+
+            Both the memory task and the KMS task swallow errors internally
+            and their results are not needed on an error exit; cancelling
+            keeps the early return non-blocking and avoids orphaned pending
+            tasks (a cancelled task never reports an unretrieved
+            exception). Hoisted above task creation (#939): the try/finally
+            backstop below calls it on generator close or any in-between
+            exception, so it must exist before either task is created.
+            """
+            for overlap_task in (memory_task, kms_task):
+                if overlap_task is not None and not overlap_task.done():
+                    overlap_task.cancel()
+
         if settings.memory_retrieval_enabled:
 
             async def _memory_retrieve() -> List[Any]:
@@ -1415,10 +1432,29 @@ class RAGEngine:
                     query_embedding: Optional[List[float]] = None
                     if has_embedder and user_input and user_input.strip():
                         try:
-                            query_embedding = await self.memory_store.embed_query(
-                                user_input
-                            )
+                            # One total budget covers BOTH the EMBEDDING
+                            # admission acquire and the embed await (#939):
+                            # with no default admission deadline the acquire
+                            # itself can wait unboundedly, so the per-turn
+                            # bound must wrap it too. asyncio.timeout cancels
+                            # at THIS task's await points (no wrapper task),
+                            # so the coroutine name stays _memory_retrieve.
+                            async with asyncio.timeout(
+                                settings.memory_embed_budget_seconds
+                            ):
+                                async with get_admission_controller().admit(
+                                    AdmissionClass.EMBEDDING
+                                ):
+                                    query_embedding = (
+                                        await self.memory_store.embed_query(
+                                            user_input
+                                        )
+                                    )
                         except Exception as exc:  # noqa: BLE001 — degrade, not abort
+                            # Covers asyncio.TimeoutError (budget exceeded;
+                            # the embed task is cancelled by the timeout) and
+                            # AdmissionRejected (budget saturated) with the
+                            # same mechanism-named WARNING (#939 AC1/AC4).
                             logger.warning(
                                 "Memory query embedding precompute failed; "
                                 "continuing FTS-only: %s",
@@ -1452,747 +1488,746 @@ class RAGEngine:
 
             memory_task = asyncio.create_task(_memory_retrieve())
 
-        # Wiki + KMS retrieval. Wiki is awaited BEFORE the raw-RAG gate
-        # below — its evidence decides whether raw document RAG runs at all
-        # (real precedence). KMS evidence is only consumed at prompt
-        # building and gates nothing, so when ``retrieval_kms_overlap`` is
-        # enabled (RAG-DEEP-03, issue #511 B2) its retrieval runs as a task
-        # launched alongside the memory task and is awaited only where its
-        # evidence is consumed, overlapping the document pipeline instead
-        # of serializing ahead of it. With the flag off, the legacy
-        # wiki+KMS gather is preserved exactly.
-        async def _wiki_retrieve() -> List[Any]:
-            if self._wiki_retrieval is None or vault_id is None:
-                return []
-            try:
-                result = await asyncio.to_thread(
-                    self._wiki_retrieval.retrieve, retrieval_query, vault_id
-                )
-                logger.info("[query] Wiki retrieval: %d candidates", len(result))
-                return result
-            except Exception as exc:
-                logger.warning("Wiki retrieval failed: %s", exc)
-                return []
+        # Overlap-task lifecycle backstop (#939 AC3): every yield,
+        # exception, or return between task creation and the two overlap
+        # awaits above/below can orphan an in-flight memory or KMS task —
+        # generator close throws GeneratorExit at the CURRENT yield
+        # point, so only a finally over this whole window guarantees
+        # cancellation. Past the two awaits the tasks are done and the
+        # tail of the stream needs no backstop (the helper no-ops on
+        # completed tasks).
+        try:
 
-        async def _kms_retrieve() -> List[Any]:
-            if (
-                self._kms_retrieval is None
-                or vault_id is None
-                or not settings.kms_enabled
-            ):
-                return []
-            try:
-                result = await asyncio.to_thread(
-                    self._kms_retrieval.retrieve, retrieval_query, vault_id
-                )
-                logger.info("[query] KMS retrieval: %d candidates", len(result))
-                return result
-            except Exception as exc:
-                logger.warning("KMS retrieval failed: %s", exc)
-                return []
-
-        kms_task: Optional[asyncio.Task] = None
-        kms_evidence: List[Any] = []
-        if settings.retrieval_kms_overlap:
-            # The inner coroutine swallows all errors (→ []), so awaiting
-            # this task never raises — the same contract as the memory
-            # task above.
-            kms_task = asyncio.create_task(_kms_retrieve())
-            wiki_evidence = await _wiki_retrieve()
-        else:
-            wiki_evidence, kms_evidence = await asyncio.gather(
-                _wiki_retrieve(), _kms_retrieve()
-            )
-
-        def _cancel_overlap_tasks() -> None:
-            """Cancel in-flight overlap tasks on early exits (RAG-DEEP-03).
-
-            Both the memory task and the KMS task swallow errors internally
-            and their results are not needed on an error exit; cancelling
-            keeps the early return non-blocking and avoids orphaned pending
-            tasks (a cancelled task never reports an unretrieved
-            exception).
-            """
-            for overlap_task in (memory_task, kms_task):
-                if overlap_task is not None and not overlap_task.done():
-                    overlap_task.cancel()
-
-        # Update trace with wiki results
-        query_type = _classify_query(retrieval_query)
-        trace.wiki_query = retrieval_query
-        trace.wiki_candidates_total = len(wiki_evidence)
-        trace.wiki_injected = len(wiki_evidence)
-        trace.wiki_filtered = [
-            f"{ev.label_placeholder}:{ev.filtered_reason}"
-            for ev in wiki_evidence
-            if ev.filtered_reason
-        ]
-
-        # Decide whether raw document RAG is needed
-        raw_rag_needed = _raw_rag_required(query_type, wiki_evidence)
-
-        # FR-015: Signal "Searching" stage to the SSE stream so the user sees
-        # feedback before the first content token arrives.
-        get_telemetry().record_stage(
-            current_turn_id() or "",
-            "planning",
-            time.perf_counter() - _planning_started,
-        )
-        _searching_started = time.perf_counter()
-        yield {"type": "stage", "stage": STAGE_SEARCHING}
-
-        # ------------------------------------------------------------------
-        # RAG-DEEP-01 (issue #511 B2): lazy variant embeddings. The embed
-        # block runs AFTER the wiki gather + raw-RAG decision so that:
-        #   - a wiki-answerable query computes NO embeddings at all;
-        #   - the decomposition route (len(plan) > 1) embeds ONLY the
-        #     original retrieval query — the multi-sub-query orchestration
-        #     embeds each sub-query itself and never consumes the
-        #     step_back/hyde variants;
-        #   - the standard route embeds all variants exactly as before.
-        # The embedding-failure guards below therefore fire only when raw
-        # RAG will actually run, with the same user-visible error behavior.
-        # ------------------------------------------------------------------
-        query_embeddings: List[Tuple[str, List[float]]] = []
-        variants_dropped: List[str] = []
-
-        async def _embed_one(vtype: str, text: str) -> List[float]:
-            if vtype == 'hyde':
-                return await self.embedding_service.embed_passage(text)
-            return await self.embedding_service.embed_single(text)
-
-        # Set when the original retrieval query was embedded; handed to the
-        # sub-query orchestration so a sub-query with the same text reuses
-        # it instead of embedding the same string twice.
-        original_query_text: Optional[str] = None
-        original_query_embedding: Optional[List[float]] = None
-
-        if raw_rag_needed:
-            variants_to_embed = transformed_queries
-            if len(plan) > 1:
-                variants_to_embed = [
-                    (vt, text)
-                    for vt, text in transformed_queries
-                    if vt == 'original'
-                ] or [('original', retrieval_query)]
-            # E3 admission (issue #518): the embedding device budget is shared
-            # process-wide (and cross-process via ADMISSION_STORE_URL). The
-            # variant coroutines are built INSIDE the admitted context so a
-            # rejected admission never leaves un-awaited coroutines behind.
-            try:
-                async with get_admission_controller().admit(
-                    AdmissionClass.EMBEDDING
-                ):
-                    embed_tasks = [_embed_one(vt, t) for vt, t in variants_to_embed]
-                    raw_embeddings = await asyncio.gather(
-                        *embed_tasks, return_exceptions=True
-                    )
-            except AdmissionRejected as exc:
-                _cancel_overlap_tasks()
-                if stream:
-                    _merge_request_llm_failure(
-                        {"status": "admission_rejected", "detail": str(exc)}
-                    )
-                    yield {
-                        "type": "error",
-                        "message": f"Embedding admission rejected: {exc}",
-                        "code": "ADMISSION_REJECTED",
-                    }
-                    return
-                raise RAGEngineError(f"Embedding admission rejected: {exc}")
-
-            for (variant_label, _), result in zip(variants_to_embed, raw_embeddings):
-                if isinstance(result, EmbeddingError):
-                    if variant_label == 'original':
-                        logger.error(
-                            "Query embedding failure for original query: %s", result
-                        )
-                        _cancel_overlap_tasks()
-                        if stream:
-                            _merge_request_llm_failure(
-                                {"status": "embedding_error", "error_code": "EMBEDDING_ERROR"}
-                            )
-                            yield {
-                                "type": "error",
-                                "message": f"Original query embedding failed: {result}",
-                                "code": "EMBEDDING_ERROR",
-                            }
-                            return
-                        raise RAGEngineError(f"Original query embedding failed: {result}")
-                    logger.warning(
-                        "Query embedding failure for variant '%s': %s", variant_label, result
-                    )
-                    variants_dropped.append(variant_label)
-                elif isinstance(result, BaseException):
-                    if variant_label == 'original':
-                        logger.error("Query embedding failure for original query: %s", result)
-                        _cancel_overlap_tasks()
-                        if stream:
-                            _merge_request_llm_failure(
-                                {"status": "embedding_error", "error_code": "EMBEDDING_ERROR"}
-                            )
-                            yield {
-                                "type": "error",
-                                "message": f"Original query embedding failed: {result}",
-                                "code": "EMBEDDING_ERROR",
-                            }
-                            return
-                        raise RAGEngineError(f"Original query embedding failed: {result}")
-                    variants_dropped.append(variant_label)
-                else:
-                    query_embeddings.append((variant_label, result))
-
-            if not query_embeddings:
-                error_msg = "Unable to encode any query variants"
-                logger.error(
-                    "[query] No query embeddings produced — all embedding attempts failed"
-                )
-                _cancel_overlap_tasks()
-                _merge_request_llm_failure(
-                    {"status": "embedding_error", "error_code": "EMBEDDING_ERROR"}
-                )
-                if stream:
-                    yield {"type": "error", "message": error_msg, "code": "EMBEDDING_ERROR"}
-                    return
-                raise RAGEngineError(error_msg)
-
-            for variant_type, text in variants_to_embed:
-                if variant_type == 'original':
-                    original_query_text = text
-                    break
-            original_query_embedding = next(
-                (emb for vt, emb in query_embeddings if vt == 'original'), None
-            )
-
-            logger.info(
-                "[query] query_embeddings: count=%d, dim=%s",
-                len(query_embeddings),
-                len(query_embeddings[0][1]) if query_embeddings else "N/A",
-            )
-
-        # Execute retrieval and evaluation
-        fallback_reason: Optional[str] = None
-        vector_results: List[Dict[str, Any]] = []
-        relevance_hint: Optional[str] = None
-
-        logger.debug(
-            "RAG query: retrieval_top_k=%d, vault_id=%s, vector_store_connected=%s",
-            self.retrieval_top_k,
-            vault_id,
-            getattr(self.vector_store, "is_connected", lambda: "unknown")(),
-        )
-
-        eval_result = "CONFIDENT"
-        rerank_success: Optional[bool] = None
-        # Initialize variables that will be set by _execute_retrieval (or fallback values)
-        score_type = "distance"
-        hybrid_status = "disabled"
-        fts_exceptions = 0
-        rerank_status = "disabled"
-        exact_match_promoted = False
-        token_pack_stats: Dict[str, int] = {
-            "token_pack_included": 0,
-            "token_pack_skipped": 0,
-            "token_pack_truncated": 0,
-        }
-        # ------------------------------------------------------------------
-        # FR-002 part 2: Multi-sub-query orchestration — fan out independent
-        # retrievals for each sub-query and RRF-fuse the results before
-        # feeding the fused, deduplicated set into distillation.
-        # ------------------------------------------------------------------
-        # Flag to skip standard retrieval when multi-sub-query succeeded.
-        # Set to True when len(plan) > 1 and orchestration produces results.
-        _skip_standard_retrieval = False
-        _multi_sub_query_results: Optional[List[Dict[str, Any]]] = None
-        _multi_sub_score_type = "distance"
-        _multi_sub_relevance_hint: Optional[str] = None
-        _multi_sub_sub_queries_failed: List[str] = []
-        _multi_sub_rerank_success: Optional[bool] = None
-        _multi_sub_hybrid_status: str = "disabled"
-        _multi_sub_rerank_status: str = "disabled"
-        # OPS-005 (issue #494): maintenance mode must gate the multi-sub-query
-        # branch too. When set, skip orchestration entirely so the flow falls
-        # through to the single-query maintenance gate below (inside
-        # ``elif not _skip_standard_retrieval:``), producing the identical
-        # maintenance indication (fallback_reason="RAG index is under
-        # maintenance", vector_results=[]) with zero retrieval calls.
-        if raw_rag_needed and len(plan) > 1 and not self.maintenance_mode:
-            try:
-                (
-                    vector_results,
-                    fusion_applied,
-                    sub_queries_failed,
-                    score_type,
-                    relevance_hint,
-                    rerank_success,
-                    hybrid_status,
-                    rerank_status,
-                ) = await self._orchestrate_sub_query_retrieval(
-                    plan=plan,
-                    vault_id=vault_id,
-                    user_input=retrieval_query,
-                    effective_alpha=effective_alpha,
-                    variants_dropped=[],
-                    effective_initial_top_k=effective_initial_top_k,
-                    effective_reranker_top_n=effective_reranker_top_n,
-                    active_client=active_client,
-                    mode=mode,
-                    retrieval_mode=active_retrieval_mode,
-                    filter_expr=active_filter_expr,
-                    original_query_text=original_query_text,
-                    original_query_embedding=original_query_embedding,
-                )
-                _skip_standard_retrieval = True
-                _multi_sub_query_results = vector_results
-                _multi_sub_score_type = score_type
-                _multi_sub_relevance_hint = relevance_hint
-                _multi_sub_sub_queries_failed = sub_queries_failed or []
-                _multi_sub_rerank_success = rerank_success
-                _multi_sub_hybrid_status = hybrid_status
-                _multi_sub_rerank_status = rerank_status
-                trace.fusion_used = fusion_applied
-                if sub_queries_failed:
-                    # Sub-query text is user-derived — count-only at INFO,
-                    # full (truncated) text at DEBUG only (#287/#710).
-                    logger.info(
-                        "[query] %d sub-queries failed (degraded fusion)",
-                        len(sub_queries_failed),
-                    )
-                    logger.debug(
-                        "[query] failed sub-queries (degraded fusion): %s",
-                        [sq[:40] for sq in sub_queries_failed],
-                    )
-            except SearchSemaphoreTimeoutError:
-                _cancel_overlap_tasks()
-                raise
-            except Exception as exc:
-                logger.warning(
-                    "[query] Multi-sub-query orchestration failed (%s): %s, "
-                    "falling back to single-query retrieval",
-                    type(exc).__name__,
-                    exc,
-                )
-                _skip_standard_retrieval = False
-
-        if _skip_standard_retrieval and _multi_sub_query_results is not None:
-            # Use multi-sub-query results; skip standard retrieval.
-            trace.fused_hits = len(_multi_sub_query_results)
-            trace.fts_status = "disabled"
-            trace.fts_exceptions = 0
-            trace.rerank_status = _multi_sub_rerank_status
-            trace.variants_dropped = list(_multi_sub_sub_queries_failed)
-            trace.exact_match_promoted = False
-            trace.token_pack_included = 0
-            trace.token_pack_skipped = 0
-            trace.token_pack_truncated = 0
-            vector_results = _multi_sub_query_results
-            score_type = _multi_sub_score_type
-            relevance_hint = _multi_sub_relevance_hint
-            # Run the retrieval evaluator on the fused/deduped set so a real
-            # eval_result is computed (A7-3). Previously this was hardcoded to
-            # "CONFIDENT", which meant NO_MATCH distillation synthesis could
-            # never fire for decomposed multi-facet queries even when the fused
-            # evidence was genuinely irrelevant. Default to CONFIDENT on
-            # evaluator outage (fail-open, matching the single-query path).
-            eval_result = "CONFIDENT"
-            # Mode-specific evaluation skip (issue #510 RAG-005): Instant mode
-            # with instant_skip_retrieval_evaluation must skip the evaluator on
-            # the FUSED path too, exactly like the single-query path does.
-            skip_fused_evaluation = (
-                mode == ChatMode.INSTANT
-                and settings.instant_skip_retrieval_evaluation
-            )
-            if (
-                settings.retrieval_evaluation_enabled
-                and active_client is not None
-                and vector_results
-                and not skip_fused_evaluation
-            ):
+            # Wiki + KMS retrieval. Wiki is awaited BEFORE the raw-RAG gate
+            # below — its evidence decides whether raw document RAG runs at all
+            # (real precedence). KMS evidence is only consumed at prompt
+            # building and gates nothing, so when ``retrieval_kms_overlap`` is
+            # enabled (RAG-DEEP-03, issue #511 B2) its retrieval runs as a task
+            # launched alongside the memory task and is awaited only where its
+            # evidence is consumed, overlapping the document pipeline instead
+            # of serializing ahead of it. With the flag off, the legacy
+            # wiki+KMS gather is preserved exactly.
+            async def _wiki_retrieve() -> List[Any]:
+                if self._wiki_retrieval is None or vault_id is None:
+                    return []
                 try:
-                    evaluator_key = id(active_client)
-                    if evaluator_key not in self._retrieval_evaluators:
-                        self._retrieval_evaluators[evaluator_key] = RetrievalEvaluator(
-                            active_client
-                        )
-                    _fusion_evaluator = self._retrieval_evaluators[evaluator_key]
-                    eval_result = await _fusion_evaluator.evaluate(
-                        retrieval_query, vector_results
+                    result = await asyncio.to_thread(
+                        self._wiki_retrieval.retrieve, retrieval_query, vault_id
                     )
-                    if eval_result == "NO_MATCH":
-                        relevance_hint = "Note: The retrieved documents may not be directly relevant to your query."
-                        if logger.isEnabledFor(logging.DEBUG):
-                            logger.debug(
-                                "Multi-sub-query fusion evaluation: NO_MATCH for query (len=%d)",
-                                len(retrieval_query),
+                    logger.info("[query] Wiki retrieval: %d candidates", len(result))
+                    return result
+                except Exception as exc:
+                    logger.warning("Wiki retrieval failed: %s", exc)
+                    return []
+
+            async def _kms_retrieve() -> List[Any]:
+                if (
+                    self._kms_retrieval is None
+                    or vault_id is None
+                    or not settings.kms_enabled
+                ):
+                    return []
+                try:
+                    result = await asyncio.to_thread(
+                        self._kms_retrieval.retrieve, retrieval_query, vault_id
+                    )
+                    logger.info("[query] KMS retrieval: %d candidates", len(result))
+                    return result
+                except Exception as exc:
+                    logger.warning("KMS retrieval failed: %s", exc)
+                    return []
+
+            kms_evidence: List[Any] = []
+            if settings.retrieval_kms_overlap:
+                # The inner coroutine swallows all errors (→ []), so awaiting
+                # this task never raises — the same contract as the memory
+                # task above.
+                kms_task = asyncio.create_task(_kms_retrieve())
+                wiki_evidence = await _wiki_retrieve()
+            else:
+                wiki_evidence, kms_evidence = await asyncio.gather(
+                    _wiki_retrieve(), _kms_retrieve()
+                )
+
+            # Update trace with wiki results
+            query_type = _classify_query(retrieval_query)
+            trace.wiki_query = retrieval_query
+            trace.wiki_candidates_total = len(wiki_evidence)
+            trace.wiki_injected = len(wiki_evidence)
+            trace.wiki_filtered = [
+                f"{ev.label_placeholder}:{ev.filtered_reason}"
+                for ev in wiki_evidence
+                if ev.filtered_reason
+            ]
+
+            # Decide whether raw document RAG is needed
+            raw_rag_needed = _raw_rag_required(query_type, wiki_evidence)
+
+            # FR-015: Signal "Searching" stage to the SSE stream so the user sees
+            # feedback before the first content token arrives.
+            get_telemetry().record_stage(
+                current_turn_id() or "",
+                "planning",
+                time.perf_counter() - _planning_started,
+            )
+            _searching_started = time.perf_counter()
+            yield {"type": "stage", "stage": STAGE_SEARCHING}
+
+            # ------------------------------------------------------------------
+            # RAG-DEEP-01 (issue #511 B2): lazy variant embeddings. The embed
+            # block runs AFTER the wiki gather + raw-RAG decision so that:
+            #   - a wiki-answerable query computes NO embeddings at all;
+            #   - the decomposition route (len(plan) > 1) embeds ONLY the
+            #     original retrieval query — the multi-sub-query orchestration
+            #     embeds each sub-query itself and never consumes the
+            #     step_back/hyde variants;
+            #   - the standard route embeds all variants exactly as before.
+            # The embedding-failure guards below therefore fire only when raw
+            # RAG will actually run, with the same user-visible error behavior.
+            # ------------------------------------------------------------------
+            query_embeddings: List[Tuple[str, List[float]]] = []
+            variants_dropped: List[str] = []
+
+            async def _embed_one(vtype: str, text: str) -> List[float]:
+                if vtype == 'hyde':
+                    return await self.embedding_service.embed_passage(text)
+                return await self.embedding_service.embed_single(text)
+
+            # Set when the original retrieval query was embedded; handed to the
+            # sub-query orchestration so a sub-query with the same text reuses
+            # it instead of embedding the same string twice.
+            original_query_text: Optional[str] = None
+            original_query_embedding: Optional[List[float]] = None
+
+            if raw_rag_needed:
+                variants_to_embed = transformed_queries
+                if len(plan) > 1:
+                    variants_to_embed = [
+                        (vt, text)
+                        for vt, text in transformed_queries
+                        if vt == 'original'
+                    ] or [('original', retrieval_query)]
+                # E3 admission (issue #518): the embedding device budget is shared
+                # process-wide (and cross-process via ADMISSION_STORE_URL). The
+                # variant coroutines are built INSIDE the admitted context so a
+                # rejected admission never leaves un-awaited coroutines behind.
+                try:
+                    async with get_admission_controller().admit(
+                        AdmissionClass.EMBEDDING
+                    ):
+                        embed_tasks = [_embed_one(vt, t) for vt, t in variants_to_embed]
+                        raw_embeddings = await asyncio.gather(
+                            *embed_tasks, return_exceptions=True
+                        )
+                except AdmissionRejected as exc:
+                    _cancel_overlap_tasks()
+                    if stream:
+                        _merge_request_llm_failure(
+                            {"status": "admission_rejected", "detail": str(exc)}
+                        )
+                        yield {
+                            "type": "error",
+                            "message": f"Embedding admission rejected: {exc}",
+                            "code": "ADMISSION_REJECTED",
+                        }
+                        return
+                    raise RAGEngineError(f"Embedding admission rejected: {exc}")
+
+                for (variant_label, _), result in zip(variants_to_embed, raw_embeddings):
+                    if isinstance(result, EmbeddingError):
+                        if variant_label == 'original':
+                            logger.error(
+                                "Query embedding failure for original query: %s", result
                             )
-                    elif eval_result == "AMBIGUOUS" and logger.isEnabledFor(logging.DEBUG):
-                        logger.debug(
-                            "Multi-sub-query fusion evaluation: AMBIGUOUS for query (len=%d)",
-                            len(retrieval_query),
+                            _cancel_overlap_tasks()
+                            if stream:
+                                _merge_request_llm_failure(
+                                    {"status": "embedding_error", "error_code": "EMBEDDING_ERROR"}
+                                )
+                                yield {
+                                    "type": "error",
+                                    "message": f"Original query embedding failed: {result}",
+                                    "code": "EMBEDDING_ERROR",
+                                }
+                                return
+                            raise RAGEngineError(f"Original query embedding failed: {result}")
+                        logger.warning(
+                            "Query embedding failure for variant '%s': %s", variant_label, result
                         )
-                except Exception as _fusion_eval_exc:
-                    logger.warning(
-                        "Multi-sub-query fusion evaluation failed (defaulting to CONFIDENT): %s",
-                        _fusion_eval_exc,
+                        variants_dropped.append(variant_label)
+                    elif isinstance(result, BaseException):
+                        if variant_label == 'original':
+                            logger.error("Query embedding failure for original query: %s", result)
+                            _cancel_overlap_tasks()
+                            if stream:
+                                _merge_request_llm_failure(
+                                    {"status": "embedding_error", "error_code": "EMBEDDING_ERROR"}
+                                )
+                                yield {
+                                    "type": "error",
+                                    "message": f"Original query embedding failed: {result}",
+                                    "code": "EMBEDDING_ERROR",
+                                }
+                                return
+                            raise RAGEngineError(f"Original query embedding failed: {result}")
+                        variants_dropped.append(variant_label)
+                    else:
+                        query_embeddings.append((variant_label, result))
+
+                if not query_embeddings:
+                    error_msg = "Unable to encode any query variants"
+                    logger.error(
+                        "[query] No query embeddings produced — all embedding attempts failed"
                     )
-            rerank_success = _multi_sub_rerank_success
-            hybrid_status = _multi_sub_hybrid_status
+                    _cancel_overlap_tasks()
+                    _merge_request_llm_failure(
+                        {"status": "embedding_error", "error_code": "EMBEDDING_ERROR"}
+                    )
+                    if stream:
+                        yield {"type": "error", "message": error_msg, "code": "EMBEDDING_ERROR"}
+                        return
+                    raise RAGEngineError(error_msg)
+
+                for variant_type, text in variants_to_embed:
+                    if variant_type == 'original':
+                        original_query_text = text
+                        break
+                original_query_embedding = next(
+                    (emb for vt, emb in query_embeddings if vt == 'original'), None
+                )
+
+                logger.info(
+                    "[query] query_embeddings: count=%d, dim=%s",
+                    len(query_embeddings),
+                    len(query_embeddings[0][1]) if query_embeddings else "N/A",
+                )
+
+            # Execute retrieval and evaluation
+            fallback_reason: Optional[str] = None
+            vector_results: List[Dict[str, Any]] = []
+            relevance_hint: Optional[str] = None
+
+            logger.debug(
+                "RAG query: retrieval_top_k=%d, vault_id=%s, vector_store_connected=%s",
+                self.retrieval_top_k,
+                vault_id,
+                getattr(self.vector_store, "is_connected", lambda: "unknown")(),
+            )
+
+            eval_result = "CONFIDENT"
+            rerank_success: Optional[bool] = None
+            # Initialize variables that will be set by _execute_retrieval (or fallback values)
+            score_type = "distance"
+            hybrid_status = "disabled"
             fts_exceptions = 0
+            rerank_status = "disabled"
             exact_match_promoted = False
-            token_pack_stats = {
+            token_pack_stats: Dict[str, int] = {
                 "token_pack_included": 0,
                 "token_pack_skipped": 0,
                 "token_pack_truncated": 0,
             }
-        elif not _skip_standard_retrieval:
-            # Standard single-query (or fallback) retrieval path.
-            if self.maintenance_mode:
-                fallback_reason = "RAG index is under maintenance"
-                vector_results = []
-            elif not raw_rag_needed:
-                logger.info("[query] Skipping raw RAG: wiki evidence directly answers (query_type=%s)", query_type)
-                vector_results = []
-            else:
+            # ------------------------------------------------------------------
+            # FR-002 part 2: Multi-sub-query orchestration — fan out independent
+            # retrievals for each sub-query and RRF-fuse the results before
+            # feeding the fused, deduplicated set into distillation.
+            # ------------------------------------------------------------------
+            # Flag to skip standard retrieval when multi-sub-query succeeded.
+            # Set to True when len(plan) > 1 and orchestration produces results.
+            _skip_standard_retrieval = False
+            _multi_sub_query_results: Optional[List[Dict[str, Any]]] = None
+            _multi_sub_score_type = "distance"
+            _multi_sub_relevance_hint: Optional[str] = None
+            _multi_sub_sub_queries_failed: List[str] = []
+            _multi_sub_rerank_success: Optional[bool] = None
+            _multi_sub_hybrid_status: str = "disabled"
+            _multi_sub_rerank_status: str = "disabled"
+            # OPS-005 (issue #494): maintenance mode must gate the multi-sub-query
+            # branch too. When set, skip orchestration entirely so the flow falls
+            # through to the single-query maintenance gate below (inside
+            # ``elif not _skip_standard_retrieval:``), producing the identical
+            # maintenance indication (fallback_reason="RAG index is under
+            # maintenance", vector_results=[]) with zero retrieval calls.
+            if raw_rag_needed and len(plan) > 1 and not self.maintenance_mode:
                 try:
-                    vector_results, relevance_hint, eval_result, rerank_success, score_type, hybrid_status, fts_exceptions, rerank_status, variants_dropped, exact_match_promoted, token_pack_stats = await self._execute_retrieval(
-                        query_embeddings,
-                        retrieval_query,
-                        vault_id,
+                    (
+                        vector_results,
+                        fusion_applied,
+                        sub_queries_failed,
+                        score_type,
+                        relevance_hint,
+                        rerank_success,
+                        hybrid_status,
+                        rerank_status,
+                    ) = await self._orchestrate_sub_query_retrieval(
+                        plan=plan,
+                        vault_id=vault_id,
+                        user_input=retrieval_query,
                         effective_alpha=effective_alpha,
-                        variants_dropped=variants_dropped,
-                        override_initial_top_k=effective_initial_top_k,
-                        override_reranker_top_n=effective_reranker_top_n,
+                        variants_dropped=[],
+                        effective_initial_top_k=effective_initial_top_k,
+                        effective_reranker_top_n=effective_reranker_top_n,
                         active_client=active_client,
                         mode=mode,
                         retrieval_mode=active_retrieval_mode,
                         filter_expr=active_filter_expr,
+                        original_query_text=original_query_text,
+                        original_query_embedding=original_query_embedding,
                     )
-                    logger.info(
-                        "[query] _execute_retrieval returned: result_count=%d, first_3_distances=%s",
-                        len(vector_results),
-                        [r.get("_distance") for r in vector_results[:3]]
-                        if vector_results
-                        else "N/A",
-                    )
+                    _skip_standard_retrieval = True
+                    _multi_sub_query_results = vector_results
+                    _multi_sub_score_type = score_type
+                    _multi_sub_relevance_hint = relevance_hint
+                    _multi_sub_sub_queries_failed = sub_queries_failed or []
+                    _multi_sub_rerank_success = rerank_success
+                    _multi_sub_hybrid_status = hybrid_status
+                    _multi_sub_rerank_status = rerank_status
+                    trace.fusion_used = fusion_applied
+                    if sub_queries_failed:
+                        # Sub-query text is user-derived — count-only at INFO,
+                        # full (truncated) text at DEBUG only (#287/#710).
+                        logger.info(
+                            "[query] %d sub-queries failed (degraded fusion)",
+                            len(sub_queries_failed),
+                        )
+                        logger.debug(
+                            "[query] failed sub-queries (degraded fusion): %s",
+                            [sq[:40] for sq in sub_queries_failed],
+                        )
                 except SearchSemaphoreTimeoutError:
                     _cancel_overlap_tasks()
                     raise
                 except Exception as exc:
-                    fallback_reason = str(exc)
-                    vector_results = []
-                    rerank_success = None  # Default for fallback case
-                    rerank_status = "disabled"  # Default for fallback
-                    score_type = "distance"  # Default for fallback
-                    hybrid_status = "disabled"  # Default for fallback
-                    fts_exceptions = 0  # Default for fallback
-                    variants_dropped = []  # Safety net: reset on exception
-                    exact_match_promoted = False  # Default for fallback
-                    token_pack_stats = {
-                        "token_pack_included": 0,
-                        "token_pack_skipped": 0,
-                        "token_pack_truncated": 0,
-                    }
+                    logger.warning(
+                        "[query] Multi-sub-query orchestration failed (%s): %s, "
+                        "falling back to single-query retrieval",
+                        type(exc).__name__,
+                        exc,
+                    )
+                    _skip_standard_retrieval = False
 
-        # Fetch indexed file IDs for atomic visibility filter (Issue #13)
-        # Only chunks from fully-indexed files are returned — pending/processing files are hidden.
-        indexed_file_ids: Optional[Set[str]] = None
-        try:
-            indexed_file_ids = await asyncio.to_thread(
-                self._get_indexed_file_ids, vault_id
-            )
-        except Exception as _exc:
-            logger.warning(
-                "Failed to fetch indexed_file_ids (visibility filter disabled): %s", _exc
-            )
-
-        # Explicit document scope: a partially-indexed scoped document still has
-        # its succeeded chunks in the vector store and the detail page offers
-        # "Ask about this document" for it, so admit those ids into the
-        # visibility set — otherwise filter_relevant would strip every hit and
-        # the scoped question would come back ungrounded. Unscoped retrieval is
-        # unchanged (partial files stay hidden, Issue #13 semantics).
-        if document_ids and indexed_file_ids is not None:
-            try:
-                scoped_partial = await asyncio.to_thread(
-                    self._get_scoped_partial_file_ids, document_ids, vault_id
+            if _skip_standard_retrieval and _multi_sub_query_results is not None:
+                # Use multi-sub-query results; skip standard retrieval.
+                trace.fused_hits = len(_multi_sub_query_results)
+                trace.fts_status = "disabled"
+                trace.fts_exceptions = 0
+                trace.rerank_status = _multi_sub_rerank_status
+                trace.variants_dropped = list(_multi_sub_sub_queries_failed)
+                trace.exact_match_promoted = False
+                trace.token_pack_included = 0
+                trace.token_pack_skipped = 0
+                trace.token_pack_truncated = 0
+                vector_results = _multi_sub_query_results
+                score_type = _multi_sub_score_type
+                relevance_hint = _multi_sub_relevance_hint
+                # Run the retrieval evaluator on the fused/deduped set so a real
+                # eval_result is computed (A7-3). Previously this was hardcoded to
+                # "CONFIDENT", which meant NO_MATCH distillation synthesis could
+                # never fire for decomposed multi-facet queries even when the fused
+                # evidence was genuinely irrelevant. Default to CONFIDENT on
+                # evaluator outage (fail-open, matching the single-query path).
+                eval_result = "CONFIDENT"
+                # Mode-specific evaluation skip (issue #510 RAG-005): Instant mode
+                # with instant_skip_retrieval_evaluation must skip the evaluator on
+                # the FUSED path too, exactly like the single-query path does.
+                skip_fused_evaluation = (
+                    mode == ChatMode.INSTANT
+                    and settings.instant_skip_retrieval_evaluation
                 )
-                indexed_file_ids = set(indexed_file_ids) | scoped_partial
+                if (
+                    settings.retrieval_evaluation_enabled
+                    and active_client is not None
+                    and vector_results
+                    and not skip_fused_evaluation
+                ):
+                    try:
+                        evaluator_key = id(active_client)
+                        if evaluator_key not in self._retrieval_evaluators:
+                            self._retrieval_evaluators[evaluator_key] = RetrievalEvaluator(
+                                active_client
+                            )
+                        _fusion_evaluator = self._retrieval_evaluators[evaluator_key]
+                        eval_result = await _fusion_evaluator.evaluate(
+                            retrieval_query, vector_results
+                        )
+                        if eval_result == "NO_MATCH":
+                            relevance_hint = "Note: The retrieved documents may not be directly relevant to your query."
+                            if logger.isEnabledFor(logging.DEBUG):
+                                logger.debug(
+                                    "Multi-sub-query fusion evaluation: NO_MATCH for query (len=%d)",
+                                    len(retrieval_query),
+                                )
+                        elif eval_result == "AMBIGUOUS" and logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(
+                                "Multi-sub-query fusion evaluation: AMBIGUOUS for query (len=%d)",
+                                len(retrieval_query),
+                            )
+                    except Exception as _fusion_eval_exc:
+                        logger.warning(
+                            "Multi-sub-query fusion evaluation failed (defaulting to CONFIDENT): %s",
+                            _fusion_eval_exc,
+                        )
+                rerank_success = _multi_sub_rerank_success
+                hybrid_status = _multi_sub_hybrid_status
+                fts_exceptions = 0
+                exact_match_promoted = False
+                token_pack_stats = {
+                    "token_pack_included": 0,
+                    "token_pack_skipped": 0,
+                    "token_pack_truncated": 0,
+                }
+            elif not _skip_standard_retrieval:
+                # Standard single-query (or fallback) retrieval path.
+                if self.maintenance_mode:
+                    fallback_reason = "RAG index is under maintenance"
+                    vector_results = []
+                elif not raw_rag_needed:
+                    logger.info("[query] Skipping raw RAG: wiki evidence directly answers (query_type=%s)", query_type)
+                    vector_results = []
+                else:
+                    try:
+                        vector_results, relevance_hint, eval_result, rerank_success, score_type, hybrid_status, fts_exceptions, rerank_status, variants_dropped, exact_match_promoted, token_pack_stats = await self._execute_retrieval(
+                            query_embeddings,
+                            retrieval_query,
+                            vault_id,
+                            effective_alpha=effective_alpha,
+                            variants_dropped=variants_dropped,
+                            override_initial_top_k=effective_initial_top_k,
+                            override_reranker_top_n=effective_reranker_top_n,
+                            active_client=active_client,
+                            mode=mode,
+                            retrieval_mode=active_retrieval_mode,
+                            filter_expr=active_filter_expr,
+                        )
+                        logger.info(
+                            "[query] _execute_retrieval returned: result_count=%d, first_3_distances=%s",
+                            len(vector_results),
+                            [r.get("_distance") for r in vector_results[:3]]
+                            if vector_results
+                            else "N/A",
+                        )
+                    except SearchSemaphoreTimeoutError:
+                        _cancel_overlap_tasks()
+                        raise
+                    except Exception as exc:
+                        fallback_reason = str(exc)
+                        vector_results = []
+                        rerank_success = None  # Default for fallback case
+                        rerank_status = "disabled"  # Default for fallback
+                        score_type = "distance"  # Default for fallback
+                        hybrid_status = "disabled"  # Default for fallback
+                        fts_exceptions = 0  # Default for fallback
+                        variants_dropped = []  # Safety net: reset on exception
+                        exact_match_promoted = False  # Default for fallback
+                        token_pack_stats = {
+                            "token_pack_included": 0,
+                            "token_pack_skipped": 0,
+                            "token_pack_truncated": 0,
+                        }
+
+            # Fetch indexed file IDs for atomic visibility filter (Issue #13)
+            # Only chunks from fully-indexed files are returned — pending/processing files are hidden.
+            indexed_file_ids: Optional[Set[str]] = None
+            try:
+                indexed_file_ids = await asyncio.to_thread(
+                    self._get_indexed_file_ids, vault_id
+                )
             except Exception as _exc:
                 logger.warning(
-                    "Failed to admit partial scoped files (filter unchanged): %s", _exc
+                    "Failed to fetch indexed_file_ids (visibility filter disabled): %s", _exc
                 )
 
-        # Capture retrieval-phase trace stats before filtering.
-        trace.fused_hits = len(vector_results)
-        trace.fts_status = hybrid_status
-        trace.fts_exceptions = fts_exceptions
-        trace.rerank_status = rerank_status
-        trace.variants_dropped = list(variants_dropped or [])
-        trace.exact_match_promoted = exact_match_promoted
-        trace.token_pack_included = token_pack_stats.get("token_pack_included", 0)
-        trace.token_pack_skipped = token_pack_stats.get("token_pack_skipped", 0)
-        trace.token_pack_truncated = token_pack_stats.get("token_pack_truncated", 0)
-
-        # Filter relevant chunks using document retrieval service.
-        # Push live settings to the service before each call so admin Settings
-        # UI changes (and per-instance test overrides) take effect immediately.
-        self._sync_document_retrieval_settings()
-        relevant_chunks = await self.document_retrieval.filter_relevant(
-            vector_results,
-            reranked=rerank_success if rerank_success is not None else False,
-            indexed_file_ids=indexed_file_ids,
-        )
-        logger.info(
-            "[query] After filter_relevant: relevant_chunk_count=%d",
-            len(relevant_chunks),
-        )
-        trace.filtered_hits = len(relevant_chunks)
-
-        # FR-010: feedback-driven reranking — apply historical user feedback
-        # to adjust retrieval ranking before distillation. Documents with positive
-        # net feedback receive a bounded additive bonus; negative feedback
-        # receives a bounded malus; documents with no feedback are unchanged.
-        if vault_id is not None and relevant_chunks and score_type == "rerank":
-            try:
-                fb_reranker = self._get_feedback_reranker()
-                relevant_chunks = await fb_reranker.rerank_async(relevant_chunks, vault_id)
-                logger.info(
-                    "[query] Feedback reranking applied: vault_id=%s, chunk_count=%d",
-                    vault_id,
-                    len(relevant_chunks),
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Feedback reranking failed (%s): %s — continuing without adjustment",
-                    type(exc).__name__,
-                    exc,
-                )
-
-        # Context distillation: deduplicate overlapping chunks and optionally synthesize
-        if settings.context_distillation_enabled and relevant_chunks:
-            try:
-                # Synthesis is gated by (a) the global flag and (b) Instant-mode
-                # skip. Defense-in-depth: Instant skips CRAG eval so eval_result
-                # stays CONFIDENT and synthesis would not fire anyway, but we also
-                # withhold the client so it is structurally impossible in Instant.
-                synthesis_client = (
-                    active_client
-                    if (
-                        settings.context_distillation_synthesis_enabled
-                        and not (
-                            mode == ChatMode.INSTANT
-                            and settings.instant_skip_distillation_synthesis
-                        )
-                    )
-                    else None
-                )
-                distiller = ContextDistiller(
-                    self.embedding_service,
-                    synthesis_client,
-                )
-                trace.distillation_before = len(relevant_chunks)
-                distill_result = await distiller.distill(
-                    retrieval_query, relevant_chunks, eval_result
-                )
-                relevant_chunks = distill_result.sources
-                sentence_provenance = distill_result.sentence_provenance
-                # OBS-002 sibling: request-local only. The legacy
-                # ``self._last_distillation_provenance`` mirror is written on
-                # GENERATION success (see the success paths in
-                # _stream_llm_response/_get_llm_response) so a failed turn
-                # never leaves provenance state behind for the next request.
-                _request_distillation_provenance.set(list(sentence_provenance or []))
-                logger.info(
-                    "[query] Context distillation: kept %d sentences with provenance",
-                    len(sentence_provenance),
-                )
-                trace.distillation_after = len(relevant_chunks)
-                logger.info(
-                    "[query] After context distillation: chunk_count=%d",
-                    len(relevant_chunks),
-                )
-                # Re-pack against the token budget: distillation can APPEND a
-                # synthesized summary after the pre-distillation token packing in
-                # _execute_retrieval, which would otherwise let the final prompt
-                # exceed context_max_tokens by one passage. The synthesized source
-                # is appended last (never in the reserved top-N), so re-packing
-                # keeps all real evidence prioritized and includes the summary
-                # only if it fits the budget.
-                if settings.context_max_tokens > 0 and relevant_chunks:
-                    relevant_chunks, repack_stats = self._pack_context_by_token_budget(
-                        relevant_chunks, settings.context_max_tokens
-                    )
-                    # Reflect the post-distillation pack in the trace so the
-                    # final included/skipped counts (e.g. a synthesized summary
-                    # dropped for budget) are observable, not the stale
-                    # pre-distillation pack stats from _execute_retrieval.
-                    trace.token_pack_included = repack_stats.get(
-                        "token_pack_included", trace.token_pack_included
-                    )
-                    trace.token_pack_skipped = repack_stats.get(
-                        "token_pack_skipped", trace.token_pack_skipped
-                    )
-                    trace.token_pack_truncated = repack_stats.get(
-                        "token_pack_truncated", trace.token_pack_truncated
-                    )
-            except SearchSemaphoreTimeoutError:
-                _cancel_overlap_tasks()
-                raise
-            except Exception as exc:
-                logger.warning("Context distillation failed, continuing: %s", exc)
-
-        # Parent window expansion: deliver parent context to LLM (Issue #12)
-        # Reads pre-computed parent_window_text from chunk metadata and assigns it to
-        # source.parent_window_text; prompt_builder renders it with [[MATCH:]] markers.
-        if settings.parent_retrieval_enabled and relevant_chunks:
-            relevant_chunks = self._expand_parent_windows(relevant_chunks)
-            trace.parent_windows_expanded = sum(
-                1 for c in relevant_chunks if getattr(c, "parent_window_text", None)
-            )
-
-        # Check if distance filtering removed all results (no_match)
-        if not relevant_chunks and self.document_retrieval.no_match:
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug("Distance filtering: NO_MATCH for query '%s'", user_input)
-            relevance_hint = "Note: The retrieved documents may not be directly relevant to your query. The system found no chunks within the relevance threshold."
-
-        # Supersession check: warn if retrieved files have newer versions
-        currency_warnings: List[str] = []
-        if relevant_chunks:
-            supersession_warning = await self._check_supersession(relevant_chunks)
-            if supersession_warning:
-                currency_warnings.append(supersession_warning)
-                if relevance_hint:
-                    relevance_hint = supersession_warning + "\n" + relevance_hint
-                else:
-                    relevance_hint = supersession_warning
-
-        if fallback_reason:
-            logger.warning("Vector search fallback triggered: %s", fallback_reason)
-            logger.debug("[query] Yielding 'fallback' chunk")
-            yield {
-                "type": "fallback",
-                "reason": fallback_reason,
-                "results": [],
-                "total": 0,
-                "fallback": True,
-                # #715 T1-32-K-01: every chunk consumer reads `content` — a
-                # degraded-retrieval notice here makes the outage visible in
-                # the transcript instead of rendering as an empty turn that
-                # looks like a legitimate abstention. FIXED generic text:
-                # fallback_reason is str(exc) on the generic error path, and
-                # exception detail belongs in the server-side WARNING (and
-                # the `reason` field), never in client-visible content
-                # (A04/#562 leak hygiene). The trailing "\n\n" keeps the
-                # notice a separate block from the answer in both route
-                # collectors.
-                "content": (
-                    "Retrieval is degraded, so this answer is not grounded "
-                    "in retrieved documents.\n\n"
-                ),
-            }
-
-        # Collect memories from the task launched concurrently above (hybrid:
-        # FTS + dense + RRF). The inner coroutine already applied the
-        # context_top_k cap and swallowed errors, so awaiting here never raises
-        # and yields [] on any failure or when memory retrieval is disabled.
-        memories: List[Any] = []
-        if memory_task is not None:
-            memories = await memory_task
-
-        # FR-015: Signal "Reading" stage — retrieval + distillation are complete;
-        # the LLM now reads the assembled context.
-        get_telemetry().record_stage(
-            current_turn_id() or "",
-            "searching",
-            time.perf_counter() - _searching_started,
-        )
-        _reading_started = time.perf_counter()
-        yield {"type": "stage", "stage": STAGE_READING}
-
-        # Issue #462 — retrieval-first vision evidence (LATE FUSION). Runs ONLY
-        # when a vision context was supplied (standard stream/non-stream chat) and
-        # eligible artifact sources exist, AFTER final distillation/packing/parent
-        # expansion and BEFORE prompt construction + source serialization (V1/V5).
-        # Per-source failures degrade to the stored proxy; this never changes rank
-        # or the [S#] labels. Cancelled on generator close (it is awaited here).
-        trace.artifact_sources_retrieved = sum(
-            1 for c in relevant_chunks if getattr(c, "artifact_id", None)
-        )
-        if vision_context is not None and relevant_chunks:
-            if any(
-                getattr(c, "artifact_id", None) and getattr(c, "modality", None)
-                for c in relevant_chunks
-            ):
+            # Explicit document scope: a partially-indexed scoped document still has
+            # its succeeded chunks in the vector store and the detail page offers
+            # "Ask about this document" for it, so admit those ids into the
+            # visibility set — otherwise filter_relevant would strip every hit and
+            # the scoped question would come back ungrounded. Unscoped retrieval is
+            # unchanged (partial files stay hidden, Issue #13 semantics).
+            if document_ids and indexed_file_ids is not None:
                 try:
-                    # E3 admission (issue #518): vision-device budget; an
-                    # AdmissionRejected degrades to the stored proxy via the
-                    # per-source failure handler below (never fails the turn).
-                    async with get_admission_controller().admit(
-                        AdmissionClass.VISION
-                    ):
-                        vision_result = await vision_context.service.run(
-                            query=user_input,
-                            sources=relevant_chunks,
-                            vault_id=vault_id,
-                            user=vision_context.user,
-                            evaluate=vision_context.evaluate,
+                    scoped_partial = await asyncio.to_thread(
+                        self._get_scoped_partial_file_ids, document_ids, vault_id
+                    )
+                    indexed_file_ids = set(indexed_file_ids) | scoped_partial
+                except Exception as _exc:
+                    logger.warning(
+                        "Failed to admit partial scoped files (filter unchanged): %s", _exc
+                    )
+
+            # Capture retrieval-phase trace stats before filtering.
+            trace.fused_hits = len(vector_results)
+            trace.fts_status = hybrid_status
+            trace.fts_exceptions = fts_exceptions
+            trace.rerank_status = rerank_status
+            trace.variants_dropped = list(variants_dropped or [])
+            trace.exact_match_promoted = exact_match_promoted
+            trace.token_pack_included = token_pack_stats.get("token_pack_included", 0)
+            trace.token_pack_skipped = token_pack_stats.get("token_pack_skipped", 0)
+            trace.token_pack_truncated = token_pack_stats.get("token_pack_truncated", 0)
+
+            # Filter relevant chunks using document retrieval service.
+            # Push live settings to the service before each call so admin Settings
+            # UI changes (and per-instance test overrides) take effect immediately.
+            self._sync_document_retrieval_settings()
+            relevant_chunks = await self.document_retrieval.filter_relevant(
+                vector_results,
+                reranked=rerank_success if rerank_success is not None else False,
+                indexed_file_ids=indexed_file_ids,
+            )
+            logger.info(
+                "[query] After filter_relevant: relevant_chunk_count=%d",
+                len(relevant_chunks),
+            )
+            trace.filtered_hits = len(relevant_chunks)
+
+            # FR-010: feedback-driven reranking — apply historical user feedback
+            # to adjust retrieval ranking before distillation. Documents with positive
+            # net feedback receive a bounded additive bonus; negative feedback
+            # receives a bounded malus; documents with no feedback are unchanged.
+            if vault_id is not None and relevant_chunks and score_type == "rerank":
+                try:
+                    fb_reranker = self._get_feedback_reranker()
+                    relevant_chunks = await fb_reranker.rerank_async(relevant_chunks, vault_id)
+                    logger.info(
+                        "[query] Feedback reranking applied: vault_id=%s, chunk_count=%d",
+                        vault_id,
+                        len(relevant_chunks),
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Feedback reranking failed (%s): %s — continuing without adjustment",
+                        type(exc).__name__,
+                        exc,
+                    )
+
+            # Context distillation: deduplicate overlapping chunks and optionally synthesize
+            if settings.context_distillation_enabled and relevant_chunks:
+                try:
+                    # Synthesis is gated by (a) the global flag and (b) Instant-mode
+                    # skip. Defense-in-depth: Instant skips CRAG eval so eval_result
+                    # stays CONFIDENT and synthesis would not fire anyway, but we also
+                    # withhold the client so it is structurally impossible in Instant.
+                    synthesis_client = (
+                        active_client
+                        if (
+                            settings.context_distillation_synthesis_enabled
+                            and not (
+                                mode == ChatMode.INSTANT
+                                and settings.instant_skip_distillation_synthesis
+                            )
                         )
-                    apply_vision_to_sources(vision_result, relevant_chunks)
-                    trace.vision_eligible = vision_result.eligible
-                    trace.vision_selected = vision_result.selected
-                    trace.vision_deduped = vision_result.deduped
-                    trace.vision_capped = vision_result.capped
-                    trace.vision_used = vision_result.vlm_used
-                    trace.vision_proxy_only = vision_result.proxy_only
-                    trace.vision_policy_blocked = vision_result.policy_blocked
-                    trace.vision_asset_missing = vision_result.asset_missing
-                    trace.vision_provider_unavailable = vision_result.provider_unavailable
-                    trace.vision_empty_response = vision_result.empty_response
-                    trace.vision_latency_ms = vision_result.latency_ms
-                    trace.vision_payload_bytes = vision_result.payload_bytes
-                except asyncio.CancelledError:
+                        else None
+                    )
+                    distiller = ContextDistiller(
+                        self.embedding_service,
+                        synthesis_client,
+                    )
+                    trace.distillation_before = len(relevant_chunks)
+                    distill_result = await distiller.distill(
+                        retrieval_query, relevant_chunks, eval_result
+                    )
+                    relevant_chunks = distill_result.sources
+                    sentence_provenance = distill_result.sentence_provenance
+                    # OBS-002 sibling: request-local only. The legacy
+                    # ``self._last_distillation_provenance`` mirror is written on
+                    # GENERATION success (see the success paths in
+                    # _stream_llm_response/_get_llm_response) so a failed turn
+                    # never leaves provenance state behind for the next request.
+                    _request_distillation_provenance.set(list(sentence_provenance or []))
+                    logger.info(
+                        "[query] Context distillation: kept %d sentences with provenance",
+                        len(sentence_provenance),
+                    )
+                    trace.distillation_after = len(relevant_chunks)
+                    logger.info(
+                        "[query] After context distillation: chunk_count=%d",
+                        len(relevant_chunks),
+                    )
+                    # Re-pack against the token budget: distillation can APPEND a
+                    # synthesized summary after the pre-distillation token packing in
+                    # _execute_retrieval, which would otherwise let the final prompt
+                    # exceed context_max_tokens by one passage. The synthesized source
+                    # is appended last (never in the reserved top-N), so re-packing
+                    # keeps all real evidence prioritized and includes the summary
+                    # only if it fits the budget.
+                    if settings.context_max_tokens > 0 and relevant_chunks:
+                        relevant_chunks, repack_stats = self._pack_context_by_token_budget(
+                            relevant_chunks, settings.context_max_tokens
+                        )
+                        # Reflect the post-distillation pack in the trace so the
+                        # final included/skipped counts (e.g. a synthesized summary
+                        # dropped for budget) are observable, not the stale
+                        # pre-distillation pack stats from _execute_retrieval.
+                        trace.token_pack_included = repack_stats.get(
+                            "token_pack_included", trace.token_pack_included
+                        )
+                        trace.token_pack_skipped = repack_stats.get(
+                            "token_pack_skipped", trace.token_pack_skipped
+                        )
+                        trace.token_pack_truncated = repack_stats.get(
+                            "token_pack_truncated", trace.token_pack_truncated
+                        )
+                except SearchSemaphoreTimeoutError:
+                    _cancel_overlap_tasks()
                     raise
                 except Exception as exc:
-                    # Never let a vision failure break the answer path; fall back to
-                    # the stored proxies with no statuses (V1/V5).
-                    logger.warning(
-                        "Query-time vision failed, continuing with proxies: %s", exc
-                    )
+                    logger.warning("Context distillation failed, continuing: %s", exc)
 
-        # Versioned retrieval-candidate event: emitted after vision enrichment
-        # so candidates serialize identically to done.sources (minus the
-        # done-time evidence_type assignment). Emitted even when the list is
-        # empty — this point is reached only on the standard retrieval
-        # pipeline; the agentic early-return path above bypasses it.
-        yield {
-            "type": "evidence_candidates",
-            "version": 1,
-            "candidates": self._serialize_source_candidates(relevant_chunks),
-        }
+            # Parent window expansion: deliver parent context to LLM (Issue #12)
+            # Reads pre-computed parent_window_text from chunk metadata and assigns it to
+            # source.parent_window_text; prompt_builder renders it with [[MATCH:]] markers.
+            if settings.parent_retrieval_enabled and relevant_chunks:
+                relevant_chunks = self._expand_parent_windows(relevant_chunks)
+                trace.parent_windows_expanded = sum(
+                    1 for c in relevant_chunks if getattr(c, "parent_window_text", None)
+                )
 
-        # Build messages using prompt builder service.
-        # Resolve the effective prompt per-query (org override, else the global
-        # active version; org-less/All-Vaults queries get the global active one)
-        # so different orgs always get their own version, and an activated
-        # version is served everywhere, without stale caching on the builder.
-        # FR-007 part 3: A/B experiment layering — if an active global experiment
-        # exists, its assigned variant takes precedence over the 3.5 effective version.
-        effective_prompt_override, ab_eid, ab_var, p_version = await asyncio.to_thread(
-            self._resolve_prompt_with_ab_sync, vault_id, user_id
-        )
-        if ab_eid is not None:
-            trace.ab_experiment_id = ab_eid
-            trace.ab_variant = ab_var
-        if p_version is not None:
-            trace.prompt_version = p_version
-        # RAG-DEEP-03: KMS evidence is consumed here (prompt building) —
-        # the overlap task launched before the wiki gate is awaited at
-        # this point, after the retrieval phase has had the whole document
-        # pipeline to run concurrently with it. The inner coroutine
-        # swallows all errors, so awaiting never raises.
-        if kms_task is not None:
-            kms_evidence = await kms_task
+            # Check if distance filtering removed all results (no_match)
+            if not relevant_chunks and self.document_retrieval.no_match:
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug("Distance filtering: NO_MATCH for query '%s'", user_input)
+                relevance_hint = "Note: The retrieved documents may not be directly relevant to your query. The system found no chunks within the relevance threshold."
+
+            # Supersession check: warn if retrieved files have newer versions
+            currency_warnings: List[str] = []
+            if relevant_chunks:
+                supersession_warning = await self._check_supersession(relevant_chunks)
+                if supersession_warning:
+                    currency_warnings.append(supersession_warning)
+                    if relevance_hint:
+                        relevance_hint = supersession_warning + "\n" + relevance_hint
+                    else:
+                        relevance_hint = supersession_warning
+
+            if fallback_reason:
+                logger.warning("Vector search fallback triggered: %s", fallback_reason)
+                logger.debug("[query] Yielding 'fallback' chunk")
+                yield {
+                    "type": "fallback",
+                    "reason": fallback_reason,
+                    "results": [],
+                    "total": 0,
+                    "fallback": True,
+                    # #715 T1-32-K-01: every chunk consumer reads `content` — a
+                    # degraded-retrieval notice here makes the outage visible in
+                    # the transcript instead of rendering as an empty turn that
+                    # looks like a legitimate abstention. FIXED generic text:
+                    # fallback_reason is str(exc) on the generic error path, and
+                    # exception detail belongs in the server-side WARNING (and
+                    # the `reason` field), never in client-visible content
+                    # (A04/#562 leak hygiene). The trailing "\n\n" keeps the
+                    # notice a separate block from the answer in both route
+                    # collectors.
+                    "content": (
+                        "Retrieval is degraded, so this answer is not grounded "
+                        "in retrieved documents.\n\n"
+                    ),
+                }
+
+            # Collect memories from the task launched concurrently above (hybrid:
+            # FTS + dense + RRF). The inner coroutine already applied the
+            # context_top_k cap and swallowed errors, so awaiting here never raises
+            # and yields [] on any failure or when memory retrieval is disabled.
+            memories: List[Any] = []
+            if memory_task is not None:
+                memories = await memory_task
+
+            # FR-015: Signal "Reading" stage — retrieval + distillation are complete;
+            # the LLM now reads the assembled context.
+            get_telemetry().record_stage(
+                current_turn_id() or "",
+                "searching",
+                time.perf_counter() - _searching_started,
+            )
+            _reading_started = time.perf_counter()
+            yield {"type": "stage", "stage": STAGE_READING}
+
+            # Issue #462 — retrieval-first vision evidence (LATE FUSION). Runs ONLY
+            # when a vision context was supplied (standard stream/non-stream chat) and
+            # eligible artifact sources exist, AFTER final distillation/packing/parent
+            # expansion and BEFORE prompt construction + source serialization (V1/V5).
+            # Per-source failures degrade to the stored proxy; this never changes rank
+            # or the [S#] labels. Cancelled on generator close (it is awaited here).
+            trace.artifact_sources_retrieved = sum(
+                1 for c in relevant_chunks if getattr(c, "artifact_id", None)
+            )
+            if vision_context is not None and relevant_chunks:
+                if any(
+                    getattr(c, "artifact_id", None) and getattr(c, "modality", None)
+                    for c in relevant_chunks
+                ):
+                    try:
+                        # E3 admission (issue #518): vision-device budget; an
+                        # AdmissionRejected degrades to the stored proxy via the
+                        # per-source failure handler below (never fails the turn).
+                        async with get_admission_controller().admit(
+                            AdmissionClass.VISION
+                        ):
+                            vision_result = await vision_context.service.run(
+                                query=user_input,
+                                sources=relevant_chunks,
+                                vault_id=vault_id,
+                                user=vision_context.user,
+                                evaluate=vision_context.evaluate,
+                            )
+                        apply_vision_to_sources(vision_result, relevant_chunks)
+                        trace.vision_eligible = vision_result.eligible
+                        trace.vision_selected = vision_result.selected
+                        trace.vision_deduped = vision_result.deduped
+                        trace.vision_capped = vision_result.capped
+                        trace.vision_used = vision_result.vlm_used
+                        trace.vision_proxy_only = vision_result.proxy_only
+                        trace.vision_policy_blocked = vision_result.policy_blocked
+                        trace.vision_asset_missing = vision_result.asset_missing
+                        trace.vision_provider_unavailable = vision_result.provider_unavailable
+                        trace.vision_empty_response = vision_result.empty_response
+                        trace.vision_latency_ms = vision_result.latency_ms
+                        trace.vision_payload_bytes = vision_result.payload_bytes
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        # Never let a vision failure break the answer path; fall back to
+                        # the stored proxies with no statuses (V1/V5).
+                        logger.warning(
+                            "Query-time vision failed, continuing with proxies: %s", exc
+                        )
+
+            # Versioned retrieval-candidate event: emitted after vision enrichment
+            # so candidates serialize identically to done.sources (minus the
+            # done-time evidence_type assignment). Emitted even when the list is
+            # empty — this point is reached only on the standard retrieval
+            # pipeline; the agentic early-return path above bypasses it.
+            yield {
+                "type": "evidence_candidates",
+                "version": 1,
+                "candidates": self._serialize_source_candidates(relevant_chunks),
+            }
+
+            # Build messages using prompt builder service.
+            # Resolve the effective prompt per-query (org override, else the global
+            # active version; org-less/All-Vaults queries get the global active one)
+            # so different orgs always get their own version, and an activated
+            # version is served everywhere, without stale caching on the builder.
+            # FR-007 part 3: A/B experiment layering — if an active global experiment
+            # exists, its assigned variant takes precedence over the 3.5 effective version.
+            effective_prompt_override, ab_eid, ab_var, p_version = await asyncio.to_thread(
+                self._resolve_prompt_with_ab_sync, vault_id, user_id
+            )
+            if ab_eid is not None:
+                trace.ab_experiment_id = ab_eid
+                trace.ab_variant = ab_var
+            if p_version is not None:
+                trace.prompt_version = p_version
+            # RAG-DEEP-03: KMS evidence is consumed here (prompt building) —
+            # the overlap task launched before the wiki gate is awaited at
+            # this point, after the retrieval phase has had the whole document
+            # pipeline to run concurrently with it. The inner coroutine
+            # swallows all errors, so awaiting never raises.
+            if kms_task is not None:
+                kms_evidence = await kms_task
+        finally:
+            # Synchronous cancel only: never await during GeneratorExit.
+            _cancel_overlap_tasks()
         messages = self.prompt_builder.build_messages(
             user_input, chat_history, relevant_chunks, memories, relevance_hint,
             wiki_evidence=wiki_evidence if wiki_evidence else None,

@@ -27,6 +27,7 @@ from app.api.deps import (
 from app.config import settings
 from app.limiter import limiter
 from app.security import csrf_protect
+from app.services.admission import AdmissionClass, get_admission_controller
 from app.services.memory_store import MemoryRecord, MemoryStore, MemoryStoreError
 
 logger = logging.getLogger(__name__)
@@ -204,7 +205,15 @@ class MemorySearchResponse(BaseModel):
 
 
 class MemorySearchRequest(BaseModel):
-    query: Optional[str] = Field(default="", description="Search query string")
+    query: Optional[str] = Field(
+        default="",
+        max_length=10000,
+        description=(
+            "Search query string (capped at 10000 chars, matching memory "
+            "content; longer queries are rejected before any embedding work "
+            "— issue #939)"
+        ),
+    )
     limit: int = Field(default=5, ge=1, le=100, description="Maximum number of results")
     vault_id: Optional[int] = Field(
         None, description="Optional vault ID to filter search"
@@ -350,7 +359,16 @@ async def _perform_memory_search(
     query_embedding = None
     if has_embedder and query and query.strip():
         try:
-            query_embedding = await memory_store.embed_query(query)
+            # Same total budget + EMBEDDING admission as the engine-side
+            # precompute (#939): one asyncio.timeout window covers BOTH the
+            # admission acquire (unbounded without a default admission
+            # deadline) and the embed await; either a budget expiry or a
+            # saturated budget degrades this request FTS-only.
+            async with asyncio.timeout(settings.memory_embed_budget_seconds):
+                async with get_admission_controller().admit(
+                    AdmissionClass.EMBEDDING
+                ):
+                    query_embedding = await memory_store.embed_query(query)
         except Exception as exc:  # noqa: BLE001 — degrade, not fail the request
             logger.warning(
                 "Memory query embedding precompute failed; continuing "
@@ -951,7 +969,15 @@ async def _authorize_memory_search(
 
 @router.get("/memories/search", response_model=MemorySearchResponse)
 async def search_memories(
-    query: str = Query(..., min_length=1, description="Search query string"),
+    query: str = Query(
+        ...,
+        min_length=1,
+        max_length=10000,
+        description=(
+            "Search query string (capped at 10000 chars, matching memory "
+            "content — issue #939)"
+        ),
+    ),
     limit: int = Query(5, ge=1, le=100, description="Maximum number of results"),
     vault_id: Optional[int] = Query(None, description="Filter by vault ID"),
     conn: sqlite3.Connection = Depends(get_db),

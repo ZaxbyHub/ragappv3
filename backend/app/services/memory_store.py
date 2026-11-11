@@ -677,15 +677,15 @@ class MemoryStore:
         # completed here by issue #712): CJK and accented query terms survive
         # (the old ASCII-only regex silently discarded them) and punctuation
         # plus bare FTS5 operator words are neutralized to literal prefix
-        # terms. ``build_fts_match_query`` caps RAW tokens at ``max_tokens``
-        # BEFORE we filter, so we pass a generous raw cap and apply the
-        # memory-search term cap AFTER stop-word removal — that ordering is
-        # what keeps a stop-word-heavy question from being decapitated at the
-        # 8-term memory cap. The generous raw cap is not unbounded: a query
-        # whose FIRST ``max_tokens`` raw tokens are ALL stop words still
-        # yields no terms (the builder drops the rest) and returns [] — a
-        # deliberate bound, not a silent one.
-        match_tokens = build_fts_match_query(query, max_tokens=64).split()
+        # terms. Since issue #940 the builder filters stop words BEFORE every
+        # cap (we pass our set down), so a stop-word-heavy question is bounded
+        # by its CONTENT terms — a query with arbitrarily many leading stop
+        # words keeps every content term — and only then is the memory-search
+        # term cap applied (the [:8] slice below, the deliberate
+        # 8-content-term cap).
+        match_tokens = build_fts_match_query(
+            query, max_tokens=64, stop_words=_FTS_STOP_WORDS
+        ).split()
         tokens = [
             t
             for t in match_tokens

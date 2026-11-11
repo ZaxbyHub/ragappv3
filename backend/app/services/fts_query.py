@@ -28,10 +28,11 @@ re-point here for tokenizer convergence without importing each other's modules.
 """
 
 import re
+from typing import AbstractSet, Optional
 
 # Unicode word characters: letters/digits/underscore in any script, so CJK
-# queries tokenize (and prefix-match) instead of being discarded as
-# "punctuation". ``re.UNICODE`` is the default for str patterns; spelled out
+# and accented queries tokenize (and prefix-match) instead of being discarded
+# as "punctuation". ``re.UNICODE`` is the default for str patterns; spelled out
 # here because the property is load-bearing for this helper.
 _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 
@@ -70,13 +71,25 @@ FTS_CANDIDATE_CAP = 500
 FTS_SNIPPET_MAX_COLUMN_BYTES = 131_072
 
 
-def build_fts_match_query(raw_search: str, max_tokens: int = MAX_TOKENS) -> str:
+def build_fts_match_query(
+    raw_search: str,
+    max_tokens: int = MAX_TOKENS,
+    stop_words: Optional[AbstractSet[str]] = None,
+) -> str:
     """Sanitize ``raw_search`` into a safe FTS5 prefix-match MATCH string.
 
     Returns ``""`` when no usable token remains (punctuation-only ASCII
     input); callers then skip the FTS search leg rather than matching on
     raw syntax.
+
+    ``stop_words`` (optional, issue #940): when provided, stop-word tokens
+    are dropped BEFORE the ``max_tokens`` cap, so a stop-word-heavy query is
+    bounded by its CONTENT terms and can never be decapitated by leading
+    stop words filling the raw-token cap. Callers that pass no set keep the
+    historical raw-token-cap behavior byte-for-byte.
     """
     normalized = (raw_search or "").lower().replace("-", " ")
     tokens = _TOKEN_RE.findall(normalized)
+    if stop_words is not None:
+        tokens = [t for t in tokens if t not in stop_words]
     return " ".join(f"{token}*" for token in tokens[:max_tokens])

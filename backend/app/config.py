@@ -509,6 +509,12 @@ class Settings(BaseSettings):
     chat pipeline skips the memory_store search step entirely."""
     memory_retrieval_top_k: int = 5
     """Maximum memories returned by hybrid memory search per query."""
+    memory_embed_budget_seconds: float = Field(default=10.0, gt=0)
+    """Total per-call budget in seconds for the memory query-embedding precompute
+    (issue #939): one asyncio.timeout window covering BOTH the EMBEDDING admission
+    acquire and the embed await, on the chat-turn path and the memories search
+    route. On expiry the memory leg degrades to FTS-only with a WARNING naming
+    the mechanism instead of stalling the turn; the embed task is cancelled."""
     memory_store_pool_size: int = 10
     """Dedicated SQLiteConnectionPool max_size for MemoryStore concurrent
     retrieval operations. Default 10 matches the application pool default

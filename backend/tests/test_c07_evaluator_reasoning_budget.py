@@ -92,16 +92,48 @@ async def test_no_match_reachable_under_reasoning_client():
     assert verdict == "NO_MATCH"
 
 
-def test_fail_open_signal_has_production_reader():
-    """AC7: some production file other than the evaluator reads fail_open."""
-    app_dir = Path(__file__).resolve().parents[1] / "app"
-    excluded = "services/retrieval_evaluator.py"
+def test_fail_open_signal_has_production_reader(tmp_path):
+    """AC7 (amended per #941 AC2): "production reader" means a LIVE CALL PATH
+    — the three record_evaluator_fail_open call sites in
+    retrieval_evaluator.py feeding telemetry's recorder — and the exposition
+    actually binding the counter into /metrics text. The old shape was a
+    substring scan over files that EXCLUDED the production call sites, so
+    deleting all three calls left it green (reviewer-executed mutation,
+    PR #931 review); this binding goes red under both that deletion and a
+    metrics_text() un-wiring while the call sites remain."""
+    import ast as _ast
+    from pathlib import Path as _Path
 
-    count = 0
-    for path in sorted(app_dir.rglob("*.py")):
-        if path.relative_to(app_dir).as_posix() == excluded:
-            continue
-        if "fail_open" in path.read_text(encoding="utf-8"):
-            count += 1
+    import app.services.telemetry as telemetry_module
 
-    assert count >= 1
+    backend_dir = _Path(__file__).resolve().parents[1]
+    evaluator_path = backend_dir / "app" / "services" / "retrieval_evaluator.py"
+    evaluator_tree = _ast.parse(
+        evaluator_path.read_text(encoding="utf-8"), filename=str(evaluator_path)
+    )
+    call_sites = [
+        node.lineno
+        for node in _ast.walk(evaluator_tree)
+        if isinstance(node, _ast.Call)
+        and isinstance(node.func, _ast.Attribute)
+        and node.func.attr == "record_evaluator_fail_open"
+    ]
+    assert len(call_sites) >= 3, (
+        "the production fail-open call sites live in retrieval_evaluator.py "
+        f"(exception / empty_response / unexpected_response); found only "
+        f"{len(call_sites)} at {call_sites}"
+    )
+
+    # The reader: a recorded fail-open must reach the /metrics exposition —
+    # recorder definition alone is not a read path.
+    tel = telemetry_module.Telemetry(
+        enabled=True, registry_dir=tmp_path / "telreg"
+    )
+    tel.record_evaluator_fail_open("exception")
+    assert (
+        'ragapp_retrieval_evaluator_fail_open_total{reason="exception"} 1'
+        in tel.metrics_text()
+    ), (
+        "a recorded fail-open must appear in metrics_text() — the "
+        "recorder-to-exposition read path is the wiring AC7 pins"
+    )
