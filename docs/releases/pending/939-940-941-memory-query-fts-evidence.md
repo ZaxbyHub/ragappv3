@@ -16,7 +16,12 @@
   device budget) on both call sites. A saturated budget degrades the memory leg
   FTS-only with the same WARNING instead of bypassing the budget. Capacity
   note: memory-search requests and chat turns now share the embedding device
-  budget with retrieval embeds (one slot per call, held for the embed only).
+  budget with retrieval embeds (one slot per call, held for the embed only —
+  and the lease release now completes even when the budget window cancels the
+  holder mid-embed, so an expiring budget can no longer hold the slot until
+  the store TTL: `AdmissionLease.release` finishes the local accounting and
+  shields the store release, then re-raises the cancellation so the #827
+  cancellation-coverage contract is preserved).
 - A blocked admission (a controller whose acquire never yields) is also bounded
   by the same budget window — previously the acquire could wait unboundedly
   (no default admission deadline).

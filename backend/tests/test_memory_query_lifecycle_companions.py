@@ -40,7 +40,12 @@ from test_memory_query_lifecycle import (  # noqa: E402
 )
 
 from app.api.routes import memories as memories_routes  # noqa: E402
-from app.services.admission import AdmissionClass  # noqa: E402
+from app.services.admission import (  # noqa: E402
+    AdmissionClass,
+    AdmissionController,
+    AdmissionRejected,
+    MemoryAdmissionStore,  # noqa: E402
+)
 
 
 class _LeaseTrackingController(_CountingAdmissionController):
@@ -137,11 +142,13 @@ async def test_budget_fire_cancels_the_hung_embed(caplog, monkeypatch):
     engine = _make_engine(store)
     controller = _CountingAdmissionController()
     with caplog.at_level(logging.WARNING), _memory_admission_patches(controller):
+        started = asyncio.get_running_loop().time()
         agen = engine.query("quarterly roadmap status", [], stream=True)
         try:
             chunks = await asyncio.wait_for(_consume(agen), 10.0)
         finally:
             await _drain_leftover_tasks()
+        elapsed = asyncio.get_running_loop().time() - started
 
     observed_cancel = await asyncio.wait_for(store.cancelled_seen.wait(), 5.0)
     assert observed_cancel and store.cancelled is True, (
@@ -150,6 +157,11 @@ async def test_budget_fire_cancels_the_hung_embed(caplog, monkeypatch):
     )
     assert chunks, "the turn must still complete FTS-only"
     assert _warned_mechanism(caplog)
+    assert elapsed < 5.0, (
+        f"value sensitivity: a 0.3s configured budget must degrade well "
+        f"inside the 10s check ceiling (elapsed {elapsed:.2f}s) — a "
+        "hard-coded 5s bound would also pass the ceiling assert"
+    )
 
 
 async def test_rejected_admission_runs_zero_embeds_and_fts_kwarg(
@@ -323,3 +335,89 @@ async def _drain_leftover_tasks():
                 await task
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
+
+
+# ---------------------------------------------------------------------------
+# Implementation-review round 1 additions (finding 1 + questions 1/2).
+# ---------------------------------------------------------------------------
+
+
+async def test_budget_expiry_releases_the_real_admission_slot(monkeypatch):
+    """Implementation-review finding 1 (real-controller probe): when the
+    budget window cancels the holder mid-embed, the EMBEDDING lease MUST be
+    released — occupancy returns to zero and a second admit succeeds —
+    instead of holding the slot until the store TTL and eroding the shared
+    #518 budget on every expiry. Drives a REAL AdmissionController over a
+    MemoryAdmissionStore (no controller double can observe this)."""
+    _pin_embed_budget(monkeypatch)
+    store = MemoryAdmissionStore()
+    controller = AdmissionController(
+        budgets={"embedding": 1},
+        class_budgets={AdmissionClass.EMBEDDING: "embedding"},
+        store=store,
+        instance_id="companion-budget-expiry",
+    )
+
+    async def _hold_until_cancelled():
+        async with asyncio.timeout(0.3):
+            async with controller.admit(AdmissionClass.EMBEDDING):
+                await asyncio.Future()  # hang until the budget cancels us
+
+    try:
+        await asyncio.wait_for(_hold_until_cancelled(), 10.0)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        pass  # the budget expiry is the expected outcome
+
+    # The release must complete despite the cancellation: poll briefly for
+    # occupancy to return to zero (the shielded store release may finish a
+    # tick after the cancellation surfaced).
+    occupancy = -1
+    for _ in range(50):
+        occupancy = await store.occupancy("embedding")
+        if occupancy == 0:
+            break
+        await asyncio.sleep(0.02)
+    assert occupancy == 0, (
+        "budget expiry must release the EMBEDDING slot (occupancy "
+        f"{occupancy}); a slot held to the store TTL erodes the shared "
+        "budget on every expiry"
+    )
+    assert not controller._local_actives, (
+        f"local lease accounting must forget the cancelled holder; got "
+        f"{controller._local_actives}"
+    )
+
+    # And the freed slot is immediately usable again.
+    async with asyncio.timeout(5.0):
+        async with controller.admit(AdmissionClass.EMBEDDING):
+            pass
+
+
+def test_telemetry_binds_json_under_its_own_name():
+    """Bounds frozen C13's matcher limitation (implementation-review
+    question 2): the frozen seam check matches Call nodes on the literal
+    name ``json``. An aliased ``import json as j; j.dumps(...)`` would
+    evade it — this pin makes that evasion impossible in telemetry.py by
+    requiring the module binds json under its own name (no alias)."""
+    import ast as _ast
+
+    import app.services.telemetry as telemetry_module
+
+    source_path = _ast.get_source_segment  # noqa: F841 — documented no-op use
+    src = open(telemetry_module.__file__, encoding="utf-8").read()
+    tree = _ast.parse(src)
+    json_aliases = set()
+    plain_json_import = False
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Import):
+            for alias in node.names:
+                if alias.name == "json":
+                    if alias.asname is None:
+                        plain_json_import = True
+                    else:
+                        json_aliases.add(alias.asname)
+    assert plain_json_import and not json_aliases, (
+        "telemetry.py must import json under its own name (no alias) so "
+        "the frozen no-direct-json.dumps matcher cannot be evaded by an "
+        "aliased binding"
+    )

@@ -509,17 +509,46 @@ class _Lease:
         if self._released:
             return
         self._released = True
-        await self._stop_renewal()
+        # Cancellation-completes-release (#939 review, implementation
+        # review finding 1): when the holder is being cancelled (e.g. an
+        # asyncio.timeout budget window firing mid-hold), _stop_renewal
+        # re-raises the pending cancellation (its #827 coverage contract)
+        # and an unshielded store release would never run — the device
+        # slot then stays held until the store TTL and every budget
+        # expiry erodes the shared budget. Complete the release anyway
+        # (renewal stop without awaiting it, sync local accounting, the
+        # store release shielded so a pending cancellation cannot abort
+        # it mid-flight) and re-raise the cancellation at the END so the
+        # cancellation coverage #827 established is preserved.
+        cancelled_during_release = False
+        try:
+            await self._stop_renewal()
+        except asyncio.CancelledError:
+            cancelled_during_release = True
+            if self._renewer is not None:
+                self._renewer.cancel()
+                self._renewer = None
         if self._reentrant:
+            if cancelled_during_release:
+                raise asyncio.CancelledError()
             return
         controller = self._controller
         controller._forget_lease(self)
         if self._store_bound and not self.revoked:
             try:
-                await controller.store.release(self.key, self.holder)
+                await asyncio.shield(
+                    controller.store.release(self.key, self.holder)
+                )
+            except asyncio.CancelledError:
+                # The pending cancellation cannot abort the shielded
+                # store release — it keeps running to completion; surface
+                # the cancellation after the release finishes its part.
+                cancelled_during_release = True
             except Exception:  # noqa: BLE001 — store outage must not leak slots
                 controller._mark_degraded()
         controller.hub.schedule_pump()
+        if cancelled_during_release:
+            raise asyncio.CancelledError()
 
 
 def _default_instance_id() -> str:
