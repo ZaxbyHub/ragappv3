@@ -30,7 +30,23 @@ APP_ROOT = Path(__file__).resolve().parents[1] / "app"
 
 _TAG_OPENER = re.compile(r"<([a-zA-Z_][a-zA-Z0-9_]*)>$")
 
-_ESCAPE_CALL_NAMES = {"_xml_escape", "_escape", "_header_escape", "escape"}
+# #884/#925: _escape_clip joined the proven set — it escapes via
+# _xml_escape (or a caller-supplied escaper) BEFORE clipping, so tagged
+# interpolations routed through it carry the same escaping guarantee with
+# an escaped-length budget on top. Honest scope (review pr1105-20261109
+# PRR-006): the escaper is CALLER-SUPPLIED, so name membership alone does
+# not prove which escaper ran — call sites must pass a proven escaper, the
+# ALLOWED paired pins name the exact escaper where budget-critical, and the
+# per-call-site behavior is additionally covered by behavioural tests. The
+# census still rejects every tag-interpolation that is not a call to a name
+# in this set.
+_ESCAPE_CALL_NAMES = {
+    "_xml_escape",
+    "_escape",
+    "_header_escape",
+    "_escape_clip",
+    "escape",
+}
 
 # (module-relative path, tag name, expression source) -> (justification,
 # paired_escape regex that MUST still match the module source).
@@ -40,8 +56,17 @@ ALLOWED = {
         "source_passages",
         "escaped_snippet",
     ): (
-        "pre-escaped local: escaped_snippet = xml.sax.saxutils.escape(raw_snippet)",
-        re.compile(r"escaped_snippet\s*=\s*xml\.sax\.saxutils\.escape\("),
+        "pre-escaped local (#884/#925 4.2 review round): escaped_snippet = "
+        "_escape_clip(raw_snippet, _per_source, escape_fn="
+        "xml.sax.saxutils.escape) — escape FIRST, then clip to the "
+        "documented per-source budget, entity-safely. _escape_clip is in "
+        "_ESCAPE_CALL_NAMES, so this entry only keeps the paired pin: it "
+        "asserts the exact escaper argument too (review pr1105-20261109 "
+        "PRR-006 — _escape_clip's escaper is caller-supplied, so the pin "
+        "must name it, not just the call shape).",
+        re.compile(
+            r"escaped_snippet\s*=\s*_escape_clip\(\s*raw_snippet,\s*_per_source,\s*escape_fn=xml\.sax\.saxutils\.escape"
+        ),
     ),
     (
         "services/agentic_tools.py",
@@ -88,6 +113,22 @@ ALLOWED = {
     ): (
         "int() conversion: a page number cannot carry markup",
         re.compile(r"<page_number>\{int\(page_number\)\}"),
+    ),
+    (
+        "api/routes/chat.py",
+        "user_message",
+        "prompt_text",
+    ): (
+        "pre-escaped local (#884/#925 4.2 sweep; review pr1105-20261109 "
+        "PRR-009 moved it into the _title_prompt_seed helper so tests drive "
+        "the production expression): prompt_text = _title_prompt_seed("
+        "first_message) where the helper returns _escape_clip("
+        "first_message, 200) — escaped FIRST, then clipped entity-safely; "
+        "the wrap site must not double-escape. The paired regex pins the "
+        "helper's escaping expression.",
+        re.compile(
+            r"return _escape_clip\(first_message,\s*200\)"
+        ),
     ),
 }
 

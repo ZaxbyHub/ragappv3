@@ -115,18 +115,25 @@ COPY backend/app ./app
 # Copy built frontend
 COPY --from=frontend-builder /app/frontend/dist ./static
 
-# Create data directory
-RUN mkdir -p /data/knowledgevault
+# Create the data directory the compose stack pins (DATA_DIR=/app/data; the
+# host bind ${HOST_DATA_DIR:-./data} mounts here)
+RUN mkdir -p /app/data
 
 # Create non-root runtime user
 RUN adduser --disabled-password --gecos '' appuser
 
-# Set ownership for runtime user
-RUN chown -R appuser:appuser /app /data
+# Set ownership for runtime user (recursive over /app covers /app/data)
+RUN chown -R appuser:appuser /app
 
 # Switch to non-root user
 USER appuser
 
 EXPOSE 9090
 
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port 9090 --proxy-headers --forwarded-allow-ips \"${FORWARDED_ALLOW_IPS:-127.0.0.1}\" --no-access-log"]
+# `exec` makes uvicorn replace sh as PID 1 so `docker stop` delivers SIGTERM and
+# the graceful-shutdown path (queue drain, admission release, final optimize)
+# actually runs instead of being SIGKILLed at the grace-period boundary
+# (issue #748, T1-04-S-01). `--workers 1` pins the single-process topology the
+# app's in-process state assumes: a forwarded WEB_CONCURRENCY>1 cannot silently
+# enable multi-worker mode (uvicorn reads that env only when --workers is absent).
+CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port 9090 --proxy-headers --forwarded-allow-ips \"${FORWARDED_ALLOW_IPS:-127.0.0.1}\" --no-access-log --workers 1"]

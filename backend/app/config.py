@@ -1197,7 +1197,12 @@ class Settings(BaseSettings):
             if value.startswith("["):
                 import json
 
-                parsed = json.loads(value)
+                try:
+                    parsed = json.loads(value)
+                except RecursionError as exc:
+                    raise ValueError(
+                        "backend_cors_origins JSON value is nested too deeply"
+                    ) from exc
                 if not isinstance(parsed, list):
                     raise ValueError("backend_cors_origins JSON value must be a list")
                 return parsed
@@ -1221,7 +1226,12 @@ class Settings(BaseSettings):
             if value.startswith("["):
                 import json
 
-                parsed = json.loads(value)
+                try:
+                    parsed = json.loads(value)
+                except RecursionError as exc:
+                    raise ValueError(
+                        "origin allowlist JSON value is nested too deeply"
+                    ) from exc
                 if not isinstance(parsed, list):
                     raise ValueError("origin allowlist JSON value must be a list")
                 return parsed
