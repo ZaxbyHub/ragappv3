@@ -369,53 +369,67 @@ async def test_fenced_dimension_settle_writes_no_files_row(tmp_path, monkeypatch
 
 
 def test_sync_tolerates_malformed_payload_rows(tmp_path):
-    """#954 contract, scoped to this PR's new scan: a malformed TERMINAL
-    payload_json row never aborts the latest-job-id set.
+    """#954 contract, full scope: a malformed payload_json row in ANY status
+    never aborts the sync.
 
     The latest-job-id set scans every ingestion row (the latest job may be
-    completed/cancelled), so a malformed terminal row must be dropped by
-    the json_valid guards instead of raising OperationalError inside
-    BEGIN IMMEDIATE and aborting the whole boot sync (delta-review finding,
-    reproduced on the unguarded form). Cohort expectations alongside the
-    malformed row: latest-capped still excluded+settled (#702), and a
-    superseded-capped cohort still recovers. Scope note: malformed rows in
-    pending/running status still abort via the PRE-EXISTING unguarded
-    coverage anti-joins (same on master) — recorded in the PR body's
-    Considered table.
+    completed/cancelled), and the coverage anti-joins scan every
+    pending/running ingestion row, so a malformed row in ANY of those
+    statuses must be dropped by the json_valid guards instead of raising
+    OperationalError inside BEGIN IMMEDIATE and aborting the whole boot
+    sync (delta-review finding, reproduced on the unguarded form; the
+    pending/running anti-join widening landed as the follow-up for the PR
+    body's Considered row). Cohort expectations alongside the malformed
+    rows: latest-capped still excluded+settled (#702), a superseded-capped
+    cohort still recovers, and a file covered by a valid PENDING job is
+    left to that job (no duplicate minted, no processing reset).
     """
 
     def seed(conn):
         cap = int(settings.jobs_max_attempts)
         # Cohort A: capped-failed LATEST (valid payload) -> still excluded
-        # and settled even with a malformed row elsewhere in the table.
+        # and settled even with malformed rows elsewhere in the table.
         fid_a = conn.execute(
             "INSERT INTO files (file_name, file_path, vault_id, status, "
             "phase, source, file_size) "
             "VALUES ('a.txt', 'a.txt', 1, 'pending', 'queued', 'upload', 10)"
         ).lastrowid
         # Cohort B: capped failure superseded by a later COMPLETED job ->
-        # recovers despite the malformed row in the same scan.
+        # recovers despite the malformed rows in the same scans.
         fid_b = conn.execute(
             "INSERT INTO files (file_name, file_path, vault_id, status, "
             "phase, source, file_size) "
             "VALUES ('b.txt', 'b.txt', 1, 'pending', 'queued', 'upload', 10)"
         ).lastrowid
+        # Cohort C: covered by a valid PENDING job whose payload is fine ->
+        # the malformed siblings in the same anti-join must not drop its
+        # coverage (no duplicate job, processing stays queued).
+        fid_c = conn.execute(
+            "INSERT INTO files (file_name, file_path, vault_id, status, "
+            "phase, source, file_size) "
+            "VALUES ('c.txt', 'c.txt', 1, 'processing', 'staged', "
+            "'upload', 10)"
+        ).lastrowid
         conn.commit()
         _insert_ingest_job(conn, fid_a, status="failed", attempts=cap)
         _insert_ingest_job(conn, fid_b, status="failed", attempts=cap)
         _insert_ingest_job(conn, fid_b, status="completed", attempts=1)
-        # A malformed TERMINAL row with NO file_id that the latest-job scan
-        # must tolerate (planted raw, uncommitted -> commit before sync).
-        conn.execute(
-            "INSERT INTO jobs (queue, payload_json, status) "
-            "VALUES (?, '{not-json', 'completed')",
-            (INGESTION_QUEUE,),
-        )
+        _insert_ingest_job(conn, fid_c, status="pending", attempts=0)
+        # Malformed rows in EVERY status the sync's scans touch: terminal
+        # (latest-job set), pending (coverage anti-join + processing-reset
+        # subquery), and running (coverage anti-joins). Planted raw ->
+        # commit before sync.
+        for status in ("completed", "pending", "running"):
+            conn.execute(
+                "INSERT INTO jobs (queue, payload_json, status) "
+                "VALUES (?, '{not-json', ?)",
+                (INGESTION_QUEUE, status),
+            )
         conn.commit()
-        return fid_a, fid_b
+        return fid_a, fid_b, fid_c
 
     db_path, conn = _seed(tmp_path, "mal.db")
-    file_a, file_b = seed(conn)
+    file_a, file_b, file_c = seed(conn)
     pool = SQLiteConnectionPool(db_path, max_size=2)
     try:
         bp = BackgroundProcessor(pool=pool)
@@ -424,13 +438,21 @@ def test_sync_tolerates_malformed_payload_rows(tmp_path):
 
         fresh_a = conn.execute(
             "SELECT COUNT(*) AS n FROM jobs WHERE queue=? AND status='pending' "
+            "AND json_valid(payload_json) "
             "AND CAST(json_extract(payload_json, '$.file_id') AS INTEGER)=?",
             (INGESTION_QUEUE, file_a),
         ).fetchone()["n"]
         fresh_b = conn.execute(
             "SELECT COUNT(*) AS n FROM jobs WHERE queue=? AND status='pending' "
+            "AND json_valid(payload_json) "
             "AND CAST(json_extract(payload_json, '$.file_id') AS INTEGER)=?",
             (INGESTION_QUEUE, file_b),
+        ).fetchone()["n"]
+        fresh_c = conn.execute(
+            "SELECT COUNT(*) AS n FROM jobs WHERE queue=? AND status='pending' "
+            "AND json_valid(payload_json) "
+            "AND CAST(json_extract(payload_json, '$.file_id') AS INTEGER)=?",
+            (INGESTION_QUEUE, file_c),
         ).fetchone()["n"]
         row_a = conn.execute(
             "SELECT status, error_message FROM files WHERE id=?", (file_a,)
@@ -438,13 +460,27 @@ def test_sync_tolerates_malformed_payload_rows(tmp_path):
         row_b = conn.execute(
             "SELECT status FROM files WHERE id=?", (file_b,)
         ).fetchone()
+        row_c = conn.execute(
+            "SELECT status, phase FROM files WHERE id=?", (file_c,)
+        ).fetchone()
+        # created == 1: only cohort B recovers; A is capped-settled, C is
+        # covered by its valid pending job. The malformed rows in every
+        # scanned status must be skipped, not abort the sync.
         assert created == 1 and fresh_b == 1, (
-            "the malformed terminal row must be skipped by the json_valid "
-            "guards, not abort the sync - the superseded cohort still recovers"
+            "the malformed rows must be skipped by the json_valid guards, "
+            "not abort the sync - the superseded cohort still recovers"
         )
         assert fresh_a == 0
         assert row_a["status"] == "error"
         assert row_a["error_message"] == "lease_attempt_cap_exceeded"
         assert row_b["status"] == "pending"
+        assert fresh_c == 1, (
+            "the malformed pending/running rows must not drop cohort C's "
+            "valid pending coverage - the guarded anti-joins still see it"
+        )
+        assert row_c["status"] == "pending" and row_c["phase"] == "queued", (
+            "cohort C keeps its covered pending job -> processing reset to "
+            "queued, no duplicate minted"
+        )
     finally:
         conn.close()
