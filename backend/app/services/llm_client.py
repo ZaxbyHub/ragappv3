@@ -57,6 +57,15 @@ _THINKING_PROCESS_MARKER = "Thinking Process:"
 # the default equals 32768).
 _DEFAULT_MAX_TOKENS = 32768
 
+# finish_reason tokens that mean "the generation was cut by the output token
+# budget" (issues #1075/#1076). OpenAI-compatible servers report "length";
+# Anthropic-compatible servers report "max_tokens" as their stop reason and
+# some OpenAI-compatible gateways report "max_length". Every truncation guard
+# tests membership in this set — never a literal comparison — so the
+# vocabulary has one edit point. Non-truncation tokens ("stop", None, or an
+# omitted field) are accepted as complete generations.
+TRUNCATION_FINISH_REASONS = frozenset({"length", "max_tokens", "max_length"})
+
 
 class _UnsetMaxTokens(int):
     """Sentinel for "the caller did not pass ``max_tokens``.

@@ -8,7 +8,9 @@ roles, not capacity claims.
 ## Worker topology
 
 - The backend runs as one uvicorn process per container
-  (`Dockerfile` CMD; `WEB_CONCURRENCY` defaults to 1). All background work —
+  (`Dockerfile` CMD pins `--workers 1`; the forwarded `WEB_CONCURRENCY` env
+  cannot change the container's worker count — uvicorn reads it only when
+  `--workers` is absent). All background work —
   ingestion workers, enrichment, reindex, wiki/draft/kms compile processors,
   email ingestion, file watcher — runs as asyncio tasks INSIDE that process.
 - SQLite (`app.db`, WAL mode, shared by the main pool and MemoryStore) and

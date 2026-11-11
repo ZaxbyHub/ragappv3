@@ -4,7 +4,13 @@
 // make* fixtures). These tests assert REQUIRED behavior and are expected to
 // FAIL until the fix lands; each prints an AC<n> CHECK sentinel.
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { render as rtlRender, screen, waitFor, within, fireEvent } from "@testing-library/react";
+import {
+  render as rtlRender,
+  screen,
+  waitFor,
+  within,
+  fireEvent,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -33,7 +39,8 @@ class MockResizeObserver {
 }
 global.ResizeObserver = MockResizeObserver as unknown as typeof ResizeObserver;
 
-const render: typeof rtlRender = (ui, options) => rtlRender(ui, { wrapper: MemoryRouter, ...options });
+const render: typeof rtlRender = (ui, options) =>
+  rtlRender(ui, { wrapper: MemoryRouter, ...options });
 
 vi.mock("sonner", () => ({
   toast: { success: vi.fn(), error: vi.fn(), info: vi.fn() },
@@ -44,11 +51,15 @@ vi.mock("sonner", () => ({
 // DraftStageArtifact / DraftInspector stubs are extended to surface the
 // owning job_id + error_code so AC18 can assert WHICH job's stages render.
 vi.mock("./DraftAssignmentForm", async () => {
-  const actual = await vi.importActual<typeof import("./DraftAssignmentForm")>("./DraftAssignmentForm");
+  const actual = await vi.importActual<typeof import("./DraftAssignmentForm")>(
+    "./DraftAssignmentForm",
+  );
   return {
     ...actual,
     DraftAssignmentForm: (props: { inputs?: unknown[] }) => (
-      <div data-testid="assignment-form">inputs:{props.inputs?.length ?? "none"}</div>
+      <div data-testid="assignment-form">
+        inputs:{props.inputs?.length ?? "none"}
+      </div>
     ),
   };
 });
@@ -60,15 +71,22 @@ vi.mock("./DraftSourceUpload", () => ({
     currentInputCount: number;
   }) => (
     <div data-testid="source-upload">
-      disabled:{String(props.disabled)}|reason:{props.disabledReason ?? "none"}|max:{props.maxInputs}|count:
+      disabled:{String(props.disabled)}|reason:{props.disabledReason ?? "none"}
+      |max:{props.maxInputs}|count:
       {props.currentInputCount}
     </div>
   ),
 }));
 vi.mock("./DraftSourceList", () => ({
-  DraftSourceList: (props: { locked: boolean; canEdit: boolean; lockedReason?: string; inputs: unknown[] }) => (
+  DraftSourceList: (props: {
+    locked: boolean;
+    canEdit: boolean;
+    lockedReason?: string;
+    inputs: unknown[];
+  }) => (
     <div data-testid="source-list">
-      locked:{String(props.locked)}|canEdit:{String(props.canEdit)}|count:{props.inputs.length}
+      locked:{String(props.locked)}|canEdit:{String(props.canEdit)}|count:
+      {props.inputs.length}
     </div>
   ),
 }));
@@ -91,12 +109,17 @@ vi.mock("./DraftEditor", () => ({
     </div>
   ),
 }));
-vi.mock("./DraftPreview", () => ({ DraftPreview: () => <div data-testid="preview" /> }));
-vi.mock("./DraftRevisionDiff", () => ({ DraftRevisionDiff: () => <div data-testid="revision-diff" /> }));
+vi.mock("./DraftPreview", () => ({
+  DraftPreview: () => <div data-testid="preview" />,
+}));
+vi.mock("./DraftRevisionDiff", () => ({
+  DraftRevisionDiff: () => <div data-testid="revision-diff" />,
+}));
 vi.mock("./DraftStageArtifact", () => ({
   DraftStageArtifact: (props: { stage: DraftStage | null }) => (
     <div data-testid="stage-artifact">
-      stage:{props.stage?.stage ?? "none"}|job:{props.stage?.job_id ?? "none"}|error:
+      stage:{props.stage?.stage ?? "none"}|job:{props.stage?.job_id ?? "none"}
+      |error:
       {props.stage?.error_code ?? "none"}
     </div>
   ),
@@ -112,7 +135,11 @@ vi.mock("./DraftStageRail", () => ({
       <span>jobStatus:{props.jobStatus ?? "none"}</span>
       <span>selected:{props.selectedStage ?? "none"}</span>
       {props.stageOrder.map((stage) => (
-        <button key={stage} type="button" onClick={() => props.onSelectStage(stage)}>
+        <button
+          key={stage}
+          type="button"
+          onClick={() => props.onSelectStage(stage)}
+        >
           select-{stage}
         </button>
       ))}
@@ -128,24 +155,35 @@ vi.mock("./DraftInspector", () => ({
     tier: string;
   }) => (
     <div data-testid="inspector">
-      stage:{props.stage?.stage ?? "none"}|stageJob:{props.stage?.job_id ?? "none"}|revision:
-      {String(props.revisionId)}|job:{String(props.jobId)}|canDispose:{String(props.canDispose)}|tier:
+      stage:{props.stage?.stage ?? "none"}|stageJob:
+      {props.stage?.job_id ?? "none"}|revision:
+      {String(props.revisionId)}|job:{String(props.jobId)}|canDispose:
+      {String(props.canDispose)}|tier:
       {props.tier}
     </div>
   ),
 }));
 vi.mock("./DraftReadyDialog", () => ({
-  DraftReadyDialog: (props: { open: boolean; eligibility: { ok: boolean; blockers: string[] } }) =>
+  DraftReadyDialog: (props: {
+    open: boolean;
+    eligibility: { ok: boolean; blockers: string[] };
+  }) =>
     props.open ? (
-      <div data-testid="ready-dialog">ok:{String(props.eligibility.ok)}|blockers:{props.eligibility.blockers.join(",")}</div>
+      <div data-testid="ready-dialog">
+        ok:{String(props.eligibility.ok)}|blockers:
+        {props.eligibility.blockers.join(",")}
+      </div>
     ) : null,
 }));
 vi.mock("./DraftExportDialog", () => ({
-  DraftExportDialog: (props: { open: boolean }) => (props.open ? <div data-testid="export-dialog" /> : null),
+  DraftExportDialog: (props: { open: boolean }) =>
+    props.open ? <div data-testid="export-dialog" /> : null,
 }));
 vi.mock("./DraftPromoteDialog", () => ({
   DraftPromoteDialog: (props: { open: boolean; canWrite: boolean }) =>
-    props.open ? <div data-testid="promote-dialog">canWrite:{String(props.canWrite)}</div> : null,
+    props.open ? (
+      <div data-testid="promote-dialog">canWrite:{String(props.canWrite)}</div>
+    ) : null,
 }));
 
 // The only real `ui/select` consumer left in DraftWorkspace itself is the
@@ -156,15 +194,41 @@ vi.mock("@/components/ui/select", async () => {
   const React = await import("react");
   const Ctx = React.createContext<(value: string) => void>(() => {});
   return {
-    Select: ({ onValueChange, children }: { onValueChange: (v: string) => void; children: React.ReactNode }) =>
-      React.createElement(Ctx.Provider, { value: onValueChange }, children),
-    SelectTrigger: ({ children, id }: { children: React.ReactNode; id?: string }) =>
-      React.createElement("div", { role: "group", "aria-label": "Retry from", id }, children),
+    Select: ({
+      onValueChange,
+      children,
+    }: {
+      onValueChange: (v: string) => void;
+      children: React.ReactNode;
+    }) => React.createElement(Ctx.Provider, { value: onValueChange }, children),
+    SelectTrigger: ({
+      children,
+      id,
+    }: {
+      children: React.ReactNode;
+      id?: string;
+    }) =>
+      React.createElement(
+        "div",
+        { role: "group", "aria-label": "Retry from", id },
+        children,
+      ),
     SelectValue: () => null,
-    SelectContent: ({ children }: { children: React.ReactNode }) => React.createElement("div", null, children),
-    SelectItem: ({ value, children }: { value: string; children: React.ReactNode }) => {
+    SelectContent: ({ children }: { children: React.ReactNode }) =>
+      React.createElement("div", null, children),
+    SelectItem: ({
+      value,
+      children,
+    }: {
+      value: string;
+      children: React.ReactNode;
+    }) => {
       const onValueChange = React.useContext(Ctx);
-      return React.createElement("button", { type: "button", onClick: () => onValueChange(value) }, children);
+      return React.createElement(
+        "button",
+        { type: "button", onClick: () => onValueChange(value) },
+        children,
+      );
     },
   };
 });
@@ -200,7 +264,9 @@ const {
 }));
 
 vi.mock("@/lib/api/draftRoom", async () => {
-  const actual = await vi.importActual<typeof import("@/lib/api/draftRoom")>("@/lib/api/draftRoom");
+  const actual = await vi.importActual<typeof import("@/lib/api/draftRoom")>(
+    "@/lib/api/draftRoom",
+  );
   return {
     ...actual,
     listDraftJobs: mockListDraftJobs,
@@ -302,7 +368,9 @@ function makeDetail(overrides: Partial<DraftDetail> = {}): DraftDetail {
   };
 }
 
-function makeCapabilities(overrides: Partial<DraftRoomCapabilities> = {}): DraftRoomCapabilities {
+function makeCapabilities(
+  overrides: Partial<DraftRoomCapabilities> = {},
+): DraftRoomCapabilities {
   return {
     enabled: true,
     modes: ["rewrite", "compose"],
@@ -313,11 +381,30 @@ function makeCapabilities(overrides: Partial<DraftRoomCapabilities> = {}): Draft
     export_formats: ["md"],
     logical_model_modes: ["default"],
     default_logical_mode: "default",
-    compile_start_stages: ["research", "outline", "draft", "lint", "copy", "standards", "fact"],
-    compile_stage_order: ["intake", "research", "outline", "draft", "lint", "copy", "standards", "fact", "assemble"],
+    compile_start_stages: [
+      "research",
+      "outline",
+      "draft",
+      "lint",
+      "copy",
+      "standards",
+      "fact",
+    ],
+    compile_stage_order: [
+      "intake",
+      "research",
+      "outline",
+      "draft",
+      "lint",
+      "copy",
+      "standards",
+      "fact",
+      "assemble",
+    ],
     prompt_bundle_version: "v1",
     editorial_gates_installed: true,
     compile_available: true,
+    upload_available: true,
     findings_available: true,
     claims_available: true,
     evidence_available: true,
@@ -355,7 +442,13 @@ function makeJob(overrides: Partial<DraftJob> = {}): DraftJob {
   };
 }
 
-function makeStage(overrides: Partial<DraftStage> & { stage: DraftStageName; job_id: number; status: DraftStageStatus }): DraftStage {
+function makeStage(
+  overrides: Partial<DraftStage> & {
+    stage: DraftStageName;
+    job_id: number;
+    status: DraftStageStatus;
+  },
+): DraftStage {
   return {
     id: 1,
     attempt: 1,
@@ -379,7 +472,9 @@ function makeStage(overrides: Partial<DraftStage> & { stage: DraftStageName; job
   };
 }
 
-function makeRevisionDetail(overrides: Partial<DraftRevisionDetail> = {}): DraftRevisionDetail {
+function makeRevisionDetail(
+  overrides: Partial<DraftRevisionDetail> = {},
+): DraftRevisionDetail {
   return {
     summary: {
       id: 101,
@@ -403,8 +498,12 @@ function makeRevisionDetail(overrides: Partial<DraftRevisionDetail> = {}): Draft
 
 const initialUiState = useDraftRoomUiStore.getState();
 
-function renderWorkspace(props: Partial<React.ComponentProps<typeof DraftWorkspace>> = {}) {
-  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+function renderWorkspace(
+  props: Partial<React.ComponentProps<typeof DraftWorkspace>> = {},
+) {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
   const detail = props.detail ?? makeDetail();
   const draft = props.draft ?? detail.summary;
   const utils = render(
@@ -417,14 +516,16 @@ function renderWorkspace(props: Partial<React.ComponentProps<typeof DraftWorkspa
         vaultAccess="write"
         {...props}
       />
-    </QueryClientProvider>
+    </QueryClientProvider>,
   );
   return { ...utils, queryClient };
 }
 
 beforeEach(() => {
   useDraftRoomUiStore.setState(initialUiState, true);
-  mockListDraftJobs.mockReset().mockResolvedValue({ items: [makeJob()], total: 1, page: 1, per_page: 10 });
+  mockListDraftJobs
+    .mockReset()
+    .mockResolvedValue({ items: [makeJob()], total: 1, page: 1, per_page: 10 });
   mockGetDraftStages.mockReset().mockResolvedValue({
     items: [
       makeStage({
@@ -476,7 +577,9 @@ beforeEach(() => {
     citations: [],
     qa_summary: {},
   });
-  mockListDraftFindings.mockReset().mockResolvedValue({ items: [], total: 0, page: 1, per_page: 100 });
+  mockListDraftFindings
+    .mockReset()
+    .mockResolvedValue({ items: [], total: 0, page: 1, per_page: 100 });
   mockUpdateDraft.mockReset();
   mockCompileDraft.mockReset();
   mockCancelDraftJob.mockReset();
@@ -509,24 +612,32 @@ describe("DraftWorkspace (issue #516)", () => {
         () =>
           new Promise<DraftRevisionDetail>((resolve) => {
             resolveSave = resolve;
-          })
+          }),
       );
       renderWorkspace();
 
       const textarea = await screen.findByLabelText("Draft content");
       // Wait for the current-revision query to load the saved baseline.
-      await waitFor(() => expect(textarea).toHaveValue("Original manuscript text."));
+      await waitFor(() =>
+        expect(textarea).toHaveValue("Original manuscript text."),
+      );
 
       // Baseline edit that will be submitted.
       await user.clear(textarea);
       await user.type(textarea, "First saved text.");
 
-      await user.click(screen.getByRole("button", { name: "Save new revision" }));
+      await user.click(
+        screen.getByRole("button", { name: "Save new revision" }),
+      );
       const dialog = await screen.findByRole("dialog");
-      await user.click(within(dialog).getByRole("button", { name: "Save new revision" }));
+      await user.click(
+        within(dialog).getByRole("button", { name: "Save new revision" }),
+      );
 
       // The mutation is now in flight with exactly the submitted text.
-      await waitFor(() => expect(mockCreateDraftRevision).toHaveBeenCalledTimes(1));
+      await waitFor(() =>
+        expect(mockCreateDraftRevision).toHaveBeenCalledTimes(1),
+      );
       const submitted = mockCreateDraftRevision.mock.calls[0][1];
       expect(submitted).toEqual({
         base_revision_id: 100,
@@ -537,16 +648,22 @@ describe("DraftWorkspace (issue #516)", () => {
       // While the request is pending, the user keeps typing. Close the
       // confirmation first (Cancel), then edit the textarea.
       await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
-      fireEvent.change(textarea, { target: { value: "First saved text. Late edit." } });
+      fireEvent.change(textarea, {
+        target: { value: "First saved text. Late edit." },
+      });
       expect(textarea).toHaveValue("First saved text. Late edit.");
 
       // The save succeeds.
       resolveSave(makeRevisionDetail());
-      await waitFor(() => expect(toast.success).toHaveBeenCalledWith("New revision saved."));
+      await waitFor(() =>
+        expect(toast.success).toHaveBeenCalledWith("New revision saved."),
+      );
 
       // REQUIRED: the newer text is still in the editor and still dirty.
       expect(textarea).toHaveValue("First saved text. Late edit.");
-      expect(screen.getByRole("button", { name: "Save new revision" })).toBeEnabled();
+      expect(
+        screen.getByRole("button", { name: "Save new revision" }),
+      ).toBeEnabled();
 
       console.log("AC12 CHECK: PASS");
     } catch (err) {
@@ -572,7 +689,11 @@ describe("DraftWorkspace (issue #516)", () => {
       // revision; a newer one (job 12) failed.
       mockListDraftJobs.mockResolvedValue({
         items: [
-          makeJob({ id: 9, status: "completed", created_at: "2026-01-01T00:00:00Z" }),
+          makeJob({
+            id: 9,
+            status: "completed",
+            created_at: "2026-01-01T00:00:00Z",
+          }),
           makeJob({
             id: 12,
             status: "failed",
@@ -589,7 +710,13 @@ describe("DraftWorkspace (issue #516)", () => {
       });
 
       const oldJobStages = [
-        makeStage({ id: 1, job_id: 9, stage: "research", status: "completed", error_code: null }),
+        makeStage({
+          id: 1,
+          job_id: 9,
+          stage: "research",
+          status: "completed",
+          error_code: null,
+        }),
       ];
       const failedJobStages = [
         makeStage({
@@ -601,29 +728,37 @@ describe("DraftWorkspace (issue #516)", () => {
           error_message: "model call timed out",
         }),
       ];
-      mockGetDraftStages.mockImplementation(async (_draftId: number, jobId: number) => ({
-        items: jobId === 12 ? failedJobStages : oldJobStages,
-        total: (jobId === 12 ? failedJobStages : oldJobStages).length,
-        page: 1,
-        per_page: 100,
-      }));
+      mockGetDraftStages.mockImplementation(
+        async (_draftId: number, jobId: number) => ({
+          items: jobId === 12 ? failedJobStages : oldJobStages,
+          total: (jobId === 12 ? failedJobStages : oldJobStages).length,
+          page: 1,
+          per_page: 100,
+        }),
+      );
 
       renderWorkspace();
 
       // Only the ACTIVE tab panel is mounted, so wait for the artifact to
       // exist and scope the single-match query to that panel.
       await waitFor(() =>
-        expect(screen.getAllByTestId("stage-artifact").length).toBeGreaterThan(0)
+        expect(screen.getAllByTestId("stage-artifact").length).toBeGreaterThan(
+          0,
+        ),
       );
       await waitFor(() => expect(mockGetDraftStages).toHaveBeenCalled());
 
       // REQUIRED: stages are queried for the FAILED job's id (12)…
-      expect(mockGetDraftStages).toHaveBeenCalledWith(42, 12, expect.objectContaining({ per_page: 100 }));
+      expect(mockGetDraftStages).toHaveBeenCalledWith(
+        42,
+        12,
+        expect.objectContaining({ per_page: 100 }),
+      );
 
       // …and the artifact rendered for the research stage is the FAILED
       // job's stage (job 12 with its error), not the old job's.
       const activePanel = document.querySelector(
-        '[role="tabpanel"][data-state="active"]'
+        '[role="tabpanel"][data-state="active"]',
       ) as HTMLElement;
       const artifact = within(activePanel).getByTestId("stage-artifact");
       expect(artifact).toHaveTextContent("stage:research");

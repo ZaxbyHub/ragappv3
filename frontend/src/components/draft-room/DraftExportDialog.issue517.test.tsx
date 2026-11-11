@@ -8,7 +8,10 @@ import { render, screen } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { DraftExportDialog } from "./DraftExportDialog";
-import type { DraftRevisionSummary, DraftRoomCapabilities } from "@/lib/api/draftRoom";
+import type {
+  DraftRevisionSummary,
+  DraftRoomCapabilities,
+} from "@/lib/api/draftRoom";
 
 // jsdom has no ResizeObserver; Radix's Checkbox and Select need it.
 class MockResizeObserver {
@@ -28,7 +31,9 @@ vi.mock("sonner", () => ({
 }));
 
 vi.mock("@/lib/api/draftRoom", async () => {
-  const actual = await vi.importActual<typeof import("@/lib/api/draftRoom")>("@/lib/api/draftRoom");
+  const actual = await vi.importActual<typeof import("@/lib/api/draftRoom")>(
+    "@/lib/api/draftRoom",
+  );
   return {
     ...actual,
     exportDraftRevision: mockExportDraftRevision,
@@ -36,7 +41,9 @@ vi.mock("@/lib/api/draftRoom", async () => {
   };
 });
 
-function makeCapabilities(overrides: Partial<DraftRoomCapabilities> = {}): DraftRoomCapabilities {
+function makeCapabilities(
+  overrides: Partial<DraftRoomCapabilities> = {},
+): DraftRoomCapabilities {
   return {
     enabled: true,
     modes: ["compose", "rewrite"],
@@ -48,10 +55,21 @@ function makeCapabilities(overrides: Partial<DraftRoomCapabilities> = {}): Draft
     logical_model_modes: ["instant", "thinking"],
     default_logical_mode: "instant",
     compile_start_stages: ["research"],
-    compile_stage_order: ["intake", "research", "outline", "draft", "lint", "copy", "standards", "fact", "assemble"],
+    compile_stage_order: [
+      "intake",
+      "research",
+      "outline",
+      "draft",
+      "lint",
+      "copy",
+      "standards",
+      "fact",
+      "assemble",
+    ],
     prompt_bundle_version: "v1",
     editorial_gates_installed: true,
     compile_available: true,
+    upload_available: true,
     findings_available: true,
     claims_available: true,
     evidence_available: true,
@@ -61,7 +79,9 @@ function makeCapabilities(overrides: Partial<DraftRoomCapabilities> = {}): Draft
   };
 }
 
-function makeRevision(overrides: Partial<DraftRevisionSummary> = {}): DraftRevisionSummary {
+function makeRevision(
+  overrides: Partial<DraftRevisionSummary> = {},
+): DraftRevisionSummary {
   return {
     id: 501,
     revision_no: 3,
@@ -87,7 +107,9 @@ beforeEach(() => {
 
 describe("DraftExportDialog (issue #517)", () => {
   it("AC13b: shows the unresolved-blocker disclosure before any export runs", async () => {
-    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
     // NEW-SURFACE contract: the dialog takes the count of OPEN BLOCKER
     // findings for the revision. Cast through unknown so this acceptance
     // test compiles before the prop exists.
@@ -104,7 +126,7 @@ describe("DraftExportDialog (issue #517)", () => {
           isReadyRevision={false}
           {...extraProps}
         />
-      </QueryClientProvider>
+      </QueryClientProvider>,
     );
 
     console.log("AC13b CHECK: FAIL");

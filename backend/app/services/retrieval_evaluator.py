@@ -52,10 +52,15 @@ class RetrievalEvaluator:
             chunk_texts = []
             for i, chunk in enumerate(top_chunks, 1):
                 text = chunk.get("text", "")
-                # Truncate to 500 chars
-                if len(text) > 500:
-                    text = text[:500] + "..."
-                chunk_texts.append(f"{i}. {_xml_escape(text)}")
+                # Bound the ESCAPED region to the documented 500-char
+                # budget INCLUDING the truncation marker (Multi-Stage BOT-2:
+                # the marker previously pushed the render to 503), with the
+                # marker appended inside the budget by _escape_clip itself
+                # (also drops the earlier double full-text escape).
+                from app.services.query_transformer import _escape_clip
+
+                escaped = _escape_clip(text, 500, truncation_marker="...")
+                chunk_texts.append(f"{i}. {escaped}")
 
             chunks_str = "\n".join(chunk_texts)
 
