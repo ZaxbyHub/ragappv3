@@ -36,7 +36,7 @@
       "SEVERITY.LOW": 59,
       "SEVERITY.MEDIUM": 63,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 96968,
+      "loc": 96977,
       "nosec": 0,
       "skipped_tests": 72
     },
@@ -725,7 +725,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 1,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 4636,
+      "loc": 4631,
       "nosec": 0,
       "skipped_tests": 6
     },
@@ -868,7 +868,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 2,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 4619,
+      "loc": 4633,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -3584,7 +3584,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "3056                 cursor = conn.execute(\n3057                     \"UPDATE files SET enrichment_status = (\"\n3058                     + est.aggregate_status_case_sql()\n3059                     + \"), enrichment_error = NULL, enrichment_updated_at = ? \"\n",
+      "code": "3053                 cursor = conn.execute(\n3054                     \"UPDATE files SET enrichment_status = (\"\n3055                     + est.aggregate_status_case_sql()\n3056                     + \"), enrichment_error = NULL, enrichment_updated_at = ? \"\n",
       "col_offset": 20,
       "end_col_offset": 60,
       "filename": "backend/app/services/background_tasks.py",
@@ -3595,10 +3595,10 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 3057,
+      "line_number": 3054,
       "line_range": [
-        3057,
-        3058
+        3054,
+        3055
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
