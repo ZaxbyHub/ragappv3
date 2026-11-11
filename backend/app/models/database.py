@@ -3884,9 +3884,10 @@ def migrate_add_files_processing_progress(sqlite_path: str) -> None:
 
     Also creates ``idx_files_hash_vault_status`` to back the in-flight
     duplicate check used by the async upload route. Without this index,
-    the ``IN ('pending','processing','indexed')`` filter falls back to
-    scanning every indexed row and the request-blocking dedup check
-    becomes O(indexed_rows).
+    the ``IN ('pending','processing','indexed','partial')`` filter falls back
+    to scanning every indexed row and the request-blocking dedup check
+    becomes O(indexed_rows) (issue #963 site 4b: the live in-flight filter
+    includes 'partial' — the #693-widened content-available state).
 
     Idempotent — safe to run multiple times.
     """

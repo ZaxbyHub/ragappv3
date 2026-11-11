@@ -189,18 +189,21 @@ def redact_legacy_detail_entry(entry: object) -> str:
 def redact_legacy_result_json(result_json) -> Optional[str]:
     """Mask pre-redaction raw error strings inside a stored ``result_json``.
 
-    Issue #953/#958 review fix (PRR-002/PRR-007): parses the stored payload
-    and rewrites only the reader-visible error strings that still carry raw
-    text — the curator/compiler ``errors`` lists (``<code>: <Class>: <msg>``,
-    nested under ``curator`` or at the top level) and the reindex
-    legacy-persist ``details`` list (``file_id=<id>: <raw str(exc)>``). Rows
-    without such an entry are returned byte-identical so clean payloads never
-    change shape. Non-dict or unparseable payloads are returned unchanged
-    (nothing reader-sensitive to mask).
+    Issue #953/#958 review fix (PRR-002/PRR-007), hardened by issue #819
+    (plan-critic R3-1): parses the stored payload and rewrites only the
+    reader-visible error strings that still carry raw text — the
+    curator/compiler ``errors`` lists (``<code>: <Class>: <msg>``, nested
+    under ``curator`` or at the top level) and, for REINDEX result payloads
+    (identified at the PAYLOAD level by an integer ``processed`` +
+    ``failed`` pair — the composed reindex result shape), every entry of the
+    ``details`` list, shaped ``file_id=<id>: <raw str(exc)>`` and shape-less
+    raw text alike. Non-reindex payloads (wiki/KMS free-form ``details``,
+    operational strings) never enter the details masker and stay
+    byte-identical. Rows without a masked entry are returned byte-identical
+    so clean payloads never change shape. Non-dict or unparseable payloads
+    are returned unchanged (nothing reader-sensitive to mask).
     """
     if not result_json or not isinstance(result_json, str):
-        return result_json
-    if "error" not in result_json:
         return result_json
     try:
         payload = json.loads(result_json)
@@ -208,12 +211,22 @@ def redact_legacy_result_json(result_json) -> Optional[str]:
         return result_json
     if not isinstance(payload, dict):
         return result_json
+    # Issue #819: the old ``"error" not in result_json`` substring shortcut
+    # returned failed reindex rows raw whenever their serialized form lacked
+    # the literal substring — parse always and let the payload-level gate
+    # decide what to mask.
+    processed = payload.get("processed")
+    failed = payload.get("failed")
+    is_reindex_payload = isinstance(processed, int) and isinstance(failed, int)
 
     changed = False
     curator = payload.get("curator")
-    # (container, key, masker) — curator errors are nested; details and any
-    # top-level errors list are on the payload root.
-    targets = [(payload, "details", redact_legacy_detail_entry)]
+    # (container, key, masker) — curator errors are nested; reindex details
+    # are masked only for the composed reindex result shape; any top-level
+    # errors list is on the payload root.
+    targets: list = []
+    if is_reindex_payload:
+        targets.append((payload, "details", redact_legacy_detail_entry))
     if isinstance(curator, dict):
         targets.append((curator, "errors", _mask_legacy_error_string))
     targets.append((payload, "errors", _mask_legacy_error_string))
@@ -702,16 +715,41 @@ class JobLease:
             done = cur.rowcount > 0
         return done
 
-    def fail(self, job_id: int, worker_id: str, error: str) -> bool:
+    def fail(
+        self,
+        job_id: int,
+        worker_id: str,
+        error: str,
+        *,
+        result: Optional[dict] = None,
+    ) -> bool:
         """Fenced terminal failure; ``False`` (and no mutation) when the
-        lease was lost or already settled."""
+        lease was lost or already settled.
+
+        Issue #819: ``result`` optionally persists the job's composed
+        ``processed/failed/details`` payload into ``result_json`` so a
+        terminally failed lease reindex job exposes the same operator
+        diagnostics the legacy settlement table records. When ``result`` is
+        None (every other caller — ingest, wiki, kms, draft) the UPDATE is
+        byte-identical to the historical statement and the column keeps its
+        default.
+        """
         with self._write_txn():
-            cur = self._conn.execute(
-                f"UPDATE {self._table} SET status = 'failed', {self._shape.error_set} "  # nosec B608 - allowlist fragments only
-                "completed_at = CURRENT_TIMESTAMP, heartbeat_at = CURRENT_TIMESTAMP "
-                "WHERE id = ? AND worker_id = ? AND status = 'running'",
-                (error, job_id, worker_id),
-            )
+            if result is not None:
+                cur = self._conn.execute(
+                    f"UPDATE {self._table} SET status = 'failed', "  # nosec B608 - allowlist fragments only
+                    f"{self._shape.error_set} result_json = ?, "
+                    "completed_at = CURRENT_TIMESTAMP, heartbeat_at = CURRENT_TIMESTAMP "
+                    "WHERE id = ? AND worker_id = ? AND status = 'running'",
+                    (error, json.dumps(result), job_id, worker_id),
+                )
+            else:
+                cur = self._conn.execute(
+                    f"UPDATE {self._table} SET status = 'failed', {self._shape.error_set} "  # nosec B608 - allowlist fragments only
+                    "completed_at = CURRENT_TIMESTAMP, heartbeat_at = CURRENT_TIMESTAMP "
+                    "WHERE id = ? AND worker_id = ? AND status = 'running'",
+                    (error, job_id, worker_id),
+                )
             done = cur.rowcount > 0
         return done
 

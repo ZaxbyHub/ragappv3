@@ -6,17 +6,24 @@ import type { DraftRoomCapabilities } from "@/lib/api/draftRoom";
 const getDraftRoomCapabilitiesMock = vi.hoisted(() => vi.fn());
 
 vi.mock("@/lib/api/draftRoom", async () => {
-  const actual = await vi.importActual<typeof import("@/lib/api/draftRoom")>("@/lib/api/draftRoom");
+  const actual = await vi.importActual<typeof import("@/lib/api/draftRoom")>(
+    "@/lib/api/draftRoom",
+  );
   return {
     ...actual,
     getDraftRoomCapabilities: getDraftRoomCapabilitiesMock,
   };
 });
 
-import { useDraftRoomCapabilities, useDraftRoomVisible } from "./useDraftRoomCapabilities";
+import {
+  useDraftRoomCapabilities,
+  useDraftRoomVisible,
+} from "./useDraftRoomCapabilities";
 import { draftRoomKeys } from "@/lib/api/draftRoom";
 
-function makeCapabilities(overrides: Partial<DraftRoomCapabilities> = {}): DraftRoomCapabilities {
+function makeCapabilities(
+  overrides: Partial<DraftRoomCapabilities> = {},
+): DraftRoomCapabilities {
   return {
     enabled: true,
     modes: ["compose", "rewrite"],
@@ -27,7 +34,15 @@ function makeCapabilities(overrides: Partial<DraftRoomCapabilities> = {}): Draft
     export_formats: ["md"],
     logical_model_modes: ["instant", "thinking"],
     default_logical_mode: "instant",
-    compile_start_stages: ["research", "outline", "draft", "lint", "copy", "standards", "fact"],
+    compile_start_stages: [
+      "research",
+      "outline",
+      "draft",
+      "lint",
+      "copy",
+      "standards",
+      "fact",
+    ],
     compile_stage_order: [
       "intake",
       "research",
@@ -42,6 +57,7 @@ function makeCapabilities(overrides: Partial<DraftRoomCapabilities> = {}): Draft
     prompt_bundle_version: "v1",
     editorial_gates_installed: true,
     compile_available: true,
+    upload_available: true,
     findings_available: true,
     claims_available: true,
     evidence_available: true,
@@ -52,8 +68,12 @@ function makeCapabilities(overrides: Partial<DraftRoomCapabilities> = {}): Draft
 }
 
 function wrapper({ children }: { children: React.ReactNode }) {
-  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>;
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  return (
+    <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+  );
 }
 
 describe("useDraftRoomCapabilities", () => {
@@ -64,7 +84,9 @@ describe("useDraftRoomCapabilities", () => {
 
   it("fetches capabilities with the canonical query key", async () => {
     getDraftRoomCapabilitiesMock.mockResolvedValue(makeCapabilities());
-    const { result } = renderHook(() => useDraftRoomCapabilities(), { wrapper });
+    const { result } = renderHook(() => useDraftRoomCapabilities(), {
+      wrapper,
+    });
 
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
     expect(result.current.data?.enabled).toBe(true);
@@ -72,7 +94,10 @@ describe("useDraftRoomCapabilities", () => {
   });
 
   it("exposes the query under draftRoomKeys.capabilities()", () => {
-    expect(draftRoomKeys.capabilities()).toEqual(["draft-room", "capabilities"]);
+    expect(draftRoomKeys.capabilities()).toEqual([
+      "draft-room",
+      "capabilities",
+    ]);
   });
 });
 
@@ -95,24 +120,36 @@ describe("useDraftRoomVisible", () => {
   });
 
   it("returns false when the backend reports the feature disabled", async () => {
-    getDraftRoomCapabilitiesMock.mockResolvedValue(makeCapabilities({ enabled: false }));
+    getDraftRoomCapabilitiesMock.mockResolvedValue(
+      makeCapabilities({ enabled: false }),
+    );
     const { result } = renderHook(() => useDraftRoomVisible(), { wrapper });
-    await waitFor(() => expect(getDraftRoomCapabilitiesMock).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(getDraftRoomCapabilitiesMock).toHaveBeenCalled(),
+    );
     // Give the query a tick to settle into success state.
     await waitFor(() => expect(result.current).toBe(false));
   });
 
   it("returns false when editorial_gates_installed is false", async () => {
-    getDraftRoomCapabilitiesMock.mockResolvedValue(makeCapabilities({ editorial_gates_installed: false }));
+    getDraftRoomCapabilitiesMock.mockResolvedValue(
+      makeCapabilities({ editorial_gates_installed: false }),
+    );
     const { result } = renderHook(() => useDraftRoomVisible(), { wrapper });
-    await waitFor(() => expect(getDraftRoomCapabilitiesMock).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(getDraftRoomCapabilitiesMock).toHaveBeenCalled(),
+    );
     await waitFor(() => expect(result.current).toBe(false));
   });
 
   it("returns false when ready_available is false", async () => {
-    getDraftRoomCapabilitiesMock.mockResolvedValue(makeCapabilities({ ready_available: false }));
+    getDraftRoomCapabilitiesMock.mockResolvedValue(
+      makeCapabilities({ ready_available: false }),
+    );
     const { result } = renderHook(() => useDraftRoomVisible(), { wrapper });
-    await waitFor(() => expect(getDraftRoomCapabilitiesMock).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(getDraftRoomCapabilitiesMock).toHaveBeenCalled(),
+    );
     await waitFor(() => expect(result.current).toBe(false));
   });
 

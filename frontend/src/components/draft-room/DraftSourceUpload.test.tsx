@@ -434,6 +434,29 @@ describe("DraftSourceUpload", () => {
     expect(screen.getByRole("button", { name: /remove/i })).toBeInTheDocument();
   });
 
+  it("shows the server detail for commit_pending (503) with no Retry, since the upload may still land", async () => {
+    // Review PRR-013: the server is still committing this upload in the
+    // background — a blind Retry would duplicate it, so the row must point the
+    // user at the inputs list instead of offering a re-upload.
+    const user = userEvent.setup();
+    mockUploadDraftInput.mockRejectedValue(
+      makeApiError(
+        503,
+        "commit_pending",
+        "upload is still being processed; check the draft inputs list before retrying"
+      )
+    );
+    renderComponent();
+
+    await user.upload(screen.getByLabelText(ADD_SOURCE_FILES_CTA), makeFile());
+
+    await waitFor(() =>
+      expect(screen.getByText(/upload is still being processed/)).toBeInTheDocument()
+    );
+    expect(screen.queryByRole("button", { name: /retry/i })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /remove/i })).toBeInTheDocument();
+  });
+
   it("offers Retry and Remove for a generic/transient failure, and Retry re-uploads", async () => {
     const user = userEvent.setup();
     mockUploadDraftInput

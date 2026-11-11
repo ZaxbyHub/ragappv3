@@ -8,7 +8,8 @@ import DraftRoomPage from "./DraftRoomPage";
 import { DRAFT_ROOM_DISABLED_MESSAGE } from "@/components/draft-room/labels";
 import type { DraftSummary } from "@/lib/api/draftRoom";
 
-const render: typeof rtlRender = (ui, options) => rtlRender(ui, { wrapper: MemoryRouter, ...options });
+const render: typeof rtlRender = (ui, options) =>
+  rtlRender(ui, { wrapper: MemoryRouter, ...options });
 
 const {
   mockNavigate,
@@ -23,7 +24,10 @@ const {
 }));
 
 vi.mock("react-router-dom", async () => {
-  const actual = await vi.importActual<typeof import("react-router-dom")>("react-router-dom");
+  const actual =
+    await vi.importActual<typeof import("react-router-dom")>(
+      "react-router-dom",
+    );
   return { ...actual, useNavigate: () => mockNavigate };
 });
 
@@ -32,7 +36,9 @@ vi.mock("@/lib/api", () => ({
 }));
 
 vi.mock("@/lib/api/draftRoom", async () => {
-  const actual = await vi.importActual<typeof import("@/lib/api/draftRoom")>("@/lib/api/draftRoom");
+  const actual = await vi.importActual<typeof import("@/lib/api/draftRoom")>(
+    "@/lib/api/draftRoom",
+  );
   return {
     ...actual,
     listDrafts: mockListDrafts,
@@ -50,7 +56,10 @@ vi.mock("@/components/draft-room/DraftCreateDialog", () => ({
     props.open ? (
       <div data-testid="create-dialog">
         defaultVault:{String(props.defaultVaultId)}
-        <button type="button" onClick={() => props.onCreated(makeDraft({ id: 99 }))}>
+        <button
+          type="button"
+          onClick={() => props.onCreated(makeDraft({ id: 99 }))}
+        >
           simulate-created
         </button>
       </div>
@@ -79,11 +88,13 @@ function makeDraft(overrides: Partial<DraftSummary> = {}): DraftSummary {
 }
 
 function renderPage() {
-  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
   return render(
     <QueryClientProvider client={queryClient}>
       <DraftRoomPage />
-    </QueryClientProvider>
+    </QueryClientProvider>,
   );
 }
 
@@ -106,6 +117,7 @@ beforeEach(() => {
     prompt_bundle_version: "v1",
     editorial_gates_installed: true,
     compile_available: true,
+    upload_available: true,
     findings_available: true,
     claims_available: true,
     evidence_available: true,
@@ -122,29 +134,53 @@ describe("DraftRoomPage", () => {
 
     expect(screen.getByTestId("draft-list-skeleton")).toBeInTheDocument();
     expect(screen.queryByText(/no projects/i)).not.toBeInTheDocument();
-    expect(screen.queryByText(/you need vault access/i)).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/you need vault access/i),
+    ).not.toBeInTheDocument();
   });
 
   it("explains the vault requirement and links to Vaults when the user has no accessible vault", async () => {
     const user = userEvent.setup();
     mockListAccessibleVaults.mockResolvedValue({ vaults: [] });
-    mockListDrafts.mockResolvedValue({ items: [], total: 0, page: 1, per_page: 20 });
+    mockListDrafts.mockResolvedValue({
+      items: [],
+      total: 0,
+      page: 1,
+      per_page: 20,
+    });
     renderPage();
 
-    expect(await screen.findByText("You need vault access to use Draft Room")).toBeInTheDocument();
+    expect(
+      await screen.findByText("You need vault access to use Draft Room"),
+    ).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Go to Vaults" }));
     expect(mockNavigate).toHaveBeenCalledWith("/vaults");
-    expect(screen.getByRole("button", { name: NEW_DRAFT_CTA_TEXT })).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: NEW_DRAFT_CTA_TEXT }),
+    ).toBeDisabled();
   });
 
   it("shows the purpose statement, privacy note, and New draft CTA when the vault exists but no projects do", async () => {
-    mockListAccessibleVaults.mockResolvedValue({ vaults: [{ id: 7, name: "Research vault" }] });
-    mockListDrafts.mockResolvedValue({ items: [], total: 0, page: 1, per_page: 20 });
+    mockListAccessibleVaults.mockResolvedValue({
+      vaults: [{ id: 7, name: "Research vault" }],
+    });
+    mockListDrafts.mockResolvedValue({
+      items: [],
+      total: 0,
+      page: 1,
+      per_page: 20,
+    });
     renderPage();
 
-    expect(await screen.findByText("Start your first drafting project")).toBeInTheDocument();
-    expect(screen.getByText(/stay private to this project/i)).toBeInTheDocument();
-    expect(screen.getAllByRole("button", { name: NEW_DRAFT_CTA_TEXT }).length).toBeGreaterThan(0);
+    expect(
+      await screen.findByText("Start your first drafting project"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/stay private to this project/i),
+    ).toBeInTheDocument();
+    expect(
+      screen.getAllByRole("button", { name: NEW_DRAFT_CTA_TEXT }).length,
+    ).toBeGreaterThan(0);
   });
 
   it("shows the honest unavailable message and disables New draft when the capability is off, while the list still works", async () => {
@@ -163,23 +199,37 @@ describe("DraftRoomPage", () => {
       prompt_bundle_version: "v1",
       editorial_gates_installed: false,
       compile_available: false,
+      upload_available: true,
       findings_available: false,
       claims_available: false,
       evidence_available: false,
       ready_available: false,
       promote_available: false,
     });
-    mockListAccessibleVaults.mockResolvedValue({ vaults: [{ id: 7, name: "Research vault" }] });
-    mockListDrafts.mockResolvedValue({ items: [makeDraft()], total: 1, page: 1, per_page: 20 });
+    mockListAccessibleVaults.mockResolvedValue({
+      vaults: [{ id: 7, name: "Research vault" }],
+    });
+    mockListDrafts.mockResolvedValue({
+      items: [makeDraft()],
+      total: 1,
+      page: 1,
+      per_page: 20,
+    });
     renderPage();
 
-    expect(await screen.findByText(DRAFT_ROOM_DISABLED_MESSAGE)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: NEW_DRAFT_CTA_TEXT })).toBeDisabled();
+    expect(
+      await screen.findByText(DRAFT_ROOM_DISABLED_MESSAGE),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: NEW_DRAFT_CTA_TEXT }),
+    ).toBeDisabled();
     expect(screen.getByText("Q3 press release")).toBeInTheDocument();
   });
 
   it("renders the drafts list with vault name, status, updated date, counts, and an Open link, and paginates", async () => {
-    mockListAccessibleVaults.mockResolvedValue({ vaults: [{ id: 7, name: "Research vault" }] });
+    mockListAccessibleVaults.mockResolvedValue({
+      vaults: [{ id: 7, name: "Research vault" }],
+    });
     mockListDrafts.mockResolvedValue({
       items: [makeDraft()],
       total: 45,
@@ -190,18 +240,35 @@ describe("DraftRoomPage", () => {
 
     expect(await screen.findByText("Q3 press release")).toBeInTheDocument();
     expect(screen.getByText("Research vault")).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "Open" })).toHaveAttribute("href", "/draft-room/1");
-    expect(screen.getByText((_, element) => element?.textContent === "Showing 1 to 20 of 45 projects")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Open" })).toHaveAttribute(
+      "href",
+      "/draft-room/1",
+    );
+    expect(
+      screen.getByText(
+        (_, element) =>
+          element?.textContent === "Showing 1 to 20 of 45 projects",
+      ),
+    ).toBeInTheDocument();
   });
 
   it("opens the create dialog with the current vault filter and navigates to the new draft on success", async () => {
     const user = userEvent.setup();
-    mockListAccessibleVaults.mockResolvedValue({ vaults: [{ id: 7, name: "Research vault" }] });
-    mockListDrafts.mockResolvedValue({ items: [makeDraft()], total: 1, page: 1, per_page: 20 });
+    mockListAccessibleVaults.mockResolvedValue({
+      vaults: [{ id: 7, name: "Research vault" }],
+    });
+    mockListDrafts.mockResolvedValue({
+      items: [makeDraft()],
+      total: 1,
+      page: 1,
+      per_page: 20,
+    });
     renderPage();
 
     await screen.findByText("Q3 press release");
-    await user.click(screen.getAllByRole("button", { name: NEW_DRAFT_CTA_TEXT })[0]);
+    await user.click(
+      screen.getAllByRole("button", { name: NEW_DRAFT_CTA_TEXT })[0],
+    );
 
     const dialog = await screen.findByTestId("create-dialog");
     expect(dialog).toHaveTextContent("defaultVault:null");
@@ -210,9 +277,18 @@ describe("DraftRoomPage", () => {
   });
 
   it("renders exactly one main landmark when nested inside the app shell's main region", async () => {
-    mockListAccessibleVaults.mockResolvedValue({ vaults: [{ id: 7, name: "Research vault" }] });
-    mockListDrafts.mockResolvedValue({ items: [makeDraft()], total: 1, page: 1, per_page: 20 });
-    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    mockListAccessibleVaults.mockResolvedValue({
+      vaults: [{ id: 7, name: "Research vault" }],
+    });
+    mockListDrafts.mockResolvedValue({
+      items: [makeDraft()],
+      total: 1,
+      page: 1,
+      per_page: 20,
+    });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
     rtlRender(
       <QueryClientProvider client={queryClient}>
         <MemoryRouter>
@@ -220,7 +296,7 @@ describe("DraftRoomPage", () => {
             <DraftRoomPage />
           </main>
         </MemoryRouter>
-      </QueryClientProvider>
+      </QueryClientProvider>,
     );
 
     await screen.findByText("Q3 press release");
@@ -248,19 +324,33 @@ describe("DraftRoomPage", () => {
     expect(allFilter.getAttribute("aria-pressed")).toBe("true");
 
     // Navigate to page 2 first.
-    await user.click(await screen.findByRole("button", { name: "Go to page 2" }));
+    await user.click(
+      await screen.findByRole("button", { name: "Go to page 2" }),
+    );
     await waitFor(() => {
-      const lastCall = mockListDrafts.mock.calls.at(-1)?.[0] as Record<string, unknown>;
+      const lastCall = mockListDrafts.mock.calls.at(-1)?.[0] as Record<
+        string,
+        unknown
+      >;
       expect(lastCall?.page).toBe(2);
     });
 
     // Changing the status filter must reset the page to 1.
     await user.click(screen.getByRole("button", { name: "In progress" }));
 
-    expect(screen.getByRole("button", { name: "In progress" }).getAttribute("aria-pressed")).toBe("true");
-    expect(screen.getByRole("button", { name: "All" }).getAttribute("aria-pressed")).toBe("false");
+    expect(
+      screen
+        .getByRole("button", { name: "In progress" })
+        .getAttribute("aria-pressed"),
+    ).toBe("true");
+    expect(
+      screen.getByRole("button", { name: "All" }).getAttribute("aria-pressed"),
+    ).toBe("false");
     await waitFor(() => {
-      const lastCall = mockListDrafts.mock.calls.at(-1)?.[0] as Record<string, unknown>;
+      const lastCall = mockListDrafts.mock.calls.at(-1)?.[0] as Record<
+        string,
+        unknown
+      >;
       expect(lastCall?.status).toBe("running");
       expect(lastCall?.page).toBe(1);
     });

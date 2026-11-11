@@ -1,4 +1,10 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
@@ -34,20 +40,29 @@ const mocks = vi.hoisted(() => ({
   getDraftInputContent: vi.fn(),
 }));
 
-vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn(), info: vi.fn() } }));
+vi.mock("sonner", () => ({
+  toast: { success: vi.fn(), error: vi.fn(), info: vi.fn() },
+}));
 
 vi.mock("./DraftAssignmentForm", async () => {
   const React = await import("react");
   return {
     DRAFT_ASSIGNMENT_FIELD_ORDER: [],
-    DraftAssignmentForm: () => React.createElement("div", { "data-testid": "assignment" }),
+    DraftAssignmentForm: () =>
+      React.createElement("div", { "data-testid": "assignment" }),
     focusFirstInvalidDraftAssignmentField: vi.fn(),
     validateDraftAssignmentForm: () => ({}),
   };
 });
 
 vi.mock("react-dropzone", () => ({
-  useDropzone: ({ onDrop, disabled }: { onDrop: (files: File[]) => void; disabled: boolean }) => ({
+  useDropzone: ({
+    onDrop,
+    disabled,
+  }: {
+    onDrop: (files: File[]) => void;
+    disabled: boolean;
+  }) => ({
     getRootProps: () => ({
       "data-drop-disabled": disabled ? "true" : "false",
       onDrop: (event: React.DragEvent<HTMLElement>) => {
@@ -61,12 +76,18 @@ vi.mock("react-dropzone", () => ({
 
 vi.mock("@/components/ui/input", async () => {
   const React = await import("react");
-  return { Input: (props: React.InputHTMLAttributes<HTMLInputElement>) => React.createElement("input", props) };
+  return {
+    Input: (props: React.InputHTMLAttributes<HTMLInputElement>) =>
+      React.createElement("input", props),
+  };
 });
 
 vi.mock("@/components/ui/progress", async () => {
   const React = await import("react");
-  return { Progress: (props: React.HTMLAttributes<HTMLDivElement>) => React.createElement("div", props) };
+  return {
+    Progress: (props: React.HTMLAttributes<HTMLDivElement>) =>
+      React.createElement("div", props),
+  };
 });
 
 vi.mock("./DraftSourceList", () => ({ DraftSourceList: () => null }));
@@ -82,7 +103,9 @@ vi.mock("./DraftExportDialog", () => ({ DraftExportDialog: () => null }));
 vi.mock("./DraftPromoteDialog", () => ({ DraftPromoteDialog: () => null }));
 
 vi.mock("@/lib/api/draftRoom", async () => {
-  const actual = await vi.importActual<typeof import("@/lib/api/draftRoom")>("@/lib/api/draftRoom");
+  const actual = await vi.importActual<typeof import("@/lib/api/draftRoom")>(
+    "@/lib/api/draftRoom",
+  );
   return {
     ...actual,
     ...mocks,
@@ -92,40 +115,61 @@ vi.mock("@/lib/api/draftRoom", async () => {
 vi.mock("@/components/ui/button", async () => {
   const React = await import("react");
   return {
-    Button: (props: React.ButtonHTMLAttributes<HTMLButtonElement>) => React.createElement("button", props),
+    Button: (props: React.ButtonHTMLAttributes<HTMLButtonElement>) =>
+      React.createElement("button", props),
     buttonVariants: () => "",
   };
 });
 vi.mock("@/components/ui/alert", async () => {
   const React = await import("react");
-  const Box = (props: React.HTMLAttributes<HTMLDivElement>) => React.createElement("div", props);
+  const Box = (props: React.HTMLAttributes<HTMLDivElement>) =>
+    React.createElement("div", props);
   return { Alert: Box, AlertDescription: Box, AlertTitle: Box };
 });
 vi.mock("@/components/ui/label", async () => {
   const React = await import("react");
-  return { Label: (props: React.LabelHTMLAttributes<HTMLLabelElement>) => React.createElement("label", props) };
+  return {
+    Label: (props: React.LabelHTMLAttributes<HTMLLabelElement>) =>
+      React.createElement("label", props),
+  };
 });
 vi.mock("@/components/ui/dialog", async () => {
   const React = await import("react");
-  const Box = (props: React.HTMLAttributes<HTMLDivElement>) => React.createElement("div", props);
+  const Box = (props: React.HTMLAttributes<HTMLDivElement>) =>
+    React.createElement("div", props);
   return {
-    Dialog: ({ open, children }: { open: boolean; children: React.ReactNode }) => (open ? children : null),
+    Dialog: ({
+      open,
+      children,
+    }: {
+      open: boolean;
+      children: React.ReactNode;
+    }) => (open ? children : null),
     DialogContent: (props: React.HTMLAttributes<HTMLDivElement>) =>
       React.createElement("div", { ...props, role: "dialog" }),
     DialogDescription: Box,
     DialogFooter: Box,
     DialogHeader: Box,
-    DialogTitle: (props: React.HTMLAttributes<HTMLHeadingElement>) => React.createElement("h2", props),
+    DialogTitle: (props: React.HTMLAttributes<HTMLHeadingElement>) =>
+      React.createElement("h2", props),
   };
 });
 vi.mock("@/components/ui/sheet", async () => {
   const React = await import("react");
-  const Box = (props: React.HTMLAttributes<HTMLDivElement>) => React.createElement("div", props);
+  const Box = (props: React.HTMLAttributes<HTMLDivElement>) =>
+    React.createElement("div", props);
   return {
-    Sheet: ({ open, children }: { open: boolean; children: React.ReactNode }) => (open ? children : null),
+    Sheet: ({
+      open,
+      children,
+    }: {
+      open: boolean;
+      children: React.ReactNode;
+    }) => (open ? children : null),
     SheetContent: Box,
     SheetHeader: Box,
-    SheetTitle: (props: React.HTMLAttributes<HTMLHeadingElement>) => React.createElement("h2", props),
+    SheetTitle: (props: React.HTMLAttributes<HTMLHeadingElement>) =>
+      React.createElement("h2", props),
   };
 });
 vi.mock("@/components/ui/tabs", async () => {
@@ -134,20 +178,38 @@ vi.mock("@/components/ui/tabs", async () => {
   return {
     Tabs: ({ value, children }: { value: string; children: React.ReactNode }) =>
       React.createElement(TabsContext.Provider, { value }, children),
-    TabsList: (props: React.HTMLAttributes<HTMLDivElement>) => React.createElement("div", props),
-    TabsTrigger: ({ value, children }: { value: string; children: React.ReactNode }) =>
-      React.createElement("button", { type: "button" }, children),
-    TabsContent: ({ value, children }: { value: string; children: React.ReactNode }) =>
-      React.useContext(TabsContext) === value ? React.createElement("div", null, children) : null,
+    TabsList: (props: React.HTMLAttributes<HTMLDivElement>) =>
+      React.createElement("div", props),
+    TabsTrigger: ({
+      value,
+      children,
+    }: {
+      value: string;
+      children: React.ReactNode;
+    }) => React.createElement("button", { type: "button" }, children),
+    TabsContent: ({
+      value,
+      children,
+    }: {
+      value: string;
+      children: React.ReactNode;
+    }) =>
+      React.useContext(TabsContext) === value
+        ? React.createElement("div", null, children)
+        : null,
   };
 });
 vi.mock("@/components/ui/select", async () => {
   const React = await import("react");
   return {
-    Select: ({ children }: { children: React.ReactNode }) => React.createElement("div", null, children),
-    SelectContent: ({ children }: { children: React.ReactNode }) => React.createElement("div", null, children),
-    SelectItem: ({ children }: { children: React.ReactNode }) => React.createElement("div", null, children),
-    SelectTrigger: ({ children }: { children: React.ReactNode }) => React.createElement("div", null, children),
+    Select: ({ children }: { children: React.ReactNode }) =>
+      React.createElement("div", null, children),
+    SelectContent: ({ children }: { children: React.ReactNode }) =>
+      React.createElement("div", null, children),
+    SelectItem: ({ children }: { children: React.ReactNode }) =>
+      React.createElement("div", null, children),
+    SelectTrigger: ({ children }: { children: React.ReactNode }) =>
+      React.createElement("div", null, children),
     SelectValue: () => null,
   };
 });
@@ -208,7 +270,9 @@ function makeDetail(inputs: DraftInput[]): DraftDetail {
   } as DraftDetail;
 }
 
-function makeCapabilities(limits: Record<string, unknown> = { job_max_model_calls: 40, max_inputs: 10 }): DraftRoomCapabilities {
+function makeCapabilities(
+  limits: Record<string, unknown> = { job_max_model_calls: 40, max_inputs: 10 },
+): DraftRoomCapabilities {
   return {
     enabled: true,
     modes: ["compose"],
@@ -224,6 +288,7 @@ function makeCapabilities(limits: Record<string, unknown> = { job_max_model_call
     prompt_bundle_version: "v1",
     editorial_gates_installed: true,
     compile_available: true,
+    upload_available: true,
     findings_available: true,
     claims_available: true,
     evidence_available: true,
@@ -235,7 +300,9 @@ function makeCapabilities(limits: Record<string, unknown> = { job_max_model_call
 function renderWorkspace(
   overrides: Partial<React.ComponentProps<typeof DraftWorkspace>> = {},
 ) {
-  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
   const detail = overrides.detail ?? makeDetail([makeInput("ready")]);
   const draft = overrides.draft ?? detail.summary;
   return {
@@ -259,11 +326,19 @@ function renderWorkspace(
 
 beforeEach(() => {
   useDraftRoomUiStore.getState().resetForDraft(42);
-  mocks.listDraftJobs.mockReset().mockResolvedValue({ items: [], total: 0, page: 1, per_page: 10 });
-  mocks.getDraftStages.mockReset().mockResolvedValue({ items: [], total: 0, page: 1, per_page: 100 });
-  mocks.listDraftRevisions.mockReset().mockResolvedValue({ items: [], total: 0, page: 1, per_page: 50 });
+  mocks.listDraftJobs
+    .mockReset()
+    .mockResolvedValue({ items: [], total: 0, page: 1, per_page: 10 });
+  mocks.getDraftStages
+    .mockReset()
+    .mockResolvedValue({ items: [], total: 0, page: 1, per_page: 100 });
+  mocks.listDraftRevisions
+    .mockReset()
+    .mockResolvedValue({ items: [], total: 0, page: 1, per_page: 50 });
   mocks.getDraftRevision.mockReset();
-  mocks.listDraftFindings.mockReset().mockResolvedValue({ items: [], total: 0, page: 1, per_page: 100 });
+  mocks.listDraftFindings
+    .mockReset()
+    .mockResolvedValue({ items: [], total: 0, page: 1, per_page: 100 });
   mocks.uploadDraftInput.mockReset();
   mocks.getDraft.mockReset();
   mocks.getDraftInputContent.mockReset();
@@ -275,13 +350,19 @@ describe("issue #773 Draft source upload readiness", () => {
   it("fails closed through the real file/drop controls until capabilities load, then uploads", async () => {
     const user = userEvent.setup();
     useDraftRoomUiStore.setState({ workspaceTab: "sources" });
-    const { rerender, queryClient } = renderWorkspace({ capabilities: undefined });
+    const { rerender, queryClient } = renderWorkspace({
+      capabilities: undefined,
+    });
     const file = new File(["source"], "source.md", { type: "text/markdown" });
     const fileInput = screen.getByLabelText(ADD_SOURCE_FILES_CTA);
-    const dropTarget = screen.getByText("Drag and drop files here, or").parentElement;
+    const dropTarget = screen.getByText(
+      "Drag and drop files here, or",
+    ).parentElement;
 
     expect(fileInput).toBeDisabled();
-    expect(screen.getByRole("status")).toHaveTextContent("Loading Draft Room capabilities");
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Loading Draft Room capabilities",
+    );
     fireEvent.drop(dropTarget!, { dataTransfer: { files: [file] } });
     await user.upload(fileInput, file);
     expect(mocks.uploadDraftInput).not.toHaveBeenCalled();
@@ -300,9 +381,13 @@ describe("issue #773 Draft source upload readiness", () => {
       </MemoryRouter>,
     );
     expect(screen.getByLabelText(ADD_SOURCE_FILES_CTA)).toBeDisabled();
-    expect(screen.getByRole("status")).toHaveTextContent("Draft Room is not enabled on this deployment");
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Draft Room is not enabled on this deployment",
+    );
 
-    mocks.uploadDraftInput.mockResolvedValue({ input: { id: 1, parse_status: "ready" } });
+    mocks.uploadDraftInput.mockResolvedValue({
+      input: { id: 1, parse_status: "ready" },
+    });
     rerender(
       <MemoryRouter>
         <QueryClientProvider client={queryClient}>
@@ -321,6 +406,8 @@ describe("issue #773 Draft source upload readiness", () => {
     expect(enabledInput).toBeEnabled();
     expect(screen.queryByRole("status")).not.toBeInTheDocument();
     await user.upload(enabledInput, file);
-    await waitFor(() => expect(mocks.uploadDraftInput).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(mocks.uploadDraftInput).toHaveBeenCalledTimes(1),
+    );
   });
 });
