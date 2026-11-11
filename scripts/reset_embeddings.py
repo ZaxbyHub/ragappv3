@@ -389,9 +389,13 @@ def reset_all_embeddings():
         f"3. Background processor will auto-reprocess the {updated_count} reset file(s)"
     )
     print(
-        "   (a file whose ingestion retry budget was exhausted by a previous"
-        " run settles to 'error' instead — retry it per-file via the admin"
-        " retry endpoint)"
+        "   (a file whose LATEST ingestion job is still capped-failed keeps"
+        " the terminal 'error' state — retry it per-file via the admin retry"
+        " endpoint; older capped failures that a later job completed no"
+        " longer block reset recovery. Files already settled to 'error' by"
+        " an OLDER build stay in 'error' — this script resets only"
+        " indexed/partial/pending rows, so recover those via the per-file"
+        " admin retry endpoint too.)"
     )
     print()
 

@@ -979,6 +979,16 @@ class BackgroundProcessor:
         cap must not be silently bypassed), and its files row is settled to
         the matching terminal state in the same transaction so it can never
         linger invisible in ``processing``.
+
+        Issue #872: the capped-failure exclusion is keyed on the file's
+        LATEST ingestion job — a capped failure only excludes/settles a file
+        when no LATER ingestion job exists for it — so a file whose capped
+        failure was followed by a later successful job is job-less again and
+        mints fresh work when it returns to pending/queued (e.g. after an
+        operator reset). Each arm evaluates ONE uncorrelated
+        latest-job-id set per statement (O(N) over the jobs table, not
+        O(capped rows x jobs rows) — a correlated per-row probe measurably
+        stalls boot inside BEGIN IMMEDIATE on failure-storm deployments).
         """
         with self.processor.pool.connection() as conn:
             ensure_jobs_schema(conn)
@@ -1009,12 +1019,25 @@ class BackgroundProcessor:
                       AND json_extract(j.payload_json, '$.file_id') IS NOT NULL
                   )
                   AND f.id NOT IN (
-                    SELECT CAST(json_extract(j.payload_json, '$.file_id') AS INTEGER)
+                    SELECT CASE WHEN json_valid(j.payload_json)
+                                THEN CAST(json_extract(j.payload_json,
+                                           '$.file_id') AS INTEGER)
+                           END
                     FROM jobs j
                     WHERE j.queue = 'ingestion'
                       AND j.status = 'failed'
                       AND j.attempts >= ?
+                      AND json_valid(j.payload_json)
                       AND json_extract(j.payload_json, '$.file_id') IS NOT NULL
+                      AND j.id IN (
+                        SELECT MAX(j2.id) FROM jobs j2
+                        WHERE j2.queue = 'ingestion'
+                          AND json_valid(j2.payload_json)
+                          AND json_extract(j2.payload_json, '$.file_id')
+                              IS NOT NULL
+                        GROUP BY CAST(json_extract(j2.payload_json,
+                                       '$.file_id') AS INTEGER)
+                      )
                   )
                 """,
                 (settings.jobs_max_attempts,),
@@ -1040,13 +1063,15 @@ class BackgroundProcessor:
             # budget is terminally exhausted — settle the files row to the
             # matching terminal state instead of leaving it stranded in
             # 'processing' with no job and no recovery path. Keyed on
-            # TERMINAL-AT-CAP (status='failed' AND attempts >=
-            # jobs_max_attempts) regardless of error text: the literal
-            # marker is only written when the row's error column was empty
-            # (JobLease's reclaim COALESCE), so an error-keyed predicate
-            # missed the common requeue-then-crash shape (PR #858 feedback
-            # round: PRR-001 / out-of-band F-002, probe-proven). The
-            # attempts predicate also covers worker-driven terminal
+            # TERMINAL-AT-CAP of the file's LATEST ingestion job (issue
+            # #872): a capped failure only settles the file when no later
+            # ingestion job supersedes it (the latest-job-id set below is
+            # computed once, uncorrelated). Regardless of error text: the
+            # literal marker is only written when the row's error column
+            # was empty (JobLease's reclaim COALESCE), so an error-keyed
+            # predicate missed the common requeue-then-crash shape (PR #858
+            # feedback round: PRR-001 / out-of-band F-002, probe-proven).
+            # The attempts predicate also covers worker-driven terminal
             # failures ('attempt_cap_exceeded: ...', no marker). A file
             # that a NON-TERMINAL job still covers (an admin retry that
             # minted fresh work after the cap) is left to that job — only
@@ -1058,12 +1083,25 @@ class BackgroundProcessor:
                 WHERE status IN ('pending', 'processing')
                   AND (phase IS NULL OR phase != 'error')
                   AND id IN (
-                    SELECT CAST(json_extract(j.payload_json, '$.file_id') AS INTEGER)
+                    SELECT CASE WHEN json_valid(j.payload_json)
+                                THEN CAST(json_extract(j.payload_json,
+                                           '$.file_id') AS INTEGER)
+                           END
                     FROM jobs j
                     WHERE j.queue = 'ingestion'
                       AND j.status = 'failed'
                       AND j.attempts >= ?
+                      AND json_valid(j.payload_json)
                       AND json_extract(j.payload_json, '$.file_id') IS NOT NULL
+                      AND j.id IN (
+                        SELECT MAX(j2.id) FROM jobs j2
+                        WHERE j2.queue = 'ingestion'
+                          AND json_valid(j2.payload_json)
+                          AND json_extract(j2.payload_json, '$.file_id')
+                              IS NOT NULL
+                        GROUP BY CAST(json_extract(j2.payload_json,
+                                       '$.file_id') AS INTEGER)
+                      )
                   )
                   AND id NOT IN (
                     SELECT CAST(json_extract(j.payload_json, '$.file_id') AS INTEGER)
@@ -1821,14 +1859,25 @@ class BackgroundProcessor:
                 # (unprefixed: the cap was never reached) and writes the same
                 # terminal file-row state the cap path uses. Only
                 # DIMENSION_CHANGED; contention keeps its #1011 predicate and
-                # every other class keeps the ladder.
-                await self._settle_ingest_job(
+                # every other class keeps the ladder. The files-row mark is
+                # gated on the fenced settle having landed: a lease lost
+                # mid-run means the successor/janitor owns the row (the
+                # cancel arm above models the same check).
+                settled = await self._settle_ingest_job(
                     job_id,
                     worker_id,
                     "fail",
                     error=outcome_error,
                 )
-                self._mark_task_permanently_failed(task, outcome_exc)
+                if settled:
+                    self._mark_task_permanently_failed(task, outcome_exc)
+                else:
+                    logger.warning(
+                        "Lease ingest job %d dimension-refusal settle "
+                        "fenced off — lease lost; not marking the files "
+                        "row (successor owns it)",
+                        job_id,
+                    )
                 return
             if task.attempt < max_attempts or contention_retryable:
                 await self._settle_ingest_job(
@@ -1841,16 +1890,26 @@ class BackgroundProcessor:
             else:
                 # Terminal at the durable attempt cap: carry the plan's
                 # operator-visible literal (issue #559 R2-2), preserving the
-                # last processing error as the detail.
-                await self._settle_ingest_job(
+                # last processing error as the detail. Same fence gate as
+                # the dimension arm: no files-row write from a worker that
+                # lost the lease.
+                settled = await self._settle_ingest_job(
                     job_id,
                     worker_id,
                     "fail",
                     error=f"attempt_cap_exceeded: {outcome_error}"[:500],
                 )
-                self._mark_task_permanently_failed(
-                    task, outcome_exc if outcome_exc is not None else outcome_error
-                )
+                if settled:
+                    self._mark_task_permanently_failed(
+                        task, outcome_exc if outcome_exc is not None else outcome_error
+                    )
+                else:
+                    logger.warning(
+                        "Lease ingest job %d cap-failure settle fenced "
+                        "off — lease lost; not marking the files row "
+                        "(successor owns it)",
+                        job_id,
+                    )
         finally:
             heartbeat_task.cancel()
             await asyncio.gather(heartbeat_task, return_exceptions=True)
