@@ -36,9 +36,9 @@
       "SEVERITY.LOW": 59,
       "SEVERITY.MEDIUM": 63,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 97028,
+      "loc": 97286,
       "nosec": 0,
-      "skipped_tests": 71
+      "skipped_tests": 72
     },
     "backend/app/__init__.py": {
       "CONFIDENCE.HIGH": 0,
@@ -530,7 +530,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 6970,
+      "loc": 6971,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -725,7 +725,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 1,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 4534,
+      "loc": 4631,
       "nosec": 0,
       "skipped_tests": 6
     },
@@ -868,7 +868,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 2,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 4554,
+      "loc": 4633,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1089,7 +1089,7 @@
       "SEVERITY.LOW": 1,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1611,
+      "loc": 1659,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1245,9 +1245,9 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 682,
+      "loc": 714,
       "nosec": 0,
-      "skipped_tests": 8
+      "skipped_tests": 9
     },
     "backend/app/services/kms_compile_processor.py": {
       "CONFIDENCE.HIGH": 0,
@@ -1466,7 +1466,7 @@
       "SEVERITY.LOW": 19,
       "SEVERITY.MEDIUM": 1,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 3595,
+      "loc": 3596,
       "nosec": 0,
       "skipped_tests": 2
     },
@@ -3584,7 +3584,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "2984                 cursor = conn.execute(\n2985                     \"UPDATE files SET enrichment_status = (\"\n2986                     + est.aggregate_status_case_sql()\n2987                     + \"), enrichment_error = NULL, enrichment_updated_at = ? \"\n",
+      "code": "3053                 cursor = conn.execute(\n3054                     \"UPDATE files SET enrichment_status = (\"\n3055                     + est.aggregate_status_case_sql()\n3056                     + \"), enrichment_error = NULL, enrichment_updated_at = ? \"\n",
       "col_offset": 20,
       "end_col_offset": 60,
       "filename": "backend/app/services/background_tasks.py",
@@ -3595,10 +3595,10 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 2985,
+      "line_number": 3054,
       "line_range": [
-        2985,
-        2986
+        3054,
+        3055
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
@@ -3671,7 +3671,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "780         # frozen snapshot so the key describes the issuing configuration).\n781         model_fingerprint = hashlib.md5(config.model.encode(\"utf-8\")).hexdigest()[:8]\n782         url_fingerprint = hashlib.md5(config.url.encode(\"utf-8\")).hexdigest()[:8]\n",
+      "code": "792         # frozen snapshot so the key describes the issuing configuration).\n793         model_fingerprint = hashlib.md5(config.model.encode(\"utf-8\")).hexdigest()[:8]\n794         url_fingerprint = hashlib.md5(config.url.encode(\"utf-8\")).hexdigest()[:8]\n",
       "col_offset": 28,
       "end_col_offset": 69,
       "filename": "backend/app/services/embeddings.py",
@@ -3682,16 +3682,16 @@
       },
       "issue_severity": "HIGH",
       "issue_text": "Use of weak MD5 hash for security. Consider usedforsecurity=False",
-      "line_number": 781,
+      "line_number": 793,
       "line_range": [
-        781
+        793
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b324_hashlib.html",
       "test_id": "B324",
       "test_name": "hashlib"
     },
     {
-      "code": "781         model_fingerprint = hashlib.md5(config.model.encode(\"utf-8\")).hexdigest()[:8]\n782         url_fingerprint = hashlib.md5(config.url.encode(\"utf-8\")).hexdigest()[:8]\n783         prefix_fingerprint = hashlib.md5((prefix or \"\").encode(\"utf-8\")).hexdigest()[:8]\n",
+      "code": "793         model_fingerprint = hashlib.md5(config.model.encode(\"utf-8\")).hexdigest()[:8]\n794         url_fingerprint = hashlib.md5(config.url.encode(\"utf-8\")).hexdigest()[:8]\n795         prefix_fingerprint = hashlib.md5((prefix or \"\").encode(\"utf-8\")).hexdigest()[:8]\n",
       "col_offset": 26,
       "end_col_offset": 65,
       "filename": "backend/app/services/embeddings.py",
@@ -3702,16 +3702,16 @@
       },
       "issue_severity": "HIGH",
       "issue_text": "Use of weak MD5 hash for security. Consider usedforsecurity=False",
-      "line_number": 782,
+      "line_number": 794,
       "line_range": [
-        782
+        794
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b324_hashlib.html",
       "test_id": "B324",
       "test_name": "hashlib"
     },
     {
-      "code": "782         url_fingerprint = hashlib.md5(config.url.encode(\"utf-8\")).hexdigest()[:8]\n783         prefix_fingerprint = hashlib.md5((prefix or \"\").encode(\"utf-8\")).hexdigest()[:8]\n784         cache_key = f\"{model_fingerprint}_{url_fingerprint}_{prefix_fingerprint}_{hashlib.md5(text_to_embed.encode('utf-8')).hexdigest()}\"\n",
+      "code": "794         url_fingerprint = hashlib.md5(config.url.encode(\"utf-8\")).hexdigest()[:8]\n795         prefix_fingerprint = hashlib.md5((prefix or \"\").encode(\"utf-8\")).hexdigest()[:8]\n796         cache_key = f\"{model_fingerprint}_{url_fingerprint}_{prefix_fingerprint}_{hashlib.md5(text_to_embed.encode('utf-8')).hexdigest()}\"\n",
       "col_offset": 29,
       "end_col_offset": 72,
       "filename": "backend/app/services/embeddings.py",
@@ -3722,16 +3722,16 @@
       },
       "issue_severity": "HIGH",
       "issue_text": "Use of weak MD5 hash for security. Consider usedforsecurity=False",
-      "line_number": 783,
+      "line_number": 795,
       "line_range": [
-        783
+        795
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b324_hashlib.html",
       "test_id": "B324",
       "test_name": "hashlib"
     },
     {
-      "code": "783         prefix_fingerprint = hashlib.md5((prefix or \"\").encode(\"utf-8\")).hexdigest()[:8]\n784         cache_key = f\"{model_fingerprint}_{url_fingerprint}_{prefix_fingerprint}_{hashlib.md5(text_to_embed.encode('utf-8')).hexdigest()}\"\n785 \n",
+      "code": "795         prefix_fingerprint = hashlib.md5((prefix or \"\").encode(\"utf-8\")).hexdigest()[:8]\n796         cache_key = f\"{model_fingerprint}_{url_fingerprint}_{prefix_fingerprint}_{hashlib.md5(text_to_embed.encode('utf-8')).hexdigest()}\"\n797 \n",
       "col_offset": 82,
       "end_col_offset": 124,
       "filename": "backend/app/services/embeddings.py",
@@ -3742,16 +3742,16 @@
       },
       "issue_severity": "HIGH",
       "issue_text": "Use of weak MD5 hash for security. Consider usedforsecurity=False",
-      "line_number": 784,
+      "line_number": 796,
       "line_range": [
-        784
+        796
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b324_hashlib.html",
       "test_id": "B324",
       "test_name": "hashlib"
     },
     {
-      "code": "1576                 )\n1577         except Exception:\n1578             pass  # Silently ignore any errors accessing internal pool state\n1579 \n",
+      "code": "1645                 )\n1646         except Exception:\n1647             pass  # Silently ignore any errors accessing internal pool state\n1648 \n",
       "col_offset": 8,
       "end_col_offset": 16,
       "filename": "backend/app/services/embeddings.py",
@@ -3762,10 +3762,10 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1577,
+      "line_number": 1646,
       "line_range": [
-        1577,
-        1578
+        1646,
+        1647
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
@@ -4463,9 +4463,9 @@
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "4081                     sql = (\n4082                         f\"SELECT file_name FROM files \"\n4083                         f\"WHERE supersedes_file_id IN ({placeholders}) AND status='indexed'\"\n4084                     )\n",
+      "code": "4086                     sql = (\n4087                         f\"SELECT file_name FROM files \"\n4088                         f\"WHERE supersedes_file_id IN ({placeholders}) \"\n4089                         f\"AND status IN ('indexed', 'partial')\"\n4090                     )\n",
       "col_offset": 24,
-      "end_col_offset": 92,
+      "end_col_offset": 63,
       "filename": "backend/app/services/rag_engine.py",
       "issue_confidence": "LOW",
       "issue_cwe": {
@@ -4474,10 +4474,11 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 4082,
+      "line_number": 4087,
       "line_range": [
-        4082,
-        4083
+        4087,
+        4088,
+        4089
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",

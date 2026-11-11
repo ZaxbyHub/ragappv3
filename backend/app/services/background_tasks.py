@@ -24,8 +24,10 @@ from app.services.admission import (
 )
 
 from ..models.database import SQLiteConnectionPool
+from . import document_processor as _document_processor
 from .document_processor import (
     _INGEST_ERROR_REASONS,
+    INGEST_ERROR_DIMENSION_CHANGED,
     INGEST_ERROR_VECTOR_STORE_LOCK_TIMEOUT,
     DocumentProcessingError,
     DocumentProcessor,
@@ -35,7 +37,7 @@ from .document_processor import (
     classify_ingest_error,
     redact_ingest_error,
 )
-from .embeddings import EmbeddingService
+from .embeddings import EmbeddingProgressLost, EmbeddingService
 from .job_lease import (
     LEGACY_ERROR_REDACTED,
     JobLease,
@@ -64,6 +66,45 @@ class ReindexOperatorGuidance(VectorStoreError):
 
 
 _REINDEX_DETAIL_SHAPE = re.compile(r"^(file_id=\d+: )(.*)$", re.DOTALL)
+
+
+class _ReindexBatchProgressCallback:
+    """Per-embedding-batch watermark refresher (issue #1020).
+
+    Contract (plan-critic rounds 1-3): NON-RAISING. A fenced stamp that
+    matches zero rows (lost lease fence) or an ordinary stamp exception
+    records loss — ``lost`` on this object — and stops stamping; it
+    never raises into the batch gather (that would be misrouted into
+    failed-batch semantics). ``CancelledError`` propagates. The batch wrapper
+    in ``embed_batch`` consults ``lost`` before dispatching each queued batch
+    and raises ``EmbeddingProgressLost`` after the gather; the per-file loop
+    converts that to the ``_LeaseProgressLost`` lease-stop path.
+    """
+
+    def __init__(self, processor: "BackgroundProcessor") -> None:
+        self._processor = processor
+        self.lost = False
+
+    async def __call__(self) -> None:
+        if self.lost or self._processor._active_progress is None:
+            return
+        try:
+            ok = await self._processor._stamp_progress_watermark()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — conservative loss-stop
+            self.lost = True
+            logger.warning(
+                "Reindex batch watermark stamp raised; treating the lease "
+                "fence as lost and stopping the attempt (issue #1020)"
+            )
+            return
+        if not ok:
+            self.lost = True
+            logger.warning(
+                "Reindex batch watermark stamp matched zero rows; lease "
+                "fence lost mid-batch, stopping the attempt (issue #1020)"
+            )
 
 # The #562 ingest codes the composition layer (``_reindex_embed_all``)
 # writes into detail entries via ``redact_ingest_error`` — trusted at
@@ -1769,6 +1810,26 @@ class BackgroundProcessor:
                 lock_window = float(settings.write_lock_timeout_seconds)
                 delay = min(delay, max(60.0, lock_window))
                 delay = max(delay, lock_window)
+            if (
+                outcome_exc is not None
+                and classify_ingest_error(outcome_exc)
+                == INGEST_ERROR_DIMENSION_CHANGED
+            ):
+                # Issue #820: a dimension refusal is deterministic — the live
+                # index dimension cannot change back between attempts — so
+                # the lease transport settles 'failed' on the FIRST attempt
+                # (unprefixed: the cap was never reached) and writes the same
+                # terminal file-row state the cap path uses. Only
+                # DIMENSION_CHANGED; contention keeps its #1011 predicate and
+                # every other class keeps the ladder.
+                await self._settle_ingest_job(
+                    job_id,
+                    worker_id,
+                    "fail",
+                    error=outcome_error,
+                )
+                self._mark_task_permanently_failed(task, outcome_exc)
+                return
             if task.attempt < max_attempts or contention_retryable:
                 await self._settle_ingest_job(
                     job_id,
@@ -2593,13 +2654,18 @@ class BackgroundProcessor:
                     # timestamp value (with a created_at fallback for legacy
                     # rows) prevents startup recovery from touching work
                     # submitted after this start began.
+                    # Issue #963 (site 2): 'partial' files carry retrievable
+                    # base-index content (#693) and their enrichment fan-out
+                    # runs like any returned result — a stranded partial
+                    # enrichment row must be recovered, not left 'processing'
+                    # forever.
                     cursor = conn.execute(
                         """
                         UPDATE files
                         SET enrichment_status = 'error',
                             enrichment_error = 'Enrichment interrupted or queued before completion; base index remains available',
                             enrichment_updated_at = ?
-                        WHERE status = 'indexed'
+                        WHERE status IN ('indexed', 'partial')
                           AND enrichment_status IN ('pending', 'processing')
                           AND julianday(COALESCE(enrichment_updated_at, created_at)) < julianday(?)
                         """,
@@ -2612,7 +2678,7 @@ class BackgroundProcessor:
                         SET enrichment_status = 'error',
                             enrichment_error = 'Enrichment interrupted or queued before completion; base index remains available',
                             enrichment_updated_at = ?
-                        WHERE status = 'indexed'
+                        WHERE status IN ('indexed', 'partial')
                           AND enrichment_status IN ('pending', 'processing')
                         """,
                         (datetime.now(UTC).isoformat(),),
@@ -2709,13 +2775,16 @@ class BackgroundProcessor:
                 # atoms but NO enrichment stage row at all. Enabling multimodal
                 # after ingestion creates no stage rows (F-6a), so these files
                 # would otherwise never be enriched without a re-ingest.
-                # Restricted to 'indexed' files so error/deleted/processing-state
-                # rows are not (re)enqueued for enrichment.
+                # Restricted to content-available states — 'indexed' and
+                # 'partial' (#963 site 3: parsing completes before chunk
+                # embedding fails, so partial files carry atoms) — so
+                # error/deleted/processing-state rows are not (re)enqueued for
+                # enrichment.
                 backfill_rows = conn.execute(
                     "SELECT DISTINCT a.file_id, f.vault_id, f.file_hash "
                     "FROM document_atoms a "
                     "JOIN files f ON f.id = a.file_id "
-                    "WHERE f.status = 'indexed' "
+                    "WHERE f.status IN ('indexed', 'partial') "
                     "AND a.generation_hash = f.active_generation_hash "
                     "AND a.kind IN ('image','chart','table','equation') "
                     "AND NOT EXISTS ("
@@ -4218,12 +4287,12 @@ class BackgroundProcessor:
         watermark age passes the stall budget while the row is still ours,
         OR when the row no longer belongs to this attempt. Release is
         therefore budget-bounded from above, but poll latency and the
-        bounded per-file granularity (the watermark advances on file
-        COMPLETION — one very large file on a slow embedder can legitimately
-        exceed the budget; raise ``jobs_stall_timeout_seconds`` for such
-        workloads, or see the per-batch refresh follow-up) mean the release
-        can land after the nominal budget: the janitor's heartbeat-age arm
-        stays the crash backstop either way.
+        bounded batch granularity (issue #1020: the watermark advances
+        after every dispatched embedding batch, so a large file on a slow
+        embedder stays fresh as long as its batches progress; a genuinely
+        wedged attempt — no batch completing — still trips the budget) mean
+        the release can land after the nominal budget: the janitor's
+        heartbeat-age arm stays the crash backstop either way.
         """
         budget = self._reindex_stall_budget()
         if budget is None:
@@ -4500,10 +4569,30 @@ class BackgroundProcessor:
                     )
                 return
             if attempts >= settings.jobs_max_attempts:
+                # Issue #819: a terminal failure with a COMPOSED result
+                # (processed/failed/details — the per-file partial-failure
+                # shape) persists that payload into result_json so
+                # lease-mode operators see the same diagnostics the legacy
+                # settlement table records. Stall-cap and janitor settlements
+                # have no composed result and keep the error-only shape. The
+                # details pass the same #957 persist-boundary redaction the
+                # legacy arm applies.
+                fail_result: Optional[dict] = None
+                if isinstance(result, dict) and result:
+                    fail_result = dict(result)
+                    details = fail_result.get("details")
+                    if isinstance(details, list):
+                        fail_result["details"] = [
+                            _redact_reindex_detail_entry(entry)
+                            if isinstance(entry, str)
+                            else entry
+                            for entry in details
+                        ]
                 failed_ok = lease.fail(
                     job_id,
                     worker_id,
                     f"attempt_cap_exceeded: {error_text}"[:500],
+                    result=fail_result,
                 )
                 if not failed_ok:
                     logger.warning(
@@ -4772,30 +4861,38 @@ class BackgroundProcessor:
                 json.dumps([int(i) for i in retry_file_ids]) if retry_file_ids else None
             )
             async with self.processor.pool.connection_async() as conn:
+                # Issue #963 (site 1): 'partial' is a content-available state
+                # (#693 producer contract; #793 widened the KMS twin to the
+                # same set) — a partial file (parsed_text retrievable, at
+                # least one failed chunk) is exactly the state a reindex
+                # heals. Indexed-only selection was pre-#693 drift; the
+                # per-file retry path has always included partial.
                 if vault_id is not None and retry_scope_json is not None:
                     sql = (
                         "SELECT id, file_path, vault_id FROM files "
-                        "WHERE vault_id = ? AND status IN ('indexed', 'error') "
+                        "WHERE vault_id = ? AND status IN "
+                        "('indexed', 'partial', 'error') "
                         "AND id IN (SELECT value FROM json_each(?))"
                     )
                     params: tuple = (vault_id, retry_scope_json)
                 elif vault_id is not None:
                     sql = (
                         "SELECT id, file_path, vault_id FROM files "
-                        "WHERE vault_id = ? AND status IN ('indexed', 'error')"
+                        "WHERE vault_id = ? AND status IN "
+                        "('indexed', 'partial', 'error')"
                     )
                     params = (vault_id,)
                 elif retry_scope_json is not None:
                     sql = (
                         "SELECT id, file_path, vault_id FROM files "
-                        "WHERE status IN ('indexed', 'error') "
+                        "WHERE status IN ('indexed', 'partial', 'error') "
                         "AND id IN (SELECT value FROM json_each(?))"
                     )
                     params = (retry_scope_json,)
                 else:
                     sql = (
                         "SELECT id, file_path, vault_id FROM files "
-                        "WHERE status IN ('indexed', 'error')"
+                        "WHERE status IN ('indexed', 'partial', 'error')"
                     )
                     params = ()
                 rows = conn.execute(sql, params).fetchall()
@@ -5000,143 +5097,194 @@ class BackgroundProcessor:
                             vault_id_file,
                         )
 
-                        # Snapshot the pre-reindex status: a cancel during a
-                        # staged rebuild must not destroy the document's
-                        # previously indexed live content (issue #783 review
-                        # F-001) — the file is skipped and its prior serving
-                        # state restored instead.
-                        def _read_prior_status():
-                            with self.processor.pool.connection() as _conn:
-                                return _conn.execute(
-                                    "SELECT status FROM files WHERE id = ?",
-                                    (file_id,),
-                                ).fetchone()
+                        # Issue #963 (F4/R2-7): serialize with chunk retry on
+                        # the same W15 per-file lock, and take the status
+                        # snapshot + stale-cancel clear only AFTER acquiring
+                        # it — restoration uses the at-acquisition status, so
+                        # a retry that promotes the file while the reindex
+                        # waited can never be overwritten with a stale
+                        # value.
+                        async with _document_processor._per_file_retry_lock(
+                            file_id
+                        ):
+                            # Issue #1020: fresh per-file batch-progress
+                            # callback (None when no attempt is armed — the
+                            # legacy transport — so the embed call keeps its
+                            # historical shape).
+                            progress_cb = (
+                                _ReindexBatchProgressCallback(self)
+                                if self._active_progress is not None
+                                else None
+                            )
+                            # Snapshot the pre-reindex status: a cancel during a
+                            # staged rebuild must not destroy the document's
+                            # previously indexed live content (issue #783 review
+                            # F-001) — the file is skipped and its prior serving
+                            # state restored instead.
+                            def _read_prior_status():
+                                with self.processor.pool.connection() as _conn:
+                                    return _conn.execute(
+                                        "SELECT status FROM files WHERE id = ?",
+                                        (file_id,),
+                                    ).fetchone()
 
-                        prior_status_row = await asyncio.to_thread(_read_prior_status)
-                        prior_status = (
-                            prior_status_row["status"]
-                            if prior_status_row is not None
-                            else None
-                        )
-                        # A stale document-cancel registered before this
-                        # rebuild must not trip the gates for this file
-                        # (issue #783 review F-006): the rebuild owns the row
-                        # until it finishes.
-                        self.processor.clear_cancel(file_id)
-                        reprocess_kwargs = (
-                            {"vector_target": rebuild_handle}
-                            if rebuild_handle is not None
-                            else {}
-                        )
-                        try:
-                            await self.processor.process_existing_file(
-                                file_id,
-                                file_path,
-                                vault_id_file,
-                                retry_context="reindex",
-                                **reprocess_kwargs,
+                            prior_status_row = await asyncio.to_thread(_read_prior_status)
+                            prior_status = (
+                                prior_status_row["status"]
+                                if prior_status_row is not None
+                                else None
                             )
-                            processed_files += 1
-                            # Issue #1010: refresh the per-file progress
-                            # watermark (a lost fence stops this attempt).
-                            await self._refresh_progress_watermark()
-                        except _LeaseProgressLost:
-                            # Issue #1010: this attempt lost the lease fence —
-                            # STOP (no failed_ids accumulation, no successor
-                            # scope mutation); the successor owns the row.
-                            raise
-                        except asyncio.CancelledError:
-                            # Issue #1010: the stall watchdog cancelled a
-                            # wedged per-file await. Record the interrupted +
-                            # remaining file ids (the settle's
-                            # $.retry_file_ids scope) and re-raise so the
-                            # worker wrapper converts and settles; the file
-                            # row itself was restored by
-                            # process_existing_file's cancellation handler.
-                            # Files that already FAILED earlier in THIS
-                            # attempt (failed_ids) must ride the retry scope
-                            # too — otherwise the narrowed retry re-runs only
-                            # the interrupted+remaining files, the failed
-                            # ones keep their error rows, and the job
-                            # completes reporting false success (PR #1018
-                            # review B2: file1 raises, file2 hangs → scope
-                            # [2, 3], file 1 never retried). Order-stable
-                            # dedupe: failed first (oldest failure first),
-                            # then the interrupted + remaining tail.
-                            self._stall_retry_file_ids = list(
-                                dict.fromkeys(
-                                    [int(fid) for fid in failed_ids]
-                                    + [
-                                        int(fid)
-                                        for fid in ordered_file_ids[
-                                            max(total_files - 1, 0) :
-                                        ]
-                                    ]
-                                )
-                            )
-                            raise
-                        except IngestCancelledError:
-                            # issue #783 review PRR-011/F-001: a user
-                            # cancellation during a staged rebuild skips the
-                            # file WITHOUT destroying its previously indexed
-                            # live content — the prior serving state is
-                            # restored so the file is neither stranded in
-                            # 'processing' nor silently unindexed.
-                            logger.info(
-                                "Re-embed skipped for file_id=%d in vault_id=%d: "
-                                "ingest cancelled by user; restoring prior "
-                                "status %r",
-                                file_id,
-                                vault_id_file,
-                                prior_status,
+                            # A stale document-cancel registered before this
+                            # rebuild must not trip the gates for this file
+                            # (issue #783 review F-006): the rebuild owns the row
+                            # until it finishes.
+                            self.processor.clear_cancel(file_id)
+                            reprocess_kwargs = (
+                                {"vector_target": rebuild_handle}
+                                if rebuild_handle is not None
+                                else {}
                             )
                             try:
-                                if prior_status in ("indexed", "partial", "error"):
-
-                                    def _restore_prior_status():
-                                        with self.processor.pool.connection() as _conn:
-                                            return _conn.execute(
-                                                "UPDATE files SET status = ? "
-                                                "WHERE id = ? "
-                                                "AND status = 'processing'",
-                                                (prior_status, file_id),
-                                            ).rowcount
-
-                                    await asyncio.to_thread(_restore_prior_status)
-                                self.processor.clear_cancel(file_id)
-                            except Exception:  # noqa: BLE001 — never mask the skip
-                                logger.warning(
-                                    "reindex cancel state restore failed for "
-                                    "file_id=%d",
+                                await self.processor.process_existing_file(
                                     file_id,
-                                    exc_info=True,
+                                    file_path,
+                                    vault_id_file,
+                                    retry_context="reindex",
+                                    progress_cb=progress_cb,
+                                    **reprocess_kwargs,
                                 )
-                            cancelled_files += 1
-                            continue
-                        except (
-                            DocumentProcessingError,
-                            FileNotFoundError,
-                            OSError,
-                            RuntimeError,
-                            Exception,
-                        ) as exc:
-                            logger.exception(
-                                "Re-embed failed for file_id=%d in vault_id=%d: %s",
-                                file_id,
-                                vault_id_file,
-                                exc,
-                            )
-                            failed_files += 1
-                            # Issue #957 hygiene: compose the detail
-                            # from the redacted code (the persist
-                            # boundary maps any remnant anyway).
-                            failed_details.append(
-                                f"file_id={file_id}: {_redact_reindex_error(exc)}"
-                            )
-                            failed_ids.append(file_id)
-                            if first_failure is None:
-                                first_failure = exc
-                            continue
+                                processed_files += 1
+                                # Issue #1010: refresh the per-file progress
+                                # watermark (a lost fence stops this attempt).
+                                await self._refresh_progress_watermark()
+                            except EmbeddingProgressLost:
+                                # Issue #1020: the per-batch callback recorded a
+                                # lost lease fence mid-embed (the row's status was
+                                # already restored by process_existing_file's
+                                # dedicated loss arm — never 'processing'). Same
+                                # stop semantics as the per-file fence loss: no
+                                # failed_ids accumulation, no successor-scope
+                                # mutation; the successor owns the row.
+                                _lost_job = (
+                                    self._active_progress[0]
+                                    if self._active_progress is not None
+                                    else job_id
+                                )
+                                raise _LeaseProgressLost(
+                                    f"reindex job {_lost_job} lost its lease "
+                                    "fence mid-batch (issue #1020)"
+                                ) from None
+                            except _LeaseProgressLost:
+                                # Issue #1010: this attempt lost the lease fence —
+                                # STOP (no failed_ids accumulation, no successor
+                                # scope mutation); the successor owns the row.
+                                raise
+                            except asyncio.CancelledError:
+                                # Issue #1010: the stall watchdog cancelled a
+                                # wedged per-file await. Record the interrupted +
+                                # remaining file ids (the settle's
+                                # $.retry_file_ids scope) and re-raise so the
+                                # worker wrapper converts and settles; the file
+                                # row itself was restored by
+                                # process_existing_file's cancellation handler.
+                                # Files that already FAILED earlier in THIS
+                                # attempt (failed_ids) must ride the retry scope
+                                # too — otherwise the narrowed retry re-runs only
+                                # the interrupted+remaining files, the failed
+                                # ones keep their error rows, and the job
+                                # completes reporting false success (PR #1018
+                                # review B2: file1 raises, file2 hangs → scope
+                                # [2, 3], file 1 never retried). Order-stable
+                                # dedupe: failed first (oldest failure first),
+                                # then the interrupted + remaining tail.
+                                self._stall_retry_file_ids = list(
+                                    dict.fromkeys(
+                                        [int(fid) for fid in failed_ids]
+                                        + [
+                                            int(fid)
+                                            for fid in ordered_file_ids[
+                                                max(total_files - 1, 0) :
+                                            ]
+                                        ]
+                                    )
+                                )
+                                raise
+                            except IngestCancelledError:
+                                # issue #783 review PRR-011/F-001: a user
+                                # cancellation during a staged rebuild skips the
+                                # file WITHOUT destroying its previously indexed
+                                # live content — the prior serving state is
+                                # restored so the file is neither stranded in
+                                # 'processing' nor silently unindexed.
+                                logger.info(
+                                    "Re-embed skipped for file_id=%d in vault_id=%d: "
+                                    "ingest cancelled by user; restoring prior "
+                                    "status %r",
+                                    file_id,
+                                    vault_id_file,
+                                    prior_status,
+                                )
+                                try:
+                                    if prior_status in ("indexed", "partial", "error"):
+
+                                        def _restore_prior_status():
+                                            with self.processor.pool.connection() as _conn:
+                                                _rc = _conn.execute(
+                                                    "UPDATE files SET status = ? "
+                                                    "WHERE id = ? "
+                                                    "AND status = 'processing'",
+                                                    (prior_status, file_id),
+                                                ).rowcount
+                                                # Commit explicitly: pool
+                                                # connections keep Python's
+                                                # deferred-transaction default
+                                                # and release_connection
+                                                # ROLLS BACK an open
+                                                # transaction (issue #548) —
+                                                # without this commit the
+                                                # restore was a silent no-op
+                                                # and the file stranded in
+                                                # 'processing' (found by the
+                                                # #963 cancel-after-promotion
+                                                # frozen leg).
+                                                _conn.commit()
+                                                return _rc
+
+                                        await asyncio.to_thread(_restore_prior_status)
+                                    self.processor.clear_cancel(file_id)
+                                except Exception:  # noqa: BLE001 — never mask the skip
+                                    logger.warning(
+                                        "reindex cancel state restore failed for "
+                                        "file_id=%d",
+                                        file_id,
+                                        exc_info=True,
+                                    )
+                                cancelled_files += 1
+                                continue
+                            except (
+                                DocumentProcessingError,
+                                FileNotFoundError,
+                                OSError,
+                                RuntimeError,
+                                Exception,
+                            ) as exc:
+                                logger.exception(
+                                    "Re-embed failed for file_id=%d in vault_id=%d: %s",
+                                    file_id,
+                                    vault_id_file,
+                                    exc,
+                                )
+                                failed_files += 1
+                                # Issue #957 hygiene: compose the detail
+                                # from the redacted code (the persist
+                                # boundary maps any remnant anyway).
+                                failed_details.append(
+                                    f"file_id={file_id}: {_redact_reindex_error(exc)}"
+                                )
+                                failed_ids.append(file_id)
+                                if first_failure is None:
+                                    first_failure = exc
+                                continue
 
                 # A staged rebuild (dimension OR same-dimension identity
                 # change, issue #696) swaps only on full success.
@@ -5557,6 +5705,30 @@ class BackgroundProcessor:
             )
             return
 
+        # Issue #820: an ingest refused by the #691 dimension probe is
+        # DETERMINISTICALLY non-retryable — the live index dimension cannot
+        # change back between attempts, so the generic ladder would re-parse
+        # and re-embed the whole document on every attempt before landing on
+        # the same terminal refusal. Settle to the permanent-failure path on
+        # the FIRST attempt (same terminal write the retries-exhausted path
+        # uses, so the file row lands its DIMENSION_CHANGED stable code).
+        # Only DIMENSION_CHANGED is short-circuited: contention keeps its
+        # #1011 never-terminal predicate and every other class keeps the
+        # ladder.
+        if (
+            isinstance(error, BaseException)
+            and classify_ingest_error(error) == INGEST_ERROR_DIMENSION_CHANGED
+        ):
+            logger.warning(
+                "Task failed for %s with a deterministic dimension refusal "
+                "(DIMENSION_CHANGED); settling permanently on attempt %d "
+                "without retry (issue #820)",
+                task.file_path,
+                task.attempt,
+            )
+            self._mark_task_permanently_failed(task, error)
+            return
+
         if task.attempt < self.max_retries or (
             isinstance(error, BaseException)
             and classify_ingest_error(error) == INGEST_ERROR_VECTOR_STORE_LOCK_TIMEOUT
@@ -5693,7 +5865,7 @@ class BackgroundProcessor:
                 )
         logger.error(
             f"Task permanently failed for {task.file_path} "
-            f"after {self.max_retries} attempts: {error}"
+            f"at attempt {task.attempt}/{self.max_retries}: {error}"
         )
 
     @property
