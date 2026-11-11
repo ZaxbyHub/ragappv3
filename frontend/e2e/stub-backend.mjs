@@ -179,7 +179,8 @@ function resetE2eJobs() {
   // Ingest seeds materialize document rows; drop only the rows a seeder
   // created (flagged at seed time), never walkthrough-uploaded documents.
   for (let i = documents.length - 1; i >= 0; i -= 1) {
-    if (documents[i].e2eSeed || documents[i].e2eA11ySeed) documents.splice(i, 1);
+    if (documents[i].e2eSeed || documents[i].e2eA11ySeed)
+      documents.splice(i, 1);
   }
 }
 
@@ -190,7 +191,8 @@ function e2eJobShape(family, seed) {
     // A failed seed's title rides the error field - the same place the
     // real backend puts a failed job's reason, and the field the tray
     // surfaces as a failed row's title.
-    error: seed.status === "failed" ? seed.title ?? `job ${seed.id} failed` : null,
+    error:
+      seed.status === "failed" ? (seed.title ?? `job ${seed.id} failed`) : null,
     result_json: "{}",
     created_at: seed.created_at,
     started_at: seed.created_at,
@@ -201,10 +203,22 @@ function e2eJobShape(family, seed) {
     return { ...base, vault_id: 1, trigger_type: "manual", trigger_id: null };
   }
   if (family === "kms") {
-    return { ...base, vault_id: 1, trigger_type: "manual", trigger_id: null, input_json: "{}" };
+    return {
+      ...base,
+      vault_id: 1,
+      trigger_type: "manual",
+      trigger_id: null,
+      input_json: "{}",
+    };
   }
   if (family === "reindex") {
-    return { ...base, vault_id: 1, trigger_type: "api", trigger_id: "1", input_json: "{}" };
+    return {
+      ...base,
+      vault_id: 1,
+      trigger_type: "api",
+      trigger_id: "1",
+      input_json: "{}",
+    };
   }
   // draft-room
   return {
@@ -244,7 +258,10 @@ function createSession(vaultId = 1) {
   return session;
 }
 
-function addMessage(sessionId, { role, content, sources = null, turn_id = null, status = null, mode = null }) {
+function addMessage(
+  sessionId,
+  { role, content, sources = null, turn_id = null, status = null, mode = null },
+) {
   const entry = sessions.get(sessionId);
   if (!entry) return null;
   const message = {
@@ -367,7 +384,15 @@ const DRAFT_CAPABILITIES_FIXTURE = {
   export_formats: ["md"],
   logical_model_modes: ["thinking", "instant"],
   default_logical_mode: "thinking",
-  compile_start_stages: ["research", "outline", "draft", "lint", "copy", "standards", "fact"],
+  compile_start_stages: [
+    "research",
+    "outline",
+    "draft",
+    "lint",
+    "copy",
+    "standards",
+    "fact",
+  ],
   compile_stage_order: [
     "intake",
     "research",
@@ -382,6 +407,7 @@ const DRAFT_CAPABILITIES_FIXTURE = {
   prompt_bundle_version: "e2e",
   editorial_gates_installed: false,
   compile_available: true,
+  upload_available: true,
   findings_available: true,
   claims_available: true,
   evidence_available: true,
@@ -606,7 +632,6 @@ function resetA11yFixtures() {
   return { ok: true };
 }
 
-
 // ---- helpers ----------------------------------------------------------------
 
 function corsHeaders(req) {
@@ -682,7 +707,12 @@ const server = http.createServer(async (req, res) => {
         status: "ok",
         version: "e2e-stub",
         timestamp: nowIso(),
-        services: { backend: true, embeddings: true, chat: true, vector_store: true },
+        services: {
+          backend: true,
+          embeddings: true,
+          chat: true,
+          vector_store: true,
+        },
       });
     }
     if (method === "GET" && path === "/api/llm-health/modes") {
@@ -697,13 +727,16 @@ const server = http.createServer(async (req, res) => {
         users_enabled: true,
       });
     }
-    if (method === "GET" && (path === "/api/csrf-token" || path === "/api/auth/csrf")) {
+    if (
+      method === "GET" &&
+      (path === "/api/csrf-token" || path === "/api/auth/csrf")
+    ) {
       return sendJson(
         req,
         res,
         200,
         { csrf_token: "stub-csrf-token" },
-        { "Set-Cookie": "X-CSRF-Token=stub-csrf-token; Path=/; SameSite=Lax" }
+        { "Set-Cookie": "X-CSRF-Token=stub-csrf-token; Path=/; SameSite=Lax" },
       );
     }
     if (method === "POST" && path === "/api/auth/login") {
@@ -719,7 +752,7 @@ const server = http.createServer(async (req, res) => {
             "ragapp_refresh_token=stub-refresh-token; Path=/; HttpOnly; SameSite=Lax",
             "X-CSRF-Token=stub-csrf-token; Path=/; SameSite=Lax",
           ],
-        }
+        },
       );
     }
     if (method === "POST" && path === "/api/auth/register") {
@@ -739,7 +772,7 @@ const server = http.createServer(async (req, res) => {
             "ragapp_refresh_token=stub-refresh-token; Path=/; HttpOnly; SameSite=Lax",
             "X-CSRF-Token=stub-csrf-token; Path=/; SameSite=Lax",
           ],
-        }
+        },
       );
     }
     if (method === "POST" && path === "/api/auth/refresh") {
@@ -768,7 +801,10 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ---- vaults ----
-    if (method === "GET" && (path === "/api/vaults/accessible" || path === "/api/vaults")) {
+    if (
+      method === "GET" &&
+      (path === "/api/vaults/accessible" || path === "/api/vaults")
+    ) {
       // Model the full VaultListResponse contract (issue #725): total is the
       // exact count and truncated is false below the 1000-row cap.
       return sendJson(req, res, 200, {
@@ -802,18 +838,25 @@ const server = http.createServer(async (req, res) => {
     if (method === "GET" && path === "/api/documents") {
       const vaultId = Number(url.searchParams.get("vault_id") || 0);
       const status = url.searchParams.get("status");
-      let scoped = vaultId ? documents.filter((d) => d.vault_id === vaultId) : documents;
+      let scoped = vaultId
+        ? documents.filter((d) => d.vault_id === vaultId)
+        : documents;
       if (status) {
         scoped = scoped.filter((d) => (d.metadata?.status ?? "") === status);
       }
-      return sendJson(req, res, 200, { documents: scoped, total: scoped.length });
+      return sendJson(req, res, 200, {
+        documents: scoped,
+        total: scoped.length,
+      });
     }
     if (method === "GET" && path === "/api/documents/stats") {
       return sendJson(req, res, 200, {
         total_documents: documents.length,
         total_chunks: documents.length,
         total_size_bytes: documents.reduce((sum, d) => sum + (d.size ?? 0), 0),
-        documents_by_status: documents.length ? { processed: documents.length } : {},
+        documents_by_status: documents.length
+          ? { processed: documents.length }
+          : {},
       });
     }
     if (method === "POST" && path === "/api/documents") {
@@ -835,8 +878,11 @@ const server = http.createServer(async (req, res) => {
         req.on("error", () => resolve(""));
       });
       const disposition = raw.match(/filename="([^"]+)"/);
-      const filename = disposition ? disposition[1] : `e2e-upload-${nextDocumentId}.txt`;
-      const vaultId = Number(url.searchParams.get("vault_id") || 0) || vaults[0]?.id || 1;
+      const filename = disposition
+        ? disposition[1]
+        : `e2e-upload-${nextDocumentId}.txt`;
+      const vaultId =
+        Number(url.searchParams.get("vault_id") || 0) || vaults[0]?.id || 1;
       const doc = {
         id: String(nextDocumentId++),
         filename,
@@ -850,7 +896,11 @@ const server = http.createServer(async (req, res) => {
       };
       documents.push(doc);
       onboarding.upload_indexed = true;
-      return sendJson(req, res, 200, { id: doc.id, filename, status: "processed" });
+      return sendJson(req, res, 200, {
+        id: doc.id,
+        filename,
+        status: "processed",
+      });
     }
 
     // ---- Activity tray job routes (issue #784) ----
@@ -862,15 +912,20 @@ const server = http.createServer(async (req, res) => {
     // multi-vault stub state cannot duplicate rows per vault the way the
     // real per-vault backend never would (review F-003/M-PLAT-01).
     const trayVaultId = Number(url.searchParams.get("vault_id") || 0);
-    const inTrayVault = (seed) => !trayVaultId || (seed.vaultId ?? 1) === trayVaultId;
+    const inTrayVault = (seed) =>
+      !trayVaultId || (seed.vaultId ?? 1) === trayVaultId;
     if (method === "GET" && path === "/api/wiki/jobs") {
       return sendJson(req, res, 200, {
-        jobs: e2eSeeds.wiki.filter(inTrayVault).map((s) => e2eJobShape("wiki", s)),
+        jobs: e2eSeeds.wiki
+          .filter(inTrayVault)
+          .map((s) => e2eJobShape("wiki", s)),
       });
     }
     if (method === "GET" && path === "/api/kms/jobs") {
       return sendJson(req, res, 200, {
-        jobs: e2eSeeds.kms.filter(inTrayVault).map((s) => e2eJobShape("kms", s)),
+        jobs: e2eSeeds.kms
+          .filter(inTrayVault)
+          .map((s) => e2eJobShape("kms", s)),
       });
     }
     if (method === "GET" && path === "/api/documents/reindex/jobs") {
@@ -886,14 +941,27 @@ const server = http.createServer(async (req, res) => {
         status: "ready",
         active_job_id: s.status === "running" ? s.id : null,
       }));
-      return sendJson(req, res, 200, { items, total: items.length, page: 1, per_page: 50 });
+      return sendJson(req, res, 200, {
+        items,
+        total: items.length,
+        page: 1,
+        per_page: 50,
+      });
     }
-    if ((trayMatch = path.match(/^\/api\/draft-room\/drafts\/(\d+)\/jobs$/)) && method === "GET") {
+    if (
+      (trayMatch = path.match(/^\/api\/draft-room\/drafts\/(\d+)\/jobs$/)) &&
+      method === "GET"
+    ) {
       const draftId = Number(trayMatch[1]);
       const items = e2eSeeds["draft-room"]
         .filter((s) => s.draftId === draftId)
         .map((s) => e2eJobShape("draft-room", s));
-      return sendJson(req, res, 200, { items, total: items.length, page: 1, per_page: 50 });
+      return sendJson(req, res, 200, {
+        items,
+        total: items.length,
+        page: 1,
+        per_page: 50,
+      });
     }
     // Action routes: mutate the SAME seed records the list routes and
     // GET /_e2e/jobs read, with the production terminal-state gates — a
@@ -902,28 +970,41 @@ const server = http.createServer(async (req, res) => {
     // finished document 409s (documents.py) — so the e2e cannot pass with
     // an affordance the real server would refuse (review F-003/M-PLAT-01,
     // PRR-026).
-    if ((trayMatch = path.match(/^\/api\/wiki\/jobs\/(\d+)\/(cancel|retry)$/)) && method === "POST") {
+    if (
+      (trayMatch = path.match(/^\/api\/wiki\/jobs\/(\d+)\/(cancel|retry)$/)) &&
+      method === "POST"
+    ) {
       const seed = e2eSeeds.wiki.find((s) => s.id === Number(trayMatch[1]));
-      if (!seed) return sendJson(req, res, 404, { detail: "Job not found or not cancellable" });
+      if (!seed)
+        return sendJson(req, res, 404, {
+          detail: "Job not found or not cancellable",
+        });
       if (trayMatch[2] === "cancel") {
         if (E2E_TERMINAL_JOB_STATUSES.includes(seed.status)) {
-          return sendJson(req, res, 404, { detail: "Job not found or not cancellable" });
+          return sendJson(req, res, 404, {
+            detail: "Job not found or not cancellable",
+          });
         }
         seed.status = "cancelled";
       } else {
         if (seed.status !== "failed") {
-          return sendJson(req, res, 404, { detail: "Job is not in 'failed' state" });
+          return sendJson(req, res, 404, {
+            detail: "Job is not in 'failed' state",
+          });
         }
         seed.status = "pending";
       }
       return sendJson(req, res, 200, { job_id: seed.id, status: seed.status });
     }
     if (
-      (trayMatch = path.match(/^\/api\/draft-room\/drafts\/(\d+)\/jobs\/(\d+)\/(cancel|retry)$/)) &&
+      (trayMatch = path.match(
+        /^\/api\/draft-room\/drafts\/(\d+)\/jobs\/(\d+)\/(cancel|retry)$/,
+      )) &&
       method === "POST"
     ) {
       const seed = e2eSeeds["draft-room"].find(
-        (s) => s.draftId === Number(trayMatch[1]) && s.id === Number(trayMatch[2])
+        (s) =>
+          s.draftId === Number(trayMatch[1]) && s.id === Number(trayMatch[2]),
       );
       if (!seed) return sendJson(req, res, 404, { detail: "job not found" });
       if (trayMatch[3] === "cancel") {
@@ -933,24 +1014,36 @@ const server = http.createServer(async (req, res) => {
         seed.status = "cancelled";
       } else {
         if (seed.status !== "failed") {
-          return sendJson(req, res, 404, { detail: "job not in 'failed' state" });
+          return sendJson(req, res, 404, {
+            detail: "job not in 'failed' state",
+          });
         }
         seed.status = "pending";
       }
       return sendJson(req, res, 200, e2eJobShape("draft-room", seed));
     }
-    if ((trayMatch = path.match(/^\/api\/documents\/(\d+)\/cancel$/)) && method === "POST") {
+    if (
+      (trayMatch = path.match(/^\/api\/documents\/(\d+)\/cancel$/)) &&
+      method === "POST"
+    ) {
       const doc = documents.find((d) => String(d.id) === trayMatch[1]);
       if (!doc) return sendJson(req, res, 404, { detail: "file not found" });
       const current = doc.metadata?.status ?? "";
       if (current === "cancelled") {
-        return sendJson(req, res, 200, { file_id: doc.id, status: "cancelled" });
+        return sendJson(req, res, 200, {
+          file_id: doc.id,
+          status: "cancelled",
+        });
       }
       if (["indexed", "partial", "error"].includes(current)) {
-        return sendJson(req, res, 409, { detail: "Ingest already finished; nothing to cancel" });
+        return sendJson(req, res, 409, {
+          detail: "Ingest already finished; nothing to cancel",
+        });
       }
       doc.metadata = { ...(doc.metadata ?? {}), status: "cancelled" };
-      const seed = e2eSeeds.ingest.find((s) => String(s.docId) === trayMatch[1]);
+      const seed = e2eSeeds.ingest.find(
+        (s) => String(s.docId) === trayMatch[1],
+      );
       if (seed) seed.status = "cancelled";
       return sendJson(req, res, 200, { file_id: doc.id, status: "cancelled" });
     }
@@ -968,42 +1061,67 @@ const server = http.createServer(async (req, res) => {
       return sendJson(req, res, 200, session);
     }
     let m;
-    if ((m = path.match(/^\/api\/chat\/sessions\/(\d+)$/)) && method === "GET") {
+    if (
+      (m = path.match(/^\/api\/chat\/sessions\/(\d+)$/)) &&
+      method === "GET"
+    ) {
       const entry = sessions.get(Number(m[1]));
-      if (!entry) return sendJson(req, res, 404, { detail: "session not found" });
-      return sendJson(req, res, 200, { ...entry.session, messages: entry.messages });
+      if (!entry)
+        return sendJson(req, res, 404, { detail: "session not found" });
+      return sendJson(req, res, 200, {
+        ...entry.session,
+        messages: entry.messages,
+      });
     }
-    if ((m = path.match(/^\/api\/chat\/sessions\/(\d+)\/messages$/)) && method === "POST") {
+    if (
+      (m = path.match(/^\/api\/chat\/sessions\/(\d+)\/messages$/)) &&
+      method === "POST"
+    ) {
       const body = await readBody(req);
       const row = addMessage(Number(m[1]), body);
       if (!row) return sendJson(req, res, 404, { detail: "session not found" });
       return sendJson(req, res, 200, row);
     }
-    if ((m = path.match(/^\/api\/chat\/sessions\/(\d+)\/messages\/batch$/)) && method === "POST") {
+    if (
+      (m = path.match(/^\/api\/chat\/sessions\/(\d+)\/messages\/batch$/)) &&
+      method === "POST"
+    ) {
       const body = await readBody(req);
-      const rows = (body.messages || []).map((msg) => addMessage(Number(m[1]), msg));
+      const rows = (body.messages || []).map((msg) =>
+        addMessage(Number(m[1]), msg),
+      );
       if (rows.some((r) => r === null)) {
         return sendJson(req, res, 404, { detail: "session not found" });
       }
       return sendJson(req, res, 200, { messages: rows });
     }
-    if ((m = path.match(/^\/api\/chat\/sessions\/(\d+)\/truncate$/)) && method === "POST") {
+    if (
+      (m = path.match(/^\/api\/chat\/sessions\/(\d+)\/truncate$/)) &&
+      method === "POST"
+    ) {
       const body = await readBody(req);
       const entry = sessions.get(Number(m[1]));
-      if (!entry) return sendJson(req, res, 404, { detail: "session not found" });
+      if (!entry)
+        return sendJson(req, res, 404, { detail: "session not found" });
       const keepSeq = Number(body.keep_seq) || 0;
-      entry.messages = entry.messages.filter((row) => (row.seq ?? 0) <= keepSeq);
+      entry.messages = entry.messages.filter(
+        (row) => (row.seq ?? 0) <= keepSeq,
+      );
       entry.session.message_count = entry.messages.length;
       return sendJson(req, res, 200, {
         remaining_count: entry.messages.length,
-        tail_seq: entry.messages.length ? entry.messages[entry.messages.length - 1].seq : null,
+        tail_seq: entry.messages.length
+          ? entry.messages[entry.messages.length - 1].seq
+          : null,
       });
     }
 
     // ---- chat stream (SSE) ----
     if (method === "POST" && path === "/api/chat/stream") {
       const body = await readBody(req);
-      const lastUser = (body.messages || []).filter((x) => x.role === "user").pop();
+      const lastUser = (body.messages || [])
+        .filter((x) => x.role === "user")
+        .pop();
       if (lastUser) onboarding.first_question_asked = true;
       const userText = String(lastUser?.content ?? "");
       const slow = /SLOW/i.test(userText);
@@ -1022,7 +1140,10 @@ const server = http.createServer(async (req, res) => {
         // the Stop test can interrupt mid-generation. No done frame.
         sseFrame(res, { type: "mode", mode: "thinking" });
         await sleep(60);
-        sseFrame(res, { type: "content", content: "The coolant interval is 500 hours according to the manual" });
+        sseFrame(res, {
+          type: "content",
+          content: "The coolant interval is 500 hours according to the manual",
+        });
         await sleep(60);
         sseFrame(res, {
           type: "evidence",
@@ -1060,7 +1181,11 @@ const server = http.createServer(async (req, res) => {
         candidates: [SOURCE],
       });
       await sleep(40);
-      sseFrame(res, { type: "sources", sources: [SOURCE], score_type: "rerank" });
+      sseFrame(res, {
+        type: "sources",
+        sources: [SOURCE],
+        score_type: "rerank",
+      });
       await sleep(40);
       sseFrame(res, {
         type: "done",
@@ -1076,7 +1201,10 @@ const server = http.createServer(async (req, res) => {
     if (method === "GET" && path === "/api/onboarding/milestones") {
       return sendJson(req, res, 200, onboardingPayload());
     }
-    if (method === "POST" && path === "/api/onboarding/milestones/citation-opened") {
+    if (
+      method === "POST" &&
+      path === "/api/onboarding/milestones/citation-opened"
+    ) {
       await readBody(req);
       onboarding.first_citation_opened = true;
       return sendJson(req, res, 200, { ok: true });
@@ -1102,7 +1230,14 @@ const server = http.createServer(async (req, res) => {
       const status = String(body.status || "running");
       const title = body.title ? String(body.title) : null;
       const id = nextE2eJobId++;
-      const seed = { id, family, status, title, created_at: nowIso(), vaultId: 1 };
+      const seed = {
+        id,
+        family,
+        status,
+        title,
+        created_at: nowIso(),
+        vaultId: 1,
+      };
       if (family === "ingest") {
         const docId = nextDocumentId++;
         seed.docId = String(docId);
@@ -1126,7 +1261,11 @@ const server = http.createServer(async (req, res) => {
         seed.draftId = nextE2eDraftId++;
       }
       e2eSeeds[family].push(seed);
-      return sendJson(req, res, 200, { id: seed.id, family: seed.family, status: seed.status });
+      return sendJson(req, res, 200, {
+        id: seed.id,
+        family: seed.family,
+        status: seed.status,
+      });
     }
     if (method === "GET" && path === "/_e2e/jobs") {
       const family = url.searchParams.get("family") || "";
@@ -1203,7 +1342,15 @@ const server = http.createServer(async (req, res) => {
     if (method === "GET" && path === "/api/folders") {
       if (!a11ySeeded) return sendJson(req, res, 404, { detail: "not seeded" });
       return sendJson(req, res, 200, {
-        folders: [{ id: 1, vault_id: 1, name: "Manuals", parent_id: null, created_at: nowIso() }],
+        folders: [
+          {
+            id: 1,
+            vault_id: 1,
+            name: "Manuals",
+            parent_id: null,
+            created_at: nowIso(),
+          },
+        ],
       });
     }
     if (method === "GET" && path === "/api/memories") {
@@ -1221,7 +1368,12 @@ const server = http.createServer(async (req, res) => {
     }
     if (method === "GET" && path === "/api/wiki/pages") {
       if (!a11ySeeded) return sendJson(req, res, 404, { detail: "not seeded" });
-      return sendJson(req, res, 200, { pages: [a11yWikiPage()], page: 1, per_page: 20, total: 1 });
+      return sendJson(req, res, 200, {
+        pages: [a11yWikiPage()],
+        page: 1,
+        per_page: 20,
+        total: 1,
+      });
     }
     if (method === "GET" && path === "/api/wiki/lint") {
       if (!a11ySeeded) return sendJson(req, res, 404, { detail: "not seeded" });
@@ -1233,7 +1385,12 @@ const server = http.createServer(async (req, res) => {
     }
     if (method === "GET" && path === "/api/kms/entries") {
       if (!a11ySeeded) return sendJson(req, res, 404, { detail: "not seeded" });
-      return sendJson(req, res, 200, { entries: [a11yKmsEntry()], total: 1, page: 1, per_page: 200 });
+      return sendJson(req, res, 200, {
+        entries: [a11yKmsEntry()],
+        total: 1,
+        page: 1,
+        per_page: 200,
+      });
     }
     if (method === "GET" && path === "/api/kms/entries/1") {
       if (!a11ySeeded) return sendJson(req, res, 404, { detail: "not seeded" });
@@ -1273,17 +1430,27 @@ const server = http.createServer(async (req, res) => {
         : [];
       return sendJson(req, res, 200, { results });
     }
-    if (method === "GET" && path === "/api/canvas/artifacts/cav_a11y_fixture_0") {
+    if (
+      method === "GET" &&
+      path === "/api/canvas/artifacts/cav_a11y_fixture_0"
+    ) {
       if (!a11ySeeded) return sendJson(req, res, 404, { detail: "not seeded" });
       return sendJson(req, res, 200, a11yCanvasPayload());
     }
-    if (method === "GET" && path === "/api/canvas/artifacts/cav_a11y_fixture_0/versions") {
+    if (
+      method === "GET" &&
+      path === "/api/canvas/artifacts/cav_a11y_fixture_0/versions"
+    ) {
       if (!a11ySeeded) return sendJson(req, res, 404, { detail: "not seeded" });
       const { version } = a11yCanvasPayload();
       return sendJson(req, res, 200, { versions: [version] });
     }
-    if (method === "GET" && path === `/api/draft-room/drafts/${A11Y_DRAFT_ID}`) {
-      if (!a11ySeeded) return sendJson(req, res, 404, { detail: "draft not found" });
+    if (
+      method === "GET" &&
+      path === `/api/draft-room/drafts/${A11Y_DRAFT_ID}`
+    ) {
+      if (!a11ySeeded)
+        return sendJson(req, res, 404, { detail: "draft not found" });
       return sendJson(req, res, 200, a11yDraftDetail());
     }
     if (method === "POST" && path === "/_e2e/a11y-seed") {
@@ -1303,7 +1470,9 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ---- fallback ----
-    return sendJson(req, res, 404, { detail: `stub has no route ${method} ${path}` });
+    return sendJson(req, res, 404, {
+      detail: `stub has no route ${method} ${path}`,
+    });
   } catch (err) {
     sendJson(req, res, 500, { detail: `stub error: ${String(err)}` });
   }

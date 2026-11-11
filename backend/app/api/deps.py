@@ -248,6 +248,19 @@ def get_background_processor(request: Request) -> BackgroundProcessor:
     return request.app.state.background_processor
 
 
+def get_draft_job_processor(request: Request):
+    """Return the Draft Room job processor from app state (``None`` when absent).
+
+    Reads through ``scope.get("app")`` rather than ``Request.app`` so direct
+    handler invocations whose scope carries no ``app`` key (the
+    commit-boundary harness) resolve ``None`` instead of raising — review
+    PRR-002. Production ASGI servers always set ``scope["app"]``.
+    """
+    app = request.scope.get("app")
+    state = getattr(app, "state", None) if app is not None else None
+    return getattr(state, "draft_job_processor", None)
+
+
 def get_maintenance_service(request: Request) -> MaintenanceService:
     """Return the maintenance service from app state."""
     return request.app.state.maintenance_service

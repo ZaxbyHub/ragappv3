@@ -108,10 +108,12 @@
   keep claiming vectors they no longer have and need a per-file admin retry
   (or manual cleanup) rather than being re-enqueued automatically. It also
   does not probe for a live writer — the stop-the-app warning is the
-  contract. Under the shipped lease-mode recovery, a file whose ingestion
-  retry budget was exhausted by a previous run settles to `error` instead of
-  being re-processed; the printed next-steps call this out (app-side root
-  fix tracked in #872).
+  contract. Under the shipped lease-mode recovery, a file whose LATEST
+  ingestion job settled terminally at the attempt cap settles to `error`
+  instead of being re-processed; the printed next-steps call this out
+  (root fix shipped via #872: older capped failures superseded by a later
+  job no longer block reset recovery, and rows already settled to `error`
+  by older builds still need the per-file admin retry).
 - `--delete-stale-multiscale --confirm` with an explicit `--multi-scale-
   indexing-enabled false` deletes non-default-scale rows table-wide by
   design (the pinned base contract): rows owned by files in any status are

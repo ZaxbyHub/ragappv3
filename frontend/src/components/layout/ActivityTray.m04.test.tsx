@@ -25,6 +25,7 @@
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor, within } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
 
 const {
@@ -101,7 +102,9 @@ interface ActivityJobRowLike {
   fileId?: string;
 }
 
-function makeRow(overrides: Partial<ActivityJobRowLike> = {}): ActivityJobRowLike {
+function makeRow(
+  overrides: Partial<ActivityJobRowLike> = {},
+): ActivityJobRowLike {
   return {
     family: "ingest",
     key: "row-1",
@@ -191,7 +194,15 @@ describe("ActivityTray m04 (issue-trace 784-activity-tray-shell-job-center)", ()
       }),
     ]);
 
-    render(<ActivityTray />);
+    render(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <ActivityTray />
+      </QueryClientProvider>,
+    );
 
     // One row per family, no more, no less.
     expect(screen.getAllByRole("listitem").length).toBe(5);
@@ -200,7 +211,7 @@ describe("ActivityTray m04 (issue-trace 784-activity-tray-shell-job-center)", ()
     for (const family of ["ingest", "wiki", "draft-room", "kms", "reindex"]) {
       expect(
         screen.getAllByText(new RegExp(family, "i")).length,
-        `family ${family} should appear in the tray`
+        `family ${family} should appear in the tray`,
       ).toBeGreaterThan(0);
     }
 
@@ -224,7 +235,15 @@ describe("ActivityTray m04 (issue-trace 784-activity-tray-shell-job-center)", ()
       }),
     ]);
 
-    render(<ActivityTray />);
+    render(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <ActivityTray />
+      </QueryClientProvider>,
+    );
 
     expect(screen.getAllByRole("listitem").length).toBe(1);
     const row = rowByFamily("ingest");
@@ -265,16 +284,26 @@ describe("ActivityTray m04 (issue-trace 784-activity-tray-shell-job-center)", ()
       }),
     ]);
 
-    render(<ActivityTray />);
+    render(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <ActivityTray />
+      </QueryClientProvider>,
+    );
 
     await user.click(
-      within(rowByFamily("wiki")).getByRole("button", { name: /cancel/i })
+      within(rowByFamily("wiki")).getByRole("button", { name: /cancel/i }),
     );
     await user.click(
-      within(rowByFamily("draft-room")).getByRole("button", { name: /cancel/i })
+      within(rowByFamily("draft-room")).getByRole("button", {
+        name: /cancel/i,
+      }),
     );
     await user.click(
-      within(rowByFamily("ingest")).getByRole("button", { name: /cancel/i })
+      within(rowByFamily("ingest")).getByRole("button", { name: /cancel/i }),
     );
 
     await waitFor(() => {
@@ -329,18 +358,26 @@ describe("ActivityTray m04 (issue-trace 784-activity-tray-shell-job-center)", ()
       }),
     ]);
 
-    render(<ActivityTray />);
+    render(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <ActivityTray />
+      </QueryClientProvider>,
+    );
 
     // Retry is NOT offered on the non-retryable row.
     expect(
-      within(rowByFamily("ingest")).queryByRole("button", { name: /retry/i })
+      within(rowByFamily("ingest")).queryByRole("button", { name: /retry/i }),
     ).not.toBeInTheDocument();
 
     await user.click(
-      within(rowByFamily("wiki")).getByRole("button", { name: /retry/i })
+      within(rowByFamily("wiki")).getByRole("button", { name: /retry/i }),
     );
     await user.click(
-      within(rowByFamily("draft-room")).getByRole("button", { name: /retry/i })
+      within(rowByFamily("draft-room")).getByRole("button", { name: /retry/i }),
     );
 
     await waitFor(() => {
@@ -349,7 +386,12 @@ describe("ActivityTray m04 (issue-trace 784-activity-tray-shell-job-center)", ()
     });
     await waitFor(() => {
       expect(mockRetryDraftJob).toHaveBeenCalledTimes(1);
-      expect(mockRetryDraftJob).toHaveBeenCalledWith(5, 9);
+      expect(mockRetryDraftJob).toHaveBeenCalledWith(
+        5,
+        9,
+        {},
+        expect.any(String),
+      );
     });
   });
 
@@ -367,7 +409,15 @@ describe("ActivityTray m04 (issue-trace 784-activity-tray-shell-job-center)", ()
       }),
     ]);
 
-    const view = render(<ActivityTray />);
+    const view = render(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <ActivityTray />
+      </QueryClientProvider>,
+    );
     expect(screen.getAllByRole("listitem").length).toBe(1);
     expect(rowByFamily("kms").textContent).not.toMatch(/completed/i);
 
@@ -382,7 +432,15 @@ describe("ActivityTray m04 (issue-trace 784-activity-tray-shell-job-center)", ()
         terminal: true,
       }),
     ]);
-    view.rerender(<ActivityTray />);
+    view.rerender(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <ActivityTray />
+      </QueryClientProvider>,
+    );
 
     const kmsRow = rowByFamily("kms");
     expect(within(kmsRow).getByText(/completed/i)).toBeInTheDocument();

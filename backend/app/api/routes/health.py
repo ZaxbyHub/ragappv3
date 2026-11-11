@@ -228,12 +228,29 @@ async def _collect_deep_state(app_state, llm_checker, model_checker) -> dict:
                     vector_status["stale_embeddings_detail"] = (
                         f"LanceDB index was built with {stored_dim}-dim embeddings but "
                         f"EMBEDDING_DIM is now {configured_dim}. "
-                        f"Run scripts/migrate_embeddings.py to re-index."
+                        "Back up the data directory and stop the application, "
+                        "then preview the migration from the repo root with the "
+                        "backend dependencies installed (the script needs "
+                        "lancedb: pip install -r backend/requirements-lock.txt). "
+                        "Run: python scripts/migrate_embeddings.py --dry-run "
+                        "--lancedb-path ./data/lancedb --sqlite-path ./data/app.db "
+                        "(from the repo root; adjust the paths to your data "
+                        "directory if you changed HOST_DATA_DIR — see the "
+                        "script's --help). Inspect its output, then re-run the "
+                        "same command without --dry-run to apply it."
                     )
                     logger.warning(
                         "Stale embedding dimensions detected: stored=%d, configured=%d. "
                         "Documents will not be searchable until re-embedded. "
-                        "Run scripts/migrate_embeddings.py.",
+                        "Back up the data directory and stop the application, then "
+                        "preview the migration from the repo root with the backend "
+                        "dependencies installed (the script needs lancedb: pip install "
+                        "-r backend/requirements-lock.txt). "
+                        "Run: python scripts/migrate_embeddings.py --dry-run --lancedb-path "
+                        "./data/lancedb --sqlite-path ./data/app.db (from the repo "
+                        "root; adjust the paths to your data directory if you "
+                        "changed HOST_DATA_DIR — see the script's --help). Inspect "
+                        "its output, then re-run without --dry-run to apply it.",
                         stored_dim,
                         configured_dim,
                     )

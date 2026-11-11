@@ -78,8 +78,8 @@ Persisted-shape note (additive): `ChunkEnrichment.to_dict()` now includes an
 `"error"` key (None on success) in the enrichment metadata stored on enriched
 vector rows; no consumer asserts an exact shape, and successful rows simply
 carry `error: null` alongside the existing fields.
-- Retargeted: `test_existing_embedding_index_is_refreshed_after_new_rows`,
-  `test_delete_then_add_same_row_count_still_refreshes_existing_index`
+- Retargeted: `test_existing_embedding_index_is_accepted_without_retrain_after_new_rows`,
+  `test_delete_then_add_same_row_count_accepts_existing_index`
   (test_ingestion_integrity.py) and the `await_count` assertion in
   `test_vector_store_async.py` now pin the no-retrain contract.
 
