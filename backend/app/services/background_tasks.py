@@ -1012,10 +1012,14 @@ class BackgroundProcessor:
                 WHERE f.status IN ('pending', 'processing')
                   AND (f.phase IS NULL OR f.phase != 'error')
                   AND f.id NOT IN (
-                    SELECT CAST(json_extract(j.payload_json, '$.file_id') AS INTEGER)
+                    SELECT CASE WHEN json_valid(j.payload_json)
+                                THEN CAST(json_extract(j.payload_json,
+                                           '$.file_id') AS INTEGER)
+                           END
                     FROM jobs j
                     WHERE j.queue = 'ingestion'
                       AND j.status IN ('pending', 'running')
+                      AND json_valid(j.payload_json)
                       AND json_extract(j.payload_json, '$.file_id') IS NOT NULL
                   )
                   AND f.id NOT IN (
@@ -1051,10 +1055,14 @@ class BackgroundProcessor:
                     error_message = NULL
                 WHERE status = 'processing'
                   AND id IN (
-                    SELECT CAST(json_extract(j.payload_json, '$.file_id') AS INTEGER)
+                    SELECT CASE WHEN json_valid(j.payload_json)
+                                THEN CAST(json_extract(j.payload_json,
+                                           '$.file_id') AS INTEGER)
+                           END
                     FROM jobs j
                     WHERE j.queue = 'ingestion'
                       AND j.status = 'pending'
+                      AND json_valid(j.payload_json)
                       AND json_extract(j.payload_json, '$.file_id') IS NOT NULL
                   )
                 """
@@ -1104,10 +1112,14 @@ class BackgroundProcessor:
                       )
                   )
                   AND id NOT IN (
-                    SELECT CAST(json_extract(j.payload_json, '$.file_id') AS INTEGER)
+                    SELECT CASE WHEN json_valid(j.payload_json)
+                                THEN CAST(json_extract(j.payload_json,
+                                           '$.file_id') AS INTEGER)
+                           END
                     FROM jobs j
                     WHERE j.queue = 'ingestion'
                       AND j.status IN ('pending', 'running')
+                      AND json_valid(j.payload_json)
                       AND json_extract(j.payload_json, '$.file_id') IS NOT NULL
                   )
                 """,

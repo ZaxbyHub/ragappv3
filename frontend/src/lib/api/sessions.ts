@@ -1,4 +1,4 @@
-import { apiClient, API_BASE_URL, _jwtAccessToken, getCsrfCookie, getCsrfToken, ChatStreamCallbacks, ChatMessage, Source, UsedMemory, WikiReference, KMSReference, CitationValidationDebug, ChatMetadataFilter, CitationEnforcement, ChatSession, ChatSessionDetail, ChatSessionMessage, CreateSessionRequest, AddMessageRequest, ChatHistoryItem, ensureCsrfToken, refreshAccessToken, isTokenNearExpiry } from "./core";
+import { apiClient, API_BASE_URL, _jwtAccessToken, getCsrfCookie, getCsrfToken, ChatStreamCallbacks, ChatMessage, Source, UsedMemory, WikiReference, KMSReference, CitationValidationDebug, ChatMetadataFilter, CitationEnforcement, ChatSession, ChatSessionDetail, ChatSessionMessage, CreateSessionRequest, AddMessageRequest, ChatHistoryItem, ensureCsrfToken, refreshAccessToken, isTokenNearExpiry, httpStatusOf } from "./core";
 import { setChatHistory as storageSetChatHistory, getChatHistory as storageGetChatHistory } from "../storage";
 import { captureAuthOwner, captureAuthPrincipalGeneration, isCurrentAuthOwner, subscribeAuthPrincipal } from "./auth-lifecycle";
 
@@ -676,7 +676,11 @@ export async function addChatMessagesBatch(
     );
     return response.data.messages;
   } catch (err) {
-    const status = (err as { response?: { status?: number } })?.response?.status;
+    // Issue #1078: read the status through the three-tier walk — apiClient
+    // rejects with a normalized Error whose status is top-level, so the old
+    // single-tier `response.status` read never saw the 404 and the fallback
+    // below was dead in production.
+    const status = httpStatusOf(err);
     if (status !== 404) throw err;
     const saved: ChatSessionMessage[] = [];
     for (const message of messages) {

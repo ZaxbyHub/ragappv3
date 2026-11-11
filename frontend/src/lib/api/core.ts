@@ -1361,6 +1361,38 @@ export function deleteDocumentKeepalive(fileId: string): boolean {
 }
 
 /**
+ * HTTP status of a caught API error, in either error shape this repo's API
+ * client produces: the response interceptor's normalized Error (top-level
+ * `status`, the original axios error under `originalError`) or a raw
+ * AxiosError (`.response.status`). Tier order matches `logApiFailure`:
+ * `status` → `response.status` → `originalError.response.status`.
+ *
+ * Shared-helper census (issue #1078) — readers routed through this helper:
+ * sessions.ts `addChatMessagesBatch` (404 fallback), TranscriptPane.tsx
+ * (both stale-view 409 arms), useSendMessage.ts (session-create 403),
+ * draftRoom.ts `parseDraftRoomError`. Convention sites that still carry a
+ * local copy of the walk: useJobStatus.ts `httpStatusOf`,
+ * useHealthCheck.ts `httpStatusOf`, ActivityTray.tsx `errorStatus`,
+ * canvas.ts `getCanvasErrorStatus` (two-tier).
+ */
+export function httpStatusOf(err: unknown): number | undefined {
+  const candidate = err as
+    | {
+        status?: unknown;
+        response?: { status?: unknown };
+        originalError?: { response?: { status?: unknown } };
+      }
+    | null
+    | undefined;
+  if (typeof candidate?.status === "number") return candidate.status;
+  const viaResponse = candidate?.response?.status;
+  if (typeof viaResponse === "number") return viaResponse;
+  const viaOriginal = candidate?.originalError?.response?.status;
+  if (typeof viaOriginal === "number") return viaOriginal;
+  return undefined;
+}
+
+/**
  * Sanitized API-failure logging for the documents surfaces (#766): logs the
  * error's message plus response status and request URL — never the raw error
  * object or its config, whose toJSON() serialization would carry the
