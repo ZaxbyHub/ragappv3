@@ -62,12 +62,19 @@ def _make_recording_transformer(return_value: str):
 
 
 def _is_xml_escape_call(expr: ast.expr) -> bool:
-    """True when expr is a direct call to the _xml_escape helper."""
-    return (
-        isinstance(expr, ast.Call)
-        and isinstance(expr.func, ast.Name)
-        and expr.func.id == "_xml_escape"
-    )
+    """True when expr is a direct call to a PROVEN escaping helper.
+
+    #884/#925: _escape_clip joined the proven set — it escapes via
+    _xml_escape before clipping, so tagged interpolations fed through it
+    (the rewrite_followup prior-question/answer regions, called inline in
+    the f-strings) carry the same escaping guarantee, with an
+    escaped-length budget on top. Extending the set is a strengthening:
+    the guard still rejects every tag-interpolation whose value is NOT a
+    proven escaping call.
+    """
+    if not (isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name)):
+        return False
+    return expr.func.id in ("_xml_escape", "_escape_clip")
 
 
 def _count_unescaped_tagged_interpolations(source: str) -> int:
@@ -171,3 +178,16 @@ def test_query_transformer_tagged_fstrings_are_escaped():
         f"{count} f-string interpolation(s) wrap unescaped values in XML "
         "tags — every tagged interpolation must go through _xml_escape"
     )
+
+
+def test_count_helper_has_a_positive_control():
+    """Positive control for the census detector itself (review
+    pr1105-20261109 F-4): a detector that always returns 0 must fail this
+    file, so the structural guard above cannot silently go blind."""
+    synthetic = 'msg = f"<user_query>{raw_input}</user_query>"'
+    assert _count_unescaped_tagged_interpolations(synthetic) == 1, (
+        "the census detector missed a plainly unescaped tagged "
+        "interpolation — it can no longer be trusted as a structural guard"
+    )
+    escaped = 'msg = f"<user_query>{_xml_escape(raw_input)}</user_query>"'
+    assert _count_unescaped_tagged_interpolations(escaped) == 0
