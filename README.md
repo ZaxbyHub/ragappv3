@@ -147,6 +147,9 @@ backend/app/
 - Docker and Docker Compose installed
 - Ollama installed and running (see Ollama Setup below)
 - At least 8GB RAM (16GB+ recommended)
+- An NVIDIA GPU reserved by the bundled embedding and reranker containers —
+  CPU-only hosts run the CPU image override instead (see
+  [CPU-only hosts](#cpu-only-hosts))
 
 ### 1. Clone and Configure
 
@@ -167,6 +170,24 @@ HOST_DATA_DIR=/path/to/your/data
 OLLAMA_CHAT_URL=http://192.168.1.50:11434
 CHAT_MODEL=gemma4:26b   # example — use the model YOUR endpoint serves
 ```
+
+**Native Linux, before the first start:** the app container runs as uid 1000
+and the Docker daemon creates a missing bind-mount source root-owned, so
+create the data directory yourself and hand it to uid 1000 — using the same
+path you configured above:
+
+```bash
+# default data directory (HOST_DATA_DIR unset):
+mkdir -p data
+sudo chown -R 1000:1000 data
+
+# or, for a custom path such as HOST_DATA_DIR=/path/to/your/data:
+mkdir -p /path/to/your/data
+sudo chown -R 1000:1000 /path/to/your/data
+```
+
+Skip this and startup fails with a message naming the directory, the current
+uid, and the owner uid, together with the ownership remediation.
 
 ### 2. Start Your Inference Endpoint
 
@@ -197,6 +218,40 @@ Open your browser to: `http://localhost:9090`
 On first launch, you'll be redirected to the **Setup Wizard** (`/setup`) to create the initial superadmin account. After setup, log in with your credentials.
 
 > **Security:** In production, set `JWT_SECRET_KEY` to a random value and change the default admin password immediately.
+
+> **Startup order:** `knowledgevault` waits for the `harrier-embed` container
+> to report healthy before starting (so the strict embedding-model check runs
+> against a ready service). First boot downloads the embedder model; the
+> healthcheck budget is roughly 120 s of download grace plus 5 probes at
+> 30 s intervals (~270 s total). If the embedder is not healthy within that
+> budget, compose ABORTS with `dependency failed to start` and
+> `knowledgevault` is NOT started — its restart policy does not cover a
+> dependency that never came up, so this does not recover by itself. Fix the
+> embedder (check `docker compose logs harrier-embed`; a slow first download
+> is the usual cause) and re-run `docker compose up -d`. Operators pointing
+`OLLAMA_EMBEDDING_URL` at an external embedding endpoint (not the bundled
+containers) can start the app without that gate:
+`docker compose up -d knowledgevault --no-deps`.
+
+## CPU-only hosts
+
+The bundled `harrier-embed` and `reranker` containers run CUDA builds and
+reserve an NVIDIA GPU. On a host without one, start with the CPU override:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.cpu.yml up -d
+```
+
+The override swaps both services to the CPU build of text-embeddings-inference
+(`cpu-latest`) and removes the GPU reservations (`!reset []` — required under
+compose merge semantics; a plain empty list would keep the inherited devices).
+The `!reset` tag needs **Docker Compose v2.19 or newer** (check with
+`docker compose version`); older releases reject or mis-merge the file.
+Models, ports, and healthchecks are unchanged, so startup gating and the app
+behave identically. Expect meaningfully slower embedding/rerank throughput on
+CPU. Before relying on this in production, pin the CPU image digest the same
+way the shipped CUDA images are pinned (see the comments in
+`docker-compose.cpu.yml`).
 
 ## Environment Setup
 
@@ -271,25 +326,24 @@ On first launch, you'll be redirected to the **Setup Wizard** (`/setup`) to crea
 ### Data Directory Structure
 
 ```
-data/
-├── knowledgevault/       # Root data directory
-│   ├── uploads/          # [LEGACY] Legacy flat uploads directory (deprecated)
-│   ├── vaults/           # Vault-specific data directories
-│   │   ├── 1/            # Vault directory (ID-based)
-│   │   │   └── uploads/  # Per-vault upload directory
-│   │   ├── 2/            # Vault 2
-│   │   │   └── uploads/  # Uploads for vault 2
-│   │   └── ...           # Additional vaults
-│   ├── documents/        # Documents (legacy, kept for compatibility)
-│   ├── library/          # Library files
-│   ├── lancedb/          # Vector database
-│   │   └── chunks.lance/
-│   └── app.db            # SQLite database
+data/                    # Host-side default (./data; compose binds it at /app/data)
+├── uploads/              # [LEGACY] Legacy flat uploads directory (deprecated)
+├── vaults/               # Vault-specific data directories
+│   ├── 1/                # Vault directory (ID-based)
+│   │   └── uploads/      # Per-vault upload directory
+│   ├── 2/                # Vault 2
+│   │   └── uploads/      # Uploads for vault 2
+│   └── ...               # Additional vaults
+├── documents/            # Documents (legacy, kept for compatibility)
+├── library/              # Library files
+├── lancedb/              # Vector database
+│   └── chunks.lance/
+└── app.db                # SQLite database
 ```
 
 > **Logs:** the application writes structured JSON logs to **stdout** (there is no log file on disk). Docker captures them via the default `json-file` driver; retrieve them with `docker compose logs knowledgevault` (or `docker logs <container>`). Configure a Docker logging driver or redirect output if you need file-based persistence.
 
-**Note:** The system stores uploads in vault-specific directories (`/data/knowledgevault/vaults/{vault_id}/uploads/`). On first startup, the system automatically migrates files from the legacy flat `uploads/` directory to vault-specific directories. Files are renamed with `.migrated` suffix to create a safe backup. If a file cannot be associated with a specific vault, the migration logs a warning and skips the file — vault_id must always be explicit.
+**Note:** The system stores uploads in vault-specific directories under the configured data directory (`./data/vaults/{vault_id}/uploads/` host-side; `/app/data/vaults/{vault_id}/uploads/` inside the container). On first startup, the system automatically migrates files from the legacy flat `uploads/` directory to vault-specific directories. Files are renamed with `.migrated` suffix to create a safe backup. If a file cannot be associated with a specific vault, the migration logs a warning and skips the file — vault_id must always be explicit.
 
 ## Ollama Models
 
@@ -448,7 +502,8 @@ re-index requirement.)
 One caveat: the job only re-embeds files whose status is `indexed` or `error`.
 A store with no such rows reports `completed` with `"processed": 0` **without**
 recording an identity, so the 503 persists and re-running changes nothing — in
-that case use the offline migration script below, which wipes the index (the
+that case use the offline migration script below, which replaces the index
+(keeping a timestamped rollback copy of the previous one — see below; the
 next start records the identity on the fresh table).
 
 ### Embedding Dimension Change (Harrier Migration)
@@ -460,6 +515,12 @@ dimension-incompatible.
 
 **Symptom:** Chat returns no document results or the `/api/health?deep=true` response
 includes `"stale_embeddings": true` in the `vector_store` section.
+
+**Prerequisites:** run these from the repo root with the backend
+dependencies installed — the script needs the `lancedb` package to read
+the index (`pip install -r backend/requirements-lock.txt`). On a fresh
+deployment where neither path exists yet the script exits 7 (nothing to
+migrate) — that is expected.
 
 **Required steps:**
 
@@ -473,14 +534,20 @@ cp /your/data/dir/app.db /your/data/dir/app.db.bak
 docker compose stop knowledgevault
 
 # 3. Run the migration script to clear stale embeddings
-#    (dry-run first to see what will change)
-python scripts/migrate_embeddings.py --dry-run
+#    (dry-run first to see what will change). Pass the paths as seen from
+#    the host — with the default HOST_DATA_DIR unset that is ./data/...;
+#    adjust if you configured a custom HOST_DATA_DIR.
+python scripts/migrate_embeddings.py --dry-run \
+    --lancedb-path ./data/lancedb --sqlite-path ./data/app.db
 
 # 4. Run the actual migration — this resets file statuses to pending,
-#    then wipes the LanceDB index (the reset runs first so a crash or a
-#    locked database leaves the old vectors intact instead of stranding
-#    'indexed' rows over an empty index)
-python scripts/migrate_embeddings.py
+#    then replaces the LanceDB index: the previous index is preserved as a
+#    timestamped rollback directory next to the live one (see the run
+#    summary) and the live directory is recreated empty. The reset runs
+#    first so a crash or a locked database leaves the old vectors intact
+#    instead of stranding 'indexed' rows over an empty index.
+python scripts/migrate_embeddings.py \
+    --lancedb-path ./data/lancedb --sqlite-path ./data/app.db
 
 # 5. Start the application — the background processor will re-index all files
 docker compose start knowledgevault
@@ -489,12 +556,27 @@ docker compose start knowledgevault
 The background processor automatically re-embeds all files with `status='pending'`.
 Depending on the number of documents and your hardware, this may take several minutes.
 
+Rollback directories (`<index-dir-name>.rollback-YYYYMMDD-HHMMSS` — e.g.
+`lancedb.rollback-...` when the directory is named `lancedb`) accumulate next
+to the live index until you remove them manually once the rebuilt index is
+verified (`scripts/cleanup_backups.py` does not manage them). A rollback
+directory holds the previous index's full contents — including all document
+chunk text — is NOT covered by in-app document/vault deletion, and each
+migration/reset run leaves one more full-size copy, so rebuilding temporarily
+needs space for BOTH indexes and repeated runs grow the volume until you
+delete the rollback directories yourself.
+
 If a migration run is interrupted (crash, Ctrl-C, lock error), re-run the
 script **before** restarting the application: after the status reset, an app
 boot against the still-old-dimension index would fail every re-embed and
-leave files in `error`/retry states that no recovery sweep picks up. If that
-re-run itself refuses with exit code 3, the index deletion is incomplete
-(the interruption landed mid-wipe) — re-run with `--force` to finish it.
+leave files in `error`/retry states that no recovery sweep picks up. Because
+the replacement renames (rather than deletes) the index, there is no
+partially-deleted state: the previous index survives under its live name or
+its rollback name. If the interruption landed between the rename and the
+recreation, the rollback directory printed by that run is the recovery copy —
+recreate the live directory (or rename the rollback directory back) and
+re-run; renaming the rollback directory back restores the index only, so
+re-running the script afterwards is the documented completion path.
 
 **Health check after migration:**
 
@@ -516,10 +598,46 @@ curl -H "X-API-Key: ${HEALTH_CHECK_API_KEY:?set HEALTH_CHECK_API_KEY}" \
 > The script refuses (instead of destroying data) with these exit codes:
 > **3** — the stored dimension cannot be read on a non-empty index; **4** — the
 > configured `EMBEDDING_DIM` cannot be loaded; **5** — another process holds the
-> database, or the database is unreadable/corrupt at the writer probe; **6** — the
+> database, the database is unreadable/corrupt at the writer probe, or the
+> claimed-id identity probe itself could not read the SQLite database (a probe
+> failure is a refusal, never a pass); **6** — the
 > database is unreadable/corrupt during repair detection (restore `app.db` from your
-> backup). Pass `--force` to override exits 3 and 4 only; the lock/corruption refusals
-> (5 and 6) always stop the run.
+> backup); **7** — neither the `--lancedb-path` nor the `--sqlite-path` exists (wrong
+> paths — typically container-side DATA_DIR paths used from the host);
+> **8** — the SQLite file is unusable for a reset/wipe (dry runs included):
+> missing, no `files` table, a `files` table without the reset contract's
+> core columns (`id`, `status`), an obvious backup copy such as `app.db.bak`
+> (rotated and `.copy` names like `app.db.bak.1`, a file directly inside a
+> `backups/` directory, and a path that resolves to one
+> included), or rows claiming vectors that
+> share no file id with the index's chunks (a database that does not
+> describe this index). These are heuristics, not proof of identity: a
+> byte-identical copy of the live database under a live-looking name, or
+> another deployment's database whose file ids happen to overlap this
+> index's (ids number from 1 in every deployment), passes them — always
+> point `--sqlite-path` at the live file. When the migration does run, the
+> wipe preserves the previous index as a timestamped rollback directory, so
+> even a passed-heuristic wrong database leaves a recoverable copy instead
+> of destroying the index.
+> A database where NO rows claim vectors gets a loud WARNING (live run
+> and dry-run) instead (that state is indistinguishable from the
+> documented re-run after an interrupted migration). Pass `--force` to
+> override exits 3 and 4 only; the lock/corruption/wrong-path refusals
+> (5, 6, 7 and 8) always stop the run.
+>
+> `scripts/reset_embeddings.py` (configured via `DATA_DIR`; no CLI flags)
+> refuses with **exit 8** — naming both the SQLite path and the LanceDB
+> path — when the configured database cannot be the application database:
+> missing, a directory, an obvious backup copy (`app.db.bak`, a
+> `backups/` parent — the same tokens migrate refuses), a lock-shaped or
+> permission failure while opening it, corruption, no `files` table, or a
+> `files` table without the core `id`/`status` columns. A live writer
+> that already holds the database is NOT caught at the door: it surfaces
+> at the reset step as a locked error (raw traceback, exit 1) with the
+> index untouched — stop the application first. Exit 8 is dual-use: after
+> the reset commits, a rollback preservation failure (rename/recreate)
+> also exits 8 and names the rollback copy; migrate's equivalent
+> preservation failures exit 5 through `main()`.
 
 ---
 
@@ -779,7 +897,7 @@ The chat interface provides a three-zone workspace layout:
 3. Files are automatically processed and indexed
 
 **Method 2: Direct File Placement**
-1. Place files in `data/knowledgevault/vaults/{vault_id}/uploads/` (e.g., `data/knowledgevault/vaults/1/uploads/`)
+1. Place files in `data/vaults/{vault_id}/uploads/` (e.g., `data/vaults/1/uploads/`)
 2. Click "Scan Directory" on Documents page
 3. Or wait for auto-scan (if enabled)
 

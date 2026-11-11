@@ -47,6 +47,10 @@
   was incomplete — finish it with `--force`), and lists the refusal exit
   codes (3/4/5/6) with the `--force` scope in the "safe to run multiple
   times" note, which also explains the repair behavior.
+  **Superseded (pr1095):** the destructive step preserves the previous
+  index as a timestamped rollback directory instead of deleting it, so
+  there is no partially-deleted state and no exit-3-mid-wipe case — see
+  `1094-1080-embedding-index-wipe-guards.md`.
 
 ### Tests
 

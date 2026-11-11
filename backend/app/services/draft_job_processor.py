@@ -142,6 +142,21 @@ class DraftJobProcessor:
         # garbage-collect them mid-flight, mirroring WikiCompileProcessor.
         self._bg_tasks: set[asyncio.Task] = set()
 
+    @property
+    def is_alive(self) -> bool:
+        """Task liveness of this processor (issues #902/#911).
+
+        True only while the poll-loop task exists and has not terminated:
+        a processor whose ``start()`` was swallowed by lifespan's
+        ``_safe_await`` (mounted with ``_running=False``) or whose poll loop
+        died after a successful start reports False, while a test double
+        without the attribute is judged by presence alone (see
+        ``draft_room._worker_available``). This is task liveness, not proof
+        of forward progress: a live-but-wedged task still reports True.
+        """
+        task = self._task
+        return self._running and task is not None and not task.done()
+
     def _fence_kwargs(self) -> dict:
         """Terminal-write fence kwargs in lease mode (empty in legacy mode)."""
         if _draft_lease_enabled():
@@ -196,6 +211,14 @@ class DraftJobProcessor:
                 # it here avoids a warning when publication itself fails.
                 poll_coro.close()
                 raise
+            # Issue #911: surface poll-loop death after a successful start.
+            # ``_poll_loop`` survives every ordinary exception by design, so
+            # a termination is BaseException-class (or a foreign cancel) and
+            # would otherwise be silent: compile/upload availability would
+            # keep reading this object as live forever. The callback only
+            # logs (class name, no payload); ``is_alive`` is the read the
+            # capability route performs.
+            self._task.add_done_callback(self._log_poll_loop_death)
         except BaseException:
             # The caller wraps this in a timeout and swallows the result, so
             # without this reset a cancelled recovery would leave _running=True
@@ -237,6 +260,24 @@ class DraftJobProcessor:
                 pass
         self._bg_tasks.clear()
         logger.info("DraftJobProcessor stopped")
+
+    @staticmethod
+    def _log_poll_loop_death(task: asyncio.Task) -> None:
+        """Log (class name only) when the poll loop terminates (#911).
+
+        ``stop()`` cancels the task on every orderly shutdown, so a
+        cancellation here is expected noise at shutdown; anything else is a
+        BaseException-class death the capability flags must stop trusting.
+        Never logs payload text — the exception may carry user content.
+        """
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            logger.error(
+                "DraftJobProcessor poll loop died after start: %s",
+                type(error).__name__,
+            )
 
     def _consume_startup_reset(self, task: asyncio.Task) -> None:
         """Observe detached recovery failures and clear only the owned task."""
@@ -419,9 +460,7 @@ class DraftJobProcessor:
                 finally:
                     if heartbeat_task is not None:
                         heartbeat_task.cancel()
-                        await asyncio.gather(
-                            heartbeat_task, return_exceptions=True
-                        )
+                        await asyncio.gather(heartbeat_task, return_exceptions=True)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -447,9 +486,7 @@ class DraftJobProcessor:
 
             def _renew():
                 with self._pool.connection() as conn:
-                    return _draft_job_lease(conn).heartbeat(
-                        job_id, self._worker_id
-                    )
+                    return _draft_job_lease(conn).heartbeat(job_id, self._worker_id)
 
             try:
                 renewed = await asyncio.to_thread(_renew)
@@ -524,9 +561,7 @@ class DraftJobProcessor:
                     capped,
                 )
             parse_reset = store.recover_orphaned_parse_jobs(heartbeat_cutoff=cutoff)
-            compile_reset = store.recover_orphaned_compile_jobs(
-                heartbeat_cutoff=cutoff
-            )
+            compile_reset = store.recover_orphaned_compile_jobs(heartbeat_cutoff=cutoff)
         total = capped + parse_reset + compile_reset
         if total:
             logger.warning(
@@ -735,9 +770,7 @@ class DraftJobProcessor:
         if not committed:
             # A cancel landed inside the commit transaction: the extracted
             # text was discarded and the job/input settled cancelled there.
-            self._publish_event(
-                job, "job_cancelled", job_id=job.id, status="cancelled"
-            )
+            self._publish_event(job, "job_cancelled", job_id=job.id, status="cancelled")
             return
 
         logger.info("DraftJobProcessor: completed job id=%d", job.id)
@@ -847,8 +880,7 @@ class DraftJobProcessor:
             # net will also catch this, but fail explicitly here first so the
             # sanitized code (never str(exc)) is the one that gets persisted.
             logger.error(
-                "DraftJobProcessor: compile job id=%d raised %s outside "
-                "CompileFailure",
+                "DraftJobProcessor: compile job id=%d raised %s outside CompileFailure",
                 job.id,
                 type(exc).__name__,
             )
@@ -1011,11 +1043,15 @@ class DraftJobProcessor:
         path = self._storage.resolve(storage_relpath)
         return self._extraction.extract_text(path)
 
-    def _exceeds_parsed_char_limit(self, draft_id: int, input_id: int, extracted) -> bool:
+    def _exceeds_parsed_char_limit(
+        self, draft_id: int, input_id: int, extracted
+    ) -> bool:
         with self._pool.connection() as conn:
             store = DraftStore(conn)
             total = store.total_parsed_chars(draft_id, excluding_input_id=input_id)
-        return (total + extracted.character_count) > settings.draft_max_total_parsed_chars
+        return (
+            total + extracted.character_count
+        ) > settings.draft_max_total_parsed_chars
 
     def _commit_success(self, job: "DraftJobRecord", extracted) -> bool:
         """Commit the parsed output, honoring a cancel raced at the wire.
@@ -1114,8 +1150,7 @@ class DraftJobProcessor:
                 success_cursor = conn.execute(success_sql, success_params)  # nosec B608 — fence fragment is a fixed literal
                 if _draft_lease_enabled() and success_cursor.rowcount == 0:
                     raise _LeaseLostError(
-                        f"job {job.id} no longer owned by worker "
-                        f"{self._worker_id!r}"
+                        f"job {job.id} no longer owned by worker {self._worker_id!r}"
                     )
                 conn.commit()
             except Exception:
@@ -1182,7 +1217,9 @@ class DraftJobProcessor:
 
     async def _fail_job(self, job: "DraftJobRecord", *, code: str) -> None:
         await asyncio.to_thread(self._fail_job_sync, job, code=code)
-        self._publish_event(job, "job_failed", job_id=job.id, status="failed", error_code=code)
+        self._publish_event(
+            job, "job_failed", job_id=job.id, status="failed", error_code=code
+        )
 
     async def _fail_input_and_job(
         self, job: "DraftJobRecord", *, code: str, message: Optional[str] = None
@@ -1190,7 +1227,9 @@ class DraftJobProcessor:
         await asyncio.to_thread(
             self._fail_input_and_job_sync, job, code=code, message=message
         )
-        self._publish_event(job, "job_failed", job_id=job.id, status="failed", error_code=code)
+        self._publish_event(
+            job, "job_failed", job_id=job.id, status="failed", error_code=code
+        )
 
     async def _fail_over_limit(self, job: "DraftJobRecord", char_count: int) -> None:
         await asyncio.to_thread(self._fail_over_limit_sync, job, char_count)

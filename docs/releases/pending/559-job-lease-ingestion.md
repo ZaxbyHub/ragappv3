@@ -49,6 +49,10 @@
   `lease_attempt_cap_exceeded` (janitor-settled) or `attempt_cap_exceeded`
   (worker-settled) means the job exceeded `JOBS_MAX_ATTEMPTS`
   across crash/reclaim cycles — re-upload or raise the cap.
+  `status = 'failed'` with error `DIMENSION_CHANGED: ...` (#820) settled
+  terminally on the first attempt — the embedding dimension changed; run
+  the admin reindex job to migrate the index, then re-ingest (re-uploading
+  or raising the cap cannot succeed).
 - Rollback: set `INGESTION_JOB_LEASE_ENABLED=false` and restart; the legacy
   in-memory queue path is unchanged and rows left in `jobs` are re-derived
   from the `files` table on the next lease-enabled boot.
