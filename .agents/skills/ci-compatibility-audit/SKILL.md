@@ -206,6 +206,43 @@ Keep using path-safe operations (e.g., `pathlib.Path`) in any code you write;
 this guidance is about handling pre-existing tooling path issues, not excusing
 sloppy paths.
 
+## Backend CI flake signature table (issue #1101)
+
+A red Backend job is not always a regression. Before touching code, match the
+failing log against the five documented ragappv3 Backend flake families below
+(signatures quoted from the documented incidents — PR #642, the C32
+occurrences, issue #943, the 2026-10-23 freeze, and issue #1021 / PR #1095
+run 42448434901 — so classification no longer depends on out-of-repo memory).
+
+| Family | Log signature | Diff-foreign discriminator |
+|---|---|---|
+| xdist sqlite moving-set | `sqlite3.OperationalError: unable to open database file` raised via `get_connection` in `backend/app/models/database.py` (e.g. under `require_health_probe_auth` in `backend/app/api/deps.py`); a MOVING subset of health-auth/retry tests fails, all on ONE xdist worker (PR #642: 5 failures on gw1, rerun 1 had 2 DIFFERENT failures on gw2, rerun 2 green — zero code change). | The failed-test SET differs between reruns and never repeats on one worker, and the diff touches no `backend/app` runtime surface (PR #642 was skills/docs-only). |
+| C32 embedding-reuse `main()` exit | `backend/tests/issue513_checks/test_c32_embedding_reuse_enrichment_retry.py` fails at `assert main() == 0` with `C32 CHECK: FAIL: enrichment retry re-embedded N unchanged chunk text(s) ...` — a hermetic-check exit failure with no app-code traceback (mechanism: an inherited closed embedding-cache connection, documented by the file's own `test_c32_resets_inherited_closed_embedding_cache_connection`). | The byte-identical failure reproduces on a master commit whose diff touches no application code (3rd documented occurrence reproduced on a lockfile-only master commit). |
+| secretscan rglob-during-coverage-walk (#943) | `scripts/check_secretscan.py` crashes with a `FileNotFoundError` traceback from inside its repo-wide `Path.rglob` walk — a transient directory (coverage artifacts written under the repo root mid-suite) vanished between the parent listing and the recursion. | The diff touches no secretscan/coverage wiring, and the crash coincides with a coverage step writing transient artifacts under the repo root. Known producers are already closed: vitest coverage confined via `--coverage.reportsDirectory` (`backend/tests/test_issue258_coverage_gate.py`) and the walks made vanish-tolerant (`backend/tests/test_943_secretscan_walk_robustness.py`). |
+| Backend whole-job freeze, empty live log | The job dies at exactly its `timeout-minutes: 60` with ALL xdist workers silent mid-suite (~14 min of green progress at 94-98% passed) and NO pytest-timeout markers in the log. Absent TIMEOUT markers are the tell: the wait is C-level (socket/DNS/pipe), uninterruptible by pytest-timeout. 2026-10-23 incident: master froze identically 4 minutes later on a tree without the PR. | `gh run view <master-run> --job <backend-job> --log` shows the same silent cutoff at the same wall-clock on master (compare last-PASSED timestamps and percentages across trees), and the local full suite with `--timeout-method=thread --no-cov` completes. |
+| #1021 hang-class canary timeout | The env-gated canary step (`RUN_CI_HANG_CANARY=1`) fails `backend/tests/test_ci_hang_canary.py::test_wedge_starved_pool_join_aborted_by_configured_timeout` with `Failed: Timeout (>30.0s) from pytest-timeout` and a crashed worker (PR #1095 feedback push, run 42448434901; cleared by `gh run rerun --failed` with zero code change). | The diff touches neither `backend/tests/test_ci_hang_canary.py` nor its canary step in `ci.yml`; the canary is a deliberately committed wedge whose timely abort depends on runner scheduling. |
+
+### Classification protocol (runs before the rerun decision)
+
+A red Backend job may be reclassified as diff-foreign — and rerun — ONLY after
+BOTH discriminator checks pass:
+
+1. **Compare the failed-test SET across reruns** (or against master's run at
+   the same wall-clock). A non-repeating, moving set of failures — often
+   localized to one xdist worker — is infra, not a regression. A set that
+   repeats identically on rerun is a real failure: diagnose it (see the
+   `ci-fix-monitor` skill).
+2. **Confirm the diff touches none of the failing surface.** Check the PR diff
+   against every failing test's file and the code it exercises: a
+   skills/docs-only diff cannot regress `backend/app` runtime, and a
+   byte-identical failure on an application-code-free master commit proves
+   pre-existence.
+
+Only then run `gh run rerun <run-id> --failed` (a fresh runner) and expect
+green. Never chase the named tests of a moving-set family, and never rerun a
+failure whose set repeated identically — that is a regression wearing a flake
+costume.
+
 ## Output
 
 Classify each risk as:
