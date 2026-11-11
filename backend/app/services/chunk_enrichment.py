@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from html import escape as _xml_escape
 from typing import Any, Dict, List, Optional
 
-from app.services.llm_client import LLMClient, LLMError
+from app.services.llm_client import TRUNCATION_FINISH_REASONS, LLMClient, LLMError
 
 logger = logging.getLogger(__name__)
 
@@ -270,14 +270,23 @@ class ChunkEnrichmentService:
         # completion that stopped because of the cap is a failure even when
         # the cut text happens to form a closed JSON object — the tail fields
         # were never generated. Stored as an error, never ``complete``.
-        if metrics.get("finish_reason") == "length":
+        # Issue #1076: providers report the cap under different tokens
+        # (length / max_tokens / max_length) — one shared vocabulary set.
+        finish_reason = metrics.get("finish_reason")
+        # The provider JSON is unvalidated: guard with isinstance so a
+        # non-string (dict/list) finish_reason is treated as non-truncation
+        # (base `== "length"` semantics) instead of raising on unhashable
+        # set membership (PR #1093 review).
+        if isinstance(finish_reason, str) and finish_reason in TRUNCATION_FINISH_REASONS:
             logger.warning(
                 "Enrichment for chunk %s cut by the max_tokens cap "
-                "(finish_reason=length)",
+                "(finish_reason=%s)",
                 chunk_id,
+                finish_reason,
             )
             enrichment.error = (
-                "curator response cut by the max_tokens cap (finish_reason=length)"
+                "curator response cut by the max_tokens cap "
+                f"(finish_reason={finish_reason})"
             )
             return enrichment
 

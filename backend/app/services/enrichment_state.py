@@ -428,6 +428,52 @@ def aggregate_stage_status(conn, *, file_id: int, stage: str) -> dict[str, int]:
     return counts
 
 
+def aggregate_status_case_sql() -> str:
+    """SQL mapping a file's atom-stage aggregate onto the enrichment status.
+
+    One shared vocabulary for BOTH pipelines (issues #1075/#1076): the atom
+    worker's file sync and the chunk pipeline's completion writes evaluate
+    this correlated CASE inside their UPDATE, so the two writers can never
+    drift. The mapping is exactly the one ``_sync_file_enrichment_status``
+    has always used: zero stage rows -> 'complete'; all succeeded ->
+    'complete'; all failed_permanent -> 'error'; anything else (including
+    in-flight/retryable/skipped stages) -> 'partial'. The zero-row arm comes
+    first so an empty set is never treated as both all-succeeded and
+    all-failed by the count-equality arms.
+
+    Correlates on ``files.id`` — the expression is evaluated per outer row of
+    an ``UPDATE files ... SET enrichment_status = (<case>)`` statement and
+    must never aggregate another file's stage rows.
+
+    The only interpolated fragments are the module-level
+    ENRICH_STAGE/SUCCEEDED/FAILED_PERMANENT literals; no value is dynamic
+    (issues #1075/#1076).
+    """
+    return f"""
+CASE
+  WHEN (SELECT COUNT(*) FROM ingestion_stage_states s
+        WHERE s.file_id = files.id AND s.stage = '{ENRICH_STAGE}'
+          AND s.atom_id IS NOT NULL) = 0
+    THEN 'complete'
+  WHEN (SELECT COUNT(*) FROM ingestion_stage_states s
+        WHERE s.file_id = files.id AND s.stage = '{ENRICH_STAGE}'
+          AND s.atom_id IS NOT NULL AND s.status = '{SUCCEEDED}')
+     = (SELECT COUNT(*) FROM ingestion_stage_states s
+        WHERE s.file_id = files.id AND s.stage = '{ENRICH_STAGE}'
+          AND s.atom_id IS NOT NULL)
+    THEN 'complete'
+  WHEN (SELECT COUNT(*) FROM ingestion_stage_states s
+        WHERE s.file_id = files.id AND s.stage = '{ENRICH_STAGE}'
+          AND s.atom_id IS NOT NULL AND s.status = '{FAILED_PERMANENT}')
+     = (SELECT COUNT(*) FROM ingestion_stage_states s
+        WHERE s.file_id = files.id AND s.stage = '{ENRICH_STAGE}'
+          AND s.atom_id IS NOT NULL)
+    THEN 'error'
+  ELSE 'partial'
+END
+"""
+
+
 # ---------------------------------------------------------------------------
 # Derived record persistence (issue #461 S6): description/search aids + provenance
 # ---------------------------------------------------------------------------

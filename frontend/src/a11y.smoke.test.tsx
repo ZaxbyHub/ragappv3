@@ -9,14 +9,25 @@ import { EmptyState } from "@/components/EmptyState";
 import { DraftStageRail } from "@/components/draft-room/DraftStageRail";
 import { DraftStatusBanner } from "@/components/draft-room/DraftStatusBanner";
 import { DraftRevisionDiff } from "@/components/draft-room/DraftRevisionDiff";
-import { DraftAssignmentForm, createDefaultDraftAssignmentFormValue } from "@/components/draft-room/DraftAssignmentForm";
+import {
+  DraftAssignmentForm,
+  createDefaultDraftAssignmentFormValue,
+} from "@/components/draft-room/DraftAssignmentForm";
 import { DraftSourceUpload } from "@/components/draft-room/DraftSourceUpload";
 import { DraftCreateDialog } from "@/components/draft-room/DraftCreateDialog";
-import { DraftReadyDialog, type ReadyEligibility } from "@/components/draft-room/DraftReadyDialog";
+import {
+  DraftReadyDialog,
+  type ReadyEligibility,
+} from "@/components/draft-room/DraftReadyDialog";
 import { DraftExportDialog } from "@/components/draft-room/DraftExportDialog";
 import { DraftPromoteDialog } from "@/components/draft-room/DraftPromoteDialog";
 import { draftRoomKeys } from "@/lib/api/draftRoom";
-import type { DraftStage, DraftSummary, DraftRevisionSummary, DraftRoomCapabilities } from "@/lib/api/draftRoom";
+import type {
+  DraftStage,
+  DraftSummary,
+  DraftRevisionSummary,
+  DraftRoomCapabilities,
+} from "@/lib/api/draftRoom";
 
 // jsdom has no ResizeObserver; Radix Checkbox/RadioGroup (rendered unmocked
 // by several surfaces below, e.g. DraftAssignmentForm's preserve-* checkboxes
@@ -29,10 +40,19 @@ class MockResizeObserver {
 global.ResizeObserver = MockResizeObserver as unknown as typeof ResizeObserver;
 
 vi.mock("react-dropzone", () => ({
-  useDropzone: () => ({ getRootProps: () => ({}), getInputProps: () => ({}), isDragActive: false }),
+  useDropzone: () => ({
+    getRootProps: () => ({}),
+    getInputProps: () => ({}),
+    isDragActive: false,
+  }),
 }));
 
-const { mockListAccessibleVaults, mockGetVault, mockListFolders, mockListTags } = vi.hoisted(() => ({
+const {
+  mockListAccessibleVaults,
+  mockGetVault,
+  mockListFolders,
+  mockListTags,
+} = vi.hoisted(() => ({
   mockListAccessibleVaults: vi.fn(),
   mockGetVault: vi.fn(),
   mockListFolders: vi.fn(),
@@ -62,7 +82,7 @@ const { mockAuthState } = vi.hoisted(() => ({
 vi.mock("@/stores/useAuthStore", () => ({
   useAuthStore: Object.assign(
     (selector: (s: typeof mockAuthState) => unknown) => selector(mockAuthState),
-    { getState: () => mockAuthState }
+    { getState: () => mockAuthState },
   ),
 }));
 
@@ -74,11 +94,20 @@ beforeEach(() => {
 });
 
 function withQueryClient(children: React.ReactNode) {
-  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return { queryClient, ui: <QueryClientProvider client={queryClient}>{children}</QueryClientProvider> };
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  return {
+    queryClient,
+    ui: (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    ),
+  };
 }
 
-function makeStage(overrides: Partial<DraftStage> & Pick<DraftStage, "stage" | "status">): DraftStage {
+function makeStage(
+  overrides: Partial<DraftStage> & Pick<DraftStage, "stage" | "status">,
+): DraftStage {
   return {
     id: 1,
     job_id: 1,
@@ -125,7 +154,9 @@ function makeDraft(overrides: Partial<DraftSummary> = {}): DraftSummary {
   };
 }
 
-function makeRevision(overrides: Partial<DraftRevisionSummary> = {}): DraftRevisionSummary {
+function makeRevision(
+  overrides: Partial<DraftRevisionSummary> = {},
+): DraftRevisionSummary {
   return {
     id: 501,
     revision_no: 3,
@@ -141,7 +172,9 @@ function makeRevision(overrides: Partial<DraftRevisionSummary> = {}): DraftRevis
   };
 }
 
-function makeCapabilities(overrides: Partial<DraftRoomCapabilities> = {}): DraftRoomCapabilities {
+function makeCapabilities(
+  overrides: Partial<DraftRoomCapabilities> = {},
+): DraftRoomCapabilities {
   return {
     enabled: true,
     modes: ["compose", "rewrite"],
@@ -157,6 +190,7 @@ function makeCapabilities(overrides: Partial<DraftRoomCapabilities> = {}): Draft
     prompt_bundle_version: "v1",
     editorial_gates_installed: true,
     compile_available: true,
+    upload_available: true,
     findings_available: true,
     claims_available: true,
     evidence_available: true,
@@ -174,7 +208,7 @@ describe("accessibility smoke gate", () => {
         title="No documents yet"
         description="Upload files or request write access from an administrator."
         action={{ label: "Open Vaults", onClick: () => {} }}
-      />
+      />,
     );
 
     const results = await axe(container);
@@ -186,7 +220,11 @@ describe("accessibility smoke gate", () => {
     const stages: DraftStage[] = [
       makeStage({ stage: "research", status: "completed" }),
       makeStage({ stage: "outline", status: "running" }),
-      makeStage({ stage: "draft", status: "failed", error_code: "model_timeout" }),
+      makeStage({
+        stage: "draft",
+        status: "failed",
+        error_code: "model_timeout",
+      }),
     ];
     const { container } = render(
       <DraftStageRail
@@ -198,7 +236,7 @@ describe("accessibility smoke gate", () => {
         jobStatus="running"
         blockerCountsByStage={{ lint: 2 }}
         warningCountsByStage={{ copy: 1 }}
-      />
+      />,
     );
 
     const results = await axe(container);
@@ -217,7 +255,7 @@ describe("accessibility smoke gate", () => {
         vaultAccess="revoked"
         onRerunResearch={() => {}}
         onRerunNewsroom={() => {}}
-      />
+      />,
     );
 
     const results = await axe(container);
@@ -225,7 +263,10 @@ describe("accessibility smoke gate", () => {
   });
 
   it("has no axe violations for DraftRevisionDiff with added/removed/unchanged rows", async () => {
-    const revisions = [makeRevision({ id: 1, revision_no: 1 }), makeRevision({ id: 2, revision_no: 2 })];
+    const revisions = [
+      makeRevision({ id: 1, revision_no: 1 }),
+      makeRevision({ id: 2, revision_no: 2 }),
+    ];
     const { container } = render(
       <DraftRevisionDiff
         revisions={revisions}
@@ -235,7 +276,7 @@ describe("accessibility smoke gate", () => {
         onSelectTo={() => {}}
         fromContent={"unchanged line\nremoved line\n"}
         toContent={"unchanged line\nadded line\n"}
-      />
+      />,
     );
 
     const results = await axe(container);
@@ -249,7 +290,7 @@ describe("accessibility smoke gate", () => {
         onChange={() => {}}
         variant="create"
         idPrefix="a11y-create"
-      />
+      />,
     );
     const { container } = render(ui);
     await screen.findByLabelText("Project title");
@@ -259,7 +300,9 @@ describe("accessibility smoke gate", () => {
   });
 
   it("has no axe violations for DraftSourceUpload with no files queued", async () => {
-    const { ui } = withQueryClient(<DraftSourceUpload draftId={1} maxInputs={10} currentInputCount={0} />);
+    const { ui } = withQueryClient(
+      <DraftSourceUpload draftId={1} maxInputs={10} currentInputCount={0} />,
+    );
     const { container } = render(ui);
 
     const results = await axe(container);
@@ -268,7 +311,7 @@ describe("accessibility smoke gate", () => {
 
   it("has no axe violations for DraftCreateDialog, focused and open", async () => {
     const { ui } = withQueryClient(
-      <DraftCreateDialog open onOpenChange={() => {}} onCreated={() => {}} />
+      <DraftCreateDialog open onOpenChange={() => {}} onCreated={() => {}} />,
     );
     const { baseElement } = render(ui);
     await screen.findByRole("heading", { name: "Create a drafting project" });
@@ -278,7 +321,10 @@ describe("accessibility smoke gate", () => {
   });
 
   it("has no axe violations for DraftReadyDialog, focused and open with a source-only acknowledgment", async () => {
-    const eligibility: ReadyEligibility = { ok: false, blockers: ["source_only_acknowledgment_required"] };
+    const eligibility: ReadyEligibility = {
+      ok: false,
+      blockers: ["source_only_acknowledgment_required"],
+    };
     const { baseElement } = render(
       <DraftReadyDialog
         open
@@ -288,7 +334,7 @@ describe("accessibility smoke gate", () => {
         eligibility={eligibility}
         requiresSourceOnlyAck
         onReady={() => {}}
-      />
+      />,
     );
     await screen.findByRole("heading", { name: "Mark Ready" });
 
@@ -298,7 +344,13 @@ describe("accessibility smoke gate", () => {
 
   it("has no axe violations for DraftExportDialog, focused and open", async () => {
     const { queryClient, ui } = withQueryClient(
-      <DraftExportDialog open onOpenChange={() => {}} draftId={42} revision={makeRevision()} isReadyRevision={false} />
+      <DraftExportDialog
+        open
+        onOpenChange={() => {}}
+        draftId={42}
+        revision={makeRevision()}
+        isReadyRevision={false}
+      />,
     );
     queryClient.setQueryData(draftRoomKeys.capabilities(), makeCapabilities());
     const { baseElement } = render(ui);
@@ -321,7 +373,7 @@ describe("accessibility smoke gate", () => {
           canWrite
           onPromoted={() => {}}
         />
-      </MemoryRouter>
+      </MemoryRouter>,
     );
     const { baseElement } = render(ui);
     await screen.findByRole("heading", { name: "Promote to vault" });

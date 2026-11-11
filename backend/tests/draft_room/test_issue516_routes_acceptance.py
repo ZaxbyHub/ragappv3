@@ -127,7 +127,9 @@ class _PoolWithConnectionCM:
         finally:
             self.release_connection(conn)
 
-    async def get_connection_async(self, max_wait_attempts: int = 3) -> sqlite3.Connection:
+    async def get_connection_async(
+        self, max_wait_attempts: int = 3
+    ) -> sqlite3.Connection:
         # #645: async helpers (set_phase) check out through the pool's async
         # surface; delegate to the sync checkout on a worker thread to match
         # the production off-loop contract.
@@ -210,7 +212,9 @@ class Issue516AcceptanceBase(unittest.TestCase):
         app.dependency_overrides[get_db] = override_get_db
         app.dependency_overrides[csrf_protect] = lambda: "test-csrf"
         app.state.db_pool = self._connection_pool
-        app.state.csrf_manager = CSRFManager(redis_url="redis://localhost:6379/0", ttl=900)
+        app.state.csrf_manager = CSRFManager(
+            redis_url="redis://localhost:6379/0", ttl=900
+        )
 
         self._mock_vector_store = MagicMock()
         self._mock_vector_store.db = MagicMock()
@@ -218,6 +222,16 @@ class Issue516AcceptanceBase(unittest.TestCase):
         self._mock_vector_store.db.open_table = AsyncMock(return_value=MagicMock())
         self._mock_vector_store.delete_by_file = AsyncMock(return_value=1)
         app.dependency_overrides[get_vector_store] = lambda: self._mock_vector_store
+
+        # Worker liveness stubs (issues #902/#911): the enqueue routes gate on
+        # a live worker and capabilities derive availability from it; these
+        # tests never run lifespan, so stand in for started processors
+        # (presence is the liveness contract — test_draft_routes.py
+        # precedent). addCleanup restores whatever was mounted before.
+        self._prev_djp = getattr(app.state, "draft_job_processor", None)
+        self._had_djp = hasattr(app.state, "draft_job_processor")
+        app.state.draft_job_processor = object()
+        self.addCleanup(self._restore_worker_stubs)
 
         conn = self._connection_pool.get_connection()
         try:
@@ -243,6 +257,12 @@ class Issue516AcceptanceBase(unittest.TestCase):
             conn.commit()
         finally:
             self._connection_pool.release_connection(conn)
+
+    def _restore_worker_stubs(self) -> None:
+        if self._had_djp:
+            app.state.draft_job_processor = self._prev_djp
+        elif hasattr(app.state, "draft_job_processor"):
+            del app.state.draft_job_processor
 
     def tearDown(self):
         from app.models.database import _pool_cache, _pool_cache_lock
@@ -322,8 +342,16 @@ class Issue516AcceptanceBase(unittest.TestCase):
             headers=headers or self._owner_headers(),
         )
 
-    def _upload_input(self, draft_id, *, content=b"Hello world. This is the manuscript body.", filename="manuscript.txt"):
-        return self._post_input(self.client, draft_id, content=content, filename=filename)
+    def _upload_input(
+        self,
+        draft_id,
+        *,
+        content=b"Hello world. This is the manuscript body.",
+        filename="manuscript.txt",
+    ):
+        return self._post_input(
+            self.client, draft_id, content=content, filename=filename
+        )
 
     def _lock_version(self, draft_id):
         resp = self.client.get(
@@ -370,12 +398,19 @@ class Issue516AcceptanceBase(unittest.TestCase):
         finally:
             self._connection_pool.release_connection(conn)
 
-    def _seed_current_revision(self, draft_id: int, *, job_id: int, content_md: str,
-                               fact_status: str = "passed") -> int:
+    def _seed_current_revision(
+        self,
+        draft_id: int,
+        *,
+        job_id: int,
+        content_md: str,
+        fact_status: str = "passed",
+    ) -> int:
         conn = self._connection_pool.get_connection()
         try:
             conn.execute(
-                "UPDATE draft_revisions SET is_current = 0 WHERE draft_id = ?", (draft_id,)
+                "UPDATE draft_revisions SET is_current = 0 WHERE draft_id = ?",
+                (draft_id,),
             )
             next_no = int(
                 conn.execute(
@@ -388,8 +423,15 @@ class Issue516AcceptanceBase(unittest.TestCase):
                 "INSERT INTO draft_revisions (draft_id, job_id, revision_no, source, "
                 "content_md, content_sha256, fact_status, is_current, created_by) "
                 "VALUES (?, ?, ?, 'pipeline', ?, ?, ?, 1, ?)",
-                (draft_id, job_id, next_no, content_md,
-                 sha256_text(content_md), fact_status, self.OWNER_ID),
+                (
+                    draft_id,
+                    job_id,
+                    next_no,
+                    content_md,
+                    sha256_text(content_md),
+                    fact_status,
+                    self.OWNER_ID,
+                ),
             )
             conn.commit()
             return int(cur.lastrowid)
@@ -412,7 +454,9 @@ class Issue516AcceptanceBase(unittest.TestCase):
     def _set_draft_status(self, draft_id: int, status: str) -> None:
         conn = self._connection_pool.get_connection()
         try:
-            conn.execute("UPDATE drafts SET status = ? WHERE id = ?", (status, draft_id))
+            conn.execute(
+                "UPDATE drafts SET status = ? WHERE id = ?", (status, draft_id)
+            )
             conn.commit()
         finally:
             self._connection_pool.release_connection(conn)
@@ -434,20 +478,29 @@ class Issue516AcceptanceBase(unittest.TestCase):
     def _mark_ready(self, draft_id, revision_id):
         return self.client.post(
             f"/api/draft-room/drafts/{draft_id}/revisions/{revision_id}/ready",
-            json={"lock_version": self._lock_version(draft_id),
-                  "acknowledge_source_only": False},
+            json={
+                "lock_version": self._lock_version(draft_id),
+                "acknowledge_source_only": False,
+            },
             headers=self._owner_headers(),
         )
 
-    def _insert_open_blocker_finding(self, draft_id, *, revision_id, job_id,
-                                     message="unsupported claim") -> int:
+    def _insert_open_blocker_finding(
+        self, draft_id, *, revision_id, job_id, message="unsupported claim"
+    ) -> int:
         conn = self._connection_pool.get_connection()
         try:
             store = DraftStore(conn)
             return store.insert_finding(
-                draft_id=draft_id, stage="fact", rule_id="unsupported-claim",
-                rule_version="1", category="factuality", severity="blocker",
-                message=message, revision_id=revision_id, job_id=job_id,
+                draft_id=draft_id,
+                stage="fact",
+                rule_id="unsupported-claim",
+                rule_version="1",
+                category="factuality",
+                severity="blocker",
+                message=message,
+                revision_id=revision_id,
+                job_id=job_id,
                 waivable=False,
             )
         finally:
@@ -496,33 +549,36 @@ class TestAC13RevisionScopedBlockers(Issue516AcceptanceBase):
             )
             self._seed_fact_stage(job_a2, candidate_sha256=sha256_text(rev_a2_content))
             finding_id = self._insert_open_blocker_finding(
-                draft_a, revision_id=rev_a1, job_id=job_a1,
+                draft_a,
+                revision_id=rev_a1,
+                job_id=job_a1,
                 message="v1 claimed something unsupported",
             )
 
             # Draft B (control state): the open non-waivable blocker is
             # attached to the CURRENT revision itself.
             draft_b, job_b, rev_b = self._seed_ready_eligible_draft()
-            self._insert_open_blocker_finding(
-                draft_b, revision_id=rev_b, job_id=job_b
-            )
+            self._insert_open_blocker_finding(draft_b, revision_id=rev_b, job_id=job_b)
 
             def check_a_old_revision_blocker_does_not_block_ready():
                 resp = self._mark_ready(draft_a, rev_a2)
                 self.assertEqual(
-                    resp.status_code, 200,
+                    resp.status_code,
+                    200,
                     "an open non-waivable blocker on an OLDER revision must not "
                     f"block the corrected current revision's Ready: {resp.text}",
                 )
                 self.assertEqual(
-                    resp.json()["status"], "ready",
+                    resp.json()["status"],
+                    "ready",
                     f"draft must be ready after marking rev {rev_a2}: {resp.text}",
                 )
 
             def check_b_current_revision_blocker_still_blocks():
                 resp = self._mark_ready(draft_b, rev_b)
                 self.assertEqual(
-                    resp.status_code, 409,
+                    resp.status_code,
+                    409,
                     "a non-waivable open blocker on the CURRENT revision must "
                     f"still block Ready: {resp.text}",
                 )
@@ -533,13 +589,15 @@ class TestAC13RevisionScopedBlockers(Issue516AcceptanceBase):
                     f"/api/draft-room/drafts/{draft_a}", headers=self._owner_headers()
                 ).json()
                 self.assertEqual(
-                    detail["summary"]["open_blocker_count"], 0,
+                    detail["summary"]["open_blocker_count"],
+                    0,
                     "summary open_blocker_count must count only blockers "
                     "applicable to the current revision (the open blocker sits "
                     f"on old revision {rev_a1}): {detail['summary']}",
                 )
                 self.assertEqual(
-                    detail["finding_counts_by_severity"].get("blocker", 0), 0,
+                    detail["finding_counts_by_severity"].get("blocker", 0),
+                    0,
                     "detail finding_counts_by_severity['blocker'] must count "
                     "only current-revision blockers: "
                     f"{detail['finding_counts_by_severity']}",
@@ -553,22 +611,41 @@ class TestAC13RevisionScopedBlockers(Issue516AcceptanceBase):
                 self.assertEqual(resp.status_code, 200, resp.text)
                 items = resp.json()["items"]
                 matches = [f for f in items if f["id"] == finding_id]
-                self.assertEqual(len(matches), 1, f"finding {finding_id} vanished: {items}")
                 self.assertEqual(
-                    matches[0]["status"], "open",
+                    len(matches), 1, f"finding {finding_id} vanished: {items}"
+                )
+                self.assertEqual(
+                    matches[0]["status"],
+                    "open",
                     "the historical finding must remain open in history",
                 )
                 self.assertEqual(
-                    matches[0]["revision_id"], rev_a1,
+                    matches[0]["revision_id"],
+                    rev_a1,
                     "the historical finding must still reference the old revision",
                 )
 
-            self._run_checks(ac, [
-                ("a: old-revision blocker does not block Ready", check_a_old_revision_blocker_does_not_block_ready),
-                ("b: current-revision blocker still blocks Ready [control]", check_b_current_revision_blocker_still_blocks),
-                ("c: open_blocker_count counts only current-applicable blockers", check_c_counts_reflect_only_current_revision),
-                ("guard: old finding remains open in history", check_history_old_finding_remains_open),
-            ])
+            self._run_checks(
+                ac,
+                [
+                    (
+                        "a: old-revision blocker does not block Ready",
+                        check_a_old_revision_blocker_does_not_block_ready,
+                    ),
+                    (
+                        "b: current-revision blocker still blocks Ready [control]",
+                        check_b_current_revision_blocker_still_blocks,
+                    ),
+                    (
+                        "c: open_blocker_count counts only current-applicable blockers",
+                        check_c_counts_reflect_only_current_revision,
+                    ),
+                    (
+                        "guard: old finding remains open in history",
+                        check_history_old_finding_remains_open,
+                    ),
+                ],
+            )
             passed = True
         finally:
             print(f"{ac} CHECK: {'PASS' if passed else 'FAIL'}")
@@ -611,13 +688,16 @@ class TestAC14MaterialChangeInvalidatesReady(Issue516AcceptanceBase):
             def check_title_only_change_keeps_ready():
                 resp = self.client.patch(
                     f"/api/draft-room/drafts/{draft1}",
-                    json={"lock_version": self._lock_version(draft1),
-                          "title": "Retitled But Ready"},
+                    json={
+                        "lock_version": self._lock_version(draft1),
+                        "title": "Retitled But Ready",
+                    },
                     headers=self._owner_headers(),
                 )
                 self.assertEqual(resp.status_code, 200, resp.text)
                 self.assertEqual(
-                    resp.json()["status"], "ready",
+                    resp.json()["status"],
+                    "ready",
                     f"title is non-material; Ready must survive: {resp.text}",
                 )
                 export = self.client.post(
@@ -625,7 +705,8 @@ class TestAC14MaterialChangeInvalidatesReady(Issue516AcceptanceBase):
                     headers=self._owner_headers(),
                 )
                 self.assertEqual(
-                    export.headers.get("X-Draft-Approval-Status"), "ready",
+                    export.headers.get("X-Draft-Approval-Status"),
+                    "ready",
                     "title-only change must keep the ready export classification",
                 )
 
@@ -640,7 +721,8 @@ class TestAC14MaterialChangeInvalidatesReady(Issue516AcceptanceBase):
                 )
                 self.assertEqual(resp.status_code, 200, resp.text)
                 self.assertEqual(
-                    resp.json()["status"], "ready",
+                    resp.json()["status"],
+                    "ready",
                     f"an update with UNCHANGED brief values must keep Ready: {resp.text}",
                 )
 
@@ -654,7 +736,8 @@ class TestAC14MaterialChangeInvalidatesReady(Issue516AcceptanceBase):
                 self.assertEqual(resp.status_code, 200, resp.text)
                 row = self._draft_row(draft1)
                 self.assertEqual(
-                    row["status"], "needs_review",
+                    row["status"],
+                    "needs_review",
                     "a MATERIAL brief change (must_include) must move a Ready "
                     f"draft back to needs_review (got {row['status']!r})",
                 )
@@ -668,7 +751,8 @@ class TestAC14MaterialChangeInvalidatesReady(Issue516AcceptanceBase):
                     headers=self._owner_headers(),
                 )
                 self.assertEqual(
-                    export.headers.get("X-Draft-Approval-Status"), "not_ready",
+                    export.headers.get("X-Draft-Approval-Status"),
+                    "not_ready",
                     "export classification must become not_ready after a "
                     "material brief change",
                 )
@@ -682,7 +766,8 @@ class TestAC14MaterialChangeInvalidatesReady(Issue516AcceptanceBase):
                 self.assertEqual(resp.status_code, 200, resp.text)
                 row = self._draft_row(draft2)
                 self.assertEqual(
-                    row["status"], "needs_review",
+                    row["status"],
+                    "needs_review",
                     "a MATERIAL input-metadata change (role) must move a Ready "
                     f"draft back to needs_review (got {row['status']!r})",
                 )
@@ -696,18 +781,37 @@ class TestAC14MaterialChangeInvalidatesReady(Issue516AcceptanceBase):
                     headers=self._owner_headers(),
                 )
                 self.assertEqual(
-                    export.headers.get("X-Draft-Approval-Status"), "not_ready",
+                    export.headers.get("X-Draft-Approval-Status"),
+                    "not_ready",
                     "export classification must become not_ready after a "
                     "material input-metadata change",
                 )
 
-            self._run_checks(ac, [
-                ("baseline: real mark-ready route reaches ready [guard]", check_baseline_ready_via_real_route),
-                ("title-only change keeps Ready [control]", check_title_only_change_keeps_ready),
-                ("unchanged-brief update keeps Ready [control]", check_unchanged_brief_keeps_ready),
-                ("material brief change (must_include) invalidates Ready", check_material_brief_change_invalidates),
-                ("material input-metadata change (role) invalidates Ready", check_material_input_metadata_change_invalidates),
-            ])
+            self._run_checks(
+                ac,
+                [
+                    (
+                        "baseline: real mark-ready route reaches ready [guard]",
+                        check_baseline_ready_via_real_route,
+                    ),
+                    (
+                        "title-only change keeps Ready [control]",
+                        check_title_only_change_keeps_ready,
+                    ),
+                    (
+                        "unchanged-brief update keeps Ready [control]",
+                        check_unchanged_brief_keeps_ready,
+                    ),
+                    (
+                        "material brief change (must_include) invalidates Ready",
+                        check_material_brief_change_invalidates,
+                    ),
+                    (
+                        "material input-metadata change (role) invalidates Ready",
+                        check_material_input_metadata_change_invalidates,
+                    ),
+                ],
+            )
             passed = True
         finally:
             print(f"{ac} CHECK: {'PASS' if passed else 'FAIL'}")
@@ -740,7 +844,8 @@ class _EnqueueThenCancelProcessor:
         recorded not-yet-started jobs matching ``match`` (the production API
         the promotion compensation path invokes)."""
         self.jobs = [
-            job for job in self.jobs
+            job
+            for job in self.jobs
             if any(job.get(key) != value for key, value in match.items())
         ]
 
@@ -794,12 +899,14 @@ class TestAC15PromotionCancellationCompensatesIngestionJob(Issue516AcceptanceBas
 
             def check_precondition_job_was_enqueued_before_cancellation():
                 self.assertEqual(
-                    len(processor.enqueued), 1,
+                    len(processor.enqueued),
+                    1,
                     "precondition: enqueue must have inserted its job before "
                     "the cancellation was delivered (enqueue history)",
                 )
                 self.assertEqual(
-                    processor.enqueued[0].get("source"), "draft_room_promote",
+                    processor.enqueued[0].get("source"),
+                    "draft_room_promote",
                     f"unexpected enqueued job payload: {processor.enqueued}",
                 )
 
@@ -827,26 +934,37 @@ class TestAC15PromotionCancellationCompensatesIngestionJob(Issue516AcceptanceBas
             def check_no_staged_bytes():
                 uploads_dir = settings.vault_uploads_dir(self.READ_VAULT_ID)
                 self.assertEqual(
-                    list(uploads_dir.glob("*")), [],
+                    list(uploads_dir.glob("*")),
+                    [],
                     "compensation must remove the copied bytes",
                 )
 
             def check_no_orphaned_ingestion_job():
                 self.assertEqual(
-                    processor.jobs, [],
+                    processor.jobs,
+                    [],
                     "compensation must also remove the orphaned ingestion job "
                     "enqueued for the now-deleted file, so no pending "
                     "ingestion remains: "
                     f"{processor.jobs}",
                 )
 
-            self._run_checks(ac, [
-                ("precondition: job was enqueued before cancellation", check_precondition_job_was_enqueued_before_cancellation),
-                ("guard: no files row remains", check_no_files_row),
-                ("guard: no promotion row remains", check_no_promotion_row),
-                ("guard: no staged bytes remain", check_no_staged_bytes),
-                ("no orphaned ingestion job remains for the deleted file", check_no_orphaned_ingestion_job),
-            ])
+            self._run_checks(
+                ac,
+                [
+                    (
+                        "precondition: job was enqueued before cancellation",
+                        check_precondition_job_was_enqueued_before_cancellation,
+                    ),
+                    ("guard: no files row remains", check_no_files_row),
+                    ("guard: no promotion row remains", check_no_promotion_row),
+                    ("guard: no staged bytes remain", check_no_staged_bytes),
+                    (
+                        "no orphaned ingestion job remains for the deleted file",
+                        check_no_orphaned_ingestion_job,
+                    ),
+                ],
+            )
             passed = True
         finally:
             print(f"{ac} CHECK: {'PASS' if passed else 'FAIL'}")
@@ -889,25 +1007,34 @@ class TestAC16UploadSchedulingDurability(Issue516AcceptanceBase):
                     ),
                 ):
                     resp = self._post_input(
-                        client, draft_id, content=control_content, filename="control.txt"
+                        client,
+                        draft_id,
+                        content=control_content,
+                        filename="control.txt",
                     )
                 self.assertEqual(
-                    resp.status_code, 409,
+                    resp.status_code,
+                    409,
                     f"a DraftStoreError-based conflict must keep its mapped HTTP "
                     f"error: {resp.status_code} {resp.text}",
                 )
                 self.assertEqual(resp.json().get("code"), "conflict", resp.text)
                 self.assertEqual(
-                    self._stranded_input_count(draft_id), 0,
+                    self._stranded_input_count(draft_id),
+                    0,
                     "domain-error compensation must leave no stranded input row",
                 )
 
             def check_retry_after_domain_conflict_succeeds():
                 resp = self._post_input(
-                    self.client, draft_id, content=control_content, filename="control.txt"
+                    self.client,
+                    draft_id,
+                    content=control_content,
+                    filename="control.txt",
                 )
                 self.assertEqual(
-                    resp.status_code, 202,
+                    resp.status_code,
+                    202,
                     f"retry after a compensated domain error must succeed: {resp.text}",
                 )
 
@@ -922,7 +1049,8 @@ class TestAC16UploadSchedulingDurability(Issue516AcceptanceBase):
                         client, draft_id, content=infra_content, filename="infra.txt"
                     )
                 self.assertGreaterEqual(
-                    resp.status_code, 400,
+                    resp.status_code,
+                    400,
                     f"the original infrastructure error must still surface as a "
                     f"non-200 response (got {resp.status_code})",
                 )
@@ -930,14 +1058,16 @@ class TestAC16UploadSchedulingDurability(Issue516AcceptanceBase):
                 # input row may remain without a job (the failed upload must
                 # roll back cleanly, leaving no stranded input).
                 self.assertEqual(
-                    self._stranded_input_count(draft_id), 0,
+                    self._stranded_input_count(draft_id),
+                    0,
                     "an infrastructure error from enqueue_parse_job must not "
                     "strand an input row without a parse job; the failed upload "
                     "must roll back cleanly",
                 )
                 files_after = self._snapshot_draft_room_files()
                 self.assertEqual(
-                    files_after, files_before,
+                    files_after,
+                    files_before,
                     "the rolled-back upload must leave no stored bytes behind",
                 )
 
@@ -946,21 +1076,38 @@ class TestAC16UploadSchedulingDurability(Issue516AcceptanceBase):
                     self.client, draft_id, content=infra_content, filename="infra.txt"
                 )
                 self.assertEqual(
-                    resp.status_code, 202,
+                    resp.status_code,
+                    202,
                     f"a RETRY upload of the same content must succeed without a "
                     f"process restart after the infrastructure error: {resp.text}",
                 )
                 self.assertEqual(
-                    self._stranded_input_count(draft_id), 0,
+                    self._stranded_input_count(draft_id),
+                    0,
                     "the retried upload must leave every input with a parse job",
                 )
 
-            self._run_checks(ac, [
-                ("control: DraftStoreError conflict maps to HTTP error and compensates", check_domain_conflict_maps_and_compensates),
-                ("control: retry after domain conflict succeeds", check_retry_after_domain_conflict_succeeds),
-                ("infra error surfaces non-200 and rolls the input back", check_infra_error_rolls_back_upload),
-                ("retry after infra error succeeds without restart", check_retry_after_infra_error_succeeds),
-            ])
+            self._run_checks(
+                ac,
+                [
+                    (
+                        "control: DraftStoreError conflict maps to HTTP error and compensates",
+                        check_domain_conflict_maps_and_compensates,
+                    ),
+                    (
+                        "control: retry after domain conflict succeeds",
+                        check_retry_after_domain_conflict_succeeds,
+                    ),
+                    (
+                        "infra error surfaces non-200 and rolls the input back",
+                        check_infra_error_rolls_back_upload,
+                    ),
+                    (
+                        "retry after infra error succeeds without restart",
+                        check_retry_after_infra_error_succeeds,
+                    ),
+                ],
+            )
             passed = True
         finally:
             print(f"{ac} CHECK: {'PASS' if passed else 'FAIL'}")

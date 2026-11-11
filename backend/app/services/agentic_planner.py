@@ -12,6 +12,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from html import escape as _xml_escape
+from html import unescape as _xml_unescape
 from typing import Any, Dict, List, Optional
 
 from app.services.agentic_tools import ToolRegistry
@@ -137,7 +138,18 @@ class AgenticPlanner:
                 # T1-35-K-13 (#715): a retrieve_more decision may omit
                 # sub_query (or send it empty) — the documented fallback is
                 # the current query, never an empty-string retrieval.
-                sub_query = decision.get("sub_query") or current_query
+                # The decision prompt showed the query XML-escaped, so a
+                # compliant echo may come back entity-encoded — unescape
+                # before the sub-query reaches retrieval (#884/#925 class).
+                # A non-string sub_query (a provider ignoring the JSON
+                # schema) falls back to the current query too — never
+                # allowed to raise past the fallback.
+                _raw_sub = decision.get("sub_query")
+                sub_query = (
+                    _xml_unescape(_raw_sub)
+                    if isinstance(_raw_sub, str) and _raw_sub
+                    else current_query
+                )
                 sub_queries_used.append(sub_query)
 
                 retrieval_result = await retrieval_tool.execute(

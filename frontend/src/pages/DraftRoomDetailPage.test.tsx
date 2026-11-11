@@ -26,8 +26,14 @@ const {
 }));
 
 vi.mock("@/lib/api/draftRoom", async () => {
-  const actual = await vi.importActual<typeof import("@/lib/api/draftRoom")>("@/lib/api/draftRoom");
-  return { ...actual, getDraft: mockGetDraft, getDraftRevision: mockGetDraftRevision };
+  const actual = await vi.importActual<typeof import("@/lib/api/draftRoom")>(
+    "@/lib/api/draftRoom",
+  );
+  return {
+    ...actual,
+    getDraft: mockGetDraft,
+    getDraftRevision: mockGetDraftRevision,
+  };
 });
 
 vi.mock("@/hooks/useDraftRoomCapabilities", () => ({
@@ -50,8 +56,10 @@ vi.mock("@/components/draft-room/DraftStatusBanner", () => ({
   }) => (
     <div data-testid="status-banner">
       <span>
-        sourceOnly:{String(props.sourceOnly)}|retrievalPartial:{String(props.retrievalPartial)}|
-        evidenceInvalidated:{String(props.evidenceInvalidated)}|vaultAccess:{props.vaultAccess}|factStatus:
+        sourceOnly:{String(props.sourceOnly)}|retrievalPartial:
+        {String(props.retrievalPartial)}| evidenceInvalidated:
+        {String(props.evidenceInvalidated)}|vaultAccess:{props.vaultAccess}
+        |factStatus:
         {String(props.factStatus)}
       </span>
       <button type="button" onClick={props.onRerunResearch}>
@@ -69,19 +77,34 @@ vi.mock("@/components/draft-room/DraftWorkspace", async () => {
   interface StubProps {
     draftId: number;
     vaultAccess: string;
-    onDerivedStatus?: (status: { sourceOnly: boolean; retrievalPartial: boolean; evidenceInvalidated: boolean }) => void;
+    onDerivedStatus?: (status: {
+      sourceOnly: boolean;
+      retrievalPartial: boolean;
+      evidenceInvalidated: boolean;
+    }) => void;
   }
-  const DraftWorkspace = React.forwardRef<{ requestCompile: (s?: string) => void }, StubProps>((props, ref) => {
-    React.useImperativeHandle(ref, () => ({ requestCompile: mockRequestCompile }), []);
+  const DraftWorkspace = React.forwardRef<
+    { requestCompile: (s?: string) => void },
+    StubProps
+  >((props, ref) => {
+    React.useImperativeHandle(
+      ref,
+      () => ({ requestCompile: mockRequestCompile }),
+      [],
+    );
     React.useEffect(() => {
-      props.onDerivedStatus?.({ sourceOnly: true, retrievalPartial: false, evidenceInvalidated: false });
+      props.onDerivedStatus?.({
+        sourceOnly: true,
+        retrievalPartial: false,
+        evidenceInvalidated: false,
+      });
       // Fire once per mount to simulate the workspace's own derivation effect.
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
     return React.createElement(
       "div",
       { "data-testid": "workspace" },
-      `draftId:${props.draftId}|vaultAccess:${props.vaultAccess}`
+      `draftId:${props.draftId}|vaultAccess:${props.vaultAccess}`,
     );
   });
   return { DraftWorkspace };
@@ -144,7 +167,9 @@ function makeDetail(overrides: Partial<DraftDetail> = {}): DraftDetail {
   };
 }
 
-function makeCapabilities(overrides: Partial<DraftRoomCapabilities> = {}): DraftRoomCapabilities {
+function makeCapabilities(
+  overrides: Partial<DraftRoomCapabilities> = {},
+): DraftRoomCapabilities {
   return {
     enabled: true,
     modes: ["rewrite", "compose"],
@@ -160,6 +185,7 @@ function makeCapabilities(overrides: Partial<DraftRoomCapabilities> = {}): Draft
     prompt_bundle_version: "v1",
     editorial_gates_installed: true,
     compile_available: true,
+    upload_available: true,
     findings_available: true,
     claims_available: true,
     evidence_available: true,
@@ -192,17 +218,22 @@ function ProgrammaticNavButton() {
 }
 
 function renderDetailPage(draftId: string) {
-  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
   const utils = render(
     <QueryClientProvider client={queryClient}>
       <MemoryRouter initialEntries={[`/draft-room/${draftId}`]}>
         <ProgrammaticNavButton />
         <Routes>
           <Route path="/draft-room" element={<div>Draft Room List</div>} />
-          <Route path="/draft-room/:draftId" element={<DraftRoomDetailPage />} />
+          <Route
+            path="/draft-room/:draftId"
+            element={<DraftRoomDetailPage />}
+          />
         </Routes>
       </MemoryRouter>
-    </QueryClientProvider>
+    </QueryClientProvider>,
   );
   return { ...utils, queryClient };
 }
@@ -233,7 +264,13 @@ beforeEach(() => {
     isLoading: false,
     isError: false,
   });
-  mockUseDraftRoomEvents.mockReset().mockReturnValue({ connected: true, pollingFallback: false, lastEvent: null });
+  mockUseDraftRoomEvents
+    .mockReset()
+    .mockReturnValue({
+      connected: true,
+      pollingFallback: false,
+      lastEvent: null,
+    });
   mockRequestCompile.mockReset();
   vi.mocked(window.confirm).mockReset().mockReturnValue(true);
   useNavigationGuardStore.getState().setConfirmLeave(null);
@@ -263,7 +300,9 @@ describe("DraftRoomDetailPage", () => {
     const error = Object.assign(new Error("forbidden"), { status: 403 });
     mockGetDraft.mockRejectedValue(error);
     renderDetailPage("42");
-    expect(await screen.findByText("You don't have access to this project")).toBeInTheDocument();
+    expect(
+      await screen.findByText("You don't have access to this project"),
+    ).toBeInTheDocument();
   });
 
   it("shows the capability-disabled banner while still rendering the workspace", async () => {
@@ -275,13 +314,19 @@ describe("DraftRoomDetailPage", () => {
     });
     renderDetailPage("42");
 
-    expect(await screen.findByText(DRAFT_ROOM_DISABLED_MESSAGE)).toBeInTheDocument();
+    expect(
+      await screen.findByText(DRAFT_ROOM_DISABLED_MESSAGE),
+    ).toBeInTheDocument();
     expect(screen.getByTestId("workspace")).toBeInTheDocument();
   });
 
   it("shows no polling indicator while the live stream is connected", async () => {
     mockGetDraft.mockResolvedValue(makeDetail());
-    mockUseDraftRoomEvents.mockReturnValue({ connected: true, pollingFallback: false, lastEvent: null });
+    mockUseDraftRoomEvents.mockReturnValue({
+      connected: true,
+      pollingFallback: false,
+      lastEvent: null,
+    });
     renderDetailPage("42");
 
     await screen.findByTestId("workspace");
@@ -290,7 +335,11 @@ describe("DraftRoomDetailPage", () => {
 
   it("shows the polling indicator when the live stream has degraded to bounded polling", async () => {
     mockGetDraft.mockResolvedValue(makeDetail());
-    mockUseDraftRoomEvents.mockReturnValue({ connected: false, pollingFallback: true, lastEvent: null });
+    mockUseDraftRoomEvents.mockReturnValue({
+      connected: false,
+      pollingFallback: true,
+      lastEvent: null,
+    });
     renderDetailPage("42");
 
     expect(await screen.findByText("Polling for updates")).toBeInTheDocument();
@@ -302,8 +351,8 @@ describe("DraftRoomDetailPage", () => {
 
     await waitFor(() =>
       expect(screen.getByTestId("status-banner").textContent).toMatch(
-        /sourceOnly:true\|retrievalPartial:false\|\s*evidenceInvalidated:false\|vaultAccess:write\|factStatus:\s*passed/
-      )
+        /sourceOnly:true\|retrievalPartial:false\|\s*evidenceInvalidated:false\|vaultAccess:write\|factStatus:\s*passed/,
+      ),
     );
   });
 
@@ -326,7 +375,9 @@ describe("DraftRoomDetailPage", () => {
     renderDetailPage("42");
     await screen.findByTestId("workspace");
 
-    useDraftRoomUiStore.setState((state) => ({ draftText: { ...state.draftText, 42: "Edited text." } }));
+    useDraftRoomUiStore.setState((state) => ({
+      draftText: { ...state.draftText, 42: "Edited text." },
+    }));
     vi.mocked(window.confirm).mockReturnValue(false);
 
     await user.click(screen.getByRole("link", { name: /back to draft room/i }));
@@ -354,7 +405,9 @@ describe("DraftRoomDetailPage", () => {
     renderDetailPage("42");
     await screen.findByTestId("workspace");
 
-    useDraftRoomUiStore.setState((state) => ({ draftText: { ...state.draftText, 42: "Edited text." } }));
+    useDraftRoomUiStore.setState((state) => ({
+      draftText: { ...state.draftText, 42: "Edited text." },
+    }));
     vi.mocked(window.confirm).mockReturnValue(true);
 
     await user.click(screen.getByRole("link", { name: /back to draft room/i }));
@@ -369,10 +422,14 @@ describe("DraftRoomDetailPage", () => {
     renderDetailPage("42");
     await screen.findByTestId("workspace");
 
-    useDraftRoomUiStore.setState((state) => ({ draftText: { ...state.draftText, 42: "Edited text." } }));
+    useDraftRoomUiStore.setState((state) => ({
+      draftText: { ...state.draftText, 42: "Edited text." },
+    }));
     vi.mocked(window.confirm).mockReturnValue(false);
 
-    await user.click(screen.getByRole("button", { name: "mobile-nav-documents" }));
+    await user.click(
+      screen.getByRole("button", { name: "mobile-nav-documents" }),
+    );
 
     expect(window.confirm).toHaveBeenCalled();
     expect(screen.queryByText("Draft Room List")).not.toBeInTheDocument();
@@ -385,10 +442,14 @@ describe("DraftRoomDetailPage", () => {
     renderDetailPage("42");
     await screen.findByTestId("workspace");
 
-    useDraftRoomUiStore.setState((state) => ({ draftText: { ...state.draftText, 42: "Edited text." } }));
+    useDraftRoomUiStore.setState((state) => ({
+      draftText: { ...state.draftText, 42: "Edited text." },
+    }));
     vi.mocked(window.confirm).mockReturnValue(true);
 
-    await user.click(screen.getByRole("button", { name: "mobile-nav-documents" }));
+    await user.click(
+      screen.getByRole("button", { name: "mobile-nav-documents" }),
+    );
 
     expect(window.confirm).toHaveBeenCalled();
     expect(await screen.findByText("Draft Room List")).toBeInTheDocument();
@@ -396,17 +457,22 @@ describe("DraftRoomDetailPage", () => {
 
   it("renders exactly one main landmark when nested inside the app shell's main region", async () => {
     mockGetDraft.mockResolvedValue(makeDetail());
-    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
     render(
       <QueryClientProvider client={queryClient}>
         <MemoryRouter initialEntries={["/draft-room/42"]}>
           <main id="main-content">
             <Routes>
-              <Route path="/draft-room/:draftId" element={<DraftRoomDetailPage />} />
+              <Route
+                path="/draft-room/:draftId"
+                element={<DraftRoomDetailPage />}
+              />
             </Routes>
           </main>
         </MemoryRouter>
-      </QueryClientProvider>
+      </QueryClientProvider>,
     );
 
     await screen.findByTestId("workspace");
