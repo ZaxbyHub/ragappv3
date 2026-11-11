@@ -79,6 +79,11 @@ justify each newly-suppressed ID in the PR. The same check also asserts the
 still `backend/app`, so the gate cannot be silently weakened by editing one
 constant or replacing one command.
 
+> Note (PR #1093, restored by the SAST gate-restore PR): PR #1093 briefly set
+> the env permanently in ci.yml to admit three constants-only B608
+> suppressions; that override was reverted once master's baseline contained
+> them, restoring fail-closed growth gating for later PRs.
+
 ## Cross-platform note
 
 The committed baseline stores paths with forward slashes (e.g.

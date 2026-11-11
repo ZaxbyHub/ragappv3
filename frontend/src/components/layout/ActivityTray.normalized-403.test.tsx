@@ -17,6 +17,7 @@
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor, within } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
 
 const {
@@ -119,7 +120,7 @@ describe("ActivityTray 403 suppression vs the api client's normalized error shap
   it("stops offering Cancel after a 403 that rejects with the client's normalized shape (top-level status)", async () => {
     const user = userEvent.setup();
     mockCancelWikiJob.mockRejectedValue(
-      normalizedApiError(403, "Insufficient vault permissions")
+      normalizedApiError(403, "Insufficient vault permissions"),
     );
     hookRows = [
       makeRow({
@@ -130,24 +131,36 @@ describe("ActivityTray 403 suppression vs the api client's normalized error shap
         vaultId: 3,
       }),
     ];
-    render(<ActivityTray />);
+    render(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <ActivityTray />
+      </QueryClientProvider>,
+    );
 
-    await user.click(within(rowByFamily("wiki")).getByRole("button", { name: /cancel/i }));
+    await user.click(
+      within(rowByFamily("wiki")).getByRole("button", { name: /cancel/i }),
+    );
 
     await waitFor(
       () => {
         expect(
-          within(rowByFamily("wiki")).queryByRole("button", { name: /cancel/i })
+          within(rowByFamily("wiki")).queryByRole("button", {
+            name: /cancel/i,
+          }),
         ).toBeNull();
       },
-      { timeout: 2000 }
+      { timeout: 2000 },
     );
   });
 
   it("stops offering Retry after a 403 that rejects with the client's normalized shape (top-level status)", async () => {
     const user = userEvent.setup();
     mockRetryWikiJob.mockRejectedValue(
-      normalizedApiError(403, "Insufficient vault permissions")
+      normalizedApiError(403, "Insufficient vault permissions"),
     );
     hookRows = [
       makeRow({
@@ -161,17 +174,27 @@ describe("ActivityTray 403 suppression vs the api client's normalized error shap
         vaultId: 3,
       }),
     ];
-    render(<ActivityTray />);
+    render(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <ActivityTray />
+      </QueryClientProvider>,
+    );
 
-    await user.click(within(rowByFamily("wiki")).getByRole("button", { name: /retry/i }));
+    await user.click(
+      within(rowByFamily("wiki")).getByRole("button", { name: /retry/i }),
+    );
 
     await waitFor(
       () => {
         expect(
-          within(rowByFamily("wiki")).queryByRole("button", { name: /retry/i })
+          within(rowByFamily("wiki")).queryByRole("button", { name: /retry/i }),
         ).toBeNull();
       },
-      { timeout: 2000 }
+      { timeout: 2000 },
     );
   });
 
@@ -180,7 +203,7 @@ describe("ActivityTray 403 suppression vs the api client's normalized error shap
     mockCancelWikiJob.mockRejectedValue(
       Object.assign(new Error("Insufficient vault permissions"), {
         response: { status: 403 },
-      })
+      }),
     );
     hookRows = [
       makeRow({
@@ -191,13 +214,23 @@ describe("ActivityTray 403 suppression vs the api client's normalized error shap
         vaultId: 3,
       }),
     ];
-    render(<ActivityTray />);
+    render(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <ActivityTray />
+      </QueryClientProvider>,
+    );
 
-    await user.click(within(rowByFamily("wiki")).getByRole("button", { name: /cancel/i }));
+    await user.click(
+      within(rowByFamily("wiki")).getByRole("button", { name: /cancel/i }),
+    );
 
     await waitFor(() => {
       expect(
-        within(rowByFamily("wiki")).queryByRole("button", { name: /cancel/i })
+        within(rowByFamily("wiki")).queryByRole("button", { name: /cancel/i }),
       ).toBeNull();
     });
   });
@@ -212,7 +245,7 @@ describe("ActivityTray 403 suppression vs the api client's normalized error shap
     mockCancelWikiJob.mockRejectedValue(
       Object.assign(new Error("Insufficient vault permissions"), {
         originalError: { response: { status: 403 } },
-      })
+      }),
     );
     hookRows = [
       makeRow({
@@ -223,24 +256,36 @@ describe("ActivityTray 403 suppression vs the api client's normalized error shap
         vaultId: 3,
       }),
     ];
-    render(<ActivityTray />);
+    render(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <ActivityTray />
+      </QueryClientProvider>,
+    );
 
-    await user.click(within(rowByFamily("wiki")).getByRole("button", { name: /cancel/i }));
+    await user.click(
+      within(rowByFamily("wiki")).getByRole("button", { name: /cancel/i }),
+    );
 
     await waitFor(
       () => {
         expect(
-          within(rowByFamily("wiki")).queryByRole("button", { name: /cancel/i })
+          within(rowByFamily("wiki")).queryByRole("button", {
+            name: /cancel/i,
+          }),
         ).toBeNull();
       },
-      { timeout: 2000 }
+      { timeout: 2000 },
     );
   });
 
   it("a normalized NON-403 failure keeps the affordance (widening must not over-suppress)", async () => {
     const user = userEvent.setup();
     mockCancelWikiJob.mockRejectedValue(
-      normalizedApiError(503, "service unavailable")
+      normalizedApiError(503, "service unavailable"),
     );
     hookRows = [
       makeRow({
@@ -251,15 +296,25 @@ describe("ActivityTray 403 suppression vs the api client's normalized error shap
         vaultId: 3,
       }),
     ];
-    render(<ActivityTray />);
+    render(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <ActivityTray />
+      </QueryClientProvider>,
+    );
 
-    await user.click(within(rowByFamily("wiki")).getByRole("button", { name: /cancel/i }));
+    await user.click(
+      within(rowByFamily("wiki")).getByRole("button", { name: /cancel/i }),
+    );
 
     await waitFor(() => {
       expect(mockToastError).toHaveBeenCalledWith("service unavailable");
     });
     expect(
-      within(rowByFamily("wiki")).queryByRole("button", { name: /cancel/i })
+      within(rowByFamily("wiki")).queryByRole("button", { name: /cancel/i }),
     ).not.toBeNull();
   });
 });
