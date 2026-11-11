@@ -42,7 +42,7 @@ from app.services.canvas_store import (
     CanvasStore,
 )
 from app.services.llm_client import TRUNCATION_FINISH_REASONS, LLMError
-from app.services.upload_validation import secure_filename
+from app.services.upload_validation import fold_title_separators, secure_filename
 
 logger = logging.getLogger(__name__)
 
@@ -258,7 +258,10 @@ def _strip_markdown_fences(text: str) -> str:
 
 
 def _download_filename(name: str, language: Optional[str]) -> str:
-    safe_name = secure_filename(name.replace(" ", "_")) or "canvas"
+    # A canvas NAME is user content, not a client path: fold separators
+    # before sanitizing so "A/B notes" keeps its "A" (issue #902, same fold
+    # #789 shipped for draft export filenames).
+    safe_name = secure_filename(fold_title_separators(name).replace(" ", "_")) or "canvas"
     # secure_filename(".")/".." return "."/".." — normalize those to the
     # fallback so a degenerate artifact name cannot yield "..txt".
     if safe_name in {".", ".."}:

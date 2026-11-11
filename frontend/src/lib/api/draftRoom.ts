@@ -19,10 +19,22 @@ export const DRAFT_STATUSES = [
 ] as const;
 export type DraftStatus = (typeof DRAFT_STATUSES)[number];
 
-export const DRAFT_JOB_STATUSES = ["pending", "running", "completed", "failed", "cancelled"] as const;
+export const DRAFT_JOB_STATUSES = [
+  "pending",
+  "running",
+  "completed",
+  "failed",
+  "cancelled",
+] as const;
 export type DraftJobStatus = (typeof DRAFT_JOB_STATUSES)[number];
 
-export const DRAFT_INPUT_PARSE_STATUSES = ["pending", "parsing", "ready", "failed", "cancelled"] as const;
+export const DRAFT_INPUT_PARSE_STATUSES = [
+  "pending",
+  "parsing",
+  "ready",
+  "failed",
+  "cancelled",
+] as const;
 export type DraftInputParseStatus = (typeof DRAFT_INPUT_PARSE_STATUSES)[number];
 
 export const DRAFT_MODES = ["rewrite", "compose"] as const;
@@ -31,7 +43,13 @@ export type DraftMode = (typeof DRAFT_MODES)[number];
 export const DRAFT_TIERS = ["standard", "high_stakes", "sensitive"] as const;
 export type DraftTier = (typeof DRAFT_TIERS)[number];
 
-export const DRAFT_INPUT_ROLES = ["manuscript", "reference", "style", "background", "challenge"] as const;
+export const DRAFT_INPUT_ROLES = [
+  "manuscript",
+  "reference",
+  "style",
+  "background",
+  "challenge",
+] as const;
 export type DraftInputRole = (typeof DRAFT_INPUT_ROLES)[number];
 
 export const DRAFT_INPUT_AUTHORITIES = [
@@ -72,8 +90,14 @@ export const DRAFT_STAGE_STATUSES = [
 ] as const;
 export type DraftStageStatus = (typeof DRAFT_STAGE_STATUSES)[number];
 
-export const DRAFT_EVIDENCE_SOURCE_KINDS = ["draft_input", "document", "wiki", "kms"] as const;
-export type DraftEvidenceSourceKind = (typeof DRAFT_EVIDENCE_SOURCE_KINDS)[number];
+export const DRAFT_EVIDENCE_SOURCE_KINDS = [
+  "draft_input",
+  "document",
+  "wiki",
+  "kms",
+] as const;
+export type DraftEvidenceSourceKind =
+  (typeof DRAFT_EVIDENCE_SOURCE_KINDS)[number];
 
 export const DRAFT_CLAIM_TYPES = ["factual", "quote", "opinion"] as const;
 export type DraftClaimType = (typeof DRAFT_CLAIM_TYPES)[number];
@@ -91,11 +115,21 @@ export type DraftClaimStatus = (typeof DRAFT_CLAIM_STATUSES)[number];
 export const DRAFT_CLAIM_SEVERITIES = ["info", "warning", "blocker"] as const;
 export type DraftClaimSeverity = (typeof DRAFT_CLAIM_SEVERITIES)[number];
 
-export const DRAFT_CLAIM_RESOLUTIONS = ["open", "resolved_by_revision", "accepted", "waived"] as const;
+export const DRAFT_CLAIM_RESOLUTIONS = [
+  "open",
+  "resolved_by_revision",
+  "accepted",
+  "waived",
+] as const;
 export type DraftClaimResolution = (typeof DRAFT_CLAIM_RESOLUTIONS)[number];
 
-export const DRAFT_CLAIM_SOURCE_RELATIONSHIPS = ["supports", "contradicts", "context"] as const;
-export type DraftClaimSourceRelationship = (typeof DRAFT_CLAIM_SOURCE_RELATIONSHIPS)[number];
+export const DRAFT_CLAIM_SOURCE_RELATIONSHIPS = [
+  "supports",
+  "contradicts",
+  "context",
+] as const;
+export type DraftClaimSourceRelationship =
+  (typeof DRAFT_CLAIM_SOURCE_RELATIONSHIPS)[number];
 
 export const DRAFT_FINDING_CATEGORIES = [
   "boilerplate",
@@ -124,7 +158,13 @@ export type DraftFindingStatus = (typeof DRAFT_FINDING_STATUSES)[number];
 export const DRAFT_VAULT_ACCESS_LEVELS = ["write", "read", "revoked"] as const;
 export type DraftVaultAccess = (typeof DRAFT_VAULT_ACCESS_LEVELS)[number];
 
-export const DRAFT_FACT_STATUSES = ["not_run", "running", "passed", "findings", "invalidated"] as const;
+export const DRAFT_FACT_STATUSES = [
+  "not_run",
+  "running",
+  "passed",
+  "findings",
+  "invalidated",
+] as const;
 export type DraftFactStatus = (typeof DRAFT_FACT_STATUSES)[number];
 
 export const DRAFT_COMPILE_START_STAGES = [
@@ -136,13 +176,20 @@ export const DRAFT_COMPILE_START_STAGES = [
   "standards",
   "fact",
 ] as const;
-export type DraftCompileStartStage = (typeof DRAFT_COMPILE_START_STAGES)[number];
+export type DraftCompileStartStage =
+  (typeof DRAFT_COMPILE_START_STAGES)[number];
 
 export const DRAFT_PROMOTE_SOURCE_TYPES = ["input", "revision"] as const;
-export type DraftPromoteSourceType = (typeof DRAFT_PROMOTE_SOURCE_TYPES)[number];
+export type DraftPromoteSourceType =
+  (typeof DRAFT_PROMOTE_SOURCE_TYPES)[number];
 
 /** Claim statuses that block a revision from being marked ready. */
-export const BLOCKING_CLAIM_STATUSES = ["contradicted", "unsupported", "ambiguous", "stale"] as const;
+export const BLOCKING_CLAIM_STATUSES = [
+  "contradicted",
+  "unsupported",
+  "ambiguous",
+  "stale",
+] as const;
 
 /** Fact-check statuses that count as "current" (fact stage ran against this content). */
 export const FACT_CURRENT_STATUSES = ["passed", "findings"] as const;
@@ -437,11 +484,17 @@ export const DEFAULT_DRAFT_ROOM_POLL_INTERVAL_MS = 2000;
  * than the 500ms browser minimum.
  */
 export function getDraftRoomPollIntervalMs(seconds: unknown): number {
-  if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds <= 0) {
+  if (
+    typeof seconds !== "number" ||
+    !Number.isFinite(seconds) ||
+    seconds <= 0
+  ) {
     return DEFAULT_DRAFT_ROOM_POLL_INTERVAL_MS;
   }
   const milliseconds = seconds * 1000;
-  return Number.isFinite(milliseconds) ? Math.max(500, milliseconds) : DEFAULT_DRAFT_ROOM_POLL_INTERVAL_MS;
+  return Number.isFinite(milliseconds)
+    ? Math.max(500, milliseconds)
+    : DEFAULT_DRAFT_ROOM_POLL_INTERVAL_MS;
 }
 
 export interface DraftRoomCapabilities {
@@ -459,6 +512,7 @@ export interface DraftRoomCapabilities {
   prompt_bundle_version: string;
   editorial_gates_installed: boolean;
   compile_available: boolean;
+  upload_available: boolean;
   findings_available: boolean;
   claims_available: boolean;
   evidence_available: boolean;
@@ -594,7 +648,9 @@ function isNormalizedApiError(error: unknown): error is NormalizedApiError {
  */
 export function parseDraftRoomError(error: unknown): DraftRoomErrorInfo {
   const fallbackDetail =
-    isNormalizedApiError(error) && typeof error.message === "string" && error.message
+    isNormalizedApiError(error) &&
+    typeof error.message === "string" &&
+    error.message
       ? error.message
       : "An unexpected error occurred";
 
@@ -603,9 +659,14 @@ export function parseDraftRoomError(error: unknown): DraftRoomErrorInfo {
   }
 
   const data = error.originalError?.response?.data;
-  const detail = typeof data?.detail === "string" && data.detail ? data.detail : fallbackDetail;
-  const code = typeof data?.code === "string" && data.code ? data.code : "unknown";
-  const context = data?.context && typeof data.context === "object" ? data.context : {};
+  const detail =
+    typeof data?.detail === "string" && data.detail
+      ? data.detail
+      : fallbackDetail;
+  const code =
+    typeof data?.code === "string" && data.code ? data.code : "unknown";
+  const context =
+    data?.context && typeof data.context === "object" ? data.context : {};
 
   return { detail, code, context, status: httpStatusOf(error) };
 }
@@ -623,16 +684,24 @@ export const draftRoomKeys = {
   all: ["draft-room"] as const,
   capabilities: () => [...draftRoomKeys.all, "capabilities"] as const,
   lists: () => [...draftRoomKeys.all, "drafts"] as const,
-  list: (params: Record<string, unknown>) => [...draftRoomKeys.lists(), params] as const,
+  list: (params: Record<string, unknown>) =>
+    [...draftRoomKeys.lists(), params] as const,
   detail: (id: number) => [...draftRoomKeys.all, "draft", id] as const,
   inputs: (id: number) => [...draftRoomKeys.detail(id), "inputs"] as const,
   inputContent: (id: number, inputId: number) =>
     [...draftRoomKeys.detail(id), "input", inputId, "content"] as const,
   jobs: (id: number, params?: Record<string, unknown>) =>
     [...draftRoomKeys.detail(id), "jobs", params ?? {}] as const,
-  job: (id: number, jobId: number) => [...draftRoomKeys.detail(id), "job", jobId] as const,
+  job: (id: number, jobId: number) =>
+    [...draftRoomKeys.detail(id), "job", jobId] as const,
   stages: (id: number, jobId: number, includeContent?: boolean) =>
-    [...draftRoomKeys.detail(id), "job", jobId, "stages", includeContent ?? false] as const,
+    [
+      ...draftRoomKeys.detail(id),
+      "job",
+      jobId,
+      "stages",
+      includeContent ?? false,
+    ] as const,
   revisions: (id: number, params?: Record<string, unknown>) =>
     [...draftRoomKeys.detail(id), "revisions", params ?? {}] as const,
   revision: (id: number, revisionId: number) =>
@@ -643,7 +712,8 @@ export const draftRoomKeys = {
     [...draftRoomKeys.detail(id), "claims", params ?? {}] as const,
   findings: (id: number, params?: Record<string, unknown>) =>
     [...draftRoomKeys.detail(id), "findings", params ?? {}] as const,
-  promotions: (id: number) => [...draftRoomKeys.detail(id), "promotions"] as const,
+  promotions: (id: number) =>
+    [...draftRoomKeys.detail(id), "promotions"] as const,
 };
 
 // ============================================================================
@@ -653,48 +723,80 @@ export const draftRoomKeys = {
 const DRAFT_ROOM_BASE = "/draft-room";
 
 export async function getDraftRoomCapabilities(): Promise<DraftRoomCapabilities> {
-  const response = await apiClient.get<DraftRoomCapabilities>(`${DRAFT_ROOM_BASE}/capabilities`);
+  const response = await apiClient.get<DraftRoomCapabilities>(
+    `${DRAFT_ROOM_BASE}/capabilities`,
+  );
   return response.data;
 }
 
-export async function createDraft(data: DraftCreateRequest): Promise<DraftSummary> {
-  const response = await apiClient.post<DraftSummary>(`${DRAFT_ROOM_BASE}/drafts`, data);
+export async function createDraft(
+  data: DraftCreateRequest,
+): Promise<DraftSummary> {
+  const response = await apiClient.post<DraftSummary>(
+    `${DRAFT_ROOM_BASE}/drafts`,
+    data,
+  );
   return response.data;
 }
 
-export async function listDrafts(params: {
-  vault_id?: number;
-  status?: DraftStatus;
-  page?: number;
-  per_page?: number;
-} = {}): Promise<DraftPaginated<DraftSummary>> {
-  const response = await apiClient.get<DraftPaginated<DraftSummary>>(`${DRAFT_ROOM_BASE}/drafts`, {
-    params,
-  });
+export async function listDrafts(
+  params: {
+    vault_id?: number;
+    status?: DraftStatus;
+    page?: number;
+    per_page?: number;
+  } = {},
+): Promise<DraftPaginated<DraftSummary>> {
+  const response = await apiClient.get<DraftPaginated<DraftSummary>>(
+    `${DRAFT_ROOM_BASE}/drafts`,
+    {
+      params,
+    },
+  );
   return response.data;
 }
 
 export async function getDraft(draftId: number): Promise<DraftDetail> {
-  const response = await apiClient.get<DraftDetail>(`${DRAFT_ROOM_BASE}/drafts/${draftId}`);
+  const response = await apiClient.get<DraftDetail>(
+    `${DRAFT_ROOM_BASE}/drafts/${draftId}`,
+  );
   return response.data;
 }
 
-export async function updateDraft(draftId: number, data: DraftUpdateRequest): Promise<DraftSummary> {
-  const response = await apiClient.patch<DraftSummary>(`${DRAFT_ROOM_BASE}/drafts/${draftId}`, data);
+export async function updateDraft(
+  draftId: number,
+  data: DraftUpdateRequest,
+): Promise<DraftSummary> {
+  const response = await apiClient.patch<DraftSummary>(
+    `${DRAFT_ROOM_BASE}/drafts/${draftId}`,
+    data,
+  );
   return response.data;
 }
 
-export async function archiveDraft(draftId: number, lockVersion: number): Promise<DraftSummary> {
-  const response = await apiClient.post<DraftSummary>(`${DRAFT_ROOM_BASE}/drafts/${draftId}/archive`, {
-    lock_version: lockVersion,
-  });
+export async function archiveDraft(
+  draftId: number,
+  lockVersion: number,
+): Promise<DraftSummary> {
+  const response = await apiClient.post<DraftSummary>(
+    `${DRAFT_ROOM_BASE}/drafts/${draftId}/archive`,
+    {
+      lock_version: lockVersion,
+    },
+  );
   return response.data;
 }
 
-export async function restoreDraft(draftId: number, lockVersion: number): Promise<DraftSummary> {
-  const response = await apiClient.post<DraftSummary>(`${DRAFT_ROOM_BASE}/drafts/${draftId}/restore`, {
-    lock_version: lockVersion,
-  });
+export async function restoreDraft(
+  draftId: number,
+  lockVersion: number,
+): Promise<DraftSummary> {
+  const response = await apiClient.post<DraftSummary>(
+    `${DRAFT_ROOM_BASE}/drafts/${draftId}/restore`,
+    {
+      lock_version: lockVersion,
+    },
+  );
   return response.data;
 }
 
@@ -710,7 +812,7 @@ export async function uploadDraftInput(
     authority: DraftInputAuthority;
     as_of_date?: string;
   },
-  onUploadProgress?: (progress: number) => void
+  onUploadProgress?: (progress: number) => void,
 ): Promise<DraftInputUploadResponse> {
   const formData = new FormData();
   formData.append("file", params.file);
@@ -729,13 +831,15 @@ export async function uploadDraftInput(
       onUploadProgress: (progressEvent) => {
         if (!onUploadProgress) return;
         if (progressEvent.total) {
-          onUploadProgress(Math.round((progressEvent.loaded * 100) / progressEvent.total));
+          onUploadProgress(
+            Math.round((progressEvent.loaded * 100) / progressEvent.total),
+          );
         } else {
           // Total unknown - report 0 for indeterminate progress
           onUploadProgress(0);
         }
       },
-    }
+    },
   );
   return response.data;
 }
@@ -743,57 +847,73 @@ export async function uploadDraftInput(
 export async function updateDraftInput(
   draftId: number,
   inputId: number,
-  data: InputUpdateRequest
+  data: InputUpdateRequest,
 ): Promise<DraftInput> {
   const response = await apiClient.patch<DraftInput>(
     `${DRAFT_ROOM_BASE}/drafts/${draftId}/inputs/${inputId}`,
-    data
+    data,
   );
   return response.data;
 }
 
-export async function getDraftInputContent(draftId: number, inputId: number): Promise<DraftInputContent> {
+export async function getDraftInputContent(
+  draftId: number,
+  inputId: number,
+): Promise<DraftInputContent> {
   const response = await apiClient.get<DraftInputContent>(
-    `${DRAFT_ROOM_BASE}/drafts/${draftId}/inputs/${inputId}/content`
+    `${DRAFT_ROOM_BASE}/drafts/${draftId}/inputs/${inputId}/content`,
   );
   return response.data;
 }
 
-export async function deleteDraftInput(draftId: number, inputId: number): Promise<void> {
-  await apiClient.delete(`${DRAFT_ROOM_BASE}/drafts/${draftId}/inputs/${inputId}`);
+export async function deleteDraftInput(
+  draftId: number,
+  inputId: number,
+): Promise<void> {
+  await apiClient.delete(
+    `${DRAFT_ROOM_BASE}/drafts/${draftId}/inputs/${inputId}`,
+  );
 }
 
 export async function listDraftJobs(
   draftId: number,
-  params: { page?: number; per_page?: number } = {}
+  params: { page?: number; per_page?: number } = {},
 ): Promise<DraftPaginated<DraftJob>> {
   const response = await apiClient.get<DraftPaginated<DraftJob>>(
     `${DRAFT_ROOM_BASE}/drafts/${draftId}/jobs`,
-    { params }
+    { params },
   );
   return response.data;
 }
 
-export async function getDraftJob(draftId: number, jobId: number): Promise<DraftJob> {
-  const response = await apiClient.get<DraftJob>(`${DRAFT_ROOM_BASE}/drafts/${draftId}/jobs/${jobId}`);
+export async function getDraftJob(
+  draftId: number,
+  jobId: number,
+): Promise<DraftJob> {
+  const response = await apiClient.get<DraftJob>(
+    `${DRAFT_ROOM_BASE}/drafts/${draftId}/jobs/${jobId}`,
+  );
   return response.data;
 }
 
 export async function getDraftStages(
   draftId: number,
   jobId: number,
-  params: { include_content?: boolean; page?: number; per_page?: number } = {}
+  params: { include_content?: boolean; page?: number; per_page?: number } = {},
 ): Promise<DraftPaginated<DraftStage>> {
   const response = await apiClient.get<DraftPaginated<DraftStage>>(
     `${DRAFT_ROOM_BASE}/drafts/${draftId}/jobs/${jobId}/stages`,
-    { params }
+    { params },
   );
   return response.data;
 }
 
-export async function cancelDraftJob(draftId: number, jobId: number): Promise<DraftJob> {
+export async function cancelDraftJob(
+  draftId: number,
+  jobId: number,
+): Promise<DraftJob> {
   const response = await apiClient.post<DraftJob>(
-    `${DRAFT_ROOM_BASE}/drafts/${draftId}/jobs/${jobId}/cancel`
+    `${DRAFT_ROOM_BASE}/drafts/${draftId}/jobs/${jobId}/cancel`,
   );
   return response.data;
 }
@@ -801,11 +921,17 @@ export async function cancelDraftJob(draftId: number, jobId: number): Promise<Dr
 export async function retryDraftJob(
   draftId: number,
   jobId: number,
-  data: RetryJobRequest = {}
+  data: RetryJobRequest = {},
+  idempotencyKey?: string,
 ): Promise<DraftJob> {
   const response = await apiClient.post<DraftJob>(
     `${DRAFT_ROOM_BASE}/drafts/${draftId}/jobs/${jobId}/retry`,
-    data
+    data,
+    // Spread (not a ternary config) so a keyless call posts with exactly
+    // two arguments — existing call-shape pins assert the two-arg form.
+    ...(idempotencyKey != null
+      ? [{ headers: { "Idempotency-Key": idempotencyKey } }]
+      : []),
   );
   return response.data;
 }
@@ -813,12 +939,14 @@ export async function retryDraftJob(
 export async function compileDraft(
   draftId: number,
   data: CompileRequest,
-  idempotencyKey?: string
+  idempotencyKey?: string,
 ): Promise<DraftJob> {
   const response = await apiClient.post<DraftJob>(
     `${DRAFT_ROOM_BASE}/drafts/${draftId}/compile`,
     data,
-    idempotencyKey != null ? { headers: { "Idempotency-Key": idempotencyKey } } : undefined
+    idempotencyKey != null
+      ? { headers: { "Idempotency-Key": idempotencyKey } }
+      : undefined,
   );
   return response.data;
 }
@@ -835,29 +963,32 @@ export function getDraftEventsUrl(draftId: number): string {
 
 export async function listDraftRevisions(
   draftId: number,
-  params: { page?: number; per_page?: number } = {}
+  params: { page?: number; per_page?: number } = {},
 ): Promise<DraftPaginated<DraftRevisionSummary>> {
   const response = await apiClient.get<DraftPaginated<DraftRevisionSummary>>(
     `${DRAFT_ROOM_BASE}/drafts/${draftId}/revisions`,
-    { params }
+    { params },
   );
   return response.data;
 }
 
-export async function getDraftRevision(draftId: number, revisionId: number): Promise<DraftRevisionDetail> {
+export async function getDraftRevision(
+  draftId: number,
+  revisionId: number,
+): Promise<DraftRevisionDetail> {
   const response = await apiClient.get<DraftRevisionDetail>(
-    `${DRAFT_ROOM_BASE}/drafts/${draftId}/revisions/${revisionId}`
+    `${DRAFT_ROOM_BASE}/drafts/${draftId}/revisions/${revisionId}`,
   );
   return response.data;
 }
 
 export async function createDraftRevision(
   draftId: number,
-  data: RevisionCreateRequest
+  data: RevisionCreateRequest,
 ): Promise<DraftRevisionDetail> {
   const response = await apiClient.post<DraftRevisionDetail>(
     `${DRAFT_ROOM_BASE}/drafts/${draftId}/revisions`,
-    data
+    data,
   );
   return response.data;
 }
@@ -865,11 +996,11 @@ export async function createDraftRevision(
 export async function markDraftRevisionReady(
   draftId: number,
   revisionId: number,
-  data: ReadyRequest
+  data: ReadyRequest,
 ): Promise<DraftSummary> {
   const response = await apiClient.post<DraftSummary>(
     `${DRAFT_ROOM_BASE}/drafts/${draftId}/revisions/${revisionId}/ready`,
-    data
+    data,
   );
   return response.data;
 }
@@ -891,7 +1022,8 @@ export interface DraftExportResult {
 const DEFAULT_EXPORT_FILENAME = "draft.md";
 
 function parseContentDispositionFilename(headerValue: unknown): string {
-  if (typeof headerValue !== "string" || !headerValue) return DEFAULT_EXPORT_FILENAME;
+  if (typeof headerValue !== "string" || !headerValue)
+    return DEFAULT_EXPORT_FILENAME;
   // Matches filename="quoted value" or filename=unquoted-value (RFC 6266, no ext params).
   const match = /filename\s*=\s*(?:"([^"]*)"|([^;]+))/i.exec(headerValue);
   const rawName = match ? (match[1] ?? match[2])?.trim() : undefined;
@@ -900,7 +1032,7 @@ function parseContentDispositionFilename(headerValue: unknown): string {
 
 function getHeaderCaseInsensitive(
   headers: Record<string, unknown> | undefined,
-  name: string
+  name: string,
 ): string {
   if (!headers) return "";
   const lowerName = name.toLowerCase();
@@ -922,21 +1054,31 @@ function getHeaderCaseInsensitive(
 export async function exportDraftRevision(
   draftId: number,
   revisionId: number,
-  params: { format?: string; acknowledge_not_fact_checked?: boolean } = {}
+  params: { format?: string; acknowledge_not_fact_checked?: boolean } = {},
 ): Promise<DraftExportResult> {
   const response = await apiClient.post(
     `${DRAFT_ROOM_BASE}/drafts/${draftId}/revisions/${revisionId}/export`,
     undefined,
-    { params, responseType: "blob" }
+    { params, responseType: "blob" },
   );
   const headers = response.headers as Record<string, unknown> | undefined;
-  const openBlockersRaw = getHeaderCaseInsensitive(headers, "x-draft-open-blockers");
-  const openBlockers = /^\d+$/.test(openBlockersRaw) ? Number(openBlockersRaw) : undefined;
+  const openBlockersRaw = getHeaderCaseInsensitive(
+    headers,
+    "x-draft-open-blockers",
+  );
+  const openBlockers = /^\d+$/.test(openBlockersRaw)
+    ? Number(openBlockersRaw)
+    : undefined;
   return {
     blob: response.data as Blob,
-    filename: parseContentDispositionFilename(getHeaderCaseInsensitive(headers, "content-disposition")),
+    filename: parseContentDispositionFilename(
+      getHeaderCaseInsensitive(headers, "content-disposition"),
+    ),
     factStatus: getHeaderCaseInsensitive(headers, "x-draft-fact-status"),
-    approvalStatus: getHeaderCaseInsensitive(headers, "x-draft-approval-status"),
+    approvalStatus: getHeaderCaseInsensitive(
+      headers,
+      "x-draft-approval-status",
+    ),
     contentSha256: getHeaderCaseInsensitive(headers, "x-draft-content-sha256"),
     ...(openBlockers !== undefined ? { openBlockers } : {}),
   };
@@ -944,22 +1086,27 @@ export async function exportDraftRevision(
 
 export async function listDraftEvidence(
   draftId: number,
-  params: { job_id?: number; page?: number; per_page?: number } = {}
+  params: { job_id?: number; page?: number; per_page?: number } = {},
 ): Promise<DraftPaginated<DraftEvidence>> {
   const response = await apiClient.get<DraftPaginated<DraftEvidence>>(
     `${DRAFT_ROOM_BASE}/drafts/${draftId}/evidence`,
-    { params }
+    { params },
   );
   return response.data;
 }
 
 export async function listDraftClaims(
   draftId: number,
-  params: { revision_id?: number; status?: DraftClaimStatus; page?: number; per_page?: number } = {}
+  params: {
+    revision_id?: number;
+    status?: DraftClaimStatus;
+    page?: number;
+    per_page?: number;
+  } = {},
 ): Promise<DraftPaginated<DraftClaim>> {
   const response = await apiClient.get<DraftPaginated<DraftClaim>>(
     `${DRAFT_ROOM_BASE}/drafts/${draftId}/claims`,
-    { params }
+    { params },
   );
   return response.data;
 }
@@ -972,11 +1119,11 @@ export async function listDraftFindings(
     severity?: DraftFindingSeverity;
     page?: number;
     per_page?: number;
-  } = {}
+  } = {},
 ): Promise<DraftPaginated<DraftFinding>> {
   const response = await apiClient.get<DraftPaginated<DraftFinding>>(
     `${DRAFT_ROOM_BASE}/drafts/${draftId}/findings`,
-    { params }
+    { params },
   );
   return response.data;
 }
@@ -984,19 +1131,22 @@ export async function listDraftFindings(
 export async function setDraftFindingDisposition(
   draftId: number,
   findingId: number,
-  data: FindingDispositionRequest
+  data: FindingDispositionRequest,
 ): Promise<FindingDispositionResponse> {
   const response = await apiClient.post<FindingDispositionResponse>(
     `${DRAFT_ROOM_BASE}/drafts/${draftId}/findings/${findingId}/disposition`,
-    data
+    data,
   );
   return response.data;
 }
 
-export async function promoteDraftSource(draftId: number, data: PromoteRequest): Promise<PromoteResponse> {
+export async function promoteDraftSource(
+  draftId: number,
+  data: PromoteRequest,
+): Promise<PromoteResponse> {
   const response = await apiClient.post<PromoteResponse>(
     `${DRAFT_ROOM_BASE}/drafts/${draftId}/promote`,
-    data
+    data,
   );
   return response.data;
 }
