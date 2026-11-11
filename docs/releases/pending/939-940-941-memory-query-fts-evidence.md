@@ -89,7 +89,8 @@
 - `backend/tests/test_memory_query_lifecycle.py` (4 frozen checks, issue #939)
 - `backend/tests/test_memory_fts_semantics.py` (4 checks, issue #940)
 - `backend/tests/test_c07_evidence_oracles.py` (5 checks, issue #941)
-- `backend/tests/test_memory_query_lifecycle_companions.py` (7 non-frozen
-  mechanics pins: cancellation observation, rejected-admission zero-embeds +
-  FTS kwarg, active-lease occupancy, blocked-admission budget bound, and three
-  route-side legs)
+- `backend/tests/test_memory_query_lifecycle_companions.py` (9 non-frozen
+  tests: cancellation observation with value sensitivity, rejected-admission
+  zero-embeds + FTS kwarg, active-lease occupancy, blocked-admission budget
+  bound, three route-side legs, the real-controller budget-expiry release pin,
+  and the telemetry json-binding pin)
