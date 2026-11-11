@@ -77,7 +77,12 @@ def build_query_user_text(
     itself travels as a separate content part via ``build_image_content_part``.
     """
     parts: list[str] = []
-    parts.append(f"<query>{_escape(_bound(query, 400))}</query>")
+    # The query budget bounds the ESCAPED render like every other seam
+    # (review pr1105-20261109 F-6: the old clip-raw-then-escape let a
+    # 400-quote query render ~2400 chars).
+    from app.services.query_transformer import _escape_clip
+
+    parts.append(f"<query>{_escape_clip(query or '', 400, escape_fn=_escape)}</query>")
     parts.append(_wrap("artifact_kind", _bound(kind or "", 100), 100))
     if page_number is not None:
         parts.append(f"<page_number>{int(page_number)}</page_number>")
@@ -116,18 +121,34 @@ class DerivedError(Exception):
 
 
 def _escape(value: Any) -> str:
-    """Header/boundary-safe escape: normalize control/newlines, then XML-escape."""
+    """Header/boundary-safe escape: normalize control/newlines, then XML-escape.
+
+    Separator set matches prompt_builder._header_escape (review
+    pr1105-20261109 F-5: the missing Unicode/ASCII separator forms are the
+    same line-spoof class fixed there for CR/LF).
+    """
     s = str(value or "")
-    s = s.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+    for _sep in (
+        "\r\n", "\n", "\r", "\u2028", "\u2029", "\x0b", "\x0c", "\x85", "\x00",
+        "\x1c", "\x1d", "\x1e",
+    ):
+        s = s.replace(_sep, " ")
     return _xml_escape(s)
 
 
 def _wrap(field_label: str, value: Any, cap: int) -> str:
-    """Escape + truncate a single text field and wrap it in a <document> boundary."""
+    """Escape + truncate a single text field and wrap it in a <document> boundary.
+
+    #925 clip-before-escape class (4.2 review round): the cap bounds the
+    ESCAPED render — escape first, then clip entity-safely, so quote-heavy
+    text cannot inflate the rendered field ~6x past the cap.
+    """
+    from app.services.query_transformer import _escape_clip
+
     text = str(value or "").strip()
     if not text:
         return ""
-    return f"<{field_label}><document>{_escape(text[:cap])}</document></{field_label}>"
+    return f"<{field_label}><document>{_escape_clip(text, cap, escape_fn=_escape)}</document></{field_label}>"
 
 
 def _bound(text: str, cap: int) -> str:

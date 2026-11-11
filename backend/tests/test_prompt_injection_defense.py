@@ -277,12 +277,20 @@ class TestPromptInjectionDefense(unittest.TestCase):
         )
         # messages[0] = system, messages[1] = first history entry,
         # messages[2] = second history entry, messages[3] = user message
+        # (#925: history turns now render inside a declared <user_message>
+        # wrapper — escaping stays inside the wrapper for tag integrity.)
         self.assertEqual(len(result), 4)
         self.assertEqual(result[0]["role"], "system")
         self.assertEqual(result[1]["role"], "user")
-        self.assertEqual(result[1]["content"], "What is Flask?")
+        self.assertEqual(
+            result[1]["content"],
+            "<user_message>What is Flask?</user_message>",
+        )
         self.assertEqual(result[2]["role"], "assistant")
-        self.assertEqual(result[2]["content"], "Flask is a web framework.")
+        self.assertEqual(
+            result[2]["content"],
+            "<user_message>Flask is a web framework.</user_message>",
+        )
         self.assertEqual(result[3]["role"], "user")
         # The user message still has its own <user_query> wrapper
         self.assertIn("<user_query>", result[3]["content"])
@@ -395,7 +403,10 @@ class TestChatHistoryEscaping(unittest.TestCase):
         history_msg = result[1]
         self.assertEqual(history_msg["role"], "assistant")
         self.assertEqual(history_msg["name"], "helper")
-        self.assertEqual(history_msg["content"], "Hello")
+        # #925: history renders inside the declared <user_message> wrapper.
+        self.assertEqual(
+            history_msg["content"], "<user_message>Hello</user_message>"
+        )
 
     def test_chat_history_none_content_does_not_crash(self):
         """chat_history entry with content=None must not raise AttributeError."""
@@ -407,7 +418,11 @@ class TestChatHistoryEscaping(unittest.TestCase):
             memories=self.empty_memories,
         )
         history_msg = result[1]
-        self.assertEqual(history_msg["content"], "")
+        # #925: None content still must not raise; the empty turn renders as
+        # an empty declared wrapper.
+        self.assertEqual(
+            history_msg["content"], "<user_message></user_message>"
+        )
 
     def test_chat_history_tag_injection_neutralized(self):
         """Tag injection via chat_history is neutralized by XML escaping."""

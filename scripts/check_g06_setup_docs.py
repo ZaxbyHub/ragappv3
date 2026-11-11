@@ -254,9 +254,9 @@ def check_parsing_strategy() -> list[str]:
     if documented_env_entry(env_text, "DOCUMENT_PARSING_STRATEGY") is None:
         return [
             "FAIL parsing-strategy: .env.example has no DOCUMENT_PARSING_STRATEGY "
-            "entry (active or commented) - the key must stay documented; compose "
-            "forwards an empty value for a missing key, which fails startup "
-            "validation"
+            "entry (active or commented) - the key must stay documented so "
+            "operators overriding parsing behavior can discover it; an invalid "
+            "value (not an absent one) fails startup validation"
         ]
     entry = active_env_entry(env_text, "DOCUMENT_PARSING_STRATEGY")
     if entry is None:
@@ -300,8 +300,24 @@ def check_contributing_env_path() -> list[str]:
             paragraph.append(lines[cursor])
             cursor += 1
         paragraph_text = "\n".join(paragraph)
-        if ".env.example" in paragraph_text and "backend/.env" not in paragraph_text:
-            return ["FAIL contributing-env-path"]
+        # Path-token match (#1062 review round): a bare substring would let a
+        # near-miss name like backend/.env.example or backend/.environment
+        # satisfy the gate, so match whole path tokens only.
+        # Sentence-final punctuation must not bind to a path token (a plain
+        # "create backend/.env." sentence is valid prose).
+        tokens = {tok.rstrip(".,;:!?") for tok in re.findall(r"[A-Za-z0-9_./-]+", paragraph_text)}
+        if ".env.example" in tokens and "backend/.env" not in tokens:
+            return [
+                "FAIL contributing-env-path: the **Environment:** paragraph "
+                "names .env.example but not backend/.env - the native-run "
+                "env-file step must stay documented"
+            ]
+        if "backend/.env" not in tokens:
+            return [
+                "FAIL contributing-env-path: **Environment:** paragraph must "
+                "name backend/.env - the native-run env-file step must stay "
+                "documented"
+            ]
     if not found_paragraph:
         return [
             "FAIL contributing-env-path: CONTRIBUTING.md has no **Environment:** "
