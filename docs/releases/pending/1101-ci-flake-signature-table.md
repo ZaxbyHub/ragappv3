@@ -4,11 +4,16 @@
 
 - `.agents/skills/ci-compatibility-audit/SKILL.md` gains a new section,
   "Backend CI flake signature table (issue #1101)", placed between
-  "Environment caveats" and "Output". It is a purely additive docs change:
-  no CI workflow, test, or production code changed, and the
+  "Environment caveats" and "Output". The SKILL.md change itself is purely
+  additive docs: no CI workflow or production code changed, and the
   `.claude/skills/ci-compatibility-audit/` thin pointer is untouched (the
   canonical home of this repo-specific skill is `.agents/skills/`, per
   `docs/engineering/skill-conventions.md`).
+- `backend/tests/test_1101_flake_signature_table.py` pins the table as the
+  issue's executing substitute evidence for the NON-EXECUTABLE(DOCS_ONLY)
+  ACs: it fails if the section is dropped or moved, a family row loses its
+  log-signature or discriminator marker, a cross-referenced path rots, or the
+  classification protocol no longer precedes the rerun rule.
 - The table covers the five documented ragappv3 Backend flake families, each
   row carrying its log signature and its diff-foreign discriminator:
   1. xdist sqlite moving-set — `sqlite3.OperationalError: unable to open
