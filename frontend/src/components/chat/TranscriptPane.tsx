@@ -39,6 +39,9 @@ import {
   forkChatSession, getChatSession, truncateChatSession,
   addChatMessagesBatch, type AddMessageRequest,
 } from "@/lib/api";
+// Issue #1078: direct core-module import (not the barrel) so the status
+// read below is not hostage to barrel mocks in the test suites.
+import { httpStatusOf } from "@/lib/api/core";
 import { mapSessionMessage } from "@/lib/chatMessageMapper";
 import { toast } from "sonner";
 import type { Message } from "@/stores/useChatStore";
@@ -751,7 +754,10 @@ export function TranscriptPane({ className, onSessionCreated }: TranscriptPanePr
         } catch (err) {
           // Issue #684 (T1-13-S-05): a stale-view refusal (409) converges this
           // tab from the server; any other failure keeps today's behavior.
-          if ((err as { response?: { status?: number } })?.response?.status === 409) {
+          // Issue #1078: shape-tolerant status read — apiClient rejects with
+          // a normalized Error whose status is top-level, so a single-tier
+          // `response.status` read never saw the 409.
+          if (httpStatusOf(err) === 409) {
             await reloadAfterStaleRefusal(activeChatId);
           } else {
             toast.error("Couldn't update conversation history");
@@ -842,8 +848,9 @@ export function TranscriptPane({ className, onSessionCreated }: TranscriptPanePr
           );
         } catch (err) {
           // Issue #684 (T1-13-S-05): a stale-view refusal reloads the session;
-          // other failures keep today's behavior.
-          if ((err as { response?: { status?: number } })?.response?.status === 409) {
+          // other failures keep today's behavior. Issue #1078: shape-tolerant
+          // status read (same three-tier walk as the retry arm above).
+          if (httpStatusOf(err) === 409) {
             await reloadAfterStaleRefusal(activeChatId);
           } else {
             toast.error("Couldn't update conversation history");

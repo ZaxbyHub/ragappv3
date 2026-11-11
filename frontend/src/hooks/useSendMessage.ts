@@ -27,6 +27,9 @@ import { useSettingsStore } from "@/stores/useSettingsStore";
 import { readFeedbackVote, writeFeedbackVote } from "@/lib/chatFeedbackStorage";
 import { computeEffectiveChatMode } from "@/lib/chatMode";
 import type { UsedMemory } from "@/lib/api";
+// Issue #1078: direct core-module import (not the barrel) so the status
+// read below is not hostage to barrel mocks in the test suites.
+import { httpStatusOf } from "@/lib/api/core";
 import useCoalescedAppend from "./useCoalescedAppend";
 
 // Inline composer cap. The backend imposes no message-length contract
@@ -394,7 +397,11 @@ export function useSendMessage(
           createdSession = true;
         } catch (err) {
           console.error("Failed to create chat session:", err);
-          const status = (err as { response?: { status?: number } })?.response?.status;
+          // Issue #1078: shape-tolerant status read — apiClient rejects with
+          // a normalized Error whose status is top-level, so a single-tier
+          // `response.status` read never saw the 403 and the permission
+          // branch was dead in production.
+          const status = httpStatusOf(err);
           setInputError(
             status === 403
               ? "You don't have permission to chat in this vault."

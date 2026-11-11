@@ -1,4 +1,4 @@
-import { apiClient, API_BASE_URL } from "./core";
+import { apiClient, API_BASE_URL, httpStatusOf } from "./core";
 
 // ============================================================================
 // Draft Room — enums (const tuples + derived union types)
@@ -622,7 +622,6 @@ export interface DraftRoomErrorInfo {
 
 interface NormalizedApiError {
   message?: string;
-  status?: number;
   originalError?: {
     response?: {
       data?: {
@@ -642,7 +641,9 @@ function isNormalizedApiError(error: unknown): error is NormalizedApiError {
  * Extracts the Draft Room error envelope (`{detail, code, context?}`) from an
  * error thrown by `apiClient`. `core.ts`'s response interceptor normalizes
  * axios errors into a plain `Error` carrying `.status` and `.originalError`
- * (the original axios error) — read the real envelope from there. Never
+ * (the original axios error) — read the real envelope from there. The status
+ * is read through `httpStatusOf`'s three-tier walk (issue #1078), so a raw
+ * axios error that reaches this parser still surfaces its status. Never
  * throws; falls back to a safe "unknown" shape for anything unrecognised.
  */
 export function parseDraftRoomError(error: unknown): DraftRoomErrorInfo {
@@ -667,7 +668,7 @@ export function parseDraftRoomError(error: unknown): DraftRoomErrorInfo {
   const context =
     data?.context && typeof data.context === "object" ? data.context : {};
 
-  return { detail, code, context, status: error.status };
+  return { detail, code, context, status: httpStatusOf(error) };
 }
 
 /** Predicate for checking a caught error against a known Draft Room error code. */
