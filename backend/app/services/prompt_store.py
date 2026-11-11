@@ -1,8 +1,29 @@
 """PromptVersionStore: CRUD for prompt_versions table (FR-007)."""
 
+import logging
 import sqlite3
 from dataclasses import dataclass
 from typing import List, Optional
+
+from app.services.prompt_builder import missing_tag_declarations
+
+logger = logging.getLogger(__name__)
+
+
+def _audit_activation_declarations(content: str, version: str) -> None:
+    """Warn when a JUST-ACTIVATED prompt leaves builder-emitted wrapper
+    tags undeclared under a SECURITY BOUNDARY clause (#925). Advisory only:
+    the version still activates; the warning names the missing tags, never
+    the prompt content."""
+    for tag in missing_tag_declarations(content):
+        logger.warning(
+            "prompt-declaration-audit: activated prompt version %r does "
+            "not declare the %s tag under a SECURITY BOUNDARY clause; "
+            "content rendered with this tag will not be covered by the "
+            "boundary instruction",
+            version,
+            tag,
+        )
 
 
 @dataclass
@@ -179,6 +200,10 @@ class PromptVersionStore:
             "FROM prompt_versions WHERE id = ?",
             (cursor.lastrowid,),
         ).fetchone()
+        if activate:
+            # #925: both activation paths audit the freshly-activated
+            # content (create-with-activate here, activate() below).
+            _audit_activation_declarations(content, version)
         return self._row_to_prompt_version(row)
 
     def activate(self, version: str) -> PromptVersion:
@@ -197,6 +222,8 @@ class PromptVersionStore:
             (version,),
         )
         self._db.commit()
+        # #925: declaration audit on the explicit-activation path.
+        _audit_activation_declarations(row["content"], version)
 
         updated_row = self._db.execute(
             "SELECT id, version, content, created_at, is_active, created_by "

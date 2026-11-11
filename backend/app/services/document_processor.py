@@ -71,7 +71,8 @@ from .embedding_cache import (
 from .embedding_cache import (
     store as embedding_cache_store,
 )
-from .embeddings import EmbeddingError, EmbeddingService
+from .embeddings import EmbeddingError, EmbeddingProgressLost, EmbeddingService
+from .enrichment_state import aggregate_status_case_sql
 from .image_processor import ImageProcessingResult, _process_image_sync
 from .image_search import build_searchable_text
 from .llm_client import LLMClient
@@ -360,6 +361,14 @@ INGEST_ERROR_PARSE_TIMEOUT = "PARSE_TIMEOUT"
 INGEST_ERROR_FILE_MISSING = "FILE_MISSING"
 INGEST_ERROR_ENRICHMENT_FAILED = "ENRICHMENT_FAILED"
 INGEST_ERROR_DIMENSION_CHANGED = "DIMENSION_CHANGED"
+
+# Issues #1075/#1076: return sentinel for a currency-guarded enrichment
+# status write whose WHERE clause (file_hash/status) matched zero rows — the
+# row is owned by a newer ingest. Deliberately a non-timestamp string so it
+# can never be confused with the updated_at stamp callers normally receive,
+# and distinct from ``None`` (sqlite error / no pool), which keeps its
+# pre-existing swallow-and-do-nothing meaning.
+ENRICHMENT_WRITE_NOT_CURRENT = "not-current-row"
 # issue #704 (T1-25-KR-02): an embedding-provider outage and a vector-store
 # rejection are not parse failures; persisting them as PARSE_FAILED hid the
 # actual failure provenance from operators (#562 asked for distinguishable
@@ -1570,29 +1579,75 @@ class DocumentProcessor:
         return selected
 
     async def set_enrichment_status(
-        self, file_id: int, status: str, error_message: Optional[str] = None
+        self,
+        file_id: int,
+        status: str,
+        error_message: Optional[str] = None,
+        *,
+        require_file_hash: Optional[str] = None,
     ) -> Optional[str]:
         """Update enrichment state without changing files.status.
 
         Async since issue #704 (T1-25-KR-09): the write routes through the
         shared write permit like every other committing write.
+
+        Issues #1075/#1076 — two terminal-write hardenings, both atomic in a
+        single UPDATE:
+
+        * ``status == "complete"`` computes the written status with the
+          shared correlated CASE (:func:`enrichment_state.aggregate_status_case_sql`)
+          instead of the literal: the atom-stage decision and the row write
+          are one SQL statement, and a file whose atom-enrichment stages are
+          not all-succeeded is never reported ``complete`` by the chunk
+          pipeline (mixed -> ``partial``, all-permanent -> ``error``; zero
+          atom stages -> ``complete`` exactly as before).
+        * ``require_file_hash`` adds the currency predicate
+          ``AND file_hash = ? AND status IN ('indexed', 'partial')`` — the
+          same check :meth:`_is_enrichment_job_current` performs, but
+          atomic with the write. ANY write that matches zero rows (guarded
+          no-match, or an unguarded write against an absent row) returns the
+          :data:`ENRICHMENT_WRITE_NOT_CURRENT` sentinel so callers can react
+          (stale marker / silent skip); ``None`` keeps its pre-existing
+          meaning (sqlite error or no pool) and callers must NOT treat it as
+          no-match. The unguarded processing-stamp caller may therefore
+          receive the sentinel when its row is absent — harmless, because a
+          CAS keyed on the sentinel can never match a real row.
         """
         if self.pool is None:
             return None
         updated_at = datetime.now(UTC).isoformat()
+        status_sql = "?"
+        params: list[Any] = [status]
+        if status == "complete":
+            # Shared aggregate mapping: atom-stage truth decides the value.
+            status_sql = "(" + aggregate_status_case_sql() + ")"
+            params = []
+        params = params + [error_message, updated_at, file_id]
+        where = "WHERE id = ?"
+        if require_file_hash is not None:
+            where = (
+                "WHERE id = ? AND file_hash = ? "
+                "AND status IN ('indexed', 'partial')"
+            )
+            params = params + [require_file_hash]
         try:
             async with write_session(self.pool, self._write_semaphore) as conn:
-                conn.execute(
-                    """
+                # The only interpolated fragments are the module-level CASE
+                # expression and the literal WHERE shapes; every value is a
+                # bound parameter (issues #1075/#1076).
+                cursor = conn.execute(
+                    f"""
                     UPDATE files
-                    SET enrichment_status = ?,
+                    SET enrichment_status = {status_sql},
                         enrichment_error = ?,
                         enrichment_updated_at = ?
-                    WHERE id = ?
+                    {where}
                     """,
-                    (status, error_message, updated_at, file_id),
+                    params,
                 )
                 conn.commit()
+                if cursor.rowcount == 0:
+                    return ENRICHMENT_WRITE_NOT_CURRENT
             return updated_at
         except sqlite3.Error as e:
             logger.warning(
@@ -1601,9 +1656,30 @@ class DocumentProcessor:
             return None
 
     async def _mark_enrichment_stale_if_current_job(
-        self, file_id: int, processing_started_at: Optional[str]
+        self,
+        file_id: int,
+        processing_started_at: Optional[str],
+        error_message: str = (
+            "Enrichment job became stale before completion; base index remains available"
+        ),
     ) -> None:
-        """Finish the same enrichment attempt if it becomes stale mid-flight."""
+        """Finish the same enrichment attempt with a terminal error, CAS-guarded.
+
+        The write lands only while THIS attempt still owns the row
+        (``processing`` + this attempt's own ``enrichment_updated_at`` stamp),
+        so the cancellation/stale write cannot clobber a newer job's terminal
+        state while that ownership holds (issues #1075/#1076). Scope note
+        (PR #1093 review): the guarantee covers THIS CAS only — the unguarded
+        ``processing`` entry stamp itself (predates this change) and the
+        synchronous pre-stamp window are outside it, and an atom sync
+        interleaved before the cancel takes the row (pinned by the
+        ``test_cancelled_write_yields_to_interleaved_atom_aggregate``
+        residual). ``error_message`` parameterizes the marker text: the
+        stale marker by default, and the cancellation marker from the
+        ``except asyncio.CancelledError`` handler — the detached task keeps
+        its #704 survival (the write outlives the cancelled coroutine) while
+        gaining the same currency guarantee.
+        """
         if self.pool is None or processing_started_at is None:
             return
         try:
@@ -1619,7 +1695,7 @@ class DocumentProcessor:
                       AND enrichment_updated_at = ?
                     """,
                     (
-                        "Enrichment job became stale before completion; base index remains available",
+                        error_message,
                         datetime.now(UTC).isoformat(),
                         file_id,
                         processing_started_at,
@@ -2566,12 +2642,21 @@ class DocumentProcessor:
 
         enrichment_service = self._get_chunk_enrichment_service(vault_id, file_id)
         if enrichment_service is None:
-            await self.set_enrichment_status(file_id, "complete")
+            # Issues #1075/#1076: guarded + atom-aware. The early arms run
+            # BEFORE the 'processing' stamp, so a NOT_CURRENT result means a
+            # newer ingest owns the row — skip silently (there is no attempt
+            # stamp to mark stale against), leaving the newer lifecycle's
+            # state untouched.
+            await self.set_enrichment_status(
+                file_id, "complete", require_file_hash=file_hash
+            )
             return
 
         candidates = self._candidate_chunks_for_enrichment(file_id, chunks)
         if not candidates:
-            await self.set_enrichment_status(file_id, "complete")
+            await self.set_enrichment_status(
+                file_id, "complete", require_file_hash=file_hash
+            )
             return
 
         source_filename = Path(file_path).name
@@ -2601,17 +2686,22 @@ class DocumentProcessor:
                 if getattr(enrichment, "error", None)
             ]
             if failed_enrichments:
-                if not self._is_enrichment_job_current(file_id, file_hash):
-                    await self._mark_enrichment_stale_if_current_job(
-                        file_id, processing_started_at
-                    )
-                    return
-                await self.set_enrichment_status(
+                # Issues #1075/#1076: single atomic currency-guarded write —
+                # the hash/status predicate moves into the UPDATE, closing
+                # the check-then-write race; the stale marker fires only on
+                # the NOT_CURRENT sentinel (a sqlite error keeps today's
+                # swallow-and-do-nothing behavior).
+                outcome = await self.set_enrichment_status(
                     file_id,
                     "error",
                     format_ingest_error(INGEST_ERROR_ENRICHMENT_FAILED)
                     + f" ({len(failed_enrichments)} of {len(enrichments)} chunks)",
+                    require_file_hash=file_hash,
                 )
+                if outcome == ENRICHMENT_WRITE_NOT_CURRENT:
+                    await self._mark_enrichment_stale_if_current_job(
+                        file_id, processing_started_at
+                    )
                 return
             enrichment_by_uid = {
                 enrichment.chunk_id: enrichment
@@ -2619,7 +2709,15 @@ class DocumentProcessor:
                 if self._enrichment_has_content(enrichment)
             }
             if not enrichment_by_uid:
-                await self.set_enrichment_status(file_id, "complete")
+                # Issues #1075/#1076: guarded + atom-aware; post-stamp, so a
+                # NOT_CURRENT result falls back to the stale marker.
+                outcome = await self.set_enrichment_status(
+                    file_id, "complete", require_file_hash=file_hash
+                )
+                if outcome == ENRICHMENT_WRITE_NOT_CURRENT:
+                    await self._mark_enrichment_stale_if_current_job(
+                        file_id, processing_started_at
+                    )
                 return
 
             enrichment_texts = [
@@ -2664,7 +2762,15 @@ class DocumentProcessor:
                 return
             await self._swap_in_enriched_vector_records(records, old_ids)
             await self._verify_vector_rows_visible(file_id)
-            await self.set_enrichment_status(file_id, "complete")
+            # Issues #1075/#1076: guarded + atom-aware; post-stamp, so a
+            # NOT_CURRENT result falls back to the stale marker.
+            outcome = await self.set_enrichment_status(
+                file_id, "complete", require_file_hash=file_hash
+            )
+            if outcome == ENRICHMENT_WRITE_NOT_CURRENT:
+                await self._mark_enrichment_stale_if_current_job(
+                    file_id, processing_started_at
+                )
         except asyncio.CancelledError:
             # The status write must survive a pending cancellation (the
             # sync-era write always completed; issue #704 made it async).
@@ -2674,11 +2780,18 @@ class DocumentProcessor:
             # ("Task was destroyed but it is pending"), leaking the permit
             # and a pool slot and leaving enrichment_status='processing'
             # forever (issue #704 review, PRR-006).
+            # Issues #1075/#1076: the write is the attempt-stamp CAS
+            # (processing + this attempt's own enrichment_updated_at), so a
+            # cancelled superseded attempt can never clobber a newer job's
+            # terminal row; #704 survival is unchanged — only the coroutine
+            # body is the CAS. Disclosed residual (decision D1): an atom
+            # sync that interleaves between this attempt's stamp and the
+            # cancel takes the row and the CAS does not fire.
             status_task = asyncio.ensure_future(
-                self.set_enrichment_status(
+                self._mark_enrichment_stale_if_current_job(
                     file_id,
-                    "error",
-                    "Enrichment job cancelled before completion",
+                    processing_started_at,
+                    error_message="Enrichment job cancelled before completion",
                 )
             )
             self._detached_status_tasks.add(status_task)
@@ -2692,19 +2805,20 @@ class DocumentProcessor:
             logger.warning(
                 "Post-index enrichment failed for file_id=%s: %s", file_id, e
             )
-            # PR #1073 review ASK (user-approved): the terminal write is
-            # currency-guarded like the failed-candidate block and the swap
-            # tail — a superseded attempt (a newer job re-ingested and wrote
-            # its own terminal state mid-flight) must never clobber the newer
-            # job's enrichment row.
-            if not self._is_enrichment_job_current(file_id, file_hash):
+            # PR #1073 review ASK (user-approved) + issues #1075/#1076: the
+            # sequential check becomes a single atomic currency-guarded
+            # write (the hash/status predicate moves into the UPDATE);
+            # the stale marker fires only on the NOT_CURRENT sentinel.
+            outcome = await self.set_enrichment_status(
+                file_id,
+                "error",
+                format_ingest_error(INGEST_ERROR_ENRICHMENT_FAILED),
+                require_file_hash=file_hash,
+            )
+            if outcome == ENRICHMENT_WRITE_NOT_CURRENT:
                 await self._mark_enrichment_stale_if_current_job(
                     file_id, processing_started_at
                 )
-                return
-            await self.set_enrichment_status(
-                file_id, "error", format_ingest_error(INGEST_ERROR_ENRICHMENT_FAILED)
-            )
 
     @with_retry(
         max_attempts=3, retry_exceptions=(sqlite3.Error,), raise_last_exception=True
@@ -2746,8 +2860,9 @@ class DocumentProcessor:
         Check for any existing file with this hash in any non-terminal state.
 
         Used by the async upload route to collapse two concurrent uploads of the
-        same content to a single ingestion. ``_check_duplicate`` only matches
-        ``status='indexed'`` (its legacy semantic for synchronous callers); the
+        same content to a single ingestion. ``_check_duplicate`` matches
+        ``status IN ('indexed', 'partial')`` — the #693-widened semantics
+        ('partial' is a content-available state that owns its slot); the
         async route inserts rows with ``status='pending'`` first, so it needs to
         reject duplicates at every stage of the pipeline, not just indexed.
 
@@ -4867,6 +4982,7 @@ class DocumentProcessor:
         file_hash: Optional[str] = None,
         vector_target: object | None = None,
         retry_context: str = "upload",
+        progress_cb: Optional[object] = None,
     ) -> ProcessedDocument:
         """Process a file whose `files` row already exists.
 
@@ -4876,6 +4992,16 @@ class DocumentProcessor:
         retryable and never write status='error') vs "reindex" (the reindex
         job path, where a disturbed attempt may truthfully settle to a
         selectable 'error' the next reindex pass re-selects).
+
+        ``progress_cb`` (issue #1020, reindex callers only) is a non-raising
+        per-embedding-batch progress callback object exposing a ``lost``
+        attribute: when the fenced watermark refresh records a lost lease
+        fence mid-batch, ``embed_batch`` raises ``EmbeddingProgressLost``
+        and the guard below stops the file BEFORE any vector/atom write,
+        restoring the row's pre-ingest status exactly like a cancellation —
+        the file never strands in ``processing``. The default call to
+        ``embed_batch`` stays exactly ``embed_batch(texts, fail_fast=False)``
+        when no callback is supplied (existing doubles keep working).
 
         Used by the async upload path: the route inserts the `files` row
         with status='pending' / phase='queued' and a duplicate-hash check
@@ -5150,9 +5276,33 @@ class DocumentProcessor:
                         percent=0.0,
                     )
                     stage_started_at = time.monotonic()
-                    embeddings_result = await self.embedding_service.embed_batch(
-                        texts, fail_fast=False
-                    )
+                    # Issue #1020: the reindex path passes a per-batch
+                    # progress callback; the call stays byte-identical for
+                    # every other caller (upload path, doubles).
+                    if progress_cb is not None:
+                        embeddings_result = (
+                            await self.embedding_service.embed_batch(
+                                texts, fail_fast=False, progress_cb=progress_cb
+                            )
+                        )
+                    else:
+                        embeddings_result = (
+                            await self.embedding_service.embed_batch(
+                                texts, fail_fast=False
+                            )
+                        )
+                    # Belt-and-braces guard (issue #1020): embed_batch raises
+                    # EmbeddingProgressLost on a lost fence, but if a
+                    # non-raising double returned normally while the callback
+                    # recorded loss, stop HERE — before any vector write, atom
+                    # publication, or partial-failure bookkeeping below.
+                    if progress_cb is not None and bool(
+                        getattr(progress_cb, "lost", False)
+                    ):
+                        raise EmbeddingProgressLost(
+                            "embedding stage lost its progress fence "
+                            "(issue #1020); no vectors written"
+                        )
                     _add_elapsed_ms(stage_timings, "embedding_ms", stage_started_at)
                     batch_embeddings, failed_batch_indices = embeddings_result
 
@@ -5461,6 +5611,10 @@ class DocumentProcessor:
             if not prior_generation_disturbed and pre_ingest_status in (
                 "indexed",
                 "partial",
+                # Issue #963 review (08b round-2 residual): the reindex
+                # selection includes error rows, whose truthful pre-attempt
+                # state is selectable again — restore them too.
+                "error",
             ):
                 async with self._write_session() as conn:
                     conn.execute(
@@ -5489,10 +5643,78 @@ class DocumentProcessor:
                 prior_generation_disturbed,
             )
             raise
+        except EmbeddingProgressLost:
+            # Issue #1020: the per-batch watermark refresh recorded a lost
+            # lease fence mid-embed. Same restoration contract as the
+            # cancellation arm above — vector/atom writes were suppressed by
+            # the embed-stage guard, and the row must never strand in
+            # 'processing': undisturbed restores the prior selectable status
+            # (indexed/partial, and 'error' — the reindex selection includes
+            # error rows, whose truthful pre-attempt state is selectable
+            # again); a disturbed reindex attempt settles to the selectable
+            # interrupted 'error' the next pass re-selects.
+            if not prior_generation_disturbed and pre_ingest_status in (
+                "indexed",
+                "partial",
+                "error",
+            ):
+                async with self._write_session() as conn:
+                    conn.execute(
+                        "UPDATE files SET status = ? WHERE id = ? "
+                        "AND status = 'processing'",
+                        (pre_ingest_status, file_id),
+                    )
+                    conn.commit()
+            elif prior_generation_disturbed and retry_context == "reindex":
+                async with self._write_session() as conn:
+                    self._update_status(
+                        file_id,
+                        "error",
+                        conn,
+                        error_message=format_ingest_error(
+                            INGEST_ERROR_REINDEX_INTERRUPTED
+                        ),
+                    )
+                    conn.commit()
+            logger.info(
+                "Existing-file embedding stopped for file_id=%s: the reindex "
+                "attempt lost its progress fence mid-batch (retry_context="
+                "%s, disturbed=%s); row restored to a selectable state "
+                "(issue #1020)",
+                file_id,
+                retry_context,
+                prior_generation_disturbed,
+            )
+            raise
         except Exception as e:
             # Raw exception stays in the server log; persisted fields are
             # user-facing (issue #562).
             logger.exception("Existing-file ingestion failed for file_id=%s", file_id)
+            if progress_cb is not None and bool(getattr(progress_cb, "lost", False)):
+                # Issue #1020 precedence: a lost lease fence outranks a
+                # provider/batch failure — the restoration contract of the
+                # dedicated arm above (not per-file failure handling) owns
+                # the row's final state. This belt path is reachable only
+                # through a non-raising double that returned normally while
+                # its callback recorded loss; run the same undisturbed
+                # restore inline before raising so the row cannot strand in
+                # 'processing' here either.
+                if not prior_generation_disturbed and pre_ingest_status in (
+                    "indexed",
+                    "partial",
+                    "error",
+                ):
+                    async with self._write_session() as conn:
+                        conn.execute(
+                            "UPDATE files SET status = ? WHERE id = ? "
+                            "AND status = 'processing'",
+                            (pre_ingest_status, file_id),
+                        )
+                        conn.commit()
+                raise EmbeddingProgressLost(
+                    "embedding stage lost its progress fence "
+                    "(issue #1020); provider error suppressed"
+                ) from e
             if self.is_cancel_requested(file_id):
                 # issue #783: the failure raced a user cancel; the terminal
                 # 'cancelled' must not be clobbered with 'error'.

@@ -268,3 +268,25 @@ def secure_filename(filename: str) -> str:
     filename = re.sub(r"[^a-zA-Z0-9._-]", "", filename)
 
     return filename
+
+
+#: Path separators that are CONTENT in a user-authored title/name but would be
+#: treated as path structure by ``secure_filename`` (which basenames first, so
+#: "A/B notes" would silently lose "A/"). Issue #789 introduced the fold for
+#: draft export filenames; issues #902 generalize it to every content-title
+#: call site. Upload FILENAME callers keep raw ``secure_filename`` semantics —
+#: a client-supplied path in an upload filename is hostile, not content.
+_TITLE_SEPARATOR_RE = re.compile("[/\\\\]")
+
+
+def fold_title_separators(text: str) -> str:
+    r"""Rewrite title/path separators to underscores before sanitizing.
+
+    ``secure_filename`` strips client *paths* (``os.path.basename`` first), so
+    feeding it a raw title silently drops everything before a ``/`` or ``\``
+    (issue #789: ``A/B test results`` exported as ``B_test_results``). In a
+    title the separator is content, not a path, so it is rewritten to an
+    underscore before sanitizing; the ASCII-safe name itself is unchanged for
+    pure-ASCII separator-free titles.
+    """
+    return _TITLE_SEPARATOR_RE.sub("_", text)

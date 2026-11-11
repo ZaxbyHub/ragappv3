@@ -68,8 +68,9 @@ Repository contract job:
   CONTRIBUTING's env step names `backend/.env`.
 - `python scripts/check_pr_scope_drift.py`
 - `python scripts/check_sast_baseline.py` — fails if the SAST baseline grew on
-  the PR (suppresses new findings without `SAST_ALLOW_BASELINE_EXPANSION=1`),
-  if the `sast` CI job no longer runs `run_bandit.py`, or if the scan scope
+  the PR (suppresses new findings; intentional growth needs
+  `SAST_ALLOW_BASELINE_EXPANSION=1` with per-ID justification), fails if the
+  `sast` CI job no longer runs `run_bandit.py`, or if the scan scope
   (`TARGET`) drifted from `backend/app`.
 - `python scripts/check_secretscan.py` — fails if `.secretscanignore` has
   unparseable globs, adversarial positive samples are not ignored, or
