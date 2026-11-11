@@ -17,15 +17,27 @@
 // rendered); row keys never appear as DOM text; buttons are named plain
 // "Cancel" / "Retry".
 
-import { useRef, useState } from "react";
+import { useContext, useRef, useState } from "react";
+import { QueryClientContext } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { useActivityJobs } from "@/hooks/useJobStatus";
 import type { ActivityJobRow } from "@/hooks/useJobStatus";
 import { cancelDocumentIngest } from "@/lib/api";
-import { cancelDraftJob, retryDraftJob } from "@/lib/api/draftRoom";
+import {
+  cancelDraftJob,
+  draftRoomKeys,
+  isDraftRoomErrorCode,
+  retryDraftJob,
+} from "@/lib/api/draftRoom";
 import { cancelWikiJob, retryWikiJob } from "@/lib/api/wiki";
-import { Activity, ChevronDown, Loader2, RotateCcw, XCircle } from "lucide-react";
+import {
+  Activity,
+  ChevronDown,
+  Loader2,
+  RotateCcw,
+  XCircle,
+} from "lucide-react";
 
 function rowPhaseTone(row: ActivityJobRow): string {
   if (row.status === "failed") {
@@ -71,15 +83,54 @@ export function ActivityTray() {
   const focusedKeyRef = useRef<string | null>(null);
   const prevRowKeysRef = useRef<Set<string>>(new Set());
 
+  // Context-optional client read (#911): the real app always mounts the
+  // provider, but shell-level tests render the tray bare — useQueryClient
+  // throws there. A missing client degrades the worker_unavailable
+  // capabilities refetch to a no-op, which is the correct behavior for a
+  // consumer with no cache to invalidate.
+  const queryClient = useContext(QueryClientContext);
+  // #905: a tray Retry's Idempotency-Key is bound to the retry identity
+  // (draft + parent job), not to request settlement — a second click on the
+  // same (not yet refreshed) failed row replays the same key, while a new
+  // parent job rotates it naturally.
+  const retryKeysRef = useRef<Map<string, string>>(new Map());
+
+  function retryKeyFor(draftId: number, jobId: number): string {
+    const identity = `${draftId}:${jobId}`;
+    let key = retryKeysRef.current.get(identity);
+    if (key == null) {
+      key =
+        typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+          ? crypto.randomUUID()
+          : `draft-retry-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      retryKeysRef.current.set(identity, key);
+    }
+    return key;
+  }
+
+  function invalidateCapabilitiesOnWorkerError(err: unknown) {
+    // #911: a worker_unavailable rejection means the server-side liveness
+    // read just changed — refetch capabilities now instead of waiting out
+    // the stale window. Other 503s say nothing about worker liveness.
+    if (isDraftRoomErrorCode(err, "worker_unavailable")) {
+      queryClient?.invalidateQueries({
+        queryKey: draftRoomKeys.capabilities(),
+      });
+    }
+  }
+
   async function runAction(
     row: ActivityJobRow,
     action: () => Promise<unknown>,
-    failureLabel: string
+    failureLabel: string,
   ) {
     setPendingKey(row.key);
     try {
       await action();
     } catch (e) {
+      if (row.family === "draft-room") {
+        invalidateCapabilitiesOnWorkerError(e);
+      }
       if (errorStatus(e) === 403) {
         // A 403 means this user lacks the server-side gate for that action
         // on that row: stop offering an affordance that can only ever fail.
@@ -98,23 +149,57 @@ export function ActivityTray() {
 
   function handleCancel(row: ActivityJobRow) {
     if (row.family === "wiki" && row.jobId != null && row.vaultId != null) {
-      return runAction(row, () => cancelWikiJob(row.jobId as number, row.vaultId as number), "Cancel failed");
+      return runAction(
+        row,
+        () => cancelWikiJob(row.jobId as number, row.vaultId as number),
+        "Cancel failed",
+      );
     }
-    if (row.family === "draft-room" && row.draftId != null && row.jobId != null) {
-      return runAction(row, () => cancelDraftJob(row.draftId as number, row.jobId as number), "Cancel failed");
+    if (
+      row.family === "draft-room" &&
+      row.draftId != null &&
+      row.jobId != null
+    ) {
+      return runAction(
+        row,
+        () => cancelDraftJob(row.draftId as number, row.jobId as number),
+        "Cancel failed",
+      );
     }
     if (row.family === "ingest" && row.fileId != null) {
-      return runAction(row, () => cancelDocumentIngest(row.fileId as string), "Cancel failed");
+      return runAction(
+        row,
+        () => cancelDocumentIngest(row.fileId as string),
+        "Cancel failed",
+      );
     }
     return Promise.resolve();
   }
 
   function handleRetry(row: ActivityJobRow) {
     if (row.family === "wiki" && row.jobId != null && row.vaultId != null) {
-      return runAction(row, () => retryWikiJob(row.jobId as number, row.vaultId as number), "Retry failed");
+      return runAction(
+        row,
+        () => retryWikiJob(row.jobId as number, row.vaultId as number),
+        "Retry failed",
+      );
     }
-    if (row.family === "draft-room" && row.draftId != null && row.jobId != null) {
-      return runAction(row, () => retryDraftJob(row.draftId as number, row.jobId as number), "Retry failed");
+    if (
+      row.family === "draft-room" &&
+      row.draftId != null &&
+      row.jobId != null
+    ) {
+      return runAction(
+        row,
+        () =>
+          retryDraftJob(
+            row.draftId as number,
+            row.jobId as number,
+            {},
+            retryKeyFor(row.draftId as number, row.jobId as number),
+          ),
+        "Retry failed",
+      );
     }
     return Promise.resolve();
   }
@@ -213,10 +298,15 @@ export function ActivityTray() {
                     <span className="text-xs font-medium uppercase tracking-wide text-foreground">
                       {row.family}
                     </span>
-                    <span className={`text-xs ${rowPhaseTone(row)}`}>{row.phase}</span>
+                    <span className={`text-xs ${rowPhaseTone(row)}`}>
+                      {row.phase}
+                    </span>
                   </div>
                   <div className="flex items-center justify-between gap-2">
-                    <span className="truncate text-xs text-foreground" title={row.title}>
+                    <span
+                      className="truncate text-xs text-foreground"
+                      title={row.title}
+                    >
                       {row.title}
                     </span>
                     <span className="flex shrink-0 items-center gap-1">
@@ -231,7 +321,10 @@ export function ActivityTray() {
                             void handleCancel(row);
                           }}
                         >
-                          <XCircle className="mr-1 h-3 w-3" aria-hidden="true" />
+                          <XCircle
+                            className="mr-1 h-3 w-3"
+                            aria-hidden="true"
+                          />
                           Cancel
                         </Button>
                       )}
@@ -246,7 +339,10 @@ export function ActivityTray() {
                             void handleRetry(row);
                           }}
                         >
-                          <RotateCcw className="mr-1 h-3 w-3" aria-hidden="true" />
+                          <RotateCcw
+                            className="mr-1 h-3 w-3"
+                            aria-hidden="true"
+                          />
                           Retry
                         </Button>
                       )}

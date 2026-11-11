@@ -659,23 +659,23 @@ Every paginated response is `{items, total, page, per_page}` with `page>=1`, def
 
 | Method and path | Authorization | Success | Required behavior |
 |---|---|---:|---|
-| `GET /draft-room/capabilities` | current user | 200 | Return enabled state, non-secret allowed logical model modes, tier availability, limits, and export formats |
+| `GET /draft-room/capabilities` | current user | 200 | Return enabled state, non-secret allowed logical model modes, tier availability, limits, and export formats; `compile_available`/`upload_available`/`promote_available` reflect worker task liveness (a mounted-but-not-running or dead-poll-loop worker reports false) |
 | `POST /draft-room/drafts` | current user + vault `read` | 201 | Validate title/mode/brief, create owner-scoped project/event |
 | `GET /draft-room/drafts?vault_id=&status=&page=&per_page=` | current user | 200 | Return caller-owned metadata, including revoked-vault rows so the owner can delete them; annotate `vault_access` |
 | `GET /draft-room/drafts/{draft_id}` | owner + vault `read` | 200 | Return canonical detail; owner mismatch is 404 |
 | `PATCH /draft-room/drafts/{draft_id}` | owner + vault `read` | 200 | Update title/brief/tier using required `lock_version`; 409 on stale version or active compile |
 | `POST /draft-room/drafts/{draft_id}/archive` | owner + vault `read` | 200 | Require no active job; archive with `lock_version`; retain inputs and audit |
 | `POST /draft-room/drafts/{draft_id}/restore` | owner + vault `read` | 200 | Restore to `draft` or `needs_review` according to current revision; never restore directly to Ready |
-| `POST /draft-room/drafts/{draft_id}/inputs` | owner + vault `read` | 202 | Multipart `file`, `role`, `authority`, `as_of_date`; store and enqueue parse job |
+| `POST /draft-room/drafts/{draft_id}/inputs` | owner + vault `read` | 202/503 | Multipart `file`, `role`, `authority`, `as_of_date`; store and enqueue parse job |
 | `PATCH /draft-room/drafts/{draft_id}/inputs/{input_id}` | owner + vault `read` | 200 | Update role/authority/as-of/locked spans; not while compile active |
 | `GET /draft-room/drafts/{draft_id}/inputs/{input_id}/content` | owner + vault `read` | 200 | Return normalized parsed text for the selected input; never include it in list/detail summaries |
 | `DELETE /draft-room/drafts/{draft_id}/inputs/{input_id}` | owner + vault `read` | 204 | Reject if active/used by completed artifacts; otherwise use §6.3 tombstone deletion |
-| `POST /draft-room/drafts/{draft_id}/compile` | owner + vault `read` | 202 | Accept `CompileRequest`; require ready inputs; snapshot brief, input/revision hashes, prompt bundle, and model IDs; same `Idempotency-Key` may return its existing job, otherwise an active job is 409; a Ready draft is invalidated first |
+| `POST /draft-room/drafts/{draft_id}/compile` | owner + vault `read` | 202/503 | Accept `CompileRequest`; require ready inputs; snapshot brief, input/revision hashes, prompt bundle, and model IDs; same `Idempotency-Key` may return its existing job, otherwise an active job is 409; a Ready draft is invalidated first |
 | `GET /draft-room/drafts/{draft_id}/jobs/{job_id}` | owner + vault `read` | 200 | Canonical job/stage state |
 | `GET /draft-room/drafts/{draft_id}/jobs?job_type=&status=&page=&per_page=` | owner + vault `read` | 200 | Paginated project job history; supports parse retry/recovery UI |
 | `GET /draft-room/drafts/{draft_id}/jobs/{job_id}/stages?include_content=false` | owner + vault `read` | 200 | Ordered stage attempts and validated artifacts; include `content_md` only when explicitly true |
 | `POST /draft-room/drafts/{draft_id}/jobs/{job_id}/cancel` | owner | 200 | Allowed after vault revocation; pending→cancelled; running→set cancellation request |
-| `POST /draft-room/drafts/{draft_id}/jobs/{job_id}/retry` | owner + vault `read` | 202 | Accept `RetryJobRequest`; only failed/cancelled; create child job and preserve old audit; never accept `assemble` |
+| `POST /draft-room/drafts/{draft_id}/jobs/{job_id}/retry` | owner + vault `read` | 202/503 | Accept `RetryJobRequest`; only failed/cancelled; create child job and preserve old audit; never accept `assemble` |
 | `GET /draft-room/drafts/{draft_id}/events` | owner + vault `read` | 200 SSE | Authenticated fetch stream; DB released before generator begins |
 | `GET /draft-room/drafts/{draft_id}/revisions?page=&per_page=` | owner + vault `read` | 200 | Revision metadata newest first; no Markdown bodies |
 | `GET /draft-room/drafts/{draft_id}/revisions/{revision_id}` | owner + vault `read` | 200 | Exact immutable revision content/artifacts summary |
@@ -686,7 +686,7 @@ Every paginated response is `{items, total, page, per_page}` with `page>=1`, def
 | `POST /draft-room/drafts/{draft_id}/findings/{finding_id}/disposition` | owner + vault `read` | 200/201 | Apply/dismiss/waive through the exact contract below; applying creates a revision |
 | `POST /draft-room/drafts/{draft_id}/revisions/{revision_id}/ready` | owner + vault `read` | 200 | Apply §12.5 using `lock_version` and `acknowledge_source_only`; audit human approval |
 | `POST /draft-room/drafts/{draft_id}/revisions/{revision_id}/export` | owner + vault `read` | 200 file | `format='md'`; exact revision, sanitized filename, audit hash |
-| `POST /draft-room/drafts/{draft_id}/promote` | owner + vault `write` | 202 | PR 4; enqueue normal ingestion of selected input/revision |
+| `POST /draft-room/drafts/{draft_id}/promote` | owner + vault `write` | 202/503 | PR 4; enqueue normal ingestion of selected input/revision |
 | `DELETE /draft-room/drafts/{draft_id}` | owner | 204 | Allowed after vault access loss; cancel pending jobs; return 409 until a running job is cancelled; use tombstone deletion |
 
 For compile/retry idempotency, accept an ASCII `Idempotency-Key` of 1-128 characters. Reusing a key for the same authenticated user and identical request fingerprint returns the original job and status; reusing it for a different draft, input snapshot, base revision, or requested start stage returns `409`. Keys and request fingerprints persist with the job and are never recycled.
@@ -704,7 +704,8 @@ Export always returns the exact stored revision bytes and both `X-Draft-Fact-Sta
 - `415`: extension/content signature is unsupported or inconsistent.
 - `422`: request shape or brief validation fails.
 - `429`: compile/upload rate limit.
-- `503`: configured model/retrieval service unavailable before enqueue.
+- `503`: configured model/retrieval service unavailable before enqueue, or no live Draft Room worker can claim the enqueue (`worker_unavailable`; a genuine `Idempotency-Key` replay still returns its original job).
+- `503 commit_pending`: a live (uncancelled) upload request whose commit task did not settle within the commit drain budget; the detached commit task still owns the outcome (it will commit or compensate) — the client should check the inputs list rather than blindly re-upload. A cancelled request is drained under the same budget and the cancellation is re-raised (no response is sent).
 
 Draft Room custom errors preserve the repository's string `detail` while adding stable machine-readable fields: `{"detail":"lowercase message","code":"snake_case_code","context":{}}`. `context` is omitted when empty and may contain only documented non-secret scalar identifiers. Duplicate upload is exactly `409 {"detail":"input content already exists in this draft","code":"duplicate_input","context":{"existing_input_id":123}}`. Framework-generated validation errors retain FastAPI's standard `422` shape. Durable job failures additionally use stable `error_code` values such as `permission_revoked`, `input_parse_failed`, `retrieval_unavailable`, `model_unavailable`, `model_budget_exceeded`, `job_timeout`, `invalid_stage_output`, and `internal_error`.
 

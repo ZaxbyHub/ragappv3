@@ -69,13 +69,36 @@ services:
     image: redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
     container_name: knowledgevault_redis
     restart: unless-stopped
+    # Loopback-bound publish (#1061): local debugging keeps host access via
+    # 127.0.0.1:6379 while the port is no longer reachable from other
+    # interfaces. The bundled Redis also requires authentication — the same
+    # REDIS_PASSWORD token drives the command, the service env (which the
+    # healthcheck reads at runtime), and the backend REDIS_URL default below.
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
-    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    # maxmemory-policy caveat (#1061): allkeys-lru may evict csrf:* tokens AND
+    # rate-limit counters / admission-state hashes under memory pressure.
+    # CSRF eviction forces a re-challenge (not an auth bypass); evicted
+    # rate-limit counters reset that client's window allowance.
+    # List-form command (#1061 review round): NOT shell-parsed, so an operator
+    # password containing shell metacharacters cannot truncate the
+    # --requirepass value the way a string command would.
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru", "--requirepass", "${REDIS_PASSWORD:-knowledgevault-local-redis}"]
+    environment:
+      # Runtime env form (#1061 review round 2): the healthcheck reads the
+      # password from the container environment at runtime ($$ escapes compose
+      # interpolation), so no operator credential is ever interpolated into a
+      # shell string — a password containing a single quote cannot break out
+      # of the healthcheck command the way a '-quoted interpolation could.
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-knowledgevault-local-redis}
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      # PONG-grep form (#1061 review round): redis-cli exits 0 even on a WRONG
+      # password (AUTH failed), so an exit-code-only check cannot detect a
+      # credential mismatch; piping through grep -q PONG fails the healthcheck
+      # when authentication does not actually succeed.
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -203,7 +226,11 @@ services:
       - INITIAL_RETRIEVAL_TOP_K=${INITIAL_RETRIEVAL_TOP_K:-20}
       - HYBRID_SEARCH_ENABLED=${HYBRID_SEARCH_ENABLED:-true}
       - HYBRID_ALPHA=${HYBRID_ALPHA:-0.6}
-      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      # Bundled Redis requires authentication (#1061): the default URL carries
+      # the same REDIS_PASSWORD as the redis service. A non-empty operator
+      # REDIS_URL wins verbatim (and must carry credentials if it targets the
+      # bundled instance); an empty value falls back to this default.
+      - REDIS_URL=${REDIS_URL:-redis://:${REDIS_PASSWORD:-knowledgevault-local-redis}@redis:6379/0}
       # REQUIRED — no default, backend rejects empty values
       - ADMIN_SECRET_TOKEN=${ADMIN_SECRET_TOKEN}
       # REQUIRED — generate with: python -c "import secrets; print(secrets.token_urlsafe(48))"
@@ -246,16 +273,24 @@ services:
       #   - `- KEY=${KEY:-}` for str keys pinned by check_config_contract
       #     (APP_ROOT_PATH, MULTIMODAL_*): "" is their documented default.
       # Empty-string values remain MEANINGFUL in Settings (REDIS_URL="" →
-      # in-memory limiter) — do NOT add env_ignore_empty=True.
+      # in-memory limiter) — do NOT add env_ignore_empty=True. (Settings-layer
+      # statement: this interpolation's ${VAR:-} default substitutes for an
+      # empty REDIS_URL too, so an operator's empty override resolves to the
+      # bundled default HERE, not to "" — the in-memory-limiter meaning only
+      # applies to natively-set environments.)
       # Secrets (ADMIN_SECRET_TOKEN, JWT_SECRET_KEY) stay explicit above.
       # Keep in sync with .env.example (guarded by
       # backend/tests/test_issue494_compose_env_forwarding.py and
       # ..._compose_literal_values.py).
       # ------------------------------------------------------------------
       - EVAL_ENABLED
-      # Concurrency: forwarded so the health module's worker guard
-      # (health.py _warn_multi_worker_cache) is live on scale-out
-      # deployments — default 1 keeps the single-worker default silent.
+      # Concurrency: the image CMD pins `--workers 1` (issue #748) and
+      # uvicorn reads this env only when --workers is absent, so the
+      # container always runs a single worker. The health module's
+      # multi-worker cache guard still keys on this env (a value != 1 emits
+      # the per-worker-cache warning even in the single-worker container).
+      # Compose forwarding cannot reach bare-metal/native uvicorn runs —
+      # set the env in the process environment for those.
       - WEB_CONCURRENCY=${WEB_CONCURRENCY:-1}
       # Shared inference admission + telemetry (issue #518, E3). Budgets
       # default generous (see .env.example); ADMISSION_STORE_URL empty =
@@ -290,7 +325,10 @@ services:
       # Document processing & retrieval
       - CHUNK_SIZE_CHARS
       - CHUNK_OVERLAP_CHARS
-      - DOCUMENT_PARSING_STRATEGY=${DOCUMENT_PARSING_STRATEGY:-}
+      # Short pass-through form (#1061): an unset key is omitted entirely so
+      # Settings keeps its code default; the ${VAR:-} empty-default form
+      # crash-looped the container (enum-strict validator rejects "").
+      - DOCUMENT_PARSING_STRATEGY
       - RETRIEVAL_TOP_K
       - MAX_DISTANCE_THRESHOLD
       - VECTOR_METRIC=${VECTOR_METRIC:-}
@@ -338,6 +376,15 @@ services:
       - "host.docker.internal:host-gateway"
     depends_on:
       redis:
+        condition: service_healthy
+      # Wait for the embedder the strict TEI model validation probes (issue
+      # #748, T1-04-S2-07): without this, a fresh `up` can start the app before
+      # harrier-embed is ready and the strict check silently self-skips (its
+      # except arm re-raises only its own RuntimeError). start_period
+      # grace-marks early probe failures but is NOT a wait deadline — an
+      # embedder that never reports healthy leaves this service waiting
+      # (README Troubleshooting; CPU-only hosts use docker-compose.cpu.yml).
+      harrier-embed:
         condition: service_healthy
     healthcheck:
       # Readiness probe (/api/healthz) instead of the always-200 liveness

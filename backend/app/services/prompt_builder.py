@@ -4,6 +4,7 @@ Handles building system prompts, user messages, and formatting context for LLM.
 """
 
 import dataclasses
+import hashlib
 import logging
 import re
 import sqlite3
@@ -129,9 +130,98 @@ def _header_escape(value: str) -> str:
     In addition to HTML/XML escaping, normalize control characters and
     whitespace that could break the header line or enable injection:
     - ``\\r\\n``, ``\\n``, ``\\r`` → space (prevent line-break injection)
+    - Unicode line/paragraph separators (U+2028, U+2029), vertical tab,
+      form feed, NEL (\\x85), NUL, and the ASCII information separators
+      U+001C-U+001E (str.splitlines() treats all of these as line breaks —
+      review pr1105-20261109 F-5) → space
     """
-    value = value.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+    for _sep in (
+        "\r\n", "\n", "\r", "\u2028", "\u2029", "\x0b", "\x0c", "\x85", "\x00",
+        "\x1c", "\x1d", "\x1e",
+    ):
+        value = value.replace(_sep, " ")
     return _xml_escape(value)
+
+
+# Wrapper tags the builder emits around untrusted content. A system prompt
+# (built-in default, DB-active version, or per-query override) should
+# declare each of these under its SECURITY BOUNDARY clause; serving or
+# activating one that does not triggers a warning (#925).
+_BUILDER_WRAPPER_TAGS: tuple = (
+    "<document>",
+    "<memory>",
+    "<wiki_evidence>",
+    "<kms_evidence>",
+    "<user_message>",
+    "<user_query>",
+    "<visual_observation>",
+)
+
+# Per-process dedupe for serving-time declaration warnings: one warning per
+# (prompt identity, tag) so repeated queries do not spam the log (#925).
+_SERVED_MISSING_DECL_WARNED: set = set()
+
+
+def missing_tag_declarations(content: str) -> List[str]:
+    """Return the builder-emitted wrapper tags a system prompt leaves
+    undeclared.
+
+    "Declared" means the tag is named inside the prompt's SECURITY BOUNDARY
+    clause — the blank-line-delimited paragraph starting with the literal
+    ``SECURITY BOUNDARY:`` (review pr1105-20261109: the docstring previously
+    said "sentence"; the implemented scope is the paragraph, whose END
+    truncation and untrusted requirement are pinned by test). A tag merely
+    mentioned elsewhere in the prompt (prose, examples) does NOT count — the
+    model is only told to distrust what the boundary clause enumerates
+    (#925). The clause must also mark the content UNTRUSTED: a boundary
+    paragraph that names a tag without the literal ``untrusted`` (e.g. an
+    inverted "<user_query> is trusted" clause) declares nothing, so every
+    tag is reported missing and the audit warns (Multi-Stage BOT-1 / review
+    api-schema-migrations-001).
+    """
+    if not content:
+        return list(_BUILDER_WRAPPER_TAGS)
+    declared: List[str] = []
+    boundary_start = content.find("SECURITY BOUNDARY:")
+    if boundary_start != -1:
+        boundary_text = content[boundary_start:]
+        # The clause runs to the next blank line (paragraph break); tolerate
+        # CRLF separators (review pr1105-20261109 F-3).
+        boundary_text = re.split(r"\r?\n\r?\n", boundary_text, maxsplit=1)[0]
+        if "untrusted" in boundary_text.lower():
+            declared = [
+                tag for tag in _BUILDER_WRAPPER_TAGS if tag in boundary_text
+            ]
+    return [tag for tag in _BUILDER_WRAPPER_TAGS if tag not in declared]
+
+
+def warn_missing_prompt_declarations(
+    content: str, emitted_tags: List[str], *, once_key: Optional[str] = None
+) -> None:
+    """Log a WARNING naming every EMITTED tag the prompt leaves undeclared.
+
+    Rate-limited once per process per (once_key, tag) so serving-time audits
+    do not spam; activation-time callers pass once_key=None to always warn.
+    Warning text carries tag names only, never prompt content. An empty
+    effective prompt declares nothing, so it is audited like any other
+    (review pr1105-20261109 PRR-015 — the early return silently skipped it).
+    """
+    if not emitted_tags:
+        return
+    missing = [t for t in missing_tag_declarations(content) if t in emitted_tags]
+    for tag in missing:
+        if once_key is not None:
+            dedupe_key = (once_key, tag)
+            if dedupe_key in _SERVED_MISSING_DECL_WARNED:
+                continue
+            _SERVED_MISSING_DECL_WARNED.add(dedupe_key)
+        logger.warning(
+            "prompt-declaration-audit: effective prompt does not declare "
+            "the %s tag under a SECURITY BOUNDARY clause; evidence rendered "
+            "with this tag will not be covered by the boundary instruction "
+            "(activate a prompt version that declares all emitted tags)",
+            tag,
+        )
 
 
 def format_wiki_evidence(evidence: "WikiEvidence", index: int) -> str:
@@ -401,12 +491,56 @@ class PromptBuilderService:
                 "from the provided evidence."
             )
 
-        # Truncate history to last N messages to prevent context overflow
+        # Serving-time declaration audit (#925): warn when the effective
+        # prompt (override, DB-active, or default) leaves a tag THIS build
+        # actually emits undeclared. The built-in default declares all of
+        # them, so a warning here indicts a stored/overriding prompt.
+        # Rate-limited once per process per (prompt-identity, tag), keyed on
+        # a digest of the FULL served text — the earlier 120-char prefix key
+        # let different prompts sharing a preamble suppress each other's
+        # warnings (review pr1105-20261109 PRR-001/F-7).
+        _emitted: List[str] = ["<user_query>"]  # user_input is always wrapped
+        if chat_history:
+            _emitted.append("<user_message>")
+        if memories:
+            _emitted.append("<memory>")
+        if wiki_evidence:
+            _emitted.append("<wiki_evidence>")
+        if kms_evidence:
+            _emitted.append("<kms_evidence>")
+        if chunks:
+            _emitted.append("<document>")
+        if any(
+            getattr(chunk, "vision_observation", None) for chunk in chunks or []
+        ):
+            # format_chunk renders chunk.vision_observation under this tag
+            # (review pr1105-20261109 PRR-007: the audit never listed it).
+            _emitted.append("<visual_observation>")
+        warn_missing_prompt_declarations(
+            effective_prompt,
+            _emitted,
+            once_key=hashlib.sha256(
+                effective_prompt.encode("utf-8", errors="replace")
+            ).hexdigest(),
+        )
+
+        # Truncate history to last N messages to prevent context overflow.
+        # Each turn is wrapped in the declared <user_message> untrusted
+        # wrapper (#925): escaping stays (tag integrity — a raw
+        # </user_message> payload in a prior turn must not break out), but
+        # the model now reads the text inside a declared boundary tag
+        # instead of loose entity-encoded prose. Rendered as an f-string so
+        # the repo-wide escape census (test_c06_service_escape_ast_census)
+        # sees and pins the interpolation (review PRR-006), and via
+        # _header_escape so line/paragraph-separator code points cannot
+        # spoof lines inside the wrapper region (review PRR-017/F-5).
         max_history = 20
         history_messages: List[Dict[str, Any]] = []
         for entry in chat_history[-max_history:]:
             safe_entry = dict(entry)
-            safe_entry["content"] = _xml_escape(safe_entry.get("content") or "")
+            safe_entry["content"] = (
+                f"<user_message>{_header_escape(str(safe_entry.get('content') or ''))}</user_message>"
+            )
             if safe_entry.get("role") not in {"user", "assistant"}:
                 continue
             history_messages.append(safe_entry)
@@ -803,7 +937,13 @@ class PromptBuilderService:
             header_parts.append(f"id: {chunk.file_id}")
         ctx_note = chunk.metadata.get("contextual_context", "")
         if ctx_note:
-            header_parts.append(f"context: {_header_escape(ctx_note[:200])}")
+            # 4.2 sweep: bound the ESCAPED header field, not the raw text
+            # (clip-before-escape could inflate the rendered header ~6x).
+            from app.services.query_transformer import _escape_clip
+
+            header_parts.append(
+                f"context: {_escape_clip(ctx_note, 200, escape_fn=_header_escape)}"
+            )
 
         header = " | ".join(header_parts)
 

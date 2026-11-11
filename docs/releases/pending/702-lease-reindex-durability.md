@@ -45,8 +45,10 @@ Workstream B PR 13 of 16 (frontier audit 20260923T174456Z, findings P02-SK2-01/-
   cap resync acts only on jobs newly capped by that sweep (a job-id diff), so
   a historical capped job can never flip an unrelated pending file to
   `error` (P02-SK2-07).
-- The boot sync never mints a fresh zero-attempt job for a file whose job
-  settled terminally at the attempts cap — keyed on terminal-at-cap
+- The boot sync never mints a fresh zero-attempt job for a file whose
+  LATEST job settled terminally at the attempts cap (#872: a capped
+  failure superseded by a later ingestion job no longer excludes the
+  file) — keyed on terminal-at-cap
   (`status='failed' AND attempts >= JOBS_MAX_ATTEMPTS`) regardless of the
   row's error text, because the literal marker is only written when the
   error column was empty (a requeue-then-crash job keeps its old error) —

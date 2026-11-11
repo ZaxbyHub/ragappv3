@@ -8,7 +8,14 @@
 // DraftRevisionDiff are left REAL — the real findings panel provides the
 // focusable row, and the real diff proves the compare wiring end to end.
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
-import { render as rtlRender, screen, within, waitFor, fireEvent, cleanup } from "@testing-library/react";
+import {
+  render as rtlRender,
+  screen,
+  within,
+  waitFor,
+  fireEvent,
+  cleanup,
+} from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
@@ -46,7 +53,9 @@ vi.mock("sonner", () => ({
 // deliberately NOT mocked — the real row focus target and diff UI are the
 // behaviors under test) -----------------------------------------------
 vi.mock("./DraftAssignmentForm", async () => {
-  const actual = await vi.importActual<typeof import("./DraftAssignmentForm")>("./DraftAssignmentForm");
+  const actual = await vi.importActual<typeof import("./DraftAssignmentForm")>(
+    "./DraftAssignmentForm",
+  );
   return {
     ...actual,
     DraftAssignmentForm: () => <div data-testid="assignment-form" />,
@@ -77,7 +86,9 @@ vi.mock("./DraftEditor", () => ({
     </div>
   ),
 }));
-vi.mock("./DraftPreview", () => ({ DraftPreview: () => <div data-testid="preview" /> }));
+vi.mock("./DraftPreview", () => ({
+  DraftPreview: () => <div data-testid="preview" />,
+}));
 vi.mock("./DraftStageArtifact", () => ({
   DraftStageArtifact: (props: { stage: DraftStage | null }) => (
     <div data-testid="stage-artifact">stage:{props.stage?.stage ?? "none"}</div>
@@ -103,16 +114,41 @@ vi.mock("@/components/ui/select", async () => {
   const React = await import("react");
   const Ctx = React.createContext<(value: string) => void>(() => {});
   return {
-    Select: ({ onValueChange, children }: { onValueChange: (v: string) => void; children: React.ReactNode }) =>
-      React.createElement(Ctx.Provider, { value: onValueChange }, children),
-    SelectTrigger: ({ children, id }: { children: React.ReactNode; id?: string }) =>
-      React.createElement("div", { role: "group", "aria-label": "Retry from", id }, children),
+    Select: ({
+      onValueChange,
+      children,
+    }: {
+      onValueChange: (v: string) => void;
+      children: React.ReactNode;
+    }) => React.createElement(Ctx.Provider, { value: onValueChange }, children),
+    SelectTrigger: ({
+      children,
+      id,
+    }: {
+      children: React.ReactNode;
+      id?: string;
+    }) =>
+      React.createElement(
+        "div",
+        { role: "group", "aria-label": "Retry from", id },
+        children,
+      ),
     SelectValue: () => null,
     SelectContent: ({ children }: { children: React.ReactNode }) =>
       React.createElement("div", null, children),
-    SelectItem: ({ value, children }: { value: string; children: React.ReactNode }) => {
+    SelectItem: ({
+      value,
+      children,
+    }: {
+      value: string;
+      children: React.ReactNode;
+    }) => {
       const onValueChange = React.useContext(Ctx);
-      return React.createElement("button", { type: "button", onClick: () => onValueChange(value) }, children);
+      return React.createElement(
+        "button",
+        { type: "button", onClick: () => onValueChange(value) },
+        children,
+      );
     },
   };
 });
@@ -152,7 +188,9 @@ const {
 }));
 
 vi.mock("@/lib/api/draftRoom", async () => {
-  const actual = await vi.importActual<typeof import("@/lib/api/draftRoom")>("@/lib/api/draftRoom");
+  const actual = await vi.importActual<typeof import("@/lib/api/draftRoom")>(
+    "@/lib/api/draftRoom",
+  );
   return {
     ...actual,
     listDraftJobs: mockListDraftJobs,
@@ -235,7 +273,9 @@ function makeDetail(overrides: Partial<DraftDetail> = {}): DraftDetail {
   };
 }
 
-function makeCapabilities(overrides: Partial<DraftRoomCapabilities> = {}): DraftRoomCapabilities {
+function makeCapabilities(
+  overrides: Partial<DraftRoomCapabilities> = {},
+): DraftRoomCapabilities {
   return {
     enabled: true,
     modes: ["rewrite", "compose"],
@@ -247,10 +287,21 @@ function makeCapabilities(overrides: Partial<DraftRoomCapabilities> = {}): Draft
     logical_model_modes: ["default"],
     default_logical_mode: "default",
     compile_start_stages: ["research"],
-    compile_stage_order: ["intake", "research", "outline", "draft", "lint", "copy", "standards", "fact", "assemble"],
+    compile_stage_order: [
+      "intake",
+      "research",
+      "outline",
+      "draft",
+      "lint",
+      "copy",
+      "standards",
+      "fact",
+      "assemble",
+    ],
     prompt_bundle_version: "v1",
     editorial_gates_installed: true,
     compile_available: true,
+    upload_available: true,
     findings_available: true,
     claims_available: true,
     evidence_available: true,
@@ -288,7 +339,9 @@ function makeJob(overrides: Partial<DraftJob> = {}): DraftJob {
   };
 }
 
-function makeRevisionSummary(overrides: Partial<DraftRevisionSummary> = {}): DraftRevisionSummary {
+function makeRevisionSummary(
+  overrides: Partial<DraftRevisionSummary> = {},
+): DraftRevisionSummary {
   return {
     id: 100,
     revision_no: 2,
@@ -304,7 +357,9 @@ function makeRevisionSummary(overrides: Partial<DraftRevisionSummary> = {}): Dra
   };
 }
 
-function makeRevisionDetail(overrides: Partial<DraftRevisionDetail> = {}): DraftRevisionDetail {
+function makeRevisionDetail(
+  overrides: Partial<DraftRevisionDetail> = {},
+): DraftRevisionDetail {
   return {
     summary: makeRevisionSummary(),
     content_md: "New text line.\nSecond line.",
@@ -353,8 +408,12 @@ function paginated<T>(items: T[]): DraftPaginated<T> {
 
 const initialUiState = useDraftRoomUiStore.getState();
 
-function renderWorkspace(props: Partial<React.ComponentProps<typeof DraftWorkspace>> = {}) {
-  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+function renderWorkspace(
+  props: Partial<React.ComponentProps<typeof DraftWorkspace>> = {},
+) {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
   const detail = props.detail ?? makeDetail();
   const draft = props.draft ?? detail.summary;
   const utils = render(
@@ -367,15 +426,19 @@ function renderWorkspace(props: Partial<React.ComponentProps<typeof DraftWorkspa
         vaultAccess="write"
         {...props}
       />
-    </QueryClientProvider>
+    </QueryClientProvider>,
   );
   return { ...utils, queryClient };
 }
 
 beforeEach(() => {
   useDraftRoomUiStore.setState(initialUiState, true);
-  mockListDraftJobs.mockReset().mockResolvedValue({ items: [makeJob()], total: 1, page: 1, per_page: 10 });
-  mockGetDraftStages.mockReset().mockResolvedValue({ items: [], total: 0, page: 1, per_page: 100 });
+  mockListDraftJobs
+    .mockReset()
+    .mockResolvedValue({ items: [makeJob()], total: 1, page: 1, per_page: 10 });
+  mockGetDraftStages
+    .mockReset()
+    .mockResolvedValue({ items: [], total: 0, page: 1, per_page: 100 });
   mockListDraftRevisions.mockReset().mockResolvedValue({
     items: [makeRevisionSummary()],
     total: 1,
@@ -383,9 +446,15 @@ beforeEach(() => {
     per_page: 50,
   });
   mockGetDraftRevision.mockReset().mockResolvedValue(makeRevisionDetail());
-  mockListDraftFindings.mockReset().mockResolvedValue({ items: [], total: 0, page: 1, per_page: 20 });
-  mockListDraftClaims.mockReset().mockResolvedValue({ items: [], total: 0, page: 1, per_page: 50 });
-  mockListDraftEvidence.mockReset().mockResolvedValue({ items: [], total: 0, page: 1, per_page: 50 });
+  mockListDraftFindings
+    .mockReset()
+    .mockResolvedValue({ items: [], total: 0, page: 1, per_page: 20 });
+  mockListDraftClaims
+    .mockReset()
+    .mockResolvedValue({ items: [], total: 0, page: 1, per_page: 50 });
+  mockListDraftEvidence
+    .mockReset()
+    .mockResolvedValue({ items: [], total: 0, page: 1, per_page: 50 });
   mockUpdateDraft.mockReset();
   mockCompileDraft.mockReset();
   mockCancelDraftJob.mockReset();
@@ -407,23 +476,32 @@ describe("DraftWorkspace (issue #533)", () => {
     renderWorkspace();
 
     // Fixture sanity: the real inspector's findings panel rendered the row.
-    const showButton = await screen.findByRole("button", { name: /show finding in editor/i });
+    const showButton = await screen.findByRole("button", {
+      name: /show finding in editor/i,
+    });
     fireEvent.click(showButton);
 
     // Activation reveals the editor with the return bar; the finding is on
     // the current revision, so no compare CTA may appear.
     expect(await screen.findByLabelText("Draft content")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: FINDINGS_BACK_LABEL })).toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: compareFindingRevisionLabel() })
+      screen.getByRole("button", { name: FINDINGS_BACK_LABEL }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: compareFindingRevisionLabel() }),
     ).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: FINDINGS_BACK_LABEL }));
 
     await waitFor(() => {
-      expect(document.activeElement).toHaveAttribute("data-finding-row", String(finding.id));
+      expect(document.activeElement).toHaveAttribute(
+        "data-finding-row",
+        String(finding.id),
+      );
     });
-    expect(screen.queryByRole("button", { name: FINDINGS_BACK_LABEL })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: FINDINGS_BACK_LABEL }),
+    ).not.toBeInTheDocument();
   });
 
   it("a finding from another revision offers Compare with current revision and switches to the diff", async () => {
@@ -431,26 +509,33 @@ describe("DraftWorkspace (issue #533)", () => {
     mockListDraftFindings.mockResolvedValue(paginated([finding]));
     // The diff query needs two distinct revisions: 99 (the finding's) and
     // 100 (the current one).
-    mockGetDraftRevision.mockImplementation(async (_draftId: number, revisionId: number) =>
-      revisionId === 99
-        ? makeRevisionDetail({
-            summary: makeRevisionSummary({
-              id: 99,
-              revision_no: 1,
-              parent_revision_id: null,
-              content_sha256: "sha-old",
-              is_current: false,
-            }),
-            content_md: "Old text line.\nSecond line.",
-          })
-        : makeRevisionDetail({ content_md: "New text line.\nSecond line." })
+    mockGetDraftRevision.mockImplementation(
+      async (_draftId: number, revisionId: number) =>
+        revisionId === 99
+          ? makeRevisionDetail({
+              summary: makeRevisionSummary({
+                id: 99,
+                revision_no: 1,
+                parent_revision_id: null,
+                content_sha256: "sha-old",
+                is_current: false,
+              }),
+              content_md: "Old text line.\nSecond line.",
+            })
+          : makeRevisionDetail({ content_md: "New text line.\nSecond line." }),
     );
     renderWorkspace();
 
-    fireEvent.click(await screen.findByRole("button", { name: /show finding in editor/i }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: /show finding in editor/i }),
+    );
 
-    const compareButton = await screen.findByRole("button", { name: compareFindingRevisionLabel() });
-    expect(screen.getByRole("button", { name: FINDINGS_BACK_LABEL })).toBeInTheDocument();
+    const compareButton = await screen.findByRole("button", {
+      name: compareFindingRevisionLabel(),
+    });
+    expect(
+      screen.getByRole("button", { name: FINDINGS_BACK_LABEL }),
+    ).toBeInTheDocument();
     fireEvent.click(compareButton);
 
     // The editor switches to the compare tab with the finding's revision as
@@ -459,7 +544,10 @@ describe("DraftWorkspace (issue #533)", () => {
       expect(useDraftRoomUiStore.getState().compareFromRevisionId).toBe(99);
       expect(useDraftRoomUiStore.getState().compareToRevisionId).toBe(100);
     });
-    expect(screen.getByRole("tab", { name: "Compare" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tab", { name: "Compare" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
     // The editor panel unmounts while Compare is active — the editor is
     // unreachable in the DOM, not merely hidden.
     expect(screen.queryByLabelText("Draft content")).not.toBeInTheDocument();
