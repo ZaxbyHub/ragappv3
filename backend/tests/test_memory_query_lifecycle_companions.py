@@ -342,14 +342,13 @@ async def _drain_leftover_tasks():
 # ---------------------------------------------------------------------------
 
 
-async def test_budget_expiry_releases_the_real_admission_slot(monkeypatch):
+async def test_budget_expiry_releases_the_real_admission_slot():
     """Implementation-review finding 1 (real-controller probe): when the
     budget window cancels the holder mid-embed, the EMBEDDING lease MUST be
     released — occupancy returns to zero and a second admit succeeds —
     instead of holding the slot until the store TTL and eroding the shared
     #518 budget on every expiry. Drives a REAL AdmissionController over a
     MemoryAdmissionStore (no controller double can observe this)."""
-    _pin_embed_budget(monkeypatch)
     store = MemoryAdmissionStore()
     controller = AdmissionController(
         budgets={"embedding": 1},
@@ -403,11 +402,11 @@ def test_telemetry_binds_json_under_its_own_name():
 
     import app.services.telemetry as telemetry_module
 
-    source_path = _ast.get_source_segment  # noqa: F841 — documented no-op use
     src = open(telemetry_module.__file__, encoding="utf-8").read()
     tree = _ast.parse(src)
     json_aliases = set()
     plain_json_import = False
+    from_import_offenders = []
     for node in _ast.walk(tree):
         if isinstance(node, _ast.Import):
             for alias in node.names:
@@ -416,8 +415,22 @@ def test_telemetry_binds_json_under_its_own_name():
                         plain_json_import = True
                     else:
                         json_aliases.add(alias.asname)
+        elif isinstance(node, _ast.ImportFrom):
+            if node.module == "json":
+                # `from json import dumps` (aliased or not) puts a bare
+                # Name binding outside the frozen matcher's `json.<attr>`
+                # shape — flag every spelling of it.
+                from_import_offenders.append(
+                    ", ".join(a.name + (f" as {a.asname}" if a.asname else "")
+                              for a in node.names)
+                )
     assert plain_json_import and not json_aliases, (
         "telemetry.py must import json under its own name (no alias) so "
         "the frozen no-direct-json.dumps matcher cannot be evaded by an "
         "aliased binding"
+    )
+    assert not from_import_offenders, (
+        "telemetry.py must not `from json import ...` (offenders: "
+        f"{from_import_offenders}) — a bare dumps() Name evades both the "
+        "frozen matcher and this pin"
     )

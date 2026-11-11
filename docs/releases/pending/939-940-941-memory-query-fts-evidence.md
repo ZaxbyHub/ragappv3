@@ -19,7 +19,7 @@
   budget with retrieval embeds (one slot per call, held for the embed only —
   and the lease release now completes even when the budget window cancels the
   holder mid-embed, so an expiring budget can no longer hold the slot until
-  the store TTL: `AdmissionLease.release` finishes the local accounting and
+  the store TTL: the admission lease's `release()` (the `_Lease` class in app/services/admission.py) finishes the local accounting and
   shields the store release, then re-raises the cancellation so the #827
   cancellation-coverage contract is preserved).
 - A blocked admission (a controller whose acquire never yields) is also bounded
