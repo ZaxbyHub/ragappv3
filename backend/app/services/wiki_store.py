@@ -2197,16 +2197,22 @@ class WikiStore:
             )
             detected.setdefault(fp, spec)
 
-        rows = self._db.execute(
-            "SELECT * FROM wiki_lint_findings WHERE vault_id = ?", (vault_id,)
-        ).fetchall()
-        existing_by_fp: dict[tuple, list] = {}
-        for row in rows:
-            existing_by_fp.setdefault(self._row_lint_fingerprint(row), []).append(row)
-
         now = datetime.utcnow().isoformat()
         result: list = []
         with self.transaction():
+            # Issue #932: the snapshot read lives INSIDE the BEGIN
+            # IMMEDIATE so the write lock serializes snapshot + decisions
+            # + writes as one unit — a user disposition committed between
+            # the (old, pre-transaction) snapshot and this point can no
+            # longer be silently overwritten by the UPDATEs below.
+            rows = self._db.execute(
+                "SELECT * FROM wiki_lint_findings WHERE vault_id = ?", (vault_id,)
+            ).fetchall()
+            existing_by_fp: dict[tuple, list] = {}
+            for row in rows:
+                existing_by_fp.setdefault(
+                    self._row_lint_fingerprint(row), []
+                ).append(row)
             for fp, spec in detected.items():
                 matches = existing_by_fp.get(fp)
                 if matches:
@@ -2280,11 +2286,12 @@ class WikiStore:
                         # changed since the row was auto-resolved — e.g. a
                         # contradiction that gained a third claim. Without
                         # this the reopened row would keep the stale payload.
-                        self._db.execute(
+                        reopened = self._db.execute(
                             "UPDATE wiki_lint_findings SET status = 'open',"
                             " severity = ?, details = ?,"
                             " related_page_ids_json = ?, related_claim_ids_json = ?,"
-                            " updated_at = ? WHERE id = ? AND vault_id = ?",
+                            " updated_at = ? WHERE id = ? AND vault_id = ?"
+                            " AND status = 'auto_resolved'",
                             (
                                 spec.get("severity", "medium"),
                                 spec.get("details", ""),
@@ -2295,6 +2302,15 @@ class WikiStore:
                                 vault_id,
                             ),
                         )
+                        if reopened.rowcount == 0:
+                            # Issue #932 AC7: the row left 'auto_resolved'
+                            # after the snapshot (a concurrent user
+                            # disposition). Its fingerprint is suppressed by
+                            # the user's terminal status — do NOT reopen it
+                            # and do NOT fall through to rule 4 (that would
+                            # insert a duplicate open row for a fingerprint
+                            # the user dismissed).
+                            continue
                         fresh = self._db.execute(
                             "SELECT * FROM wiki_lint_findings WHERE id = ?",
                             (newest["id"],),
@@ -2327,9 +2343,13 @@ class WikiStore:
                         and row["origin"] == "linter"
                         and self._row_lint_fingerprint(row) not in detected
                     ):
+                        # Issue #932 AC6: only a row STILL open may
+                        # auto-resolve — the predicate makes the snapshot's
+                        # assumption hold at write time even if the row's
+                        # status changed after the snapshot was taken.
                         self._db.execute(
                             "UPDATE wiki_lint_findings SET status = 'auto_resolved', updated_at = ? "
-                            "WHERE id = ? AND vault_id = ?",
+                            "WHERE id = ? AND vault_id = ? AND status = 'open'",
                             (now, row["id"], vault_id),
                         )
         return result

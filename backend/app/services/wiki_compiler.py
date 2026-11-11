@@ -1295,6 +1295,27 @@ class WikiCompiler:
                         ):
                             self._store.reactivate_claim_if_superseded(existing.id)
                             existing.status = "active"
+                        # Issue #929: promote unverified → active with the
+                        # same commit-free discipline (the deterministic
+                        # twin _find_or_create_claim lifts status +
+                        # source_type + confidence and then commits; inside
+                        # this savepoint the commit belongs to the pair, so
+                        # replicate the lift with a predicated UPDATE — the
+                        # status predicate makes the check-and-flip atomic
+                        # the way reactivate_claim_if_superseded's is).
+                        if (
+                            existing.status == "unverified"
+                            and accepted.status == "active"
+                        ):
+                            cur = self._db.execute(
+                                "UPDATE wiki_claims SET status = 'active',"
+                                " source_type = 'document', confidence = ?,"
+                                " updated_at = datetime('now')"
+                                " WHERE id = ? AND status = 'unverified'",
+                                (accepted.confidence, existing.id),
+                            )
+                            if cur.rowcount:
+                                existing.status = "active"
                         already = any(
                             s.source_kind == "document"
                             and s.file_id == accepted.file_id

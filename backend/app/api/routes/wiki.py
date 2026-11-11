@@ -766,7 +766,11 @@ async def run_wiki_lint(
     await _require_vault_write(evaluate, user, request.vault_id)
     store = WikiStore(db)
     linter = WikiLinter(db, store)
-    findings = linter.run_lint(request.vault_id)
+    # Issue #935 item 1: run_lint is synchronous full-table work; running it
+    # inline on the event loop stalls every other request in the process
+    # for the scan's duration. Dispatch to the default thread pool (the
+    # same asyncio.to_thread pattern this module already uses at :671).
+    findings = await asyncio.to_thread(linter.run_lint, request.vault_id)
     return {"findings": [_as_dict(f) for f in findings], "count": len(findings)}
 
 

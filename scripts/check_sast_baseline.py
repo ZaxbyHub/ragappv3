@@ -32,6 +32,7 @@ import json
 import os
 import re
 import sys
+from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -247,17 +248,35 @@ def _baseline_count(path_or_text: str | None, *, is_path: bool) -> int | None:
 
 
 def _diff_added_keys(prev_text: str) -> list[str]:
-    """Finding IDs present in the current baseline but absent from ``prev_text``."""
+    """Finding identities present in the current baseline but absent from ``prev_text``.
+
+    Issue #935 item 3: identities are CONTENT-keyed on
+    (test_id, filename, issue_text) with per-key occurrence counts — a
+    multiset comparison. Keying on line numbers made every pure line
+    drift (an unrelated edit shifting scanned files) print under
+    "Newly-suppressed IDs" with a zero count delta, training reviewers to
+    ignore the swap list. A duplicate occurrence of an existing identity
+    still counts as an add, so trading two findings for one cannot hide.
+    """
     try:
         prev_data = json.loads(prev_text)
         cur_data = json.loads(BASELINE.read_text(encoding="utf-8"))
 
         def _key(r: dict) -> str:
             fn = r.get("filename", "").replace("\\", "/")
-            return f"{r.get('test_id', '?')} {fn}:{r.get('line_number', '?')}"
+            return f"{r.get('test_id', '?')} {fn} :: {r.get('issue_text', '?')}"
 
-        prev_keys = {_key(r) for r in prev_data.get("results", [])}
-        return sorted({_key(r) for r in cur_data.get("results", [])} - prev_keys)
+        prev_counts: Counter[str] = Counter(
+            _key(r) for r in prev_data.get("results", [])
+        )
+        cur_counts: Counter[str] = Counter(
+            _key(r) for r in cur_data.get("results", [])
+        )
+        added: list[str] = []
+        for identity, n in cur_counts.items():
+            for _ in range(n - prev_counts.get(identity, 0)):
+                added.append(identity)
+        return sorted(added)
     except (OSError, ValueError):
         return []
 
@@ -343,10 +362,13 @@ def check_baseline_expansion(paths: list[str]) -> bool:
     if delta <= 0:
         # Did not grow. Surface any same-count finding-ID swaps so a reviewer
         # notices if a HIGH finding was silently traded for a different one.
+        # Identities are content-keyed (issue #935 item 3): a pure line
+        # drift is NOT a swap and prints nothing here.
         if added:
             print(
                 f"sast-baseline: baseline {baseline_rel} did not grow "
-                f"({prev_count} -> {current_count}) but finding IDs changed. "
+                f"({prev_count} -> {current_count}) but finding identities "
+                "changed (content-keyed: line shifts are not swaps). "
                 "Newly-suppressed IDs (review the swap):"
             )
             for key in added:
