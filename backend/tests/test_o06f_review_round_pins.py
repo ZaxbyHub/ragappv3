@@ -82,10 +82,10 @@ class TestLintRunsOnDedicatedExecutor(unittest.TestCase):
         from app.api.routes import wiki as routes
 
         conn, td, _store, _compiler = _make_env()
-        self.addCleanup(conn.close)
-        # Temp-hygiene (swarm-pr-review round 2, N-07 — fifth leaker found
-        # by reviewer shard B).
+        # Temp-hygiene (round 2, N-07): registered BEFORE close so LIFO
+        # runs close first and rmtree last (Windows open-file lock).
         self.addCleanup(shutil.rmtree, td, True)
+        self.addCleanup(conn.close)
         recorded = {}
 
         class _StubLinter:
@@ -190,6 +190,9 @@ class TestCapStoredRowShape(unittest.TestCase):
         self._flag = _FlagSnapshot()
         self._flag.__enter__()
         self.conn, self._td, self.store, self.compiler = _make_env()
+        # Temp-hygiene (delta-gate r8): registered FIRST so LIFO runs it
+        # LAST, after the connection is closed (Windows open-file lock).
+        self.addCleanup(shutil.rmtree, self._td, True)
         self.addCleanup(self._flag.__exit__, None, None, None)
         self.addCleanup(self.conn.close)
         settings.wiki_llm_curator_enabled = True
@@ -292,6 +295,107 @@ class TestLifespanShutsDownLintExecutor(unittest.TestCase):
             source,
             "lifespan shutdown must shut the executor down (wait=False)",
         )
+
+
+class TestPromotionNumericIdentityGate(unittest.TestCase):
+    """F-03 (OOB review, critic-executed end to end): the normalized lookup
+    strips punctuation, so a quote verified for "The limit is 5.10 MB"
+    must NOT promote an existing unverified "The limit is 510 MB" — the
+    promotion requires equal numeric multisets. Punctuation-only variants
+    (same numbers) still promote."""
+
+    def setUp(self):
+        self._flag = _FlagSnapshot()
+        self._flag.__enter__()
+        self.conn, self._td, self.store, self.compiler = _make_env()
+        self.addCleanup(self._flag.__exit__, None, None, None)
+        self.addCleanup(self.conn.close)
+        settings.wiki_llm_curator_enabled = True
+        settings.wiki_llm_curator_run_on_ingest = True
+        settings.wiki_llm_curator_url = "https://curator-invalid.example"
+        settings.wiki_llm_curator_model = "qwen-1b"
+        settings.wiki_llm_curator_mode = "active_if_verified"
+        settings.wiki_llm_curator_require_quote_match = True
+        settings.wiki_llm_curator_require_chunk_id = True
+
+    def _seed_unverified(self, text):
+        claim = self.store.create_claim(
+            vault_id=1,
+            claim_text=text,
+            source_type="document",
+            page_id=None,
+            status="unverified",
+            created_by_kind="deterministic",
+        )
+        return claim.id
+
+    def _compile_payload(self, claim_text):
+        payload = json.dumps({"claims": [{
+            "claim_text": claim_text,
+            "claim_type": "fact",
+            "source_quote": claim_text,
+            "chunk_id": "1_0",
+            "confidence": 0.9,
+        }]})
+
+        class _Stub:
+            def __init__(self, *a, **k):
+                pass
+
+            async def propose(self, *_a, **_k):
+                return payload
+
+        with patch("app.services.wiki_compiler.CuratorClient", _Stub):
+            return self.compiler.compile_ingest_job(
+                1, {"file_id": 1, "text": f"{claim_text}. Filler text."}
+            )
+
+    def _status(self):
+        row = self.conn.execute(
+            "SELECT status FROM wiki_claims WHERE claim_text LIKE ?",
+            ("The fee is%",),
+        ).fetchone()
+        return dict(row)["status"] if row else None
+
+    def test_numeric_mismatch_blocks_promotion(self):
+        # "The fee is 5.10 USD" normalizes equal to "The fee is 510 USD"
+        # (punctuation stripped) — the numeric gate must block the lift.
+        cid = self._seed_unverified("The fee is 510 USD")
+        result = self._compile_payload("The fee is 5.10 USD")
+        self.assertEqual(result["curator"]["accepted"], 1)
+        self.assertEqual(
+            self._status(), "unverified",
+            "a quote verified for different numbers must NOT promote the "
+            "matched claim (5.10 vs 510 collide under normalize)",
+        )
+
+    def test_numeric_identical_variant_promotes(self):
+        # Control: punctuation-only variant with the SAME numbers promotes.
+        cid = self._seed_unverified("The fee is 510 USD")
+        result = self._compile_payload("The fee is 510 USD!")
+        self.assertEqual(result["curator"]["accepted"], 1)
+        self.assertEqual(
+            self._status(), "active",
+            "punctuation-only variant with identical numbers promotes",
+        )
+
+    def test_non_numeric_texts_promote(self):
+        # Control: no numeric tokens on either side -> multisets equal.
+        self.store.create_claim(
+            vault_id=1,
+            claim_text="Delta is pinned",
+            source_type="document",
+            page_id=None,
+            status="unverified",
+            created_by_kind="deterministic",
+        )
+        settings.wiki_llm_curator_mode = "active_if_verified"
+        result = self._compile_payload("Delta is pinned")
+        self.assertEqual(result["curator"]["accepted"], 1)
+        row = self.conn.execute(
+            "SELECT status FROM wiki_claims WHERE claim_text = 'Delta is pinned'"
+        ).fetchone()
+        self.assertEqual(dict(row)["status"], "active")
 
 
 if __name__ == "__main__":  # pragma: no cover

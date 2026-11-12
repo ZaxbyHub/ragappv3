@@ -360,10 +360,13 @@ def check_baseline_expansion(paths: list[str]) -> bool:
     added = _diff_added_keys(prev_text)
 
     if delta <= 0:
-        # Did not grow. Surface any same-count finding-ID swaps so a reviewer
-        # notices if a HIGH finding was silently traded for a different one.
-        # Identities are content-keyed (issue #935 item 3): a pure line
-        # drift is NOT a swap and prints nothing here.
+        # Did not grow. Advisory only — returns True below. Content-keyed
+        # identities (issue #935 item 3): pure line drift prints nothing,
+        # and a same-identity occurrence move (fix one finding in a file,
+        # add another of the same rule/message in that file) is invisible
+        # here by design; run_bandit.py --update-baseline remains the
+        # line-keyed surface for file:line swap review (PR #1113 OOB F-05;
+        # a code-snippet key would catch relocations — future option).
         if added:
             print(
                 f"sast-baseline: baseline {baseline_rel} did not grow "

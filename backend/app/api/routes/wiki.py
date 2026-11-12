@@ -54,13 +54,12 @@ async def require_wiki_enabled() -> None:
 # Dedicated bounded executor for the wiki lint scan (swarm-pr-review
 # PRR-001, pr1113-20261111): run_lint is a synchronous five-query
 # full-vault scan. Running it on the shared default executor (bare
-# asyncio.to_thread) lets concurrent lint runs occupy every default-
-# executor worker and delay unrelated to_thread work — most importantly
-# the per-request auth read in deps.py, which shares that pool. The
-# repo's doctrine (document_processor.py ~:1025, database.py ~:6497,
-# wiki_compiler.py:47) gives unbounded-duration off-loop work its own
-# bounded pool; max_workers=1 additionally preserves the pre-#935
-# one-scan-at-a-time serialization.
+# asyncio.to_thread) let concurrent scans occupy default-executor workers
+# and delay unrelated to_thread work. This bound does NOT eliminate
+# contention — each queued run still pins a pooled DB connection, and a
+# burst can exhaust the pool (OOB review F-02, execution-proven) — it
+# moves the stall off the loop and serializes scans. A queue bound or
+# admission gate is the follow-up if that ever surfaces in practice.
 _WIKI_LINT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     max_workers=1, thread_name_prefix="wiki-lint"
 )
@@ -784,8 +783,8 @@ async def run_wiki_lint(
     # Issue #935 item 1: run_lint is synchronous full-table work; running it
     # inline on the event loop stalls every other request in the process
     # for the scan's duration. Dispatch to the dedicated bounded executor
-    # above (swarm-pr-review PRR-001: the shared default executor carries
-    # the per-request auth read, so a burst of scans there starves auth).
+    # above (review PRR-001; note F-02: queued runs pin their pooled
+    # connection, so this bounds executor starvation, not pool contention).
     loop = asyncio.get_running_loop()
     findings = await loop.run_in_executor(
         _WIKI_LINT_EXECUTOR, linter.run_lint, request.vault_id

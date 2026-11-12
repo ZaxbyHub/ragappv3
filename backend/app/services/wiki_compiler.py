@@ -37,6 +37,15 @@ _CITE_STRIP_RE = re.compile(r"\[(?:S|M|W)\d+\]")
 
 logger = logging.getLogger(__name__)
 
+
+def _numeric_multiset(text: str) -> tuple:
+    """Sorted tuple of numeric tokens in ``text`` (F-03, PR #1113 review
+    round 2): ``normalize_claim_text`` strips punctuation, so "5.10 MB"
+    and "510 MB" normalize identically and a quote verified for one can
+    promote the other. Requiring equal numeric multisets blocks those
+    collisions while keeping punctuation-only variants matching."""
+    return tuple(sorted(re.findall(r"\d+(?:\.\d+)?", text or "")))
+
 # Module-level executor used when _maybe_run_curator is called from
 # inside a running event loop. The previous per-call
 # ``with ThreadPoolExecutor(max_workers=1) as ex: ...`` pattern paid
@@ -1313,6 +1322,12 @@ class WikiCompiler:
                         if (
                             existing.status == "unverified"
                             and accepted.status == "active"
+                            # F-03: the normalized lookup strips
+                            # punctuation, so require identical numeric
+                            # tokens before lifting (blocks 5.10-vs-510
+                            # promotions on the lossy-match path).
+                            and _numeric_multiset(existing.claim_text)
+                            == _numeric_multiset(accepted.claim_text)
                         ):
                             cur = self._db.execute(
                                 "UPDATE wiki_claims SET status = 'active',"

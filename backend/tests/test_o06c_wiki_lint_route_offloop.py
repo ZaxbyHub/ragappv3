@@ -10,7 +10,8 @@ evaluate — the same boundary production uses (a pooled
 C9 (AC9, DISCRIMINATING): ``run_wiki_lint`` calls the synchronous
 ``WikiLinter.run_lint`` inline on the event-loop thread, blocking every
 other request on that loop for the whole scan (the same file already uses
-``await asyncio.to_thread`` for its DB reads). The check stubs
+``await asyncio.to_thread`` for its DB reads; the lint scan itself now
+    dispatches to the dedicated wiki-lint executor). The check stubs
 ``app.api.routes.wiki.WikiLinter`` so ``run_lint`` records the thread it
 executes on and asserts it is NOT the thread running the event loop. RED
 at base (same thread), GREEN after the fix.
@@ -95,7 +96,7 @@ class TestRunWikiLintOffLoop(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(response["count"], 0)
         # Discriminating assertion: the synchronous lint scan must run on
-        # a worker thread (asyncio.to_thread), not inline on the event
+        # a worker thread (the dedicated wiki-lint executor), not inline
         # loop's thread. At base this fails with identical idents.
         self.assertNotEqual(
             recorded["thread_ident"], loop_thread,
