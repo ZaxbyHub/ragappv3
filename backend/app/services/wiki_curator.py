@@ -54,7 +54,7 @@ logger = logging.getLogger(__name__)
 _DETAIL_TEXT_MAX_CHARS = 500
 
 
-def _cap(value) -> str:
+def _cap(value) -> "str | None":
     """Safely bound one LLM-derived detail value to the documented cap.
 
     Non-string model output (a number, a nested object) is stringified before
