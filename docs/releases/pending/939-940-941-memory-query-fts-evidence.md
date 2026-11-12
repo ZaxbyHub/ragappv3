@@ -18,7 +18,8 @@
   hanging embed.
 - The memory precompute now acquires an `EMBEDDING` admission slot (issue #518
   device budget) on both call sites. A saturated budget degrades the memory leg
-  FTS-only with the same WARNING instead of bypassing the budget. Capacity
+  FTS-only with its own admission-rejected WARNING instead of bypassing the
+  budget. Capacity
   note: memory-search requests and chat turns now share the embedding device
   budget with retrieval embeds (one slot per call, held for the embed only.
   Operator note: the memories search routes carry no rate limiter, so a burst
