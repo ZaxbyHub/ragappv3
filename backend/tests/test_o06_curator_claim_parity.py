@@ -99,11 +99,11 @@ class _FlagSnapshot:
 _CLAIM_TEXT = "Alpha is verified"
 
 
-def _seed_unverified_claim(store):
+def _seed_unverified_claim(store, source_type="document"):
     claim = store.create_claim(
         vault_id=1,
         claim_text=_CLAIM_TEXT,
-        source_type="document",
+        source_type=source_type,
         page_id=None,
         status="unverified",
         created_by_kind="deterministic",
@@ -223,6 +223,95 @@ class TestCuratorClaimParity(unittest.TestCase):
         self.assertEqual(
             dict(typed)["source_type"], "document",
             "document-backed promotion must lift source_type to 'document'",
+        )
+
+    def test_active_mode_lifts_document_source_type_from_memory_seed(self):
+        # Implementation-review round 2: the source_type pin must be
+        # DISCRIMINATING — seeding 'document' made the original assert
+        # unfailable. This arm seeds a MEMORY-sourced unverified claim and
+        # requires the document-backed (ingest-trigger, file_id=1)
+        # promotion to LIFT source_type to 'document'. Kills the
+        # preserve-mutant (gate replaced by existing.source_type) and the
+        # no-op-mutant (lift removed). RED at base (no promotion at all),
+        # GREEN after the fix.
+        cid = _seed_unverified_claim(self.store, source_type="memory")
+        settings.wiki_llm_curator_mode = "active_if_verified"
+        settings.wiki_llm_curator_require_quote_match = True
+        settings.wiki_llm_curator_require_chunk_id = True
+        payload = json.dumps({"claims": [{
+            "claim_text": _CLAIM_TEXT,
+            "claim_type": "fact",
+            "source_quote": _CLAIM_TEXT,
+            "chunk_id": "1_0",
+            "confidence": 0.9,
+        }]})
+        result = self._run_curator_payload(payload)
+        self.assertEqual(result["curator"]["accepted"], 1)
+        self.assertEqual(_claim_status(self.conn, cid), "active")
+        typed = self.conn.execute(
+            "SELECT source_type FROM wiki_claims WHERE id = ?", (cid,)
+        ).fetchone()
+        self.assertEqual(
+            dict(typed)["source_type"], "document",
+            "document-backed promotion must LIFT a memory-sourced claim's "
+            "source_type to 'document' (deterministic-path parity)",
+        )
+
+    def test_manual_trigger_preserves_memory_source_type(self):
+        # Implementation-review round 2, preserve arm: on the manual
+        # trigger (file_id=None — the curator holds no document), the
+        # promotion must PRESERVE the matched claim's own source_type
+        # instead of relabeling memory provenance as 'document'. Kills the
+        # unconditional-'document' mutant. RED at base (no promotion),
+        # GREEN after the fix.
+        cid = _seed_unverified_claim(self.store, source_type="memory")
+        settings.wiki_llm_curator_enabled = True
+        settings.wiki_llm_curator_url = "https://curator-invalid.example"
+        settings.wiki_llm_curator_model = "qwen-1b"
+        settings.wiki_llm_curator_mode = "active_if_verified"
+        settings.wiki_llm_curator_require_quote_match = True
+        settings.wiki_llm_curator_require_chunk_id = True
+        settings.wiki_llm_curator_run_on_manual = True
+        payload = json.dumps({"claims": [{
+            "claim_text": _CLAIM_TEXT,
+            "claim_type": "fact",
+            "source_quote": _CLAIM_TEXT,
+            "chunk_id": "text_0",
+            "confidence": 0.9,
+        }]})
+
+        class _Stub:
+            def __init__(self, *a, **k):
+                pass
+
+            async def propose(self, *_a, **_k):
+                return payload
+
+        _ns = types.SimpleNamespace(role_claims=[], acronyms=[])
+        with patch("app.services.wiki_compiler.CuratorClient", _Stub):
+            summary = self.compiler._maybe_run_curator(
+                vault_id=1,
+                file_id=None,
+                text=f"{_CLAIM_TEXT}. Filler text.",
+                trigger="manual",
+                deterministic_extraction=_ns,
+                page_id=None,
+                existing_entities=[],
+            )
+        self.assertEqual(summary["accepted"], 1)
+        self.assertEqual(
+            _claim_status(self.conn, cid), "active",
+            "quote-verified manual-trigger candidate must still promote "
+            "the matched claim",
+        )
+        typed = self.conn.execute(
+            "SELECT source_type FROM wiki_claims WHERE id = ?", (cid,)
+        ).fetchone()
+        self.assertEqual(
+            dict(typed)["source_type"], "memory",
+            "a file_id-less (manual/query) promotion must PRESERVE the "
+            "matched claim's source_type — memory provenance is never "
+            "relabeled as document",
         )
 
     def test_active_mode_promotes_normalized_text_match(self):
