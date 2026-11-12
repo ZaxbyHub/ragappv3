@@ -9,6 +9,7 @@ import concurrent.futures
 import json
 import logging
 import sqlite3
+import threading
 from dataclasses import asdict
 from typing import Callable, Dict, List, Literal, Optional
 
@@ -63,6 +64,32 @@ async def require_wiki_enabled() -> None:
 _WIKI_LINT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     max_workers=1, thread_name_prefix="wiki-lint"
 )
+_WIKI_LINT_EXECUTOR_LOCK = threading.Lock()
+
+
+def _wiki_lint_executor() -> concurrent.futures.ThreadPoolExecutor:
+    """Return the dedicated lint executor, recreating it after shutdown.
+
+    Lifespan shutdown tears the module-level executor down (queued scans
+    must not extend interpreter exit), so any later dispatch — a test
+    ordering that runs an app-shutdown test ahead of lint-route tests in
+    the same worker process, or an embedded/multi-cycle server — hit
+    'cannot schedule new futures after shutdown' (post-merge master CI
+    run 43283445925: two FAILED tests at tree-identical content that was
+    green in PR CI; the pool was poisoned by an earlier lifespan-shutdown
+    test in the same worker). Dispatch and shutdown both happen on the
+    event-loop thread; the lock makes the recreation safe unconditionally.
+    """
+    global _WIKI_LINT_EXECUTOR
+    with _WIKI_LINT_EXECUTOR_LOCK:
+        # `_shutdown` is a CPython-internal bool, stable 3.9–3.14; reading
+        # it here detects ANY shutdown path (lifespan, direct call, tests)
+        # without bookkeeping our own flag in two modules.
+        if _WIKI_LINT_EXECUTOR is None or _WIKI_LINT_EXECUTOR._shutdown:
+            _WIKI_LINT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="wiki-lint"
+            )
+        return _WIKI_LINT_EXECUTOR
 
 router = APIRouter(dependencies=[Depends(require_wiki_enabled)])
 
@@ -787,7 +814,7 @@ async def run_wiki_lint(
     # connection, so this bounds executor starvation, not pool contention).
     loop = asyncio.get_running_loop()
     findings = await loop.run_in_executor(
-        _WIKI_LINT_EXECUTOR, linter.run_lint, request.vault_id
+        _wiki_lint_executor(), linter.run_lint, request.vault_id
     )
     return {"findings": [_as_dict(f) for f in findings], "count": len(findings)}
 

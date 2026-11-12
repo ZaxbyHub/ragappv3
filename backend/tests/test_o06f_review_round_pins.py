@@ -401,5 +401,87 @@ class TestPromotionNumericIdentityGate(unittest.TestCase):
         self.assertEqual(dict(row)["status"], "active")
 
 
+class TestExecutorRecreatedAfterShutdown(unittest.TestCase):
+    """Post-merge CI regression pins (master run 43283445925, PR #1113
+    follow-up): lifespan shutdown tears down the module-level lint
+    executor, and every later dispatch in the same process then raised
+    'cannot schedule new futures after shutdown' (two FAILED tests on
+    tree-identical content that was green in PR CI — an app-shutdown test
+    ran ahead of lint-route tests on the same xdist worker). RED on the
+    pre-fix dispatch (raises), GREEN with the recreation accessor."""
+
+    def test_run_wiki_lint_succeeds_after_shutdown(self):
+        from app.api.routes import wiki as routes
+
+        conn, td, _store, _compiler = _make_env()
+        # Temp-hygiene (round 2, N-07): registered BEFORE close so LIFO
+        # runs close first and rmtree last (Windows open-file lock).
+        self.addCleanup(shutil.rmtree, td, True)
+        self.addCleanup(conn.close)
+        # Simulate the lifespan shutdown that poisoned the pool in CI.
+        routes._WIKI_LINT_EXECUTOR.shutdown(wait=True)
+        recorded = {}
+
+        class _StubLinter:
+            def __init__(self, db, store):
+                pass
+
+            def run_lint(self, vault_id):
+                recorded["thread_name"] = threading.current_thread().name
+                return []
+
+        import asyncio
+
+        async def _evaluate(*_a, **_k):
+            return True
+
+        async def _call():
+            return await routes.run_wiki_lint(
+                request=types.SimpleNamespace(vault_id=1),
+                db=conn,
+                user={"id": 1},
+                evaluate=_evaluate,
+                _csrf_token="x",
+            )
+
+        with patch.object(routes, "WikiLinter", _StubLinter):
+            response = asyncio.run(_call())
+        self.assertEqual(response["count"], 0)
+        self.assertTrue(
+            recorded["thread_name"].startswith("wiki-lint"),
+            f"the post-shutdown dispatch must run on a recreated wiki-lint "
+            f"executor (got worker thread {recorded['thread_name']!r})",
+        )
+
+    def test_accessor_returns_new_executor_after_shutdown(self):
+        from app.api.routes import wiki as routes
+
+        poisoned = routes._WIKI_LINT_EXECUTOR
+        poisoned.shutdown(wait=True)
+        executor = routes._wiki_lint_executor()
+        self.assertIsNot(
+            executor,
+            poisoned,
+            "the accessor must not hand back the shutdown executor",
+        )
+        name = executor.submit(
+            lambda: threading.current_thread().name
+        ).result(timeout=10)
+        self.assertTrue(
+            name.startswith("wiki-lint"),
+            f"recreated workers must keep the wiki-lint prefix (got {name!r})",
+        )
+
+    def test_accessor_is_stable_between_dispatches(self):
+        from app.api.routes import wiki as routes
+
+        executor = routes._wiki_lint_executor()
+        self.assertIs(
+            executor,
+            routes._wiki_lint_executor(),
+            "the accessor must not churn the executor between dispatches",
+        )
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
