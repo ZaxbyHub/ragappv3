@@ -308,6 +308,9 @@ class TestPromotionNumericIdentityGate(unittest.TestCase):
         self._flag = _FlagSnapshot()
         self._flag.__enter__()
         self.conn, self._td, self.store, self.compiler = _make_env()
+        # Temp-hygiene: registered FIRST so LIFO runs it LAST, after the
+        # connection is closed (Windows open-file lock).
+        self.addCleanup(shutil.rmtree, self._td, True)
         self.addCleanup(self._flag.__exit__, None, None, None)
         self.addCleanup(self.conn.close)
         settings.wiki_llm_curator_enabled = True
