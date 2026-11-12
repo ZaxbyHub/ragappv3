@@ -1439,6 +1439,10 @@ class RAGEngine:
                             # bound must wrap it too. asyncio.timeout cancels
                             # at THIS task's await points (no wrapper task),
                             # so the coroutine name stays _memory_retrieve.
+                            # (Provider errors do NOT reach these handlers:
+                            # MemoryStore.embed_query swallows them and logs
+                            # its own degrade WARNING — these arms see
+                            # budget/admission/other non-provider failures.)
                             async with asyncio.timeout(
                                 settings.memory_embed_budget_seconds
                             ):
@@ -1450,11 +1454,27 @@ class RAGEngine:
                                             user_input
                                         )
                                     )
+                        except asyncio.TimeoutError:
+                            # asyncio.timeout's TimeoutError carries no
+                            # message (str() is empty), so name the budget
+                            # explicitly — this arm is the only operator
+                            # signal that distinguishes BUDGET expiry from
+                            # admission saturation (swarm-review F-003).
+                            logger.warning(
+                                "Memory query embedding precompute exceeded "
+                                "the %.1fs memory_embed_budget_seconds "
+                                "budget; continuing FTS-only",
+                                settings.memory_embed_budget_seconds,
+                            )
+                            query_embedding = None
+                        except AdmissionRejected as exc:
+                            logger.warning(
+                                "Memory query embedding admission rejected "
+                                "(%s); continuing FTS-only",
+                                exc,
+                            )
+                            query_embedding = None
                         except Exception as exc:  # noqa: BLE001 — degrade, not abort
-                            # Covers asyncio.TimeoutError (budget exceeded;
-                            # the embed task is cancelled by the timeout) and
-                            # AdmissionRejected (budget saturated) with the
-                            # same mechanism-named WARNING (#939 AC1/AC4).
                             logger.warning(
                                 "Memory query embedding precompute failed; "
                                 "continuing FTS-only: %s",

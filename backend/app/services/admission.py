@@ -510,43 +510,67 @@ class _Lease:
             return
         self._released = True
         # Cancellation-completes-release (#939 review, implementation
-        # review finding 1): when the holder is being cancelled (e.g. an
+        # review finding 1; wakeup ordering sharpened by swarm-review
+        # F-002): when the holder is being cancelled (e.g. an
         # asyncio.timeout budget window firing mid-hold), _stop_renewal
-        # re-raises the pending cancellation (its #827 coverage contract)
+        # surfaces the pending cancellation (the #827 coverage contract)
         # and an unshielded store release would never run — the device
-        # slot then stays held until the store TTL and every budget
-        # expiry erodes the shared budget. Complete the release anyway
-        # (renewal stop without awaiting it, sync local accounting, the
-        # store release shielded so a pending cancellation cannot abort
-        # it mid-flight) and re-raise the cancellation at the END so the
-        # cancellation coverage #827 established is preserved.
+        # slot then stays held until the store TTL. Complete the release
+        # anyway: await the renewal stop (swallowing ITS cancellation so
+        # the release below still runs), keep the sync local accounting,
+        # shield the store release so the cancellation cannot abort it
+        # mid-flight, and re-raise the cancellation at the END.
         cancelled_during_release = False
         try:
             await self._stop_renewal()
         except asyncio.CancelledError:
+            # The renewer ends cancelled; drop the reference so it is
+            # not re-cancelled, and continue the release below (the
+            # shield keeps the store release alive through the pending
+            # cancellation).
             cancelled_during_release = True
             if self._renewer is not None:
                 self._renewer.cancel()
                 self._renewer = None
         if self._reentrant:
-            if cancelled_during_release:
-                raise asyncio.CancelledError()
+            # Reentrant leases are store-unbound (no renewer, no store
+            # release), so cancelled_during_release cannot be set here.
             return
         controller = self._controller
         controller._forget_lease(self)
         if self._store_bound and not self.revoked:
+            # ensure_future holds a strong reference to the detached
+            # release even when this task is cancelled mid-await.
+            inner = asyncio.ensure_future(
+                controller.store.release(self.key, self.holder)
+            )
             try:
-                await asyncio.shield(
-                    controller.store.release(self.key, self.holder)
-                )
+                await asyncio.shield(inner)
             except asyncio.CancelledError:
-                # The pending cancellation cannot abort the shielded
-                # store release — it keeps running to completion; surface
-                # the cancellation after the release finishes its part.
+                # A cancellation landed while the store release was in
+                # flight (#827). The detached release keeps running:
+                # DEFER the hub wakeup to its completion — pumping first
+                # reads a still-held slot on a latency store (Redis), so
+                # the parked waiter would stay parked until the next
+                # local hub event (swarm-review F-002) — and mark
+                # degraded if it fails.
                 cancelled_during_release = True
+
+                def _finish_detached_release(task: "asyncio.Task") -> None:
+                    if task.cancelled():
+                        return
+                    if task.exception() is not None:
+                        controller._mark_degraded()
+                    controller.hub.schedule_pump()
+
+                inner.add_done_callback(_finish_detached_release)
             except Exception:  # noqa: BLE001 — store outage must not leak slots
                 controller._mark_degraded()
-        controller.hub.schedule_pump()
+                controller.hub.schedule_pump()
+            else:
+                controller.hub.schedule_pump()
+        else:
+            controller.hub.schedule_pump()
         if cancelled_during_release:
             raise asyncio.CancelledError()
 

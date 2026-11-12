@@ -310,6 +310,10 @@ async def test_route_precompute_happy_path_passes_embedding(monkeypatch):
                 10.0,
             )
     assert store.embed_calls == ["quarterly roadmap"]
+    assert store.search_calls, (
+        "the FTS search must still run — an empty kwargs list would make "
+        "the all() below vacuously true (swarm-review F-004/PRR-007)"
+    )
     assert all(
         kw.get("query_embedding") == [1.0, 0.0] for kw in _fts_kwargs(store)
     )
@@ -434,3 +438,284 @@ def test_telemetry_binds_json_under_its_own_name():
         f"{from_import_offenders}) — a bare dumps() Name evades both the "
         "frozen matcher and this pin"
     )
+
+# ---------------------------------------------------------------------------
+# Feedback-round pins (swarm review F-001/F-004/F-005 + PRR-007 companion).
+# ---------------------------------------------------------------------------
+
+
+class _RouteRecordingStore:
+    """Route-level store double: gates on embedding_service presence,
+    records embed calls, serves one memory row."""
+
+    def __init__(self):
+        from types import SimpleNamespace
+
+        self.embedding_service = SimpleNamespace()
+        self.embed_calls = []
+
+    async def embed_query(self, query):
+        self.embed_calls.append(query)
+        return [1.0, 0.0]
+
+    def search_memories(self, query, limit=5, **kwargs):
+        from test_memory_query_lifecycle import _memory_record
+
+        return [_memory_record()]
+
+
+def _route_client(store):
+    """Fresh FastAPI app mounting the memories router with overrides
+    (mirrors the frozen AC2 test's builder so the boundary pins drive the
+    real route validation)."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from app.api.deps import (
+        get_current_active_user,
+        get_db,
+        get_evaluate_policy,
+        get_memory_store,
+        require_model_ready,
+    )
+
+    async def _evaluate(_user, _kind, _vault_id, _action):
+        return True
+
+    app = FastAPI()
+    app.include_router(memories_routes.router, prefix="/api")
+    app.dependency_overrides.update({
+        get_db: lambda: None,
+        get_memory_store: lambda: store,
+        get_current_active_user: lambda: {"id": 1, "role": "member", "username": "u"},
+        get_evaluate_policy: lambda: _evaluate,
+        require_model_ready: lambda: None,
+    })
+    return TestClient(app)
+
+
+def test_post_search_rejects_oversized_query_before_embed():
+    """F-004/PRR-002: the POST /memories/search body cap (the
+    MemorySearchRequest.query max_length) is claimed in the PR body and the
+    release fragment but was asserted by no test — deleting the POST cap
+    left every suite green. Pins: an oversized POST body gets 422 with ZERO
+    embed calls; a normal POST body still returns 200 with results."""
+    store = _RouteRecordingStore()
+    client = _route_client(store)
+    try:
+        oversized = client.post(
+            "/api/memories/search",
+            json={"query": "q" * 10001, "limit": 5, "vault_id": 1},
+        )
+        assert oversized.status_code == 422, (
+            "an over-cap POST query must be rejected with 422 before any "
+            f"embedding work; got {oversized.status_code}: "
+            f"{oversized.text[:200]}"
+        )
+        assert store.embed_calls == [], (
+            f"no embed may run for a rejected POST body; got {store.embed_calls}"
+        )
+
+        control = client.post(
+            "/api/memories/search",
+            json={"query": "roadmap", "limit": 5, "vault_id": 1},
+        )
+        assert control.status_code == 200, control.text[:400]
+        assert control.json()["total"] >= 1, (
+            "control leg: the normal POST query must still be served")
+        assert store.embed_calls == ["roadmap"], (
+            f"control leg: exactly one embed; got {store.embed_calls}"
+        )
+    finally:
+        pass
+
+
+def test_get_search_boundary_pins_the_exact_10000_cap():
+    """F-004: the GET 422 boundary was pinned only at 20001 — a mutant
+    raising the cap to 15000/20000 stayed green. Pins both sides of the
+    exact 10000 boundary: 10001 rejected (zero embeds), 10000 accepted."""
+    store = _RouteRecordingStore()
+    client = _route_client(store)
+    try:
+        over = client.get(
+            "/api/memories/search", params={"query": "q" * 10001, "vault_id": 1}
+        )
+        assert over.status_code == 422, (
+            f"a 10001-char query must be rejected; got {over.status_code}")
+        assert store.embed_calls == [], "rejected query must not embed"
+
+        at_cap = client.get(
+            "/api/memories/search", params={"query": "q" * 10000, "vault_id": 1}
+        )
+        assert at_cap.status_code == 200, (
+            f"the exactly-at-cap query must be accepted; got "
+            f"{at_cap.status_code}: {at_cap.text[:200]}")
+        assert store.embed_calls == ["q" * 10000], (
+            "the at-cap query is served and embedded (cap is inclusive)")
+    finally:
+        pass
+
+
+def test_memory_embed_budget_validator_rejects_non_finite():
+    """F-005: the knob's gt=0 accepted inf/1e400 (asyncio.timeout(inf)
+    never fires — the #939 budget silently disabled). The new
+    validate_memory_embed_budget_seconds must reject every non-finite
+    value and bound the ceiling, matching the sibling timeout knobs."""
+    import pytest
+
+    from app.config import Settings
+
+    for bad in (float("inf"), float("1e400"), float("nan")):
+        with pytest.raises(ValueError):
+            Settings.validate_memory_embed_budget_seconds(bad)
+    assert Settings.validate_memory_embed_budget_seconds(10.0) == 10.0
+    assert Settings.validate_memory_embed_budget_seconds(600.0) == 600.0
+    with pytest.raises(ValueError):
+        Settings.validate_memory_embed_budget_seconds(600.1)
+    # The gt=0 bound lives on the Field: pin it at the model level (a
+    # non-positive budget would also disable the asyncio.timeout guard).
+    import pydantic
+
+    with pytest.raises(pydantic.ValidationError):
+        Settings(memory_embed_budget_seconds=-1.0)
+    with pytest.raises(pydantic.ValidationError):
+        Settings(memory_embed_budget_seconds=float("inf"))
+
+
+def test_eight_term_cap_lower_bound(tmp_path):
+    """F-004: the 8-content-term cap had only an UPPER-side pin (a row with
+    only term 9), so a mutant narrowing the cap to [:5] stayed green. A row
+    carrying ONLY content term 6 (inside 1..8, outside 1..5) kills it: the
+    real cap includes term 6 in the query (match); the narrowed cap drops
+    it (no match)."""
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    _sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
+    for _mod in ("lancedb", "pyarrow"):
+        if _mod not in _sys.modules:
+            try:
+                __import__(_mod)
+            except ImportError:
+                import types as _types
+
+                _sys.modules[_mod] = _types.ModuleType(_mod)
+    if "lancedb.index" not in _sys.modules:
+        import types as _types
+
+        _idx = _types.ModuleType("lancedb.index")
+        _idx.FTS = type("FTS", (), {})
+        _idx.IvfPq = type("IvfPq", (), {})
+        _sys.modules["lancedb.index"] = _idx
+
+    from app.models.database import SQLiteConnectionPool, init_db
+    from app.services.memory_store import MemoryStore
+
+    db_path = _Path(str(tmp_path)) / "cap-lower.db"
+    init_db(str(db_path))
+    pool = SQLiteConnectionPool(str(db_path), max_size=2)
+    store = MemoryStore(pool=pool)
+    # Under FTS5's implicit AND, MORE kept query terms = STRICTER match.
+    # A row carrying terms 1-6 only:
+    #   - head cap [:8]: the query keeps 8 terms -> the row lacks 7,8
+    #     -> NO match;
+    #   - narrowed-cap mutant ([:5]): the query keeps terms 1-5 -> the row
+    #     has all five -> MATCH. Asserting NOT-match therefore kills the
+    #     mutant and passes at head (the discriminating direction).
+    store.add_memory(
+        "term1 term2 term3 term4 term5 term6",
+        category="terms-1-6",
+    )
+    # Sanity rows: the full row matches every cap value; a term-9-only row
+    # matches no AND query here.
+    store.add_memory(
+        "term1 term2 term3 term4 term5 term6 term7 term8 term9 term10",
+        category="all",
+    )
+    try:
+        query8 = "term1 term2 term3 term4 term5 term6 term7 term8"
+        results = store.search_memories(query8, limit=10)
+        contents = [r.content for r in results]
+        assert not any(c == "term1 term2 term3 term4 term5 term6" for c in contents), (
+            "the 8-term cap must keep all 8 content terms: a row carrying "
+            "only terms 1-6 must NOT match the 8-term AND query at the true "
+            f"cap (it DOES match a narrowed cap-5 mutant); got {contents}"
+        )
+        assert any(c.startswith("term1 term2 term3") for c in contents), (
+            f"the full row must match the 8-term query; got {contents}"
+        )
+    finally:
+        pool.close_all()
+
+
+async def test_cancel_during_yielding_store_release_keeps_shield_and_reraise():
+    """F-001 (swarm-review ship blocker): the cancellation-completes-
+    release behaviour must be PINNED, not just implemented — removing
+    ``asyncio.shield`` from ``_Lease.release`` left ~760 related tests
+    green (Redis-class stores only), and dropping the final
+    ``CancelledError`` re-raise swallowed the #827 cancellation contract.
+    Drives a REAL AdmissionController over a MemoryAdmissionStore whose
+    release YIELDS (event-gated) so the cancel lands deterministically
+    INSIDE the shielded await — never in the renewer join (the reviewer's
+    Windows warning). Asserts all three legs: the holder task ends
+    CANCELLED (re-raise), the after-block code never ran, and the shielded
+    detached release still frees the slot (occupancy 0)."""
+    store = MemoryAdmissionStore()
+    controller = AdmissionController(
+        budgets={"embedding": 1},
+        class_budgets={AdmissionClass.EMBEDDING: "embedding"},
+        store=store,
+        instance_id="f001-shield-pin",
+    )
+    release_started = asyncio.Event()
+    orig_release = store.release
+
+    async def _yielding_release(key, holder):
+        release_started.set()
+        await asyncio.sleep(0.05)  # the cancel arrives inside this window
+        await orig_release(key, holder)
+
+    store.release = _yielding_release  # instance override: yields mid-release
+
+    after_block_ran = False
+
+    async def _holder():
+        nonlocal after_block_ran
+        async with controller.admit(AdmissionClass.EMBEDDING):
+            pass
+        after_block_ran = True
+
+    holder_task = asyncio.create_task(_holder())
+    await asyncio.wait_for(release_started.wait(), 5.0)
+    holder_task.cancel()
+    with _suppress_cancel():
+        await asyncio.wait_for(holder_task, 5.0)
+
+    assert holder_task.cancelled() is True, (
+        "the final CancelledError re-raise must surface at the holder "
+        "(the #827 cancellation contract); a release that swallows the "
+        "cancellation ends the task normally")
+    assert after_block_ran is False, (
+        "code after the async-with must NOT run when the cancellation "
+        "surfaces during release")
+    occupancy = -1
+    for _ in range(50):
+        occupancy = await store.occupancy("embedding")
+        if occupancy == 0:
+            break
+        await asyncio.sleep(0.02)
+    assert occupancy == 0, (
+        "the shield must keep the detached store release running to "
+        f"completion under the cancellation; occupancy {occupancy}")
+
+
+class _suppress_cancel:
+    """contextlib.suppress(asyncio.CancelledError) twin that does NOT
+    swallow a CancelledError raised through wait_for's own timeout path
+    (wait_for(timeout) raises TimeoutError, which is not suppressed)."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return exc_type is not None and issubclass(exc_type, asyncio.CancelledError)

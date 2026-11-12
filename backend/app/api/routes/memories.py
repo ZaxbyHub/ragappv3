@@ -27,7 +27,11 @@ from app.api.deps import (
 from app.config import settings
 from app.limiter import limiter
 from app.security import csrf_protect
-from app.services.admission import AdmissionClass, get_admission_controller
+from app.services.admission import (
+    AdmissionClass,
+    AdmissionRejected,
+    get_admission_controller,
+)
 from app.services.memory_store import MemoryRecord, MemoryStore, MemoryStoreError
 
 logger = logging.getLogger(__name__)
@@ -363,12 +367,30 @@ async def _perform_memory_search(
             # precompute (#939): one asyncio.timeout window covers BOTH the
             # admission acquire (unbounded without a default admission
             # deadline) and the embed await; either a budget expiry or a
-            # saturated budget degrades this request FTS-only.
+            # saturated budget degrades this request FTS-only. (Provider
+            # errors do NOT reach these arms: MemoryStore.embed_query
+            # swallows them and logs its own degrade WARNING.)
             async with asyncio.timeout(settings.memory_embed_budget_seconds):
                 async with get_admission_controller().admit(
                     AdmissionClass.EMBEDDING
                 ):
                     query_embedding = await memory_store.embed_query(query)
+        except asyncio.TimeoutError:
+            # asyncio.timeout's TimeoutError carries no message, so name
+            # the budget explicitly (swarm-review F-003).
+            logger.warning(
+                "Memory query embedding precompute exceeded the %.1fs "
+                "memory_embed_budget_seconds budget; continuing FTS-only",
+                settings.memory_embed_budget_seconds,
+            )
+            query_embedding = None
+        except AdmissionRejected as exc:
+            logger.warning(
+                "Memory query embedding admission rejected (%s); "
+                "continuing FTS-only",
+                exc,
+            )
+            query_embedding = None
         except Exception as exc:  # noqa: BLE001 — degrade, not fail the request
             logger.warning(
                 "Memory query embedding precompute failed; continuing "
