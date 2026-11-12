@@ -89,11 +89,6 @@ def _real_module(name: str) -> str:
     return (REPO / ROUTE_REL[name]).read_text(encoding="utf-8")
 
 
-def _patch(text: str, old: str, new: str) -> str:
-    assert old in text, f"anchor not found in source: {old!r}"
-    return text.replace(old, new, 1)
-
-
 def test_gate_fails_on_planted_draftroom_500_fstring_and_str_details(tmp_path) -> None:
     """The #917 extension: a literal >= 500 DraftRoomHTTPError whose detail
     echoes the exception (either shape) must fail with file and line."""
