@@ -15,7 +15,9 @@ One PR authorized by the session owner 2026-11-11.
   with the pair. `source_type` lifts to `document` only when the curator's
   evidence is document-backed (`file_id` present, the ingest trigger); on the
   manual/query triggers a matched claim keeps its own source_type, so
-  memory-sourced provenance is never relabeled. Previously the matched claim stayed `unverified` forever —
+  memory-sourced provenance is never relabeled. The confidence lift writes
+  the curator's verified-candidate confidence, not the deterministic
+  path's compile-time 0.8 (review round 2 clarification). Previously the matched claim stayed `unverified` forever —
   quote-verified knowledge the curator had just confirmed never activated.
   Draft-mode (`needs_review`) candidates never promote (unchanged boundary,
   now pinned).
@@ -43,7 +45,8 @@ One PR authorized by the session owner 2026-11-11.
   prefix) via `run_in_executor`, so a long lint no longer stalls the event
   loop for the whole process — and a burst of concurrent lint runs cannot
   occupy the shared default executor that carries the per-request auth
-  read (review round 1, PRR-001).
+  read (review round 1, PRR-001). The executor is shut down with the app
+  (lifespan, `wait=False`).
 
 **Curator lint details are capped at 500 chars (wiki_curator.py — #935 item 2)**
 - Every LLM-derived string stored in lint `details` — `claim_text` (three
@@ -52,7 +55,8 @@ One PR authorized by the session owner 2026-11-11.
   documented `_DETAIL_TEXT_MAX_CHARS = 500` (matching the pre-existing
   `attempted_quote` cap, which now uses the same constant). Values pass
   through safe `str()` normalization first, so a schema-drifting model
-  payload cannot TypeError the slice. A hostile or runaway model can no
+  payload cannot TypeError the slice; absent optional fields stay JSON
+  null (review round 2, PRR-002 follow-up). A hostile or runaway model can no
   longer push unbounded text into a column served to every lint-panel
   reader.
 
@@ -63,6 +67,12 @@ One PR authorized by the session owner 2026-11-11.
   prints ~113 "Newly-suppressed IDs" at a zero count delta; a genuine
   content add — including a duplicate occurrence of an existing finding —
   still reports. The separate `run_bandit.py` gate identity is unchanged.
+  Known limitation (review round 2): because identities are content-keyed,
+  the swap advisory cannot carry a `file:line` locator and a same-identity
+  occurrence move at a different line is invisible to it — use
+  `python scripts/run_bandit.py --update-baseline` (line-keyed) as the
+  source for the file:line IDs the security README requires in PR
+  descriptions.
 - The PR also regenerates `backend/security/bandit-baseline.json`
   (line-number re-anchor only: 128 findings before and after, identical
   (test_id, filename, issue_text) multiset, zero new suppressions) —
@@ -86,6 +96,9 @@ One PR authorized by the session owner 2026-11-11.
 - backend/tests/test_o06d_curator_detail_caps.py (C10, incl. chunk_id legs)
 - backend/tests/test_o06e_sast_diff_multiset_key.py (C11, incl.
   duplicate-occurrence multiset leg)
+- backend/tests/test_o06f_review_round_pins.py (dedicated-executor
+  thread-prefix pin, `_cap` None + stored-row pins, lifespan shutdown
+  source pin)
 - frontend/src/pages/WikiLintPanel.test.tsx (C12, pre-existing)
 - Blast radius: backend/tests/test_o01_*, test_o02_*, test_o05*, test_wiki_*,
   test_issue515_wiki_curator, test_settings_curator.

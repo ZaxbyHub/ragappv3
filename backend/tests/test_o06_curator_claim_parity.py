@@ -31,6 +31,7 @@ chunk id "1_0"). Checks in this file:
 
 import json
 import os
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -140,6 +141,9 @@ class TestCuratorClaimParity(unittest.TestCase):
         self._flag.__enter__()
         self.conn, self.store, self.compiler, self._td = _make_env()
         self.addCleanup(self._flag.__exit__, None, None, None)
+        # Temp-hygiene (swarm-pr-review round 2, N-07): remove the fixture
+        # dir at test end (ignore_errors: the db file may linger briefly).
+        self.addCleanup(shutil.rmtree, self._td, True)
 
     def tearDown(self):
         self.conn.close()
@@ -415,7 +419,9 @@ class TestUpdateLintFindingStatusContract(unittest.TestCase):
     'auto_resolved' stays rejected. GREEN at base (pin)."""
 
     def setUp(self):
-        self.conn, self.store = _make_env()[:2]
+        conn, store, _compiler, td = _make_env()
+        self.conn, self.store, self._td = conn, store, td
+        self.addCleanup(shutil.rmtree, self._td, True)
 
     def tearDown(self):
         self.conn.close()

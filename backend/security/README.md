@@ -63,6 +63,13 @@ When a PR regenerates the baseline, the PR description MUST list every
 newly-suppressed finding ID (`test_id` + `file:line`) with a one-line
 justification. Suppressing a real new vulnerability silently defeats the gate.
 
+Note (PR #1113 review round 2): the baseline-*comparison* advisory in
+`scripts/check_sast_baseline.py` reports content-keyed identities
+(`test_id` + `file` + `issue_text`, no line numbers), so a same-identity
+occurrence move to a different line is invisible to that advisory.
+`scripts/run_bandit.py` and `--update-baseline` remain line-keyed and are
+the source for the `file:line` IDs this section requires.
+
 Because the suppressed set is reviewable in this committed file and the
 regeneration prints its diff, baseline "rot" is auditable: every bump is a
 reviewable change to `bandit-baseline.json`.

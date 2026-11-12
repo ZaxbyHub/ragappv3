@@ -28,6 +28,7 @@ fix cannot pass by switching to collapsing set semantics. The module's
 
 import importlib.util
 import json
+import shutil
 import unittest
 from pathlib import Path
 from tempfile import mkdtemp
@@ -76,7 +77,9 @@ class TestSastDiffMultisetKey(unittest.TestCase):
         # the grown baseline leaking into the shift leg contaminated it).
         grown = json.loads(original_text)
         grown.setdefault("results", []).append(_FAB_ENTRY)
-        grown_path = Path(mkdtemp()) / "o06e-grown-baseline.json"
+        grown_dir = Path(mkdtemp())
+        self.addCleanup(shutil.rmtree, grown_dir, True)
+        grown_path = grown_dir / "o06e-grown-baseline.json"
         grown_path.write_text(json.dumps(grown), encoding="utf-8")
         module.BASELINE = grown_path
         added_real = module._diff_added_keys(original_text)
@@ -99,7 +102,9 @@ class TestSastDiffMultisetKey(unittest.TestCase):
         dup["line_number"] = int(dup_source.get("line_number", 1)) + 1000
         grown_dup = json.loads(original_text)
         grown_dup.setdefault("results", []).append(dup)
-        dup_path = Path(mkdtemp()) / "o06e-dup-baseline.json"
+        dup_dir = Path(mkdtemp())
+        self.addCleanup(shutil.rmtree, dup_dir, True)
+        dup_path = dup_dir / "o06e-dup-baseline.json"
         dup_path.write_text(json.dumps(grown_dup), encoding="utf-8")
         module.BASELINE = dup_path
         added_dup = module._diff_added_keys(original_text)

@@ -27,6 +27,7 @@ fix.
 
 import json
 import os
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -108,6 +109,8 @@ class TestCuratorDetailCaps(unittest.TestCase):
 
     def tearDown(self):
         self.conn.close()
+        # Temp-hygiene (swarm-pr-review round 2, N-07).
+        shutil.rmtree(self._td, ignore_errors=True)
 
     def test_llm_detail_fields_capped(self):
         settings.wiki_llm_curator_enabled = True

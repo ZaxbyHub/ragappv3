@@ -1,17 +1,24 @@
 """Race checks for ``WikiStore.upsert_lint_findings`` reconciliation
 (collated wiki lint lifecycle trace, issues #929 + #932 + #935).
 
-At base the reconciliation reads its snapshot of ``wiki_lint_findings``
+At base the reconciliation read its snapshot of ``wiki_lint_findings``
 BEFORE opening its ``BEGIN IMMEDIATE`` write transaction, and both its
-status-changing UPDATEs (the rule-3 reopen and the resolve pass) carry no
-status predicate — so any concurrent user disposition committed in that
-window is silently overwritten.
+status-changing UPDATEs (the rule-3 reopen and the resolve pass) carried no
+status predicate — so a concurrent user disposition committed in that
+window was silently overwritten. At head the snapshot read lives INSIDE
+the transaction (the AC5 fix), so the race checks below verify the
+dispositions survive the reconciliation on the fixed shape; the AC6/AC7
+status predicates themselves are pinned by the AST-scoped source
+assertions in C6/C7 (the race oracle passes via snapshot visibility once
+AC5 lands).
 
-Harness (the AC8 race-injection pattern, verified by the orchestrator's
-probe): ``store.transaction`` is patched with a wrapper whose ``__enter__``
-first performs writes + COMMIT on a SECOND sqlite3 connection (they land
-exactly between the snapshot read and the real BEGIN IMMEDIATE) and only
-then delegates to ONE captured real context-manager instance. The real
+Harness (the AC8 race-injection pattern): ``store.transaction`` is
+patched with a wrapper whose ``__enter__`` first performs writes + COMMIT
+on a SECOND sqlite3 connection, then delegates to ONE captured real
+context-manager instance. At BASE that injection lands between the
+snapshot read and the BEGIN IMMEDIATE (the bug window); at HEAD it lands
+just before the BEGIN, so the in-transaction snapshot already sees the
+disposition. The real
 context manager is created inside ``__enter__`` — creating it at patch time
 would emit the BEGIN before the injected writes land, and creating it twice
 fails with "cannot start a transaction within a transaction".
@@ -38,6 +45,7 @@ pre-fix code by construction):
 
 import ast
 import os
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -97,11 +105,15 @@ def _make_env():
 class _InterleavedTransaction:
     """Patch target for ``store.transaction`` (the AC8 injection site).
 
-    ``upsert_lint_findings`` calls ``with self.transaction():`` AFTER its
-    snapshot read. Wrapping that call means ``__enter__`` is the exact
-    moment between the snapshot and the real BEGIN: the second connection
-    writes and COMMITS first, then the ONE captured real context manager
-    opens the production ``BEGIN IMMEDIATE``.
+    ``upsert_lint_findings`` opens its write transaction around the whole
+    reconciliation (snapshot included, post-AC5). Wrapping that call means
+    ``__enter__`` runs just before the production ``BEGIN IMMEDIATE``: the
+    second connection writes and COMMITS first, so the in-transaction
+    snapshot at head already observes the disposition (at base, where the
+    snapshot preceded the transaction, the injection landed in the bug
+    window). The ONE captured real context manager is created inside
+    ``__enter__`` — creating it twice fails with "cannot start a
+    transaction within a transaction".
     """
 
     def __init__(self, real_transaction, writer):
@@ -130,6 +142,9 @@ class TestUpsertLintReconcileRace(unittest.TestCase):
     def tearDown(self):
         self.conn.close()
         self.conn2.close()
+        # Temp-hygiene (swarm-pr-review round 2, N-07): the fixture db
+        # lives alone in its mkdtemp dir.
+        shutil.rmtree(Path(self.db_path).parent, ignore_errors=True)
 
     # -- helpers -----------------------------------------------------------
 
