@@ -92,16 +92,19 @@ Repository contract job:
   upload-migration timeout contract drifts from the documented wiring.
 - `python scripts/check_l05_raw_palette.py` — fails if the frontend introduces
   raw palette colors outside the design tokens (issue L05).
-- `python scripts/check_l05_page_headers.py` — fails if a page loses its
-  required header structure (issue L05).
+- `python scripts/check_l05_page_headers.py` — fails if a page owns its own
+  `<h1>` header instead of leaving the page header to PageShell (issue #776 /
+  L05).
 - `python scripts/check_l07_a11y_gate_wired.py` — fails if the a11y-matrix CI
   job stops running the a11y spec or waives an axe rule silently (issue #778).
 - `python scripts/check_l09_skill_trigger_paths.py` — fails if a skill's
   trigger globs drift from the generated skill tree contract (issue L09).
-- `python scripts/check_l09_index_assets.py` — fails if generated index assets
-  referenced by skills go missing (issue L09).
-- `python scripts/check_l09_memory_response_fields.py` — fails if the memory
-  response schema loses required fields (issue L09).
+- `python scripts/check_l09_index_assets.py` — fails if a `%BASE_URL%` asset
+  link in `frontend/index.html` has no matching file under `frontend/public/`
+  (issue #780 / L09).
+- `python scripts/check_l09_memory_response_fields.py` — fails if the
+  TypeScript `AddMemoryResponse` declares fields the backend
+  `MemoryResponse` never sends (issue #780 / L09).
 - `python scripts/check_n05_draftclaim_nullable.py` — fails if the backend
   DraftClaim/DraftClaimSource `Optional` fields and the hand-maintained
   TypeScript `| null` mirror drift apart in either direction (issue #789 /
