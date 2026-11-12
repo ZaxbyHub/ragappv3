@@ -324,8 +324,14 @@ class TestCuratorClaimParity(unittest.TestCase):
         settings.wiki_llm_curator_require_quote_match = True
         settings.wiki_llm_curator_require_chunk_id = True
         payload = json.dumps({"claims": [{
-            # Normalized-equivalent variant of the seeded claim text.
-            "claim_text": f"  {_CLAIM_TEXT}  ",
+            # Normalized-EQUIVALENT but textually-DIFFERENT variant: the
+            # trailing exclamation survives the curator's strip() (so the
+            # exact-text lookup misses) while normalize_claim_text strips
+            # punctuation (so the normalized lookup hits). A pure
+            # whitespace variant would NOT work here — the curator strips
+            # whitespace before the lookup, restoring exact equality
+            # (final-critic round 1).
+            "claim_text": f"{_CLAIM_TEXT}!",
             "claim_type": "fact",
             "source_quote": _CLAIM_TEXT,
             "chunk_id": "1_0",
