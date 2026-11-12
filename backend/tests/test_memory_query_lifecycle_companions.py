@@ -502,32 +502,27 @@ def test_post_search_rejects_oversized_query_before_embed():
     embed calls; a normal POST body still returns 200 with results."""
     store = _RouteRecordingStore()
     client = _route_client(store)
-    try:
-        oversized = client.post(
-            "/api/memories/search",
-            json={"query": "q" * 10001, "limit": 5, "vault_id": 1},
-        )
-        assert oversized.status_code == 422, (
-            "an over-cap POST query must be rejected with 422 before any "
-            f"embedding work; got {oversized.status_code}: "
-            f"{oversized.text[:200]}"
-        )
-        assert store.embed_calls == [], (
-            f"no embed may run for a rejected POST body; got {store.embed_calls}"
-        )
+    oversized = client.post(
+        "/api/memories/search",
+        json={"query": "q" * 10001, "limit": 5, "vault_id": 1},
+    )
+    assert oversized.status_code == 422, (
+        "an over-cap POST query must be rejected with 422 before any "
+        f"embedding work; got {oversized.status_code}: {oversized.text[:200]}"
+    )
+    assert store.embed_calls == [], (
+        f"no embed may run for a rejected POST body; got {store.embed_calls}"
+    )
 
-        control = client.post(
-            "/api/memories/search",
-            json={"query": "roadmap", "limit": 5, "vault_id": 1},
-        )
-        assert control.status_code == 200, control.text[:400]
-        assert control.json()["total"] >= 1, (
-            "control leg: the normal POST query must still be served")
-        assert store.embed_calls == ["roadmap"], (
-            f"control leg: exactly one embed; got {store.embed_calls}"
-        )
-    finally:
-        pass
+    control = client.post(
+        "/api/memories/search",
+        json={"query": "roadmap", "limit": 5, "vault_id": 1},
+    )
+    assert control.status_code == 200, control.text[:400]
+    assert control.json()["total"] >= 1, (
+        "control leg: the normal POST query must still be served")
+    assert store.embed_calls == ["roadmap"], (
+        f"control leg: exactly one embed; got {store.embed_calls}")
 
 
 def test_get_search_boundary_pins_the_exact_10000_cap():
@@ -536,24 +531,84 @@ def test_get_search_boundary_pins_the_exact_10000_cap():
     exact 10000 boundary: 10001 rejected (zero embeds), 10000 accepted."""
     store = _RouteRecordingStore()
     client = _route_client(store)
-    try:
-        over = client.get(
-            "/api/memories/search", params={"query": "q" * 10001, "vault_id": 1}
-        )
-        assert over.status_code == 422, (
-            f"a 10001-char query must be rejected; got {over.status_code}")
-        assert store.embed_calls == [], "rejected query must not embed"
+    over = client.get(
+        "/api/memories/search", params={"query": "q" * 10001, "vault_id": 1}
+    )
+    assert over.status_code == 422, (
+        f"a 10001-char query must be rejected; got {over.status_code}")
+    assert store.embed_calls == [], "rejected query must not embed"
 
-        at_cap = client.get(
-            "/api/memories/search", params={"query": "q" * 10000, "vault_id": 1}
-        )
-        assert at_cap.status_code == 200, (
-            f"the exactly-at-cap query must be accepted; got "
-            f"{at_cap.status_code}: {at_cap.text[:200]}")
-        assert store.embed_calls == ["q" * 10000], (
-            "the at-cap query is served and embedded (cap is inclusive)")
-    finally:
-        pass
+    at_cap = client.get(
+        "/api/memories/search", params={"query": "q" * 10000, "vault_id": 1}
+    )
+    assert at_cap.status_code == 200, (
+        f"the exactly-at-cap query must be accepted; got "
+        f"{at_cap.status_code}: {at_cap.text[:200]}")
+    assert store.embed_calls == ["q" * 10000], (
+        "the at-cap query is served and embedded (cap is inclusive)")
+
+
+async def test_cancelled_release_wakeup_is_deferred_until_store_release_completes():
+    """F-002 (delta-crit Important): the cancelled path must NOT pump before
+    the detached store release completes — an immediate pump reads a
+    still-held slot on a latency store and the parked waiter stays parked.
+    Drives a real controller (budget 1) over a yielding store: the holder
+    is cancelled mid-release while a waiter is parked; the pinned assertion
+    is that the waiter gets ADMITTED afterwards (kills both the
+    immediate-pump and the no-wakeup mutants)."""
+    store = MemoryAdmissionStore()
+    controller = AdmissionController(
+        budgets={"embedding": 1},
+        class_budgets={AdmissionClass.EMBEDDING: "embedding"},
+        store=store,
+        instance_id="f002-deferred-pump",
+    )
+    release_started = asyncio.Event()
+    orig_release = store.release
+
+    async def _yielding_release(key, holder):
+        release_started.set()
+        await asyncio.sleep(0.05)
+        await orig_release(key, holder)
+
+    store.release = _yielding_release
+
+    holder_entered = asyncio.Event()
+
+    async def _holder():
+        async with controller.admit(AdmissionClass.EMBEDDING):
+            holder_entered.set()
+            await asyncio.sleep(10.0)  # holds the slot until cancelled
+
+    holder_task = asyncio.create_task(_holder())
+    await asyncio.wait_for(holder_entered.wait(), 5.0)
+
+    waiter_got_slot = asyncio.Event()
+
+    async def _waiter():
+        async with controller.admit(AdmissionClass.EMBEDDING):
+            waiter_got_slot.set()
+            await asyncio.sleep(0)
+
+    waiter_task = asyncio.create_task(_waiter())
+    # let the waiter park while the holder still owns the slot
+    await asyncio.sleep(0.05)
+
+    # cancel lands during the release; release_started gates the yielding
+    # store's window so the detached release is in flight
+    holder_task.cancel()
+    with _suppress_cancel():
+        await asyncio.wait_for(holder_task, 5.0)
+
+    # head: the deferred done-callback pumps AFTER the detached release
+    # finishes -> the parked waiter is admitted. Mutant "immediate pump":
+    # pumped while the slot is still held -> waiter never re-woken -> RED.
+    # Mutant "no wakeup": never pumped -> RED.
+    await asyncio.wait_for(waiter_got_slot.wait(), 2.0)
+    # cleanup: the waiter still holds the slot it was admitted into
+    waiter_task.cancel()
+    with _suppress_cancel():
+        await waiter_task
 
 
 def test_memory_embed_budget_validator_rejects_non_finite():
@@ -646,6 +701,72 @@ def test_eight_term_cap_lower_bound(tmp_path):
         )
     finally:
         pool.close_all()
+
+
+async def test_degrade_arms_name_budget_and_admission_reason(caplog, monkeypatch):
+    """F-003 (delta-crit Important): deleting both named arms at both call
+    sites left every suite green (the existing oracles match only the shared
+    prefix). Pins the arm DISTINCT text: budget expiry names
+    memory_embed_budget_seconds; admission saturation names the rejection
+    reason — at the engine and the memories-route call sites."""
+    _pin_embed_budget(monkeypatch)  # 0.3s at head
+
+    # ---- engine site: budget expiry names the knob ----
+    store = _FakeMemoryStore(hang=True)
+    engine = _make_engine(store)
+    with caplog.at_level(logging.WARNING), _memory_admission_patches(
+        _CountingAdmissionController()
+    ):
+        agen = engine.query("quarterly roadmap status", [], stream=True)
+        try:
+            await asyncio.wait_for(_consume(agen), 10.0)
+        finally:
+            await _drain_leftover_tasks()
+    expiry_msgs = [
+        r.getMessage() for r in caplog.records
+        if r.levelno >= logging.WARNING and "memory_embed_budget_seconds" in r.getMessage()
+    ]
+    assert expiry_msgs, (
+        "the budget-expiry WARNING must name memory_embed_budget_seconds "
+        "(the arm discriminator); records: "
+        + repr([r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING])
+    )
+    caplog.clear()
+
+    # ---- engine site: saturated budget names the rejection reason ----
+    store2 = _FakeMemoryStore(hang=False)
+    engine2 = _make_engine(store2)
+    saturated = _CountingAdmissionController(reject_embedding=True)
+    with caplog.at_level(logging.WARNING), _memory_admission_patches(saturated):
+        agen2 = engine2.query("quarterly roadmap status", [], stream=True)
+        try:
+            await asyncio.wait_for(_consume(agen2), 10.0)
+        finally:
+            await _drain_leftover_tasks()
+    assert any(
+        "admission rejected" in r.getMessage() for r in caplog.records
+        if r.levelno >= logging.WARNING
+    ), "the saturated-budget WARNING must carry the admission rejection reason"
+    caplog.clear()
+
+    # ---- route site: budget expiry names the knob ----
+    route_store = _RouteStore(hang=True)
+    with caplog.at_level(logging.WARNING):
+        with patch(
+            "app.api.routes.memories.get_admission_controller",
+            lambda: _CountingAdmissionController(),
+            create=True,
+        ):
+            await asyncio.wait_for(
+                memories_routes._perform_memory_search(
+                    route_store, "quarterly roadmap", limit=5, vault_id=1
+                ),
+                10.0,
+            )
+    assert any(
+        "memory_embed_budget_seconds" in r.getMessage() for r in caplog.records
+        if r.levelno >= logging.WARNING
+    ), "the route budget-expiry WARNING must name memory_embed_budget_seconds"
 
 
 async def test_cancel_during_yielding_store_release_keeps_shield_and_reraise():
