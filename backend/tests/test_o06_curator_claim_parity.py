@@ -211,6 +211,19 @@ class TestCuratorClaimParity(unittest.TestCase):
             "promotion must lift the verified candidate's confidence onto "
             "the matched claim (deterministic-path parity)",
         )
+        # Document-evidence arm (implementation-review round 1): this
+        # candidate carries file_id=1 (ingest trigger), so the promotion
+        # lifts source_type to 'document' exactly like the deterministic
+        # twin; a file_id-less candidate (manual/query trigger) must
+        # PRESERVE the matched claim's own source_type instead of
+        # relabeling memory-sourced provenance.
+        typed = self.conn.execute(
+            "SELECT source_type FROM wiki_claims WHERE id = ?", (cid,)
+        ).fetchone()
+        self.assertEqual(
+            dict(typed)["source_type"], "document",
+            "document-backed promotion must lift source_type to 'document'",
+        )
 
     def test_active_mode_promotes_normalized_text_match(self):
         # AC1 arm (plan-critic round 1, finding 5): the find-or-create

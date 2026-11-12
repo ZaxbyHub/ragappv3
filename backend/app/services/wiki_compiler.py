@@ -1303,16 +1303,28 @@ class WikiCompiler:
                         # replicate the lift with a predicated UPDATE — the
                         # status predicate makes the check-and-flip atomic
                         # the way reactivate_claim_if_superseded's is).
+                        # source_type lifts to 'document' only when the
+                        # curator's evidence IS document-backed
+                        # (accepted.file_id set — the ingest trigger); on
+                        # the manual/query triggers the curator has no
+                        # document, so a memory-sourced claim keeps its
+                        # own source_type instead of being relabeled
+                        # (implementation-review round 1).
                         if (
                             existing.status == "unverified"
                             and accepted.status == "active"
                         ):
                             cur = self._db.execute(
                                 "UPDATE wiki_claims SET status = 'active',"
-                                " source_type = 'document', confidence = ?,"
+                                " source_type = ?, confidence = ?,"
                                 " updated_at = datetime('now')"
                                 " WHERE id = ? AND status = 'unverified'",
-                                (accepted.confidence, existing.id),
+                                (
+                                    "document" if accepted.file_id
+                                    else existing.source_type,
+                                    accepted.confidence,
+                                    existing.id,
+                                ),
                             )
                             if cur.rowcount:
                                 existing.status = "active"

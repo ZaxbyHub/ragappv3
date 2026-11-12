@@ -144,14 +144,18 @@ class TestCuratorDetailCaps(unittest.TestCase):
                 },
                 {
                     # Known chunk + non-matching quote → quote-mismatch
-                    # rejection whose details embed chunk_id and the capped
-                    # attempted_quote. Its chunk_id is always a short
-                    # internal id (an oversized id can never be KNOWN), so
-                    # this leg pins the field's presence on that site, not
-                    # its length. Sorts third.
-                    "claim_text": "T" * 100,
+                    # rejection whose details embed claim_text, chunk_id,
+                    # and the capped attempted_quote. claim_text and
+                    # source_quote are OVERSIZED so this site's caps are
+                    # length-guarded too (implementation-review round 1:
+                    # short values made the site's loop assertion
+                    # unfailable). Its chunk_id is always a short internal
+                    # id (an oversized id can never be KNOWN), so only that
+                    # one field stays presence-pinned on this site. Sorts
+                    # third — the A-row still fails first at base.
+                    "claim_text": "T" * 5000,
                     "claim_type": "fact",
-                    "source_quote": "T" * 100,
+                    "source_quote": "Q" * 5000,
                     "chunk_id": "1_0",
                     "confidence": 0.9,
                 },

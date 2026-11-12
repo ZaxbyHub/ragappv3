@@ -12,7 +12,10 @@ One PR authorized by the session owner 2026-11-11.
   column lift the deterministic `_find_or_create_claim` twin performs. The
   promotion is commit-free inside the claim-pair savepoint and predicated on
   `status = 'unverified'`; a failed source attach rolls the promotion back
-  with the pair. Previously the matched claim stayed `unverified` forever —
+  with the pair. `source_type` lifts to `document` only when the curator's
+  evidence is document-backed (`file_id` present, the ingest trigger); on the
+  manual/query triggers a matched claim keeps its own source_type, so
+  memory-sourced provenance is never relabeled. Previously the matched claim stayed `unverified` forever —
   quote-verified knowledge the curator had just confirmed never activated.
   Draft-mode (`needs_review`) candidates never promote (unchanged boundary,
   now pinned).
@@ -41,8 +44,8 @@ One PR authorized by the session owner 2026-11-11.
 
 **Curator lint details are capped at 500 chars (wiki_curator.py — #935 item 2)**
 - Every LLM-derived string stored in lint `details` — `claim_text` (three
-  sites), model-cited `chunk_id` (two sites), and the contradiction
-  quintet `claim_a`/`claim_b`/`reason`/`source_quote` — is bounded by the
+  sites), model-cited `chunk_id` (two sites), and the four contradiction
+  fields `claim_a`/`claim_b`/`reason`/`source_quote` — is bounded by the
   documented `_DETAIL_TEXT_MAX_CHARS = 500` (matching the pre-existing
   `attempted_quote` cap, which now uses the same constant). Values pass
   through safe `str()` normalization first, so a schema-drifting model
