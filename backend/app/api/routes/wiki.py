@@ -5,6 +5,7 @@ All endpoints are vault-scoped. Access follows vault access permissions.
 """
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 import sqlite3
@@ -49,6 +50,19 @@ async def require_wiki_enabled() -> None:
     if not settings.wiki_enabled:
         raise HTTPException(status_code=503, detail="Wiki subsystem is disabled")
 
+
+# Dedicated bounded executor for the wiki lint scan (swarm-pr-review
+# PRR-001, pr1113-20261111): run_lint is a synchronous five-query
+# full-vault scan. Running it on the shared default executor (bare
+# asyncio.to_thread) let concurrent scans occupy default-executor workers
+# and delay unrelated to_thread work. This bound does NOT eliminate
+# contention — each queued run still pins a pooled DB connection, and a
+# burst can exhaust the pool (OOB review F-02, execution-proven) — it
+# moves the stall off the loop and serializes scans. A queue bound or
+# admission gate is the follow-up if that ever surfaces in practice.
+_WIKI_LINT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="wiki-lint"
+)
 
 router = APIRouter(dependencies=[Depends(require_wiki_enabled)])
 
@@ -766,7 +780,15 @@ async def run_wiki_lint(
     await _require_vault_write(evaluate, user, request.vault_id)
     store = WikiStore(db)
     linter = WikiLinter(db, store)
-    findings = linter.run_lint(request.vault_id)
+    # Issue #935 item 1: run_lint is synchronous full-table work; running it
+    # inline on the event loop stalls every other request in the process
+    # for the scan's duration. Dispatch to the dedicated bounded executor
+    # above (review PRR-001; note F-02: queued runs pin their pooled
+    # connection, so this bounds executor starvation, not pool contention).
+    loop = asyncio.get_running_loop()
+    findings = await loop.run_in_executor(
+        _WIKI_LINT_EXECUTOR, linter.run_lint, request.vault_id
+    )
     return {"findings": [_as_dict(f) for f in findings], "count": len(findings)}
 
 

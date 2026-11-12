@@ -37,6 +37,15 @@ _CITE_STRIP_RE = re.compile(r"\[(?:S|M|W)\d+\]")
 
 logger = logging.getLogger(__name__)
 
+
+def _numeric_multiset(text: str) -> tuple:
+    """Sorted tuple of numeric tokens in ``text`` (F-03, PR #1113 review
+    round 2): ``normalize_claim_text`` strips punctuation, so "5.10 MB"
+    and "510 MB" normalize identically and a quote verified for one can
+    promote the other. Requiring equal numeric multisets blocks those
+    collisions while keeping punctuation-only variants matching."""
+    return tuple(sorted(re.findall(r"\d+(?:\.\d+)?", text or "")))
+
 # Module-level executor used when _maybe_run_curator is called from
 # inside a running event loop. The previous per-call
 # ``with ThreadPoolExecutor(max_workers=1) as ex: ...`` pattern paid
@@ -1295,6 +1304,45 @@ class WikiCompiler:
                         ):
                             self._store.reactivate_claim_if_superseded(existing.id)
                             existing.status = "active"
+                        # Issue #929: promote unverified → active with the
+                        # same commit-free discipline (the deterministic
+                        # twin _find_or_create_claim lifts status +
+                        # source_type + confidence and then commits; inside
+                        # this savepoint the commit belongs to the pair, so
+                        # replicate the lift with a predicated UPDATE — the
+                        # status predicate makes the check-and-flip atomic
+                        # the way reactivate_claim_if_superseded's is).
+                        # source_type lifts to 'document' only when the
+                        # curator's evidence IS document-backed
+                        # (accepted.file_id set — the ingest trigger); on
+                        # the manual/query triggers the curator has no
+                        # document, so a memory-sourced claim keeps its
+                        # own source_type instead of being relabeled
+                        # (implementation-review round 1).
+                        if (
+                            existing.status == "unverified"
+                            and accepted.status == "active"
+                            # F-03: the normalized lookup strips
+                            # punctuation, so require identical numeric
+                            # tokens before lifting (blocks 5.10-vs-510
+                            # promotions on the lossy-match path).
+                            and _numeric_multiset(existing.claim_text)
+                            == _numeric_multiset(accepted.claim_text)
+                        ):
+                            cur = self._db.execute(
+                                "UPDATE wiki_claims SET status = 'active',"
+                                " source_type = ?, confidence = ?,"
+                                " updated_at = datetime('now')"
+                                " WHERE id = ? AND status = 'unverified'",
+                                (
+                                    "document" if accepted.file_id
+                                    else existing.source_type,
+                                    accepted.confidence,
+                                    existing.id,
+                                ),
+                            )
+                            if cur.rowcount:
+                                existing.status = "active"
                         already = any(
                             s.source_kind == "document"
                             and s.file_id == accepted.file_id
