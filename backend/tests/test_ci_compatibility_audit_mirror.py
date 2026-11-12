@@ -163,3 +163,24 @@ def test_mirror_section_states_its_scope_and_the_enforcing_test() -> None:
     assert PARITY_TEST_NAME in section_intro, (
         "the Local Mirror section must name the enforcing parity test"
     )
+
+
+def test_prose_repository_contract_list_matches_the_job() -> None:
+    """The prose "Repository contract job" list is the second mirrored surface
+    (final-critic MINOR-1): it drifted with the fence before #914, so it gets
+    the same bidirectional parity — every job script is described, and the
+    prose names no script the job does not run."""
+    text = SKILL.read_text(encoding="utf-8")
+    start = text.index("Repository contract job:")
+    rest = text[start:]
+    end = re.search(r"\n## ", rest[1:])
+    section = rest[: end.end()] if end else rest
+    prose = set(
+        re.findall(r"python\s+(" + _SCRIPT + r")", section)
+    )
+    assert prose, "parser found no contract scripts in the prose list"
+    ci_scripts = _ci_contract_scripts(CI.read_text(encoding="utf-8"))
+    missing = sorted(ci_scripts - prose)
+    extra = sorted(prose - ci_scripts)
+    assert not missing, f"skill prose list is missing: {missing}"
+    assert not extra, f"skill prose list names scripts the job does not run: {extra}"

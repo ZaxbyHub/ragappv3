@@ -166,21 +166,16 @@ def test_gate_passes_on_the_real_route_modules() -> None:
 
 def test_audited_module_set_is_exactly_the_four_route_files() -> None:
     """Removing any audited module (e.g. vaults.py or admin.py) would silently
-    shrink the gate's scope; pin the exact set (plan-critic round 1, MAJOR-4)."""
-    source = SCRIPT.read_text(encoding="utf-8")
-    block = _patch(
-        source,
-        'AUDITED_MODULES = [',
-        'AUDITED_MODULES = [  # pinned by test_a04_gate_wiring.py',
-    )
-    for name in ROUTE_REL:
-        assert f'"{ROUTE_REL[name].as_posix()}"' in source, (
-            f"{name} missing from the gate's AUDITED_MODULES"
-        )
-    # The list has exactly the four entries: no fifth module sneaks in.
+    shrink the gate's scope; pin the exact set (plan-critic round 1, MAJOR-4).
+    The regex is scoped to the AUDITED_MODULES assignment itself so a route
+    path written anywhere else in the script cannot count as an entry
+    (final-critic NIT)."""
     import re
 
-    entries = re.findall(r'"(backend/app/api/routes/[a-z_]+\.py)"', block)
+    source = SCRIPT.read_text(encoding="utf-8")
+    match = re.search(r"AUDITED_MODULES\s*=\s*\[(.*?)\]", source, re.DOTALL)
+    assert match, "AUDITED_MODULES assignment not found in the gate"
+    entries = re.findall(r'"(backend/app/api/routes/[a-z_]+\.py)"', match.group(1))
     assert sorted(entries) == sorted(
         ROUTE_REL[name].as_posix() for name in ROUTE_REL
     ), f"unexpected AUDITED_MODULES entries: {entries}"
