@@ -174,3 +174,90 @@ def test_gate_fails_closed_when_the_interface_is_gone(tmp_path) -> None:
     result = _run_on(tmp_path, frontend=broken)
     assert result.returncode == 3, result.stdout + result.stderr
     assert "ABORT" in result.stderr
+
+
+# --- DraftClaimSource coverage (issue #912 residual) ------------------------
+#
+# The maintainer's scope-narrowing comment on #912 left the issue open as the
+# registry for "extending the same parity check to DraftClaimSource": the
+# gate's per-class spec now covers both claim-family pairs, and these tamper
+# tests pin every direction for the new pair (mirroring the DraftClaim tests
+# above).
+
+
+def test_gate_fails_when_a_nullable_source_field_is_non_null_in_ts(tmp_path) -> None:
+    backend = (REPO / BACKEND_REL).read_text(encoding="utf-8")
+    frontend = (REPO / FRONTEND_REL).read_text(encoding="utf-8")
+    backend = _patch(
+        backend,
+        "    lexical_overlap_score: Optional[float]\n\n\nclass DraftClaim(BaseModel):",
+        "    lexical_overlap_score: Optional[float]\n"
+        "    verifier_note: Optional[str]\n\n\nclass DraftClaim(BaseModel):",
+    )
+    frontend = _patch(
+        frontend,
+        "  lexical_overlap_score: number | null;\n}\n\nexport interface DraftClaim {",
+        "  lexical_overlap_score: number | null;\n"
+        "  verifier_note: string;\n}\n\nexport interface DraftClaim {",
+    )
+    result = _run_on(tmp_path, backend=backend, frontend=frontend)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "NON-NULL DraftClaimSource.verifier_note" in result.stdout
+
+
+def test_gate_fails_on_source_reverse_drift(tmp_path) -> None:
+    """TS keeps ``| null`` after the backend drops Optional — the direction a
+    one-directional gate could never see."""
+    backend = (REPO / BACKEND_REL).read_text(encoding="utf-8")
+    backend = _patch(
+        backend,
+        "    passage_start: Optional[int]\n    passage_end: Optional[int]",
+        "    passage_start: int\n    passage_end: int",
+    )
+    result = _run_on(tmp_path, backend=backend)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "OVER-NULL DraftClaimSource.passage_start" in result.stdout
+    assert "OVER-NULL DraftClaimSource.passage_end" in result.stdout
+
+
+def test_gate_fails_on_a_source_field_missing_from_the_ts_interface(tmp_path) -> None:
+    """A backend-only DraftClaimSource field is drift the nullability
+    comparison cannot express (the UNMIRRORED class)."""
+    backend = (REPO / BACKEND_REL).read_text(encoding="utf-8")
+    backend = _patch(
+        backend,
+        "    lexical_overlap_score: Optional[float]\n\n\nclass DraftClaim(BaseModel):",
+        "    lexical_overlap_score: Optional[float]\n"
+        "    provenance_note: Optional[str]\n\n\nclass DraftClaim(BaseModel):",
+    )
+    result = _run_on(tmp_path, backend=backend)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "DraftClaimSource.provenance_note" in result.stdout
+
+
+def test_gate_fails_closed_when_the_source_interface_is_gone(tmp_path) -> None:
+    frontend = (REPO / FRONTEND_REL).read_text(encoding="utf-8")
+    broken = _patch(
+        frontend,
+        "export interface DraftClaimSource {",
+        "export interface DraftClaimSourceRenamed {",
+    )
+    result = _run_on(tmp_path, frontend=broken)
+    assert result.returncode == 3, result.stdout + result.stderr
+    assert "ABORT" in result.stderr
+    assert "DraftClaimSource" in result.stderr
+
+
+def test_gate_fails_closed_when_the_source_backend_class_is_gone(tmp_path) -> None:
+    """Both halves of the structural fail-closed contract: renaming the
+    backend class must abort exactly like renaming the TS interface."""
+    backend = (REPO / BACKEND_REL).read_text(encoding="utf-8")
+    broken = _patch(
+        backend,
+        "class DraftClaimSource(BaseModel):",
+        "class DraftClaimSourceModel(BaseModel):",
+    )
+    result = _run_on(tmp_path, backend=broken)
+    assert result.returncode == 3, result.stdout + result.stderr
+    assert "ABORT" in result.stderr
+    assert "DraftClaimSource" in result.stderr

@@ -79,6 +79,33 @@ Repository contract job:
 - `python scripts/check_test_collection_scope.py` — fails if a pytest test
   file (`test_*.py` / `*_test.py`) exists outside `backend/tests/`, where
   `pytest tests/` would never collect it (issue #563 / C11).
+- `python scripts/check_settings_consumers.py` — fails if a settings field
+  loses its last consumer (an unwired setting), a consumer reads an unknown
+  field, or the documented settings-consumer contract drifts (issue #662).
+- `python scripts/check_batch_mock_seq.py` — fails if a batch-save mock
+  sequence drifts from the recorded call-shape contract.
+- `python scripts/check_a04_http500_detail_hygiene.py` — fails if any audited
+  route module (memories, vaults, admin, draft_room) builds an HTTP 500
+  `detail` from a raw exception (f-string interpolation or `str(exc)`;
+  issue #686 / #917).
+- `python scripts/check_b03_upload_migration_timeout.py` — fails if the
+  upload-migration timeout contract drifts from the documented wiring.
+- `python scripts/check_l05_raw_palette.py` — fails if the frontend introduces
+  raw palette colors outside the design tokens (issue L05).
+- `python scripts/check_l05_page_headers.py` — fails if a page loses its
+  required header structure (issue L05).
+- `python scripts/check_l07_a11y_gate_wired.py` — fails if the a11y-matrix CI
+  job stops running the a11y spec or waives an axe rule silently (issue #778).
+- `python scripts/check_l09_skill_trigger_paths.py` — fails if a skill's
+  trigger globs drift from the generated skill tree contract (issue L09).
+- `python scripts/check_l09_index_assets.py` — fails if generated index assets
+  referenced by skills go missing (issue L09).
+- `python scripts/check_l09_memory_response_fields.py` — fails if the memory
+  response schema loses required fields (issue L09).
+- `python scripts/check_n05_draftclaim_nullable.py` — fails if the backend
+  DraftClaim/DraftClaimSource `Optional` fields and the hand-maintained
+  TypeScript `| null` mirror drift apart in either direction (issue #789 /
+  #912).
 
 SAST job:
 
@@ -116,6 +143,13 @@ SAST job:
 
 ## Local Mirror Commands
 
+These mirror the `ci.yml` **quality-contracts** job exactly — every contract
+script below is one of that job's steps, in both directions: adding a
+`scripts/check_*.py` step to `ci.yml` (or removing one) fails
+`backend/tests/test_ci_compatibility_audit_mirror.py` until this list matches,
+so a local pre-push audit can never silently under-run Quality contracts
+(issue #914).
+
 ```bash
 cd frontend && npm ci --engine-strict && npm run typecheck && npm run lint
 cd frontend && npm test -- src/lib/api.test.ts src/lib/api.csrf.test.ts src/lib/api.sse.test.ts src/pages/WikiPage.sse.test.tsx src/stores/useAuthStore.api-base.test.ts
@@ -131,10 +165,21 @@ cd backend && ruff check . && pytest --tb=short -v --timeout=300 --timeout-metho
 python scripts/check_runtime_contract.py
 python scripts/check_config_contract.py
 python scripts/check_g06_setup_docs.py --check all
+python scripts/check_settings_consumers.py
+python scripts/check_batch_mock_seq.py
 python scripts/check_pr_scope_drift.py
 python scripts/check_sast_baseline.py
 python scripts/check_secretscan.py
 python scripts/check_test_collection_scope.py
+python scripts/check_a04_http500_detail_hygiene.py
+python scripts/check_b03_upload_migration_timeout.py
+python scripts/check_l05_raw_palette.py
+python scripts/check_l05_page_headers.py
+python scripts/check_l07_a11y_gate_wired.py
+python scripts/check_l09_skill_trigger_paths.py
+python scripts/check_l09_index_assets.py
+python scripts/check_l09_memory_response_fields.py
+python scripts/check_n05_draftclaim_nullable.py
 python scripts/run_bandit.py
 ```
 

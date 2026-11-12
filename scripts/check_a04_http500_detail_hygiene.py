@@ -7,10 +7,20 @@ SQL fragments) to API clients. The audited route modules must instead log the
 full exception server-side and return a generic detail string.
 
 This gate walks the audited modules with the stdlib ``ast`` module and fails
-(exit 1) while any ``HTTPException`` call has BOTH:
-  - a ``status_code`` keyword that is the constant ``500``, AND
-  - a ``detail`` keyword that is an f-string (JoinedStr) containing at least
-    one interpolation (FormattedValue).
+(exit 1) while any audited exception call has BOTH:
+
+  - a ``status_code`` that is the constant ``500`` or above (literal only —
+    read from the ``status_code`` keyword or, for exceptions with positional
+    signatures like ``DraftRoomHTTPError(status_code, detail, code)``, the
+    first positional argument), AND
+  - a ``detail`` that is an f-string (JoinedStr) containing at least one
+    interpolation (FormattedValue) or a ``str(...)`` call — read from the
+    ``detail`` keyword or the second positional argument.
+
+Issue #917 extended the audited set with the Draft Room: ``DraftRoomHTTPError``
+carries the same leak surface as ``HTTPException`` (it renders ``detail`` to
+the client through the registered handler), so calls of either name in
+``draft_room.py`` are inspected with both keyword and positional shapes.
 
 Usage (from the repo root):
 
@@ -29,19 +39,46 @@ AUDITED_MODULES = [
     "backend/app/api/routes/memories.py",
     "backend/app/api/routes/vaults.py",
     "backend/app/api/routes/admin.py",
+    "backend/app/api/routes/draft_room.py",
 ]
+
+#: Exception classes whose ``detail`` reaches the client. ``HTTPException`` is
+#: FastAPI's own; ``DraftRoomHTTPError`` is its Draft Room subclass with the
+#: positional ``(status_code, detail, code)`` signature (issue #917).
+AUDITED_EXCEPTION_NAMES = ("HTTPException", "DraftRoomHTTPError")
+
+
+def _is_str_call(node: ast.expr) -> bool:
+    """True for a ``str(...)`` call — the other raw-exception echo shape."""
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "str"
+    )
+
+
+def _interpolated_detail(detail: ast.expr | None) -> bool:
+    if detail is None:
+        return False
+    if isinstance(detail, ast.JoinedStr) and any(
+        isinstance(value, ast.FormattedValue) for value in detail.values
+    ):
+        return True
+    return _is_str_call(detail)
 
 
 def raw_500_detail_lines(source: str) -> list[int]:
-    """Line numbers of HTTPException calls with status_code=500 and an
-    f-string detail that interpolates at least one value."""
+    """Line numbers of audited exception calls with a literal status >= 500
+    and a detail that is an f-string with at least one interpolation or a
+    ``str(...)`` call. The status and detail are read from keywords, or from
+    the first two positional arguments for positional signatures."""
     hits: list[int] = []
     for node in ast.walk(ast.parse(source)):
         if not isinstance(node, ast.Call):
             continue
         func = node.func
         name = getattr(func, "id", None) or getattr(func, "attr", None)
-        if name != "HTTPException":
+        if name not in AUDITED_EXCEPTION_NAMES:
             continue
         status_code: ast.expr | None = None
         detail: ast.expr | None = None
@@ -50,11 +87,17 @@ def raw_500_detail_lines(source: str) -> list[int]:
                 status_code = keyword.value
             elif keyword.arg == "detail":
                 detail = keyword.value
-        if not (isinstance(status_code, ast.Constant) and status_code.value == 500):
-            continue
-        if isinstance(detail, ast.JoinedStr) and any(
-            isinstance(value, ast.FormattedValue) for value in detail.values
+        if status_code is None and len(node.args) >= 1:
+            status_code = node.args[0]
+        if detail is None and len(node.args) >= 2:
+            detail = node.args[1]
+        if not (
+            isinstance(status_code, ast.Constant)
+            and isinstance(status_code.value, int)
+            and status_code.value >= 500
         ):
+            continue
+        if _interpolated_detail(detail):
             hits.append(node.lineno)
     return sorted(hits)
 
