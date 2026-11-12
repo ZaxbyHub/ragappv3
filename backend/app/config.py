@@ -509,6 +509,14 @@ class Settings(BaseSettings):
     chat pipeline skips the memory_store search step entirely."""
     memory_retrieval_top_k: int = 5
     """Maximum memories returned by hybrid memory search per query."""
+    memory_embed_budget_seconds: float = Field(default=10.0, gt=0)
+    """Total per-call budget in seconds for the memory query-embedding precompute
+    (issue #939): one asyncio.timeout window covering BOTH the EMBEDDING admission
+    acquire and the embed await, on the chat-turn path and the memories search
+    route. On expiry the memory leg degrades to FTS-only with a WARNING naming
+    the mechanism instead of stalling the turn; the embed task is cancelled.
+    Finite-bounded (<= 600.0) by validate_memory_embed_budget_seconds — a
+    non-finite value would silently disable the budget (swarm-review F-005)."""
     memory_store_pool_size: int = 10
     """Dedicated SQLiteConnectionPool max_size for MemoryStore concurrent
     retrieval operations. Default 10 matches the application pool default
@@ -1502,6 +1510,20 @@ class Settings(BaseSettings):
     def validate_write_lock_timeout_seconds(cls, v: float) -> float:
         """Validate write lock timeout is in range 1.0..300.0."""
         return cls._validate_float_range(v, 1.0, 300.0, "write_lock_timeout_seconds")
+
+    @field_validator("memory_embed_budget_seconds", mode="after")
+    @classmethod
+    def validate_memory_embed_budget_seconds(cls, v: float) -> float:
+        """Validate the memory embed budget is finite and at most 600.0s.
+
+        A non-finite value (``inf`` passes ``gt=0``) would hand
+        ``asyncio.timeout`` an infinite deadline and silently disable the
+        #939 budget, so the knob is finite-bounded like the sibling
+        timeout knobs (swarm-review F-005). The 600s ceiling stays well
+        above any useful embed budget while bounding operator typos
+        (``1e400`` parses to ``inf`` and is caught by the finite check).
+        """
+        return cls._validate_float_range(v, None, 600.0, "memory_embed_budget_seconds")
 
     @field_validator("active_user_cache_ttl_seconds", mode="after")
     @classmethod

@@ -170,7 +170,18 @@ async def test_dense_embedding_failure_is_logged_at_warning(tmp_path):
         log.removeHandler(handler)
         pool.close_all()
 
-    warned = any(r.levelno >= logging.WARNING for r in handler.records)
+    # Amended per #941 AC1: the oracle credits the embed_query MECHANISM
+    # ("Memory query embedding failed...", memory_store.embed_query's own
+    # degrade log) — not any WARNING on the memory_store logger. The old
+    # source-agnostic shape was also satisfiable by the never-attempted
+    # tripwire ("Memory dense search skipped: no precomputed query embedding
+    # supplied") firing alone, so silencing the mechanism left the check
+    # green (reviewer-executed mutation, PR #931 review PRR-020).
+    warned = any(
+        r.levelno >= logging.WARNING
+        and "Memory query embedding" in r.getMessage()
+        for r in handler.records
+    )
     assert warned is True
     assert query_embedding is None
     assert len(result) == 1
