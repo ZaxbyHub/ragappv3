@@ -60,6 +60,10 @@ One PR authorized by the session owner 2026-11-11.
   prints ~113 "Newly-suppressed IDs" at a zero count delta; a genuine
   content add — including a duplicate occurrence of an existing finding —
   still reports. The separate `run_bandit.py` gate identity is unchanged.
+- The PR also regenerates `backend/security/bandit-baseline.json`
+  (line-number re-anchor only: 128 findings before and after, identical
+  (test_id, filename, issue_text) multiset, zero new suppressions) —
+  per `backend/security/README.md` this is the required disclosure.
 
 **Unchanged, now pinned (was already fixed earlier)**
 - `update_lint_finding` still rejects the system-only `auto_resolved`

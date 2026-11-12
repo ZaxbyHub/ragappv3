@@ -5,6 +5,7 @@ All endpoints are vault-scoped. Access follows vault access permissions.
 """
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 import sqlite3
@@ -49,6 +50,20 @@ async def require_wiki_enabled() -> None:
     if not settings.wiki_enabled:
         raise HTTPException(status_code=503, detail="Wiki subsystem is disabled")
 
+
+# Dedicated bounded executor for the wiki lint scan (swarm-pr-review
+# PRR-001, pr1113-20261111): run_lint is a synchronous five-query
+# full-vault scan. Running it on the shared default executor (bare
+# asyncio.to_thread) lets concurrent lint runs occupy every default-
+# executor worker and delay unrelated to_thread work — most importantly
+# the per-request auth read in deps.py, which shares that pool. The
+# repo's doctrine (document_processor.py ~:1025, database.py ~:6497,
+# wiki_compiler.py:47) gives unbounded-duration off-loop work its own
+# bounded pool; max_workers=1 additionally preserves the pre-#935
+# one-scan-at-a-time serialization.
+_WIKI_LINT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="wiki-lint"
+)
 
 router = APIRouter(dependencies=[Depends(require_wiki_enabled)])
 
@@ -768,9 +783,13 @@ async def run_wiki_lint(
     linter = WikiLinter(db, store)
     # Issue #935 item 1: run_lint is synchronous full-table work; running it
     # inline on the event loop stalls every other request in the process
-    # for the scan's duration. Dispatch to the default thread pool (the
-    # same asyncio.to_thread pattern this module already uses at :671).
-    findings = await asyncio.to_thread(linter.run_lint, request.vault_id)
+    # for the scan's duration. Dispatch to the dedicated bounded executor
+    # above (swarm-pr-review PRR-001: the shared default executor carries
+    # the per-request auth read, so a burst of scans there starves auth).
+    loop = asyncio.get_running_loop()
+    findings = await loop.run_in_executor(
+        _WIKI_LINT_EXECUTOR, linter.run_lint, request.vault_id
+    )
     return {"findings": [_as_dict(f) for f in findings], "count": len(findings)}
 
 

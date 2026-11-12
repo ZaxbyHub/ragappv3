@@ -57,9 +57,14 @@ _DETAIL_TEXT_MAX_CHARS = 500
 def _cap(value) -> str:
     """Safely bound one LLM-derived detail value to the documented cap.
 
-    Non-string model output (a number, null, a nested object) is stringified
-    before slicing so a schema-drifting payload cannot TypeError the slice.
+    Non-string model output (a number, a nested object) is stringified before
+    slicing so a schema-drifting payload cannot TypeError the slice. None is
+    preserved as None so absent optional fields persist as JSON null exactly
+    as they did before the cap (swarm-pr-review PRR-002: str(None) would
+    store a truthy literal "None" string).
     """
+    if value is None:
+        return None
     return str(value)[:_DETAIL_TEXT_MAX_CHARS]
 
 

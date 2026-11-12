@@ -2175,7 +2175,11 @@ class WikiStore:
            regardless of 'auto_resolved' siblings;
         3. otherwise, the NEWEST same-origin 'auto_resolved' row flips back
            to open — recurrence reopens the same row (no per-flap growth);
-        4. otherwise a fresh open row is inserted with the caller's origin.
+        4. otherwise a fresh open row is inserted with the caller's origin
+           (issue #932 exception: when the rule-3 reopen UPDATE matches zero
+           rows — the row left auto_resolved after the snapshot — the
+           fingerprint is suppressed entirely, because a concurrent user
+           disposition now owns that row).
 
         ``origin`` records the producing caller ('linter', 'curator', ...).
         The resolve pass — open rows the caller did NOT detect — runs only
