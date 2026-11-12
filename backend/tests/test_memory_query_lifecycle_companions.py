@@ -553,9 +553,11 @@ async def test_cancelled_release_wakeup_is_deferred_until_store_release_complete
     the detached store release completes — an immediate pump reads a
     still-held slot on a latency store and the parked waiter stays parked.
     Drives a real controller (budget 1) over a yielding store: the holder
-    is cancelled mid-release while a waiter is parked; the pinned assertion
-    is that the waiter gets ADMITTED afterwards (kills both the
-    immediate-pump and the no-wakeup mutants)."""
+    exits its body instantly, the cancel lands DURING the shielded release
+    (gated on the release-started event, the F-001 pin's deterministic
+    position), a waiter is parked meanwhile, and the pinned assertion is
+    that the waiter gets ADMITTED afterwards (kills both the immediate-pump
+    and the no-wakeup mutants)."""
     store = MemoryAdmissionStore()
     controller = AdmissionController(
         budgets={"embedding": 1},
@@ -573,15 +575,12 @@ async def test_cancelled_release_wakeup_is_deferred_until_store_release_complete
 
     store.release = _yielding_release
 
-    holder_entered = asyncio.Event()
-
     async def _holder():
         async with controller.admit(AdmissionClass.EMBEDDING):
-            holder_entered.set()
-            await asyncio.sleep(10.0)  # holds the slot until cancelled
+            pass  # the body completes; the cancel lands in release below
 
     holder_task = asyncio.create_task(_holder())
-    await asyncio.wait_for(holder_entered.wait(), 5.0)
+    await asyncio.wait_for(release_started.wait(), 5.0)
 
     waiter_got_slot = asyncio.Event()
 
@@ -591,11 +590,10 @@ async def test_cancelled_release_wakeup_is_deferred_until_store_release_complete
             await asyncio.sleep(0)
 
     waiter_task = asyncio.create_task(_waiter())
-    # let the waiter park while the holder still owns the slot
-    await asyncio.sleep(0.05)
+    # let the waiter park while the detached release is still in flight
+    for _ in range(4):
+        await asyncio.sleep(0)
 
-    # cancel lands during the release; release_started gates the yielding
-    # store's window so the detached release is in flight
     holder_task.cancel()
     with _suppress_cancel():
         await asyncio.wait_for(holder_task, 5.0)
