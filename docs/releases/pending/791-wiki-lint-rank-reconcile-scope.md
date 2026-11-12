@@ -114,12 +114,14 @@ runtime schema probe is tracked as follow-up work.
 
 ## Caveats
 
-- Curator claims deliberately do NOT borrow the deterministic compile path's
+- Curator claims deliberately did not borrow the deterministic compile path's
   unverified→active promotion or superseded→active reactivation (WIKI-006):
   in `active_if_verified` deployments a quote-verified curator claim matching
-  an existing unverified/superseded claim attaches provenance without
-  promoting it — strictly better than today (the source was dropped entirely
-  via the UNIQUE violation), with full parity filed as **#929**. The persistence/migration robustness items (schema probe, concurrent-upsert duplicates, immortal duplicate open rows, compile-query retry loss, multi-worker migration race) are filed as **#948**; exposing `origin` on the read path is **#949**.
+  an existing unverified/superseded claim attached provenance without
+  promoting it — strictly better than the pre-#791 behavior at the time (the
+  source was dropped entirely via the UNIQUE violation). Full parity,
+  including the commit-free savepoint discipline this omission preserved,
+  shipped in **#929** and supersedes this caveat. The persistence/migration robustness items (schema probe, concurrent-upsert duplicates, immortal duplicate open rows, compile-query retry loss, multi-worker migration race) are filed as **#948**; exposing `origin` on the read path is **#949**.
 - `compile_query_job`'s unverified-claim rows are now origin-scoped against
   resolution, but their per-query creation semantics are unchanged (a re-asked
   query answer can still insert a second row); only reconciler ownership was

@@ -1274,5 +1274,12 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
     with contextlib_suppress(Exception):
+        # PR #1113 (swarm-pr-review N-05a): the wiki lint scan executor is
+        # created at routes import time; shut it down with the same
+        # convention as the auth/curator executors so a queued scan does
+        # not extend interpreter exit.
+        from app.api.routes.wiki import _WIKI_LINT_EXECUTOR
+        _WIKI_LINT_EXECUTOR.shutdown(wait=False)
+    with contextlib_suppress(Exception):
         from app.services import redis_io
         redis_io.shutdown_executor()

@@ -5,9 +5,11 @@ All endpoints are vault-scoped. Access follows vault access permissions.
 """
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 import sqlite3
+import threading
 from dataclasses import asdict
 from typing import Callable, Dict, List, Literal, Optional
 
@@ -49,6 +51,45 @@ async def require_wiki_enabled() -> None:
     if not settings.wiki_enabled:
         raise HTTPException(status_code=503, detail="Wiki subsystem is disabled")
 
+
+# Dedicated bounded executor for the wiki lint scan (swarm-pr-review
+# PRR-001, pr1113-20261111): run_lint is a synchronous five-query
+# full-vault scan. Running it on the shared default executor (bare
+# asyncio.to_thread) let concurrent scans occupy default-executor workers
+# and delay unrelated to_thread work. This bound does NOT eliminate
+# contention — each queued run still pins a pooled DB connection, and a
+# burst can exhaust the pool (OOB review F-02, execution-proven) — it
+# moves the stall off the loop and serializes scans. A queue bound or
+# admission gate is the follow-up if that ever surfaces in practice.
+_WIKI_LINT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="wiki-lint"
+)
+_WIKI_LINT_EXECUTOR_LOCK = threading.Lock()
+
+
+def _wiki_lint_executor() -> concurrent.futures.ThreadPoolExecutor:
+    """Return the dedicated lint executor, recreating it after shutdown.
+
+    Lifespan shutdown tears the module-level executor down (queued scans
+    must not extend interpreter exit), so any later dispatch — a test
+    ordering that runs an app-shutdown test ahead of lint-route tests in
+    the same worker process, or an embedded/multi-cycle server — hit
+    'cannot schedule new futures after shutdown' (post-merge master CI
+    run 43283445925: two FAILED tests at tree-identical content that was
+    green in PR CI; the pool was poisoned by an earlier lifespan-shutdown
+    test in the same worker). Dispatch and shutdown both happen on the
+    event-loop thread; the lock makes the recreation safe unconditionally.
+    """
+    global _WIKI_LINT_EXECUTOR
+    with _WIKI_LINT_EXECUTOR_LOCK:
+        # `_shutdown` is a CPython-internal bool, stable 3.9–3.14; reading
+        # it here detects ANY shutdown path (lifespan, direct call, tests)
+        # without bookkeeping our own flag in two modules.
+        if _WIKI_LINT_EXECUTOR is None or _WIKI_LINT_EXECUTOR._shutdown:
+            _WIKI_LINT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="wiki-lint"
+            )
+        return _WIKI_LINT_EXECUTOR
 
 router = APIRouter(dependencies=[Depends(require_wiki_enabled)])
 
@@ -766,7 +807,15 @@ async def run_wiki_lint(
     await _require_vault_write(evaluate, user, request.vault_id)
     store = WikiStore(db)
     linter = WikiLinter(db, store)
-    findings = linter.run_lint(request.vault_id)
+    # Issue #935 item 1: run_lint is synchronous full-table work; running it
+    # inline on the event loop stalls every other request in the process
+    # for the scan's duration. Dispatch to the dedicated bounded executor
+    # above (review PRR-001; note F-02: queued runs pin their pooled
+    # connection, so this bounds executor starvation, not pool contention).
+    loop = asyncio.get_running_loop()
+    findings = await loop.run_in_executor(
+        _wiki_lint_executor(), linter.run_lint, request.vault_id
+    )
     return {"findings": [_as_dict(f) for f in findings], "count": len(findings)}
 
 

@@ -45,6 +45,28 @@ from app.services.wiki_store import WikiStore
 
 logger = logging.getLogger(__name__)
 
+# Documented cap for LLM-derived lint detail fields (issue #935 item 2):
+# the curator stores model-chosen strings (claim_text, the contradiction
+# quintet, model-cited chunk ids) in wiki_lint_findings.details, which is
+# served back to every lint-panel reader. A misbehaving or hostile model
+# payload must not land unbounded in that column. 500 matches the
+# attempted_quote precedent that predates this constant.
+_DETAIL_TEXT_MAX_CHARS = 500
+
+
+def _cap(value) -> "str | None":
+    """Safely bound one LLM-derived detail value to the documented cap.
+
+    Non-string model output (a number, a nested object) is stringified before
+    slicing so a schema-drifting payload cannot TypeError the slice. None is
+    preserved as None so absent optional fields persist as JSON null exactly
+    as they did before the cap (swarm-pr-review PRR-002: str(None) would
+    store a truthy literal "None" string).
+    """
+    if value is None:
+        return None
+    return str(value)[:_DETAIL_TEXT_MAX_CHARS]
+
 
 # A single chunk handed to the curator. The compiler prepares these
 # from already-loaded source rows.
@@ -567,7 +589,7 @@ class WikiCurator:
                         ),
                         "details": json.dumps({
                             "subtype": "curator",
-                            "claim_text": claim_text,
+                            "claim_text": _cap(claim_text),
                         }),
                     })
                 continue
@@ -587,8 +609,8 @@ class WikiCurator:
                         ),
                         "details": json.dumps({
                             "subtype": "curator",
-                            "claim_text": claim_text,
-                            "chunk_id": chunk_id,
+                            "claim_text": _cap(claim_text),
+                            "chunk_id": _cap(chunk_id),
                         }),
                     })
                 continue
@@ -618,9 +640,9 @@ class WikiCurator:
                             ),
                             "details": json.dumps({
                                 "subtype": "curator",
-                                "claim_text": claim_text,
-                                "chunk_id": chunk_id,
-                                "attempted_quote": source_quote[:500],
+                                "claim_text": _cap(claim_text),
+                                "chunk_id": _cap(chunk_id),
+                                "attempted_quote": _cap(source_quote),
                             }),
                         })
                     continue
@@ -705,10 +727,10 @@ class WikiCurator:
                 "title": f"Curator-detected contradiction: {claim_a} vs {claim_b}",
                 "details": json.dumps({
                     "subtype": "curator",
-                    "claim_a": c.get("claim_a"),
-                    "claim_b": c.get("claim_b"),
-                    "reason": c.get("reason"),
-                    "source_quote": c.get("source_quote"),
+                    "claim_a": _cap(c.get("claim_a")),
+                    "claim_b": _cap(c.get("claim_b")),
+                    "reason": _cap(c.get("reason")),
+                    "source_quote": _cap(c.get("source_quote")),
                 }),
             })
 
