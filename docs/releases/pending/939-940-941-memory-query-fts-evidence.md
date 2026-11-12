@@ -101,11 +101,14 @@
 - `backend/tests/test_memory_query_lifecycle.py` (4 frozen checks, issue #939)
 - `backend/tests/test_memory_fts_semantics.py` (4 checks, issue #940)
 - `backend/tests/test_c07_evidence_oracles.py` (5 checks, issue #941)
-- `backend/tests/test_memory_query_lifecycle_companions.py` (14 non-frozen
+- `backend/tests/test_memory_query_lifecycle_companions.py` (16 non-frozen
   tests: cancellation observation with value sensitivity, rejected-admission
   zero-embeds + FTS kwarg, active-lease occupancy, blocked-admission budget
   bound, three route-side legs, the real-controller budget-expiry release pin,
   the telemetry json-binding pin, the event-gated shield + re-raise falsifier
   pin (a real controller over a yielding store; kills the shield-removal and
   re-raise-removal mutants), POST/GET query-cap boundary pins, the 8-term cap
-  lower-bound pin, and the finite-budget-validator pin)
+  lower-bound pin, the finite-budget-validator pin, the deferred-wakeup pin
+  (a parked waiter is admitted after a cancelled release; kills the
+  immediate-pump and no-wakeup mutants), and the named degrade-arm pins
+  (budget-expiry names the knob; admission saturation names the reason))

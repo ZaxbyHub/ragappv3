@@ -741,10 +741,23 @@ async def test_degrade_arms_name_budget_and_admission_reason(caplog, monkeypatch
             await asyncio.wait_for(_consume(agen2), 10.0)
         finally:
             await _drain_leftover_tasks()
-    assert any(
-        "admission rejected" in r.getMessage() for r in caplog.records
+    # Assert the NAMED arm's message (starts "Memory query embedding
+    # admission rejected"), not just the reason substring — the generic
+    # fallback's text also contains "admission rejected" via str(exc), so a
+    # substring check alone would pass with the named arm deleted.
+    named = [
+        r.getMessage() for r in caplog.records
         if r.levelno >= logging.WARNING
-    ), "the saturated-budget WARNING must carry the admission rejection reason"
+        and r.getMessage().startswith("Memory query embedding admission rejected")
+    ]
+    assert named, (
+        "the saturated-budget WARNING must come from the named "
+        "AdmissionRejected arm (message starts 'Memory query embedding "
+        "admission rejected'); records: "
+        + repr([r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING])
+    )
+    assert all("precompute failed" not in m for m in named), (
+        "the named arm must not be the generic fallback shape")
     caplog.clear()
 
     # ---- route site: budget expiry names the knob ----
