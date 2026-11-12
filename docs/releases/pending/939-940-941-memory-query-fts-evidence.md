@@ -4,24 +4,35 @@
 
 - New setting `MEMORY_EMBED_BUDGET_SECONDS` (default 10.0): the total per-call
   budget for the memory query-embedding precompute. One `asyncio.timeout` window
-  covers BOTH the `EMBEDDING` admission acquire and the embed await, on the two
-  production precompute call sites — the chat-turn engine path
+  covers BOTH the `EMBEDDING` admission acquire and the embed await (the budget
+  binds before the embedding client's own 60s per-request timeout, so a
+  slow-but-alive provider degrades the memory leg instead of holding the
+  device), on the two production precompute call sites — the chat-turn engine path
   (`RAGEngine._memory_retrieve`) and the memories search route
   (`_perform_memory_search`, both `GET /memories/search` and the POST search
   model). On expiry the embed task is cancelled, a WARNING names the mechanism
-  ("Memory query embedding precompute failed; continuing FTS-only: …"), and the
-  memory leg completes FTS-only within the budget instead of stalling the turn
-  on a hanging embed.
+  (the expiry arm: "Memory query embedding precompute exceeded the …
+  memory_embed_budget_seconds budget; continuing FTS-only"; the saturated
+  arm: "… admission rejected (admission rejected: …)"), and the memory leg
+  completes FTS-only within the budget instead of stalling the turn on a
+  hanging embed.
 - The memory precompute now acquires an `EMBEDDING` admission slot (issue #518
   device budget) on both call sites. A saturated budget degrades the memory leg
   FTS-only with the same WARNING instead of bypassing the budget. Capacity
   note: memory-search requests and chat turns now share the embedding device
-  budget with retrieval embeds (one slot per call, held for the embed only —
+  budget with retrieval embeds (one slot per call, held for the embed only.
+  Operator note: the memories search routes carry no rate limiter, so a burst
+  of concurrent authenticated searches now contends with chat-embed capacity —
+  each hold is capped at the budget and authorization precedes the embed; add
+  a limiter if search traffic is untrusted —
   and the lease release now completes even when the budget window cancels the
   holder mid-embed, so an expiring budget can no longer hold the slot until
   the store TTL: the admission lease's `release()` (the `_Lease` class in app/services/admission.py) finishes the local accounting and
   shields the store release, then re-raises the cancellation so the #827
-  cancellation-coverage contract is preserved).
+  cancellation-coverage contract is preserved; when the holder is cancelled
+  mid-store-release, the hub wakeup is DEFERRED to the detached release's
+  completion so the pump observes a freed slot on latency stores, with
+  `_mark_degraded` on its failure).
 - A blocked admission (a controller whose acquire never yields) is also bounded
   by the same budget window — previously the acquire could wait unboundedly
   (no default admission deadline).
@@ -89,8 +100,11 @@
 - `backend/tests/test_memory_query_lifecycle.py` (4 frozen checks, issue #939)
 - `backend/tests/test_memory_fts_semantics.py` (4 checks, issue #940)
 - `backend/tests/test_c07_evidence_oracles.py` (5 checks, issue #941)
-- `backend/tests/test_memory_query_lifecycle_companions.py` (9 non-frozen
+- `backend/tests/test_memory_query_lifecycle_companions.py` (14 non-frozen
   tests: cancellation observation with value sensitivity, rejected-admission
   zero-embeds + FTS kwarg, active-lease occupancy, blocked-admission budget
   bound, three route-side legs, the real-controller budget-expiry release pin,
-  and the telemetry json-binding pin)
+  the telemetry json-binding pin, the event-gated shield + re-raise falsifier
+  pin (a real controller over a yielding store; kills the shield-removal and
+  re-raise-removal mutants), POST/GET query-cap boundary pins, the 8-term cap
+  lower-bound pin, and the finite-budget-validator pin)
