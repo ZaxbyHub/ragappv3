@@ -39,8 +39,11 @@ One PR authorized by the session owner 2026-11-11.
 
 **Lint runs stop blocking every other request (routes/wiki.py — #935 item 1)**
 - `POST /wiki/lint/run` dispatches the synchronous `WikiLinter.run_lint`
-  scan through `asyncio.to_thread` (the pattern this module already uses),
-  so a long lint no longer stalls the event loop for the whole process.
+  scan onto a dedicated bounded executor (max_workers=1, wiki-lint thread
+  prefix) via `run_in_executor`, so a long lint no longer stalls the event
+  loop for the whole process — and a burst of concurrent lint runs cannot
+  occupy the shared default executor that carries the per-request auth
+  read (review round 1, PRR-001).
 
 **Curator lint details are capped at 500 chars (wiki_curator.py — #935 item 2)**
 - Every LLM-derived string stored in lint `details` — `claim_text` (three
