@@ -351,6 +351,7 @@ services:
       - ACTIVE_USER_CACHE_TTL_SECONDS
       - CHAT_MESSAGE_MAX_CHARS
       - MEMORY_STORE_POOL_SIZE
+      - MEMORY_EMBED_BUDGET_SECONDS
       - DB_POOL_MAX_SIZE
       # Legacy/deprecated aliases (still honored for backward compatibility)
       - CHUNK_SIZE

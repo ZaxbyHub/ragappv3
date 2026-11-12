@@ -295,17 +295,17 @@ def test_self_test_keyword_form_revert_bites_p1():
 
     def mutate(source: str) -> str:
         old = (
-            "                    vector_results, relevance_hint, eval_result, "
+            "                        vector_results, relevance_hint, eval_result, "
             "rerank_success, score_type, hybrid_status, fts_exceptions, "
             "rerank_status, variants_dropped, exact_match_promoted, "
             "token_pack_stats = await self._execute_retrieval(\n"
-            "                        query_embeddings,\n"
-            "                        retrieval_query,\n"
-            "                        vault_id,"
+            "                            query_embeddings,\n"
+            "                            retrieval_query,\n"
+            "                            vault_id,"
         )
         new = old.replace(
-            "retrieval_query,\n                        vault_id,",
-            "vault_id=vault_id,\n                        user_input=user_input,",
+            "retrieval_query,\n                            vault_id,",
+            "vault_id=vault_id,\n                            user_input=user_input,",
         )
         return source.replace(old, new, 1)
 
@@ -363,13 +363,13 @@ def test_self_test_positional_revert_bites_p1():
 
     def mutate(source: str) -> str:
         old = (
-            "                    vector_results, relevance_hint, eval_result, "
+            "                        vector_results, relevance_hint, eval_result, "
             "rerank_success, score_type, hybrid_status, fts_exceptions, "
             "rerank_status, variants_dropped, exact_match_promoted, "
             "token_pack_stats = await self._execute_retrieval(\n"
-            "                        query_embeddings,\n"
-            "                        retrieval_query,\n"
-            "                        vault_id,"
+            "                            query_embeddings,\n"
+            "                            retrieval_query,\n"
+            "                            vault_id,"
         )
         new = old.replace("retrieval_query,", "user_input,")
         return source.replace(old, new, 1)

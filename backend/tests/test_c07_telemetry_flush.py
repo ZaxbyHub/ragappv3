@@ -45,17 +45,16 @@ def test_flush_runtime_error_does_not_escape_recorder(tmp_path, monkeypatch):
     def _explode(*args, **kwargs):
         raise RuntimeError("dictionary changed size during iteration")
 
-    # Poison telemetry's shard serializer. Post-fix it calls its own
-    # module-local ``_dumps`` alias (patching the stdlib json module would
-    # mutate it process-wide — #931 review PRR-022); on the pre-fix tree the
-    # alias does not exist and it calls ``json.dumps`` directly, so fall back.
-    # Either way the check must run on BOTH trees.
+    # Poison telemetry's shard serializer through its module-local ``_dumps``
+    # alias ONLY (patching the stdlib json module would mutate it
+    # process-wide — #931 review PRR-022). The pre-fix fallback branch that
+    # mutated telemetry_module.json was deleted per #941 AC5: the seam is
+    # pinned by test_c07_evidence_oracles.py
+    # (::test_telemetry_serialization_seam_is_module_local), so every tree
+    # this suite ships on routes serialization through the alias.
     import app.services.telemetry as telemetry_module
 
-    if hasattr(telemetry_module, "_dumps"):
-        monkeypatch.setattr(telemetry_module, "_dumps", _explode)
-    else:  # pre-fix tree
-        monkeypatch.setattr(telemetry_module.json, "dumps", _explode)
+    monkeypatch.setattr(telemetry_module, "_dumps", _explode)
 
     telemetry = Telemetry(enabled=True, registry_dir=tmp_path)
 
