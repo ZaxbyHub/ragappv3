@@ -80,6 +80,7 @@ _FLAG_FIELDS = (
     "wiki_llm_curator_mode",
     "wiki_llm_curator_require_quote_match",
     "wiki_llm_curator_require_chunk_id",
+    "wiki_llm_curator_run_on_manual",
 )
 
 
