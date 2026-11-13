@@ -378,12 +378,21 @@ class TestBackfillConcurrencySetting(unittest.IsolatedAsyncioTestCase):
     always falling back to the hardcoded default of 4)."""
 
     async def test_semaphore_uses_configured_embedding_concurrent_batches(self):
+        import weakref
+
         from app.services.memory_store import MemoryStore
 
         store = MemoryStore.__new__(MemoryStore)
         store.embedding_service = MagicMock()
         store.embed_and_store = AsyncMock(return_value=None)
         store._has_embedding_columns = MagicMock(return_value=True)
+        # Issue #937 mock-contract adaptation: backfill now bounds concurrency
+        # with the STORE-LEVEL per-loop semaphore (_embed_batch_semaphore),
+        # which needs the per-instance weakref map + guard the __init__ sets.
+        import threading as _threading
+
+        store._embed_semaphores_guard = _threading.Lock()
+        store._embed_semaphores = weakref.WeakKeyDictionary()
 
         mock_cursor = MagicMock()
         mock_cursor.fetchall.return_value = [(1, "a"), (2, "b")]

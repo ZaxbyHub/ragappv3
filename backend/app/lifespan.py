@@ -1111,12 +1111,21 @@ async def lifespan(app: FastAPI):
 
     # Start memory embedding backfill as a non-blocking background task.
     # Memories created before the embedding column existed (or with a stale model)
-    # will be embedded so hybrid/semantic retrieval can use them.
+    # will be embedded so hybrid/semantic retrieval can use them. The run
+    # holds the store-level backfill lock (issue #937) so the startup pass,
+    # the periodic embed-heal loop, and the superadmin backfill route are
+    # single-flight within this process (per-worker in multi-worker
+    # deployments; duplicate work there is idempotent).
     async def _run_memory_backfill() -> None:
         try:
-            summary = await app.state.memory_store.backfill_missing_embeddings()
-            if summary["total"] > 0:
-                logger.info("Memory embedding backfill summary: %s", summary)
+            async with app.state.memory_store.get_backfill_lock():
+                summary = await (
+                    app.state.memory_store.backfill_missing_embeddings()
+                )
+                if summary["total"] > 0:
+                    logger.info(
+                        "Memory embedding backfill summary: %s", summary
+                    )
         except Exception as exc:
             logger.warning("Memory embedding backfill startup task failed: %s", exc)
 
@@ -1124,6 +1133,14 @@ async def lifespan(app: FastAPI):
     # orphaned at process exit (mirrors memory_eviction_task below).
     memory_backfill_task = asyncio.create_task(_run_memory_backfill())
 
+    # Periodic embed-heal (issue #937): the third healer for NULL-embedding
+    # rows. Bounded by the configured interval; NULL-only selection and
+    # per-row EMBEDDING admission keep it inside the #939 embedding budget.
+    memory_embed_heal_task = asyncio.create_task(
+        app.state.memory_store.periodic_embed_heal_loop(
+            interval=settings.memory_embed_heal_interval_seconds
+        )
+    )
 
     # Start periodic memory eviction as a background task so
     # evict_expired_memories no longer runs on every search_memories call
@@ -1202,6 +1219,13 @@ async def lifespan(app: FastAPI):
         memory_backfill_task.cancel()
         try:
             await memory_backfill_task
+        except asyncio.CancelledError:
+            pass
+    # Cancel the periodic memory embed-heal task (issue #937).
+    if memory_embed_heal_task and not memory_embed_heal_task.done():
+        memory_embed_heal_task.cancel()
+        try:
+            await memory_embed_heal_task
         except asyncio.CancelledError:
             pass
     if app.state.file_watcher:
