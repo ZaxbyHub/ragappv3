@@ -441,10 +441,10 @@ def test_queue_depths_capped_on_write_and_merge(tmp_path):
 
 
 def test_two_capped_shards_keep_true_cross_shard_mean(tmp_path):
-    """Final-critic finding 1 (executed probe): worker A holds 200 samples
-    of 10.0s, worker B (sorting later) holds 200 samples of 0.0s — the true
-    mean is 5.0. A merged-list trim reported 0.0; per-shard capping keeps
-    the honest aggregate.
+    """Final-critic finding 1 (executed probes): worker A holds 200 samples
+    of 10.0s, worker B holds 200 samples of 0.0s — the true mean is 5.0. A
+    merged-list trim reported 0.0 or 10.0 (whichever shard sorted last
+    won); per-shard capping keeps the honest aggregate.
     """
     tel = Telemetry(enabled=True, registry_dir=tmp_path)
     for _ in range(QUEUE_HISTORY_CAP):
@@ -1122,5 +1122,205 @@ def test_exception_arm_wordings_create_and_remember(tmp_path, caplog):
         ]
         assert create_exc, "create exception arm did not log"
         assert any(phrase in m for m in create_exc), create_exc[0][:120]
+    finally:
+        pool.close_all()
+
+
+def test_outcome_arm_wordings_message_specific(tmp_path, caplog):
+    """Delta-review probe 4c (executed): reverting the create-route OUTCOME
+    arm wording survived all 53 tests (C10 pools create+update messages
+    under one substring; the exception-arm drives do not reach outcome
+    arms). This matrix isolates EVERY degradation arm message-specifically:
+    create outcome, update outcome, remember newly-inserted outcome,
+    remember found-existing outcome, and the found-existing exception arm.
+    Outcome arms are reached with an embedder whose embed_passage returns
+    None (provider None -> outcome "failed" per _embed_text_with_outcome),
+    NOT with a raise.
+    """
+    import logging as _logging
+    from unittest.mock import MagicMock, patch
+
+    from app.models.database import SQLiteConnectionPool, init_db, run_migrations
+    from app.services import rag_engine as rag_engine_module
+    from app.services.memory_store import MemoryStore
+
+    phrase = (
+        "healed by the startup backfill task, the periodic embed-heal "
+        "task, or the superadmin backfill route"
+    )
+
+    class _NoneEmbedder:
+        """Provider that returns None -> outcome 'failed' (outcome arm)."""
+
+        async def embed_passage(self, text):
+            return None
+
+    db_path = str(tmp_path / "outcome-arms.db")
+    init_db(db_path)
+    run_migrations(db_path)
+    pool = SQLiteConnectionPool(db_path, max_size=3)
+
+    class _Permissive:
+        def admit(self, admission_class):
+            class _Ctx:
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *exc):
+                    return False
+
+            return _Ctx()
+
+    def _route_msgs():
+        return [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "app.api.routes.memories"
+            and r.levelno >= _logging.WARNING
+        ]
+
+    def _engine_msgs():
+        return [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "app.services.rag_engine"
+            and r.levelno >= _logging.WARNING
+        ]
+
+    try:
+        from _db_pool import SimpleConnectionPool
+        from fastapi.testclient import TestClient
+
+        from app.main import app
+
+        store = MemoryStore(pool=pool, embedding_service=_NoneEmbedder())
+        simple_pool = SimpleConnectionPool(db_path)
+        from app.api.deps import (
+            get_current_active_user,
+            get_db,
+            get_evaluate_policy,
+            get_memory_store,
+        )
+
+        async def _allow(user, resource, rid, action):
+            return True
+
+        originals = {}
+        try:
+            for dep in (get_db, get_memory_store, get_current_active_user,
+                        get_evaluate_policy):
+                originals[dep] = app.dependency_overrides.get(dep)
+            app.dependency_overrides[get_db] = lambda: simple_pool.get_connection()
+            app.dependency_overrides[get_memory_store] = lambda: store
+            app.dependency_overrides[get_current_active_user] = lambda: {
+                "id": 1,
+                "role": "admin",
+            }
+            app.dependency_overrides[get_evaluate_policy] = lambda: _allow
+            client = TestClient(app)
+
+            # -- create outcome arm + update outcome arm via the routes
+            with caplog.at_level(_logging.WARNING):
+                created = client.post(
+                    "/api/memories",
+                    json={"content": "outcome arms row", "vault_id": 1},
+                )
+                assert created.status_code == 200, created.text
+                mid = int(created.json()["id"])
+                updated = client.put(
+                    f"/api/memories/{mid}",
+                    json={"content": "outcome arms row CHANGED"},
+                )
+                assert updated.status_code == 200, updated.text
+            msgs = _route_msgs()
+            create_outcome = [
+                m for m in msgs if "Memory stored without embedding" in m
+            ]
+            assert create_outcome, "create outcome arm did not log"
+            assert any(phrase in m for m in create_outcome), create_outcome[0][:110]
+            update_outcome = [
+                m for m in msgs
+                if "Memory update left the row without an embedding" in m
+            ]
+            assert update_outcome, "update outcome arm did not log"
+            assert any(phrase in m for m in update_outcome), update_outcome[0][:110]
+        finally:
+            for dep, orig in originals.items():
+                if orig is not None:
+                    app.dependency_overrides[dep] = orig
+                else:
+                    app.dependency_overrides.pop(dep, None)
+            simple_pool.close_all()
+
+        # -- remember newly-inserted outcome arm (real engine, None provider)
+        caplog.clear()
+        rem_store = MemoryStore(pool=pool, embedding_service=_NoneEmbedder())
+        engine = rag_engine_module.RAGEngine(
+            embedding_service=MagicMock(),
+            vector_store=MagicMock(),
+            memory_store=rem_store,
+            llm_client=MagicMock(),
+            db_path=db_path,
+        )
+
+        async def _drive_remember(query):
+            chunks = []
+            with patch.object(
+                rag_engine_module,
+                "get_admission_controller",
+                lambda: _Permissive(),
+            ):
+                async for chunk in engine.query(
+                    query, [], stream=True, vault_id=1, can_write_memory=True
+                ):
+                    chunks.append(chunk)
+            return chunks
+
+        with caplog.at_level(_logging.WARNING):
+            chunks = asyncio.run(
+                _drive_remember("remember that the outcome arms probe fires")
+            )
+        assert chunks, "harness: remember-directive produced no chunks"
+        msgs = _engine_msgs()
+        new_outcome = [
+            m for m in msgs if "Memory stored without embedding" in m
+        ]
+        assert new_outcome, "remember newly-inserted outcome arm did not log"
+        assert any(phrase in m for m in new_outcome), new_outcome[0][:110]
+
+        # -- found-existing outcome arm (re-send the same directive)
+        caplog.clear()
+        with caplog.at_level(_logging.WARNING):
+            chunks = asyncio.run(
+                _drive_remember("remember that the outcome arms probe fires")
+            )
+        assert chunks, "harness: re-sent directive produced no chunks"
+        msgs = _engine_msgs()
+        resent_outcome = [
+            m for m in msgs if "Memory re-sent without embedding" in m
+        ]
+        assert resent_outcome, "found-existing outcome arm did not log"
+        assert any(phrase in m for m in resent_outcome), resent_outcome[0][:110]
+
+        # -- found-existing exception arm (raising embed_and_store)
+        caplog.clear()
+
+        async def _raising_embed(memory_id, content):
+            raise RuntimeError("embed exploded")
+
+        rem_store.embed_and_store = _raising_embed
+        with caplog.at_level(_logging.WARNING):
+            chunks = asyncio.run(
+                _drive_remember("remember that the outcome arms probe fires")
+            )
+        assert chunks, "harness: exception-arm directive produced no chunks"
+        msgs = _engine_msgs()
+        found_exc = [
+            m
+            for m in msgs
+            if "Memory re-embed after re-sent remember-directive failed" in m
+        ]
+        assert found_exc, "found-existing exception arm did not log"
+        assert any(phrase in m for m in found_exc), found_exc[0][:110]
     finally:
         pool.close_all()

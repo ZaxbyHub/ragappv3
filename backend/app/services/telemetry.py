@@ -648,8 +648,9 @@ class Telemetry:
                     # CROSS-SHARD aggregate sums every shard's retained
                     # window. Trimming the merged list instead would let
                     # whichever shard sorts last monopolize the queue-wait
-                    # average (executed probe: two capped shards, true mean
-                    # 5.0, merged-trim reported 0.0).
+                    # average (executed probes: two capped shards, true mean
+                    # 5.0, the merged trim reported 0.0 or 10.0 —
+                    # whichever shard sorts last wins).
                     merged_waits = totals["queue_waits"].setdefault(cls, [])
                     merged_waits.extend(waits[-QUEUE_HISTORY_CAP:])
                 for cls, depths in shard.get("queue_depths", {}).items():
