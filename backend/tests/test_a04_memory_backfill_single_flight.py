@@ -8,7 +8,9 @@ run instead of overlapping it.
 import asyncio
 import os
 import sys
+import threading
 import types
+import weakref
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -80,6 +82,23 @@ class _SlowBackfillStore:
     def __init__(self):
         self.in_flight = 0
         self.max_in_flight = 0
+        # Issue #937 mock-contract adaptation: the single-flight lock moved
+        # from the memories route module onto MemoryStore — the stub now
+        # exposes the same per-event-loop lock the route delegates to
+        # (loop-keyed weakref map, the pattern the store itself uses).
+        self._locks_guard = threading.Lock()
+        self._locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = (
+            weakref.WeakKeyDictionary()
+        )
+
+    def get_backfill_lock(self) -> asyncio.Lock:
+        loop = asyncio.get_running_loop()
+        with self._locks_guard:
+            lock = self._locks.get(loop)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._locks[loop] = lock
+            return lock
 
     async def backfill_missing_embeddings(self, batch_size: int = 50) -> dict:
         self.in_flight += 1

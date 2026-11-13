@@ -550,6 +550,16 @@ class Settings(BaseSettings):
     """Interval, in seconds, between periodic background sweeps that delete expired
     memories (rows with a past `expires_at`). Runs off the search hot path (issue #263);
     see `MemoryStore.periodic_eviction_loop` in memory_store.py."""
+    memory_embed_heal_interval_seconds: int = 600
+    """Interval, in seconds, between periodic embed-heal ticks that re-embed
+    memory rows whose embedding is NULL (issue #937): a runtime embed failure
+    heals itself once the provider recovers — no restart and no superadmin
+    action. Bounded to [60, 86400]: the floor keeps an unhealthy provider
+    from being hot-looped; the ceiling keeps an arbitrarily large value from
+    breaking asyncio.sleep arithmetic. The healer selects NULL rows only and
+    each row's embed runs inside the #939 EMBEDDING admission +
+    memory_embed_budget_seconds window; see
+    MemoryStore.periodic_embed_heal_loop in memory_store.py."""
     rag_trace_in_response: bool = False
     """When True, RAG queries emit a ``trace`` field in the streaming
     done event with detailed retrieval/generation observability. Default
@@ -1632,6 +1642,19 @@ class Settings(BaseSettings):
         0 or negative would make the periodic eviction loop a tight/instant busy loop.
         """
         return cls._validate_int_range(v, 1, None, "memory_eviction_interval_seconds")
+
+    @field_validator("memory_embed_heal_interval_seconds", mode="after")
+    @classmethod
+    def validate_memory_embed_heal_interval_seconds(cls, v: int) -> int:
+        """Validate memory_embed_heal_interval_seconds is in range 60..86400.
+
+        The floor (60s) keeps an unhealthy embedding provider from being
+        hot-looped by the heal ticks; the ceiling (86400s) keeps an
+        arbitrarily large configured value from breaking asyncio.sleep
+        arithmetic (issue #937; bounded above unlike the eviction knob
+        because heal ticks issue provider work while eviction does not).
+        """
+        return cls._validate_int_range(v, 60, 86400, "memory_embed_heal_interval_seconds")
 
     @field_validator("embedding_concurrent_batches", mode="after")
     @classmethod

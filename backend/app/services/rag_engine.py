@@ -1225,10 +1225,10 @@ class RAGEngine:
                     )
                     # Embed on THIS loop right after the insert (issue #712):
                     # add_memory no longer bridges into the embedding service
-                    # synchronously. Only the newly-inserted branch embeds —
-                    # a re-sent directive hits the found-existing branch and
-                    # leaves that row's embedding as it stands (a prior
-                    # failed embed stays NULL; healing is the backfill's job).
+                    # synchronously. A failure leaves the row FTS-only; the
+                    # healing paths are the startup backfill task, the
+                    # periodic embed-heal task (issue #937), and the
+                    # superadmin backfill route.
                     if (
                         getattr(self.memory_store, "embedding_service", None)
                         is not None
@@ -1242,18 +1242,59 @@ class RAGEngine:
                                     "Memory stored without embedding (id=%s, "
                                     "outcome=%s); dense recall degraded to "
                                     "FTS-only for this row (healed by the "
-                                    "startup backfill task or the superadmin "
-                                    "backfill route, not on a timer)",
+                                    "startup backfill task, the periodic "
+                                    "embed-heal task, or the superadmin "
+                                    "backfill route)",
                                     memory.id,
                                     outcome,
                                 )
                         except Exception as exc:  # noqa: BLE001 — chat hot path
                             logger.warning(
                                 "Memory embedding after remember-directive "
-                                "failed (id=%s): %s",
+                                "failed (id=%s); dense recall degraded to "
+                                "FTS-only for this row (healed by the startup "
+                                "backfill task, the periodic embed-heal task, "
+                                "or the superadmin backfill route): %s",
                                 memory.id,
                                 exc,
                             )
+                elif (
+                    getattr(self.memory_store, "embedding_service", None)
+                    is not None
+                    and await self.memory_store.memory_embedding_is_null(
+                        memory.id
+                    )
+                ):
+                    # Issue #937: a re-sent directive that finds an EXISTING
+                    # row whose embedding is NULL re-attempts the embed —
+                    # the directive's content equals the stored content, so
+                    # the revision guard accepts and a recovered provider
+                    # heals the row here without waiting for a heal tick.
+                    # Non-NULL rows are left alone (no redundant embed).
+                    try:
+                        outcome = await self.memory_store.embed_and_store(
+                            memory.id, memory_content
+                        )
+                        if outcome != "stored":
+                            logger.warning(
+                                "Memory re-sent without embedding (id=%s, "
+                                "outcome=%s); dense recall stays FTS-only for "
+                                "this row (healed by the startup backfill "
+                                "task, the periodic embed-heal task, or the "
+                                "superadmin backfill route)",
+                                memory.id,
+                                outcome,
+                            )
+                    except Exception as exc:  # noqa: BLE001 — chat hot path
+                        logger.warning(
+                            "Memory re-embed after re-sent remember-directive "
+                            "failed (id=%s); dense recall stays FTS-only for "
+                            "this row (healed by the startup backfill task, "
+                            "the periodic embed-heal task, or the superadmin "
+                            "backfill route): %s",
+                            memory.id,
+                            exc,
+                        )
                 yield {
                     "type": "content",
                     "content": f"Memory stored: {memory.content}",
