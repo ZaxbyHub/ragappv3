@@ -1324,3 +1324,31 @@ def test_outcome_arm_wordings_message_specific(tmp_path, caplog):
         assert any(phrase in m for m in found_exc), found_exc[0][:110]
     finally:
         pool.close_all()
+
+
+def test_deeply_nested_and_bigint_shards_skip_with_200(tmp_path, caplog):
+    """Swarm-review L2R-1 + L2R-2 (both executed at HEAD and base):
+    a shard whose JSON nests deeply raises RecursionError out of
+    json.loads (RuntimeError subclass, missed by the old ValueError leg),
+    and a shard carrying an arbitrarily large int sample raises
+    OverflowError out of math.isfinite — both previously escaped
+    metrics_text as a 500. After the fix both are skipped with the
+    rate-limited WARNING and the exposition still serves the good shard.
+    """
+    import logging as _logging
+
+    deep = tmp_path / "telemetry-00000000-1-deep0001.json"
+    deep.write_text("[" * 1500 + "]" * 1500, encoding="utf-8")
+    bigint = tmp_path / "telemetry-00000000-1-big00001.json"
+    bigint.write_text(
+        json.dumps({"queue_waits": {"x": [10 ** 400]}}), encoding="utf-8"
+    )
+    good = tmp_path / "telemetry-00000000-1-good0001.json"
+    good.write_text(json.dumps({"chat_turns": 7}), encoding="utf-8")
+    tel = Telemetry(enabled=True, registry_dir=tmp_path)
+    with caplog.at_level(_logging.WARNING, logger="app.services.telemetry"):
+        text = tel.metrics_text()
+    assert _sample(text, telemetry_module.METRIC_CHAT_TURNS) == 7
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("not valid JSON" in m for m in msgs), msgs[:2]
+    assert any("failed validation" in m for m in msgs), msgs[:2]

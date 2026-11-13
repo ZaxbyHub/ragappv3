@@ -313,10 +313,19 @@ cleared automatically).
   `ragapp_provider_calls_total`, `ragapp_embedding_cache_hits_total`,
   `ragapp_retrieval_evaluator_fail_open_total` (labelled by `reason=`;
   a non-zero value means the CRAG retrieval evaluator failed open —
-  see `docs/releases/pending/712-memory-stall-evaluator-starvation.md`).
+  see `docs/releases/pending/712-memory-stall-evaluator-starvation.md`),
+  `ragapp_telemetry_shard_flush_failures_total` (issue #936: a non-zero
+  value means counters are NOT persisting to the shared registry
+  directory — every write-through flush is failing; check the directory's
+  writability and the rate-limited WARNING logs).
   Multiprocess aggregation: set `TELEMETRY_REGISTRY_DIR` to one shared
   writable directory (all workers/replicas) and the counter/gauge families
-  above are summed across shards; empty = single-process counters. Note:
+  above are summed across shards; empty = single-process counters.
+  Retention: shard files whose owning process is confirmed dead (same
+  host, new-format names) are pruned automatically; foreign-host and
+  legacy-format shards are retained (size-bounded, count-unbounded under
+  per-incarnation hostnames — see issue #1121) and may be deleted by hand
+  once every worker runs the new format. Note:
   the chat route records queue depth snapshots only where the engine's
   admission API exposes them; the queue-wait gauge is the primary
   saturation signal. **Stage durations and first-useful-content latencies

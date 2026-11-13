@@ -1114,7 +1114,8 @@ async def lifespan(app: FastAPI):
     # will be embedded so hybrid/semantic retrieval can use them. The run
     # holds the store-level backfill lock (issue #937) so the startup pass,
     # the periodic embed-heal loop, and the superadmin backfill route are
-    # single-flight across the whole system.
+    # single-flight within this process (per-worker in multi-worker
+    # deployments; duplicate work there is idempotent).
     async def _run_memory_backfill() -> None:
         try:
             async with app.state.memory_store.get_backfill_lock():

@@ -172,7 +172,10 @@ class MemoryStore:
         # to FTS-only retrieval so memory features still work in
         # environments without a live embedding server.
         self.embedding_service = embedding_service
-        # Issue #937: whole-system single-flight for backfill runs. A
+        # Issue #937: per-process single-flight for backfill runs (all
+        # callers inside one process share it; multi-worker deployments
+        # each run their own loop — duplicate embed work is idempotent and
+        # revision-guarded, so the cost is provider spend only). A
         # module-level asyncio.Lock binds to the first loop that acquires it
         # and raises on later loops (TestClient spins a fresh loop per
         # request), so locks are keyed by the running loop via a weakref

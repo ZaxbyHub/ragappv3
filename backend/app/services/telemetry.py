@@ -174,7 +174,13 @@ def _valid_sample(value) -> bool:
         return False
     if not isinstance(value, (int, float)) or value < 0:
         return False
-    return math.isfinite(value)
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        # json.loads parses exact arbitrary-precision ints; a 400-digit
+        # sample is not representable as a finite float and is exactly what
+        # the finite-number contract rejects (swarm review L2R-2, executed).
+        return False
 
 
 def _valid_shard(obj) -> "tuple[bool, str]":
@@ -203,10 +209,17 @@ def _valid_shard(obj) -> "tuple[bool, str]":
         mapping = obj.get(list_key, {})
         if not isinstance(mapping, dict):
             return False, f"{list_key} is not an object"
+        depths = list_key == "queue_depths"
         for cls, samples in mapping.items():
             if not isinstance(cls, str) or not isinstance(samples, list):
                 return False, f"{list_key}[{cls!r}] is not a list"
             for sample in samples:
+                # Depths are int-only (the writer emits int(depth); the
+                # approved plan types them int) — a fractional depth is a
+                # malformed sample (swarm review L1-8).
+                if depths and (isinstance(sample, bool)
+                               or not isinstance(sample, int)):
+                    return False, f"{list_key}[{cls!r}] has an invalid sample"
                 if not _valid_sample(sample):
                     return False, f"{list_key}[{cls!r}] has an invalid sample"
     calls = obj.get("provider_calls", {})
@@ -550,7 +563,13 @@ class Telemetry:
                 # until an operator removes it, because this host cannot
                 # safely judge those pids. A host-independent liveness
                 # signal (or a long foreign-stale window) is the
-                # maintainer-level follow-up.
+                # maintainer-level follow-up. ASSUMPTION (swarm review
+                # L2R-3): the host tag treats a hostname as a unique host
+                # identity — two simultaneously-live hosts sharing one
+                # hostname over a shared registry dir (cloned VMs,
+                # StatefulSet pod-name reuse) can mis-judge each other's
+                # pids; the victim's next write-through flush recreates its
+                # shard, so the loss is transient.
                 try:
                     if entry.name != self._shard_name and (
                         now - entry.stat().st_mtime > _SHARD_STALE_SECONDS
@@ -589,7 +608,10 @@ class Telemetry:
                     continue
                 try:
                     parsed = json.loads(raw)
-                except ValueError:
+                # RecursionError (RuntimeError subclass) rides the same leg:
+                # deeply nested hostile JSON blew the 500 contract before
+                # this widening (swarm review L2R-1, executed at HEAD+base).
+                except (ValueError, RecursionError):
                     self._rate_limited_warning(
                         f"parse:{entry.name}",
                         "Telemetry shard is not valid JSON (path=%s); "
