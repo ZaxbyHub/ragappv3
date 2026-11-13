@@ -29,8 +29,10 @@ deploy and do not describe them as stable (docs/operations.md).
 import hashlib
 import json
 import logging
+import math
 import os
 import secrets
+import socket
 import threading
 import time
 from contextvars import ContextVar
@@ -51,6 +53,269 @@ METRIC_QUEUE_DEPTH = "ragapp_queue_depth"
 METRIC_QUEUE_WAIT = "ragapp_queue_wait_seconds"
 METRIC_PROVIDER_CALLS = "ragapp_provider_calls_total"
 METRIC_EVALUATOR_FAIL_OPEN = "ragapp_retrieval_evaluator_fail_open_total"
+METRIC_EMBEDDING_CACHE_HITS = "ragapp_embedding_cache_hits_total"
+METRIC_SHARD_FLUSH_FAILURES = "ragapp_telemetry_shard_flush_failures_total"
+
+# Per-class cap on retained queue-wait/queue-depth history (issue #936 AC6):
+# the lists are re-serialized in full on every write-through flush, so an
+# unbounded history grows shard size and lock-hold time with process
+# lifetime. 200 samples per class keeps percentiles honest while bounding
+# the serialized blob.
+QUEUE_HISTORY_CAP = 200
+
+# Rate-limit window (seconds, monotonic) for operator-facing WARNINGs about
+# shard flush failures and skipped shards (issue #936 AC1/AC3): a persistent
+# failure must be visible but must not flood the log on every record.
+_FLUSH_WARN_INTERVAL = 60.0
+# Bound for the per-shard warning-suppression ledger (r2 review RP-2/PO-2):
+# entries are keyed by per-incarnation shard names and previously grew
+# monotonically; past this cap the oldest entries are evicted (an evicted
+# shard may warn again once — the harmless direction).
+_WARN_STATE_MAX = 1024
+
+# Retention window (seconds): a shard not written for over an hour is a
+# prune CANDIDATE — but only new-format, same-host shards whose owning pid
+# is confirmed dead are ever deleted (issue #936 AC5).
+_SHARD_STALE_SECONDS = 3600.0
+
+# Magnitude ceiling for a single queue-list sample (a wait in seconds or a
+# queue depth): anything above 1e9 is not a real measurement, and letting
+# one through lets the cross-shard SUM overflow into OverflowError (which
+# would 500 the unauthenticated /metrics scrape — the exact contract
+# violation this validation exists to prevent).
+_MAX_QUEUE_SAMPLE = 1e9
+# POSIX pid_t is a signed int32; os.kill() converts the pid through
+# _Py_PARSE_PID and raises OverflowError (an ArithmeticError, NOT an
+# OSError) above INT_MAX — the r2 swarm review (F-001, critic-confirmed)
+# showed a hostile shard NAME with a 20+ digit pid segment escaping the
+# prune's except-OSError guard and 500ing unauthenticated /metrics on
+# every scrape. The prune never probes a pid above this bound (such a
+# shard is retained as unknown-ownership, the conservative direction),
+# and _pid_alive's POSIX leg catches OverflowError defensively.
+_MAX_PID = 2**31 - 1
+
+
+def _escape_label(value: str) -> str:
+    """Escape a label value for the Prometheus text exposition format.
+
+    Issue #936 AC4: every label interpolated into ``metrics_text`` goes
+    through here, so shard-sourced strings can never inject ``"``, ``\\``
+    or a newline into the exposition.
+    """
+    return (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+    )
+
+
+def _host_tag() -> str:
+    """Stable 8-hex tag for this host, embedded in new-format shard names.
+
+    Issue #936 AC5: a shard name carries its owner's host so the retention
+    prune never deletes a shard whose pid it cannot meaningfully probe (a
+    live worker on another host would look dead to this host's pid check).
+    """
+    return hashlib.sha256(
+        socket.gethostname().encode("utf-8", "replace")
+    ).hexdigest()[:8]
+
+
+_HOST_TAG = _host_tag()
+
+
+def _pid_alive(pid: int) -> bool:
+    """Best-effort liveness probe for a LOCAL pid. Conservative on error.
+
+    Issue #936 AC5. NEVER ``os.kill`` on Windows: any signal other than the
+    console-event constants is delivered via TerminateProcess. Error
+    mapping (both platforms): permission denied / unknown error -> ALIVE
+    (a retention leak is strictly safer than deleting a live worker's
+    shard); a confirmed nonexistent pid -> dead.
+    """
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        try:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.argtypes = [
+                wintypes.DWORD,  # dwDesiredAccess
+                wintypes.BOOL,  # bInheritHandle
+                wintypes.DWORD,  # dwProcessId
+            ]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            # 0x1000 = PROCESS_QUERY_LIMITED_INFORMATION.
+            handle = kernel32.OpenProcess(0x1000, False, pid)
+            if handle:
+                try:
+                    return True
+                finally:
+                    kernel32.CloseHandle(handle)
+            err = ctypes.get_last_error()
+            # 87 (ERROR_INVALID_PARAMETER): the pid does not exist.
+            if err == 87:
+                return False
+            # 5 (ERROR_ACCESS_DENIED) and anything else: treat as alive —
+            # the probe could not establish death.
+            return True
+        except Exception:  # noqa: BLE001 — probe must never raise
+            return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except OverflowError:
+        # Unrepresentable pid (defensive; the prune's _MAX_PID gate keeps
+        # such pids from reaching this probe): treat as alive — retention
+        # over deletion, never an escaping exception (r2 review F-001).
+        return True
+    except OSError:
+        # PermissionError and any other probe failure: alive (conservative).
+        return True
+
+
+def _coerce_counter(value) -> "int | None":
+    """Counter-field coercion for shard validation: int >= 0, bool rejected.
+
+    Returns None when the value is not a valid counter (issue #936 AC3 —
+    the read side validates shape before merging anything).
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    # Magnitude ceiling (r2 review F-007, user-approved parity fix; also
+    # closes the external review's F-03 int-to-str 500): an
+    # arbitrary-precision counter (10**401, or a 4300-digit literal) passes
+    # the int checks, but a scraper parses sample values as float64 and a
+    # value beyond its range errors the WHOLE scrape — and a sum of such
+    # counters can exceed Python's 4300-digit int-to-str limit, raising
+    # ValueError inside the f-string render. Same ceiling class the queue
+    # samples got in ca200349; a real counter above 1e9 per process is not
+    # a real measurement.
+    if value > _MAX_QUEUE_SAMPLE:
+        return None
+    return value
+
+
+def _safe_label_str(value) -> bool:
+    """True when the string survives UTF-8 response encoding (external
+    review F-02): json.loads accepts lone surrogates ("\\ud800") in keys,
+    and the /metrics body is UTF-8-encoded only at response construction —
+    a surrogate label key raises UnicodeEncodeError THERE and 500s the
+    scrape. Reject such keys at validation instead (a shape skip with a
+    WARNING, never an escaping exception).
+    """
+    if not isinstance(value, str):
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _valid_sample(value) -> bool:
+    """Queue-list element check: finite int|float in [0, _MAX_QUEUE_SAMPLE],
+    bool rejected."""
+    if isinstance(value, bool):
+        return False
+    if not isinstance(value, (int, float)) or value < 0:
+        return False
+    # Magnitude ceiling BEFORE any float conversion: int-vs-float comparison
+    # is exact in Python, so a 10**308 sample (which converts to a finite
+    # float fine and would pass isfinite) is rejected here — otherwise two
+    # such samples in the merged list overflow sum(waits) into
+    # OverflowError at the average, re-opening the /metrics 500 the
+    # contract forbids (final-critic delta finding 1, executed). A wait in
+    # seconds or a queue depth above 1e9 is not a real measurement.
+    if value > _MAX_QUEUE_SAMPLE:
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        # json.loads parses exact arbitrary-precision ints; a 400-digit
+        # sample is not representable as a finite float and is exactly what
+        # the finite-number contract rejects (swarm review L2R-2, executed).
+        return False
+
+
+def _valid_shard(obj) -> "tuple[bool, str]":
+    """Validate a parsed shard blob against the shard schema.
+
+    Issue #936 AC3/AC4. Every field is OPTIONAL (older shards stay
+    readable); a present field must match its type exactly or the whole
+    shard is skipped with a WARNING: bools are not counters, evaluator
+    reason keys must be write-side allowlisted, queue samples must be
+    finite non-negative numbers. Returns (ok, reason).
+    """
+    if not isinstance(obj, dict):
+        return False, "shard is not a JSON object"
+    for key in ("chat_turns", "embedding_cache_hits", "shard_flush_failures"):
+        if key in obj and _coerce_counter(obj[key]) is None:
+            return False, f"{key} is not a non-negative int"
+    reasons = obj.get("evaluator_fail_opens", {})
+    if not isinstance(reasons, dict):
+        return False, "evaluator_fail_opens is not an object"
+    for reason, count in reasons.items():
+        if not isinstance(reason, str) or reason not in EVALUATOR_FAIL_OPEN_REASONS:
+            return False, f"evaluator_fail_opens key not allowlisted: {reason!r}"
+        if _coerce_counter(count) is None:
+            return False, "evaluator_fail_opens value is not a non-negative int"
+    for list_key in ("queue_waits", "queue_depths"):
+        mapping = obj.get(list_key, {})
+        if not isinstance(mapping, dict):
+            return False, f"{list_key} is not an object"
+        depths = list_key == "queue_depths"
+        for cls, samples in mapping.items():
+            if (
+                not isinstance(cls, str)
+                or not _safe_label_str(cls)
+                or not isinstance(samples, list)
+            ):
+                return False, f"{list_key}[{cls!r}] is not a list"
+            for sample in samples:
+                # Depths are int-only (the writer emits int(depth); the
+                # approved plan types them int) — a fractional depth is a
+                # malformed sample (swarm review L1-8).
+                if depths and (isinstance(sample, bool)
+                               or not isinstance(sample, int)):
+                    return False, f"{list_key}[{cls!r}] has an invalid sample"
+                if not _valid_sample(sample):
+                    return False, f"{list_key}[{cls!r}] has an invalid sample"
+    calls = obj.get("provider_calls", {})
+    if not isinstance(calls, dict):
+        return False, "provider_calls is not an object"
+    for provider, outcomes in calls.items():
+        if (
+            not isinstance(provider, str)
+            or not _safe_label_str(provider)
+            or not isinstance(outcomes, dict)
+        ):
+            return False, f"provider_calls[{provider!r}] is not an object"
+        for outcome, count in outcomes.items():
+            # Read-side allowlist (r2 review F-008, user-approved parity
+            # fix): the write side rejects any outcome outside
+            # PROVIDER_OUTCOMES (record_provider_call), so a shard carrying
+            # an unallowlisted outcome key is hostile — without this gate a
+            # fabricated series merges into the unauthenticated exposition
+            # (the evaluator-reason leg was already allowlisted here; this
+            # closes the asymmetry the r2 lanes found).
+            if outcome not in PROVIDER_OUTCOMES:
+                return False, (
+                    f"provider_calls[{provider!r}] outcome not allowlisted: "
+                    f"{outcome!r}"
+                )
+            if _coerce_counter(count) is None:
+                return False, f"provider_calls[{provider!r}] value is invalid"
+    return True, ""
 
 # Valid reasons for record_evaluator_fail_open (issue #712, AC7 wiring).
 EVALUATOR_FAIL_OPEN_REASONS = ("exception", "empty_response", "unexpected_response")
@@ -100,7 +365,20 @@ class Telemetry:
         self._stage_totals: Dict[str, float] = {}
         self._embedding_cache_hits = 0
         self._evaluator_fail_opens: Dict[str, int] = {}
-        self._shard_name = f"telemetry-{os.getpid()}-{secrets.token_hex(4)}.json"
+        # Issue #936 AC1: operator-visible flush-failure accounting plus the
+        # rate-limit state for the WARNING (None = the next failure ALWAYS
+        # warns; a fresh process whose monotonic clock is below the interval
+        # must not have its first failure silenced).
+        self._shard_flush_failures = 0
+        self._last_flush_warning: Optional[float] = None
+        # Per-key rate-limit timestamps for skipped-shard/warning suppression.
+        self._warn_state: Dict[str, float] = {}
+        # Issue #936 AC5: the host tag makes shard ownership explicit so the
+        # retention prune never pid-probes a shard it cannot meaningfully
+        # judge (a live worker on another host looks dead to this host).
+        self._shard_name = (
+            f"telemetry-{_HOST_TAG}-{os.getpid()}-{secrets.token_hex(4)}.json"
+        )
         self._otel_observers: list = []
         # Guards every counter/dict mutation and the shard serialization so a
         # recorder can never interleave with another thread's serializer
@@ -146,12 +424,17 @@ class Telemetry:
         if not self.enabled:
             return
         with self._lock:
-            self._queue_waits.setdefault(str(admission_class), []).append(
-                float(wait_seconds)
-            )
-            self._queue_depths.setdefault(str(admission_class), []).append(
-                int(depth)
-            )
+            waits = self._queue_waits.setdefault(str(admission_class), [])
+            waits.append(float(wait_seconds))
+            depths = self._queue_depths.setdefault(str(admission_class), [])
+            depths.append(int(depth))
+            # Issue #936 AC6: cap BOTH histories at QUEUE_HISTORY_CAP so the
+            # write-through flush blob and the lock-hold time stop growing
+            # with process lifetime (the oldest samples fall off).
+            if len(waits) > QUEUE_HISTORY_CAP:
+                del waits[0]
+            if len(depths) > QUEUE_HISTORY_CAP:
+                del depths[0]
 
     def record_first_useful_content(self, turn_id: str, seconds: float) -> None:
         if not self.enabled or not turn_id:
@@ -255,6 +538,9 @@ class Telemetry:
             self._provider_calls = {}
             self._embedding_cache_hits = 0
             self._evaluator_fail_opens = {}
+            self._shard_flush_failures = 0
+            self._last_flush_warning = None
+            self._warn_state = {}
             if self.registry_dir is not None:
                 shard = self.registry_dir / self._shard_name
                 try:
@@ -282,12 +568,71 @@ class Telemetry:
                     "provider_calls": self._provider_calls,
                     "embedding_cache_hits": self._embedding_cache_hits,
                     "evaluator_fail_opens": self._evaluator_fail_opens,
+                    "shard_flush_failures": self._shard_flush_failures,
                 }
-                (self.registry_dir / self._shard_name).write_text(
-                    _dumps(counts), encoding="utf-8"
-                )
+                # Issue #936 AC2: write to a temp sibling then os.replace so a
+                # crash mid-write (or a scrape racing the write) never
+                # observes a torn shard — the previous flush stays intact
+                # and the swap is atomic. The ".tmp" suffix never matches the
+                # readers'/prune's "telemetry-*.json" glob.
+                tmp_path = self.registry_dir / (self._shard_name + ".tmp")
+                tmp_path.write_text(_dumps(counts), encoding="utf-8")
+                os.replace(tmp_path, self.registry_dir / self._shard_name)
             except Exception:  # noqa: BLE001 — telemetry must never raise
+                # Issue #936 AC1: a persistent flush failure must be
+                # operator-visible — count it ALWAYS, warn at most once per
+                # _FLUSH_WARN_INTERVAL (None state means the first failure
+                # warns unconditionally). The DEBUG record keeps the full
+                # traceback.
+                self._shard_flush_failures += 1
+                now = time.monotonic()
+                if (
+                    self._last_flush_warning is None
+                    or now - self._last_flush_warning >= _FLUSH_WARN_INTERVAL
+                ):
+                    self._last_flush_warning = now
+                    logger.warning(
+                        "Telemetry shard flush failed (shard=%s); counters "
+                        "are not persisting to the registry directory — "
+                        "see ragapp_telemetry_shard_flush_failures_total",
+                        self._shard_name,
+                    )
                 logger.debug("telemetry shard flush failed", exc_info=True)
+
+    def _forget_shard_warnings(self, shard_name: str) -> None:
+        """Drop the warning-ledger keys of a pruned shard (r2 review RP-2).
+
+        The ledger keys are prefixed with the shard name (read:/parse:/
+        shape:); once its file is gone the suppression state is dead weight
+        and would keep the name immortal in the map.
+        """
+        with self._lock:
+            for prefix in ("read:", "parse:", "shape:"):
+                self._warn_state.pop(prefix + shard_name, None)
+
+    def _rate_limited_warning(self, key: str, message: str, *args) -> None:
+        """Log one WARNING per key per _FLUSH_WARN_INTERVAL (issue #936 AC3).
+
+        Skipped/unreadable shards warn once a minute per shard instead of on
+        every scrape; the underlying condition stays observable without
+        flooding the log. The _warn_state map is guarded by the reentrant
+        lock (implementation-review F3: callers may already hold it; every
+        counter/dict mutation on this class goes through the same guard).
+        """
+        with self._lock:
+            now = time.monotonic()
+            last = self._warn_state.get(key)
+            if last is not None and now - last < _FLUSH_WARN_INTERVAL:
+                return
+            # Bounded ledger (r2 review RP-2/PO-2): _warn_state is keyed by
+            # per-incarnation shard names and nothing evicted entries, so
+            # it grew monotonically for the process lifetime. Evict the
+            # oldest entries (insertion order) past the cap — an evicted
+            # shard may warn again once, which is the harmless direction.
+            while len(self._warn_state) >= _WARN_STATE_MAX:
+                self._warn_state.pop(next(iter(self._warn_state)))
+            self._warn_state[key] = now
+        logger.warning(message, *args)
 
     def _aggregate_counts(self) -> dict:
         totals = {
@@ -297,34 +642,127 @@ class Telemetry:
             "provider_calls": {},
             "embedding_cache_hits": 0,
             "evaluator_fail_opens": {},
+            "shard_flush_failures": 0,
         }
         shards: list = []
+        own_disk_failures = 0
         if self.registry_dir is not None and self.registry_dir.exists():
             now = time.time()
             for entry in sorted(self.registry_dir.glob("telemetry-*.json")):
-                # Retention (swarm review PRR-018): shards are named per
-                # (pid, random token), so a restarted replica leaves its
-                # dead shard behind forever. A shard not written for over
-                # an hour belongs to a dead process (live processes flush
-                # write-through on every record) — prune it during
-                # aggregation. The current process's shard is exempt.
+                # Retention (issue #936 AC5, swarm review PRR-018 before it):
+                # a shard stale for over an hour is a prune CANDIDATE, but it
+                # is deleted ONLY when ownership is established as local
+                # (new-format name carrying THIS host's tag) AND the pid is
+                # confirmed dead. Foreign-host shards (a cross-host pid probe
+                # is meaningless — a live remote worker would look dead
+                # here), legacy-format shards, and unparsable names are all
+                # RETAINED: unknown ownership is never conflated with
+                # confirmed death. Retention HONESTY (final-critic finding
+                # 3): each retained shard's SIZE is bounded (its histories
+                # are capped), but the shard COUNT is not — under
+                # per-incarnation hostnames (Docker container ids, K8s pod
+                # names) every past incarnation's shard is retained forever
+                # until an operator removes it, because this host cannot
+                # safely judge those pids. A host-independent liveness
+                # signal (or a long foreign-stale window) is the
+                # maintainer-level follow-up. ASSUMPTION (swarm review
+                # L2R-3): the host tag treats a hostname as a unique host
+                # identity — two simultaneously-live hosts sharing one
+                # hostname over a shared registry dir (cloned VMs,
+                # StatefulSet pod-name reuse) can mis-judge each other's
+                # pids; the victim's next write-through flush recreates its
+                # shard, so the loss is transient.
                 try:
-                    if (
-                        entry.name != self._shard_name
-                        and now - entry.stat().st_mtime > 3600
+                    if entry.name != self._shard_name and (
+                        now - entry.stat().st_mtime > _SHARD_STALE_SECONDS
                     ):
-                        entry.unlink(missing_ok=True)
-                        continue
-                except OSError:  # pragma: no cover — racing unlink
+                        stem = entry.name[: -len(".json")]
+                        parts = stem.split("-")
+                        if (
+                            len(parts) == 4
+                            and parts[0] == "telemetry"
+                            and parts[1] == _HOST_TAG
+                            and parts[2].isascii()
+                            and parts[2].isdigit()
+                            # _MAX_PID gate (r2 review F-001): int() is
+                            # arbitrary precision, so a 20+ digit pid part
+                            # passes the digit checks but os.kill would
+                            # raise OverflowError on POSIX — an exception
+                            # class the guard below does not catch. Such a
+                            # shard is retained (unknown ownership), never
+                            # probed.
+                            and int(parts[2]) <= _MAX_PID
+                            and not _pid_alive(int(parts[2]))
+                        ):
+                            entry.unlink(missing_ok=True)
+                            self._forget_shard_warnings(entry.name)
+                            continue
+                except OSError:  # pragma: no cover — racing unlink/stat
+                    continue
+                # Issue #936 AC3: unreadable shards (OSError) and malformed
+                # or hostile payloads (shape/allowlist violations) are
+                # skipped with a rate-limited WARNING — never a 500 on
+                # /metrics and never merged into the exposition.
+                # UnicodeDecodeError (a ValueError subclass — binary-corrupt
+                # or non-UTF-8 bytes) is caught HERE at the read leg, not by
+                # the json.loads ValueError arm below (implementation-review
+                # F1: base caught (OSError, ValueError) around both).
+                try:
+                    raw = entry.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    self._rate_limited_warning(
+                        f"read:{entry.name}",
+                        "Telemetry shard unreadable (path=%s); skipping it "
+                        "in /metrics aggregation",
+                        entry,
+                    )
                     continue
                 try:
-                    shards.append(
-                        json.loads(entry.read_text(encoding="utf-8"))
+                    parsed = json.loads(raw)
+                # RecursionError (RuntimeError subclass) rides the same leg:
+                # deeply nested hostile JSON blew the 500 contract before
+                # this widening (swarm review L2R-1, executed at HEAD+base).
+                except (ValueError, RecursionError):
+                    self._rate_limited_warning(
+                        f"parse:{entry.name}",
+                        "Telemetry shard is not valid JSON (path=%s); "
+                        "skipping it in /metrics aggregation",
+                        entry,
                     )
-                except (OSError, ValueError):  # pragma: no cover — torn shard
+                    continue
+                valid, reason = _valid_shard(parsed)
+                if not valid:
+                    self._rate_limited_warning(
+                        f"shape:{entry.name}",
+                        "Telemetry shard failed validation (path=%s, %s); "
+                        "skipping it in /metrics aggregation",
+                        entry,
+                        reason,
+                    )
+                    continue
+                if entry.name == self._shard_name:
+                    own_disk_failures = int(
+                        parsed.get("shard_flush_failures", 0)
+                    )
+                shards.append(parsed)
+            # Crash-leftover temp siblings (issue #936 AC2): an interrupted
+            # atomic write strands a ".tmp" file; reclaim stale ones. An
+            # in-flight temp write has a fresh mtime and is naturally spared.
+            for entry in sorted(
+                self.registry_dir.glob("telemetry-*.json.tmp")
+            ):
+                try:
+                    if now - entry.stat().st_mtime > _SHARD_STALE_SECONDS:
+                        entry.unlink(missing_ok=True)
+                except OSError:  # pragma: no cover — racing unlink/stat
                     continue
         else:
             shards.append(self._local_counts())
+            # The fallback "shard" IS the local counts dict: its
+            # shard_flush_failures value equals the in-memory counter, so
+            # subtracting it back out keeps the replace-with-local rule
+            # exact in this branch too.
+            own_disk_failures = self._shard_flush_failures
         # Merge under the lock: the local shard references LIVE dicts, so an
         # unlocked .items() iteration races concurrent recorders (the same
         # RuntimeError class _flush_shard guards against).
@@ -338,13 +776,37 @@ class Telemetry:
                     merged_eval = totals["evaluator_fail_opens"]
                     merged_eval[reason] = merged_eval.get(reason, 0) + int(count)
                 for cls, waits in shard.get("queue_waits", {}).items():
-                    totals["queue_waits"].setdefault(cls, []).extend(waits)
+                    # Per-SHARD cap only (final-critic finding 1): the cap
+                    # bounds what each process retains and serializes; the
+                    # CROSS-SHARD aggregate sums every shard's retained
+                    # window. Trimming the merged list instead would let
+                    # whichever shard sorts last monopolize the queue-wait
+                    # average (executed probes: two capped shards, true mean
+                    # 5.0, the merged trim reported 0.0 or 10.0 —
+                    # whichever shard sorts last wins).
+                    merged_waits = totals["queue_waits"].setdefault(cls, [])
+                    merged_waits.extend(waits[-QUEUE_HISTORY_CAP:])
                 for cls, depths in shard.get("queue_depths", {}).items():
-                    totals["queue_depths"].setdefault(cls, []).extend(depths)
+                    merged_depths = totals["queue_depths"].setdefault(cls, [])
+                    merged_depths.extend(depths[-QUEUE_HISTORY_CAP:])
                 for provider, outcomes in shard.get("provider_calls", {}).items():
                     merged = totals["provider_calls"].setdefault(provider, {})
                     for outcome, count in outcomes.items():
                         merged[outcome] = merged.get(outcome, 0) + int(count)
+            # Flush-failure accounting (issue #936 AC1): every shard's
+            # persisted counter sums, EXCEPT this process's own disk copy,
+            # whose contribution is REPLACED by the live in-memory count —
+            # a failing writer cannot persist its own counter, and a
+            # transient failure followed by a successful flush must read 1,
+            # not 2. In the registry-absent fallback the only "shard" is the
+            # local counts dict (own_disk_failures == the in-memory number),
+            # so the same arithmetic is correct there too.
+            persisted_total = 0
+            for shard in shards:
+                persisted_total += int(shard.get("shard_flush_failures", 0))
+            totals["shard_flush_failures"] = (
+                persisted_total - own_disk_failures + self._shard_flush_failures
+            )
         return totals
 
     def _local_counts(self) -> dict:
@@ -355,6 +817,7 @@ class Telemetry:
             "provider_calls": self._provider_calls,
             "embedding_cache_hits": self._embedding_cache_hits,
             "evaluator_fail_opens": self._evaluator_fail_opens,
+            "shard_flush_failures": self._shard_flush_failures,
         }
 
     def metrics_text(self) -> str:
@@ -362,46 +825,62 @@ class Telemetry:
             return ""
         self._flush_shard()
         totals = self._aggregate_counts()
+        # Issue #936 AC7: every HELP/TYPE line and every sample interpolates
+        # the METRIC_* constants — no metric name appears as a string literal
+        # here, so a constant rename can never desync the exposition from
+        # its samples (label values go through _escape_label per AC4).
         lines = [
-            "# HELP ragapp_chat_turns_total Chat turns recorded.",
-            "# TYPE ragapp_chat_turns_total counter",
+            f"# HELP {METRIC_CHAT_TURNS} Chat turns recorded.",
+            f"# TYPE {METRIC_CHAT_TURNS} counter",
             f"{METRIC_CHAT_TURNS} {totals['chat_turns']}",
         ]
         for cls in sorted(totals["queue_depths"]):
             depths = totals["queue_depths"][cls]
             lines.append(
-                f'{METRIC_QUEUE_DEPTH}{{admission_class="{cls}"}} '
+                f'{METRIC_QUEUE_DEPTH}{{admission_class="{_escape_label(cls)}"}} '
                 f"{depths[-1] if depths else 0}"
             )
         for cls in sorted(totals["queue_waits"]):
             waits = totals["queue_waits"][cls]
             avg = (sum(waits) / len(waits)) if waits else 0.0
             lines.append(
-                f'{METRIC_QUEUE_WAIT}{{admission_class="{cls}"}} {avg:.6f}'
+                f'{METRIC_QUEUE_WAIT}{{admission_class="{_escape_label(cls)}"}} '
+                f"{avg:.6f}"
             )
         for provider in sorted(totals["provider_calls"]):
             for outcome in sorted(totals["provider_calls"][provider]):
                 count = totals["provider_calls"][provider][outcome]
                 lines.append(
-                    f'{METRIC_PROVIDER_CALLS}{{provider="{provider}",'
-                    f'outcome="{outcome}"}} {count}'
+                    f'{METRIC_PROVIDER_CALLS}{{provider="{_escape_label(provider)}",'
+                    f'outcome="{_escape_label(outcome)}"}} {count}'
                 )
         lines.append(
-            f"ragapp_embedding_cache_hits_total {totals['embedding_cache_hits']}"
+            f"# HELP {METRIC_EMBEDDING_CACHE_HITS} Embedding cache hits."
+        )
+        lines.append(f"# TYPE {METRIC_EMBEDDING_CACHE_HITS} counter")
+        lines.append(
+            f"{METRIC_EMBEDDING_CACHE_HITS} {totals['embedding_cache_hits']}"
         )
 
         lines.append(
-            "# HELP ragapp_retrieval_evaluator_fail_open_total Retrieval "
+            f"# HELP {METRIC_EVALUATOR_FAIL_OPEN} Retrieval "
             "evaluator fail-opens by cause (issue #712)."
         )
-        lines.append(
-            "# TYPE ragapp_retrieval_evaluator_fail_open_total counter"
-        )
+        lines.append(f"# TYPE {METRIC_EVALUATOR_FAIL_OPEN} counter")
         for reason in sorted(totals["evaluator_fail_opens"]):
             count = totals["evaluator_fail_opens"][reason]
             lines.append(
-                f'{METRIC_EVALUATOR_FAIL_OPEN}{{reason="{reason}"}} {count}'
+                f'{METRIC_EVALUATOR_FAIL_OPEN}{{reason="{_escape_label(reason)}"}} '
+                f"{count}"
             )
+        lines.append(
+            f"# HELP {METRIC_SHARD_FLUSH_FAILURES} Failed telemetry shard "
+            "flushes (counters not persisting to the registry directory)."
+        )
+        lines.append(f"# TYPE {METRIC_SHARD_FLUSH_FAILURES} counter")
+        lines.append(
+            f"{METRIC_SHARD_FLUSH_FAILURES} {totals['shard_flush_failures']}"
+        )
         return "\n".join(lines) + "\n"
 
 

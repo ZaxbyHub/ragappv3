@@ -9,8 +9,6 @@ import contextlib
 import json
 import logging
 import sqlite3
-import threading
-import weakref
 from datetime import datetime, timezone
 from typing import Callable, List, Optional, Union
 
@@ -318,28 +316,19 @@ async def _atomic_memory_write(conn: sqlite3.Connection):
         await asyncio.to_thread(conn.commit)
 
 
-_backfill_locks_guard = threading.Lock()
-_backfill_locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = (
-    weakref.WeakKeyDictionary()
-)
+def _get_backfill_lock(memory_store: MemoryStore) -> asyncio.Lock:
+    """Per-event-loop single-flight lock for backfill runs (issue #937).
 
-
-def _get_backfill_lock() -> asyncio.Lock:
-    """Per-event-loop single-flight lock for the superadmin backfill.
-
-    A module-level ``asyncio.Lock`` binds to the first loop that acquires it
-    and raises on later loops (starlette's TestClient spins a fresh loop per
-    request), so locks are keyed by the running loop; dead loops drop out of
-    the weakref map. Scope is per-process, matching the in-request overlap
-    the audit found (issue #686, T1-02-S2-07).
+    Delegates to the store-level lock so all three backfill callers — the
+    lifespan startup task, the periodic embed-heal loop, and this module's
+    superadmin route — serialize on ONE per-loop lock (the store keeps the
+    loop-keyed weakref map because a module-level ``asyncio.Lock`` binds to
+    the first loop that acquires it and raises on later loops; starlette's
+    TestClient spins a fresh loop per request). Previously module-local
+    (issue #686, T1-02-S2-07); moved to the store when the heal loop made
+    overlap possible beyond in-request scope.
     """
-    loop = asyncio.get_running_loop()
-    with _backfill_locks_guard:
-        lock = _backfill_locks.get(loop)
-        if lock is None:
-            lock = asyncio.Lock()
-            _backfill_locks[loop] = lock
-        return lock
+    return memory_store.get_backfill_lock()
 
 
 async def _perform_memory_search(
@@ -588,24 +577,26 @@ async def create_memory(
     # Embed on THIS loop right after the insert (issue #712): add_memory no
     # longer bridges into the embedding service synchronously. Best-effort —
     # a failure leaves the row FTS-only (observable via the WARNING); the
-    # healing paths are the startup backfill task and the superadmin
-    # backfill route, NOT a periodic timer, so the row stays FTS-only for
-    # this process's lifetime if both are missed.
+    # healing paths are the startup backfill task, the periodic embed-heal
+    # task (issue #937), and the superadmin backfill route.
     if getattr(memory_store, "embedding_service", None) is not None:
         try:
             outcome = await memory_store.embed_and_store(record.id, body.content)
             if outcome != "stored":
                 logger.warning(
                     "Memory stored without embedding (id=%s, outcome=%s); "
-                    "dense recall degraded to FTS-only for this row until "
-                    "backfill",
+                    "dense recall degraded to FTS-only for this row (healed "
+                    "by the startup backfill task, the periodic embed-heal "
+                    "task, or the superadmin backfill route)",
                     record.id,
                     outcome,
                 )
         except Exception:  # noqa: BLE001 — never fail the created row
             logger.warning(
                 "Memory embedding after create failed (id=%s); dense recall "
-                "degraded to FTS-only for this row until backfill",
+                "degraded to FTS-only for this row (healed by the startup "
+                "backfill task, the periodic embed-heal task, or the "
+                "superadmin backfill route)",
                 record.id,
                 exc_info=True,
             )
@@ -848,14 +839,18 @@ async def update_memory(
                         "Memory update left the row without an embedding "
                         "(id=%s, outcome=%s); dense recall degraded to "
                         "FTS-only for this row (healed by the startup "
-                        "backfill task or the superadmin backfill route, not "
-                        "on a timer)",
+                        "backfill task, the periodic embed-heal task, or "
+                        "the superadmin backfill route)",
                         memory_id,
                         outcome,
                     )
             except Exception:
                 logger.warning(
-                    "Could not recompute embedding for memory %d after content update",
+                    "Could not recompute embedding for memory %d after "
+                    "content update; dense recall degraded to FTS-only for "
+                    "this row (healed by the startup backfill task, the "
+                    "periodic embed-heal task, or the superadmin backfill "
+                    "route)",
                     memory_id,
                 )
 
@@ -1071,6 +1066,6 @@ async def backfill_memory_embeddings(
     """
     if user.get("role") != "superadmin":
         raise HTTPException(status_code=403, detail="Superadmin access required")
-    async with _get_backfill_lock():
+    async with _get_backfill_lock(memory_store):
         summary = await memory_store.backfill_missing_embeddings()
     return {"status": "complete", "summary": summary}

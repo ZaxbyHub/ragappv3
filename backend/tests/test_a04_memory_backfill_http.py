@@ -6,8 +6,11 @@ route registration, superadmin gate, CSRF/auth dependencies — had no
 suite-wide coverage. These tests exercise the endpoint through TestClient.
 """
 
+import asyncio
 import os
 import sys
+import threading
+import weakref
 
 import pytest
 
@@ -24,6 +27,23 @@ class _CountingStore:
 
     def __init__(self):
         self.calls = 0
+        # Issue #937 mock-contract adaptation: the single-flight lock moved
+        # onto MemoryStore (the route now delegates to
+        # store.get_backfill_lock()), so the stub exposes the same
+        # per-event-loop lock.
+        self._locks_guard = threading.Lock()
+        self._locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = (
+            weakref.WeakKeyDictionary()
+        )
+
+    def get_backfill_lock(self) -> asyncio.Lock:
+        loop = asyncio.get_running_loop()
+        with self._locks_guard:
+            lock = self._locks.get(loop)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._locks[loop] = lock
+            return lock
 
     async def backfill_missing_embeddings(self):
         self.calls += 1
