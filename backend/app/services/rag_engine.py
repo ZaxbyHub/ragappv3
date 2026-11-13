@@ -1277,9 +1277,34 @@ class RAGEngine:
                         if await self.memory_store.memory_embedding_is_null(
                             memory.id
                         ):
-                            outcome = await self.memory_store.embed_and_store(
-                                memory.id, memory_content
-                            )
+                            # Admitted + budgeted (r2 review F-004): the
+                            # same admit(EMBEDDING) + budget-window pattern
+                            # the query-side precompute and the healer use,
+                            # so a re-sent directive cannot hold an
+                            # unbudgeted provider call inside the chat SSE
+                            # (the client's 60s timeout previously pinned
+                            # the "Memory stored" frame AND a CHAT admission
+                            # slot). Budget expiry / a saturated budget
+                            # degrade to the same three-healer WARNING as
+                            # any other failed outcome.
+                            from app.config import settings as _settings
+
+                            try:
+                                async with asyncio.timeout(
+                                    _settings.memory_embed_budget_seconds
+                                ):
+                                    async with get_admission_controller().admit(
+                                        AdmissionClass.EMBEDDING
+                                    ):
+                                        outcome = await (
+                                            self.memory_store.embed_and_store(
+                                                memory.id, memory_content
+                                            )
+                                        )
+                            except asyncio.TimeoutError:
+                                outcome = "deferred:budget"
+                            except AdmissionRejected:
+                                outcome = "deferred:admission"
                             if outcome != "stored":
                                 logger.warning(
                                     "Memory re-sent without embedding (id=%s, "

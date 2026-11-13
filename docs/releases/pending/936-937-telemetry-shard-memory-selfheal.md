@@ -30,15 +30,28 @@
   host-independent liveness signal (or a long foreign-stale window) is an
   open maintainer decision tracked in a follow-up issue. Until then,
   operators may delete stale foreign/legacy shards by hand once every
-  worker runs the new format.
+  worker runs the new format. **During a mixed-version rollout**, replicas
+  still running the previous image keep applying the OLD mtime-only prune
+  to ALL shards — including new-format shards of upgraded, live workers —
+  so freshly written shard data may briefly disappear until the upgraded
+  worker's next write-through flush recreates it (visibility-only, self-
+  healing). Upgrade all replicas of a shared-registry deployment together
+  where practical.
+- Rollback: a single revert of this change restores the base behavior —
+  the base reader ignores the new-format shard names and the optional
+  `shard_flush_failures` key, and the base prune's mtime-only rule resumes
+  (no schema, API, or config migration to undo). The optional
+  `MEMORY_EMBED_HEAL_INTERVAL_SECONDS` env var can simply be unset.
 - Per-class queue-wait/queue-depth history is capped at 200 samples per
   process on write and per shard at merge entry — the cross-shard
   aggregate keeps every shard's retained window (a merged-list trim would
   let the last-sorting shard monopolize the queue-wait average), so shard
   size and lock-hold time stop growing with process lifetime (#936 AC6).
-- Every HELP/TYPE line and sample (including the new embedding-cache
-  family) is generated from the `METRIC_*` constants — a rename can no
-  longer desync the exposition from its samples (#936 AC7).
+- Every HELP/TYPE line and sample is generated from the `METRIC_*`
+  constants — a rename can no longer desync the exposition from its
+  samples (#936 AC7); the existing embedding-cache family gains the
+  HELP/TYPE metadata lines it previously lacked (the sample itself was
+  already emitted before this change).
 
 ## Memory embedding self-heal (#937)
 
@@ -52,8 +65,12 @@
   EMBEDDING admission + `MEMORY_EMBED_BUDGET_SECONDS` window; budget-
   rejected rows are deferred and a later tick retries them.
 - All three backfill callers (lifespan startup task, heal loop, superadmin
-  route) are now single-flight on one store-level lock; overlapping runs
-  share one store-level embed-concurrency semaphore.
+  route) are now single-flight on one store-level lock **per process**
+  (multi-worker deployments each run their own loop — duplicate embed work
+  is idempotent and revision-guarded, so the cost is provider spend only);
+  overlapping runs share one store-level embed-concurrency semaphore. The
+  heal tick processes at most 200 rows per tick, bounding how long the
+  single-flight lock is held (remaining rows retry on later ticks).
 - A re-sent remember-directive that finds an existing NULL-embedding row
   re-attempts its embed (non-NULL rows untouched).
 - Every post-embed degradation WARNING — create/update/remember, outcome

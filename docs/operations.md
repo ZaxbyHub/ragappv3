@@ -314,15 +314,19 @@ cleared automatically).
   `ragapp_retrieval_evaluator_fail_open_total` (labelled by `reason=`;
   a non-zero value means the CRAG retrieval evaluator failed open —
   see `docs/releases/pending/712-memory-stall-evaluator-starvation.md`),
-  `ragapp_telemetry_shard_flush_failures_total` (issue #936: a non-zero
-  value means counters are NOT persisting to the shared registry
-  directory — every write-through flush is failing; check the directory's
-  writability and the rate-limited WARNING logs).
+  `ragapp_telemetry_shard_flush_failures_total` (issue #936: a CUMULATIVE
+  per-worker count of write-through flushes that failed — a non-zero
+  value is HISTORICAL failure evidence and does NOT mean persistence is
+  failing now; a count RISING between scrapes means flushes are currently
+  failing. Check the directory's writability and the rate-limited WARNING
+  logs).
   Multiprocess aggregation: set `TELEMETRY_REGISTRY_DIR` to one shared
   writable directory (all workers/replicas) and the counter/gauge families
   above are summed across shards; empty = single-process counters.
   Retention: shard files whose owning process is confirmed dead (same
-  host, new-format names) are pruned automatically; foreign-host and
+  host, new-format names) are pruned automatically (on the next /metrics
+  scrape — pruning is scrape-driven, not a background sweep); foreign-host
+  and
   legacy-format shards are retained (size-bounded, count-unbounded under
   per-incarnation hostnames — see issue #1121) and may be deleted by hand
   once every worker runs the new format. Note:

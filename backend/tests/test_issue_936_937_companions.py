@@ -105,22 +105,6 @@ def test_persistent_flush_failure_grows_and_fallback(tmp_path, monkeypatch):
     assert _sample(text2, METRIC_SHARD_FLUSH_FAILURES) == 2
 
 
-def test_two_instances_flush_failures_sum(tmp_path, monkeypatch):
-    a = Telemetry(enabled=True, registry_dir=tmp_path)
-    _failing_flush(a, monkeypatch)
-    a.record_chat_turn("a")
-    b = Telemetry(enabled=True, registry_dir=tmp_path)
-    _failing_flush(b, monkeypatch)
-    b.record_chat_turn("b")
-    # Cross-process semantics: a failing writer cannot persist its
-    # counter, so each process's exposition surfaces ITS OWN in-memory
-    # count (the scraper's own flush also fails under the global patch).
-    # The invariant is visibility, not summability-without-persistence.
-    scraper = Telemetry(enabled=True, registry_dir=tmp_path)
-    text = scraper.metrics_text()
-    assert _sample(text, METRIC_SHARD_FLUSH_FAILURES) >= 1
-
-
 def test_reset_clears_flush_failure_state(tmp_path, monkeypatch):
     tel = Telemetry(enabled=True, registry_dir=tmp_path)
     _failing_flush(tel, monkeypatch)
@@ -211,6 +195,10 @@ def test_stale_tmp_removed_fresh_tmp_survives(tmp_path):
         {"queue_waits": {"c": [float("nan")]}},
         {"queue_depths": {"c": [-1]}},
         {"provider_calls": {"p": {"ok": "x"}}},
+        {"queue_waits": {"c": [True]}},  # bool queue sample (r2 TI-3)
+        {"chat_turns": 1.5},  # float counter (r2 TI-3)
+        {"evaluator_fail_opens": {"exception": -5}},  # negative count (r2 TI-3)
+        {"provider_calls": {"p": "not-a-dict"}},  # non-dict map (r2 TI-3)
     ],
 )
 def test_malformed_shapes_skip_with_warning_and_200(tmp_path, caplog, payload):
@@ -532,49 +520,6 @@ def _make_store(tmp_path, embedder):
     return MemoryStore(pool=pool, embedding_service=embedder), pool
 
 
-def test_heal_loop_survives_failed_tick_then_heals(tmp_path):
-    embedder = _ScriptedEmbedder([RuntimeError("outage"), RuntimeError("outage")])
-    store, pool = _make_store(tmp_path, embedder)
-    try:
-        store.add_memory("heal me", source="chat", vault_id=1)
-        conn = pool.get_connection()
-        try:
-            conn.execute(
-                "UPDATE memories SET embedding = NULL, embedding_model = NULL"
-            )
-            conn.commit()
-        finally:
-            pool.release_connection(conn)
-
-        async def _run():
-            task = asyncio.create_task(store.periodic_embed_heal_loop(interval=0))
-            try:
-                for _ in range(300):
-                    await asyncio.sleep(0.01)
-                    conn = pool.get_connection()
-                    try:
-                        row = conn.execute(
-                            "SELECT embedding IS NULL FROM memories"
-                        ).fetchone()
-                    finally:
-                        pool.release_connection(conn)
-                    if row and not row[0]:
-                        return True
-                return False
-            finally:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-
-        # First tick raises (scripted outage); the loop must CONTINUE and a
-        # later tick (script now exhausted -> success) heals the row.
-        assert asyncio.run(_run()) is True
-    finally:
-        pool.close_all()
-
-
 def test_heal_tick_skips_when_lock_held(tmp_path, caplog):
     embedder = _ScriptedEmbedder([])
     store, pool = _make_store(tmp_path, embedder)
@@ -627,7 +572,7 @@ class _BudgetOneAdmission:
         self._waiters = deque()
         self._held = external_holds
 
-    def admit(self, admission_class):
+    def admit(self, admission_class, *, foreground: bool = True):
         controller = self
 
         class _Ctx:
@@ -1381,3 +1326,628 @@ def test_sum_overflow_shards_skip_with_200(tmp_path, caplog):
         for r in caplog.records
         if r.name == "app.services.telemetry"
     )
+
+
+# ==========================================================================
+# r2 swarm-pr-review feedback round (FB-001..FB-011) + external-review and
+# final-critic round-2 deltas (FB-012..FB-018) — regression pins
+# ==========================================================================
+
+from pathlib import Path as _Path
+
+_REPO_ROOT = _Path(__file__).resolve().parents[1]
+
+
+def test_pid_alive_never_raises_on_oversized_pid(monkeypatch):
+    """FB-001 leg 1 (r2 review F-001 = external review F-01, critic-confirmed
+    blocker): on POSIX os.kill() converts the pid via _Py_PARSE_PID and
+    raises OverflowError (an ArithmeticError, NOT an OSError) above INT_MAX
+    — the exception escaped the prune's except-OSError guard and 500ed
+    unauthenticated /metrics on every scrape while the poison shard existed.
+    _pid_alive must therefore NEVER raise: an unrepresentable pid is treated
+    as alive (retention over deletion). Simulated POSIX leg (a Windows box
+    cannot execute the real os.kill conversion); no Path objects are touched
+    inside the patched window (os.name patching would break pathlib's
+    flavor selection mid-test).
+    """
+
+    def _posix_kill(pid, sig):
+        if pid > telemetry_module._MAX_PID:
+            raise OverflowError("Python int too large to convert to C long")
+        raise ProcessLookupError(pid)
+
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(os, "kill", _posix_kill)
+    # Oversized pid: caught defensively -> alive (conservative retention).
+    assert telemetry_module._pid_alive(2**40) is True
+    # A real-range dead pid still maps to dead.
+    assert telemetry_module._pid_alive(2**31 - 5) is False
+
+
+def test_prune_never_probes_oversized_pid(tmp_path, monkeypatch):
+    """FB-001 leg 2: the prune's name gate must never probe a pid segment
+    above _MAX_PID (int() is arbitrary precision, so a 20+ digit pid part
+    passes the digit checks; probing it is what raised on POSIX). Retained
+    shards are the conservative direction. Discriminating on every
+    platform: with the _MAX_PID gate removed, the probe spy records the
+    oversized pid and the assertion fails.
+    """
+    hostile_pid = 2**40
+    hostile = tmp_path / (
+        f"telemetry-{telemetry_module._HOST_TAG}-{hostile_pid}-0ff00001.json"
+    )
+    # Empty contents: retention and merge are independent — this shard is
+    # valid-but-empty, so the count assertion below isolates the good shard.
+    hostile.write_text(json.dumps({}), encoding="utf-8")
+    good = tmp_path / "telemetry-00000000-1-good0002.json"
+    good.write_text(json.dumps({"chat_turns": 9}), encoding="utf-8")
+    os.utime(hostile, (time.time() - 7200, time.time() - 7200))
+
+    probed = []
+    real_alive = telemetry_module._pid_alive
+
+    def _spy(pid):
+        probed.append(pid)
+        return real_alive(pid)
+
+    monkeypatch.setattr(telemetry_module, "_pid_alive", _spy)
+    tel = Telemetry(enabled=True, registry_dir=tmp_path)
+    text = tel.metrics_text()
+    assert _sample(text, telemetry_module.METRIC_CHAT_TURNS) == 9
+    assert hostile.exists(), (
+        "an unrepresentable-pid shard must be retained (unknown ownership)"
+    )
+    assert probed == [], (
+        f"the prune must never probe an oversized pid (probed: {probed})"
+    )
+
+
+def test_over_ceiling_counter_shard_skips(tmp_path, caplog):
+    """FB-007 (r2 review parity fix, user-approved; also closes external
+    review F-03's int-to-str 500): a counter above the magnitude ceiling is
+    a hostile shape — without the gate a 10**401 counter renders verbatim
+    and a float64 scraper errors the WHOLE scrape (200 preserved app-side).
+    Isolated dir so the rendered digits cannot hide inside a merged total
+    (the first draft of this pin survived the ceiling mutant because
+    11 + 10**401 shifted the digit string — lesson recorded).
+    """
+    import logging as _logging
+
+    hostile = tmp_path / "telemetry-00000000-7-bigc0001.json"
+    hostile.write_text(
+        json.dumps({"chat_turns": 10 ** 401}), encoding="utf-8"
+    )
+    tel = Telemetry(enabled=True, registry_dir=tmp_path)
+    with caplog.at_level(_logging.WARNING, logger="app.services.telemetry"):
+        text = tel.metrics_text()
+    msgs = [r.getMessage() for r in caplog.records
+            if r.name == "app.services.telemetry"]
+    assert any("failed validation" in m for m in msgs), msgs[:3]
+    assert str(10 ** 401) not in text, (
+        "an over-ceiling counter must never render into the exposition"
+    )
+
+
+def test_unallowlisted_outcome_shard_skips(tmp_path, caplog):
+    """FB-008 (r2 review parity fix, user-approved): an unallowlisted
+    provider-outcome key is a hostile shape — the write side rejects it, so
+    a shard carrying one must skip with the shape WARNING and never merge a
+    fabricated series into the exposition.
+    """
+    import logging as _logging
+
+    fabricated = tmp_path / "telemetry-00000000-7-fabc0002.json"
+    fabricated.write_text(
+        json.dumps({"provider_calls": {"ghost": {"fabricated_outcome": 7}}}),
+        encoding="utf-8",
+    )
+    tel = Telemetry(enabled=True, registry_dir=tmp_path)
+    with caplog.at_level(_logging.WARNING, logger="app.services.telemetry"):
+        text = tel.metrics_text()
+    msgs = [r.getMessage() for r in caplog.records
+            if r.name == "app.services.telemetry"]
+    assert any("failed validation" in m for m in msgs), msgs[:3]
+    assert "fabricated_outcome" not in text, (
+        "an unallowlisted outcome must never render into the exposition"
+    )
+
+
+def test_windows_liveness_never_uses_os_kill(monkeypatch):
+    """FB-003 (r2 review F-003 = external review TINF-001, HIGH_IMPACT test
+    gap): the nt liveness leg must use OpenProcess and NEVER os.kill
+    (TerminateProcess would kill the probed worker). Portable simulation:
+    force the nt branch with a stubbed kernel32 and plant an os.kill
+    tripwire — reintroducing os.kill on the nt path fails this test on ANY
+    platform, including CI's ubuntu runners.
+    """
+    import ctypes
+
+    def _kill_tripwire(*args, **kwargs):
+        raise AssertionError(
+            "os.kill was called on the Windows liveness path — the #936 "
+            "contract forbids os.kill on Windows (TerminateProcess kills "
+            "the probed worker)"
+        )
+
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(os, "kill", _kill_tripwire)
+
+    class _FakeKernel32:
+        def __init__(self):
+            self.OpenProcess = lambda access, inherit, pid: None
+            self.CloseHandle = lambda handle: 1
+
+    # raising=False (final critic round 2, FB-014): ctypes.WinDLL and
+    # ctypes.get_last_error exist ONLY under `if _os.name == "nt"` inside
+    # ctypes itself, so on the ubuntu CI runners these attributes are
+    # absent and a default setattr raises AttributeError at setup — the
+    # test must CREATE the missing attributes, not just replace them.
+    monkeypatch.setattr(
+        ctypes, "WinDLL", lambda *a, **k: _FakeKernel32(), raising=False
+    )
+    monkeypatch.setattr(
+        ctypes, "get_last_error", lambda: 87, raising=False
+    )
+
+    assert telemetry_module._pid_alive(999999) is False
+    assert telemetry_module._pid_alive(os.getpid()) is True
+
+
+def test_warn_ledger_bounded_and_pruned_shard_forgotten(tmp_path, caplog):
+    """FB-011 (r2 review RP-2/PO-2): the warning-suppression ledger must be
+    bounded and must drop a pruned shard's keys instead of keeping the name
+    immortal in the map.
+    """
+    import logging as _logging
+
+    tel = Telemetry(enabled=True, registry_dir=tmp_path)
+    # Cap: fill the ledger past _WARN_STATE_MAX via _rate_limited_warning.
+    with caplog.at_level(_logging.WARNING, logger="app.services.telemetry"):
+        for i in range(telemetry_module._WARN_STATE_MAX + 8):
+            tel._rate_limited_warning(f"shape:shard-{i}.json", "w %d", i)
+    assert len(tel._warn_state) <= telemetry_module._WARN_STATE_MAX
+
+    # Prune-coupled eviction: warn for a shard, then forget it.
+    tel._rate_limited_warning("read:gone.json", "w")
+    assert "read:gone.json" in tel._warn_state
+    tel._forget_shard_warnings("gone.json")
+    assert "read:gone.json" not in tel._warn_state
+    assert "parse:gone.json" not in tel._warn_state
+    assert "shape:gone.json" not in tel._warn_state
+
+
+def test_skip_warning_rate_limited_across_scrapes(tmp_path, caplog):
+    """FB-010/TF-4: the read-side skip-WARNING rate limiter's suppression
+    half — the same hostile shard scraped repeatedly must warn only once
+    inside the interval (previously only the flush-side limiter was pinned;
+    disabling the suppression half kept the whole suite green).
+    """
+    import logging as _logging
+
+    hostile = tmp_path / "telemetry-00000000-5-supr0001.json"
+    hostile.write_text(
+        json.dumps({"queue_waits": {"c": "nope"}}), encoding="utf-8"
+    )
+    tel = Telemetry(enabled=True, registry_dir=tmp_path)
+    with caplog.at_level(_logging.WARNING, logger="app.services.telemetry"):
+        tel.metrics_text()
+        tel.metrics_text()
+        tel.metrics_text()
+    shape_warns = [
+        r
+        for r in caplog.records
+        if r.name == "app.services.telemetry"
+        and "failed validation" in r.getMessage()
+    ]
+    assert len(shape_warns) == 1, (
+        f"expected exactly 1 rate-limited WARNING, got {len(shape_warns)}"
+    )
+
+
+def test_embed_semaphore_reused_per_loop(tmp_path):
+    """FB-010/TF-6/TI-2: the store-level embed semaphore must be reused on
+    the same loop (minting a fresh semaphore per call kept the suite green
+    via the 296 constructor-bound assert).
+    """
+
+    async def _main():
+        embedder = _ScriptedEmbedder([])
+        store, pool = _make_store(tmp_path, embedder)
+        try:
+            s1 = store._embed_batch_semaphore()
+            s2 = store._embed_batch_semaphore()
+            return s1, s2
+        finally:
+            pool.close_all()
+
+    s1, s2 = asyncio.run(_main())
+    assert s1 is s2
+
+
+def test_heal_loop_call_kwargs_pinned(tmp_path):
+    """FB-002 + FB-005 (r2 review TF-2 HIGH_IMPACT + IA-1): the heal loop's
+    scheduler seam must pass null_only=True, admitted=True and the per-tick
+    row cap (dropping any of them previously kept the whole suite green,
+    re-opening the staged-rebuild re-embed storm and the #939 budget
+    bypass), and the admitted arm must take the lease on the BACKGROUND
+    lane like every other background processor.
+    """
+
+    async def _main():
+        embedder = _ScriptedEmbedder([])
+        store, pool = _make_store(tmp_path, embedder)
+        calls = []
+
+        async def _spy(**kwargs):
+            calls.append(kwargs)
+            return {"total": 0, "processed": 0, "skipped": 0, "failed": 0}
+
+        orig = store.backfill_missing_embeddings
+        store.backfill_missing_embeddings = _spy
+        task = asyncio.create_task(store.periodic_embed_heal_loop(interval=0))
+        try:
+            for _ in range(200):
+                await asyncio.sleep(0.01)
+                if calls:
+                    return calls
+            return calls
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            store.backfill_missing_embeddings = orig
+            pool.close_all()
+
+    calls = asyncio.run(_main())
+    assert calls, "the heal loop must call backfill_missing_embeddings"
+    assert calls[0].get("null_only") is True, calls[0]
+    assert calls[0].get("admitted") is True, calls[0]
+    assert calls[0].get("max_rows") == 200, calls[0]
+    # Line-shape pin (Stage B reviewer: a bare substring check was
+    # satisfied by the comment's own phrase "passes foreground=False
+    # here", so deleting the kwarg kept the pin green) — only the actual
+    # kwarg line "foreground=False," matches.
+    import re as _re
+    ms_src = (_REPO_ROOT / "app" / "services" / "memory_store.py").read_text(
+        encoding="utf-8"
+    )
+    marker = "Background-class lane (r2 review F-005)"
+    assert marker in ms_src
+    admit_window = ms_src[ms_src.index(marker):]
+    assert _re.search(r"^\s*foreground=False,\s*$", admit_window[:1200], _re.M), (
+        "the heal tick's admitted arm must pass foreground=False on the "
+        "admit() call itself, not only in a comment"
+    )
+
+
+def test_heal_tick_row_cap(tmp_path):
+    """FB-006 (r2 review F-006): max_rows bounds one run's work — rows
+    beyond the cap stay NULL and are picked up by later ticks, which bounds
+    how long the single-flight lock is held per tick.
+    """
+    embedder = _ScriptedEmbedder([])
+    store, pool = _make_store(tmp_path, embedder)
+    try:
+        for i in range(3):
+            store.add_memory(f"row {i}", source="chat", vault_id=1)
+        conn = pool.get_connection()
+        try:
+            conn.execute(
+                "UPDATE memories SET embedding = NULL, embedding_model = NULL"
+            )
+            conn.commit()
+        finally:
+            pool.release_connection(conn)
+
+        async def _run():
+            return await store.backfill_missing_embeddings(
+                null_only=True, admitted=False, max_rows=2
+            )
+
+        summary = asyncio.run(_run())
+        assert summary["total"] == 2, summary
+        assert summary["processed"] == 2, summary
+        conn = pool.get_connection()
+        try:
+            null_count = conn.execute(
+                "SELECT COUNT(*) FROM memories WHERE embedding IS NULL"
+            ).fetchone()[0]
+        finally:
+            pool.release_connection(conn)
+        assert null_count == 1, (
+            "the row beyond the cap must stay NULL for later ticks"
+        )
+    finally:
+        pool.close_all()
+
+
+def test_heal_rotation_reaches_rows_behind_persistent_failures(tmp_path):
+    """FB-015 (final critic round 2): a plain prefix cap lets 200
+    persistently failing NULL rows monopolize every tick — a healthy row
+    behind them would NEVER be attempted (critic-executed probe: three
+    ticks attempted the same 200 ids). The rotating window must advance so
+    the healthy row is reached on a later tick.
+    """
+    embedder = _ScriptedEmbedder([])
+    store, pool = _make_store(tmp_path, embedder)
+    try:
+        failing = []
+        healthy = None
+        for i in range(201):
+            rec = store.add_memory(
+                "healthy" if i == 200 else f"failing {i}",
+                source="chat",
+                vault_id=1,
+            )
+            if i == 200:
+                healthy = rec.id
+            else:
+                failing.append(rec.id)
+        conn = pool.get_connection()
+        try:
+            conn.execute(
+                "UPDATE memories SET embedding = NULL, embedding_model = NULL"
+            )
+            conn.commit()
+        finally:
+            pool.release_connection(conn)
+        failing_ids = set(failing)
+
+        orig_embed = store.embed_and_store
+
+        async def _failing_embed_for_prefix(mid, text):
+            if mid in failing_ids:
+                raise RuntimeError("persistent provider failure")
+            return await orig_embed(mid, text)
+
+        store.embed_and_store = _failing_embed_for_prefix
+
+        async def _run_ticks(ticks):
+            for _ in range(ticks):
+                await store.backfill_missing_embeddings(
+                    null_only=True, admitted=False, max_rows=200
+                )
+            conn = pool.get_connection()
+            try:
+                row = conn.execute(
+                    "SELECT embedding IS NULL FROM memories WHERE id = ?",
+                    (healthy,),
+                ).fetchone()
+            finally:
+                pool.release_connection(conn)
+            return bool(row and not row[0])
+
+        # Tick 1 covers the failing prefix; tick 2's window starts at the
+        # cursor (offset 200) and reaches the healthy row.
+        healed = asyncio.run(_run_ticks(2))
+        store.embed_and_store = orig_embed
+        assert healed is True, (
+            "the rotating window must reach rows behind persistently "
+            "failing ones within two ticks"
+        )
+    finally:
+        pool.close_all()
+
+
+def test_deferred_landed_write_counted_processed(tmp_path):
+    """FB-009 (r2 review CS-3/CON-4, probe-proven): asyncio.timeout can
+    expire while the to_thread DB write is still in flight — the worker
+    thread commits after the awaiting coroutine was cancelled, so the row
+    is EMBEDDED even though the coroutine saw the timeout. The deferred
+    arm must re-check the row instead of counting a landed write as
+    deferred (and the 'a later run retries it' log must stay true).
+    """
+    from app.config import settings as _settings
+
+    embedder = _ScriptedEmbedder([])
+    store, pool = _make_store(tmp_path, embedder)
+    try:
+        store.add_memory("row", source="chat", vault_id=1)
+        conn = pool.get_connection()
+        try:
+            conn.execute(
+                "UPDATE memories SET embedding = NULL, embedding_model = NULL"
+            )
+            conn.commit()
+        finally:
+            pool.release_connection(conn)
+
+        orig_budget = _settings.memory_embed_budget_seconds
+        orig_embed = store.embed_and_store
+        _settings.memory_embed_budget_seconds = 0.1
+
+        async def _landed_write_embed(mid, text):
+            # Mimic the real embed_and_store shape: the DB write runs on a
+            # worker thread and LANDS, then the coroutine is still awaiting
+            # (provider latency) when the budget expires.
+            await asyncio.to_thread(
+                store._store_embedding,
+                mid,
+                [0.1, 0.2, 0.3],
+                text,
+                _settings.embedding_model,
+            )
+            await asyncio.sleep(0.5)
+            return "stored"
+
+        store.embed_and_store = _landed_write_embed
+        try:
+
+            async def _run():
+                return await store.backfill_missing_embeddings(
+                    null_only=True, admitted=True
+                )
+
+            summary = asyncio.run(_run())
+        finally:
+            _settings.memory_embed_budget_seconds = orig_budget
+            store.embed_and_store = orig_embed
+        assert summary["processed"] == 1, summary
+        assert summary["deferred"] == 0, summary
+    finally:
+        pool.close_all()
+
+
+def test_resend_branch_embed_is_admitted_and_budgeted():
+    """FB-004 (r2 review F-004 = external review A-06/CON-005): the re-send
+    directive's NULL-embed branch must run inside the admit(EMBEDDING) +
+    budget-window pattern (a bare inline embed previously pinned the SSE
+    content frame and a CHAT admission slot for up to the provider's 60s
+    timeout). Static tripwire over the branch the way the AC3 wording
+    tripwire pins message shape.
+    """
+    import re as _re
+
+    src = (
+        _REPO_ROOT / "app" / "services" / "rag_engine.py"
+    ).read_text(encoding="utf-8")
+    marker = "Admitted + budgeted (r2 review F-004)"
+    assert marker in src, "the re-send branch lost its admitted-embed shape"
+    window = src[src.index(marker):]
+    branch = window[: window.index("yield {")]
+    assert _re.search(r"asyncio\.timeout\(", branch), branch[:400]
+    assert "AdmissionClass.EMBEDDING" in branch
+    assert "deferred:budget" in branch and "deferred:admission" in branch
+
+
+def test_lifespan_heal_task_wiring_pinned():
+    """FB-010/TF-3: the production activation of the healer (lifespan
+    creating the periodic task from the settings knob and cancelling it at
+    shutdown) must stay wired — deleting the create_task call previously
+    kept the whole suite green because no test enters the app lifespan.
+    Static tripwire: each mutation (create -> None, cancel removed) breaks
+    its assertion.
+    """
+    import re as _re
+
+    src = (_REPO_ROOT / "app" / "lifespan.py").read_text(encoding="utf-8")
+    assert _re.search(
+        r"memory_embed_heal_task\s*=\s*asyncio\.create_task", src
+    ), "lifespan no longer creates the periodic embed-heal task"
+    assert _re.search(r"memory_embed_heal_task\.cancel\(\)", src), (
+        "lifespan no longer cancels the periodic embed-heal task"
+    )
+    assert "memory_embed_heal_interval_seconds" in src, (
+        "the heal task must be scheduled from the settings knob"
+    )
+
+
+def test_lone_surrogate_key_shard_skips_with_200(tmp_path, caplog):
+    """FB-012 (external review F-02, critic-confirmed): a lone surrogate in
+    a label key parses from JSON, passes naive str checks, and then raises
+    UnicodeEncodeError at RESPONSE ENCODING time — 500ing the
+    unauthenticated /metrics scrape and falsifying the release note's
+    never-500 claim. The validator must reject unencodable label keys so
+    the shard skips with a WARNING and the scrape stays 200 (executed probe
+    at head pre-fix: _valid_shard returned (True, '') and response encoding
+    raised).
+    """
+    import logging as _logging
+
+    surrogate_key = "\ud800"
+    hostile = tmp_path / "telemetry-00000000-3-surr0001.json"
+    hostile.write_text(
+        json.dumps({"provider_calls": {surrogate_key: {"ok": 1}}}),
+        encoding="utf-8",
+    )
+    good = tmp_path / "telemetry-00000000-3-surr0002.json"
+    good.write_text(json.dumps({"chat_turns": 4}), encoding="utf-8")
+    tel = Telemetry(enabled=True, registry_dir=tmp_path)
+    with caplog.at_level(_logging.WARNING, logger="app.services.telemetry"):
+        text = tel.metrics_text()
+    assert _sample(text, telemetry_module.METRIC_CHAT_TURNS) == 4
+    msgs = [r.getMessage() for r in caplog.records
+            if r.name == "app.services.telemetry"]
+    assert any("failed validation" in m for m in msgs), msgs[:3]
+    assert surrogate_key not in text
+
+
+def test_heal_loop_survives_failed_tick_then_heals(tmp_path, caplog):
+    """FB-010/TF-7 = external review F-05/TEST-004 (probe-proven theater):
+    the previous version scripted a PROVIDER outage, but
+    _embed_text_with_outcome swallows every provider exception into a
+    "failed" outcome — the tick completed normally and the loop's keep-alive
+    except arm never executed; a `raise`-after-warning mutant kept 46
+    green. Drive a REAL tick exception instead (backfill itself raises,
+    e.g. a DB outage) and assert BOTH the keep-alive WARNING and a later
+    tick healing the row.
+    """
+    import logging as _logging
+
+    embedder = _ScriptedEmbedder([])
+    store, pool = _make_store(tmp_path, embedder)
+    try:
+        store.add_memory("heal me", source="chat", vault_id=1)
+        conn = pool.get_connection()
+        try:
+            conn.execute(
+                "UPDATE memories SET embedding = NULL, embedding_model = NULL"
+            )
+            conn.commit()
+        finally:
+            pool.release_connection(conn)
+
+        orig_backfill = store.backfill_missing_embeddings
+        state = {"failed_once": False}
+
+        async def _flaky_backfill(**kwargs):
+            if not state["failed_once"]:
+                state["failed_once"] = True
+                raise RuntimeError("simulated tick failure (db outage)")
+            return await orig_backfill(**kwargs)
+
+        store.backfill_missing_embeddings = _flaky_backfill
+
+        async def _run():
+            task = asyncio.create_task(
+                store.periodic_embed_heal_loop(interval=0)
+            )
+            try:
+                for _ in range(300):
+                    await asyncio.sleep(0.01)
+                    conn = pool.get_connection()
+                    try:
+                        row = conn.execute(
+                            "SELECT embedding IS NULL FROM memories"
+                        ).fetchone()
+                    finally:
+                        pool.release_connection(conn)
+                    if row and not row[0]:
+                        return True
+                return False
+            finally:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+        with caplog.at_level(
+            _logging.WARNING, logger="app.services.memory_store"
+        ):
+            healed = asyncio.run(_run())
+        store.backfill_missing_embeddings = orig_backfill
+        assert healed is True, "the loop must survive the failing tick and heal"
+        assert any(
+            "Periodic memory embed-heal failed" in r.getMessage()
+            for r in caplog.records
+            if r.name == "app.services.memory_store"
+        ), "the keep-alive WARNING arm must actually execute"
+    finally:
+        pool.close_all()
+
+
+def test_two_instances_flush_failures_sum(tmp_path):
+    # Recovered-sibling exact count (external review F-04, TEST-001): a
+    # sibling that failed N flushes and then RECOVERED persists its N, and
+    # the scraper must expose exactly that sibling contribution. The old
+    # `>= 1` assertion was satisfied by the scraper's own failing flush, so
+    # a mutant dropping persisted sibling totals kept every test green.
+    b = Telemetry(enabled=True, registry_dir=tmp_path)
+    b._shard_flush_failures = 2
+    b.record_chat_turn("b")  # flush succeeds -> persists shard_flush_failures=2
+    scraper = Telemetry(enabled=True, registry_dir=tmp_path)
+    text = scraper.metrics_text()
+    assert _sample(text, METRIC_SHARD_FLUSH_FAILURES) == 2

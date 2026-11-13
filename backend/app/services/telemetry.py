@@ -67,6 +67,11 @@ QUEUE_HISTORY_CAP = 200
 # shard flush failures and skipped shards (issue #936 AC1/AC3): a persistent
 # failure must be visible but must not flood the log on every record.
 _FLUSH_WARN_INTERVAL = 60.0
+# Bound for the per-shard warning-suppression ledger (r2 review RP-2/PO-2):
+# entries are keyed by per-incarnation shard names and previously grew
+# monotonically; past this cap the oldest entries are evicted (an evicted
+# shard may warn again once — the harmless direction).
+_WARN_STATE_MAX = 1024
 
 # Retention window (seconds): a shard not written for over an hour is a
 # prune CANDIDATE — but only new-format, same-host shards whose owning pid
@@ -79,6 +84,15 @@ _SHARD_STALE_SECONDS = 3600.0
 # would 500 the unauthenticated /metrics scrape — the exact contract
 # violation this validation exists to prevent).
 _MAX_QUEUE_SAMPLE = 1e9
+# POSIX pid_t is a signed int32; os.kill() converts the pid through
+# _Py_PARSE_PID and raises OverflowError (an ArithmeticError, NOT an
+# OSError) above INT_MAX — the r2 swarm review (F-001, critic-confirmed)
+# showed a hostile shard NAME with a 20+ digit pid segment escaping the
+# prune's except-OSError guard and 500ing unauthenticated /metrics on
+# every scrape. The prune never probes a pid above this bound (such a
+# shard is retained as unknown-ownership, the conservative direction),
+# and _pid_alive's POSIX leg catches OverflowError defensively.
+_MAX_PID = 2**31 - 1
 
 
 def _escape_label(value: str) -> str:
@@ -159,6 +173,11 @@ def _pid_alive(pid: int) -> bool:
         return True
     except ProcessLookupError:
         return False
+    except OverflowError:
+        # Unrepresentable pid (defensive; the prune's _MAX_PID gate keeps
+        # such pids from reaching this probe): treat as alive — retention
+        # over deletion, never an escaping exception (r2 review F-001).
+        return True
     except OSError:
         # PermissionError and any other probe failure: alive (conservative).
         return True
@@ -172,7 +191,35 @@ def _coerce_counter(value) -> "int | None":
     """
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         return None
+    # Magnitude ceiling (r2 review F-007, user-approved parity fix; also
+    # closes the external review's F-03 int-to-str 500): an
+    # arbitrary-precision counter (10**401, or a 4300-digit literal) passes
+    # the int checks, but a scraper parses sample values as float64 and a
+    # value beyond its range errors the WHOLE scrape — and a sum of such
+    # counters can exceed Python's 4300-digit int-to-str limit, raising
+    # ValueError inside the f-string render. Same ceiling class the queue
+    # samples got in ca200349; a real counter above 1e9 per process is not
+    # a real measurement.
+    if value > _MAX_QUEUE_SAMPLE:
+        return None
     return value
+
+
+def _safe_label_str(value) -> bool:
+    """True when the string survives UTF-8 response encoding (external
+    review F-02): json.loads accepts lone surrogates ("\\ud800") in keys,
+    and the /metrics body is UTF-8-encoded only at response construction —
+    a surrogate label key raises UnicodeEncodeError THERE and 500s the
+    scrape. Reject such keys at validation instead (a shape skip with a
+    WARNING, never an escaping exception).
+    """
+    if not isinstance(value, str):
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 def _valid_sample(value) -> bool:
@@ -228,7 +275,11 @@ def _valid_shard(obj) -> "tuple[bool, str]":
             return False, f"{list_key} is not an object"
         depths = list_key == "queue_depths"
         for cls, samples in mapping.items():
-            if not isinstance(cls, str) or not isinstance(samples, list):
+            if (
+                not isinstance(cls, str)
+                or not _safe_label_str(cls)
+                or not isinstance(samples, list)
+            ):
                 return False, f"{list_key}[{cls!r}] is not a list"
             for sample in samples:
                 # Depths are int-only (the writer emits int(depth); the
@@ -243,9 +294,25 @@ def _valid_shard(obj) -> "tuple[bool, str]":
     if not isinstance(calls, dict):
         return False, "provider_calls is not an object"
     for provider, outcomes in calls.items():
-        if not isinstance(provider, str) or not isinstance(outcomes, dict):
+        if (
+            not isinstance(provider, str)
+            or not _safe_label_str(provider)
+            or not isinstance(outcomes, dict)
+        ):
             return False, f"provider_calls[{provider!r}] is not an object"
         for outcome, count in outcomes.items():
+            # Read-side allowlist (r2 review F-008, user-approved parity
+            # fix): the write side rejects any outcome outside
+            # PROVIDER_OUTCOMES (record_provider_call), so a shard carrying
+            # an unallowlisted outcome key is hostile — without this gate a
+            # fabricated series merges into the unauthenticated exposition
+            # (the evaluator-reason leg was already allowlisted here; this
+            # closes the asymmetry the r2 lanes found).
+            if outcome not in PROVIDER_OUTCOMES:
+                return False, (
+                    f"provider_calls[{provider!r}] outcome not allowlisted: "
+                    f"{outcome!r}"
+                )
             if _coerce_counter(count) is None:
                 return False, f"provider_calls[{provider!r}] value is invalid"
     return True, ""
@@ -532,6 +599,17 @@ class Telemetry:
                     )
                 logger.debug("telemetry shard flush failed", exc_info=True)
 
+    def _forget_shard_warnings(self, shard_name: str) -> None:
+        """Drop the warning-ledger keys of a pruned shard (r2 review RP-2).
+
+        The ledger keys are prefixed with the shard name (read:/parse:/
+        shape:); once its file is gone the suppression state is dead weight
+        and would keep the name immortal in the map.
+        """
+        with self._lock:
+            for prefix in ("read:", "parse:", "shape:"):
+                self._warn_state.pop(prefix + shard_name, None)
+
     def _rate_limited_warning(self, key: str, message: str, *args) -> None:
         """Log one WARNING per key per _FLUSH_WARN_INTERVAL (issue #936 AC3).
 
@@ -546,6 +624,13 @@ class Telemetry:
             last = self._warn_state.get(key)
             if last is not None and now - last < _FLUSH_WARN_INTERVAL:
                 return
+            # Bounded ledger (r2 review RP-2/PO-2): _warn_state is keyed by
+            # per-incarnation shard names and nothing evicted entries, so
+            # it grew monotonically for the process lifetime. Evict the
+            # oldest entries (insertion order) past the cap — an evicted
+            # shard may warn again once, which is the harmless direction.
+            while len(self._warn_state) >= _WARN_STATE_MAX:
+                self._warn_state.pop(next(iter(self._warn_state)))
             self._warn_state[key] = now
         logger.warning(message, *args)
 
@@ -599,9 +684,18 @@ class Telemetry:
                             and parts[1] == _HOST_TAG
                             and parts[2].isascii()
                             and parts[2].isdigit()
+                            # _MAX_PID gate (r2 review F-001): int() is
+                            # arbitrary precision, so a 20+ digit pid part
+                            # passes the digit checks but os.kill would
+                            # raise OverflowError on POSIX — an exception
+                            # class the guard below does not catch. Such a
+                            # shard is retained (unknown ownership), never
+                            # probed.
+                            and int(parts[2]) <= _MAX_PID
                             and not _pid_alive(int(parts[2]))
                         ):
                             entry.unlink(missing_ok=True)
+                            self._forget_shard_warnings(entry.name)
                             continue
                 except OSError:  # pragma: no cover — racing unlink/stat
                     continue
