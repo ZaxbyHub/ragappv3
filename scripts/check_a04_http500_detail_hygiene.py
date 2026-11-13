@@ -131,7 +131,10 @@ class _ScopeState:
 
     def merge(self, other: "_ScopeState") -> None:
         """Conservative join: union of value-sets; a name present in only one
-        side keeps that side's set (the other branch left it untouched)."""
+        side keeps that side's set (the other branch left it untouched).
+        Dicts bound on BOTH sides union their value-sets — keeping one
+        side's values would make the result depend on branch order and drop
+        reachable 5xx values (final-critic round-1 finding)."""
         for k in set(self.vars) | set(other.vars):
             if k not in self.vars:
                 self.vars[k] = other.vars[k]
@@ -140,6 +143,8 @@ class _ScopeState:
         for k in set(self.dicts) | set(other.dicts):
             if k not in self.dicts:
                 self.dicts[k] = other.dicts[k]
+            elif k in other.dicts:
+                self.dicts[k] = set(self.dicts[k]) | set(other.dicts[k])
 
 
 def _check_calls_in(node: ast.AST, state: _ScopeState, hits: list[int]) -> None:
@@ -197,6 +202,36 @@ def _visit(
                     else:
                         bound = _binding_values(stmt.value, state.dicts)
                         state.vars[tgt.id] = bound if bound is not None else set()
+            continue
+        if isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+            # `status: int = 503` binds exactly like a plain assignment
+            # (final-critic round-1 finding).
+            _check_calls_in(stmt.value, state, hits)
+            if isinstance(stmt.target, ast.Name):
+                dv = _dict_values(stmt.value)
+                if dv is not None:
+                    state.dicts[stmt.target.id] = set(dv)
+                else:
+                    bound = _binding_values(stmt.value, state.dicts)
+                    state.vars[stmt.target.id] = (
+                        bound if bound is not None else set()
+                    )
+            continue
+        if isinstance(stmt, ast.With):
+            # The body runs in order on the SAME state (assignments inside
+            # the block bind for the code after it — final-critic round-1
+            # finding).
+            _visit(stmt.body, state, hits)
+            continue
+        if isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
+            # Zero or more iterations: the body may run, so its bindings are
+            # POSSIBLE — visit on a clone and merge back (a loop-assigned
+            # status must not be treated as its pre-loop value alone).
+            body_state = state.clone()
+            _visit(stmt.body, body_state, hits)
+            if stmt.orelse:
+                _visit(stmt.orelse, body_state, hits)
+            state.merge(body_state)
             continue
         if isinstance(stmt, ast.If):
             _check_calls_in(stmt.test, state, hits)

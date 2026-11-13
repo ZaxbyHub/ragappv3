@@ -243,5 +243,97 @@ def test_r45f1_try_else_literal_500_flags(tmp_path) -> None:
     )
 
 
+def test_fc1a_branch_merged_dict_union_flags_both_orders(tmp_path) -> None:
+    """Final-critic round-1 F1a: a mapping bound on both branches of an if
+    with different values — the union must be taken regardless of which
+    branch holds the 5xx value (order-independence)."""
+    for order in ("400-first", "503-first"):
+        a, b = ('{"a": 400}', '{"a": 503}') if order == "400-first" else ('{"a": 503}', '{"a": 400}')
+        source = (
+            "class DraftRoomHTTPError(Exception):\n"
+            "    pass\n"
+            "\n"
+            "\n"
+            "def f(exc, flag):\n"
+            "    if flag:\n"
+            f"        m = {a}\n"
+            "    else:\n"
+            f"        m = {b}\n"
+            '    status = m.get("a", 400)\n'
+            '    raise DraftRoomHTTPError(status, str(exc), "x")\n'
+        )
+        result = _run_gate(tmp_path, source)
+        assert result.returncode == 1 and _flagged(result) == [11], (
+            f"FC1a ({order}): the merged dict must union both branches' "
+            f"values; exit={result.returncode} flagged={_flagged(result)}; "
+            f"stdout: {result.stdout}"[:DIAGNOSTIC_LIMIT]
+        )
+
+
+def test_fc1b_for_loop_binding_flags(tmp_path) -> None:
+    """Final-critic round-1 F1b: a status assigned inside a for body is a
+    POSSIBLE binding (zero or more iterations) — the echo must flag."""
+    source = (
+        "class DraftRoomHTTPError(Exception):\n"
+        "    pass\n"
+        "\n"
+        "\n"
+        "def f(exc, xs):\n"
+        "    status = 400\n"
+        "    for x in xs:\n"
+        "        status = 503\n"
+        '    raise DraftRoomHTTPError(status, str(exc), "x")\n'
+    )
+    result = _run_gate(tmp_path, source)
+    assert result.returncode == 1 and _flagged(result) == [9], (
+        f"FC1b: loop-assigned statuses must not be treated as their pre-loop "
+        f"value alone; exit={result.returncode} flagged={_flagged(result)}; "
+        f"stdout: {result.stdout}"[:DIAGNOSTIC_LIMIT]
+    )
+
+
+def test_fc1c_with_block_binding_flags(tmp_path) -> None:
+    """Final-critic round-1 F1c: assignments inside a with block bind for
+    the code after it — the echo must flag."""
+    source = (
+        "class DraftRoomHTTPError(Exception):\n"
+        "    pass\n"
+        "\n"
+        "\n"
+        "def f(exc, lk):\n"
+        "    with lk:\n"
+        "        status = 503\n"
+        '    raise DraftRoomHTTPError(status, str(exc), "x")\n'
+    )
+    result = _run_gate(tmp_path, source)
+    assert result.returncode == 1 and _flagged(result) == [8], (
+        f"FC1c: with-block assignments must bind; exit={result.returncode} "
+        f"flagged={_flagged(result)}; stdout: {result.stdout}"[
+            :DIAGNOSTIC_LIMIT
+        ]
+    )
+
+
+def test_fc1d_annassign_binding_flags(tmp_path) -> None:
+    """Final-critic round-1 F1d: `status: int = 503` binds exactly like a
+    plain assignment — the echo must flag."""
+    source = (
+        "class DraftRoomHTTPError(Exception):\n"
+        "    pass\n"
+        "\n"
+        "\n"
+        "def f(exc):\n"
+        "    status: int = 503\n"
+        '    raise DraftRoomHTTPError(status, str(exc), "x")\n'
+    )
+    result = _run_gate(tmp_path, source)
+    assert result.returncode == 1 and _flagged(result) == [7], (
+        f"FC1d: AnnAssign must bind; exit={result.returncode} "
+        f"flagged={_flagged(result)}; stdout: {result.stdout}"[
+            :DIAGNOSTIC_LIMIT
+        ]
+    )
+
+
 def test_control_guarded_function_local_stays_clean(tmp_path) -> None:
     _assert_clean(tmp_path, GUARDED_FUNCTION_LOCAL_CONTROL, "guarded control")
