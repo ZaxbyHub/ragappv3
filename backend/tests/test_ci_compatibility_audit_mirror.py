@@ -105,9 +105,12 @@ def test_mirror_matches_the_quality_contracts_job() -> None:
     assert not extra, f"skill Local Mirror runs scripts the job does not: {extra}"
 
 
-def test_a_new_ci_contract_script_fails_until_the_skill_updates() -> None:
+def test_planted_ci_addition_registers_as_missing_from_the_skill() -> None:
     """Adding a job step without touching the skill must fail this suite
-    (issue #914 AC2) — proven by simulating the addition on the parsed text."""
+    (issue #914 AC2). This test proves the PARSER side: the planted step lands
+    in the ci.yml script set and is absent from the skill mirror, which is
+    exactly the condition ``test_mirror_matches_the_quality_contracts_job``
+    asserts against — the enforcing assertion itself lives there."""
     ci_text = CI.read_text(encoding="utf-8")
     block = _quality_contracts_block(ci_text)
     planted = block.replace(
@@ -123,9 +126,11 @@ def test_a_new_ci_contract_script_fails_until_the_skill_updates() -> None:
     assert "scripts/check_zzz_planted_parity_probe.py" in ci_scripts - mirror
 
 
-def test_commented_mentions_do_not_count_as_steps() -> None:
-    """A commented script mention inside the job block is not a step
-    (plan-critic round 1, MAJOR-2)."""
+def test_parsers_ignore_commented_script_mentions() -> None:
+    """A commented script mention is not a step on either surface
+    (plan-critic round 1, MAJOR-2). This proves the parser level: both the
+    ci.yml block parser and the fence parser skip comment lines, so a
+    commented mention cannot enter either script set."""
     ci_text = CI.read_text(encoding="utf-8")
     block = _quality_contracts_block(ci_text)
     planted = block.replace(
@@ -138,13 +143,26 @@ def test_commented_mentions_do_not_count_as_steps() -> None:
     assert "scripts/check_yyy_commented_probe.py" not in ci_scripts
 
     skill_text = SKILL.read_text(encoding="utf-8")
+    # Anchor the plant INSIDE the fenced Local Mirror block: the bare
+    # "\npython scripts/run_bandit.py\n" line only exists in the fence (the
+    # prose mentions are backtick-wrapped), and the assertion below proves
+    # the plant really landed between the fence markers before the parser
+    # runs (a plant outside the fence would make this control vacuous).
+    anchor = "\npython scripts/run_bandit.py\n"
+    assert skill_text.count(anchor) == 1, (
+        "expected exactly one bare in-fence run_bandit.py line to anchor the plant"
+    )
+    planted_skill = skill_text.replace(
+        anchor,
+        "\npython scripts/run_bandit.py\n"
+        "# scripts/check_yyy_commented_probe.py (commented mention)\n",
+        1,
+    )
+    fence_start = planted_skill.index("```bash", planted_skill.index("## Local Mirror Commands"))
+    plant_at = planted_skill.index("# scripts/check_yyy_commented_probe.py")
+    assert fence_start < plant_at, "planted comment must land inside the fenced block"
     assert "scripts/check_yyy_commented_probe.py" not in _skill_mirror_scripts(
-        skill_text.replace(
-            "python scripts/run_bandit.py",
-            "python scripts/run_bandit.py\n"
-            "# scripts/check_yyy_commented_probe.py (commented mention)",
-            1,
-        )
+        planted_skill
     ), "a commented line inside the fenced block must not count as a command"
 
 

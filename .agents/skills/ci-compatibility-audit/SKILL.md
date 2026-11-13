@@ -85,13 +85,17 @@ Repository contract job:
 - `python scripts/check_batch_mock_seq.py` — fails if a batch-save mock
   sequence drifts from the recorded call-shape contract.
 - `python scripts/check_a04_http500_detail_hygiene.py` — fails if any audited
-  route module (memories, vaults, admin, draft_room) builds an HTTP 500
-  `detail` from a raw exception (f-string interpolation or `str(exc)`;
-  issue #686 / #917).
+  route module (memories, vaults, admin, draft_room) builds a **literal
+  status >= 500** `detail` from a raw exception (f-string interpolation or
+  `str(exc)`; issue #686 / #917). A status computed at runtime (a variable or
+  expression) is outside the gate's detection class — the two Draft Room
+  mapper arms are pinned by
+  `backend/tests/test_a04_draftroom_map_helpers.py` instead.
 - `python scripts/check_b03_upload_migration_timeout.py` — fails if the
   upload-migration timeout contract drifts from the documented wiring.
-- `python scripts/check_l05_raw_palette.py` — fails if the frontend introduces
-  raw palette colors outside the design tokens (issue L05).
+- `python scripts/check_l05_raw_palette.py` — fails if the frontend exceeds
+  its raw-palette **budget** (10 occurrences, plus an allowlist); the ESLint
+  `local/no-raw-palette` rule is the zero-tolerance companion (issue L05).
 - `python scripts/check_l05_page_headers.py` — fails if a page owns its own
   `<h1>` header instead of leaving the page header to PageShell (issue #776 /
   L05).
@@ -146,12 +150,15 @@ SAST job:
 
 ## Local Mirror Commands
 
-These mirror the `ci.yml` **quality-contracts** job exactly — every contract
-script below is one of that job's steps, in both directions: adding a
-`scripts/check_*.py` step to `ci.yml` (or removing one) fails
-`backend/tests/test_ci_compatibility_audit_mirror.py` until this list matches,
-so a local pre-push audit can never silently under-run Quality contracts
-(issue #914).
+The contract-script block below mirrors the `ci.yml` **quality-contracts**
+job — every `python scripts/check_*.py` line in the fence is one of that
+job's steps and every one of the job's steps appears here, in both
+directions: adding a `scripts/check_*.py` step to `ci.yml` (or removing one)
+fails `backend/tests/test_ci_compatibility_audit_mirror.py` until this list
+matches, so a local pre-push audit can never silently under-run Quality
+contracts (issue #914). The fence also carries the frontend/backend build and
+test commands and `run_bandit.py`; the parity contract covers the
+`check_*.py` contract scripts, not those other commands.
 
 ```bash
 cd frontend && npm ci --engine-strict && npm run typecheck && npm run lint

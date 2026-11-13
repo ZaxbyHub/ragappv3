@@ -33,13 +33,21 @@
   positional `(status_code, detail, code)` signature: a literal status >= 500
   whose detail is an f-string interpolation or `str(...)` fails the gate with
   the file and line. The existing `HTTPException` coverage of
-  memories/vaults/admin is unchanged.
-- Production fix for the two live echo paths the localization probe found:
+  memories/vaults/admin is intact (and now strictly stricter — the widened
+  predicate also reads positional args and >= 500 statuses). A status
+  computed at runtime is outside the gate's literal-status detection class;
+  the two Draft Room mapper arms below are pinned by
+  `backend/tests/test_a04_draftroom_map_helpers.py` instead.
+- Defensive fix for two latent echo paths the localization probe found:
   `_map_store_error` and `_map_storage_error` no longer put `str(exc)` in the
   client-visible detail on their unmapped-code (status 500) fallback arms —
   the client now sees a generic detail ("draft store operation failed" /
   "draft input storage failed") while the registered exception handler's
   >= 500 branch continues to log the cause server-side (every helper result
-  is raised `from exc`). Mapped 4xx arms keep their crafted `str(exc)`
-  messages. API clients that matched on the previous raw 500 detail text will
-  see the new generic strings.
+  is raised `from exc`). No application code raises the base
+  `DraftStoreError`/`DraftInputStorageError` (the only unmapped subclass,
+  `_LeaseLostError`, is raised and caught on worker paths), so these arms are
+  not reachable from a route today; the change hardens the fallback contract.
+  Mapped 4xx arms keep their crafted `str(exc)` messages. API clients that
+  matched on the previous raw 500 detail text will see the new generic
+  strings.
