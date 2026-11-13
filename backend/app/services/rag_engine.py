@@ -1261,30 +1261,35 @@ class RAGEngine:
                 elif (
                     getattr(self.memory_store, "embedding_service", None)
                     is not None
-                    and await self.memory_store.memory_embedding_is_null(
-                        memory.id
-                    )
                 ):
                     # Issue #937: a re-sent directive that finds an EXISTING
                     # row whose embedding is NULL re-attempts the embed —
                     # the directive's content equals the stored content, so
                     # the revision guard accepts and a recovered provider
                     # heals the row here without waiting for a heal tick.
-                    # Non-NULL rows are left alone (no redundant embed).
+                    # Non-NULL rows are left alone (no redundant embed). The
+                    # status read AND the embed both sit inside the try
+                    # (final-critic finding 6): a DB hiccup in the status
+                    # read must degrade to this WARNING, not fall to the
+                    # outer handler that would tell the user the memory
+                    # failed to save (the row IS stored).
                     try:
-                        outcome = await self.memory_store.embed_and_store(
-                            memory.id, memory_content
-                        )
-                        if outcome != "stored":
-                            logger.warning(
-                                "Memory re-sent without embedding (id=%s, "
-                                "outcome=%s); dense recall stays FTS-only for "
-                                "this row (healed by the startup backfill "
-                                "task, the periodic embed-heal task, or the "
-                                "superadmin backfill route)",
-                                memory.id,
-                                outcome,
+                        if await self.memory_store.memory_embedding_is_null(
+                            memory.id
+                        ):
+                            outcome = await self.memory_store.embed_and_store(
+                                memory.id, memory_content
                             )
+                            if outcome != "stored":
+                                logger.warning(
+                                    "Memory re-sent without embedding (id=%s, "
+                                    "outcome=%s); dense recall stays FTS-only "
+                                    "for this row (healed by the startup "
+                                    "backfill task, the periodic embed-heal "
+                                    "task, or the superadmin backfill route)",
+                                    memory.id,
+                                    outcome,
+                                )
                     except Exception as exc:  # noqa: BLE001 — chat hot path
                         logger.warning(
                             "Memory re-embed after re-sent remember-directive "

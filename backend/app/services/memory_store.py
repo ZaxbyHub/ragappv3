@@ -279,23 +279,28 @@ class MemoryStore:
 
         Issue #937: the remember-directive found-existing branch needs the
         embedding status ``find_memory_by_content`` does not select
-        (``MemoryRecord`` carries no embedding field). Uses a
-        ``to_thread``-style synchronous pool read via the async pool API;
-        returns False (no re-embed needed) when the row is missing or the
-        embedding columns are absent.
+        (``MemoryRecord`` carries no embedding field). The whole read runs
+        on a worker thread via ``asyncio.to_thread`` (final-critic finding
+        6: this sits on the chat hot path and the execute must not run on
+        the event loop); returns False (no re-embed needed) when the row is
+        missing or the embedding columns are absent.
         """
-        conn = await self.pool.get_connection_async()
-        try:
-            if not self._has_embedding_columns(conn):
-                return False
-            cursor = conn.execute(
-                "SELECT embedding IS NULL FROM memories WHERE id = ?",
-                (memory_id,),
-            )
-            row = cursor.fetchone()
-        finally:
-            self.pool.release_connection(conn)
-        return bool(row is not None and row[0])
+
+        def _read_sync() -> bool:
+            conn = self.pool.get_connection()
+            try:
+                if not self._has_embedding_columns(conn):
+                    return False
+                cursor = conn.execute(
+                    "SELECT embedding IS NULL FROM memories WHERE id = ?",
+                    (memory_id,),
+                )
+                row = cursor.fetchone()
+            finally:
+                self.pool.release_connection(conn)
+            return bool(row is not None and row[0])
+
+        return await asyncio.to_thread(_read_sync)
 
     def _has_embedding_columns(self, conn: sqlite3.Connection) -> bool:
         """Detect whether the optional ``embedding`` column is present.
@@ -645,8 +650,13 @@ class MemoryStore:
                     summary["processed"] += 1
                 elif res == "failed":
                     summary["failed"] += 1
-                elif res.startswith("deferred:"):
-                    summary["deferred"] += 1
+                elif isinstance(res, str) and res.startswith("deferred:"):
+                    # isinstance guard (final-critic finding 7): a mocked or
+                    # wrapped embed helper returning a non-string must land
+                    # in the skipped arm, never raise AttributeError here;
+                    # .get tolerates an admitted-arm string surfacing under
+                    # a default (non-admitted) summary shape.
+                    summary["deferred"] = summary.get("deferred", 0) + 1
                     logger.info(
                         "Backfill deferred memory %d (%s); a later run retries it",
                         memory_id,
