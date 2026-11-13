@@ -335,5 +335,28 @@ def test_fc1d_annassign_binding_flags(tmp_path) -> None:
     )
 
 
+def test_r3f1_async_with_binding_flags(tmp_path) -> None:
+    """Implementation-review round-3 F1: `async with` is the audited FastAPI
+    routes' natural idiom — assignments inside it must bind exactly like a
+    sync `with` (the async-with false negative)."""
+    source = (
+        "class DraftRoomHTTPError(Exception):\n"
+        "    pass\n"
+        "\n"
+        "\n"
+        "async def f(exc, lk):\n"
+        "    async with lk:\n"
+        "        status = 503\n"
+        '    raise DraftRoomHTTPError(status, str(exc), "x")\n'
+    )
+    result = _run_gate(tmp_path, source)
+    assert result.returncode == 1 and _flagged(result) == [8], (
+        f"R3-F1: async-with assignments must bind; exit={result.returncode} "
+        f"flagged={_flagged(result)}; stdout: {result.stdout}"[
+            :DIAGNOSTIC_LIMIT
+        ]
+    )
+
+
 def test_control_guarded_function_local_stays_clean(tmp_path) -> None:
     _assert_clean(tmp_path, GUARDED_FUNCTION_LOCAL_CONTROL, "guarded control")

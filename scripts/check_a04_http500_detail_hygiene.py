@@ -217,21 +217,42 @@ def _visit(
                         bound if bound is not None else set()
                     )
             continue
-        if isinstance(stmt, ast.With):
+        if isinstance(stmt, (ast.With, ast.AsyncWith)):
             # The body runs in order on the SAME state (assignments inside
             # the block bind for the code after it — final-critic round-1
-            # finding).
+            # finding; AsyncWith joined per implementation-review round 3 —
+            # the audited FastAPI routes' natural idiom is `async with`).
+            for item in stmt.items:
+                _check_calls_in(item.context_expr, state, hits)
             _visit(stmt.body, state, hits)
             continue
         if isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
             # Zero or more iterations: the body may run, so its bindings are
             # POSSIBLE — visit on a clone and merge back (a loop-assigned
             # status must not be treated as its pre-loop value alone).
+            if isinstance(stmt, (ast.For, ast.AsyncFor)):
+                _check_calls_in(stmt.iter, state, hits)
+            else:
+                _check_calls_in(stmt.test, state, hits)
             body_state = state.clone()
             _visit(stmt.body, body_state, hits)
             if stmt.orelse:
                 _visit(stmt.orelse, body_state, hits)
             state.merge(body_state)
+            continue
+        if isinstance(stmt, getattr(ast, "TryStar", ())):
+            # `except*` handlers: same shape contract as ast.Try.
+            body_state = state.clone()
+            _visit(stmt.body, body_state, hits)
+            _visit(stmt.orelse, body_state, hits)
+            handler_base = state.clone()
+            for h in stmt.handlers:
+                hs = handler_base.clone()
+                _visit(h.body, hs, hits)
+                handler_base.merge(hs)
+            state.merge(body_state)
+            state.merge(handler_base)
+            _visit(stmt.finalbody, state, hits)
             continue
         if isinstance(stmt, ast.If):
             _check_calls_in(stmt.test, state, hits)
