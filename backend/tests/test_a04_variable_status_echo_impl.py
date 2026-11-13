@@ -381,5 +381,31 @@ def test_fc2r2_loop_carried_binding_flags(tmp_path) -> None:
     )
 
 
+def test_fc3r3_var_chain_inside_loop_flags(tmp_path) -> None:
+    """Final-critic round-3: a 5xx value reaching the status through a CHAIN
+    of var-to-var copies inside a loop body needs one pass per hop — the
+    loop analysis runs to the state fixpoint, and var copies resolve."""
+    source = (
+        "class DraftRoomHTTPError(Exception):\n"
+        "    pass\n"
+        "\n"
+        "\n"
+        "def f(exc, xs):\n"
+        "    status = 400\n"
+        "    s2 = 400\n"
+        "    for x in xs:\n"
+        "        if x:\n"
+        '            raise DraftRoomHTTPError(status, str(exc), "x")\n'
+        "        status = s2\n"
+        "        s2 = 503\n"
+    )
+    result = _run_gate(tmp_path, source)
+    assert result.returncode == 1 and _flagged(result) == [10], (
+        f"FC3r3: var chains inside loops must converge (one pass per hop); "
+        f"exit={result.returncode} flagged={_flagged(result)}; "
+        f"stdout: {result.stdout}"[:DIAGNOSTIC_LIMIT]
+    )
+
+
 def test_control_guarded_function_local_stays_clean(tmp_path) -> None:
     _assert_clean(tmp_path, GUARDED_FUNCTION_LOCAL_CONTROL, "guarded control")

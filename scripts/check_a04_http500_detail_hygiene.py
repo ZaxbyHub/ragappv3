@@ -89,19 +89,27 @@ def _dict_values(expr: ast.expr) -> set[int] | None:
     return vals
 
 
-def _binding_values(expr: ast.expr, dicts: dict[str, set[int]]) -> set[int] | None:
-    """Value-set for a status binding expression, or None if unresolvable."""
+def _binding_values(
+    expr: ast.expr, state: "_ScopeState"
+) -> set[int] | None:
+    """Value-set for a status binding expression, or None if unresolvable.
+    Var-to-var copies (`status = s2`) resolve from the source variable's
+    current value-set, so chains inside loop bodies converge (final-critic
+    round 3)."""
     if isinstance(expr, ast.Constant) and isinstance(expr.value, int):
         return {expr.value}
     if isinstance(expr, ast.Name):
-        v = dicts.get(expr.id)
-        return set(v) if isinstance(v, set) else None
+        v = state.dicts.get(expr.id)
+        if isinstance(v, set):
+            return set(v)
+        bound = state.vars.get(expr.id)
+        return set(bound) if bound is not None else None
     if (
         isinstance(expr, ast.Call)
         and isinstance(expr.func, ast.Attribute)
         and expr.func.attr == "get"
         and isinstance(expr.func.value, ast.Name)
-        and isinstance(dicts.get(expr.func.value.id), set)
+        and isinstance(state.dicts.get(expr.func.value.id), set)
     ):
         if len(expr.args) >= 2:
             default = expr.args[1]
@@ -109,7 +117,7 @@ def _binding_values(expr: ast.expr, dicts: dict[str, set[int]]) -> set[int] | No
                 isinstance(default, ast.Constant)
                 and isinstance(default.value, int)
             ):
-                return set(dicts[expr.func.value.id]) | {default.value}
+                return set(state.dicts[expr.func.value.id]) | {default.value}
         return None
     return None
 
@@ -171,7 +179,7 @@ def _check_calls_in(node: ast.AST, state: _ScopeState, hits: list[int]) -> None:
             detail = sub.args[1]
         if status_code is None:
             continue
-        values = _binding_values(status_code, state.dicts)
+        values = _binding_values(status_code, state)
         if values is None and isinstance(status_code, ast.Name):
             bound = state.vars.get(status_code.id)
             if bound is not None:
@@ -200,7 +208,7 @@ def _visit(
                     if dv is not None:
                         state.dicts[tgt.id] = set(dv)
                     else:
-                        bound = _binding_values(stmt.value, state.dicts)
+                        bound = _binding_values(stmt.value, state)
                         state.vars[tgt.id] = bound if bound is not None else set()
             continue
         if isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
@@ -212,7 +220,7 @@ def _visit(
                 if dv is not None:
                     state.dicts[stmt.target.id] = set(dv)
                 else:
-                    bound = _binding_values(stmt.value, state.dicts)
+                    bound = _binding_values(stmt.value, state)
                     state.vars[stmt.target.id] = (
                         bound if bound is not None else set()
                     )
@@ -230,28 +238,44 @@ def _visit(
             # Zero or more iterations: the body may run, so its bindings are
             # POSSIBLE — visit on a clone and merge back (a loop-assigned
             # status must not be treated as its pre-loop value alone). A
-            # call BEFORE a later binding still sees that binding on the
-            # NEXT pass, so the body is visited a second time from the
-            # merged state (value-sets only grow and are finite, so two
-            # passes reach the stable fixpoint for the merge-union lattice);
-            # hits are recorded from the FINAL pass only so no line is
-            # reported twice.
+            # call EARLY in the body sees bindings later lines set on the
+            # NEXT pass, and a chain of copy steps (a = b; b = 503) needs
+            # one pass per hop — so the body is re-visited from the merged
+            # state UNTIL the value-sets stop changing (they only grow and
+            # are finite, so this terminates), discarding hits from every
+            # state-building pass; the FINAL pass alone records hits, so no
+            # line is reported twice. A while test is re-checked against the
+            # final state for the same reason.
             if isinstance(stmt, (ast.For, ast.AsyncFor)):
                 _check_calls_in(stmt.iter, state, hits)
-            else:
-                _check_calls_in(stmt.test, state, hits)
-            body_state = state.clone()
             mark = len(hits)
+            while True:
+                if isinstance(stmt, ast.While):
+                    _check_calls_in(stmt.test, state, hits)
+                    del hits[len(hits):]
+                body_state = state.clone()
+                _visit(stmt.body, body_state, hits)
+                if stmt.orelse:
+                    _visit(stmt.orelse, body_state, hits)
+                snapshot = (
+                    {k: set(v) for k, v in state.vars.items()},
+                    {k: set(v) for k, v in state.dicts.items()},
+                )
+                state.merge(body_state)
+                if (
+                    {k: set(v) for k, v in state.vars.items()},
+                    {k: set(v) for k, v in state.dicts.items()},
+                ) == snapshot:
+                    break
+                del hits[mark:]
+            del hits[mark:]
+            body_state = state.clone()
+            if isinstance(stmt, ast.While):
+                _check_calls_in(stmt.test, state, hits)
             _visit(stmt.body, body_state, hits)
             if stmt.orelse:
                 _visit(stmt.orelse, body_state, hits)
             state.merge(body_state)
-            del hits[mark:]
-            body_state2 = state.clone()
-            _visit(stmt.body, body_state2, hits)
-            if stmt.orelse:
-                _visit(stmt.orelse, body_state2, hits)
-            state.merge(body_state2)
             continue
         if isinstance(stmt, getattr(ast, "TryStar", ())):
             # `except*` handlers: same shape contract as ast.Try.
