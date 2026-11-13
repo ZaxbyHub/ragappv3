@@ -507,13 +507,16 @@ class Telemetry:
 
         Skipped/unreadable shards warn once a minute per shard instead of on
         every scrape; the underlying condition stays observable without
-        flooding the log.
+        flooding the log. The _warn_state map is guarded by the reentrant
+        lock (implementation-review F3: callers may already hold it; every
+        counter/dict mutation on this class goes through the same guard).
         """
-        now = time.monotonic()
-        last = self._warn_state.get(key)
-        if last is not None and now - last < _FLUSH_WARN_INTERVAL:
-            return
-        self._warn_state[key] = now
+        with self._lock:
+            now = time.monotonic()
+            last = self._warn_state.get(key)
+            if last is not None and now - last < _FLUSH_WARN_INTERVAL:
+                return
+            self._warn_state[key] = now
         logger.warning(message, *args)
 
     def _aggregate_counts(self) -> dict:
@@ -553,6 +556,7 @@ class Telemetry:
                             len(parts) == 4
                             and parts[0] == "telemetry"
                             and parts[1] == _HOST_TAG
+                            and parts[2].isascii()
                             and parts[2].isdigit()
                             and not _pid_alive(int(parts[2]))
                         ):
@@ -564,9 +568,13 @@ class Telemetry:
                 # or hostile payloads (shape/allowlist violations) are
                 # skipped with a rate-limited WARNING — never a 500 on
                 # /metrics and never merged into the exposition.
+                # UnicodeDecodeError (a ValueError subclass — binary-corrupt
+                # or non-UTF-8 bytes) is caught HERE at the read leg, not by
+                # the json.loads ValueError arm below (implementation-review
+                # F1: base caught (OSError, ValueError) around both).
                 try:
                     raw = entry.read_text(encoding="utf-8")
-                except OSError:
+                except (OSError, UnicodeDecodeError):
                     self._rate_limited_warning(
                         f"read:{entry.name}",
                         "Telemetry shard unreadable (path=%s); skipping it "

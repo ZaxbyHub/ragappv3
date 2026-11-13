@@ -267,6 +267,29 @@ def test_metrics_route_serves_200_with_hostile_shard(tmp_path):
     assert "injected" not in resp.text
 
 
+def test_binary_corrupt_shard_skipped_without_500(tmp_path, caplog):
+    """Implementation-review F1: non-UTF-8 shard bytes raise
+    UnicodeDecodeError (a ValueError subclass) at the READ leg — the skip
+    must happen there, never propagate out of metrics_text. RED at the
+    pre-fix head (executed by the reviewer), GREEN after the read-leg fix.
+    """
+    import logging as _logging
+
+    binary = tmp_path / "telemetry-00000000-9-cafe06.json"
+    binary.write_bytes(b"\xff\xfeinvalid")
+    good = tmp_path / "telemetry-00000000-9-cafe07.json"
+    good.write_text(json.dumps({"chat_turns": 4}), encoding="utf-8")
+    tel = Telemetry(enabled=True, registry_dir=tmp_path)
+    with caplog.at_level(_logging.WARNING, logger="app.services.telemetry"):
+        text = tel.metrics_text()
+    assert _sample(text, telemetry_module.METRIC_CHAT_TURNS) == 4
+    assert any(
+        "unreadable" in r.getMessage()
+        for r in caplog.records
+        if r.name == "app.services.telemetry"
+    )
+
+
 def test_shard_schema_compat_both_directions():
     # old shard without the new key is valid
     ok, reason = _valid_shard({"chat_turns": 3})
