@@ -680,3 +680,112 @@ async def test_reindex_terminal_cap_composes_duplicates(tmp_path, monkeypatch):
         pool.close_all()
         conn.close()
         lease_conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Reviewer round-1 CRITICAL: set_phase must run OUTSIDE the write session
+# (pool.write_permit is the same non-reentrant Semaphore(1) under
+# multi-worker ingestion — awaiting set_phase inside the session deadlocks).
+# ---------------------------------------------------------------------------
+
+
+async def test_finalization_backstop_no_deadlock_under_write_permit(
+    tmp_path, monkeypatch
+):
+    """Wire the multi-worker permit (one Semaphore(1) on both the processor
+    and the pool, exactly BackgroundProcessor.start's wiring) and drive the
+    backstop: it must complete (no deadlock) and settle the row."""
+    import asyncio as _aio
+
+    db_path, conn = _seed(tmp_path, "fin-permit.db")
+    pool = SQLiteConnectionPool(db_path, max_size=4)
+    try:
+        file_path, file_hash = _real_file(tmp_path)
+        subject_id = _insert_file(conn, file_hash=file_hash, status="pending")
+        stub = _RecordingVectorStore()
+        processor = DocumentProcessor(pool=pool, vector_store=stub)
+        permit = _aio.Semaphore(1)
+        processor._write_semaphore = permit
+        pool.write_permit = permit
+
+        async def _fake_finalize(**kwargs):  # noqa: ARG001
+            raise sqlite3.IntegrityError(
+                "UNIQUE constraint failed: files.file_hash, files.vault_id"
+            )
+
+        monkeypatch.setattr(processor, "_finalize_indexed_success", _fake_finalize)
+        monkeypatch.setattr(processor, "_process_schema_file", _fake_schema_file)
+        monkeypatch.setattr(processor, "_is_schema_file", lambda path: True)
+
+        class _EmbedStub:
+            async def embed_batch(self, texts, fail_fast=True, **kwargs):  # noqa: ARG002
+                embeddings = [[0.1, 0.2] for _ in texts]
+                return embeddings if fail_fast else (embeddings, [])
+
+        processor.embedding_service = _EmbedStub()
+        with pytest.raises(sqlite3.IntegrityError):
+            await _aio.wait_for(
+                processor.process_existing_file(
+                    subject_id, file_path, 1, file_hash=file_hash
+                ),
+                timeout=10,
+            )
+        row = conn.execute(
+            "SELECT status, error_message, phase_message FROM files WHERE id = ?",
+            (subject_id,),
+        ).fetchone()
+        assert row["status"] == "error"
+        assert (row["error_message"] or "").startswith("DUPLICATE_FILE:")
+    finally:
+        pool.close_all()
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Reviewer round-1 IMPORTANT 3: a GLOBAL failure shape must not terminate a
+# mixed job early nor wipe the pending retry scope.
+# ---------------------------------------------------------------------------
+
+
+async def test_reindex_global_failure_keeps_scope_and_requeues(
+    tmp_path, monkeypatch
+):
+    """Attempt 2 returns ("failed", {}, exc) with prior duplicates + a
+    pending retry scope: the job must REQUEUE (not terminate) and the
+    payload must keep its retry_file_ids."""
+    db_path, conn = _seed(tmp_path, "rx4.db")
+    pool = SQLiteConnectionPool(db_path, max_size=4)
+    lease_conn = _connect(db_path)
+    try:
+        _seed_reindex_job(
+            conn, payload_extra={"duplicate_file_ids": [7], "retry_file_ids": [9]}
+        )
+        await _drive_reindex_settle(
+            conn,
+            pool,
+            lease_conn,
+            "rx4-worker",
+            monkeypatch,
+            attempts=2,
+            result={"status": "failed", "result": {}},
+            exc=RuntimeError("global transient"),
+        )
+        jobs_row = conn.execute(
+            "SELECT status, payload_json FROM jobs WHERE queue = ?"
+            " ORDER BY id DESC LIMIT 1",
+            (REINDEX_QUEUE,),
+        ).fetchone()
+        assert jobs_row["status"] == "pending", (
+            "a global failure with a pending retry scope must requeue, not "
+            f"terminate; got {jobs_row['status']!r}"
+        )
+        payload = json.loads(jobs_row["payload_json"] or "{}")
+        assert payload.get("retry_file_ids") == [9], (
+            "the prior retry scope must survive a global failure; "
+            f"payload={payload}"
+        )
+        assert payload.get("duplicate_file_ids") == [7]
+    finally:
+        pool.close_all()
+        conn.close()
+        lease_conn.close()

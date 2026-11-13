@@ -218,5 +218,30 @@ def test_r5f1_strict_gt_guard_leaves_500_reachable(tmp_path) -> None:
     _assert_flagged(tmp_path, STRICT_GT_GUARD, "R5-F1 strict-gt guard")
 
 
+def test_r45f1_try_else_literal_500_flags(tmp_path) -> None:
+    """Implementation-review round-1 F2: the try/except/ELSE arm must stay
+    covered (the base gate's ast.walk visited every node; the ordered
+    visitor must too)."""
+    source = (
+        "from fastapi import HTTPException\n"
+        "\n"
+        "\n"
+        "def handler(exc):\n"
+        "    try:\n"
+        "        x = 1\n"
+        "    except Exception as e:  # noqa: BLE001\n"
+        "        pass\n"
+        "    else:\n"
+        '        raise HTTPException(status_code=500, detail=f"boom {exc}")\n'
+    )
+    result = _run_gate(tmp_path, source)
+    assert result.returncode == 1 and _flagged(result) == [10], (
+        "the try/except/ELSE arm must stay covered by the ordered visitor "
+        f"(base gate's ast.walk visited it); exit={result.returncode} "
+        f"flagged={_flagged(result)}; stdout: {result.stdout}; "
+        f"stderr: {result.stderr}"[:DIAGNOSTIC_LIMIT]
+    )
+
+
 def test_control_guarded_function_local_stays_clean(tmp_path) -> None:
     _assert_clean(tmp_path, GUARDED_FUNCTION_LOCAL_CONTROL, "guarded control")

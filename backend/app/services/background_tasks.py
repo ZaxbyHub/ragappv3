@@ -4740,8 +4740,17 @@ class BackgroundProcessor:
                 # would either rerun zero files or, with the scope marker
                 # removed, re-embed the WHOLE vault. Settle terminally now
                 # (no cap prefix: the cap was never reached) with the
-                # composed duplicate outcome.
-                if not retry_scope_ids and cumulative_duplicate_ids:
+                # composed duplicate outcome. The `result` guard keeps a
+                # GLOBAL failure shape (("failed", {}, exc) — staged-rebuild
+                # abort, vector-store refusal outside per-file accounting)
+                # on the retry ladder: it carries no per-file outcomes, and
+                # a pending payload retry scope must survive it.
+                if (
+                    not retry_scope_ids
+                    and cumulative_duplicate_ids
+                    and isinstance(result, dict)
+                    and result
+                ):
                     composed = dict(result) if isinstance(result, dict) else {}
                     composed["duplicate_file_ids"] = list(cumulative_duplicate_ids)
                     failed_ok = lease.fail(
@@ -4783,13 +4792,18 @@ class BackgroundProcessor:
                             worker_id,
                         ),
                     )
-                else:
+                elif failed_ids:
+                    # Per-file accounting ran and the narrowed scope is
+                    # genuinely empty — clear the marker.
                     conn.execute(
                         "UPDATE jobs SET payload_json = json_remove("
                         "payload_json, '$.retry_file_ids') "
                         "WHERE id = ? AND worker_id = ? AND status = 'running'",
                         (job_id, worker_id),
                     )
+                # else: a GLOBAL failure shape (("failed", {}, exc)) carried
+                # no per-file outcomes — the payload's prior retry scope
+                # (issue #702) must survive untouched for the next attempt.
                 # issue #1112: persist the CUMULATIVE duplicate set at every
                 # requeue (same one-transaction unit as the retry scope) so
                 # terminal composition and the next attempt's exclusion both

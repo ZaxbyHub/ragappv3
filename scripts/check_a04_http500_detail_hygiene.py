@@ -237,6 +237,7 @@ def _visit(
         if isinstance(stmt, ast.Try):
             body_state = state.clone()
             _visit(stmt.body, body_state, hits)
+            _visit(stmt.orelse, body_state, hits)
             handler_base = state.clone()
             for h in stmt.handlers:
                 hs = handler_base.clone()

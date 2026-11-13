@@ -5912,6 +5912,7 @@ class DocumentProcessor:
             if not _is_duplicate_hash_integrity_error(exc):
                 raise
             safe_error = format_ingest_error(INGEST_ERROR_DUPLICATE_FILE)
+            landed = False
             async with self._write_session() as conn:
                 landed = (
                     conn.execute(
@@ -5924,20 +5925,26 @@ class DocumentProcessor:
                 )
                 if landed:
                     conn.commit()
-                    await set_phase(
-                        self.pool,
-                        file_id,
-                        phase="error",
-                        message=safe_error,
-                        percent=None,
-                    )
-                else:
-                    logger.warning(
-                        "Duplicate finalization collision for file_id=%d "
-                        "lost the row race (concurrent settle/cancel owns "
-                        "it); skipping fenced error write",
-                        file_id,
-                    )
+            # set_phase acquires pool.write_permit — the SAME non-reentrant
+            # permit _write_session holds under multi-worker ingestion
+            # (BackgroundProcessor.start wires one Semaphore(1) into both), so
+            # it must run AFTER the session exits (the generic handler's own
+            # ordering), never inside it.
+            if landed:
+                await set_phase(
+                    self.pool,
+                    file_id,
+                    phase="error",
+                    message=safe_error,
+                    percent=None,
+                )
+            else:
+                logger.warning(
+                    "Duplicate finalization collision for file_id=%d "
+                    "lost the row race (concurrent settle/cancel owns "
+                    "it); skipping fenced error write",
+                    file_id,
+                )
             raise
         if not finalized:
             logger.info(
