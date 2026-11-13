@@ -79,6 +79,40 @@ Repository contract job:
 - `python scripts/check_test_collection_scope.py` — fails if a pytest test
   file (`test_*.py` / `*_test.py`) exists outside `backend/tests/`, where
   `pytest tests/` would never collect it (issue #563 / C11).
+- `python scripts/check_settings_consumers.py` — fails if a settings field
+  loses its last consumer (an unwired setting), a consumer reads an unknown
+  field, or the documented settings-consumer contract drifts (issue #662).
+- `python scripts/check_batch_mock_seq.py` — fails if a batch-save mock
+  sequence drifts from the recorded call-shape contract.
+- `python scripts/check_a04_http500_detail_hygiene.py` — fails if any audited
+  route module (memories, vaults, admin, draft_room) builds a **literal
+  status >= 500** `detail` from a raw exception (f-string interpolation or
+  `str(exc)`; issue #686 / #917). A status computed at runtime (a variable or
+  expression) is outside the gate's detection class — the two Draft Room
+  mapper arms are pinned by
+  `backend/tests/test_a04_draftroom_map_helpers.py` instead.
+- `python scripts/check_b03_upload_migration_timeout.py` — fails if the
+  upload-migration timeout contract drifts from the documented wiring.
+- `python scripts/check_l05_raw_palette.py` — fails if the frontend exceeds
+  its raw-palette **budget** (10 occurrences, plus an allowlist); the ESLint
+  `local/no-raw-palette` rule is the zero-tolerance companion (issue L05).
+- `python scripts/check_l05_page_headers.py` — fails if a page owns its own
+  `<h1>` header instead of leaving the page header to PageShell (issue #776 /
+  L05).
+- `python scripts/check_l07_a11y_gate_wired.py` — fails if the a11y-matrix CI
+  job stops running the a11y spec or waives an axe rule silently (issue #778).
+- `python scripts/check_l09_skill_trigger_paths.py` — fails if a skill's
+  trigger globs drift from the generated skill tree contract (issue L09).
+- `python scripts/check_l09_index_assets.py` — fails if a `%BASE_URL%` asset
+  link in `frontend/index.html` has no matching file under `frontend/public/`
+  (issue #780 / L09).
+- `python scripts/check_l09_memory_response_fields.py` — fails if the
+  TypeScript `AddMemoryResponse` declares fields the backend
+  `MemoryResponse` never sends (issue #780 / L09).
+- `python scripts/check_n05_draftclaim_nullable.py` — fails if the backend
+  DraftClaim/DraftClaimSource `Optional` fields and the hand-maintained
+  TypeScript `| null` mirror drift apart in either direction (issue #789 /
+  #912).
 
 SAST job:
 
@@ -116,6 +150,16 @@ SAST job:
 
 ## Local Mirror Commands
 
+The contract-script block below mirrors the `ci.yml` **quality-contracts**
+job — every `python scripts/check_*.py` line in the fence is one of that
+job's steps and every one of the job's steps appears here, in both
+directions: adding a `scripts/check_*.py` step to `ci.yml` (or removing one)
+fails `backend/tests/test_ci_compatibility_audit_mirror.py` until this list
+matches, so a local pre-push audit can never silently under-run Quality
+contracts (issue #914). The fence also carries the frontend/backend build and
+test commands and `run_bandit.py`; the parity contract covers the
+`check_*.py` contract scripts, not those other commands.
+
 ```bash
 cd frontend && npm ci --engine-strict && npm run typecheck && npm run lint
 cd frontend && npm test -- src/lib/api.test.ts src/lib/api.csrf.test.ts src/lib/api.sse.test.ts src/pages/WikiPage.sse.test.tsx src/stores/useAuthStore.api-base.test.ts
@@ -131,10 +175,21 @@ cd backend && ruff check . && pytest --tb=short -v --timeout=300 --timeout-metho
 python scripts/check_runtime_contract.py
 python scripts/check_config_contract.py
 python scripts/check_g06_setup_docs.py --check all
+python scripts/check_settings_consumers.py
+python scripts/check_batch_mock_seq.py
 python scripts/check_pr_scope_drift.py
 python scripts/check_sast_baseline.py
 python scripts/check_secretscan.py
 python scripts/check_test_collection_scope.py
+python scripts/check_a04_http500_detail_hygiene.py
+python scripts/check_b03_upload_migration_timeout.py
+python scripts/check_l05_raw_palette.py
+python scripts/check_l05_page_headers.py
+python scripts/check_l07_a11y_gate_wired.py
+python scripts/check_l09_skill_trigger_paths.py
+python scripts/check_l09_index_assets.py
+python scripts/check_l09_memory_response_fields.py
+python scripts/check_n05_draftclaim_nullable.py
 python scripts/run_bandit.py
 ```
 

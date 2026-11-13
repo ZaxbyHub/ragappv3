@@ -339,6 +339,14 @@ def _map_store_error(exc: DraftStoreError) -> DraftRoomHTTPError:
     existing_input_id = getattr(exc, "existing_input_id", None)
     if existing_input_id is not None:
         context["existing_input_id"] = existing_input_id
+    if status_code >= 500:
+        # An unmapped store code is a server fault: ``str(exc)`` can carry
+        # store internals (driver messages, SQL fragments), so the client gets
+        # a generic detail while the handler's >=500 branch logs the cause
+        # (issue #917).
+        return DraftRoomHTTPError(
+            status_code, "draft store operation failed", exc.code, context
+        )
     return DraftRoomHTTPError(status_code, str(exc), exc.code, context)
 
 
@@ -350,6 +358,12 @@ def _map_storage_error(exc: DraftInputStorageError) -> DraftRoomHTTPError:
         "invalid_storage_path": 400,
     }
     status_code = status_by_code.get(exc.code, 500)
+    if status_code >= 500:
+        # Unknown storage code -> server fault; same generic-detail rule as
+        # ``_map_store_error`` (issue #917).
+        return DraftRoomHTTPError(
+            status_code, "draft input storage failed", exc.code
+        )
     return DraftRoomHTTPError(status_code, str(exc), exc.code)
 
 
