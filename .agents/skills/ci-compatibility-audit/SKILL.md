@@ -85,12 +85,19 @@ Repository contract job:
 - `python scripts/check_batch_mock_seq.py` — fails if a batch-save mock
   sequence drifts from the recorded call-shape contract.
 - `python scripts/check_a04_http500_detail_hygiene.py` — fails if any audited
-  route module (memories, vaults, admin, draft_room) builds a **literal
-  status >= 500** `detail` from a raw exception (f-string interpolation or
-  `str(exc)`; issue #686 / #917). A status computed at runtime (a variable or
-  expression) is outside the gate's detection class — the two Draft Room
-  mapper arms are pinned by
-  `backend/tests/test_a04_draftroom_map_helpers.py` instead.
+  route module (memories, vaults, admin, draft_room) builds a **5xx-capable**
+  `detail` from a raw exception (f-string interpolation or `str(exc)`; issues
+  #686 / #917 / #1119). A literal status >= 500 flags directly; a status
+  computed at runtime flags when inline, time-ordered per-scope analysis can
+  resolve it to a value-set where ANY value is >= 500 (int literals, mapping
+  dicts and `.get(key, DEFAULT)` defaults, module-level AND function-local) —
+  a dominating `if NAME >= 500: return/raise` guard proves the fall-through
+  < 500 until rebinding (strict `>` guards do not refine: 500 stays
+  reachable). Unresolvable statuses (function parameters) stay outside the
+  detection class; the guarded real Draft Room mapper arms are pinned by
+  `backend/tests/test_a04_draftroom_map_helpers.py`, and the analyzer's
+  mutation shapes by
+  `backend/tests/test_a04_variable_status_echo_impl.py`.
 - `python scripts/check_b03_upload_migration_timeout.py` — fails if the
   upload-migration timeout contract drifts from the documented wiring.
 - `python scripts/check_l05_raw_palette.py` — fails if the frontend exceeds

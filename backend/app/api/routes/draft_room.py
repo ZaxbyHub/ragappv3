@@ -4447,7 +4447,22 @@ async def _run_promotion(
     except DraftPromotionPathConflictError as exc:
         if exc.cleanup_incomplete:
             await _record_promotion_cleanup_failure(db, request, user, draft_id, exc)
-        raise DraftRoomHTTPError(409, str(exc), "promotion_path_conflict") from exc
+        # issue #1119: the client-visible 409 detail is a fixed string — it
+        # must not echo the server filesystem destination path that
+        # str(exc) embeds. The RAW path (repr-escaping-free, so single
+        # backslashes survive on Windows) is logged server-side from the
+        # structured attribute.
+        logger.error(
+            "draft_room: promotion path conflict draft_id=%s dest_path=%s (%s)",
+            draft_id,
+            getattr(exc, "dest_path", None),
+            exc,
+        )
+        raise DraftRoomHTTPError(
+            409,
+            "a files row already exists for the destination path",
+            "promotion_path_conflict",
+        ) from exc
     except DraftPromotionError as exc:
         # A 500 must never be silent (issue #789): every exit from this branch
         # carries the exception into the server log. The cleanup-incomplete

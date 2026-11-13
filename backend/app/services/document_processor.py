@@ -11,6 +11,7 @@ import io
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -385,6 +386,11 @@ INGEST_ERROR_VECTOR_STORE_LOCK_TIMEOUT = "VECTOR_STORE_LOCK_TIMEOUT"
 # 'error' so the next reindex pass re-selects it (the retry scope normally
 # carries it, but a janitor-first settle re-selects by status).
 INGEST_ERROR_REINDEX_INTERRUPTED = "REINDEX_INTERRUPTED"
+# issue #1112: a same-hash retry/reindex whose files-row flip collides with
+# another indexed/partial row in the same vault (the partial unique index
+# idx_files_hash_vault_indexed) is a DUPLICATE, not a parse failure — the
+# operator remediation is resolving which row owns the hash, never re-parsing.
+INGEST_ERROR_DUPLICATE_FILE = "DUPLICATE_FILE"
 
 _INGEST_ERROR_REASONS = {
     INGEST_ERROR_PARSER_UNAVAILABLE: "document parser is unavailable",
@@ -416,6 +422,10 @@ _INGEST_ERROR_REASONS = {
         "the reindex attempt was interrupted mid-file; the next reindex "
         "pass re-processes this file"
     ),
+    INGEST_ERROR_DUPLICATE_FILE: (
+        "a files row with the same content hash is already indexed in this "
+        "vault; resolve which row owns the hash before retrying"
+    ),
 }
 
 # Matches document_extraction.MAX_ERROR_MESSAGE_CHARS: persisted messages are
@@ -425,6 +435,23 @@ _INGEST_ERROR_MAX_CHARS = 200
 # Bound on the __cause__ walk so pathological (or cyclic) exception chains
 # cannot make classification unbounded.
 _INGEST_ERROR_CAUSE_DEPTH = 5
+
+# issue #1112: SQLite's uniqueness-violation signature for the files hash/vault
+# partial index (idx_files_hash_vault_indexed), either column order. Matching
+# this text is schema-identifier matching, not user-content sniffing — the
+# #562 content-free contract concerns user data, and this string is emitted by
+# SQLite from the schema. Every OTHER integrity failure (foreign keys, checks,
+# other tables) keeps the existing fallback classification and retry
+# semantics.
+_FILES_HASH_VAULT_UNIQUE_RE = re.compile(
+    r"^UNIQUE constraint failed:\s*files\.file_hash,\s*files\.vault_id$"
+    r"|^UNIQUE constraint failed:\s*files\.vault_id,\s*files\.file_hash$"
+)
+
+
+def _is_duplicate_hash_integrity_error(exc: BaseException) -> bool:
+    """True only for the files hash/vault uniqueness collision (issue #1112)."""
+    return bool(_FILES_HASH_VAULT_UNIQUE_RE.match(str(exc) or ""))
 
 
 def classify_ingest_error(exc: BaseException) -> str:
@@ -458,6 +485,17 @@ def classify_ingest_error(exc: BaseException) -> str:
             return INGEST_ERROR_VECTOR_STORE_LOCK_TIMEOUT
         if isinstance(current, VectorStoreError):
             return INGEST_ERROR_VECTOR_STORE_FAILED
+        # issue #1112: a duplicate-hash collision is its own deterministic
+        # failure class — the insert-path translation (DuplicateFileError) and
+        # the raw uniqueness violation from the files hash/vault partial index
+        # both classify to DUPLICATE_FILE; every other sqlite3.IntegrityError
+        # (FK, CHECK, other tables) keeps the fallback below.
+        if isinstance(current, DuplicateFileError):
+            return INGEST_ERROR_DUPLICATE_FILE
+        if isinstance(current, sqlite3.IntegrityError) and (
+            _is_duplicate_hash_integrity_error(current)
+        ):
+            return INGEST_ERROR_DUPLICATE_FILE
         if isinstance(current, ImportError):
             return INGEST_ERROR_PARSER_UNAVAILABLE
         if isinstance(current, (FileNotFoundError, FileExistsError)):
@@ -5135,6 +5173,30 @@ class DocumentProcessor:
         stage_timings = _new_stage_timings()
 
         try:
+            # issue #1112: pre-vector duplicate-ownership guard. Before any
+            # parse/embed/vector work, check whether ANOTHER row (never this
+            # one) already owns this content hash in this vault as
+            # indexed/partial. If so this attempt is a deterministic
+            # duplicate: raising here (inside the processing try) settles the
+            # row through the standard error handler for every caller —
+            # upload retry, admin retry, AND the reindex path — with ZERO
+            # vector writes, and the transports treat DUPLICATE_FILE as
+            # terminal (no retry ladder). The own-row exclusion keeps a
+            # healthy same-file reindex green. The finalization partial
+            # unique index remains the race backstop for a sibling that
+            # flips between this guard and the status flip.
+            async with self._write_session() as guard_conn:
+                owner = guard_conn.execute(
+                    "SELECT id FROM files "
+                    "WHERE file_hash = ? AND vault_id = ? "
+                    "AND status IN ('indexed', 'partial') AND id != ?",
+                    (file_hash, vault_id, file_id),
+                ).fetchone()
+                if owner is not None:
+                    raise DuplicateFileError(
+                        f"file with hash {file_hash} already indexed in "
+                        f"vault {vault_id} (status owner file_id={owner['id']})"
+                    )
             generation_hash, parser_fingerprint = _compile_generation(file_hash)
             parsed: ParsedDocument = ParsedDocument(
                 atoms=(), parser_fingerprint=parser_fingerprint
@@ -5825,16 +5887,58 @@ class DocumentProcessor:
         # (issue #513 W9/C26): status write, parsed_text + gated wiki
         # enqueue, gated KMS enqueue, near-dup centroid, progress cleanup.
         stage_started_at = time.monotonic()
-        finalized = await self._finalize_indexed_success(
-            file_id=file_id,
-            vault_id=vault_id,
-            chunks=chunks,
-            document_text=document_text,
-            chunks_failed_count=chunks_failed_count,
-            embeddings=chunk_embeddings,
-            partial_final_status="partial",
-            vector_target=vector_target,
-        )
+        try:
+            finalized = await self._finalize_indexed_success(
+                file_id=file_id,
+                vault_id=vault_id,
+                chunks=chunks,
+                document_text=document_text,
+                chunks_failed_count=chunks_failed_count,
+                embeddings=chunk_embeddings,
+                partial_final_status="partial",
+                vector_target=vector_target,
+            )
+        except sqlite3.IntegrityError as exc:
+            # issue #1112 finalization race backstop: a sibling row flipped
+            # to indexed/partial between the pre-vector guard and this
+            # status flip, so the partial unique index fired HERE — outside
+            # the processing try whose generic handler settles the row.
+            # Perform the same fenced settlement the generic handler would
+            # (guarded UPDATE: rowcount 0 means a concurrent winner or
+            # cancel owns the row — log and skip), then re-raise so the
+            # transports / reindex runner apply duplicate semantics. Other
+            # integrity failures (FK, CHECK, other tables) re-raise
+            # unchanged through this same arm.
+            if not _is_duplicate_hash_integrity_error(exc):
+                raise
+            safe_error = format_ingest_error(INGEST_ERROR_DUPLICATE_FILE)
+            async with self._write_session() as conn:
+                landed = (
+                    conn.execute(
+                        "UPDATE files SET status='error', "
+                        "error_message=?, phase='error' WHERE id = ? "
+                        "AND status IN ('pending', 'processing')",
+                        (safe_error[:500], file_id),
+                    ).rowcount
+                    > 0
+                )
+                if landed:
+                    conn.commit()
+                    await set_phase(
+                        self.pool,
+                        file_id,
+                        phase="error",
+                        message=safe_error,
+                        percent=None,
+                    )
+                else:
+                    logger.warning(
+                        "Duplicate finalization collision for file_id=%d "
+                        "lost the row race (concurrent settle/cancel owns "
+                        "it); skipping fenced error write",
+                        file_id,
+                    )
+            raise
         if not finalized:
             logger.info(
                 "Ingest generation voided for file_id=%d: row settled "

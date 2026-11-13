@@ -36,7 +36,7 @@
       "SEVERITY.LOW": 59,
       "SEVERITY.MEDIUM": 63,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 97532,
+      "loc": 97730,
       "nosec": 0,
       "skipped_tests": 72
     },
@@ -140,7 +140,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 4203,
+      "loc": 4221,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -387,7 +387,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1129,
+      "loc": 1150,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -725,7 +725,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 1,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 4694,
+      "loc": 4780,
       "nosec": 0,
       "skipped_tests": 6
     },
@@ -868,7 +868,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 2,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 4633,
+      "loc": 4696,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -985,7 +985,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 814,
+      "loc": 824,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -3584,7 +3584,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "3124                 cursor = conn.execute(\n3125                     \"UPDATE files SET enrichment_status = (\"\n3126                     + est.aggregate_status_case_sql()\n3127                     + \"), enrichment_error = NULL, enrichment_updated_at = ? \"\n",
+      "code": "3131                 cursor = conn.execute(\n3132                     \"UPDATE files SET enrichment_status = (\"\n3133                     + est.aggregate_status_case_sql()\n3134                     + \"), enrichment_error = NULL, enrichment_updated_at = ? \"\n",
       "col_offset": 20,
       "end_col_offset": 60,
       "filename": "backend/app/services/background_tasks.py",
@@ -3595,17 +3595,17 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 3125,
+      "line_number": 3132,
       "line_range": [
-        3125,
-        3126
+        3132,
+        3133
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1638                 cursor = conn.execute(\n1639                     f\"\"\"\n1640                     UPDATE files\n1641                     SET enrichment_status = {status_sql},\n1642                         enrichment_error = ?,\n1643                         enrichment_updated_at = ?\n1644                     {where}\n1645                     \"\"\",\n1646                     params,\n",
+      "code": "1676                 cursor = conn.execute(\n1677                     f\"\"\"\n1678                     UPDATE files\n1679                     SET enrichment_status = {status_sql},\n1680                         enrichment_error = ?,\n1681                         enrichment_updated_at = ?\n1682                     {where}\n1683                     \"\"\",\n1684                     params,\n",
       "col_offset": 20,
       "end_col_offset": 23,
       "filename": "backend/app/services/document_processor.py",
@@ -3616,22 +3616,22 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 1639,
+      "line_number": 1677,
       "line_range": [
-        1639,
-        1640,
-        1641,
-        1642,
-        1643,
-        1644,
-        1645
+        1677,
+        1678,
+        1679,
+        1680,
+        1681,
+        1682,
+        1683
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "2426                     conn.execute(\n2427                         f\"DELETE FROM failed_chunks WHERE id IN ({placeholders})\",\n2428                         clear_ids,\n",
+      "code": "2464                     conn.execute(\n2465                         f\"DELETE FROM failed_chunks WHERE id IN ({placeholders})\",\n2466                         clear_ids,\n",
       "col_offset": 24,
       "end_col_offset": 81,
       "filename": "backend/app/services/document_processor.py",
@@ -3642,9 +3642,9 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 2427,
+      "line_number": 2465,
       "line_range": [
-        2427
+        2465
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",

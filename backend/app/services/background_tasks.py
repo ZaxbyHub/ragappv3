@@ -28,6 +28,7 @@ from . import document_processor as _document_processor
 from .document_processor import (
     _INGEST_ERROR_REASONS,
     INGEST_ERROR_DIMENSION_CHANGED,
+    INGEST_ERROR_DUPLICATE_FILE,
     INGEST_ERROR_VECTOR_STORE_LOCK_TIMEOUT,
     DocumentProcessingError,
     DocumentProcessor,
@@ -1863,14 +1864,20 @@ class BackgroundProcessor:
             if (
                 outcome_exc is not None
                 and classify_ingest_error(outcome_exc)
-                == INGEST_ERROR_DIMENSION_CHANGED
+                in (
+                    INGEST_ERROR_DIMENSION_CHANGED,
+                    INGEST_ERROR_DUPLICATE_FILE,
+                )
             ):
                 # Issue #820: a dimension refusal is deterministic — the live
                 # index dimension cannot change back between attempts — so
                 # the lease transport settles 'failed' on the FIRST attempt
                 # (unprefixed: the cap was never reached) and writes the same
-                # terminal file-row state the cap path uses. Only
-                # DIMENSION_CHANGED; contention keeps its #1011 predicate and
+                # terminal file-row state the cap path uses. Issue #1112:
+                # DUPLICATE_FILE joins the deterministic set — another
+                # indexed/partial row owning the hash cannot un-own it
+                # between attempts. Only these two; contention keeps its
+                # #1011 predicate and
                 # every other class keeps the ladder. The files-row mark is
                 # gated on the fenced settle having landed: a lease lost
                 # mid-run means the successor/janitor owns the row (the
@@ -4569,6 +4576,12 @@ class BackgroundProcessor:
         payload = json.loads(row["payload_json"] or "{}")
         vault_id = payload.get("vault_id")
         retry_file_ids = payload.get("retry_file_ids") or []
+        # issue #1112: duplicate-hash failures accumulated by EARLIER attempts
+        # of this job (they are deterministic, excluded from every retry
+        # scope, and must surface in the terminal result_json).
+        cumulative_duplicate_ids: list[int] = sorted(
+            {int(i) for i in payload.get("duplicate_file_ids") or []}
+        )
         logger.info("Starting lease-claimed reindex job %d", job_id)
         # Issue #1010: stamp the progress watermark BEFORE the first per-file
         # await (rowcount-checked — a lost fence means the janitor owns the
@@ -4600,6 +4613,14 @@ class BackgroundProcessor:
         # pop it before ANY persistence (issue #702 — sibling suites pin the
         # persisted result shapes by equality).
         failed_ids = result.pop("failed_ids", None) or []
+        # issue #1112: this attempt's duplicate-hash failures join the
+        # cumulative set (transport metadata, popped before persistence —
+        # same contract as failed_ids).
+        attempt_duplicate_ids = result.pop("duplicate_file_ids", None) or []
+        cumulative_duplicate_ids = sorted(
+            {*cumulative_duplicate_ids, *(int(i) for i in attempt_duplicate_ids)}
+        )
+        retry_scope_ids = [i for i in failed_ids if int(i) not in set(cumulative_duplicate_ids)]
         # Issue #562 invariant: persisted error fields are user-facing —
         # redact exception payloads at the persist boundary; operator
         # constants remain verbatim (issue #702 P02-SK2-03/P02-SK2-10: a
@@ -4622,6 +4643,37 @@ class BackgroundProcessor:
                 max_attempts=settings.jobs_max_attempts,
             )
             if status == "completed":
+                # issue #1112: cumulative duplicate-hash failures from earlier
+                # attempts are permanent file failures — the any-failure
+                # contract (:4863-4870 era) forbids completing a job that
+                # still holds one. Compose the cumulative duplicate outcomes
+                # into the result and settle 'failed' instead.
+                if cumulative_duplicate_ids:
+                    composed = dict(result) if isinstance(result, dict) else {}
+                    composed["duplicate_file_ids"] = list(cumulative_duplicate_ids)
+                    composed["failed"] = int(composed.get("failed") or 0) + len(
+                        cumulative_duplicate_ids
+                    )
+                    failed_ok = lease.fail(
+                        job_id,
+                        worker_id,
+                        error_text if error_text != "reindex failed (no detail recorded)" else "duplicate file hash (DUPLICATE_FILE)",
+                        result=composed,
+                    )
+                    if not failed_ok:
+                        logger.warning(
+                            "Lease reindex job %d duplicate-composition failure "
+                            "fenced off — lease lost",
+                            job_id,
+                        )
+                    logger.error(
+                        "Lease reindex job %d settled 'failed' with %d "
+                        "cumulative duplicate-hash file(s); transient scope "
+                        "completed",
+                        job_id,
+                        len(cumulative_duplicate_ids),
+                    )
+                    return
                 settled = lease.complete(job_id, worker_id, result)
                 if settled:
                     logger.info(
@@ -4659,6 +4711,13 @@ class BackgroundProcessor:
                             else entry
                             for entry in details
                         ]
+                    # issue #1112: the cap-path terminal result composes the
+                    # CUMULATIVE duplicate outcomes (this attempt plus every
+                    # prior attempt's), never current-attempt-only.
+                    if cumulative_duplicate_ids:
+                        fail_result["duplicate_file_ids"] = list(
+                            cumulative_duplicate_ids
+                        )
                 failed_ok = lease.fail(
                     job_id,
                     worker_id,
@@ -4676,6 +4735,32 @@ class BackgroundProcessor:
                     error_text,
                 )
             else:
+                # issue #1112: a duplicate-ONLY failure has an EMPTY retry
+                # scope (deterministic duplicates are excluded) — requeueing
+                # would either rerun zero files or, with the scope marker
+                # removed, re-embed the WHOLE vault. Settle terminally now
+                # (no cap prefix: the cap was never reached) with the
+                # composed duplicate outcome.
+                if not retry_scope_ids and cumulative_duplicate_ids:
+                    composed = dict(result) if isinstance(result, dict) else {}
+                    composed["duplicate_file_ids"] = list(cumulative_duplicate_ids)
+                    failed_ok = lease.fail(
+                        job_id, worker_id, error_text, result=composed
+                    )
+                    if not failed_ok:
+                        logger.warning(
+                            "Lease reindex job %d duplicate-only failure "
+                            "fenced off — lease lost",
+                            job_id,
+                        )
+                    logger.error(
+                        "Lease reindex job %d settled 'failed': %d "
+                        "deterministic duplicate-hash file(s), no retryable "
+                        "scope",
+                        job_id,
+                        len(cumulative_duplicate_ids),
+                    )
+                    return
                 delay = 2.0 ** max(attempts - 1, 0)
                 # Record the retry scope BEFORE the requeue (issue #702 /
                 # P02-SK2-04): the marker and the requeue commit as ONE
@@ -4687,13 +4772,13 @@ class BackgroundProcessor:
                 # the same worker/status fence as requeue so a
                 # lease-reclaimed worker cannot rewrite a row its successor
                 # now owns.
-                if failed_ids:
+                if retry_scope_ids:
                     conn.execute(
                         "UPDATE jobs SET payload_json = json_set(payload_json,"
                         " '$.retry_file_ids', json(?)) "
                         "WHERE id = ? AND worker_id = ? AND status = 'running'",
                         (
-                            json.dumps([int(i) for i in failed_ids]),
+                            json.dumps([int(i) for i in retry_scope_ids]),
                             job_id,
                             worker_id,
                         ),
@@ -4704,6 +4789,21 @@ class BackgroundProcessor:
                         "payload_json, '$.retry_file_ids') "
                         "WHERE id = ? AND worker_id = ? AND status = 'running'",
                         (job_id, worker_id),
+                    )
+                # issue #1112: persist the CUMULATIVE duplicate set at every
+                # requeue (same one-transaction unit as the retry scope) so
+                # terminal composition and the next attempt's exclusion both
+                # survive completion's result_json replacement.
+                if cumulative_duplicate_ids:
+                    conn.execute(
+                        "UPDATE jobs SET payload_json = json_set(payload_json,"
+                        " '$.duplicate_file_ids', json(?)) "
+                        "WHERE id = ? AND worker_id = ? AND status = 'running'",
+                        (
+                            json.dumps([int(i) for i in cumulative_duplicate_ids]),
+                            job_id,
+                            worker_id,
+                        ),
                     )
                 requeued_ok = lease.requeue(
                     job_id, worker_id, delay_seconds=delay, error=error_text
@@ -4723,7 +4823,7 @@ class BackgroundProcessor:
                 logger.warning(
                     "Lease reindex job %d failed; retrying %d file(s) in %.1fs: %s",
                     job_id,
-                    len(failed_ids),
+                    len(retry_scope_ids),
                     delay,
                     error_text,
                 )
@@ -4781,6 +4881,13 @@ class BackgroundProcessor:
             # settlement writes below (the legacy error/result payloads keep
             # their exact historical shapes).
             result.pop("failed_ids", None)
+            # issue #1112: the legacy transport settles terminally after one
+            # pass (no retry ladder), so duplicates ride the composed result
+            # directly — popped only to keep the persisted shape free of
+            # transport metadata, then re-added as a persisted outcome key.
+            legacy_duplicate_ids = result.pop("duplicate_file_ids", None) or []
+            if legacy_duplicate_ids:
+                result["duplicate_file_ids"] = legacy_duplicate_ids
 
             # Legacy settlement on document_reindex_jobs, mapped from the
             # shared body's outcome (writes preserved verbatim per branch).
@@ -5154,6 +5261,10 @@ class BackgroundProcessor:
             # failing exception object so the persisted cap error carries a
             # real (redacted, #562) reason instead of a literal None.
             failed_ids: list[int] = []
+            # issue #1112: deterministic duplicate-hash failures tracked
+            # separately from transient failures so the job settlers exclude
+            # them from every retry scope.
+            duplicate_ids: list[int] = []
             first_failure: Optional[BaseException] = None
             commit_attempted = False
 
@@ -5352,6 +5463,17 @@ class BackgroundProcessor:
                                 failed_details.append(
                                     f"file_id={file_id}: {_redact_reindex_error(exc)}"
                                 )
+                                # Issue #1112: duplicate-hash collisions are
+                                # deterministic — tracked separately so the
+                                # job settlers never fold them into the
+                                # retry scope (a retry would stop at the
+                                # pre-vector duplicate guard again).
+                                if (
+                                    isinstance(exc, BaseException)
+                                    and classify_ingest_error(exc)
+                                    == INGEST_ERROR_DUPLICATE_FILE
+                                ):
+                                    duplicate_ids.append(file_id)
                                 failed_ids.append(file_id)
                                 if first_failure is None:
                                     first_failure = exc
@@ -5421,6 +5543,11 @@ class BackgroundProcessor:
                     # Transport metadata for the lease caller's retry-scope
                     # narrowing (issue #702): popped before any persistence.
                     "failed_ids": failed_ids,
+                    # issue #1112: deterministic duplicate-hash failures —
+                    # the settlers exclude these from every retry scope and
+                    # compose them into the terminal result so the
+                    # operator-visible outcomes survive mixed retries.
+                    "duplicate_file_ids": duplicate_ids,
                 }
                 logger.error(
                     "Reindex job %d failed for %d/%d files; stored model identity left unchanged.",
@@ -5783,18 +5910,23 @@ class BackgroundProcessor:
         # the same terminal refusal. Settle to the permanent-failure path on
         # the FIRST attempt (same terminal write the retries-exhausted path
         # uses, so the file row lands its DIMENSION_CHANGED stable code).
-        # Only DIMENSION_CHANGED is short-circuited: contention keeps its
+        # Only DIMENSION_CHANGED and #1112's DUPLICATE_FILE are
+        # short-circuited: another indexed/partial row owning the hash
+        # cannot un-own it between attempts, and every retry would stop at
+        # the pre-vector duplicate guard anyway; contention keeps its
         # #1011 never-terminal predicate and every other class keeps the
         # ladder.
         if (
             isinstance(error, BaseException)
-            and classify_ingest_error(error) == INGEST_ERROR_DIMENSION_CHANGED
+            and classify_ingest_error(error)
+            in (INGEST_ERROR_DIMENSION_CHANGED, INGEST_ERROR_DUPLICATE_FILE)
         ):
             logger.warning(
-                "Task failed for %s with a deterministic dimension refusal "
-                "(DIMENSION_CHANGED); settling permanently on attempt %d "
-                "without retry (issue #820)",
+                "Task failed for %s with a deterministic refusal "
+                "(%s); settling permanently on attempt %d "
+                "without retry (issue #820, #1112)",
                 task.file_path,
+                classify_ingest_error(error),
                 task.attempt,
             )
             self._mark_task_permanently_failed(task, error)
@@ -5922,11 +6054,15 @@ class BackgroundProcessor:
         if task.file_id is not None and self.processor.pool is not None:
             try:
                 with self.processor.pool.connection() as conn:
+                    # issue #1112: phase_message joins the terminal write so a
+                    # capped row can never keep the last stage label (the
+                    # two-user-facing-columns convention; documents.py's
+                    # phase_message writer precedent).
                     conn.execute(
                         "UPDATE files SET status='error', "
-                        "error_message=?, phase='error' WHERE id = ? "
-                        "AND status IN ('pending', 'processing')",
-                        (safe_error[:500], task.file_id),
+                        "error_message=?, phase='error', phase_message=? "
+                        "WHERE id = ? AND status IN ('pending', 'processing')",
+                        (safe_error[:500], safe_error[:500], task.file_id),
                     )
                     conn.commit()
             except Exception:

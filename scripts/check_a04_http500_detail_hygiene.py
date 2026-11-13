@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Gate: no raw-exception interpolation in HTTP 500 detail strings.
+"""Gate: no raw-exception interpolation in HTTP 5xx detail strings.
 
 Interpolating a raw exception object into an ``HTTPException(status_code=500,
 detail=f"...{e}...")`` leaks internals (driver messages, filesystem paths,
@@ -9,10 +9,19 @@ full exception server-side and return a generic detail string.
 This gate walks the audited modules with the stdlib ``ast`` module and fails
 (exit 1) while any audited exception call has BOTH:
 
-  - a ``status_code`` that is the constant ``500`` or above (literal only —
-    read from the ``status_code`` keyword or, for exceptions with positional
-    signatures like ``DraftRoomHTTPError(status_code, detail, code)``, the
-    first positional argument), AND
+  - a ``status_code`` that resolves to a 5xx-CAPABLE value-set: either a
+    literal integer >= 500, OR — the issue #1119 widening for the variable-
+    status shape issue #917 was filed about — a runtime-computed status whose
+    local binding analysis (inline, time-ordered per scope) can resolve to a
+    set of possible values where ANY value is >= 500. Bindings resolve from
+    int literals, mapping dicts (module-level or function-local) and
+    ``MAP.get(key, DEFAULT)`` calls; a dominating ``if NAME >= 500: return/
+    raise`` guard proves the fall-through is < 500 for ``NAME`` until it is
+    rebound (strict ``>`` guards do NOT refine: 500 stays reachable); non-
+    guard branches merge conservatively. Statuses that are function
+    parameters or otherwise unresolvable are not flagged. Sync functions,
+    async functions, and module-level code are all covered — the literal
+    arm of the pre-widening gate is preserved everywhere, AND
   - a ``detail`` that is an f-string (JoinedStr) containing at least one
     interpolation (FormattedValue) or a ``str(...)`` call — read from the
     ``detail`` keyword or the second positional argument.
@@ -67,38 +76,216 @@ def _interpolated_detail(detail: ast.expr | None) -> bool:
     return _is_str_call(detail)
 
 
-def raw_500_detail_lines(source: str) -> list[int]:
-    """Line numbers of audited exception calls with a literal status >= 500
-    and a detail that is an f-string with at least one interpolation or a
-    ``str(...)`` call. The status and detail are read from keywords, or from
-    the first two positional arguments for positional signatures."""
-    hits: list[int] = []
-    for node in ast.walk(ast.parse(source)):
-        if not isinstance(node, ast.Call):
+def _dict_values(expr: ast.expr) -> set[int] | None:
+    """Value-set for a dict literal of int values, else None."""
+    if not isinstance(expr, ast.Dict):
+        return None
+    vals: set[int] = set()
+    for v in expr.values:
+        if isinstance(v, ast.Constant) and isinstance(v.value, int):
+            vals.add(v.value)
+        else:
+            return None
+    return vals
+
+
+def _binding_values(expr: ast.expr, dicts: dict[str, set[int]]) -> set[int] | None:
+    """Value-set for a status binding expression, or None if unresolvable."""
+    if isinstance(expr, ast.Constant) and isinstance(expr.value, int):
+        return {expr.value}
+    if isinstance(expr, ast.Name):
+        v = dicts.get(expr.id)
+        return set(v) if isinstance(v, set) else None
+    if (
+        isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Attribute)
+        and expr.func.attr == "get"
+        and isinstance(expr.func.value, ast.Name)
+        and isinstance(dicts.get(expr.func.value.id), set)
+    ):
+        if len(expr.args) >= 2:
+            default = expr.args[1]
+            if (
+                isinstance(default, ast.Constant)
+                and isinstance(default.value, int)
+            ):
+                return set(dicts[expr.func.value.id]) | {default.value}
+        return None
+    return None
+
+
+class _ScopeState:
+    """Time-ordered binding state for one analysis scope: local variable
+    name -> value-set (empty set = refined away), plus visible mapping
+    dicts (name -> value-set)."""
+
+    def __init__(self, module_dicts: dict[str, set[int]] | None = None):
+        self.vars: dict[str, set[int]] = {}
+        self.dicts: dict[str, set[int]] = dict(module_dicts or {})
+
+    def clone(self) -> "_ScopeState":
+        s = _ScopeState()
+        s.vars = {k: set(v) for k, v in self.vars.items()}
+        s.dicts = {k: set(v) for k, v in self.dicts.items()}
+        return s
+
+    def merge(self, other: "_ScopeState") -> None:
+        """Conservative join: union of value-sets; a name present in only one
+        side keeps that side's set (the other branch left it untouched)."""
+        for k in set(self.vars) | set(other.vars):
+            if k not in self.vars:
+                self.vars[k] = other.vars[k]
+            elif k in other.vars:
+                self.vars[k] = set(self.vars[k]) | set(other.vars[k])
+        for k in set(self.dicts) | set(other.dicts):
+            if k not in self.dicts:
+                self.dicts[k] = other.dicts[k]
+
+
+def _check_calls_in(node: ast.AST, state: _ScopeState, hits: list[int]) -> None:
+    """Classify every audited exception call inside ``node`` with the CURRENT
+    binding state (callers invoke this BEFORE applying their statement's
+    binding effects, so every call sees the state at its own moment)."""
+    for sub in ast.walk(node):
+        if not isinstance(sub, ast.Call):
             continue
-        func = node.func
+        func = sub.func
         name = getattr(func, "id", None) or getattr(func, "attr", None)
         if name not in AUDITED_EXCEPTION_NAMES:
             continue
         status_code: ast.expr | None = None
         detail: ast.expr | None = None
-        for keyword in node.keywords:
+        for keyword in sub.keywords:
             if keyword.arg == "status_code":
                 status_code = keyword.value
             elif keyword.arg == "detail":
                 detail = keyword.value
-        if status_code is None and len(node.args) >= 1:
-            status_code = node.args[0]
-        if detail is None and len(node.args) >= 2:
-            detail = node.args[1]
-        if not (
-            isinstance(status_code, ast.Constant)
-            and isinstance(status_code.value, int)
-            and status_code.value >= 500
-        ):
+        if status_code is None and len(sub.args) >= 1:
+            status_code = sub.args[0]
+        if detail is None and len(sub.args) >= 2:
+            detail = sub.args[1]
+        if status_code is None:
+            continue
+        values = _binding_values(status_code, state.dicts)
+        if values is None and isinstance(status_code, ast.Name):
+            bound = state.vars.get(status_code.id)
+            if bound is not None:
+                values = set(bound)
+        if not values:
+            continue
+        if not any(v >= 500 for v in values):
             continue
         if _interpolated_detail(detail):
-            hits.append(node.lineno)
+            hits.append(sub.lineno)
+
+
+def _visit(
+    stmts: list[ast.stmt], state: _ScopeState, hits: list[int]
+) -> None:
+    """Ordered traversal: statements apply their binding effects as they are
+    reached, so every audited call is classified with the state at the moment
+    of the call (issue #1119: inline, time-ordered analysis)."""
+    for stmt in stmts:
+        if isinstance(stmt, ast.Assign):
+            # The RHS evaluates with the PRE-assignment state.
+            _check_calls_in(stmt.value, state, hits)
+            for tgt in stmt.targets:
+                if isinstance(tgt, ast.Name):
+                    dv = _dict_values(stmt.value)
+                    if dv is not None:
+                        state.dicts[tgt.id] = set(dv)
+                    else:
+                        bound = _binding_values(stmt.value, state.dicts)
+                        state.vars[tgt.id] = bound if bound is not None else set()
+            continue
+        if isinstance(stmt, ast.If):
+            _check_calls_in(stmt.test, state, hits)
+            test = stmt.test
+            dominating = (
+                isinstance(test, ast.Compare)
+                and isinstance(test.left, ast.Name)
+                and len(test.ops) == 1
+                and isinstance(test.ops[0], ast.GtE)
+                and isinstance(test.comparators[0], ast.Constant)
+                and test.comparators[0].value == 500
+                and all(
+                    isinstance(s, (ast.Return, ast.Raise)) for s in stmt.body
+                )
+            )
+            if dominating:
+                # The guard body's calls see the pre-refinement state; the
+                # fall-through (and any else-arm) sees NAME refined to < 500.
+                for s in stmt.body:
+                    _check_calls_in(s, state, hits)
+                refined = state.clone()
+                nm = test.left.id
+                if nm in refined.vars:
+                    refined.vars[nm] = {
+                        v for v in refined.vars[nm] if v < 500
+                    }
+                _visit(stmt.orelse, refined, hits)
+                state.vars = refined.vars
+                state.dicts = refined.dicts
+                continue
+            arm_a = state.clone()
+            arm_b = state.clone()
+            _visit(stmt.body, arm_a, hits)
+            _visit(stmt.orelse, arm_b, hits)
+            state.merge(arm_a)
+            state.merge(arm_b)
+            continue
+        if isinstance(stmt, ast.Try):
+            body_state = state.clone()
+            _visit(stmt.body, body_state, hits)
+            handler_base = state.clone()
+            for h in stmt.handlers:
+                hs = handler_base.clone()
+                _visit(h.body, hs, hits)
+                handler_base.merge(hs)
+            state.merge(body_state)
+            state.merge(handler_base)
+            _visit(stmt.finalbody, state, hits)
+            continue
+        if isinstance(
+            stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        ):
+            continue  # separate scope, visited by the driver
+        # Return / Raise / Expr / With / For / While / ...: calls in the
+        # statement see the current state.
+        _check_calls_in(stmt, state, hits)
+
+
+def raw_500_detail_lines(source: str) -> list[int]:
+    """Line numbers of audited exception calls whose status resolves to a
+    5xx-CAPABLE value-set at the moment of the call (inline, time-ordered
+    scope analysis — see the module docstring) with an interpolated detail."""
+    hits: list[int] = []
+    tree = ast.parse(source)
+    module_dicts: dict[str, set[int]] = {}
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Assign):
+            dv = _dict_values(stmt.value)
+            if (
+                dv is not None
+                and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name)
+            ):
+                module_dicts[stmt.targets[0].id] = dv
+    module_state = _ScopeState(module_dicts)
+    outer = [
+        s
+        for s in tree.body
+        if not isinstance(
+            s, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        )
+    ]
+    _visit(outer, module_state, hits)
+    for fn in [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]:
+        _visit(fn.body, _ScopeState(module_dicts), hits)
     return sorted(hits)
 
 
