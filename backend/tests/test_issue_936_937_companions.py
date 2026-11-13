@@ -1367,7 +1367,7 @@ def test_sum_overflow_shards_skip_with_200(tmp_path, caplog):
 
     hostile = tmp_path / "telemetry-00000000-1-ovf00001.json"
     hostile.write_text(
-        json.dumps({"queue_waits": {"x": [10 ** 308, 10 ** 308]}}),
+        json.dumps({"queue_waits": {"x": [10 ** 308, 10 ** 308, 0.5]}}),
         encoding="utf-8",
     )
     good = tmp_path / "telemetry-00000000-1-good0002.json"
