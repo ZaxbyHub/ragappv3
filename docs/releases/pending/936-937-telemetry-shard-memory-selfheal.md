@@ -23,11 +23,19 @@
   never `os.kill`). Foreign-host, legacy-format, and unparsable-name
   shards are conservatively retained — a live-but-idle worker no longer
   looks like a Prometheus counter reset, and a cross-host pid is never
-  probed (#936 AC5). Retained legacy shards are safe to delete by hand
-  after every worker runs the new format.
-- Per-class queue-wait/queue-depth history is capped at 200 samples on
-  both the write and merge sides, so shard size and lock-hold time stop
-  growing with process lifetime (#936 AC6).
+  probed (#936 AC5). Retention honesty: retained shards are size-bounded
+  (per-shard history caps) but NOT count-bounded — under per-incarnation
+  hostnames (Docker container ids, Kubernetes pod names) every past
+  incarnation's shard is kept until an operator removes it; a
+  host-independent liveness signal (or a long foreign-stale window) is an
+  open maintainer decision tracked in a follow-up issue. Until then,
+  operators may delete stale foreign/legacy shards by hand once every
+  worker runs the new format.
+- Per-class queue-wait/queue-depth history is capped at 200 samples per
+  process on write and per shard at merge entry — the cross-shard
+  aggregate keeps every shard's retained window (a merged-list trim would
+  let the last-sorting shard monopolize the queue-wait average), so shard
+  size and lock-hold time stop growing with process lifetime (#936 AC6).
 - Every HELP/TYPE line and sample (including the new embedding-cache
   family) is generated from the `METRIC_*` constants — a rename can no
   longer desync the exposition from its samples (#936 AC7).

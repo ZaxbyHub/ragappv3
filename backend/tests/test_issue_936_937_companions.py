@@ -872,14 +872,16 @@ def test_warning_wordings_name_all_three_healers():
 
 
 def test_exception_arm_wordings_name_the_healers(tmp_path, caplog):
-    """Final-critic finding 2 (executed): reverting either failure-arm
-    wording survived the whole battery. These drives make each RAISED
-    exception arm log its own three-healer message: an embedder whose
-    embed_and_store raises is driven through the update-route shape and the
-    remember-directive path, and each logger's message must carry the
-    three-healer phrase. Also pins the update arm MESSAGE-SPECIFICALLY (at
-    head, frozen C10's update assertion is satisfied by the create message
-    because both share the phrase).
+    """Final-critic findings 2 + round-2 finding 1 (both executed): a
+    reverted failure-arm wording survived the whole battery. Every RAISED
+    exception arm is driven with a raising embed_and_store and its message
+    asserted MESSAGE-SPECIFICALLY per logger: the update-route arm
+    ("Could not recompute embedding"), the create-route arm ("after create
+    failed"), and the remember-directive newly-inserted arm ("after
+    remember-directive failed"). An embedder outage alone does NOT reach
+    these arms (it is converted to the "failed" OUTCOME by
+    _embed_text_with_outcome), so the drive replaces embed_and_store
+    itself — the arms' real trigger.
     """
     import logging as _logging
 
@@ -975,3 +977,150 @@ def test_exception_arm_wordings_name_the_healers(tmp_path, caplog):
     ]
     assert update_exc, "update exception arm did not log"
     assert any(phrase in m for m in update_exc), update_exc[0][:120]
+
+
+def test_exception_arm_wordings_create_and_remember(tmp_path, caplog):
+    """Final-critic round-2 finding 1 (executed): reverting the REMEMBER
+    exception-arm wording survived all 52 tests. These drives pin the
+    create-route and remember-directive exception arms message-specifically
+    with a raising embed_and_store on a real RAGEngine / real store.
+    """
+    import logging as _logging
+
+    phrase = (
+        "healed by the startup backfill task, the periodic embed-heal "
+        "task, or the superadmin backfill route"
+    )
+    from unittest.mock import MagicMock, patch
+
+    from app.models.database import SQLiteConnectionPool, init_db, run_migrations
+    from app.services import rag_engine as rag_engine_module
+    from app.services.memory_store import MemoryStore
+
+    class _SilentEmbedder:
+        async def embed_passage(self, text):
+            return [0.1, 0.2, 0.3]
+
+    db_path = str(tmp_path / "arms.db")
+    init_db(db_path)
+    run_migrations(db_path)
+    pool = SQLiteConnectionPool(db_path, max_size=3)
+    try:
+        # -- remember-directive newly-inserted exception arm
+        rem_store = MemoryStore(pool=pool, embedding_service=_SilentEmbedder())
+
+        async def _raising_remember_embed(memory_id, content):
+            raise RuntimeError("embed exploded")
+
+        rem_store.embed_and_store = _raising_remember_embed
+        engine = rag_engine_module.RAGEngine(
+            embedding_service=MagicMock(),
+            vector_store=MagicMock(),
+            memory_store=rem_store,
+            llm_client=MagicMock(),
+            db_path=db_path,
+        )
+
+        class _Permissive:
+            def admit(self, admission_class):
+                class _Ctx:
+                    async def __aenter__(self):
+                        return self
+
+                    async def __aexit__(self, *exc):
+                        return False
+
+                return _Ctx()
+
+        async def _drive():
+            chunks = []
+            with patch.object(
+                rag_engine_module,
+                "get_admission_controller",
+                lambda: _Permissive(),
+            ):
+                async for chunk in engine.query(
+                    "remember that the round3 arm wording fires",
+                    [],
+                    stream=True,
+                    vault_id=1,
+                    can_write_memory=True,
+                ):
+                    chunks.append(chunk)
+            return chunks
+
+        with caplog.at_level(_logging.WARNING):
+            chunks = asyncio.run(_drive())
+        assert chunks, "harness: remember-directive produced no chunks"
+        remember_exc = [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "app.services.rag_engine"
+            and "after remember-directive failed" in r.getMessage()
+        ]
+        assert remember_exc, "remember exception arm did not log"
+        assert any(
+            phrase in m for m in remember_exc
+        ), remember_exc[0][:120]
+
+        # -- create-route exception arm
+        caplog.clear()
+        create_store = MemoryStore(pool=pool, embedding_service=_SilentEmbedder())
+
+        async def _raising_create_embed(memory_id, content):
+            raise RuntimeError("embed exploded")
+
+        create_store.embed_and_store = _raising_create_embed
+        from _db_pool import SimpleConnectionPool
+        from fastapi.testclient import TestClient
+
+        from app.main import app
+
+        simple_pool = SimpleConnectionPool(db_path)
+        from app.api.deps import (
+            get_current_active_user,
+            get_db,
+            get_evaluate_policy,
+            get_memory_store,
+        )
+
+        originals = {}
+        try:
+            for dep in (get_db, get_memory_store, get_current_active_user,
+                        get_evaluate_policy):
+                originals[dep] = app.dependency_overrides.get(dep)
+
+            async def _allow(user, resource, rid, action):
+                return True
+
+            app.dependency_overrides[get_db] = lambda: simple_pool.get_connection()
+            app.dependency_overrides[get_memory_store] = lambda: create_store
+            app.dependency_overrides[get_current_active_user] = lambda: {
+                "id": 1,
+                "role": "admin",
+            }
+            app.dependency_overrides[get_evaluate_policy] = lambda: _allow
+            with caplog.at_level(_logging.WARNING):
+                resp = TestClient(app).post(
+                    "/api/memories",
+                    json={"content": "round3 create arm wording row", "vault_id": 1},
+                )
+                assert resp.status_code == 200, resp.text
+        finally:
+            for dep, orig in originals.items():
+                if orig is not None:
+                    app.dependency_overrides[dep] = orig
+                else:
+                    app.dependency_overrides.pop(dep, None)
+            simple_pool.close_all()
+
+        create_exc = [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "app.api.routes.memories"
+            and "after create failed" in r.getMessage()
+        ]
+        assert create_exc, "create exception arm did not log"
+        assert any(phrase in m for m in create_exc), create_exc[0][:120]
+    finally:
+        pool.close_all()
