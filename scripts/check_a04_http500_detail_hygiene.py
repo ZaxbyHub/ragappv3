@@ -229,16 +229,29 @@ def _visit(
         if isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
             # Zero or more iterations: the body may run, so its bindings are
             # POSSIBLE — visit on a clone and merge back (a loop-assigned
-            # status must not be treated as its pre-loop value alone).
+            # status must not be treated as its pre-loop value alone). A
+            # call BEFORE a later binding still sees that binding on the
+            # NEXT pass, so the body is visited a second time from the
+            # merged state (value-sets only grow and are finite, so two
+            # passes reach the stable fixpoint for the merge-union lattice);
+            # hits are recorded from the FINAL pass only so no line is
+            # reported twice.
             if isinstance(stmt, (ast.For, ast.AsyncFor)):
                 _check_calls_in(stmt.iter, state, hits)
             else:
                 _check_calls_in(stmt.test, state, hits)
             body_state = state.clone()
+            mark = len(hits)
             _visit(stmt.body, body_state, hits)
             if stmt.orelse:
                 _visit(stmt.orelse, body_state, hits)
             state.merge(body_state)
+            del hits[mark:]
+            body_state2 = state.clone()
+            _visit(stmt.body, body_state2, hits)
+            if stmt.orelse:
+                _visit(stmt.orelse, body_state2, hits)
+            state.merge(body_state2)
             continue
         if isinstance(stmt, getattr(ast, "TryStar", ())):
             # `except*` handlers: same shape contract as ast.Try.

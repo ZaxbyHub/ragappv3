@@ -358,5 +358,28 @@ def test_r3f1_async_with_binding_flags(tmp_path) -> None:
     )
 
 
+def test_fc2r2_loop_carried_binding_flags(tmp_path) -> None:
+    """Final-critic round-2: a call EARLY in a loop body sees the binding a
+    LATER line sets on the NEXT pass (loop-carried)."""
+    source = (
+        "class DraftRoomHTTPError(Exception):\n"
+        "    pass\n"
+        "\n"
+        "\n"
+        "def f(exc, xs):\n"
+        "    status = 400\n"
+        "    for x in xs:\n"
+        "        if x:\n"
+        '            raise DraftRoomHTTPError(status, str(exc), "x")\n'
+        "        status = 503\n"
+    )
+    result = _run_gate(tmp_path, source)
+    assert result.returncode == 1 and _flagged(result) == [9], (
+        f"FC2r2: loop-carried bindings must reach earlier call sites on the "
+        f"next pass; exit={result.returncode} flagged={_flagged(result)}; "
+        f"stdout: {result.stdout}"[:DIAGNOSTIC_LIMIT]
+    )
+
+
 def test_control_guarded_function_local_stays_clean(tmp_path) -> None:
     _assert_clean(tmp_path, GUARDED_FUNCTION_LOCAL_CONTROL, "guarded control")
