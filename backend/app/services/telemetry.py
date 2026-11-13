@@ -73,6 +73,13 @@ _FLUSH_WARN_INTERVAL = 60.0
 # is confirmed dead are ever deleted (issue #936 AC5).
 _SHARD_STALE_SECONDS = 3600.0
 
+# Magnitude ceiling for a single queue-list sample (a wait in seconds or a
+# queue depth): anything above 1e9 is not a real measurement, and letting
+# one through lets the cross-shard SUM overflow into OverflowError (which
+# would 500 the unauthenticated /metrics scrape — the exact contract
+# violation this validation exists to prevent).
+_MAX_QUEUE_SAMPLE = 1e9
+
 
 def _escape_label(value: str) -> str:
     """Escape a label value for the Prometheus text exposition format.
@@ -169,10 +176,20 @@ def _coerce_counter(value) -> "int | None":
 
 
 def _valid_sample(value) -> bool:
-    """Queue-list element check: finite int|float >= 0, bool rejected."""
+    """Queue-list element check: finite int|float in [0, _MAX_QUEUE_SAMPLE],
+    bool rejected."""
     if isinstance(value, bool):
         return False
     if not isinstance(value, (int, float)) or value < 0:
+        return False
+    # Magnitude ceiling BEFORE any float conversion: int-vs-float comparison
+    # is exact in Python, so a 10**308 sample (which converts to a finite
+    # float fine and would pass isfinite) is rejected here — otherwise two
+    # such samples in the merged list overflow sum(waits) into
+    # OverflowError at the average, re-opening the /metrics 500 the
+    # contract forbids (final-critic delta finding 1, executed). A wait in
+    # seconds or a queue depth above 1e9 is not a real measurement.
+    if value > _MAX_QUEUE_SAMPLE:
         return False
     try:
         return math.isfinite(value)

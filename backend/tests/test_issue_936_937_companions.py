@@ -1352,3 +1352,32 @@ def test_deeply_nested_and_bigint_shards_skip_with_200(tmp_path, caplog):
     msgs = [r.getMessage() for r in caplog.records]
     assert any("not valid JSON" in m for m in msgs), msgs[:2]
     assert any("failed validation" in m for m in msgs), msgs[:2]
+
+
+def test_sum_overflow_shards_skip_with_200(tmp_path, caplog):
+    """Final-critic delta finding 1 (executed at 61fce0bd and 202e284c):
+    two 10**308 int samples each convert to a finite float (so the L2R-2
+    isfinite guard passes them), but their int SUM plus any float in the
+    merged list overflows at avg = sum(waits)/len(waits) -> /metrics 500.
+    The _MAX_QUEUE_SAMPLE ceiling rejects each sample at validation, so
+    the hostile shard skips with the shape WARNING and the good shard
+    still serves.
+    """
+    import logging as _logging
+
+    hostile = tmp_path / "telemetry-00000000-1-ovf00001.json"
+    hostile.write_text(
+        json.dumps({"queue_waits": {"x": [10 ** 308, 10 ** 308]}}),
+        encoding="utf-8",
+    )
+    good = tmp_path / "telemetry-00000000-1-good0002.json"
+    good.write_text(json.dumps({"chat_turns": 9}), encoding="utf-8")
+    tel = Telemetry(enabled=True, registry_dir=tmp_path)
+    with caplog.at_level(_logging.WARNING, logger="app.services.telemetry"):
+        text = tel.metrics_text()
+    assert _sample(text, telemetry_module.METRIC_CHAT_TURNS) == 9
+    assert any(
+        "failed validation" in r.getMessage()
+        for r in caplog.records
+        if r.name == "app.services.telemetry"
+    )
