@@ -9,6 +9,14 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 10
+    # numpy 2.5+ requires Python >= 3.12 but this repo pins Python 3.11
+    # (CI setup-python, docs/engineering/testing.md), so minor bumps to the
+    # 2.5 line are unsatisfiable for the lockfiles. Patch updates within
+    # 2.4.x remain allowed. Lift this when the repo moves to Python 3.12.
+    ignore:
+      - dependency-name: "numpy"
+        update-types:
+          - "version-update:semver-minor"
     groups:
       python-minor-patch:
         update-types:
