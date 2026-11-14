@@ -24,8 +24,8 @@ from tests.draft_room.test_draft_compile_routes import (  # noqa: E402
     CompileRouteTestBase,
 )
 from tests.draft_room.test_draft_store import (  # noqa: E402
-    DraftStoreTestBase,
     OWNER_ID,
+    DraftStoreTestBase,
 )
 
 
