@@ -1346,9 +1346,11 @@ def test_pid_alive_never_raises_on_oversized_pid(monkeypatch):
     unauthenticated /metrics on every scrape while the poison shard existed.
     _pid_alive must therefore NEVER raise: an unrepresentable pid is treated
     as alive (retention over deletion). Simulated POSIX leg (a Windows box
-    cannot execute the real os.kill conversion); no Path objects are touched
-    inside the patched window (os.name patching would break pathlib's
-    flavor selection mid-test).
+    cannot execute the real os.kill conversion). The platform branch is
+    selected by patching the module-level _is_windows seam, NOT the
+    process-global os.name (LC-1: an os.name patch changes the os module
+    seen by pathlib and pytest internals, and an assertion failure inside
+    the patched window crashes failure reporting).
     """
 
     def _posix_kill(pid, sig):
@@ -1356,7 +1358,7 @@ def test_pid_alive_never_raises_on_oversized_pid(monkeypatch):
             raise OverflowError("Python int too large to convert to C long")
         raise ProcessLookupError(pid)
 
-    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(telemetry_module, "_is_windows", lambda: False)
     monkeypatch.setattr(os, "kill", _posix_kill)
     # Oversized pid: caught defensively -> alive (conservative retention).
     assert telemetry_module._pid_alive(2**40) is True
@@ -1458,7 +1460,10 @@ def test_windows_liveness_never_uses_os_kill(monkeypatch):
     (TerminateProcess would kill the probed worker). Portable simulation:
     force the nt branch with a stubbed kernel32 and plant an os.kill
     tripwire — reintroducing os.kill on the nt path fails this test on ANY
-    platform, including CI's ubuntu runners.
+    platform, including CI's ubuntu runners. Scope note (pr1132 review
+    TD-1/TD-2): this pins the nt BRANCH BODY; platform-SELECTION
+    discrimination (which branch the _is_windows predicate picks) is pinned
+    separately by test_is_windows_seam_discriminates_os_name.
     """
     import ctypes
 
@@ -1469,7 +1474,10 @@ def test_windows_liveness_never_uses_os_kill(monkeypatch):
             "the probed worker)"
         )
 
-    monkeypatch.setattr(os, "name", "nt")
+    # Patch the module-level _is_windows seam, NOT process-global os.name
+    # (LC-1: an os.name patch changes the os module seen by pathlib and
+    # pytest internals; the seam keeps the spoof scoped to _pid_alive).
+    monkeypatch.setattr(telemetry_module, "_is_windows", lambda: True)
     monkeypatch.setattr(os, "kill", _kill_tripwire)
 
     class _FakeKernel32:
@@ -1491,6 +1499,34 @@ def test_windows_liveness_never_uses_os_kill(monkeypatch):
 
     assert telemetry_module._pid_alive(999999) is False
     assert telemetry_module._pid_alive(os.getpid()) is True
+
+
+def test_is_windows_seam_discriminates_os_name(monkeypatch):
+    """TD-1 (pr1132-20261114 reviewer + critic, UPHELD MEDIUM): the seam
+    BODY must be VALUE-discriminated, not just stubbed. The r2 spoofing
+    tests replace the whole predicate, so an always-false mutant of the
+    production expression (`return False`, or the typo
+    `os.name == "windows"`) passed the entire ubuntu-only CI suite — and on
+    Windows it would route _pid_alive probes into os.kill ->
+    TerminateProcess (reviewer-executed: a live child was killed,
+    rc 3221225794; at base the os.name patch drove the production inline
+    expression, so the same mutant was killed via the tripwire on any
+    platform). Rebind the MODULE-LEVEL os binding (telemetry_module.os)
+    with a SimpleNamespace — module-scoped, so pathlib/pytest never see a
+    spoofed global platform (LC-1 preserved) — and assert both outcomes of
+    the actual production expression. Kills: constant-false, constant-true,
+    `== "windows"` typo, and negation mutants.
+    """
+    import types
+
+    monkeypatch.setattr(
+        telemetry_module, "os", types.SimpleNamespace(name="nt")
+    )
+    assert telemetry_module._is_windows() is True
+    monkeypatch.setattr(
+        telemetry_module, "os", types.SimpleNamespace(name="posix")
+    )
+    assert telemetry_module._is_windows() is False
 
 
 def test_warn_ledger_bounded_and_pruned_shard_forgotten(tmp_path, caplog):
