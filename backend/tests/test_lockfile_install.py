@@ -37,7 +37,10 @@ def _pip_parse_report(lockfile_path: str) -> tuple[bool, str]:
                 ],
                 capture_output=True,
                 text=True,
-                timeout=120,
+                # 300s: the sentence-transformers 6.3 lock carries the full
+                # torch/nvidia metadata tree, and the live PyPI resolve on
+                # CI exceeded the previous 120s budget (PR #1134 round 2).
+                timeout=300,
             )
             if result.returncode == 0:
                 return True, ""
@@ -46,7 +49,7 @@ def _pip_parse_report(lockfile_path: str) -> tuple[bool, str]:
             if os.path.exists(report_path):
                 os.unlink(report_path)
     except subprocess.TimeoutExpired:
-        return False, "pip install --dry-run timed out after 120s"
+        return False, "pip install --dry-run timed out after 300s"
     except Exception as e:
         return False, str(e)
 
