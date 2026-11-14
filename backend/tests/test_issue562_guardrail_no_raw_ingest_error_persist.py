@@ -51,6 +51,10 @@ SHIPPED_INGEST_ERROR_CODES = frozenset(
         # watchdog settles to this stable code so a status-selected next
         # pass re-selects the file.
         "REINDEX_INTERRUPTED",
+        # issue #1112: a same-hash retry/reindex whose files-row flip
+        # collides with another indexed/partial row in the same vault is a
+        # deterministic duplicate, never a parse failure.
+        "DUPLICATE_FILE",
     }
 )
 
