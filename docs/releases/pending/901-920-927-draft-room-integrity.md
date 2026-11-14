@@ -12,8 +12,8 @@
 - **Storage faults are no longer client conflicts (issue #901 AC4).** A retryable
   storage fault raised inside a disposition transaction (`sqlite3.OperationalError`,
   e.g. lock contention after the busy timeout) now surfaces as a server-side error
-  instead of HTTP 409 `conflict`. Only `sqlite3.IntegrityError` (the uniqueness-violation
-  trigger path) keeps the 409 mapping. The frontend no longer renders lock contention
+  instead of HTTP 409 `conflict`. Only the constraint-violation subclass
+  (`sqlite3.IntegrityError`) keeps the 409 mapping. The frontend no longer renders lock contention
   as a reload-conflict banner.
 - **Disposition eligibility uses the draft's current revision (issue #901 AC2).** The
   dismiss/waive response's `can_apply` is computed against the same

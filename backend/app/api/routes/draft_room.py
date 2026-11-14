@@ -247,7 +247,8 @@ _FACT_CURRENT_STATUSES: frozenset[str] = frozenset({"passed", "findings"})
 
 #: Upper bound on rows scanned when a listing needs an in-Python filter the
 #: store's paged accessors do not express (claim ``status``; finding
-#: ``status``/``severity`` are bound in SQL by ``DraftStore.list_findings``).
+#: ``status``/``severity`` are bound in SQL by
+#: ``DraftStore.findings_page_after_authorization``).
 #: Reads are still issued through the store's ``limit``/``offset`` methods in
 #: ``_LIST_SCAN_CHUNK``-sized pages; this only bounds how deep the scan goes
 #: so a pathological ledger cannot be pulled into memory. A single revision's

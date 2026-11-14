@@ -29,6 +29,7 @@ import tempfile
 import unittest
 from dataclasses import dataclass, field
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -97,7 +98,12 @@ MIRRORED_ALLOWLISTS = {
 class RegistryEntry:
     priors: frozenset
     kind: str
-    guard_text: str = ""
+    #: For inline entries: EVERY predicate that must appear as a complete
+    #: ``If.test``/``Compare`` node (ast.unparse-normalized) in the guarding
+    #: function — substring presence is insufficient (swarm-pr-review
+    #: pr1133-20261114 TF-05: a weakened guard kept passing the old substring
+    #: check). For allowlist entries this names the constant (documentation).
+    guards: tuple = ()
     composite: dict = field(default_factory=dict)
     #: For parameterized writes (status == "?"): the located literal constraint
     #: on the bound parameter. Every (prior, target) pair must be a legal edge.
@@ -110,13 +116,13 @@ REGISTRY = {
         RegistryEntry(
             priors=frozenset({"ready"}),
             kind="inline",
-            guard_text='status == "ready"',
+            guards=('status == "ready" or ready_revision_id is not None',),
         ),
     ("api/routes/draft_room.py", "_sync_enqueue_compile", "drafts", "queued"):
         RegistryEntry(
             priors=MIRRORED_ALLOWLISTS["_COMPILE_ALLOWED_PRIOR_STATUSES"][1],
             kind="allowlist",
-            guard_text="_COMPILE_ALLOWED_PRIOR_STATUSES",
+            guards=("_COMPILE_ALLOWED_PRIOR_STATUSES",),
             # 'ready' is not a direct edge to queued: the same function first
             # writes ready -> needs_review (the Ready invalidation above),
             # and needs_review -> queued is a legal edge.
@@ -128,32 +134,32 @@ REGISTRY = {
         RegistryEntry(
             priors=frozenset({"open"}),
             kind="inline",
-            guard_text='if finding_status != "open"',
+            guards=('finding_status != "open"',),
         ),
     ("api/routes/draft_room.py", "_sync_apply_finding", "drafts", "needs_review"):
         RegistryEntry(
             priors=MIRRORED_ALLOWLISTS["_APPLY_FINDING_ALLOWED_PRIOR_STATUSES"][1],
             kind="allowlist",
-            guard_text="_APPLY_FINDING_ALLOWED_PRIOR_STATUSES",
+            guards=("_APPLY_FINDING_ALLOWED_PRIOR_STATUSES",),
         ),
     ("api/routes/draft_room.py", "_sync_mark_ready", "drafts", "ready"):
         RegistryEntry(
             priors=frozenset({"needs_review"}),
             kind="inline",
-            guard_text='!= "needs_review"',
+            guards=('status != "needs_review"',),
         ),
     # ── services/draft_job_processor.py ──────────────────────────────────
     ("services/draft_job_processor.py", "_fail_compile_job_sync", "drafts", "failed"):
         RegistryEntry(
             priors=frozenset({"queued", "running"}),
             kind="inline",
-            guard_text='in ("queued", "running")',
+            guards=('row is not None and row[0] in ("queued", "running")',),
         ),
     ("services/draft_job_processor.py", "_schedule_compile_retry_sync", "drafts", "queued"):
         RegistryEntry(
             priors=frozenset({"failed"}),
             kind="inline",
-            guard_text='!= "failed"',
+            guards=('row is None or row[0] != "failed"',),
         ),
     # The four _commit_success terminal settles: the documented byte-identical
     # in-transaction replacement of store.set_input_parse_status('ready') +
@@ -173,7 +179,7 @@ REGISTRY = {
         RegistryEntry(
             priors=MIRRORED_ALLOWLISTS["_ASSEMBLE_ALLOWED_PRIOR_DRAFT_STATUSES"][1],
             kind="allowlist",
-            guard_text="_ASSEMBLE_ALLOWED_PRIOR_DRAFT_STATUSES",
+            guards=("_ASSEMBLE_ALLOWED_PRIOR_DRAFT_STATUSES",),
             # 'queued' is not a direct edge to needs_review: the compile claim
             # (DraftStore.claim_next_compile_job -> _mark_draft_running_locked)
             # moves the draft queued -> running first, and running ->
@@ -189,7 +195,7 @@ REGISTRY = {
         RegistryEntry(
             priors=frozenset({"queued", "running"}),
             kind="inline",
-            guard_text='not in ("failed", "cancelled")',
+            guards=('target not in ("failed", "cancelled")', 'row is not None and row[0] in ("queued", "running")',),
             composite={},
             targets=frozenset({"failed", "cancelled"}),
         ),
@@ -215,7 +221,16 @@ _UPDATE_RE = re.compile(
     r")?\s+SET\s+(.*?)(?=\s+WHERE\b|$)",
     re.IGNORECASE | re.DOTALL,
 )
-_STATUS_COL_RE = re.compile(r"\b(status|parse_status)\s*=\s*('([a-z_]+)'|\?)", re.I)
+_STATUS_COL_RE = re.compile(
+    r"\b(status|parse_status)\s*=\s*('[^']*'|\"[^\"]*\"|\?|[^,\s][^,]*)", re.I
+)
+
+#: Sentinel for a status RHS that is neither a quoted literal nor a bound
+#: ``?`` — f-string values, ``%``-format, ``.format``, and ``:named`` binds
+#: all fold to this. Such sites have no registry entry by construction, so
+#: ``validate_sites`` reports them UNMAPPED and fails closed (swarm-pr-review
+#: pr1133-20261114 TF-01: the guard's promise covers EVERY status write).
+_DYNAMIC = "<dynamic>"
 
 
 def _canonical_table(raw: str) -> str:
@@ -242,6 +257,9 @@ def _fold(node: ast.AST):
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
         left, right = _fold(node.left), _fold(node.right)
         return None if left is None or right is None else left + right
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
+        # "%s"-template: the LEFT operand carries the template markers.
+        return _fold(node.left)
     if (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
@@ -298,7 +316,26 @@ def scan_status_writes(source: str, rel_path: str) -> list[StatusWrite]:
                 if table not in TRANSITION_MAPS:
                     continue
                 for sm in _STATUS_COL_RE.finditer(um.group(3)):
-                    literal = sm.group(3)
+                    rhs = sm.group(2).strip()
+                    if rhs == "?":
+                        status = "?"
+                    elif rhs[:1] in ("'", '"'):
+                        inner = rhs[1:-1]
+                        if (
+                            "\x00" in inner
+                            or "{}" in inner
+                            or "%s" in inner
+                            or "%(" in inner
+                        ):
+                            # %-template or .format() template masquerading
+                            # as a quoted literal: dynamic, fail closed.
+                            status = _DYNAMIC
+                        else:
+                            status = inner.lower()
+                    else:
+                        # Dynamic value (folded NUL, bare interpolation,
+                        # :named bind, any non-literal): fail closed.
+                        status = _DYNAMIC
                     sites.append(
                         StatusWrite(
                             rel_path=rel_path,
@@ -306,7 +343,7 @@ def scan_status_writes(source: str, rel_path: str) -> list[StatusWrite]:
                             lineno=getattr(node, "lineno", 0),
                             table=table,
                             column=sm.group(1).lower(),
-                            status=literal if literal else "?",
+                            status=status,
                         )
                     )
         for child in ast.iter_child_nodes(node):
@@ -328,6 +365,29 @@ def _function_source(source: str, function: str) -> str:
             lines = source.splitlines()
             return "\n".join(lines[node.lineno - 1: node.end_lineno])
     return ""
+
+
+def _function_predicates(source: str, function: str) -> set:
+    """Normalized predicate strings for every If.test/Compare in a function.
+
+    ``ast.unparse`` form with single quotes and collapsed whitespace, so a
+    registered guard like ``'status != "needs_review"'`` matches only the
+    COMPLETE comparison — adding ``and status != "draft"`` changes the If.test
+    string and no longer matches.
+    """
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == function:
+            preds = set()
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.If):
+                    # The COMPLETE If.test only: an ``and``-widened guard
+                    # changes this string and no longer matches, so the
+                    # registry pins guards at the strength they are written.
+                    text = re.sub(r"\s+", " ", ast.unparse(sub.test)).replace("'", '"')
+                    preds.add(text)
+            return preds
+    return set()
 
 
 def _store_source() -> str:
@@ -441,17 +501,21 @@ def validate_sites(sites: list[StatusWrite]) -> list[str]:
                     f"{site.rel_path}:{site.lineno}"
                 )
 
-    # Inline guards must actually exist at their registered functions.
+    # Inline guards must exist AS THE COMPLETE REGISTERED PREDICATES at
+    # their registered functions: each guard must equal the ast.unparse form
+    # of an If.test or Compare node in that function (TF-05: substring
+    # presence let weakened guards through).
     for (module, function, table, status), entry in REGISTRY.items():
-        if entry.kind != "inline" or not entry.guard_text:
+        if entry.kind != "inline" or not entry.guards:
             continue
-        fn_src = _function_source(_module_source(module), function)
-        if entry.guard_text not in fn_src:
-            failures.append(
-                f"INLINE GUARD MISSING: {module}#{function} (writes "
-                f"{table}.{status}) no longer carries its registered guard "
-                f"predicate {entry.guard_text!r}"
-            )
+        predicates = _function_predicates(_module_source(module), function)
+        for guard in entry.guards:
+            if guard not in predicates:
+                failures.append(
+                    f"INLINE GUARD MISSING: {module}#{function} (writes "
+                    f"{table}.{status}) no longer carries its registered "
+                    f"guard predicate {guard!r} as a complete comparison"
+                )
 
     # Chain entries: the documented establishers must hold.
     store_src = _store_source()
@@ -608,6 +672,161 @@ class TestStatusTransitionMap(unittest.TestCase):
             )
             sites = scan_status_writes(p.read_text(encoding="utf-8"), "where_only.py")
         self.assertEqual(sites, [])
+
+    def test_dynamic_status_write_forms_fail_closed(self):
+        """TF-01: dynamically-built status writes are SEEN and fail closed.
+
+        f-string values, %-format, .format, and :named binds previously
+        produced zero sites; they now yield ``<dynamic>`` sites that no
+        registry entry can match, so validate_sites reports them UNMAPPED.
+        """
+        forms = [
+            (
+                "import sqlite3\n\n\n"
+                "def w(conn: sqlite3.Connection, s: str) -> None:\n"
+                "    conn.execute(\n"
+                "        f\"UPDATE drafts SET status = '{s}' WHERE id = 1\"\n"
+                "    )\n",
+                "f-string value",
+            ),
+            (
+                "import sqlite3\n\n\n"
+                "def w(conn: sqlite3.Connection, s: str) -> None:\n"
+                "    conn.execute(\n"
+                "        f\"UPDATE drafts SET status = {s} WHERE id = 1\"\n"
+                "    )\n",
+                "f-string bare",
+            ),
+            (
+                "import sqlite3\n\n\n"
+                "def w(conn: sqlite3.Connection, s: str) -> None:\n"
+                "    conn.execute(\n"
+                "        \"UPDATE drafts SET status = '%s' WHERE id = 1\" % s\n"
+                "    )\n",
+                "percent-format",
+            ),
+            (
+                "import sqlite3\n\n\n"
+                "def w(conn: sqlite3.Connection, s: str) -> None:\n"
+                "    conn.execute(\n"
+                "        \"UPDATE drafts SET status = '{}' WHERE id = 1\".format(s)\n"
+                "    )\n",
+                "str.format",
+            ),
+            (
+                "import sqlite3\n\n\n"
+                "def w(conn: sqlite3.Connection, s: str) -> None:\n"
+                "    conn.execute(\n"
+                "        \"UPDATE drafts SET status = :st WHERE id = 1\",\n"
+                "        {\"st\": s},\n"
+                "    )\n",
+                "named bind",
+            ),
+        ]
+        for planted_src, label in forms:
+            with self.subTest(form=label):
+                sites = scan_status_writes(planted_src, "api/routes/draft_room.py")
+                hit = [s for s in sites if s.status == _DYNAMIC]
+                self.assertTrue(
+                    hit,
+                    f"{label}: scanner went blind on the dynamic status write",
+                )
+                failures = validate_sites(hit)
+                self.assertTrue(
+                    any("UNMAPPED" in f and _DYNAMIC in f for f in failures),
+                    f"{label}: dynamic write must fail closed, got {failures}",
+                )
+
+    def test_weakened_inline_guard_is_detected(self):
+        """TF-05: weakening a registered predicate breaks the guard.
+
+        ``_sync_mark_ready``'s ``status != "needs_review"`` widened with an
+        extra clause changes the ast.unparse form of the If.test, so the
+        registered complete-predicate match fails.
+        """
+        original = _module_source("api/routes/draft_room.py")
+        weakened = original.replace(
+            'if status != "needs_review":',
+            'if status != "needs_review" and status != "draft":',
+            1,
+        )
+        self.assertNotEqual(weakened, original, "plant failed")
+        real = _module_source
+
+        def fake_source(rel: str) -> str:
+            return weakened if rel == "api/routes/draft_room.py" else real(rel)
+
+        with mock.patch.object(
+            sys.modules[__name__], "_module_source", side_effect=fake_source
+        ):
+            failures = validate_sites(self._scan_real_modules())
+        self.assertTrue(
+            any(
+                "INLINE GUARD MISSING" in f and 'status != "needs_review"' in f
+                for f in failures
+            ),
+            f"weakened mark_ready guard must be reported, got {failures}",
+        )
+
+    def test_widened_move_draft_prior_guard_is_detected(self):
+        """TF-05: _move_draft's registered PRIOR guard is verified too.
+
+        Widening ``row[0] in ("queued", "running")`` (the priors the registry
+        claims) must fail the guard even though the target guard is intact.
+        """
+        original = _module_source("services/draft_pipeline.py")
+        widened = original.replace(
+            'row[0] in ("queued", "running")',
+            'row[0] in ("queued", "running", "needs_review")',
+            1,
+        )
+        self.assertNotEqual(widened, original, "plant failed")
+        real = _module_source
+
+        def fake_source(rel: str) -> str:
+            return widened if rel == "services/draft_pipeline.py" else real(rel)
+
+        with mock.patch.object(
+            sys.modules[__name__], "_module_source", side_effect=fake_source
+        ):
+            failures = validate_sites(self._scan_real_modules())
+        self.assertTrue(
+            any(
+                "INLINE GUARD MISSING" in f and 'row[0] in ("queued", "running")' in f
+                for f in failures
+            ),
+            f"widened prior guard must be reported, got {failures}",
+        )
+
+    def test_registered_parameterized_write_without_constraint_fails(self):
+        """TF-04: the UNCONSTRAINED PARAMETER branch is directly exercised."""
+        entry = REGISTRY[
+            ("services/draft_pipeline.py", "_move_draft", "drafts", "?")
+        ]
+        stripped = RegistryEntry(
+            priors=entry.priors,
+            kind="inline",
+            guards=entry.guards,
+            composite={},
+            targets=None,
+        )
+        site = StatusWrite(
+            rel_path="services/draft_pipeline.py",
+            function="_move_draft",
+            lineno=1,
+            table="drafts",
+            column="status",
+            status="?",
+        )
+        with mock.patch.dict(
+            REGISTRY,
+            {("services/draft_pipeline.py", "_move_draft", "drafts", "?"): stripped},
+        ):
+            failures = validate_sites([site])
+        self.assertTrue(
+            any("UNCONSTRAINED PARAMETER" in f for f in failures),
+            f"constraint-less parameterized write must fail closed, got {failures}",
+        )
 
 
 if __name__ == "__main__":
