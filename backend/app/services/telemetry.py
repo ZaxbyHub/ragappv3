@@ -125,6 +125,18 @@ def _host_tag() -> str:
 _HOST_TAG = _host_tag()
 
 
+def _is_windows() -> bool:
+    """Platform predicate for the liveness probe (LC-1 seam).
+
+    Module-level so tests can patch THIS instead of the process-global
+    ``os.name``: patching ``os.name`` changes the ``os`` module seen by
+    pathlib and pytest internals, and an assertion failure inside the
+    patched window crashes failure REPORTING (INTERNALERROR PosixPath on
+    Windows) — the exact failure the first draft of the spoofing test hit.
+    """
+    return os.name == "nt"
+
+
 def _pid_alive(pid: int) -> bool:
     """Best-effort liveness probe for a LOCAL pid. Conservative on error.
 
@@ -138,7 +150,7 @@ def _pid_alive(pid: int) -> bool:
         return False
     if pid == os.getpid():
         return True
-    if os.name == "nt":
+    if _is_windows():
         import ctypes
         from ctypes import wintypes
 

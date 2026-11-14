@@ -1346,9 +1346,11 @@ def test_pid_alive_never_raises_on_oversized_pid(monkeypatch):
     unauthenticated /metrics on every scrape while the poison shard existed.
     _pid_alive must therefore NEVER raise: an unrepresentable pid is treated
     as alive (retention over deletion). Simulated POSIX leg (a Windows box
-    cannot execute the real os.kill conversion); no Path objects are touched
-    inside the patched window (os.name patching would break pathlib's
-    flavor selection mid-test).
+    cannot execute the real os.kill conversion). The platform branch is
+    selected by patching the module-level _is_windows seam, NOT the
+    process-global os.name (LC-1: an os.name patch changes the os module
+    seen by pathlib and pytest internals, and an assertion failure inside
+    the patched window crashes failure reporting).
     """
 
     def _posix_kill(pid, sig):
@@ -1356,7 +1358,7 @@ def test_pid_alive_never_raises_on_oversized_pid(monkeypatch):
             raise OverflowError("Python int too large to convert to C long")
         raise ProcessLookupError(pid)
 
-    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(telemetry_module, "_is_windows", lambda: False)
     monkeypatch.setattr(os, "kill", _posix_kill)
     # Oversized pid: caught defensively -> alive (conservative retention).
     assert telemetry_module._pid_alive(2**40) is True
@@ -1469,7 +1471,10 @@ def test_windows_liveness_never_uses_os_kill(monkeypatch):
             "the probed worker)"
         )
 
-    monkeypatch.setattr(os, "name", "nt")
+    # Patch the module-level _is_windows seam, NOT process-global os.name
+    # (LC-1: an os.name patch changes the os module seen by pathlib and
+    # pytest internals; the seam keeps the spoof scoped to _pid_alive).
+    monkeypatch.setattr(telemetry_module, "_is_windows", lambda: True)
     monkeypatch.setattr(os, "kill", _kill_tripwire)
 
     class _FakeKernel32:
