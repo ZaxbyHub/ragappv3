@@ -4949,22 +4949,14 @@ async def list_draft_findings(
     await _require_vault_read(evaluate, user, draft.vault_id)
 
     # The disposition flags must agree with the disposition route (issue
-    # #788): fetch the current revision and the compile-liveness probe once
-    # so every item's can_apply reflects revision currency, draft status,
-    # and active-compile eligibility.
-    current_revision = await _run_store(
-        lambda: store.get_current_revision(draft_id=draft_id, owner_id=owner_id)
-    )
-    current_revision_id = None if current_revision is None else current_revision.id
-    has_active_compile = await _run_store(
-        lambda: store.has_active_compile_job(draft_id)
-    )
-
-    # The store binds status/severity in SQL and returns the exact filtered
-    # total, so pages reach rows older than any scan window and the count is
-    # never capped by one.
-    findings, total = await _run_store(
-        lambda: store.list_findings(
+    # #788): fetch the current revision and the compile-liveness probe so
+    # every item's can_apply reflects revision currency, draft status, and
+    # active-compile eligibility. All post-authorization child reads share
+    # ONE store hop and never re-read the drafts row (issue #901 AC3);
+    # authorization order is unchanged — ownership, then vault read, then
+    # child reads (SPEC 9.1 rule 2).
+    current_revision_id, has_active_compile, findings, total = await _run_store(
+        lambda: store.findings_page_after_authorization(
             draft_id=draft_id,
             owner_id=owner_id,
             revision_id=revision_id,
@@ -5147,11 +5139,24 @@ async def dispose_draft_finding(
         )
     )
     refreshed = await _run_store(lambda: store.get_draft(draft_id, owner_id))
+    # The response's currency clause must use the same input the list route
+    # uses (issue #901 AC2): the draft's CURRENT revision. Apply already
+    # holds it — the splice just created it — so only dismiss/waive pay for
+    # the read.
+    current_revision = (
+        new_revision
+        if new_revision is not None
+        else await _run_store(
+            lambda: store.get_current_revision(draft_id=draft_id, owner_id=owner_id)
+        )
+    )
     return FindingDispositionResponse(
         finding=_to_finding(
             updated,
             current_revision_id=(
-                new_revision.id if new_revision is not None else finding.revision_id
+                new_revision.id
+                if new_revision is not None
+                else (current_revision.id if current_revision is not None else None)
             ),
             draft_status=refreshed.status,
             has_active_compile=await _run_store(

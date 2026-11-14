@@ -3687,6 +3687,78 @@ class DraftStore:
         ).fetchall()
         return [_row_to_finding(r) for r in rows], total
 
+    def findings_page_after_authorization(
+        self,
+        *,
+        draft_id: int,
+        owner_id: int,
+        revision_id: Optional[int] = None,
+        status: Optional[str] = None,
+        severity: Optional[str] = None,
+        limit: int,
+        offset: int,
+    ) -> tuple[Optional[int], bool, list, int]:
+        """Read the findings page plus its eligibility inputs in one pass.
+
+        The caller (findings-list route, issue #901 AC3) has already loaded
+        and vault-authorized the draft in a first hop; this method performs
+        every post-authorization child read synchronously on one connection
+        WITHOUT re-selecting the ``drafts`` row: the current revision id, the
+        compile-liveness probe (the same ``_assert_no_active_compile``
+        predicate :meth:`has_active_compile_job` uses), and the bound filtered
+        findings page with its exact total (the same query
+        :meth:`list_findings` runs). Read-only — no ``BEGIN IMMEDIATE``, no
+        transaction held across an ``await`` (the whole method runs inside one
+        caller-side ``_run_store`` hop).
+
+        ``owner_id`` scopes the findings exactly like :meth:`list_findings`;
+        it is not used to re-read the drafts row.
+        """
+        if status is not None and status not in FINDING_STATUSES:
+            raise DraftValidationError(f"unknown finding status: {status!r}")
+        if severity is not None and severity not in FINDING_SEVERITIES:
+            raise DraftValidationError(f"unknown finding severity: {severity!r}")
+        current_row = self._db.execute(
+            "SELECT id FROM draft_revisions "
+            "WHERE draft_id = ? AND is_current = 1 LIMIT 1",
+            (draft_id,),
+        ).fetchone()
+        current_revision_id = None if current_row is None else int(current_row[0])
+        active_row = self._db.execute(
+            "SELECT id FROM draft_jobs WHERE draft_id = ? AND job_type = 'compile' "
+            "AND status IN ('pending','running') LIMIT 1",
+            (draft_id,),
+        ).fetchone()
+        where = ["draft_id = ?"]
+        params: list[Any] = [draft_id]
+        if revision_id is not None:
+            where.append("revision_id = ?")
+            params.append(revision_id)
+        if status is not None:
+            where.append("status = ?")
+            params.append(status)
+        if severity is not None:
+            where.append("severity = ?")
+            params.append(severity)
+        clause = " AND ".join(where)
+        # clause is built only from literal fragments; all values are bound parameters
+        total = int(
+            self._db.execute(
+                f"SELECT COUNT(*) FROM draft_findings WHERE {clause}", params  # nosec B608
+            ).fetchone()[0]
+        )
+        rows = self._db.execute(
+            f"SELECT {_FINDING_COLUMNS} FROM draft_findings WHERE {clause} "  # nosec B608
+            "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+            (*params, limit, offset),
+        ).fetchall()
+        return (
+            current_revision_id,
+            active_row is not None,
+            [_row_to_finding(r) for r in rows],
+            total,
+        )
+
     def get_finding(
         self, *, draft_id: int, owner_id: int, finding_id: int
     ) -> DraftFindingRecord:
@@ -3757,9 +3829,22 @@ class DraftStore:
             ).fetchone()
             if row is None:
                 raise DraftNotFoundError("finding not found")
-            severity, _status, rule_id, rule_version, revision_id = row
+            severity, status, rule_id, rule_version, revision_id = row
             if severity == "blocker":
                 raise DraftValidationError("blocker findings cannot be dismissed")
+            if status != "open":
+                # A disposition is a user action against an OPEN finding; the
+                # same-target short-circuit in ``_check_transition`` would
+                # otherwise wave a re-dismiss through as a no-op while the
+                # finish path still writes a second audit row and bumps the
+                # draft's lock_version (issue #901 AC1 — apply's route guard
+                # is the reference pattern, extended here at the store seam so
+                # every caller inherits it).
+                err = DraftConflictError(
+                    "finding has already been dispositioned"
+                )
+                err.code = "finding_not_open"
+                raise err
             self._complete_finding_disposition(
                 draft_id=draft_id,
                 finding_id=finding_id,
@@ -3775,7 +3860,11 @@ class DraftStore:
         except DraftStoreError:
             self._db.rollback()
             raise
-        except sqlite3.Error as exc:
+        except sqlite3.IntegrityError as exc:
+            # Only the client-fault subclass maps to the conflict the route
+            # renders as 409; OperationalError (lock contention after the
+            # busy timeout) and the IO/corrupt family stay server-side
+            # faults (issue #901 AC4).
             self._db.rollback()
             err = DraftConflictError(
                 "the disposition could not be recorded and was rolled back"
@@ -3829,49 +3918,39 @@ class DraftStore:
             status, waivable, severity, rule_id, rule_version, revision_id = row
             if not waivable:
                 raise DraftValidationError("this finding is not waivable")
-            _check_transition(
-                "finding", status, "waived",
-                _FINDING_TRANSITIONS, _FINDING_RECOVERY_TRANSITIONS,
-            )
-            self._db.execute(
-                "UPDATE draft_findings SET status = 'waived', resolved_by = ?, "
-                "resolved_at = CURRENT_TIMESTAMP, resolution_note = ?, "
-                "waiver_rule_version = ?, waiver_text_sha256 = ? "
-                "WHERE id = ? AND draft_id = ?",
-                (
-                    resolved_by,
-                    resolution_note,
-                    waiver_rule_version,
-                    waiver_text_sha256,
-                    finding_id,
-                    draft_id,
-                ),
-            )
-            self._db.execute(
-                "UPDATE drafts SET lock_version = lock_version + 1, "
-                "updated_at = CURRENT_TIMESTAMP WHERE id = ? AND created_by = ?",
-                (draft_id, resolved_by),
-            )
-            # IDs and reason codes only (the ``_insert_event`` payload
-            # contract): the note text lives in ``resolution_note``.
-            self._insert_event(
+            if status != "open":
+                # Same store-seam open guard as dismiss (issue #901 AC1): a
+                # waiver is a user action against an OPEN finding; without
+                # this the same-target transition short-circuit lets a
+                # re-waive through with a second audit row + lock bump.
+                err = DraftConflictError(
+                    "finding has already been dispositioned"
+                )
+                err.code = "finding_not_open"
+                raise err
+            # One shared finish path owns the status write (including the
+            # waiver columns), the lock bump, the audit event, and the commit
+            # (issue #901 AC5); waive previously inlined its own copy.
+            self._complete_finding_disposition(
                 draft_id=draft_id,
+                finding_id=finding_id,
+                resolved_by=resolved_by,
+                resolution_note=resolution_note,
+                target="waived",
                 event_type="finding_waived",
-                actor_user_id=resolved_by,
+                severity=severity,
+                rule_id=rule_id,
+                rule_version=rule_version,
                 revision_id=revision_id,
-                payload={
-                    "finding_id": finding_id,
-                    "rule_id": str(rule_id),
-                    "rule_version": str(rule_version),
-                    "severity": str(severity),
-                    "has_note": bool(resolution_note),
-                },
+                waiver_rule_version=waiver_rule_version,
+                waiver_text_sha256=waiver_text_sha256,
             )
-            self._db.commit()
         except DraftStoreError:
             self._db.rollback()
             raise
-        except sqlite3.Error as exc:
+        except sqlite3.IntegrityError as exc:
+            # Only the client-fault subclass maps to the conflict the route
+            # renders as 409 (issue #901 AC4; mirrors dismiss_finding).
             self._db.rollback()
             err = DraftConflictError(
                 "the disposition could not be recorded and was rolled back"
@@ -3927,6 +4006,8 @@ class DraftStore:
         rule_id,
         rule_version,
         revision_id: Optional[int] = None,
+        waiver_rule_version: Optional[str] = None,
+        waiver_text_sha256: Optional[str] = None,
     ) -> None:
         """Finish a guarded disposition: status, lock bump, event, commit.
 
@@ -3935,7 +4016,10 @@ class DraftStore:
         caller's open transaction, then the caller's handler rolls everything
         back on any failure. ``revision_id`` links the audit row to the
         revision the finding was raised against, matching what the apply path
-        and the ``ready_invalidated`` writers record.
+        and the ``ready_invalidated`` writers record. Waivers pass
+        ``waiver_rule_version``/``waiver_text_sha256`` so the waiver columns
+        land in the same single write — the one shared finish path for both
+        dismiss and waive (issue #901 AC5).
         """
         status_row = self._db.execute(
             "SELECT status FROM draft_findings WHERE id = ? AND draft_id = ?",
@@ -3947,11 +4031,25 @@ class DraftStore:
             "finding", status_row[0], target,
             _FINDING_TRANSITIONS, _FINDING_RECOVERY_TRANSITIONS,
         )
+        # The ONE inline finding-status writer: dismiss passes NULL waiver
+        # columns (an OPEN finding's waiver columns are NULL by construction —
+        # the open guard above means a finding can only be dispositioned
+        # once), a waiver pins the rule version and the exact text it was
+        # granted against (SPEC section 8.2).
         self._db.execute(
             "UPDATE draft_findings SET status = ?, resolved_by = ?, "
-            "resolved_at = CURRENT_TIMESTAMP, resolution_note = ? "
+            "resolved_at = CURRENT_TIMESTAMP, resolution_note = ?, "
+            "waiver_rule_version = ?, waiver_text_sha256 = ? "
             "WHERE id = ? AND draft_id = ?",
-            (target, resolved_by, resolution_note, finding_id, draft_id),
+            (
+                target,
+                resolved_by,
+                resolution_note,
+                waiver_rule_version,
+                waiver_text_sha256,
+                finding_id,
+                draft_id,
+            ),
         )
         self._db.execute(
             "UPDATE drafts SET lock_version = lock_version + 1, "

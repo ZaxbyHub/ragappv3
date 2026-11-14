@@ -127,7 +127,7 @@ flowchart LR
 | File | Responsibility |
 |---|---|
 | `backend/app/api/routes/draft_room.py` | Pydantic contracts, authorization, CSRF/rate limits, HTTP/SSE endpoints |
-| `backend/app/services/draft_store.py` | All SQLite CRUD, atomic claims/transitions, revision numbering, event records |
+| `backend/app/services/draft_store.py` | Default owner of all six Draft Room tables — atomic claims/transitions, revision numbering, event records. Three declared co-owners write them directly (`api/routes/draft_room.py`, `services/draft_job_processor.py`, `services/draft_pipeline.py`); see the owner map in the store's module docstring |
 | `backend/app/services/draft_input_storage.py` | Safe private paths, streaming writes, reads, deletes, cleanup |
 | `backend/app/services/draft_deletion.py` | Two-phase project/input tombstones, parent-delete integration, orphan reconciliation |
 | `backend/app/services/document_extraction.py` | Shared parse-only extraction wrapper around existing `DocumentParser` |
@@ -818,7 +818,7 @@ Required behavior:
 
 ### 10.3 State transitions
 
-No code may write an arbitrary status string. Centralize the following transitions and reject all others:
+No code may write an arbitrary status string. Status changes routed through `DraftStore` go through the transition tables below and are rejected otherwise. The three declared co-owners (`api/routes/draft_room.py`, `services/draft_job_processor.py`, `services/draft_pipeline.py`) write `drafts.status`, `draft_jobs.status`, and `draft_inputs.parse_status` directly, so each keeps its own mirrored prior-status allowlist (the owner map in `draft_store.py`'s module docstring) instead of calling the module-private tables — every status write must resolve to a store transition or a registered mirrored allowlist entry (pinned by `backend/tests/draft_room/test_n06b_status_transition_map.py`). Centralize the following transitions and reject all others:
 
 ```text
 draft:

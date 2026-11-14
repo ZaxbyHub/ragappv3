@@ -16,7 +16,11 @@ Hard invariants (SPEC section 10.1):
   blocking or async step.
 * Claim jobs atomically through ``DraftStore.claim_next_parse_job`` /
   ``DraftStore.claim_next_compile_job`` (both use ``BEGIN IMMEDIATE``) so two
-  processors can never double-run a job.
+  processors can never double-run a job. Claim mediation covers claims only:
+  as a declared co-owner of the Draft Room tables (owner map in
+  ``draft_store.py``'s module docstring), this worker also writes
+  ``drafts.status`` (fail/requeue settles), ``draft_jobs`` rows (retry jobs,
+  terminal job settles), and ``draft_inputs.parse_status`` directly.
 * Cooperative cancellation is checked before starting extraction and again
   immediately before committing parsed text — and re-checked inside the very
   transaction that persists that text (issue #516 DRAFT-005), so a cancel
