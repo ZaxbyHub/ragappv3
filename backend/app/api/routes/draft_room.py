@@ -247,7 +247,8 @@ _FACT_CURRENT_STATUSES: frozenset[str] = frozenset({"passed", "findings"})
 
 #: Upper bound on rows scanned when a listing needs an in-Python filter the
 #: store's paged accessors do not express (claim ``status``; finding
-#: ``status``/``severity`` are bound in SQL by ``DraftStore.list_findings``).
+#: ``status``/``severity`` are bound in SQL by
+#: ``DraftStore.findings_page_after_authorization``).
 #: Reads are still issued through the store's ``limit``/``offset`` methods in
 #: ``_LIST_SCAN_CHUNK``-sized pages; this only bounds how deep the scan goes
 #: so a pathological ledger cannot be pulled into memory. A single revision's
@@ -4949,24 +4950,15 @@ async def list_draft_findings(
     await _require_vault_read(evaluate, user, draft.vault_id)
 
     # The disposition flags must agree with the disposition route (issue
-    # #788): fetch the current revision and the compile-liveness probe once
-    # so every item's can_apply reflects revision currency, draft status,
-    # and active-compile eligibility.
-    current_revision = await _run_store(
-        lambda: store.get_current_revision(draft_id=draft_id, owner_id=owner_id)
-    )
-    current_revision_id = None if current_revision is None else current_revision.id
-    has_active_compile = await _run_store(
-        lambda: store.has_active_compile_job(draft_id)
-    )
-
-    # The store binds status/severity in SQL and returns the exact filtered
-    # total, so pages reach rows older than any scan window and the count is
-    # never capped by one.
-    findings, total = await _run_store(
-        lambda: store.list_findings(
+    # #788): fetch the current revision and the compile-liveness probe so
+    # every item's can_apply reflects revision currency, draft status, and
+    # active-compile eligibility. All post-authorization child reads share
+    # ONE store hop and never re-read the drafts row (issue #901 AC3);
+    # authorization order is unchanged — ownership, then vault read, then
+    # child reads (SPEC 9.1 rule 2).
+    current_revision_id, has_active_compile, findings, total = await _run_store(
+        lambda: store.findings_page_after_authorization(
             draft_id=draft_id,
-            owner_id=owner_id,
             revision_id=revision_id,
             status=status,
             severity=severity,
@@ -5014,6 +5006,15 @@ async def dispose_draft_finding(
     * ``dismiss`` is prohibited for blockers (409 ``blocker_not_dismissable``).
     * ``waive`` needs ``waivable=1``, an unchanged span text and rule version,
       a user actor, and a non-empty ``note``.
+    * ``dismiss``/``waive`` of a finding that is no longer ``open`` is refused
+      409 ``finding_not_open`` with ``lock_version`` unchanged (issue #901);
+      earlier preconditions keep their own codes (a blocker's dismissal is
+      refused 409 ``blocker_not_dismissable``, a non-waivable waive 409
+      ``finding_not_waivable``, a blank note 422).
+    * A constraint violation raised inside the disposition transaction
+      (``sqlite3.IntegrityError``) keeps the 409 ``conflict`` mapping; other
+      storage faults (e.g. ``sqlite3.OperationalError`` lock contention)
+      surface as server-side 5xx, NOT 409 (issue #901).
 
     Dismiss and waive additionally refuse an archived draft (409
     ``invalid_state``) and a stale ``lock_version`` (409
@@ -5114,10 +5115,12 @@ async def dispose_draft_finding(
                 )
             )
 
-        # No route-tail event: each disposition writes exactly one audit row
-        # inside its own transaction — apply's has existed there all along, and
-        # dismiss/waive moved theirs into DraftStore with the same guards (issue
-        # #788 / T1-08-K-02). The note text stays in
+        # No route-tail draft_events row: each disposition writes exactly one
+        # ``draft_events`` row inside its own transaction — apply's has existed
+        # there all along, and dismiss/waive moved theirs into DraftStore with
+        # the same guards (issue #788 / T1-08-K-02). (The best-effort global
+        # ``security_audit_log`` tail below is a separate, platform-level
+        # record, not the draft event ledger.) The note text stays in
         # ``draft_findings.resolution_note``; payloads carry IDs and codes only.
         await drain_audit(
             safe_record_security_event(
@@ -5147,11 +5150,24 @@ async def dispose_draft_finding(
         )
     )
     refreshed = await _run_store(lambda: store.get_draft(draft_id, owner_id))
+    # The response's currency clause must use the same input the list route
+    # uses (issue #901 AC2): the draft's CURRENT revision. Apply already
+    # holds it — the splice just created it — so only dismiss/waive pay for
+    # the read.
+    current_revision = (
+        new_revision
+        if new_revision is not None
+        else await _run_store(
+            lambda: store.get_current_revision(draft_id=draft_id, owner_id=owner_id)
+        )
+    )
     return FindingDispositionResponse(
         finding=_to_finding(
             updated,
             current_revision_id=(
-                new_revision.id if new_revision is not None else finding.revision_id
+                new_revision.id
+                if new_revision is not None
+                else (current_revision.id if current_revision is not None else None)
             ),
             draft_status=refreshed.status,
             has_active_compile=await _run_store(
