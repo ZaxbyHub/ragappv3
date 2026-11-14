@@ -108,6 +108,11 @@ class RegistryEntry:
     #: For parameterized writes (status == "?"): the located literal constraint
     #: on the bound parameter. Every (prior, target) pair must be a legal edge.
     targets: frozenset | None = None
+    #: For allowlist entries consulted OUTSIDE the writing function: the
+    #: function whose body must carry the `not in <CONST>` comparison
+    #: (defaults to the writing function). The pipeline publish write is
+    #: guarded by _db_commit_revision's consult (parallel-review F-02 shape).
+    consult_function: str | None = None
 
 
 REGISTRY = {
@@ -187,6 +192,9 @@ REGISTRY = {
             composite={
                 "queued": "store_claim_moves_prior:queued:running",
             },
+            # The allowlist is consulted in _db_commit_revision (pipeline
+            # :3309), not in the writing function.
+            consult_function="_db_commit_revision",
         ),
     # Parameterized terminal write: _move_draft's target is constrained to
     # the two terminal compile outcomes by an inline literal guard, and its
@@ -221,9 +229,6 @@ _UPDATE_RE = re.compile(
     r")?\s+SET\s+(.*?)(?=\s+WHERE\b|$)",
     re.IGNORECASE | re.DOTALL,
 )
-_STATUS_COL_RE = re.compile(
-    r"\b(status|parse_status)\s*=\s*('[^']*'|\"[^\"]*\"|\?|[^,\s][^,]*)", re.I
-)
 
 #: Sentinel for a status RHS that is neither a quoted literal nor a bound
 #: ``?`` — f-string values, ``%``-format, ``.format``, and ``:named`` binds
@@ -242,10 +247,18 @@ def _canonical_table(raw: str) -> str:
     return last.lower()
 
 
-def _fold(node: ast.AST):
-    """Best-effort static SQL string (census fold semantics)."""
+def _fold_env(node: ast.AST, env: dict[str, str]):
+    """Best-effort static SQL string (census fold semantics + Name resolution).
+
+    ``env`` maps simple assignment-target names to their folded string values
+    (parallel-review F-01: ``sql = "UPDATE drafts SET "`` then
+    ``conn.execute(sql + "status = 'x' ...")`` and ``success_sql += ...``
+    chains must resolve, not vanish).
+    """
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value
+    if isinstance(node, ast.Name):
+        return env.get(node.id)
     if isinstance(node, ast.JoinedStr):
         parts = []
         for v in node.values:
@@ -255,7 +268,8 @@ def _fold(node: ast.AST):
                 parts.append("\x00")
         return "".join(parts)
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-        left, right = _fold(node.left), _fold(node.right)
+        left = _fold_env(node.left, env)
+        right = _fold_env(node.right, env)
         if left is None and right is None:
             return None
         # A side that cannot fold is DYNAMIC, not absent: "SET status = " + s
@@ -266,14 +280,59 @@ def _fold(node: ast.AST):
         )
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
         # "%s"-template: the LEFT operand carries the template markers.
-        return _fold(node.left)
+        return _fold_env(node.left, env)
     if (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "format"
     ):
-        return _fold(node.func.value)
+        return _fold_env(node.func.value, env)
     return None
+
+
+def _fold(node: ast.AST):
+    """Fold without an environment (kept for direct callers/probes)."""
+    return _fold_env(node, {})
+
+
+def _collect_string_env(fn_node: ast.AST, outer: dict[str, str]) -> dict[str, str]:
+    """Ordered string-assignment environment for one scope.
+
+    Walks ``fn_node``'s subtree in statement order, resolving ``name = <str>``
+    and ``name += <str>`` chains (Assign/AugAssign). Unresolvable augends
+    become a NUL-prefixed dynamic value so later folds still fail closed.
+    Nested function/class scopes are skipped (they have their own envs).
+    """
+    env: dict[str, str] = dict(outer)
+
+    def fold_local(node: ast.AST):
+        return _fold_env(node, env)
+
+    def walk(node: ast.AST) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            if isinstance(child, ast.Assign):
+                value = fold_local(child.value)
+                if value is not None:
+                    for target in child.targets:
+                        if isinstance(target, ast.Name):
+                            env[target.id] = value
+            elif isinstance(child, ast.AugAssign):
+                if (
+                    isinstance(child.target, ast.Name)
+                    and isinstance(child.op, ast.Add)
+                ):
+                    value = fold_local(child.value)
+                    if value is not None:
+                        current = env.get(child.target.id)
+                        env[child.target.id] = (
+                            current if current is not None else "\x00"
+                        ) + value
+            walk(child)
+
+    walk(fn_node)
+    return env
 
 
 def _docstring_ids(tree: ast.Module) -> set[int]:
@@ -295,25 +354,67 @@ def _docstring_ids(tree: ast.Module) -> set[int]:
     return ids
 
 
+def _split_top_level(text: str) -> list[str]:
+    """Split a SET body on commas OUTSIDE quoted literals (UR-001).
+
+    Matching per segment anchors ``status =`` to assignment-target position,
+    so a value like ``'the status = pending'`` can never masquerade as a
+    second assignment.
+    """
+    parts: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+    for ch in text:
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"'):
+            quote = ch
+            buf.append(ch)
+        elif ch == ",":
+            parts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    parts.append("".join(buf))
+    return parts
+
+
+_ASSIGN_RE = re.compile(r"\s*(status|parse_status)\s*=\s*(.+)", re.I | re.S)
+
+
 def scan_status_writes(source: str, rel_path: str) -> list[StatusWrite]:
     """Every status-column assignment in a SET clause against the four tables.
 
     WHERE-clause ``status`` predicates are NOT writes: the regex stops the SET
     capture at WHERE, so ``UPDATE ... WHERE status = 'running'`` never yields
-    a StatusWrite (pipeline :3066/:3112 shape). Fails closed on parse errors.
+    a StatusWrite (pipeline :3066/:3112 shape). SET bodies are split on
+    top-level commas and each assignment is matched at segment start, so a
+    string VALUE containing ``status =`` is not a site (UR-001). String
+    assignments (including ``+=`` chains) are resolved before folding, and a
+    Name operand that resolves to nothing folds to NUL — both directions fail
+    closed. Fails closed on parse errors.
     """
     tree = ast.parse(source, filename=rel_path)
     skip = _docstring_ids(tree)
+    module_env = _collect_string_env(tree, {})
+    fn_envs: dict[int, dict[str, str]] = {}
     sites: list[StatusWrite] = []
 
-    def visit(node: ast.AST, fn: str) -> None:
+    def visit(node: ast.AST, fn: str, env: dict[str, str]) -> None:
+        scope_env = env
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             fn = node.name
+            scope_env = fn_envs.get(id(node))
+            if scope_env is None:
+                scope_env = _collect_string_env(node, module_env)
+                fn_envs[id(node)] = scope_env
         if id(node) in skip:
             return
         folded = None
-        if isinstance(node, (ast.Constant, ast.JoinedStr, ast.BinOp, ast.Call)):
-            folded = _fold(node)
+        if isinstance(node, (ast.Constant, ast.JoinedStr, ast.BinOp, ast.Call, ast.Name)):
+            folded = _fold_env(node, scope_env)
         if folded:
             for um in _UPDATE_RE.finditer(folded):
                 raw_table = um.group(1)
@@ -322,7 +423,10 @@ def scan_status_writes(source: str, rel_path: str) -> list[StatusWrite]:
                 table = _canonical_table(raw_table)
                 if table not in TRANSITION_MAPS:
                     continue
-                for sm in _STATUS_COL_RE.finditer(um.group(3)):
+                for segment in _split_top_level(um.group(3)):
+                    sm = _ASSIGN_RE.match(segment)
+                    if not sm:
+                        continue
                     rhs = sm.group(2).strip()
                     if rhs == "?":
                         status = "?"
@@ -354,9 +458,9 @@ def scan_status_writes(source: str, rel_path: str) -> list[StatusWrite]:
                         )
                     )
         for child in ast.iter_child_nodes(node):
-            visit(child, fn)
+            visit(child, fn, scope_env)
 
-    visit(tree, "<module>")
+    visit(tree, "<module>", module_env)
     return sites
 
 
@@ -372,6 +476,31 @@ def _function_source(source: str, function: str) -> str:
             lines = source.splitlines()
             return "\n".join(lines[node.lineno - 1: node.end_lineno])
     return ""
+
+
+def _function_uses_allowlist(source: str, function: str, constant: str) -> bool:
+    """True when the function contains a `not in <constant>` comparison.
+
+    The backstop for allowlist-kind registry entries (ST-01): the constant's
+    definition existing in the module is not enough — the registered write's
+    function must actually consult it.
+    """
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == function:
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Compare):
+                    if any(isinstance(op, ast.NotIn) for op in sub.ops):
+                        for comparator in sub.comparators:
+                            if isinstance(comparator, ast.Name) and comparator.id == constant:
+                                return True
+                            if (
+                                isinstance(sub.left, ast.Name)
+                                and sub.left.id == constant
+                            ):
+                                return True
+            return False
+    return False
 
 
 def _function_predicates(source: str, function: str) -> set:
@@ -483,11 +612,20 @@ def validate_sites(sites: list[StatusWrite]) -> list[str]:
                 continue
             if justification.startswith("same_function_predecessor:"):
                 _, fn, lit = justification.split(":", 2)
-                if (site.rel_path, fn, site.table, lit) not in site_index:
+                predecessor = site_index.get((site.rel_path, fn, site.table, lit))
+                if predecessor is None:
                     failures.append(
                         f"COMPOSITE BROKEN {site.rel_path}:{site.lineno}: "
                         f"prior {prior!r} relies on predecessor write "
                         f"{fn} -> {lit!r} which is not present"
+                    )
+                elif predecessor.lineno > site.lineno:
+                    failures.append(
+                        f"COMPOSITE ORDER {site.rel_path}:{site.lineno}: "
+                        f"prior {prior!r} relies on predecessor write "
+                        f"{fn} -> {lit!r} at line {predecessor.lineno}, which "
+                        f"is AFTER this write — the claimed sequence does not "
+                        f"hold (parallel-review F-14d)"
                     )
             elif justification.startswith("store_claim_moves_prior:"):
                 _, prior2, via = justification.split(":", 2)
@@ -523,6 +661,25 @@ def validate_sites(sites: list[StatusWrite]) -> list[str]:
                     f"{table}.{status}) no longer carries its registered "
                     f"guard predicate {guard!r} as a complete comparison"
                 )
+
+    # Allowlist USE backstop (ST-01): every allowlist-kind registry entry's
+    # constant must appear in a `not in <CONSTANT>` comparison inside the
+    # registered function — or in the entry's named consult function when the
+    # guard lives elsewhere (cross-function consult). A definition regex alone
+    # let a call-site check be deleted while the guard stayed green.
+    for (module, function, table, status), entry in REGISTRY.items():
+        if entry.kind != "allowlist" or not entry.guards:
+            continue
+        constant = entry.guards[0]
+        consult_at = entry.consult_function or function
+        if not _function_uses_allowlist(
+            _module_source(module), consult_at, constant
+        ):
+            failures.append(
+                f"ALLOWLIST USE MISSING: {module}#{consult_at} (guards the "
+                f"{table}.{status} write in {function}) no longer consults "
+                f"its registered prior-status allowlist {constant!r}"
+            )
 
     # Chain entries: the documented establishers must hold.
     store_src = _store_source()
@@ -573,8 +730,10 @@ class TestStatusTransitionMap(unittest.TestCase):
         sites = self._scan_real_modules()
         self.assertEqual(
             len(sites),
-            13,
-            f"expected the 13 registered status writes, found {len(sites)}: "
+            16,
+            "expected the 16 scanned occurrences of the 13 registered writes "
+            "(the success_sql template counts at its assignment nodes AND its "
+            f"execute use via env resolution), found {len(sites)}: "
             f"{[(s.rel_path, s.function, s.table, s.status) for s in sites]}",
         )
         failures = validate_sites(sites)
@@ -637,6 +796,129 @@ class TestStatusTransitionMap(unittest.TestCase):
         self.assertTrue(
             any("UNMAPPED" in f and "'invented'" in f for f in failures),
             f"planted literal must be named in the failures, got: {failures}",
+        )
+
+    def test_expression_built_writes_are_seen(self):
+        """F-01: writes built across Name assignments and ``+=`` chains are
+        seen and fail closed (the live ``success_sql +=`` idiom's shape)."""
+        cases = [
+            (
+                "import sqlite3\n\n\n"
+                "_SET = \"UPDATE drafts SET \"\n\n\n"
+                "def w(conn: sqlite3.Connection) -> None:\n"
+                "    conn.execute(\n"
+                "        _SET + \"status = 'invented' WHERE id = 1\"\n"
+                "    )\n",
+                "Name-prefix assignment",
+            ),
+            (
+                "import sqlite3\n\n\n"
+                "def w(conn: sqlite3.Connection) -> None:\n"
+                "    sql = \"UPDATE draft_jobs SET status = 'invented'\"\n"
+                "    sql += \" WHERE id = 1\"\n"
+                "    conn.execute(sql)\n",
+                "AugAssign chain",
+            ),
+        ]
+        for planted_src, label in cases:
+            with self.subTest(form=label):
+                sites = scan_status_writes(planted_src, "api/routes/draft_room.py")
+                hit = [s for s in sites if s.status == "invented"]
+                self.assertTrue(
+                    hit,
+                    f"{label}: scanner went blind on the expression-built write",
+                )
+                failures = validate_sites(hit)
+                self.assertTrue(
+                    any("UNMAPPED" in f and "'invented'" in f for f in failures),
+                    f"{label}: expression-built write must fail closed, "
+                    f"got {failures}",
+                )
+
+    def test_allowlist_use_backstop_bites(self):
+        """ST-01 red test: deleting the call-site allowlist consult fails."""
+        src = _module_source("api/routes/draft_room.py")
+        planted = src.replace(
+            "if status not in _COMPILE_ALLOWED_PRIOR_STATUSES:",
+            "if False:",
+            1,
+        )
+        self.assertNotEqual(planted, src, "plant failed to apply")
+        real = _module_source
+
+        def fake_source(rel: str) -> str:
+            return planted if rel == "api/routes/draft_room.py" else real(rel)
+
+        with mock.patch.object(
+            sys.modules[__name__], "_module_source", side_effect=fake_source
+        ):
+            failures = validate_sites(self._scan_real_modules())
+        self.assertTrue(
+            any(
+                "ALLOWLIST USE MISSING" in f and "_COMPILE_ALLOWED_PRIOR_STATUSES" in f
+                for f in failures
+            ),
+            f"deleted allowlist consult must be reported, got {failures}",
+        )
+
+    def test_illegal_edge_red_path(self):
+        """F-14 red test: a registry prior outside the table's edges fails."""
+        entry = REGISTRY[
+            ("api/routes/draft_room.py", "_sync_mark_ready", "drafts", "ready")
+        ]
+        bogus = RegistryEntry(
+            priors=frozenset({"archived"}),
+            kind="inline",
+            guards=entry.guards,
+        )
+        site = StatusWrite(
+            rel_path="api/routes/draft_room.py",
+            function="_sync_mark_ready",
+            lineno=1,
+            table="drafts",
+            column="status",
+            status="ready",
+        )
+        with mock.patch.dict(
+            REGISTRY,
+            {("api/routes/draft_room.py", "_sync_mark_ready", "drafts", "ready"): bogus},
+        ):
+            failures = validate_sites([site])
+        self.assertTrue(
+            any("ILLEGAL EDGE" in f and "'archived'" in f for f in failures),
+            f"illegal prior must produce ILLEGAL EDGE, got {failures}",
+        )
+
+    def test_allowlist_drift_red_path(self):
+        """Red test: an allowlist constant drifting from its registered value
+        fails the guard (the value pin, independent of the use pin)."""
+        real = _module_source
+        src = real("api/routes/draft_room.py")
+        planted = src.replace(
+            '_COMPILE_ALLOWED_PRIOR_STATUSES: frozenset[str] = frozenset(\n'
+            '    {"draft", "needs_review", "failed", "cancelled", "ready"}\n'
+            ")",
+            '_COMPILE_ALLOWED_PRIOR_STATUSES: frozenset[str] = frozenset(\n'
+            '    {"draft", "needs_review", "failed", "cancelled"}\n'
+            ")",
+            1,
+        )
+        self.assertNotEqual(planted, src, "plant failed to apply")
+
+        def fake_source(rel: str) -> str:
+            return planted if rel == "api/routes/draft_room.py" else real(rel)
+
+        with mock.patch.object(
+            sys.modules[__name__], "_module_source", side_effect=fake_source
+        ):
+            failures = validate_sites(self._scan_real_modules())
+        self.assertTrue(
+            any(
+                "mirrored allowlist _COMPILE_ALLOWED_PRIOR_STATUSES" in f
+                and "drifted" in f
+                for f in failures
+            ),
+            f"allowlist drift must be reported, got {failures}",
         )
 
     def test_planted_unconstrained_parameterized_write_fails_closed(self):
@@ -736,6 +1018,23 @@ class TestStatusTransitionMap(unittest.TestCase):
                 "        \"UPDATE draft_jobs SET status = \" + s + \" WHERE id = 1\"\n"
                 "    )\n",
                 "+ concatenation",
+            ),
+            (
+                "import sqlite3\n\n\n"
+                "def w(conn: sqlite3.Connection, s: str) -> None:\n"
+                "    conn.execute(\n"
+                "        \"UPDATE drafts SET status = '%(key)s' WHERE id = 1\"\n"
+                "        % {\"key\": s},\n"
+                "    )\n",
+                "percent-mapping template",
+            ),
+            (
+                "import sqlite3\n\n\n"
+                "def w(conn: sqlite3.Connection, s: str) -> None:\n"
+                "    conn.execute(\n"
+                "        (\"UPDATE drafts SET status = '%s' WHERE id = 1\") % s\n"
+                "    )\n",
+                "concat + percent-template",
             ),
         ]
         for planted_src, label in forms:

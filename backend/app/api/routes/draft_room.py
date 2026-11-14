@@ -5007,11 +5007,14 @@ async def dispose_draft_finding(
     * ``waive`` needs ``waivable=1``, an unchanged span text and rule version,
       a user actor, and a non-empty ``note``.
     * ``dismiss``/``waive`` of a finding that is no longer ``open`` is refused
-      409 ``finding_not_open`` with ``lock_version`` unchanged (issue #901).
-    * A retryable storage fault inside the disposition transaction (e.g.
-      ``sqlite3.OperationalError`` lock contention) surfaces as a server-side
-      5xx, NOT 409 — only the uniqueness-violation trigger keeps the 409
-      ``conflict`` mapping (issue #901).
+      409 ``finding_not_open`` with ``lock_version`` unchanged (issue #901);
+      earlier preconditions keep their own codes (a blocker's dismissal is
+      refused 409 ``blocker_not_dismissable``, a non-waivable waive 409
+      ``finding_not_waivable``, a blank note 422).
+    * A constraint violation raised inside the disposition transaction
+      (``sqlite3.IntegrityError``) keeps the 409 ``conflict`` mapping; other
+      storage faults (e.g. ``sqlite3.OperationalError`` lock contention)
+      surface as server-side 5xx, NOT 409 (issue #901).
 
     Dismiss and waive additionally refuse an archived draft (409
     ``invalid_state``) and a stale ``lock_version`` (409
@@ -5112,10 +5115,12 @@ async def dispose_draft_finding(
                 )
             )
 
-        # No route-tail event: each disposition writes exactly one audit row
-        # inside its own transaction — apply's has existed there all along, and
-        # dismiss/waive moved theirs into DraftStore with the same guards (issue
-        # #788 / T1-08-K-02). The note text stays in
+        # No route-tail draft_events row: each disposition writes exactly one
+        # ``draft_events`` row inside its own transaction — apply's has existed
+        # there all along, and dismiss/waive moved theirs into DraftStore with
+        # the same guards (issue #788 / T1-08-K-02). (The best-effort global
+        # ``security_audit_log`` tail below is a separate, platform-level
+        # record, not the draft event ledger.) The note text stays in
         # ``draft_findings.resolution_note``; payloads carry IDs and codes only.
         await drain_audit(
             safe_record_security_event(

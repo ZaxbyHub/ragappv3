@@ -41,8 +41,12 @@ Invariants enforced here that SQLite cannot express (SPEC sections 5.7, 9.1, 10.
 * A caller of this store may not write an arbitrary status string — every
   status change routed through here goes through the transition tables below
   and is rejected otherwise. The declared co-owners above write
-  ``drafts.status`` directly and therefore keep their own mirrored prior-status
-  allowlists instead of calling the module-private tables below.
+  ``drafts.status``, ``draft_jobs.status``, ``draft_inputs.parse_status``, and
+  — on the apply path — ``draft_findings.status`` directly; each such write
+  resolves, per the guard in ``tests/draft_room/test_n06b_status_transition_map.py``,
+  to a named mirrored prior-status allowlist (kept by the route and pipeline
+  co-owners), a located inline prior-status guard, or the documented
+  settle-pair chain — never to an unregistered literal.
 * Revision-number allocation and current-revision replacement happen inside a
   single ``BEGIN IMMEDIATE`` transaction.
 
@@ -3632,61 +3636,6 @@ class DraftStore:
             raise
         return finding_id
 
-    def list_findings(
-        self,
-        *,
-        draft_id: int,
-        owner_id: int,
-        revision_id: Optional[int] = None,
-        job_id: Optional[int] = None,
-        status: Optional[str] = None,
-        severity: Optional[str] = None,
-        limit: int = 100,
-        offset: int = 0,
-    ) -> tuple[list[DraftFindingRecord], int]:
-        """Page through a draft's findings, newest first.
-
-        ``status``/``severity`` are bound in SQL, so a filtered page reaches
-        rows older than any Python-side scan window and ``total`` is the exact
-        filtered row count, not a scan-window cap.
-
-        Raises:
-            DraftValidationError: ``status``/``severity`` is not a known value.
-        """
-        self.get_draft(draft_id, owner_id)
-        if status is not None and status not in FINDING_STATUSES:
-            raise DraftValidationError(f"unknown finding status: {status!r}")
-        if severity is not None and severity not in FINDING_SEVERITIES:
-            raise DraftValidationError(f"unknown finding severity: {severity!r}")
-        where = ["draft_id = ?"]
-        params: list[Any] = [draft_id]
-        if revision_id is not None:
-            where.append("revision_id = ?")
-            params.append(revision_id)
-        if job_id is not None:
-            where.append("job_id = ?")
-            params.append(job_id)
-        if status is not None:
-            where.append("status = ?")
-            params.append(status)
-        if severity is not None:
-            where.append("severity = ?")
-            params.append(severity)
-        clause = " AND ".join(where)
-        # clause is built only from literal fragments; all values are bound parameters
-        total = int(
-            self._db.execute(
-                f"SELECT COUNT(*) FROM draft_findings WHERE {clause}", params  # nosec B608
-            ).fetchone()[0]
-        )
-        # clause is built only from literal fragments; all values are bound parameters
-        rows = self._db.execute(
-            f"SELECT {_FINDING_COLUMNS} FROM draft_findings WHERE {clause} "  # nosec B608
-            "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
-            (*params, limit, offset),
-        ).fetchall()
-        return [_row_to_finding(r) for r in rows], total
-
     def findings_page_after_authorization(
         self,
         *,
@@ -3696,7 +3645,7 @@ class DraftStore:
         severity: Optional[str] = None,
         limit: int,
         offset: int,
-    ) -> tuple[Optional[int], bool, list, int]:
+    ) -> tuple[Optional[int], bool, list[DraftFindingRecord], int]:
         """Read the findings page plus its eligibility inputs in one pass.
 
         The caller (findings-list route, issue #901 AC3) has already loaded
@@ -3705,16 +3654,17 @@ class DraftStore:
         WITHOUT re-selecting the ``drafts`` row: the current revision id, the
         compile-liveness probe (the same ``_assert_no_active_compile``
         predicate :meth:`has_active_compile_job` uses), and the bound filtered
-        findings page with its exact total (the same query
-        :meth:`list_findings` runs). Read-only — no ``BEGIN IMMEDIATE``, no
-        transaction held across an ``await`` (the whole method runs inside one
-        caller-side ``_run_store`` hop).
+        findings page with its exact total. Read-only — no ``BEGIN IMMEDIATE``,
+        no transaction held across an ``await`` (the whole method runs inside
+        one caller-side ``_run_store`` hop).
 
-        This method deliberately performs NO ownership check of its own (the
-        route's hop-1 ``get_draft`` did it) and takes no ``owner_id`` for
-        exactly that reason — unlike :meth:`list_findings`, which enforces
-        ownership itself and must stay the reader of record for any caller
-        that has not already authorized.
+        This method deliberately performs NO ownership check of its own and
+        takes no ``owner_id`` — that is its contract (SPEC section 1.2's
+        post-authorization exception): it MUST only be called after the same
+        request has run ``get_draft(draft_id, owner_id)`` and evaluated vault
+        access. Its sole caller is the findings-list route, whose hop-1
+        ``get_draft`` raises ``DraftNotFoundError`` for a foreign or missing
+        draft before this method can run.
         """
         if status is not None and status not in FINDING_STATUSES:
             raise DraftValidationError(f"unknown finding status: {status!r}")

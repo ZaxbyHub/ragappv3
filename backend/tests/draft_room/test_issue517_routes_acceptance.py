@@ -4,11 +4,12 @@ disclosure.
 Discriminating regression tests (expected RED at HEAD d9e3460):
 
 * **AC11 (DRAFT-021)** — the findings listing scans only the newest
-  ``_MAX_LIST_SCAN_ROWS`` (2000) rows in Python because
-  ``DraftStore.list_findings`` has no SQL status/severity filters, so a
-  ledger of 2050 findings reports a capped total, truncates the last page,
-  loses filtered rows older than the scan window, and finding disposition
-  404s on them (``_sync_get_finding`` scans too).
+  ``_MAX_LIST_SCAN_ROWS`` (2000) rows in Python because the findings-list
+  reader (``DraftStore.list_findings`` at the time; now
+  ``findings_page_after_authorization``) had no SQL status/severity filters,
+  so a ledger of 2050 findings reports a capped total, truncates the last
+  page, loses filtered rows older than the scan window, and finding
+  disposition 404s on them (``_sync_get_finding`` scans too).
 * **AC13 backend part** — export returns fact/approval/content headers but
   no unresolved-issues disclosure; the contract pinned here is an explicit
   ``X-Draft-Open-Blockers: <count>`` header on every export (plus the

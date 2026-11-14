@@ -18,6 +18,7 @@ coverage without touching the frozen check files:
 
 from __future__ import annotations
 
+import ast
 import os
 import re
 import sys
@@ -86,6 +87,21 @@ class TestFindingsPageStoreContract(DraftStoreTestBase):
         self.assertTrue(
             {"draft_revisions", "draft_jobs", "draft_findings"} <= touched,
             f"the eligibility inputs and the page must all be read; saw {sorted(touched)}",
+        )
+        drafts_writes = [
+            s
+            for s in statements
+            if re.search(
+                r"\b(UPDATE|INSERT INTO|REPLACE INTO|DELETE FROM)\s+drafts\b",
+                s,
+                re.I,
+            )
+        ]
+        self.assertEqual(
+            drafts_writes,
+            [],
+            f"the batched reader is read-only and must never write drafts; "
+            f"saw {drafts_writes}",
         )
 
     def test_unknown_status_is_rejected(self):
@@ -205,6 +221,121 @@ class TestSpec103ScopingPinned(unittest.TestCase):
             centralize,
             "the 'Centralize ... reject all others' sentence must come AFTER "
             "the co-owner scoping clause so it reads as scoped",
+        )
+        # The registered sources are exactly what the registry implements:
+        # allowlists, located inline guards, and the settle-pair chain. A
+        # "DraftStore transition call" is not a DIRECT write source — direct
+        # writes bypass the store (IA-01/CD-04: the SPEC must not name a
+        # mechanism that contradicts the guard's own taxonomy).
+        self.assertNotIn(
+            "draftstore transition call",
+            lowered,
+            "SPEC 10.3 must not list 'a DraftStore transition call' as a "
+            "direct-write resolution source: direct writes bypass the store "
+            "and the registry implements allowlist/inline-guard/chain kinds "
+            "only",
+        )
+
+
+class TestOwnerMapDocstringPinned(unittest.TestCase):
+    """IA-01/CD-04: the store docstring that SPEC 4.1 and 10.3 cross-reference
+    as the owner map must describe the shipped mechanism — all four directly
+    written tables and the three registered source kinds — not the old
+    allowlists-only story (the frozen AC14 vocabulary check cannot see this)."""
+
+    longMessage = False
+
+    def test_docstring_names_tables_and_kinds(self):
+        store_src = (
+            Path(__file__).resolve().parents[2] / "app" / "services" / "draft_store.py"
+        ).read_text(encoding="utf-8-sig")
+        docstring = ast.get_docstring(ast.parse(store_src)) or ""
+        lowered = " ".join(docstring.split()).lower()
+        for table in (
+            "drafts.status",
+            "draft_jobs.status",
+            "draft_inputs.parse_status",
+            "draft_findings.status",
+        ):
+            self.assertIn(
+                table,
+                lowered,
+                f"the owner-map docstring must name the directly written "
+                f"table {table}",
+            )
+        for kind_term in ("allowlist", "inline prior-status guard", "settle-pair"):
+            self.assertIn(
+                kind_term,
+                lowered,
+                f"the owner-map docstring must name the registered source "
+                f"kind {kind_term!r}",
+            )
+        self.assertNotIn(
+            "instead of calling the module-private tables below",
+            lowered,
+            "the old allowlists-only story ('...instead of calling the "
+            "module-private tables below') must not survive: only the route "
+            "and pipeline co-owners keep mirrored allowlists",
+        )
+
+
+class TestSpec12PostAuthorizationException(unittest.TestCase):
+    """IA-02: SPEC 1.2's MUST rule carries a named post-authorization
+    exception, and the exception's caller contract is pinned in source."""
+
+    longMessage = False
+
+    def test_spec_12_names_the_exception(self):
+        spec = _SPEC.read_text(encoding="utf-8-sig")
+        head = spec[: spec.index("## 2")] if "## 2" in spec else spec[:4000]
+        lowered = " ".join(head.split()).lower()
+        self.assertIn(
+            "findings_page_after_authorization",
+            lowered,
+            "SPEC 1.2 must name the sanctioned post-authorization reader",
+        )
+        self.assertIn(
+            "post-authorization",
+            lowered,
+            "SPEC 1.2 must state the post-authorization exception explicitly",
+        )
+
+    def test_route_caller_order_pinned(self):
+        route_src = (
+            Path(__file__).resolve().parents[2] / "app" / "api" / "routes" / "draft_room.py"
+        ).read_text(encoding="utf-8-sig")
+        tree = ast.parse(route_src)
+        target = None
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
+                node.name == "list_draft_findings"
+            ):
+                target = node
+                break
+        self.assertIsNotNone(target, "list_draft_findings route handler missing")
+        get_draft_line = vault_line = batched_line = None
+        for sub in ast.walk(target):
+            if isinstance(sub, ast.Call):
+                text = ast.unparse(sub.func)
+                if text.endswith("get_draft") and get_draft_line is None:
+                    get_draft_line = sub.lineno
+                elif "findings_page_after_authorization" in text:
+                    batched_line = sub.lineno
+                elif text.endswith("_require_vault_read") and vault_line is None:
+                    vault_line = sub.lineno
+        self.assertIsNotNone(get_draft_line, "hop-1 get_draft call missing")
+        self.assertIsNotNone(vault_line, "_require_vault_read call missing")
+        self.assertIsNotNone(batched_line, "batched-reader call missing")
+        self.assertLess(
+            get_draft_line,
+            vault_line,
+            "ownership (get_draft) must precede the vault read",
+        )
+        self.assertLess(
+            vault_line,
+            batched_line,
+            "vault authorization must precede the draft_id-only batched read "
+            "(the SPEC 1.2 exception's caller contract)",
         )
 
 
