@@ -409,3 +409,168 @@ def test_fc3r3_var_chain_inside_loop_flags(tmp_path) -> None:
 
 def test_control_guarded_function_local_stays_clean(tmp_path) -> None:
     _assert_clean(tmp_path, GUARDED_FUNCTION_LOCAL_CONTROL, "guarded control")
+
+
+# ---------------------------------------------------------------------------
+# Feedback round (FB-002/FB-003/FB-009) legs
+# ---------------------------------------------------------------------------
+
+
+def test_fb002_class_body_literal_flags(tmp_path) -> None:
+    """FB-002: the whole-tree literal pass restores class-body coverage
+    (the scoped traversal skips ClassDef statements)."""
+    source = (
+        "from fastapi import HTTPException\n"
+        "\n"
+        "\n"
+        "class H:\n"
+        '    x = HTTPException(status_code=500, detail=str("boom"))\n'
+    )
+    result = _run_gate(tmp_path, source)
+    assert result.returncode == 1 and _flagged(result) == [5], (
+        f"FB-002 class-body: literal-500 echo must flag; "
+        f"exit={result.returncode} flagged={_flagged(result)}; "
+        f"stdout: {result.stdout}"[:DIAGNOSTIC_LIMIT]
+    )
+
+
+def test_fb002_decorator_arg_literal_flags(tmp_path) -> None:
+    """FB-002: decorator-argument placements are covered by the literal
+    pass."""
+    source = (
+        "from fastapi import HTTPException\n"
+        "\n"
+        "\n"
+        "def deco(x):\n"
+        "    return x\n"
+        "\n"
+        "\n"
+        '@deco(HTTPException(500, str("boom")))\n'
+        "def f():\n"
+        "    return 1\n"
+    )
+    result = _run_gate(tmp_path, source)
+    assert result.returncode == 1 and _flagged(result) == [8], (
+        f"FB-002 decorator: literal-500 echo must flag; "
+        f"exit={result.returncode} flagged={_flagged(result)}; "
+        f"stdout: {result.stdout}"[:DIAGNOSTIC_LIMIT]
+    )
+
+
+def test_fb002_default_arg_literal_flags(tmp_path) -> None:
+    """FB-002: default-argument placements are covered by the literal
+    pass."""
+    source = (
+        "from fastapi import HTTPException\n"
+        "\n"
+        "\n"
+        'def g(e=HTTPException(500, detail=str("boom"))):\n'
+        "    return e\n"
+    )
+    result = _run_gate(tmp_path, source)
+    assert result.returncode == 1 and _flagged(result) == [4], (
+        f"FB-002 default-arg: literal-500 echo must flag; "
+        f"exit={result.returncode} flagged={_flagged(result)}; "
+        f"stdout: {result.stdout}"[:DIAGNOSTIC_LIMIT]
+    )
+
+
+def test_fb003_try_rebind_handler_echo_flags(tmp_path) -> None:
+    """FB-003: a status rebound inside the try body is visible to the
+    except-handler echo (handler base merges the end-of-body state)."""
+    source = (
+        "class DraftRoomHTTPError(Exception):\n"
+        "    pass\n"
+        "\n"
+        "\n"
+        "def f(exc, flag):\n"
+        "    status = 404\n"
+        "    try:\n"
+        "        status = 503\n"
+        "        risky()\n"
+        "    except Exception:\n"
+        '        raise DraftRoomHTTPError(status, str(exc), "x")\n'
+    )
+    result = _run_gate(tmp_path, source)
+    assert result.returncode == 1 and _flagged(result) == [11], (
+        f"FB-003 try-rebind-handler: the handler echo must flag; "
+        f"exit={result.returncode} flagged={_flagged(result)}; "
+        f"stdout: {result.stdout}"[:DIAGNOSTIC_LIMIT]
+    )
+
+
+def test_fb003_guarded_handler_control_stays_clean(tmp_path) -> None:
+    """FB-003 control: a dominating >= 500 guard inside the handler keeps
+    the refined fall-through clean even after the body merge."""
+    source = (
+        "class DraftRoomHTTPError(Exception):\n"
+        "    pass\n"
+        "\n"
+        "\n"
+        "def f(exc, flag):\n"
+        "    status = 400\n"
+        "    try:\n"
+        "        status = 503\n"
+        "        risky()\n"
+        "    except Exception:\n"
+        "        if status >= 500:\n"
+        '            raise DraftRoomHTTPError(status, "fixed detail", "x")\n'
+        '        return DraftRoomHTTPError(status, str(exc), "mapper")\n'
+    )
+    _assert_clean(tmp_path, source, "FB-003 guarded-handler control")
+
+
+def test_fb009_dict_rebound_to_int_flags(tmp_path) -> None:
+    """FB-009: a dict-bound name rebound to an int resolves the NEW value
+    (the stale dicts entry is cleared on non-dict rebind)."""
+    source = (
+        "class DraftRoomHTTPError(Exception):\n"
+        "    pass\n"
+        "\n"
+        "\n"
+        "def f(exc):\n"
+        '    codes = {"conflict": 409}\n'
+        "    codes = 503\n"
+        '    raise DraftRoomHTTPError(codes, str(exc), "x")\n'
+    )
+    result = _run_gate(tmp_path, source)
+    assert result.returncode == 1 and _flagged(result) == [8], (
+        f"FB-009 dict-rebind: the int rebind must resolve; "
+        f"exit={result.returncode} flagged={_flagged(result)}; "
+        f"stdout: {result.stdout}"[:DIAGNOSTIC_LIMIT]
+    )
+
+
+def test_fb009_dict_rebind_below_500_stays_clean(tmp_path) -> None:
+    """FB-009 control: the same rebind to a sub-500 value must NOT flag
+    (the stale 5xx dict values are gone after the rebind)."""
+    source = (
+        "class DraftRoomHTTPError(Exception):\n"
+        "    pass\n"
+        "\n"
+        "\n"
+        "def f(exc):\n"
+        '    codes = {"boom": 503}\n'
+        "    codes = 404\n"
+        '    raise DraftRoomHTTPError(codes, str(exc), "x")\n'
+    )
+    _assert_clean(tmp_path, source, "FB-009 dict-rebind-404 control")
+
+
+def test_fb003_suppress_direction_rebind_stays_clean(tmp_path) -> None:
+    """TF-003: REPLACE semantics in the suppress direction — a 500 binding
+    refined away, then rebound DOWN to 404 before the echo, stays
+    unflagged (an order-insensitive union mutant fails this leg)."""
+    source = (
+        "class DraftRoomHTTPError(Exception):\n"
+        "    pass\n"
+        "\n"
+        "\n"
+        "def f(exc):\n"
+        "    status = 500\n"
+        "    if status >= 500:\n"
+        '        raise DraftRoomHTTPError(status, "fixed", "x")\n'
+        "    status = 404\n"
+        '    raise DraftRoomHTTPError(status, str(exc), "mapper")\n'
+    )
+    _assert_clean(tmp_path, source, "TF-003 suppress-direction rebind")

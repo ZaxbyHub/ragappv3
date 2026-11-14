@@ -208,6 +208,10 @@ def _visit(
                     if dv is not None:
                         state.dicts[tgt.id] = set(dv)
                     else:
+                        # A non-dict rebind clears a stale dict entry so the
+                        # name resolves from vars afterwards (review FB-009:
+                        # dicts-first resolution otherwise shadows the int).
+                        state.dicts.pop(tgt.id, None)
                         bound = _binding_values(stmt.value, state)
                         state.vars[tgt.id] = bound if bound is not None else set()
             continue
@@ -220,6 +224,7 @@ def _visit(
                 if dv is not None:
                     state.dicts[stmt.target.id] = set(dv)
                 else:
+                    state.dicts.pop(stmt.target.id, None)
                     bound = _binding_values(stmt.value, state)
                     state.vars[stmt.target.id] = (
                         bound if bound is not None else set()
@@ -252,7 +257,6 @@ def _visit(
             while True:
                 if isinstance(stmt, ast.While):
                     _check_calls_in(stmt.test, state, hits)
-                    del hits[len(hits):]
                 body_state = state.clone()
                 _visit(stmt.body, body_state, hits)
                 if stmt.orelse:
@@ -283,6 +287,7 @@ def _visit(
             _visit(stmt.body, body_state, hits)
             _visit(stmt.orelse, body_state, hits)
             handler_base = state.clone()
+            handler_base.merge(body_state)
             for h in stmt.handlers:
                 hs = handler_base.clone()
                 _visit(h.body, hs, hits)
@@ -332,6 +337,11 @@ def _visit(
             _visit(stmt.body, body_state, hits)
             _visit(stmt.orelse, body_state, hits)
             handler_base = state.clone()
+            # A status rebound inside the try body is visible to the handler
+            # (the exception may fire after the binding) — merge the end-of-
+            # body state into the handler base so handler echo calls see it
+            # (review FB-003: pre-try-only state was a false negative).
+            handler_base.merge(body_state)
             for h in stmt.handlers:
                 hs = handler_base.clone()
                 _visit(h.body, hs, hits)
@@ -380,7 +390,16 @@ def raw_500_detail_lines(source: str) -> list[int]:
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
     ]:
         _visit(fn.body, _ScopeState(module_dicts), hits)
-    return sorted(hits)
+    # Whole-tree literal pass (review FB-002): the scoped traversal above
+    # visits module-level non-scope statements and function bodies only, so
+    # audited calls in class bodies, decorator arguments, default arguments,
+    # and annotations would escape the literal arm the pre-widening gate's
+    # whole-tree ast.walk covered. With an EMPTY state only literal-status
+    # calls resolve (Name bindings are invisible), so this pass adds exactly
+    # the literal placements back without weakening the flow analysis; set
+    # dedup keeps placements the scoped passes already recorded single.
+    _check_calls_in(tree, _ScopeState({}), hits)
+    return sorted(set(hits))
 
 
 def main() -> int:

@@ -17,7 +17,10 @@
     (own row excluded) settles the file at the terminal duplicate state with
     ZERO vector writes, for every caller — upload retry, admin retry, and the
     reindex path; the finalization partial index stays as the race backstop
-    with a fenced row settlement of its own;
+    with a fenced row settlement of its own, now mirrored on `process_file`'s
+    converged finalize tail (shared `_settle_duplicate_finalize_race`
+    helper — the legacy scan/email/FileWatcher path settles the race loser
+    too instead of stranding it in `processing`);
   - both ingestion transports (legacy ladder and lease) treat the duplicate
     class as deterministic, mirroring the #820 DIMENSION_CHANGED first-attempt
     terminal settle (no requeue, no `attempt_cap_exceeded` prefix); an
@@ -27,28 +30,38 @@
   - reindex jobs track duplicate-hash failures in a separate non-retryable
     set (`duplicate_file_ids`): duplicate-only failures settle the job
     `failed` on the first attempt; mixed failures retry only the transient
-    ids; every terminal path composes the cumulative duplicate outcomes into
-    `result_json` (the operator-visible surface), and a job holding a
-    permanent duplicate never completes;
-  - the attempt-cap terminal writer now sets `phase_message` alongside
-    `error_message` (the same redacted stable reason, 500-char cap), so a
-    capped row can no longer keep its last stage label ("Writing vector
-    index").
+    ids; the worker-settled terminal paths (completed-with-duplicates,
+    attempt cap, duplicate-only) compose the cumulative duplicate outcomes
+    into `result_json` (the operator-visible surface), and a job holding a
+    permanent duplicate never completes. STALL-RECLAIM AND JANITOR
+    SETTLEMENTS keep the error-only shape (duplicates remain discoverable in
+    `payload_json`), and a staged dimension/identity rebuild still aborts on
+    any per-file failure with full-vault retry semantics — the
+    duplicate-accounting residuals on the janitor/stall-reclaim paths and
+    the staged-rebuild path are disclosed in the PR body;
+  - the attempt-cap terminal writers now set `phase_message` alongside
+    `error_message` (the same redacted reason, 500-char cap) — the transport
+    writer AND the janitor cap sweeps — so a capped row can no longer keep
+    its last stage label ("Writing vector index").
 - **#1119** — the HTTP-500 detail-hygiene CI gate
   (`scripts/check_a04_http500_detail_hygiene.py`) catches the
   variable-status shape issue #917 was filed about: a `DraftRoomHTTPError`
   (or `HTTPException`) call whose status is computed at runtime is flagged
   when inline, time-ordered per-scope analysis resolves it to a 5xx-capable
   value-set (literals; module-level and function-local mapping dicts and
-  their `.get(key, DEFAULT)` defaults) with an interpolated detail —
-  dominating `>= 500` guards prove guarded fall-through arms safe (strict
-  `>` guards do not refine: 500 stays reachable); sync functions, async
-  functions, and module-level code are covered (the literal arm is preserved
-  everywhere). The promotion path-conflict 409 detail no longer echoes the
-  server filesystem destination path: fixed client-safe detail, with the RAW
-  path logged server-side from the new structured
-  `DraftPromotionPathConflictError.dest_path` attribute (repr-escaping-free,
-  so single backslashes survive on Windows).
+  their `.get(key, DEFAULT)` defaults; annotated assignments; `with`/
+  `async with` bodies; loop bodies via a state fixpoint that resolves
+  var-to-var chains) with an interpolated detail — dominating `>= 500`
+  guards prove guarded fall-through arms safe (strict `>` guards do not
+  refine: 500 stays reachable), non-guard branches merge by union, a
+  non-dict rebind clears a stale mapping binding, and a whole-tree literal
+  pass keeps every placement the pre-widening gate covered (class bodies,
+  decorators, default args, module level, sync/async function bodies). The
+  promotion path-conflict 409 detail no longer echoes the server filesystem
+  destination path: fixed client-safe detail (logged at warning per the
+  module's 4xx doctrine), with the RAW path logged server-side from the new
+  structured `DraftPromotionPathConflictError.dest_path` attribute
+  (repr-escaping-free, so single backslashes survive on Windows).
 
 ## Why
 
@@ -67,13 +80,19 @@ promotion 409 detail disclosed the server path to authenticated users.
   `backend/tests/test_a04_variable_status_echo.py` and
   `backend/tests/draft_room/test_promotion_conflict_detail.py` ship as the
   #1119 regression specs.
-- `backend/tests/test_1112_duplicate_settle.py` (11 tests): guard legs
+- `backend/tests/test_1112_duplicate_settle.py` (14 tests): guard legs
   (indexed/partial owner, own-row control, bytes-changed restore), both
-  transports, nonduplicate-FK control, the finalization-race backstop, and
-  the three reindex-job terminal shapes.
-- `backend/tests/test_a04_variable_status_echo_impl.py` (8 legs): the gate
-  analyzer's mutation shapes (mixed mappings, function-local mappings,
-  rebinding, call-before-rebind, async/module-level literals, strict-gt
-  guard, guarded control).
+  transports, nonduplicate-FK control, the finalization-race backstop (plus
+  its multi-worker write-permit wiring), the three reindex-job terminal
+  shapes, a global-failure scope-preservation leg, and an end-to-end leg
+  driving the REAL `_reindex_embed_all` over a seeded duplicate pair
+  (asserts `duplicate_file_ids`, failed-scope membership, the stable code in
+  details, and exactly one vector generation).
+- `backend/tests/test_a04_variable_status_echo_impl.py` (24 legs): the gate
+  analyzer's mutation shapes — mixed mappings (module and function-local),
+  rebinding (after-guard, call-before-rebind, dict-to-int both directions),
+  async/module-level literals, strict-gt guard, try/else and try-handler
+  echoes, with/async-with and loop bindings, var chains, class-body/
+  decorator/default-arg literal placements, and guarded controls.
 - `backend/tests/test_issue562_guardrail_no_raw_ingest_error_persist.py`:
   `DUPLICATE_FILE` registered in the shipped-codes census.

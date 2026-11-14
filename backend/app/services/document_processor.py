@@ -4286,6 +4286,62 @@ class DocumentProcessor:
         await clear_progress(self.pool, file_id)
         return True
 
+    async def _settle_duplicate_finalize_race(
+        self, file_id: int, exc: sqlite3.IntegrityError
+    ) -> None:
+        """issue #1112 finalization race backstop, shared by both ingest
+        tails (review FB-008 — the tails converge per issue #513 W9/C26, so
+        the race handling converges too).
+
+        A sibling row flipped to indexed/partial between the pre-vector
+        duplicate-ownership guard and this status flip, so the partial
+        unique index fired at finalization — OUTSIDE the processing try
+        whose generic handler settles the row. Perform the same fenced
+        settlement the generic handler would (guarded UPDATE: rowcount 0
+        means a concurrent winner or cancel owns the row — log and skip),
+        then re-raise so the transports / reindex runner apply duplicate
+        semantics. Other integrity failures (FK, CHECK, other tables)
+        re-raise unchanged through this same arm. Must be called from the
+        ``except sqlite3.IntegrityError`` block of a finalize call.
+        """
+        if not _is_duplicate_hash_integrity_error(exc):
+            raise
+        safe_error = format_ingest_error(INGEST_ERROR_DUPLICATE_FILE)
+        landed = False
+        async with self._write_session() as conn:
+            landed = (
+                conn.execute(
+                    "UPDATE files SET status='error', "
+                    "error_message=?, phase='error' WHERE id = ? "
+                    "AND status IN ('pending', 'processing')",
+                    (safe_error[:500], file_id),
+                ).rowcount
+                > 0
+            )
+            if landed:
+                conn.commit()
+        # set_phase acquires pool.write_permit — the SAME non-reentrant
+        # permit _write_session holds under multi-worker ingestion
+        # (BackgroundProcessor.start wires one Semaphore(1) into both), so
+        # it must run AFTER the session exits (the generic handler's own
+        # ordering), never inside it.
+        if landed:
+            await set_phase(
+                self.pool,
+                file_id,
+                phase="error",
+                message=safe_error,
+                percent=None,
+            )
+        else:
+            logger.warning(
+                "Duplicate finalization collision for file_id=%d "
+                "lost the row race (concurrent settle/cancel owns "
+                "it); skipping fenced error write",
+                file_id,
+            )
+        raise
+
     async def process_file(
         self,
         file_path: str,
@@ -4969,14 +5025,25 @@ class DocumentProcessor:
         # enqueue, near-dup centroid, progress cleanup). Both ingest entry
         # points converge here with identical semantics (issue #513 W9/C26).
         stage_started_at = time.monotonic()
-        finalized = await self._finalize_indexed_success(
-            file_id=file_id,
-            vault_id=vault_id,
-            chunks=chunks,
-            document_text=document_text,
-            chunks_failed_count=chunks_failed_count,
-            embeddings=chunk_embeddings,
-        )
+        try:
+            finalized = await self._finalize_indexed_success(
+                file_id=file_id,
+                vault_id=vault_id,
+                chunks=chunks,
+                document_text=document_text,
+                chunks_failed_count=chunks_failed_count,
+                embeddings=chunk_embeddings,
+            )
+        except sqlite3.IntegrityError as exc:
+            # issue #1112 finalization race backstop — the same fenced
+            # settlement its twin process_existing_file applies (review
+            # FB-008: the tails converge per issue #513 W9/C26, so the race
+            # handling converges too). Legacy scan/email/FileWatcher callers
+            # have task.file_id=None, whose transport failure path does NOT
+            # settle the files row — without this arm a race loser could
+            # strand in 'processing'.
+            await self._settle_duplicate_finalize_race(file_id, exc)
+            finalized = False
         if not finalized:
             logger.info(
                 "Ingest generation voided for file_id=%d: row settled "
@@ -5899,53 +5966,9 @@ class DocumentProcessor:
                 vector_target=vector_target,
             )
         except sqlite3.IntegrityError as exc:
-            # issue #1112 finalization race backstop: a sibling row flipped
-            # to indexed/partial between the pre-vector guard and this
-            # status flip, so the partial unique index fired HERE — outside
-            # the processing try whose generic handler settles the row.
-            # Perform the same fenced settlement the generic handler would
-            # (guarded UPDATE: rowcount 0 means a concurrent winner or
-            # cancel owns the row — log and skip), then re-raise so the
-            # transports / reindex runner apply duplicate semantics. Other
-            # integrity failures (FK, CHECK, other tables) re-raise
-            # unchanged through this same arm.
-            if not _is_duplicate_hash_integrity_error(exc):
-                raise
-            safe_error = format_ingest_error(INGEST_ERROR_DUPLICATE_FILE)
-            landed = False
-            async with self._write_session() as conn:
-                landed = (
-                    conn.execute(
-                        "UPDATE files SET status='error', "
-                        "error_message=?, phase='error' WHERE id = ? "
-                        "AND status IN ('pending', 'processing')",
-                        (safe_error[:500], file_id),
-                    ).rowcount
-                    > 0
-                )
-                if landed:
-                    conn.commit()
-            # set_phase acquires pool.write_permit — the SAME non-reentrant
-            # permit _write_session holds under multi-worker ingestion
-            # (BackgroundProcessor.start wires one Semaphore(1) into both), so
-            # it must run AFTER the session exits (the generic handler's own
-            # ordering), never inside it.
-            if landed:
-                await set_phase(
-                    self.pool,
-                    file_id,
-                    phase="error",
-                    message=safe_error,
-                    percent=None,
-                )
-            else:
-                logger.warning(
-                    "Duplicate finalization collision for file_id=%d "
-                    "lost the row race (concurrent settle/cancel owns "
-                    "it); skipping fenced error write",
-                    file_id,
-                )
-            raise
+            # issue #1112 finalization race backstop (shared helper — the
+            # same fenced settlement its process_file twin applies).
+            await self._settle_duplicate_finalize_race(file_id, exc)
         if not finalized:
             logger.info(
                 "Ingest generation voided for file_id=%d: row settled "

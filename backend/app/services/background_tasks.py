@@ -1088,7 +1088,8 @@ class BackgroundProcessor:
             conn.execute(
                 """
                 UPDATE files SET status = 'error', phase = 'error',
-                    error_message = 'lease_attempt_cap_exceeded'
+                    error_message = 'lease_attempt_cap_exceeded',
+                    phase_message = 'lease_attempt_cap_exceeded'
                 WHERE status IN ('pending', 'processing')
                   AND (phase IS NULL OR phase != 'error')
                   AND id IN (
@@ -1538,7 +1539,8 @@ class BackgroundProcessor:
                         if cap_fids:
                             cap_cursor = conn.executemany(
                                 "UPDATE files SET status = 'error', phase = 'error', "
-                                "error_message = 'lease_attempt_cap_exceeded' "
+                                "error_message = 'lease_attempt_cap_exceeded', "
+                                "phase_message = 'lease_attempt_cap_exceeded' "
                                 "WHERE id = ? AND status IN ('processing', 'pending')",
                                 [(fid,) for fid in cap_fids],
                             )
@@ -1892,10 +1894,13 @@ class BackgroundProcessor:
                     self._mark_task_permanently_failed(task, outcome_exc)
                 else:
                     logger.warning(
-                        "Lease ingest job %d dimension-refusal settle "
-                        "fenced off — lease lost; not marking the files "
-                        "row (successor owns it)",
+                        "Lease ingest job %d %s settle fenced off — lease "
+                        "lost; not marking the files row (successor owns "
+                        "it)",
                         job_id,
+                        classify_ingest_error(outcome_exc)
+                        if outcome_exc is not None
+                        else "deterministic-refusal",
                     )
                 return
             if task.attempt < max_attempts or contention_retryable:
@@ -4651,13 +4656,28 @@ class BackgroundProcessor:
                 if cumulative_duplicate_ids:
                     composed = dict(result) if isinstance(result, dict) else {}
                     composed["duplicate_file_ids"] = list(cumulative_duplicate_ids)
-                    composed["failed"] = int(composed.get("failed") or 0) + len(
-                        cumulative_duplicate_ids
+                    composed["failed"] = len(
+                        {
+                            *(int(i) for i in (result.get("failed_ids") or []) if isinstance(result, dict)),
+                            *cumulative_duplicate_ids,
+                        }
                     )
+                    # Same #957 persist-boundary redaction the cap arm
+                    # applies to identical producer output (review FB-014).
+                    details = composed.get("details")
+                    if isinstance(details, list):
+                        composed["details"] = [
+                            _redact_reindex_detail_entry(entry)
+                            if isinstance(entry, str)
+                            else entry
+                            for entry in details
+                        ]
                     failed_ok = lease.fail(
                         job_id,
                         worker_id,
-                        error_text if error_text != "reindex failed (no detail recorded)" else "duplicate file hash (DUPLICATE_FILE)",
+                        f"{INGEST_ERROR_DUPLICATE_FILE}: cumulative "
+                        "duplicate-file settlements; transient scope "
+                        "completed",
                         result=composed,
                     )
                     if not failed_ok:
@@ -4718,6 +4738,25 @@ class BackgroundProcessor:
                         fail_result["duplicate_file_ids"] = list(
                             cumulative_duplicate_ids
                         )
+                elif cumulative_duplicate_ids:
+                    # issue #1112: a GLOBAL failure shape at the cap (a
+                    # staged-rebuild abort or a metadata failure returning
+                    # ("failed", {}, exc)) carries no per-file result — the
+                    # accumulated duplicates still surface in the terminal
+                    # result_json instead of persisting result=None.
+                    fail_result = {
+                        "duplicate_file_ids": list(cumulative_duplicate_ids)
+                    }
+                if fail_result is not None and cumulative_duplicate_ids:
+                    # Consistent operator accounting: 'failed' covers every
+                    # DISTINCT terminal file (this attempt's plus prior
+                    # attempts' duplicates), matching the completed arm.
+                    fail_result["failed"] = len(
+                        {
+                            *(int(i) for i in (result.get("failed_ids") or []) if isinstance(result, dict)),
+                            *cumulative_duplicate_ids,
+                        }
+                    )
                 failed_ok = lease.fail(
                     job_id,
                     worker_id,
@@ -4753,6 +4792,16 @@ class BackgroundProcessor:
                 ):
                     composed = dict(result) if isinstance(result, dict) else {}
                     composed["duplicate_file_ids"] = list(cumulative_duplicate_ids)
+                    # Same #957 persist-boundary redaction the cap arm
+                    # applies to identical producer output (review FB-014).
+                    details = composed.get("details")
+                    if isinstance(details, list):
+                        composed["details"] = [
+                            _redact_reindex_detail_entry(entry)
+                            if isinstance(entry, str)
+                            else entry
+                            for entry in details
+                        ]
                     failed_ok = lease.fail(
                         job_id, worker_id, error_text, result=composed
                     )
@@ -4792,18 +4841,13 @@ class BackgroundProcessor:
                             worker_id,
                         ),
                     )
-                elif failed_ids:
-                    # Per-file accounting ran and the narrowed scope is
-                    # genuinely empty — clear the marker.
-                    conn.execute(
-                        "UPDATE jobs SET payload_json = json_remove("
-                        "payload_json, '$.retry_file_ids') "
-                        "WHERE id = ? AND worker_id = ? AND status = 'running'",
-                        (job_id, worker_id),
-                    )
-                # else: a GLOBAL failure shape (("failed", {}, exc)) carried
-                # no per-file outcomes — the payload's prior retry scope
-                # (issue #702) must survive untouched for the next attempt.
+                # else: either per-file accounting ran and the narrowed scope
+                # is genuinely empty (every failure was a deterministic
+                # duplicate — the duplicate-only settle above already
+                # returned), or a GLOBAL failure shape (("failed", {}, exc))
+                # carried no per-file outcomes and the payload's prior retry
+                # scope (issue #702) must survive untouched for the next
+                # attempt.
                 # issue #1112: persist the CUMULATIVE duplicate set at every
                 # requeue (same one-transaction unit as the retry scope) so
                 # terminal composition and the next attempt's exclusion both
@@ -4899,12 +4943,11 @@ class BackgroundProcessor:
             # pass (no retry ladder), so duplicates ride the composed result
             # directly — popped only to keep the persisted shape free of
             # transport metadata, then re-added as a persisted outcome key.
-            legacy_duplicate_ids = result.pop("duplicate_file_ids", None) or []
-            if legacy_duplicate_ids:
-                result["duplicate_file_ids"] = legacy_duplicate_ids
-
             # Legacy settlement on document_reindex_jobs, mapped from the
             # shared body's outcome (writes preserved verbatim per branch).
+            # duplicate_file_ids stays in result (it is a persisted operator
+            # outcome here, not transport metadata — the legacy transport
+            # settles terminally after one pass).
             if status == "completed":
                 async with self.processor.pool.connection_async() as conn:
                     conn.execute(

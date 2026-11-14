@@ -4451,8 +4451,10 @@ async def _run_promotion(
         # must not echo the server filesystem destination path that
         # str(exc) embeds. The RAW path (repr-escaping-free, so single
         # backslashes survive on Windows) is logged server-side from the
-        # structured attribute.
-        logger.error(
+        # structured attribute. Level is warning, not error: this is a
+        # client-triggerable 409 (the module doctrine at :296-299 keeps 4xx
+        # out of the error channel; review PO-001).
+        logger.warning(
             "draft_room: promotion path conflict draft_id=%s dest_path=%s (%s)",
             draft_id,
             getattr(exc, "dest_path", None),

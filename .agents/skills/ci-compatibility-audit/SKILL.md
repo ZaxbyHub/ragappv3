@@ -87,12 +87,15 @@ Repository contract job:
 - `python scripts/check_a04_http500_detail_hygiene.py` — fails if any audited
   route module (memories, vaults, admin, draft_room) builds a **5xx-capable**
   `detail` from a raw exception (f-string interpolation or `str(exc)`; issues
-  #686 / #917 / #1119). A literal status >= 500 flags directly; a status
-  computed at runtime flags when inline, time-ordered per-scope analysis can
-  resolve it to a value-set where ANY value is >= 500 (int literals, plain
-  and annotated assignments, mapping dicts and `.get(key, DEFAULT)` defaults
-  — module-level AND function-local; if/else branches merge by union;
-  with-block assignments bind; loop bodies are merged as possible bindings) —
+  #686 / #917 / #1119). A literal status >= 500 flags directly (whole-tree
+  literal pass: class bodies, decorators, default args, module level, and
+  function bodies — sync and async); a status computed at runtime flags when
+  inline, time-ordered per-scope analysis can resolve it to a value-set where
+  ANY value is >= 500 (int literals, plain and annotated assignments, mapping
+  dicts and `.get(key, DEFAULT)` defaults — module-level AND function-local;
+  if/else branches merge by union; with/async-with assignments bind; loop
+  bodies are merged as possible bindings via a state fixpoint that resolves
+  var-to-var chains; try-body bindings are visible to except-handler echoes) —
   a dominating `if NAME >= 500: return/raise` guard proves the fall-through
   < 500 until rebinding (strict `>` guards do not refine: 500 stays
   reachable). Unresolvable statuses (function parameters and other

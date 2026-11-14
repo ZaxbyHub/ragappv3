@@ -86,6 +86,10 @@ class _RecordingVectorStore:
         # visibility verification: report the just-written count
         return len(self.calls)
 
+    async def get_live_embedding_dim(self, *a, **k):
+        # dimension probe (reindex pre-loop); matches the embed stub's dim
+        return 2
+
 
 def _real_file(tmp_path, content=b"duplicate-hash-bytes-1112") -> tuple[str, str]:
     path = tmp_path / "doc.pdf"
@@ -164,7 +168,10 @@ async def test_guard_partial_owner(tmp_path):
 
 async def test_guard_own_row_reindex_control(tmp_path):
     """A healthy same-file reprocess (own row already indexed) must NOT trip
-    the guard — the own-row exclusion."""
+    the guard — the status flip to 'processing' (before the guard) excludes
+    the own row via the status filter; the ``AND id != ?`` clause is
+    belt-and-suspenders on top of it (review TF-002: the clause itself is
+    not independently discriminated by this control)."""
     db_path, conn = _seed(tmp_path, "g3.db")
     pool = SQLiteConnectionPool(db_path, max_size=4)
     try:
@@ -789,3 +796,85 @@ async def test_reindex_global_failure_keeps_scope_and_requeues(
         pool.close_all()
         conn.close()
         lease_conn.close()
+
+# ---------------------------------------------------------------------------
+# FIX-1 (review TF-001): the REAL _reindex_embed_all production wiring.
+# The settler legs above monkeypatch _reindex_embed_all; this leg drives the
+# REAL runner over a seeded indexed owner + same-hash target so a regression
+# in the per-file classify/append (background_tasks.py ~5485-5490 — the only
+# production producer of duplicate_file_ids) fails THIS test instead of
+# shipping mock-fed (mutation M1: delete the classify/append -> RED here).
+# ---------------------------------------------------------------------------
+
+
+async def test_reindex_runner_duplicate_file_ids_end_to_end(tmp_path, monkeypatch):
+    """The real _reindex_embed_all classifies a same-hash target into
+    result["duplicate_file_ids"] and the per-file details carry the
+    DUPLICATE_FILE stable code."""
+    db_path, conn = _seed(tmp_path, "e2e.db")
+    pool = SQLiteConnectionPool(db_path, max_size=4)
+    try:
+        file_path, file_hash = _real_file(tmp_path)
+        owner_id = _insert_file(
+            conn, file_hash=file_hash, status="indexed", path=file_path
+        )
+        target_id = _insert_file(
+            conn,
+            file_hash=file_hash,
+            status="error",
+            path=file_path,
+        )
+        assert owner_id != target_id
+        bp = BackgroundProcessor(pool=pool, retry_delay=0.05)
+        stub = _RecordingVectorStore()
+        bp.processor.vector_store = stub
+
+        class _EmbedStub:
+            async def embed_batch(self, texts, fail_fast=True, **kwargs):  # noqa: ARG002
+                embeddings = [[0.1, 0.2] for _ in texts]
+                return embeddings if fail_fast else (embeddings, [])
+
+        bp.processor.embedding_service = _EmbedStub()
+        monkeypatch.setattr(bp.processor, "_is_schema_file", lambda p: True)
+
+        async def _fake_schema_file(fpath, fid, generation_hash, parser_fp):  # noqa: ARG001
+            from app.services.chunking import ProcessedChunk
+            from app.services.document_processor import ParsedDocument
+
+            chunks = [
+                ProcessedChunk(
+                    text="duplicate e2e body",
+                    metadata={"section": "s", "total_chunks": 1},
+                    chunk_index=0,
+                )
+            ]
+            return chunks, "duplicate e2e body", ParsedDocument(
+                atoms=(), parser_fingerprint=parser_fp
+            )
+
+        monkeypatch.setattr(bp.processor, "_process_schema_file", _fake_schema_file)
+
+        status, result, error = await bp._reindex_embed_all(1, vault_id=1)  # noqa: SLF001
+
+        assert status == "failed"
+        assert result["duplicate_file_ids"] == [target_id], (
+            "the REAL reindex runner must classify the same-hash target into "
+            f"duplicate_file_ids; got {result} (error={error!r})"
+        )
+        assert target_id in result["failed_ids"]
+        assert owner_id not in result.get("duplicate_file_ids", []), (
+            "the indexed owner must not be reported as a duplicate (own-row "
+            "exclusion at runner level)"
+        )
+        assert any(
+            "DUPLICATE_FILE" in entry for entry in result.get("details", [])
+        ), f"per-file details must carry the DUPLICATE_FILE stable code; got {result.get('details')}"
+        # Exactly ONE generation written (the owner's): the duplicate target
+        # must stop at the pre-vector guard with zero vector writes.
+        assert stub.calls.count("add_chunks") == 1, (
+            f"exactly one vector generation (the owner's) may be written; "
+            f"got {stub.calls}"
+        )
+    finally:
+        pool.close_all()
+        conn.close()
