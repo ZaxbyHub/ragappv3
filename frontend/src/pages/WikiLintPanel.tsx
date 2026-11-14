@@ -50,6 +50,18 @@ function statusLabel(status: WikiLintFinding["status"]): string | null {
   return status === "auto_resolved" ? "auto-resolved" : status;
 }
 
+/**
+ * Producer provenance (issue #949): 'linter' rows are the reconciler's own
+ * output and the overwhelming default, so they stay implicit; the other three
+ * writers (invalidation pass, compiler, curator) are surfaced so an operator
+ * can tell a reconciler-owned row from one another subsystem wrote — e.g. a
+ * curator row that survives repeated lint runs is expected, not a bug.
+ * Undefined origin (a pre-#949 payload) renders nothing.
+ */
+function originLabel(origin: WikiLintFinding["origin"]): string | null {
+  return origin && origin !== "linter" ? origin : null;
+}
+
 export function WikiLintPanel({ findings, loading, onRunLint, onRefresh, vaultId }: WikiLintPanelProps) {
   const [resolving, setResolving] = useState<number | null>(null);
 
@@ -93,6 +105,9 @@ export function WikiLintPanel({ findings, loading, onRunLint, onRefresh, vaultId
             <div className="flex items-center justify-between mt-1">
               <div className="text-xs text-muted-foreground uppercase tracking-wide">
                 {finding.severity} · {finding.finding_type.replace(/_/g, " ")}
+                {originLabel(finding.origin) && (
+                  <span className="ml-1 normal-case">· {originLabel(finding.origin)}</span>
+                )}
                 {statusLabel(finding.status) && (
                   <span className="ml-1 normal-case">· {statusLabel(finding.status)}</span>
                 )}

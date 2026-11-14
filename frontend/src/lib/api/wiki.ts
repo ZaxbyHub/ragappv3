@@ -149,6 +149,10 @@ export interface WikiLintFinding {
   status: "open" | "acknowledged" | "resolved" | "dismissed" | "auto_resolved";
   created_at: string;
   updated_at: string;
+  // Producer provenance (issue #949): which subsystem wrote the row — the
+  // wiki_lint_findings CHECK vocabulary. Optional so payloads cached before
+  // the field was exposed keep parsing; the backend now always sends it.
+  origin?: "linter" | "invalidation" | "compiler" | "curator";
 }
 
 export interface WikiSearchResponse {
