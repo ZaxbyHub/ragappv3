@@ -256,7 +256,14 @@ def _fold(node: ast.AST):
         return "".join(parts)
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
         left, right = _fold(node.left), _fold(node.right)
-        return None if left is None or right is None else left + right
+        if left is None and right is None:
+            return None
+        # A side that cannot fold is DYNAMIC, not absent: "SET status = " + s
+        # must yield a <dynamic> site, not vanish (closeout-critic Blocker 1 —
+        # returning None here made the whole concatenation invisible).
+        return (left if left is not None else "\x00") + (
+            right if right is not None else "\x00"
+        )
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
         # "%s"-template: the LEFT operand carries the template markers.
         return _fold(node.left)
@@ -368,7 +375,7 @@ def _function_source(source: str, function: str) -> str:
 
 
 def _function_predicates(source: str, function: str) -> set:
-    """Normalized predicate strings for every If.test/Compare in a function.
+    """Normalized predicate strings for every complete If.test in a function.
 
     ``ast.unparse`` form with single quotes and collapsed whitespace, so a
     registered guard like ``'status != "needs_review"'`` matches only the
@@ -721,6 +728,14 @@ class TestStatusTransitionMap(unittest.TestCase):
                 "        {\"st\": s},\n"
                 "    )\n",
                 "named bind",
+            ),
+            (
+                "import sqlite3\n\n\n"
+                "def w(conn: sqlite3.Connection, s: str) -> None:\n"
+                "    conn.execute(\n"
+                "        \"UPDATE draft_jobs SET status = \" + s + \" WHERE id = 1\"\n"
+                "    )\n",
+                "+ concatenation",
             ),
         ]
         for planted_src, label in forms:

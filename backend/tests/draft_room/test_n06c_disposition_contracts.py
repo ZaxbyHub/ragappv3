@@ -64,14 +64,21 @@ class TestFindingsPageStoreContract(DraftStoreTestBase):
             )
         finally:
             self.conn.set_trace_callback(None)
-        drafts_reads = [s for s in statements if re.search(r"\bFROM\s+drafts\b", s, re.I)]
+        drafts_reads = [
+            s
+            for s in statements
+            if re.search(r"\b(FROM|JOIN)\s+drafts\b", s, re.I)
+        ]
         self.assertEqual(
             drafts_reads,
             [],
-            f"the batched reader must never SELECT from drafts; saw {drafts_reads}",
+            f"the batched reader must never read drafts (FROM or JOIN); saw {drafts_reads}",
         )
-        touched = {m.group(1).lower() for s in statements
-                   for m in [re.search(r"\bFROM\s+([a-z_]+)", s, re.I)] if m}
+        touched = {
+            m.group(2).lower()
+            for s in statements
+            for m in re.finditer(r"\b(FROM|JOIN)\s+([a-z_]+)", s, re.I)
+        }
         self.assertTrue(
             touched <= {"draft_revisions", "draft_jobs", "draft_findings"},
             f"only the three child tables may be read; saw {sorted(touched)}",
