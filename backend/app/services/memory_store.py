@@ -24,6 +24,8 @@ import json
 import logging
 import re
 import sqlite3
+import threading
+import weakref
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
@@ -170,6 +172,168 @@ class MemoryStore:
         # to FTS-only retrieval so memory features still work in
         # environments without a live embedding server.
         self.embedding_service = embedding_service
+        # Issue #937: per-process single-flight for backfill runs (all
+        # callers inside one process share it; multi-worker deployments
+        # each run their own loop — duplicate embed work is idempotent and
+        # revision-guarded, so the cost is provider spend only). A
+        # module-level asyncio.Lock binds to the first loop that acquires it
+        # and raises on later loops (TestClient spins a fresh loop per
+        # request), so locks are keyed by the running loop via a weakref
+        # map — the same pattern the memories.py route module used before
+        # the lock moved here. All three backfill callers (startup task,
+        # periodic heal loop, superadmin route) share it. Known wart (r2
+        # review RP-5, documented residual): an asyncio.Lock/Semaphore pins
+        # its event loop via _LoopBoundMixin's strong _loop ref, so once a
+        # primitive bound to a loop is stored here that map entry (and the
+        # loop) is immortal for the store's lifetime. Production impact is
+        # one lock + one semaphore per worker process (a single loop per
+        # worker); only multi-loop hosts (per-request test loops)
+        # accumulate more, bounded by the process lifetime.
+        self._backfill_locks_guard = threading.Lock()
+        self._backfill_locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = (
+            weakref.WeakKeyDictionary()
+        )
+        # Issue #937: store-level embedding-batch semaphore (one bound shared
+        # by every backfill run, keyed per loop like the lock).
+        self._embed_semaphores_guard = threading.Lock()
+        self._embed_semaphores: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore]" = (
+            weakref.WeakKeyDictionary()
+        )
+        # Heal-tick work cap (r2 review F-006): the periodic tick holds the
+        # single-flight backfill lock for its entire run, so its per-tick
+        # row count bounds the lock hold (see backfill_missing_embeddings
+        # max_rows). 200 rows x 10s budget / 4 concurrency ~= 500s worst
+        # case per tick — bounded, and remaining rows retry on later ticks.
+        self._heal_max_rows_per_tick = 200
+        # Rotating-window cursor (final-critic FB-006 round 2): with a
+        # plain prefix slice, 200 persistently failing NULL rows would
+        # occupy every tick's window forever and a healthy row behind
+        # them would NEVER be attempted. Each tick starts its window at
+        # this cursor and advances it by the window size, so the whole
+        # candidate set is eventually covered even when the head of the
+        # selection never succeeds.
+        self._heal_tick_cursor = 0
+
+    def get_backfill_lock(self) -> asyncio.Lock:
+        """Per-event-loop single-flight lock for backfill runs (issue #937).
+
+        Shared by the lifespan startup task, the periodic embed-heal loop,
+        and the superadmin backfill route so at most one backfill run is in
+        flight per loop.
+        """
+        loop = asyncio.get_running_loop()
+        with self._backfill_locks_guard:
+            lock = self._backfill_locks.get(loop)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._backfill_locks[loop] = lock
+            return lock
+
+    def _embed_batch_semaphore(self) -> asyncio.Semaphore:
+        """Per-event-loop embed-batch semaphore (issue #937).
+
+        Binds every backfill run on a loop to ONE shared concurrency bound
+        of ``embedding_concurrent_batches`` instead of each run minting its
+        own semaphore.
+        """
+        loop = asyncio.get_running_loop()
+        with self._embed_semaphores_guard:
+            sem = self._embed_semaphores.get(loop)
+            if sem is None:
+                sem = asyncio.Semaphore(
+                    max(1, getattr(settings, "embedding_concurrent_batches", 4))
+                )
+                self._embed_semaphores[loop] = sem
+            return sem
+
+    async def periodic_embed_heal_loop(self, interval: int = 600) -> None:
+        """Periodically re-embed NULL-embedding memories (issue #937).
+
+        The third healer for degraded rows (besides the one-shot startup
+        backfill task and the superadmin backfill route): a bounded schedule
+        that runs ``backfill_missing_embeddings(null_only=True,
+        admitted=True)`` once per interval, so a runtime embed failure heals
+        itself once the provider recovers — no restart, no superadmin
+        action. NULL-only selection keeps a staged embedding rebuild from
+        re-embedding valid old-generation rows every tick, and per-row
+        EMBEDDING admission (issue #939) keeps the healer inside the shared
+        embedding budget. A tick whose single-flight lock is held skips
+        quietly (bounded 5s acquire wait); a failing tick logs at WARNING and
+        the loop continues; CancelledError breaks the loop for shutdown.
+        """
+        logger.info(
+            "Starting periodic memory embed-heal task (interval: %ds)", interval
+        )
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                if self.embedding_service is None:
+                    continue
+                try:
+                    async with asyncio.timeout(5):
+                        lock = self.get_backfill_lock()
+                        await lock.acquire()
+                except asyncio.TimeoutError:
+                    logger.info(
+                        "Memory embed-heal tick skipped: backfill in flight"
+                    )
+                    continue
+                try:
+                    summary = await self.backfill_missing_embeddings(
+                        null_only=True,
+                        admitted=True,
+                        # Row cap (r2 review F-006): the tick holds the
+                        # single-flight backfill lock for its whole run;
+                        # capping the per-tick work bounds the lock hold
+                        # (200 rows x 10s budget / 4 concurrency ~= 500s
+                        # worst case) so the superadmin route and the
+                        # startup task are not excluded for hours. Rows
+                        # beyond the cap stay NULL for later ticks.
+                        max_rows=self._heal_max_rows_per_tick,
+                    )
+                    if summary.get("total", 0) > 0:
+                        logger.info(
+                            "Memory embed-heal tick summary: %s", summary
+                        )
+                finally:
+                    lock.release()
+            except asyncio.CancelledError:
+                logger.info("Periodic memory embed-heal task cancelled")
+                break
+            except Exception as exc:  # noqa: BLE001 — keep the loop alive
+                logger.warning(
+                    "Periodic memory embed-heal failed (will retry next "
+                    "tick): %s",
+                    exc,
+                )
+
+    async def memory_embedding_is_null(self, memory_id: int) -> bool:
+        """Return True when the row exists and its embedding is NULL.
+
+        Issue #937: the remember-directive found-existing branch needs the
+        embedding status ``find_memory_by_content`` does not select
+        (``MemoryRecord`` carries no embedding field). The whole read runs
+        on a worker thread via ``asyncio.to_thread`` (final-critic finding
+        6: this sits on the chat hot path and the execute must not run on
+        the event loop); returns False (no re-embed needed) when the row is
+        missing or the embedding columns are absent.
+        """
+
+        def _read_sync() -> bool:
+            conn = self.pool.get_connection()
+            try:
+                if not self._has_embedding_columns(conn):
+                    return False
+                cursor = conn.execute(
+                    "SELECT embedding IS NULL FROM memories WHERE id = ?",
+                    (memory_id,),
+                )
+                row = cursor.fetchone()
+            finally:
+                self.pool.release_connection(conn)
+            return bool(row is not None and row[0])
+
+        return await asyncio.to_thread(_read_sync)
 
     def _has_embedding_columns(self, conn: sqlite3.Connection) -> bool:
         """Detect whether the optional ``embedding`` column is present.
@@ -390,7 +554,13 @@ class MemoryStore:
         )
         return "stored" if written else "failed"
 
-    async def backfill_missing_embeddings(self, batch_size: int = 50) -> dict:
+    async def backfill_missing_embeddings(
+        self,
+        batch_size: int = 50,
+        null_only: bool = False,
+        admitted: bool = False,
+        max_rows: "int | None" = None,
+    ) -> dict:
         """Idempotent backfill: embed memories that have no embedding or whose
         embedding was generated by a different model than the current one.
 
@@ -402,11 +572,37 @@ class MemoryStore:
         (issue #515, OBS-004); provider exceptions, provider None results, and
         revision-guard-rejected writes count as ``failed``, and rows never
         attempted (no service / empty content) count as ``skipped``.
+
+        Issue #937: ``null_only=True`` restricts the selection to rows whose
+        embedding IS NULL (dropping the model-mismatch arm) — the periodic
+        healer's path, so a staged embedding rebuild (live model NEW, serving
+        pin OLD) can never make every tick re-embed the same valid
+        old-generation rows forever. ``admitted=True`` (also the healer's
+        path) wraps EACH row's embed in the #939 EMBEDDING admission +
+        ``memory_embed_budget_seconds`` window — one lease per concurrent
+        backfill run would let N simultaneous provider calls hold a single
+        budget slot — and adds a ``deferred`` summary key for rows the
+        budget turned away (a later tick retries them). The default
+        ``admitted=False`` keeps the startup task's and the superadmin
+        route's summary shape byte-identical (processed/skipped/failed/
+        total only).
+
+        ``max_rows`` (r2 review F-006): bounds how many selected rows ONE
+        run processes. The periodic heal tick passes a cap because it holds
+        the store-level single-flight backfill lock for its ENTIRE run and
+        the other two callers (startup task, superadmin route) wait on that
+        lock with no timeout of their own — an uncapped backlog against a
+        slow provider held the lock for hours (5000 rows x 10s budget / 4
+        concurrency ~= 3.5h). Rows beyond the cap stay NULL and are picked
+        up by later ticks (the deferred-retry mechanism). The startup task
+        and the route keep the default (uncapped) run shape.
         """
         from app.config import settings as _settings
 
         current_model = _settings.embedding_model
-        summary = {"processed": 0, "skipped": 0, "failed": 0, "total": 0}
+        summary: dict = {"processed": 0, "skipped": 0, "failed": 0, "total": 0}
+        if admitted:
+            summary["deferred"] = 0
 
         if self.embedding_service is None:
             logger.info("Memory embedding backfill skipped: no embedding service configured")
@@ -418,13 +614,42 @@ class MemoryStore:
                 logger.info("Memory embedding backfill skipped: embedding columns not present")
                 return summary
 
-            cursor = conn.execute(
-                "SELECT id, content FROM memories WHERE embedding IS NULL OR embedding_model IS NULL OR embedding_model != ?",
-                (current_model,),
-            )
+            if null_only:
+                cursor = conn.execute(
+                    "SELECT id, content FROM memories WHERE embedding IS NULL"
+                )
+            else:
+                cursor = conn.execute(
+                    "SELECT id, content FROM memories WHERE embedding IS NULL OR embedding_model IS NULL OR embedding_model != ?",
+                    (current_model,),
+                )
             rows = cursor.fetchall()
         finally:
             self.pool.release_connection(conn)
+
+        if max_rows is not None and len(rows) > max_rows:
+            # Rotating window (final-critic round 2): a plain prefix slice
+            # lets persistently failing rows monopolize every tick (the
+            # selection is unordered-NULL, so the same prefix would be
+            # re-sliced forever and rows behind it starve). The window
+            # starts at the cursor and wraps, and the cursor advances by
+            # the window size each capped tick, so every selected row is
+            # attempted within len(rows)/max_rows ticks regardless of how
+            # many earlier rows keep failing.
+            start = self._heal_tick_cursor % len(rows)
+            window = rows[start:start + max_rows]
+            if len(window) < max_rows:
+                window = window + rows[: max_rows - len(window)]
+            self._heal_tick_cursor = (start + len(window)) % len(rows)
+            logger.info(
+                "Memory embedding backfill capped to %d of %d selected rows "
+                "(rotating window from offset %d; every row is attempted "
+                "across successive ticks)",
+                max_rows,
+                len(rows),
+                start,
+            )
+            rows = window
 
         summary["total"] = len(rows)
         if not rows:
@@ -443,10 +668,10 @@ class MemoryStore:
             # (E2-4): the previous sequential await issued one embedding HTTP
             # round-trip at a time. Bound concurrency with a Semaphore reusing
             # the embedding batch limit; return_exceptions preserves per-memory
-            # error handling.
-            sem = asyncio.Semaphore(
-                max(1, getattr(settings, "embedding_concurrent_batches", 4))
-            )
+            # error handling. The semaphore is store-level (issue #937) so
+            # overlapping runs share one bound instead of each minting its
+            # own.
+            sem = self._embed_batch_semaphore()
 
             # Each row's content was read at selection time; embed_and_store
             # uses it as the revision guard's expected content (issue #515,
@@ -455,7 +680,40 @@ class MemoryStore:
             # is picked up again by the next backfill run with fresh content.
             async def _embed_one(mid: int, text: str) -> str:
                 async with sem:
-                    return await self.embed_and_store(mid, text)
+                    if not admitted:
+                        return await self.embed_and_store(mid, text)
+                    # Per-row admission (issue #937, #939 budget): the same
+                    # pattern as the query-side precompute — ONE timeout
+                    # window covers the admission acquire AND the embed
+                    # await; a saturated budget or an expired window defers
+                    # THIS row and the batch continues with the rest.
+                    from app.services.admission import (
+                        AdmissionClass,
+                        AdmissionRejected,
+                        get_admission_controller,
+                    )
+
+                    try:
+                        async with asyncio.timeout(
+                            _settings.memory_embed_budget_seconds
+                        ):
+                            async with get_admission_controller().admit(
+                                AdmissionClass.EMBEDDING,
+                                # Background-class lane (r2 review F-005):
+                                # the healer is a periodic background task;
+                                # every other background processor in the
+                                # repo passes foreground=False here. With
+                                # the default foreground=True the tick's
+                                # leases queue in the foreground lane and
+                                # contend with the interactive query
+                                # precompute on the shared 4-slot budget.
+                                foreground=False,
+                            ):
+                                return await self.embed_and_store(mid, text)
+                    except asyncio.TimeoutError:
+                        return "deferred:budget"
+                    except AdmissionRejected:
+                        return "deferred:admission"
 
             results = await asyncio.gather(
                 *(_embed_one(memory_id, content) for memory_id, content in batch),
@@ -469,6 +727,34 @@ class MemoryStore:
                     summary["processed"] += 1
                 elif res == "failed":
                     summary["failed"] += 1
+                elif isinstance(res, str) and res.startswith("deferred:"):
+                    # Landed-write re-check (r2 review F-009, probe-proven):
+                    # asyncio.timeout can expire while the to_thread DB
+                    # write is still in flight — the worker thread completes
+                    # its commit after the awaiting coroutine was cancelled,
+                    # so the row may be EMBEDDED even though the coroutine
+                    # saw the timeout. Count it processed instead of
+                    # deferred when the write landed; the "a later run
+                    # retries it" log below is only true while the row is
+                    # still NULL.
+                    landed_write = not await self.memory_embedding_is_null(
+                        memory_id
+                    )
+                    if landed_write:
+                        summary["processed"] += 1
+                    else:
+                        # isinstance guard (final-critic finding 7): a mocked
+                        # or wrapped embed helper returning a non-string must
+                        # land in the skipped arm, never raise AttributeError
+                        # here; .get tolerates an admitted-arm string
+                        # surfacing under a default (non-admitted) summary
+                        # shape.
+                        summary["deferred"] = summary.get("deferred", 0) + 1
+                        logger.info(
+                            "Backfill deferred memory %d (%s); a later run retries it",
+                            memory_id,
+                            res.split(":", 1)[1],
+                        )
                 else:
                     # "skipped" (and any unexpected outcome from wrapped or
                     # mocked embed helpers) — nothing was written.
@@ -591,8 +877,8 @@ class MemoryStore:
         # vector this fix removes. Async callers embed via
         # ``embed_and_store`` right after the row write (memories.py routes,
         # the chat remember-directive path). A caller that misses it leaves a
-        # FTS-only row; only the startup backfill task and the superadmin
-        # backfill route heal it — there is no periodic retry.
+        # FTS-only row; the startup backfill task, the periodic embed-heal
+        # loop (issue #937), and the superadmin backfill route heal it.
         return MemoryRecord(
             id=memory_id,
             content=content,

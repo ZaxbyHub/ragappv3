@@ -1070,7 +1070,10 @@ curl -s -H "Authorization: Bearer <token>" \
 # PARSE_TIMEOUT / FILE_MISSING / ENRICHMENT_FAILED / DIMENSION_CHANGED /
 # EMBEDDING_FAILED / VECTOR_STORE_FAILED / VECTOR_STORE_LOCK_TIMEOUT [issue #1011:
 # write-lock contention, retried non-terminally] / REINDEX_INTERRUPTED [issue
-# #1010: reindex attempt interrupted mid-file, re-selected by the next pass])
+# #1010: reindex attempt interrupted mid-file, re-selected by the next pass] /
+# DUPLICATE_FILE [issue #1112: another files row in the same vault already owns
+# this content hash as indexed/partial; resolve which row owns the hash before
+# retrying — never a parse failure])
 # plus a short
 # content-free reason — raw exception text and server paths stay in the
 # server log only (issue #562; DIMENSION_CHANGED since issue #691;

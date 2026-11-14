@@ -8,7 +8,9 @@ run instead of overlapping it.
 import asyncio
 import os
 import sys
+import threading
 import types
+import weakref
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -80,6 +82,30 @@ class _SlowBackfillStore:
     def __init__(self):
         self.in_flight = 0
         self.max_in_flight = 0
+        # Wiring pin (r2 review TF-1/TI-1): count get_backfill_lock calls
+        # so the route->store delegation is discriminatingly asserted —
+        # reverting the route to its own module-level lock (the pre-#937
+        # shape) previously kept every test green because a module lock
+        # and this stub's loop-keyed lock serialize identically.
+        self.get_backfill_lock_calls = 0
+        # Issue #937 mock-contract adaptation: the single-flight lock moved
+        # from the memories route module onto MemoryStore — the stub now
+        # exposes the same per-event-loop lock the route delegates to
+        # (loop-keyed weakref map, the pattern the store itself uses).
+        self._locks_guard = threading.Lock()
+        self._locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = (
+            weakref.WeakKeyDictionary()
+        )
+
+    def get_backfill_lock(self) -> asyncio.Lock:
+        self.get_backfill_lock_calls += 1
+        loop = asyncio.get_running_loop()
+        with self._locks_guard:
+            lock = self._locks.get(loop)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._locks[loop] = lock
+            return lock
 
     async def backfill_missing_embeddings(self, batch_size: int = 50) -> dict:
         self.in_flight += 1
@@ -109,3 +135,7 @@ def test_concurrent_backfill_requests_do_not_overlap():
 
     store = asyncio.run(main())
     assert store.max_in_flight == 1
+    # Wiring pin (r2 review TF-1/TI-1): the route must acquire the lock
+    # THROUGH the store (once per route call) — a route that keeps its own
+    # module-level lock never calls the store's getter.
+    assert store.get_backfill_lock_calls == 2, store.get_backfill_lock_calls

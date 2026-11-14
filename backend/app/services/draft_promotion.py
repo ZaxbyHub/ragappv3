@@ -151,9 +151,20 @@ class DraftPromotionPathConflictError(DraftPromotionError):
     in the window between reserving it and registering it. Either way, this
     module never adopts or overwrites a row it did not itself insert —
     see the module docstring. Callers translate this to ``409``.
+
+    ``dest_path`` (issue #1119) carries the RAW server filesystem destination
+    path (single backslashes on Windows) so callers can log the full path
+    server-side without the repr-escaping ``str(exc)`` embeds (``{path!r}``
+    doubles backslashes) — the client-visible 409 detail must NOT carry it.
     """
 
     code = "promotion_path_conflict"
+
+    def __init__(
+        self, message: str, *, dest_path: Optional[str] = None, **kwargs: object
+    ) -> None:
+        super().__init__(message, **kwargs)  # type: ignore[arg-type]
+        self.dest_path = dest_path
 
 
 @dataclass
@@ -436,7 +447,8 @@ def _register_file(
             ).fetchone()
             if existing is not None:
                 raise DraftPromotionPathConflictError(
-                    f"a files row already exists for path {path_str!r}"
+                    f"a files row already exists for path {path_str!r}",
+                    dest_path=path_str,
                 )
             cursor = conn.execute(
                 "INSERT INTO files "

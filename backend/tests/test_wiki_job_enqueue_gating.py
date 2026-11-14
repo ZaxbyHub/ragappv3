@@ -133,6 +133,21 @@ class TestWikiJobEnqueueGating(unittest.IsolatedAsyncioTestCase):
         # the route accepted must not be buried); the mocked driver reports
         # a landed write.
         conn.execute.return_value.rowcount = 1
+        # issue #1112: the pre-vector duplicate-ownership guard SELECTs for
+        # another indexed/partial row owning the hash — in this mocked
+        # harness there is no sibling, so the guard's fetchone() must read
+        # None; every OTHER fetchone consumer in this flow keeps the
+        # legacy truthy-MagicMock reading (a bare MagicMock on the guard
+        # query would read as a found owner and trip the duplicate guard
+        # spuriously; a blanket None would read as a vanished row).
+        def _execute_cursor(sql, *args, **kwargs):
+            cur = MagicMock()
+            cur.rowcount = 1
+            if "file_hash = ?" in str(sql):
+                cur.fetchone.return_value = None
+            return cur
+
+        conn.execute = MagicMock(side_effect=_execute_cursor)
 
         embedding_service = MagicMock()
         embedding_service.embed_batch = AsyncMock(return_value=([[0.1, 0.2]], []))
@@ -388,6 +403,21 @@ class TestWikiJobEnqueueGatingProcessExistingFile(unittest.IsolatedAsyncioTestCa
         # the route accepted must not be buried); the mocked driver reports
         # a landed write.
         conn.execute.return_value.rowcount = 1
+        # issue #1112: the pre-vector duplicate-ownership guard SELECTs for
+        # another indexed/partial row owning the hash — in this mocked
+        # harness there is no sibling, so the guard's fetchone() must read
+        # None; every OTHER fetchone consumer in this flow keeps the
+        # legacy truthy-MagicMock reading (a bare MagicMock on the guard
+        # query would read as a found owner and trip the duplicate guard
+        # spuriously; a blanket None would read as a vanished row).
+        def _execute_cursor(sql, *args, **kwargs):
+            cur = MagicMock()
+            cur.rowcount = 1
+            if "file_hash = ?" in str(sql):
+                cur.fetchone.return_value = None
+            return cur
+
+        conn.execute = MagicMock(side_effect=_execute_cursor)
 
         embedding_service = MagicMock()
         embedding_service.embed_batch = AsyncMock(return_value=([[0.1, 0.2]], []))
