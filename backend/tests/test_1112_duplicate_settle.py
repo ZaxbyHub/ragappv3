@@ -166,6 +166,40 @@ async def test_guard_partial_owner(tmp_path):
         conn.close()
 
 
+async def test_guard_error_sibling_does_not_trip(tmp_path):
+    """hermes M2: a same-hash sibling in a NON-owner status ('error') must
+    NOT trip the guard — the status IN ('indexed', 'partial') filter is
+    load-bearing. Deleting the filter makes re-uploading after a FAILED
+    upload settle as a terminal false DUPLICATE_FILE with no retry (the
+    hermes probe: removing the filter survived 298 tests before this
+    leg)."""
+    db_path, conn = _seed(tmp_path, "g5.db")
+    pool = SQLiteConnectionPool(db_path, max_size=4)
+    try:
+        file_path, file_hash = _real_file(tmp_path)
+        _insert_file(conn, file_hash=file_hash, status="error")
+        subject_id = _insert_file(
+            conn, file_hash=file_hash, status="indexed", path="uploads/doc5.pdf"
+        )
+        stub = _RecordingVectorStore()
+        processor = DocumentProcessor(pool=pool, vector_store=stub)
+        try:
+            await processor.process_existing_file(
+                subject_id, file_path, 1, file_hash=file_hash
+            )
+        except DuplicateFileError:
+            pytest.fail("error-status sibling tripped the duplicate guard")
+        except Exception:
+            pass  # downstream parse/vector failure on the stub — fine here
+        row = conn.execute(
+            "SELECT status, error_message FROM files WHERE id = ?", (subject_id,)
+        ).fetchone()
+        assert not (row["error_message"] or "").startswith("DUPLICATE_FILE:")
+    finally:
+        pool.close_all()
+        conn.close()
+
+
 async def test_guard_own_row_reindex_control(tmp_path):
     """A healthy same-file reprocess (own row already indexed) must NOT trip
     the guard — the status flip to 'processing' (before the guard) excludes
@@ -614,6 +648,13 @@ async def test_reindex_mixed_retry_scope_excludes_duplicate_and_composes(
         monkeypatch.setattr(settings, "jobs_max_attempts", 3)
 
         async def _fake_reindex2(jid, vault_id, retry_file_ids=None):  # noqa: ARG001
+            # hermes item-8: assert the narrowed retry scope REACHES the
+            # consumer — a mutant that drops the scope (re-embedding the
+            # whole vault) goes red here.
+            assert retry_file_ids == [9], (
+                f"attempt 2 must re-embed only the narrowed scope; got "
+                f"retry_file_ids={retry_file_ids!r}"
+            )
             return "completed", {"processed": 1, "failed": 0}, None
 
         monkeypatch.setattr(processor, "_reindex_embed_all", _fake_reindex2)
@@ -754,6 +795,12 @@ async def test_reindex_duplicate_only_attempt2_composes_prior_payload_duplicates
         monkeypatch.setattr(settings, "jobs_max_attempts", 3)
 
         async def _fake_reindex2(jid, vault_id, retry_file_ids=None):  # noqa: ARG001
+            # hermes item-8: the narrowed retry scope must REACH the consumer
+            # (a whole-vault-retry mutant fails this assertion).
+            assert retry_file_ids == [9], (
+                f"attempt 2 must re-embed only the narrowed scope; got "
+                f"retry_file_ids={retry_file_ids!r}"
+            )
             return (
                 "failed",
                 {

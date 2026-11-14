@@ -80,7 +80,7 @@ promotion 409 detail disclosed the server path to authenticated users.
   `backend/tests/test_a04_variable_status_echo.py` and
   `backend/tests/draft_room/test_promotion_conflict_detail.py` ship as the
   #1119 regression specs.
-- `backend/tests/test_1112_duplicate_settle.py` (15 tests): guard legs
+- `backend/tests/test_1112_duplicate_settle.py` (16 tests): guard legs
   (indexed/partial owner, own-row control, bytes-changed restore), both
   transports, nonduplicate-FK control, the finalization-race backstop (plus
   its multi-worker write-permit wiring), the four reindex-job terminal
