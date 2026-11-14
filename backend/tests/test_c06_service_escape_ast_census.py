@@ -130,6 +130,46 @@ ALLOWED = {
             r"return _escape_clip\(first_message,\s*200\)"
         ),
     ),
+    # #1104: the canvas edit-assistant prompt tags its two untrusted regions
+    # WITHOUT escaping, by design (tag-without-escaping): the replacement the
+    # model returns is spliced back byte-verbatim, so XML-escaping the
+    # selection would invite an escaped reply and an output-side unescape
+    # would corrupt genuine entity text already in the document. The defense
+    # is the SECURITY BOUNDARY clause declaring both tags, which the shared
+    # paired regex below pins in the module source (both entries name the
+    # same regex text deliberately — the clause declares both tags in one
+    # sentence); the behaviour is pinned by
+    # test_canvas_edit_prompt_boundary.py (clause + tagged regions, RED at
+    # the pre-#1104 base) and test_canvas_edit_roundtrip.py (verbatim
+    # round-trip, RED at base).
+    (
+        "api/routes/canvas.py",
+        "selected_lines",
+        "selected",
+    ): (
+        "tag-without-escaping (#1104 AC2): the selected document lines must "
+        "reach the model byte-verbatim — the model's replacement is spliced "
+        "back verbatim, so escaping the input would corrupt the replacement "
+        "text. Untrusted-ness is declared by the SECURITY BOUNDARY clause "
+        "naming <selected_lines>; the paired regex pins that clause.",
+        re.compile(
+            r"\(<selected_lines>, <instruction>\) is untrusted external"
+        ),
+    ),
+    (
+        "api/routes/canvas.py",
+        "instruction",
+        "body.instruction",
+    ): (
+        "tag-without-escaping (#1104 AC2), same design as <selected_lines>: "
+        "the replacement is free text shaped by this instruction, so an "
+        "escaped instruction teaches the model an escaped output dialect "
+        "that would splice entities into the artifact. Declared untrusted "
+        "by the same SECURITY BOUNDARY clause; the paired regex pins it.",
+        re.compile(
+            r"\(<selected_lines>, <instruction>\) is untrusted external"
+        ),
+    ),
 }
 
 
