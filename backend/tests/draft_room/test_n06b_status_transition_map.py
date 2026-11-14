@@ -798,6 +798,24 @@ class TestStatusTransitionMap(unittest.TestCase):
             f"planted literal must be named in the failures, got: {failures}",
         )
 
+    def test_fold_mod_and_format_branches_are_unit_pinned(self):
+        """TF-003 (Stage-B falsification): the Mod and .format branches of
+        _fold_env are pinned by DIRECT unit asserts — the end-to-end planted
+        subtests cannot discriminate their deletion because the scanner's
+        visit folds the template's Constant child independently."""
+
+        def fold_source(source: str):
+            return _fold_env(ast.parse(source).body[0].value, {})
+
+        mod_tmpl = fold_source("\"UPDATE drafts SET status = '%s' WHERE id = 1\" % s")
+        self.assertEqual(mod_tmpl, "UPDATE drafts SET status = '%s' WHERE id = 1")
+        format_tmpl = fold_source(
+            "\"UPDATE drafts SET status = '{}' WHERE id = 1\".format(s)"
+        )
+        self.assertEqual(
+            format_tmpl, "UPDATE drafts SET status = '{}' WHERE id = 1"
+        )
+
     def test_expression_built_writes_are_seen(self):
         """F-01: writes built across Name assignments and ``+=`` chains are
         seen and fail closed (the live ``success_sql +=`` idiom's shape)."""
