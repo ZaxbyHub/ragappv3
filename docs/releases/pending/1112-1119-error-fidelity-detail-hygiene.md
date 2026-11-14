@@ -80,11 +80,12 @@ promotion 409 detail disclosed the server path to authenticated users.
   `backend/tests/test_a04_variable_status_echo.py` and
   `backend/tests/draft_room/test_promotion_conflict_detail.py` ship as the
   #1119 regression specs.
-- `backend/tests/test_1112_duplicate_settle.py` (14 tests): guard legs
+- `backend/tests/test_1112_duplicate_settle.py` (15 tests): guard legs
   (indexed/partial owner, own-row control, bytes-changed restore), both
   transports, nonduplicate-FK control, the finalization-race backstop (plus
-  its multi-worker write-permit wiring), the three reindex-job terminal
-  shapes, a global-failure scope-preservation leg, and an end-to-end leg
+  its multi-worker write-permit wiring), the four reindex-job terminal
+  shapes (each pinning the DISTINCT terminal-file `failed` count compose),
+  a global-failure scope-preservation leg, and an end-to-end leg
   driving the REAL `_reindex_embed_all` over a seeded duplicate pair
   (asserts `duplicate_file_ids`, failed-scope membership, the stable code in
   details, and exactly one vector generation).

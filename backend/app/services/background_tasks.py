@@ -4656,9 +4656,12 @@ class BackgroundProcessor:
                 if cumulative_duplicate_ids:
                     composed = dict(result) if isinstance(result, dict) else {}
                     composed["duplicate_file_ids"] = list(cumulative_duplicate_ids)
+                    # failed_ids was popped above (:pop-contract) — the local
+                    # is the only surviving copy of this attempt's transient
+                    # failures (Stage B review r1).
                     composed["failed"] = len(
                         {
-                            *(int(i) for i in (result.get("failed_ids") or []) if isinstance(result, dict)),
+                            *(int(i) for i in failed_ids),
                             *cumulative_duplicate_ids,
                         }
                     )
@@ -4751,9 +4754,12 @@ class BackgroundProcessor:
                     # Consistent operator accounting: 'failed' covers every
                     # DISTINCT terminal file (this attempt's plus prior
                     # attempts' duplicates), matching the completed arm.
+                    # failed_ids was popped above — the local is the only
+                    # surviving copy of this attempt's transient failures
+                    # (Stage B review r1).
                     fail_result["failed"] = len(
                         {
-                            *(int(i) for i in (result.get("failed_ids") or []) if isinstance(result, dict)),
+                            *(int(i) for i in failed_ids),
                             *cumulative_duplicate_ids,
                         }
                     )
@@ -4792,6 +4798,18 @@ class BackgroundProcessor:
                 ):
                     composed = dict(result) if isinstance(result, dict) else {}
                     composed["duplicate_file_ids"] = list(cumulative_duplicate_ids)
+                    # Consistent operator accounting (Stage B review r1):
+                    # 'failed' recomputes to the DISTINCT terminal-file union
+                    # exactly like the completed and cap arms — a multi-attempt
+                    # duplicate-only settlement (prior-attempt duplicates from
+                    # payload + this attempt's) must not persist the producer's
+                    # current-attempt-only count.
+                    composed["failed"] = len(
+                        {
+                            *(int(i) for i in failed_ids),
+                            *cumulative_duplicate_ids,
+                        }
+                    )
                     # Same #957 persist-boundary redaction the cap arm
                     # applies to identical producer output (review FB-014).
                     details = composed.get("details")

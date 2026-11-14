@@ -557,7 +557,7 @@ def test_fb009_dict_rebind_below_500_stays_clean(tmp_path) -> None:
     _assert_clean(tmp_path, source, "FB-009 dict-rebind-404 control")
 
 
-def test_fb003_suppress_direction_rebind_stays_clean(tmp_path) -> None:
+def test_tf003_suppress_direction_rebind_stays_clean(tmp_path) -> None:
     """TF-003: REPLACE semantics in the suppress direction — a 500 binding
     refined away, then rebound DOWN to 404 before the echo, stays
     unflagged (an order-insensitive union mutant fails this leg)."""

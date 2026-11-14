@@ -5043,7 +5043,6 @@ class DocumentProcessor:
             # settle the files row — without this arm a race loser could
             # strand in 'processing'.
             await self._settle_duplicate_finalize_race(file_id, exc)
-            finalized = False
         if not finalized:
             logger.info(
                 "Ingest generation voided for file_id=%d: row settled "

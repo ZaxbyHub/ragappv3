@@ -544,9 +544,12 @@ async def test_reindex_duplicate_only_settles_failed_no_cap_prefix(
         assert jobs_row["status"] == "failed"
         err = jobs_row["error"] or ""
         assert "DUPLICATE_FILE" in err and "attempt_cap_exceeded" not in err
-        assert "7" in (jobs_row["payload_json"] or "") or json.loads(
-            jobs_row["result_json"] or "{}"
-        ).get("duplicate_file_ids") == [7]
+        result_json = json.loads(jobs_row["result_json"] or "{}")
+        assert result_json.get("duplicate_file_ids") == [7]
+        assert result_json.get("failed") == 1, (
+            "single-attempt duplicate-only 'failed' stays the distinct "
+            f"terminal count; result={result_json}"
+        )
     finally:
         pool.close_all()
         conn.close()
@@ -634,6 +637,12 @@ async def test_reindex_mixed_retry_scope_excludes_duplicate_and_composes(
             "the terminal result composes the CUMULATIVE duplicate outcome; "
             f"result={result}"
         )
+        assert result.get("failed") == 1, (
+            "the completed arm's 'failed' count covers the DISTINCT "
+            "terminal-file union (prior duplicate 7; the transient id "
+            "succeeded), matching the cap and duplicate-only arms; "
+            f"result={result}"
+        )
     finally:
         pool.close_all()
         conn.close()
@@ -682,6 +691,107 @@ async def test_reindex_terminal_cap_composes_duplicates(tmp_path, monkeypatch):
         assert result.get("duplicate_file_ids") == [7], (
             "the cap path composes the CUMULATIVE duplicates from the "
             f"payload; result={result}"
+        )
+        assert result.get("failed") == 2, (
+            "the cap-path 'failed' count covers the DISTINCT terminal-file "
+            "union (transient 9 + duplicate 7), not just the cumulative "
+            f"duplicates; result={result}"
+        )
+    finally:
+        pool.close_all()
+        conn.close()
+        lease_conn.close()
+
+
+async def test_reindex_duplicate_only_attempt2_composes_prior_payload_duplicates(
+    tmp_path, monkeypatch
+):
+    """Multi-attempt duplicate-only settlement: attempt 1 requeues the
+    transient id with the duplicate set persisted in the payload; attempt 2
+    finds that id ALSO a duplicate — the empty-retry-scope terminal
+    settlement recomputes 'failed' to the DISTINCT terminal-file union
+    (prior payload duplicates + this attempt's), exactly like the completed
+    and cap arms (Stage B review r1)."""
+    db_path, conn = _seed(tmp_path, "rx4.db")
+    pool = SQLiteConnectionPool(db_path, max_size=4)
+    lease_conn = _connect(db_path)
+    try:
+        _seed_reindex_job(conn)
+        # Attempt 1: duplicate 7 + transient 9 -> requeue 9, persist dup 7.
+        await _drive_reindex_settle(
+            conn,
+            pool,
+            lease_conn,
+            "rx4-worker",
+            monkeypatch,
+            result={
+                "status": "failed",
+                "result": {
+                    "processed": 0,
+                    "failed": 2,
+                    "details": ["file_id=7: DUPLICATE_FILE", "file_id=9: transient"],
+                    "failed_ids": [7, 9],
+                    "duplicate_file_ids": [7],
+                },
+            },
+            exc=DuplicateFileError("dup"),
+        )
+        jobs_row = conn.execute(
+            "SELECT id, payload_json FROM jobs WHERE queue = ?"
+            " ORDER BY id DESC LIMIT 1",
+            (REINDEX_QUEUE,),
+        ).fetchone()
+        payload = json.loads(jobs_row["payload_json"] or "{}")
+        assert payload.get("retry_file_ids") == [9]
+        assert payload.get("duplicate_file_ids") == [7]
+        job_id = int(jobs_row["id"])
+
+        # Attempt 2: file 9 is now ALSO a duplicate -> empty retry scope,
+        # terminal duplicate-only settlement below the cap.
+        conn.execute("UPDATE jobs SET run_after = NULL WHERE id = ?", (job_id,))
+        conn.commit()
+        processor = BackgroundProcessor(pool=pool, retry_delay=0.05)
+        monkeypatch.setattr(settings, "jobs_max_attempts", 3)
+
+        async def _fake_reindex2(jid, vault_id, retry_file_ids=None):  # noqa: ARG001
+            return (
+                "failed",
+                {
+                    "processed": 0,
+                    "failed": 1,
+                    "details": ["file_id=9: DUPLICATE_FILE: duplicate"],
+                    "failed_ids": [9],
+                    "duplicate_file_ids": [9],
+                },
+                DuplicateFileError("dup"),
+            )
+
+        monkeypatch.setattr(processor, "_reindex_embed_all", _fake_reindex2)
+        lease = JobLease(lease_conn, reclaim_timeout_seconds=300.0, max_attempts=3)
+        claimed = lease.claim(REINDEX_QUEUE, "rx4-worker")
+        assert claimed is not None
+        claimed = dict(claimed) if not isinstance(claimed, dict) else claimed
+        claimed["attempts"] = 2
+        await processor._run_reindex_job_row(  # noqa: SLF001
+            claimed, "rx4-worker"
+        )
+        final = conn.execute(
+            "SELECT status, error, result_json FROM jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+        assert final["status"] == "failed"
+        assert "attempt_cap_exceeded" not in (final["error"] or ""), (
+            "the cap was never reached; no cap prefix on the "
+            "duplicate-only settlement"
+        )
+        result = json.loads(final["result_json"] or "{}")
+        assert result.get("duplicate_file_ids") == [7, 9], (
+            f"the terminal result composes the cumulative duplicates; result={result}"
+        )
+        assert result.get("failed") == 2, (
+            "the duplicate-only arm recomputes 'failed' to the DISTINCT "
+            "terminal-file union (7 + 9), not the producer's "
+            f"current-attempt-only count; result={result}"
         )
     finally:
         pool.close_all()
