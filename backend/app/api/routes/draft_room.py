@@ -4958,7 +4958,6 @@ async def list_draft_findings(
     current_revision_id, has_active_compile, findings, total = await _run_store(
         lambda: store.findings_page_after_authorization(
             draft_id=draft_id,
-            owner_id=owner_id,
             revision_id=revision_id,
             status=status,
             severity=severity,
@@ -5006,6 +5005,12 @@ async def dispose_draft_finding(
     * ``dismiss`` is prohibited for blockers (409 ``blocker_not_dismissable``).
     * ``waive`` needs ``waivable=1``, an unchanged span text and rule version,
       a user actor, and a non-empty ``note``.
+    * ``dismiss``/``waive`` of a finding that is no longer ``open`` is refused
+      409 ``finding_not_open`` with ``lock_version`` unchanged (issue #901).
+    * A retryable storage fault inside the disposition transaction (e.g.
+      ``sqlite3.OperationalError`` lock contention) surfaces as a server-side
+      5xx, NOT 409 — only the uniqueness-violation trigger keeps the 409
+      ``conflict`` mapping (issue #901).
 
     Dismiss and waive additionally refuse an archived draft (409
     ``invalid_state``) and a stale ``lock_version`` (409

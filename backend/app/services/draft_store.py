@@ -3691,7 +3691,6 @@ class DraftStore:
         self,
         *,
         draft_id: int,
-        owner_id: int,
         revision_id: Optional[int] = None,
         status: Optional[str] = None,
         severity: Optional[str] = None,
@@ -3711,8 +3710,11 @@ class DraftStore:
         transaction held across an ``await`` (the whole method runs inside one
         caller-side ``_run_store`` hop).
 
-        ``owner_id`` scopes the findings exactly like :meth:`list_findings`;
-        it is not used to re-read the drafts row.
+        This method deliberately performs NO ownership check of its own (the
+        route's hop-1 ``get_draft`` did it) and takes no ``owner_id`` for
+        exactly that reason — unlike :meth:`list_findings`, which enforces
+        ownership itself and must stay the reader of record for any caller
+        that has not already authorized.
         """
         if status is not None and status not in FINDING_STATUSES:
             raise DraftValidationError(f"unknown finding status: {status!r}")
