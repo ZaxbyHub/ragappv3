@@ -168,6 +168,12 @@ class WikiLintFinding:
     status: str
     created_at: str
     updated_at: str
+    # Producer provenance (issue #949 / #791): which subsystem wrote the row
+    # ('linter' | 'invalidation' | 'compiler' | 'curator' — the table's CHECK
+    # vocabulary). Defaulted, not required, to mirror the column's DEFAULT
+    # 'linter' so hand-built instances and the reconciler's scoping stay
+    # source-compatible; ``update_lint_finding`` never lets callers set it.
+    origin: str = "linter"
 
 
 @dataclass
@@ -443,6 +449,7 @@ def _to_lint_finding(row: sqlite3.Row) -> WikiLintFinding:
         status=d["status"],
         created_at=d["created_at"],
         updated_at=d["updated_at"],
+        origin=d["origin"],
     )
 
 
