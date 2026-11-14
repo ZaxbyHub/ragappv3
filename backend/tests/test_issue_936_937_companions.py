@@ -1460,7 +1460,10 @@ def test_windows_liveness_never_uses_os_kill(monkeypatch):
     (TerminateProcess would kill the probed worker). Portable simulation:
     force the nt branch with a stubbed kernel32 and plant an os.kill
     tripwire — reintroducing os.kill on the nt path fails this test on ANY
-    platform, including CI's ubuntu runners.
+    platform, including CI's ubuntu runners. Scope note (pr1132 review
+    TD-1/TD-2): this pins the nt BRANCH BODY; platform-SELECTION
+    discrimination (which branch the _is_windows predicate picks) is pinned
+    separately by test_is_windows_seam_discriminates_os_name.
     """
     import ctypes
 
@@ -1496,6 +1499,34 @@ def test_windows_liveness_never_uses_os_kill(monkeypatch):
 
     assert telemetry_module._pid_alive(999999) is False
     assert telemetry_module._pid_alive(os.getpid()) is True
+
+
+def test_is_windows_seam_discriminates_os_name(monkeypatch):
+    """TD-1 (pr1132-20261114 reviewer + critic, UPHELD MEDIUM): the seam
+    BODY must be VALUE-discriminated, not just stubbed. The r2 spoofing
+    tests replace the whole predicate, so an always-false mutant of the
+    production expression (`return False`, or the typo
+    `os.name == "windows"`) passed the entire ubuntu-only CI suite — and on
+    Windows it would route _pid_alive probes into os.kill ->
+    TerminateProcess (reviewer-executed: a live child was killed,
+    rc 3221225794; at base the os.name patch drove the production inline
+    expression, so the same mutant was killed via the tripwire on any
+    platform). Rebind the MODULE-LEVEL os binding (telemetry_module.os)
+    with a SimpleNamespace — module-scoped, so pathlib/pytest never see a
+    spoofed global platform (LC-1 preserved) — and assert both outcomes of
+    the actual production expression. Kills: constant-false, constant-true,
+    `== "windows"` typo, and negation mutants.
+    """
+    import types
+
+    monkeypatch.setattr(
+        telemetry_module, "os", types.SimpleNamespace(name="nt")
+    )
+    assert telemetry_module._is_windows() is True
+    monkeypatch.setattr(
+        telemetry_module, "os", types.SimpleNamespace(name="posix")
+    )
+    assert telemetry_module._is_windows() is False
 
 
 def test_warn_ledger_bounded_and_pruned_shard_forgotten(tmp_path, caplog):
