@@ -127,7 +127,7 @@ flowchart LR
 | File | Responsibility |
 |---|---|
 | `backend/app/api/routes/draft_room.py` | Pydantic contracts, authorization, CSRF/rate limits, HTTP/SSE endpoints |
-| `backend/app/services/draft_store.py` | All SQLite CRUD, atomic claims/transitions, revision numbering, event records |
+| `backend/app/services/draft_store.py` | Default owner of all six Draft Room tables — atomic claims/transitions, revision numbering, event records. Three declared co-owners write them directly (`api/routes/draft_room.py`, `services/draft_job_processor.py`, `services/draft_pipeline.py`); see the owner map in the store's module docstring |
 | `backend/app/services/draft_input_storage.py` | Safe private paths, streaming writes, reads, deletes, cleanup |
 | `backend/app/services/draft_deletion.py` | Two-phase project/input tombstones, parent-delete integration, orphan reconciliation |
 | `backend/app/services/document_extraction.py` | Shared parse-only extraction wrapper around existing `DocumentParser` |
@@ -691,7 +691,7 @@ Every paginated response is `{items, total, page, per_page}` with `page>=1`, def
 
 For compile/retry idempotency, accept an ASCII `Idempotency-Key` of 1-128 characters. Reusing a key for the same authenticated user and identical request fingerprint returns the original job and status; reusing it for a different draft, input snapshot, base revision, or requested start stage returns `409`. Keys and request fingerprints persist with the job and are never recycled.
 
-`FindingDispositionRequest` contains `action: 'apply'|'dismiss'|'waive'`, `base_revision_id`, `lock_version`, and `note`. `apply` requires a current-revision finding with a non-null suggestion and unchanged span hash; it applies exactly that span, creates a new immutable manual revision in the same transaction, sets the finding to `applied`, and invalidates Ready/Fact. `dismiss` is allowed only for non-blockers and sets `dismissed`. `waive` requires `waivable=1`, an unchanged span/rule version, and a non-empty note. Pipeline-created edits use internal `resolved_by_revision`; they do not impersonate a user action.
+`FindingDispositionRequest` contains `action: 'apply'|'dismiss'|'waive'`, `base_revision_id`, `lock_version`, and `note`. `apply` requires a current-revision finding with a non-null suggestion and unchanged span hash; it applies exactly that span, creates a new immutable manual revision in the same transaction, sets the finding to `applied`, and invalidates Ready/Fact. `dismiss` is allowed only for open, non-blocker findings and sets `dismissed`. `waive` requires an open, `waivable=1` finding with an unchanged span/rule version and a non-empty note. Dismissing or waiving a finding that is no longer `open` is refused `409 finding_not_open` with `lock_version` unchanged. Pipeline-created edits use internal `resolved_by_revision`; they do not impersonate a user action.
 
 Export always returns the exact stored revision bytes and both `X-Draft-Fact-Status` and `X-Draft-Approval-Status` headers. If Fact is not currently valid (`not_run`, `running`, or `invalidated`), require `acknowledge_not_fact_checked=true`, use a sanitized filename ending `-UNVERIFIED.md`, and show the warning before download. A fact-checked but not Ready revision uses `-REVIEW.md`. Only the draft's current human-Ready revision uses the ordinary title/revision filename. Do not prepend a warning to the Markdown or otherwise mutate the revision.
 
@@ -818,7 +818,7 @@ Required behavior:
 
 ### 10.3 State transitions
 
-No code may write an arbitrary status string. Centralize the following transitions and reject all others:
+No code may write an arbitrary status string. Status changes routed through `DraftStore` go through the transition tables below and are rejected otherwise. The three declared co-owners (`api/routes/draft_room.py`, `services/draft_job_processor.py`, `services/draft_pipeline.py`) write `drafts.status`, `draft_jobs.status`, `draft_inputs.parse_status`, and — on the apply path — `draft_findings.status` directly. Instead of calling the module-private tables, every such write resolves to one of the four registered sources pinned by `backend/tests/draft_room/test_n06b_status_transition_map.py` (per the owner map in `draft_store.py`'s module docstring): a DraftStore transition call, a named mirrored prior-status allowlist (kept by the route and pipeline co-owners), a located inline prior-status guard, or the documented settle-pair chain. Centralize the following transitions and reject all others:
 
 ```text
 draft:
