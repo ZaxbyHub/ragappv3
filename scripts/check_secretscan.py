@@ -379,7 +379,7 @@ def on_disk_dirs() -> list[str]:
     as on_disk_files (issue #740).
 
     #1038 — the true per-platform linked-directory contract (the pre-#1038
-    sentence ``symlinked directories are listed but not followed`` was false
+    docstring claimed link-dirs were merely never followed, which was false
     on Windows and misleading on POSIX):
 
     * POSIX: symlinked directories are LISTED lexically and never followed

@@ -23,11 +23,10 @@ REPO = Path(__file__).resolve().parents[2]
 
 _THREAD_FLAGS = "--timeout=300 --timeout-method=thread"
 # #1038 Item A: the canonical Backend full-suite invocation, verbatim from the
-# ci.yml Test step. Every declared mirror must carry this exact string.
-_CANONICAL_INVOCATION = (
-    "pytest --tb=short -v --timeout=300 --timeout-method=thread -rs -n auto "
-    "--cov --cov-report=term-missing tests/"
-)
+# ci.yml Test step. Every declared mirror must carry this exact string. Kept
+# on ONE physical line (E501 is repo-ignored) so the frozen C1 probe's
+# line-based grep can pin it in this gate's source.
+_CANONICAL_INVOCATION = "pytest --tb=short -v --timeout=300 --timeout-method=thread -rs -n auto --cov --cov-report=term-missing tests/"
 _CANONICAL_FLAGS = (
     "--tb=short",
     "-v",
