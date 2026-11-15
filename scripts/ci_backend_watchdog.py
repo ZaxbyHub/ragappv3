@@ -48,8 +48,15 @@ IS_POSIX = os.name == "posix"
 
 # pytest -v dispatch/result line shapes. A dispatched-but-uncompleted test
 # appears as a bare node id (possibly as the final unterminated partial line);
-# a completed test's line carries one of the outcome tokens.
-_NODE_ID = r"[\w./\\\-]+\.(?:py|pyi)::[\w./\-]+(?:\[[^\]]*\])?"
+# a completed test's line carries one of the outcome tokens. The id pattern
+# spans the FULL node path — file :: Class :: test, with optional [param] —
+# so class-path ids are not truncated at the class component, and param
+# brackets are included (implementation-review round 1).
+_NODE_ID = (
+    r"[\w./\\\-]+\.(?:py|pyi)"
+    r"(?:::[\w./\-]+)+"  # one or more :: components (module, class(es), test)
+    r"(?:\[[^\]]*\])?"
+)
 _NODE_ID_RE = re.compile(_NODE_ID)
 _OUTCOME_RE = re.compile(
     r"\b(?:PASSED|FAILED|SKIPPED|ERROR|XFAIL|XPASS|CRASHED|crashed while running)\b"
@@ -140,18 +147,24 @@ def preflight_hook(skip: bool = False) -> bool:
     if dump_dir is None:
         eprint("watchdog preflight: WATCHDOG_DUMP_DIR is not set")
         return False
+    # Popen (not subprocess.run): CompletedProcess carries no pid, and the
+    # readiness marker is keyed by the PROBE's pid (implementation-review
+    # round 1 CRITICAL).
+    probe = subprocess.Popen(
+        [sys.executable, "-c", "pass"],
+        env=os.environ.copy(),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    probe_pid = probe.pid
     try:
-        probe = subprocess.run(
-            [sys.executable, "-c", "pass"],
-            env=os.environ.copy(),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=30,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        eprint(f"watchdog preflight: probe failed to run ({exc})")
+        probe.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        probe.kill()
+        probe.wait(timeout=5)
+        eprint("watchdog preflight: probe timed out")
         return False
-    ready = dump_dir / f"{READY_FILE_PREFIX}{probe.pid}.log"
+    ready = dump_dir / f"{READY_FILE_PREFIX}{probe_pid}.log"
     # The probe has exited by now; give the filesystem a moment if needed.
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline and not ready.exists():
@@ -236,7 +249,16 @@ class StreamTracker:
             return
         node = ids[-1]
         if completed and _OUTCOME_RE.search(line):
+            # Retire the completed id AND any pending ids that are partial
+            # prefixes of it (a node id that grew across chunk boundaries:
+            # `tests/x.py::TestG` observed mid-growth, completed as
+            # `tests/x.py::TestG::test_a` — the prefix must not linger as a
+            # phantom pending entry; implementation-review round 1).
             self.pending.pop(node, None)
+            for pending_id in [
+                p for p in self.pending if node.startswith(p + "::")
+            ]:
+                del self.pending[pending_id]
             self._completed.append(line.encode("utf-8", errors="replace"))
         else:
             if node not in self.pending:
@@ -424,11 +446,16 @@ def terminate_tree(child: subprocess.Popen, deadline_s: float = 120.0) -> None:
         end_wait = time.monotonic() + wait
         while time.monotonic() < end_wait and child.poll() is None:
             time.sleep(0.05)
-        if child.poll() is None:
-            try:
-                os.killpg(child.pid, _signal.SIGKILL)
-            except (OSError, ProcessLookupError):
-                pass
+        # Unconditional bounded SIGKILL to the GROUP: the controller (direct
+        # child) may have exited on SIGTERM while a TERM-resistant descendant
+        # (e.g. a wedged xdist worker with SIGTERM ignored) is still alive in
+        # the group — gating the kill on direct-child liveness would spare it
+        # (implementation-review round 1). killpg on an all-dead group raises
+        # ProcessLookupError, which is the clean outcome.
+        try:
+            os.killpg(child.pid, _signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            pass
     else:
         try:
             subprocess.run(

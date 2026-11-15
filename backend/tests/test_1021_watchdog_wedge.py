@@ -345,6 +345,36 @@ def test_watchdog_pending_tracker_synthetic_stream():
     )
     assert tracker.pending == {}, tracker.pending
 
+    # Implementation-review round 1 shapes: class-path ids are captured in
+    # FULL (not truncated at the class component) ...
+    tracker2 = mod.StreamTracker.__new__(mod.StreamTracker)
+    tracker2._pipe = None
+    tracker2._lock = __import__("threading").Lock()
+    tracker2._rolling = bytearray()
+    tracker2._partial = bytearray()
+    tracker2._completed = deque(maxlen=512)
+    tracker2.pending = {}
+    tracker2.last_activity = 0.0
+    tracker2.reader_error = None
+    tracker2._thread = threading.Thread(target=lambda: None, daemon=True)
+    tracker2._absorb(b"tests/test_wedge.py::TestGroup::test_class_case ")
+    assert set(tracker2.pending) == {
+        "tests/test_wedge.py::TestGroup::test_class_case"
+    }, tracker2.pending
+    # ... and an id that GROWS across chunk boundaries leaves no phantom
+    # prefix when its full form completes (split absorb, prefix then rest).
+    tracker2._absorb(b"tests/test_wedge.py::TestGrow")
+    assert "tests/test_wedge.py::TestGrow" in tracker2.pending, tracker2.pending
+    tracker2._absorb(b"::test_grown PASSED [100%]\r\n")
+    assert "tests/test_wedge.py::TestGrow" not in tracker2.pending, (
+        f"phantom prefix pending after growth completion: {tracker2.pending}"
+    )
+    # The class-path id from the earlier dispatch is deliberately never
+    # completed in this stream: it stays pending, captured in full.
+    assert set(tracker2.pending) == {
+        "tests/test_wedge.py::TestGroup::test_class_case"
+    }, tracker2.pending
+
 
 @pytest.mark.skipif(
     os.name == "nt",
@@ -457,3 +487,56 @@ def test_watchdog_posix_kills_process_group():
         time.sleep(0.2)
     for kind, pid in pids.items():
         assert not _probe_alive(pid), f"{kind} ({pid}) survived the group kill"
+
+
+@pytest.mark.skipif(
+    not IS_POSIX,
+    reason="TERM-resistant descendant kill is a POSIX process-group behavior",
+)
+def test_watchdog_posix_kills_term_resistant_descendant():
+    """Implementation-review round 1: the controller may exit on SIGTERM while
+    a descendant IGNORES SIGTERM — the unconditional bounded SIGKILL-to-the-
+    group must still reap it (the kill may never be gated on direct-child
+    liveness)."""
+    child = [
+        sys.executable,
+        "-c",
+        "import os, signal, subprocess, sys, time\n"
+        "subprocess.Popen([sys.executable, '-c', "
+        "'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "import os; print(\"RESISTANT_PID\", os.getpid(), flush=True); "
+        "time.sleep(600)'])\n"
+        "print('TERM_CONTROLLER_PID', os.getpid(), flush=True)\n"
+        "time.sleep(600)\n",
+    ]
+    proc = _run_watchdog(
+        [
+            "--skip-preflight",
+            "--quiet-window",
+            "2",
+            "--poll-interval",
+            "0.3",
+            "--hard-deadline",
+            "60",
+            "--",
+            *child,
+        ]
+    )
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 88, combined
+    pids = {}
+    for line in combined.splitlines():
+        if line.startswith(("TERM_CONTROLLER_PID", "RESISTANT_PID")):
+            kind, pid = line.split()
+            pids[kind] = int(pid)
+    assert set(pids) == {"TERM_CONTROLLER_PID", "RESISTANT_PID"}, combined
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and any(
+        _probe_alive(p) for p in pids.values()
+    ):
+        time.sleep(0.2)
+    for kind, pid in pids.items():
+        assert not _probe_alive(pid), (
+            f"{kind} ({pid}) survived the group SIGKILL (TERM-resistant "
+            "descendant must die with the group)"
+        )

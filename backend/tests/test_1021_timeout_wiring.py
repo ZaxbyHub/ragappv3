@@ -141,25 +141,36 @@ def test_local_and_doc_mirrors_carry_the_flag():
 
 
 def test_canonical_flags_at_every_declared_mirror():
-    """#1038 Item A: every declared mirror carries the canonical invocation.
+    """#1038 Item A: every declared mirror site carries the canonical invocation.
 
-    A mirror dropping or altering ANY flag of the canonical set fails here
-    with a message naming the site and each missing flag (the frozen mutant
-    probe drops ``-rs`` from the ci.yml Test step and must fail via this
-    naming, not via line-not-found).
+    Presence is asserted PER SITE, not per file: each mirror file must carry
+    the canonical invocation at least as many times as it has declared
+    command sites, so a drifted site cannot hide behind an unchanged copy
+    elsewhere in the same file (implementation-review round 1). A miss fails
+    naming the site and each missing flag; a short count fails naming the
+    site and both counts.
     """
     sites = {
-        "ci.yml Backend Test step": _read(".github", "workflows", "ci.yml"),
-        "justfile backend-test recipe": _read("justfile"),
-        "docs/engineering/testing.md": _read("docs", "engineering", "testing.md"),
-        ".agents/skills/ci-compatibility-audit/SKILL.md": _read(
-            ".agents", "skills", "ci-compatibility-audit", "SKILL.md"
+        "ci.yml Backend Test step": (_read(".github", "workflows", "ci.yml"), 1),
+        "justfile backend-test recipe": (_read("justfile"), 1),
+        "docs/engineering/testing.md": (_read("docs", "engineering", "testing.md"), 1),
+        ".agents/skills/ci-compatibility-audit/SKILL.md": (
+            _read(".agents", "skills", "ci-compatibility-audit", "SKILL.md"),
+            2,  # the CI description + the Local Mirror Commands fence
         ),
-        ".agents/skills/ci-fix-monitor/SKILL.md": _read(
-            ".agents", "skills", "ci-fix-monitor", "SKILL.md"
+        ".agents/skills/ci-fix-monitor/SKILL.md": (
+            _read(".agents", "skills", "ci-fix-monitor", "SKILL.md"),
+            2,  # the job-row table + the full-suite reproduction block
         ),
     }
-    for site, text in sites.items():
+    for site, (text, expected_sites) in sites.items():
+        count = text.count(_CANONICAL_INVOCATION)
+        assert count >= expected_sites, (
+            f"{site} lost the canonical Backend invocation at one of its "
+            f"command sites (found {count} of >= {expected_sites} expected; "
+            f"a drifted site cannot hide behind an unchanged copy — check "
+            f"every command site in this file)"
+        )
         assert _CANONICAL_INVOCATION in text, (
             f"{site} drifted from the canonical Backend invocation "
             f"(missing flag(s): {', '.join(_missing_flags(text)) or 'flag order/shape'})"
