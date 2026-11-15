@@ -61,4 +61,21 @@ describe("ReindexConfirmDialog", () => {
       screen.getByText(/about to save changes to fields/i),
     ).toBeInTheDocument();
   });
+
+  it("states the gated recovery contract and drops the pre-#695 false claims (issue #833)", () => {
+    setup({ dirtyReindexFields: ["embedding_model"] });
+    const body = screen.getByText(/embedding-mismatch 503/i, {
+      exact: false,
+    });
+    expect(body.textContent).toMatch(/all-vault reindex/i);
+    expect(body.textContent).toMatch(/run to completion/i);
+    expect(body.textContent).toMatch(/restarting does not clear/i);
+    // The pre-#695 claims are false once the readiness gate flips on save:
+    // embeddings are NOT queryable and new uploads do NOT go through until
+    // the all-vault reindex completes.
+    expect(body.textContent).not.toMatch(/remain queryable/i);
+    expect(body.textContent).not.toMatch(
+      /new documents will use the new settings immediately/i,
+    );
+  });
 });

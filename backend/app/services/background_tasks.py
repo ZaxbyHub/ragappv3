@@ -48,7 +48,12 @@ from .job_lease import (
 from .llm_client import LLMClient
 from .maintenance import MaintenanceService
 from .multimodal_enrichment import ArtifactEnrichmentService
-from .vector_store import VectorStore, VectorStoreError
+from .vector_store import (
+    VectorStore,
+    VectorStoreError,
+    readiness_epoch,
+    readiness_guard,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -5716,6 +5721,38 @@ class BackgroundProcessor:
                                 "readiness NOT lifted (re-run the reindex job)"
                             ),
                         )
+                    # [issue #736] A vault-scoped reindex never records a
+                    # validating identity or lifts a DOWN gate: other vaults
+                    # still hold old-model vectors, so lifting here would
+                    # deterministically serve a mixed index. When the gate is
+                    # UP (steady state) scoped jobs keep today's full sequence
+                    # — mark_ready(True) is a semantic no-op there and the
+                    # metadata failure-injection suites depend on the write
+                    # running.
+                    if vault_id is not None and (
+                        getattr(vector_store, "_ready", True) is False
+                    ):
+                        logger.warning(
+                            "Reindex job %d (vault %d) completed while the "
+                            "readiness gate is down; stored model identity "
+                            "and readiness left unchanged — an ALL-VAULT "
+                            "reindex is required to lift an "
+                            "embedding-mismatch gate.",
+                            job_id,
+                            vault_id,
+                        )
+                        return (
+                            "completed",
+                            {
+                                "processed": processed_files,
+                                "failed": 0,
+                                "readiness_lifted": False,
+                                "readiness_skip_reason": (
+                                    "vault_scoped_gate_down"
+                                ),
+                            },
+                            None,
+                        )
                     # [issue #706] Record the JOB-START identity, not the live
                     # one: when the R1 guard above passed, job-start == live,
                     # so behavior is identical — and a settings save landing
@@ -5723,6 +5760,7 @@ class BackgroundProcessor:
                     # the wrong identity over a table embedded under the old
                     # one. On the staged path the same values were already
                     # persisted at commit; this re-write is idempotent.
+                    epoch_at_record = readiness_epoch(vector_store)
                     await vector_store.record_embedding_metadata(
                         probe_dim or settings.embedding_dim,
                         raise_on_error=True,
@@ -5733,7 +5771,38 @@ class BackgroundProcessor:
                         if commit_attempted and job_identity_snapshot
                         else None,
                     )
-                    await vector_store.mark_ready(True)
+                    # [issue #736] Epoch-guarded lift: a settings save that
+                    # invalidated readiness during the metadata await bumped
+                    # the epoch; the guarded compare + mark_ready(True) are
+                    # mutually exclusive with the invalidation flip, so a
+                    # stale lift can never reopen the gate over a mismatch.
+                    # mark_ready's body has no suspension point, so awaiting
+                    # it inside the guard never yields the event loop (see
+                    # readiness_guard).
+                    readiness_lifted = False
+                    with readiness_guard(vector_store):
+                        if readiness_epoch(vector_store) == epoch_at_record:
+                            await vector_store.mark_ready(True)
+                            readiness_lifted = True
+                    if not readiness_lifted:
+                        logger.warning(
+                            "Reindex job %d: readiness was invalidated during "
+                            "completion; the gate is left down — re-run the "
+                            "reindex under the new identity.",
+                            job_id,
+                        )
+                        return (
+                            "completed",
+                            {
+                                "processed": processed_files,
+                                "failed": 0,
+                                "readiness_lifted": False,
+                                "readiness_skip_reason": (
+                                    "invalidated_during_completion"
+                                ),
+                            },
+                            None,
+                        )
                     # Cutover complete: the draining snapshot that pinned
                     # query embedding to the old generation is obsolete (#696).
                     clear_drain = getattr(

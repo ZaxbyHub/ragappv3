@@ -47,6 +47,7 @@ from app.api.deps import (
     get_user_accessible_vault_ids,
     get_vector_store,
     require_admin_role,
+    require_ingest_ready,
     require_vault_permission,
 )
 from app.config import Settings, settings
@@ -2411,6 +2412,7 @@ async def upload_document_root(
     vault_id: int = Query(..., description="Target vault ID (required — no default)"),
     settings_dep: Settings = Depends(get_settings),
     vector_store: VectorStore = Depends(get_vector_store),
+    _ingest_gate: VectorStore = Depends(require_ingest_ready),
     embedding_service: EmbeddingService = Depends(get_embedding_service),
     db_pool: SQLiteConnectionPool = Depends(get_db_pool),
     background_processor: BackgroundProcessor = Depends(get_background_processor),
@@ -2453,6 +2455,7 @@ async def upload_document(
     vault_id: int = Query(..., description="Target vault ID (required — no default)"),
     settings_dep: Settings = Depends(get_settings),
     vector_store: VectorStore = Depends(get_vector_store),
+    _ingest_gate: VectorStore = Depends(require_ingest_ready),
     embedding_service: EmbeddingService = Depends(get_embedding_service),
     db_pool: SQLiteConnectionPool = Depends(get_db_pool),
     background_processor: BackgroundProcessor = Depends(get_background_processor),
@@ -2993,6 +2996,7 @@ async def scan_directories(
     db_pool: SQLiteConnectionPool = Depends(get_db_pool),
     user: dict = Depends(require_admin_role),
     _csrf_token: str = Depends(csrf_protect),
+    _ingest_gate: VectorStore = Depends(require_ingest_ready),
 ):
     """
     Trigger a scan of configured directories for new files.

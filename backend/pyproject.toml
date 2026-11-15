@@ -13,6 +13,10 @@ ignore = ["E501"]
 # F841 unused variables common in test fixtures and diagnostic assertions
 "tests/*.py" = ["F401", "E402", "E722", "F821", "F841"]
 "test_*.py" = ["F401", "E402", "E722", "F821", "F841"]
+# Checkpoint-frozen test files (issue #736/#833 trace): the sys.path-insert
+# harness block sits between import groups by design and re-sorting the
+# block would change the blob the frozen checkpoint manifest pins.
+"tests/test_g04_embedding_readiness_and_metric.py" = ["I001"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["app"]

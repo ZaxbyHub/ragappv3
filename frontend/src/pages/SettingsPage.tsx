@@ -339,9 +339,10 @@ function SettingsPageContent({
             </p>
             <p className="text-xs text-warning/80 mt-0.5">
               Changes to embedding model, chunk size, or vector settings
-              invalidate existing document embeddings. Re-process documents
-              from the Documents page or run a wiki recompile from the
-              Maintenance tab.
+              invalidate existing document embeddings. Rebuild embeddings
+              (all-vault reindex) from the Maintenance tab — the run must
+              complete to restore search readiness, and restarting does not
+              clear it.
             </p>
           </div>
           <button

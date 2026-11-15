@@ -20,6 +20,7 @@ from app.security import CSRFManager, csrf_protect, issue_csrf_token
 from app.services.model_provider_policy import ProviderPolicyError, _parse_strict_origin
 from app.services.ssrf import URLBlocked, assert_url_safe
 from app.services.ssrf_transport import SSRFSafeTransport
+from app.services.vector_store import readiness_guard
 
 router = APIRouter()
 
@@ -1732,8 +1733,13 @@ def _invalidate_vector_store_readiness(app, prior_config: dict) -> None:
         return
     # Same transition VectorStore.mark_ready(False) performs (vector_store.py);
     # executed synchronously because these route handlers run off the event
-    # loop and mark_ready is a coroutine.
-    store._ready = False
+    # loop and mark_ready is a coroutine. The guard + epoch bump (issue #736)
+    # make this flip mutually exclusive with a reindex completion's
+    # epoch-recheck + mark_ready(True) critical section, so a save landing in
+    # the completion's final window can never be overwritten by a stale lift.
+    with readiness_guard(store):
+        store._ready = False
+        store._readiness_epoch = getattr(store, "_readiness_epoch", 0) + 1
     register = getattr(store, "register_draining_embedding_config", None)
     if callable(register):
         try:

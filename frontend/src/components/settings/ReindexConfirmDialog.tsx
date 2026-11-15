@@ -58,9 +58,11 @@ export function ReindexConfirmDialog({
 
         <p className="text-sm text-muted-foreground">
           Existing document embeddings were generated with the previous
-          settings. They will remain queryable but may produce stale or lower-
-          quality results until you re-index. New documents will use the new
-          settings immediately.
+          settings. After saving, search, chat, memories, and wiki pause
+          with an embedding-mismatch 503 and new uploads are paused until
+          you rebuild embeddings (all-vault reindex) from the Maintenance
+          tab. The reindex must run to completion to restore readiness —
+          restarting does not clear the 503.
         </p>
 
         <DialogFooter>

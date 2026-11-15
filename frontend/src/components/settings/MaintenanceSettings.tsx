@@ -1,16 +1,17 @@
 /**
  * Settings → Maintenance tab.
  *
- * Action buttons that hit existing backend endpoints only (per the
- * approved plan, the unwired "Reindex current vault" button is dropped —
- * POST /documents/reindex has since shipped (admin-gated; the Activity
- * tray's reindex family reads its job list); wiring a maintenance-tab
- * button for it is tracked separately).
+ * Action buttons that hit existing backend endpoints only — nothing here is
+ * decorative.
  *
  * Buttons:
  *   - Recompile wiki current vault   → POST /wiki/recompile
  *   - Run wiki lint                  → POST /wiki/lint/run
  *   - Test connections               → GET /settings/connection
+ *   - Rebuild embeddings (all-vault reindex) → POST /documents/reindex
+ *     (issue #833: the in-app recovery path for an embedding-mismatch 503
+ *     after a runtime embedding-model change; always all-vault — a
+ *     vault-scoped run restores readiness over a mixed index)
  *
  * Plus a "Recent jobs" mini-list using GET /wiki/jobs?limit=10 so the
  * operator can see the effect of a recompile without leaving the tab.
@@ -24,13 +25,22 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { Loader2, RefreshCw } from "lucide-react";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { AlertTriangle, Loader2, RefreshCw } from "lucide-react";
 import { toast } from "sonner";
 import {
   recompileVaultWiki,
   runWikiLint,
   listWikiJobs,
   testConnections,
+  triggerDocumentReindex,
 } from "@/lib/api";
 import type { WikiCompileJob } from "@/lib/api";
 import { useAuthOwner } from "@/hooks/useAuthOwner";
@@ -152,7 +162,7 @@ function MaintenanceSettingsState({
   vaultMutationTokenRef,
 }: MaintenanceSettingsStateProps) {
   const [busy, setBusy] = useState<
-    null | "recompile" | "lint"
+    null | "recompile" | "lint" | "reindex"
   >(null);
   const [recentJobs, setRecentJobs] = useState<WikiCompileJob[]>([]);
   const [jobsLoading, setJobsLoading] = useState(Boolean(vaultId));
@@ -245,7 +255,7 @@ function MaintenanceSettingsState({
 
   const runMutation = useCallback(
     async (
-      action: "recompile" | "lint",
+      action: "recompile" | "lint" | "reindex",
       request: () => Promise<string>,
       failure: string,
       refreshAfter = false,
@@ -313,6 +323,16 @@ function MaintenanceSettingsState({
     }, "Failed to run wiki lint");
   };
 
+  const [reindexConfirmOpen, setReindexConfirmOpen] = useState(false);
+
+  const handleReindex = async () => {
+    await runMutation("reindex", async () => {
+      const out = await triggerDocumentReindex();
+      if (!out?.job_id) throw new Error("Reindex response was malformed");
+      return `Embedding reindex queued (job ${out.job_id}) — all vaults; recovery completes when the job finishes`;
+    }, "Failed to queue embedding reindex");
+  };
+
   return (
     <div className="space-y-4">
       <Card>
@@ -367,6 +387,87 @@ function MaintenanceSettingsState({
           )}
         </CardContent>
       </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">Embeddings recovery</CardTitle>
+          <CardDescription>
+            After changing the embedding model (or an embedding prefix) in
+            Models, search, chat, memories, and wiki pause with an
+            embedding-mismatch 503 until an all-vault reindex runs to
+            completion. Restarting does not clear the 503 — only a completed
+            all-vault reindex restores readiness.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-2">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setReindexConfirmOpen(true)}
+            disabled={busy !== null || connectionsBusy}
+          >
+            {busy === "reindex" && (
+              <Loader2 className="w-4 h-4 mr-1 animate-spin" />
+            )}
+            Rebuild embeddings (all-vault reindex)
+          </Button>
+          <p className="text-xs text-muted-foreground">
+            Re-embeds every indexed document across all vaults under the
+            current embedding settings. Recovery from an embedding-mismatch
+            503 requires this run to complete — the Activity tray shows the
+            job&apos;s progress.
+          </p>
+        </CardContent>
+      </Card>
+
+      <Dialog
+        open={reindexConfirmOpen}
+        onOpenChange={(open) => {
+          if (busy !== "reindex") setReindexConfirmOpen(open);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <AlertTriangle
+                className="h-5 w-5 text-warning"
+                aria-hidden="true"
+              />
+              Rebuild all embeddings?
+            </DialogTitle>
+            <DialogDescription>
+              This queues an all-vault reindex job that re-embeds every
+              indexed document under the current embedding settings. It must
+              run to completion to clear an embedding-mismatch 503 — partial
+              or vault-scoped runs do not recover, and restarting the app
+              does not clear the 503.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setReindexConfirmOpen(false)}
+              disabled={busy === "reindex"}
+            >
+              Cancel
+            </Button>
+            <Button
+              size="sm"
+              onClick={() => {
+                setReindexConfirmOpen(false);
+                void handleReindex();
+              }}
+              disabled={busy !== null}
+            >
+              {busy === "reindex" && (
+                <Loader2 className="w-4 h-4 mr-1 animate-spin" />
+              )}
+              Start all-vault reindex
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Card>
         <CardHeader className="flex flex-row items-center justify-between">
