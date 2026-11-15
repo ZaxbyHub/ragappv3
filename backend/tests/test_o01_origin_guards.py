@@ -32,15 +32,11 @@ swarm-pr-review round (pr930-20261015) additions:
 
 import asyncio
 import json
-import sqlite3
-import tempfile
 import unittest
-from pathlib import Path
-from unittest.mock import patch
+
+from _wiki_lint_o01_support import CuratorHarness, make_env
 
 from app.config import settings
-from app.models.database import run_migrations
-from app.services.wiki_compiler import WikiCompiler
 from app.services.wiki_curator import (
     CuratorAcceptedClaim,
     CuratorChunk,
@@ -51,40 +47,13 @@ from app.services.wiki_linter import WikiLinter
 from app.services.wiki_store import WikiStore
 
 
-def _make_env():
-    td = tempfile.mkdtemp()
-    db_path = str(Path(td) / "test.db")
-    run_migrations(db_path)
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA foreign_keys = ON;")
-    conn.row_factory = sqlite3.Row
-    conn.execute("INSERT OR IGNORE INTO vaults (id, name) VALUES (1, 'Test')")
-    conn.commit()
-    return conn, WikiStore(conn)
-
-
-_CURATOR_FIELDS = (
-    "wiki_llm_curator_enabled",
-    "wiki_llm_curator_run_on_ingest",
-    "wiki_llm_curator_run_on_query",
-    "wiki_llm_curator_run_on_manual",
-    "wiki_llm_curator_url",
-    "wiki_llm_curator_model",
-)
-
-
-class _Ext:
-    acronyms: list = []
-    persons: list = []
-    role_claims: list = []
-
-
 class TestOriginScoping(unittest.TestCase):
     """Guard (i): non-linter producers survive run_lint even when their
     finding_type is one the linter itself emits."""
 
     def setUp(self):
-        self.conn, self.store = _make_env()
+        self.conn = make_env(self)
+        self.store = WikiStore(self.conn)
 
     def tearDown(self):
         self.conn.close()
@@ -136,7 +105,8 @@ class TestUserTerminalSuppression(unittest.TestCase):
     alongside auto_resolved siblings."""
 
     def setUp(self):
-        self.conn, self.store = _make_env()
+        self.conn = make_env(self)
+        self.store = WikiStore(self.conn)
         self.linter = WikiLinter(self.conn, self.store)
         claim = self.store.create_claim(
             vault_id=1, claim_text="Suppression probe claim", source_type="manual"
@@ -249,6 +219,66 @@ class TestUserTerminalSuppression(unittest.TestCase):
             " ORDER BY id"
         ).fetchall()
         self.assertEqual([r["status"] for r in rows], ["dismissed", "auto_resolved"])
+
+    def test_cross_origin_dismissal_suppresses_linter_redetect(self):
+        """Issue #934 item 5: the precedence rule is CROSS-origin. A curator
+        row the user dismissed must suppress a later LINTER re-detection of
+        the same fingerprint — rule 2 may not be scoped to the reconciling
+        producer's own origin. (An origin-scoped rule 2 would instead flip
+        the linter's auto_resolved sibling open here.)"""
+        # Linter detect: open linter row for the unsupported claim.
+        self.linter.run_lint(1)
+        linter_row = self.conn.execute(
+            "SELECT id, title, status, origin FROM wiki_lint_findings"
+            " WHERE finding_type='unsupported_claim'"
+        ).fetchone()
+        self.assertEqual(
+            (linter_row["status"], linter_row["origin"]), ("open", "linter")
+        )
+        # Empty linter upsert (undetect): the reconcile auto-resolves it.
+        self.store.upsert_lint_findings(1, [], origin="linter")
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT status FROM wiki_lint_findings WHERE id = ?",
+                (linter_row["id"],),
+            ).fetchone()["status"],
+            "auto_resolved",
+        )
+        # Curator upsert of the SAME fingerprint: cross-origin, no open row,
+        # no user-terminal row, no same-origin auto_resolved row — rule 4
+        # inserts a fresh open CURATOR row.
+        spec = {
+            "finding_type": "unsupported_claim",
+            "severity": "medium",
+            "title": linter_row["title"],
+            "details": "",
+            "related_page_ids": [],
+            "related_claim_ids": [],
+        }
+        result = self.store.upsert_lint_findings(1, [spec], origin="curator")
+        self.assertEqual([f.origin for f in result], ["curator"])
+        # The user dismisses the CURATOR row.
+        curator_id = result[0].id
+        self.store.update_lint_finding(curator_id, 1, "dismissed")
+        # Linter re-detects: the dismissed curator row suppresses it.
+        detected = self.linter.run_lint(1)
+        self.assertEqual(
+            [f.id for f in detected if f.finding_type == "unsupported_claim"], []
+        )
+        open_count = self.conn.execute(
+            "SELECT COUNT(*) FROM wiki_lint_findings WHERE vault_id=1"
+            " AND finding_type='unsupported_claim' AND status='open'"
+        ).fetchone()[0]
+        self.assertEqual(open_count, 0)
+        # The curator row keeps its user disposition and the linter sibling
+        # stays auto_resolved — no resurrect, no duplicate.
+        statuses = self.conn.execute(
+            "SELECT status FROM wiki_lint_findings WHERE finding_type="
+            "'unsupported_claim' ORDER BY id"
+        ).fetchall()
+        self.assertEqual(
+            [r["status"] for r in statuses], ["auto_resolved", "dismissed"]
+        )
 
     def test_update_lint_finding_rejects_system_only_status(self):
         """PRR-009: 'auto_resolved' is reconciler-owned; the user-settable set
@@ -376,42 +406,15 @@ class TestCuratorSourceDedupe(unittest.TestCase):
     detect cycle holds one row per fingerprint."""
 
     def setUp(self):
-        self.conn, self.store = _make_env()
-        self._settings = settings
-        self._snap = {f: getattr(settings, f) for f in _CURATOR_FIELDS}
-        compiler = WikiCompiler.__new__(WikiCompiler)
-        compiler._db = self.conn
-        compiler._store = self.store
-        self.compiler = compiler
+        self.conn = make_env(self)
+        self.store = WikiStore(self.conn)
+        self.harness = CuratorHarness(self, self.conn, self.store)
 
     def tearDown(self):
-        for name, value in self._snap.items():
-            setattr(self._settings, name, value)
         self.conn.close()
 
     def _run_curator(self, accepted, file_id):
-        result = CuratorResult(accepted=list(accepted), lint_findings=[])
-
-        async def _curate(**kwargs):
-            return result
-
-        self._settings.wiki_llm_curator_enabled = True
-        self._settings.wiki_llm_curator_run_on_ingest = True
-        self._settings.wiki_llm_curator_url = "https://api.example.com"
-        self._settings.wiki_llm_curator_model = "qwen-1b"
-        with patch("app.services.wiki_compiler.CuratorClient"), patch(
-            "app.services.wiki_compiler.WikiCurator"
-        ) as cur_ctor:
-            cur_ctor.return_value.curate = _curate
-            return self.compiler._maybe_run_curator(
-                vault_id=1,
-                file_id=file_id,
-                text="probe text " * 50,
-                trigger="ingest",
-                deterministic_extraction=_Ext(),
-                page_id=None,
-                existing_entities=[],
-            )
+        return self.harness.run_curator(accepted, file_id=file_id)
 
     @staticmethod
     def _accepted(file_id):
@@ -476,7 +479,8 @@ class TestCuratorFindingIdentity(unittest.TestCase):
             return self.payload
 
     def setUp(self):
-        self.conn, self.store = _make_env()
+        self.conn = make_env(self)
+        self.store = WikiStore(self.conn)
         self._settings = settings
         self._snap = {
             f: getattr(settings, f)

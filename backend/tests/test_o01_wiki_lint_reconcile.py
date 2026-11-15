@@ -5,33 +5,24 @@ Pins the accepted wiki-lint contract:
     medium, low), not insertion order;
   - run_lint reconciliation is scoped to finding types the linter
     emits, so foreign findings stay open;
-  - an auto-resolved finding reopens when its condition recurs;
+  - an auto-resolved finding reopens when its condition recurs (issue
+    #934 item 4: the intermediate auto_resolved state and the reused
+    row id are pinned, not just the final open count);
   - curator reruns do not duplicate lint findings and keep per-file
     sources when a claim text repeats across files;
   - update_lint_finding on a missing id leaves no open transaction.
+
+Issue #934 items 6 + 8: the env bootstrap and curator stubbing live in
+_wiki_lint_o01_support (shared with test_o01_origin_guards.py) and every
+temp directory registers its own cleanup.
 """
 
 import sqlite3
-import tempfile
 import unittest
-from pathlib import Path
-from unittest.mock import patch
 
+from _wiki_lint_o01_support import CuratorHarness, make_env
 
-def _make_env():
-    from app.models.database import run_migrations
-    from app.services.wiki_store import WikiStore
-
-    td = tempfile.mkdtemp()
-    db_path = str(Path(td) / "test.db")
-    run_migrations(db_path)
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA foreign_keys = ON;")
-    conn.row_factory = sqlite3.Row
-    conn.execute("INSERT OR IGNORE INTO vaults (id, name) VALUES (1, 'Test')")
-    conn.commit()
-    store = WikiStore(conn)
-    return conn, store
+from app.services.wiki_store import WikiStore
 
 
 class _SeverityOrder:
@@ -60,7 +51,8 @@ class TestLintFindingsSeverityOrder(unittest.TestCase):
     """list_lint_findings returns findings ordered by severity rank."""
 
     def setUp(self):
-        self.conn, self.store = _make_env()
+        self.conn = make_env(self)
+        self.store = WikiStore(self.conn)
 
     def tearDown(self):
         self.conn.close()
@@ -79,7 +71,8 @@ class TestLintReconcileScope(unittest.TestCase):
     """run_lint reconciles only finding types the linter itself emits."""
 
     def setUp(self):
-        self.conn, self.store = _make_env()
+        self.conn = make_env(self)
+        self.store = WikiStore(self.conn)
 
     def tearDown(self):
         self.conn.close()
@@ -112,11 +105,26 @@ class TestLintReconcileScope(unittest.TestCase):
         )
         self.conn.commit()
         linter.run_lint(1)
+        # Issue #934 item 4: pin the INTERMEDIATE state — between runs the
+        # row is auto_resolved (not deleted, not left open).
+        resolved = self.conn.execute(
+            "SELECT id, status FROM wiki_lint_findings WHERE vault_id=1"
+            " AND finding_type='unsupported_claim'"
+        ).fetchone()
+        self.assertEqual(resolved["status"], "auto_resolved")
+        original_id = resolved["id"]
         self.conn.execute(
             "DELETE FROM wiki_claim_sources WHERE claim_id = ?", (claim.id,)
         )
         self.conn.commit()
         linter.run_lint(1)
+        row = self.conn.execute(
+            "SELECT id, status FROM wiki_lint_findings WHERE vault_id=1"
+            " AND finding_type='unsupported_claim'"
+        ).fetchone()
+        assert row["status"] == "open"
+        # Reopen reuses the SAME row — no duplicate history row per flap.
+        assert row["id"] == original_id
         open_count = self.conn.execute(
             "SELECT COUNT(*) FROM wiki_lint_findings WHERE vault_id=1 "
             "AND status='open' AND finding_type='unsupported_claim'"
@@ -124,77 +132,16 @@ class TestLintReconcileScope(unittest.TestCase):
         assert open_count == 1
 
 
-_CURATOR_FIELDS = (
-    "wiki_llm_curator_enabled",
-    "wiki_llm_curator_run_on_ingest",
-    "wiki_llm_curator_run_on_query",
-    "wiki_llm_curator_run_on_manual",
-    "wiki_llm_curator_url",
-    "wiki_llm_curator_model",
-)
-
-
 class TestCuratorFindingPersistence(unittest.TestCase):
     """Curator reruns dedupe lint findings and keep per-file sources."""
 
     def setUp(self):
-        self.conn, self.store = _make_env()
-        from app.config import settings
-
-        self._settings = settings
-        self._snap = {f: getattr(settings, f) for f in _CURATOR_FIELDS}
+        self.conn = make_env(self)
+        self.store = WikiStore(self.conn)
+        self.harness = CuratorHarness(self, self.conn, self.store)
 
     def tearDown(self):
-        for name, value in self._snap.items():
-            setattr(self._settings, name, value)
         self.conn.close()
-
-    def _compiler(self):
-        from app.services.wiki_compiler import WikiCompiler
-
-        compiler = WikiCompiler.__new__(WikiCompiler)  # type: ignore
-        compiler._db = self.conn
-        compiler._store = self.store
-        return compiler
-
-    def _ext(self):
-        # The deterministic extractor duck-type: the compiler only reads
-        # .acronyms / .persons / .role_claims.
-        class _E:
-            acronyms: list = []
-            persons: list = []
-            role_claims: list = []
-
-        return _E()
-
-    def _enable(self):
-        self._settings.wiki_llm_curator_enabled = True
-        self._settings.wiki_llm_curator_run_on_ingest = True
-        self._settings.wiki_llm_curator_url = "https://api.example.com"
-        self._settings.wiki_llm_curator_model = "qwen-1b"
-
-    def _curate(self, accepted, lint_findings):
-        from app.services.wiki_curator import CuratorResult
-
-        result = CuratorResult(
-            accepted=list(accepted), lint_findings=list(lint_findings)
-        )
-
-        async def _run(**kwargs):
-            return result
-
-        return _run
-
-    def _run_curator(self, compiler, *, file_id):
-        compiler._maybe_run_curator(
-            vault_id=1,
-            file_id=file_id,
-            text="probe text " * 50,
-            trigger="ingest",
-            deterministic_extraction=self._ext(),
-            page_id=None,
-            existing_entities=[],
-        )
 
     def test_curator_rerun_does_not_duplicate_lint_finding(self):
         finding = {
@@ -203,14 +150,8 @@ class TestCuratorFindingPersistence(unittest.TestCase):
             "title": "Curator contradiction probe",
             "details": "d",
         }
-        compiler = self._compiler()
-        self._enable()
-        with patch("app.services.wiki_compiler.CuratorClient"), patch(
-            "app.services.wiki_compiler.WikiCurator"
-        ) as cur_ctor:
-            cur_ctor.return_value.curate = self._curate([], [finding])
-            for _ in range(2):
-                self._run_curator(compiler, file_id=1)
+        for _ in range(2):
+            self.harness.run_curator([], [finding], file_id=1)
         open_count = self.conn.execute(
             "SELECT COUNT(*) FROM wiki_lint_findings WHERE vault_id=1 "
             "AND status='open' AND title='Curator contradiction probe'"
@@ -235,15 +176,8 @@ class TestCuratorFindingPersistence(unittest.TestCase):
                 status="needs_review",
             )
 
-        compiler = self._compiler()
-        self._enable()
-        with patch("app.services.wiki_compiler.CuratorClient"), patch(
-            "app.services.wiki_compiler.WikiCurator"
-        ) as cur_ctor:
-            cur_ctor.return_value.curate = self._curate([_acc(1)], [])
-            self._run_curator(compiler, file_id=1)
-            cur_ctor.return_value.curate = self._curate([_acc(2)], [])
-            self._run_curator(compiler, file_id=2)
+        self.harness.run_curator([_acc(1)], file_id=1)
+        self.harness.run_curator([_acc(2)], file_id=2)
         count = self.conn.execute(
             "SELECT COUNT(*) FROM wiki_claim_sources cs JOIN wiki_claims c "
             "ON c.id = cs.claim_id WHERE c.vault_id=1 AND "
@@ -256,7 +190,8 @@ class TestUpdateLintFindingTransaction(unittest.TestCase):
     """update_lint_finding on a missing id leaves no open transaction."""
 
     def setUp(self):
-        self.conn, self.store = _make_env()
+        self.conn = make_env(self)
+        self.store = WikiStore(self.conn)
 
     def tearDown(self):
         self.conn.close()
