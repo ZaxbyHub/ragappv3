@@ -183,7 +183,7 @@ cd frontend && VITE_APP_BASENAME=/knowledgevault VITE_API_URL=/knowledgevault/ap
 #   "Base path contains unsafe characters: <the rewritten value>" (issue #567).
 #   On PowerShell and on Linux no prefix is needed. The repo justfile handles
 #   this automatically via `just frontend-build-subpath`.
-cd backend && ruff check . && pytest --tb=short -v --timeout=300 --timeout-method=thread tests/
+cd backend && ruff check . && pytest --tb=short -v --timeout=300 --timeout-method=thread -rs -n auto --cov --cov-report=term-missing tests/
 python scripts/check_runtime_contract.py
 python scripts/check_config_contract.py
 python scripts/check_g06_setup_docs.py --check all

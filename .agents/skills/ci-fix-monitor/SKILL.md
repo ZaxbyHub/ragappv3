@@ -29,7 +29,7 @@ CI is a single PR-triggered workflow (`.github/workflows/ci.yml`, triggered on
 | Job | Steps that can fail | Run locally from |
 |-----|--------------------|------------------|
 | **Frontend** | `npm ci --engine-strict`, toolchain graph check, `npm run typecheck`, `npm run lint` (`--max-warnings 0`), API smoke subset, `npm test`, `npm run build`, two subpath builds | `frontend/` |
-| **Backend** | `ruff check .`, **`pytest --tb=short -v --timeout=300 --timeout-method=thread tests/`** (full suite, ~9.9k tests; the four-leg hang-class canary step runs after Test), `pytest --cov=app --cov-report=term-missing -q --timeout=300 --timeout-method=thread tests/` (coverage) | `backend/` |
+| **Backend** | `ruff check .`, **`pytest --tb=short -v --timeout=300 --timeout-method=thread -rs -n auto --cov --cov-report=term-missing tests/`** (the canonical single Test-step invocation under the out-of-process #1021 watchdog `python ../scripts/ci_backend_watchdog.py --quiet-window 360 --poll-interval 5 --hard-deadline 2700 -- ...`; full suite ~9.9k tests with coverage inline; the four-leg hang-class canary step runs after Test) | `backend/` |
 | **Quality contracts** | All eighteen contract scripts, in CI order: `python scripts/check_runtime_contract.py` (CI/docs inventory parity), `python scripts/check_config_contract.py` (`.env.example`↔Settings key contract), `python scripts/check_g06_setup_docs.py --check all` (setup-doc drift, six modes), `python scripts/check_settings_consumers.py` (Settings field consumer wiring), `python scripts/check_batch_mock_seq.py` (batch mock sequencing), `python scripts/check_pr_scope_drift.py` (PR scope drift), `python scripts/check_sast_baseline.py` (bandit baseline structural guard), `python scripts/check_secretscan.py` (`.secretscanignore` globs), `python scripts/check_test_collection_scope.py` (pytest files outside `backend/tests/`), `python scripts/check_a04_http500_detail_hygiene.py` (HTTP-500 detail redaction), `python scripts/check_b03_upload_migration_timeout.py` (upload migration timeout), `python scripts/check_l05_raw_palette.py` (raw palette tokens), `python scripts/check_l05_page_headers.py` (page headers), `python scripts/check_l07_a11y_gate_wired.py` (a11y gate wiring), `python scripts/check_l09_skill_trigger_paths.py` (skill trigger paths), `python scripts/check_l09_index_assets.py` (index assets), `python scripts/check_l09_memory_response_fields.py` (memory response fields), `python scripts/check_n05_draftclaim_nullable.py` (DraftClaim nullable parity) | repo root |
 | **SAST** | `python scripts/run_bandit.py` (bandit baseline gate; fails on new findings vs `backend/security/bandit-baseline.json`) | repo root |
 
@@ -37,12 +37,16 @@ CI is a single PR-triggered workflow (`.github/workflows/ci.yml`, triggered on
 > (issue #209). It takes ~18m on CI Linux (5.6x slower than local). A green
 > Backend job DOES prove the changed area passes (as long as the touched
 > test file isn't skipped via markers). Run the changed-area tests too for
-> faster local feedback.
+> faster local feedback. Coverage is PART of the single Test invocation
+> (`--cov --cov-report=term-missing` inline) — there is no separate
+> coverage step and never was a split coverage run (#1038 fixed this
+> row's drift).
 >
-> The coverage step (`continue-on-error: true`) cannot fail the job — never
-> chase a red there. BUT the job timeout (60m after #215) can be hit by the
-> test+coverage combo on very slow runners.
-
+> The Test step runs under the #1021 out-of-process watchdog: a silent wedge
+> now ends with a `WATCHDOG-FIRED` banner (naming every pending test) and
+> exit 88 by ~47m worst case, before the 50-minute step ceiling — see the
+> triage row below.
+>
 ## Tool availability
 
 Use the `gh` CLI when available; otherwise use the GitHub MCP tools. Verify MCP
@@ -81,8 +85,9 @@ marker:
     with `--timeout-method=thread --timeout=30` to get the Timeout banner +
     all-thread stack dump. A slow-but-completing test over 300s also shows
     as a crashed worker. Disclosed residual: a native call that holds the
-    GIL indefinitely starves both timeout methods — that subclass still
-    wedges to the job ceiling; audit it as the pre-#1021 C-level case
+    GIL indefinitely starves both timeout methods — that subclass is now
+    BOUNDED by the #1021 out-of-process watchdog (see the C-level hang
+    triage row below); audit it as the pre-#1021 C-level case
     (bcrypt hashpw, sqlite3.connect, fcntl locks) via the last PASSED test.
 - **Frontend → typecheck/build**: `error TS####` with file + line. `npm run
   build` runs `tsc` first, so a type error fails the build too.
@@ -102,7 +107,7 @@ Do not guess the cause from the job name. Read the log.
 | **Introduced by this PR** | Failure references a file/area your branch touched | Fix it before merge |
 | **Pre-existing on `master`** | Same check fails on `master`'s latest run, unrelated to your diff | Document in PR body; do not fix unless scoped |
 | **Environment / branch drift** | `npm ci` lockfile mismatch, or `check_pr_scope_drift.py` empty diff because base history isn't fetched | Re-sync (rebase onto `master`, refetch `origin/master`) |
-| **C-level hang (GIL-held, silent)** | pytest -v produces zero output for 30+ min, no TimeoutExpired, and the #1021 thread-method crashed-worker signature is ABSENT | GIL-held native hang (bcrypt, sqlite3, fcntl) — the only residual class both timeout methods cannot fire on. Find the last PASSED test, audit its setUp/tearDown for blocking I/O. File it: the diagnostics this class needs (out-of-process watchdog) do not exist yet. |
+| **C-level hang (GIL-held, silent)** | pytest -v produces zero output for 30+ min, no TimeoutExpired, and the #1021 thread-method crashed-worker signature is ABSENT | GIL-held native hang (bcrypt, sqlite3, fcntl) — the residual class both timeout methods cannot fire on. The #1021 watchdog now bounds it: look for the `WATCHDOG-FIRED` banner (names every pending test), per-PID stack dumps (py-spy, else the SIGUSR2 faulthandler files), and step exit 88 at ≤~47m — the dump settles the attribution on the recurrence. Re-run clears nothing: read the captured stacks. |
 
 Confirm "pre-existing" by reproducing on `master` in a throwaway worktree (see
 `running-tests` → *Confirming a pre-existing failure*) before claiming it.
@@ -129,9 +134,9 @@ For PR-introduced test failures, reproduce in isolation:
 cd backend && pytest --tb=short -v tests/<file>.py::<Class>::<test>
 ```
 
-For full-suite reproduction (mimics CI):
+For full-suite reproduction (mimics CI, the canonical invocation #1038 pins):
 ```bash
-cd backend && pytest --tb=short -v --timeout=300 --timeout-method=thread tests/
+cd backend && pytest --tb=short -v --timeout=300 --timeout-method=thread -rs -n auto --cov --cov-report=term-missing tests/
 # Expect ~18m on CI Linux, ~3-5m locally. If you don't have 3-5m, use a narrower scope.
 ```
 
@@ -147,9 +152,11 @@ cd backend && pytest --tb=short -v --timeout=300 --timeout-method=thread tests/
 
 5. **Bounded queue with no consumer (deadlock)**: When adding `asyncio.Queue(maxsize=N)` for DoS mitigation, audit all `put()` call sites. If `put()` happens BEFORE any consumer task is spawned, deadlock on >N items. **Fix**: spawn consumers before producers. Pattern in `BackgroundProcessor.start()`.
 
-#### When the suite is too slow for the 60m job timeout
+#### When the suite is too slow for the 50m step timeout
 
-The full suite (3918 tests) takes ~18m on CI Linux. Plus coverage step (re-runs all tests with --cov) = ~36m total. If the job hits 60m, the most likely cause is:
+The full suite (~9.9k tests, coverage inline in the single Test invocation —
+there is no separate coverage step) takes ~18m on CI Linux. If the run
+approaches the ceiling, the most likely cause is:
 - A test in a tight loop calling a slow function (e.g., bcrypt) — see pattern 3 above
 - The CI runner is unusually slow (transient) — re-trigger by force-pushing an empty commit
 

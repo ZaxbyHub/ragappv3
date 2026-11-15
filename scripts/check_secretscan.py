@@ -303,6 +303,31 @@ def tracked_files() -> list[str]:
     return _gate_git.git_lines(ROOT, "ls-files") or []
 
 
+def _is_no_follow_dir(entry) -> bool:
+    """True for directory entries the walks must LIST but never DESCEND.
+
+    #1038: two platform shapes hide from ``entry.is_symlink()``:
+
+    * POSIX symlinks report ``is_symlink() == True`` (detected directly);
+    * Windows junctions/directory-symlinks are reparse points that report
+      ``is_symlink() == False`` while ``is_dir(follow_symlinks=False)`` is
+      True — the only reliable discriminator is the
+      ``FILE_ATTRIBUTE_REPARSE_POINT`` (0x400) bit in
+      ``entry.stat(follow_symlinks=False).st_file_attributes`` (probe-verified
+      at the #1038 base: a junction passes every is_symlink()-only guard).
+    """
+    try:
+        if entry.is_symlink():
+            return True
+        if os.name == "nt":
+            attrs = entry.stat(follow_symlinks=False).st_file_attributes
+            return bool(attrs & 0x400)  # FILE_ATTRIBUTE_REPARSE_POINT
+    except OSError:
+        # Unreadable metadata: treat as no-follow (containment over reach).
+        return True
+    return False
+
+
 def on_disk_files() -> list[str]:
     """Return on-disk file paths (relative, posix) under ROOT, excluding .git.
 
@@ -311,6 +336,10 @@ def on_disk_files() -> list[str]:
     gate's npm run under pytest-xdist) skips the vanished entry instead of
     crashing the whole scan with FileNotFoundError. Dependency and
     virtualenv trees (PRUNE_DIR_NAMES) are not descended at all (issue #740).
+
+    #1038: linked directories (POSIX symlinks, Windows junctions and
+    directory-symlinks/reparse points) are never DESCENDED — their lexical
+    contents never appear in this list.
     """
     out: list[str] = []
     stack = [ROOT]
@@ -328,6 +357,8 @@ def on_disk_files() -> list[str]:
                     if ".git" not in path.parts:
                         out.append(path.relative_to(ROOT).as_posix())
                 elif entry.is_dir(follow_symlinks=False):
+                    if _is_no_follow_dir(entry):
+                        continue
                     if ".git" not in Path(entry.path).parts and entry.name not in PRUNE_DIR_NAMES:
                         stack.append(Path(entry.path))
             except OSError:
@@ -347,13 +378,19 @@ def on_disk_dirs() -> list[str]:
     Dependency/virtualenv trees (PRUNE_DIR_NAMES) are not descended, same
     as on_disk_files (issue #740).
 
-    Deliberate semantic change vs the replaced ``ROOT.rglob`` comprehension:
-    symlinked directories are listed but not followed here
-    (``follow_symlinks=False``), matching on_disk_files' directory
-    handling, whereas rglob recursed into them. A ``<dir>/**`` ignore
-    pattern whose target is only reachable through a symlinked directory
-    will now be reported by the stale-glob advisory; the repo carries no
-    symlinked directories today.
+    #1038 — the true per-platform linked-directory contract (the pre-#1038
+    sentence ``symlinked directories are listed but not followed`` was false
+    on Windows and misleading on POSIX):
+
+    * POSIX: symlinked directories are LISTED lexically and never followed
+      (the pre-#1038 scandir walk silently DROPPED them — a link-dir and any
+      ``<dir>/**`` ignore reachable only through it went unlisted entirely);
+    * Windows: junctions and directory-symlinks (reparse points, which
+      ``entry.is_symlink()`` does not flag) are LISTED lexically and never
+      followed (the pre-#1038 walk DESCENDED into their targets, silently
+      enumerating directories outside ROOT).
+
+    Regular directories recurse as before in both walkers.
     """
     out: list[str] = []
     stack = [ROOT]
@@ -366,11 +403,16 @@ def on_disk_dirs() -> list[str]:
             continue
         for entry in entries:
             try:
-                if entry.is_dir(follow_symlinks=False):
+                if entry.is_dir(follow_symlinks=False) or (
+                    entry.is_symlink() and entry.is_dir(follow_symlinks=True)
+                ):
                     path = Path(entry.path)
-                    if ".git" not in path.parts and entry.name not in PRUNE_DIR_NAMES:
-                        out.append(path.relative_to(ROOT).as_posix())
-                        stack.append(path)
+                    if ".git" in path.parts or entry.name in PRUNE_DIR_NAMES:
+                        continue
+                    out.append(path.relative_to(ROOT).as_posix())
+                    if _is_no_follow_dir(entry):
+                        continue
+                    stack.append(path)
             except OSError:
                 continue
     return out

@@ -419,6 +419,23 @@ jobs:
       - name: Install TypeScript for the #566 config guardrail (outside the repo tree)
         run: npm install --prefix "$RUNNER_TEMP/h03-gate-ts" typescript@6.0.3
 
+      # #1021 residual: py-spy is the watchdog's opportunistic EXTERNAL stack
+      # provider (denial is expected under Yama sibling-ptrace and is handled);
+      # the primary provider is the faulthandler hook written next.
+      - name: Install watchdog stack provider (py-spy, #1021)
+        run: pip install py-spy==0.4.3
+
+      # #1021 residual: ONE committed hook source, copied (never re-authored)
+      # to the PYTHONPATH sitecustomize location for the Test step. It opens a
+      # per-PID dump file and registers faulthandler.register(SIGUSR2, ...) —
+      # a C-level handler that dumps without the GIL and to a FILE, so wedged
+      # xdist workers' frames survive pytest's capture. Pinned by
+      # backend/tests/test_1021_timeout_wiring.py.
+      - name: Write Backend watchdog faulthandler hook (#1021)
+        run: |
+          mkdir -p "$RUNNER_TEMP/watchdog-faulthandler-hook" "$RUNNER_TEMP/watchdog-dumps"
+          cp scripts/ci_watchdog_faulthandler_hook.py "$RUNNER_TEMP/watchdog-faulthandler-hook/sitecustomize.py"
+
       - name: Lint (ruff)
         run: ruff check .
 
@@ -435,14 +452,31 @@ jobs:
         # thread method aborts a wedged worker fast and xdist names the hung
         # test. This flag line itself is pinned by
         # backend/tests/test_1021_timeout_wiring.py.
+        # #1021 residual: the run is wrapped in the out-of-process watchdog
+        # (scripts/ci_backend_watchdog.py). Both pytest-timeout methods starve
+        # on a GIL-held hang, so the watchdog bounds that class from OUTSIDE:
+        # quiet-window 360s (= the 300s per-test timeout + 60s grace so the
+        # in-process timeout always fires first when it can), hard deadline
+        # 2700s with a ~120s bounded FIRE path (exit 88, WATCHDOG-FIRED banner
+        # naming every pending test + per-PID stack dumps via the hook above).
+        # The watchdog invocation AND the canonical pytest flags below are
+        # pinned together by test_1021_timeout_wiring.py.
         timeout-minutes: 50
-        run: pytest --tb=short -v --timeout=300 --timeout-method=thread -rs -n auto --cov --cov-report=term-missing tests/
+        run: python ../scripts/ci_backend_watchdog.py --quiet-window 360 --poll-interval 5 --hard-deadline 2700 -- pytest --tb=short -v --timeout=300 --timeout-method=thread -rs -n auto --cov --cov-report=term-missing tests/
         env:
           REDIS_URL: ""
           # #742 / #566: makes the outside-tree TypeScript install resolvable
           # by the walker's `require('typescript')` (cwd stays frontend/, so
           # NODE_PATH carries the dependency instead of node_modules there).
           NODE_PATH: ${{ runner.temp }}/h03-gate-ts/node_modules
+          # #1021: guarantees SIGABRT (the watchdog's fatal last resort)
+          # produces Python frames even without faulthandler-enable elsewhere.
+          PYTHONFAULTHANDLER: "1"
+          # #1021: loads the copied faulthandler hook in every Python process
+          # of this step (controller + xdist workers); dump files land in
+          # WATCHDOG_DUMP_DIR for the watchdog to collect.
+          PYTHONPATH: ${{ runner.temp }}/watchdog-faulthandler-hook
+          WATCHDOG_DUMP_DIR: ${{ runner.temp }}/watchdog-dumps
 
       - name: Hang-class timeout canary (#1021)
         # Exercises the timeout mechanism on every non-cancelled run, on
