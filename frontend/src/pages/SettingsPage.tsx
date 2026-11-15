@@ -216,10 +216,15 @@ function SettingsPageContent({
       }
       if (dirtyReindexFields.length > 0) {
         setReindexRequired(true);
+        // Sticky until dismissed (final-critic round 2): a later
+        // non-identity save in the same session must not clear the 503
+        // copy while the backend gate is still down — only an all-vault
+        // reindex lifts it.
         setReindexIdentityChanged(
-          IDENTITY_REINDEX_FIELDS.some((field) =>
-            dirtyReindexFields.includes(field),
-          ),
+          useSettingsStore.getState().reindexIdentityChanged ||
+            IDENTITY_REINDEX_FIELDS.some((field) =>
+              dirtyReindexFields.includes(field),
+            ),
         );
         toast.warning(
           "Settings saved. Existing document embeddings are stale — reindex required.",
