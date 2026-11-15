@@ -15,6 +15,14 @@ un-taken nested branch). It now also matches the equivalent spellings
 (``not X.rowcount``, ``X.rowcount < 1``, constant-on-left), requires the
 rollback to sit on the taken path before the return, scans every store module
 under ``app/services``, and self-tests each of those extensions.
+
+Issue #934 item 1: the RETURNING-style 0-row exit (``row =
+X.execute('UPDATE ... RETURNING ...').fetchone()`` followed by ``if row:`` /
+``if not row:``) is a zero-row early return without any rowcount guard, so it
+now gets the same treatment — the no-row path must roll back before it
+returns. Nested control flow on the no-row path is followed one level;
+deeper shapes are not flagged (conservative by design: the census never
+false-positives, at the cost of missing exotic nesting).
 """
 
 import ast
@@ -99,6 +107,123 @@ def _rowcount_zero_branches_missing_rollback(tree):
             continue
         if not _taken_path_rolls_back(node):
             violations.append(node.lineno)
+    return violations
+
+
+def _is_returning_fetchone(value: ast.AST) -> bool:
+    """True for ``X.execute(<SQL containing RETURNING>, ...).fetchone()`` —
+    the statement returns a row only when the UPDATE matched one."""
+    if not (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Attribute)
+        and value.func.attr == "fetchone"
+    ):
+        return False
+    inner = value.func.value
+    if not (
+        isinstance(inner, ast.Call)
+        and isinstance(inner.func, ast.Attribute)
+        and inner.func.attr == "execute"
+    ):
+        return False
+    return any(
+        isinstance(arg, ast.Constant)
+        and isinstance(arg.value, str)
+        and "returning" in arg.value.lower()
+        for arg in inner.args
+    )
+
+
+def _assigned_returning_names(func: ast.AST) -> set:
+    """Names bound to a RETURNING fetchone inside ``func``."""
+    names = set()
+    for node in ast.walk(func):
+        if isinstance(node, ast.Assign) and _is_returning_fetchone(node.value):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    names.add(target.id)
+    return names
+
+
+def _statements_after(node: ast.AST, parents: dict) -> list:
+    """The statements following ``node`` in its enclosing block (identity
+    match, so structurally identical siblings cannot be confused)."""
+    parent = parents.get(node)
+    if parent is None:
+        return []
+    for field in ("body", "orelse", "finalbody"):
+        stmts = getattr(parent, field, None)
+        if isinstance(stmts, list):
+            for i, stmt in enumerate(stmts):
+                if stmt is node:
+                    return stmts[i + 1 :]
+    return []
+
+
+def _zero_path_verdict(stmts) -> str:
+    """Verdict for the flat 0-row statement sequence after a guard:
+
+    ``"clean"`` — a rollback call is reached before any exit;
+    ``"dirty"`` — a return (or a nested returning guard that does not roll
+    back) is reached first; ``"unclear"`` — no clear exit, do not flag.
+    """
+    for stmt in stmts:
+        if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+            func = stmt.value.func
+            if isinstance(func, ast.Attribute) and func.attr == "rollback":
+                return "clean"
+        if isinstance(stmt, ast.Return):
+            return "dirty"
+        if isinstance(stmt, ast.If) and _returns(stmt):
+            return "clean" if _taken_path_rolls_back(stmt) else "dirty"
+    return "unclear"
+
+
+def _returning_zero_row_exits_missing_rollback(tree):
+    """Return source lines of RETURNING-style zero-row exits that do not roll
+    the implicit transaction back before returning.
+
+    Two forms, both over names assigned from a RETURNING fetchone:
+
+    * ``if not row:`` — the branch body IS the 0-row path (same taken-path
+      rollback requirement as the rowcount guard);
+    * ``if row:`` whose body ends in a return (the has-row path always
+      exits) — the 0-row path is the else branch and/or the statements
+      after the guard, and must roll back before its own return.
+    """
+    parents = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parents[child] = parent
+    violations = []
+    for func in ast.walk(tree):
+        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        names = _assigned_returning_names(func)
+        if not names:
+            continue
+        for node in ast.walk(func):
+            if not isinstance(node, ast.If):
+                continue
+            test = node.test
+            if (
+                isinstance(test, ast.UnaryOp)
+                and isinstance(test.op, ast.Not)
+                and isinstance(test.operand, ast.Name)
+                and test.operand.id in names
+            ):
+                if _returns(node) and not _taken_path_rolls_back(node):
+                    violations.append(node.lineno)
+                continue
+            if (
+                isinstance(test, ast.Name)
+                and test.id in names
+                and node.body
+                and isinstance(node.body[-1], ast.Return)
+            ):
+                zero_path = list(node.orelse) + _statements_after(node, parents)
+                if _zero_path_verdict(zero_path) == "dirty":
+                    violations.append(node.lineno)
     return violations
 
 
@@ -226,20 +351,128 @@ class TestZeroRowPathsRollBack(unittest.TestCase):
         self.assertIn("kms_store.py", modules)
         self.assertGreaterEqual(len(modules), 2)
 
+    def test_returning_fallthrough_without_rollback_is_detected(self):
+        """Issue #934 item 1: the RETURNING shape used by
+        WikiStore.claim_next_pending_job — ``if row:`` guard, has-row body
+        returns, the 0-row path falls through and must roll back."""
+        bad = ast.parse(
+            "class S:\n"
+            "    def f(self):\n"
+            "        row = self._db.execute(\n"
+            "            'UPDATE t SET x = 1 WHERE y = 2 RETURNING *'\n"
+            "        ).fetchone()\n"
+            "        if row:\n"
+            "            self._db.commit()\n"
+            "            return row\n"
+            "        return None\n"
+        )
+        self.assertEqual(_returning_zero_row_exits_missing_rollback(bad), [6])
+        good = ast.parse(
+            "class S:\n"
+            "    def f(self):\n"
+            "        row = self._db.execute(\n"
+            "            'UPDATE t SET x = 1 WHERE y = 2 RETURNING *'\n"
+            "        ).fetchone()\n"
+            "        if row:\n"
+            "            self._db.commit()\n"
+            "            return row\n"
+            "        self._db.rollback()\n"
+            "        return None\n"
+        )
+        self.assertEqual(_returning_zero_row_exits_missing_rollback(good), [])
+
+    def test_returning_else_branch_without_rollback_is_detected(self):
+        """Issue #934 item 1: a rollback only in an else-branch counts only
+        when the else branch is the 0-row path that returns."""
+        bad = ast.parse(
+            "class S:\n"
+            "    def f(self):\n"
+            "        row = self._db.execute(\n"
+            "            'UPDATE t SET x = 1 RETURNING *'\n"
+            "        ).fetchone()\n"
+            "        if row:\n"
+            "            self._db.commit()\n"
+            "            return row\n"
+            "        else:\n"
+            "            return None\n"
+        )
+        self.assertEqual(_returning_zero_row_exits_missing_rollback(bad), [6])
+        good = ast.parse(
+            "class S:\n"
+            "    def f(self):\n"
+            "        row = self._db.execute(\n"
+            "            'UPDATE t SET x = 1 RETURNING *'\n"
+            "        ).fetchone()\n"
+            "        if row:\n"
+            "            self._db.commit()\n"
+            "            return row\n"
+            "        else:\n"
+            "            self._db.rollback()\n"
+            "            return None\n"
+        )
+        self.assertEqual(_returning_zero_row_exits_missing_rollback(good), [])
+
+    def test_returning_not_row_form_without_rollback_is_detected(self):
+        """Issue #934 item 1: ``if not row:`` — the branch body is the 0-row
+        path and must roll back before returning."""
+        bad = ast.parse(
+            "class S:\n"
+            "    def f(self):\n"
+            "        row = self._db.execute(\n"
+            "            'UPDATE t SET x = 1 RETURNING *'\n"
+            "        ).fetchone()\n"
+            "        if not row:\n"
+            "            return None\n"
+            "        self._db.commit()\n"
+            "        return row\n"
+        )
+        self.assertEqual(_returning_zero_row_exits_missing_rollback(bad), [6])
+        good = ast.parse(
+            "class S:\n"
+            "    def f(self):\n"
+            "        row = self._db.execute(\n"
+            "            'UPDATE t SET x = 1 RETURNING *'\n"
+            "        ).fetchone()\n"
+            "        if not row:\n"
+            "            self._db.rollback()\n"
+            "            return None\n"
+            "        self._db.commit()\n"
+            "        return row\n"
+        )
+        self.assertEqual(_returning_zero_row_exits_missing_rollback(good), [])
+
+    def test_plain_fetchone_without_returning_is_ignored(self):
+        """A SELECT fetchone followed by the same guard shape is not a write
+        and opens no implicit transaction — it must stay unflagged."""
+        plain = ast.parse(
+            "class S:\n"
+            "    def f(self):\n"
+            "        row = self._db.execute('SELECT * FROM t').fetchone()\n"
+            "        if row:\n"
+            "            return row\n"
+            "        return None\n"
+        )
+        self.assertEqual(_returning_zero_row_exits_missing_rollback(plain), [])
+
     def test_wiki_and_kms_stores_have_no_unguarded_zero_row_returns(self):
         backend = Path(__file__).resolve().parents[1] / "app" / "services"
         violations = {}
         for store in _store_modules(backend):
             source = (backend / store).read_text(encoding="utf-8")
-            found = _rowcount_zero_branches_missing_rollback(ast.parse(source))
+            tree = ast.parse(source)
+            found = (
+                _rowcount_zero_branches_missing_rollback(tree)
+                + _returning_zero_row_exits_missing_rollback(tree)
+            )
             if found:
                 violations[store] = found
         self.assertEqual(
             violations,
             {},
             "0-row early return(s) without rollback — every "
-            "`if cur.rowcount == 0:` branch that returns must call "
-            "self._db.rollback() first (issue #791, C14)",
+            "`if cur.rowcount == 0:` branch that returns, and every "
+            "RETURNING-fetchone guard's no-row path, must call "
+            "self._db.rollback() first (issue #791, C14; issue #934 item 1)",
         )
 
 
