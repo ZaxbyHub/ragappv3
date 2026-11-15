@@ -218,6 +218,57 @@ def require_model_ready(vector_store: VectorStore = Depends(get_vector_store)) -
     return vector_store
 
 
+def require_ingest_ready(
+    vector_store: VectorStore = Depends(get_vector_store),
+) -> VectorStore:
+    """Return the vector store only if NEW documents can be ingested safely.
+
+    Ingest gate for routes that enqueue new embeddable content (issue #736:
+    uploads and directory scans). Unlike ``require_model_ready`` — which
+    ADMITS queries during a staged rebuild because the live table is still
+    the previous, internally consistent generation — new ingestion is refused
+    under EITHER condition, each with its own operator message:
+
+    * ``_ready`` is False: the configured embedding identity no longer
+      matches the stored one. Embedding a new upload now would write
+      new-model vectors into the old-model table (a silently mixed index).
+      Recovery is an all-vault reindex (POST /documents/reindex).
+    * ``rebuild_in_progress`` is True: a staged rebuild is in flight and the
+      live table it would write to is replaced at cutover, discarding the
+      write (the #837-review M-UNC-002 deferral). Retry after completion.
+
+    Both probes are STRICT singleton-bool checks (same style as
+    ``require_model_ready``) so ``getattr`` defaults are not defeated by
+    MagicMock auto-attributes in existing suites.
+    """
+    if vector_store is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Vector store is not initialized.",
+        )
+    if getattr(vector_store, '_ready', True) is False:
+        logger.warning(
+            "Ingest refused: embedding identity gate is down (admin "
+            "reindex required)"
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Embedding model mismatch — admin reindex required before "
+                "ingesting documents"
+            ),
+        )
+    if getattr(vector_store, 'rebuild_in_progress', False) is True:
+        logger.warning(
+            "Ingest refused: a staged document reindex is in progress"
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Document reindex in progress — retry when it completes",
+        )
+    return vector_store
+
+
 def get_memory_store(request: Request) -> MemoryStore:
     """Return the memory store from app state."""
     return request.app.state.memory_store

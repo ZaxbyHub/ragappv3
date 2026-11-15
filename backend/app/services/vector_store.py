@@ -10,7 +10,7 @@ import logging
 import sqlite3
 import threading
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, cast
@@ -289,6 +289,39 @@ def _chunks_table_schema(embedding_dim: int) -> pa.Schema:
     )
 
 
+# Fallback readiness lock for duck-typed store doubles that do not inherit
+# VectorStore (issue #736): test doubles carry only the attributes their
+# suites exercise, so a double without ``_readiness_lock`` still needs the
+# invalidation/completion critical sections to work — they share this
+# module-level lock instead. A real store always uses its own instance lock;
+# the fallback is only observable in tests, where both sides of a given
+# interaction use the same module.
+_FALLBACK_READINESS_LOCK = threading.Lock()
+
+
+def readiness_epoch(store: object) -> int:
+    """Read the store's readiness epoch with a safe default (issue #736)."""
+    return getattr(store, "_readiness_epoch", 0)
+
+
+@contextmanager
+def readiness_guard(store: object):
+    """Hold the store's readiness critical section (issue #736).
+
+    Makes (settings invalidation: ``_ready = False`` + epoch bump) and
+    (reindex completion: epoch recheck + ``mark_ready(True)``) mutually
+    exclusive. The completion path awaits ``mark_ready`` inside the guard —
+    sanctioned because that coroutine's body is a plain assignment with no
+    suspension point, so the event loop is never yielded while the lock is
+    held; never introduce a suspending await inside the guard. Stores without
+    ``_readiness_lock`` (duck-typed doubles) share the module-level fallback
+    lock.
+    """
+    lock = getattr(store, "_readiness_lock", None) or _FALLBACK_READINESS_LOCK
+    with lock:
+        yield
+
+
 class VectorStore:
     """LanceDB-based vector store for document chunk embeddings."""
 
@@ -305,6 +338,17 @@ class VectorStore:
         self._embedding_dim: Optional[int] = None
         self._fts_exceptions: int = 0
         self._ready: bool = True
+        # Readiness synchronization (issue #736): a monotonic epoch bumped by
+        # the settings-save invalidation path, plus the lock that makes
+        # (invalidation: flip + bump) and (reindex completion: epoch recheck +
+        # mark_ready) mutually exclusive. The settings route runs synchronously
+        # on a worker thread while reindex completion runs on the event loop,
+        # so this is a threading.Lock held for microseconds on both sides and
+        # NEVER across an await. Duck-typed test doubles that do not inherit
+        # VectorStore resolve the module-level fallback through
+        # readiness_guard() below.
+        self._readiness_epoch: int = 0
+        self._readiness_lock = threading.Lock()
         # True while a staged dimension rebuild is open on THIS store instance
         # (issue #696): the live table is still the previous, internally
         # consistent generation, so require_model_ready admits queries and

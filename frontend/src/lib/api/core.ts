@@ -1176,6 +1176,28 @@ export async function listReindexJobs(): Promise<{ jobs: ReindexJobSummary[] }> 
   return response.data;
 }
 
+/** Response from `POST /documents/reindex` (all-vault when `vault_id` is null). */
+export interface ReindexTriggerResponse {
+  job_id: number;
+  status: string;
+  vault_id: number | null;
+}
+
+/**
+ * Trigger an embedding reindex job — the in-app recovery path for an
+ * embedding-mismatch 503 (issue #833). Sends an empty JSON body so the
+ * all-vault shape is explicit: a vault-scoped reindex would restore
+ * readiness over a mixed index, so the Maintenance trigger is always
+ * all-vault.
+ */
+export async function triggerDocumentReindex(): Promise<ReindexTriggerResponse> {
+  const response = await apiClient.post<ReindexTriggerResponse>(
+    "/documents/reindex",
+    {}
+  );
+  return response.data;
+}
+
 export async function uploadDocument(
   file: File,
   onProgress?: (progress: number) => void,

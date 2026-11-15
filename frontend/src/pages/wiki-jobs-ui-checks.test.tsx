@@ -171,6 +171,9 @@ vi.mock("@/components/EmptyState", () => ({
 
 vi.mock("lucide-react", () => ({
   AlertCircle: () => <span />,
+  // issue #736/#833: MaintenanceSettings' embeddings-recovery confirm
+  // dialog imports AlertTriangle.
+  AlertTriangle: () => <span />,
   ClipboardList: () => <span />,
   Loader2: () => <span />,
   RefreshCw: Object.assign(() => <span data-handler-key="refresh" />, { issue774HandlerKey: "refresh" }),

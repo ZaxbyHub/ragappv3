@@ -47,6 +47,7 @@ from app.api.deps import (
     get_user_accessible_vault_ids,
     get_vector_store,
     require_admin_role,
+    require_ingest_ready,
     require_vault_permission,
 )
 from app.config import Settings, settings
@@ -233,6 +234,7 @@ async def retry_document(
     secret_manager: SecretManager = Depends(get_secret_manager),
     background_processor: BackgroundProcessor = Depends(get_background_processor),
     current_user: dict | None = Depends(_optional_current_user),
+    _ingest_gate: VectorStore = Depends(require_ingest_ready),
 ) -> dict:
     try:
         cursor = await asyncio.to_thread(
@@ -443,6 +445,7 @@ async def retry_failed_chunks(
     evaluate: Callable = Depends(get_evaluate_policy),
     csrf_token: str = Depends(csrf_protect),
     vector_store: VectorStore = Depends(get_vector_store),
+    _ingest_gate: VectorStore = Depends(require_ingest_ready),
     embedding_service: EmbeddingService = Depends(get_embedding_service),
     db_pool: SQLiteConnectionPool = Depends(get_db_pool),
     secret_manager: SecretManager = Depends(get_secret_manager),
@@ -2416,6 +2419,7 @@ async def upload_document_root(
     background_processor: BackgroundProcessor = Depends(get_background_processor),
     user: dict = Depends(require_vault_permission("write")),
     _csrf_token: str = Depends(csrf_protect),
+    _ingest_gate: VectorStore = Depends(require_ingest_ready),
 ):
     """
     Upload endpoint at root /documents for frontend compatibility.
@@ -2458,6 +2462,7 @@ async def upload_document(
     background_processor: BackgroundProcessor = Depends(get_background_processor),
     user: dict = Depends(require_vault_permission("write")),
     _csrf_token: str = Depends(csrf_protect),
+    _ingest_gate: VectorStore = Depends(require_ingest_ready),
 ):
     """
     Upload a file with strict security controls and queue it for indexing.
@@ -2993,6 +2998,7 @@ async def scan_directories(
     db_pool: SQLiteConnectionPool = Depends(get_db_pool),
     user: dict = Depends(require_admin_role),
     _csrf_token: str = Depends(csrf_protect),
+    _ingest_gate: VectorStore = Depends(require_ingest_ready),
 ):
     """
     Trigger a scan of configured directories for new files.

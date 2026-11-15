@@ -55,6 +55,10 @@ SHIPPED_INGEST_ERROR_CODES = frozenset(
         # collides with another indexed/partial row in the same vault is a
         # deterministic duplicate, never a parse failure.
         "DUPLICATE_FILE",
+        # issue #736: ordinary ingest refused because the embedding identity
+        # gate is down or a staged rebuild is in flight; recoverable via the
+        # all-vault admin reindex.
+        "EMBEDDING_MODEL_MISMATCH",
     }
 )
 

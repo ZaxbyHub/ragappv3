@@ -206,6 +206,19 @@ export const REINDEX_REQUIRED_FIELDS = new Set<keyof SettingsFormData>([
   "embedding_query_prefix",
 ]);
 
+// The subset of REINDEX_REQUIRED_FIELDS that changes the embedding
+// IDENTITY: these flip vector-store readiness on save (backend
+// `_effective_embedding_identity`), pausing search/chat/memories/wiki with
+// the embedding-mismatch 503 and pausing uploads until an all-vault
+// reindex completes (issue #736). The other reindex-required fields only
+// stale the embeddings — copy must not claim a 503 for them (issue #833
+// fidelity, final-critic round 1).
+export const IDENTITY_REINDEX_FIELDS: ReadonlyArray<keyof SettingsFormData> = [
+  "embedding_model",
+  "embedding_doc_prefix",
+  "embedding_query_prefix",
+];
+
 export interface SettingsState {
   settings: SettingsResponse | null;
   formData: SettingsFormData;
@@ -221,6 +234,10 @@ export interface SettingsState {
   reindexRequired: boolean;
   setReindexRequired: (value: boolean) => void;
   checkReindexRequired: () => boolean;
+  /** True when the save that raised reindexRequired changed an identity
+   * field (drives the banner's 503/recovery copy variant). */
+  reindexIdentityChanged: boolean;
+  setReindexIdentityChanged: (value: boolean) => void;
 
   setSettings: (settings: SettingsResponse | null) => void;
   setFormData: (
@@ -679,8 +696,11 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
   errors: {},
   saveStatus: "idle",
   reindexRequired: false,
+  reindexIdentityChanged: false,
 
   setReindexRequired: (value) => set({ reindexRequired: value }),
+  setReindexIdentityChanged: (value) =>
+    set({ reindexIdentityChanged: value }),
 
   checkReindexRequired: () => {
     const { settings, formData } = get();
@@ -831,6 +851,7 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
       errors: {},
       saveStatus: "idle",
       reindexRequired: false,
+      reindexIdentityChanged: false,
     });
   },
 }));

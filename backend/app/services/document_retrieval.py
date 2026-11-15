@@ -456,9 +456,17 @@ class DocumentRetrievalService:
 
         input_count = len(results)
         logger.debug(
-            "Filtering: input_results=%d, max_distance_threshold=%s",
+            "Filtering: input_results=%d, max_distance_threshold=%s, "
+            "vector_metric=%s, l2_effective_threshold=%s",
             input_count,
             self.max_distance_threshold,
+            settings.vector_metric,
+            (
+                self.max_distance_threshold * 2.0
+                if self.max_distance_threshold is not None
+                and settings.vector_metric == "l2"
+                else self.max_distance_threshold
+            ),
         )
         if results:
             first_distances = [
@@ -526,12 +534,32 @@ class DocumentRetrievalService:
                 threshold = self.relevance_threshold
                 legacy_mode = True
 
+            # Metric-aware bound (issue #736 / TQ-differential-c-06): the
+            # configured threshold is calibrated for cosine distance. LanceDB
+            # ``l2`` reports squared-L2 distances, which on unit vectors are
+            # exactly 2x the cosine-equivalent (l2 1.22 where cosine 0.61),
+            # so the raw threshold under ``l2`` drops results sitting at the
+            # calibrated centre. ``dot`` on unit vectors equals cosine
+            # distance and needs no rescale. Applied here — at the comparison
+            # seam — so explicit caller thresholds and RAGEngine's pre-filter
+            # re-sync (_sync_document_retrieval_settings) are covered
+            # identically; only the distance branch rescales, never the
+            # score floor below.
+            effective_threshold = threshold
+            if (
+                has_distance
+                and threshold is not None
+                and settings.vector_metric == "l2"
+            ):
+                effective_threshold = threshold * 2.0
+
             should_skip = False
             if not skip_distance_filter and threshold is not None:
                 if has_distance:
                     # Cosine-distance semantics: max threshold (issue #36
-                    # calibration, 0.75 for the Harrier scale).
-                    should_skip = distance > threshold
+                    # calibration, 0.75 for the Harrier scale), rescaled to
+                    # the configured metric above.
+                    should_skip = distance > effective_threshold
                     if should_skip:
                         distance_gated_drops += 1
                 else:

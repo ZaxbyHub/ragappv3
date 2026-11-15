@@ -339,6 +339,31 @@ class EmbeddingDimensionChangedError(DocumentProcessingError):
     pass
 
 
+# issue #736: ordinary (non-reindex) ingest refused because new vectors
+# cannot land safely — the embedding identity gate is down (a mixed
+# old/new-model index would result) or a staged rebuild is in flight (the
+# live table is replaced at cutover, discarding the write). Terminal row
+# state once the retry ladder exhausts; transient for the staged-rebuild
+# cause (a retry after cutover can land). The all-vault admin reindex
+# recovers the row (review2 F-13 wording).
+# Defined before the exception class below so the class attribute can
+# reference it at import time.
+INGEST_ERROR_EMBEDDING_MISMATCH = "EMBEDDING_MODEL_MISMATCH"
+
+
+class IngestGateClosedError(DocumentProcessingError):
+    """Ordinary ingest refused by the readiness gate (issue #736).
+
+    New vectors cannot land safely: the embedding identity gate is down
+    (writing would mix new-model vectors into the old-model table) or a
+    staged rebuild is in flight (the live table is replaced at cutover,
+    discarding the write). Terminal and operator-actionable — the all-vault
+    admin reindex recovers, and its selection re-processes errored rows.
+    """
+
+    ingest_error_code = INGEST_ERROR_EMBEDDING_MISMATCH
+
+
 class DocumentParseError(Exception):
     """Exception raised when document parsing fails."""
 
@@ -425,6 +450,10 @@ _INGEST_ERROR_REASONS = {
     INGEST_ERROR_DUPLICATE_FILE: (
         "a files row with the same content hash is already indexed in this "
         "vault; resolve which row owns the hash before retrying"
+    ),
+    INGEST_ERROR_EMBEDDING_MISMATCH: (
+        "the embedding identity gate is down or a reindex is in flight; run "
+        "the all-vault admin reindex to recover, then re-ingest this file"
     ),
 }
 
@@ -2113,6 +2142,49 @@ class DocumentProcessor:
                 file_id=file_id,
             )
 
+    def _raise_if_ingest_gate_closed(
+        self, *, reindex: bool = False, vector_target: Optional[object] = None
+    ) -> None:
+        """Pre-write ingest gate (issue #736).
+
+        Called at the last-durable-write seam of BOTH ordinary ingest paths
+        (``process_file`` — scan/email/watcher/legacy tasks with no file row
+        — and ``process_existing_file``'s upload/scan arm) next to the
+        cancellation and staleness gates. Ordinary ingestion is refused when
+        EITHER gate condition holds:
+
+        * ``_ready`` is False — the configured embedding identity no longer
+          matches the stored one; embedding now would mix new-model vectors
+          into the old-model table (the issue #736 AC2 constraint).
+        * ``rebuild_in_progress`` is True — the live table is replaced at
+          the staged rebuild's cutover, discarding the write (the #837
+          review M-UNC-002 deferral).
+
+        Reindex-context work is exempt: it writes a staged ``vector_target``
+        (never the live table) or is the all-vault in-place recovery itself.
+        The refusal settles through the normal error path to the stable
+        ``EMBEDDING_MODEL_MISMATCH`` code; the all-vault reindex's selection
+        re-processes errored rows, so the outcome is recoverable. Probes are
+        strict singleton-bool checks (require_model_ready style) so store
+        doubles without the attributes pass.
+        """
+        if reindex or vector_target is not None:
+            return
+        # getattr (not bare attribute): attribute-less test doubles that
+        # drive run_enrichment_job unbound must gate no-op here, exactly as
+        # the strict-probe defaults elsewhere treat absence as pass.
+        store = getattr(self, "vector_store", None)
+        if store is None:
+            return
+        if (
+            getattr(store, "_ready", True) is False
+            or getattr(store, "rebuild_in_progress", False) is True
+        ):
+            raise IngestGateClosedError(
+                "ingest refused: vector store not ready for new vectors "
+                "(embedding identity gate down or staged rebuild in flight)"
+            )
+
     async def rollback_cancelled_ingest(
         self, file_id: int, *, run_deletes: bool = True
     ) -> None:
@@ -2444,6 +2516,12 @@ class DocumentProcessor:
                     "failed_chunk_indices": [],
                     "skipped_stale_generation": True,
                 }
+            # [issue #736] Ordinary-ingest gate at this write seam too (the
+            # retry re-embeds chunks with the LIVE model — under a down gate
+            # or an open staged rebuild the write would mix or be discarded);
+            # the route-level require_ingest_ready dependency answers 503 for
+            # the API path, this seam covers any non-route caller.
+            self._raise_if_ingest_gate_closed(reindex=False)
             # [N3] LanceDB write FIRST (not transactional with SQLite), then
             # SQLite cleanup in its own try/except. On SQLite failure the next
             # retry's pre-check reconciles already-indexed chunks.
@@ -2530,6 +2608,11 @@ class DocumentProcessor:
     ) -> None:
         if self.vector_store is None:
             return
+        # [issue #736, review2 F-07] Ordinary-ingest gate at this write
+        # seam: enriched records embed with the LIVE model, so under a down
+        # identity gate or an open staged rebuild the swap would mix or be
+        # discarded. Never reindex context.
+        self._raise_if_ingest_gate_closed(reindex=False)
         add_then_delete = getattr(self.vector_store, "add_chunks_then_delete_ids", None)
         if add_then_delete is not None:
             await add_then_delete(records, old_ids)
@@ -2798,6 +2881,18 @@ class DocumentProcessor:
                     file_id, processing_started_at
                 )
                 return
+            # [issue #736, review2 F-07] The enrichment swap writes
+            # live-model vectors over the live table (embed_batch reads the
+            # LIVE settings), so it takes the same ordinary-ingest gate as
+            # the document-chunk seams — enforced INSIDE
+            # _swap_in_enriched_vector_records (single caller, all paths;
+            # kept in-method so test doubles that replace the swap skip the
+            # gate with it, per the unbound-stub convention). The gate
+            # raises IngestGateClosedError; the enclosing enrichment
+            # handler catches it and sets enrichment_status='error'
+            # (ENRICHMENT_FAILED code). It is NOT auto-retried and the
+            # recovery reindex does not re-enrich — re-enable/re-trigger
+            # enrichment after the gate lifts.
             await self._swap_in_enriched_vector_records(records, old_ids)
             await self._verify_vector_rows_visible(file_id)
             # Issues #1075/#1076: guarded + atom-aware; post-stamp, so a
@@ -4803,6 +4898,11 @@ class DocumentProcessor:
                     # no atoms.
                     self._raise_if_cancelled(file_id)
                     self._raise_if_file_row_missing(file_id)
+                    # [issue #736] Ordinary-ingest gate: this path is never
+                    # reindex work, so refuse the write when new vectors
+                    # cannot land safely (identity gate down or staged
+                    # rebuild in flight).
+                    self._raise_if_ingest_gate_closed(reindex=False)
                     # Initialize vector table with embedding dimension and add chunks
                     embedding_dim = len(embeddings[0])
                     stage_started_at = time.monotonic()
@@ -5602,6 +5702,14 @@ class DocumentProcessor:
                     # no atoms.
                     self._raise_if_cancelled(file_id)
                     self._raise_if_file_row_missing(file_id)
+                    # [issue #736] Ordinary-ingest gate: upload/scan arms of
+                    # this shared seam refuse when new vectors cannot land
+                    # safely; reindex-context work (staged target or the
+                    # in-place all-vault recovery) is exempt.
+                    self._raise_if_ingest_gate_closed(
+                        reindex=(retry_context == "reindex"),
+                        vector_target=vector_target,
+                    )
                     # [W8/W13 contract] Thread the optional rebuild target into
                     # every vector-store call below as a trailing ``target=``
                     # argument (dimension-migrating reindex); omitted entirely

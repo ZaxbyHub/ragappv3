@@ -985,6 +985,12 @@ docker compose logs -f knowledgevault | grep -i email
    - Check logs for processing errors
    - Solution: Verify file is valid and not corrupted
 
+5. **Embedding identity gate down** (`EMBEDDING_MODEL_MISMATCH`, issue #736)
+   - The file was received and enqueued while the embedding model had been
+     changed but the all-vault reindex had not yet completed
+   - Solution: run Settings → Maintenance → "Rebuild embeddings (all-vault
+     reindex)" — its selection re-processes errored rows automatically
+
 **Troubleshooting Steps:**
 ```bash
 # 1. Check allowed MIME types
