@@ -59,7 +59,10 @@ import { draftRoomKeys } from "@/lib/api/draftRoom";
 import { SaveDiscardFooter } from "@/components/settings/SaveDiscardFooter";
 import { PageTitleHeader } from "@/components/layout/PageTitleHeader";
 import { ReindexConfirmDialog } from "@/components/settings/ReindexConfirmDialog";
-import { REINDEX_REQUIRED_FIELDS } from "@/stores/useSettingsStore";
+import {
+  IDENTITY_REINDEX_FIELDS,
+  REINDEX_REQUIRED_FIELDS,
+} from "@/stores/useSettingsStore";
 import { useVaultStore } from "@/stores/useVaultStore";
 
 function pickDirtyPayload(
@@ -96,6 +99,7 @@ function SettingsPageContent({
     error,
     errors,
     reindexRequired,
+    reindexIdentityChanged,
     setSettings,
     initializeForm,
     initializeFormAfterSave,
@@ -103,6 +107,7 @@ function SettingsPageContent({
     setError,
     setLoadError,
     setReindexRequired,
+    setReindexIdentityChanged,
     updateFormField,
     validateForm,
     discard,
@@ -211,6 +216,11 @@ function SettingsPageContent({
       }
       if (dirtyReindexFields.length > 0) {
         setReindexRequired(true);
+        setReindexIdentityChanged(
+          IDENTITY_REINDEX_FIELDS.some((field) =>
+            dirtyReindexFields.includes(field),
+          ),
+        );
         toast.warning(
           "Settings saved. Existing document embeddings are stale — reindex required.",
         );
@@ -338,15 +348,16 @@ function SettingsPageContent({
               Reindex required
             </p>
             <p className="text-xs text-warning/80 mt-0.5">
-              Changes to embedding model, chunk size, or vector settings
-              invalidate existing document embeddings. Rebuild embeddings
-              (all-vault reindex) from the Maintenance tab — the run must
-              complete to restore search readiness, and restarting does not
-              clear it.
+              {reindexIdentityChanged
+                ? "Changes to the embedding identity paused search, chat, memories, and wiki with an embedding-mismatch 503 and paused new uploads. Rebuild embeddings (all-vault reindex) from the Maintenance tab — the run must complete to restore readiness, and restarting does not clear it."
+                : "Changes to embedding model, chunk size, or vector settings invalidate existing document embeddings. Rebuild embeddings (all-vault reindex) from the Maintenance tab so new and existing documents share the same settings."}
             </p>
           </div>
           <button
-            onClick={() => setReindexRequired(false)}
+            onClick={() => {
+              setReindexRequired(false);
+              setReindexIdentityChanged(false);
+            }}
             className="text-warning hover:text-warning/80 text-xs underline shrink-0"
           >
             Dismiss

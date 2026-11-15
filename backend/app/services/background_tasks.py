@@ -5611,10 +5611,21 @@ class BackgroundProcessor:
                         rebuild_handle = None
                 raise
 
-            # Determine final job status and result
+            # Determine final job status and result. A zero-file job does NOT
+            # early-return (final-critic round 1, issue #736): an all-vault
+            # reindex on an emptied index must still run the guarded
+            # identity-record + readiness lift below — otherwise the gate
+            # stays down forever now that uploads are refused while gated
+            # (the fresh-install path: set the model before uploading
+            # anything). The embed loop above is a no-op with zero files
+            # (probe_dim stays None, so the record uses settings.embedding_dim),
+            # and the failed_files>0 path is unreachable with zero files.
             if total_files == 0:
-                logger.info("Reindex job %d completed (no files to reindex).", job_id)
-                return "completed", {"processed": 0, "failed": 0}, None
+                logger.info(
+                    "Reindex job %d has no files to reindex; running the "
+                    "guarded identity record and readiness lift.",
+                    job_id,
+                )
             if failed_files > 0:
                 result = {
                     "processed": processed_files,

@@ -1717,7 +1717,8 @@ def _invalidate_vector_store_readiness(app, prior_config: dict) -> None:
     the old model until the next restart (``validate_schema``). Mirror the
     restart-time mismatch handling here so ``require_model_ready`` returns
     503 until an all-vault reindex that begins after the change completes
-    (a vault-scoped reindex also lifts the gate, over a mixed index).
+    (since issue #736, a vault-scoped completion no longer lifts the
+    gate while it is down — only an all-vault reindex does).
 
     Issue #696: additionally persist the PRIOR embedding config
     (``prior_config``, captured before the save applied) as the draining

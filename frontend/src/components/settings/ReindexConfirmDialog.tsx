@@ -1,5 +1,6 @@
 import { AlertTriangle } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { IDENTITY_REINDEX_FIELDS } from "@/stores/useSettingsStore";
 import {
   Dialog,
   DialogContent,
@@ -56,14 +57,25 @@ export function ReindexConfirmDialog({
           ))}
         </ul>
 
-        <p className="text-sm text-muted-foreground">
-          Existing document embeddings were generated with the previous
-          settings. After saving, search, chat, memories, and wiki pause
-          with an embedding-mismatch 503 and new uploads are paused until
-          you rebuild embeddings (all-vault reindex) from the Maintenance
-          tab. The reindex must run to completion to restore readiness —
-          restarting does not clear the 503.
-        </p>
+        {IDENTITY_REINDEX_FIELDS.some((field) =>
+          dirtyReindexFields.includes(field),
+        ) ? (
+          <p className="text-sm text-muted-foreground">
+            Existing document embeddings were generated with the previous
+            settings. After saving, search, chat, memories, and wiki pause
+            with an embedding-mismatch 503 and new uploads are paused until
+            you rebuild embeddings (all-vault reindex) from the Maintenance
+            tab. The reindex must run to completion to restore readiness —
+            restarting does not clear the 503.
+          </p>
+        ) : (
+          <p className="text-sm text-muted-foreground">
+            Existing document embeddings were generated with the previous
+            settings. They remain queryable but may produce stale or
+            lower-quality results until you rebuild embeddings (all-vault
+            reindex) from the Maintenance tab.
+          </p>
+        )}
 
         <DialogFooter>
           <Button

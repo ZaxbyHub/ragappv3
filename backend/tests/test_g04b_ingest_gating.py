@@ -1362,3 +1362,69 @@ def test_epoch_capture_pre_r1_closes_invalidations_window():
         assert getattr(env.vs, "_ready", True) is False, (
             "a save landing in the R1->epoch-capture window must not end READY"
         )
+
+
+def test_admin_retry_route_gated_when_not_ready():
+    """POST /documents/admin/retry/{file_id} is an ordinary-ingest enqueue
+    (final-critic round 1, census row 21): with ``_ready=False`` it must
+    answer 503 with the mismatch detail like upload/scan/retry-chunks."""
+    store = _G04RecordingVectorStore()
+    store._ready = False
+    cleanup = setup_app_state(
+        app,
+        vector_store=store,
+        embedding_service=_G04EmbeddingService(),
+        llm_client=FakeLLMClient(),
+        memory_store=FakeMemoryStore(),
+    )
+    try:
+        client = TestClient(app)
+        resp = client.post("/api/documents/admin/retry/1")
+        assert resp.status_code == 503, (
+            f"admin retry must be refused while the identity gate is down; "
+            f"got {resp.status_code}: {resp.text[:300]}"
+        )
+        assert resp.json()["detail"] == _MISMATCH_DETAIL
+    finally:
+        cleanup()
+        _reset_pools()
+
+
+def test_zero_file_all_vault_reindex_still_lifts_gate():
+    """Final-critic round 1 blocker: on an EMPTIED index a model change puts
+    the gate down and uploads are refused — the all-vault reindex must still
+    record the identity and lift readiness through the same epoch guard, or
+    the deployment is bricked (fresh install: set the model before the first
+    upload). The zero-file path must NOT early-return before the guarded
+    record+lift block."""
+    with _reindex_completion_env(vault_id=None) as env:
+        # Empty the index: remove every files row so the reindex has zero
+        # files to process (the critic's probe shape).
+        conn = sqlite3.connect(env.db_path)
+        conn.execute("DELETE FROM files")
+        conn.commit()
+        conn.close()
+        # Gate down via the REAL invalidation hook.
+        old_model = settings.embedding_model
+        try:
+            from app.api.routes.settings import _invalidate_vector_store_readiness
+
+            with _app_state_store(env.vs):
+                settings.embedding_model = old_model + "-empty"
+                _invalidate_vector_store_readiness(app, _prior_config())
+                assert getattr(env.vs, "_ready", True) is False, (
+                    "precondition: the gate must be down before the reindex"
+                )
+                processor = _make_reindex_processor(env.vs, env.pool)
+                asyncio.run(processor._process_reindex_job(env.job_id))
+            status, result_json, _error = _job_row(env.db_path, env.job_id)
+            assert status == "completed", (status, result_json)
+            result = json.loads(result_json) if result_json else {}
+            assert result.get("processed", 0) == 0, result
+            assert getattr(env.vs, "_ready", True) is True, (
+                "a completed all-vault reindex on an empty index must lift "
+                "the readiness gate — otherwise gated uploads leave the "
+                "deployment with no in-app recovery"
+            )
+        finally:
+            settings.embedding_model = old_model
