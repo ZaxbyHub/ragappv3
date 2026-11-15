@@ -2511,6 +2511,12 @@ class DocumentProcessor:
                     "failed_chunk_indices": [],
                     "skipped_stale_generation": True,
                 }
+            # [issue #736] Ordinary-ingest gate at this write seam too (the
+            # retry re-embeds chunks with the LIVE model — under a down gate
+            # or an open staged rebuild the write would mix or be discarded);
+            # the route-level require_ingest_ready dependency answers 503 for
+            # the API path, this seam covers any non-route caller.
+            self._raise_if_ingest_gate_closed(reindex=False)
             # [N3] LanceDB write FIRST (not transactional with SQLite), then
             # SQLite cleanup in its own try/except. On SQLite failure the next
             # retry's pre-check reconciles already-indexed chunks.

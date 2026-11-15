@@ -444,6 +444,7 @@ async def retry_failed_chunks(
     evaluate: Callable = Depends(get_evaluate_policy),
     csrf_token: str = Depends(csrf_protect),
     vector_store: VectorStore = Depends(get_vector_store),
+    _ingest_gate: VectorStore = Depends(require_ingest_ready),
     embedding_service: EmbeddingService = Depends(get_embedding_service),
     db_pool: SQLiteConnectionPool = Depends(get_db_pool),
     secret_manager: SecretManager = Depends(get_secret_manager),
