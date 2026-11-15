@@ -52,6 +52,20 @@ def _read(*parts: str) -> str:
     return (REPO.joinpath(*parts)).read_text(encoding="utf-8")
 
 
+def _step_body(ci: str, step_name: str) -> str:
+    """The full text of one named ci.yml step (name line to the next name)."""
+    lines = ci.splitlines()
+    for index, line in enumerate(lines):
+        if f"- name: {step_name}" in line:
+            body: list[str] = [line]
+            for follow in lines[index + 1 :]:
+                if follow.strip().startswith("- name:"):
+                    break
+                body.append(follow)
+            return "\n".join(body)
+    return ""
+
+
 def _backend_test_step_run_lines(ci: str) -> list[str]:
     """The Backend Test step's pytest invocation line(s), watchdog-wrapped or not.
 
@@ -248,6 +262,19 @@ def test_backend_test_step_invokes_watchdog():
     )
     assert _WATCHDOG_HOOK_STEP_NAME in ci, (
         "ci.yml lost the 'Write Backend watchdog faulthandler hook (#1021)' step"
+    )
+    # Final-critic round 1: the Backend job's default working directory is
+    # backend/, so the hook-copy source must be reachable FROM THERE — a bare
+    # `scripts/...` cp fails on every CI run (the hook lives at the repo
+    # root). Pin the ../ path shape (or an explicit working-directory override).
+    hook_step_body = _step_body(ci, _WATCHDOG_HOOK_STEP_NAME)
+    assert (
+        f"cp ../scripts/{_WATCHDOG_HOOK_SCRIPT}" in hook_step_body
+        or "working-directory: ." in hook_step_body
+    ), (
+        "ci.yml hook step copies the hook with a path that does not resolve "
+        "from the Backend job's working directory (backend/) — use "
+        f"'cp ../scripts/{_WATCHDOG_HOOK_SCRIPT}' or set working-directory: ."
     )
     for key in _WATCHDOG_ENV_KEYS:
         assert f"{key}:" in ci, (

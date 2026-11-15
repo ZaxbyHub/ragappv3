@@ -432,9 +432,14 @@ jobs:
       # xdist workers' frames survive pytest's capture. Pinned by
       # backend/tests/test_1021_timeout_wiring.py.
       - name: Write Backend watchdog faulthandler hook (#1021)
+        # NOTE: this job's default working directory is backend/, so the
+        # committed hook at the repo root is reached via ../scripts (same
+        # convention as the Test step's watchdog invocation below). Pinned
+        # (including the ../ path shape) by
+        # backend/tests/test_1021_timeout_wiring.py.
         run: |
           mkdir -p "$RUNNER_TEMP/watchdog-faulthandler-hook" "$RUNNER_TEMP/watchdog-dumps"
-          cp scripts/ci_watchdog_faulthandler_hook.py "$RUNNER_TEMP/watchdog-faulthandler-hook/sitecustomize.py"
+          cp ../scripts/ci_watchdog_faulthandler_hook.py "$RUNNER_TEMP/watchdog-faulthandler-hook/sitecustomize.py"
 
       - name: Lint (ruff)
         run: ruff check .
