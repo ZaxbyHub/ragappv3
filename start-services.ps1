@@ -5,7 +5,12 @@ param(
     [string]$BackendPort = $(if ($env:PORT) { $env:PORT } else { "9090" }),
     [string]$FrontendPort = $(if ($env:FRONTEND_PORT) { $env:FRONTEND_PORT } else { "3000" }),
     [string]$EmbeddingDataDir = $(if ($env:EMBEDDING_DATA_DIR) { $env:EMBEDDING_DATA_DIR } else { (Join-Path $RepoRoot ".cache\harrier-embed") }),
-    [string]$EmbeddingImage = $(if ($env:EMBEDDING_IMAGE) { $env:EMBEDDING_IMAGE } else { "ghcr.io/huggingface/text-embeddings-inference:cuda-latest" }),
+    # Embedding image (#750, T1-04-MH-12): default to the SAME digest-pinned
+    # image docker-compose.yml's harrier-embed service uses (compose pins it
+    # for supply-chain integrity and dependabot bumps it there) by reading
+    # the pin from docker-compose.yml; the floating-tag literal below is only
+    # the fallback when the compose file is unreachable.
+    [string]$EmbeddingImage = $(if ($env:EMBEDDING_IMAGE) { $env:EMBEDDING_IMAGE } else { $pin = Select-String -LiteralPath (Join-Path $PSScriptRoot "docker-compose.yml") -Pattern "ghcr.io/huggingface/text-embeddings-inference:\S+" -ErrorAction SilentlyContinue | Select-Object -First 1; if ($pin) { $pin.Matches[0].Value } else { "ghcr.io/huggingface/text-embeddings-inference:cuda-latest" } }),
     [string]$EmbeddingContainerName = $(if ($env:EMBEDDING_CONTAINER) { $env:EMBEDDING_CONTAINER } else { "harrier-embed" }),
     [string]$EmbeddingPort = $(if ($env:EMBEDDING_PORT) { $env:EMBEDDING_PORT } else { "8080" }),
     [string]$EmbeddingModel = $(if ($env:EMBEDDING_MODEL) { $env:EMBEDDING_MODEL } else { "microsoft/harrier-oss-v1-0.6b" }),
