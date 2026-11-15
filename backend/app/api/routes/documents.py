@@ -2414,12 +2414,12 @@ async def upload_document_root(
     vault_id: int = Query(..., description="Target vault ID (required — no default)"),
     settings_dep: Settings = Depends(get_settings),
     vector_store: VectorStore = Depends(get_vector_store),
-    _ingest_gate: VectorStore = Depends(require_ingest_ready),
     embedding_service: EmbeddingService = Depends(get_embedding_service),
     db_pool: SQLiteConnectionPool = Depends(get_db_pool),
     background_processor: BackgroundProcessor = Depends(get_background_processor),
     user: dict = Depends(require_vault_permission("write")),
     _csrf_token: str = Depends(csrf_protect),
+    _ingest_gate: VectorStore = Depends(require_ingest_ready),
 ):
     """
     Upload endpoint at root /documents for frontend compatibility.
@@ -2457,12 +2457,12 @@ async def upload_document(
     vault_id: int = Query(..., description="Target vault ID (required — no default)"),
     settings_dep: Settings = Depends(get_settings),
     vector_store: VectorStore = Depends(get_vector_store),
-    _ingest_gate: VectorStore = Depends(require_ingest_ready),
     embedding_service: EmbeddingService = Depends(get_embedding_service),
     db_pool: SQLiteConnectionPool = Depends(get_db_pool),
     background_processor: BackgroundProcessor = Depends(get_background_processor),
     user: dict = Depends(require_vault_permission("write")),
     _csrf_token: str = Depends(csrf_protect),
+    _ingest_gate: VectorStore = Depends(require_ingest_ready),
 ):
     """
     Upload a file with strict security controls and queue it for indexing.
