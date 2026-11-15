@@ -5799,6 +5799,8 @@ class BackgroundProcessor:
                                 "readiness_lifted": False,
                                 "readiness_skip_reason": (
                                     "vault_scoped_gate_down"
+                                    if vault_id is not None
+                                    else "retry_scope_gate_down"
                                 ),
                             },
                             None,

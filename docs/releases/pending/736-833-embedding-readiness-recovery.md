@@ -30,11 +30,13 @@ rebuild's cutover:
   all-vault reindex's selection re-processes errored rows, so the outcome
   is recoverable — note a refusal during a STAGED rebuild settles the row
   to `error` and the running reindex does not re-pick it until the next
-  pass). The enrichment seams take the same gate check; their bounded
-  retry re-reaches the work after recovery (bounded by
-  `multimodal_max_attempts`; longer outages recover via the startup resume
-  sweep). Reindex-context work is exempt — staged rebuild targets and the
-  all-vault in-place recovery keep writing.
+  pass). The enrichment seams take the same gate check. A refusal on the
+  chunk-enrichment swap sets `enrichment_status=error` (`ENRICHMENT_FAILED`)
+  and is NOT auto-retried or resumed by the recovery reindex — re-enable or
+  re-trigger enrichment after the gate lifts; the atom-proxy refusal
+  propagates to the atom worker's bounded retry. Reindex-context work is
+  exempt — staged rebuild targets and the all-vault in-place recovery keep
+  writing.
 
 **Empty-index recovery (final-critic round).** A zero-file all-vault
 reindex no longer early-returns before the guarded identity-record and

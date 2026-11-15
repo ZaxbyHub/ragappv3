@@ -1510,7 +1510,7 @@ def test_retry_scoped_all_vault_zero_rows_does_not_lift_gate():
                 )
             assert status == "completed", (status, result)
             assert result.get("readiness_skip_reason") == (
-                "vault_scoped_gate_down"
+                "retry_scope_gate_down"
             ), result
             assert getattr(env.vs, "_ready", True) is False, (
                 "a retry-scoped zero-row completion must not lift a DOWN gate"
@@ -1538,9 +1538,11 @@ def test_ingest_gate_seam_census_pins_every_call_site():
     bt_calls = len(
         re.findall(r"self\.processor\._raise_if_ingest_gate_closed\(", bt_src)
     )
-    # document_processor: def line + 4 gated seams (retry-chunks [N3],
-    # process_file, process_existing_file, enrichment swap) = 5 matches;
-    # background_tasks: exactly the atom-proxy call.
+    # document_processor: 5 gate CALL sites (retry-chunks [N3], the
+    # enrichment swap's in-method gate, the run_enrichment_job call-site
+    # gate, process_file, process_existing_file); background_tasks:
+    # exactly the atom-proxy call. (The def line does not match the
+    # self.-anchored regex.)
     assert dp_calls == 5, (
         f"document_processor gate matches = {dp_calls}, want 5 "
         "(def + retry-chunks + process_file + process_existing_file + "

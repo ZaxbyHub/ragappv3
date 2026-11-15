@@ -342,8 +342,10 @@ class EmbeddingDimensionChangedError(DocumentProcessingError):
 # issue #736: ordinary (non-reindex) ingest refused because new vectors
 # cannot land safely — the embedding identity gate is down (a mixed
 # old/new-model index would result) or a staged rebuild is in flight (the
-# live table is replaced at cutover, discarding the write). Terminal and
-# operator-actionable: the all-vault admin reindex recovers the row.
+# live table is replaced at cutover, discarding the write). Terminal row
+# state once the retry ladder exhausts; transient for the staged-rebuild
+# cause (a retry after cutover can land). The all-vault admin reindex
+# recovers the row (review2 F-13 wording).
 # Defined before the exception class below so the class attribute can
 # reference it at import time.
 INGEST_ERROR_EMBEDDING_MISMATCH = "EMBEDDING_MODEL_MISMATCH"
@@ -2881,9 +2883,11 @@ class DocumentProcessor:
             # LIVE settings), so it takes the same ordinary-ingest gate as
             # the document-chunk seams — enforced inside
             # _swap_in_enriched_vector_records (single caller, all paths).
-            # The gate raises IngestGateClosedError; the enrichment job
-            # settles through its own retry/status path and re-runs after
-            # recovery.
+            # The gate raises IngestGateClosedError; the enclosing
+            # enrichment handler catches it and sets
+            # enrichment_status='error' (ENRICHMENT_FAILED code). It is NOT
+            # auto-retried and the recovery reindex does not re-enrich —
+            # re-enable/re-trigger enrichment after the gate lifts.
             self._raise_if_ingest_gate_closed(reindex=False)
             await self._swap_in_enriched_vector_records(records, old_ids)
             await self._verify_vector_rows_visible(file_id)
