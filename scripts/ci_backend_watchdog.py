@@ -63,7 +63,6 @@ _OUTCOME_RE = re.compile(
 )
 
 _READ_CHUNK = 65536
-_TAIL_BYTES = 262144  # bounded rolling buffer for the completed-line tail
 
 
 def eprint(*args: object) -> None:
@@ -200,7 +199,6 @@ class StreamTracker:
     def __init__(self, pipe) -> None:  # pipe: the raw stdout FileIO
         self._pipe = pipe
         self._lock = threading.Lock()
-        self._rolling = bytearray()
         self._partial = bytearray()
         self._completed: deque[bytes] = deque(maxlen=512)
         self.pending: dict[str, float] = {}  # node id -> dispatch time (ordered)
@@ -227,16 +225,22 @@ class StreamTracker:
                 return  # pipe closed / bad fd: child is done
             if not chunk:
                 return
-            sys.stdout.buffer.write(chunk)
-            sys.stdout.buffer.flush()
+            try:
+                sys.stdout.buffer.write(chunk)
+                sys.stdout.buffer.flush()
+            except (OSError, ValueError) as exc:
+                # Forwarding failed (our own stdout closed, e.g. a cancelled
+                # step): record it and stop reading — silently continuing
+                # would detach the monitor from the child's stream and could
+                # cause a spurious quiet-arm fire (implementation-review
+                # round 3 MINOR-1).
+                self.reader_error = exc
+                return
             self._absorb(chunk)
 
     def _absorb(self, chunk: bytes) -> None:
         with self._lock:
             self.last_activity = time.monotonic()
-            self._rolling.extend(chunk)
-            if len(self._rolling) > _TAIL_BYTES:
-                del self._rolling[: len(self._rolling) - _TAIL_BYTES]
             # The previous partial's id was speculation about an unterminated
             # record; drop it before re-parsing (the record may have grown
             # anywhere — including mid-component).
@@ -535,6 +539,15 @@ def run(args: argparse.Namespace) -> int:
     try:
         while True:
             if child.poll() is not None:
+                break
+            if tracker.reader_error is not None:
+                # Our own output channel failed: the monitor is blind to the
+                # child's stream, so a quiet-arm verdict would be a guess.
+                # Fail bounded instead of trusting stale silence.
+                fire_reason = (
+                    f"reader arm: output forwarding failed "
+                    f"({tracker.reader_error!r}) — refusing to monitor blind"
+                )
                 break
             quiet = tracker.quiet_for()
             elapsed = time.monotonic() - start
