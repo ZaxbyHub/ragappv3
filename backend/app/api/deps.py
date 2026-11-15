@@ -247,6 +247,10 @@ def require_ingest_ready(
             detail="Vector store is not initialized.",
         )
     if getattr(vector_store, '_ready', True) is False:
+        logger.warning(
+            "Ingest refused: embedding identity gate is down (admin "
+            "reindex required)"
+        )
         raise HTTPException(
             status_code=503,
             detail=(
@@ -255,6 +259,9 @@ def require_ingest_ready(
             ),
         )
     if getattr(vector_store, 'rebuild_in_progress', False) is True:
+        logger.warning(
+            "Ingest refused: a staged document reindex is in progress"
+        )
         raise HTTPException(
             status_code=503,
             detail="Document reindex in progress — retry when it completes",

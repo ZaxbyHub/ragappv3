@@ -2603,6 +2603,11 @@ class DocumentProcessor:
     ) -> None:
         if self.vector_store is None:
             return
+        # [issue #736, review2 F-07] Ordinary-ingest gate at this write
+        # seam: enriched records embed with the LIVE model, so under a down
+        # identity gate or an open staged rebuild the swap would mix or be
+        # discarded. Never reindex context.
+        self._raise_if_ingest_gate_closed(reindex=False)
         add_then_delete = getattr(self.vector_store, "add_chunks_then_delete_ids", None)
         if add_then_delete is not None:
             await add_then_delete(records, old_ids)
@@ -2871,6 +2876,15 @@ class DocumentProcessor:
                     file_id, processing_started_at
                 )
                 return
+            # [issue #736, review2 F-07] The enrichment swap writes
+            # live-model vectors over the live table (embed_batch reads the
+            # LIVE settings), so it takes the same ordinary-ingest gate as
+            # the document-chunk seams — enforced inside
+            # _swap_in_enriched_vector_records (single caller, all paths).
+            # The gate raises IngestGateClosedError; the enrichment job
+            # settles through its own retry/status path and re-runs after
+            # recovery.
+            self._raise_if_ingest_gate_closed(reindex=False)
             await self._swap_in_enriched_vector_records(records, old_ids)
             await self._verify_vector_rows_visible(file_id)
             # Issues #1075/#1076: guarded + atom-aware; post-stamp, so a

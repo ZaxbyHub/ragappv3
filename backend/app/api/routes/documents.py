@@ -231,10 +231,10 @@ async def retry_document(
     conn: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(require_admin_role),
     csrf_token: str = Depends(csrf_protect),
-    _ingest_gate: VectorStore = Depends(require_ingest_ready),
     secret_manager: SecretManager = Depends(get_secret_manager),
     background_processor: BackgroundProcessor = Depends(get_background_processor),
     current_user: dict | None = Depends(_optional_current_user),
+    _ingest_gate: VectorStore = Depends(require_ingest_ready),
 ) -> dict:
     try:
         cursor = await asyncio.to_thread(

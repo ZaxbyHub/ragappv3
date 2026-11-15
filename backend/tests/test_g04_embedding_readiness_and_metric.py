@@ -101,6 +101,32 @@ _VAULT_OTHER = 3    # the vault that still holds old-model vectors
 # and test_embedding_model_versioning — no new harness styles invented).
 # ---------------------------------------------------------------------------
 
+def _setup_app_state_with_restore(app, **overrides):
+    """setup_app_state + app.state.vector_store restore (review2 F-02).
+
+    setup_app_state's cleanup() pops dependency overrides and removes the
+    temp dir but leaves every app.state attribute it set installed —
+    harmless at base (FakeVectorStore has no _ready, strict probe defaults
+    True) but a 503 leak for later chat tests when this module installs a
+    not-ready recording store. Save/restore the attribute here.
+    """
+    orig_vs = getattr(app.state, "vector_store", None)
+    had_vs = hasattr(app.state, "vector_store")
+    cleanup = setup_app_state(app, **overrides)
+
+    def cleanup_with_restore():
+        cleanup()
+        if had_vs:
+            app.state.vector_store = orig_vs
+        else:
+            try:
+                del app.state.vector_store
+            except AttributeError:
+                pass
+
+    return cleanup_with_restore
+
+
 def _gate_status(store) -> int:
     """Evaluate the readiness gate exactly as a request-scoped dependency
     would (test_b06 pattern): call ``require_model_ready`` on the live store
@@ -190,9 +216,16 @@ def _isolated_env():
     """Temp data_dir + fresh DB + snapshotted settings singleton, restored
     on exit (merges the test_b06 snapshot loop with the versioning-suite
     pool/init pattern)."""
+    # Census evidence literals (#987 AC11, review2 F-03): this module
+    # assigns "reindex_job_lease_enabled" (inside this snapshot scope) —
+    # the literal gives the census its module-wide restore evidence.
+    _module_assigned = {"reindex_job_lease_enabled"}
     snapshot = {
         name: getattr(settings, name) for name in type(settings).model_fields
     }
+    assert _module_assigned <= set(snapshot), (
+        "census-evidence fields must be part of the snapshot"
+    )
     tmp_dir = tempfile.mkdtemp(prefix="g04_ac_")
     _reset_pools()
     settings.data_dir = Path(tmp_dir)
@@ -452,7 +485,7 @@ def test_upload_after_embedding_model_change_is_not_mixed():
     settings.ingestion_job_lease_enabled = False
     store = _G04RecordingVectorStore()
     embedding = _G04EmbeddingService()
-    cleanup = setup_app_state(
+    cleanup = _setup_app_state_with_restore(
         app,
         vector_store=store,
         embedding_service=embedding,
@@ -640,9 +673,9 @@ def test_vault_scoped_reindex_does_not_lift_gate_over_mixed_index():
     from app.api.routes.settings import _invalidate_vector_store_readiness
     from app.services.background_tasks import BackgroundProcessor
 
-    orig_lease_flag = settings.reindex_job_lease_enabled
-    settings.reindex_job_lease_enabled = False  # legacy transport (pinned)
     with _isolated_env() as (tmp_dir, db_path):
+        # Mutate INSIDE the snapshot scope (review2 F-01) — see g04b twin.
+        settings.reindex_job_lease_enabled = False  # legacy transport (pinned)
         vs, _db, table = _make_real_lancedb_store(tmp_dir)
         # Production awaits the async lancedb API shapes (table.schema());
         # rebind the store to async handles over the same on-disk table.
@@ -771,4 +804,3 @@ def test_vault_scoped_reindex_does_not_lift_gate_over_mixed_index():
                 pool.close_all()
             except Exception:
                 pass
-            settings.reindex_job_lease_enabled = orig_lease_flag

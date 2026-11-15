@@ -55,6 +55,16 @@ class _StubVectorStore:
     async def get_live_embedding_dim(self):
         return PROBE_DIM
 
+    async def record_embedding_metadata(
+        self, embedding_dim, raise_on_error=False, model_id=None, prefix_hash=None
+    ):
+        # issue #736 zero-file fall-through: the completion block now runs
+        # for zero-file jobs too, so the stub must carry the metadata write.
+        return None
+
+    async def mark_ready(self, ready: bool = True) -> None:
+        return None
+
 
 class ReindexDimensionProbeTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):

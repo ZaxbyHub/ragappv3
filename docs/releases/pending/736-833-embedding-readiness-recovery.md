@@ -21,16 +21,20 @@ rebuild's cutover:
 - Processor-level backstops at every ordinary-ingest vector-write seam —
   the three document-chunk seams (`backend/app/services/
   document_processor.py`: process_file, process_existing_file's upload arm,
-  and the failed-chunk retry) plus the enrichment atom-proxy write
-  (`backend/app/services/background_tasks.py` `_write_atom_proxies`): each
-  refuses the vector write under either gate condition. The document-chunk
-  seams settle the file row to the new stable error code
+  and the failed-chunk retry), the enrichment atom-proxy write
+  (`backend/app/services/background_tasks.py` `_write_atom_proxies`), and
+  the chunk-enrichment vector swap (`_swap_in_enriched_vector_records`):
+  each refuses the vector write under either gate condition. The
+  document-chunk seams settle the file row to the new stable error code
   `EMBEDDING_MODEL_MISMATCH` (registered in `_INGEST_ERROR_REASONS`; the
   all-vault reindex's selection re-processes errored rows, so the outcome
-  is recoverable); the enrichment seam takes the same gate check and its
-  bounded retry re-reaches the work after recovery. Reindex-context work is
-  exempt — staged rebuild targets and the all-vault in-place recovery keep
-  writing.
+  is recoverable — note a refusal during a STAGED rebuild settles the row
+  to `error` and the running reindex does not re-pick it until the next
+  pass). The enrichment seams take the same gate check; their bounded
+  retry re-reaches the work after recovery (bounded by
+  `multimodal_max_attempts`; longer outages recover via the startup resume
+  sweep). Reindex-context work is exempt — staged rebuild targets and the
+  all-vault in-place recovery keep writing.
 
 **Empty-index recovery (final-critic round).** A zero-file all-vault
 reindex no longer early-returns before the guarded identity-record and
@@ -38,7 +42,7 @@ readiness lift: a fresh install whose admin sets the embedding model
 before the first upload (or a deployment that emptied its index) can
 recover in-app instead of being locked out by the now-gated uploads.
 
-**Vault-scoped completions never lift a down gate (issue #736 AC7).** A
+**Vault-scoped completions never lift a down gate (issue #736's mixed-index constraint).** A
 vault-scoped reindex completing while the embedding-mismatch gate is down no
 longer records a validating identity or marks the store ready over the
 other vaults' old-model vectors (previously deterministic — not a race). In

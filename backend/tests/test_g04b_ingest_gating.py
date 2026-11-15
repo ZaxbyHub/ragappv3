@@ -80,8 +80,11 @@ CSRF_TEST_POLICY = "naive"  # harness sends no token header; declared for tests/
 
 # lancedb / pyarrow are REQUIRED for these tests (real-store checks) — import
 # them early, exactly like test_g04_embedding_readiness_and_metric.py.
+import re  # noqa: E402
+
 import lancedb  # noqa: E402
 import pyarrow as pa  # noqa: E402
+import pytest  # noqa: E402
 
 # Stub missing optional dependencies (same defensive pattern as test_settings.py)
 try:
@@ -123,6 +126,7 @@ from app.main import app  # noqa: E402
 from app.services.background_tasks import BackgroundProcessor  # noqa: E402
 from app.services.document_processor import (  # noqa: E402
     INGEST_ERROR_EMBEDDING_MISMATCH,
+    DocumentProcessor,
     IngestGateClosedError,
     classify_ingest_error,
     format_ingest_error,
@@ -194,13 +198,53 @@ def _make_real_lancedb_store(tmp_dir: str, dim: int = _EMB_DIM):
     return vs, db, table
 
 
+def _setup_app_state_with_restore(app, **overrides):
+    """setup_app_state + app.state.vector_store restore (review2 F-02).
+
+    setup_app_state's cleanup() pops dependency overrides and removes the
+    temp dir but leaves every app.state attribute it set installed —
+    harmless at base (FakeVectorStore has no _ready, strict probe defaults
+    True) but a 503 leak for later chat tests when this module installs a
+    not-ready recording store. Save/restore the attribute here.
+    """
+    orig_vs = getattr(app.state, "vector_store", None)
+    had_vs = hasattr(app.state, "vector_store")
+    cleanup = setup_app_state(app, **overrides)
+
+    def cleanup_with_restore():
+        cleanup()
+        if had_vs:
+            app.state.vector_store = orig_vs
+        else:
+            try:
+                del app.state.vector_store
+            except AttributeError:
+                pass
+
+    return cleanup_with_restore
+
+
 @contextlib.contextmanager
 def _settings_snapshot():
     """Snapshot the whole settings singleton and restore it on exit (g04
     ``_isolated_env`` snapshot loop, lifted so every test can use it)."""
+    # Field names named for the settings-singleton census (#987 AC11,
+    # review2 F-03): the generic loop below snapshot/restores EVERY model
+    # field; these are the ones this module assigns ("data_dir",
+    # "users_enabled", "ingestion_job_lease_enabled") — the literals give
+    # the census its module-wide restore evidence for the generic helper.
+    _module_assigned = {
+        "data_dir",
+        "users_enabled",
+        "ingestion_job_lease_enabled",
+        "reindex_job_lease_enabled",
+    }
     snapshot = {
         name: getattr(settings, name) for name in type(settings).model_fields
     }
+    assert _module_assigned <= set(snapshot), (
+        "census-evidence fields must be part of the snapshot"
+    )
     try:
         yield
     finally:
@@ -475,7 +519,7 @@ def _real_store_worker_env():
         settings.ingestion_job_lease_enabled = False  # legacy in-memory transport
         _reset_pools()
         embedding = _G04EmbeddingService()
-        cleanup = setup_app_state(
+        cleanup = _setup_app_state_with_restore(
             app,
             embedding_service=embedding,
             llm_client=FakeLLMClient(),
@@ -528,9 +572,11 @@ def _reindex_completion_env(vault_id):
     """The g04 AC7 reindex-completion harness: isolated env + real lancedb
     store on ASYNC handles + migrated pool + one indexed file + one pending
     ``document_reindex_jobs`` row (``vault_id=None`` seeds a global job)."""
-    orig_lease = settings.reindex_job_lease_enabled
-    settings.reindex_job_lease_enabled = False  # legacy transport (pinned)
     with _isolated_env() as (tmp_dir, db_path):
+        # Mutate INSIDE the snapshot scope (review2 F-01): setting the flag
+        # before _isolated_env made its exit-restore re-leak False after the
+        # manual restore ran. The snapshot now captures and restores it.
+        settings.reindex_job_lease_enabled = False  # legacy transport (pinned)
         vs, _db, _table = _make_real_lancedb_store(tmp_dir)
         # Production awaits the async lancedb API shapes; rebind the store to
         # async handles over the same on-disk table (AC7 pattern).
@@ -571,7 +617,6 @@ def _reindex_completion_env(vault_id):
                 pool.close_all()
             except Exception:
                 pass
-            settings.reindex_job_lease_enabled = orig_lease
 
 
 def _make_reindex_processor(vs, pool) -> BackgroundProcessor:
@@ -633,7 +678,7 @@ def test_upload_document_root_alias_gated_when_not_ready():
     with _settings_snapshot():
         settings.users_enabled = False
         store = _G04RecordingVectorStore()
-        cleanup = setup_app_state(
+        cleanup = _setup_app_state_with_restore(
             app,
             vector_store=store,
             embedding_service=_G04EmbeddingService(),
@@ -687,7 +732,7 @@ def test_upload_refused_during_staged_rebuild():
     an upload during a staged rebuild would be discarded at cutover."""
     with _settings_snapshot():
         settings.users_enabled = False
-        cleanup = setup_app_state(
+        cleanup = _setup_app_state_with_restore(
             app,
             embedding_service=_G04EmbeddingService(),
             llm_client=FakeLLMClient(),
@@ -734,7 +779,7 @@ def test_scan_route_gated_when_not_ready():
     TestClient harness; admin auth + csrf via the naive policy overrides)."""
     store = _G04RecordingVectorStore()
     store._ready = False
-    cleanup = setup_app_state(
+    cleanup = _setup_app_state_with_restore(
         app,
         vector_store=store,
         embedding_service=_G04EmbeddingService(),
@@ -1370,7 +1415,7 @@ def test_admin_retry_route_gated_when_not_ready():
     answer 503 with the mismatch detail like upload/scan/retry-chunks."""
     store = _G04RecordingVectorStore()
     store._ready = False
-    cleanup = setup_app_state(
+    cleanup = _setup_app_state_with_restore(
         app,
         vector_store=store,
         embedding_service=_G04EmbeddingService(),
@@ -1428,3 +1473,105 @@ def test_zero_file_all_vault_reindex_still_lifts_gate():
             )
         finally:
             settings.embedding_model = old_model
+
+
+# ---------------------------------------------------------------------------
+# review2 F-06/F-07/F-08 — retry-scoped completion skip + gate falsifiers.
+# ---------------------------------------------------------------------------
+
+def test_retry_scoped_all_vault_zero_rows_does_not_lift_gate():
+    """review2 F-06: a lease-mode all-vault RETRY whose retry_file_ids
+    select no rows falls into the completion block with zero files; with
+    the gate down it must NOT record the identity or lift — the sidecar
+    would otherwise match the configured model and a restart would never
+    re-detect the mismatch over the old-model vectors outside the scope."""
+    with _reindex_completion_env(vault_id=None) as env:
+        conn = sqlite3.connect(env.db_path)
+        conn.execute("DELETE FROM files")
+        conn.commit()
+        conn.close()
+        old_model = settings.embedding_model
+        try:
+            from app.api.routes.settings import _invalidate_vector_store_readiness
+
+            with _app_state_store(env.vs):
+                settings.embedding_model = old_model + "-f06"
+                _invalidate_vector_store_readiness(app, _prior_config())
+                assert getattr(env.vs, "_ready", True) is False, (
+                    "precondition: the gate must be down before the retry"
+                )
+                processor = _make_reindex_processor(env.vs, env.pool)
+                # retry scope that selects nothing (the files were deleted);
+                # _reindex_embed_all returns (status, result, error) directly
+                status, result, _err = asyncio.run(
+                    processor._reindex_embed_all(
+                        env.job_id, None, retry_file_ids=[424242]
+                    )
+                )
+            assert status == "completed", (status, result)
+            assert result.get("readiness_skip_reason") == (
+                "vault_scoped_gate_down"
+            ), result
+            assert getattr(env.vs, "_ready", True) is False, (
+                "a retry-scoped zero-row completion must not lift a DOWN gate"
+            )
+        finally:
+            settings.embedding_model = old_model
+
+
+def test_ingest_gate_seam_census_pins_every_call_site():
+    """review2 F-08 (structural falsifier, repo source-text-guard
+    convention): every ordinary-ingest vector-write seam carries the
+    ``_raise_if_ingest_gate_closed`` gate as a REAL call. Removing ANY
+    gate call — the retry-chunks seam, the atom-proxy seam, the
+    enrichment swap, or either document-chunk seam — changes a pinned
+    count and turns this test red."""
+    dp_src = (
+        Path(__file__).resolve().parent.parent / "app" / "services"
+        / "document_processor.py"
+    ).read_text(encoding="utf-8")
+    bt_src = (
+        Path(__file__).resolve().parent.parent / "app" / "services"
+        / "background_tasks.py"
+    ).read_text(encoding="utf-8")
+    dp_calls = len(re.findall(r"self\._raise_if_ingest_gate_closed\(", dp_src))
+    bt_calls = len(
+        re.findall(r"self\.processor\._raise_if_ingest_gate_closed\(", bt_src)
+    )
+    # document_processor: def line + 4 gated seams (retry-chunks [N3],
+    # process_file, process_existing_file, enrichment swap) = 5 matches;
+    # background_tasks: exactly the atom-proxy call.
+    assert dp_calls == 5, (
+        f"document_processor gate matches = {dp_calls}, want 5 "
+        "(def + retry-chunks + process_file + process_existing_file + "
+        "enrichment swap); an ingest gate was removed or a new seam went "
+        "ungated"
+    )
+    assert bt_calls == 1, (
+        f"background_tasks atom-proxy gate matches = {bt_calls}, want 1; "
+        "the enrichment proxy seam gate was removed"
+    )
+
+
+def test_enrichment_swap_gate_down_raises_without_writing():
+    """review2 F-07/F-08: the chunk-enrichment vector swap's ingest gate
+    must be load-bearing — with the gate down the swap raises
+    IngestGateClosedError before writing (the gate is the method's first
+    post-None check, so no pool use precedes the raise)."""
+    store = _G04RecordingVectorStore()
+    store._ready = False
+    with _settings_snapshot():
+        processor = DocumentProcessor(
+            chunk_size_chars=500,
+            chunk_overlap_chars=0,
+            vector_store=store,
+            embedding_service=_G04EmbeddingService(),
+            pool=SimpleConnectionPool(str(settings.sqlite_path)),
+        )
+        with pytest.raises(IngestGateClosedError):
+            asyncio.run(
+                processor._swap_in_enriched_vector_records(
+                    [{"id": "r1", "vector": [0.1]}], ["old1"]
+                )
+            )
+        assert store.stored_chunks == [], "the gated swap must write zero vectors"

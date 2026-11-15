@@ -3318,10 +3318,11 @@ class BackgroundProcessor:
         # queued before an identity flip must not write new-model proxies
         # into the old-model live table, and a staged rebuild's cutover must
         # not silently discard the write. Enrichment is never reindex
-        # context, so no exemption applies. The settled file row keeps its
-        # EMBEDDING_MODEL_MISMATCH error (recoverable via the all-vault
-        # reindex's errored-row selection); skipping here only leaves the
-        # prior proxy generation in place.
+        # context, so no exemption applies. The gate error propagates to
+        # the enrichment worker's bounded retry (skipping here leaves the
+        # prior proxy generation in place); recovery is the all-vault
+        # reindex / startup resume sweep, not a per-file error row — this
+        # seam writes no files-row settlement of its own.
         self.processor._raise_if_ingest_gate_closed(reindex=False)
         await vec_store.add_chunks_then_delete_ids(new_records, stale_ids)
         # Post-write compensation (issue #692 review follow-up F-004): the
@@ -5062,8 +5063,11 @@ class BackgroundProcessor:
 
         Returns ``(status, result, error)`` where status is ``completed`` or
         ``failed`` and the caller owns settlement on its own table. Behavior
-        preserved from the pre-refactor legacy path: zero files -> completed;
-        any file failure -> failed after every file was visited; a dimension
+        preserved from the pre-refactor legacy path EXCEPT the zero-file
+        case (issue #736 review2): zero files no longer early-returns — the
+        guarded identity record + readiness lift still run (an empty index
+        must be recoverable); any file failure -> failed after every file
+        was visited; a dimension
         rebuild (issue #513 W13) commits only when ALL files succeed and is
         aborted otherwise; stored model identity is updated (and its failure
         fails the job) before ``completed`` is reported.
@@ -5678,10 +5682,11 @@ class BackgroundProcessor:
                     # and a later epoch snapshot would hand the snapshot the
                     # ALREADY-BUMPED epoch, letting the stale job lift
                     # readiness over the invalidation. With the capture
-                    # first, every interleaving is covered — a save before
-                    # the identity check trips R1 (identity moved, job
-                    # failed), a save after it drifts the epoch and
-                    # suppresses the lift.
+                    # first, every interleaving EXCEPT a same-run A->B->A
+                    # identity round-trip is covered (pre-existing at base;
+                    # review2 F-26) — a save before the identity check trips
+                    # R1 (identity moved, job failed), a save after it drifts
+                    # the epoch and suppresses the lift.
                     epoch_at_completion_entry = readiness_epoch(vector_store)
                     if _job_identity() != job_start_identity:
                         # Identity moved between job start and completion. On
@@ -5762,17 +5767,29 @@ class BackgroundProcessor:
                     # — mark_ready(True) is a semantic no-op there and the
                     # metadata failure-injection suites depend on the write
                     # running.
-                    if vault_id is not None and (
+                    # [review2 F-06] A retry-scoped all-vault job is partial
+                    # too: its retry_file_ids select only the failed subset,
+                    # so with the gate down a completion (in particular a
+                    # ZERO-ROW scope after the files were deleted) must not
+                    # record the identity or lift — the sidecar would then
+                    # match the configured model and a restart would never
+                    # re-detect the mismatch over the old-model vectors
+                    # outside the scope.
+                    job_scope_is_partial = (
+                        vault_id is not None or bool(retry_file_ids)
+                    )
+                    if job_scope_is_partial and (
                         getattr(vector_store, "_ready", True) is False
                     ):
                         logger.warning(
-                            "Reindex job %d (vault %d) completed while the "
-                            "readiness gate is down; stored model identity "
-                            "and readiness left unchanged — an ALL-VAULT "
-                            "reindex is required to lift an "
-                            "embedding-mismatch gate.",
+                            "Reindex job %d (vault %r, retry-scoped %r) "
+                            "completed while the readiness gate is down; "
+                            "stored model identity and readiness left "
+                            "unchanged — an ALL-VAULT reindex is required "
+                            "to lift an embedding-mismatch gate.",
                             job_id,
                             vault_id,
+                            bool(retry_file_ids),
                         )
                         return (
                             "completed",
