@@ -11,7 +11,8 @@ rebuild's cutover:
 
 - `require_ingest_ready` (`backend/app/api/deps.py`) — a new route
   dependency on both upload routes (`POST /documents` and
-  `POST /documents/upload`) and `POST /documents/scan`. It refuses with 503
+  `POST /documents/upload`), `POST /documents/scan`, and
+  `POST /documents/{file_id}/retry-chunks`. It refuses with 503
   "Embedding model mismatch — admin reindex required before ingesting
   documents" when the vector store's readiness gate is down, and 503
   "Document reindex in progress — retry when it completes" while a staged
@@ -72,6 +73,7 @@ completes).
 
 Frozen checks C1–C9 (test_g04_embedding_readiness_and_metric.py +
 MaintenanceSettings.reindex.test.tsx) plus direct coverage in
-test_g04b_ingest_gating.py (route/alias/scan gating, backstop combination
-matrix, watcher/legacy path, staged-rebuild and all-vault-recovery
-preservation legs, both interleaving races, production-path l2 threshold).
+test_g04b_ingest_gating.py (route/alias/scan/retry-chunks gating, backstop
+combination matrix, watcher/legacy path, staged-rebuild and all-vault
+recovery preservation legs, both interleaving races plus the
+epoch-capture-window leg, production-path l2 threshold).
