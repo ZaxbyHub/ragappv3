@@ -204,6 +204,13 @@ class StreamTracker:
         self._partial = bytearray()
         self._completed: deque[bytes] = deque(maxlen=512)
         self.pending: dict[str, float] = {}  # node id -> dispatch time (ordered)
+        # The single SPECULATIVE id extracted from the current unterminated
+        # partial record. A read can split a node id ANYWHERE (mid-component:
+        # `tests/x.py::test_fo` + `o PASSED`), so the partial's id is
+        # provisional: the next absorb retires it before re-parsing the grown
+        # record. Ids from COMPLETED lines are never speculative and are
+        # untouched (implementation-review round 2).
+        self._provisional_id: str | None = None
         self.last_activity = time.monotonic()
         self.reader_error: BaseException | None = None
         self._thread = threading.Thread(target=self._read_loop, daemon=True)
@@ -230,14 +237,26 @@ class StreamTracker:
             self._rolling.extend(chunk)
             if len(self._rolling) > _TAIL_BYTES:
                 del self._rolling[: len(self._rolling) - _TAIL_BYTES]
+            # The previous partial's id was speculation about an unterminated
+            # record; drop it before re-parsing (the record may have grown
+            # anywhere — including mid-component).
+            if self._provisional_id is not None:
+                self.pending.pop(self._provisional_id, None)
+                self._provisional_id = None
             data = self._partial + chunk
             *lines, self._partial = data.split(b"\n")
             for line in lines:
                 self._ingest_line(line.decode("utf-8", errors="replace"), completed=True)
             if self._partial:
+                before = set(self.pending)
                 self._ingest_line(
                     self._partial.decode("utf-8", errors="replace"), completed=False
                 )
+                added = set(self.pending) - before
+                if added:
+                    # Exactly one id can be speculative: remember it for the
+                    # next absorb's retirement (idempotent if unchanged).
+                    self._provisional_id = next(iter(added))
 
     def _ingest_line(self, line: str, *, completed: bool) -> None:
         # Only the most recent occurrence decides: a result record retires the

@@ -22,7 +22,9 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import threading
 import time
+from collections import deque
 from pathlib import Path
 
 import pytest
@@ -305,20 +307,22 @@ def test_watchdog_pending_tracker_synthetic_stream():
     or as the final unterminated partial — and removed only by a result
     record. Runs everywhere; the real-pytest proof is the xdist arms."""
     mod = _load_watchdog_module()
-    tracker = mod.StreamTracker.__new__(mod.StreamTracker)
-    tracker._pipe = None
-    tracker._lock = __import__("threading").Lock()
-    tracker._rolling = bytearray()
-    tracker._partial = bytearray()
-    from collections import deque
 
-    tracker._completed = deque(maxlen=512)
-    tracker.pending = {}
-    tracker.last_activity = 0.0
-    tracker.reader_error = None
-    import threading
+    def _fresh_tracker():
+        tracker = mod.StreamTracker.__new__(mod.StreamTracker)
+        tracker._pipe = None
+        tracker._lock = threading.Lock()
+        tracker._rolling = bytearray()
+        tracker._partial = bytearray()
+        tracker._completed = deque(maxlen=512)
+        tracker.pending = {}
+        tracker._provisional_id = None
+        tracker.last_activity = 0.0
+        tracker.reader_error = None
+        tracker._thread = threading.Thread(target=lambda: None, daemon=True)
+        return tracker
 
-    tracker._thread = threading.Thread(target=lambda: None, daemon=True)
+    tracker = _fresh_tracker()
 
     stream = (
         b"============================= test session starts =============================\r\n"
@@ -347,17 +351,11 @@ def test_watchdog_pending_tracker_synthetic_stream():
 
     # Implementation-review round 1 shapes: class-path ids are captured in
     # FULL (not truncated at the class component) ...
-    tracker2 = mod.StreamTracker.__new__(mod.StreamTracker)
-    tracker2._pipe = None
-    tracker2._lock = __import__("threading").Lock()
-    tracker2._rolling = bytearray()
-    tracker2._partial = bytearray()
-    tracker2._completed = deque(maxlen=512)
-    tracker2.pending = {}
-    tracker2.last_activity = 0.0
-    tracker2.reader_error = None
-    tracker2._thread = threading.Thread(target=lambda: None, daemon=True)
-    tracker2._absorb(b"tests/test_wedge.py::TestGroup::test_class_case ")
+    tracker2 = _fresh_tracker()
+    # The record is newline-TERMINATED (the real -v shape: a dispatched id
+    # ends its record when the next event arrives), so it is a completed-line
+    # dispatch — not speculative — and survives later absorbs.
+    tracker2._absorb(b"tests/test_wedge.py::TestGroup::test_class_case \r\n")
     assert set(tracker2.pending) == {
         "tests/test_wedge.py::TestGroup::test_class_case"
     }, tracker2.pending
@@ -374,6 +372,22 @@ def test_watchdog_pending_tracker_synthetic_stream():
     assert set(tracker2.pending) == {
         "tests/test_wedge.py::TestGroup::test_class_case"
     }, tracker2.pending
+
+    # Implementation-review round 2: a read can split a node id
+    # MID-COMPONENT (`tests/x.py::test_fo` + `o PASSED`) — the speculative
+    # prefix must be retired when the completed record arrives, and the
+    # pending set must end up exactly the genuinely-still-pending ids.
+    tracker3 = _fresh_tracker()
+    tracker3._absorb(b"tests/test_wedge.py::test_mid_component_fo")
+    assert "tests/test_wedge.py::test_mid_component_fo" in tracker3.pending
+    tracker3._absorb(b"o PASSED [ 90%]\r\ntests/test_wedge.py::test_still_pending ")
+    assert "tests/test_wedge.py::test_mid_component_foo" not in tracker3.pending
+    assert "tests/test_wedge.py::test_mid_component_fo" not in tracker3.pending, (
+        f"mid-component split left a phantom prefix: {tracker3.pending}"
+    )
+    assert set(tracker3.pending) == {
+        "tests/test_wedge.py::test_still_pending"
+    }, tracker3.pending
 
 
 @pytest.mark.skipif(
