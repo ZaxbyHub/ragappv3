@@ -1538,16 +1538,15 @@ def test_ingest_gate_seam_census_pins_every_call_site():
     bt_calls = len(
         re.findall(r"self\.processor\._raise_if_ingest_gate_closed\(", bt_src)
     )
-    # document_processor: 5 gate CALL sites (retry-chunks [N3], the
-    # enrichment swap's in-method gate, the run_enrichment_job call-site
-    # gate, process_file, process_existing_file); background_tasks:
-    # exactly the atom-proxy call. (The def line does not match the
-    # self.-anchored regex.)
-    assert dp_calls == 5, (
-        f"document_processor gate matches = {dp_calls}, want 5 "
-        "(def + retry-chunks + process_file + process_existing_file + "
-        "enrichment swap); an ingest gate was removed or a new seam went "
-        "ungated"
+    # document_processor: 4 gate CALL sites (retry-chunks [N3], the
+    # enrichment swap's in-method gate, process_file,
+    # process_existing_file); background_tasks: exactly the atom-proxy
+    # call. (The def line does not match the self.-anchored regex.)
+    assert dp_calls == 4, (
+        f"document_processor gate matches = {dp_calls}, want 4 "
+        "(retry-chunks + enrichment swap + process_file + "
+        "process_existing_file); an ingest gate was removed or a new seam "
+        "went ungated"
     )
     assert bt_calls == 1, (
         f"background_tasks atom-proxy gate matches = {bt_calls}, want 1; "

@@ -2170,7 +2170,10 @@ class DocumentProcessor:
         """
         if reindex or vector_target is not None:
             return
-        store = self.vector_store
+        # getattr (not bare attribute): attribute-less test doubles that
+        # drive run_enrichment_job unbound must gate no-op here, exactly as
+        # the strict-probe defaults elsewhere treat absence as pass.
+        store = getattr(self, "vector_store", None)
         if store is None:
             return
         if (
@@ -2881,14 +2884,15 @@ class DocumentProcessor:
             # [issue #736, review2 F-07] The enrichment swap writes
             # live-model vectors over the live table (embed_batch reads the
             # LIVE settings), so it takes the same ordinary-ingest gate as
-            # the document-chunk seams — enforced inside
-            # _swap_in_enriched_vector_records (single caller, all paths).
-            # The gate raises IngestGateClosedError; the enclosing
-            # enrichment handler catches it and sets
-            # enrichment_status='error' (ENRICHMENT_FAILED code). It is NOT
-            # auto-retried and the recovery reindex does not re-enrich —
-            # re-enable/re-trigger enrichment after the gate lifts.
-            self._raise_if_ingest_gate_closed(reindex=False)
+            # the document-chunk seams — enforced INSIDE
+            # _swap_in_enriched_vector_records (single caller, all paths;
+            # kept in-method so test doubles that replace the swap skip the
+            # gate with it, per the unbound-stub convention). The gate
+            # raises IngestGateClosedError; the enclosing enrichment
+            # handler catches it and sets enrichment_status='error'
+            # (ENRICHMENT_FAILED code). It is NOT auto-retried and the
+            # recovery reindex does not re-enrich — re-enable/re-trigger
+            # enrichment after the gate lifts.
             await self._swap_in_enriched_vector_records(records, old_ids)
             await self._verify_vector_rows_visible(file_id)
             # Issues #1075/#1076: guarded + atom-aware; post-stamp, so a
