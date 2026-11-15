@@ -1,0 +1,27 @@
+# Compose forwards safe values for validated settings, bounds log growth, keeps its pinning promises (#750)
+
+## What changed
+
+- **Four validated str settings forward in the short pass-through form** (`- JWT_ALGORITHM`, `- ADMIN_RATE_LIMIT`, `- VECTOR_METRIC`, `- IMAP_MAILBOX` in `docker-compose.yml`): the `${KEY:-}` empty-default form made Settings resolve a real `""` whenever an operator's `.env` omitted the key (Settings deliberately keeps empty env values meaningful — no `env_ignore_empty`), breaking the HS-family allowlist at first login (`jwt_algorithm`, default `HS256`), the admin limiter parse (`admin_rate_limit`, default `10/minute`), the vector metric validation (`vector_metric`, default `cosine`), and the IMAP mailbox selection (`imap_mailbox`, default `INBOX`). Unset keys are now omitted entirely so the Settings defaults govern; explicit `.env` values still forward verbatim. This closes the four keys PR #1102 deferred; `DOCUMENT_PARSING_STRATEGY` had already moved in #1061.
+- **Every compose service bounds its container log growth**: a top-level `x-logging` anchor (json-file driver, `max-size: 10m`, `max-file: 5` — 50 MiB per service, ~200 MiB for the four-service stack) is attached to `harrier-embed`, `reranker`, `redis`, and `knowledgevault`, all of which run `restart: unless-stopped`. Retention is documented in `docs/operations.md` (Container log retention): rotation discards only the oldest files; raise limits or ship logs off-host instead of removing the bounds.
+- **Dependabot now watches the compose image pins**: `.github/dependabot.yml` gains a `package-ecosystem: "docker-compose"` entry for `/` (weekly schedule, semver-major ignore, 14-day cooldown — the same posture as the existing `docker` entries), so `docker-compose.yml`'s own digest-promise comments are finally backed by configuration. Those comments (harrier-embed and redis) now name the `docker-compose` ecosystem instead of the Dockerfile-only `docker` ecosystem.
+- **`start-services.ps1` defaults its embedding image from `docker-compose.yml`**: the `$EmbeddingImage` parameter default reads the digest-pinned `harrier-embed` image reference out of `docker-compose.yml`, so the Windows dev launcher tracks dependabot digest bumps instead of drifting on the floating `cuda-latest` tag (kept only as the fallback literal for the missing-compose-file edge case). Verified by parsing and evaluating the default expression in PowerShell: it resolves to exactly compose's `ghcr.io/huggingface/text-embeddings-inference:cuda-latest@sha256:1bf1...0353` pin.
+- **New guard `backend/tests/test_i03_compose_contracts.py`** (all four discriminating tests RED at this PR's base, GREEN at its head): `test_validated_str_keys_not_forwarded_with_empty_default` (no `${KEY:-}` empty default for the five validated keys, and they stay forwarded), `test_every_service_bounds_log_growth` (json-file/local driver with both `max-size` and `max-file`), `test_compose_digest_promise_matches_dependabot_config` (promise backed or gone; `docker` entries keep major-ignore + cooldown), and `test_windows_launcher_default_image_matches_compose_pin` (launcher default equals the compose pin or resolves from `docker-compose.yml`).
+- **`backend/tests/test_1061_compose_enum_forward_guard.py` dispositions updated**: the four keys left its empty-default forward census (27 → 23 entries; the floor of 20 still holds) — its docstrings now record that instead of describing them as "#750-owned, allowed here".
+
+## Why
+
+Audit findings TQ-sibling-batch-05-01, T1-04-S-09, T1-04-K-05, T1-04-MH-12 (issue #750): the empty-default forwards are consumer-level breakage with a green CI signal (Settings construction passes; the first login / limiter / vector-store / IMAP consumer fails); unbounded json-file logs under `restart: unless-stopped` can fill the Docker host's disk on long-lived deployments; compose's comments promised dependabot digest PRs that the `docker` ecosystem (Dockerfile scanning) cannot deliver; and the Windows launcher defaulted to a floating tag where compose pins a digest for supply-chain integrity.
+
+## Migration steps
+
+- None for operators whose `.env` sets `JWT_ALGORITHM`, `ADMIN_RATE_LIMIT`, `VECTOR_METRIC`, or `IMAP_MAILBOX` explicitly — values still forward verbatim.
+- Deployments that relied on the (broken) empty forwards — e.g. a deliberately empty `JWT_ALGORITHM=` line — must set a real value or remove the key to fall back to the Settings default.
+- Container logs now rotate at 5 files x 10 MiB per service; operators needing longer local history should raise `max-size`/`max-file` per service or ship logs off-host (see `docs/operations.md`, Container log retention).
+- Windows dev launcher users get the compose-pinned digest automatically; `EMBEDDING_IMAGE` still overrides it.
+
+## Known caveats
+
+- Dependabot's `docker-compose` ecosystem updates `docker-compose.yml` only; the `start-services.ps1` floating-tag fallback (reachable only when `docker-compose.yml` is absent) is not dependabot-tracked.
+- The `test_1061` census floor (>= 20) sits at 23 actual entries now; any further short-form conversion that drops the census below 20 must revisit that floor.
+- CI never boots the compose stack: the logging and env-forwarding behavior is guarded by the YAML contract tests in `test_i03_compose_contracts.py` plus `docker compose config` (verified with Compose v5.7.1 at PR time), not by a standing runtime gate.

@@ -1,3 +1,15 @@
+# Bounded container logs (issue #750, T1-04-S-09): every service below runs
+# under `restart: unless-stopped`, so Docker's default json-file driver grows
+# container logs without bound on a long-lived host. Every service inherits
+# this anchor (max-file x max-size = 5 x 10 MiB per service, 200 MiB for the
+# four-service stack). Rotation only discards the OLDEST files — recent
+# errors always land in the live log; raise the limits, never remove them.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 services:
 
   # Harrier Embedding Server (replaces flag-embed-server)
@@ -6,12 +18,13 @@ services:
     # cuda-latest is a floating multi-arch tag (linux/amd64 + attestation);
     # the digest below is the manifest-LIST digest, so Docker still selects
     # the correct platform image at pull time. Pinning freezes the image at
-    # today's build — dependabot (docker ecosystem) will open PRs when a new
-    # digest is published. Update both harrier-embed and reranker together
-    # (same upstream image).
+    # today's build — dependabot (docker-compose ecosystem) will open PRs
+    # when a new digest is published. Update both harrier-embed and reranker
+    # together (same upstream image).
     image: ghcr.io/huggingface/text-embeddings-inference:cuda-latest@sha256:1bf10562b37c8b835693084e1bab4d80232188cb258da886eaf1e6eaf6770353
     container_name: harrier-embed
     restart: unless-stopped
+    logging: *default-logging
     command: --model-id microsoft/harrier-oss-v1-0.6b --port 8080 --max-batch-tokens 16384 --max-client-batch-size 128
     ports:
       - "8080:8080"
@@ -39,6 +52,7 @@ services:
     image: ghcr.io/huggingface/text-embeddings-inference:cuda-latest@sha256:1bf10562b37c8b835693084e1bab4d80232188cb258da886eaf1e6eaf6770353
     container_name: reranker
     restart: unless-stopped
+    logging: *default-logging
     # --max-client-batch-size declares TEI's per-request client batch cap
     # (issue #719): the backend splits /rerank candidate sets at
     # RERANKER_MAX_BATCH (default 32) to match it.
@@ -65,10 +79,12 @@ services:
   redis:
     # Pinned by digest for supply-chain integrity (issue #404 / #391).
     # redis:7-alpine is a multi-arch manifest list; the digest below is the
-    # list digest. Dependabot (docker ecosystem) will surface digest updates.
+    # list digest. Dependabot (docker-compose ecosystem) will surface digest
+    # updates.
     image: redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
     container_name: knowledgevault_redis
     restart: unless-stopped
+    logging: *default-logging
     # Loopback-bound publish (#1061): local debugging keeps host access via
     # 127.0.0.1:6379 while the port is no longer reachable from other
     # interfaces. The bundled Redis also requires authentication — the same
@@ -113,6 +129,7 @@ services:
         VITE_API_URL: ${VITE_API_URL:-}
     container_name: knowledgevault
     restart: unless-stopped
+    logging: *default-logging
     # Shutdown budget (issue #700, T1-04-S2-02): BackgroundProcessor.stop()
     # applies its 60 s timeout PER DRAIN PHASE (queues, enrichment, atoms,
     # lease settle) and the final optimize is unbounded, so the composed
@@ -272,11 +289,16 @@ services:
       # variable documented in .env.example is forwarded into the backend
       # container so tuning it in .env reaches the containerized backend.
       # Two forms, deliberately:
-      #   - `- KEY` (short passthrough) for typed int/float/bool keys: an
+      #   - `- KEY` (short passthrough) for typed int/float/bool keys AND for
+      #     validator/allowlist-constrained str keys whose Settings default
+      #     is a real, non-empty value (JWT_ALGORITHM, DOCUMENT_PARSING_
+      #     STRATEGY, VECTOR_METRIC, IMAP_MAILBOX, ADMIN_RATE_LIMIT): an
       #     unset key is OMITTED entirely, so compose never injects "" into
-      #     a field that would fail startup coercion (review F2, PR #576).
+      #     a field that would fail startup coercion (review F2, PR #576)
+      #     or a downstream allowlist/enum check (#1061, #750).
       #   - `- KEY=${KEY:-}` for str keys pinned by check_config_contract
-      #     (APP_ROOT_PATH, MULTIMODAL_*): "" is their documented default.
+      #     (APP_ROOT_PATH, MULTIMODAL_*) and the genuinely-empty str keys
+      #     (IMAP_HOST, OLLAMA_CHAT_URL, ...): "" is their documented default.
       # Empty-string values remain MEANINGFUL in Settings (REDIS_URL="" →
       # in-memory limiter) — do NOT add env_ignore_empty=True. (Settings-layer
       # statement: this interpolation's ${VAR:-} default substitutes for an
@@ -318,8 +340,14 @@ services:
       - TELEMETRY_REGISTRY_DIR=${TELEMETRY_REGISTRY_DIR:-}
       # Auth & security
       - USERS_ENABLED
-      - JWT_ALGORITHM=${JWT_ALGORITHM:-}
-      - ADMIN_RATE_LIMIT=${ADMIN_RATE_LIMIT:-}
+      # Short pass-through form (#750): these two are validator/allowlist-
+      # constrained str keys with non-empty Settings defaults — the
+      # ${KEY:-} empty default injected "" and broke the HS-family
+      # allowlist at first login (jwt_algorithm) and the limiter parse
+      # (admin_rate_limit) whenever .env omitted them. Unset keys are
+      # omitted entirely; the Settings defaults govern.
+      - JWT_ALGORITHM
+      - ADMIN_RATE_LIMIT
       - HEALTH_CHECK_API_KEY=${HEALTH_CHECK_API_KEY:-}
       - HEALTH_PROBE_RATE_LIMIT=${HEALTH_PROBE_RATE_LIMIT:-30/minute}
       - CSRF_TOKEN_TTL
@@ -336,7 +364,10 @@ services:
       - DOCUMENT_PARSING_STRATEGY
       - RETRIEVAL_TOP_K
       - MAX_DISTANCE_THRESHOLD
-      - VECTOR_METRIC=${VECTOR_METRIC:-}
+      # Short pass-through form (#750, same rationale as JWT_ALGORITHM above):
+      # vector_metric has an enum-validated non-empty default; an injected ""
+      # is rejected by the vector-store config instead of falling back.
+      - VECTOR_METRIC
       - RETRIEVAL_WINDOW
       - ALLOWED_EXTENSIONS=${ALLOWED_EXTENSIONS:-}
       # Embedding tuning
@@ -376,7 +407,11 @@ services:
       - IMAP_USE_SSL
       - IMAP_USERNAME=${IMAP_USERNAME:-}
       - IMAP_PASSWORD=${IMAP_PASSWORD:-}
-      - IMAP_MAILBOX=${IMAP_MAILBOX:-}
+      # Short pass-through form (#750, same rationale as JWT_ALGORITHM above):
+      # imap_mailbox's documented default is "INBOX"; the empty-default form
+      # injected "" and left the poller selecting no mailbox. The other IMAP_*
+      # str keys keep ${KEY:-} — empty IS their documented default.
+      - IMAP_MAILBOX
       - IMAP_POLL_INTERVAL
       - IMAP_MAX_ATTACHMENT_SIZE
     extra_hosts:
