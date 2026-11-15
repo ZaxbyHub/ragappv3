@@ -279,6 +279,26 @@ def normalize_claim_text(text: str) -> str:
     return normalized
 
 
+def promotion_identity_key(text: str) -> str:
+    """Identity key for STATUS-LIFT decisions on matched claims (issue #1117).
+
+    ``normalize_claim_text`` (the DD-C011 fuzzy-dedup key) strips ALL
+    punctuation, so texts that differ by internal punctuation — "U.S.
+    economy shrank" vs "US economy shrank" — share one normalized key.
+    Promoting an existing claim on that lossy match conflates distinct
+    statements. This key keeps punctuation identity-relevant everywhere
+    EXCEPT trailing sentence terminals (``!`` and ``?``): "Alpha is
+    verified" ≡ "Alpha is verified!" still match (the #929 promotion
+    parity pins that arm), while comma/colon/hyphen/period variants —
+    internal or at token edges — compare distinct. Storage dedup keeps
+    using ``normalize_claim_text``; only the unverified→active and
+    superseded→active lifts consult this key.
+    """
+    return " ".join(
+        token.rstrip("!?") for token in (text or "").lower().split()
+    )
+
+
 def _row_to_dict(row: sqlite3.Row) -> dict:
     return dict(row)
 

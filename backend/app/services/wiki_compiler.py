@@ -26,7 +26,11 @@ from app.services.wiki_curator import (
     deterministic_dedupe_key,
 )
 from app.services.wiki_curator_client import CuratorClient
-from app.services.wiki_store import WikiStore, normalize_slug
+from app.services.wiki_store import (
+    WikiStore,
+    normalize_slug,
+    promotion_identity_key,
+)
 
 # Approximate bytes per text chunk for deterministic chunk-uid generation.
 # Matches the 2 000-character window used by SemanticChunker.
@@ -257,12 +261,31 @@ class WikiCompiler:
         """
         # Exact match first; fall back to normalized (fuzzy) match so claims that
         # differ only in punctuation/whitespace/case are deduped (DD-C011).
-        existing = self._store.find_claim_by_text(vault_id, claim_text) or \
-            self._store.find_claim_by_normalized_text(vault_id, claim_text)
+        exact = self._store.find_claim_by_text(vault_id, claim_text)
+        existing = exact or self._store.find_claim_by_normalized_text(
+            vault_id, claim_text
+        )
+        # Issue #1117: the fuzzy (normalized) arm strips ALL punctuation, so
+        # it can match a DIFFERENT statement ("U.S. economy shrank" vs "US
+        # economy shrank"). Dedup/source-attach may still ride the fuzzy
+        # match, but the STATUS LIFTS below additionally require text
+        # identity: an exact-arm match, or equality under
+        # promotion_identity_key (which tolerates only trailing sentence
+        # terminals — the "Alpha is verified" ≡ "Alpha is verified!" arm
+        # the #929 parity pins).
+        liftable = exact is not None or (
+            existing is not None
+            and promotion_identity_key(existing.claim_text)
+            == promotion_identity_key(claim_text)
+        )
         if existing:
             # Promote unverified → active when the caller has explicit per-claim citations.
             new_status = create_kwargs.get("status")
-            if existing.status == "unverified" and new_status == "active":
+            if (
+                existing.status == "unverified"
+                and new_status == "active"
+                and liftable
+            ):
                 self._db.execute(
                     "UPDATE wiki_claims SET status = 'active', source_type = ?, confidence = ?, "
                     "updated_at = datetime('now') WHERE id = ?",
@@ -282,7 +305,11 @@ class WikiCompiler:
             # file-recompile path such claims are retired by the post-pass in
             # compile_ingest_job (issue #794), and on the memory-edit path by
             # mark_claims_stale_by_memory.
-            if existing.status == "superseded" and new_status == "active":
+            if (
+                existing.status == "superseded"
+                and new_status == "active"
+                and liftable
+            ):
                 if self._store.reactivate_claim(existing.id):
                     existing.status = "active"
             # Attach dedup source if not already present
@@ -1275,10 +1302,20 @@ class WikiCompiler:
                     # lookup + source-dedupe semantics INLINE — its own
                     # promotion/reactivation branches commit internally, which
                     # would break the pair-atomicity established above.
-                    existing = self._store.find_claim_by_text(
+                    # Issue #1117: same identity discipline as the
+                    # deterministic twin — the fuzzy arm may match a
+                    # punctuation-differing statement, so record which arm
+                    # matched and require text identity for the lifts.
+                    _exact = self._store.find_claim_by_text(
                         vault_id, accepted.claim_text
-                    ) or self._store.find_claim_by_normalized_text(
+                    )
+                    existing = _exact or self._store.find_claim_by_normalized_text(
                         vault_id, accepted.claim_text
+                    )
+                    _liftable = _exact is not None or (
+                        existing is not None
+                        and promotion_identity_key(existing.claim_text)
+                        == promotion_identity_key(accepted.claim_text)
                     )
                     if existing is not None:
                         claim = existing
@@ -1297,10 +1334,15 @@ class WikiCompiler:
                         # identically (new_status == "active") — so a
                         # needs_review candidate (draft mode, unknown
                         # chunk, quote check off) can never resurrect a
-                        # superseded claim as active.
+                        # superseded claim as active. Issue #1117: the lift
+                        # also requires text identity (exact arm or
+                        # promotion_identity_key equality) — a
+                        # punctuation variant of a superseded claim is NOT
+                        # the same statement and must not resurrect it.
                         if (
                             existing.status == "superseded"
                             and accepted.status == "active"
+                            and _liftable
                         ):
                             self._store.reactivate_claim_if_superseded(existing.id)
                             existing.status = "active"
@@ -1328,6 +1370,12 @@ class WikiCompiler:
                             # promotions on the lossy-match path).
                             and _numeric_multiset(existing.claim_text)
                             == _numeric_multiset(accepted.claim_text)
+                            # Issue #1117: the numeric gate passes for
+                            # non-numeric-differing texts, so ALSO require
+                            # text identity (exact arm or
+                            # promotion_identity_key equality) before the
+                            # lift.
+                            and _liftable
                         ):
                             cur = self._db.execute(
                                 "UPDATE wiki_claims SET status = 'active',"

@@ -91,6 +91,46 @@ def _wiki_lint_executor() -> concurrent.futures.ThreadPoolExecutor:
             )
         return _WIKI_LINT_EXECUTOR
 
+
+# Bounded admission for the lint-run route (issue #1117, follow-up to the
+# PRR-001 executor comment above): every request the route admits holds its
+# pooled DB connection for the whole executor round-trip — including the
+# queue wait on the single-worker executor — so an unbounded burst pins the
+# pool (execution-proven at 10/10 connections, OOB review F-02). The bound
+# counts IN-FLIGHT admitted runs and rejects the excess with a 503-family
+# response at admission time, before any wait. Default 2, not 1: the
+# frontend deliberately supports two overlapping lint calls (a vault switch
+# mid-scan starts a second run — wiki-jobs-ui-checks.test.tsx); a bound of
+# 2 admits exactly that flow while capping pinned connections at 2 of the
+# 10-connection pool.
+_WIKI_LINT_MAX_CONCURRENT_RUNS = 2
+_wiki_lint_in_flight = 0
+_wiki_lint_admission_lock = threading.Lock()
+
+
+def _wiki_lint_try_acquire() -> bool:
+    """Admit one lint run when under the bound.
+
+    Reads `_WIKI_LINT_MAX_CONCURRENT_RUNS` from the module namespace at
+    call time (operators and tests may patch it between requests); the
+    lock makes check-and-increment atomic for every caller thread.
+    """
+    global _wiki_lint_in_flight
+    with _wiki_lint_admission_lock:
+        if _wiki_lint_in_flight >= _WIKI_LINT_MAX_CONCURRENT_RUNS:
+            return False
+        _wiki_lint_in_flight += 1
+        return True
+
+
+def _wiki_lint_release() -> None:
+    """Release one admission slot (floor 0: releases are best-effort and
+    must never drive the counter negative)."""
+    global _wiki_lint_in_flight
+    with _wiki_lint_admission_lock:
+        if _wiki_lint_in_flight > 0:
+            _wiki_lint_in_flight -= 1
+
 router = APIRouter(dependencies=[Depends(require_wiki_enabled)])
 
 
@@ -805,17 +845,51 @@ async def run_wiki_lint(
     _csrf_token: str = Depends(csrf_protect),
 ):
     await _require_vault_write(evaluate, user, request.vault_id)
-    store = WikiStore(db)
-    linter = WikiLinter(db, store)
-    # Issue #935 item 1: run_lint is synchronous full-table work; running it
-    # inline on the event loop stalls every other request in the process
-    # for the scan's duration. Dispatch to the dedicated bounded executor
-    # above (review PRR-001; note F-02: queued runs pin their pooled
-    # connection, so this bounds executor starvation, not pool contention).
-    loop = asyncio.get_running_loop()
-    findings = await loop.run_in_executor(
-        _wiki_lint_executor(), linter.run_lint, request.vault_id
-    )
+    # Issue #1117: bounded admission BEFORE any wait. Each admitted run
+    # pins its pooled connection for the whole executor round-trip, so the
+    # excess of a burst must be rejected here (503-family, retryable), not
+    # queued. The release is tied to WORKER COMPLETION via the future's
+    # done-callback, not to handler exit: cancelling the await mid-scan
+    # must not free the slot while the single worker is still occupied.
+    if not _wiki_lint_try_acquire():
+        raise HTTPException(
+            status_code=503,
+            detail="Wiki lint scan capacity reached; retry shortly",
+        )
+    cf_future = None
+    try:
+        store = WikiStore(db)
+        linter = WikiLinter(db, store)
+        # Issue #935 item 1: run_lint is synchronous full-table work; running
+        # it inline on the event loop stalls every other request in the
+        # process for the scan's duration. Dispatch to the dedicated bounded
+        # executor above (review PRR-001; the admission bound above now also
+        # bounds the pool pinning F-02 called out there).
+        loop = asyncio.get_running_loop()
+        cf_future = _wiki_lint_executor().submit(
+            linter.run_lint, request.vault_id
+        )
+
+        def _release_when_done(_f, _loop=loop):
+            try:
+                _loop.call_soon_threadsafe(_wiki_lint_release)
+            except RuntimeError:
+                # The loop already closed (lifespan tears the executor down
+                # with wait=False, so a scan can outlive its loop): the
+                # worker thread still owns the slot — release it directly
+                # under the lock so an embedded/multi-cycle server does not
+                # permanently lose admission capacity.
+                _wiki_lint_release()
+
+        cf_future.add_done_callback(_release_when_done)
+    except BaseException:
+        if cf_future is None:
+            # Construction or submission failed BEFORE completion ownership
+            # transferred to the future — roll the admission back. Once the
+            # done-callback is registered the future alone owns the release.
+            _wiki_lint_release()
+        raise
+    findings = await asyncio.wrap_future(cf_future)
     return {"findings": [_as_dict(f) for f in findings], "count": len(findings)}
 
 

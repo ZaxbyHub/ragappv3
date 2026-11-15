@@ -2090,6 +2090,12 @@ def run_migrations(sqlite_path: str) -> None:
     # (issue #791): table rebuild, so it runs after every other migration
     # that may create or rebuild wiki_lint_findings.
     migrate_wiki_lint_findings_origin_auto_resolved(sqlite_path)
+    # Legacy lint-row backfill (issue #1118): re-evaluate pre-#791 resolved
+    # rows and re-label curator-shaped legacy rows. Runs immediately after
+    # the origin migration above so the origin column and its CHECK
+    # vocabulary exist; naturally idempotent (predicates empty after the
+    # first run) and journal-silent on converged boots.
+    migrate_wiki_lint_findings_legacy_backfill(sqlite_path)
 
     # Partial unique index for duplicate hash detection (HIGH-10), widened to
     # treat a `partial` row the same as an `indexed` one (issue #693 /
@@ -7487,6 +7493,142 @@ def migrate_wiki_lint_findings_origin_auto_resolved(sqlite_path: str) -> None:
             conn, migration_name=_journal, phase="succeeded", outcome="ok",
             detail=f"rows={before_count}",
         )
+    finally:
+        conn.close()
+
+
+# Legacy cohort boundary for the wiki-lint backfill (issue #1118): rows
+# created before this instant predate the #791 reconciler semantics (PR
+# #930 / f9105acc, merged 2026-10-16T10:16Z), which introduced the
+# origin vocabulary and the system-only auto_resolved status. Midnight at
+# the START of that ship day is the conservative boundary: every row with
+# created_at before it predates the 10:16Z merge; rows created later on
+# 2026-10-16 (post-merge) fall outside the cohort, as they should.
+_LEGACY_LINT_CUTOFF = "2026-10-16T00:00:00Z"
+
+
+def migrate_wiki_lint_findings_legacy_backfill(sqlite_path: str) -> None:
+    """
+    Migration: re-evaluate legacy resolved lint rows and re-label legacy
+    curator-produced rows (issue #1118, maintainer decision "backfill
+    needed" 2026-11-12 on the PR #1113 body's #935 items 5+6).
+
+    Two plain UPDATEs over the pre-_LEGACY_LINT_CUTOFF cohort — no DDL, no
+    table rebuild (origin keeps its existing CHECK vocabulary; 'curator' is
+    already a legal value):
+
+    1. Truthful origin re-label FIRST (runs before the status UPDATE, which
+       advances updated_at): legacy rows backfilled as origin='linter' by
+       migrate_wiki_lint_findings_origin_auto_resolved that were actually
+       produced by the curator are identifiable by the two curator-exclusive
+       signals (the "Curator"-prefixed title shape every curator emitter
+       writes, and details JSON carrying subtype "curator"). Re-labeling
+       them to origin='curator' restores same-origin rule-3 reopening for
+       curator detections. Keyed to legacy CREATION only — a mislabeled row
+       the linter resolve pass or an open-row payload refresh touched after
+       the cutoff is still mislabeled and still repaired. Linter-shaped
+       legacy rows are data-indistinguishable and stay 'linter' (disclosed
+       boundary, see the #791 migration docstring above).
+    2. Legacy re-evaluation SECOND: a 'resolved' row whose created_at AND
+       updated_at both predate the cutoff was resolved under the pre-#791
+       reconciler semantics and is indistinguishable from a user resolve;
+       the backfill flips it to the system-only, rule-3-reopenable
+       'auto_resolved' so a recurring detection reopens it instead of being
+       permanently suppressed by rule 2. Both timestamps are required
+       (conservative): a resolved row touched after the cutoff had recent
+       interaction and stays user-terminal. dismissed/acknowledged are
+       user-only vocabulary and never flip; post-cutoff rows never flip.
+
+    Timestamps are compared with julianday() because the column carries two
+    writer formats (schema default CURRENT_TIMESTAMP 'YYYY-MM-DD HH:MM:SS'
+    vs store writers' isoformat with 'T' and optional microseconds) — raw
+    lexical comparison misclassifies same-day space-format rows. NULL or
+    unparseable values are excluded from the cohort (conservative: not
+    legacy).
+
+    Idempotence is NATURAL, not journal-gated (issue-tracer plan-critic
+    round 1): the predicates match zero rows after the first run. Journal
+    contract: a direct journal INSERT — not record_migration_outcome, which
+    never raises — written in the SAME BEGIN IMMEDIATE transaction as the
+    mutations, and ONLY when the invocation actually mutated rows
+    (test_b10_journal_noise_guard's clean-second-boot contract: a converged
+    boot journals nothing). A journal INSERT failure rolls the mutations
+    back so they retry intact on the next boot (purge-migration F-007
+    precedent).
+    """
+    journal_name = "migrate_wiki_lint_findings_legacy_backfill"
+    conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        relabeled = conn.execute(
+            """
+            UPDATE wiki_lint_findings SET origin = 'curator'
+            WHERE origin = 'linter'
+              AND created_at IS NOT NULL
+              AND julianday(created_at) IS NOT NULL
+              AND julianday(created_at) < julianday(?)
+              AND (
+                  title LIKE 'Curator %'
+                  OR (json_valid(details)
+                      AND json_extract(details, '$.subtype') = 'curator')
+              )
+            """,
+            (_LEGACY_LINT_CUTOFF,),
+        ).rowcount
+        reevaluated = conn.execute(
+            """
+            UPDATE wiki_lint_findings
+            SET status = 'auto_resolved', updated_at = CURRENT_TIMESTAMP
+            WHERE status = 'resolved'
+              AND created_at IS NOT NULL AND updated_at IS NOT NULL
+              AND julianday(created_at) IS NOT NULL
+              AND julianday(updated_at) IS NOT NULL
+              AND julianday(created_at) < julianday(?)
+              AND julianday(updated_at) < julianday(?)
+            """,
+            (_LEGACY_LINT_CUTOFF, _LEGACY_LINT_CUTOFF),
+        ).rowcount
+        if relabeled or reevaluated:
+            if relabeled:
+                logger.info(
+                    "run_migrations: re-labeled %d legacy curator-shaped "
+                    "wiki_lint_findings row(s) origin linter->curator "
+                    "(issue #1118 backfill)",
+                    relabeled,
+                )
+            if reevaluated:
+                logger.info(
+                    "run_migrations: re-evaluated %d legacy resolved "
+                    "wiki_lint_findings row(s) to auto_resolved "
+                    "(issue #1118 backfill)",
+                    reevaluated,
+                )
+            # Direct INSERT (record_migration_outcome never raises, so a
+            # journal failure must roll the mutations back with it).
+            conn.execute(
+                "INSERT INTO migration_journal"
+                " (migration_name, phase, outcome, detail)"
+                " VALUES (?, ?, ?, ?)",
+                (
+                    journal_name,
+                    "succeeded",
+                    "ok",
+                    f"legacy backfill: origin relabeled={relabeled}, "
+                    f"resolved re-evaluated={reevaluated}",
+                ),
+            )
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        record_migration_outcome(
+            conn,
+            migration_name=journal_name,
+            phase="failed",
+            outcome="error",
+            detail=f"{type(exc).__name__}: {exc}",
+        )
+        conn.commit()
+        raise
     finally:
         conn.close()
 
