@@ -355,7 +355,7 @@ function SettingsPageContent({
             <p className="text-xs text-warning/80 mt-0.5">
               {reindexIdentityChanged
                 ? "Changes to the embedding identity paused search, chat, memories, and wiki with an embedding-mismatch 503 and paused new uploads. Rebuild embeddings (all-vault reindex) from the Maintenance tab — the run must complete to restore readiness, and restarting does not clear it."
-                : "Changes to embedding model, chunk size, or vector settings invalidate existing document embeddings. Rebuild embeddings (all-vault reindex) from the Maintenance tab so new and existing documents share the same settings."}
+                : "Changes to chunk size or vector settings invalidate existing document embeddings. Rebuild embeddings (all-vault reindex) from the Maintenance tab so new and existing documents share the same settings."}
             </p>
           </div>
           <button

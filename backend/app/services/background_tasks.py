@@ -3312,6 +3312,17 @@ class BackgroundProcessor:
         except DocumentProcessingError:
             logger.info("Skipping proxy vector write for deleted file_id=%s", file_id)
             return
+        # [issue #736, swarm review F-001] Enrichment proxies embed with the
+        # LIVE settings (embed_batch), so this fourth vector-write seam takes
+        # the same ordinary-ingest gate as the document-chunk seams: a ticket
+        # queued before an identity flip must not write new-model proxies
+        # into the old-model live table, and a staged rebuild's cutover must
+        # not silently discard the write. Enrichment is never reindex
+        # context, so no exemption applies. The settled file row keeps its
+        # EMBEDDING_MODEL_MISMATCH error (recoverable via the all-vault
+        # reindex's errored-row selection); skipping here only leaves the
+        # prior proxy generation in place.
+        self.processor._raise_if_ingest_gate_closed(reindex=False)
         await vec_store.add_chunks_then_delete_ids(new_records, stale_ids)
         # Post-write compensation (issue #692 review follow-up F-004): the
         # pre-write gate above cannot cover the embedding awaits between it

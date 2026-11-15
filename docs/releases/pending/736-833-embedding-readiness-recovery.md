@@ -18,15 +18,19 @@ rebuild's cutover:
   documents" when the vector store's readiness gate is down, and 503
   "Document reindex in progress — retry when it completes" while a staged
   rebuild is in flight.
-- A processor-level backstop at both last-durable-write seams
-  (`backend/app/services/document_processor.py`): ordinary ingestion
-  (uploads, scans, watcher/legacy `process_file` work, anything queued
-  before a flip) refuses the vector write under either gate condition and
-  settles the file row to the new stable error code
+- Processor-level backstops at every ordinary-ingest vector-write seam —
+  the three document-chunk seams (`backend/app/services/
+  document_processor.py`: process_file, process_existing_file's upload arm,
+  and the failed-chunk retry) plus the enrichment atom-proxy write
+  (`backend/app/services/background_tasks.py` `_write_atom_proxies`): each
+  refuses the vector write under either gate condition. The document-chunk
+  seams settle the file row to the new stable error code
   `EMBEDDING_MODEL_MISMATCH` (registered in `_INGEST_ERROR_REASONS`; the
   all-vault reindex's selection re-processes errored rows, so the outcome
-  is recoverable). Reindex-context work is exempt — staged rebuild targets
-  and the all-vault in-place recovery keep writing.
+  is recoverable); the enrichment seam takes the same gate check and its
+  bounded retry re-reaches the work after recovery. Reindex-context work is
+  exempt — staged rebuild targets and the all-vault in-place recovery keep
+  writing.
 
 **Empty-index recovery (final-critic round).** A zero-file all-vault
 reindex no longer early-returns before the guarded identity-record and
