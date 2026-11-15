@@ -511,6 +511,19 @@ def test_upload_after_embedding_model_change_is_not_mixed():
         )
         upload_status = upload_resp.status_code
 
+        # [CHECK_WRONG amendment, implementation review R2] Only the intended
+        # outcomes may satisfy this check: accepted-for-processing (200,
+        # then the drain must show zero mixed vectors) or the ingest gate's
+        # refusal (409/503). Any other status (e.g. an unrelated 500 from a
+        # broken route) previously passed vacuously because the drain was
+        # skipped and no vectors were written.
+        assert upload_status in (200, 409, 503), (
+            "AC2: upload returned an unexpected status "
+            f"{upload_status}: {upload_resp.text[:200]!r} — the check only "
+            "accepts the gate's refusal (409/503) or an accepted upload "
+            "whose drain writes zero old-model vectors."
+        )
+
         if upload_status == 200:
             # Deterministically drain the real in-process worker.
             asyncio.run(_drain_queue(bp))

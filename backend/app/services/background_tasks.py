@@ -5650,6 +5650,17 @@ class BackgroundProcessor:
             try:
                 vector_store = self.processor.vector_store
                 if vector_store is not None:
+                    # [issue #736, implementation-review R1] Capture the
+                    # readiness epoch BEFORE the R1 identity check below: a
+                    # settings save landing between the identity comparison
+                    # and a later epoch snapshot would hand the snapshot the
+                    # ALREADY-BUMPED epoch, letting the stale job lift
+                    # readiness over the invalidation. With the capture
+                    # first, every interleaving is covered — a save before
+                    # the identity check trips R1 (identity moved, job
+                    # failed), a save after it drifts the epoch and
+                    # suppresses the lift.
+                    epoch_at_completion_entry = readiness_epoch(vector_store)
                     if _job_identity() != job_start_identity:
                         # Identity moved between job start and completion. On
                         # the staged path the (old-identity) drain snapshot is
@@ -5760,7 +5771,7 @@ class BackgroundProcessor:
                     # the wrong identity over a table embedded under the old
                     # one. On the staged path the same values were already
                     # persisted at commit; this re-write is idempotent.
-                    epoch_at_record = readiness_epoch(vector_store)
+                    epoch_at_record = epoch_at_completion_entry
                     await vector_store.record_embedding_metadata(
                         probe_dim or settings.embedding_dim,
                         raise_on_error=True,

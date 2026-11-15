@@ -1314,3 +1314,51 @@ def test_stable_reason_format_pinned():
     pinned = format_ingest_error(INGEST_ERROR_EMBEDDING_MISMATCH)
     assert settled == pinned
     assert settled.startswith("EMBEDDING_MODEL_MISMATCH: ")
+
+
+def test_epoch_capture_pre_r1_closes_invalidations_window():
+    """Implementation-review R1: a settings save landing between the R1
+    identity comparison and a LATER epoch snapshot would hand the snapshot
+    the already-bumped epoch and let the stale job lift readiness over the
+    invalidation. The fix captures the epoch at completion ENTRY (before
+    R1), so this interleaving trips R1 instead (identity moved -> job
+    failed, no lift). Discriminating: under the pre-fix ordering the store
+    ends READY and this test fails."""
+    import app.services.background_tasks as bt
+    from app.api.routes.settings import _invalidate_vector_store_readiness
+
+    with _reindex_completion_env(vault_id=None) as env:
+        prior = _prior_config()
+        old_model = settings.embedding_model
+        fired = threading.Event()
+        orig_epoch = bt.readiness_epoch
+        calls = {"n": 0}
+
+        def _epoch_firing_invalidation(store):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # The completion-entry capture: change the LIVE identity and
+                # run the REAL invalidation hook BEFORE the snapshot reads
+                # the epoch — the PUT-equivalent interleaving.
+                settings.embedding_model = old_model + "-r1window"
+                _invalidate_vector_store_readiness(app, prior)
+                fired.set()
+            return orig_epoch(store)
+
+        bt.readiness_epoch = _epoch_firing_invalidation
+        try:
+            with _app_state_store(env.vs):
+                processor = _make_reindex_processor(env.vs, env.pool)
+                asyncio.run(processor._process_reindex_job(env.job_id))
+        finally:
+            bt.readiness_epoch = orig_epoch
+            settings.embedding_model = old_model
+
+        assert fired.is_set(), "the capture hook must have run at completion entry"
+        # R1 must have tripped (identity moved before the comparison): the
+        # job settles failed with the #702 guidance and NEVER lifts.
+        status, result_json, _error = _job_row(env.db_path, env.job_id)
+        assert status == "failed", (status, result_json)
+        assert getattr(env.vs, "_ready", True) is False, (
+            "a save landing in the R1->epoch-capture window must not end READY"
+        )
