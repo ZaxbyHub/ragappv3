@@ -12,7 +12,8 @@ rebuild's cutover:
 - `require_ingest_ready` (`backend/app/api/deps.py`) — a new route
   dependency on both upload routes (`POST /documents` and
   `POST /documents/upload`), `POST /documents/scan`, and
-  `POST /documents/{file_id}/retry-chunks`. It refuses with 503
+  `POST /documents/{file_id}/retry-chunks` and
+`POST /documents/admin/retry/{file_id}`. It refuses with 503
   "Embedding model mismatch — admin reindex required before ingesting
   documents" when the vector store's readiness gate is down, and 503
   "Document reindex in progress — retry when it completes" while a staged
@@ -26,6 +27,12 @@ rebuild's cutover:
   all-vault reindex's selection re-processes errored rows, so the outcome
   is recoverable). Reindex-context work is exempt — staged rebuild targets
   and the all-vault in-place recovery keep writing.
+
+**Empty-index recovery (final-critic round).** A zero-file all-vault
+reindex no longer early-returns before the guarded identity-record and
+readiness lift: a fresh install whose admin sets the embedding model
+before the first upload (or a deployment that emptied its index) can
+recover in-app instead of being locked out by the now-gated uploads.
 
 **Vault-scoped completions never lift a down gate (issue #736 AC7).** A
 vault-scoped reindex completing while the embedding-mismatch gate is down no
@@ -54,10 +61,12 @@ copy stating the recovery contract: an embedding-mismatch 503 requires an
 ALL-VAULT reindex run to COMPLETION, and restarting does not clear it. The
 SettingsPage "Reindex required" banner no longer points at reprocess /
 wiki-recompile paths that never restore readiness, and
-`ReindexConfirmDialog`'s false claims ("embeddings will remain queryable",
-"new documents will use the new settings immediately") are replaced with
-the gated truth (queries and uploads pause until the all-vault reindex
-completes).
+`ReindexConfirmDialog`'s false claims are replaced: when an identity
+field (model/prefixes) changed, the copy states the gated truth (queries
+and uploads pause until the all-vault reindex completes; restarting does
+not clear it); for chunking/vector-only changes it keeps the accurate
+stale-embeddings wording without claiming a 503 (identity-conditional
+copy, new `IDENTITY_REINDEX_FIELDS` + `reindexIdentityChanged`).
 
 ## Notes for operators
 
