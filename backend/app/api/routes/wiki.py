@@ -857,6 +857,7 @@ async def run_wiki_lint(
             detail="Wiki lint scan capacity reached; retry shortly",
         )
     cf_future = None
+    callback_registered = False
     try:
         store = WikiStore(db)
         linter = WikiLinter(db, store)
@@ -880,11 +881,16 @@ async def run_wiki_lint(
             _wiki_lint_release()
 
         cf_future.add_done_callback(_release_when_done)
+        callback_registered = True
     except BaseException:
-        if cf_future is None:
-            # Construction or submission failed BEFORE completion ownership
-            # transferred to the future — roll the admission back. Once the
-            # done-callback is registered the future alone owns the release.
+        if not callback_registered:
+            # The future does not own the release yet — either submission
+            # failed (cf_future is None) or an async-injected BaseException
+            # (signal class) landed between submit() returning and the
+            # done-callback registration (swarm review F-001: keying the
+            # rollback on `cf_future is None` alone leaked the slot in that
+            # window). Roll the admission back; once the callback is
+            # registered the future alone owns the release.
             _wiki_lint_release()
         raise
     findings = await asyncio.wrap_future(cf_future)

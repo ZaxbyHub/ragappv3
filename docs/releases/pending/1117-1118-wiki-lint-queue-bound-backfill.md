@@ -16,9 +16,11 @@
   mid-scan cannot free a slot the executor still occupies, and a scan that
   outlives its event loop (embedded/multi-cycle servers) releases through
   the worker thread itself (the release is independent of the
-  submitting event loop's lifecycle). Operators can tune the bound by patching
-  `app.api.routes.wiki._WIKI_LINT_MAX_CONCURRENT_RUNS`; it is read at
-  request time.
+  submitting event loop's lifecycle). The bound is the module constant
+  `app.api.routes.wiki._WIKI_LINT_MAX_CONCURRENT_RUNS` (read at request
+  time — patchable in-process for tests and embedded use; there is
+  deliberately no settings key: the chat-admission budget pattern does not
+  fit a per-process executor bound).
 - **Promotion identity gate (wiki claims)** — a compile or curator run
   that re-derives a claim which differs from an existing one by INTERNAL
   punctuation ("U.S. economy shrank" vs "US economy shrank",
@@ -27,8 +29,8 @@
   to `active` or reactivates a `superseded` one. Dedup/source-attach still
   rides the fuzzy match (DD-C011 design); only the STATUS LIFTS now
   require text identity (exact match, or equality under the new
-  `promotion_identity_key`, which tolerates only trailing `!`/`?`
-  terminals — "Alpha is verified" ≡ "Alpha is verified!" still promotes,
+  `promotion_identity_key`, which tolerates case, whitespace-run, and
+  trailing `!`/`?`-terminal differences — "Alpha is verified" ≡ "Alpha is verified!" still promotes,
   preserving the #929 parity; note a trailing PERIOD is now
   identity-relevant and blocks promotion, a visible narrowing of the
   pre-#1117 fuzzy-promotion behavior). Both promotion paths (the deterministic
@@ -58,7 +60,14 @@ backfill for #935 items 5+6), collated per session authorization.
 
 ## Operator notes
 
-- The lint 503 is retryable; the frontend surfaces route errors as
-  before. Single-operator lint runs never hit the bound.
+- The lint 503 is retryable; the WikiPage lint action now surfaces the
+  error (toast) instead of silently dropping it. Single-operator lint
+  runs never hit the bound.
+- On an install that kept running pre-#791 code after 2026-10-16, the
+  backfill treats everything before the database's own upgrade instant
+  as legacy — including user resolves made in that window, which become
+  re-openable on recurrence (the pre-#791 reconciler wrote system and
+  user resolves indistinguishably; reopening is the chosen recovery
+  direction).
 - The migration runs at boot; no DDL, no downtime, safe to re-run.
 - The `wiki_lint_findings.origin` CHECK vocabulary is unchanged.

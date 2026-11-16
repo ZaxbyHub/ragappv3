@@ -242,9 +242,18 @@ export default function WikiPage() {
 
   async function handleRunLint() {
     if (!activeVaultId) return;
-    const findings = await runLint();
-    setLintPanelOpen(true);
-    toast.info(`Lint complete: ${findings.length} finding(s)`);
+    try {
+      const findings = await runLint();
+      setLintPanelOpen(true);
+      toast.info(`Lint complete: ${findings.length} finding(s)`);
+    } catch (err) {
+      // The lint run can fail with a retryable 503 when the lint admission
+      // bound is saturated (concurrent runs) - surface it instead of
+      // leaving an unhandled rejection with no user feedback.
+      toast.error(
+        err instanceof Error ? err.message : "Wiki lint run failed"
+      );
+    }
   }
 
   // AC35 (#515): after resolve/dismiss, refresh the panel from the findings
