@@ -47,28 +47,66 @@ TESTS_DIR = Path(__file__).resolve().parent
 PARSED_TEST_FILE = TESTS_DIR / "test_real_docs_parsing.py"
 FIXTURE_DIR = TESTS_DIR / "fixtures" / "real_docs"
 MARKDOWN_FIXTURE = "markdown_notes.md"
+PROTECTED_TEST_NAME = "test_each_fixture_format_yields_chunks_with_markers"
 OFFICE_SUFFIXES = (".docx", ".xlsx", ".pptx")
 
 
-def _marker_rows() -> list[tuple[str, tuple[str, ...]]]:
-    """Literal (fixture, markers) rows of the markers parametrize table.
+def _decorator_parametrize_calls(decorators: list[ast.expr]) -> list[ast.Call]:
+    """pytest.mark.parametrize calls in one function's decorator list.
 
-    Fail-closed: a non-literal or malformed row is a test failure, never a
-    silently skipped one — the guard must never pass because it stopped
+    Bind the guard to the PROTECTED TEST's own decorators: a whole-AST table
+    search could silently skip a non-literal target table and be satisfied by
+    an unrelated literal `markers` table elsewhere in the file (reviewer
+    finding, Phase 4.5 Round 1).
+    """
+    calls: list[ast.Call] = []
+    for decorator in decorators:
+        node: ast.AST | None = decorator
+        while isinstance(node, ast.Call):
+            func = node.func
+            if (
+                isinstance(func, ast.Attribute)
+                and func.attr == "parametrize"
+                and isinstance(node, ast.Call)
+            ):
+                calls.append(node)
+            node = func
+    return calls
+
+
+def _marker_rows() -> list[tuple[str, tuple[str, ...]]]:
+    """Literal (fixture, markers) rows of the protected test's parametrize table.
+
+    Fail-closed: a missing protected test, a missing/uninspectable markers
+    parametrize on it, or a non-literal/malformed row is a test failure, never
+    a silently skipped one — the guard must never pass because it stopped
     understanding the table.
     """
     source = PARSED_TEST_FILE.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(PARSED_TEST_FILE))
 
+    protected = [
+        node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == PROTECTED_TEST_NAME
+    ]
+    assert protected, (
+        f"{PARSED_TEST_FILE.name} no longer defines {PROTECTED_TEST_NAME} — "
+        "the marker guard has lost its protected target (fail closed)"
+    )
+    assert len(protected) == 1, (
+        f"{PARSED_TEST_FILE.name} defines {len(protected)} copies of "
+        f"{PROTECTED_TEST_NAME}"
+    )
+
     tables: list[list[tuple[str, tuple[str, ...]]]] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        if not (isinstance(func, ast.Attribute) and func.attr == "parametrize"):
-            continue
+    for node in _decorator_parametrize_calls(protected[0].decorator_list):
         if not node.args:
-            continue
+            pytest.fail(
+                f"the markers parametrize on {PROTECTED_TEST_NAME} lost its "
+                "arguments — the guard fails closed"
+            )
         argnames = node.args[0]
         if isinstance(argnames, ast.Constant) and isinstance(argnames.value, str):
             names = [argnames.value]
@@ -79,12 +117,19 @@ def _marker_rows() -> list[tuple[str, tuple[str, ...]]]:
                 if isinstance(elt, ast.Constant) and isinstance(elt.value, str)
             ]
         else:
-            continue
+            pytest.fail(
+                f"cannot read the parametrize argnames on {PROTECTED_TEST_NAME} "
+                "— the guard fails closed on an uninspectable table"
+            )
         if "markers" not in names:
             continue
         rows_arg = node.args[1] if len(node.args) > 1 else None
         if not isinstance(rows_arg, (ast.List, ast.Tuple)):
-            continue
+            pytest.fail(
+                f"the markers parametrize rows on {PROTECTED_TEST_NAME} are not "
+                "a literal sequence (e.g. moved to a module constant) — the "
+                "guard fails closed on an uninspectable table"
+            )
         rows: list[tuple[str, tuple[str, ...]]] = []
         for row in rows_arg.elts:
             assert isinstance(row, ast.Tuple) and len(row.elts) == 2, (
@@ -121,12 +166,12 @@ def _marker_rows() -> list[tuple[str, tuple[str, ...]]]:
         tables.append(rows)
 
     assert tables, (
-        f"no pytest.mark.parametrize table with 'markers' argnames found in "
-        f"{PARSED_TEST_FILE} — the marker guard has lost its target"
+        f"{PROTECTED_TEST_NAME} carries no parametrize with 'markers' argnames "
+        f"— the marker guard has lost its target"
     )
     assert len(tables) == 1, (
-        f"ambiguous: {len(tables)} parametrize tables use 'markers' in "
-        f"{PARSED_TEST_FILE}"
+        f"ambiguous: {len(tables)} parametrize decorators on "
+        f"{PROTECTED_TEST_NAME} use 'markers' argnames"
     )
     return tables[0]
 
