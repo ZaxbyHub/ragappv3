@@ -39,6 +39,22 @@ against ``drafts``, ``draft_jobs``, ``draft_revisions``,
 the owner set fails this census. Migrating the 26 co-owner writes into
 ``DraftStore`` is deliberately out of scope (issue #790); this guard exists
 so the map cannot silently regress to "single owner" or grow a fifth writer.
+
+Precision boundary (issue #926), with each limitation's trigger named:
+a verb+table match counts only at a live statement position — comments are
+stripped quote-aware (single/double/backtick/bracket quoting all suppress
+the markers), the verb must start a statement (start-of-string, ``;`` or
+``(`` behind it), and the prose colon after the table rejects sentence
+noise. Disclosed limitations the grammar cannot close: a SQL constant
+defined in one module and executed in another stays invisible (cross-module
+name resolution is out of scope — the name map is module-local);
+``job_lease.py`` writes ``draft_jobs`` through a constructor-supplied table
+attribute, unreachable to any static fold (declared co-owner in
+``draft_store.py``'s map instead); directory symlinks under the scan root
+are not traversed (``rglob`` recursion follows no symlinks); a
+``PermissionError`` on a directory aborts the walk (fail closed); and a
+function-local assignment shadowing a module constant resolves to nothing
+(fail toward missing, never the wrong value).
 """
 
 from __future__ import annotations
@@ -138,13 +154,27 @@ _DYNAMIC = "\x00"
 WriteSite = namedtuple("WriteSite", ["rel_path", "lineno", "verb", "table"])
 
 
-def _fold(node: ast.AST) -> str | None:
+def _fold(
+    node: ast.AST,
+    names: dict[str, tuple[str, int]] | None = None,
+    local_assigned: frozenset[str] = frozenset(),
+    used_names: set[str] | None = None,
+) -> str | None:
     """Best-effort static value of a string-bearing expression.
 
     Dynamic parts collapse to ``_DYNAMIC`` so a verb followed by a dynamic
     table reference cannot match a real table name (no false positive), while
     a verb and table both inside the static prefix still match (no false
     negative for folded/concatenated/f-string SQL).
+
+    Issue #926 blind spot 4: with ``names`` (a module-level constant map of
+    ``name -> (folded value, value-node id)``), an ``ast.Name`` operand
+    resolves to its module constant — one level, module scope only. A name
+    that is also assigned anywhere inside the ENCLOSING function scope
+    (``local_assigned``) resolves to nothing: local shadowing fails toward
+    missing rather than binding the wrong value. ``used_names`` records which
+    module constants were consumed, so their assignment-site constants can be
+    suppressed (no assignment-site + use-site double count).
     """
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value
@@ -157,8 +187,8 @@ def _fold(node: ast.AST) -> str | None:
                 parts.append(_DYNAMIC)
         return "".join(parts)
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-        left = _fold(node.left)
-        right = _fold(node.right)
+        left = _fold(node.left, names, local_assigned, used_names)
+        right = _fold(node.right, names, local_assigned, used_names)
         if left is None or right is None:
             return None
         return left + right
@@ -167,32 +197,176 @@ def _fold(node: ast.AST) -> str | None:
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "format"
     ):
-        return _fold(node.func.value)
+        return _fold(node.func.value, names, local_assigned, used_names)
+    if isinstance(node, ast.Name) and names is not None:
+        # Only a LOAD counts as a use of the constant — an assignment
+        # TARGET (Store context) defines it, it does not consume it.
+        if not isinstance(node.ctx, ast.Load):
+            return None
+        if node.id in local_assigned:
+            return None
+        if node.id in names:
+            if used_names is not None:
+                used_names.add(node.id)
+            return names[node.id][0]
     return None
 
 
-def _docstring_ids(tree: ast.Module) -> set[int]:
-    """Identity of every docstring node in ``tree`` (module, class, function).
+def _strip_sql_comments(text: str) -> str:
+    """R1 (issue #926 blind spot 2): strip SQL comments, quote-aware.
 
-    Docstrings are documentation, not SQL; without this exclusion a docstring
-    describing an UPDATE would count as a write.
+    ``--`` line comments and ``/* */`` block comments are removed ONLY
+    outside quoted tokens; the scanner tracks all four SQLite quoting
+    styles (single-quoted strings, double-quoted identifiers, backtick,
+    and bracket quoting), so a ``--`` inside any quoted token is string
+    text, not a comment boundary (``"SELECT '--'; UPDATE drafts ..."``
+    keeps its live write). A block comment that spanned lines leaves a
+    newline behind so statement anchors survive.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    quote: str | None = None
+    while i < n:
+        ch = text[i]
+        if quote is None:
+            if ch in ("'", '"', "`"):
+                quote = ch
+                out.append(ch)
+                i += 1
+            elif ch == "[":
+                quote = "]"
+                out.append(ch)
+                i += 1
+            elif ch == "-" and i + 1 < n and text[i + 1] == "-":
+                j = text.find("\n", i)
+                i = n if j == -1 else j
+            elif ch == "/" and i + 1 < n and text[i + 1] == "*":
+                j = text.find("*/", i + 2)
+                if j == -1:
+                    i = n
+                else:
+                    if "\n" in text[i : j + 2]:
+                        out.append("\n")
+                    i = j + 2
+            else:
+                out.append(ch)
+                i += 1
+        else:
+            out.append(ch)
+            if quote == "]":
+                if ch == "]":
+                    quote = None
+            elif ch == quote:
+                if i + 1 < n and text[i + 1] == quote:
+                    out.append(text[i + 1])
+                    i += 2
+                    continue
+                quote = None
+            i += 1
+    return "".join(out)
+
+
+def _match_is_live_statement(stripped: str, match: re.Match) -> bool:
+    """R2 + R3 (issue #926 blind spots 1-2): SQL-statement context gates.
+
+    R2 — statement-start anchor: the verb must begin a SQL statement; the
+    nearest preceding non-whitespace character must be start-of-string,
+    ``;``, or ``(`` (whitespace after the anchor is tolerated, so
+    ``";   UPDATE drafts ..."`` matches).
+
+    R3 — prose-separator gate: the character following the captured table
+    reference must not be ``:`` — the published prose shape
+    ``"delete from drafts: constraint failed"`` starts a sentence with the
+    verb but continues with prose. The rule is deliberately conservative
+    (colon-only): valid SQLite continuations (``SELECT``, ``DEFAULT
+    VALUES``, ``RETURNING``, ``WHERE``, ``SET``, ``VALUES``, ...) all pass,
+    trading nothing for the prose false positive.
+    """
+    k = match.start() - 1
+    while k >= 0 and stripped[k] in " \t\r\n":
+        k -= 1
+    if k >= 0 and stripped[k] not in ";(":
+        return False
+    e = match.end()
+    n = len(stripped)
+    while e < n and stripped[e] in " \t\r\n":
+        e += 1
+    if e < n and stripped[e] == ":":
+        return False
+    return True
+
+
+def _docstring_ids(tree: ast.Module) -> set[int]:
+    """Identity of every bare string statement in ``tree``.
+
+    Docstrings are documentation, not SQL; without this exclusion a
+    docstring describing an UPDATE would count as a write. Issue #926
+    blind spot 3: the exclusion covers EVERY bare string ``ast.Expr``
+    statement — PEP 258 attribute docstrings after another statement and
+    no-op string statements under ``if``/``try`` included — not only
+    first-statement docstrings.
     """
     ids: set[int] = set()
-
-    def first_stmt_doc(body: list[ast.stmt]) -> None:
-        if (
-            body
-            and isinstance(body[0], ast.Expr)
-            and isinstance(body[0].value, ast.Constant)
-            and isinstance(body[0].value.value, str)
-        ):
-            ids.add(id(body[0].value))
-
-    first_stmt_doc(tree.body)
     for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            first_stmt_doc(node.body)
+        if (
+            isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        ):
+            ids.add(id(node.value))
     return ids
+
+
+def _module_constants(tree: ast.Module) -> dict[str, tuple[str, int]]:
+    """Module-level constants: ``name -> (folded value, value-node id)``.
+
+    Only literal-composed module-level assignments participate; a name
+    whose value is not foldable without names is simply absent (fail toward
+    missing).
+    """
+    consts: dict[str, tuple[str, int]] = {}
+    for node in tree.body:
+        targets: list[ast.expr] = []
+        value: ast.expr | None = None
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+            value = node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets = [node.target]
+            value = node.value
+        if value is None:
+            continue
+        folded = _fold(value)
+        if folded is None:
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name):
+                consts[target.id] = (folded, id(value))
+    return consts
+
+
+def _function_assigned_names(tree: ast.Module) -> dict[int, frozenset[str]]:
+    """Per-function sets of locally assigned names (shadow detection)."""
+    assigned: dict[int, frozenset[str]] = {}
+    for fn in ast.walk(tree):
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            names: set[str] = set()
+            for node in ast.walk(fn):
+                if isinstance(node, ast.Assign):
+                    for target in node.targets:
+                        if isinstance(target, ast.Name):
+                            names.add(target.id)
+                elif isinstance(node, ast.AnnAssign) and isinstance(
+                    node.target, ast.Name
+                ):
+                    names.add(node.target.id)
+                elif isinstance(node, ast.AugAssign) and isinstance(
+                    node.target, ast.Name
+                ):
+                    names.add(node.target.id)
+            assigned[id(fn)] = frozenset(names)
+    return assigned
 
 
 def scan_tree(root: Path) -> list[WriteSite]:
@@ -202,6 +376,18 @@ def scan_tree(root: Path) -> list[WriteSite]:
     ``AssertionError`` naming it, because an unreadable file could hide
     writers. Decoding is ``utf-8-sig`` so a Windows-authored BOM (which
     CPython imports happily) is not misreported as a syntax error.
+
+    Grammar (issue #926): a write is caught when its verb and table are
+    static SQL text at a live statement position — R1 strips comments
+    quote-aware, R2 anchors the verb to a statement start, R3 rejects the
+    prose colon. Disclosed limitations, each with its trigger: a SQL
+    constant defined in one module and executed in another is invisible
+    (cross-module name resolution is out of scope); ``job_lease.py`` writes
+    ``draft_jobs`` through a constructor-supplied table attribute the fold
+    cannot see; directory symlinks under the scan root are not traversed
+    (pathlib recursion follows no symlinks); a ``PermissionError`` on a
+    directory aborts the walk (fail closed); a function-local assignment
+    shadowing a module constant resolves to nothing (fail toward missing).
     """
     sites: list[WriteSite] = []
     for path in sorted(root.rglob("*.py")):
@@ -213,17 +399,55 @@ def scan_tree(root: Path) -> list[WriteSite]:
             tree = ast.parse(source, filename=str(path))
         except SyntaxError as exc:
             raise AssertionError(f"census cannot parse {path}: {exc}") from exc
-        skip = _docstring_ids(tree)
+        consts = _module_constants(tree)
+        func_assigned = _function_assigned_names(tree)
+        skip_docstrings = _docstring_ids(tree)
 
-        def visit(node: ast.AST) -> None:
+        # Pass A: discover which module constants are consumed by folded
+        # uses, so their assignment-site constants can be suppressed (a
+        # whole-SQL constant executed via its name counts exactly once).
+        used: set[str] = set()
+
+        def fold(
+            node: ast.AST, local: frozenset[str] = frozenset()
+        ) -> str | None:
+            return _fold(node, consts, local, used)
+
+        def walk_refs(node: ast.AST, local: frozenset[str]) -> None:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                local = func_assigned.get(id(node), frozenset())
+            if isinstance(
+                node, (ast.Constant, ast.JoinedStr, ast.BinOp, ast.Call, ast.Name)
+            ):
+                fold(node, local)
+            for child in ast.iter_child_nodes(node):
+                walk_refs(child, local)
+
+        walk_refs(tree, frozenset())
+        skip = skip_docstrings | {
+            consts[name][1] for name in used if name in consts
+        }
+
+        def visit(node: ast.AST, local: frozenset[str]) -> None:
             if id(node) in skip:
                 return
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                local = func_assigned.get(id(node), frozenset())
+                for child in ast.iter_child_nodes(node):
+                    visit(child, local)
+                return
             folded = None
-            if isinstance(node, (ast.Constant, ast.JoinedStr, ast.BinOp, ast.Call)):
-                folded = _fold(node)
+            if isinstance(
+                node,
+                (ast.Constant, ast.JoinedStr, ast.BinOp, ast.Call, ast.Name),
+            ):
+                folded = fold(node, local)
             if folded is not None:
+                stripped = _strip_sql_comments(folded)
                 matched = False
-                for match in _VERB_RE.finditer(folded):
+                for match in _VERB_RE.finditer(stripped):
+                    if not _match_is_live_statement(stripped, match):
+                        continue
                     raw = match.group(2)
                     if match.group(3):
                         raw = f"{raw}.{match.group(3)}"
@@ -241,9 +465,9 @@ def scan_tree(root: Path) -> list[WriteSite]:
                 if matched:
                     return  # outermost expression wins; inner parts not re-counted
             for child in ast.iter_child_nodes(node):
-                visit(child)
+                visit(child, local)
 
-        visit(tree)
+        visit(tree, frozenset())
     return sites
 
 
@@ -293,13 +517,20 @@ class TestTableOwnershipCensus(unittest.TestCase):
             "processor + 11 pipeline) — if writes were legitimately removed, "
             "shrink the pin; if the scanner went blind, fix the scanner",
         )
-        for module, minimum in _KNOWN_MINIMUMS.items():
-            self.assertGreaterEqual(
+        for module, exact in _KNOWN_MINIMUMS.items():
+            # Plan-critic round 1: pin the co-owner counts EXACTLY (8/7/11),
+            # not as floors — precision work must not move real sites in
+            # EITHER direction, and a floor cannot detect double-counting
+            # inside a declared owner. The store keeps its floor (46 at the
+            # 2026-11-16 baseline) because DraftStore is the default owner
+            # whose write surface legitimately grows.
+            self.assertEqual(
                 by_module.get(module, 0),
-                minimum,
-                f"{module} carried {minimum} declared write sites at issue "
-                f"#790's base but the census now sees "
-                f"{by_module.get(module, 0)}",
+                exact,
+                f"{module} carried exactly {exact} declared write sites at "
+                f"issue #790's base but the census now sees "
+                f"{by_module.get(module, 0)} — the census precision work "
+                "must not move real sites in either direction",
             )
 
     def test_a_python_comment_is_not_a_write(self):
@@ -473,6 +704,300 @@ class TestTableOwnershipCensus(unittest.TestCase):
             "census must recognize — the quoted form is what SQLite's own "
             "dump tooling emits (issue #790 implementation review round 1)",
         )
+
+
+    def test_census_ignores_prose_in_a_string_literal(self):
+        """#926 blind spot 1: prose mentioning a write is not a write.
+
+        ``MSG = "... no separate DELETE FROM drafts needed"`` is a note in a
+        string literal, not SQL. RED at base (the folded literal matches the
+        verb regex with no SQL-statement context requirement), GREEN after
+        the fix reports zero sites for it. Per the plan critic's round-1
+        revision, every published prose shape is pinned: mid-string prose,
+        sentence-initial prose (``"delete from drafts: constraint failed"``),
+        label-led prose (``"cleanup: DELETE FROM drafts"``), PEP 258
+        attribute docstrings, and bare string statements under ``if``
+        (issue #926 blind spots 1 and 3).
+        """
+        cases = {
+            "mid_string_prose": (
+                'MSG = "note: the draft row is purged above with '
+                'no separate DELETE FROM drafts needed"\n'
+            ),
+            "sentence_initial_prose": (
+                'ERR = "delete from drafts: constraint failed"\n'
+            ),
+            "label_led_prose": 'NOTE = "cleanup: DELETE FROM drafts"\n',
+            "attribute_docstring": (
+                "class C:\n"
+                "    x = 1\n"
+                '    """attr docstring: UPDATE drafts SET title = 1"""\n'
+            ),
+            "bare_string_under_if": (
+                'def f() -> None:\n'
+                '    if True:\n'
+                '        "DELETE FROM drafts WHERE id = 1"\n'
+            ),
+        }
+        for name, source in cases.items():
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as tmp:
+                notes = Path(tmp) / "notes.py"
+                notes.write_text(source, encoding="utf-8")
+                sites = scan_tree(Path(tmp))
+                self.assertEqual(
+                    sites,
+                    [],
+                    "prose_in_literal: a prose string literal mentioning a "
+                    f"census table write is not SQL ({name}); the census "
+                    f"reported {sites} (issue #926 blind spots 1 and 3)",
+                )
+
+    def test_census_ignores_sql_commented_text_in_a_string_literal(self):
+        """#926 blind spot 2: text behind a SQL comment is not live SQL.
+
+        ``Q = 'SELECT 1 -- old: DELETE FROM drafts'`` keeps the DELETE only
+        inside the comment. RED at base (the regex matches forward from the
+        verb and cannot see the ``--`` boundary), GREEN after the fix
+        reports zero sites for it. Per the plan critic's round-1 revision:
+        block comments strip the same way, and a QUOTED ``'--'`` literal
+        must not disable the live write that follows it (quote-aware
+        stripping — markers inside single-quoted strings are text).
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            commented = Path(tmp) / "commented.py"
+            commented.write_text(
+                "Q = 'SELECT 1 -- old: DELETE FROM drafts'\n",
+                encoding="utf-8",
+            )
+            sites = scan_tree(Path(tmp))
+        self.assertEqual(
+            sites,
+            [],
+            "sql_comment_in_literal: text after a SQL line comment inside a "
+            f"string literal is not live SQL; the census reported {sites} "
+            "(issue #926 blind spot 2)",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            block_commented = Path(tmp) / "blockcommented.py"
+            block_commented.write_text(
+                'Q = "SELECT 1 /* old: DELETE FROM drafts */"\n',
+                encoding="utf-8",
+            )
+            sites = scan_tree(Path(tmp))
+        self.assertEqual(
+            sites,
+            [],
+            "sql_comment_in_literal: text inside a SQL block comment inside "
+            f"a string literal is not live SQL; the census reported {sites} "
+            "(issue #926 blind spot 2)",
+        )
+        # Mutation-probe hardening: comment text must not be able to FORGE a
+        # statement anchor. With stripping disabled, the ';' inside the
+        # '-- cleanup;' comment would satisfy the R2 anchor and admit the
+        # commented-out DELETE — only R1 kills this shape.
+        with tempfile.TemporaryDirectory() as tmp:
+            forged_anchor = Path(tmp) / "forgedanchor.py"
+            forged_anchor.write_text(
+                "Q = 'SELECT 1\\n-- cleanup;\\nDELETE FROM drafts'\n",
+                encoding="utf-8",
+            )
+            sites = scan_tree(Path(tmp))
+        self.assertEqual(
+            sites,
+            [],
+            "sql_comment_in_literal: a ';' inside a SQL line comment must "
+            "not forge a statement anchor for the commented-out verb; the "
+            f"census reported {sites}",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            quoted_marker = Path(tmp) / "quotedmarker.py"
+            quoted_marker.write_text(
+                'Q = "SELECT \'--\'; UPDATE drafts SET title = 1"\n',
+                encoding="utf-8",
+            )
+            sites = scan_tree(Path(tmp))
+        self.assertEqual(
+            [(s.rel_path, s.table) for s in sites],
+            [("quotedmarker.py", "drafts")],
+            "sql_comment_in_literal: a QUOTED '--' is string text, not a "
+            "comment boundary — the live UPDATE after the semicolon must "
+            "still be recorded; the census saw "
+            f"{[(s.rel_path, s.table) for s in sites]}",
+        )
+        # Plan-critic round 2: SQLite double-quoted IDENTIFIERS may contain
+        # '--' — stripping there would hide a subsequent live write.
+        with tempfile.TemporaryDirectory() as tmp:
+            dq_marker = Path(tmp) / "dqmarker.py"
+            dq_marker.write_text(
+                "Q = 'SELECT 1; UPDATE \"we--ird\".drafts SET title = 1'\n",
+                encoding="utf-8",
+            )
+            sites = scan_tree(Path(tmp))
+        self.assertEqual(
+            [(s.rel_path, s.table) for s in sites],
+            [("dqmarker.py", "drafts")],
+            "sql_comment_in_literal: a '--' inside a double-quoted "
+            "identifier is identifier text, not a comment boundary — the "
+            f"live UPDATE must be recorded; the census saw "
+            f"{[(s.rel_path, s.table) for s in sites]}",
+        )
+
+    def test_census_accepts_valid_continuation_forms_after_the_table(self):
+        """Plan-critic round 2: the after-table gate must not trade prose
+        false positives for valid-SQL false negatives.
+
+        Every form here is VALID SQLite (verified by execution in the plan
+        review) and must be recorded: INSERT ... SELECT, INSERT ... DEFAULT
+        VALUES, DELETE ... RETURNING. GREEN after the fix ships the
+        conservative colon-only prose gate; at base all three PASS too (the
+        base regex matches them) — this row's discrimination lives in the
+        prose/comment rows above; these are the no-false-negative pins."""
+        valid_forms = {
+            "insert_select": (
+                "def go(conn) -> None:\n"
+                "    conn.execute('INSERT INTO drafts SELECT * FROM tmp')\n"
+            ),
+            "default_values": (
+                "def go(conn) -> None:\n"
+                "    conn.execute('INSERT INTO drafts DEFAULT VALUES')\n"
+            ),
+            "delete_returning": (
+                "def go(conn) -> None:\n"
+                "    conn.execute('DELETE FROM drafts RETURNING id')\n"
+            ),
+        }
+        for name, source in valid_forms.items():
+            with self.subTest(form=name), tempfile.TemporaryDirectory() as tmp:
+                module = Path(tmp) / "validform.py"
+                module.write_text(source, encoding="utf-8")
+                sites = scan_tree(Path(tmp))
+                self.assertEqual(
+                    [(s.rel_path, s.table) for s in sites],
+                    [("validform.py", "drafts")],
+                    "valid_sql_continuation: valid SQLite continuation forms "
+                    f"({name}) must never become false negatives; the census "
+                    f"saw {[(s.rel_path, s.table) for s in sites]}",
+                )
+
+    def test_census_records_a_name_indirection_write(self):
+        """#926 blind spot 4: a module-level name feeding a write is seen.
+
+        ``PREFIX + "draft_jobs SET status = 1"`` is a real write against a
+        census table assembled across a variable boundary. RED at base
+        (``_fold`` gives up on the ``ast.Name`` operand and records zero
+        sites), GREEN after the fix records the site. Per the plan critic's
+        round-1 revision: a whole-SQL module constant counts exactly ONCE
+        (no assignment-site + use-site double count), and a semicolon
+        anchor with whitespace before the verb still starts a statement.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            indirect = Path(tmp) / "indirect.py"
+            indirect.write_text(
+                'PREFIX = "UPDATE "\n\n\n'
+                "import sqlite3\n\n\n"
+                "def touch(conn: sqlite3.Connection) -> None:\n"
+                '    conn.execute(PREFIX + "draft_jobs SET status = 1")\n',
+                encoding="utf-8",
+            )
+            sites = scan_tree(Path(tmp))
+        self.assertEqual(
+            [(s.rel_path, s.table) for s in sites],
+            [("indirect.py", "draft_jobs")],
+            "name_indirection: a census-table write assembled from a "
+            "module-level name (PREFIX + 'draft_jobs SET ...') must be "
+            f"recorded; the census saw {[(s.rel_path, s.table) for s in sites]} "
+            "(issue #926 blind spot 4)",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            whole_constant = Path(tmp) / "wholeconstant.py"
+            whole_constant.write_text(
+                'SQL = "DELETE FROM drafts"\n\n\n'
+                "import sqlite3\n\n\n"
+                "def go(conn: sqlite3.Connection) -> None:\n"
+                "    conn.execute(SQL)\n",
+                encoding="utf-8",
+            )
+            sites = scan_tree(Path(tmp))
+        self.assertEqual(
+            [(s.rel_path, s.table) for s in sites],
+            [("wholeconstant.py", "drafts")],
+            "name_indirection: a whole-SQL module constant executed via its "
+            "name counts exactly once (assignment site suppressed for "
+            f"referenced names); the census saw "
+            f"{[(s.rel_path, s.table) for s in sites]}",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            spaced_semicolon = Path(tmp) / "spacedsemicolon.py"
+            spaced_semicolon.write_text(
+                'Q = "SELECT 1 ;   UPDATE drafts SET title = 1"\n',
+                encoding="utf-8",
+            )
+            sites = scan_tree(Path(tmp))
+        self.assertEqual(
+            [(s.rel_path, s.table) for s in sites],
+            [("spacedsemicolon.py", "drafts")],
+            "name_indirection: whitespace between the ';' statement anchor "
+            "and the verb is tolerated (multi-statement literal); the "
+            f"census saw {[(s.rel_path, s.table) for s in sites]}",
+        )
+
+    def test_census_local_shadowing_is_not_resolved(self):
+        """Plan-critic round 2: a function-local assignment shadowing a
+        module-level constant is NOT resolved — the fold fails toward
+        missing (zero sites) rather than binding the wrong value. The
+        shipped behavior is a documented limitation, pinned here so it
+        cannot silently change."""
+        with tempfile.TemporaryDirectory() as tmp:
+            shadowed = Path(tmp) / "shadowed.py"
+            shadowed.write_text(
+                'PREFIX = "UPDATE "\n\n\n'
+                "import sqlite3\n\n\n"
+                "def touch(conn: sqlite3.Connection) -> None:\n"
+                '    PREFIX = "DELETE FROM "\n'
+                '    conn.execute(PREFIX + "draft_jobs SET status = 1")\n',
+                encoding="utf-8",
+            )
+            sites = scan_tree(Path(tmp))
+        self.assertEqual(
+            sites,
+            [],
+            "local_shadowing: a function-local constant shadowing the "
+            "module-level name must not be resolved to either value (fail "
+            "toward missing, disclosed limitation); the census reported "
+            f"{sites}",
+        )
+
+    def test_census_docstring_names_the_disclosed_limitations(self):
+        """Plan-critic round 2 (round-3 fix: module docstring included): the
+        #926 disclosed-limitation class (items 5-7 plus permission-denied
+        traversal and local shadowing) must be NAMED in the census MODULE
+        docstring — executable presence pin so the limitation lines cannot
+        be silently dropped or parked in an unchecked docstring."""
+        import sys
+
+        module_doc = (sys.modules[__name__].__doc__ or "")
+        class_doc = (TestTableOwnershipCensus.__doc__ or "")
+        function_doc = (scan_tree.__doc__ or "")
+        combined = module_doc + "\n" + class_doc + "\n" + function_doc
+        self.assertIn(
+            "cross-module",
+            module_doc + "\n" + function_doc,
+            "census_limitation_docs: the module-level census documentation "
+            "must name the cross-module-constant limitation (#926 item 5)",
+        )
+        for limitation in (
+            "job_lease",
+            "symlink",
+            "PermissionError",
+            "shadow",
+        ):
+            self.assertIn(
+                limitation,
+                combined,
+                "census_limitation_docs: the census documentation must name "
+                f"the disclosed limitation '{limitation}' (#926 items 5-7 "
+                "plus round-2 additions)",
+            )
 
 
 if __name__ == "__main__":

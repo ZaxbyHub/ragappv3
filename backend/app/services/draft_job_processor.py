@@ -333,6 +333,21 @@ class DraftJobProcessor:
 
         with self._pool.connection() as conn:
             store = DraftStore(conn)
+            # Issue #1135 claim 3b: settle drafts stranded on queued/running
+            # by the two-transaction crash window in _fail_compile_job_sync
+            # (job terminal in tx1, draft settle in tx2). Runs AFTER the
+            # orphan-job reset so a to-be-retried running job is already
+            # back to pending (and therefore not stranded) when this looks.
+            stranded = store.recover_stranded_compile_drafts()
+        if stranded:
+            logger.warning(
+                "DraftJobProcessor: settled %d stranded compile draft(s) "
+                "to failed",
+                stranded,
+            )
+
+        with self._pool.connection() as conn:
+            store = DraftStore(conn)
             valid_pairs = store.list_all_owner_draft_pairs()
             # Issue #723 (T1-21-S2-03): the exact restore rule — reconcile
             # restores a tombstone only when its relpath is still backed by a
