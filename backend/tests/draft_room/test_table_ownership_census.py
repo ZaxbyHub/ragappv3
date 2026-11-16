@@ -261,16 +261,29 @@ def _strip_sql_comments(text: str) -> str:
                 out.append(ch)
                 i += 1
         else:
-            out.append(ch)
             if quote == "]":
+                # Bracket quoting is an IDENTIFIER form — keep the content
+                # (the census must capture ``[draft_inputs]`` tables).
+                out.append(ch)
                 if ch == "]":
                     quote = None
             elif ch == quote:
+                out.append(ch)
                 if i + 1 < n and text[i + 1] == quote:
-                    out.append(text[i + 1])
                     i += 2
                     continue
                 quote = None
+            elif quote == "'":
+                # Implementation-review round 3: a single-quoted token is a
+                # SQL string LITERAL (data). Blank its content (same length,
+                # benign filler) so SQL text held as data
+                # ("SELECT '; UPDATE drafts SET status = 1'") cannot forge a
+                # live statement anchor or a verb+table match. Double-quoted
+                # and backtick tokens are IDENTIFIERS — their content stays
+                # (table names must remain capturable).
+                out.append(" ")
+            else:
+                out.append(ch)
             i += 1
     return "".join(out)
 
@@ -833,6 +846,41 @@ class TestTableOwnershipCensus(unittest.TestCase):
             "comment boundary — the live UPDATE after the semicolon must "
             "still be recorded; the census saw "
             f"{[(s.rel_path, s.table) for s in sites]}",
+        )
+        # Implementation-review round 3: SQL text held as string DATA must
+        # not forge a live statement — the quoted-value content is blanked,
+        # so the ';' inside the value cannot anchor the embedded verb.
+        with tempfile.TemporaryDirectory() as tmp:
+            quoted_value = Path(tmp) / "quotedvalue.py"
+            quoted_value.write_text(
+                'def go(conn) -> None:\n'
+                "    conn.execute(\"SELECT '; UPDATE drafts SET status = 1'\")\n",
+                encoding="utf-8",
+            )
+            sites = scan_tree(Path(tmp))
+        self.assertEqual(
+            sites,
+            [],
+            "sql_comment_in_literal: a write embedded in a quoted SQL VALUE "
+            "is data, not a live statement; the census reported "
+            f"{sites}",
+        )
+        # ...and a real write AFTER a quoted value stays visible.
+        with tempfile.TemporaryDirectory() as tmp:
+            after_value = Path(tmp) / "aftervalue.py"
+            after_value.write_text(
+                'def go(conn) -> None:\n'
+                "    conn.execute("
+                "\"SELECT 'x'; UPDATE drafts SET status = 1\")\n",
+                encoding="utf-8",
+            )
+            sites = scan_tree(Path(tmp))
+        self.assertEqual(
+            [(x.rel_path, x.table) for x in sites],
+            [("aftervalue.py", "drafts")],
+            "sql_comment_in_literal: a live write following a quoted value "
+            f"must stay visible; the census saw "
+            f"{[(x.rel_path, x.table) for x in sites]}",
         )
         # Plan-critic round 2: SQLite double-quoted IDENTIFIERS may contain
         # '--' — stripping there would hide a subsequent live write.
