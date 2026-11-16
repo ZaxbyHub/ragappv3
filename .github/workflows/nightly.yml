@@ -88,13 +88,27 @@ jobs:
           fi
           grep -qE "[0-9]+ passed" gate.log || { echo "::error::no passing run recorded"; exit 1; }
 
+      - name: Write watchdog faulthandler hook (full-deps tier, #1021)
+        run: |
+          mkdir -p "$RUNNER_TEMP/watchdog-faulthandler-hook" "$RUNNER_TEMP/watchdog-dumps"
+          cp ../scripts/ci_watchdog_faulthandler_hook.py "$RUNNER_TEMP/watchdog-faulthandler-hook/sitecustomize.py"
+
       - name: Full backend suite (plain full run = cross-file isolation check)
-        # --timeout-method=thread: same hang-class coverage as the CI Backend
-        # job's Test step (#1021) — the signal method cannot fire on a
-        # GIL-releasing C-block wedge.
-        run: pytest --tb=short -q --timeout=300 --timeout-method=thread -n auto tests/
+        # #1021: the full-deps tier runs under the SAME out-of-process
+        # watchdog as the PR-gate Backend Test step (same budgets, same
+        # SIGUSR2 hook wiring) — the in-process thread-method timeout alone
+        # cannot bound the GIL-held hang class, which is exactly why the
+        # watchdog exists. -v -rs (not the old bare -q): the watchdog's
+        # pending-test banner names ids from pytest -v DISPATCH records —
+        # quiet output would bound the wedge but name nothing. -rs keeps
+        # skips visible in the same full run.
+        timeout-minutes: 55
+        run: python ../scripts/ci_backend_watchdog.py --quiet-window 360 --poll-interval 5 --hard-deadline 2700 -- pytest --tb=short -v --timeout=300 --timeout-method=thread -rs -n auto tests/
         env:
           REDIS_URL: ""
+          PYTHONFAULTHANDLER: "1"
+          PYTHONPATH: ${{ runner.temp }}/watchdog-faulthandler-hook
+          WATCHDOG_DUMP_DIR: ${{ runner.temp }}/watchdog-dumps
 
       - name: Parser bake-off (unstructured hi_res vs fast; Docling/marker when installed)
         working-directory: ${{ github.workspace }}

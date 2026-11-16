@@ -300,6 +300,24 @@ def _load_watchdog_module():
     return module
 
 
+def _fresh_tracker(mod):
+    """A StreamTracker instance built via __new__ (no reader thread started)
+    with every instance attribute the tracker methods touch pre-initialized —
+    shared by the synthetic-stream and bounded-matching probes."""
+    tracker = mod.StreamTracker.__new__(mod.StreamTracker)
+    tracker._pipe = None
+    tracker._lock = threading.Lock()
+    tracker._partial = bytearray()
+    tracker._completed = deque(maxlen=512)
+    tracker.pending = {}
+    tracker._provisional_id = None
+    tracker.last_activity = 0.0
+    tracker.forwarding_inflight_since = None
+    tracker.reader_error = None
+    tracker._thread = threading.Thread(target=lambda: None, daemon=True)
+    return tracker
+
+
 def test_watchdog_pending_tracker_synthetic_stream():
     """Cross-platform pending-set semantics (plan F10): an id is added when
     DISPATCHED — whether newline-terminated-but-uncompleted (the plan-critic
@@ -308,21 +326,7 @@ def test_watchdog_pending_tracker_synthetic_stream():
     record. Runs everywhere; the real-pytest proof is the xdist arms."""
     mod = _load_watchdog_module()
 
-    def _fresh_tracker():
-        tracker = mod.StreamTracker.__new__(mod.StreamTracker)
-        tracker._pipe = None
-        tracker._lock = threading.Lock()
-        tracker._rolling = bytearray()
-        tracker._partial = bytearray()
-        tracker._completed = deque(maxlen=512)
-        tracker.pending = {}
-        tracker._provisional_id = None
-        tracker.last_activity = 0.0
-        tracker.reader_error = None
-        tracker._thread = threading.Thread(target=lambda: None, daemon=True)
-        return tracker
-
-    tracker = _fresh_tracker()
+    tracker = _fresh_tracker(mod)
 
     stream = (
         b"============================= test session starts =============================\r\n"
@@ -351,7 +355,7 @@ def test_watchdog_pending_tracker_synthetic_stream():
 
     # Implementation-review round 1 shapes: class-path ids are captured in
     # FULL (not truncated at the class component) ...
-    tracker2 = _fresh_tracker()
+    tracker2 = _fresh_tracker(mod)
     # The record is newline-TERMINATED (the real -v shape: a dispatched id
     # ends its record when the next event arrives), so it is a completed-line
     # dispatch — not speculative — and survives later absorbs.
@@ -377,7 +381,7 @@ def test_watchdog_pending_tracker_synthetic_stream():
     # MID-COMPONENT (`tests/x.py::test_fo` + `o PASSED`) — the speculative
     # prefix must be retired when the completed record arrives, and the
     # pending set must end up exactly the genuinely-still-pending ids.
-    tracker3 = _fresh_tracker()
+    tracker3 = _fresh_tracker(mod)
     tracker3._absorb(b"tests/test_wedge.py::test_mid_component_fo")
     assert "tests/test_wedge.py::test_mid_component_fo" in tracker3.pending
     tracker3._absorb(b"o PASSED [ 90%]\r\ntests/test_wedge.py::test_still_pending ")
@@ -388,6 +392,537 @@ def test_watchdog_pending_tracker_synthetic_stream():
     assert set(tracker3.pending) == {
         "tests/test_wedge.py::test_still_pending"
     }, tracker3.pending
+
+
+def test_watchdog_pending_tracker_long_py_line_is_bounded():
+    """micro-uib-001 residual (bounded matching): a long `.py`-bearing line
+    that cannot yield a node id must fail LINEARLY, not quadratically, under
+    the tracker lock (the pre-possessive regex re-scanned the whole run from
+    every start position). Oracle-based probe: the module regex must beat an
+    in-test UNBOUNDED legacy pattern on the SAME line by a wide factor —
+    robust to CI machine speed, unlike a wall-clock bound (review round 5).
+    Plus the control that a genuinely LONG VALID id still tracks."""
+    legacy = re.compile(
+        r"[\w./\\\-]+\.(?:py|pyi)(?:::[\w./\-]+)+(?:\[[^\]]*\])?"
+    )
+    mod = _load_watchdog_module()
+    tracker = _fresh_tracker(mod)
+    long_line = ("tests/" + "a" * 50_000 + ".py no components here\n").encode()
+    legacy_started = time.monotonic()
+    [m.group(0) for m in legacy.finditer(long_line.decode())]
+    legacy_s = time.monotonic() - legacy_started
+    module_started = time.monotonic()
+    tracker._absorb(long_line)
+    module_s = time.monotonic() - module_started
+    assert tracker.pending == {}, tracker.pending
+    assert module_s < legacy_s / 2, (
+        f"module matching took {module_s:.2f}s vs legacy {legacy_s:.2f}s — "
+        "quadratic backtracking is back"
+    )
+    # Control: a legitimately LONG VALID node id still parses and tracks.
+    long_valid = _fresh_tracker(mod)
+    long_valid._absorb(("tests/" + "b" * 50_000 + ".py::test_long_valid ").encode())
+    assert "test_long_valid" in "".join(long_valid.pending), (
+        f"bounded matching lost a long VALID id: {long_valid.pending}"
+    )
+
+
+def test_watchdog_pending_tracker_unclosed_bracket_is_bounded():
+    """review rounds 4+5: MANY unclosed-bracket candidates on one line must
+    not go quadratic either — with the uncapped optional bracket, every
+    candidate scanned the whole remaining suffix. Oracle-based probe: the
+    module regex must beat an in-test UNCAPPED pattern on the SAME line by a
+    wide factor (robust to CI machine speed), and the bounded window must
+    keep distinct full identities for params within it (a 300-char param
+    completes only its OWN dispatch key)."""
+    uncapped = re.compile(
+        r"(?:\A|\s)(?P<node>[\w./\\\-]++(?:(?<=\.pyi)|(?<=\.py))"
+        r"(?:::[\w./\\\-]++)++(?:\[[^\]]*\])?)"
+    )
+    mod = _load_watchdog_module()
+    line = " ".join(["tests/a.py::test_x["] * 20_000)
+    uncapped_started = time.monotonic()
+    [m.group(0) for m in uncapped.finditer(line)]
+    uncapped_s = time.monotonic() - uncapped_started
+    tracker = _fresh_tracker(mod)
+    module_started = time.monotonic()
+    tracker._absorb(line.encode())
+    module_s = time.monotonic() - module_started
+    assert module_s < uncapped_s / 2, (
+        f"module matching took {module_s:.2f}s vs uncapped {uncapped_s:.2f}s "
+        "— the suffix-wide bracket scan is back"
+    )
+    # An unclosed `[` on the (pathological single-line) stream extends the
+    # one tracked key to end-of-line by depth resolution — exactly one
+    # pending key, prefixed by the candidate id.
+    assert len(tracker.pending) == 1, tracker.pending
+    (tracked,) = tracker.pending
+    assert tracked.startswith("tests/a.py::test_x["), tracked[:60]
+    # Identity control: two long (300-char) params of the same function keep
+    # DISTINCT keys inside the 2048 window; completing one leaves the other.
+    param_tracker = _fresh_tracker(mod)
+    param_tracker._absorb(
+        ("tests/p.py::t[" + "1" * 300 + "] \n").encode()
+        + ("tests/p.py::t[" + "2" * 300 + "] \n").encode()
+    )
+    keys = sorted(param_tracker.pending)
+    assert len(keys) == 2 and keys[0] != keys[1], (
+        f"long params within the window must keep distinct keys: {keys}"
+    )
+    param_tracker._absorb(("tests/p.py::t[" + "1" * 300 + "] PASSED\n").encode())
+    remaining = sorted(param_tracker.pending)
+    assert remaining == ["tests/p.py::t[" + "2" * 300 + "]"], (
+        f"completing one long param must retire only its own key: {remaining}"
+    )
+
+
+def test_watchdog_pending_tracker_params_beyond_any_limit_keep_identity():
+    """review rounds 4-6 (full identity, no cap): param ids of ANY length
+    keep distinct pending keys — the tracked id's bracket is reattached
+    after the bounded base match with one str.find, so there is NO length
+    limit to move. Two concurrently-dispatched parameterizations with
+    3000-char params get two distinct keys; completing one retires only its
+    own and the other stays pending (the banner contract 'names EVERY
+    pending test' holds at every param length)."""
+    mod = _load_watchdog_module()
+    tracker = _fresh_tracker(mod)
+    tracker._absorb(
+        ("tests/p.py::t[" + "1" * 3000 + "] \n").encode()
+        + ("tests/p.py::t[" + "2" * 3000 + "] \n").encode()
+    )
+    keys = sorted(tracker.pending)
+    assert len(keys) == 2 and keys[0] != keys[1], (
+        f"params beyond 2048 chars must keep distinct keys: {len(keys)} keys"
+    )
+    tracker._absorb(("tests/p.py::t[" + "1" * 3000 + "] PASSED\n").encode())
+    remaining = sorted(tracker.pending)
+    assert remaining == ["tests/p.py::t[" + "2" * 3000 + "]"], (
+        f"completing one must retire only its own key: {remaining}"
+    )
+
+
+def test_watchdog_rejects_abbreviated_options():
+    """review round 6: argparse long-option abbreviation is DISABLED
+    (allow_abbrev=False) — an abbreviated duplicate-override such as
+    `--poll-i=50` must be REJECTED (SystemExit 2), not silently accepted as
+    an override the wiring pin can't see."""
+    mod = _load_watchdog_module()
+    with pytest.raises(SystemExit) as ei:
+        mod.parse_args(["--poll-i=50", "--", "true"])
+    assert ei.value.code == 2
+
+
+def test_watchdog_pending_tracker_node_like_text_inside_param_bracket():
+    """review rounds 6-8: node-like text INSIDE a param bracket is not a
+    test — bracket-depth-aware candidate selection keeps the OUTER
+    parameterized id as the tracked key, and depth resolution recovers the
+    FULL id (spaces and all) through dispatch and completion."""
+    mod = _load_watchdog_module()
+    tracker = _fresh_tracker(mod)
+    tracker._absorb(b"tests/p.py::t[input tests/other.py::test_x] \n")
+    assert set(tracker.pending) == {
+        "tests/p.py::t[input tests/other.py::test_x]"
+    }, tracker.pending
+    tracker._absorb(
+        b"tests/p.py::t[input tests/other.py::test_x] PASSED [100%]\n"
+    )
+    assert tracker.pending == {}, tracker.pending
+
+
+def test_watchdog_pending_tracker_space_param_ids_keep_identity():
+    """review round 8: explicit param ids containing SPACES keep distinct
+    pending keys — depth resolution extends a whitespace token to its
+    closing bracket, so `t[input one]` and `t[input two]` never collide;
+    completing one retires only its own key."""
+    mod = _load_watchdog_module()
+    tracker = _fresh_tracker(mod)
+    tracker._absorb(
+        b"tests/p.py::t[input one] \ntests/p.py::t[input two] \n"
+    )
+    assert set(tracker.pending) == {
+        "tests/p.py::t[input one]",
+        "tests/p.py::t[input two]",
+    }, tracker.pending
+    tracker._absorb(b"tests/p.py::t[input one] PASSED [ 50%]\n")
+    assert set(tracker.pending) == {"tests/p.py::t[input two]"}, (
+        tracker.pending
+    )
+
+
+def test_watchdog_pending_tracker_close_bracket_and_space_combined():
+    """review round 8: explicit param ids containing BOTH an embedded `]`
+    and spaces (`[a] one]` vs `[a] two]` — depth-to-zero ends both after
+    `[a]`) keep DISTINCT keys — the id ends at the LAST `]` followed by
+    whitespace/EOL that does not close a progress bracket; completing one
+    retires only its own key."""
+    mod = _load_watchdog_module()
+    tracker = _fresh_tracker(mod)
+    tracker._absorb(
+        b"tests/p.py::t[a] one] \ntests/p.py::t[a] two] \n"
+    )
+    assert set(tracker.pending) == {
+        "tests/p.py::t[a] one]",
+        "tests/p.py::t[a] two]",
+    }, tracker.pending
+    tracker._absorb(b"tests/p.py::t[a] one] PASSED [ 50%]\n")
+    assert set(tracker.pending) == {"tests/p.py::t[a] two]"}, (
+        tracker.pending
+    )
+
+
+def test_watchdog_tracker_on_real_pytest_param_stream(tmp_path):
+    """review round 9 — ground truth from a REAL pytest -v stream: explicit
+    ids containing `]`, spaces, and both (`a] one` / `b two]`) render as
+    ``id OUTCOME [ NN%]`` with the progress bracket at line end. The REAL
+    captured stream is the falsifier the review demanded: the tracker must
+    retire BOTH ids on the full stream (nothing stuck pending), and a
+    wedge-simulated truncation before the last outcome must leave the final
+    id pending with its FULL identity, retired exactly by the completion
+    record."""
+    mod = _load_watchdog_module()
+    suite = tmp_path / "test_param_ids_probe.py"
+    suite.write_text(
+        "import pytest\n\n"
+        '@pytest.mark.parametrize("x", [1, 2], ids=["a] one", "b two]"])\n'
+        "def test_t(x):\n"
+        "    assert x\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-v",
+            "-p",
+            "no:randomly",
+            "-p",
+            "no:cacheprovider",
+            str(suite),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        bufsize=0,
+        # Outside the repo tree: the backend conftest imports the app and
+        # would turn this two-test probe into a multi-minute run.
+        cwd=str(tmp_path),
+    )
+    chunks: list[bytes] = []
+    fd = proc.stdout.fileno()
+    while True:
+        # 32-byte reads: the tiny probe stream would otherwise arrive as ONE
+        # production-size chunk; forcing small reads deterministically
+        # produces the mid-record split boundaries that the multi-MB
+        # production stream hits stochastically (production reads 64KB
+        # chunks whose boundaries land anywhere).
+        chunk = os.read(fd, 32)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    proc.wait(timeout=120)
+    assert proc.returncode == 0, b"".join(chunks)
+    # Leg 1 — the full stream replayed through the tracker at the OBSERVED
+    # split-prone os.read chunk boundaries, recording the pending state
+    # AFTER EVERY chunk so the intermediate DISPATCH state is proven, not
+    # just final emptiness.
+    tracker = _fresh_tracker(mod)
+    ever_pending: set[str] = set()
+    for chunk in chunks:
+        tracker._absorb(chunk)
+        ever_pending |= set(tracker.pending)
+    assert tracker.pending == {}, tracker.pending
+    assert any(
+        k.endswith("a] one]") or k.endswith("b two]]") for k in ever_pending
+    ), (
+        "at some observed split boundary the FULL pathological id must "
+        f"have been the live pending state: {sorted(ever_pending)}"
+    )
+    # Leg 2 — a SYNTHETIC split (explicitly labeled): truncate before the
+    # LAST outcome token to simulate a wedge mid-record.
+    stream = b"".join(chunks)
+    outcome_idx = stream.rfind(b"PASSED")
+    assert outcome_idx != -1
+    tracker2 = _fresh_tracker(mod)
+    tracker2._absorb(stream[:outcome_idx])
+    assert len(tracker2.pending) == 1, tracker2.pending
+    (key,) = tracker2.pending
+    assert "test_t[" in key and (
+        key.endswith("a] one]") or key.endswith("b two]]")
+    ), f"the pending key must keep the FULL pathological id: {key!r}"
+    tracker2._absorb(stream[outcome_idx:])
+    assert tracker2.pending == {}, tracker2.pending
+
+
+@pytest.mark.skipif(
+    not IS_POSIX, reason="real xdist through a pipe is POSIX-only in this suite"
+)
+def test_watchdog_tracker_on_real_xdist_param_stream(tmp_path):
+    """review round 10 — PRIMARY xdist evidence: the captured REAL
+    ``pytest -v -n 2`` stream for the pathological explicit ids is the
+    production-shaped falsifier the review demanded. The tracker must
+    retire BOTH ids on the full stream, and a wedge-simulated truncation
+    before the last outcome must leave the final id pending with its FULL
+    identity. This pins the terminal-close rule against the REAL xdist
+    record framing — whatever that framing is, it is captured here, not
+    assumed."""
+    mod = _load_watchdog_module()
+    suite = tmp_path / "test_param_ids_probe_xdist.py"
+    suite.write_text(
+        "import pytest\n\n"
+        '@pytest.mark.parametrize("x", [1, 2], ids=["a] one", "b two]"])\n'
+        "def test_t(x):\n"
+        "    assert x\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-v",
+            "-n",
+            "2",
+            "-p",
+            "no:randomly",
+            "-p",
+            "no:cacheprovider",
+            str(suite),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        bufsize=0,
+        cwd=str(tmp_path),
+    )
+    chunks: list[bytes] = []
+    fd = proc.stdout.fileno()
+    while True:
+        # 32-byte reads: force the mid-record split boundaries (see the
+        # serial probe for the full rationale).
+        chunk = os.read(fd, 32)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    proc.wait(timeout=120)
+    assert proc.returncode == 0, b"".join(chunks)
+    # Leg 1 — full stream replayed at the OBSERVED split-prone os.read
+    # chunk boundaries, recording the pending state AFTER EVERY chunk so
+    # the intermediate DISPATCH state is proven, not just final emptiness.
+    tracker = _fresh_tracker(mod)
+    ever_pending: set[str] = set()
+    for chunk in chunks:
+        tracker._absorb(chunk)
+        ever_pending |= set(tracker.pending)
+    assert tracker.pending == {}, tracker.pending
+    assert any(
+        k.endswith("a] one]") or k.endswith("b two]]") for k in ever_pending
+    ), (
+        "at some observed split boundary the FULL pathological id must "
+        f"have been the live pending state: {sorted(ever_pending)}"
+    )
+    # Leg 2 — a SYNTHETIC split (explicitly labeled): truncate before the
+    # LAST outcome token to simulate a wedge mid-record.
+    stream = b"".join(chunks)
+    outcome_idx = stream.rfind(b"PASSED")
+    assert outcome_idx != -1
+    tracker2 = _fresh_tracker(mod)
+    tracker2._absorb(stream[:outcome_idx])
+    assert len(tracker2.pending) == 1, tracker2.pending
+    (key,) = tracker2.pending
+    assert "test_t[" in key and (
+        key.endswith("a] one]") or key.endswith("b two]]")
+    ), f"the pending key must keep the FULL pathological id: {key!r}"
+    tracker2._absorb(stream[outcome_idx:])
+    assert tracker2.pending == {}, tracker2.pending
+
+
+def test_watchdog_pending_tracker_close_bracket_inside_param_keeps_identity():
+    """review round 7: explicit param ids containing `]` (distinct pytest
+    node ids like `[a]one` and `[a]two`) keep DISTINCT pending keys — the
+    tracked token ends at the next WHITESPACE, not at the first `]`;
+    completing one retires only its own key."""
+    mod = _load_watchdog_module()
+    tracker = _fresh_tracker(mod)
+    tracker._absorb(b"tests/p.py::t[a]one \ntests/p.py::t[a]two \n")
+    assert set(tracker.pending) == {
+        "tests/p.py::t[a]one",
+        "tests/p.py::t[a]two",
+    }, tracker.pending
+    tracker._absorb(b"tests/p.py::t[a]one PASSED [ 50%]\n")
+    assert set(tracker.pending) == {"tests/p.py::t[a]two"}, tracker.pending
+
+
+def test_watchdog_fires_deadline_arm_before_quiet_window():
+    """tests-falsifiability-004: the hard-deadline arm is independently
+    reachable. A silent child with quiet-window > hard-deadline must fire the
+    DEADLINE arm (never the quiet arm) with the bounded kill."""
+    marker = "tests/fake_deadline.py::test_marker deadline-silence "
+    proc = _run_watchdog(
+        [
+            "--skip-preflight",
+            "--quiet-window",
+            "60",
+            "--poll-interval",
+            "0.3",
+            "--hard-deadline",
+            "2",
+            "--",
+            *_child_marker_cmd(marker),
+        ]
+    )
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 88, combined
+    assert "WATCHDOG-FIRED" in combined
+    assert "deadline arm" in combined
+    assert "quiet arm" not in combined
+
+
+@pytest.mark.skipif(not IS_POSIX, reason="fail-closed hook preflight is POSIX-only")
+def test_watchdog_preflight_refuses_without_dump_dir(tmp_path):
+    """tests-falsifiability-005 / plan F18 fail-closed: with the hook
+    preflight UNSKIPPED and WATCHDOG_DUMP_DIR unset, the watchdog refuses
+    (exit 3) BEFORE spawning the suite — proven by the child's side effect
+    never appearing (the suite-never-ran sentinel stays absent)."""
+    sentinel = tmp_path / "suite-never-ran"
+    env = os.environ.copy()
+    env.pop("WATCHDOG_DUMP_DIR", None)
+    proc = _run_watchdog(
+        [
+            "--quiet-window",
+            "60",
+            "--hard-deadline",
+            "60",
+            "--",
+            sys.executable,
+            "-c",
+            "import pathlib, time\n"
+            f"pathlib.Path({str(sentinel)!r}).touch()\n"
+            "print('suite ran', flush=True)\n"
+            "time.sleep(600)\n",
+        ],
+        env=env,
+    )
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 3, combined
+    assert "WATCHDOG_DUMP_DIR is not set" in combined
+    assert "refusing to run the suite unmonitored" in combined
+    assert not sentinel.exists(), (
+        "the suite must NEVER start on a preflight refusal — the child ran"
+    )
+
+
+def test_watchdog_run_fires_forwarding_arm_on_stalled_forwarding(capsys):
+    """reliability-performance-001: a forwarding write in flight past the
+    quiet window fires the FORWARDING arm — checked BEFORE the quiet arm so a
+    wedged log drain is never misattributed to child silence. In-process
+    probe: a stub tracker reports a stalled write while a REAL child sleeps;
+    run() must fire the forwarding arm and bound-kill the child."""
+    import types
+
+    mod = _load_watchdog_module()
+
+    class _StalledTracker:
+        def __init__(self, pipe):
+            self.reader_error = None
+
+        def start(self):
+            pass
+
+        def snapshot(self):
+            self.snapshot_called = True
+            return (999.0, 999.0)
+
+        def pending_ids(self):
+            return []
+
+        def tail_lines(self, count):
+            return []
+
+        def drain(self, timeout_s=2.0):
+            pass
+
+        def forwarding_stall_for(self):
+            # Display use after the fire is fine; ARM SELECTION must consult
+            # snapshot() (round 4 Important-1: one consistent sample).
+            if not getattr(self, "snapshot_called", False):
+                raise AssertionError(
+                    "arm selection must sample quiet+stall from ONE "
+                    "snapshot() before any separate accessor call"
+                )
+            return 999.0
+
+        def quiet_for(self):
+            if not getattr(self, "snapshot_called", False):
+                raise AssertionError(
+                    "arm selection must sample quiet+stall from ONE "
+                    "snapshot() before any separate accessor call"
+                )
+            return 999.0
+
+    real_tracker = mod.StreamTracker
+    mod.StreamTracker = _StalledTracker
+    try:
+        args = types.SimpleNamespace(
+            skip_preflight=True,
+            command=[sys.executable, "-c", "import time; time.sleep(600)"],
+            quiet_window=60.0,
+            poll_interval=0.3,
+            hard_deadline=600.0,
+            dump_tail=5,
+            dump_budget=5.0,
+        )
+        code = mod.run(args)
+    finally:
+        mod.StreamTracker = real_tracker
+    assert code == 88
+    err = capsys.readouterr().err
+    assert "forwarding arm" in err, err
+    assert "quiet arm" not in err, err
+
+
+def test_tracker_stamps_forwarding_inflight_around_the_write():
+    """reliability-performance-001 (stamp truth): the in-flight stamp goes
+    down BEFORE the forwarding write and is observable WHILE the write runs
+    (a stalled drain is visible mid-write, not only in hindsight), then is
+    cleared after the write completes — never left set."""
+    mod = _load_watchdog_module()
+    read_fd, write_fd = os.pipe()
+    pipe = open(read_fd, "rb", buffering=0)
+    tracker = mod.StreamTracker(pipe)
+    observed = {}
+
+    class _SinkBuffer:
+        @staticmethod
+        def write(data):
+            observed["during_write"] = (
+                tracker.forwarding_inflight_since is not None
+            )
+            return len(data)
+
+        @staticmethod
+        def flush():
+            pass
+
+    class _SinkStdout:
+        buffer = _SinkBuffer
+
+    real_stdout = sys.stdout
+    sys.stdout = _SinkStdout()
+    try:
+        tracker.start()
+        os.write(write_fd, b"hello\n")
+        os.close(write_fd)  # EOF: the reader loop returns after the absorb
+        tracker._thread.join(timeout=5.0)
+    finally:
+        sys.stdout = real_stdout
+        pipe.close()
+    assert observed.get("during_write") is True, (
+        "the in-flight stamp was not set at write time (stamp runs before "
+        "the forwarding write)"
+    )
+    assert tracker.forwarding_inflight_since is None, (
+        "the in-flight stamp was left set after a completed write"
+    )
+    assert tracker.pending == {}, tracker.pending
 
 
 @pytest.mark.skipif(

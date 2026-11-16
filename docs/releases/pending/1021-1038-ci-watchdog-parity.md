@@ -29,7 +29,12 @@
   on POSIX (a missing readiness marker refuses to run the suite unmonitored
   BEFORE the expensive run starts). The production trigger stays UNDIAGNOSED
   (GIL-held native call or another mechanism); the captured stacks settle
-  the attribution on the next recurrence.
+  the attribution on the next recurrence. The nightly full-deps tier's
+  full-suite step runs under the SAME out-of-process watchdog (same budgets,
+  same SIGUSR2 hook wiring, `-v -rs` so the pending-test banner names ids
+  from verbose dispatch records, pinned by test_1021_timeout_wiring) — the
+  delivery gap flagged during this PR's review (compat-delivery-007) is
+  closed in this PR, not deferred.
 - **#1038 Item A:** `backend/tests/test_1021_timeout_wiring.py` (the #1034
   wiring gate) now pins the full canonical invocation
   `pytest --tb=short -v --timeout=300 --timeout-method=thread -rs -n auto
@@ -63,6 +68,31 @@
   production-capture real `pytest -v -n 2` two-worker wedge); POSIX
   group-kill parent+grandchild arm. Windows skips carry explicit reasons;
   Linux CI runs everything.
+- Feedback-round arms: hard-deadline-arm reachability (quiet-window >
+  hard-deadline fires the DEADLINE arm, never the quiet arm); POSIX
+  preflight-refusal (missing `WATCHDOG_DUMP_DIR` exits 3 BEFORE the suite
+  starts, child side-effect sentinel never appears); forwarding-stall arm
+  (a forwarding write in flight past the quiet window fires a FORWARDING
+  arm checked before the quiet verdict, plus the stamp-before-write probe);
+  bounded node-id matching with FULL param identity at every length: the
+  regex carries no bracket group (per-candidate matching strictly linear —
+  a 50k-char `.py` line and a 20k-fragment unclosed-bracket line are matched
+  at least 2x faster than in-test unbounded legacy patterns on the SAME
+  input, oracle-based and machine-speed-robust), and the tracked id's param
+  region ends at the LAST `]` followed by whitespace/EOL that does not
+  close a progress-percentage bracket (depth-resolved whitespace-token
+  fallback for unclosed partials): full distinct pending keys for
+  parameterizations of every shape — `]`-containing ids, space-containing
+  ids, combined `]`+space ids, 300-/3000-char params, and bracket-embedded
+  node-like text all keep their own keys, with NO truncation rule left to
+  collide two concurrent ids; a single-lock snapshot probe (quiet
+  and forwarding-stall sampled atomically — a two-call stub makes arm
+  selection fail); an exact-value watchdog budget pin (parsed argv equality
+  across BOTH argparse spellings — drift like `3600`, duplicate overrides,
+  and equals-form `--flag=value` overrides all rejected by negative
+  fixtures); and the Test-step locator negative fixtures (`Test setup`
+  prefix lookalike and an unnamed following step can never satisfy the
+  pin).
 - `backend/tests/test_1021_timeout_wiring.py`: canonical-flag mirror pins
   (site+flag-named failures), both ci-fix-monitor site pins (`cov=app`
   count 0), and the watchdog-wiring pin (watchdog on the run line + hook

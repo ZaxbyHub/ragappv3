@@ -14,8 +14,9 @@ when the run goes quiet (or approaches the hard deadline) it
   faulthandler hook (registered by ``scripts/ci_watchdog_faulthandler_hook.py``
   through PYTHONPATH sitecustomize — a C-level handler that dumps WITHOUT the
   GIL and to a FILE, so pytest/xdist capture cannot swallow it), with
-  py-spy as an opportunistic external provider before it and SIGABRT as the
-  fatal last resort;
+  py-spy as an opportunistic external provider before it; the bounded
+  group kill terminates as the fatal last resort (no further signal
+  rung is sent by the capture phase);
 * terminates the whole process group (bounded) and exits 88 so the step
   fails with a named diagnostic instead of a silent ceiling kill.
 
@@ -52,15 +53,42 @@ IS_POSIX = os.name == "posix"
 # spans the FULL node path — file :: Class :: test, with optional [param] —
 # so class-path ids are not truncated at the class component, and param
 # brackets are included (implementation-review round 1).
-_NODE_ID = (
-    r"[\w./\\\-]+\.(?:py|pyi)"
-    r"(?:::[\w./\-]+)+"  # one or more :: components (module, class(es), test)
-    r"(?:\[[^\]]*\])?"
+#
+# Bounded matching (micro-uib-001 residual): the id is anchored at a record
+# boundary (start of line or after whitespace — the only shapes pytest -v
+# emits), the path/component runs are POSSESSIVE, and the module suffix is
+# asserted with fixed-width lookbehinds instead of a backtracking
+# ``\.(?:py|pyi)`` alternation. The pre-filter (``.py in line``) cannot see
+# inside a long `.py`-bearing line that still fails to match: the old pattern
+# re-scanned the whole run from every start position there (quadratic) UNDER
+# THE TRACKER LOCK, stalling forwarding/pending/fire. Possessive quantifiers
+# (Python 3.11+) make every failure linear.
+_NODE_ID_RE = re.compile(
+    r"(?:\A|\s)"
+    r"(?P<node>"
+    r"[\w./\\\-]++(?:(?<=\.pyi)|(?<=\.py))"
+    r"(?:::[\w./\\\-]++)++"  # one or more :: components (module, class(es), test)
+    r")"
 )
-_NODE_ID_RE = re.compile(_NODE_ID)
+# The param bracket is deliberately NOT part of the regex (review rounds
+# 4-6): any in-regex bracket form is either unbounded (an unclosed `[` makes
+# the optional bracket scan the whole remaining suffix at EVERY candidate —
+# quadratic under the tracker lock) or length-capped (collapsing two
+# concurrently-dispatched parameterizations of the same function into one
+# pending key, silently under-naming the still-pending sibling). Instead,
+# _ingest_line reattaches the tracked id's FULL bracket with one bounded
+# str.find AFTER the match — see there. The bounded-matching probes assert
+# the work bound with in-test uncapped-pattern oracles, not wall-clock
+# guesses.
 _OUTCOME_RE = re.compile(
     r"\b(?:PASSED|FAILED|SKIPPED|ERROR|XFAIL|XPASS|CRASHED|crashed while running)\b"
 )
+_WS_RE = re.compile(r"\s")
+# A pytest -v progress bracket close (`[ 50%]` / `[100%]`): content is at
+# most "  100%" (spaces + digits + %). Used to EXCLUDE progress brackets
+# from the terminal-close scan below (bracket content window of 10 chars
+# covers any width-3 percentage).
+_PROGRESS_CLOSE_RE = re.compile(r"\[\s*\d{1,3}%\Z")
 
 _READ_CHUNK = 65536
 
@@ -71,7 +99,12 @@ def eprint(*args: object) -> None:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run a command under the Backend CI hang watchdog."
+        description="Run a command like `pytest` under the Backend CI hang watchdog.",
+        # Exact option spellings only: argparse's default long-option
+        # abbreviation would accept `--poll-i=50` as an override of
+        # `--poll-interval`, a drift shape the exact-value wiring pin must
+        # not be able to miss (review round 6).
+        allow_abbrev=False,
     )
     parser.add_argument(
         "--quiet-window",
@@ -210,6 +243,10 @@ class StreamTracker:
         # untouched (implementation-review round 2).
         self._provisional_id: str | None = None
         self.last_activity = time.monotonic()
+        # reliability-performance-001: set while the forwarding write to our
+        # own stdout is in flight, so a wedged log drain is observable and
+        # bounded SEPARATELY from child silence (see run()'s forwarding arm).
+        self.forwarding_inflight_since: float | None = None
         self.reader_error: BaseException | None = None
         self._thread = threading.Thread(target=self._read_loop, daemon=True)
 
@@ -226,6 +263,12 @@ class StreamTracker:
             if not chunk:
                 return
             try:
+                # Stamp activity BEFORE the forwarding write: a stalled own-stdout
+                # write (runner log-drain stall) must not masquerade as child
+                # silence toward the quiet arm — stamp first, write after (F-001).
+                with self._lock:
+                    self.last_activity = time.monotonic()
+                    self.forwarding_inflight_since = self.last_activity
                 sys.stdout.buffer.write(chunk)
                 sys.stdout.buffer.flush()
             except (OSError, ValueError) as exc:
@@ -234,8 +277,12 @@ class StreamTracker:
                 # would detach the monitor from the child's stream and could
                 # cause a spurious quiet-arm fire (implementation-review
                 # round 3 MINOR-1).
+                with self._lock:
+                    self.forwarding_inflight_since = None
                 self.reader_error = exc
                 return
+            with self._lock:
+                self.forwarding_inflight_since = None
             self._absorb(chunk)
 
     def _absorb(self, chunk: bytes) -> None:
@@ -265,12 +312,87 @@ class StreamTracker:
     def _ingest_line(self, line: str, *, completed: bool) -> None:
         # Only the most recent occurrence decides: a result record retires the
         # id, any other appearance (dispatch prefix, partial) (re)adds it.
-        ids = _NODE_ID_RE.findall(line)
-        if not ids:
+        # Prefilter (F-002, micro-uib-001): the node-id pattern requires a module
+        # suffix (`.py`/`.pyi`), so lines without one can never yield an id —
+        # skipping them keeps long non-Python progress lines off the regex
+        # entirely (the regex's nested-optional backtracking was quadratic on
+        # long lines, under the tracker lock, stalling forwarding/pending/fire).
+        if ".py" not in line:
             if completed:
                 self._completed.append(line.encode("utf-8", errors="replace"))
             return
-        node = ids[-1]
+        matches = list(_NODE_ID_RE.finditer(line))
+        if not matches:
+            if completed:
+                self._completed.append(line.encode("utf-8", errors="replace"))
+            return
+        # Bracket-aware candidate selection (review round 6): node-like text
+        # INSIDE a param bracket (`t[input tests/other.py::test_x]`) matches
+        # the regex too, but it is not a test — walk the matches in order
+        # tracking bracket depth and keep only the LAST depth-0 (top-level)
+        # candidate. Linear: one pass over the spans between matches.
+        last = None
+        depth = 0
+        cursor = 0
+        for m in matches:
+            depth += line[cursor : m.start()].count("[")
+            depth -= line[cursor : m.start()].count("]")
+            if depth == 0:
+                last = m
+            cursor = m.end()
+        if last is None:
+            last = matches[0]
+        # Only this top-level candidate becomes/updates a pending key; the
+        # regex carries no bracket group (per-candidate matching strictly
+        # linear) and the param region is resolved below with one linear
+        # scan per line — never per candidate.
+        node = last.group("node")
+        if last.end() < len(line) and line[last.end()] == "[":
+            # Param-region resolution (review rounds 6-8): the id ends at
+            # the LAST `]` that is followed by whitespace/EOL and does not
+            # close a progress-percentage bracket (`[ 50%]`/`[100%]`) —
+            # explicit ids may contain spaces, embedded `]`s, or both, so
+            # neither the first `]`, the first whitespace, nor a plain
+            # depth-to-zero rule can end the id (each collapses two
+            # concurrent ids of the same function somewhere). One linear
+            # scan of `]` positions per line, linear `]` scan per line; the
+            # progress-bracket exclusion keeps pytest's trailing `[ NN%]`
+            # from being swallowed into the id. No terminal-`]` (unclosed
+            # bracket, or only a progress bracket like `t[a]one PASSED
+            # [ 50%]`): fall back to the depth-resolved whitespace token —
+            # a balanced token ends the id; an unclosed partial extends to
+            # end-of-line (the provisional-id retirement re-parses the
+            # grown record on the next absorb).
+            terminal: list[int] = []
+            j = line.find("]", last.end())
+            while j != -1:
+                after = line[j + 1] if j + 1 < len(line) else " "
+                if after.isspace() and not _PROGRESS_CLOSE_RE.search(
+                    line[max(last.end(), j - 10) : j]
+                ):
+                    terminal.append(j)
+                j = line.find("]", j + 1)
+            if terminal:
+                node = line[last.start() : terminal[-1] + 1]
+            else:
+                ws = _WS_RE.search(line[last.end() :])
+                token_end = last.end() + ws.start() if ws else len(line)
+                depth = 0
+                for idx in range(last.end(), token_end):
+                    ch = line[idx]
+                    if ch == "[":
+                        depth += 1
+                    elif ch == "]":
+                        depth -= 1
+                scan = token_end
+                while depth > 0 and scan < len(line):
+                    ch = line[scan]
+                    scan += 1
+                    if ch == "[":
+                        depth += 1
+                    elif ch == "]":
+                        depth -= 1
+                node = line[last.start() : scan]
         if completed and _OUTCOME_RE.search(line):
             # Retire the completed id AND any pending ids that are partial
             # prefixes of it (a node id that grew across chunk boundaries:
@@ -289,6 +411,29 @@ class StreamTracker:
             if completed:
                 self._completed.append(line.encode("utf-8", errors="replace"))
 
+    def forwarding_stall_for(self) -> float:
+        """Seconds the current forwarding write has been in flight, or 0.0
+        when no write is in flight (reliability-performance-001)."""
+        with self._lock:
+            since = self.forwarding_inflight_since
+        if since is None:
+            return 0.0
+        return time.monotonic() - since
+
+    def snapshot(self) -> tuple[float, float]:
+        """One consistent (quiet, forwarding_stall) sample under a single
+        lock acquisition (review round 4 Important-1): the monitor must
+        never compare a stall measured at one instant against a quiet
+        measured at another — fresh child output landing between two
+        separate samples could fire a stale quiet verdict on a live child.
+        """
+        with self._lock:
+            now = time.monotonic()
+            quiet = now - self.last_activity
+            since = self.forwarding_inflight_since
+            stall = 0.0 if since is None else now - since
+            return quiet, stall
+
     def quiet_for(self) -> float:
         with self._lock:
             return time.monotonic() - self.last_activity
@@ -296,6 +441,13 @@ class StreamTracker:
     def pending_ids(self) -> list[str]:
         with self._lock:
             return list(self.pending.keys())
+
+    def drain(self, timeout_s: float = 2.0) -> None:
+        """Bounded exit-time flushing (reliability-performance-001): after
+        the child exits, give the daemon reader a short window to absorb the
+        stream tail — never join unbounded, and never block process exit on a
+        reader wedged in a forwarding write (it is abandoned, not waited on)."""
+        self._thread.join(timeout=timeout_s)
 
     def tail_lines(self, count: int) -> list[str]:
         with self._lock:
@@ -413,9 +565,10 @@ def sigusr2_dump(pid: int, dump_dir: Path) -> str | None:
 
 def capture_stacks(child_pid: int, budget_s: float) -> None:
     """Bounded per-PID capture chain: py-spy (nonfatal) -> SIGUSR2 file dump
-    (workers before controller) -> explicit unavailable note. SIGABRT is NOT
-    used here: it is the fatal last resort of the termination phase, never a
-    stack provider of record (its stderr dump is invisible under xdist)."""
+    (workers before controller) -> explicit unavailable note. No fatal
+    signal is sent from this phase — the bounded group kill in terminate_tree
+    is the fatal last resort; SIGABRT is not a stack-capture rung (its stderr
+    dump is invisible under xdist)."""
     started = time.monotonic()
     pids: list[tuple[int, int]]
     if IS_POSIX:
@@ -549,8 +702,25 @@ def run(args: argparse.Namespace) -> int:
                     f"({tracker.reader_error!r}) — refusing to monitor blind"
                 )
                 break
-            quiet = tracker.quiet_for()
             elapsed = time.monotonic() - start
+            # reliability-performance-001 + review round 4 Important-1:
+            # quiet and stall come from ONE atomic snapshot — never compare
+            # a stall measured at one instant against a quiet measured at
+            # another (fresh output between two separate samples could fire
+            # a stale quiet verdict on a live child).
+            quiet, stall = tracker.snapshot()
+            # reliability-performance-001: check the forwarding stall BEFORE
+            # the quiet arm — a forwarding write wedged past the quiet window
+            # is a LOG-DRAIN stall (the child may still be producing), not
+            # child silence; attributing it to the quiet arm would name the
+            # wrong arm and the wrong diagnostic.
+            if stall >= args.quiet_window:
+                fire_reason = (
+                    f"forwarding arm: own-stdout write stalled {stall:.0f}s "
+                    f"(>= the {args.quiet_window:.0f}s quiet window) — the "
+                    "log drain is wedged; the child may still be producing"
+                )
+                break
             if quiet >= args.quiet_window:
                 fire_reason = f"quiet arm: no output progress for {quiet:.0f}s"
                 break
@@ -566,8 +736,10 @@ def run(args: argparse.Namespace) -> int:
 
     if fire_reason is None:
         code = child.returncode
-        # Give the daemon reader a moment to drain, then mirror the exit code.
-        time.sleep(0.2)
+        # Bounded exit-time flushing (reliability-performance-001): give the
+        # daemon reader a short window to absorb the stream tail after the
+        # child exits — never unbounded.
+        tracker.drain(timeout_s=2.0)
         return code if code is not None else 0
 
     elapsed = time.monotonic() - start
@@ -594,6 +766,9 @@ def run(args: argparse.Namespace) -> int:
 
     capture_stacks(child.pid, budget_s=args.dump_budget)
     terminate_tree(child, deadline_s=30.0)
+    # Bounded exit-time flushing on the fire path too: the daemon reader is
+    # joined bounded (never unbounded) after the group kill.
+    tracker.drain(timeout_s=2.0)
     eprint(
         f"watchdog: failing the step with exit {WATCHDOG_EXIT_CODE} "
         "(named hang diagnostic above; see #1021)"

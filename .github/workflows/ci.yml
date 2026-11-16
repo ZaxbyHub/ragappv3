@@ -474,8 +474,9 @@ jobs:
           # by the walker's `require('typescript')` (cwd stays frontend/, so
           # NODE_PATH carries the dependency instead of node_modules there).
           NODE_PATH: ${{ runner.temp }}/h03-gate-ts/node_modules
-          # #1021: guarantees SIGABRT (the watchdog's fatal last resort)
-          # produces Python frames even without faulthandler-enable elsewhere.
+          # #1021: guarantees the SIGUSR2 faulthandler handler produces Python
+          # frames in every Python process of this step (the watchdog's fatal
+          # last resort is the bounded group kill; SIGABRT is not sent).
           PYTHONFAULTHANDLER: "1"
           # #1021: loads the copied faulthandler hook in every Python process
           # of this step (controller + xdist workers); dump files land in
