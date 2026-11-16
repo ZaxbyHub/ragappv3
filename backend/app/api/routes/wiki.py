@@ -91,6 +91,46 @@ def _wiki_lint_executor() -> concurrent.futures.ThreadPoolExecutor:
             )
         return _WIKI_LINT_EXECUTOR
 
+
+# Bounded admission for the lint-run route (issue #1117, follow-up to the
+# PRR-001 executor comment above): every request the route admits holds its
+# pooled DB connection for the whole executor round-trip — including the
+# queue wait on the single-worker executor — so an unbounded burst pins the
+# pool (execution-proven at 10/10 connections, OOB review F-02). The bound
+# counts IN-FLIGHT admitted runs and rejects the excess with a 503-family
+# response at admission time, before any wait. Default 2, not 1: the
+# frontend deliberately supports two overlapping lint calls (a vault switch
+# mid-scan starts a second run — wiki-jobs-ui-checks.test.tsx); a bound of
+# 2 admits exactly that flow while capping pinned connections at 2 of the
+# 10-connection pool.
+_WIKI_LINT_MAX_CONCURRENT_RUNS = 2
+_wiki_lint_in_flight = 0
+_wiki_lint_admission_lock = threading.Lock()
+
+
+def _wiki_lint_try_acquire() -> bool:
+    """Admit one lint run when under the bound.
+
+    Reads `_WIKI_LINT_MAX_CONCURRENT_RUNS` from the module namespace at
+    call time (operators and tests may patch it between requests); the
+    lock makes check-and-increment atomic for every caller thread.
+    """
+    global _wiki_lint_in_flight
+    with _wiki_lint_admission_lock:
+        if _wiki_lint_in_flight >= _WIKI_LINT_MAX_CONCURRENT_RUNS:
+            return False
+        _wiki_lint_in_flight += 1
+        return True
+
+
+def _wiki_lint_release() -> None:
+    """Release one admission slot (floor 0: releases are best-effort and
+    must never drive the counter negative)."""
+    global _wiki_lint_in_flight
+    with _wiki_lint_admission_lock:
+        if _wiki_lint_in_flight > 0:
+            _wiki_lint_in_flight -= 1
+
 router = APIRouter(dependencies=[Depends(require_wiki_enabled)])
 
 
@@ -805,17 +845,76 @@ async def run_wiki_lint(
     _csrf_token: str = Depends(csrf_protect),
 ):
     await _require_vault_write(evaluate, user, request.vault_id)
-    store = WikiStore(db)
-    linter = WikiLinter(db, store)
-    # Issue #935 item 1: run_lint is synchronous full-table work; running it
-    # inline on the event loop stalls every other request in the process
-    # for the scan's duration. Dispatch to the dedicated bounded executor
-    # above (review PRR-001; note F-02: queued runs pin their pooled
-    # connection, so this bounds executor starvation, not pool contention).
-    loop = asyncio.get_running_loop()
-    findings = await loop.run_in_executor(
-        _wiki_lint_executor(), linter.run_lint, request.vault_id
-    )
+    # Issue #1117: bounded admission BEFORE any wait. Each admitted run
+    # pins its pooled connection for the whole executor round-trip, so the
+    # excess of a burst must be rejected here (503-family, retryable), not
+    # queued. The release is tied to WORKER COMPLETION via the future's
+    # done-callback, not to handler exit: cancelling the await mid-scan
+    # must not free the slot while the single worker is still occupied.
+    if not _wiki_lint_try_acquire():
+        raise HTTPException(
+            status_code=503,
+            detail="Wiki lint scan capacity reached; retry shortly",
+        )
+    cf_future = None
+    # One admission, exactly one release. The done-callback (worker thread)
+    # and the rollback below (loop thread) both route through this
+    # release-once guard: its flag flips under a per-admission lock, so the
+    # two release paths can never double-count one acquire no matter where
+    # a signal-class BaseException lands — including the one-bytecode
+    # window between add_done_callback() returning and any flag store
+    # (swarm review FR-001: a plain boolean keyed on that ordering left a
+    # double-release there, masked by the floor-at-0 as over-admission).
+    # The lock is per-request, so there is no contention.
+    release_state = {"done": False}
+    release_guard = threading.Lock()
+
+    def _release_once() -> None:
+        with release_guard:
+            if release_state["done"]:
+                return
+            release_state["done"] = True
+        _wiki_lint_release()
+
+    try:
+        store = WikiStore(db)
+        linter = WikiLinter(db, store)
+        # Issue #935 item 1: run_lint is synchronous full-table work; running
+        # it inline on the event loop stalls every other request in the
+        # process for the scan's duration. Dispatch to the dedicated bounded
+        # executor above (review PRR-001; the admission bound above now also
+        # bounds the pool pinning F-02 called out there).
+        cf_future = _wiki_lint_executor().submit(
+            linter.run_lint, request.vault_id
+        )
+
+        def _release_when_done(_f):
+            # Release DIRECTLY from the worker thread: the admission lock
+            # serializes every counter mutation, so the release does not
+            # depend on the submitting event loop's lifecycle at all. (A
+            # call_soon_threadsafe marshalling would silently DROP the
+            # release when the loop is stopped-but-not-closed at completion
+            # time — the callback is accepted but never run before close,
+            # permanently leaking the slot on embedded/multi-cycle servers.)
+            _release_once()
+
+        cf_future.add_done_callback(_release_when_done)
+    except BaseException:
+        if cf_future is not None:
+            # An async-injected BaseException (signal class) landed in the
+            # dispatch/registration span. If the scan is still QUEUED,
+            # cancel it so the orphan does not run to completion holding
+            # the request-scoped pooled connection (FR-006); on a running
+            # scan cancel() is a harmless False. If the done-callback was
+            # already invoked inline (future already done), cancel() is a
+            # no-op on the CANCELLED/finished state and the guard has
+            # already claimed the release. cancel() on a queued future
+            # fires its done-callbacks inline, which routes through the
+            # same guard — exactly one release either way.
+            cf_future.cancel()
+        _release_once()
+        raise
+    findings = await asyncio.wrap_future(cf_future)
     return {"findings": [_as_dict(f) for f in findings], "count": len(findings)}
 
 
