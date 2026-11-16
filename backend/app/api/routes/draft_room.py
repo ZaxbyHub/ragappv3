@@ -4430,23 +4430,27 @@ async def _run_promotion(
     compensation (delete the just-created ``files``/``draft_promotions`` rows
     and the bytes) itself failed after a later step in the same attempt
     failed — an orphan may genuinely exist. That is recorded as its own
-    security-audit event so an operator can find it, and surfaced with a
-    status/code distinguishable from an ordinary clean failure.
+    security-audit event and logged as one ERROR record (issue #916) so an
+    operator can find it, and surfaced with a status/code distinguishable
+    from an ordinary clean failure.
     """
     try:
         return await coro
     except DraftPromotionDuplicateError as exc:
         if exc.cleanup_incomplete:
+            _log_promotion_cleanup_incomplete(draft_id, exc)
             await _record_promotion_cleanup_failure(db, request, user, draft_id, exc)
         raise DraftRoomHTTPError(
             409, str(exc), "duplicate_document", _duplicate_context(exc)
         ) from exc
     except DraftPromotionTooLargeError as exc:
         if exc.cleanup_incomplete:
+            _log_promotion_cleanup_incomplete(draft_id, exc)
             await _record_promotion_cleanup_failure(db, request, user, draft_id, exc)
         raise DraftRoomHTTPError(413, str(exc), "promotion_too_large") from exc
     except DraftPromotionPathConflictError as exc:
         if exc.cleanup_incomplete:
+            _log_promotion_cleanup_incomplete(draft_id, exc)
             await _record_promotion_cleanup_failure(db, request, user, draft_id, exc)
         # issue #1119: the client-visible 409 detail is a fixed string — it
         # must not echo the server filesystem destination path that
@@ -4481,6 +4485,23 @@ async def _run_promotion(
                 "promotion_failed_incomplete_cleanup",
             ) from exc
         raise DraftRoomHTTPError(500, "promotion failed", "internal_error") from exc
+
+
+def _log_promotion_cleanup_incomplete(draft_id: int, exc: DraftPromotionError) -> None:
+    """Issue #916: exactly one ERROR record for a typed 4xx promotion branch
+    whose compensation failed — a ``files``/``draft_promotions`` row or
+    on-disk bytes may be orphaned, and the security-audit event alone is
+    invisible to an operator tailing the process log (the shared
+    ``draft_room_exception_handler`` logs 5xx only). Carries ``draft_id``
+    and the error class name ONLY, never ``str(exc)`` (the #789 leak class:
+    these messages embed row ids, sizes, or filesystem paths). Unlike
+    ordinary 4xx traffic, an unverified cleanup is a server-state problem,
+    so ERROR is the right channel here."""
+    logger.error(
+        "draft_room: promotion cleanup incomplete draft_id=%s error=%s",
+        draft_id,
+        type(exc).__name__,
+    )
 
 
 async def _record_promotion_cleanup_failure(

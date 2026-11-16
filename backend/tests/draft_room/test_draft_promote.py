@@ -38,6 +38,7 @@ except ImportError:
 import anyio
 from fastapi.testclient import TestClient
 
+import app.api.routes.draft_room as draft_room_module
 import app.services.draft_promotion as draft_promotion_module
 from app.api.deps import get_background_processor, get_db, get_vector_store
 from app.config import settings
@@ -45,7 +46,12 @@ from app.main import app
 from app.security import CSRFManager, csrf_protect
 from app.services.auth_service import compute_client_fingerprint, create_access_token
 from app.services.draft_input_storage import DraftInputStorage
-from app.services.draft_promotion import DraftPromotionDuplicateError, promote_input
+from app.services.draft_promotion import (
+    DraftPromotionDuplicateError,
+    DraftPromotionPathConflictError,
+    DraftPromotionTooLargeError,
+    promote_input,
+)
 from app.services.draft_store import DraftStore
 
 
@@ -1528,6 +1534,185 @@ class TestPromoteCleanupFailureIsRecorded(DraftPromoteTestBase):
         self.assertEqual(len(rows), 1)
         metadata = json.loads(rows[0]["metadata_json"])
         self.assertEqual(metadata["draft_id"], draft_id)
+
+
+class TestPromoteTypedCleanupIncompleteLogging(DraftPromoteTestBase):
+    """Issue #916: the typed promotion branches (duplicate 409 / too-large
+    413 / path-conflict 409) with ``cleanup_incomplete=True`` record the
+    ``draft_promotion_cleanup_failed`` security-audit event but left no
+    process-log record — the shared ``draft_room_exception_handler`` logs
+    5xx only, so an operator tailing logs never saw the possible orphan (a
+    ``files``/``draft_promotions`` row or on-disk bytes). Each branch must
+    emit exactly one ERROR record on ``app.api.routes.draft_room`` carrying
+    ``draft_id`` and the error class name ONLY — never ``str(exc)`` (the
+    #789 leak class: these messages embed row ids, sizes, or filesystem
+    paths). A clean typed failure (``cleanup_incomplete`` False) is
+    ordinary 4xx traffic and stays unlogged.
+
+    The service is patched at the route module's ``promote_input`` binding
+    so each typed arm is reached deterministically through the real HTTP
+    route — the route's own gates, the real audit write, and the real 4xx
+    exception handler all run; only the service call is replaced. (The
+    service sets ``cleanup_incomplete`` on these typed errors only when its
+    own compensation failed after the failure — see ``draft_promotion.py``'s
+    ``except BaseException`` block — which cannot be forced deterministically
+    for all three types from the HTTP surface.)"""
+
+    def _ready_input(self, draft_id, content=b"body"):
+        upload = self._upload_input(draft_id, content=content)
+        input_id = upload.json()["input"]["id"]
+        self._mark_input_ready(input_id)
+        return input_id
+
+    def test_duplicate_cleanup_incomplete_logs_one_error_record(self):
+        draft_id = self._create_draft().json()["id"]
+        input_id = self._ready_input(draft_id)
+
+        exc = DraftPromotionDuplicateError(
+            "file with hash leakmarker already exists in this vault "
+            "(status=indexed, file_id=77)",
+            existing_file_id=77,
+        )
+        # Set by the service's compensation block on re-raise.
+        exc.cleanup_incomplete = True
+
+        with patch.object(
+            draft_room_module, "promote_input", AsyncMock(side_effect=exc)
+        ):
+            with self.assertLogs("app.api.routes.draft_room", level="ERROR") as logs:
+                resp = self._promote(draft_id, source_type="input", source_id=input_id)
+
+        # Client response unchanged: 409 duplicate_document with the
+        # conflicting-id context.
+        self.assertEqual(resp.status_code, 409, resp.text)
+        self.assertEqual(resp.json()["code"], "duplicate_document")
+        self.assertEqual(resp.json()["context"], {"existing_file_id": 77})
+
+        error_records = [r for r in logs.records if r.levelno >= logging.ERROR]
+        self.assertEqual(len(error_records), 1, logs.output)
+        message = error_records[0].getMessage()
+        self.assertIn(f"draft_id={draft_id}", message)
+        self.assertIn("DraftPromotionDuplicateError", message)
+        # #789 leak class: the record must not carry the exception text.
+        self.assertNotIn("leakmarker", message)
+
+        # Non-vacuity: the audit trail (the pre-existing record) fired too.
+        self.assertEqual(
+            len(self._security_audit_rows("draft_promotion_cleanup_failed")), 1
+        )
+
+    def test_too_large_cleanup_incomplete_logs_one_error_record(self):
+        draft_id = self._create_draft().json()["id"]
+        input_id = self._ready_input(draft_id)
+
+        exc = DraftPromotionTooLargeError(
+            "promoted bytes exceed max_file_size_mb (leakmarker)"
+        )
+        exc.cleanup_incomplete = True
+
+        with patch.object(
+            draft_room_module, "promote_input", AsyncMock(side_effect=exc)
+        ):
+            with self.assertLogs("app.api.routes.draft_room", level="ERROR") as logs:
+                resp = self._promote(draft_id, source_type="input", source_id=input_id)
+
+        # Client response unchanged: 413 promotion_too_large whose detail is
+        # the service's own message (pre-existing contract for this branch).
+        self.assertEqual(resp.status_code, 413, resp.text)
+        self.assertEqual(resp.json()["code"], "promotion_too_large")
+        self.assertIn("leakmarker", resp.json()["detail"])
+
+        error_records = [r for r in logs.records if r.levelno >= logging.ERROR]
+        self.assertEqual(len(error_records), 1, logs.output)
+        message = error_records[0].getMessage()
+        self.assertIn(f"draft_id={draft_id}", message)
+        self.assertIn("DraftPromotionTooLargeError", message)
+        self.assertNotIn("leakmarker", message)
+
+        self.assertEqual(
+            len(self._security_audit_rows("draft_promotion_cleanup_failed")), 1
+        )
+
+    def test_path_conflict_cleanup_incomplete_logs_one_error_record(self):
+        draft_id = self._create_draft().json()["id"]
+        input_id = self._ready_input(draft_id)
+
+        exc = DraftPromotionPathConflictError(
+            "a files row already exists for path '/leakmarker/dest.txt'",
+            dest_path="/leakmarker/dest.txt",
+        )
+        exc.cleanup_incomplete = True
+
+        with patch.object(
+            draft_room_module, "promote_input", AsyncMock(side_effect=exc)
+        ):
+            with self.assertLogs("app.api.routes.draft_room", level="ERROR") as logs:
+                resp = self._promote(draft_id, source_type="input", source_id=input_id)
+
+        # Client response unchanged (#1119): fixed detail, never the path.
+        self.assertEqual(resp.status_code, 409, resp.text)
+        self.assertEqual(resp.json()["code"], "promotion_path_conflict")
+        self.assertEqual(
+            resp.json()["detail"], "a files row already exists for the destination path"
+        )
+
+        error_records = [r for r in logs.records if r.levelno >= logging.ERROR]
+        self.assertEqual(len(error_records), 1, logs.output)
+        message = error_records[0].getMessage()
+        self.assertIn(f"draft_id={draft_id}", message)
+        self.assertIn("DraftPromotionPathConflictError", message)
+        # The raw path stays in the pre-existing #1119 WARNING (server-side
+        # only, not captured at ERROR); the ERROR record carries no path.
+        self.assertNotIn("leakmarker", message)
+
+        self.assertEqual(
+            len(self._security_audit_rows("draft_promotion_cleanup_failed")), 1
+        )
+
+    def test_typed_clean_failures_log_no_error_record(self):
+        """Negative control: the same typed branches with a verified
+        rollback (``cleanup_incomplete=False``) are ordinary client-facing
+        4xx traffic — no ERROR record (the module's 4xx-silent doctrine)
+        and no cleanup-failure audit event."""
+        cases = [
+            (
+                DraftPromotionDuplicateError(
+                    "file with hash leakmarker already exists",
+                    existing_file_id=5,
+                ),
+                409,
+                "duplicate_document",
+            ),
+            (
+                DraftPromotionTooLargeError("promoted bytes exceed the size cap"),
+                413,
+                "promotion_too_large",
+            ),
+            (
+                DraftPromotionPathConflictError(
+                    "a files row already exists for path '/x/dest.txt'",
+                    dest_path="/x/dest.txt",
+                ),
+                409,
+                "promotion_path_conflict",
+            ),
+        ]
+        for exc, status, code in cases:
+            with self.subTest(error=type(exc).__name__):
+                draft_id = self._create_draft().json()["id"]
+                input_id = self._ready_input(draft_id)
+                with patch.object(
+                    draft_room_module, "promote_input", AsyncMock(side_effect=exc)
+                ):
+                    with self.assertNoLogs("app.api.routes.draft_room", level="ERROR"):
+                        resp = self._promote(
+                            draft_id, source_type="input", source_id=input_id
+                        )
+                self.assertEqual(resp.status_code, status, resp.text)
+                self.assertEqual(resp.json()["code"], code)
+                self.assertEqual(
+                    self._security_audit_rows("draft_promotion_cleanup_failed"), []
+                )
 
 
 class TestPromoteCancellation(DraftPromoteTestBase):
