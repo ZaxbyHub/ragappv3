@@ -247,7 +247,15 @@ def _strip_sql_comments(text: str) -> str:
                     i = n
                 else:
                     if "\n" in text[i : j + 2]:
+                        # A multi-line block comment still separates
+                        # statements; keep the newline as the anchor.
                         out.append("\n")
+                    else:
+                        # Single-line block comment: emit a SPACE so the
+                        # surrounding tokens do not join
+                        # (``UPDATE/* c */drafts`` must not become
+                        # ``UPDATEdrafts`` — review round 2, finding 1).
+                        out.append(" ")
                     i = j + 2
             else:
                 out.append(ch)
@@ -272,8 +280,10 @@ def _match_is_live_statement(stripped: str, match: re.Match) -> bool:
 
     R2 — statement-start anchor: the verb must begin a SQL statement; the
     nearest preceding non-whitespace character must be start-of-string,
-    ``;``, or ``(`` (whitespace after the anchor is tolerated, so
-    ``";   UPDATE drafts ..."`` matches).
+    ``;``, ``(``, or ``)`` (whitespace after the anchor is tolerated, so
+    ``";   UPDATE drafts ..."`` matches, and a CTE-prefixed
+    ``WITH x AS (SELECT 1) UPDATE drafts ...`` is admitted — review round 2,
+    finding 2).
 
     R3 — prose-separator gate: the character following the captured table
     reference must not be ``:`` — the published prose shape
@@ -286,7 +296,7 @@ def _match_is_live_statement(stripped: str, match: re.Match) -> bool:
     k = match.start() - 1
     while k >= 0 and stripped[k] in " \t\r\n":
         k -= 1
-    if k >= 0 and stripped[k] not in ";(":
+    if k >= 0 and stripped[k] not in ";()":
         return False
     e = match.end()
     n = len(stripped)
@@ -852,6 +862,41 @@ class TestTableOwnershipCensus(unittest.TestCase):
         conservative colon-only prose gate; at base all three PASS too (the
         base regex matches them) — this row's discrimination lives in the
         prose/comment rows above; these are the no-false-negative pins."""
+        # Implementation-review round 2, finding 1: a single-line block
+        # comment between verb and table must not JOIN the tokens — the
+        # stripper replaces it with a space, and the write stays visible.
+        with tempfile.TemporaryDirectory() as tmp:
+            block_sep = Path(tmp) / "blocksep.py"
+            block_sep.write_text(
+                "def go(conn) -> None:\n"
+                "    conn.execute(\"UPDATE/* note */drafts SET status = 1\")\n",
+                encoding="utf-8",
+            )
+            sites = scan_tree(Path(tmp))
+        self.assertEqual(
+            [(x.rel_path, x.table) for x in sites],
+            [("blocksep.py", "drafts")],
+            "valid_sql_continuation: a block comment used as the only "
+            "verb/table separator must not hide the write; the census saw "
+            f"{[(x.rel_path, x.table) for x in sites]}",
+        )
+        # Implementation-review round 2, finding 2: a CTE-prefixed write is a
+        # live statement — the anchor set admits ')' after the CTE.
+        with tempfile.TemporaryDirectory() as tmp:
+            cte = Path(tmp) / "cte.py"
+            cte.write_text(
+                "def go(conn) -> None:\n"
+                "    conn.execute("
+                "\"WITH x AS (SELECT 1) UPDATE drafts SET status = 1\")\n",
+                encoding="utf-8",
+            )
+            sites = scan_tree(Path(tmp))
+        self.assertEqual(
+            [(x.rel_path, x.table) for x in sites],
+            [("cte.py", "drafts")],
+            "valid_sql_continuation: a CTE-prefixed write must be recorded; "
+            f"the census saw {[(x.rel_path, x.table) for x in sites]}",
+        )
         valid_forms = {
             "insert_select": (
                 "def go(conn) -> None:\n"
