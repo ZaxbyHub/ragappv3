@@ -570,6 +570,23 @@ def test_watchdog_pending_tracker_close_bracket_and_space_combined():
     )
 
 
+def test_watchdog_pending_tracker_xdist_completion_prefix_shape():
+    """CI round 2 regression, CROSS-PLATFORM: xdist completion records render
+    as ``[gwN] [ NN%] OUTCOME <id>`` — the id is preceded by WHITESPACE, and
+    resolution must slice from the node GROUP start, not the whole-match
+    start (which includes the consumed ``\\s`` anchor), or completion keys
+    gain a leading space and never retire the dispatch keys. The anchor-
+    slice bug shipped on cd7982cd and was caught only by the Linux real-
+    stream regression (skipped on Windows); this synthetic shape pins it
+    everywhere."""
+    mod = _load_watchdog_module()
+    tracker = _fresh_tracker(mod)
+    tracker._absorb(b"tests/x.py::t[a b] \n")
+    assert set(tracker.pending) == {"tests/x.py::t[a b]"}, tracker.pending
+    tracker._absorb(b"[gw0] [ 50%] PASSED tests/x.py::t[a b]\n")
+    assert tracker.pending == {}, tracker.pending
+
+
 def test_watchdog_tracker_on_real_pytest_param_stream(tmp_path):
     """review round 9 — ground truth from a REAL pytest -v stream: explicit
     ids containing `]`, spaces, and both (`a] one` / `b two]`) render as
