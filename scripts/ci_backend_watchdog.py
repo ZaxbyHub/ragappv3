@@ -373,7 +373,7 @@ class StreamTracker:
                     terminal.append(j)
                 j = line.find("]", j + 1)
             if terminal:
-                node = line[last.start() : terminal[-1] + 1]
+                node = line[last.start("node") : terminal[-1] + 1]
             else:
                 ws = _WS_RE.search(line[last.end() :])
                 token_end = last.end() + ws.start() if ws else len(line)
@@ -392,7 +392,7 @@ class StreamTracker:
                         depth += 1
                     elif ch == "]":
                         depth -= 1
-                node = line[last.start() : scan]
+                node = line[last.start("node") : scan]
         if completed and _OUTCOME_RE.search(line):
             # Retire the completed id AND any pending ids that are partial
             # prefixes of it (a node id that grew across chunk boundaries:
