@@ -84,7 +84,6 @@ describe("Register store publication contract", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     authClient.post.mockReset().mockResolvedValue({ data: { access_token: "store-token", user: principal(90) } });
-    authClient.patch.mockReset();
     authClient.get.mockReset().mockResolvedValue({ data: { csrf_token: "csrf-test" } });
     reserveReplacementAuthOwner();
     setJwtAccessToken(null);
@@ -176,7 +175,7 @@ describe("Register store publication contract", () => {
     const registerRequest = deferred({ data: { access_token: "cleanup-register", user: principal(90) } });
     authClient.post.mockImplementationOnce(() => registerRequest.promise);
     const profileRequest = deferred({ data: { ...principal(90), full_name: "cleanup-profile" } });
-    authClient.patch.mockImplementationOnce(() => profileRequest.promise);
+    authClient.post.mockImplementationOnce(() => profileRequest.promise);
     const registerPromise = useAuthStore.getState().register("profile-register", "GoodPass1");
     await Promise.resolve();
     const profilePromise = useAuthStore.getState().updateProfile({ full_name: "Profile" });

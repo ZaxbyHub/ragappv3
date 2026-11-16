@@ -797,7 +797,7 @@ describe("useAuthStore", () => {
       
       const updatedUser = { ...mockUser, full_name: "Updated Name" };
       
-      mockPatch?.mockResolvedValueOnce({
+      mockPostFn.mockResolvedValueOnce({
         data: updatedUser,
       });
 
@@ -805,7 +805,18 @@ describe("useAuthStore", () => {
 
       const state = useAuthStore.getState();
       expect(state.user).toEqual(updatedUser);
-      expect(mockPatch).toHaveBeenCalled();
+      // T2b: /auth/me goes out as POST + X-HTTP-Method-Override.
+      expect(mockPatch).not.toHaveBeenCalled();
+      expect(mockPostFn).toHaveBeenCalledWith(
+        "/auth/me",
+        { full_name: "Updated Name" },
+        expect.objectContaining({
+          headers: expect.objectContaining({
+            Authorization: "Bearer jwt123",
+            "X-HTTP-Method-Override": "PATCH",
+          }),
+        }),
+      );
     });
 
     it("should throw error when no token available", async () => {
@@ -833,14 +844,23 @@ describe("useAuthStore", () => {
       (getJwtAccessToken as ReturnType<typeof vi.fn>).mockReturnValueOnce("jwt-from-storage");
       
       const updatedUser = { ...mockUser, full_name: "New Name" };
-      mockPatch?.mockResolvedValueOnce({
+      mockPostFn.mockResolvedValueOnce({
         data: updatedUser,
       });
 
       await updateProfile({ full_name: "New Name" });
 
       expect(getJwtAccessToken).toHaveBeenCalled();
-      expect(mockPatch).toHaveBeenCalled();
+      expect(mockPostFn).toHaveBeenCalledWith(
+        "/auth/me",
+        { full_name: "New Name" },
+        expect.objectContaining({
+          headers: expect.objectContaining({
+            Authorization: "Bearer jwt-from-storage",
+            "X-HTTP-Method-Override": "PATCH",
+          }),
+        }),
+      );
     });
   });
 

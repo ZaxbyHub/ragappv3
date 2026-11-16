@@ -56,9 +56,9 @@ describe("core.ts CSRF resilience pins (FU-002)", () => {
       purgeStaleCsrfCookies();
 
       // Shadows (Path=/ and the /api base) must be purged...
-      expect(cookieWrites).toContain("X-CSRF-Token=; path=/; max-age=0");
+      expect(cookieWrites).toContain("meridian-csrf-token=; path=/; max-age=0");
       expect(cookieWrites).toContain(
-        "X-CSRF-Token=; path=/meridian/api/; max-age=0"
+        "meridian-csrf-token=; path=/meridian/api/; max-age=0"
       );
       // ...but the authoritative app-root cookie must never be touched.
       expect(
@@ -81,13 +81,13 @@ describe("core.ts CSRF resilience pins (FU-002)", () => {
 
       purgeStaleCsrfCookies();
 
-      expect(cookieWrites).toContain("X-CSRF-Token=; path=/; max-age=0");
+      expect(cookieWrites).toContain("meridian-csrf-token=; path=/; max-age=0");
     });
   });
 
   describe("ensureCsrfToken force bypass", () => {
     it("force=true bypasses the in-memory cache AND the cookie jar", async () => {
-      mockCookies = "X-CSRF-Token=cookie-token-b";
+      mockCookies = "meridian-csrf-token=cookie-token-b";
       const mockFetch = vi.fn();
       mockFetch.mockResolvedValue({
         ok: true,
@@ -135,7 +135,7 @@ describe("core.ts CSRF resilience pins (FU-002)", () => {
     it("a small JSON Blob 403 body is decoded and triggers the CSRF retry", async () => {
       // Seed the cookie jar so the request interceptor resolves its token
       // without a network fetch on the first call.
-      mockCookies = "X-CSRF-Token=stale-token";
+      mockCookies = "meridian-csrf-token=stale-token";
       const mockFetch = vi.fn().mockResolvedValue({
         ok: true,
         json: () => Promise.resolve({ csrf_token: "fresh-token" }),
@@ -180,7 +180,7 @@ describe("core.ts CSRF resilience pins (FU-002)", () => {
     });
 
     it("an over-cap Blob 403 body is never decoded and never retried", async () => {
-      mockCookies = "X-CSRF-Token=stale-token";
+      mockCookies = "meridian-csrf-token=stale-token";
       vi.stubGlobal(
         "fetch",
         vi.fn().mockResolvedValue({

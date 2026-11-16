@@ -12,7 +12,7 @@ const inTable = () => within(screen.getByRole('table'));
 const mockApiClient = vi.hoisted(() => ({
   get: vi.fn(),
   post: vi.fn(),
-  patch: vi.fn(),
+  post: vi.fn(),
   delete: vi.fn(),
 }));
 

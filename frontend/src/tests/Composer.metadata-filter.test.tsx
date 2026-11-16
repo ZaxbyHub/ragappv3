@@ -106,7 +106,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   // The chat stream never resolves; only the recorded request is inspected.
   fetchMock.mockImplementation(() => new Promise<Response>(() => {}));
-  mockCookies = "X-CSRF-Token=test-csrf-token";
+  mockCookies = "meridian-csrf-token=test-csrf-token";
   useChatStore.setState({
     messageIds: [],
     messagesById: {},

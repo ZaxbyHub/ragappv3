@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { toast } from "sonner";
 import { useAuthStore } from "@/stores/useAuthStore";
-import apiClient from "@/lib/api";
+import apiClient, { withMethodOverride } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -286,7 +286,7 @@ function OrgsPageContent() {
   const handleRoleChange = async (orgId: number, userId: number, newRole: OrgRole) => {
     setUpdatingMemberId(userId);
     try {
-      await apiClient.patch(`/organizations/${orgId}/members/${userId}`, { role: newRole });
+      await apiClient.post(`/organizations/${orgId}/members/${userId}`, { role: newRole }, withMethodOverride());
       setOrgs((prev) => prev.map((o) => {
         if (o.id !== orgId || !o.members) return o;
         return {

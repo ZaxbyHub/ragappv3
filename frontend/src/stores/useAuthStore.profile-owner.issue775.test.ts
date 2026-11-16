@@ -221,14 +221,14 @@ describe("useAuthStore profile ownership and request races for issue #775", () =
     observed.push(observe(updateA));
 
     try {
-      const requestA = await requestAt(0, "PATCH");
+      const requestA = await requestAt(0, "POST");
       useAuthStore.setState({ user: memberUser });
       expect(owner.signal.aborted).toBe(false);
       expect(requestA.config.signal?.aborted).toBe(true);
 
       const updateB = useAuthStore.getState().updateProfile({ full_name: "Current B" });
       observed.push(observe(updateB));
-      const requestB = await requestAt(1, "PATCH");
+      const requestB = await requestAt(1, "POST");
       expect(requestB.config.signal).not.toBe(owner.signal);
       resolveRequest(requestA, { ...adminUser, full_name: "Stale A" });
       resolveRequest(requestB, { ...memberUser, full_name: "Current B" });
@@ -249,10 +249,10 @@ describe("useAuthStore profile ownership and request races for issue #775", () =
     observed.push(observe(updateA));
 
     try {
-      const requestA = await requestAt(0, "PATCH");
+      const requestA = await requestAt(0, "POST");
       const updateB = useAuthStore.getState().updateProfile({ full_name: "B" });
       observed.push(observe(updateB));
-      const requestB = await requestAt(1, "PATCH");
+      const requestB = await requestAt(1, "POST");
       expect(requestA.config.signal).not.toBe(requestB.config.signal);
 
       resolveRequest(requestA, { ...adminUser, full_name: "A" });
@@ -278,7 +278,7 @@ describe("useAuthStore profile ownership and request races for issue #775", () =
       const requestA = await requestAt(0, "GET");
       const update = useAuthStore.getState().updateProfile({ full_name: "Committed Name" });
       observed.push(observe(update));
-      const requestPatch = await requestAt(1, "PATCH");
+      const requestPatch = await requestAt(1, "POST");
 
       resolveRequest(requestPatch, { ...adminUser, full_name: "Committed Name" });
       await observed[1];
@@ -301,7 +301,7 @@ describe("useAuthStore profile ownership and request races for issue #775", () =
     observed.push(observe(updateA));
 
     try {
-      const requestA = await requestAt(0, "PATCH");
+      const requestA = await requestAt(0, "POST");
       const ownerB = reserveReplacementAuthOwner();
       useAuthStore.setState({ user: { ...positiveUser, full_name: "New Owner" }, isLoading: false });
 
@@ -332,7 +332,7 @@ describe("useAuthStore profile ownership and request races for issue #775", () =
 
       const updateCurrent = useAuthStore.getState().updateProfile({ full_name: "Updated" });
       observed.push(observe(updateCurrent));
-      const requestPatch = await requestAt(1, "PATCH");
+      const requestPatch = await requestAt(1, "POST");
       resolveRequest(requestPatch, { ...positiveUser, full_name: "Updated" });
       expect((await observed[1]).status).toBe("fulfilled");
       expect(useAuthStore.getState().user?.full_name).toBe("Updated");
@@ -340,7 +340,7 @@ describe("useAuthStore profile ownership and request races for issue #775", () =
 
       const failedUpdate = useAuthStore.getState().updateProfile({ full_name: "Rejected" });
       observed.push(observe(failedUpdate));
-      const requestFailure = await requestAt(2, "PATCH");
+      const requestFailure = await requestAt(2, "POST");
       rejectRequest(requestFailure, new Error("profile network outage"));
       const failure = await observed[2];
       expect(failure.status).toBe("rejected");
