@@ -865,21 +865,19 @@ async def run_wiki_lint(
         # process for the scan's duration. Dispatch to the dedicated bounded
         # executor above (review PRR-001; the admission bound above now also
         # bounds the pool pinning F-02 called out there).
-        loop = asyncio.get_running_loop()
         cf_future = _wiki_lint_executor().submit(
             linter.run_lint, request.vault_id
         )
 
-        def _release_when_done(_f, _loop=loop):
-            try:
-                _loop.call_soon_threadsafe(_wiki_lint_release)
-            except RuntimeError:
-                # The loop already closed (lifespan tears the executor down
-                # with wait=False, so a scan can outlive its loop): the
-                # worker thread still owns the slot — release it directly
-                # under the lock so an embedded/multi-cycle server does not
-                # permanently lose admission capacity.
-                _wiki_lint_release()
+        def _release_when_done(_f):
+            # Release DIRECTLY from the worker thread: the admission lock
+            # serializes every counter mutation, so the release does not
+            # depend on the submitting event loop's lifecycle at all. (A
+            # call_soon_threadsafe marshalling would silently DROP the
+            # release when the loop is stopped-but-not-closed at completion
+            # time — the callback is accepted but never run before close,
+            # permanently leaking the slot on embedded/multi-cycle servers.)
+            _wiki_lint_release()
 
         cf_future.add_done_callback(_release_when_done)
     except BaseException:
