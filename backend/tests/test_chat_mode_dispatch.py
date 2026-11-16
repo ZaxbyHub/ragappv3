@@ -33,6 +33,12 @@ def _make_engine_for_retrieval():
     )
     engine.vector_store.get_fts_exceptions.return_value = 0
     engine.reranking_service = None
+    engine.llm_client = MagicMock()
+    engine._thinking_client_override = None
+    engine._instant_client_override = None
+    engine.llm_client = MagicMock()
+    engine._thinking_client_override = None
+    engine._instant_client_override = None
     engine._retrieval_evaluators = {}
     return engine
 
@@ -100,7 +106,7 @@ class TestRetrievalEvaluationModeGating:
                 mode=ChatMode.THINKING,
             )
 
-        evaluator_cls.assert_called_once_with(thinking_client)
+        evaluator_cls.assert_called_once_with(engine.aux_llm_client)
         fake_evaluator.evaluate.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -123,7 +129,7 @@ class TestRetrievalEvaluationModeGating:
                 # mode omitted → defaults to None → not Instant → eval runs
             )
 
-        evaluator_cls.assert_called_once_with(client)
+        evaluator_cls.assert_called_once_with(engine.aux_llm_client)
         fake_evaluator.evaluate.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -147,7 +153,7 @@ class TestRetrievalEvaluationModeGating:
                 mode=ChatMode.INSTANT,
             )
 
-        evaluator_cls.assert_called_once_with(client)
+        evaluator_cls.assert_called_once_with(engine.aux_llm_client)
         fake_evaluator.evaluate.assert_awaited_once()
 
 

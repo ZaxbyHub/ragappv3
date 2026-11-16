@@ -444,6 +444,28 @@ class RAGEngine:
         """LLM client for Instant mode. Falls back to ``self.llm_client`` when no explicit override was passed at construction."""
         return self._instant_client_override or self.llm_client
 
+    @property
+    def aux_llm_client(self) -> LLMClient:
+        """LLM client for the auxiliary retrieval-quality services (query
+        transformation/planning and the retrieval evaluator).
+
+        These are short, machine-shaped calls (one rewrite, one one-word
+        verdict) that must return non-empty, parseable text. The thinking
+        lane's model pre-opens `` on EVERY generation in
+        its chat template - there is no template kwarg to disable it, and
+        ``reasoning_effort="none"`` is not honored by this server - so at a
+        small token budget the whole allowance is spent reasoning and the
+        call returns empty content, silently degrading the service to a
+        no-op (issue #712's starvation failure). The instant lane's model
+        renders no think block at all, so it answers deterministically.
+
+        Routing the aux services to the instant lane keeps the thinking lane
+        fully intact for user-facing answers; the aux calls are not the
+        answer the user reads.
+        """
+        return self.instant_client
+
+
     def rebind_clients(
         self,
         *,
@@ -1367,7 +1389,7 @@ class RAGEngine:
             and is_followup_query(user_input)
         ):
             try:
-                followup_transformer = self._get_query_transformer(active_client)
+                followup_transformer = self._get_query_transformer(self.aux_llm_client)
                 rewritten = await followup_transformer.rewrite_followup(
                     user_input, chat_history
                 )
@@ -1398,7 +1420,7 @@ class RAGEngine:
             and not skip_query_transformation
         ):
             try:
-                query_transformer = self._get_query_transformer(active_client)
+                query_transformer = self._get_query_transformer(self.aux_llm_client)
                 transformed_queries = await query_transformer.transform(
                     retrieval_query
                 )
@@ -1433,7 +1455,7 @@ class RAGEngine:
         plan: List[str] = []  # Default: empty (used if planner is unavailable)
         if active_client is not None:
             try:
-                query_planner = self._get_query_planner(active_client)
+                query_planner = self._get_query_planner(self.aux_llm_client)
                 plan = await query_planner.plan(retrieval_query)
                 trace.query_plan = plan
                 if len(plan) > 1:
@@ -1935,7 +1957,7 @@ class RAGEngine:
                         evaluator_key = id(active_client)
                         if evaluator_key not in self._retrieval_evaluators:
                             self._retrieval_evaluators[evaluator_key] = RetrievalEvaluator(
-                                active_client
+                                self.aux_llm_client
                             )
                         _fusion_evaluator = self._retrieval_evaluators[evaluator_key]
                         eval_result = await _fusion_evaluator.evaluate(
@@ -3637,7 +3659,7 @@ class RAGEngine:
                         evaluator_key = id(active_client)
                         if evaluator_key not in self._retrieval_evaluators:
                             self._retrieval_evaluators[evaluator_key] = RetrievalEvaluator(
-                                active_client
+                                self.aux_llm_client
                             )
                         retrieval_evaluator = self._retrieval_evaluators[evaluator_key]
                         eval_result = await retrieval_evaluator.evaluate(
@@ -4431,7 +4453,7 @@ class RAGEngine:
             and not skip_followup_rewrite
         ):
             try:
-                query_transformer = self._get_query_transformer(self.llm_client)
+                query_transformer = self._get_query_transformer(self.aux_llm_client)
                 transformed_queries = await query_transformer.transform(query)
             except Exception as e:
                 logger.warning(
