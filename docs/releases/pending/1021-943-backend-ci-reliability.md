@@ -26,12 +26,17 @@
   full-repo `rglob`) got the same vanish-tolerant scandir walk as the main
   scan, closing the remaining #943 AC1 leg; a new deterministic unit
   guardrail (`test_943_secretscan_walk_robustness.py`) choreographs a
-  mid-walk vanish so the class cannot silently return. Deliberate semantic
-  change: symlinked directories are listed but not followed by the new
-  walk (matching the main walk's directory handling; rglob recursed into
-  them) — a `<dir>/**` ignore pattern reachable only through a symlinked
-  directory would now be reported stale. The repo carries no symlinked
-  directories today.
+  mid-walk vanish so the class cannot silently return. Semantic change
+  (#1038 corrected this paragraph's original claim): linked directories are
+  listed lexically and never followed by the walk, per platform — POSIX
+  symlinked directories are listed but never descended (the original
+  scandir walk silently DROPPED them entirely; rglob had recursed into
+  them), and Windows junctions/directory-symlinks (reparse points, which
+  `is_symlink()` does not flag) are listed lexically and never descended
+  (the original walk FOLLOWED them, enumerating directories outside ROOT).
+  A `<dir>/**` ignore pattern reachable only through a linked directory is
+  reported by the stale-glob advisory on both platforms. The repo carries
+  no linked directories today.
 
 ## Operator-visible effects
 

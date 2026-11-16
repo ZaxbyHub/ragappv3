@@ -60,13 +60,22 @@ def _load_ci() -> dict:
 
 
 def _backend_pytest_steps(ci: dict) -> list[dict]:
-    """Steps of the backend job whose run command is a bare pytest invocation."""
+    """Steps of the backend job whose run command is the pytest invocation.
+
+    #1021's residual fix wraps the Test step's pytest in the out-of-process
+    watchdog (``python ../scripts/ci_backend_watchdog.py ... -- pytest ...
+    tests/``), so the run line no longer STARTS with ``pytest`` — accept
+    either the bare or the watchdog-wrapped shape (same dual-form locator as
+    backend/tests/test_1021_timeout_wiring.py)."""
     steps = ci["jobs"]["backend"]["steps"]
     return [
         step
         for step in steps
-        if str(step.get("run") or "").strip().startswith("pytest")
-        and "tests/" in str(step.get("run") or "")
+        if "tests/" in str(step.get("run") or "")
+        and (
+            str(step.get("run") or "").strip().startswith("pytest")
+            or "ci_backend_watchdog.py" in str(step.get("run") or "")
+        )
     ]
 
 
