@@ -15,7 +15,8 @@
   WORKER completes — not when the handler exits — so client cancellation
   mid-scan cannot free a slot the executor still occupies, and a scan that
   outlives its event loop (embedded/multi-cycle servers) releases through
-  a worker-thread fallback. Operators can tune the bound by patching
+  the worker thread itself (the release is independent of the
+  submitting event loop's lifecycle). Operators can tune the bound by patching
   `app.api.routes.wiki._WIKI_LINT_MAX_CONCURRENT_RUNS`; it is read at
   request time.
 - **Promotion identity gate (wiki claims)** — a compile or curator run
@@ -26,9 +27,11 @@
   to `active` or reactivates a `superseded` one. Dedup/source-attach still
   rides the fuzzy match (DD-C011 design); only the STATUS LIFTS now
   require text identity (exact match, or equality under the new
-  `promotion_identity_key`, which tolerates only trailing sentence
+  `promotion_identity_key`, which tolerates only trailing `!`/`?`
   terminals — "Alpha is verified" ≡ "Alpha is verified!" still promotes,
-  preserving the #929 parity). Both promotion paths (the deterministic
+  preserving the #929 parity; note a trailing PERIOD is now
+  identity-relevant and blocks promotion, a visible narrowing of the
+  pre-#1117 fuzzy-promotion behavior). Both promotion paths (the deterministic
   `_find_or_create_claim` twin and the curator-persist twin inside the
   compile savepoint) are gated; the #1113 F-03 numeric gate (5.10-vs-510)
   stays.
@@ -38,7 +41,9 @@
   `auto_resolved`, so a recurring detection reopens them instead of being
   permanently suppressed (rule 2 keeps protecting post-cutoff and
   dismissed/acknowledged rows); (2) legacy rows the #791 backfill
-  mislabeled `origin='linter'` that were actually curator-produced
+  mislabeled `origin='linter'` (cohort boundary: the later of
+  2026-10-16 and the database's own origin-migration upgrade instant,
+  covering lagging-upgrade installs) that were actually curator-produced
   (identifiable by the "Curator "-prefixed title or details
   `subtype:"curator"`) re-label to `origin='curator'`, restoring
   same-origin rule-3 reopening for curator detections. Converged boots

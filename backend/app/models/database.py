@@ -7546,6 +7546,15 @@ def migrate_wiki_lint_findings_legacy_backfill(sqlite_path: str) -> None:
     unparseable values are excluded from the cohort (conservative: not
     legacy).
 
+    Lagging-upgrade installs (final-critic B-2): a database that kept
+    running the pre-#791 reconciler AFTER 2026-10-16 holds legacy rows
+    dated after the constant. The upgrade instant is recorded per-database
+    by the origin migration's journal row, so the EFFECTIVE cutoff is the
+    LATER of the constant and that row's created_at (a fresh database
+    writes no such row — its schema carries origin from the start and the
+    origin migration early-returns without journaling — so the constant
+    applies and the cutoff-value pin holds).
+
     Idempotence is NATURAL, not journal-gated (issue-tracer plan-critic
     round 1): the predicates match zero rows after the first run. Journal
     contract: a direct journal INSERT — not record_migration_outcome, which
@@ -7560,6 +7569,25 @@ def migrate_wiki_lint_findings_legacy_backfill(sqlite_path: str) -> None:
     conn = sqlite3.connect(sqlite_path, timeout=MIGRATION_CONNECT_TIMEOUT_SECONDS)
     try:
         conn.execute("BEGIN IMMEDIATE")
+        # Effective cutoff (lagging-upgrade installs): the later of the
+        # constant and the origin migration's own succeeded journal row —
+        # rows the pre-#791 reconciler wrote before THAT instant are legacy
+        # even when the constant has passed.
+        effective_cutoff = _LEGACY_LINT_CUTOFF
+        upgrade_row = conn.execute(
+            "SELECT created_at FROM migration_journal "
+            "WHERE migration_name = 'migrate_wiki_lint_findings_origin_auto_resolved' "
+            "AND outcome = 'ok' ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+        if (
+            upgrade_row
+            and upgrade_row[0]
+            and conn.execute(
+                "SELECT julianday(?) > julianday(?)",
+                (upgrade_row[0], _LEGACY_LINT_CUTOFF),
+            ).fetchone()[0]
+        ):
+            effective_cutoff = upgrade_row[0]
         relabeled = conn.execute(
             """
             UPDATE wiki_lint_findings SET origin = 'curator'
@@ -7573,7 +7601,7 @@ def migrate_wiki_lint_findings_legacy_backfill(sqlite_path: str) -> None:
                       AND json_extract(details, '$.subtype') = 'curator')
               )
             """,
-            (_LEGACY_LINT_CUTOFF,),
+            (effective_cutoff,),
         ).rowcount
         reevaluated = conn.execute(
             """
@@ -7586,7 +7614,7 @@ def migrate_wiki_lint_findings_legacy_backfill(sqlite_path: str) -> None:
               AND julianday(created_at) < julianday(?)
               AND julianday(updated_at) < julianday(?)
             """,
-            (_LEGACY_LINT_CUTOFF, _LEGACY_LINT_CUTOFF),
+            (effective_cutoff, effective_cutoff),
         ).rowcount
         if relabeled or reevaluated:
             if relabeled:

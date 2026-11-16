@@ -216,6 +216,87 @@ class TestAcknowledgedAndCombined(unittest.TestCase):
         self.assertEqual(dict(row)["status"], "open")
 
 
+class TestLaggingUpgrade(unittest.TestCase):
+    """Final-critic B-2: an install that kept running the pre-#791
+    reconciler AFTER 2026-10-16 holds legacy rows dated after the
+    constant. The origin migration's journal row records the actual
+    upgrade instant, and the effective cutoff is the LATER of the two —
+    so those rows are repaired too. Built with the real pre-#791 table
+    shape (no origin column, no auto_resolved in the status CHECK)."""
+
+    _OLD_TABLE = (
+        "CREATE TABLE wiki_lint_findings (\n"
+        "    id INTEGER PRIMARY KEY AUTOINCREMENT,\n"
+        "    vault_id INTEGER NOT NULL,\n"
+        "    finding_type TEXT NOT NULL CHECK (finding_type IN (\n"
+        "        'contradiction','stale','orphan','missing_page',\n"
+        "        'unsupported_claim','duplicate_entity','weak_provenance')),\n"
+        "    severity TEXT NOT NULL DEFAULT 'medium' CHECK (severity IN (\n"
+        "        'low','medium','high','critical')),\n"
+        "    title TEXT NOT NULL,\n"
+        "    details TEXT DEFAULT '',\n"
+        "    related_page_ids_json TEXT NOT NULL DEFAULT '[]'\n"
+        "        CHECK (json_type(related_page_ids_json) = 'array'),\n"
+        "    related_claim_ids_json TEXT NOT NULL DEFAULT '[]'\n"
+        "        CHECK (json_type(related_claim_ids_json) = 'array'),\n"
+        "    status TEXT NOT NULL DEFAULT 'open' CHECK (status IN (\n"
+        "        'open','acknowledged','resolved','dismissed')),\n"
+        "    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,\n"
+        "    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP\n"
+        ");"
+    )
+
+    def test_post_constant_pre_upgrade_rows_are_repaired(self):
+        from datetime import datetime, timedelta
+
+        td = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, td, True)
+        db_path = str(Path(td) / "lagging.db")
+        conn = sqlite3.connect(db_path)
+        conn.execute(self._OLD_TABLE)
+        # A row written by the pre-#791 reconciler on an install that had
+        # NOT yet upgraded: dated AFTER the constant, BEFORE the upgrade.
+        post_constant = (
+            datetime.fromisoformat(
+                _LEGACY_LINT_CUTOFF.replace("Z", "+00:00")
+            ) + timedelta(days=16)
+        ).replace(tzinfo=None).isoformat()
+        cur = conn.execute(
+            "INSERT INTO wiki_lint_findings "
+            "(vault_id, finding_type, severity, title, details, "
+            " related_page_ids_json, related_claim_ids_json, status, "
+            " created_at, updated_at) "
+            "VALUES (1, 'orphan', 'medium', 'Orphan: lagging upgrade', '', "
+            "        '[]', '[]', 'resolved', ?, ?)",
+            (post_constant, post_constant),
+        )
+        rid = cur.lastrowid
+        conn.commit()
+        conn.close()
+        # The full upgrade chain runs NOW: the origin migration rebuilds
+        # the table and journals its own success at the current instant;
+        # the backfill then treats everything before THAT instant as
+        # legacy — including our post-constant row.
+        run_migrations(db_path)
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            self.assertEqual(
+                dict(
+                    conn.execute(
+                        "SELECT status, origin FROM wiki_lint_findings "
+                        "WHERE id = ?",
+                        (rid,),
+                    ).fetchone()
+                ),
+                {"status": "auto_resolved", "origin": "linter"},
+                "a legacy row written after the constant but before the "
+                "database's actual upgrade must still be repaired",
+            )
+        finally:
+            conn.close()
+
+
 class TestJournalSilence(unittest.TestCase):
     def test_mutating_call_journals_once_noop_call_journals_zero(self):
         conn, db_path, td = _make_db()
