@@ -857,7 +857,25 @@ async def run_wiki_lint(
             detail="Wiki lint scan capacity reached; retry shortly",
         )
     cf_future = None
-    callback_registered = False
+    # One admission, exactly one release. The done-callback (worker thread)
+    # and the rollback below (loop thread) both route through this
+    # release-once guard: its flag flips under a per-admission lock, so the
+    # two release paths can never double-count one acquire no matter where
+    # a signal-class BaseException lands — including the one-bytecode
+    # window between add_done_callback() returning and any flag store
+    # (swarm review FR-001: a plain boolean keyed on that ordering left a
+    # double-release there, masked by the floor-at-0 as over-admission).
+    # The lock is per-request, so there is no contention.
+    release_state = {"done": False}
+    release_guard = threading.Lock()
+
+    def _release_once() -> None:
+        with release_guard:
+            if release_state["done"]:
+                return
+            release_state["done"] = True
+        _wiki_lint_release()
+
     try:
         store = WikiStore(db)
         linter = WikiLinter(db, store)
@@ -878,20 +896,23 @@ async def run_wiki_lint(
             # release when the loop is stopped-but-not-closed at completion
             # time — the callback is accepted but never run before close,
             # permanently leaking the slot on embedded/multi-cycle servers.)
-            _wiki_lint_release()
+            _release_once()
 
         cf_future.add_done_callback(_release_when_done)
-        callback_registered = True
     except BaseException:
-        if not callback_registered:
-            # The future does not own the release yet — either submission
-            # failed (cf_future is None) or an async-injected BaseException
-            # (signal class) landed between submit() returning and the
-            # done-callback registration (swarm review F-001: keying the
-            # rollback on `cf_future is None` alone leaked the slot in that
-            # window). Roll the admission back; once the callback is
-            # registered the future alone owns the release.
-            _wiki_lint_release()
+        if cf_future is not None:
+            # An async-injected BaseException (signal class) landed in the
+            # dispatch/registration span. If the scan is still QUEUED,
+            # cancel it so the orphan does not run to completion holding
+            # the request-scoped pooled connection (FR-006); on a running
+            # scan cancel() is a harmless False. If the done-callback was
+            # already invoked inline (future already done), cancel() is a
+            # no-op on the CANCELLED/finished state and the guard has
+            # already claimed the release. cancel() on a queued future
+            # fires its done-callbacks inline, which routes through the
+            # same guard — exactly one release either way.
+            cf_future.cancel()
+        _release_once()
         raise
     findings = await asyncio.wrap_future(cf_future)
     return {"findings": [_as_dict(f) for f in findings], "count": len(findings)}

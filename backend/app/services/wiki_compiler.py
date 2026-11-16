@@ -270,9 +270,11 @@ class WikiCompiler:
         # economy shrank"). Dedup/source-attach may still ride the fuzzy
         # match, but the STATUS LIFTS below additionally require text
         # identity: an exact-arm match, or equality under
-        # promotion_identity_key (which tolerates only trailing sentence
-        # terminals — the "Alpha is verified" ≡ "Alpha is verified!" arm
-        # the #929 parity pins).
+        # promotion_identity_key (which tolerates trailing `!`/`?` only —
+        # a trailing PERIOD is identity-relevant and blocks the lift,
+        # while case and whitespace-run differences ARE tolerated — the
+        # "Alpha is verified" ≡ "Alpha is verified!" arm the #929
+        # parity pins).
         liftable = exact is not None or (
             existing is not None
             and promotion_identity_key(existing.claim_text)

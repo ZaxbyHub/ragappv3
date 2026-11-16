@@ -148,9 +148,16 @@ class TestBlockedVariantStillAttachesSource(unittest.TestCase):
         )
 
 
-class TestCuratorArmMatchedIdGuards(unittest.TestCase):
-    """F-004 pins: count-guarded curator arms — these die if the curator
-    fuzzy fallback is removed (a NEW claim row would appear)."""
+class TestDeterministicTwinMatchedIdGuards(unittest.TestCase):
+    """F-004 twin pins on the DETERMINISTIC twin
+    (``WikiCompiler._find_or_create_claim``): the fuzzy lookup must still
+    MATCH punctuation/number variants as a single row (no duplicate
+    created) while the identity gate blocks the lift. The curator inline
+    arm's own count guard is pinned by o06g:298 (full
+    ``compile_ingest_job`` path); the curator arm's numeric gate is
+    curator-only - this deterministic path blocks 5.10-vs-510 through
+    ``promotion_identity_key`` inequality (the interior period is
+    identity-relevant), not through a numeric gate."""
 
     def _seed_and_lookup(self, existing_text, candidate_text, existing_status):
         conn, store, compiler, td = _make_env()
@@ -172,15 +179,16 @@ class TestCuratorArmMatchedIdGuards(unittest.TestCase):
         return conn, store, claim, created, td
 
     def test_numeric_collision_still_fuzzy_matches_single_row(self):
-        # The F-03 numeric gate blocks the LIFT on 5.10-vs-510 — and the
-        # lookup must still MATCH (one row, no duplicate created).
+        # The identity key blocks the LIFT on 5.10-vs-510 (interior
+        # period is identity-relevant) - and the lookup must still MATCH
+        # (one row, no duplicate created).
         conn, store, claim, created, td = self._seed_and_lookup(
             "The fee is 5.10 USD", "The fee is 510 USD", "unverified"
         )
         self.addCleanup(shutil.rmtree, td, True)
         self.addCleanup(conn.close)
         self.assertFalse(created)
-        self.assertEqual(claim.status, "unverified")  # numeric gate holds
+        self.assertEqual(claim.status, "unverified")  # identity gate holds
         count = conn.execute(
             "SELECT COUNT(*) c FROM wiki_claims WHERE vault_id = 1"
         ).fetchone()["c"]
@@ -231,6 +239,9 @@ class TestCallbackRegistrationWindowReleases(unittest.TestCase):
             def add_done_callback(self, fn):
                 raise KeyboardInterrupt("simulated signal in window")
 
+            def cancel(self):
+                return False  # never registered a callback; nothing to cancel
+
         class _BoomExecutor:
             def submit(self, fn, *a):
                 return _BoomFuture()
@@ -257,6 +268,149 @@ class TestCallbackRegistrationWindowReleases(unittest.TestCase):
             wiki_route._wiki_lint_in_flight, 0,
             "an exception before callback registration must roll the "
             "admission back (F-001 window)",
+        )
+
+
+class TestReleaseOnceIdempotency(unittest.TestCase):
+    """swarm review pr1140-20261116 FR-001/FR-006 pins: the done-callback
+    (worker thread) and the except-block rollback (loop thread) share a
+    release-once guard, so a signal landing anywhere in the dispatch/
+    registration span can never double-count one admission; and the
+    rollback cancels a queued orphan so it never runs on the released
+    slot. RED under the prior callback_registered flag keying."""
+
+    def test_inline_release_then_signal_releases_exactly_once(self):
+        # Already-done future: add_done_callback invokes the callback
+        # INLINE (release #1, claiming the guard) and then a signal-class
+        # BaseException propagates out of the call — the except block's
+        # _release_once() must no-op. The old flag keying rolled back
+        # here: counter 2 -> 0 instead of 2 -> 1.
+        class _InlineReleaseFuture:
+            def add_done_callback(self, fn):
+                fn(self)
+                raise KeyboardInterrupt("signal after inline release")
+
+            def cancel(self):
+                return False  # already finished; nothing to cancel
+
+        class _InlineExecutor:
+            def submit(self, fn, *a):
+                return _InlineReleaseFuture()
+
+        patcher = patch.object(
+            wiki_route, "_wiki_lint_executor", lambda: _InlineExecutor()
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        wiki_route._wiki_lint_in_flight = 0
+        release_calls = []
+        real_release = wiki_route._wiki_lint_release
+
+        def _counting_release():
+            release_calls.append(1)
+            real_release()
+
+        spy = patch.object(wiki_route, "_wiki_lint_release", _counting_release)
+        spy.start()
+        self.addCleanup(spy.stop)
+
+        def _reset():
+            wiki_route._wiki_lint_in_flight = 0
+
+        self.addCleanup(_reset)
+
+        async def scenario():
+            with self.assertRaises(KeyboardInterrupt):
+                await wiki_route.run_wiki_lint(
+                    R(), db=sqlite3.connect(":memory:"),
+                    user={"id": 1}, evaluate=_allow, _csrf_token="x",
+                )
+
+        asyncio.run(scenario())
+        self.assertEqual(
+            wiki_route._wiki_lint_in_flight, 0,
+            "inline release + signal must net exactly one decrement "
+            "(acquire -> 1, one release -> 0)",
+        )
+        self.assertEqual(
+            len(release_calls), 1,
+            "the release-once guard must call _wiki_lint_release exactly "
+            "once: the old flag keying released twice here (inline callback "
+            "+ rollback), and the floor-at-0 silently converted that into "
+            "a stolen slot for the NEXT admission",
+        )
+
+    def test_registration_signal_cancels_queued_orphan_and_releases_once(self):
+        # Future registers the callback, then a signal propagates before
+        # add_done_callback returns: the rollback must CANCEL the queued
+        # orphan (FR-006 — it would otherwise run to completion on the
+        # released slot) and release exactly once (cancel fires the
+        # registered callback inline, which claims the guard; the
+        # rollback's own _release_once then no-ops).
+        class _RegisteringFuture:
+            def __init__(self):
+                self._callbacks = []
+                self.cancelled = False
+
+            def add_done_callback(self, fn):
+                self._callbacks.append(fn)
+                raise KeyboardInterrupt("signal after registration")
+
+            def cancel(self):
+                self.cancelled = True
+                for fn in self._callbacks:
+                    fn(self)
+                return True
+
+        future = _RegisteringFuture()
+
+        class _RegisteringExecutor:
+            def submit(self, fn, *a):
+                return future
+
+        patcher = patch.object(
+            wiki_route, "_wiki_lint_executor", lambda: _RegisteringExecutor()
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        wiki_route._wiki_lint_in_flight = 0
+        release_calls = []
+        real_release = wiki_route._wiki_lint_release
+
+        def _counting_release():
+            release_calls.append(1)
+            real_release()
+
+        spy = patch.object(wiki_route, "_wiki_lint_release", _counting_release)
+        spy.start()
+        self.addCleanup(spy.stop)
+
+        def _reset():
+            wiki_route._wiki_lint_in_flight = 0
+
+        self.addCleanup(_reset)
+
+        async def scenario():
+            with self.assertRaises(KeyboardInterrupt):
+                await wiki_route.run_wiki_lint(
+                    R(), db=sqlite3.connect(":memory:"),
+                    user={"id": 1}, evaluate=_allow, _csrf_token="x",
+                )
+
+        asyncio.run(scenario())
+        self.assertTrue(
+            future.cancelled,
+            "the rollback must cancel a queued orphan (FR-006)",
+        )
+        self.assertEqual(
+            wiki_route._wiki_lint_in_flight, 0,
+            "cancel-fired callback + rollback must net exactly one "
+            "decrement (acquire -> 1 -> single release -> 0)",
+        )
+        self.assertEqual(
+            len(release_calls), 1,
+            "cancel-fired callback + rollback must call _wiki_lint_release "
+            "exactly once via the shared guard",
         )
 
 

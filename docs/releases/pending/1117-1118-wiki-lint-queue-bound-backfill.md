@@ -60,9 +60,11 @@ backfill for #935 items 5+6), collated per session authorization.
 
 ## Operator notes
 
-- The lint 503 is retryable; the WikiPage lint action now surfaces the
-  error (toast) instead of silently dropping it. Single-operator lint
-  runs never hit the bound.
+- The lint 503 is user-retryable (the client never auto-retries POSTs);
+  the WikiPage lint action now surfaces the error (toast) instead of
+  silently dropping it. Ordinary single-operator flows stay within the
+  bound — including the documented vault-switch overlap — but stacking a
+  third overlapping run (rapid vault switching) can hit it.
 - On an install that kept running pre-#791 code after 2026-10-16, the
   backfill treats everything before the database's own upgrade instant
   as legacy — including user resolves made in that window, which become
