@@ -49,6 +49,10 @@ class R:
     vault_id = 1
 
 
+async def _allow(user, res, rid, action):
+    return True
+
+
 def _slow_run_lint(self, vault_id):
     import time
 
@@ -213,6 +217,46 @@ class TestInteriorTerminalsStayIdentityRelevant(unittest.TestCase):
         self.assertEqual(
             promotion_identity_key("wow!!"),
             promotion_identity_key("wow"),
+        )
+
+
+class TestCallbackRegistrationWindowReleases(unittest.TestCase):
+    """Final-critic R3-B1: a BaseException landing between submit() and
+    the done-callback REGISTRATION must still release the slot (the
+    callback_registered flag closes the F-001 window; the old
+    `cf_future is None` keying leaked here)."""
+
+    def test_exception_during_callback_registration_releases(self):
+        class _BoomFuture:
+            def add_done_callback(self, fn):
+                raise KeyboardInterrupt("simulated signal in window")
+
+        class _BoomExecutor:
+            def submit(self, fn, *a):
+                return _BoomFuture()
+
+        wiki_route._wiki_lint_in_flight = 0
+
+        def _reset():
+            wiki_route._wiki_lint_in_flight = 0
+
+        self.addCleanup(_reset)
+        patcher = patch.object(wiki_route, "_wiki_lint_executor", lambda: _BoomExecutor())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        async def scenario():
+            with self.assertRaises(KeyboardInterrupt):
+                await wiki_route.run_wiki_lint(
+                    R(), db=sqlite3.connect(":memory:"),
+                    user={"id": 1}, evaluate=_allow, _csrf_token="x",
+                )
+
+        asyncio.run(scenario())
+        self.assertEqual(
+            wiki_route._wiki_lint_in_flight, 0,
+            "an exception before callback registration must roll the "
+            "admission back (F-001 window)",
         )
 
 
